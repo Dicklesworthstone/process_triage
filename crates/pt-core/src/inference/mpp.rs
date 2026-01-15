@@ -566,10 +566,17 @@ impl MarkedPointProcess {
     }
 
     /// Add multiple events from a batch.
+    ///
+    /// Events are sorted by timestamp before processing. NaN timestamps are
+    /// treated as greater than all other values (sorted to the end).
     pub fn add_batch(&mut self, events: &[MarkedEvent]) {
+        if events.is_empty() {
+            return;
+        }
         // Sort by timestamp if not already sorted
+        // Use total_cmp to handle NaN safely (NaN sorts to the end)
         let mut sorted: Vec<_> = events.to_vec();
-        sorted.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
+        sorted.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
 
         for event in sorted {
             self.add(event);
@@ -680,6 +687,13 @@ impl MarkedPointProcess {
 
         let mark_percentiles = self.mark_digest.common_percentiles().ok();
 
+        // Sanitize infinity values if no marks recorded (shouldn't happen due to min_events check)
+        let (mark_min, mark_max) = if self.mark_count > 0 {
+            (self.mark_min, self.mark_max)
+        } else {
+            (0.0, 0.0)
+        };
+
         let mark_distribution = MarkDistribution {
             count: self.mark_count,
             sum: self.mark_sum,
@@ -687,8 +701,8 @@ impl MarkedPointProcess {
             variance: mark_variance,
             std_dev: mark_std_dev,
             percentiles: mark_percentiles,
-            min: self.mark_min,
-            max: self.mark_max,
+            min: mark_min,
+            max: mark_max,
         };
 
         // Inter-arrival statistics
@@ -706,14 +720,21 @@ impl MarkedPointProcess {
 
         let ia_percentiles = self.inter_arrival_digest.common_percentiles().ok();
 
+        // Sanitize infinity values when no inter-arrivals recorded
+        let (ia_min, ia_max) = if self.ia_count > 0 {
+            (self.ia_min, self.ia_max)
+        } else {
+            (0.0, 0.0) // No inter-arrivals means no valid min/max
+        };
+
         let inter_arrival = InterArrivalStats {
             count: self.ia_count,
             mean: self.ia_mean,
             variance: ia_variance,
             std_dev: ia_std_dev,
             cv: ia_cv,
-            min: self.ia_min,
-            max: self.ia_max,
+            min: ia_min,
+            max: ia_max,
             percentiles: ia_percentiles,
         };
 
@@ -841,6 +862,7 @@ impl BatchMppAnalyzer {
 ///
 /// This is a placeholder for the multivariate Hawkes extension (nao.18).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // Placeholder for future multivariate extension
 pub struct CrossExcitationSummary {
     /// Names of event streams.
     pub stream_names: Vec<String>,
@@ -1014,5 +1036,54 @@ mod tests {
         mpp.reset();
 
         assert_eq!(mpp.event_count(), 0);
+    }
+
+    #[test]
+    fn test_add_batch_with_nan_timestamps() {
+        // Ensure NaN timestamps don't panic (they sort to end and are handled gracefully)
+        let mut mpp = MarkedPointProcess::with_defaults();
+
+        let events = vec![
+            MarkedEvent::new(0.5, 100.0),
+            MarkedEvent::new(f64::NAN, 100.0), // NaN should sort to end
+            MarkedEvent::new(0.1, 100.0),
+            MarkedEvent::new(0.3, 100.0),
+        ];
+
+        // This should not panic
+        mpp.add_batch(&events);
+
+        // 4 events added (NaN is processed but won't contribute valid inter-arrivals)
+        assert_eq!(mpp.event_count(), 4);
+    }
+
+    #[test]
+    fn test_add_batch_empty() {
+        let mut mpp = MarkedPointProcess::with_defaults();
+        mpp.add_batch(&[]); // Should not panic
+        assert_eq!(mpp.event_count(), 0);
+    }
+
+    #[test]
+    fn test_single_event_no_infinity() {
+        // With only 1 event, there are no inter-arrivals
+        // Ensure we don't serialize infinity values
+        let config = MppConfig {
+            min_events: 1, // Allow single event for this test
+            min_time_span: 0.0,
+            ..Default::default()
+        };
+        let mut mpp = MarkedPointProcess::new(config);
+
+        mpp.add_event(0.0, 100.0);
+
+        let summary = mpp.summarize(1.0);
+        assert!(summary.is_valid);
+
+        // Check that we don't have infinity values
+        assert!(summary.inter_arrival.min.is_finite());
+        assert!(summary.inter_arrival.max.is_finite());
+        assert!(summary.mark_distribution.min.is_finite());
+        assert!(summary.mark_distribution.max.is_finite());
     }
 }
