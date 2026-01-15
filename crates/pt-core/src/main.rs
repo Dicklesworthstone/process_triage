@@ -258,7 +258,7 @@ struct CheckArgs {
     policy: bool,
 
     /// Check system capabilities
-    #[arg(long = "caps")]
+    #[arg(long = "capabilities", alias = "caps")]
     check_capabilities: bool,
 
     /// Check all configuration
@@ -624,6 +624,7 @@ fn run_check(global: &GlobalOpts, args: &CheckArgs) -> ExitCode {
             let status = if all_ok { "OK" } else { "FAILED" };
             println!("[{}] check: {}", session_id, status);
         }
+        OutputFormat::Exitcode => {}
         _ => {
             println!("# pt-core check");
             println!();
@@ -792,6 +793,7 @@ fn run_config_show(global: &GlobalOpts, file_filter: Option<&str>) -> ExitCode {
                 .unwrap_or_else(|| "built-in defaults".to_string());
             println!("[{}] config: priors={} policy={}", session_id, priors_src, policy_src);
         }
+        OutputFormat::Exitcode => {}
         _ => {
             println!("# pt-core config show");
             println!();
@@ -886,6 +888,7 @@ fn run_config_validate(global: &GlobalOpts, path: Option<&String>) -> ExitCode {
                 OutputFormat::Summary => {
                     println!("[{}] config validate: OK", session_id);
                 }
+                OutputFormat::Exitcode => {}
                 _ => {
                     println!("# Configuration Validation");
                     println!();
@@ -942,6 +945,7 @@ fn output_config_error(global: &GlobalOpts, error: &ConfigError) -> ExitCode {
         OutputFormat::Summary => {
             eprintln!("[{}] config error: {}", session_id, error);
         }
+        OutputFormat::Exitcode => {}
         _ => {
             eprintln!("# Configuration Error");
             eprintln!();
@@ -974,6 +978,7 @@ fn print_version(global: &GlobalOpts) {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&version_info).unwrap());
         }
+        OutputFormat::Exitcode => {}
         _ => {
             println!("pt-core {}", env!("CARGO_PKG_VERSION"));
             println!("schema version: {}", SCHEMA_VERSION);
@@ -999,6 +1004,7 @@ fn output_stub(global: &GlobalOpts, command: &str, message: &str) {
         OutputFormat::Summary => {
             println!("[{}] {}: {}", session_id, command, message);
         }
+        OutputFormat::Exitcode => {}
         _ => {
             println!("# pt-core {}", command);
             println!();
@@ -1029,6 +1035,7 @@ fn output_capabilities(global: &GlobalOpts) {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&capabilities).unwrap());
         }
+        OutputFormat::Exitcode => {}
         _ => {
             println!("# Capabilities");
             println!();
