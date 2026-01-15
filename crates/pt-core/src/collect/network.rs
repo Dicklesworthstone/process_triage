@@ -12,6 +12,7 @@
 //! - `ss` command output (fallback)
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -32,6 +33,121 @@ pub struct NetworkInfo {
     /// Unix domain sockets.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unix_sockets: Vec<UnixSocket>,
+}
+
+/// A snapshot of global network state for O(1) process lookup.
+///
+/// This structure reads /proc/net/* files once and indexes them by inode,
+/// avoiding the O(N*M) complexity of reading them for every process.
+#[derive(Debug, Default)]
+pub struct NetworkSnapshot {
+    tcp_by_inode: HashMap<u64, TcpConnection>,
+    udp_by_inode: HashMap<u64, UdpSocket>,
+    unix_by_inode: HashMap<u64, UnixSocket>,
+}
+
+impl NetworkSnapshot {
+    /// Collect a global snapshot of network sockets.
+    pub fn collect() -> Self {
+        let mut snapshot = NetworkSnapshot::default();
+
+        // TCP
+        if let Some(entries) = parse_proc_net_tcp("/proc/net/tcp", false) {
+            for e in entries { snapshot.tcp_by_inode.insert(e.inode, e); }
+        }
+        if let Some(entries) = parse_proc_net_tcp("/proc/net/tcp6", true) {
+            for e in entries { snapshot.tcp_by_inode.insert(e.inode, e); }
+        }
+
+        // UDP
+        if let Some(entries) = parse_proc_net_udp("/proc/net/udp", false) {
+            for e in entries { snapshot.udp_by_inode.insert(e.inode, e); }
+        }
+        if let Some(entries) = parse_proc_net_udp("/proc/net/udp6", true) {
+            for e in entries { snapshot.udp_by_inode.insert(e.inode, e); }
+        }
+
+        // Unix
+        if let Some(entries) = parse_proc_net_unix("/proc/net/unix") {
+            for e in entries { snapshot.unix_by_inode.insert(e.inode, e); }
+        }
+
+        snapshot
+    }
+
+    /// Get network info for a specific process using the cached snapshot.
+    pub fn get_process_info(&self, pid: u32) -> Option<NetworkInfo> {
+        let socket_inodes = get_process_socket_inodes(pid)?;
+        if socket_inodes.is_empty() {
+            return Some(NetworkInfo::default());
+        }
+
+        let mut info = NetworkInfo::default();
+
+        for inode in socket_inodes {
+            // Check TCP
+            if let Some(conn) = self.tcp_by_inode.get(&inode) {
+                if conn.is_ipv6 {
+                    info.socket_counts.tcp6 += 1;
+                    if conn.state.is_listen() {
+                        info.listen_ports.push(ListenPort {
+                            protocol: "tcp6".to_string(),
+                            port: conn.local_port,
+                            address: conn.local_addr.clone(),
+                            inode,
+                        });
+                    }
+                } else {
+                    info.socket_counts.tcp += 1;
+                    if conn.state.is_listen() {
+                        info.listen_ports.push(ListenPort {
+                            protocol: "tcp".to_string(),
+                            port: conn.local_port,
+                            address: conn.local_addr.clone(),
+                            inode,
+                        });
+                    }
+                }
+                info.tcp_connections.push(conn.clone());
+                continue;
+            }
+
+            // Check UDP
+            if let Some(sock) = self.udp_by_inode.get(&inode) {
+                if sock.is_ipv6 {
+                    info.socket_counts.udp6 += 1;
+                    if sock.local_port != 0 && sock.remote_port == 0 {
+                        info.listen_ports.push(ListenPort {
+                            protocol: "udp6".to_string(),
+                            port: sock.local_port,
+                            address: sock.local_addr.clone(),
+                            inode,
+                        });
+                    }
+                } else {
+                    info.socket_counts.udp += 1;
+                    if sock.local_port != 0 && sock.remote_port == 0 {
+                        info.listen_ports.push(ListenPort {
+                            protocol: "udp".to_string(),
+                            port: sock.local_port,
+                            address: sock.local_addr.clone(),
+                            inode,
+                        });
+                    }
+                }
+                info.udp_sockets.push(sock.clone());
+                continue;
+            }
+
+            // Check Unix
+            if let Some(sock) = self.unix_by_inode.get(&inode) {
+                info.socket_counts.unix += 1;
+                info.unix_sockets.push(sock.clone());
+            }
+        }
+
+        Some(info)
+    }
 }
 
 /// Socket counts by protocol type.
@@ -216,105 +332,18 @@ impl UnixSocketState {
 ///
 /// This function reads /proc/[pid]/fd to find socket inodes, then
 /// looks them up in /proc/net/tcp, /proc/net/udp, /proc/net/unix.
+///
+/// Note: For bulk collection, use `NetworkSnapshot::collect()` and `get_process_info`
+/// to avoid reading /proc/net/* files repeatedly.
 pub fn collect_network_info(pid: u32) -> Option<NetworkInfo> {
-    // First, get all socket inodes for this process
-    let socket_inodes = get_process_socket_inodes(pid)?;
-    if socket_inodes.is_empty() {
-        return Some(NetworkInfo::default());
-    }
-
-    let mut info = NetworkInfo::default();
-
-    // Parse TCP connections and filter by inode
-    if let Some(tcp_entries) = parse_proc_net_tcp("/proc/net/tcp", false) {
-        for entry in tcp_entries {
-            if socket_inodes.contains(&entry.inode) {
-                info.socket_counts.tcp += 1;
-                if entry.state.is_listen() {
-                    info.listen_ports.push(ListenPort {
-                        protocol: "tcp".to_string(),
-                        port: entry.local_port,
-                        address: entry.local_addr.clone(),
-                        inode: entry.inode,
-                    });
-                }
-                info.tcp_connections.push(entry);
-            }
-        }
-    }
-
-    // Parse TCP6 connections
-    if let Some(tcp6_entries) = parse_proc_net_tcp("/proc/net/tcp6", true) {
-        for entry in tcp6_entries {
-            if socket_inodes.contains(&entry.inode) {
-                info.socket_counts.tcp6 += 1;
-                if entry.state.is_listen() {
-                    info.listen_ports.push(ListenPort {
-                        protocol: "tcp6".to_string(),
-                        port: entry.local_port,
-                        address: entry.local_addr.clone(),
-                        inode: entry.inode,
-                    });
-                }
-                info.tcp_connections.push(entry);
-            }
-        }
-    }
-
-    // Parse UDP sockets
-    if let Some(udp_entries) = parse_proc_net_udp("/proc/net/udp", false) {
-        for entry in udp_entries {
-            if socket_inodes.contains(&entry.inode) {
-                info.socket_counts.udp += 1;
-                // UDP listening is when local_port != 0 and remote is 0.0.0.0:0
-                if entry.local_port != 0 && entry.remote_port == 0 {
-                    info.listen_ports.push(ListenPort {
-                        protocol: "udp".to_string(),
-                        port: entry.local_port,
-                        address: entry.local_addr.clone(),
-                        inode: entry.inode,
-                    });
-                }
-                info.udp_sockets.push(entry);
-            }
-        }
-    }
-
-    // Parse UDP6 sockets
-    if let Some(udp6_entries) = parse_proc_net_udp("/proc/net/udp6", true) {
-        for entry in udp6_entries {
-            if socket_inodes.contains(&entry.inode) {
-                info.socket_counts.udp6 += 1;
-                if entry.local_port != 0 && entry.remote_port == 0 {
-                    info.listen_ports.push(ListenPort {
-                        protocol: "udp6".to_string(),
-                        port: entry.local_port,
-                        address: entry.local_addr.clone(),
-                        inode: entry.inode,
-                    });
-                }
-                info.udp_sockets.push(entry);
-            }
-        }
-    }
-
-    // Parse Unix sockets
-    if let Some(unix_entries) = parse_proc_net_unix("/proc/net/unix") {
-        for entry in unix_entries {
-            if socket_inodes.contains(&entry.inode) {
-                info.socket_counts.unix += 1;
-                info.unix_sockets.push(entry);
-            }
-        }
-    }
-
-    Some(info)
+    let snapshot = NetworkSnapshot::collect();
+    snapshot.get_process_info(pid)
 }
 
 /// Get all socket inode numbers for a process from /proc/[pid]/fd.
-fn get_process_socket_inodes(pid: u32) -> Option<std::collections::HashSet<u64>> {
+fn get_process_socket_inodes(pid: u32) -> Option<HashSet<u64>> {
     let fd_path = format!("/proc/{}/fd", pid);
-    let mut inodes = std::collections::HashSet::new();
+    let mut inodes = HashSet::new();
 
     let entries = fs::read_dir(&fd_path).ok()?;
     for entry in entries.flatten() {
@@ -444,7 +473,7 @@ pub fn parse_proc_net_unix_content(content: &str) -> Vec<UnixSocket> {
             .unwrap_or(UnixSocketState::Unknown);
         let inode = parts[6].parse().unwrap_or(0);
         let path = if parts.len() > 7 {
-            Some(parts[7].to_string())
+            Some(parts[7..].join(" "))
         } else {
             None
         };

@@ -127,6 +127,10 @@ pub struct TickSnapshot {
     /// Timestamp when snapshot was taken.
     pub timestamp: std::time::SystemTime,
 
+    /// Monotonic timestamp for precise duration calculation (not serialized).
+    #[serde(skip, default)]
+    pub monotonic: Option<std::time::Instant>,
+
     /// Process start time (for identity validation).
     pub starttime: u64,
 }
@@ -259,8 +263,11 @@ pub fn collect_tick_snapshot(pid: u32) -> Option<TickSnapshot> {
     let path = format!("/proc/{}/stat", pid);
     let content = fs::read_to_string(&path).ok()?;
     let timestamp = std::time::SystemTime::now();
+    let monotonic = std::time::Instant::now();
 
-    parse_tick_snapshot(&content, pid, timestamp)
+    let mut snapshot = parse_tick_snapshot(&content, pid, timestamp)?;
+    snapshot.monotonic = Some(monotonic);
+    Some(snapshot)
 }
 
 /// Parse tick snapshot from /proc/[pid]/stat content.
@@ -294,6 +301,7 @@ pub fn parse_tick_snapshot(
         total_ticks: utime + stime,
         num_threads,
         timestamp,
+        monotonic: None,
         starttime,
     })
 }
@@ -317,14 +325,26 @@ pub fn compute_tick_delta(
         return None;
     }
 
-    // Validate ordering
-    if after.timestamp <= before.timestamp {
-        return None;
-    }
-
-    // Compute delta_t
-    let delta_duration = after.timestamp.duration_since(before.timestamp).ok()?;
-    let delta_t_secs = delta_duration.as_secs_f64();
+    // Compute delta_t using monotonic time if available, otherwise SystemTime
+    let delta_t_secs = match (before.monotonic, after.monotonic) {
+        (Some(start), Some(end)) => {
+            if end <= start {
+                return None;
+            }
+            end.duration_since(start).as_secs_f64()
+        }
+        _ => {
+            // Fallback to SystemTime
+            if after.timestamp <= before.timestamp {
+                return None;
+            }
+            after
+                .timestamp
+                .duration_since(before.timestamp)
+                .ok()?
+                .as_secs_f64()
+        }
+    };
 
     if delta_t_secs <= 0.0 {
         return None;
@@ -509,6 +529,7 @@ mod tests {
             num_threads: 1,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
             starttime: 12345,
+            monotonic: None,
         };
 
         let after = TickSnapshot {
@@ -520,6 +541,7 @@ mod tests {
             num_threads: 1,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1001),
             starttime: 12345,
+            monotonic: None,
         };
 
         let config = TickDeltaConfig::default();
@@ -542,6 +564,7 @@ mod tests {
             num_threads: 1,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
             starttime: 12345,
+            monotonic: None,
         };
 
         let after = TickSnapshot {
@@ -553,6 +576,7 @@ mod tests {
             num_threads: 1,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1001),
             starttime: 99999, // Different starttime (PID reused)
+            monotonic: None,
         };
 
         let config = TickDeltaConfig::default();
@@ -572,6 +596,7 @@ mod tests {
             num_threads: 1,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
             starttime: 12345,
+            monotonic: None,
         };
 
         // Very high tick consumption for short window
@@ -586,6 +611,7 @@ mod tests {
                 + Duration::from_secs(1000)
                 + Duration::from_millis(10),
             starttime: 12345,
+            monotonic: None,
         };
 
         let config = TickDeltaConfig::default();
@@ -606,6 +632,7 @@ mod tests {
             num_threads: 4,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
             starttime: 12345,
+            monotonic: None,
         };
 
         let after = TickSnapshot {
@@ -617,6 +644,7 @@ mod tests {
             num_threads: 4,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1001),
             starttime: 12345,
+            monotonic: None,
         };
 
         // Identity policy
@@ -648,6 +676,7 @@ mod tests {
             num_threads: 1,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
             starttime: 12345,
+            monotonic: None,
         };
 
         let after = TickSnapshot {
@@ -659,6 +688,7 @@ mod tests {
             num_threads: 1,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1001),
             starttime: 12345,
+            monotonic: None,
         };
 
         let config = TickDeltaConfig {
@@ -686,6 +716,7 @@ mod tests {
             num_threads: 1, // Single thread
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
             starttime: 12345,
+            monotonic: None,
         };
 
         let after = TickSnapshot {
@@ -697,6 +728,7 @@ mod tests {
             num_threads: 1,
             timestamp: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1001),
             starttime: 12345,
+            monotonic: None,
         };
 
         let config = TickDeltaConfig::default();

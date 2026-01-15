@@ -203,7 +203,7 @@ impl ProcStat {
 
         let comm = content[comm_start + 1..comm_end].to_string();
 
-        let rest = &content[comm_end + 2..];
+        let rest = content.get(comm_end + 2..)?;
         let fields: Vec<&str> = rest.split_whitespace().collect();
 
         if fields.len() < 6 {

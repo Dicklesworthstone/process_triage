@@ -341,10 +341,13 @@ pub fn parse_fd_dir(dir: &Path, fdinfo_dir: Option<&Path>) -> Option<FdInfo> {
     let entries = fs::read_dir(dir).ok()?;
 
     for entry in entries.flatten() {
-        info.count += 1;
+        // Parse FD number from filename; skip non-numeric entries defensively.
+        let fd_name = entry.file_name();
+        let Ok(fd_num) = fd_name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
 
-        // Parse FD number from filename
-        let fd_num: u32 = entry.file_name().to_string_lossy().parse().unwrap_or(0);
+        info.count += 1;
 
         // Try to read the symlink to categorize
         if let Ok(target) = fs::read_link(entry.path()) {
