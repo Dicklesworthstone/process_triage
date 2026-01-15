@@ -440,11 +440,11 @@ mod tests {
         let engine = test_engine();
 
         // Secret env var should be redacted
-        let (name, value) = engine.redact_env("AWS_SECRET_KEY", "my_secret");
+        let (_name, value) = engine.redact_env("AWS_SECRET_KEY", "my_secret");
         assert_eq!(value.output, "[REDACTED]");
 
         // Normal env var still redacted by default policy
-        let (name, value) = engine.redact_env("PATH", "/usr/bin");
+        let (_name, value) = engine.redact_env("PATH", "/usr/bin");
         assert_eq!(value.output, "[REDACTED]"); // env_value defaults to redact
     }
 
