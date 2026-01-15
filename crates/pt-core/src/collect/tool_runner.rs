@@ -509,7 +509,7 @@ impl ToolRunner {
 
             // Try to read stdout
             if let Some(ref mut out) = stdout {
-                if let Ok(n) = Self::try_read_nonblocking(out, &mut chunk) {
+                if let Ok(n) = try_read_nonblocking(out, &mut chunk) {
                     if n > 0 {
                         did_read = true;
                         let space = max_output.saturating_sub(stdout_buf.len());
@@ -528,7 +528,7 @@ impl ToolRunner {
 
             // Try to read stderr
             if let Some(ref mut err) = stderr {
-                if let Ok(n) = Self::try_read_nonblocking(err, &mut chunk) {
+                if let Ok(n) = try_read_nonblocking(err, &mut chunk) {
                     if n > 0 {
                         did_read = true;
                         let space = max_output.saturating_sub(stderr_buf.len());
@@ -579,58 +579,6 @@ impl ToolRunner {
         let exit_code = status.and_then(|s| s.code());
 
         Ok((stdout_buf, stderr_buf, exit_code, truncated, timed_out))
-    }
-
-    /// Try to read from a stream without blocking.
-    ///
-    /// On Unix, this uses fcntl to set O_NONBLOCK on the file descriptor,
-    /// performs a read, then restores the original flags.
-    /// Returns Ok(0) if no data is available (EAGAIN/EWOULDBLOCK).
-    #[cfg(unix)]
-    fn try_read_nonblocking<R: Read + std::os::unix::io::AsRawFd>(
-        stream: &mut R,
-        buf: &mut [u8],
-    ) -> std::io::Result<usize> {
-        let fd = stream.as_raw_fd();
-
-        // Get current flags
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        // Set non-blocking if not already set
-        let was_nonblocking = (flags & libc::O_NONBLOCK) != 0;
-        if !was_nonblocking {
-            let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-            if result < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-
-        // Attempt read
-        let result = stream.read(buf);
-
-        // Restore blocking mode if we changed it
-        if !was_nonblocking {
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFL, flags);
-            }
-        }
-
-        // Convert EAGAIN/EWOULDBLOCK to Ok(0)
-        match result {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Non-blocking read fallback for non-Unix platforms.
-    /// Falls back to blocking read.
-    #[cfg(not(unix))]
-    fn try_read_nonblocking<R: Read>(stream: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
-        stream.read(buf)
     }
 
     /// Drain remaining data from a stream up to the limit.
@@ -699,6 +647,58 @@ impl ToolRunner {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// Try to read from a stream without blocking.
+///
+/// On Unix, this uses fcntl to set O_NONBLOCK on the file descriptor,
+/// performs a read, then restores the original flags.
+/// Returns Ok(0) if no data is available (EAGAIN/EWOULDBLOCK).
+#[cfg(unix)]
+fn try_read_nonblocking<R: Read + std::os::unix::io::AsRawFd>(
+    stream: &mut R,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    let fd = stream.as_raw_fd();
+
+    // Get current flags
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Set non-blocking if not already set
+    let was_nonblocking = (flags & libc::O_NONBLOCK) != 0;
+    if !was_nonblocking {
+        let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    // Attempt read
+    let result = stream.read(buf);
+
+    // Restore blocking mode if we changed it
+    if !was_nonblocking {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, flags);
+        }
+    }
+
+    // Convert EAGAIN/EWOULDBLOCK to Ok(0)
+    match result {
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+/// Non-blocking read fallback for non-Unix platforms.
+/// Falls back to blocking read.
+#[cfg(not(unix))]
+fn try_read_nonblocking<R: Read>(stream: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    stream.read(buf)
 }
 
 /// Builder for creating a tool runner with custom configuration.
