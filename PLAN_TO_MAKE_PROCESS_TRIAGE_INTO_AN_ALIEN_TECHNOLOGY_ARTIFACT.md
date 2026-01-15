@@ -64,8 +64,8 @@ B) Decision rule via expected loss (Bayesian risk)
   (note: zombies can’t be killed directly; interpret “kill” here as “resolve via parent reaping / restart parent”, see section 6)
 
 C) Survival analysis and hazards
-- hazard lambda_C
-- P(still running | t, C) = exp(-lambda_C * t)
+- hazard lambda_C (constant-hazard special case)
+- P(still running | t, C) = exp(-lambda_C * t)  (for competing hazards, lambda_total = sum of cause-specific hazards)
 - Gamma prior on lambda_C yields closed-form posterior; marginal survival (Gamma-mixed exponential) is Lomax/Pareto-II:
   P(T>t) = (β/(β+t))^α (rate-parameterization)
 
@@ -95,15 +95,15 @@ H) Bayes factors for model selection
 
 I) Optimal stopping + SPRT
 - Kill if log odds cross a boundary:
-  log [P(abandoned|x) / P(useful|x)] > log [(L(keep,useful)-L(kill,useful)) / (L(kill,abandoned)-L(keep,abandoned))]
+  log [P(abandoned|x) / P(useful|x)] > log [(L(kill,useful)-L(keep,useful)) / (L(keep,abandoned)-L(kill,abandoned))]
 
 J) Queueing theory for system-level cost
 - M/M/c or M/G/c model
-- Erlang-C delay: W_q = C(c,rho) / (c*mu - lambda)
+- Erlang-C wait (M/M/c): W_q = C(c,ρ) / (c*μ - λ_arrival) with ρ = λ_arrival/(c*μ)
 
 K) Value of Information
-- VOI = E[Delta loss | new observation] - cost of waiting
-- If VOI < 0, act now
+- VOI = E[loss_now - loss_after_measurement] - cost(measurement/waiting)
+- If VOI <= 0, act now
 
 L) Robust Bayes (imprecise priors)
 - P(C) in [lower P(C), upper P(C)]
@@ -111,7 +111,7 @@ L) Robust Bayes (imprecise priors)
 
 M) Information-theoretic abnormality
 - KL divergence: D_KL(p_hat || p_useful)
-- Chernoff bound (tail under “useful”): P_useful(observe deviation) <= exp(-t * I(p_hat))
+- Large-deviation intuition: under the “useful” model, observing an empirical rate p_hat is roughly ≲ exp(-n * D_KL(p_hat || p_useful)) for an effective sample count n
 - Large deviations / rate functions
 
 N) Wonham filtering (continuous-time partial observability)
@@ -221,7 +221,7 @@ AN) Linear Gaussian state-space (Kalman)
 - Smooth CPU/load signals; closed-form filtering/smoothing
 
 AO) Optimal transport / Wasserstein distances
-- Distribution-shift detection with analytic 1D OT distances
+- Distribution-shift detection with exact 1D OT distances via quantile functions (fast on empirical samples)
 
 AP) Martingale concentration / sequential bounds
 - Azuma/Freedman bounds for sustained anomaly detection
@@ -233,7 +233,7 @@ AR) Renewal reward / semi-regenerative processes
 - Model event rewards (CPU/IO) between renewals with conjugate updates
 
 AS) Conformal prediction (distribution-free coverage)
-- Prediction intervals for runtime/CPU with finite-sample guarantees
+- Prediction intervals for runtime/CPU with finite-sample guarantees under exchangeability (use time-blocked/online conformal variants for temporal dependence)
 
 AT) False Discovery Rate (FDR) control across many processes
 - Multiple-testing correction (Benjamini-Hochberg, local fdr) for kill recommendations
@@ -370,7 +370,7 @@ All of these are integrated in the system design below.
 - Self-protection: `pt-core` runs with an overhead budget (caps concurrency, sampling rates, and optional nice/ionice) so the triage system does not become a new source of load.
 - Quick scan inputs (fast): ps pid, ppid, etimes, rss, %cpu, tty, args, state
 - Quick scan should also capture: uid, pgid, sid, and cgroup path (when available), since “who owns it?” and “what group/unit/container is it in?” strongly affect safe actions.
-- Process identity safety: quick scan should also capture a stable per-process start identifier (e.g., Linux `/proc/PID/stat` starttime ticks since boot) so action execution can revalidate identity and avoid PID-reuse footguns.
+- Process identity safety: quick scan should also capture a stable per-process start identifier (Linux: `/proc/PID/stat` starttime ticks since boot; macOS: proc start time) so action execution can revalidate identity and avoid PID-reuse footguns.
 - Deep scan inputs (slow):
   - /proc/PID/io (read/write deltas)
   - /proc/PID/stat (CPU tick deltas)
@@ -754,7 +754,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - Azuma/Freedman bounds for sustained anomaly evidence over time
 
 ### 4.26 Graph Signal Regularization
-- Laplacian smoothing on PPID tree to reduce noisy per-process posteriors
+- Laplacian smoothing on the PPID tree (applied to log-odds / natural parameters, not raw probabilities) to reduce noisy per-process estimates
 
 ### 4.27 Renewal Reward Modeling
 - CPU/IO rewards per renewal interval; conjugate updates for reward rates
@@ -846,12 +846,12 @@ C in {useful, useful-but-bad, abandoned, zombie}
   (i.e., kill when posterior odds exceed the Bayes-risk threshold implied by the loss matrix; equivalently compare Bayes factors + prior odds to this threshold)
 
 ### 5.3 Value of Information (VOI)
-- VOI = E[Delta loss | new observation] - cost of waiting
-- if VOI < 0 then act (kill/pause/throttle)
+- VOI = E[loss_now - loss_after_measurement] - cost(measurement/waiting)
+- if VOI <= 0 then act now; otherwise spend budget on the next measurement (or pause+observe)
 
 ### 5.4 Queueing-theoretic Threshold Adjustment
 - model CPU contention as M/M/c or M/G/c
-- Erlang-C delay: W_q = C(c,rho) / (c*mu - lambda)
+- Erlang-C wait (M/M/c): W_q = C(c,ρ) / (c*μ - λ_arrival) with ρ = λ_arrival/(c*μ)
 - increase aggressiveness as W_q grows
 
 ### 5.5 Dependency-Weighted Loss
@@ -1072,7 +1072,7 @@ Use the model to interpret the observed snapshot:
 - Define an inbox contract for daemon-driven “plans ready for review” (agent and human surfaces).
 
 ### Phase 2: Math Utilities
-- Implement BetaBinomial (and optional BetaPDF approximation), GammaPDF, Dirichlet-multinomial, Beta-Bernoulli
+- Implement BetaBinomial and Beta-Bernoulli/Dirichlet-multinomial posterior-predictives (plus Beta PDF/CDF utilities for posterior reporting/galaxy-brain views), GammaPDF
 - Implement Bayes factors, log-odds, posterior computation
 - Implement numerically-stable primitives (log-sum-exp, log-domain densities, stable special functions) to prevent underflow in Bayes factors/posteriors.
 - Implement Arrow/Parquet schemas for telemetry tables and a batched Parquet writer (append-only).
@@ -1258,7 +1258,7 @@ Telemetry and data governance are specified in sections 3.3–3.4; the phases be
 
 ## 11) Tests and Validation
 
-- Unit tests: math functions (BetaBinomial/BetaPDF, GammaPDF, Bayes factors)
+- Unit tests: math functions (BetaBinomial, Beta posterior utilities, GammaPDF, Bayes factors)
 - Integration tests: deterministic output for fixed inputs
 - Telemetry tests: Parquet schema stability, batched writes, and DuckDB view/query correctness
 - Redaction tests: confirm sensitive strings never appear in persisted telemetry
