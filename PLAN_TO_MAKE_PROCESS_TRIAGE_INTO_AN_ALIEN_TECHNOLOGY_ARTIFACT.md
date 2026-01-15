@@ -369,6 +369,7 @@ Notation conventions used below:
 
 A) Basic closed-form Bayesian model (non-ML)
 - Class set: C in {useful, useful-but-bad, abandoned, zombie}
+- (Wire/schema enum keys use snake_case: `useful`, `useful_bad`, `abandoned`, `zombie`)
 - Bayes rule: P(C|x) proportional to P(C) * P(x|C)
 - Features: CPU usage u, runtime t, PPID, command, CWD, state flags, child count, TTY, I/O wait, CPU trend
 - Likelihoods (keep the runtime “decision core” conjugate and log-domain numerically stable):
@@ -924,7 +925,7 @@ Storage approach:
 - Query the Parquet lake with DuckDB (views over partitions). Optionally maintain a small `.duckdb` file for convenience views and macros, but do not rely on it for multi-writer ingestion.
 - If a `.duckdb` file is used, treat it as read-mostly (or per-run) so concurrent runs never contend on a single writable DB file.
 - Avoid per-row inserts; batch writes per scan cycle and emit new Parquet files atomically.
-- Default telemetry root: a single per-user directory (e.g., `~/.local/share/pt/telemetry/`), overridable via config/env, so full-auto runs always have somewhere to write.
+- Default telemetry root: a single per-user directory (e.g., `~/.local/share/process_triage/telemetry/`), overridable via config/env, so full-auto runs always have somewhere to write.
 - Raw tool outputs are recorded with strict size caps and redaction; structured parsed fields are the primary analytic surface.
 - Retention: enforce a disk budget and TTL for raw outputs and high-volume tables; keep aggregated summaries longer than raw streams.
   - No silent deletion: any pruning is explicit, policy-driven, and recorded as retention events; keep plan + inference ledger + outcomes longer than raw high-volume traces.
@@ -959,6 +960,9 @@ pt agent plan [OPTIONS]
 ```
 Core options:
 - `--deep` - Force deep scan on all candidates (not just top suspects)
+- `--session <id>` - Reuse an existing session snapshot/context (skip re-scanning)
+- `--signatures <path>` - Load additional signatures (organization/user patterns)
+- `--community-signatures` - Include signed community signatures (opt-in)
 - `--min-age <seconds>` - Only consider processes older than threshold (default: 0)
 - `--limit <N>` - Limit candidate count in output
 - `--only kill|review|all` - Filter output by recommendation category
@@ -1045,13 +1049,13 @@ Core options:
           "λ_r | data ~ Gamma(α_r + N_r, β_r + E_r)",
           "S(t) = exp(-∑_r λ_r * E_r)"
         ],
-	        "values": {
-	          "regimes": [
-	            {"name":"tty_lost","alpha":2.0,"beta":1.0,"N":1,"E":3600,"lambda_mean":0.00083},
-	            {"name":"io_flatline","alpha":1.0,"beta":1.0,"N":0,"E":1800,"lambda_mean":0.00056}
-	          ],
-	          "survival_t": 0.02
-	        },
+        "values": {
+          "regimes": [
+            {"name":"tty_lost","alpha":2.0,"beta":1.0,"N":1,"E":3600,"lambda_mean":0.00083},
+            {"name":"io_flatline","alpha":1.0,"beta":1.0,"N":0,"E":1800,"lambda_mean":0.00056}
+          ],
+          "survival_t": 0.02
+        },
         "intuition": "TTY loss increases abandonment hazard."
       },
       {
@@ -1178,7 +1182,7 @@ Report schema note:
   ✅ Killed 3 abandoned processes:
      • stuck jest worker (4h, 1.2GB)
      • orphaned next dev server (2d, 800MB)
-     • zombie webpack watcher (6h, 400MB)
+     • orphaned webpack watcher (6h, 400MB)
   📊 Recovered: 2.4GB RAM, 2.1 CPU cores
   ```
 
@@ -1750,7 +1754,7 @@ Agent invocation 4: pt agent verify --session <id>
 **Session state persistence:**
 
 Sessions are durable across CLI invocations:
-- Stored in `~/.local/share/pt/sessions/<session_id>/`
+- Stored in `~/.local/share/process_triage/sessions/<session_id>/`
 - Contains: initial snapshot, plan, telemetry, outcomes, audit log
 - Default retention: 7 days (configurable via `--retention`)
 - Can be exported as `.ptb` bundle for sharing
@@ -1837,8 +1841,8 @@ The human receives a complete, self-contained artifact with:
 pt agent sessions --cleanup --older-than 7d
 ```
 Removes old sessions while preserving:
-- Outcome data (for prior learning)
-- Audit log (for compliance)
+- Outcome rows in the Parquet telemetry lake (for prior learning)
+- Append-only retention/audit events (for compliance)
 
 **Agent workflow patterns:**
 
@@ -2072,7 +2076,7 @@ Matching is conjunctive (all specified criteria must match). Partial matches are
    - Distributed via config management
 
 4. **User** - Personal additions:
-   - `~/.config/pt/signatures.json`
+   - `~/.config/process_triage/signatures.json`
    - "I always kill processes matching X"
    - Learn from user decisions over time
 
@@ -3126,7 +3130,7 @@ Linux package managers:
   - conntrack-tools, cgroup-tools
   - acct, auditd, pcp
   - gdb, elfutils (eu-stack), binutils
-	  - python3-pip + pipx (py-spy), openjdk (JVM), async-profiler (separate tool; use distro package if available or pinned upstream release)
+  - python3-pip + pipx (py-spy), openjdk (JVM), async-profiler (separate tool; use distro package if available or pinned upstream release)
   - osquery (if available), intel-pcm (pcm) (if available)
 - Fedora/RHEL (dnf):
   - sysstat, perf, bpftrace, bcc, bpftool, iotop, nethogs, iftop, lsof
@@ -3135,7 +3139,7 @@ Linux package managers:
   - strace, ltrace, ethtool, iproute, conntrack-tools, cgroup-tools
   - psacct, audit, pcp
   - gdb, elfutils, binutils
-	  - python3-pip + pipx (py-spy), java-latest-openjdk (JVM), async-profiler (separate tool; use distro package if available or pinned upstream release)
+  - python3-pip + pipx (py-spy), java-latest-openjdk (JVM), async-profiler (separate tool; use distro package if available or pinned upstream release)
   - osquery (if available), intel-pcm (if available)
 - Arch (pacman):
   - sysstat, perf, bpftrace, bcc, bpftool, iotop, nethogs, iftop, lsof
@@ -3144,7 +3148,7 @@ Linux package managers:
   - strace, ltrace, ethtool, iproute2, conntrack-tools, cgroup-tools
   - acct, audit, pcp
   - gdb, elfutils, binutils
-	  - python-pipx (py-spy), jdk-openjdk (JVM), async-profiler (separate tool; use distro package if available or pinned upstream release)
+  - python-pipx (py-spy), jdk-openjdk (JVM), async-profiler (separate tool; use distro package if available or pinned upstream release)
   - osquery (if available), intel-pcm (if available)
 - Alpine (apk):
   - sysstat, perf, bpftrace, iotop, nethogs, iftop, lsof
@@ -3153,7 +3157,7 @@ Linux package managers:
   - conntrack-tools, cgroup-tools
   - acct (if available), audit (if available), pcp (if available)
   - gdb, binutils, elfutils (if available)
-	  - py3-pip + pipx (py-spy), openjdk (JVM) (if available), async-profiler (separate tool; use pinned upstream release when packages are unavailable)
+  - py3-pip + pipx (py-spy), openjdk (JVM) (if available), async-profiler (separate tool; use pinned upstream release when packages are unavailable)
   - osquery (if available), intel-pcm (if available)
 
 macOS (Homebrew):
@@ -3341,9 +3345,9 @@ Telemetry and data governance are specified in sections 3.3–3.4; the phases be
   - Parallel scanning across hosts via SSH
   - Result aggregation and cross-host comparison
 - Implement fleet-specific CLI commands:
-  - `pt agent fleet-plan --hosts <file>`
-  - `pt agent fleet-apply --session <id>`
-  - `pt agent fleet-status`
+  - `pt agent fleet plan --hosts <file>`
+  - `pt agent fleet apply --fleet-session <id>`
+  - `pt agent fleet status --fleet-session <id>`
 - Implement fleet-wide decision coordination (section 5.16):
   - Shared FDR budget across fleet
   - Cross-host pattern correlation
@@ -3506,7 +3510,7 @@ Telemetry and data governance are specified in sections 3.3–3.4; the phases be
 
 ### Fleet-Specific Deliverables
 - **Fleet session manager**: Multi-host session schema, parallel scanning, result aggregation, and cross-host comparison.
-- **Fleet CLI commands**: `pt agent fleet-plan`, `pt agent fleet-apply`, `pt agent fleet-status` with host file support.
+- **Fleet CLI commands**: `pt agent fleet plan`, `pt agent fleet apply`, `pt agent fleet status` with host file support.
 - **Fleet decision coordinator**: Shared FDR budget, cross-host pattern correlation, and coordinated action timing.
 - **Learning transfer system**: Prior export/import, fleet-wide signature sharing, and per-machine baseline normalization.
 - **Fleet reporting**: Aggregated fleet-wide HTML reports, per-host comparison views, and cross-host anomaly detection.
