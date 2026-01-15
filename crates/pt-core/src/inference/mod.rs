@@ -14,6 +14,7 @@ pub mod ledger;
 pub mod posterior;
 pub mod ppc;
 pub mod robust;
+pub mod sketches;
 pub mod wasserstein;
 
 pub use belief_prop::{
@@ -67,6 +68,11 @@ pub use wasserstein::{
     wasserstein_1d, wasserstein_2_squared, AggregatedDriftEvidence, DriftAction, DriftMonitor,
     DriftResult, DriftSeverity, WassersteinConfig, WassersteinDetector, WassersteinError,
     WassersteinEvidence,
+};
+pub use sketches::{
+    CountMinConfig, CountMinSketch, HeavyHitter, PercentileSummary, SketchError, SketchEvidence,
+    SketchManager, SketchManagerConfig, SketchResult, SketchSummary, SpaceSaving,
+    SpaceSavingConfig, TDigest, TDigestConfig,
 };
 #[cfg(target_os = "linux")]
 pub use impact::{
