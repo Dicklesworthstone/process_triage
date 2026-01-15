@@ -141,18 +141,32 @@ impl KeyManager {
     }
 
     /// Save key manager to a file with restricted permissions.
+    ///
+    /// On Unix, creates file with 0600 permissions atomically to prevent
+    /// race conditions where the file might be readable before permissions are set.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let content = serde_json::to_string_pretty(self)?;
 
-        // Write to file
-        std::fs::write(&path, &content)?;
-
-        // Set permissions to 0600 on Unix
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&path, permissions)?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // Create file with restricted permissions atomically
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            // On non-Unix systems, fall back to basic write
+            std::fs::write(&path, &content)?;
         }
 
         Ok(())
