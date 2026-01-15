@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/capabilities-manifest/1.0.0",
+  "title": "Capabilities Manifest",
+  "description": "Schema for the capabilities manifest passed from pt (bash) to pt-core (Rust)",
+  "type": "object",
+  "required": ["schema_version", "os", "tools"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Schema version for forward compatibility",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "examples": ["1.0.0"]
+    },
+    "os": {
+      "type": "object",
+      "description": "Operating system information",
+      "required": ["family", "name"],
+      "properties": {
+        "family": {
+          "type": "string",
+          "enum": ["linux", "macos"],
+          "description": "OS family (affects collection strategy)"
+        },
+        "name": {
+          "type": "string",
+          "description": "Distribution or OS name",
+          "examples": ["Ubuntu", "Fedora", "Arch", "macOS"]
+        },
+        "version": {
+          "type": "string",
+          "description": "OS version string",
+          "examples": ["24.04", "40", "Sonoma 14.5"]
+        },
+        "kernel": {
+          "type": "string",
+          "description": "Kernel version",
+          "examples": ["6.8.0-40-generic", "23.5.0"]
+        },
+        "arch": {
+          "type": "string",
+          "enum": ["x86_64", "aarch64"],
+          "description": "CPU architecture"
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "description": "Available diagnostic tools and their capabilities",
+      "additionalProperties": {
+        "$ref": "#/$defs/tool_info"
+      }
+    },
+    "proc_fs": {
+      "type": "object",
+      "description": "Linux /proc filesystem availability",
+      "properties": {
+        "available": {
+          "type": "boolean",
+          "description": "Whether /proc is mounted and readable"
+        },
+        "readable_fields": {
+          "type": "array",
+          "description": "Which /proc/PID/* files are readable by current user",
+          "items": {
+            "type": "string",
+            "enum": ["stat", "status", "io", "cgroup", "wchan", "fd", "maps", "smaps", "schedstat", "sched", "ns", "environ", "cmdline", "cwd", "exe"]
+          }
+        }
+      }
+    },
+    "cgroups": {
+      "type": "object",
+      "description": "Control groups availability",
+      "properties": {
+        "version": {
+          "type": "string",
+          "enum": ["v1", "v2", "hybrid", "none"],
+          "description": "Cgroups version in use"
+        },
+        "readable": {
+          "type": "boolean",
+          "description": "Whether cgroup paths are readable"
+        },
+        "controllers": {
+          "type": "array",
+          "description": "Available cgroup controllers",
+          "items": {
+            "type": "string",
+            "enum": ["cpu", "cpuset", "memory", "io", "pids", "rdma", "hugetlb", "cpuacct", "devices", "freezer", "net_cls", "net_prio", "blkio"]
+          }
+        }
+      }
+    },
+    "systemd": {
+      "type": "object",
+      "description": "Systemd availability (Linux)",
+      "properties": {
+        "available": {
+          "type": "boolean",
+          "description": "Whether systemd is the init system"
+        },
+        "version": {
+          "type": "string",
+          "description": "Systemd version",
+          "examples": ["256"]
+        },
+        "user_units": {
+          "type": "boolean",
+          "description": "Whether user units are accessible"
+        }
+      }
+    },
+    "launchd": {
+      "type": "object",
+      "description": "Launchd availability (macOS)",
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "user_agents": {
+          "type": "boolean",
+          "description": "Whether user agents are accessible"
+        }
+      }
+    },
+    "psi": {
+      "type": "object",
+      "description": "Pressure Stall Information availability (Linux)",
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "cpu": { "type": "boolean" },
+        "memory": { "type": "boolean" },
+        "io": { "type": "boolean" }
+      }
+    },
+    "containers": {
+      "type": "object",
+      "description": "Container runtime detection",
+      "properties": {
+        "docker": {
+          "type": "object",
+          "properties": {
+            "available": { "type": "boolean" },
+            "socket": { "type": "string" },
+            "version": { "type": "string" }
+          }
+        },
+        "podman": {
+          "type": "object",
+          "properties": {
+            "available": { "type": "boolean" },
+            "rootless": { "type": "boolean" },
+            "version": { "type": "string" }
+          }
+        }
+      }
+    },
+    "sudo": {
+      "type": "object",
+      "description": "Sudo availability for privileged operations",
+      "properties": {
+        "available": {
+          "type": "boolean",
+          "description": "Whether sudo is available"
+        },
+        "passwordless": {
+          "type": "boolean",
+          "description": "Whether sudo can run without password (NOPASSWD)"
+        },
+        "timeout_active": {
+          "type": "boolean",
+          "description": "Whether a cached sudo session exists"
+        }
+      }
+    },
+    "discovered_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when capabilities were discovered"
+    },
+    "discovery_duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How long capability discovery took in milliseconds"
+    },
+    "wrapper_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "Version of pt (bash) that generated this manifest"
+    }
+  },
+  "$defs": {
+    "tool_info": {
+      "type": "object",
+      "description": "Information about a single diagnostic tool",
+      "required": ["available"],
+      "properties": {
+        "available": {
+          "type": "boolean",
+          "description": "Whether the tool is installed and executable"
+        },
+        "path": {
+          "type": "string",
+          "description": "Absolute path to the tool binary",
+          "examples": ["/usr/bin/perf", "/usr/sbin/ss"]
+        },
+        "version": {
+          "type": "string",
+          "description": "Tool version string",
+          "examples": ["6.8.12", "iproute2-6.1.0"]
+        },
+        "permissions": {
+          "type": "object",
+          "description": "Permission-related capabilities for this tool",
+          "properties": {
+            "sudo": {
+              "type": "boolean",
+              "description": "Tool requires sudo for full functionality"
+            },
+            "cap_sys_ptrace": {
+              "type": "boolean",
+              "description": "CAP_SYS_PTRACE capability available"
+            },
+            "cap_perfmon": {
+              "type": "boolean",
+              "description": "CAP_PERFMON capability available"
+            },
+            "cap_bpf": {
+              "type": "boolean",
+              "description": "CAP_BPF capability available"
+            },
+            "cap_net_admin": {
+              "type": "boolean",
+              "description": "CAP_NET_ADMIN capability available"
+            },
+            "suid": {
+              "type": "boolean",
+              "description": "Tool has setuid bit"
+            }
+          }
+        },
+        "functional": {
+          "type": "boolean",
+          "description": "Tool passed a basic functionality check (not just installed)"
+        },
+        "restricted_reason": {
+          "type": "string",
+          "description": "Why the tool has limited functionality",
+          "examples": ["kernel.perf_event_paranoid=4", "unprivileged_bpf_disabled=1"]
+        },
+        "notes": {
+          "type": "string",
+          "description": "Additional notes about tool availability or quirks"
+        }
+      },
+      "if": {
+        "properties": { "available": { "const": true } }
+      },
+      "then": {
+        "required": ["path"]
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "os": {
+        "family": "linux",
+        "name": "Ubuntu",
+        "version": "24.04",
+        "kernel": "6.8.0-40-generic",
+        "arch": "x86_64"
+      },
+      "tools": {
+        "ps": {
+          "available": true,
+          "path": "/usr/bin/ps",
+          "version": "procps-ng 4.0.4",
+          "functional": true
+        },
+        "ss": {
+          "available": true,
+          "path": "/usr/sbin/ss",
+          "version": "iproute2-6.1.0",
+          "functional": true
+        },
+        "perf": {
+          "available": true,
+          "path": "/usr/bin/perf",
+          "version": "6.8.12",
+          "permissions": {
+            "cap_perfmon": true
+          },
+          "functional": true
+        },
+        "bpftrace": {
+          "available": true,
+          "path": "/usr/bin/bpftrace",
+          "version": "0.20.0",
+          "permissions": {
+            "sudo": true,
+            "cap_bpf": false
+          },
+          "functional": true,
+          "restricted_reason": "requires sudo or CAP_BPF"
+        }
+      },
+      "proc_fs": {
+        "available": true,
+        "readable_fields": ["stat", "status", "io", "cgroup", "wchan", "fd", "cmdline"]
+      },
+      "cgroups": {
+        "version": "v2",
+        "readable": true,
+        "controllers": ["cpu", "cpuset", "memory", "io", "pids"]
+      },
+      "systemd": {
+        "available": true,
+        "version": "256",
+        "user_units": true
+      },
+      "psi": {
+        "available": true,
+        "cpu": true,
+        "memory": true,
+        "io": true
+      },
+      "sudo": {
+        "available": true,
+        "passwordless": false,
+        "timeout_active": true
+      },
+      "discovered_at": "2026-01-15T08:45:00Z",
+      "discovery_duration_ms": 342,
+      "wrapper_version": "2.0.0"
+    }
+  ]
+}
