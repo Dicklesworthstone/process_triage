@@ -209,6 +209,8 @@ The system uses Bayesian credible bounds, PAC-Bayes, and (online) FDR/alpha-inve
 - Developers who run many concurrent projects
 - Users of AI coding assistants (which spawn many background processes)
 - DevOps engineers managing development/staging environments
+- **AI coding agents** managing machines via SSH (Claude, Cursor, Codex, etc.)
+- **Fleet operators** managing multiple development/staging hosts
 
 **Primary use cases:**
 
@@ -217,6 +219,10 @@ The system uses Bayesian credible bounds, PAC-Bayes, and (online) FDR/alpha-inve
 3. **Automated hygiene**: Run `pt --robot` in CI/CD environments or development containers to automatically clean up after test runs.
 4. **Investigation**: "This process is using a lot of CPU. Should I be worried?"
 5. **Learning**: "I always kill processes matching pattern X. Remember that."
+6. **Agent-driven maintenance**: AI agents SSH into machines and run `pt agent plan` to identify and remediate process issues as part of automated workflows.
+7. **Fleet-wide hygiene**: Run `pt` across multiple hosts to identify common patterns, aggregate telemetry, and maintain consistent process health.
+8. **Goal-oriented recovery**: "Free 4GB of RAM" or "Get CPU utilization below 70%"—resource-targeted triage rather than just "find bad processes."
+9. **Differential monitoring**: "What changed since my last check?"—efficient repeated scans that surface deltas rather than re-processing everything.
 
 **Non-goals:**
 - Production server process management (use proper supervision)
@@ -276,6 +282,16 @@ If this specification is fully realized, the result will be a tool that:
 
 7. **Feels like magic**: The combination of rigor, safety, and usability produces an experience that feels qualitatively different from other tools—hence "alien technology artifact."
 
+8. **First-class agent support**: AI agents can manage machines via `pt agent` with token-efficient outputs, fine-grained automation controls, resumable sessions, and human-friendly summaries for handoff.
+
+9. **Fleet-aware**: The system can operate across multiple hosts, aggregate telemetry, detect cross-host patterns, and apply fleet-wide FDR controls.
+
+10. **Goal-oriented**: Users can specify resource recovery targets ("free 4GB RAM") and the system optimizes candidate selection accordingly.
+
+11. **Differential efficiency**: Repeated scans surface only what changed, dramatically reducing overhead for ongoing monitoring.
+
+12. **Pattern-accelerated**: Known signatures (stuck jest workers, orphaned webpack, etc.) are recognized instantly without full Bayesian inference, while novel patterns get the full treatment.
+
 ### Document Structure
 
 The remainder of this specification is organized as follows:
@@ -283,12 +299,12 @@ The remainder of this specification is organized as follows:
 - **Section 0**: Non-negotiable requirements (constraints that must not be violated)
 - **Section 1**: Mission and success criteria
 - **Section 2**: Complete inventory of mathematical techniques incorporated
-- **Section 3**: System architecture (collection, features, telemetry, CLI, UX)
-- **Section 4**: Inference engine (all Bayesian models and techniques)
-- **Section 5**: Decision theory and optimal stopping
-- **Section 6**: Action space (beyond just "kill")
-- **Section 7**: UX and explainability design
-- **Section 8**: Real-world enhancements and pitfalls to avoid
+- **Section 3**: System architecture (collection, features, telemetry, CLI, UX, fleet mode, pattern library)
+- **Section 4**: Inference engine (all Bayesian models and techniques, including trajectory prediction)
+- **Section 5**: Decision theory and optimal stopping (including goal-oriented optimization)
+- **Section 6**: Action space (beyond just "kill", including supervisor-aware actions)
+- **Section 7**: UX and explainability design (including dependency visualization, genealogy narratives)
+- **Section 8**: Real-world enhancements and pitfalls to avoid (including agent-specific considerations)
 - **Section 9**: Applied interpretation of example processes
 - **Section 10**: Phased implementation plan
 - **Section 11**: Testing and validation requirements
@@ -575,7 +591,7 @@ BC) Posterior predictive checks / Bayesian model criticism
 
 BD) Distributionally robust decision theory (DRO)
 - Guard against distribution shift using ambiguity sets (e.g., Wasserstein / f-divergence balls)
-- Produces conservative expected-loss estimates; complements robust Bayes
+- Produces conservative expected-loss estimates (via analytic dual bounds where possible, otherwise conservative approximations used as gates); complements robust Bayes
 
 BE) Submodular probe selection (near-optimal sensor scheduling)
 - When probes have overhead and mutual redundancy, choose a set maximizing coverage/information
@@ -944,7 +960,8 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - competing hazards (per class/state): lambda_finish,C, lambda_abandon,C, lambda_bad,C
 - survival term (constant hazards): P(still running | t, C) = exp(-(lambda_finish,C+lambda_abandon,C+lambda_bad,C) * t)
 - Gamma priors on hazard rates yield closed-form posterior
-- With Gamma(α,β) prior on λ (rate parameterization), the marginal survival is Lomax/Pareto-II: P(T>t) = (β/(β+t))^α
+- With Gamma(α,β) prior on a (total) constant hazard λ (rate parameterization), the marginal survival is Lomax/Pareto-II: P(T>t) = (β/(β+t))^α
+  - If modeling cause-specific hazards separately, either put the Gamma prior on λ_total,C directly (simplest) or constrain the priors so λ_total,C has a tractable form (e.g., shared rate parameterization).
 
 ### 4.6 Markov-Modulated Poisson / Levy Subordinator CPU
 - N(t) ~ Poisson(kappa_S * t)
@@ -1125,7 +1142,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 
 ### 4.42 Distributionally Robust Optimization (DRO)
 - Replace expected loss with worst-case expected loss over an ambiguity set (e.g., Wasserstein ball)
-- Produces conservative “don’t kill unless safe” decisions under distribution shift
+- Produces conservative “don’t kill unless safe” decisions under distribution shift; implement via analytic dual bounds where available (else conservative approximations feeding a gate, not the core posterior)
 
 ### 4.43 Submodular Probe Selection
 - When probes overlap (redundant info) and have overhead, pick a near-optimal set maximizing information gain
