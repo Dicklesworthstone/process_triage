@@ -9,11 +9,14 @@
 
 use clap::{Args, Parser, Subcommand};
 use pt_common::{OutputFormat, SessionId, SCHEMA_VERSION};
-use pt_core::config::{load_config, ConfigError, ConfigOptions};
+use pt_core::config::{load_config, ConfigError, ConfigOptions, Priors};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::events::{JsonlWriter, Phase, ProgressEmitter, ProgressEvent};
 use pt_core::exit_codes::ExitCode;
-use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionState, SessionStore};
+use pt_core::session::{
+    CleanupResult, ListSessionsOptions, SessionContext, SessionManifest, SessionMode,
+    SessionState, SessionStore, SessionSummary,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -298,6 +301,9 @@ enum AgentCommands {
 
     /// Dump current capabilities manifest
     Capabilities,
+
+    /// List and manage sessions
+    Sessions(AgentSessionsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -333,9 +339,33 @@ struct AgentExplainArgs {
     #[arg(long, value_delimiter = ',')]
     pids: Vec<u32>,
 
+    /// Target process with stable identity (format: pid:start_id)
+    #[arg(long)]
+    target: Option<String>,
+
+    /// Include evidence breakdown
+    #[arg(long = "include", value_name = "TYPE")]
+    include: Vec<String>,
+
     /// Include galaxy-brain math ledger
     #[arg(long)]
     galaxy_brain: bool,
+
+    /// Show process dependencies tree
+    #[arg(long)]
+    show_dependencies: bool,
+
+    /// Show blast radius impact analysis
+    #[arg(long)]
+    show_blast_radius: bool,
+
+    /// Show process history/backstory
+    #[arg(long)]
+    show_history: bool,
+
+    /// Show what-if hypotheticals
+    #[arg(long)]
+    what_if: bool,
 }
 
 #[derive(Args, Debug)]
@@ -376,6 +406,29 @@ struct AgentSnapshotArgs {
     /// Label for the snapshot
     #[arg(long)]
     label: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct AgentSessionsArgs {
+    /// Show status for a specific session
+    #[arg(long)]
+    status: Option<String>,
+
+    /// Maximum sessions to return (default: 10)
+    #[arg(long, default_value = "10")]
+    limit: u32,
+
+    /// Filter by session state
+    #[arg(long)]
+    state: Option<String>,
+
+    /// Remove old sessions
+    #[arg(long)]
+    cleanup: bool,
+
+    /// Remove sessions older than duration (e.g., "7d", "30d")
+    #[arg(long, default_value = "7d")]
+    older_than: String,
 }
 
 #[derive(Args, Debug)]
@@ -546,7 +599,10 @@ fn run_interactive(global: &GlobalOpts, _args: &RunArgs) -> ExitCode {
     ExitCode::Clean
 }
 
-use pt_core::collect::{quick_scan, QuickScanOptions};
+use pt_core::collect::{quick_scan, QuickScanOptions, ProcessRecord};
+use pt_core::inference::{
+    compute_posterior, CpuEvidence, Evidence, EvidenceLedger,
+};
 
 fn progress_emitter(global: &GlobalOpts) -> Option<Arc<dyn ProgressEmitter>> {
     match global.format {
@@ -839,6 +895,7 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
         AgentCommands::Apply(args) => run_agent_apply(global, args),
         AgentCommands::Verify(args) => run_agent_verify(global, args),
         AgentCommands::Diff(args) => run_agent_diff(global, args),
+        AgentCommands::Sessions(args) => run_agent_sessions(global, args),
         AgentCommands::Capabilities => {
             output_capabilities(global);
             ExitCode::Clean
@@ -1352,6 +1409,145 @@ fn output_capabilities(global: &GlobalOpts) {
     }
 }
 
+// ============================================================================
+// System State Collection
+// ============================================================================
+
+/// Collect system state for snapshot output.
+fn collect_system_state() -> serde_json::Value {
+    let load = collect_load_averages();
+    let cores = collect_cpu_count();
+    let memory = collect_memory_info();
+    let process_count = collect_process_count();
+    let psi = collect_psi();
+
+    serde_json::json!({
+        "load": load,
+        "cores": cores,
+        "memory": memory,
+        "process_count": process_count,
+        "psi": psi,
+    })
+}
+
+/// Read /proc/loadavg and return [1min, 5min, 15min].
+fn collect_load_averages() -> Vec<f64> {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|content| {
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let load1 = parts[0].parse::<f64>().ok()?;
+                let load5 = parts[1].parse::<f64>().ok()?;
+                let load15 = parts[2].parse::<f64>().ok()?;
+                Some(vec![load1, load5, load15])
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Get CPU count from /proc/cpuinfo or nproc.
+fn collect_cpu_count() -> u32 {
+    // Try reading from /proc/cpuinfo
+    if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
+        let count = content
+            .lines()
+            .filter(|line| line.starts_with("processor"))
+            .count();
+        if count > 0 {
+            return count as u32;
+        }
+    }
+    // Fallback to nproc command
+    std::process::Command::new("nproc")
+        .output()
+        .ok()
+        .and_then(|output| {
+            String::from_utf8(output.stdout)
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .unwrap_or(1)
+}
+
+/// Read /proc/meminfo and return memory stats in GB.
+fn collect_memory_info() -> serde_json::Value {
+    let (total_kb, available_kb) = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .map(|content| {
+            let mut total: u64 = 0;
+            let mut available: u64 = 0;
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    total = rest.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                    available = rest.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                }
+            }
+            (total, available)
+        })
+        .unwrap_or((0, 0));
+
+    let total_gb = (total_kb as f64) / 1024.0 / 1024.0;
+    let available_gb = (available_kb as f64) / 1024.0 / 1024.0;
+    let used_gb = total_gb - available_gb;
+
+    serde_json::json!({
+        "total_gb": (total_gb * 10.0).round() / 10.0,
+        "used_gb": (used_gb * 10.0).round() / 10.0,
+        "available_gb": (available_gb * 10.0).round() / 10.0,
+    })
+}
+
+/// Count process directories in /proc.
+fn collect_process_count() -> u32 {
+    std::fs::read_dir("/proc")
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|s| s.chars().all(|c| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
+/// Read PSI (Pressure Stall Information) from /proc/pressure/.
+fn collect_psi() -> serde_json::Value {
+    fn read_psi_file(resource: &str) -> Option<f64> {
+        let path = format!("/proc/pressure/{}", resource);
+        std::fs::read_to_string(&path).ok().and_then(|content| {
+            // Parse "some avg10=X.XX avg60=Y.YY avg300=Z.ZZ total=N"
+            // We want avg10 for recent pressure
+            for line in content.lines() {
+                if line.starts_with("some") {
+                    for part in line.split_whitespace() {
+                        if let Some(val) = part.strip_prefix("avg10=") {
+                            return val.parse().ok();
+                        }
+                    }
+                }
+            }
+            None
+        })
+    }
+
+    serde_json::json!({
+        "cpu": read_psi_file("cpu").unwrap_or(0.0),
+        "memory": read_psi_file("memory").unwrap_or(0.0),
+        "io": read_psi_file("io").unwrap_or(0.0),
+    })
+}
+
 fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode {
     let session_id = SessionId::new();
 
@@ -1398,29 +1594,84 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         }
     }
 
+    // Collect system state and capabilities
+    let system_state = collect_system_state();
+    let caps = get_capabilities();
+    let host_id = pt_core::logging::get_host_id();
+    let timestamp = chrono::Utc::now();
+
+    // Build capabilities summary for output
+    let capabilities_summary = serde_json::json!({
+        "tools": {
+            "perf": caps.tools.perf.available,
+            "bpftrace": caps.tools.bpftrace.available,
+            "strace": caps.tools.strace.available,
+            "lsof": caps.tools.lsof.available,
+            "ps": caps.tools.ps.available,
+            "systemctl": caps.tools.systemctl.available,
+        },
+        "permissions": {
+            "can_sudo": caps.permissions.can_sudo,
+            "can_ptrace": caps.permissions.can_read_others_procs,
+            "is_root": caps.permissions.is_root,
+        },
+    });
+
     match global.format {
         OutputFormat::Json => {
             let output = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "session_id": session_id.0,
-                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "host_id": host_id,
+                "timestamp": timestamp.to_rfc3339(),
+                "generated_at": timestamp.to_rfc3339(),
                 "label": args.label,
                 "session_dir": handle.dir.display().to_string(),
                 "context_path": handle.context_path().display().to_string(),
+                "system_state": system_state,
+                "capabilities": capabilities_summary,
             });
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
         }
         OutputFormat::Summary => {
-            println!("[{}] agent snapshot: created", session_id);
+            let mem = system_state.get("memory").and_then(|m| m.get("used_gb")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let total = system_state.get("memory").and_then(|m| m.get("total_gb")).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let procs = system_state.get("process_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("[{}] agent snapshot: created ({} procs, {:.0}/{:.0}GB mem)", session_id, procs, mem, total);
         }
         OutputFormat::Exitcode => {}
         _ => {
             println!("# pt-core agent snapshot");
             println!();
             println!("Session: {}", session_id);
+            println!("Host: {}", host_id);
             println!("Dir: {}", handle.dir.display());
             if let Some(label) = &args.label {
                 println!("Label: {}", label);
+            }
+            println!();
+            println!("## System State");
+            if let Some(load) = system_state.get("load").and_then(|v| v.as_array()) {
+                let load_strs: Vec<String> = load.iter().filter_map(|v| v.as_f64().map(|f| format!("{:.2}", f))).collect();
+                println!("  Load: {}", load_strs.join(", "));
+            }
+            if let Some(cores) = system_state.get("cores").and_then(|v| v.as_u64()) {
+                println!("  Cores: {}", cores);
+            }
+            if let Some(mem) = system_state.get("memory") {
+                let total = mem.get("total_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let used = mem.get("used_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let avail = mem.get("available_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                println!("  Memory: {:.1}GB total, {:.1}GB used, {:.1}GB available", total, used, avail);
+            }
+            if let Some(procs) = system_state.get("process_count").and_then(|v| v.as_u64()) {
+                println!("  Processes: {}", procs);
+            }
+            if let Some(psi) = system_state.get("psi") {
+                let cpu = psi.get("cpu").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let mem = psi.get("memory").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let io = psi.get("io").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                println!("  PSI: cpu={:.2}%, mem={:.2}%, io={:.2}%", cpu, mem, io);
             }
         }
     }
@@ -1560,12 +1811,280 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
             return ExitCode::ArgsError;
         }
     };
-    if let Err(e) = store.open(&sid) {
-        eprintln!("agent explain: {}", e);
+    let handle = match store.open(&sid) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("agent explain: {}", e);
+            return ExitCode::ArgsError;
+        }
+    };
+
+    // Load priors from config or use defaults
+    let priors = match load_priors_for_explain(global) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("agent explain: failed to load priors: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    // Determine which PIDs to explain
+    let pids_to_explain: Vec<u32> = if !args.pids.is_empty() {
+        args.pids.clone()
+    } else if let Some(ref target) = args.target {
+        // Parse target format "pid:start_id" and extract PID
+        match target.split(':').next().and_then(|s| s.parse::<u32>().ok()) {
+            Some(pid) => vec![pid],
+            None => {
+                eprintln!("agent explain: invalid --target format, expected pid:start_id");
+                return ExitCode::ArgsError;
+            }
+        }
+    } else {
+        eprintln!("agent explain: must specify --pids or --target");
         return ExitCode::ArgsError;
+    };
+
+    // Quick scan to get process records for the specified PIDs
+    let scan_options = QuickScanOptions {
+        pids: pids_to_explain.clone(),
+        include_kernel_threads: false,
+        timeout: global.timeout.map(std::time::Duration::from_secs),
+        progress: None,
+    };
+
+    let scan_result = match quick_scan(&scan_options) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("agent explain: scan failed: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    // Build explanations for each process
+    let mut explanations: Vec<serde_json::Value> = Vec::new();
+
+    for pid in &pids_to_explain {
+        let record = scan_result.processes.iter().find(|p| p.pid.0 == *pid);
+        match record {
+            Some(proc) => {
+                let explanation = build_process_explanation(proc, &priors, args);
+                explanations.push(explanation);
+            }
+            None => {
+                // Process not found - might have exited
+                explanations.push(serde_json::json!({
+                    "pid": pid,
+                    "error": "process not found (may have exited)",
+                    "classification": null,
+                }));
+            }
+        }
     }
-    output_stub_with_session(global, &sid, "agent explain", "Agent explain mode not yet implemented");
+
+    // Output in requested format
+    let output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "session_id": sid.0,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "agent explain",
+        "explanations": explanations,
+    });
+
+    // Optionally save to session
+    let explain_path = handle.dir.join("inference").join("explain.json");
+    if let Err(e) = std::fs::write(&explain_path, serde_json::to_string_pretty(&output).unwrap()) {
+        eprintln!("agent explain: warning: failed to save to session: {}", e);
+    }
+
+    match global.format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Summary => {
+            for expl in &explanations {
+                if let (Some(pid), Some(class)) = (expl.get("pid"), expl.get("classification")) {
+                    let conf = expl.get("confidence").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("[{}] PID {}: {} ({})", sid, pid, class, conf);
+                }
+            }
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            // Human readable markdown output
+            println!("# pt-core agent explain\n");
+            println!("Session: {}", sid);
+            println!();
+
+            for expl in &explanations {
+                let pid = expl.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                if let Some(err) = expl.get("error") {
+                    println!("## PID {}\n", pid);
+                    println!("Error: {}\n", err);
+                    continue;
+                }
+
+                let class = expl.get("classification").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let conf = expl.get("confidence").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let why = expl.get("why_summary").and_then(|v| v.as_str()).unwrap_or("");
+
+                println!("## PID {} - {} ({})\n", pid, class, conf);
+                if !why.is_empty() {
+                    println!("{}\n", why);
+                }
+
+                // Show posterior probabilities
+                if let Some(posterior) = expl.get("posterior") {
+                    println!("### Posterior Probabilities\n");
+                    println!("| Class | P(C|x) |");
+                    println!("|-------|--------|");
+                    for class_name in &["useful", "useful_bad", "abandoned", "zombie"] {
+                        if let Some(p) = posterior.get(*class_name).and_then(|v| v.as_f64()) {
+                            println!("| {} | {:.4} |", class_name, p);
+                        }
+                    }
+                    println!();
+                }
+
+                // Show top evidence if galaxy_brain mode
+                if args.galaxy_brain {
+                    if let Some(factors) = expl.get("bayes_factors").and_then(|v| v.as_array()) {
+                        println!("### Evidence Breakdown\n");
+                        println!("| Feature | BF | Direction | Strength |");
+                        println!("|---------|-----|-----------|----------|");
+                        for bf in factors.iter().take(5) {
+                            let feat = bf.get("feature").and_then(|v| v.as_str()).unwrap_or("?");
+                            let bf_val = bf.get("bf").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let dir = bf.get("direction").and_then(|v| v.as_str()).unwrap_or("?");
+                            let strength = bf.get("strength").and_then(|v| v.as_str()).unwrap_or("?");
+                            println!("| {} | {:.2} | {} | {} |", feat, bf_val, dir, strength);
+                        }
+                        println!();
+                    }
+                }
+            }
+        }
+    }
+
     ExitCode::Clean
+}
+
+/// Load priors from config with fallback to defaults.
+fn load_priors_for_explain(global: &GlobalOpts) -> Result<Priors, ConfigError> {
+    let opts = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        priors_path: None,
+        policy_path: None,
+    };
+    match load_config(&opts) {
+        Ok(resolved) => Ok(resolved.priors),
+        Err(_) => Ok(Priors::default()),
+    }
+}
+
+/// Build a JSON explanation for a single process.
+fn build_process_explanation(
+    proc: &ProcessRecord,
+    priors: &Priors,
+    args: &AgentExplainArgs,
+) -> serde_json::Value {
+    // Convert ProcessRecord to Evidence
+    let evidence = Evidence {
+        cpu: Some(CpuEvidence::Fraction {
+            occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
+        }),
+        runtime_seconds: Some(proc.elapsed.as_secs_f64()),
+        orphan: Some(proc.is_orphan()),
+        tty: Some(proc.has_tty()),
+        net: None,      // Would need network scan
+        io_active: None, // Would need /proc inspection
+        state_flag: Some(state_to_flag(proc.state)),
+        command_category: None, // Would need category classifier
+    };
+
+    // Compute posterior
+    let posterior_result = match compute_posterior(priors, &evidence) {
+        Ok(r) => r,
+        Err(e) => {
+            return serde_json::json!({
+                "pid": proc.pid.0,
+                "comm": proc.comm,
+                "error": format!("posterior computation failed: {}", e),
+            });
+        }
+    };
+
+    // Build evidence ledger
+    let ledger = EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
+
+    // Build base explanation
+    let mut explanation = serde_json::json!({
+        "pid": proc.pid.0,
+        "ppid": proc.ppid.0,
+        "comm": proc.comm,
+        "user": proc.user,
+        "state": proc.state.to_string(),
+        "elapsed_seconds": proc.elapsed.as_secs(),
+        "cpu_percent": proc.cpu_percent,
+        "classification": ledger.classification.label(),
+        "confidence": ledger.confidence.label(),
+        "why_summary": ledger.why_summary,
+        "posterior": {
+            "useful": posterior_result.posterior.useful,
+            "useful_bad": posterior_result.posterior.useful_bad,
+            "abandoned": posterior_result.posterior.abandoned,
+            "zombie": posterior_result.posterior.zombie,
+        },
+    });
+
+    // Add Bayes factors if galaxy_brain mode or requested
+    if args.galaxy_brain || args.include.contains(&"bayes_factors".to_string()) {
+        let bf_entries: Vec<serde_json::Value> = ledger
+            .bayes_factors
+            .iter()
+            .map(|bf| {
+                serde_json::json!({
+                    "feature": bf.feature,
+                    "log_bf": bf.log_bf,
+                    "bf": bf.bf,
+                    "delta_bits": bf.delta_bits,
+                    "direction": format!("{}", bf.direction),
+                    "strength": bf.strength.label(),
+                })
+            })
+            .collect();
+        explanation["bayes_factors"] = serde_json::json!(bf_entries);
+        explanation["top_evidence"] = serde_json::json!(ledger.top_evidence);
+    }
+
+    // Add input evidence if requested
+    if args.include.contains(&"evidence".to_string()) {
+        explanation["evidence"] = serde_json::json!({
+            "cpu_occupancy": proc.cpu_percent / 100.0,
+            "runtime_seconds": proc.elapsed.as_secs_f64(),
+            "is_orphan": proc.is_orphan(),
+            "has_tty": proc.has_tty(),
+            "state": proc.state.to_string(),
+        });
+    }
+
+    explanation
+}
+
+/// Map ProcessState to state flag index for priors.
+fn state_to_flag(state: pt_core::collect::ProcessState) -> usize {
+    use pt_core::collect::ProcessState;
+    match state {
+        ProcessState::Running => 0,
+        ProcessState::Sleeping => 1,
+        ProcessState::DiskSleep => 2,
+        ProcessState::Zombie => 3,
+        ProcessState::Stopped => 4,
+        ProcessState::Idle => 5,
+        ProcessState::Dead => 6,
+        ProcessState::Unknown => 7,
+    }
 }
 
 fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
@@ -1646,4 +2165,370 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
     }
     output_stub_with_session(global, &base, "agent diff", "Agent diff mode not yet implemented");
     ExitCode::Clean
+}
+
+fn run_agent_sessions(global: &GlobalOpts, args: &AgentSessionsArgs) -> ExitCode {
+    let store = match SessionStore::from_env() {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("agent sessions: session store error: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    let host_id = pt_core::logging::get_host_id();
+
+    // Handle single session status query
+    if let Some(session_id_str) = &args.status {
+        return run_agent_session_status(global, &store, session_id_str, &host_id);
+    }
+
+    // Handle cleanup mode
+    if args.cleanup {
+        return run_agent_sessions_cleanup(global, &store, &args.older_than, &host_id);
+    }
+
+    // Default: list sessions
+    run_agent_sessions_list(global, &store, args, &host_id)
+}
+
+fn run_agent_session_status(
+    global: &GlobalOpts,
+    store: &SessionStore,
+    session_id_str: &str,
+    host_id: &str,
+) -> ExitCode {
+    let session_id = match SessionId::parse(session_id_str) {
+        Some(sid) => sid,
+        None => {
+            eprintln!("agent sessions: invalid session ID: {}", session_id_str);
+            return ExitCode::ArgsError;
+        }
+    };
+
+    let handle = match store.open(&session_id) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("agent sessions: {}", e);
+            return ExitCode::ArgsError;
+        }
+    };
+
+    let manifest = match handle.read_manifest() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("agent sessions: failed to read manifest: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    // Determine if session is resumable
+    let resumable = matches!(
+        manifest.state,
+        SessionState::Created
+            | SessionState::Scanning
+            | SessionState::Planned
+            | SessionState::Executing
+            | SessionState::Cancelled
+    );
+
+    // Count progress from action outcomes
+    let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
+    let (completed_actions, total_actions) = if outcomes_path.exists() {
+        let content = std::fs::read_to_string(&outcomes_path).unwrap_or_default();
+        let completed = content.lines().filter(|l| !l.trim().is_empty()).count();
+        // Try to get total from plan
+        let plan_path = handle.dir.join("decision").join("plan.json");
+        let total = std::fs::read_to_string(&plan_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v.get("candidates").and_then(|c| c.as_array()).map(|a| a.len()))
+            .unwrap_or(completed);
+        (completed, total)
+    } else {
+        (0, 0)
+    };
+
+    let pending_actions = total_actions.saturating_sub(completed_actions);
+
+    match global.format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": manifest.session_id,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "host_id": host_id,
+                "state": manifest.state,
+                "mode": manifest.mode,
+                "label": manifest.label,
+                "timing": manifest.timing,
+                "phase": match manifest.state {
+                    SessionState::Created => "init",
+                    SessionState::Scanning => "scan",
+                    SessionState::Planned => "plan",
+                    SessionState::Executing => "apply",
+                    SessionState::Completed => "verify",
+                    SessionState::Cancelled => "cancelled",
+                    SessionState::Failed => "failed",
+                    SessionState::Archived => "archived",
+                },
+                "progress": {
+                    "total_actions": total_actions,
+                    "completed_actions": completed_actions,
+                    "pending_actions": pending_actions,
+                },
+                "resumable": resumable,
+                "resume_command": if resumable && matches!(manifest.state, SessionState::Planned | SessionState::Executing) {
+                    Some(format!("pt agent apply --session {}", manifest.session_id))
+                } else {
+                    None
+                },
+                "state_history": manifest.state_history,
+                "error": manifest.error,
+                "status": "ok",
+                "command": format!("pt agent sessions --status {}", manifest.session_id),
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Summary => {
+            let status_char = if resumable { "⏸" } else { "✓" };
+            println!(
+                "[{}] {} {:?} ({}/{} actions)",
+                manifest.session_id, status_char, manifest.state, completed_actions, total_actions
+            );
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# Session Status: {}", manifest.session_id);
+            println!();
+            println!("State: {:?}", manifest.state);
+            println!("Mode: {:?}", manifest.mode);
+            if let Some(label) = &manifest.label {
+                println!("Label: {}", label);
+            }
+            println!("Created: {}", manifest.timing.created_at);
+            if let Some(updated) = &manifest.timing.updated_at {
+                println!("Updated: {}", updated);
+            }
+            println!();
+            println!("## Progress");
+            println!("  Total actions: {}", total_actions);
+            println!("  Completed: {}", completed_actions);
+            println!("  Pending: {}", pending_actions);
+            println!();
+            println!("Resumable: {}", if resumable { "yes" } else { "no" });
+            if resumable && matches!(manifest.state, SessionState::Planned | SessionState::Executing) {
+                println!("Resume with: pt agent apply --session {}", manifest.session_id);
+            }
+            if let Some(error) = &manifest.error {
+                println!();
+                println!("## Error");
+                println!("{}", error);
+            }
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_agent_sessions_cleanup(
+    global: &GlobalOpts,
+    store: &SessionStore,
+    older_than_str: &str,
+    host_id: &str,
+) -> ExitCode {
+    let duration = match parse_duration(older_than_str) {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "agent sessions: invalid --older-than '{}'. Use format like '7d', '24h', '30d'",
+                older_than_str
+            );
+            return ExitCode::ArgsError;
+        }
+    };
+
+    let result = match store.cleanup_sessions(duration) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("agent sessions: cleanup failed: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    match global.format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "host_id": host_id,
+                "older_than": older_than_str,
+                "removed_count": result.removed_count,
+                "removed_sessions": result.removed_sessions,
+                "preserved_count": result.preserved_count,
+                "errors": result.errors,
+                "status": if result.errors.is_empty() { "ok" } else { "partial" },
+                "command": format!("pt agent sessions --cleanup --older-than {}", older_than_str),
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Summary => {
+            println!(
+                "Cleaned up {} sessions (preserved {})",
+                result.removed_count, result.preserved_count
+            );
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# Session Cleanup");
+            println!();
+            println!("Older than: {}", older_than_str);
+            println!("Removed: {} sessions", result.removed_count);
+            println!("Preserved: {} sessions (active or in-progress)", result.preserved_count);
+            if !result.errors.is_empty() {
+                println!();
+                println!("## Errors");
+                for error in &result.errors {
+                    println!("  - {}", error);
+                }
+            }
+            if !result.removed_sessions.is_empty() {
+                println!();
+                println!("## Removed Sessions");
+                for session in &result.removed_sessions {
+                    println!("  - {}", session);
+                }
+            }
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_agent_sessions_list(
+    global: &GlobalOpts,
+    store: &SessionStore,
+    args: &AgentSessionsArgs,
+    host_id: &str,
+) -> ExitCode {
+    let state_filter = args.state.as_ref().and_then(|s| match s.to_lowercase().as_str() {
+        "created" => Some(SessionState::Created),
+        "scanning" => Some(SessionState::Scanning),
+        "planned" => Some(SessionState::Planned),
+        "executing" => Some(SessionState::Executing),
+        "completed" => Some(SessionState::Completed),
+        "cancelled" => Some(SessionState::Cancelled),
+        "failed" => Some(SessionState::Failed),
+        "archived" => Some(SessionState::Archived),
+        _ => None,
+    });
+
+    let options = ListSessionsOptions {
+        limit: Some(args.limit),
+        state: state_filter,
+        older_than: None,
+    };
+
+    let sessions = match store.list_sessions(&options) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("agent sessions: failed to list sessions: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    match global.format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "host_id": host_id,
+                "sessions": sessions.iter().map(|s| serde_json::json!({
+                    "session_id": s.session_id,
+                    "host": s.host_id,
+                    "state": s.state,
+                    "mode": s.mode,
+                    "created_at": s.created_at,
+                    "label": s.label,
+                    "candidates": s.candidates_count,
+                    "actions_taken": s.actions_count,
+                })).collect::<Vec<_>>(),
+                "total_count": sessions.len(),
+                "status": "ok",
+                "command": "pt agent sessions",
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Summary => {
+            if sessions.is_empty() {
+                println!("No sessions found");
+            } else {
+                println!("{} session(s)", sessions.len());
+                for s in &sessions {
+                    let state_char = match s.state {
+                        SessionState::Created => "○",
+                        SessionState::Scanning => "◎",
+                        SessionState::Planned => "◉",
+                        SessionState::Executing => "▶",
+                        SessionState::Completed => "✓",
+                        SessionState::Cancelled => "✗",
+                        SessionState::Failed => "✗",
+                        SessionState::Archived => "▣",
+                    };
+                    println!("  {} {} {:?}", state_char, s.session_id, s.state);
+                }
+            }
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# Sessions");
+            println!();
+            if sessions.is_empty() {
+                println!("No sessions found.");
+            } else {
+                println!(
+                    "{:<26} {:<12} {:<10} {:<8} {:<8}",
+                    "SESSION", "STATE", "MODE", "CANDS", "ACTIONS"
+                );
+                for s in &sessions {
+                    println!(
+                        "{:<26} {:<12?} {:<10?} {:<8} {:<8}",
+                        s.session_id,
+                        s.state,
+                        s.mode,
+                        s.candidates_count.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                        s.actions_count.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    ExitCode::Clean
+}
+
+/// Parse duration string like "7d", "24h", "30d" into chrono::Duration.
+fn parse_duration(s: &str) -> Option<chrono::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let (num_str, unit) = if s.ends_with('d') {
+        (&s[..s.len() - 1], 'd')
+    } else if s.ends_with('h') {
+        (&s[..s.len() - 1], 'h')
+    } else if s.ends_with('m') {
+        (&s[..s.len() - 1], 'm')
+    } else {
+        return None;
+    };
+
+    let num: i64 = num_str.parse().ok()?;
+    match unit {
+        'd' => Some(chrono::Duration::days(num)),
+        'h' => Some(chrono::Duration::hours(num)),
+        'm' => Some(chrono::Duration::minutes(num)),
+        _ => None,
+    }
 }

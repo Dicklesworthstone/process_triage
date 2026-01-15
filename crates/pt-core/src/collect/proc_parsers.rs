@@ -158,6 +158,30 @@ pub struct CriticalFile {
     pub path: String,
     /// Why this file is critical.
     pub category: CriticalFileCategory,
+    /// Detection strength (hard = definite lock, soft = heuristic match).
+    pub strength: DetectionStrength,
+    /// Which rule matched (for provenance tracking).
+    pub rule_id: String,
+}
+
+/// Detection strength for critical file matching.
+///
+/// Hard detections are definite locks that should always block kills.
+/// Soft detections are heuristic matches that may warrant caution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionStrength {
+    /// Definite lock file or active write handle - always block kill.
+    Hard,
+    /// Heuristic match - may be stale or false positive, use caution.
+    Soft,
+}
+
+impl CriticalFile {
+    /// Get a human-readable remediation hint for this critical file.
+    pub fn remediation_hint(&self) -> &'static str {
+        self.category.remediation_hint()
+    }
 }
 
 /// Categories of critical files that affect kill safety.
@@ -168,14 +192,59 @@ pub enum CriticalFileCategory {
     SqliteWal,
     /// Git index or object lock.
     GitLock,
-    /// Package manager lock (apt, dpkg, rpm, etc.).
-    PackageLock,
+    /// Git rebase/merge in progress.
+    GitRebase,
+    /// System package manager lock (apt, dpkg, rpm, pacman, dnf).
+    SystemPackageLock,
+    /// Node.js package manager lock (npm, pnpm, yarn).
+    NodePackageLock,
+    /// Cargo/Rust package manager lock.
+    CargoLock,
     /// Database file open for write.
     DatabaseWrite,
     /// Application-specific lock file.
     AppLock,
     /// Generic open write handle.
     OpenWrite,
+}
+
+impl CriticalFileCategory {
+    /// Get a human-readable remediation hint for this category.
+    pub fn remediation_hint(&self) -> &'static str {
+        match self {
+            Self::SqliteWal => {
+                "Wait for database transaction to complete, or checkpoint the WAL file"
+            }
+            Self::GitLock => "Wait for git operation to finish, or remove stale .lock file if safe",
+            Self::GitRebase => {
+                "Complete or abort the git rebase/merge with 'git rebase --abort' or 'git merge --abort'"
+            }
+            Self::SystemPackageLock => {
+                "Wait for package installation to complete; do not interrupt apt/dpkg/rpm"
+            }
+            Self::NodePackageLock => {
+                "Wait for npm/pnpm/yarn install to complete; check for stale lock with 'npm cache clean'"
+            }
+            Self::CargoLock => {
+                "Wait for cargo build/install to complete; check ~/.cargo/.package-cache-lock"
+            }
+            Self::DatabaseWrite => "Wait for database writes to flush; consider graceful shutdown",
+            Self::AppLock => "Check application documentation for proper shutdown procedure",
+            Self::OpenWrite => "Wait for file writes to complete; check for unsaved buffers",
+        }
+    }
+
+    /// Check if this category represents a hard block (always block kill).
+    pub fn is_hard_block(&self) -> bool {
+        matches!(
+            self,
+            Self::SqliteWal
+                | Self::GitLock
+                | Self::GitRebase
+                | Self::SystemPackageLock
+                | Self::DatabaseWrite
+        )
+    }
 }
 
 /// Cgroup membership information.
@@ -434,7 +503,7 @@ pub fn parse_fdinfo_content(content: &str) -> Option<OpenMode> {
 fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
     let path_lower = path.to_lowercase();
 
-    // SQLite WAL and journal files
+    // SQLite WAL and journal files - HARD block (active transaction in progress)
     if path_lower.ends_with("-wal")
         || path_lower.ends_with("-journal")
         || path_lower.ends_with("-shm")
@@ -447,43 +516,128 @@ fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
             fd,
             path: path.to_string(),
             category: CriticalFileCategory::SqliteWal,
+            strength: DetectionStrength::Hard,
+            rule_id: "sqlite_wal_journal".to_string(),
         });
     }
 
-    // Git locks
-    if path.contains(".git/")
-        && (path_lower.ends_with(".lock")
-            || path_lower.ends_with("/index.lock")
-            || path_lower.contains("/objects/"))
-    {
-        return Some(CriticalFile {
-            fd,
-            path: path.to_string(),
-            category: CriticalFileCategory::GitLock,
-        });
-    }
+    // Git rebase/merge in progress markers - HARD block
+    if path.contains(".git/") {
+        let rebase_merge_markers = [
+            "/rebase-merge/",
+            "/rebase-apply/",
+            "/MERGE_HEAD",
+            "/CHERRY_PICK_HEAD",
+            "/REVERT_HEAD",
+            "/BISECT_LOG",
+        ];
+        for marker in &rebase_merge_markers {
+            if path.contains(marker) {
+                return Some(CriticalFile {
+                    fd,
+                    path: path.to_string(),
+                    category: CriticalFileCategory::GitRebase,
+                    strength: DetectionStrength::Hard,
+                    rule_id: "git_rebase_merge".to_string(),
+                });
+            }
+        }
 
-    // Package manager locks
-    let pkg_lock_patterns = [
-        "/var/lib/dpkg/lock",
-        "/var/cache/apt/archives/lock",
-        "/var/lib/rpm/.rpm.lock",
-        "/var/lib/pacman/db.lck",
-        "/var/cache/pacman/pkg/",
-        "/var/lib/dnf/",
-        "/run/lock/",
-    ];
-    for pattern in &pkg_lock_patterns {
-        if path.starts_with(pattern) || path.contains(pattern) {
+        // Git lock files - HARD block
+        let git_lock_patterns = [
+            "/index.lock",
+            "/shallow.lock",
+            "/packed-refs.lock",
+            "/config.lock",
+            "/HEAD.lock",
+        ];
+        for pattern in &git_lock_patterns {
+            if path.ends_with(pattern) {
+                return Some(CriticalFile {
+                    fd,
+                    path: path.to_string(),
+                    category: CriticalFileCategory::GitLock,
+                    strength: DetectionStrength::Hard,
+                    rule_id: "git_lock_file".to_string(),
+                });
+            }
+        }
+
+        // Git objects being written - SOFT (could be read-only pack access)
+        if path.contains("/objects/") && path_lower.ends_with(".lock") {
             return Some(CriticalFile {
                 fd,
                 path: path.to_string(),
-                category: CriticalFileCategory::PackageLock,
+                category: CriticalFileCategory::GitLock,
+                strength: DetectionStrength::Soft,
+                rule_id: "git_objects_lock".to_string(),
             });
         }
     }
 
-    // Database files open for write
+    // System package manager locks - HARD block (corruption risk is severe)
+    let system_pkg_locks = [
+        ("/var/lib/dpkg/lock", "dpkg_lock"),
+        ("/var/lib/dpkg/lock-frontend", "dpkg_frontend_lock"),
+        ("/var/cache/apt/archives/lock", "apt_archives_lock"),
+        ("/var/lib/apt/lists/lock", "apt_lists_lock"),
+        ("/var/lib/rpm/.rpm.lock", "rpm_lock"),
+        ("/var/lib/pacman/db.lck", "pacman_lock"),
+        ("/var/cache/pacman/pkg/", "pacman_cache"),
+        ("/var/lib/dnf/", "dnf_lock"),
+        ("/run/lock/", "run_lock"),
+    ];
+    for (pattern, rule) in &system_pkg_locks {
+        if path.starts_with(pattern) || path.contains(pattern) {
+            return Some(CriticalFile {
+                fd,
+                path: path.to_string(),
+                category: CriticalFileCategory::SystemPackageLock,
+                strength: DetectionStrength::Hard,
+                rule_id: rule.to_string(),
+            });
+        }
+    }
+
+    // Node.js package manager locks - HARD for active installs
+    let node_pkg_patterns = [
+        ("node_modules/.package-lock.json", "npm_package_lock"),
+        ("node_modules/.staging/", "npm_staging"),
+        (".pnpm-lock.yaml", "pnpm_lock"),
+        (".yarn/install-state.gz", "yarn_install_state"),
+        (".yarnrc.yml.lock", "yarn_config_lock"),
+    ];
+    for (pattern, rule) in &node_pkg_patterns {
+        if path.contains(pattern) {
+            return Some(CriticalFile {
+                fd,
+                path: path.to_string(),
+                category: CriticalFileCategory::NodePackageLock,
+                strength: DetectionStrength::Hard,
+                rule_id: rule.to_string(),
+            });
+        }
+    }
+
+    // Cargo/Rust package manager locks
+    let cargo_patterns = [
+        (".cargo/registry/.package-cache-lock", "cargo_registry_lock"),
+        (".cargo/.package-cache-lock", "cargo_package_cache"),
+        ("/target/.cargo-lock", "cargo_target_lock"),
+    ];
+    for (pattern, rule) in &cargo_patterns {
+        if path.contains(pattern) {
+            return Some(CriticalFile {
+                fd,
+                path: path.to_string(),
+                category: CriticalFileCategory::CargoLock,
+                strength: DetectionStrength::Hard,
+                rule_id: rule.to_string(),
+            });
+        }
+    }
+
+    // Database files open for write - SOFT (may be read-only access)
     let db_extensions = [".db", ".sqlite", ".sqlite3", ".ldb", ".mdb"];
     for ext in &db_extensions {
         if path_lower.ends_with(ext) {
@@ -491,16 +645,20 @@ fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
                 fd,
                 path: path.to_string(),
                 category: CriticalFileCategory::DatabaseWrite,
+                strength: DetectionStrength::Soft,
+                rule_id: "database_file".to_string(),
             });
         }
     }
 
-    // Generic lock files
+    // Generic lock files - SOFT (may be stale)
     if path_lower.ends_with(".lock") || path_lower.ends_with(".lck") || path.contains("/lock/") {
         return Some(CriticalFile {
             fd,
             path: path.to_string(),
             category: CriticalFileCategory::AppLock,
+            strength: DetectionStrength::Soft,
+            rule_id: "generic_lock_file".to_string(),
         });
     }
 
@@ -1119,5 +1277,201 @@ nice                                         :                    0
         // Status should have basic fields
         assert!(snapshot.status.contains_key("Pid"));
         assert!(snapshot.status.contains_key("State"));
+    }
+
+    // =========================================================================
+    // Critical File Detection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_detect_critical_file_sqlite_wal() {
+        let cf = detect_critical_file(3, "/home/user/app/data.db-wal").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::SqliteWal);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+        assert_eq!(cf.rule_id, "sqlite_wal_journal");
+    }
+
+    #[test]
+    fn test_detect_critical_file_sqlite_journal() {
+        let cf = detect_critical_file(4, "/var/lib/app/test.sqlite-journal").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::SqliteWal);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+    }
+
+    #[test]
+    fn test_detect_critical_file_git_index_lock() {
+        let cf = detect_critical_file(5, "/home/user/repo/.git/index.lock").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::GitLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+        assert_eq!(cf.rule_id, "git_lock_file");
+    }
+
+    #[test]
+    fn test_detect_critical_file_git_shallow_lock() {
+        let cf = detect_critical_file(6, "/home/user/repo/.git/shallow.lock").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::GitLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+    }
+
+    #[test]
+    fn test_detect_critical_file_git_packed_refs_lock() {
+        let cf = detect_critical_file(7, "/home/user/repo/.git/packed-refs.lock").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::GitLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+    }
+
+    #[test]
+    fn test_detect_critical_file_git_rebase() {
+        let cf = detect_critical_file(8, "/home/user/repo/.git/rebase-merge/head-name").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::GitRebase);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+        assert_eq!(cf.rule_id, "git_rebase_merge");
+    }
+
+    #[test]
+    fn test_detect_critical_file_git_merge_head() {
+        let cf = detect_critical_file(9, "/home/user/repo/.git/MERGE_HEAD").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::GitRebase);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+    }
+
+    #[test]
+    fn test_detect_critical_file_git_cherry_pick() {
+        let cf = detect_critical_file(10, "/home/user/repo/.git/CHERRY_PICK_HEAD").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::GitRebase);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+    }
+
+    #[test]
+    fn test_detect_critical_file_dpkg_lock() {
+        let cf = detect_critical_file(11, "/var/lib/dpkg/lock").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::SystemPackageLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+        assert_eq!(cf.rule_id, "dpkg_lock");
+    }
+
+    #[test]
+    fn test_detect_critical_file_apt_lock() {
+        let cf = detect_critical_file(12, "/var/cache/apt/archives/lock").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::SystemPackageLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+        assert_eq!(cf.rule_id, "apt_archives_lock");
+    }
+
+    #[test]
+    fn test_detect_critical_file_pacman_lock() {
+        let cf = detect_critical_file(13, "/var/lib/pacman/db.lck").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::SystemPackageLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+    }
+
+    #[test]
+    fn test_detect_critical_file_npm_package_lock() {
+        let cf =
+            detect_critical_file(14, "/home/user/project/node_modules/.package-lock.json").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::NodePackageLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+        assert_eq!(cf.rule_id, "npm_package_lock");
+    }
+
+    #[test]
+    fn test_detect_critical_file_npm_staging() {
+        let cf =
+            detect_critical_file(15, "/home/user/project/node_modules/.staging/lodash-abc123")
+                .unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::NodePackageLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+        assert_eq!(cf.rule_id, "npm_staging");
+    }
+
+    #[test]
+    fn test_detect_critical_file_pnpm_lock() {
+        let cf = detect_critical_file(16, "/home/user/project/.pnpm-lock.yaml").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::NodePackageLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+        assert_eq!(cf.rule_id, "pnpm_lock");
+    }
+
+    #[test]
+    fn test_detect_critical_file_yarn_install_state() {
+        let cf = detect_critical_file(17, "/home/user/project/.yarn/install-state.gz").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::NodePackageLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+    }
+
+    #[test]
+    fn test_detect_critical_file_cargo_registry_lock() {
+        let cf =
+            detect_critical_file(18, "/home/user/.cargo/registry/.package-cache-lock").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::CargoLock);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+        assert_eq!(cf.rule_id, "cargo_registry_lock");
+    }
+
+    #[test]
+    fn test_detect_critical_file_database_soft() {
+        let cf = detect_critical_file(19, "/home/user/app/data.sqlite").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::DatabaseWrite);
+        assert_eq!(cf.strength, DetectionStrength::Soft);
+        assert_eq!(cf.rule_id, "database_file");
+    }
+
+    #[test]
+    fn test_detect_critical_file_generic_lock_soft() {
+        let cf = detect_critical_file(20, "/home/user/app/cache.lock").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::AppLock);
+        assert_eq!(cf.strength, DetectionStrength::Soft);
+        assert_eq!(cf.rule_id, "generic_lock_file");
+    }
+
+    #[test]
+    fn test_detect_critical_file_no_match() {
+        // Regular file should return None
+        let result = detect_critical_file(21, "/home/user/document.txt");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_critical_file_case_insensitive() {
+        // SQLite WAL patterns should be case-insensitive
+        let cf = detect_critical_file(22, "/home/user/DATA.DB-WAL").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::SqliteWal);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+    }
+
+    #[test]
+    fn test_critical_file_category_remediation_hints() {
+        // Verify all categories have non-empty remediation hints
+        assert!(!CriticalFileCategory::SqliteWal.remediation_hint().is_empty());
+        assert!(!CriticalFileCategory::GitLock.remediation_hint().is_empty());
+        assert!(!CriticalFileCategory::GitRebase.remediation_hint().is_empty());
+        assert!(!CriticalFileCategory::SystemPackageLock
+            .remediation_hint()
+            .is_empty());
+        assert!(!CriticalFileCategory::NodePackageLock
+            .remediation_hint()
+            .is_empty());
+        assert!(!CriticalFileCategory::CargoLock.remediation_hint().is_empty());
+        assert!(!CriticalFileCategory::DatabaseWrite
+            .remediation_hint()
+            .is_empty());
+        assert!(!CriticalFileCategory::AppLock.remediation_hint().is_empty());
+        assert!(!CriticalFileCategory::OpenWrite.remediation_hint().is_empty());
+    }
+
+    #[test]
+    fn test_critical_file_category_is_hard_block() {
+        // Hard block categories
+        assert!(CriticalFileCategory::SqliteWal.is_hard_block());
+        assert!(CriticalFileCategory::GitLock.is_hard_block());
+        assert!(CriticalFileCategory::GitRebase.is_hard_block());
+        assert!(CriticalFileCategory::SystemPackageLock.is_hard_block());
+        assert!(CriticalFileCategory::DatabaseWrite.is_hard_block());
+
+        // Soft block categories
+        assert!(!CriticalFileCategory::NodePackageLock.is_hard_block());
+        assert!(!CriticalFileCategory::CargoLock.is_hard_block());
+        assert!(!CriticalFileCategory::AppLock.is_hard_block());
+        assert!(!CriticalFileCategory::OpenWrite.is_hard_block());
     }
 }
