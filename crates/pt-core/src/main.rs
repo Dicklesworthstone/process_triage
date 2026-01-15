@@ -1126,9 +1126,9 @@ fn run_bundle_extract(global: &GlobalOpts, path: &str, output_arg: &Option<Strin
             "error": format!("Bundle not found: {}", path),
         });
         match global.format {
-            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             OutputFormat::Md => eprintln!("Error: Bundle not found: {}", path),
             OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
         return ExitCode::ArgsError;
     }
@@ -1145,9 +1145,9 @@ fn run_bundle_extract(global: &GlobalOpts, path: &str, output_arg: &Option<Strin
                 "error": format!("Failed to open bundle: {}", e),
             });
             match global.format {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
                 OutputFormat::Md => eprintln!("Error: Failed to open bundle: {}", e),
                 OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+                _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
             return ExitCode::InternalError;
         }
@@ -1173,9 +1173,9 @@ fn run_bundle_extract(global: &GlobalOpts, path: &str, output_arg: &Option<Strin
             "error": format!("Failed to create output directory: {}", e),
         });
         match global.format {
-            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             OutputFormat::Md => eprintln!("Error: Failed to create output directory: {}", e),
             OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
         return ExitCode::InternalError;
     }
@@ -1230,7 +1230,6 @@ fn run_bundle_extract(global: &GlobalOpts, path: &str, output_arg: &Option<Strin
     });
 
     match global.format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
         OutputFormat::Md => {
             println!("Extracted {} of {} files to {}", extracted, file_paths.len(), output_dir.display());
             if !errors.is_empty() {
@@ -1241,6 +1240,7 @@ fn run_bundle_extract(global: &GlobalOpts, path: &str, output_arg: &Option<Strin
             }
         }
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(&output).unwrap()),
+        _ => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
     }
 
     if errors.is_empty() {
