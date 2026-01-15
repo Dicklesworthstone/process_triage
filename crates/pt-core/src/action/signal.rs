@@ -269,12 +269,18 @@ impl ActionRunner for SignalActionRunner {
 
 /// Live identity provider that validates against /proc.
 #[cfg(target_os = "linux")]
-pub struct LiveIdentityProvider;
+pub struct LiveIdentityProvider {
+    boot_id: String,
+}
 
 #[cfg(target_os = "linux")]
 impl LiveIdentityProvider {
     pub fn new() -> Self {
-        Self
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Self { boot_id }
     }
 
     /// Read start_id from /proc/[pid]/stat.
@@ -287,13 +293,7 @@ impl LiveIdentityProvider {
         // Field 19 (0-indexed from after comm) is starttime
         let starttime = fields.get(19)?.parse::<u64>().ok()?;
 
-        // Read boot_id for full identity
-        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        Some(format!("{boot_id}:{starttime}:{pid}"))
+        Some(format!("{}:{starttime}:{pid}", self.boot_id))
     }
 
     /// Read uid from /proc/[pid]/status.
