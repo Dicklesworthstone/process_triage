@@ -45,8 +45,8 @@ pub use deep_scan::{
 #[cfg(target_os = "linux")]
 pub use network::{
     collect_network_info, parse_proc_net_tcp, parse_proc_net_udp, parse_proc_net_unix, ListenPort,
-    NetworkInfo, SocketCounts, TcpConnection, TcpState, UdpSocket, UnixSocket, UnixSocketState,
-    UnixSocketType,
+    NetworkInfo, NetworkSnapshot, SocketCounts, TcpConnection, TcpState, UdpSocket, UnixSocket,
+    UnixSocketState, UnixSocketType,
 };
 #[cfg(target_os = "linux")]
 pub use proc_parsers::{

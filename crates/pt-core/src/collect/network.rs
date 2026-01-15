@@ -590,6 +590,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ipv6_addr() {
+        // ::1 (localhost)
+        // Words (32-bit): 00000000 00000000 00000000 01000000 (each word LE)
+        assert_eq!(parse_ipv6_addr("00000000000000000000000001000000"), "::1");
+
+        // :: (unspecified)
+        assert_eq!(parse_ipv6_addr("00000000000000000000000000000000"), "::");
+    }
+
+    #[test]
     fn test_parse_addr_port() {
         let (addr, port) = parse_addr_port("0100007F:0035", false);
         assert_eq!(addr, "127.0.0.1");

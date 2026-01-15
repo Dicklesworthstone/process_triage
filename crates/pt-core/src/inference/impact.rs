@@ -37,7 +37,7 @@
 //! ```
 
 use crate::collect::{
-    collect_network_info, parse_fd, CriticalFileCategory, FdInfo, NetworkInfo,
+    collect_network_info, parse_fd, CriticalFileCategory, FdInfo, NetworkInfo, NetworkSnapshot,
 };
 use crate::supervision::{detect_supervision, CombinedResult, SupervisorCategory};
 use serde::{Deserialize, Serialize};
@@ -365,6 +365,8 @@ impl From<&ImpactResult> for ImpactEvidence {
 pub struct ImpactScorer {
     config: ImpactConfig,
     child_count_cache: HashMap<u32, usize>,
+    #[cfg(target_os = "linux")]
+    network_snapshot: Option<NetworkSnapshot>,
 }
 
 impl ImpactScorer {
@@ -378,6 +380,8 @@ impl ImpactScorer {
         Self {
             config,
             child_count_cache: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            network_snapshot: None,
         }
     }
 
@@ -387,6 +391,7 @@ impl ImpactScorer {
     #[cfg(target_os = "linux")]
     pub fn populate_caches(&mut self) -> Result<(), ImpactError> {
         self.child_count_cache.clear();
+        self.network_snapshot = Some(NetworkSnapshot::collect());
 
         // Read all PIDs and their PPIDs to build child count map
         if let Ok(entries) = std::fs::read_dir("/proc") {
@@ -468,7 +473,17 @@ impl ImpactScorer {
         let mut missing_data = Vec::new();
 
         // Collect network information
-        let network_score = match collect_network_info(pid) {
+        #[cfg(target_os = "linux")]
+        let network_info_opt = if let Some(snapshot) = &self.network_snapshot {
+            snapshot.get_process_info(pid)
+        } else {
+            collect_network_info(pid)
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let network_info_opt: Option<NetworkInfo> = None;
+
+        let network_score = match network_info_opt {
             Some(net_info) => {
                 let (score, listen, established) = self.score_network(&net_info);
                 components.listen_ports_count = listen;

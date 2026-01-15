@@ -1211,6 +1211,9 @@ nice                                         :                    0
         // Shell inherits our environment
         let proc = harness.spawn_sleep(5).expect("spawn sleep");
 
+        // Give it a moment to initialize environment
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
         // Parse real /proc/<pid>/environ
         let result = parse_environ(proc.pid());
 
