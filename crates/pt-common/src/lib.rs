@@ -7,8 +7,10 @@
 //! - Output format specifications
 //! - Configuration loading and validation
 //! - Capabilities detection and caching
+//! - Command and CWD category taxonomies
 
 pub mod capabilities;
+pub mod categories;
 pub mod config;
 pub mod error;
 pub mod id;
@@ -20,6 +22,10 @@ pub use capabilities::{
     LaunchdInfo, OsFamily, OsInfo, PathsInfo, PrivilegesInfo, ProcField, ProcFsInfo, PsiInfo,
     SudoInfo, SystemdInfo, SystemInfo, ToolInfo, ToolPermissions, UserInfo,
     CAPABILITIES_SCHEMA_VERSION, DEFAULT_CACHE_TTL_SECS,
+};
+pub use categories::{
+    CategoryMatcher, CategoryTaxonomy, CommandCategory, CommandCategoryDef, CommandPattern,
+    CwdCategory, CwdCategoryDef, CwdPattern, PriorHints, CATEGORIES_SCHEMA_VERSION,
 };
 pub use config::{Config, ConfigPaths, ConfigResolver, ConfigSnapshot, Policy, Priors};
 pub use error::{Error, Result};

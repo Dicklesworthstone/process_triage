@@ -23,7 +23,6 @@ readonly C_REVIEW=$'\e[93m'    # Bright yellow
 readonly C_SPARE=$'\e[92m'     # Bright green
 readonly C_DIM=$'\e[90m'       # Gray
 readonly C_BOLD=$'\e[1m'
-readonly C_CYAN=$'\e[96m'
 readonly C_RESET=$'\e[0m'
 
 # Scoring thresholds
@@ -185,10 +184,10 @@ get_cached_decision() {
 
 normalize_pattern() {
     echo "$1" | sed -E \
-        -e 's/[0-9]{5,}//g' \
         -e 's/--port[= ]*[0-9]+/--port=PORT/g' \
         -e 's/:[0-9]{4,5}/:PORT/g' \
         -e 's/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/UUID/g' \
+        -e 's/[0-9]{5,}//g' \
         -e 's|/tmp/[^ ]+|/tmp/TMP|g' \
         -e 's|shell-snapshot[^ ]*|shell-snapshot|g' \
         | tr -s ' ' | cut -c1-150
@@ -374,8 +373,8 @@ check_wait_channel() {
     wchan=$(cat "$wchan_file" 2>/dev/null) || { echo "unknown"; return; }
 
     case "$wchan" in
-        *futex*|*poll*|*select*|*epoll*) echo "waiting_io" ;;
-        *sleep*|*nanosleep*) echo "sleeping" ;;
+        *futex*|*poll*|*select*) echo "waiting_io" ;;
+        *sleep*) echo "sleeping" ;;
         *wait*) echo "waiting_child" ;;
         0|"") echo "running" ;;
         *) echo "waiting:$wchan" ;;
@@ -898,14 +897,9 @@ robot_emit_plan_md() {
     IFS='|' read -r load cores mem_used mem_total procs <<< "$sys"
 
     printf '# pt robot plan\n\n'
-    printf -- '- generated_at: `%s`\n' "$now"
-    printf -- '- deep: `%s`\n' "$deep"
-    printf -- '- min_age_s: `%s`\n' "$min_age"
-    printf -- '- user: `%s`\n' "$(whoami)"
-    printf -- '- loadavg: `%s`\n' "${load:-}"
-    printf -- '- cores: `%s`\n' "${cores:-}"
-    printf -- '- mem: `%s / %s`\n' "${mem_used:-}" "${mem_total:-}"
-    printf -- '- proc_count: `%s`\n\n' "${procs:-}"
+    # shellcheck disable=SC2016
+    printf -- '- generated_at: `%s`\n- deep: `%s`\n- min_age_s: `%s`\n- user: `%s`\n- loadavg: `%s`\n- cores: `%s`\n- mem: `%s / %s`\n- proc_count: `%s`\n\n' \
+        "$now" "$deep" "$min_age" "$(whoami)" "${load:-}" "${cores:-}" "${mem_used:-}" "${mem_total:-}" "${procs:-}"
 
     printf '## Candidates\n\n'
     printf '| rec | score | pid | ppid | age | mem | cpu | tty | type | evidence | cmd |\n'
@@ -921,6 +915,7 @@ robot_emit_plan_md() {
         [[ ${#cmd} -gt 60 ]] && cmd_short="${cmd_short}…"
         evidence_short=$(printf '%s' "${evidence//|/, }" | cut -c1-50)
         [[ ${#evidence_short} -gt 50 ]] && evidence_short="${evidence_short}…"
+        # shellcheck disable=SC2016
         printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n' \
             "$rec" "$score" "$pid" "$ppid" "$age_h" "$mem_h" "$cpu" "$tty" "$ptype" "$evidence_short" "$cmd_short"
     done

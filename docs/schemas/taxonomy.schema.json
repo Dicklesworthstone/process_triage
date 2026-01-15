@@ -1,0 +1,272 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/process_triage/schemas/taxonomy.schema.json",
+  "title": "Process Triage Command and CWD Taxonomy Schema",
+  "description": "Schema for taxonomy.json containing command category and CWD category definitions with pattern matching rules. Categories are features used in Bayesian inference, not final classifications.",
+  "type": "object",
+  "required": ["schema_version", "command_categories", "cwd_categories"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Schema version for compatibility checking"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of this taxonomy configuration"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this taxonomy file was created"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this taxonomy file was last updated"
+    },
+    "command_categories": {
+      "type": "object",
+      "description": "Command category definitions. Order matters: first match wins. Built-in categories cannot be removed, but can be extended.",
+      "required": ["order", "categories", "default_category"],
+      "additionalProperties": false,
+      "properties": {
+        "order": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Ordered list of category names for pattern matching (most specific first). Must end with default_category."
+        },
+        "default_category": {
+          "type": "string",
+          "description": "Category assigned when no patterns match (typically 'other')"
+        },
+        "categories": {
+          "type": "object",
+          "description": "Map of category name to category definition",
+          "additionalProperties": { "$ref": "#/$defs/command_category" }
+        }
+      }
+    },
+    "cwd_categories": {
+      "type": "object",
+      "description": "Working directory category definitions. Order matters: first match wins.",
+      "required": ["order", "categories", "default_category"],
+      "additionalProperties": false,
+      "properties": {
+        "order": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Ordered list of category names for pattern matching (most specific first). Must end with default_category."
+        },
+        "default_category": {
+          "type": "string",
+          "description": "Category assigned when no patterns match (typically 'unknown')"
+        },
+        "categories": {
+          "type": "object",
+          "description": "Map of category name to category definition",
+          "additionalProperties": { "$ref": "#/$defs/cwd_category" }
+        }
+      }
+    },
+    "user_extensions": {
+      "type": "object",
+      "description": "User-defined category extensions. These are merged with built-in categories.",
+      "additionalProperties": false,
+      "properties": {
+        "command_categories": {
+          "type": "object",
+          "description": "Additional command categories or pattern extensions",
+          "additionalProperties": { "$ref": "#/$defs/command_category" }
+        },
+        "cwd_categories": {
+          "type": "object",
+          "description": "Additional CWD categories or pattern extensions",
+          "additionalProperties": { "$ref": "#/$defs/cwd_category" }
+        },
+        "command_order_prepend": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Categories to check before built-in order (for user overrides)"
+        },
+        "cwd_order_prepend": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "CWD categories to check before built-in order (for user overrides)"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "command_category": {
+      "type": "object",
+      "description": "Definition of a command category with matching patterns and prior adjustments",
+      "required": ["description", "patterns"],
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of what this category represents"
+        },
+        "patterns": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pattern_rule" },
+          "minItems": 0,
+          "description": "Ordered list of pattern rules. First match wins within category."
+        },
+        "examples": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Example commands that match this category (for documentation)"
+        },
+        "prior_adjustments": {
+          "$ref": "#/$defs/prior_adjustments",
+          "description": "Adjustments to class priors when this category matches"
+        },
+        "typical_lifetime": {
+          "$ref": "#/$defs/lifetime_hint",
+          "description": "Expected lifetime characteristics for processes in this category"
+        },
+        "subcategories": {
+          "type": "object",
+          "description": "Optional hierarchical subcategories (e.g., test/unit, test/integration)",
+          "additionalProperties": { "$ref": "#/$defs/command_category" }
+        }
+      }
+    },
+    "cwd_category": {
+      "type": "object",
+      "description": "Definition of a working directory category with matching patterns",
+      "required": ["description", "patterns"],
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of what this category represents"
+        },
+        "patterns": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pattern_rule" },
+          "minItems": 0,
+          "description": "Ordered list of pattern rules. First match wins within category."
+        },
+        "examples": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Example paths that match this category (for documentation)"
+        },
+        "trust_level": {
+          "type": "string",
+          "enum": ["system", "user", "temp", "unknown"],
+          "description": "Trust level for processes with this CWD"
+        },
+        "prior_adjustments": {
+          "$ref": "#/$defs/prior_adjustments",
+          "description": "Adjustments to class priors when this category matches"
+        }
+      }
+    },
+    "pattern_rule": {
+      "type": "object",
+      "description": "A pattern matching rule",
+      "required": ["type", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["regex", "glob", "prefix", "suffix", "contains", "exact"],
+          "description": "Type of pattern matching to use"
+        },
+        "value": {
+          "type": "string",
+          "description": "The pattern value (regex string, glob pattern, or literal depending on type)"
+        },
+        "field": {
+          "type": "string",
+          "enum": ["comm", "cmdline", "exe", "basename"],
+          "default": "cmdline",
+          "description": "Which process field to match against (default: cmdline)"
+        },
+        "case_sensitive": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether matching is case-sensitive (default: false)"
+        },
+        "weight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 1.0,
+          "description": "Confidence weight for this pattern (1.0 = high confidence match)"
+        },
+        "comment": {
+          "type": "string",
+          "description": "Optional comment explaining this pattern"
+        }
+      }
+    },
+    "prior_adjustments": {
+      "type": "object",
+      "description": "Multiplicative adjustments to class priors. Values > 1 increase probability, < 1 decrease.",
+      "additionalProperties": false,
+      "properties": {
+        "useful_mult": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 1.0,
+          "description": "Multiplier for P(useful) prior"
+        },
+        "useful_bad_mult": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 1.0,
+          "description": "Multiplier for P(useful_bad) prior"
+        },
+        "abandoned_mult": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 1.0,
+          "description": "Multiplier for P(abandoned) prior"
+        },
+        "zombie_mult": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 1.0,
+          "description": "Multiplier for P(zombie) prior"
+        }
+      }
+    },
+    "lifetime_hint": {
+      "type": "object",
+      "description": "Expected lifetime characteristics for a command category",
+      "additionalProperties": false,
+      "properties": {
+        "typical_min_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Typical minimum runtime in seconds"
+        },
+        "typical_max_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Typical maximum runtime in seconds (null = long-running)"
+        },
+        "stale_after_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "When process should be considered potentially stale"
+        },
+        "suspicious_after_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "When process should be flagged for review"
+        }
+      }
+    }
+  }
+}

@@ -13,8 +13,8 @@
 # instead of SQLite database
 # no-db: false
 
-# Disable daemon for RPC communication (forces direct database access)
-# no-daemon: false
+## Disable daemon for RPC communication (forces direct database access)
+no-daemon: true
 
 # Disable auto-flush of database to JSONL after mutations
 # no-auto-flush: false
@@ -31,8 +31,8 @@
 # Path to database (overridden by BEADS_DB or --db)
 # db: ""
 
-# Auto-start daemon if not running (can also use BEADS_AUTO_START_DAEMON)
-# auto-start-daemon: true
+## Auto-start daemon if not running (can also use BEADS_AUTO_START_DAEMON)
+auto-start-daemon: false
 
 # Debounce interval for auto-flush (can also use BEADS_FLUSH_DEBOUNCE)
 # flush-debounce: "5s"

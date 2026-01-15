@@ -208,8 +208,13 @@ fn parse_ps_line(
     // Split line into fields, preserving command at the end
     let fields: Vec<&str> = line.split_whitespace().collect();
 
-    if fields.len() < 14 {
-        return Err(format!("Insufficient fields: expected 14+, got {}", fields.len()));
+    let comm_idx = 17;
+    if fields.len() <= comm_idx {
+        return Err(format!(
+            "Insufficient fields: expected {}+, got {}",
+            comm_idx + 1,
+            fields.len()
+        ));
     }
 
     // Parse fixed-position fields
@@ -247,8 +252,6 @@ fn parse_ps_line(
     // macOS: "Tue Jan 14 10:30:00 2026"
     let (start_time_unix, elapsed) = parse_timing_fields(platform, &fields)?;
 
-    // Comm is field 13 (0-indexed: 13) - same index for both Linux and macOS
-    let comm_idx = 13;
     let comm = fields.get(comm_idx).unwrap_or(&"").to_string();
 
     // Args/cmd is everything after comm (field 14+)
@@ -259,7 +262,7 @@ fn parse_ps_line(
     };
 
     // Compute start_id
-    let start_id = compute_start_id(platform, boot_id, start_time_unix, pid);
+    let start_id = compute_start_id(platform, boot_id, start_time_unix, elapsed, pid);
 
     Ok(ProcessRecord {
         pid: ProcessId(pid),
@@ -293,8 +296,11 @@ fn parse_timing_fields(
     // For simplicity, use etimes to compute elapsed time
     // and estimate start_time from current time - etimes
 
-    let etimes_idx = if platform == "linux" { 12 } else { 12 };
-    let etimes_str = fields.get(etimes_idx).unwrap_or(&"0");
+    let lstart_idx = 11;
+    let etimes_idx = lstart_idx + 5;
+    let etimes_str = fields
+        .get(etimes_idx)
+        .ok_or_else(|| format!("Missing etimes field for platform {platform}"))?;
 
     // Parse elapsed time
     let elapsed_secs: u64 = if etimes_str.contains(':') {
@@ -360,13 +366,16 @@ fn compute_start_id(
     platform: &str,
     boot_id: &Option<String>,
     start_time_unix: i64,
+    elapsed: Duration,
     pid: u32,
 ) -> StartId {
     match platform {
         "linux" => {
-            // Linux: use boot_id:start_time:pid
             let boot = boot_id.as_deref().unwrap_or("unknown");
-            StartId::from_linux(boot, start_time_unix as u64, pid)
+            let start_ticks = linux_start_ticks_from_uptime(elapsed)
+                .or_else(|| linux_start_ticks_from_btime(start_time_unix));
+            let ticks = start_ticks.unwrap_or_else(|| start_time_unix.max(0) as u64);
+            StartId::from_linux(boot, ticks, pid)
         }
         "macos" => {
             // macOS: use start_time:pid (no boot_id available easily)
@@ -377,6 +386,74 @@ fn compute_start_id(
             // Fallback: use start_time:pid
             StartId(format!("unknown:{}:{}", start_time_unix, pid))
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_start_ticks_from_uptime(elapsed: Duration) -> Option<u64> {
+    let uptime = read_uptime_seconds()?;
+    let hz = clock_ticks_per_second()?;
+    let elapsed_secs = elapsed.as_secs_f64();
+    if uptime < elapsed_secs {
+        return None;
+    }
+    let start_secs = uptime - elapsed_secs;
+    let ticks = (start_secs * hz as f64).floor();
+    if ticks.is_sign_negative() {
+        return None;
+    }
+    Some(ticks as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_start_ticks_from_uptime(_elapsed: Duration) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_start_ticks_from_btime(start_time_unix: i64) -> Option<u64> {
+    let boot_time = read_boot_time_unix()?;
+    let hz = clock_ticks_per_second()?;
+    let delta = start_time_unix - boot_time;
+    if delta < 0 {
+        return None;
+    }
+    Some((delta as u64) * hz)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_start_ticks_from_btime(_start_time_unix: i64) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_uptime_seconds() -> Option<f64> {
+    let content = std::fs::read_to_string("/proc/uptime").ok()?;
+    let first = content.split_whitespace().next()?;
+    first.parse::<f64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_boot_time_unix() -> Option<i64> {
+    let content = std::fs::read_to_string("/proc/stat").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("btime") {
+            let value = rest.trim();
+            if let Ok(parsed) = value.parse::<i64>() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_second() -> Option<u64> {
+    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if value <= 0 {
+        None
+    } else {
+        Some(value as u64)
     }
 }
 
@@ -439,7 +516,7 @@ mod tests {
     #[test]
     fn test_parse_ps_line_linux() {
         // Sample Linux ps output line
-        let line = "1234 1 1000 testuser 1234 1234 S 0.5 10240 20480 pts/0 0 3600 bash /bin/bash -c echo hello";
+        let line = "1234 1 1000 testuser 1234 1234 S 0.5 10240 20480 pts/0 Tue Jan 14 10:30:00 2026 3600 bash /bin/bash -c echo hello";
         let boot_id = Some("test-boot-id".to_string());
 
         let result = parse_ps_line(line, "linux", &boot_id);
@@ -453,5 +530,6 @@ mod tests {
         assert_eq!(record.state, ProcessState::Sleeping);
         assert_eq!(record.comm, "bash");
         assert!(record.cmd.contains("/bin/bash"));
+        assert_eq!(record.elapsed.as_secs(), 3600);
     }
 }

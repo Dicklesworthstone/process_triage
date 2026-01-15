@@ -24,6 +24,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "1"
 dirs = "5"
+libc = "0.2"
 
 # Structured logging
 tracing = "0.1"

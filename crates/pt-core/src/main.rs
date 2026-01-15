@@ -504,10 +504,92 @@ fn run_interactive(global: &GlobalOpts, _args: &RunArgs) -> ExitCode {
     ExitCode::Clean
 }
 
-fn run_scan(global: &GlobalOpts, _args: &ScanArgs) -> ExitCode {
-    output_stub(global, "scan", "Scan mode not yet implemented");
-    ExitCode::Clean
+use pt_core::collect::{quick_scan, QuickScanOptions};
+
+fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
+    if args.deep {
+        return run_deep_scan(global, &DeepScanArgs { pids: vec![], budget: None });
+    }
+
+    // Configure scan options
+    let options = QuickScanOptions {
+        pids: vec![], // Empty = all processes
+        include_kernel_threads: false, // Default to false for quick scan
+        timeout: global.timeout.map(std::time::Duration::from_secs),
+    };
+
+    // Perform scan
+    match quick_scan(&options) {
+        Ok(result) => {
+            match global.format {
+                OutputFormat::Json => {
+                    // Enrich with schema version and session ID
+                    let session_id = SessionId::new();
+                    let output = serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "session_id": session_id.0,
+                        "generated_at": chrono::Utc::now().to_rfc3339(),
+                        "scan": result
+                    });
+                    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+                }
+                OutputFormat::Summary => {
+                    println!("Scanned {} processes in {}ms", 
+                        result.metadata.process_count, 
+                        result.metadata.duration_ms
+                    );
+                }
+                OutputFormat::Exitcode => {} // Silent
+                _ => {
+                    // Human readable output
+                    println!("# Quick Scan Results");
+                    println!("Scanned {} processes in {}ms", 
+                        result.metadata.process_count, 
+                        result.metadata.duration_ms
+                    );
+                    println!("Platform: {}", result.metadata.platform);
+                    println!();
+                    
+                    println!("{:<8} {:<8} {:<10} {:<6} {:<6} {:<6} {}", 
+                        "PID", "PPID", "USER", "STATE", "%CPU", "RSS", "COMMAND");
+                    
+                    for p in result.processes.iter().take(20) {
+                        println!("{:<8} {:<8} {:<10} {:<6} {:<6.1} {:<6} {}", 
+                            p.pid.0, 
+                            p.ppid.0, 
+                            p.user.chars().take(10).collect::<String>(),
+                            p.state,
+                            p.cpu_percent,
+                            bytes_to_human(p.rss_bytes),
+                            p.comm
+                        );
+                    }
+                    if result.processes.len() > 20 {
+                        println!("... and {} more", result.processes.len() - 20);
+                    }
+                }
+            }
+            ExitCode::Clean
+        }
+        Err(e) => {
+            eprintln!("Scan failed: {}", e);
+            ExitCode::InternalError
+        }
+    }
 }
+
+fn bytes_to_human(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 
 fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
     output_stub(global, "deep-scan", "Deep scan mode not yet implemented");
