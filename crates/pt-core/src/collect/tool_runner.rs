@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{Read, Write as IoWrite};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -582,31 +582,54 @@ impl ToolRunner {
     }
 
     /// Try to read from a stream without blocking.
+    ///
+    /// On Unix, this uses fcntl to set O_NONBLOCK on the file descriptor,
+    /// performs a read, then restores the original flags.
+    /// Returns Ok(0) if no data is available (EAGAIN/EWOULDBLOCK).
     #[cfg(unix)]
-    fn try_read_nonblocking(stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
-        use std::os::unix::io::AsRawFd;
+    fn try_read_nonblocking<R: Read + std::os::unix::io::AsRawFd>(
+        stream: &mut R,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        let fd = stream.as_raw_fd();
 
-        // Set non-blocking mode
-        let fd = unsafe {
-            // Get file descriptor
-            let ptr = stream as *mut _ as *mut libc::c_void;
-            // This is a hack - we can't easily get the fd from a generic Read
-            // For now, just try a regular read with timeout behavior
-            -1i32
-        };
+        // Get current flags
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
 
-        if fd < 0 {
-            // Fallback: just try regular read
-            // This may block but we have timeout via try_wait
-            stream.read(buf)
-        } else {
-            // Use poll to check if data is available
-            stream.read(buf)
+        // Set non-blocking if not already set
+        let was_nonblocking = (flags & libc::O_NONBLOCK) != 0;
+        if !was_nonblocking {
+            let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        // Attempt read
+        let result = stream.read(buf);
+
+        // Restore blocking mode if we changed it
+        if !was_nonblocking {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFL, flags);
+            }
+        }
+
+        // Convert EAGAIN/EWOULDBLOCK to Ok(0)
+        match result {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
         }
     }
 
+    /// Non-blocking read fallback for non-Unix platforms.
+    /// Falls back to blocking read.
     #[cfg(not(unix))]
-    fn try_read_nonblocking(stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn try_read_nonblocking<R: Read>(stream: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
         stream.read(buf)
     }
 
@@ -640,8 +663,6 @@ impl ToolRunner {
     /// Kill a process with SIGTERM, then SIGKILL after grace period.
     #[cfg(unix)]
     fn kill_with_grace(&self, child: &mut Child) {
-        use std::os::unix::process::ExitStatusExt;
-
         let pid = child.id() as i32;
 
         // Send SIGTERM
