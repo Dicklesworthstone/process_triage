@@ -289,6 +289,19 @@ BH) Privacy/secrets governance for telemetry
 - Redact or hash sensitive fields (cmdline paths, env, endpoints) before persistence
 - Preserve analytic utility via categorization + stable hashes for grouping without leakage
 
+BI) Agent/robot CLI contract (no TUI)
+- Full access to plan/explain/apply/session/report without interactive UI
+- Token-efficient JSON/Markdown/JSONL outputs with stable schema + automation-friendly exit codes
+- Pre-toggled plan semantics identical to the TUI defaults
+
+BJ) Shareable session bundles + rich HTML reports
+- One-file `.ptb` export with manifest, plan, telemetry (Parquet), optional raw (redacted), and a single-file HTML report
+- Report loads UI libraries from CDNs (pinned + SRI) and delivers a premium “postmortem dashboard” UX
+
+BK) Dormant mode (always-on guardian)
+- Low-overhead daemon monitors for “triage needed” signals and escalates to active mode automatically
+- Produces a ready-to-approve plan (or auto-applies mitigations only when explicitly configured)
+
 R) Use-case interpretation of observed processes
 - bun test at 91% CPU for 18m in /data/projects/flywheel_gateway
 - gemini --yolo workers at 25m to 4h46m
@@ -304,7 +317,13 @@ All of these are integrated in the system design below.
 ### 3.0 Execution & Packaging Architecture
 - `pt` (bash) remains for: OS detection, maximal tool installation, capability detection, and launching `pt-core`.
 - `pt-core` (Rust monolith) is the artifact: structured concurrency for collection, robust parsing, all inference/decision math, telemetry writing, and the explainable UI.
-- Subcommands (conceptual): `pt-core scan`, `pt-core deep-scan`, `pt-core infer`, `pt-core decide`, `pt-core ui`, `pt-core duck` (run standard analytics queries/reports).
+- Subcommands (conceptual):
+  - Analysis pipeline: `pt-core scan`, `pt-core deep-scan`, `pt-core infer`, `pt-core decide`
+  - Human UI: `pt-core ui` (Apply Plan TUI)
+  - Agent/robot UI: `pt-core agent` (JSON/Markdown/JSONL outputs; no TUI)
+  - Telemetry analytics: `pt-core duck` (run standard DuckDB reports/queries)
+  - Sharing & reporting: `pt-core bundle`, `pt-core report` (single-file HTML)
+  - Always-on mode: `pt-core daemon` (dormant monitor + escalation)
 - Modes:
   - Default: full-auto scan -> infer -> decide -> TUI approval with recommended actions pre-toggled.
   - `--robot`: skip TUI and execute the policy-approved action plan automatically (still subject to safety gates).
@@ -424,6 +443,85 @@ Partitioning rule (example):
 - Before persistence, apply a redaction policy to sensitive fields (full cmdlines, paths, endpoints, env values).
 - Preserve analytical utility by logging: command/category tokens, stable hashes for grouping, and carefully scoped allowlists.
 - Keep an explicit “telemetry schema + redaction version” in `runs` so old data remains interpretable.
+
+### 3.5 Agent/Robot CLI Contract (No TUI)
+Goal: give coding agents a hyper-ergonomic console interface that exposes everything a human can see/do in the TUI, but via token-efficient JSON/Markdown outputs and deterministic automation primitives.
+
+Core commands (conceptual surface; wrapper `pt` forwards to `pt-core agent ...`):
+- `pt agent plan`:
+  - Runs full-auto exploration (quick scan -> targeted deep scan -> infer -> decide).
+  - Returns: `session_id`, `schema_version`, system snapshot, candidates, and a pre-toggled recommended plan (the same items the TUI would preselect).
+- `pt agent explain --session <id> --pid <pid>`:
+  - Returns: “why” summary + full evidence ledger (likelihood terms/Bayes factors) + relevant raw/proc samples (capped/redacted).
+- `pt agent apply --session <id> --recommended --yes`:
+  - Executes the recommended pre-toggled plan without UI.
+  - Requires explicit `--yes`; respects `--shadow` and `--dry-run`.
+- `pt agent sessions` / `pt agent show --session <id>` / `pt agent tail --session <id>`:
+  - Discover, inspect, and stream progress for automation and debugging.
+- `pt agent export --session <id> --out bundle.ptb` and `pt agent report --session <id> --out report.html`:
+  - Programmatic sharing and reporting.
+
+Output formats:
+- Default: `--format json` (token-efficient and machine-stable).
+- Optional: `--format md` (human-readable, still concise).
+- Streaming: `--format jsonl` for progress/events (`plan_started`, `scan_done`, `infer_done`, `gates_evaluated`, `action_applied`, ...).
+- Projection: `--fields`/`--compact`/`--limit`/`--only kill|review|all` to control token usage.
+
+Schema invariants (for agents):
+- Every output includes: `schema_version`, `session_id`, `generated_at`, and a stable `summary`.
+- “Pre-toggled” semantics are explicit:
+  - `recommended.preselected_pids` and/or `recommended.actions[]` (with staged action chains and per-PID safety gates).
+- Exit codes are automation-friendly:
+  - `0` clean / nothing to do
+  - `1` candidates exist (plan produced) but no actions executed
+  - `2` actions executed successfully
+  - `3` partial failure executing actions
+  - `4` blocked by safety gates / policy
+  - `>=10` tooling/internal error
+
+### 3.6 Session Bundles & Rich HTML Reports (Shareable Artifacts)
+Goal: one-command export/share of a complete session, and one-command generation of a premium, richly interactive HTML report.
+
+Bundle format (`.ptb`):
+- A single portable file that contains:
+  - `manifest.json` (schema versions, tool versions/capabilities, host fingerprint, redaction policy version, checksums)
+  - `plan.json` (candidates + recommended actions + gates)
+  - `telemetry/` (Parquet partitions or reduced aggregates, depending on profile)
+  - `raw/` (optional; capped & redacted)
+  - `report.html` (single static file; CDN-loaded libs)
+
+Export profiles:
+- `--profile minimal`: plan + summary only (max safe, tiny).
+- `--profile safe`: includes derived features/inference but aggressively redacts raw strings/paths/endpoints.
+- `--profile forensic`: includes more raw data; optionally support `--encrypt` for transport.
+
+HTML report (single file, CDN-loaded):
+- Requirements:
+  - Single `report.html` that embeds session data (or references bundled Parquet) and loads UI/chart libraries from CDNs with pinned versions and SRI.
+  - Visual polish: overview dashboard, sortable/searchable candidate table, per-process drilldown (timelines, evidence ledger, process tree, dependency impact), and actions/outcomes with before/after diffs.
+  - Optional “power mode”: DuckDB-WASM in-browser for interactive queries over embedded/attached Parquet (when bundle profile permits).
+
+### 3.7 Dormant Mode (Always-On Guardian)
+Goal: keep pt running 24/7 with minimal overhead, automatically detecting when active triage is needed and escalating to full analysis.
+
+Two operating modes:
+- Active mode: full collection + inference + plan generation (resource-intensive; on-demand).
+- Dormant mode (`ptd`): lightweight monitoring loop with strict overhead budget.
+
+Dormant mode mechanics:
+- Collect minimal signals at low frequency (loadavg, PSI, memory pressure, process count, top-N CPU by PID).
+- Maintain baselines and detect triggers (sustained load, PSI stall, runaway top-N CPU, orphan spikes).
+- On trigger:
+  1) run quick scan
+  2) run targeted deep scans on top suspects (budgeted)
+  3) generate a session + plan
+  4) notify (CLI inbox + optional hooks)
+  5) optionally auto-apply non-destructive mitigations (pause/throttle) if explicitly configured; default is “plan ready for review”.
+
+Service integration:
+- Linux: systemd user service by default (`ptd.service` + timer), optional system-level install.
+- macOS: launchd agent.
+- Must include: cooldowns, backoff, and “never become the hog” protections (nice/ionice, probe budgeting, and hard caps).
 
 ---
 
@@ -733,6 +831,20 @@ Decision engine selects action with minimum expected loss. Destructive actions (
 - The TUI allows: drill-down evidence, bulk toggles, and an “apply selected” step that executes actions in a safe order (pause/throttle before kill when appropriate).
 - `--robot` bypasses the approval UI and executes the pre-toggled plan non-interactively (still honoring `--shadow` and `--dry-run`).
 
+### 7.5 Premium TUI Layout (Stripe-level in a Terminal)
+- Plan-first UI (not list-first): show a top “Plan Summary” bar (expected relief, risk gates, blast radius) and render the actions as a coherent plan.
+- Two-pane layout: left = candidates/actions table; right = drilldown (why summary, evidence ledger, process tree, dependency impact, “what would change my mind”).
+- Progressive disclosure: default to a one-line “why”; expand to full ledger only on demand.
+
+### 7.6 Interaction Design (Fast, Keyboard-First)
+- One-keystroke actions: filter/search, sort, toggle recommended, apply plan, export bundle, generate report.
+- Bulk operations: “select recommended”, “select none”, and guarded “select all kills” behind an explicit confirmation step.
+- After-action diff: always show a “before/after” snapshot and outcomes (killed/failed/still-running) to make the tool feel complete.
+
+### 7.7 Sharing & Reporting UX
+- One command / one keybinding: export a `.ptb` bundle for sharing and render a single-file HTML report for premium postmortems.
+- Reports should look like an incident dashboard: overview metrics, timelines, candidate table, drilldowns, and action outcomes.
+
 ---
 
 ## 8) Real-World Usefulness Enhancements (All Included)
@@ -765,6 +877,9 @@ Decision engine selects action with minimum expected loss. Destructive actions (
 - Risk-sensitive control (CVaR/entropic risk)
 - Bayesian model averaging across inference layers
 - Conformal prediction for robust intervals
+- Agent/robot CLI parity with the TUI (JSON/MD/JSONL)
+- Shareable session bundles (`.ptb`) + premium single-file HTML reports (CDN-loaded)
+- Dormant mode daemon (24/7 guardian) with escalation to active triage when needed
 
 ---
 
@@ -787,12 +902,15 @@ Use the model to interpret the observed snapshot:
 
 ### Phase 1: Spec and Config
 - Define the packaging boundary: `pt` (bash wrapper/installer) vs `pt-core` (Rust monolith).
-- Define `pt-core` CLI surface (scan/deep-scan/infer/decide/ui/duck) and stable output formats (JSON + Parquet partitions).
+- Define `pt-core` CLI surface (scan/deep-scan/infer/decide/ui/agent/duck/bundle/report/daemon) and stable output formats (JSON/MD/JSONL + Parquet partitions).
 - Create priors.json schema for alpha/beta, gamma, dirichlet, hazard priors
 - Create policy.json for loss matrix and guardrails
 - Define command categories and CWD categories
 - Define telemetry schema + partitioning rules (section 3.3) and redaction/hashing policy (section 3.4); version these in `runs`.
 - Define a capabilities cache schema: tool availability, versions, permissions, and “safe fallbacks” per signal.
+- Define the agent/robot contract: schema versioning, exit codes, pre-toggled plan semantics, and gating behavior.
+- Define the bundle/report contract: `.ptb` contents, export profiles, and the single-file CDN-loaded HTML report spec.
+- Define dormant-mode daemon spec: triggers, escalation policy, cooldowns, and service integration (systemd/launchd).
 
 ### Phase 2: Math Utilities
 - Implement BetaPDF, GammaPDF, Dirichlet-multinomial, Beta-Bernoulli
@@ -868,7 +986,7 @@ macOS (Homebrew):
 Install workflow:
 - Detect OS + package manager.
 - Attempt full install; if any package fails, continue installing the rest.
-- Prefer non-interactive installs (no prompts); if privileges are insufficient (no sudo / no admin), continue with whatever signals are available and record the missing capabilities.
+- Prefer non-interactive installs (no prompts) and assume sudo/admin is available for maximal instrumentation; do not trade away power/functionality to accommodate no-sudo environments.
 - Record capabilities in a local cache (what is available vs missing).
 - Prefer richer signals when available (eBPF/perf), but never fail if missing.
 - If a tool is not available via package manager, download pinned upstream binaries (with checksums/signatures where available) into a tools cache and re-run capability detection.
