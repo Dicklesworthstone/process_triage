@@ -1069,3 +1069,48 @@ extract_json() {
 
     BATS_TEST_COMPLETED=pass
 }
+
+@test "Contract: agent list-priors --format jsonl produces compact JSON" {
+    require_jq
+    test_info "Testing list-priors JSONL format"
+
+    run "$PT_CORE" agent list-priors --standalone --format jsonl
+
+    assert_equals "0" "$status" "list-priors jsonl should succeed"
+
+    # JSONL should be single-line JSON (no newlines except at end)
+    local line_count
+    line_count=$(echo "$output" | wc -l)
+    assert_equals "1" "$line_count" "JSONL should be single line"
+
+    # Should be valid JSON
+    echo "$output" | jq '.' >/dev/null 2>&1
+    local jq_status=$?
+    assert_equals "0" "$jq_status" "JSONL output should be valid JSON"
+
+    # Should have classes
+    local has_classes
+    has_classes=$(echo "$output" | jq 'has("classes")')
+    assert_equals "true" "$has_classes" "should have classes"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors --format metrics produces key=value pairs" {
+    test_info "Testing list-priors metrics format"
+
+    run "$PT_CORE" agent list-priors --standalone --format metrics
+
+    assert_equals "0" "$status" "list-priors metrics should succeed"
+
+    # Metrics should contain key=value pairs
+    assert_contains "$output" "priors_source=" "should have priors_source"
+    assert_contains "$output" "priors_class_count=" "should have priors_class_count"
+    assert_contains "$output" "priors_schema_version=" "should have priors_schema_version"
+
+    # Should have per-class prior_prob metrics
+    assert_contains "$output" "priors_useful_prior_prob=" "should have useful prior_prob"
+    assert_contains "$output" "priors_zombie_prior_prob=" "should have zombie prior_prob"
+
+    BATS_TEST_COMPLETED=pass
+}

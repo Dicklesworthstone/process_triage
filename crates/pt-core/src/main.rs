@@ -2797,12 +2797,29 @@ fn run_agent_list_priors(global: &GlobalOpts, args: &AgentListPriorsArgs) -> Exi
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&response).unwrap());
         }
+        OutputFormat::Jsonl => {
+            // Compact single-line JSON for streaming/JSONL consumers
+            println!("{}", serde_json::to_string(&response).unwrap());
+        }
         OutputFormat::Summary => {
             let source = if snapshot.priors_path.is_some() { "custom" } else { "defaults" };
             println!("[{}] priors: {} class(es) from {}", session_id, classes_data.len(), source);
         }
         OutputFormat::Exitcode => {}
+        OutputFormat::Metrics => {
+            // Key=value pairs for monitoring systems
+            let source = if snapshot.priors_path.is_some() { "custom" } else { "defaults" };
+            println!("priors_source={}", source);
+            println!("priors_class_count={}", classes_data.len());
+            println!("priors_schema_version={}", snapshot.priors_schema_version);
+            for class_json in &classes_data {
+                let class_name = class_json["class"].as_str().unwrap_or("?");
+                let prior_prob = class_json["prior_prob"].as_f64().unwrap_or(0.0);
+                println!("priors_{}_prior_prob={:.4}", class_name, prior_prob);
+            }
+        }
         _ => {
+            // Md, Slack, Prose all use markdown-style output
             println!("# Prior Configuration\n");
             if let Some(ref path) = snapshot.priors_path {
                 println!("Source: {}", path.display());
