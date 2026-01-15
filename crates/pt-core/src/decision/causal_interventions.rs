@@ -20,6 +20,8 @@ pub enum ProcessClass {
 pub struct RecoveryExpectation {
     pub action: Action,
     pub probability: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub std_dev: Option<f64>,
 }
 
 /// Expected recovery probability per class for an action.
@@ -107,18 +109,7 @@ pub fn expected_recovery_for_action(
     posterior: &ClassScores,
     action: Action,
 ) -> Option<f64> {
-    let table = recovery_table(priors, action)?;
-    let useful = table.useful?;
-    let useful_bad = table.useful_bad?;
-    let abandoned = table.abandoned?;
-    let zombie = table.zombie?;
-
-    Some(
-        posterior.useful * useful
-            + posterior.useful_bad * useful_bad
-            + posterior.abandoned * abandoned
-            + posterior.zombie * zombie,
-    )
+    expected_recovery_stats_for_action(priors, posterior, action).map(|stats| stats.0)
 }
 
 /// Compute expected recovery probabilities for all configured actions.
@@ -129,8 +120,14 @@ pub fn expected_recovery_by_action(
     let actions = [Action::Pause, Action::Throttle, Action::Restart, Action::Kill];
     let mut expectations = Vec::new();
     for action in actions {
-        if let Some(probability) = expected_recovery_for_action(priors, posterior, action) {
-            expectations.push(RecoveryExpectation { action, probability });
+        if let Some((probability, std_dev)) =
+            expected_recovery_stats_for_action(priors, posterior, action)
+        {
+            expectations.push(RecoveryExpectation {
+                action,
+                probability,
+                std_dev,
+            });
         }
     }
     expectations
@@ -168,6 +165,60 @@ fn build_table(action: Action, priors: Option<&InterventionPriors>) -> Option<Re
         abandoned: priors.abandoned.as_ref().map(expected_recovery),
         zombie: priors.zombie.as_ref().map(expected_recovery),
     })
+}
+
+fn beta_variance(beta: &BetaParams) -> Option<f64> {
+    let denom = beta.alpha + beta.beta;
+    if denom <= 0.0 || !denom.is_finite() {
+        return None;
+    }
+    let numerator = beta.alpha * beta.beta;
+    let variance = numerator / (denom * denom * (denom + 1.0));
+    if variance.is_finite() { Some(variance) } else { None }
+}
+
+fn expected_recovery_stats_for_action(
+    priors: &Priors,
+    posterior: &ClassScores,
+    action: Action,
+) -> Option<(f64, Option<f64>)> {
+    let table = recovery_table(priors, action)?;
+    let useful = table.useful?;
+    let useful_bad = table.useful_bad?;
+    let abandoned = table.abandoned?;
+    let zombie = table.zombie?;
+
+    let mean = posterior.useful * useful
+        + posterior.useful_bad * useful_bad
+        + posterior.abandoned * abandoned
+        + posterior.zombie * zombie;
+
+    let interventions = priors.causal_interventions.as_ref()?;
+    let priors = match action {
+        Action::Pause => interventions.pause.as_ref(),
+        Action::Throttle => interventions.throttle.as_ref(),
+        Action::Kill => interventions.kill.as_ref(),
+        Action::Restart => interventions.restart.as_ref(),
+        Action::Keep => None,
+    }?;
+
+    let useful_var = priors.useful.as_ref().and_then(beta_variance)?;
+    let useful_bad_var = priors.useful_bad.as_ref().and_then(beta_variance)?;
+    let abandoned_var = priors.abandoned.as_ref().and_then(beta_variance)?;
+    let zombie_var = priors.zombie.as_ref().and_then(beta_variance)?;
+
+    let second_moment = posterior.useful * (useful_var + useful * useful)
+        + posterior.useful_bad * (useful_bad_var + useful_bad * useful_bad)
+        + posterior.abandoned * (abandoned_var + abandoned * abandoned)
+        + posterior.zombie * (zombie_var + zombie * zombie);
+
+    let mut variance = second_moment - mean * mean;
+    if variance < 0.0 && variance > -1e-12 {
+        variance = 0.0;
+    }
+    let std_dev = if variance >= 0.0 { Some(variance.sqrt()) } else { None };
+
+    Some((mean, std_dev))
 }
 
 fn update_intervention_priors(
@@ -311,6 +362,55 @@ mod tests {
             .expect("recovery");
         let manual = 0.5 * 0.9 + 0.2 * 0.5 + 0.2 * (2.0 / 8.0) + 0.1 * 0.1;
         assert!((expected - manual).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn expected_recovery_by_action_includes_std_dev() {
+        let priors = Priors {
+            schema_version: "1.0.0".to_string(),
+            description: None,
+            created_at: None,
+            updated_at: None,
+            host_profile: None,
+            classes: Classes {
+                useful: default_class(),
+                useful_bad: default_class(),
+                abandoned: default_class(),
+                zombie: default_class(),
+            },
+            hazard_regimes: vec![],
+            semi_markov: None,
+            change_point: None,
+            causal_interventions: Some(CausalInterventions {
+                pause: Some(InterventionPriors {
+                    useful: Some(BetaParams { alpha: 2.0, beta: 2.0 }),
+                    useful_bad: Some(BetaParams { alpha: 2.0, beta: 2.0 }),
+                    abandoned: Some(BetaParams { alpha: 2.0, beta: 2.0 }),
+                    zombie: Some(BetaParams { alpha: 2.0, beta: 2.0 }),
+                }),
+                throttle: None,
+                kill: None,
+                restart: None,
+            }),
+            command_categories: None,
+            state_flags: None,
+            hierarchical: None,
+            robust_bayes: None,
+            error_rate: None,
+            bocpd: None,
+        };
+        let posterior = ClassScores {
+            useful: 0.25,
+            useful_bad: 0.25,
+            abandoned: 0.25,
+            zombie: 0.25,
+        };
+        let expectations = expected_recovery_by_action(&priors, &posterior);
+        let pause = expectations
+            .iter()
+            .find(|e| e.action == Action::Pause)
+            .expect("pause");
+        assert!(pause.std_dev.is_some());
     }
 
     #[test]

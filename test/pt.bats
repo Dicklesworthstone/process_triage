@@ -7,12 +7,15 @@ setup() {
     PATH="$PROJECT_ROOT:$PATH"
 
     # Isolated config for tests
-    export PROCESS_TRIAGE_CONFIG="$BATS_TEST_TMPDIR/config"
+    local cfg_suffix="${BATS_TEST_NAME:-unknown}"
+    cfg_suffix="${cfg_suffix//[^a-zA-Z0-9_-]/_}"
+    export PROCESS_TRIAGE_CONFIG="$BATS_TEST_TMPDIR/config_${cfg_suffix}_$$"
     mkdir -p "$PROCESS_TRIAGE_CONFIG"
 }
 
 teardown() {
-    rm -rf "$BATS_TEST_TMPDIR/config" 2>/dev/null || true
+    # Intentionally do not delete any files/directories here.
+    :
 }
 
 @test "pt --help shows usage" {

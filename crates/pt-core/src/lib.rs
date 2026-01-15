@@ -21,5 +21,7 @@ pub mod logging;
 pub mod plan;
 
 // Re-export test utilities for integration tests
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_log;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;

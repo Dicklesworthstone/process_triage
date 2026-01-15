@@ -17,11 +17,12 @@ test_log() {
     timestamp="$(date '+%H:%M:%S.%3N')"
 
     case "$level" in
-        debug) [[ "$TEST_LOG_LEVEL" == "debug" ]] && echo "# [$timestamp] DEBUG: $msg" ;;
+        debug) [[ "$TEST_LOG_LEVEL" == "debug" ]] && echo "# [$timestamp] DEBUG: $msg" || : ;;
         info)  echo "# [$timestamp] INFO:  $msg" ;;
         warn)  echo "# [$timestamp] WARN:  $msg" >&2 ;;
         error) echo "# [$timestamp] ERROR: $msg" >&2 ;;
     esac
+    return 0
 }
 
 test_debug() { test_log debug "$@"; }
@@ -58,7 +59,10 @@ setup_test_env() {
     test_debug "Setting up test environment..."
 
     # Create isolated directories
-    export TEST_DIR="${BATS_TEST_TMPDIR}/test_env"
+    # Use a unique per-test directory to avoid needing cleanup (no deletions).
+    local test_suffix="${BATS_TEST_NAME:-unknown}"
+    test_suffix="${test_suffix//[^a-zA-Z0-9_-]/_}"
+    export TEST_DIR="${BATS_TEST_TMPDIR}/test_env_${test_suffix}_$$"
     export CONFIG_DIR="${TEST_DIR}/config"
     export MOCK_BIN="${TEST_DIR}/mock_bin"
     export TEST_LOG_FILE="${TEST_DIR}/test.log"
@@ -91,8 +95,8 @@ teardown_test_env() {
         done < "$TEST_LOG_FILE"
     fi
 
-    rm -rf "${BATS_TEST_TMPDIR}/test_env"
-    test_debug "Cleanup complete"
+    # Intentionally do not delete any files/directories here.
+    test_debug "Leaving test artifacts at: $TEST_DIR"
 }
 
 #==============================================================================

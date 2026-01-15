@@ -97,6 +97,8 @@ pub enum PreCheck {
 #[derive(Debug, Clone, Serialize)]
 pub struct ActionRationale {
     pub expected_loss: Option<f64>,
+    pub expected_recovery: Option<f64>,
+    pub expected_recovery_stddev: Option<f64>,
     pub posterior_odds_abandoned_vs_useful: Option<f64>,
     pub sprt_boundary: Option<SprtBoundary>,
 }
@@ -143,8 +145,12 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
             }
 
             let expected_loss = loss_for_action(&candidate.decision, action);
+            let (expected_recovery, expected_recovery_stddev) =
+                recovery_stats_for_action(&candidate.decision, action);
             let rationale = ActionRationale {
                 expected_loss,
+                expected_recovery,
+                expected_recovery_stddev,
                 posterior_odds_abandoned_vs_useful: candidate
                     .decision
                     .posterior_odds_abandoned_vs_useful,
@@ -223,6 +229,20 @@ fn loss_for_action(decision: &DecisionOutcome, action: Action) -> Option<f64> {
         .iter()
         .find(|e| e.action == action)
         .map(|e| e.loss)
+}
+
+fn recovery_stats_for_action(
+    decision: &DecisionOutcome,
+    action: Action,
+) -> (Option<f64>, Option<f64>) {
+    match decision.recovery_expectations.as_ref() {
+        Some(expectations) => expectations
+            .iter()
+            .find(|entry| entry.action == action)
+            .map(|entry| (Some(entry.probability), entry.std_dev))
+            .unwrap_or((None, None)),
+        None => (None, None),
+    }
 }
 
 fn plan_id_for(session_id: &SessionId, policy_id: Option<&str>, action_count: usize) -> String {
