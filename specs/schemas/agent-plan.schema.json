@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/agent-plan/1.0.0",
+  "title": "Agent Plan Output",
+  "description": "Schema for pt agent plan JSON output",
+  "type": "object",
+  "required": ["schema_version", "session_id", "generated_at", "summary", "candidates"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^pt-[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "args": {
+      "type": "object",
+      "description": "Arguments used for this plan invocation",
+      "properties": {
+        "max_candidates": { "type": "integer" },
+        "threshold": { "type": "number" },
+        "only": { "type": "string" },
+        "yes": { "type": "boolean" },
+        "robot": { "type": "boolean" },
+        "shadow": { "type": "boolean" },
+        "dry_run": { "type": "boolean" }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total_scanned", "candidates_found"],
+      "properties": {
+        "total_scanned": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total processes scanned"
+        },
+        "candidates_found": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of candidate processes identified"
+        },
+        "kill_recommended": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of processes recommended for kill"
+        },
+        "review_recommended": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of processes recommended for review"
+        },
+        "spare_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of processes recommended to spare"
+        },
+        "total_recoverable_mb": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Total recoverable memory in MB"
+        },
+        "total_recoverable_cpu_pct": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Total recoverable CPU percentage"
+        }
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/candidate" }
+    },
+    "recommended": {
+      "type": "object",
+      "properties": {
+        "preselected_pids": {
+          "type": "array",
+          "items": { "type": "integer" }
+        },
+        "actions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/action" }
+        },
+        "total_actions": { "type": "integer" },
+        "estimated_recovery_mb": { "type": "number" }
+      }
+    },
+    "status": {
+      "type": "string",
+      "description": "Plan status (e.g., 'ready', 'stub')"
+    },
+    "note": {
+      "type": "string",
+      "description": "Additional notes about the plan"
+    },
+    "command": {
+      "type": "string",
+      "description": "Command that generated this output"
+    }
+  },
+  "$defs": {
+    "candidate": {
+      "type": "object",
+      "required": ["pid", "start_id", "uid", "classification", "posterior", "recommended_action"],
+      "properties": {
+        "pid": { "type": "integer", "minimum": 1 },
+        "start_id": { "type": "string" },
+        "uid": { "type": "integer", "minimum": 0 },
+        "ppid": { "type": "integer", "minimum": 0 },
+        "cmd_short": { "type": "string" },
+        "cmd_full": { "type": "string" },
+        "classification": {
+          "type": "string",
+          "enum": ["useful", "useful_bad", "abandoned", "zombie"]
+        },
+        "posterior": {
+          "type": "object",
+          "properties": {
+            "useful": { "type": "number", "minimum": 0, "maximum": 1 },
+            "useful_bad": { "type": "number", "minimum": 0, "maximum": 1 },
+            "abandoned": { "type": "number", "minimum": 0, "maximum": 1 },
+            "zombie": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "very_high"]
+        },
+        "matched_signature": { "type": ["string", "null"] },
+        "novel_pattern": { "type": "boolean" },
+        "blast_radius": { "$ref": "#/$defs/blast_radius" },
+        "reversibility": { "$ref": "#/$defs/reversibility" },
+        "supervisor": { "$ref": "#/$defs/supervisor" },
+        "uncertainty": { "$ref": "#/$defs/uncertainty" },
+        "recommended_action": {
+          "type": "string",
+          "enum": ["kill", "pause", "throttle", "restart", "review", "spare"]
+        },
+        "action_rationale": { "type": "string" }
+      }
+    },
+    "blast_radius": {
+      "type": "object",
+      "required": ["memory_mb", "risk_level", "summary"],
+      "properties": {
+        "memory_mb": { "type": "number" },
+        "cpu_pct": { "type": "number" },
+        "child_count": { "type": "integer" },
+        "connection_count": { "type": "integer" },
+        "open_files": { "type": "integer" },
+        "dependent_processes": { "type": "array" },
+        "risk_level": {
+          "type": "string",
+          "enum": ["none", "low", "medium", "high", "critical"]
+        },
+        "summary": { "type": "string" }
+      }
+    },
+    "reversibility": {
+      "type": "object",
+      "required": ["reversible"],
+      "properties": {
+        "reversible": { "type": "boolean" },
+        "recovery_options": { "type": "array", "items": { "type": "string" } },
+        "data_at_risk": { "type": "boolean" },
+        "open_write_fds": { "type": "array" },
+        "note": { "type": "string" }
+      }
+    },
+    "supervisor": {
+      "type": "object",
+      "required": ["detected", "recommended_action"],
+      "properties": {
+        "detected": { "type": "boolean" },
+        "type": { "type": ["string", "null"] },
+        "unit": { "type": ["string", "null"] },
+        "recommended_action": { "type": "string" },
+        "supervisor_command": { "type": ["string", "null"] }
+      }
+    },
+    "uncertainty": {
+      "type": "object",
+      "required": ["confidence_level", "decision_robustness"],
+      "properties": {
+        "confidence_level": { "type": "number", "minimum": 0, "maximum": 1 },
+        "uncertainty_drivers": { "type": "array" },
+        "to_increase_confidence": { "type": "array" },
+        "decision_robustness": {
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        }
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": ["target", "action", "stage"],
+      "properties": {
+        "target": {
+          "type": "object",
+          "required": ["pid", "start_id"],
+          "properties": {
+            "pid": { "type": "integer" },
+            "start_id": { "type": "string" }
+          }
+        },
+        "action": { "type": "string" },
+        "stage": { "type": "integer" },
+        "gates": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

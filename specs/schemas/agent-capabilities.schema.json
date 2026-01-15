@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/agent-capabilities/1.0.0",
+  "title": "Agent Capabilities Output",
+  "description": "Schema for pt agent capabilities JSON output",
+  "type": "object",
+  "required": ["schema_version", "session_id", "generated_at"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^pt-[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "detected_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "os": {
+      "type": "object",
+      "properties": {
+        "family": { "type": "string" },
+        "arch": { "type": "string" },
+        "kernel": { "type": "string" },
+        "in_container": { "type": "boolean" },
+        "container_runtime": { "type": ["string", "null"] }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/tool_status" }
+    },
+    "data_sources": {
+      "type": "object",
+      "properties": {
+        "procfs": { "type": "boolean" },
+        "sysfs": { "type": "boolean" },
+        "cgroup_v1": { "type": "boolean" },
+        "cgroup_v2": { "type": "boolean" },
+        "schedstat": { "type": "boolean" },
+        "perf_events": { "type": "boolean" },
+        "ebpf": { "type": "boolean" }
+      }
+    },
+    "supervisors": {
+      "type": "object",
+      "properties": {
+        "systemd": { "type": "boolean" },
+        "launchd": { "type": "boolean" },
+        "docker_daemon": { "type": "boolean" },
+        "podman": { "type": "boolean" },
+        "kubernetes": { "type": "boolean" },
+        "pm2": { "type": "boolean" },
+        "supervisord": { "type": "boolean" }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "properties": {
+        "is_root": { "type": "boolean" },
+        "can_sudo": { "type": "boolean" },
+        "effective_uid": { "type": "integer" },
+        "can_signal_others": { "type": "boolean" },
+        "can_read_others_procs": { "type": "boolean" },
+        "linux_capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "actions": {
+      "type": "object",
+      "properties": {
+        "kill": { "type": "boolean" },
+        "pause": { "type": "boolean" },
+        "renice": { "type": "boolean" },
+        "ionice": { "type": "boolean" },
+        "cgroup_freeze": { "type": "boolean" },
+        "cgroup_throttle": { "type": "boolean" },
+        "cpuset_quarantine": { "type": "boolean" }
+      }
+    },
+    "features": {
+      "type": "object",
+      "properties": {
+        "deep_scan": { "type": "boolean" },
+        "maximal_scan": { "type": "boolean" }
+      }
+    }
+  },
+  "$defs": {
+    "tool_status": {
+      "type": "object",
+      "properties": {
+        "available": { "type": "boolean" },
+        "works": { "type": "boolean" },
+        "path": { "type": "string" },
+        "version": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

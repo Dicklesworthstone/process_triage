@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/agent-diff/1.0.0",
+  "title": "Agent Diff Output",
+  "description": "Schema for pt agent diff JSON output",
+  "type": "object",
+  "required": ["schema_version", "session_id", "generated_at"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^pt-[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "before_session": {
+      "type": "string",
+      "description": "Session ID of the before state"
+    },
+    "after_session": {
+      "type": "string",
+      "description": "Session ID of the after state (if different from session_id)"
+    },
+    "comparison": {
+      "type": "object",
+      "properties": {
+        "new_processes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/process_summary" }
+        },
+        "terminated_processes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/process_summary" }
+        },
+        "changed_processes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/process_change" }
+        }
+      }
+    },
+    "resource_delta": {
+      "type": "object",
+      "properties": {
+        "memory_delta_mb": { "type": "number" },
+        "cpu_delta_pct": { "type": "number" },
+        "process_count_delta": { "type": "integer" }
+      }
+    },
+    "status": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "process_summary": {
+      "type": "object",
+      "properties": {
+        "pid": { "type": "integer" },
+        "start_id": { "type": "string" },
+        "cmd_short": { "type": "string" },
+        "memory_mb": { "type": "number" },
+        "cpu_pct": { "type": "number" }
+      }
+    },
+    "process_change": {
+      "type": "object",
+      "properties": {
+        "pid": { "type": "integer" },
+        "start_id": { "type": "string" },
+        "cmd_short": { "type": "string" },
+        "changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": { "type": "string" },
+              "before": {},
+              "after": {}
+            }
+          }
+        }
+      }
+    }
+  }
+}

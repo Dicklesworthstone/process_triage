@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/agent-verify/1.0.0",
+  "title": "Agent Verify Output",
+  "description": "Schema for pt agent verify JSON output",
+  "type": "object",
+  "required": ["schema_version", "session_id", "verification", "action_outcomes"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^pt-[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "verification": {
+      "type": "object",
+      "properties": {
+        "requested_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": "string", "format": "date-time" },
+        "overall_status": {
+          "type": "string",
+          "enum": ["success", "partial_success", "failure"]
+        }
+      }
+    },
+    "action_outcomes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/verification_result" }
+    },
+    "resource_summary": {
+      "type": "object",
+      "properties": {
+        "memory_freed_mb": { "type": "number" },
+        "expected_mb": { "type": "number" },
+        "shortfall_reason": { "type": "string" }
+      }
+    },
+    "status": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "verification_result": {
+      "type": "object",
+      "required": ["target", "action", "outcome"],
+      "properties": {
+        "target": {
+          "type": "object",
+          "properties": {
+            "pid": { "type": "integer" },
+            "start_id": { "type": "string" }
+          }
+        },
+        "action": { "type": "string" },
+        "outcome": {
+          "type": "string",
+          "enum": ["confirmed_dead", "confirmed_stopped", "still_running", "respawned", "pid_reused", "cascaded", "timeout"]
+        },
+        "time_to_death_ms": { "type": "integer" },
+        "resources_freed": {
+          "type": "object",
+          "properties": {
+            "memory_mb": { "type": "number" },
+            "cpu_pct": { "type": "number" }
+          }
+        },
+        "respawn_detected": {
+          "type": "object",
+          "properties": {
+            "new_pid": { "type": "integer" },
+            "new_start_id": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

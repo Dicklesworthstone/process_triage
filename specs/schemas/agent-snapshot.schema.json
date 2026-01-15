@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/agent-snapshot/1.0.0",
+  "title": "Agent Snapshot Output",
+  "description": "Schema for pt agent snapshot JSON output",
+  "type": "object",
+  "required": ["schema_version", "session_id", "generated_at", "timestamp"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^pt-[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "label": {
+      "type": ["string", "null"],
+      "description": "Optional user-provided label for the snapshot"
+    },
+    "session_dir": {
+      "type": "string",
+      "description": "Path to the session directory"
+    },
+    "context_path": {
+      "type": "string",
+      "description": "Path to the context JSON file"
+    },
+    "system_state": {
+      "type": "object",
+      "properties": {
+        "cores": { "type": "integer", "minimum": 1 },
+        "process_count": { "type": "integer", "minimum": 0 },
+        "load": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "memory": {
+          "type": "object",
+          "properties": {
+            "total_gb": { "type": "number" },
+            "used_gb": { "type": "number" },
+            "available_gb": { "type": "number" }
+          }
+        },
+        "psi": {
+          "type": "object",
+          "properties": {
+            "cpu": { "type": "number" },
+            "memory": { "type": "number" },
+            "io": { "type": "number" }
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "description": "Summary of available capabilities",
+      "properties": {
+        "permissions": {
+          "type": "object",
+          "properties": {
+            "is_root": { "type": "boolean" },
+            "can_sudo": { "type": "boolean" },
+            "can_ptrace": { "type": "boolean" }
+          }
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

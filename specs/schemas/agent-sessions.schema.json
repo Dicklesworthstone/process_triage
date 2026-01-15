@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/agent-sessions/1.0.0",
+  "title": "Agent Sessions Output",
+  "description": "Schema for pt agent sessions JSON output",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "sessions"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "sessions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/session_summary" }
+    },
+    "total_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "status": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "session_summary": {
+      "type": "object",
+      "required": ["session_id", "created_at", "state"],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "pattern": "^pt-[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "state": {
+          "type": "string",
+          "enum": ["created", "planned", "approved", "executing", "interrupted", "completed", "verified", "cancelled", "failed"]
+        },
+        "mode": {
+          "type": "string"
+        },
+        "label": {
+          "type": ["string", "null"]
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "candidates_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actions_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

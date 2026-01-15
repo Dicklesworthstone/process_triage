@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/agent-explain/1.0.0",
+  "title": "Agent Explain Output",
+  "description": "Schema for pt agent explain JSON output",
+  "type": "object",
+  "required": ["schema_version", "session_id", "generated_at", "pid"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^pt-[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "pid": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "identity": {
+      "type": "object",
+      "properties": {
+        "pid": { "type": "integer" },
+        "start_id": { "type": "string" },
+        "uid": { "type": "integer" },
+        "ppid": { "type": "integer" },
+        "cmd_short": { "type": "string" },
+        "cmd_full": { "type": "string" }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": ["useful", "useful_bad", "abandoned", "zombie"]
+        },
+        "posterior": {
+          "type": "object",
+          "properties": {
+            "useful": { "type": "number" },
+            "useful_bad": { "type": "number" },
+            "abandoned": { "type": "number" },
+            "zombie": { "type": "number" }
+          }
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "very_high"]
+        }
+      }
+    },
+    "evidence_summary": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "factor": { "type": "string" },
+          "value": {},
+          "impact": { "type": "string" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "blast_radius": {
+      "type": "object"
+    },
+    "reversibility": {
+      "type": "object"
+    },
+    "supervisor": {
+      "type": "object"
+    },
+    "recommended_action": {
+      "type": "string"
+    },
+    "action_rationale": {
+      "type": "string"
+    },
+    "galaxy_brain": {
+      "type": "object",
+      "description": "Full math derivation when --galaxy-brain is enabled"
+    },
+    "status": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/agent-common/1.0.0",
+  "title": "Agent CLI Common Definitions",
+  "description": "Shared definitions for agent CLI output schemas",
+  "$defs": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "SemVer schema version for forward compatibility"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^pt-[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$",
+      "description": "Session identifier: pt-YYYYMMDD-HHMMSS-<random4>"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp with timezone"
+    },
+    "host_id": {
+      "type": "string",
+      "description": "Host identifier for correlation"
+    },
+    "base_response": {
+      "type": "object",
+      "description": "Common fields present in all agent CLI JSON responses",
+      "required": ["schema_version", "session_id", "generated_at"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/schema_version" },
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "generated_at": { "$ref": "#/$defs/timestamp" },
+        "host_id": { "$ref": "#/$defs/host_id" }
+      }
+    },
+    "process_identity": {
+      "type": "object",
+      "description": "Stable process identity tuple for safe targeting",
+      "required": ["pid", "start_id", "uid"],
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Process ID at capture time"
+        },
+        "start_id": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F-]{36}:[0-9]+:[0-9]+$",
+          "description": "Stable identity: <boot_id>:<start_time_ticks>:<pid>"
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Real user ID"
+        },
+        "ppid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Parent process ID"
+        },
+        "pgid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Process group ID"
+        },
+        "sid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Session ID"
+        }
+      }
+    },
+    "classification": {
+      "type": "string",
+      "enum": ["useful", "useful_bad", "abandoned", "zombie"],
+      "description": "Process classification based on Bayesian inference"
+    },
+    "recommendation": {
+      "type": "string",
+      "enum": ["kill", "pause", "throttle", "restart", "review", "spare"],
+      "description": "Recommended action based on classification and policy"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "very_high"],
+      "description": "Confidence level in the classification"
+    },
+    "risk_level": {
+      "type": "string",
+      "enum": ["none", "low", "medium", "high", "critical"],
+      "description": "Risk level assessment"
+    },
+    "action_outcome": {
+      "type": "string",
+      "enum": ["success", "skipped", "failed", "blocked"],
+      "description": "Outcome of an action execution"
+    },
+    "verify_outcome": {
+      "type": "string",
+      "enum": ["confirmed_dead", "confirmed_stopped", "still_running", "respawned", "pid_reused", "cascaded", "timeout"],
+      "description": "Post-action verification outcome"
+    },
+    "decision_robustness": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "How robust the decision is to evidence changes"
+    }
+  }
+}
