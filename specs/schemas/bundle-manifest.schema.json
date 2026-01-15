@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/bundle-manifest/1.0.0",
+  "title": "Process Triage Bundle Manifest",
+  "description": "Schema for manifest.json inside .ptb bundles",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "bundle_id",
+    "created_at",
+    "session_id",
+    "export_profile",
+    "container",
+    "policy_snapshot",
+    "contents",
+    "redaction_applied"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "bundle_id": {
+      "type": "string",
+      "description": "Unique bundle identifier"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_by": {
+      "type": "string",
+      "description": "Optional creator identifier"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "host_id": {
+      "type": "string",
+      "description": "Optional host identifier (hashed)"
+    },
+    "export_profile": {
+      "type": "string",
+      "enum": ["minimal", "safe", "forensic", "custom"]
+    },
+    "container": {
+      "type": "object",
+      "required": ["format"],
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": ["zip", "tar.zst"]
+        },
+        "compression_level": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "policy_snapshot": {
+      "type": "object",
+      "required": ["priors_hash", "policy_hash", "redaction_hash"],
+      "additionalProperties": false,
+      "properties": {
+        "priors_hash": { "type": "string" },
+        "policy_hash": { "type": "string" },
+        "redaction_hash": { "type": "string" }
+      }
+    },
+    "redaction_applied": {
+      "type": "boolean"
+    },
+    "redaction_policy_id": {
+      "type": "string"
+    },
+    "encryption": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "algorithm": {
+          "type": "string",
+          "enum": ["age", "gpg", "zip-aes-256"]
+        },
+        "key_id": { "type": "string" }
+      }
+    },
+    "contents": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/content_entry" },
+      "minItems": 1
+    }
+  },
+  "$defs": {
+    "content_entry": {
+      "type": "object",
+      "required": ["path", "sha256", "size_bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string" },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "content_type": { "type": "string" },
+        "redaction_level": {
+          "type": "string",
+          "enum": ["none", "normalized", "hashed", "redacted"]
+        }
+      }
+    }
+  }
+}

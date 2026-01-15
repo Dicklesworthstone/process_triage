@@ -1,0 +1,86 @@
+{
+  "schema_version": "1.0.0",
+  "policy_id": "default-conservative",
+  "description": "Conservative default policy for Process Triage decisioning and robot gates.",
+  "created_at": "2026-01-15T13:55:00Z",
+  "loss_matrix": {
+    "useful": {
+      "keep": 0,
+      "pause": 5,
+      "throttle": 8,
+      "kill": 100,
+      "restart": 60
+    },
+    "useful_bad": {
+      "keep": 10,
+      "pause": 6,
+      "throttle": 8,
+      "kill": 20,
+      "restart": 12
+    },
+    "abandoned": {
+      "keep": 30,
+      "pause": 15,
+      "throttle": 10,
+      "kill": 1,
+      "restart": 8
+    },
+    "zombie": {
+      "keep": 50,
+      "pause": 20,
+      "throttle": 15,
+      "kill": 1,
+      "restart": 5
+    }
+  },
+  "guardrails": {
+    "protected_patterns": [
+      { "pattern": "\\b(systemd|journald|logind|dbus-daemon)\\b", "kind": "regex", "notes": "core system services" },
+      { "pattern": "\\b(sshd|cron|crond)\\b", "kind": "regex", "notes": "remote access and schedulers" },
+      { "pattern": "\\b(dockerd|containerd)\\b", "kind": "regex", "notes": "containers" },
+      { "pattern": "\\b(postgres|redis|nginx|elasticsearch)\\b", "kind": "regex", "notes": "databases and proxies" }
+    ],
+    "force_review_patterns": [
+      { "pattern": "\\b(kube|k8s|etcd)\\b", "kind": "regex", "notes": "cluster components" }
+    ],
+    "protected_users": ["root"],
+    "protected_categories": ["daemon", "system"],
+    "never_kill_ppid": [1],
+    "never_kill_pid": [1],
+    "max_kills_per_run": 5,
+    "max_kills_per_hour": 20,
+    "max_kills_per_day": 100,
+    "min_process_age_seconds": 3600,
+    "require_confirmation": true
+  },
+  "robot_mode": {
+    "enabled": false,
+    "min_posterior": 0.99,
+    "min_confidence": "high",
+    "max_blast_radius_mb": 4096,
+    "max_kills": 5,
+    "require_known_signature": false,
+    "require_policy_snapshot": true,
+    "exclude_categories": ["daemon", "system"]
+  },
+  "fdr_control": {
+    "enabled": true,
+    "method": "bh",
+    "alpha": 0.05,
+    "min_candidates": 3,
+    "lfdr_null": ["useful"],
+    "alpha_investing": {
+      "w0": 0.05,
+      "alpha_spend": 0.02,
+      "alpha_earn": 0.01
+    }
+  },
+  "data_loss_gates": {
+    "block_if_open_write_fds": true,
+    "max_open_write_fds": 0,
+    "block_if_locked_files": true,
+    "block_if_deleted_cwd": true,
+    "block_if_active_tty": true,
+    "block_if_recent_io_seconds": 60
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/target-identity/1.0.0",
+  "title": "Target Identity",
+  "description": "Identity tuple used to safely target a process instance",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "pid",
+    "start_time_ticks",
+    "boot_id",
+    "uid",
+    "euid",
+    "start_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Schema version for forward compatibility",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "examples": ["1.0.0"]
+    },
+    "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Process ID at capture time"
+    },
+    "start_time_ticks": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Start time in jiffies since boot (stat field 22)"
+    },
+    "boot_id": {
+      "type": "string",
+      "description": "Boot identifier from /proc/sys/kernel/random/boot_id",
+      "pattern": "^[0-9a-fA-F-]{36}$"
+    },
+    "uid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Real user ID"
+    },
+    "euid": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Effective user ID"
+    },
+    "start_id": {
+      "type": "string",
+      "description": "Stable identity key: <boot_id>:<start_time_ticks>:<pid>",
+      "pattern": "^[0-9a-fA-F-]{36}:[0-9]+:[0-9]+$"
+    },
+    "exe_inode": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Inode of /proc/<pid>/exe"
+    },
+    "exe_dev": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Device id for /proc/<pid>/exe inode"
+    },
+    "cmdline_sha256": {
+      "type": "string",
+      "description": "SHA-256 hex of cmdline (no raw cmdline stored)",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "start_time_unix_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Start time in UNIX epoch milliseconds"
+    }
+  },
+  "additionalProperties": false
+}

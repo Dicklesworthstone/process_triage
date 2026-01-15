@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/policy/1.0.0",
+  "title": "Policy Schema",
+  "description": "Schema for policy.json defining loss matrix, guardrails, and robot-mode gates.",
+  "type": "object",
+  "required": ["schema_version", "loss_matrix", "guardrails", "robot_mode", "fdr_control", "data_loss_gates"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Schema version for compatibility checks"
+    },
+    "policy_id": {
+      "type": "string",
+      "description": "Optional identifier for this policy snapshot"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of this policy"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Creation timestamp"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Last update timestamp"
+    },
+    "inherits": {
+      "type": "array",
+      "description": "Optional policy inheritance chain (paths or URIs)",
+      "items": {
+        "type": "string"
+      }
+    },
+    "loss_matrix": {
+      "$ref": "#/$defs/loss_matrix"
+    },
+    "guardrails": {
+      "$ref": "#/$defs/guardrails"
+    },
+    "robot_mode": {
+      "$ref": "#/$defs/robot_mode"
+    },
+    "fdr_control": {
+      "$ref": "#/$defs/fdr_control"
+    },
+    "data_loss_gates": {
+      "$ref": "#/$defs/data_loss_gates"
+    },
+    "notes": {
+      "type": "string",
+      "description": "Freeform notes for operators"
+    }
+  },
+  "$defs": {
+    "loss_row": {
+      "type": "object",
+      "required": ["keep", "kill"],
+      "additionalProperties": false,
+      "properties": {
+        "keep": { "type": "number", "minimum": 0 },
+        "pause": { "type": "number", "minimum": 0 },
+        "throttle": { "type": "number", "minimum": 0 },
+        "kill": { "type": "number", "minimum": 0 },
+        "restart": { "type": "number", "minimum": 0 }
+      }
+    },
+    "loss_matrix": {
+      "type": "object",
+      "description": "Loss matrix by class for each action",
+      "required": ["useful", "useful_bad", "abandoned", "zombie"],
+      "additionalProperties": false,
+      "properties": {
+        "useful": { "$ref": "#/$defs/loss_row" },
+        "useful_bad": { "$ref": "#/$defs/loss_row" },
+        "abandoned": { "$ref": "#/$defs/loss_row" },
+        "zombie": { "$ref": "#/$defs/loss_row" }
+      }
+    },
+    "pattern_entry": {
+      "type": "object",
+      "required": ["pattern"],
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Pattern used for matching (regex/glob/literal)"
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["regex", "glob", "literal"],
+          "default": "regex"
+        },
+        "case_insensitive": {
+          "type": "boolean",
+          "default": true
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "guardrails": {
+      "type": "object",
+      "description": "Safety guardrails and protected patterns",
+      "additionalProperties": false,
+      "required": ["protected_patterns", "never_kill_ppid", "max_kills_per_run", "min_process_age_seconds"],
+      "properties": {
+        "protected_patterns": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pattern_entry" }
+        },
+        "force_review_patterns": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/pattern_entry" }
+        },
+        "protected_users": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "protected_groups": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "protected_categories": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "never_kill_ppid": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "never_kill_pid": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "max_kills_per_run": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_kills_per_hour": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_kills_per_day": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_process_age_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "require_confirmation": {
+          "type": "boolean"
+        }
+      }
+    },
+    "robot_mode": {
+      "type": "object",
+      "description": "Robot/agent automation gates",
+      "additionalProperties": false,
+      "required": ["enabled", "min_posterior", "max_blast_radius_mb", "max_kills", "require_known_signature"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "min_posterior": { "type": "number", "minimum": 0, "maximum": 1 },
+        "min_confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+        "max_blast_radius_mb": { "type": "number", "minimum": 0 },
+        "max_kills": { "type": "integer", "minimum": 0 },
+        "require_known_signature": { "type": "boolean" },
+        "require_policy_snapshot": { "type": "boolean" },
+        "allow_categories": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "exclude_categories": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "alpha_investing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "w0": { "type": "number", "minimum": 0 },
+        "alpha_spend": { "type": "number", "minimum": 0, "maximum": 1 },
+        "alpha_earn": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "fdr_control": {
+      "type": "object",
+      "description": "False discovery rate control settings",
+      "additionalProperties": false,
+      "required": ["enabled", "method", "alpha"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "method": { "type": "string", "enum": ["bh", "by", "alpha_investing", "none"] },
+        "alpha": { "type": "number", "minimum": 0, "maximum": 1 },
+        "min_candidates": { "type": "integer", "minimum": 1 },
+        "lfdr_null": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "alpha_investing": { "$ref": "#/$defs/alpha_investing" }
+      }
+    },
+    "data_loss_gates": {
+      "type": "object",
+      "description": "Gates that block destructive actions when data-loss risk is high",
+      "additionalProperties": false,
+      "required": ["block_if_open_write_fds", "block_if_locked_files", "block_if_active_tty"],
+      "properties": {
+        "block_if_open_write_fds": { "type": "boolean" },
+        "max_open_write_fds": { "type": "integer", "minimum": 0 },
+        "block_if_locked_files": { "type": "boolean" },
+        "block_if_deleted_cwd": { "type": "boolean" },
+        "block_if_active_tty": { "type": "boolean" },
+        "block_if_recent_io_seconds": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

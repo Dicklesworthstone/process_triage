@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/redaction-policy/1.0.0",
+  "title": "Redaction Policy",
+  "description": "Schema for pt redaction and hashing policy configuration",
+  "type": "object",
+  "required": ["schema_version", "default_profile", "field_rules"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Policy schema version",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "examples": ["1.0.0"]
+    },
+    "default_profile": {
+      "type": "string",
+      "enum": ["minimal", "safe", "forensic"],
+      "description": "Default export profile",
+      "default": "safe"
+    },
+    "hash_truncation_bytes": {
+      "type": "integer",
+      "minimum": 4,
+      "maximum": 32,
+      "default": 8,
+      "description": "Number of bytes of HMAC output to use (hex will be 2x this)"
+    },
+    "canonicalization_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "default": "1.0.0",
+      "description": "Version of canonicalization rules to apply"
+    },
+    "field_rules": {
+      "type": "object",
+      "description": "Per-field-class redaction rules",
+      "additionalProperties": {
+        "$ref": "#/$defs/field_rule"
+      }
+    },
+    "detection_enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable automatic secret detection"
+    },
+    "entropy_threshold": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 8,
+      "default": 4.5,
+      "description": "Shannon entropy threshold for high-entropy detection"
+    },
+    "detection_patterns": {
+      "type": "array",
+      "description": "Custom secret detection patterns",
+      "items": {
+        "$ref": "#/$defs/detection_pattern"
+      }
+    },
+    "custom_rules": {
+      "type": "array",
+      "description": "Custom redaction rules",
+      "items": {
+        "$ref": "#/$defs/custom_rule"
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "description": "Profile-specific overrides",
+      "properties": {
+        "minimal": { "$ref": "#/$defs/profile_config" },
+        "safe": { "$ref": "#/$defs/profile_config" },
+        "forensic": { "$ref": "#/$defs/profile_config" }
+      }
+    }
+  },
+  "$defs": {
+    "action": {
+      "type": "string",
+      "enum": ["allow", "redact", "hash", "normalize", "normalize+hash", "truncate", "detect+action"],
+      "description": "Redaction action to apply"
+    },
+    "field_class": {
+      "type": "string",
+      "enum": [
+        "cmdline", "cmd", "cmdline_arg",
+        "env_name", "env_value",
+        "path_home", "path_tmp", "path_system", "path_project",
+        "hostname", "ip_address",
+        "url", "url_host", "url_path", "url_credentials",
+        "username", "uid", "pid", "port",
+        "container_id", "systemd_unit",
+        "free_text"
+      ],
+      "description": "Field classification"
+    },
+    "field_rule": {
+      "type": "object",
+      "required": ["action"],
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "truncate_length": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Characters to keep for truncate action"
+        },
+        "pattern": {
+          "type": "string",
+          "description": "Regex pattern to match (for conditional rules)"
+        },
+        "condition": {
+          "type": "string",
+          "enum": ["always", "if_matches", "if_not_matches"],
+          "default": "always"
+        }
+      }
+    },
+    "detection_pattern": {
+      "type": "object",
+      "required": ["name", "pattern", "action"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Pattern name for logging",
+          "examples": ["aws_access_key", "github_token"]
+        },
+        "pattern": {
+          "type": "string",
+          "description": "Regex pattern to match"
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "context": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/field_class" },
+          "description": "Field classes where this pattern applies"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "custom_rule": {
+      "type": "object",
+      "required": ["name", "match", "action"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Rule name"
+        },
+        "match": {
+          "type": "object",
+          "properties": {
+            "field_class": { "$ref": "#/$defs/field_class" },
+            "pattern": { "type": "string" },
+            "entropy_above": { "type": "number" },
+            "length_above": { "type": "integer" }
+          }
+        },
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "priority": {
+          "type": "integer",
+          "default": 0,
+          "description": "Higher priority rules are evaluated first"
+        }
+      }
+    },
+    "profile_config": {
+      "type": "object",
+      "properties": {
+        "include_summary": { "type": "boolean", "default": true },
+        "include_session_metadata": { "type": "boolean", "default": true },
+        "include_candidate_list": { "type": "boolean" },
+        "include_evidence_ledger": { "type": "boolean" },
+        "include_cmdlines": { "type": "boolean" },
+        "include_paths": { "type": "boolean" },
+        "include_raw_outputs": { "type": "boolean" },
+        "include_env_vars": { "type": "boolean", "default": false },
+        "hash_hostname": { "type": "boolean" },
+        "hash_username": { "type": "boolean" },
+        "allow_raw_patterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Regex patterns for allowed raw values (forensic only)"
+        },
+        "max_raw_length": {
+          "type": "integer",
+          "description": "Maximum length for raw values (forensic only)"
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "default_profile": "safe",
+      "hash_truncation_bytes": 8,
+      "canonicalization_version": "1.0.0",
+      "field_rules": {
+        "cmdline": { "action": "normalize+hash" },
+        "cmd": { "action": "allow" },
+        "cmdline_arg": { "action": "detect+action" },
+        "env_name": { "action": "allow" },
+        "env_value": { "action": "redact" },
+        "path_home": { "action": "normalize+hash" },
+        "path_tmp": { "action": "normalize" },
+        "path_system": { "action": "allow" },
+        "path_project": { "action": "hash" },
+        "hostname": { "action": "hash" },
+        "ip_address": { "action": "hash" },
+        "url": { "action": "normalize+hash" },
+        "url_host": { "action": "hash" },
+        "url_path": { "action": "normalize" },
+        "url_credentials": { "action": "redact" },
+        "username": { "action": "hash" },
+        "uid": { "action": "allow" },
+        "pid": { "action": "allow" },
+        "port": { "action": "allow" },
+        "container_id": { "action": "truncate", "truncate_length": 12 },
+        "systemd_unit": { "action": "allow" },
+        "free_text": { "action": "detect+action" }
+      },
+      "detection_enabled": true,
+      "entropy_threshold": 4.5,
+      "detection_patterns": [
+        {
+          "name": "aws_access_key",
+          "pattern": "AKIA[0-9A-Z]{16}",
+          "action": "redact",
+          "context": ["cmdline_arg", "env_value", "free_text"]
+        },
+        {
+          "name": "github_token",
+          "pattern": "gh[pousr]_[A-Za-z0-9_]{36,}",
+          "action": "redact",
+          "context": ["cmdline_arg", "env_value", "free_text"]
+        },
+        {
+          "name": "password_arg",
+          "pattern": "--password[= ][^ ]+",
+          "action": "redact",
+          "context": ["cmdline"]
+        },
+        {
+          "name": "token_arg",
+          "pattern": "--token[= ][^ ]+",
+          "action": "redact",
+          "context": ["cmdline"]
+        }
+      ],
+      "profiles": {
+        "minimal": {
+          "include_summary": true,
+          "include_session_metadata": true,
+          "include_candidate_list": false,
+          "include_evidence_ledger": false,
+          "include_cmdlines": false,
+          "include_paths": false,
+          "hash_hostname": true,
+          "hash_username": true
+        },
+        "safe": {
+          "include_summary": true,
+          "include_session_metadata": true,
+          "include_candidate_list": true,
+          "include_evidence_ledger": true,
+          "include_cmdlines": true,
+          "include_paths": true,
+          "include_raw_outputs": false,
+          "hash_hostname": true,
+          "hash_username": true
+        },
+        "forensic": {
+          "include_summary": true,
+          "include_session_metadata": true,
+          "include_candidate_list": true,
+          "include_evidence_ledger": true,
+          "include_cmdlines": true,
+          "include_paths": true,
+          "include_raw_outputs": true,
+          "include_env_vars": false,
+          "hash_hostname": false,
+          "hash_username": false,
+          "allow_raw_patterns": ["^/usr/bin/", "^/var/log/", "^python3? "],
+          "max_raw_length": 500
+        }
+      }
+    }
+  ]
+}
