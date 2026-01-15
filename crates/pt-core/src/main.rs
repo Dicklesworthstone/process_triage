@@ -975,10 +975,10 @@ fn run_bundle_create(
                 },
             });
             match global.format {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
                 OutputFormat::Md => println!("Bundle created: {} ({} files, {} bytes)",
                     output_path.display(), manifest.file_count(), manifest.total_bytes()),
                 OutputFormat::Jsonl => println!("{}", serde_json::to_string(&output).unwrap()),
+                _ => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
             }
             ExitCode::Clean
         }
@@ -992,9 +992,9 @@ fn run_bundle_create(
                 "error": e.to_string(),
             });
             match global.format {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
                 OutputFormat::Md => eprintln!("Error creating bundle: {}", e),
                 OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+                _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
             ExitCode::InternalError
         }
@@ -1017,9 +1017,9 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
             "error": format!("Bundle not found: {}", path),
         });
         match global.format {
-            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             OutputFormat::Md => eprintln!("Error: Bundle not found: {}", path),
             OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
         return ExitCode::ArgsError;
     }
@@ -1036,9 +1036,9 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
                 "error": format!("Failed to open bundle: {}", e),
             });
             match global.format {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
                 OutputFormat::Md => eprintln!("Error: Failed to open bundle: {}", e),
                 OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+                _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
             return ExitCode::InternalError;
         }
@@ -1088,7 +1088,6 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
     });
 
     match global.format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
         OutputFormat::Md => {
             println!("Bundle: {}", path);
             println!("  Session: {}", manifest.session_id);
@@ -1105,6 +1104,7 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
             }
         }
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(&output).unwrap()),
+        _ => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
     }
 
     ExitCode::Clean
