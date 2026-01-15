@@ -37,7 +37,12 @@
 //! assert!(scaled_loss > 100.0); // Loss increased due to dependencies
 //! ```
 
+use crate::collect::{CriticalFile, CriticalFileCategory, DetectionStrength};
 use serde::{Deserialize, Serialize};
+
+// =============================================================================
+// Dependency-Based Loss Scaling (Plan §5.5)
+// =============================================================================
 
 /// Configuration for dependency-based loss scaling.
 ///
@@ -290,6 +295,243 @@ pub fn compute_dependency_scaling(
     }
 }
 
+// =============================================================================
+// Critical File Inflation (Plan §11 - Data Loss Safety Gate)
+// =============================================================================
+
+/// Configuration for critical file-based loss inflation.
+///
+/// When a process holds critical files (locks, active writes), we inflate
+/// the kill loss to make destructive actions less attractive.
+///
+/// Different file categories have different inflation levels:
+/// - Hard detections (definite locks): very high inflation (effectively blocking)
+/// - Soft detections (heuristic matches): moderate inflation (increased caution)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriticalFileInflation {
+    /// Base inflation multiplier for hard detections (default: 10.0).
+    /// A hard detection multiplies kill loss by this amount.
+    pub hard_inflation_base: f64,
+
+    /// Base inflation multiplier for soft detections (default: 2.0).
+    /// A soft detection multiplies kill loss by this amount.
+    pub soft_inflation_base: f64,
+
+    /// Additional per-file inflation (hard, default: 2.0).
+    /// Each additional hard file adds this multiplier.
+    pub hard_per_file: f64,
+
+    /// Additional per-file inflation (soft, default: 0.5).
+    /// Each additional soft file adds this multiplier.
+    pub soft_per_file: f64,
+
+    /// Maximum inflation cap (default: 100.0).
+    /// Prevents extreme scaling even with many critical files.
+    pub max_inflation: f64,
+
+    /// Category-specific multipliers (applied on top of hard/soft base).
+    /// Higher values for more dangerous categories.
+    pub sqlite_wal_weight: f64,
+    pub git_lock_weight: f64,
+    pub git_rebase_weight: f64,
+    pub system_package_lock_weight: f64,
+    pub node_package_lock_weight: f64,
+    pub cargo_lock_weight: f64,
+    pub database_write_weight: f64,
+    pub app_lock_weight: f64,
+    pub open_write_weight: f64,
+}
+
+impl Default for CriticalFileInflation {
+    fn default() -> Self {
+        Self {
+            // Hard detections should effectively block kills
+            hard_inflation_base: 10.0,
+            // Soft detections increase caution significantly
+            soft_inflation_base: 2.0,
+            // Per-file additives
+            hard_per_file: 2.0,
+            soft_per_file: 0.5,
+            // Maximum cap
+            max_inflation: 100.0,
+            // Category weights (danger level)
+            sqlite_wal_weight: 2.0,       // Very dangerous - active DB write
+            git_lock_weight: 1.5,         // Dangerous - repo operation
+            git_rebase_weight: 2.0,       // Very dangerous - complex git state
+            system_package_lock_weight: 2.5, // Very dangerous - system state
+            node_package_lock_weight: 1.5,   // Dangerous - package install
+            cargo_lock_weight: 1.5,          // Dangerous - package install
+            database_write_weight: 1.5,      // Dangerous - data writes
+            app_lock_weight: 1.0,            // Moderate - application locks
+            open_write_weight: 0.5,          // Lower - generic writes
+        }
+    }
+}
+
+impl CriticalFileInflation {
+    /// Compute inflation factor from a list of critical files.
+    ///
+    /// Returns a multiplier (>= 1.0) to apply to kill loss.
+    ///
+    /// Formula:
+    /// ```text
+    /// inflation = 1.0 + sum(base[strength] * category_weight * per_file_factor)
+    /// ```
+    pub fn compute_inflation(&self, critical_files: &[CriticalFile]) -> f64 {
+        if critical_files.is_empty() {
+            return 1.0;
+        }
+
+        let mut total_inflation = 0.0;
+        let mut hard_count = 0usize;
+        let mut soft_count = 0usize;
+
+        for file in critical_files {
+            let category_weight = self.category_weight(&file.category);
+
+            match file.strength {
+                DetectionStrength::Hard => {
+                    let per_file = if hard_count == 0 {
+                        self.hard_inflation_base
+                    } else {
+                        self.hard_per_file
+                    };
+                    total_inflation += per_file * category_weight;
+                    hard_count += 1;
+                }
+                DetectionStrength::Soft => {
+                    let per_file = if soft_count == 0 && hard_count == 0 {
+                        self.soft_inflation_base
+                    } else {
+                        self.soft_per_file
+                    };
+                    total_inflation += per_file * category_weight;
+                    soft_count += 1;
+                }
+            }
+        }
+
+        let inflation = 1.0 + total_inflation;
+        inflation.min(self.max_inflation)
+    }
+
+    /// Get the category-specific weight multiplier.
+    pub fn category_weight(&self, category: &CriticalFileCategory) -> f64 {
+        match category {
+            CriticalFileCategory::SqliteWal => self.sqlite_wal_weight,
+            CriticalFileCategory::GitLock => self.git_lock_weight,
+            CriticalFileCategory::GitRebase => self.git_rebase_weight,
+            CriticalFileCategory::SystemPackageLock => self.system_package_lock_weight,
+            CriticalFileCategory::NodePackageLock => self.node_package_lock_weight,
+            CriticalFileCategory::CargoLock => self.cargo_lock_weight,
+            CriticalFileCategory::DatabaseWrite => self.database_write_weight,
+            CriticalFileCategory::AppLock => self.app_lock_weight,
+            CriticalFileCategory::OpenWrite => self.open_write_weight,
+        }
+    }
+
+    /// Scale the kill loss by critical file inflation.
+    pub fn scale_loss(&self, base_loss: f64, critical_files: &[CriticalFile]) -> f64 {
+        let inflation = self.compute_inflation(critical_files);
+        base_loss * inflation
+    }
+}
+
+/// Result of critical file inflation computation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriticalFileInflationResult {
+    /// The computed inflation factor (>= 1.0).
+    pub inflation_factor: f64,
+
+    /// Original kill loss before inflation.
+    pub original_kill_loss: f64,
+
+    /// Inflated kill loss after applying critical file factor.
+    pub inflated_kill_loss: f64,
+
+    /// Number of hard detections.
+    pub hard_count: usize,
+
+    /// Number of soft detections.
+    pub soft_count: usize,
+
+    /// Categories detected (for explainability).
+    pub categories: Vec<CriticalFileCategory>,
+
+    /// Rule IDs that triggered (for explainability).
+    pub rule_ids: Vec<String>,
+}
+
+impl CriticalFileInflationResult {
+    /// Create a result showing no inflation (no critical files).
+    pub fn no_inflation(original_loss: f64) -> Self {
+        Self {
+            inflation_factor: 1.0,
+            original_kill_loss: original_loss,
+            inflated_kill_loss: original_loss,
+            hard_count: 0,
+            soft_count: 0,
+            categories: Vec::new(),
+            rule_ids: Vec::new(),
+        }
+    }
+}
+
+/// Compute critical file inflation with full result for audit/explainability.
+pub fn compute_critical_file_inflation(
+    original_kill_loss: f64,
+    critical_files: &[CriticalFile],
+    config: Option<&CriticalFileInflation>,
+) -> CriticalFileInflationResult {
+    if critical_files.is_empty() {
+        return CriticalFileInflationResult::no_inflation(original_kill_loss);
+    }
+
+    let inflation_config = config.cloned().unwrap_or_default();
+    let inflation_factor = inflation_config.compute_inflation(critical_files);
+    let inflated_kill_loss = original_kill_loss * inflation_factor;
+
+    let hard_count = critical_files
+        .iter()
+        .filter(|f| matches!(f.strength, DetectionStrength::Hard))
+        .count();
+    let soft_count = critical_files.len() - hard_count;
+
+    let mut categories: Vec<CriticalFileCategory> = critical_files
+        .iter()
+        .map(|f| f.category.clone())
+        .collect();
+    categories.sort_by_key(|c| format!("{:?}", c));
+    categories.dedup();
+
+    let mut rule_ids: Vec<String> = critical_files
+        .iter()
+        .map(|f| f.rule_id.clone())
+        .collect();
+    rule_ids.sort();
+    rule_ids.dedup();
+
+    CriticalFileInflationResult {
+        inflation_factor,
+        original_kill_loss,
+        inflated_kill_loss,
+        hard_count,
+        soft_count,
+        categories,
+        rule_ids,
+    }
+}
+
+/// Convenience function to check if critical files warrant blocking kill actions.
+///
+/// Returns true if any hard detection is present, which in robot mode should
+/// block kill-like actions by default.
+pub fn should_block_kill(critical_files: &[CriticalFile]) -> bool {
+    critical_files
+        .iter()
+        .any(|f| matches!(f.strength, DetectionStrength::Hard))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +745,169 @@ mod tests {
         assert!(json.contains("original_kill_loss"));
         assert!(json.contains("scaled_kill_loss"));
         assert!(json.contains("scale_factor"));
+    }
+
+    // =========================================================================
+    // Critical File Inflation Tests
+    // =========================================================================
+
+    fn make_critical_file(
+        category: CriticalFileCategory,
+        strength: DetectionStrength,
+        rule_id: &str,
+    ) -> CriticalFile {
+        CriticalFile {
+            fd: 42,
+            path: "/test/path".to_string(),
+            category,
+            strength,
+            rule_id: rule_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_no_critical_files_no_inflation() {
+        let config = CriticalFileInflation::default();
+        let inflation = config.compute_inflation(&[]);
+        assert_eq!(inflation, 1.0);
+    }
+
+    #[test]
+    fn test_hard_detection_high_inflation() {
+        let config = CriticalFileInflation::default();
+        let files = vec![make_critical_file(
+            CriticalFileCategory::SqliteWal,
+            DetectionStrength::Hard,
+            "sqlite-wal",
+        )];
+
+        let inflation = config.compute_inflation(&files);
+        // Expected: 1.0 + (10.0 base * 2.0 sqlite weight) = 21.0
+        assert!(approx_eq(inflation, 21.0, 0.01), "Got: {}", inflation);
+    }
+
+    #[test]
+    fn test_soft_detection_moderate_inflation() {
+        let config = CriticalFileInflation::default();
+        let files = vec![make_critical_file(
+            CriticalFileCategory::DatabaseWrite,
+            DetectionStrength::Soft,
+            "db-soft",
+        )];
+
+        let inflation = config.compute_inflation(&files);
+        // Expected: 1.0 + (2.0 soft base * 1.5 db weight) = 4.0
+        assert!(approx_eq(inflation, 4.0, 0.01), "Got: {}", inflation);
+    }
+
+    #[test]
+    fn test_multiple_hard_detections_additive() {
+        let config = CriticalFileInflation::default();
+        let files = vec![
+            make_critical_file(
+                CriticalFileCategory::GitLock,
+                DetectionStrength::Hard,
+                "git-lock",
+            ),
+            make_critical_file(
+                CriticalFileCategory::GitRebase,
+                DetectionStrength::Hard,
+                "git-rebase",
+            ),
+        ];
+
+        let inflation = config.compute_inflation(&files);
+        // First hard: 10.0 * 1.5 (git-lock) = 15.0
+        // Second hard: 2.0 * 2.0 (git-rebase per-file) = 4.0
+        // Total: 1.0 + 15.0 + 4.0 = 20.0
+        assert!(approx_eq(inflation, 20.0, 0.01), "Got: {}", inflation);
+    }
+
+    #[test]
+    fn test_inflation_capped_at_max() {
+        let config = CriticalFileInflation::default();
+        // Create many hard detections
+        let files: Vec<_> = (0..50)
+            .map(|i| {
+                make_critical_file(
+                    CriticalFileCategory::SystemPackageLock,
+                    DetectionStrength::Hard,
+                    &format!("rule-{}", i),
+                )
+            })
+            .collect();
+
+        let inflation = config.compute_inflation(&files);
+        assert!(
+            inflation <= config.max_inflation,
+            "Inflation {} exceeds max {}",
+            inflation,
+            config.max_inflation
+        );
+    }
+
+    #[test]
+    fn test_compute_critical_file_inflation_result() {
+        let files = vec![
+            make_critical_file(
+                CriticalFileCategory::GitLock,
+                DetectionStrength::Hard,
+                "git-lock",
+            ),
+            make_critical_file(
+                CriticalFileCategory::OpenWrite,
+                DetectionStrength::Soft,
+                "open-write",
+            ),
+        ];
+
+        let result = compute_critical_file_inflation(100.0, &files, None);
+
+        assert!(result.inflation_factor > 1.0);
+        assert_eq!(result.original_kill_loss, 100.0);
+        assert!(result.inflated_kill_loss > 100.0);
+        assert_eq!(result.hard_count, 1);
+        assert_eq!(result.soft_count, 1);
+        assert_eq!(result.categories.len(), 2);
+        assert_eq!(result.rule_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_should_block_kill_with_hard() {
+        let files = vec![make_critical_file(
+            CriticalFileCategory::SqliteWal,
+            DetectionStrength::Hard,
+            "sqlite-wal",
+        )];
+        assert!(should_block_kill(&files));
+    }
+
+    #[test]
+    fn test_should_not_block_kill_with_only_soft() {
+        let files = vec![make_critical_file(
+            CriticalFileCategory::OpenWrite,
+            DetectionStrength::Soft,
+            "open-write",
+        )];
+        assert!(!should_block_kill(&files));
+    }
+
+    #[test]
+    fn test_no_inflation_result() {
+        let result = CriticalFileInflationResult::no_inflation(100.0);
+        assert_eq!(result.inflation_factor, 1.0);
+        assert_eq!(result.inflated_kill_loss, 100.0);
+        assert_eq!(result.hard_count, 0);
+        assert_eq!(result.soft_count, 0);
+    }
+
+    #[test]
+    fn test_category_weights() {
+        let config = CriticalFileInflation::default();
+
+        // Verify category weights are properly configured
+        assert!(config.sqlite_wal_weight > config.open_write_weight);
+        assert!(config.system_package_lock_weight > config.app_lock_weight);
+        assert!(config.git_rebase_weight >= config.git_lock_weight);
     }
 }

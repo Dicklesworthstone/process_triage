@@ -29,8 +29,9 @@ pub use fdr_selection::{
     FdrSelectionResult, TargetIdentity,
 };
 pub use dependency_loss::{
-    compute_dependency_scaling, scale_kill_loss, DependencyFactors, DependencyScaling,
-    DependencyScalingResult,
+    compute_critical_file_inflation, compute_dependency_scaling, scale_kill_loss,
+    should_block_kill, CriticalFileInflation, CriticalFileInflationResult, DependencyFactors,
+    DependencyScaling, DependencyScalingResult,
 };
 pub use robot_constraints::{
     ConstraintCheckResult, ConstraintChecker, ConstraintKind, ConstraintMetrics,

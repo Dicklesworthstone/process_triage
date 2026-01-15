@@ -162,8 +162,12 @@ impl From<CriticalFileCategory> for CriticalWriteCategory {
             CriticalFileCategory::SqliteWal | CriticalFileCategory::DatabaseWrite => {
                 CriticalWriteCategory::Database
             }
-            CriticalFileCategory::GitLock => CriticalWriteCategory::Git,
-            CriticalFileCategory::PackageLock => CriticalWriteCategory::PackageManager,
+            CriticalFileCategory::GitLock | CriticalFileCategory::GitRebase => {
+                CriticalWriteCategory::Git
+            }
+            CriticalFileCategory::SystemPackageLock
+            | CriticalFileCategory::NodePackageLock
+            | CriticalFileCategory::CargoLock => CriticalWriteCategory::PackageManager,
             CriticalFileCategory::AppLock => CriticalWriteCategory::AppLock,
             CriticalFileCategory::OpenWrite => CriticalWriteCategory::Other,
         }
@@ -793,7 +797,7 @@ mod tests {
             CriticalWriteCategory::Git
         );
         assert_eq!(
-            CriticalWriteCategory::from(CriticalFileCategory::PackageLock),
+            CriticalWriteCategory::from(CriticalFileCategory::SystemPackageLock),
             CriticalWriteCategory::PackageManager
         );
     }
