@@ -26,6 +26,8 @@ mod network;
 mod proc_parsers;
 #[cfg(target_os = "linux")]
 pub mod systemd;
+#[cfg(target_os = "linux")]
+pub mod tick_delta;
 mod quick_scan;
 pub mod tool_runner;
 mod types;
@@ -79,4 +81,12 @@ pub use cpu_capacity::{
     compute_cpu_capacity, compute_n_eff, count_cpus_in_list, num_logical_cpus,
     parse_cpus_allowed_list, AffinitySource, BindingConstraint, CpuCapacity, CpuCapacityProvenance,
     CpusetSource, QuotaSource,
+};
+
+// Re-export tick-delta feature types
+#[cfg(target_os = "linux")]
+pub use tick_delta::{
+    clk_tck, collect_tick_snapshot, compute_tick_delta, parse_tick_snapshot, sample_tick_delta,
+    BudgetConstraint, NEffPolicy, TickDeltaConfig, TickDeltaFeatures, TickDeltaProvenance,
+    TickSnapshot,
 };
