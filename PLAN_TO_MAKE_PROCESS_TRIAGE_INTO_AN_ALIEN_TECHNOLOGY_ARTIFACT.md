@@ -140,7 +140,7 @@ With conjugate prior families (Beta-Binomial, Gamma-Poisson, Dirichlet-Multinomi
 
 **4. Formal guarantees are tractable.**
 
-With closed-form posteriors, we can compute exact credible intervals and exact Bayes factors. We can also apply formal error-control and calibration tools (PAC-Bayes bounds, conformal prediction for distribution-free coverage, FDR control, alpha-investing), but we must be explicit about their assumptions (e.g., approximate independence/exchangeability of trials); in always-on/optional-stopping settings we prefer anytime-valid e-values/e-process controls. ML models require empirical validation on held-out data; Bayesian models have built-in uncertainty quantification.
+With closed-form posteriors, we can compute exact credible intervals and exact Bayes factors. We can also apply formal error-control and calibration tools (PAC-Bayes bounds, conformal prediction for distribution-free coverage, FDR control, alpha-investing), but we must be explicit about their assumptions (e.g., approximate independence/exchangeability of trials); in always-on/optional-stopping settings we prefer anytime-valid e-values/e-process controls. ML models require empirical validation on held-out data; Bayesian models produce uncertainty quantification under the assumed model, which must still be stress-tested and calibrated (PPC, drift gates, conformal, shadow-mode outcomes).
 
 **5. Numerical stability is achievable.**
 
@@ -376,7 +376,7 @@ A) Basic closed-form Bayesian model (non-ML)
     - k_ticks = Δticks over window Δt (from /proc/PID/stat)
     - n_ticks = round(CLK_TCK * Δt * min(N_eff_cores, threads))  (where CLK_TCK = sysconf(_SC_CLK_TCK), and N_eff_cores accounts for affinity/cpuset/quota when available)
     - u = k_ticks / n_ticks (derived occupancy estimate; clamp to [0,1] if rounding/noise yields slight overflow); posterior for p_{u,C} is Beta(alpha_C+k_ticks, beta_C+n_ticks-k_ticks)
-  - t|C ~ Gamma(α_{t,C}, β_{t,C})
+  - t|C ~ Gamma(α_{t,C}, β_{t,C}) (caution: the process is observed while still running, so “age” is a right-censored/length-biased observation of lifetime; hazard-based modeling is preferred when you want principled runtime evidence)
   - orphan o|C ~ Bernoulli(p_{o,C}), p_{o,C} ~ Beta(a_{o,C}, b_{o,C})
   - state flags s|C ~ Categorical(pi_C), pi_C ~ Dirichlet(alpha^{state}_C)
   - command/CWD categories g|C ~ Categorical(rho_C), rho_C ~ Dirichlet(alpha^{cmd}_C)
@@ -417,7 +417,7 @@ E) Hierarchical priors by command category
 - Optional (offline calibration only): alpha_{u,C,g}, beta_{u,C,g} hyperpriors (e.g., Gamma on shapes) fit numerically (Laplace/EB), while runtime inference stays on conjugate Beta-Binomial marginals.
 
 F) Continuous-time hidden semi-Markov chain
-- S_t in {useful, useful-bad, abandoned, zombie}
+- S_t in {useful, useful-but-bad, abandoned, zombie}
 - durations D_S ~ Gamma(α_{D,S}, β_{D,S})
 
 G) CPU model as Markov-modulated Poisson / Levy subordinator
@@ -433,7 +433,7 @@ H) Bayes factors for model selection
   - Evidence-as-code-length: L_Bayes(x|H) = -log ∫ p(x|θ,H) π(θ|H) dθ
   - Prequential (online) code length: L_pre(x_{1:T}|H) = Σ_{t=1..T} -log p(x_t | x_{<t}, H)
   - Regret / anomaly evidence as compression gap: ΔL = L_pre(x|H_useful) - min_{H∈Alt} L_pre(x|H)
-  - Practical pt use: treat ΔL (and its time-uniform e-process form) as an interpretable, numerically stable “surprisal budget” that feeds the inference ledger, drift/misspecification gates (PPC/DRO), and selection control (FDR/e-FDR) without inventing new ad-hoc scores.
+  - Practical pt use: treat ΔL (and its time-uniform e-process form) as an interpretable, numerically stable “surprisal budget” (in nats unless divided by ln 2) that feeds the inference ledger, drift/misspecification gates (PPC/DRO), and selection control (FDR/e-FDR) without inventing new ad-hoc scores.
   - Safe Bayes connection: pick the generalized-Bayes learning rate η by minimizing prequential log-loss (MDL-optimal tempering) so misspecified likelihood terms don’t create fake certainty.
   - NML note (offline / baseline-building): where feasible, use normalized maximum likelihood / minimax-regret codes for command-category sequence models; when infeasible, approximate with mixture/Jeffreys codes or CTW-style mixtures.
 
@@ -584,7 +584,7 @@ AR) Renewal reward / semi-regenerative processes
 - Model event rewards (CPU/IO) between renewals with conjugate updates
 
 AS) Conformal prediction (distribution-free coverage)
-- Prediction intervals for runtime/CPU with finite-sample guarantees under exchangeability (use time-blocked/online conformal variants for temporal dependence)
+- Prediction intervals for runtime/CPU with finite-sample guarantees under exchangeability. For temporal dependence/drift, use blocked or rolling-window conformal and be explicit that coverage becomes approximate unless additional assumptions are met.
 
 AT) False Discovery Rate (FDR) control across many processes
 - Multiple-testing correction (Benjamini-Hochberg, local fdr) for kill recommendations
@@ -842,9 +842,9 @@ All of the above ideas (A through CD) are integrated in the system design below.
   - optional: container attribution: detect docker/podman/kube cgroup patterns and capture container ID (when available)
   - optional: perf (cycles, cache misses, branch mispredicts)
   - optional: bpftrace / bcc (eBPF probes for syscalls, IO, scheduler latency)
-  - optional: pidstat / iostat / mpstat / vmstat (sysstat suite)
+  - optional: pidstat / iostat / mpstat / sar (sysstat suite) and vmstat (procps)
   - optional: iotop (per-process IO)
-  - optional: nethogs / iftop (per-process network throughput)
+  - optional: nethogs (per-process) and iftop/iftop-like tools (per-interface/connection; coarse attribution)
   - optional: sar (historical system metrics)
   - optional: atop (historical per-process accounting)
   - optional: sysdig (syscall stream capture)
@@ -878,7 +878,7 @@ All of the above ideas (A through CD) are integrated in the system design below.
 - u_cores: estimated cores used (can exceed 1): u_cores = k_ticks / (CLK_TCK * Δt)
 - n_samp: number of quick-scan samples in the window (used for trend/change-point features)
 - t: elapsed time (seconds)
-- o: “unexpected reparenting” indicator (PPID=1 AND not managed-by-supervisor/job); treat PPID=1 as a weak, OS-dependent signal (e.g., macOS `launchd` makes PPID=1 common)
+- o: “unexpected reparenting” indicator (PPID=1 AND not managed-by-supervisor/job); treat PPID=1 as a weak, OS-dependent signal (macOS `launchd` makes PPID=1 common; containers often have “PID 1” as the app init, which is not an orphan)
 - s: state flags (R,S,Z,D)
 - g: command category (test, dev, agent, shell, build, daemon, unknown)
 - cwd category: repo root, temp, unknown
@@ -1045,13 +1045,13 @@ Core options:
           "λ_r | data ~ Gamma(α_r + N_r, β_r + E_r)",
           "S(t) = exp(-∑_r λ_r * E_r)"
         ],
-        "values": {
-          "regimes": [
-            {"name":"tty_lost","alpha":2.0,"beta":1.0,"N":1,"E":3600,"lambda_mean":0.00083},
-            {"name":"io_flatline","alpha":1.0,"beta":1.0,"N":0,"E":1800,"lambda_mean":0.00028}
-          ],
-          "survival_t": 0.41
-        },
+	        "values": {
+	          "regimes": [
+	            {"name":"tty_lost","alpha":2.0,"beta":1.0,"N":1,"E":3600,"lambda_mean":0.00083},
+	            {"name":"io_flatline","alpha":1.0,"beta":1.0,"N":0,"E":1800,"lambda_mean":0.00056}
+	          ],
+	          "survival_t": 0.02
+	        },
         "intuition": "TTY loss increases abandonment hazard."
       },
       {
@@ -1097,7 +1097,7 @@ Core options:
         "id": "alpha_investing",
         "title": "Alpha-Investing Budget",
         "equations": [
-          "W_i = W_{i-1} - α_i + ω (if confirmed-correct)",
+          "W_i = W_{i-1} - α_i + ω (if discovery)",
           "W_i = W_{i-1} - α_i (otherwise)"
         ],
         "values": {"W_prev":0.12,"alpha_spend":0.01,"omega_reward":0.03,"W_next":0.14}
@@ -1181,6 +1181,74 @@ Report schema note:
   📊 Recovered: 2.4GB RAM, 2.1 CPU cores
   ```
 
+**Prose generation for agent-to-user communication:**
+
+AI agents often need to communicate results to users in natural language. The `--format prose` option generates structured prose that agents can use directly or adapt for their communication style.
+
+Prose output includes:
+- **Executive summary**: one paragraph overview suitable for busy users
+- **Action narrative**: what was done and why
+- **Outcome report**: what changed, goals achieved or not
+- **Next steps**: recommendations for follow-up (if any)
+
+Example `pt agent plan --format prose` output:
+```
+Your devbox (devbox1.example.com) is under memory pressure with only 4.2GB of 32GB available. 
+I found 4 processes that appear to be abandoned and are consuming 3.2GB combined.
+
+Recommended actions:
+1. Kill the stuck Jest worker (PID 1234) - running for 4 hours with 98% CPU, consuming 1.2GB RAM. 
+   This appears to be a hung test process with no recent I/O activity.
+2. Kill the orphaned Next.js dev server (PID 5678) - running for 2 days since its parent terminal 
+   was closed, consuming 800MB RAM.
+3. Kill the zombie webpack watcher (PID 9012) - defunct process from a crashed build, consuming 
+   400MB RAM.
+4. Review the Python training script (PID 3456) - consuming 8.4GB but has recent I/O; may be 
+   legitimately working.
+
+If you approve these actions, I'll recover approximately 2.4GB RAM immediately.
+```
+
+Example `pt agent apply --format prose` (post-action):
+```
+I've cleaned up 3 abandoned processes on your devbox:
+
+Completed actions:
+- Killed the stuck Jest worker (PID 1234): process terminated cleanly in 150ms, freed 1.2GB RAM
+- Killed the orphaned Next.js dev server (PID 5678): freed 800MB RAM
+- Killed the zombie webpack watcher (PID 9012): freed 400MB RAM
+
+Results:
+- Total memory recovered: 2.4GB (available memory: 4.2GB → 6.6GB)
+- CPU load reduced: 2.1 → 0.8 (1-minute average)
+
+Note: I left the Python training script running as requested - it's still active and appears to be 
+making progress on its task.
+```
+
+**Prose style controls:**
+- `--prose-style terse` - Minimal, bullet-point style
+- `--prose-style conversational` - Natural, friendly tone (default)
+- `--prose-style formal` - Professional report style
+- `--prose-style technical` - Include more technical details
+
+**Prose field in JSON output:**
+When using `--format json`, include `--include-prose` to add a `prose_summary` field:
+```json
+{
+  "summary": {...},
+  "candidates": [...],
+  "prose_summary": {
+    "executive": "Your devbox is under memory pressure...",
+    "actions": "I recommend killing 3 abandoned processes...",
+    "rationale": "These processes have been idle for hours with no I/O...",
+    "next_steps": "After cleanup, consider adding swap or upgrading RAM if this recurs."
+  }
+}
+```
+
+This allows agents to: (1) parse structured data for their own logic, (2) use pre-generated prose for user communication without additional LLM calls.
+
 #### 6) Inbox (daemon-driven "plans ready for review")
 ```
 pt agent inbox [--limit N] [--format json|md]
@@ -1224,6 +1292,267 @@ pt agent fleet report --session <fleet-session-id> [OPTIONS]
 ```
 See section 3.8 for full fleet mode specification.
 
+#### 10) Snapshot (one-shot comprehensive reconnaissance)
+```
+pt agent snapshot [OPTIONS]
+```
+Goal: give AI agents a single command that returns everything needed to understand the system state and make decisions, without requiring multiple round-trips. This is the "recon" command that agents should call first.
+
+Output includes:
+- **System state**: loadavg, memory pressure (available/total/swap), CPU utilization, PSI stalls, disk I/O pressure, network summary
+- **Process census**: total count, by-state breakdown (R/S/D/Z/T), orphan count, zombie count
+- **Resource hogs**: top-N by CPU, top-N by RSS, top-N by IO (with just enough detail for triage decisions)
+- **Anomaly indicators**: processes in D-state, zombies, orphans with high resource use, long-running processes
+- **Capability report**: what this `pt` installation can do (see `pt agent capabilities` below), embedded inline
+- **Session bootstrap**: a `session_id` that can be used for subsequent `plan`/`explain`/`apply` calls
+
+Options:
+- `--top <N>` - Number of processes per category (default: 10)
+- `--include-env` - Include environment variable summaries (when permitted by policy)
+- `--include-network` - Include network connection summary per process
+- `--format json|md|summary` - Output format
+
+Why this matters for agents:
+- Eliminates the "multiple tool calls to understand the system" anti-pattern
+- Provides enough context to decide whether `pt agent plan` is even needed
+- Embeds capability information so agents know what actions are available
+- Returns a session_id for continuity without requiring a separate `plan` call first
+
+Example output (JSON, abbreviated):
+```json
+{
+  "schema_version": "1.0",
+  "session_id": "snap-20250115-143022-abc123",
+  "host_id": "devbox1.example.com",
+  "generated_at": "2025-01-15T14:30:22Z",
+  "system": {
+    "loadavg": [2.1, 1.8, 1.5],
+    "memory": {"total_gb": 32, "available_gb": 4.2, "swap_used_gb": 0.1},
+    "cpu_cores": 8,
+    "uptime_hours": 72.5,
+    "psi": {"cpu_some_pct": 15.2, "memory_some_pct": 2.1, "io_some_pct": 0.5}
+  },
+  "process_census": {
+    "total": 312,
+    "by_state": {"R": 3, "S": 298, "D": 2, "Z": 1, "T": 8},
+    "orphans": 12,
+    "zombies": 1
+  },
+  "top_cpu": [{"pid": 1234, "cmd_short": "node jest --worker", "cpu_pct": 98.2, "runtime_h": 4.2, "rss_mb": 1200}],
+  "top_memory": [{"pid": 5678, "cmd_short": "python train.py", "rss_mb": 8400, "cpu_pct": 12.1}],
+  "anomalies": {
+    "d_state": [{"pid": 9012, "cmd_short": "rsync", "wchan": "wait_on_sync", "duration_s": 45}],
+    "zombies": [{"pid": 3456, "ppid": 1, "cmd_short": "[defunct]"}],
+    "high_resource_orphans": [{"pid": 1234, "cmd_short": "node jest --worker", "rss_mb": 1200}]
+  },
+  "capabilities": {"supervisor_detection": ["systemd", "pm2"], "actions": ["kill", "pause", "renice", "cgroup_throttle"]},
+  "recommendation": "4 anomalies detected; run pt agent plan for full analysis"
+}
+```
+
+#### 11) Capabilities (upfront capability reporting)
+```
+pt agent capabilities [OPTIONS]
+```
+Goal: tell agents exactly what this `pt` installation can do on this host, before they attempt actions that might fail.
+
+Output includes:
+- **Platform**: Linux/macOS/FreeBSD, kernel version, container status
+- **Available data sources**: what telemetry can be collected (procfs, sysfs, dtrace, eBPF, perf)
+- **Supervisor detection**: which supervisors can be detected and controlled (systemd, launchd, pm2, Docker, etc.)
+- **Available actions**: which actions are supported (kill, pause, renice, cgroup freeze/throttle, supervisor commands)
+- **Permission level**: what the current user can do (own processes only, all users, root)
+- **Resource limits**: overhead budget, probe limits, any configured caps
+- **Feature flags**: which optional features are enabled (galaxy-brain, community signatures, fleet mode)
+
+Options:
+- `--format json|md` - Output format
+- `--check-action <action>` - Check if a specific action is available and return requirements
+
+Why this matters for agents:
+- Prevents agents from attempting unsupported actions (e.g., cgroup freeze on old kernels)
+- Enables conditional logic: "if systemd available, prefer systemctl stop; else fall back to kill"
+- Documents permission requirements upfront: "cgroup throttle requires root or CAP_SYS_RESOURCE"
+- Helps agents choose the right approach without trial-and-error
+
+Example output (JSON, abbreviated):
+```json
+{
+  "platform": {
+    "os": "linux",
+    "kernel": "6.1.0-generic",
+    "distro": "ubuntu-22.04",
+    "in_container": false
+  },
+  "data_sources": {
+    "procfs": true,
+    "sysfs": true,
+    "perf_events": true,
+    "ebpf": false,
+    "schedstat": true
+  },
+  "supervisors": {
+    "systemd": {"available": true, "can_control": true},
+    "pm2": {"available": true, "can_control": true},
+    "docker": {"available": true, "can_control": false, "reason": "user not in docker group"},
+    "launchd": {"available": false}
+  },
+  "actions": {
+    "kill": {"available": true, "scope": "own_user"},
+    "pause": {"available": true, "scope": "own_user"},
+    "renice": {"available": true, "scope": "own_user", "range": [-20, 19], "current_user_range": [0, 19]},
+    "cgroup_freeze": {"available": true, "scope": "own_cgroups"},
+    "cgroup_throttle": {"available": true, "scope": "own_cgroups"},
+    "systemctl_stop": {"available": true, "scope": "user_units_and_system_with_sudo"}
+  },
+  "permissions": {
+    "effective_uid": 1000,
+    "can_sudo": true,
+    "capabilities": ["CAP_SYS_PTRACE"]
+  },
+  "limits": {
+    "overhead_budget_pct": 5,
+    "max_deep_scans_per_run": 50,
+    "max_kills_per_run": 10
+  }
+}
+```
+
+#### 12) Verify (post-action outcome confirmation)
+```
+pt agent verify --session <id> [OPTIONS]
+```
+Goal: after executing actions, confirm outcomes and detect unexpected results. This closes the loop for agents that need to verify their work before reporting success.
+
+Output includes:
+- **Action outcomes**: for each action in the session, what actually happened
+- **Process status**: is the target process gone, still running, respawned, or in a different state?
+- **Resource recovery**: actual memory freed, CPU recovered (measured, not projected)
+- **Unexpected events**: processes that died unexpectedly, new processes that appeared, cascading effects
+- **Verification confidence**: how certain we are about the outcome
+
+Options:
+- `--wait <seconds>` - Wait up to N seconds for outcomes to stabilize (default: 5)
+- `--check-respawn` - Check if killed processes have respawned
+- `--format json|md` - Output format
+
+Action outcome states:
+- `confirmed_dead` - Process is gone, PID not reused
+- `confirmed_stopped` - Process is paused/frozen as intended
+- `still_running` - Action may have failed or process was protected
+- `respawned` - Process died but a new instance appeared (supervised)
+- `pid_reused` - PID exists but is a different process (identity mismatch)
+- `cascaded` - Action caused additional processes to die (expected or unexpected)
+- `timeout` - Outcome could not be determined in time
+
+Example output (JSON):
+```json
+{
+  "session_id": "abc123",
+  "verification": {
+    "requested_at": "2025-01-15T14:35:00Z",
+    "completed_at": "2025-01-15T14:35:05Z",
+    "overall_status": "partial_success"
+  },
+  "action_outcomes": [
+    {
+      "target": {"pid": 1234, "start_id": "1705312200.1234", "cmd_short": "node jest"},
+      "action": "kill",
+      "outcome": "confirmed_dead",
+      "time_to_death_ms": 150,
+      "resources_freed": {"rss_mb": 1200, "cpu_pct": 98}
+    },
+    {
+      "target": {"pid": 5678, "start_id": "1705312300.5678", "cmd_short": "pm2: worker"},
+      "action": "kill",
+      "outcome": "respawned",
+      "respawn_detected": {"new_pid": 9999, "delay_ms": 100, "supervisor": "pm2"},
+      "recommendation": "Use pm2 stop instead of kill for persistent termination"
+    }
+  ],
+  "resource_summary": {
+    "memory_freed_mb": 1200,
+    "memory_freed_pct": 3.8,
+    "expected_mb": 2000,
+    "shortfall_reason": "Process 5678 respawned"
+  },
+  "unexpected_events": [],
+  "next_steps": ["Run pm2 stop worker to permanently stop respawning process"]
+}
+```
+
+#### 13) Diff (before/after comparison)
+```
+pt agent diff --session <id> [OPTIONS]
+pt agent diff --before <snapshot-id> --after <snapshot-id> [OPTIONS]
+```
+Goal: compare system state before and after actions, or between any two snapshots. Essential for agents that need to demonstrate impact and verify goals were achieved.
+
+Output includes:
+- **Process delta**: processes added, removed, changed state
+- **Resource delta**: memory, CPU, IO changes (totals and per-process)
+- **Goal achievement**: if a goal was specified, was it met?
+- **Side effects**: unexpected changes that occurred during the window
+
+Options:
+- `--session <id>` - Compare before/after for a completed session
+- `--before <id>` - Explicit before snapshot
+- `--after <id>` - Explicit after snapshot (default: current state)
+- `--focus pids|resources|goals` - What to emphasize in output
+- `--format json|md|prose` - Output format
+
+Example output (JSON):
+```json
+{
+  "comparison": {
+    "before": {"snapshot_id": "snap-before", "timestamp": "2025-01-15T14:30:00Z"},
+    "after": {"snapshot_id": "snap-after", "timestamp": "2025-01-15T14:35:00Z"}
+  },
+  "process_delta": {
+    "removed": [
+      {"pid": 1234, "cmd_short": "node jest", "reason": "killed", "resources_freed": {"rss_mb": 1200}}
+    ],
+    "added": [
+      {"pid": 9999, "cmd_short": "pm2: worker", "reason": "respawned", "note": "supervised process"}
+    ],
+    "changed": [
+      {"pid": 2345, "change": "state S->T", "reason": "paused by pt"}
+    ]
+  },
+  "resource_delta": {
+    "memory": {"before_available_gb": 4.2, "after_available_gb": 5.4, "delta_gb": 1.2},
+    "cpu": {"before_idle_pct": 5, "after_idle_pct": 45, "delta_pct": 40},
+    "loadavg": {"before": [2.1, 1.8, 1.5], "after": [0.8, 1.2, 1.4]}
+  },
+  "goal_achievement": {
+    "goal": "free 2GB RAM",
+    "target_gb": 2.0,
+    "achieved_gb": 1.2,
+    "status": "partial",
+    "gap_reason": "Process 5678 respawned; need supervisor action"
+  },
+  "side_effects": []
+}
+```
+
+**Prose output mode** (`--format prose`):
+```
+Between 14:30:00 and 14:35:00, we killed 1 process and paused 1 process.
+
+Removed processes:
+- node jest (PID 1234): killed, freed 1.2GB RAM and 98% CPU
+
+Resource changes:
+- Available memory: 4.2GB -> 5.4GB (+1.2GB)
+- CPU idle: 5% -> 45% (+40 percentage points)
+- Load average: 2.1 -> 0.8 (1-minute)
+
+Goal progress:
+- Target: free 2GB RAM
+- Achieved: 1.2GB (60% of target)
+- Gap: Process 5678 respawned under pm2 supervision; use pm2 stop worker for full recovery
+```
+
 Output formats:
 - `--format json` - Default; token-efficient, machine-stable, full structure
 - `--format md` - Human-readable markdown, still concise
@@ -1257,6 +1586,75 @@ Schema invariants (for agents):
 - Galaxy-brain math is structured (when `--galaxy-brain`):
   - `galaxy_brain.cards[]` uses stable `id` values and includes `equations`, `values`, and `intuition`
   - Report generation reuses the same schema to avoid duplicate render logic
+
+**Mandatory candidate fields (for agent decision-making):**
+
+Every candidate in `pt agent plan` output includes these fields (not optional, always present):
+
+```json
+{
+  "candidates": [{
+    "pid": 1234,
+    "start_id": "1705312200.1234",
+    "uid": 1000,
+    "cmd_short": "node jest --worker",
+    "classification": "abandoned",
+    "posterior": {"abandoned": 0.94, "useful": 0.03, "useful_bad": 0.02, "zombie": 0.01},
+    "confidence": "high",
+
+    "blast_radius": {
+      "memory_mb": 1200,
+      "cpu_pct": 98,
+      "child_count": 3,
+      "connection_count": 2,
+      "open_files": 47,
+      "dependent_processes": [{"pid": 2345, "relationship": "child", "cmd_short": "node worker.js"}],
+      "risk_level": "low",
+      "summary": "Killing this process will free 1.2GB RAM and terminate 3 child processes; no external connections affected"
+    },
+
+    "reversibility": {
+      "reversible": false,
+      "recovery_options": ["Restart via: npm test", "Parent supervisor: none detected"],
+      "data_at_risk": false,
+      "open_write_fds": [],
+      "note": "Process is not supervised; kill is not automatically reversible but can be manually restarted"
+    },
+
+    "supervisor": {
+      "detected": false,
+      "type": null,
+      "unit": null,
+      "recommended_action": "kill",
+      "supervisor_command": null
+    },
+
+    "uncertainty": {
+      "confidence_level": 0.94,
+      "uncertainty_drivers": [
+        {"factor": "io_activity", "impact": "medium", "note": "Last IO 45 minutes ago; could be long-polling"},
+        {"factor": "network_state", "impact": "low", "note": "2 ESTABLISHED connections, but no traffic"}
+      ],
+      "to_increase_confidence": [
+        {"probe": "wait 15 minutes", "expected_gain": 0.03, "cost": "time"},
+        {"probe": "check parent process", "expected_gain": 0.02, "cost": "low"},
+        {"probe": "strace for 30s", "expected_gain": 0.05, "cost": "medium overhead"}
+      ],
+      "decision_robustness": "high"
+    },
+
+    "recommended_action": "kill",
+    "action_rationale": "High-confidence abandoned process consuming 1.2GB RAM with no recent activity; blast radius is contained to orphaned child processes"
+  }]
+}
+```
+
+Field semantics:
+- **blast_radius** (always present): quantifies impact of action; enables agents to make informed trade-offs
+- **reversibility** (always present): whether the action can be undone and how; critical for agent risk assessment
+- **supervisor** (always present): supervisor detection result (even if none detected); prevents kill-respawn loops
+- **uncertainty** (always present): what's driving confidence, what would increase it, and how robust the decision is to model misspecification
+- **action_rationale** (always present): one-sentence explanation suitable for logging or user communication
 
 Galaxy-brain JSON Schema sketch (agent/report outputs):
 ```json
@@ -1321,6 +1719,134 @@ Exit codes are automation-friendly:
 Ergonomic escape hatches:
 - `--exit-code always0` - Always exit 0 (for `set -e` workflows that parse JSON)
 - `--timeout <seconds>` - Abort if operation exceeds time limit (predictable runtime for scripts)
+
+### 3.5.1 Session Continuity for Agent Workflows
+
+Goal: enable AI agents to maintain context across multiple invocations, resume interrupted operations, and work efficiently with stateful sessions.
+
+**Session lifecycle for agents:**
+
+```
+Agent invocation 1: pt agent snapshot
+  → Returns session_id, system state, capabilities
+  → Agent decides: "need to clean up, let me plan"
+
+Agent invocation 2: pt agent plan --session <id>
+  → Reuses session context from snapshot
+  → Returns plan with candidates
+  → Agent decides: "looks good, let me apply"
+
+Agent invocation 3: pt agent apply --session <id> --recommended --yes
+  → Executes actions
+  → Returns outcomes
+  → Session marked as "applied"
+
+Agent invocation 4: pt agent verify --session <id>
+  → Confirms outcomes
+  → Agent reports to user
+```
+
+**Session state persistence:**
+
+Sessions are durable across CLI invocations:
+- Stored in `~/.local/share/pt/sessions/<session_id>/`
+- Contains: initial snapshot, plan, telemetry, outcomes, audit log
+- Default retention: 7 days (configurable via `--retention`)
+- Can be exported as `.ptb` bundle for sharing
+
+**Session context passing:**
+
+Every command that accepts `--session <id>` uses saved context:
+- `plan` inherits snapshot data (avoids re-scanning)
+- `explain` retrieves cached inference results
+- `apply` validates against saved plan
+- `verify` compares against pre-action state
+- `diff` uses before/after snapshots
+
+**Session resumption:**
+
+If an operation is interrupted:
+```
+pt agent status --session <id>
+```
+Returns:
+```json
+{
+  "session_id": "abc123",
+  "state": "interrupted",
+  "phase": "apply",
+  "progress": {
+    "total_actions": 4,
+    "completed_actions": 2,
+    "pending_actions": 2
+  },
+  "resumable": true,
+  "resume_command": "pt agent apply --session abc123 --resume"
+}
+```
+
+Then:
+```
+pt agent apply --session abc123 --resume
+```
+Continues from where it left off (idempotent: won't re-apply completed actions).
+
+**Multi-session tracking:**
+
+Agents managing multiple hosts can track sessions:
+```
+pt agent sessions --format json
+```
+Returns:
+```json
+{
+  "sessions": [
+    {"session_id": "abc123", "host": "devbox1", "state": "applied", "created_at": "...", "candidates": 4, "actions_taken": 3},
+    {"session_id": "def456", "host": "devbox2", "state": "planned", "created_at": "...", "candidates": 2, "actions_taken": 0}
+  ]
+}
+```
+
+**Cross-session learning:**
+
+Outcomes from completed sessions feed back into priors:
+- Confirmed kills (process stayed dead, goal achieved) → reinforce pattern
+- False positives (user spared recommended process) → adjust priors
+- Respawn surprises (supervised process came back) → learn supervisor patterns
+
+This happens automatically; agents benefit without explicit action.
+
+**Session handoff:**
+
+For agent-to-human handoff:
+```
+pt agent export --session <id> --profile safe --out handoff.ptb
+pt agent report --session <id> --out handoff.html
+```
+
+The human receives a complete, self-contained artifact with:
+- What the agent found
+- What the agent did (or recommended)
+- Why (evidence ledger, math if requested)
+- What to do next (if anything)
+
+**Session TTL and cleanup:**
+
+```
+pt agent sessions --cleanup --older-than 7d
+```
+Removes old sessions while preserving:
+- Outcome data (for prior learning)
+- Audit log (for compliance)
+
+**Agent workflow patterns:**
+
+1. **One-shot cleanup**: `snapshot → plan → apply → verify` in sequence
+2. **Plan-and-wait**: `snapshot → plan`, return results, wait for user approval, then `apply → verify`
+3. **Continuous monitoring**: `watch → inbox` polling, then `plan → apply → verify` when candidates found
+4. **Fleet sweep**: `fleet plan → fleet apply → fleet report` across multiple hosts
+
+Each pattern uses session continuity to maintain state and avoid redundant work.
 
 ### 3.6 Session Bundles & Rich HTML Reports (Shareable Artifacts)
 Goal: one-command export/share of a complete session, and one-command generation of a premium, richly interactive HTML report.
@@ -1596,7 +2122,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 ### 4.2 Priors and Likelihoods (Conjugate)
 - CPU occupancy from tick deltas: p_{u,C} ~ Beta(alpha_C, beta_C), k_ticks|p_{u,C},C ~ Binomial(n_ticks, p_{u,C}). (Use the Beta-Binomial posterior-predictive for k_ticks; u = k_ticks/n_ticks is a derived occupancy estimate. Posterior: p_{u,C}|data ~ Beta(alpha_C+k_ticks, beta_C+n_ticks-k_ticks).)
   - Modeling note: Binomial independence is an approximation (ticks are temporally correlated). To avoid overconfidence, optionally use an effective tick count n_eff (derived from autocorrelation/dispersion) in place of n_ticks; validate via shadow-mode calibration.
-- Runtime t|C ~ Gamma(α_{t,C}, β_{t,C})
+- Runtime t|C ~ Gamma(α_{t,C}, β_{t,C}) (interpret carefully: “t” is current age conditional on being observed alive; for principled runtime evidence, prefer survival/hazard modeling (section 4.5) and treat age as right-censoring)
 - Orphan o|C ~ Bernoulli(p_{o,C}), p_{o,C} ~ Beta(a_{o,C}, b_{o,C})
 - State flags s|C ~ Categorical(pi_C), pi_C ~ Dirichlet(alpha^{state}_C)
 - Command/CWD g|C ~ Categorical(rho_C), rho_C ~ Dirichlet(alpha^{cmd}_C)
@@ -1626,7 +2152,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
   - -log marginal likelihood is a code length: L_Bayes(x|H) = -log ∫ p(x|θ,H) π(θ|H) dθ
   - Online/prequential form: L_pre(x_{1:T}|H) = Σ_{t=1..T} -log p(x_t | x_{<t}, H)
   - Comparing hypotheses by Bayes factor is comparing compression lengths: log BF_{H1,H0} = L_Bayes(x|H0) - L_Bayes(x|H1)
-  - Practical pt use: emit both “Bayes factor” and “bits of surprise” (code-length gap) in the ledger; this makes model choice and anomaly evidence legible while remaining numerically stable in log-domain.
+  - Practical pt use: emit both “Bayes factor” and a code-length gap (“surprisal”) in the ledger; if you want literal bits, report (ΔL / ln 2).
 
 ### 4.5 Semi-Markov and Competing Hazards
 - hidden semi-Markov states S_t
@@ -1782,7 +2308,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - Mixture SPRT / GLR for composite alternatives with conjugate mixtures
 
 ### 4.31 Conformal Prediction
-- Distribution-free (under exchangeability) prediction intervals for runtime/CPU; use time-blocked / online conformal variants to reduce temporal dependence issues
+- Distribution-free (under exchangeability) prediction intervals for runtime/CPU. For temporal dependence/drift, use blocked or rolling-window conformal; treat coverage as approximate unless additional assumptions are explicitly adopted.
 - Regression-style conformal interval (runtime/CPU):
   - Choose a point predictor ŷ_i and nonconformity score s_i = |y_i - ŷ_i| (or s_i = -log p(y_i|x_i))
   - Let q be the conformal quantile: the ⌈(n+1)(1-α)⌉-th smallest value in {s_i} over a calibration window of size n
@@ -1795,12 +2321,12 @@ C in {useful, useful-but-bad, abandoned, zombie}
   - Predict set: {c : p_c > α}, providing finite-sample marginal coverage under exchangeability
   - Optional (Mondrian / label-conditional): compute p_c using only calibration points with y_i=c to target per-class coverage
 - Time dependence handling:
-  - Use blocked or rolling-window conformal (calibration on recent window), or online conformal with decaying weights to reduce drift sensitivity
+  - Use blocked or rolling-window conformal (calibration on a recent window). For strongly non-exchangeable time series, treat coverage as approximate unless you adopt a conformal method with explicit assumptions (e.g., covariate shift / weighted conformal) and report those assumptions.
   - Report window size and coverage target in the explainability ledger
 
 ### 4.32 FDR Control (Many-Process Safety)
 - Treat “kill-recommended” as multiple hypothesis tests across many PIDs
-- Use local false discovery rate: lfdr_i = P(useful_i | x_i)
+- Use local false discovery rate for the kill action: lfdr_i = P(C_i ∈ Null_kill | x_i), where `Null_kill` is the set of states in which a kill would be considered a false discovery (default `Null_kill = {useful}`; optionally include `useful-but-bad` if your policy treats kill there as unacceptable)
 - Bayesian FDR rule of thumb: sort by lfdr_i (ascending) and take the largest prefix K such that (1/|K|) * Σ_{i∈K} lfdr_i ≤ α
 - If additionally emitting p-values/e-values from Bayes factors/likelihood ratios, apply the corresponding BH/BY (p-values) or e-FDR (e-values) procedure consistently
 - Dependence matters: process hypotheses are not independent (shared PPID tree, shared cgroups/units, shared IO bottlenecks). The default should be conservative under dependence (e.g., Benjamini–Yekutieli) or hierarchical/group FDR (family = process group / systemd unit / container).
@@ -1851,9 +2377,9 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - Provides long-run safety even under repeated scans
 - Simple alpha-investing update (one canonical form):
   - Maintain wealth W_t > 0, choose test level α_t ≤ W_{t-1}
-  - If decision is a “discovery” (kill validated in shadow/feedback): W_t = W_{t-1} - α_t + ω
+  - If decision is a “discovery” (i.e., a kill is selected / null is rejected): W_t = W_{t-1} - α_t + ω
   - Otherwise: W_t = W_{t-1} - α_t
-  - ω sets the reward for correct actions; choose ω to target a long-run FDR bound
+  - ω is the reward for making a discovery (not for being “correct”, which is unobserved at decision time); use shadow-mode and feedback to calibrate priors/models, not to drive the online FDR accounting itself
 - e-process integration:
   - Use e-values as sequential evidence and update wealth with e-FDR control to ensure optional stopping validity
   - Emit current wealth, spend, and reward in the audit ledger so the safety budget is transparent
@@ -2002,7 +2528,7 @@ Goal: integrate pattern library matches (section 3.9) with Bayesian inference.
 - Use belief update from 4.14; enforce safety constraints
 
 ### 5.8 FDR-Gated Kill Set Selection
-- Rank candidate kills by lfdr_i = P(useful_i | x_i) (lower is “safer to kill”)
+- Rank candidate kills by lfdr_i = P(C_i ∈ Null_kill | x_i) (lower is “safer to kill”; `Null_kill` defaults to `{useful}` but is policy-definable)
 - Choose the largest set K such that estimated FDR(K) <= alpha (e.g., estimated FDR(K) = (1/|K|) * Σ_{i∈K} lfdr_i; shadow-mode calibration can tighten/validate this)
 - This prevents “scan many processes and inevitably kill one useful one”
 - Under dependence (shared PPID/cgroups), default to conservative or structured FDR control (BY, group/hierarchical FDR by unit/container/process-group) rather than assuming independence.
@@ -2021,12 +2547,12 @@ Goal: integrate pattern library matches (section 3.9) with Bayesian inference.
 
 ### 5.11 Online FDR Risk Budget (Alpha-Investing)
 - Maintain a global false-kill risk budget across time and across repeated scans
-- Spend budget only on extremely strong posterior odds; replenish with confirmed-correct actions
+- Spend budget only on extremely strong posterior odds; replenish wealth on “discoveries” (selected kills / null rejections) per an online-FDR rule (do not condition wealth updates on correctness, which is unknown at decision time)
 - Canonical update (one valid scheme):
   - Wealth W_0 set by policy (robot mode uses a small initial wealth)
   - For decision i, choose α_i ≤ W_{i-1}
-  - If confirmed-correct: W_i = W_{i-1} - α_i + ω; else W_i = W_{i-1} - α_i
-  - Use ω to target a long-run FDR bound; clamp W_i ≥ 0 to avoid overspending
+  - If a discovery occurs: W_i = W_{i-1} - α_i + ω; else W_i = W_{i-1} - α_i
+  - Use ω to target a long-run FDR bound; clamp W_i ≥ 0 to avoid overspending. Use shadow-mode outcomes/feedback to calibrate priors and gates, not to retroactively “credit” wealth.
 
 ### 5.12 DRO / Worst-Case Expected Loss
 - When model misspecification is detected (via PPC) or drift is high (Wasserstein), switch to worst-case loss estimates
@@ -2042,7 +2568,7 @@ Goal: when the user specifies a resource target (e.g., "free 4GB RAM"), optimize
 #### Goal Specification
 Supported goals:
 - `--goal "free <N> RAM"` - Target memory recovery (MB/GB)
-- `--goal "CPU < <N>%"` - Target CPU utilization
+- `--goal "CPU < <N>%"` - Target total system CPU utilization (percentage of aggregate CPU capacity; derived from system counters, not per-process `ps %cpu`)
 - `--goal "free port <N>"` - Free a specific port
 - `--goal "processes < <N>"` - Reduce total process count
 
@@ -2068,7 +2594,7 @@ This is a variant of the knapsack problem. Use:
 #### Recovery Estimates
 For each candidate, estimate recoverable resources:
 - **Memory**: RSS (or USS if available) freed on kill
-- **CPU**: cores freed = current CPU% / 100
+- **CPU**: cores freed ≈ per-process CPU% / 100 (where 100% ≈ one full core, as in common `ps`/`top` conventions)
 - **Port**: port freed if process holds it
 - **Child resources**: include resources of child processes that would also terminate
 
@@ -2209,9 +2735,9 @@ systemd-supervised process:
   - systemctl mask <unit>      # Prevent auto-restart (temporary disable)
 
 launchd-supervised process:
-  - launchctl stop <label>     # Graceful stop
-  - launchctl unload <plist>   # Remove from supervision
-  - launchctl kickstart -k <label>  # Force restart
+  - launchctl stop <label>     # Graceful stop (often requires a domain target like gui/<uid>/<label>)
+  - launchctl bootout <domain-target> <plist> # Remove from supervision (modern; `unload` is legacy on older macOS)
+  - launchctl kickstart -k <label>  # Force restart (often requires a domain target)
 
 pm2-supervised process:
   - pm2 stop <id|name>         # Graceful stop
@@ -2275,6 +2801,113 @@ To detect "kill-respawn loops", track `(command_pattern, cgroup, supervisor_unit
 ```
 
 Decision engine selects action with minimum expected loss. Destructive actions (especially kill) require explicit confirmation by default via the TUI, but can be executed automatically under an explicit `--robot` flag and only when all safety gates pass (robust Bayes/DRO/FDR/alpha-investing/policy allowlists).
+
+### 6.2 Failure Recovery Trees (Agent Error Handling)
+
+When actions fail, agents need structured guidance on what to try next. The failure recovery tree provides deterministic fallback paths for every action type.
+
+**Action failure categories:**
+- `permission_denied` - Insufficient privileges
+- `process_not_found` - PID doesn't exist (already dead or wrong target)
+- `process_protected` - Kernel/system protection blocked the action
+- `timeout` - Action didn't complete in expected time
+- `supervisor_conflict` - Supervisor restarted the process
+- `resource_conflict` - Resource held by another process
+- `unexpected_error` - Unknown/unanticipated failure
+
+**Recovery tree structure:**
+
+Each recommended action includes a failure recovery tree:
+
+```json
+{
+  "action": "kill",
+  "target": {"pid": 1234, "start_id": "1705312200.1234"},
+  "recovery_tree": {
+    "permission_denied": {
+      "diagnosis": "Current user lacks permission to signal this process",
+      "alternatives": [
+        {"action": "sudo_kill", "requirements": ["sudo_available"], "command": "sudo kill -TERM 1234"},
+        {"action": "escalate_to_user", "message": "Process owned by another user; requires elevated privileges"}
+      ]
+    },
+    "process_not_found": {
+      "diagnosis": "Process no longer exists",
+      "verification": "Check if goal achieved (process may have exited naturally)",
+      "alternatives": [
+        {"action": "verify_goal", "command": "pt agent verify --session <id>"},
+        {"action": "check_respawn", "note": "If supervised, check if replacement spawned"}
+      ]
+    },
+    "timeout": {
+      "diagnosis": "Process did not terminate within grace period",
+      "alternatives": [
+        {"action": "sigkill", "command": "kill -9 1234", "note": "Escalate to SIGKILL"},
+        {"action": "investigate_d_state", "condition": "if state == D", "note": "Process may be in uninterruptible sleep; check wchan"}
+      ]
+    },
+    "supervisor_conflict": {
+      "diagnosis": "Process was killed but immediately respawned by supervisor",
+      "alternatives": [
+        {"action": "stop_supervisor", "command": "systemctl stop myapp.service"},
+        {"action": "mask_and_kill", "command": "systemctl mask myapp.service && systemctl stop myapp.service"}
+      ]
+    }
+  }
+}
+```
+
+**Agent workflow with failure recovery:**
+
+```
+1. Attempt primary action
+2. If success: verify outcome, report success
+3. If failure:
+   a. Classify failure type
+   b. Look up recovery tree for this (action, failure_type) pair
+   c. Check if any alternative has met requirements
+   d. If yes: attempt first viable alternative
+   e. If no alternatives viable: report failure with diagnosis
+4. Limit recovery attempts (default: 3) to prevent infinite loops
+5. Log all attempts and outcomes for session audit
+```
+
+**Recovery hints in `pt agent apply` output:**
+
+```json
+{
+  "action_results": [
+    {
+      "target": {"pid": 1234},
+      "action": "kill",
+      "result": "failed",
+      "failure_type": "supervisor_conflict",
+      "attempts": [
+        {"action": "kill", "result": "process_respawned", "time_ms": 150},
+        {"action": "kill", "result": "process_respawned", "time_ms": 145}
+      ],
+      "diagnosis": "Process is supervised by systemd (myapp.service) with Restart=always",
+      "recovery_hint": {
+        "recommended_action": "systemctl stop myapp.service",
+        "explanation": "Stop the supervisor to prevent respawn, then process will stay dead",
+        "reversibility": "Service can be restarted with: systemctl start myapp.service"
+      },
+      "agent_next_step": "Run suggested supervisor command or report to user for manual intervention"
+    }
+  ]
+}
+```
+
+**Common recovery patterns for agents:**
+
+| Failure | Primary Recovery | Fallback |
+|---------|------------------|----------|
+| Permission denied on kill | sudo kill | Escalate to user |
+| Process respawns after kill | Stop supervisor | Mask unit + stop |
+| SIGTERM ignored (timeout) | SIGKILL | Investigate D-state |
+| D-state process | Wait + report | Check IO device |
+| Cgroup operation fails | Check cgroup v2 | Fall back to renice |
+| Docker container won't stop | docker kill | docker rm -f |
 
 ---
 
@@ -2365,7 +2998,7 @@ Requirement: at any time, the user can toggle a “galaxy-brain” view (keybind
       - e-BH rule: choose largest k with (1/k) * Σ_{i=1..k} (1 / e_(i)) ≤ α
       - Show current k, α, and whether the PID is inside the accepted set
     - **Alpha-investing** (online budget):
-      - Wealth update: W_i = W_{i-1} - α_i + ω (if confirmed-correct), else W_i = W_{i-1} - α_i
+      - Wealth update: W_i = W_{i-1} - α_i + ω (if discovery), else W_i = W_{i-1} - α_i
       - Show W_{i-1}, α_i spend, ω reward, and resulting W_i
     - **VOI**:
       - VOI = E[loss_now - loss_after_measurement] - cost
@@ -2479,7 +3112,7 @@ Daemonized-package note: some packages (e.g., `auditd`, `pcp`) may start service
 
 Linux package managers:
 - Debian/Ubuntu (apt):
-  - sysstat (pidstat/iostat/mpstat/vmstat/sar)
+  - sysstat (pidstat/iostat/mpstat/sar) and procps (vmstat)
   - linux-tools-common + linux-tools-$(uname -r) (perf)
   - bpftrace + bcc + bpftool (eBPF)
   - iotop, nethogs, iftop, lsof
@@ -2490,7 +3123,7 @@ Linux package managers:
   - conntrack-tools, cgroup-tools
   - acct, auditd, pcp
   - gdb, elfutils (eu-stack), binutils
-  - python3-pip + pipx (py-spy), openjdk (async-profiler)
+	  - python3-pip + pipx (py-spy), openjdk (JVM), async-profiler (separate tool; use distro package if available or pinned upstream release)
   - osquery (if available), intel-pcm (pcm) (if available)
 - Fedora/RHEL (dnf):
   - sysstat, perf, bpftrace, bcc, bpftool, iotop, nethogs, iftop, lsof
@@ -2499,7 +3132,7 @@ Linux package managers:
   - strace, ltrace, ethtool, iproute, conntrack-tools, cgroup-tools
   - psacct, audit, pcp
   - gdb, elfutils, binutils
-  - python3-pip + pipx (py-spy), java-latest-openjdk (async-profiler)
+	  - python3-pip + pipx (py-spy), java-latest-openjdk (JVM), async-profiler (separate tool; use distro package if available or pinned upstream release)
   - osquery (if available), intel-pcm (if available)
 - Arch (pacman):
   - sysstat, perf, bpftrace, bcc, bpftool, iotop, nethogs, iftop, lsof
@@ -2508,7 +3141,7 @@ Linux package managers:
   - strace, ltrace, ethtool, iproute2, conntrack-tools, cgroup-tools
   - acct, audit, pcp
   - gdb, elfutils, binutils
-  - python-pipx (py-spy), jdk-openjdk (async-profiler)
+	  - python-pipx (py-spy), jdk-openjdk (JVM), async-profiler (separate tool; use distro package if available or pinned upstream release)
   - osquery (if available), intel-pcm (if available)
 - Alpine (apk):
   - sysstat, perf, bpftrace, iotop, nethogs, iftop, lsof
@@ -2517,7 +3150,7 @@ Linux package managers:
   - conntrack-tools, cgroup-tools
   - acct (if available), audit (if available), pcp (if available)
   - gdb, binutils, elfutils (if available)
-  - py3-pip + pipx (py-spy), openjdk (async-profiler) (if available)
+	  - py3-pip + pipx (py-spy), openjdk (JVM) (if available), async-profiler (separate tool; use pinned upstream release when packages are unavailable)
   - osquery (if available), intel-pcm (if available)
 
 macOS (Homebrew):
@@ -2531,7 +3164,7 @@ macOS (Homebrew):
 Install workflow:
 - Detect OS + package manager.
 - Attempt full install; if any package fails, continue installing the rest.
-- Prefer non-interactive installs (no prompts) and assume sudo/admin is available for maximal instrumentation; do not trade away power/functionality to accommodate no-sudo environments.
+- Prefer non-interactive installs (no prompts). Attempt elevation when available for maximal instrumentation, but do not require it: no-sudo environments are common (containers, CI, locked-down hosts), so always degrade gracefully and keep the core inference usable.
 - Full-auto rule: never hang on a sudo password prompt. Use non-interactive `sudo -n` (or a dedicated “install” step) and, if elevation is unavailable, record missing capabilities and continue with degraded collection.
 - Record capabilities in a local cache (what is available vs missing).
 - Prefer richer signals when available (eBPF/perf), but never fail if missing.
@@ -2541,8 +3174,8 @@ Capability matrix (signal -> tool -> OS support -> fallback):
 - syscalls/IO events: bpftrace/bcc (Linux), dtruss (macOS if permitted) -> fallback: strace
 - CPU cycles/cache/branch: perf (Linux), powermetrics (macOS) -> fallback: sample
 - per-PID IO bandwidth: iotop (Linux), fs_usage (macOS) -> fallback: Linux: /proc/PID/io; macOS: none (fs_usage is the primary)
-- per-PID network: nethogs/iftop (Linux), nettop (macOS) -> fallback: Linux: ss + lsof; macOS: lsof -i + netstat (coarse)
-- run-queue + CPU load: mpstat/vmstat/sar (Linux), powermetrics (macOS) -> fallback: uptime/loadavg
+- per-PID network: nethogs (Linux), nettop (macOS) -> fallback: Linux: ss + lsof; macOS: lsof -i + netstat (coarse). (iftop is useful but is per-interface/connection, not per-PID)
+- run-queue + CPU load: mpstat/sar (sysstat) and vmstat (procps) (Linux), powermetrics (macOS) -> fallback: uptime/loadavg
 - FD churn + sockets: lsof (Linux/macOS) -> fallback: Linux: /proc/PID/fd; macOS: lsof -p
 - scheduler latency: bpftrace/bcc (Linux) -> fallback: perf sched (Linux) or none
 - PSI stall pressure: /proc/pressure/* (Linux) -> fallback: none
