@@ -586,6 +586,14 @@ mod signature_integration_tests {
         env.insert("VSCODE_PID".to_string(), "123".to_string());
         assert!(!environ_db.find_matches(&env).is_empty());
 
+        let mut tmux_env = HashMap::new();
+        tmux_env.insert("TMUX".to_string(), "/tmp/tmux-1000/default,123,0".to_string());
+        assert!(!environ_db.find_matches(&tmux_env).is_empty());
+
+        let mut screen_env = HashMap::new();
+        screen_env.insert("STY".to_string(), "12345.pts-0.hostname".to_string());
+        assert!(!environ_db.find_matches(&screen_env).is_empty());
+
         assert!(!ipc_db.find_matches("/tmp/vscode-test").is_empty());
     }
 }
@@ -625,7 +633,7 @@ mod combined_detection_tests {
 
 #[cfg(test)]
 mod terminal_multiplexer_integration_tests {
-    use super::super::{
+    use crate::supervision::{
         detect_environ_supervision, detect_supervision, read_environ, SupervisorCategory,
     };
     use crate::test_utils::{ProcessHarness, TestTimer};
@@ -648,7 +656,7 @@ mod terminal_multiplexer_integration_tests {
         // Wait for exec to complete and environment to update
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        let env = match read_environ(proc.pid()) {
+        let env: std::collections::HashMap<String, String> = match read_environ(proc.pid()) {
             Ok(env) if env.is_empty() => return,
             Ok(env) => env,
             Err(_) => return,
@@ -684,7 +692,7 @@ mod terminal_multiplexer_integration_tests {
         // Wait for exec to complete and environment to update
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        let env = match read_environ(proc.pid()) {
+        let env: std::collections::HashMap<String, String> = match read_environ(proc.pid()) {
             Ok(env) if env.is_empty() => return,
             Ok(env) => env,
             Err(_) => return,
