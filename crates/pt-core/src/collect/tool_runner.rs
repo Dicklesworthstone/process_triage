@@ -903,7 +903,7 @@ mod tests {
 
         assert!(result.is_ok(), "result: {:?}", result);
         let output = result.unwrap();
-        assert!(output.timed_out);
+        assert!(output.timed_out, "Expected timed_out=true, got: {:?}", output);
         // Process should have been killed
         assert!(output.duration < Duration::from_secs(2));
     }

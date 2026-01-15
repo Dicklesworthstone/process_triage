@@ -5,14 +5,16 @@
 //! - Configuration loading and validation
 //! - CLI utilities and helpers
 //! - Process collection and scanning
+//! - Capability detection and caching
 //!
 //! The binary entry point is in `main.rs`.
 
+pub mod action;
+pub mod capabilities;
 pub mod cli;
 pub mod collect;
 pub mod config;
 pub mod decision;
-pub mod action;
 pub mod exit_codes;
 pub mod inference;
 pub mod logging;
