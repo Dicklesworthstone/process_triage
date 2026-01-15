@@ -11,7 +11,9 @@
 pub mod cli;
 pub mod collect;
 pub mod config;
+pub mod decision;
 pub mod exit_codes;
+pub mod inference;
 pub mod logging;
 
 // Re-export test utilities for integration tests
