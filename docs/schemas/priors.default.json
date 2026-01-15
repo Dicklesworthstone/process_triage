@@ -1,0 +1,336 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Default Bayesian priors for Process Triage inference engine. These priors encode domain knowledge about process behavior patterns and are designed for typical development machines.",
+  "host_profile": "default",
+
+  "classes": {
+    "useful": {
+      "prior_prob": 0.70,
+      "cpu_beta": {
+        "alpha": 2.0,
+        "beta": 5.0,
+        "_comment": "Useful processes typically have moderate CPU usage. Mean = 0.29"
+      },
+      "runtime_gamma": {
+        "shape": 2.0,
+        "rate": 0.0001,
+        "_comment": "Long-lived is normal for useful processes. Mean = 20000 seconds (~5.5 hours)"
+      },
+      "orphan_beta": {
+        "alpha": 1.0,
+        "beta": 20.0,
+        "_comment": "Useful processes are rarely orphaned. P(orphan) ~ 0.05"
+      },
+      "tty_beta": {
+        "alpha": 5.0,
+        "beta": 3.0,
+        "_comment": "Useful processes often have TTY attachment. P(TTY) ~ 0.625"
+      },
+      "net_beta": {
+        "alpha": 3.0,
+        "beta": 5.0,
+        "_comment": "Moderate network activity expected. P(net) ~ 0.375"
+      },
+      "io_active_beta": {
+        "alpha": 5.0,
+        "beta": 3.0,
+        "_comment": "Useful processes typically have I/O activity. P(IO) ~ 0.625"
+      },
+      "hazard_gamma": {
+        "shape": 1.0,
+        "rate": 100000.0,
+        "_comment": "Very low base hazard rate. Mean hazard = 0.00001/sec"
+      }
+    },
+
+    "useful_bad": {
+      "prior_prob": 0.10,
+      "cpu_beta": {
+        "alpha": 8.0,
+        "beta": 2.0,
+        "_comment": "Useful-but-bad processes often have high CPU. Mean = 0.80"
+      },
+      "runtime_gamma": {
+        "shape": 3.0,
+        "rate": 0.0002,
+        "_comment": "Moderate runtime expected. Mean = 15000 seconds (~4 hours)"
+      },
+      "orphan_beta": {
+        "alpha": 2.0,
+        "beta": 8.0,
+        "_comment": "Somewhat more likely to be orphaned. P(orphan) ~ 0.20"
+      },
+      "tty_beta": {
+        "alpha": 3.0,
+        "beta": 5.0,
+        "_comment": "Less likely to have TTY. P(TTY) ~ 0.375"
+      },
+      "net_beta": {
+        "alpha": 4.0,
+        "beta": 4.0,
+        "_comment": "Mixed network activity. P(net) ~ 0.50"
+      },
+      "io_active_beta": {
+        "alpha": 6.0,
+        "beta": 2.0,
+        "_comment": "Often have high I/O (resource hog). P(IO) ~ 0.75"
+      },
+      "hazard_gamma": {
+        "shape": 2.0,
+        "rate": 50000.0,
+        "_comment": "Moderate hazard rate. Mean = 0.00004/sec"
+      }
+    },
+
+    "abandoned": {
+      "prior_prob": 0.15,
+      "cpu_beta": {
+        "alpha": 1.0,
+        "beta": 10.0,
+        "_comment": "Abandoned processes typically have very low CPU. Mean = 0.09"
+      },
+      "runtime_gamma": {
+        "shape": 4.0,
+        "rate": 0.00005,
+        "_comment": "Often long-running (been abandoned for a while). Mean = 80000 seconds (~22 hours)"
+      },
+      "orphan_beta": {
+        "alpha": 8.0,
+        "beta": 2.0,
+        "_comment": "Abandoned processes are very often orphaned. P(orphan) ~ 0.80"
+      },
+      "tty_beta": {
+        "alpha": 1.0,
+        "beta": 10.0,
+        "_comment": "Abandoned processes rarely have TTY. P(TTY) ~ 0.09"
+      },
+      "net_beta": {
+        "alpha": 1.0,
+        "beta": 8.0,
+        "_comment": "Little network activity. P(net) ~ 0.11"
+      },
+      "io_active_beta": {
+        "alpha": 1.0,
+        "beta": 12.0,
+        "_comment": "Minimal I/O activity (stalled/stuck). P(IO) ~ 0.08"
+      },
+      "hazard_gamma": {
+        "shape": 1.5,
+        "rate": 10000.0,
+        "_comment": "Higher hazard (should have finished by now). Mean = 0.00015/sec"
+      }
+    },
+
+    "zombie": {
+      "prior_prob": 0.05,
+      "cpu_beta": {
+        "alpha": 1.0,
+        "beta": 100.0,
+        "_comment": "Zombies have near-zero CPU (defunct). Mean ~ 0.01"
+      },
+      "runtime_gamma": {
+        "shape": 2.0,
+        "rate": 0.0001,
+        "_comment": "Variable runtime. Mean = 20000 seconds"
+      },
+      "orphan_beta": {
+        "alpha": 15.0,
+        "beta": 1.0,
+        "_comment": "Zombies are almost always orphaned/reparented. P(orphan) ~ 0.94"
+      },
+      "tty_beta": {
+        "alpha": 1.0,
+        "beta": 50.0,
+        "_comment": "Zombies never have TTY. P(TTY) ~ 0.02"
+      },
+      "net_beta": {
+        "alpha": 1.0,
+        "beta": 100.0,
+        "_comment": "Zombies have no network activity. P(net) ~ 0.01"
+      },
+      "io_active_beta": {
+        "alpha": 1.0,
+        "beta": 100.0,
+        "_comment": "Zombies have no I/O. P(IO) ~ 0.01"
+      },
+      "hazard_gamma": {
+        "shape": 0.5,
+        "rate": 1000.0,
+        "_comment": "Should be reaped quickly but often aren't. Mean = 0.0005/sec"
+      }
+    }
+  },
+
+  "hazard_regimes": [
+    {
+      "name": "tty_lost",
+      "description": "Process lost its controlling TTY (terminal closed, SSH disconnected)",
+      "gamma": {
+        "shape": 2.0,
+        "rate": 3600.0,
+        "_comment": "Elevated hazard after TTY loss. Mean = 0.000556/sec (~1.5 events/hour)"
+      },
+      "trigger_conditions": ["tty == null", "tty != tty_at_start"]
+    },
+    {
+      "name": "ppid_orphaned",
+      "description": "Process was reparented to init (PPID=1) indicating parent died",
+      "gamma": {
+        "shape": 3.0,
+        "rate": 7200.0,
+        "_comment": "Strong abandonment signal. Mean = 0.000417/sec"
+      },
+      "trigger_conditions": ["ppid == 1", "ppid != ppid_at_start"]
+    },
+    {
+      "name": "io_flatline",
+      "description": "Process has had zero I/O activity for extended period",
+      "gamma": {
+        "shape": 1.5,
+        "rate": 1800.0,
+        "_comment": "Moderate hazard increase. Mean = 0.000833/sec"
+      },
+      "trigger_conditions": ["io_read_bytes_delta == 0", "io_write_bytes_delta == 0", "duration > 300"]
+    },
+    {
+      "name": "cpu_spinloop",
+      "description": "Process showing high CPU with no progress (suspected infinite loop)",
+      "gamma": {
+        "shape": 2.5,
+        "rate": 1200.0,
+        "_comment": "High CPU + no IO = likely stuck. Mean = 0.00208/sec"
+      },
+      "trigger_conditions": ["cpu_percent > 90", "io_activity == false", "duration > 60"]
+    },
+    {
+      "name": "memory_leak_trajectory",
+      "description": "Process memory growing without bounds",
+      "gamma": {
+        "shape": 2.0,
+        "rate": 2400.0,
+        "_comment": "Memory leak pattern. Mean = 0.000833/sec"
+      },
+      "trigger_conditions": ["rss_trend == 'increasing'", "rss_growth_rate > threshold"]
+    }
+  ],
+
+  "semi_markov": {
+    "useful_duration": {
+      "shape": 2.0,
+      "rate": 0.0001,
+      "_comment": "Expected time in 'useful' state: ~5.5 hours mean"
+    },
+    "useful_bad_duration": {
+      "shape": 1.5,
+      "rate": 0.0003,
+      "_comment": "Expected time in 'useful_bad' state: ~1.4 hours mean"
+    },
+    "abandoned_duration": {
+      "shape": 1.0,
+      "rate": 0.00005,
+      "_comment": "Abandoned processes can persist long: ~5.5 hours mean"
+    },
+    "zombie_duration": {
+      "shape": 0.5,
+      "rate": 0.001,
+      "_comment": "Zombies should be reaped quickly: ~8 minutes mean"
+    }
+  },
+
+  "change_point": {
+    "p_before": {
+      "alpha": 5.0,
+      "beta": 5.0,
+      "_comment": "Symmetric prior for activity rate before change: mean = 0.5"
+    },
+    "p_after": {
+      "alpha": 2.0,
+      "beta": 8.0,
+      "_comment": "After change, expect lower activity: mean = 0.2"
+    },
+    "tau_geometric_p": 0.001,
+    "_comment": "Prior on change-point location: expected run length ~1000 samples"
+  },
+
+  "causal_interventions": {
+    "pause": {
+      "useful": {"alpha": 2.0, "beta": 8.0, "_comment": "Pause rarely helps useful: P(recover) ~ 0.2"},
+      "useful_bad": {"alpha": 5.0, "beta": 5.0, "_comment": "Pause sometimes helps: P(recover) ~ 0.5"},
+      "abandoned": {"alpha": 1.0, "beta": 9.0, "_comment": "Pause won't help abandoned: P(recover) ~ 0.1"},
+      "zombie": {"alpha": 1.0, "beta": 20.0, "_comment": "Pause doesn't help zombies: P(recover) ~ 0.05"}
+    },
+    "throttle": {
+      "useful": {"alpha": 1.0, "beta": 9.0, "_comment": "Throttle hurts useful: P(recover) ~ 0.1"},
+      "useful_bad": {"alpha": 6.0, "beta": 4.0, "_comment": "Throttle often helps bad: P(recover) ~ 0.6"},
+      "abandoned": {"alpha": 1.0, "beta": 10.0, "_comment": "Throttle won't help abandoned: P(recover) ~ 0.09"},
+      "zombie": {"alpha": 1.0, "beta": 20.0, "_comment": "Throttle doesn't help zombies: P(recover) ~ 0.05"}
+    },
+    "kill": {
+      "useful": {"alpha": 1.0, "beta": 15.0, "_comment": "Kill is wrong for useful: P(recover) ~ 0.06"},
+      "useful_bad": {"alpha": 3.0, "beta": 7.0, "_comment": "Kill sometimes appropriate: P(recover) ~ 0.3"},
+      "abandoned": {"alpha": 9.0, "beta": 1.0, "_comment": "Kill is right for abandoned: P(recover) ~ 0.9"},
+      "zombie": {"alpha": 8.0, "beta": 2.0, "_comment": "Kill is right for zombie: P(recover) ~ 0.8"}
+    },
+    "restart": {
+      "useful": {"alpha": 7.0, "beta": 3.0, "_comment": "Restart helps useful: P(recover) ~ 0.7"},
+      "useful_bad": {"alpha": 6.0, "beta": 4.0, "_comment": "Restart helps bad: P(recover) ~ 0.6"},
+      "abandoned": {"alpha": 3.0, "beta": 7.0, "_comment": "Restart questionable for abandoned: P(recover) ~ 0.3"},
+      "zombie": {"alpha": 2.0, "beta": 8.0, "_comment": "Restart rarely helps zombies: P(recover) ~ 0.2"}
+    }
+  },
+
+  "command_categories": {
+    "category_names": ["test", "devserver", "agent", "build", "daemon", "shell", "ide", "database", "webserver", "unknown"],
+    "_comment": "Dirichlet alpha vectors: higher values = more expected for that class",
+    "useful": {"alpha": [1.0, 3.0, 2.0, 2.0, 5.0, 3.0, 4.0, 5.0, 5.0, 2.0]},
+    "useful_bad": {"alpha": [3.0, 4.0, 2.0, 4.0, 2.0, 2.0, 3.0, 2.0, 2.0, 3.0]},
+    "abandoned": {"alpha": [8.0, 6.0, 5.0, 3.0, 1.0, 4.0, 3.0, 1.0, 1.0, 5.0]},
+    "zombie": {"alpha": [2.0, 1.0, 1.0, 2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 3.0]}
+  },
+
+  "state_flags": {
+    "flag_names": ["R", "S", "D", "Z", "T"],
+    "_comment": "R=running, S=sleeping, D=uninterruptible, Z=zombie, T=stopped",
+    "useful": {"alpha": [3.0, 10.0, 1.0, 0.1, 1.0]},
+    "useful_bad": {"alpha": [5.0, 5.0, 2.0, 0.1, 1.0]},
+    "abandoned": {"alpha": [1.0, 8.0, 2.0, 1.0, 3.0]},
+    "zombie": {"alpha": [0.1, 0.1, 0.1, 10.0, 0.1]}
+  },
+
+  "hierarchical": {
+    "shrinkage_enabled": true,
+    "shrinkage_strength": 0.3,
+    "_comment": "Apply 30% shrinkage toward global priors for category-specific estimates"
+  },
+
+  "robust_bayes": {
+    "class_prior_bounds": {
+      "useful": {"lower": 0.50, "upper": 0.85},
+      "useful_bad": {"lower": 0.05, "upper": 0.20},
+      "abandoned": {"lower": 0.05, "upper": 0.30},
+      "zombie": {"lower": 0.01, "upper": 0.15}
+    },
+    "safe_bayes_eta": 1.0,
+    "auto_eta_enabled": false,
+    "_comment": "Imprecise prior bounds for robust/credal decision making"
+  },
+
+  "error_rate": {
+    "false_kill": {
+      "alpha": 1.0,
+      "beta": 99.0,
+      "_comment": "Prior belief: false-kill rate is low (~1%). Beta(1,99) mean = 0.01"
+    },
+    "false_spare": {
+      "alpha": 5.0,
+      "beta": 95.0,
+      "_comment": "Prior belief: false-spare rate is moderate (~5%). Beta(5,95) mean = 0.05"
+    }
+  },
+
+  "bocpd": {
+    "hazard_lambda": 0.001,
+    "min_run_length": 10,
+    "_comment": "Expected run length = 1000 samples before change; require 10+ samples for detection"
+  }
+}
