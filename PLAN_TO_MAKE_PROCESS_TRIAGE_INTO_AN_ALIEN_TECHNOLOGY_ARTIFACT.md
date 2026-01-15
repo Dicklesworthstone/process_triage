@@ -38,22 +38,21 @@ A) Basic closed-form Bayesian model (non-ML)
 - Class set: C in {useful, useful-but-bad, abandoned, zombie}
 - Bayes rule: P(C|x) proportional to P(C) * P(x|C)
 - Features: CPU usage u, runtime t, PPID, command, CWD, state flags, child count, TTY, I/O wait, CPU trend
-- Likelihoods (keep the runtime “decision core” conjugate; allow continuous BetaPDF as a convenient approximation when needed):
+- Likelihoods (keep the runtime “decision core” conjugate and log-domain numerically stable):
   - CPU occupancy from tick deltas: k_ticks|C ~ Binomial(n_ticks, p_{u,C}), p_{u,C} ~ Beta(alpha_C, beta_C)
     - k_ticks = Δticks over window Δt (from /proc/PID/stat)
-    - n_ticks = HZ * Δt * N_EFF_CORES (or HZ * Δt * min(N_EFF_CORES, threads))
-    - u = k_ticks / n_ticks (continuous approximation: u|C ~ Beta(alpha_C, beta_C))
+    - n_ticks = round(HZ * Δt * min(N_eff_cores, threads))  (where N_eff_cores accounts for affinity/cpuset/quota when available)
+    - u = k_ticks / n_ticks (derived occupancy estimate in [0,1]); posterior for p_{u,C} is Beta(alpha_C+k_ticks, beta_C+n_ticks-k_ticks)
   - t|C ~ Gamma(k_C, theta_C)
-  - orphan o|C ~ Bernoulli(p_{o,C}), p_{o,C} ~ Beta(a_C, b_C)
+  - orphan o|C ~ Bernoulli(p_{o,C}), p_{o,C} ~ Beta(a_{o,C}, b_{o,C})
   - state flags s|C ~ Categorical(pi_C), pi_C ~ Dirichlet(alpha_C)
   - command/CWD categories g|C ~ Categorical(rho_C), rho_C ~ Dirichlet(alpha_C)
 - Posterior (Naive Bayes):
   P(C|x) proportional to P(C) * product_j P(x_j|C)
 - Log-posterior formula:
   log P(C|x) = log P(C) + log BetaBinomial(k_ticks; n_ticks, alpha_C, beta_C) + log GammaPDF(t; k_C, theta_C)
-                + o log p_{o,C} + (1-o) log(1-p_{o,C}) + log rho_{C,g} + ...
-  (where u = k_ticks/n_ticks; for large n_ticks you can use the continuous approximation log BetaPDF(u; alpha_C, beta_C))
-  (treat the Bernoulli/categorical terms as shorthand for the corresponding conjugate posterior-predictive log contributions from Beta-Bernoulli and Dirichlet-Multinomial)
+                + log BetaBernoulliPred(o; a_{o,C}, b_{o,C}) + log rho_{C,g} + ...
+  (categorical terms use Dirichlet-Multinomial posterior-predictives; decision core uses log-domain Beta/Gamma/Dirichlet special functions, not heuristic approximations)
 
 B) Decision rule via expected loss (Bayesian risk)
 - a* = argmin_a sum_C L(a,C) P(C|x)
@@ -345,6 +344,7 @@ All of these are integrated in the system design below.
   - Telemetry analytics: `pt-core duck` (run standard DuckDB reports/queries)
   - Sharing & reporting: `pt-core bundle`, `pt-core report` (single-file HTML)
   - Always-on mode: `pt-core daemon` (dormant monitor + escalation)
+  - Inbox: `pt-core inbox` (list/open daemon-created sessions); wrapper `pt inbox`
 - UX rule: `pt-core` exposes power, but `pt` must feel like one guided “run” by default (section 7.0). The verbose internal verbs should be discoverable for experts, but not required to use the tool.
 - Modes:
   - Default: full-auto scan -> infer -> decide -> TUI approval with recommended actions pre-toggled.
@@ -416,8 +416,9 @@ All of these are integrated in the system design below.
 ### 3.2 Feature Layer
 - Feature computation is deterministic and provenance-aware: each derived quantity records its input sources and time window so it can be recomputed and debugged from telemetry.
 - Δt: scan window duration (seconds), HZ: scheduler ticks per second
+- N_eff_cores: effective core capacity available to the process (honor affinity/cpuset/quota when available; else total logical CPUs)
 - k_ticks: CPU tick delta over Δt (utime+stime delta)
-- n_ticks: tick budget over Δt (HZ * Δt * N_EFF_CORES, or HZ * Δt * min(N_EFF_CORES, threads))
+- n_ticks: integer tick budget over Δt: n_ticks = round(HZ * Δt * min(N_eff_cores, threads))
 - u: CPU usage normalized to effective available capacity in [0,1]: u = k_ticks / n_ticks
 - u_cores: estimated cores used (can exceed 1): u_cores = k_ticks / (HZ * Δt)
 - n_samp: number of quick-scan samples in the window (used for trend/change-point features)
@@ -430,7 +431,7 @@ All of these are integrated in the system design below.
 - uid: owner uid (root vs user)
 - pgid/sid: process group and session ID (job-control + “kill the whole tree” safety)
 - cgroup/container: cgroup path, unit/container attribution (when available)
-- start_id: stable process start identifier (e.g., Linux `/proc/PID/stat` starttime ticks); used to detect PID reuse and to revalidate before applying actions.
+- start_id: stable process start identifier (Linux: `/proc/PID/stat` starttime ticks since boot; macOS: process start time from proc info); used to detect PID reuse and to revalidate before applying actions. When persisting, pair with a boot identifier so “starttime ticks” remain interpretable across reboots.
 - io delta: active/idle
 - cpu delta: progressing/stalled
 - net activity: connected/no_connections
@@ -580,7 +581,7 @@ Goal: keep pt running 24/7 with minimal overhead, automatically detecting when a
 
 Two operating modes:
 - Active mode: full collection + inference + plan generation (resource-intensive; on-demand).
-- Dormant mode (`ptd`): lightweight monitoring loop with strict overhead budget.
+- Dormant mode (`ptd`, implemented as `pt-core daemon`): lightweight monitoring loop with strict overhead budget.
 
 Dormant mode mechanics:
 - Collect minimal signals at low frequency (loadavg, PSI, memory pressure, process count, top-N CPU by PID).
@@ -610,9 +611,9 @@ Design constraint: all posterior/odds/expected-loss updates used for decisions m
 C in {useful, useful-but-bad, abandoned, zombie}
 
 ### 4.2 Priors and Likelihoods (Conjugate)
-- CPU occupancy from tick deltas: k_ticks|C ~ Binomial(n_ticks, p_{u,C}), p_{u,C} ~ Beta(alpha_C, beta_C); define u = k_ticks/n_ticks (continuous approximation: u|C ~ Beta(alpha_C, beta_C))
+- CPU occupancy from tick deltas: p_{u,C} ~ Beta(alpha_C, beta_C), k_ticks|p_{u,C},C ~ Binomial(n_ticks, p_{u,C}). (Use the Beta-Binomial posterior-predictive for k_ticks; u = k_ticks/n_ticks is a derived occupancy estimate. Posterior: p_{u,C}|data ~ Beta(alpha_C+k_ticks, beta_C+n_ticks-k_ticks).)
 - Runtime t|C ~ Gamma(k_C, theta_C)
-- Orphan o|C ~ Bernoulli(p_{o,C}), p_{o,C} ~ Beta(a_C, b_C)
+- Orphan o|C ~ Bernoulli(p_{o,C}), p_{o,C} ~ Beta(a_{o,C}, b_{o,C})
 - State flags s|C ~ Categorical(pi_C), pi_C ~ Dirichlet(alpha_C)
 - Command/CWD g|C ~ Categorical(rho_C), rho_C ~ Dirichlet(alpha_C)
 - TTY activity y|C ~ Bernoulli(q_C), q_C ~ Beta(a_{tty,C}, b_{tty,C})
@@ -622,11 +623,11 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - P(C|x) proportional to P(C) * product_j P(x_j|C)
 - log posterior formula:
   log P(C|x) = log P(C)
-               + log BetaBinomial(k_ticks; n_ticks, alpha_C, beta_C)  (≈ log BetaPDF(u; alpha_C, beta_C), u=k_ticks/n_ticks)
+               + log BetaBinomial(k_ticks; n_ticks, alpha_C, beta_C)
                + log GammaPDF(t; k_C, theta_C)
-               + o log p_{o,C} + (1-o) log(1-p_{o,C})
+               + log BetaBernoulliPred(o; a_{o,C}, b_{o,C})
                + log rho_{C,g} + ...
-  (treat the Bernoulli/categorical terms as shorthand for the corresponding conjugate posterior-predictive log contributions from Beta-Bernoulli and Dirichlet-Multinomial)
+  where BetaBernoulliPred(o; a,b) = a/(a+b) if o=1 else b/(a+b), and categorical terms use Dirichlet-Multinomial posterior-predictives
 - Marginalize nuisance parameters with conjugate priors:
   - Beta-Binomial for CPU occupancy
   - Beta-Bernoulli for orphan, TTY, and net activity
@@ -661,9 +662,9 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - Maintains posterior over change points for regime shifts
 
 ### 4.8 Information-Theoretic Abnormality
-- compute D_KL(p_hat || p_useful)
-- Chernoff bound (tail under “useful”): P_useful(observe deviation) <= exp(-t * I(p_hat))
-- large deviation rate functions for rare event detection
+- compute D_KL(p_hat || p_useful) for event-rate / Bernoulli-style features
+- large-deviation bound intuition: under the “useful” model, deviations with empirical rate p_hat have probability mass roughly ≲ exp(-n * D_KL(p_hat || p_useful)), where n is the effective sample count (window samples, events, or tick budget)
+- use this as an interpretable “surprisal” evidence term (not a replacement for the conjugate core; it feeds it)
 
 ### 4.8b Large Deviations / Rate Functions
 - Cramer/Chernoff bounds on event-rate deviations
@@ -747,7 +748,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 
 ### 4.24 Optimal Transport Shift Detection
 - Use 1D Wasserstein distance between observed and baseline distributions
-- Closed-form for univariate distributions
+- In 1D, W1 is exactly computable via quantile functions (fast on empirical samples); use it as a drift score feeding conservative gates (PPC/DRO)
 
 ### 4.25 Martingale Sequential Bounds
 - Azuma/Freedman bounds for sustained anomaly evidence over time
@@ -768,7 +769,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - Mixture SPRT / GLR for composite alternatives with conjugate mixtures
 
 ### 4.31 Conformal Prediction
-- Distribution-free prediction intervals for runtime/CPU
+- Distribution-free (under exchangeability) prediction intervals for runtime/CPU; use time-blocked / online conformal variants to reduce temporal dependence issues
 
 ### 4.32 FDR Control (Many-Process Safety)
 - Treat “kill-recommended” as multiple hypothesis tests across many PIDs
