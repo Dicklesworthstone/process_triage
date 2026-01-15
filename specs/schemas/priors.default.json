@@ -1,0 +1,206 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Default Bayesian priors for Process Triage inference engine. These priors encode reasonable beliefs for developer workstation process classification.",
+  "created_at": "2026-01-15T13:50:00Z",
+  "classes": {
+    "useful": {
+      "prior_prob": 0.70,
+      "cpu_beta": { "alpha": 5.0, "beta": 3.0 },
+      "runtime_gamma": { "shape": 2.0, "rate": 0.0001 },
+      "orphan_beta": { "alpha": 1.0, "beta": 20.0 },
+      "tty_beta": { "alpha": 8.0, "beta": 2.0 },
+      "net_beta": { "alpha": 5.0, "beta": 3.0 },
+      "io_active_beta": { "alpha": 6.0, "beta": 2.0 },
+      "hazard_gamma": { "shape": 2.0, "rate": 10.0 },
+      "competing_hazards": {
+        "finish": { "shape": 2.0, "rate": 5.0 },
+        "abandon": { "shape": 1.0, "rate": 100.0 },
+        "degrade": { "shape": 1.0, "rate": 50.0 }
+      }
+    },
+    "useful_bad": {
+      "prior_prob": 0.05,
+      "cpu_beta": { "alpha": 9.0, "beta": 1.0 },
+      "runtime_gamma": { "shape": 1.5, "rate": 0.00005 },
+      "orphan_beta": { "alpha": 2.0, "beta": 8.0 },
+      "tty_beta": { "alpha": 4.0, "beta": 4.0 },
+      "net_beta": { "alpha": 3.0, "beta": 5.0 },
+      "io_active_beta": { "alpha": 2.0, "beta": 6.0 },
+      "hazard_gamma": { "shape": 1.5, "rate": 20.0 },
+      "competing_hazards": {
+        "finish": { "shape": 1.0, "rate": 50.0 },
+        "abandon": { "shape": 1.5, "rate": 10.0 },
+        "degrade": { "shape": 2.0, "rate": 5.0 }
+      }
+    },
+    "abandoned": {
+      "prior_prob": 0.20,
+      "cpu_beta": { "alpha": 1.0, "beta": 8.0 },
+      "runtime_gamma": { "shape": 1.0, "rate": 0.00001 },
+      "orphan_beta": { "alpha": 6.0, "beta": 2.0 },
+      "tty_beta": { "alpha": 1.0, "beta": 8.0 },
+      "net_beta": { "alpha": 1.0, "beta": 6.0 },
+      "io_active_beta": { "alpha": 1.0, "beta": 10.0 },
+      "hazard_gamma": { "shape": 1.0, "rate": 50.0 },
+      "competing_hazards": {
+        "finish": { "shape": 1.0, "rate": 200.0 },
+        "abandon": { "shape": 2.0, "rate": 2.0 },
+        "degrade": { "shape": 1.0, "rate": 100.0 }
+      }
+    },
+    "zombie": {
+      "prior_prob": 0.05,
+      "cpu_beta": { "alpha": 1.0, "beta": 100.0 },
+      "runtime_gamma": { "shape": 0.5, "rate": 0.00001 },
+      "orphan_beta": { "alpha": 10.0, "beta": 1.0 },
+      "tty_beta": { "alpha": 1.0, "beta": 20.0 },
+      "net_beta": { "alpha": 1.0, "beta": 50.0 },
+      "io_active_beta": { "alpha": 1.0, "beta": 100.0 },
+      "hazard_gamma": { "shape": 0.5, "rate": 100.0 },
+      "competing_hazards": {
+        "finish": { "shape": 0.5, "rate": 500.0 },
+        "abandon": { "shape": 1.0, "rate": 10.0 },
+        "degrade": { "shape": 0.5, "rate": 200.0 }
+      }
+    }
+  },
+  "hazard_regimes": [
+    {
+      "name": "baseline",
+      "description": "Normal operation with no adverse signals",
+      "gamma": { "shape": 2.0, "rate": 20.0 },
+      "trigger_conditions": ["default state"]
+    },
+    {
+      "name": "tty_lost",
+      "description": "Process lost its controlling TTY (detached from terminal)",
+      "gamma": { "shape": 3.0, "rate": 5.0 },
+      "trigger_conditions": ["tty changed from pts/* to ?", "controlling terminal closed"]
+    },
+    {
+      "name": "orphaned",
+      "description": "Process reparented to init (PPID = 1)",
+      "gamma": { "shape": 4.0, "rate": 3.0 },
+      "trigger_conditions": ["PPID changed to 1", "parent process terminated"]
+    },
+    {
+      "name": "io_flatline",
+      "description": "Process I/O has gone completely idle",
+      "gamma": { "shape": 2.5, "rate": 8.0 },
+      "trigger_conditions": ["read_bytes delta = 0 for >60s", "write_bytes delta = 0 for >60s"]
+    },
+    {
+      "name": "cpu_stalled",
+      "description": "Process CPU time not advancing despite being schedulable",
+      "gamma": { "shape": 3.0, "rate": 4.0 },
+      "trigger_conditions": ["utime+stime delta = 0 for >30s", "state = R but no CPU progress"]
+    },
+    {
+      "name": "memory_leak",
+      "description": "Process RSS growing monotonically without bound",
+      "gamma": { "shape": 2.0, "rate": 10.0 },
+      "trigger_conditions": ["RSS growth rate > threshold", "no corresponding workload increase"]
+    }
+  ],
+  "semi_markov": {
+    "useful_duration": { "shape": 2.0, "rate": 0.0001 },
+    "useful_bad_duration": { "shape": 1.5, "rate": 0.001 },
+    "abandoned_duration": { "shape": 1.0, "rate": 0.00005 },
+    "zombie_duration": { "shape": 0.5, "rate": 0.0001 }
+  },
+  "change_point": {
+    "p_before": { "alpha": 5.0, "beta": 2.0 },
+    "p_after": { "alpha": 1.0, "beta": 5.0 },
+    "tau_geometric_p": 0.01
+  },
+  "causal_interventions": {
+    "pause": {
+      "useful": { "alpha": 1.0, "beta": 10.0 },
+      "useful_bad": { "alpha": 3.0, "beta": 3.0 },
+      "abandoned": { "alpha": 8.0, "beta": 2.0 },
+      "zombie": { "alpha": 1.0, "beta": 1.0 }
+    },
+    "throttle": {
+      "useful": { "alpha": 2.0, "beta": 8.0 },
+      "useful_bad": { "alpha": 5.0, "beta": 3.0 },
+      "abandoned": { "alpha": 6.0, "beta": 3.0 },
+      "zombie": { "alpha": 1.0, "beta": 1.0 }
+    },
+    "kill": {
+      "useful": { "alpha": 1.0, "beta": 20.0 },
+      "useful_bad": { "alpha": 4.0, "beta": 4.0 },
+      "abandoned": { "alpha": 9.0, "beta": 1.0 },
+      "zombie": { "alpha": 5.0, "beta": 5.0 }
+    },
+    "restart": {
+      "useful": { "alpha": 8.0, "beta": 2.0 },
+      "useful_bad": { "alpha": 7.0, "beta": 3.0 },
+      "abandoned": { "alpha": 2.0, "beta": 8.0 },
+      "zombie": { "alpha": 3.0, "beta": 7.0 }
+    }
+  },
+  "command_categories": {
+    "category_names": [
+      "test_runner",
+      "dev_server",
+      "build_tool",
+      "ai_agent",
+      "shell_wrapper",
+      "daemon",
+      "database",
+      "webserver",
+      "editor_lsp",
+      "container",
+      "unknown"
+    ],
+    "useful": {
+      "alpha": [2.0, 5.0, 3.0, 4.0, 2.0, 8.0, 6.0, 6.0, 5.0, 4.0, 3.0]
+    },
+    "useful_bad": {
+      "alpha": [6.0, 3.0, 4.0, 3.0, 2.0, 2.0, 2.0, 2.0, 3.0, 2.0, 4.0]
+    },
+    "abandoned": {
+      "alpha": [8.0, 6.0, 5.0, 7.0, 9.0, 1.0, 1.0, 2.0, 4.0, 3.0, 5.0]
+    },
+    "zombie": {
+      "alpha": [3.0, 2.0, 4.0, 2.0, 5.0, 1.0, 1.0, 1.0, 2.0, 3.0, 8.0]
+    }
+  },
+  "state_flags": {
+    "flag_names": ["R", "S", "D", "Z", "T", "t", "X"],
+    "useful": {
+      "alpha": [5.0, 8.0, 2.0, 0.1, 1.0, 0.5, 0.1]
+    },
+    "useful_bad": {
+      "alpha": [7.0, 3.0, 4.0, 0.1, 2.0, 1.0, 0.1]
+    },
+    "abandoned": {
+      "alpha": [1.0, 8.0, 1.0, 0.5, 3.0, 2.0, 0.1]
+    },
+    "zombie": {
+      "alpha": [0.1, 0.1, 0.5, 10.0, 0.1, 0.1, 1.0]
+    }
+  },
+  "hierarchical": {
+    "shrinkage_enabled": true,
+    "shrinkage_strength": 0.3
+  },
+  "robust_bayes": {
+    "class_prior_bounds": {
+      "useful": { "lower": 0.50, "upper": 0.85 },
+      "useful_bad": { "lower": 0.01, "upper": 0.15 },
+      "abandoned": { "lower": 0.10, "upper": 0.40 },
+      "zombie": { "lower": 0.01, "upper": 0.10 }
+    },
+    "safe_bayes_eta": 1.0,
+    "auto_eta_enabled": true
+  },
+  "error_rate": {
+    "false_kill": { "alpha": 1.0, "beta": 99.0 },
+    "false_spare": { "alpha": 5.0, "beta": 95.0 }
+  },
+  "bocpd": {
+    "hazard_lambda": 0.01,
+    "min_run_length": 10
+  }
+}

@@ -1,0 +1,352 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/process_triage/schemas/priors.schema.json",
+  "title": "Process Triage Bayesian Priors Schema",
+  "description": "Schema for priors.json containing all Bayesian hyperparameters for the inference engine. All distributions use conjugate families: Beta, Gamma, Dirichlet.",
+  "type": "object",
+  "required": ["schema_version", "classes"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Schema version for compatibility checking"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of this prior configuration"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this prior file was created"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this prior file was last updated"
+    },
+    "host_profile": {
+      "type": "string",
+      "description": "Optional host profile tag for fleet prior sharing (e.g., 'devbox', 'webserver')"
+    },
+    "classes": {
+      "type": "object",
+      "description": "Per-class Bayesian hyperparameters for the four process states",
+      "required": ["useful", "useful_bad", "abandoned", "zombie"],
+      "properties": {
+        "useful": { "$ref": "#/$defs/class_priors" },
+        "useful_bad": { "$ref": "#/$defs/class_priors" },
+        "abandoned": { "$ref": "#/$defs/class_priors" },
+        "zombie": { "$ref": "#/$defs/class_priors" }
+      },
+      "additionalProperties": false
+    },
+    "hazard_regimes": {
+      "type": "array",
+      "description": "Piecewise-constant hazard regimes for survival modeling (Section 4.5, 4.21)",
+      "items": { "$ref": "#/$defs/hazard_regime" }
+    },
+    "semi_markov": {
+      "type": "object",
+      "description": "Semi-Markov state duration parameters (Section 4.5)",
+      "properties": {
+        "useful_duration": { "$ref": "#/$defs/gamma_params" },
+        "useful_bad_duration": { "$ref": "#/$defs/gamma_params" },
+        "abandoned_duration": { "$ref": "#/$defs/gamma_params" },
+        "zombie_duration": { "$ref": "#/$defs/gamma_params" }
+      }
+    },
+    "change_point": {
+      "type": "object",
+      "description": "Change-point detection priors (Section 4.7)",
+      "properties": {
+        "p_before": {
+          "$ref": "#/$defs/beta_params",
+          "description": "Beta prior for activity rate before change point"
+        },
+        "p_after": {
+          "$ref": "#/$defs/beta_params",
+          "description": "Beta prior for activity rate after change point"
+        },
+        "tau_geometric_p": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Parameter p for geometric prior on change-point location"
+        }
+      }
+    },
+    "causal_interventions": {
+      "type": "object",
+      "description": "Priors for action outcome models (Section 4.10, do-calculus)",
+      "properties": {
+        "pause": { "$ref": "#/$defs/intervention_priors" },
+        "throttle": { "$ref": "#/$defs/intervention_priors" },
+        "kill": { "$ref": "#/$defs/intervention_priors" },
+        "restart": { "$ref": "#/$defs/intervention_priors" }
+      }
+    },
+    "command_categories": {
+      "type": "object",
+      "description": "Dirichlet priors for command category classification",
+      "properties": {
+        "category_names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered list of category names matching Dirichlet alpha vector indices"
+        },
+        "useful": { "$ref": "#/$defs/dirichlet_params" },
+        "useful_bad": { "$ref": "#/$defs/dirichlet_params" },
+        "abandoned": { "$ref": "#/$defs/dirichlet_params" },
+        "zombie": { "$ref": "#/$defs/dirichlet_params" }
+      }
+    },
+    "state_flags": {
+      "type": "object",
+      "description": "Dirichlet priors for process state flag classification (R/S/D/Z/T)",
+      "properties": {
+        "flag_names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered list of state flags matching Dirichlet alpha vector indices"
+        },
+        "useful": { "$ref": "#/$defs/dirichlet_params" },
+        "useful_bad": { "$ref": "#/$defs/dirichlet_params" },
+        "abandoned": { "$ref": "#/$defs/dirichlet_params" },
+        "zombie": { "$ref": "#/$defs/dirichlet_params" }
+      }
+    },
+    "hierarchical": {
+      "type": "object",
+      "description": "Hierarchical/empirical Bayes settings (Section 4.16)",
+      "properties": {
+        "shrinkage_enabled": {
+          "type": "boolean",
+          "description": "Whether to apply empirical Bayes shrinkage toward global priors"
+        },
+        "shrinkage_strength": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "How strongly to pull category-specific priors toward global (0=none, 1=full)"
+        }
+      }
+    },
+    "robust_bayes": {
+      "type": "object",
+      "description": "Imprecise prior settings and Safe Bayes tempering (Section 4.9)",
+      "properties": {
+        "class_prior_bounds": {
+          "type": "object",
+          "description": "Lower and upper bounds for each class prior (credal set)",
+          "properties": {
+            "useful": { "$ref": "#/$defs/prior_bounds" },
+            "useful_bad": { "$ref": "#/$defs/prior_bounds" },
+            "abandoned": { "$ref": "#/$defs/prior_bounds" },
+            "zombie": { "$ref": "#/$defs/prior_bounds" }
+          }
+        },
+        "safe_bayes_eta": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Default learning rate eta for Safe Bayes tempering (1.0 = standard Bayes)"
+        },
+        "auto_eta_enabled": {
+          "type": "boolean",
+          "description": "Whether to auto-adjust eta based on prequential log-loss"
+        }
+      }
+    },
+    "error_rate": {
+      "type": "object",
+      "description": "Beta prior for false-kill rate tracking (Section 4.15)",
+      "properties": {
+        "false_kill": {
+          "$ref": "#/$defs/beta_params",
+          "description": "Beta prior for false-kill rate e"
+        },
+        "false_spare": {
+          "$ref": "#/$defs/beta_params",
+          "description": "Beta prior for false-spare rate"
+        }
+      }
+    },
+    "bocpd": {
+      "type": "object",
+      "description": "Bayesian Online Change-Point Detection settings (Section 4.7b)",
+      "properties": {
+        "hazard_lambda": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Constant hazard rate for geometric run-length prior (1/expected_run_length)"
+        },
+        "min_run_length": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Minimum run length before considering a change point"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "beta_params": {
+      "type": "object",
+      "description": "Beta distribution parameters: Beta(alpha, beta)",
+      "required": ["alpha", "beta"],
+      "properties": {
+        "alpha": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Alpha (shape1) parameter, must be positive"
+        },
+        "beta": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Beta (shape2) parameter, must be positive"
+        }
+      },
+      "additionalProperties": false
+    },
+    "gamma_params": {
+      "type": "object",
+      "description": "Gamma distribution parameters: Gamma(shape, rate). Note: uses RATE parameterization, not scale",
+      "required": ["shape", "rate"],
+      "properties": {
+        "shape": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Shape (alpha) parameter, must be positive"
+        },
+        "rate": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Rate (beta) parameter, must be positive. rate = 1/scale"
+        }
+      },
+      "additionalProperties": false
+    },
+    "dirichlet_params": {
+      "type": "object",
+      "description": "Dirichlet distribution parameters: Dir(alpha_1, ..., alpha_k)",
+      "required": ["alpha"],
+      "properties": {
+        "alpha": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "minItems": 2,
+          "description": "Alpha concentration parameters, all must be positive"
+        }
+      },
+      "additionalProperties": false
+    },
+    "class_priors": {
+      "type": "object",
+      "description": "Bayesian hyperparameters for a single process class",
+      "required": ["prior_prob", "cpu_beta", "orphan_beta", "tty_beta", "net_beta"],
+      "properties": {
+        "prior_prob": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Prior probability P(C) for this class"
+        },
+        "cpu_beta": {
+          "$ref": "#/$defs/beta_params",
+          "description": "Beta prior for CPU occupancy p_u|C ~ Beta(alpha, beta)"
+        },
+        "runtime_gamma": {
+          "$ref": "#/$defs/gamma_params",
+          "description": "Gamma prior for runtime t|C ~ Gamma(shape, rate). Use either this OR hazard modeling, not both"
+        },
+        "orphan_beta": {
+          "$ref": "#/$defs/beta_params",
+          "description": "Beta prior for orphan probability p_o|C ~ Beta(alpha, beta)"
+        },
+        "tty_beta": {
+          "$ref": "#/$defs/beta_params",
+          "description": "Beta prior for TTY attachment probability q|C ~ Beta(alpha, beta)"
+        },
+        "net_beta": {
+          "$ref": "#/$defs/beta_params",
+          "description": "Beta prior for network activity probability r|C ~ Beta(alpha, beta)"
+        },
+        "io_active_beta": {
+          "$ref": "#/$defs/beta_params",
+          "description": "Beta prior for I/O activity probability"
+        },
+        "hazard_gamma": {
+          "$ref": "#/$defs/gamma_params",
+          "description": "Gamma prior for base hazard rate lambda|C ~ Gamma(shape, rate)"
+        },
+        "competing_hazards": {
+          "type": "object",
+          "description": "Per-class competing hazard rates",
+          "properties": {
+            "finish": { "$ref": "#/$defs/gamma_params" },
+            "abandon": { "$ref": "#/$defs/gamma_params" },
+            "degrade": { "$ref": "#/$defs/gamma_params" }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "hazard_regime": {
+      "type": "object",
+      "description": "A piecewise-constant hazard regime (e.g., TTY lost, PPID=1)",
+      "required": ["name", "gamma"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Identifier for this regime (e.g., 'tty_lost', 'orphaned', 'io_flatline')"
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of what triggers this regime"
+        },
+        "gamma": {
+          "$ref": "#/$defs/gamma_params",
+          "description": "Gamma prior for hazard rate in this regime: lambda_r ~ Gamma(shape, rate)"
+        },
+        "trigger_conditions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Conditions that activate this regime (for documentation)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "intervention_priors": {
+      "type": "object",
+      "description": "Beta priors for action outcomes per class",
+      "properties": {
+        "useful": { "$ref": "#/$defs/beta_params" },
+        "useful_bad": { "$ref": "#/$defs/beta_params" },
+        "abandoned": { "$ref": "#/$defs/beta_params" },
+        "zombie": { "$ref": "#/$defs/beta_params" }
+      }
+    },
+    "prior_bounds": {
+      "type": "object",
+      "description": "Lower and upper bounds for a class prior (credal set)",
+      "required": ["lower", "upper"],
+      "properties": {
+        "lower": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "upper": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
