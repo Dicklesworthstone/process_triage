@@ -9,6 +9,8 @@
 //! - `CheckSessionSafety`: Verify session safety (not session leader, etc.)
 
 use crate::collect::protected::ProtectedFilter;
+#[cfg(target_os = "linux")]
+use crate::collect::parse_io;
 use crate::collect::systemd::{collect_systemd_unit, SystemdUnit, SystemdUnitType};
 use crate::collect::ProcessState;
 use crate::config::policy::{DataLossGates, Guardrails};
@@ -17,6 +19,7 @@ use std::fmt;
 use crate::plan::PreCheck;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -227,6 +230,8 @@ pub trait PreCheckProvider {
 /// Configuration for live pre-check provider.
 #[derive(Debug, Clone)]
 pub struct LivePreCheckConfig {
+    /// Block if process has open write file descriptors.
+    pub block_if_open_write_fds: bool,
     /// Maximum open write file descriptors before blocking.
     pub max_open_write_fds: u32,
     /// Block if process has locked files.
@@ -252,6 +257,7 @@ pub struct LivePreCheckConfig {
 impl Default for LivePreCheckConfig {
     fn default() -> Self {
         Self {
+            block_if_open_write_fds: true,
             max_open_write_fds: 0,
             block_if_locked_files: true,
             block_if_active_tty: true,
@@ -269,6 +275,7 @@ impl Default for LivePreCheckConfig {
 impl From<&DataLossGates> for LivePreCheckConfig {
     fn from(gates: &DataLossGates) -> Self {
         Self {
+            block_if_open_write_fds: gates.block_if_open_write_fds,
             max_open_write_fds: gates.max_open_write_fds.unwrap_or(0),
             block_if_locked_files: gates.block_if_locked_files,
             block_if_active_tty: gates.block_if_active_tty,
@@ -369,6 +376,29 @@ impl LivePreCheckProvider {
         }
 
         (write_count > self.config.max_open_write_fds, write_count)
+    }
+
+    /// Best-effort check for recent I/O activity (write-heavy).
+    ///
+    /// Uses a short probe window to detect increases in /proc/<pid>/io counters.
+    fn has_recent_io(&self, pid: u32, window: Duration) -> bool {
+        let before = parse_io(pid);
+        let Some(before) = before else {
+            return false;
+        };
+
+        let probe_ms = window.as_millis().min(200).max(10) as u64;
+        std::thread::sleep(Duration::from_millis(probe_ms));
+
+        let after = parse_io(pid);
+        let Some(after) = after else {
+            return false;
+        };
+
+        let write_bytes_delta = after.write_bytes.saturating_sub(before.write_bytes);
+        let wchar_delta = after.wchar.saturating_sub(before.wchar);
+
+        write_bytes_delta > 0 || wchar_delta > 0
     }
 
     /// Check if process has any locked files.
@@ -635,16 +665,18 @@ impl PreCheckProvider for LivePreCheckProvider {
         trace!(pid, "checking data loss risk");
 
         // Check open write file descriptors
-        let (exceeds_max, write_count) = self.has_open_write_fds(pid);
-        if exceeds_max {
-            debug!(pid, write_count, "process has open write fds");
-            return PreCheckResult::Blocked {
-                check: PreCheck::CheckDataLossGate,
-                reason: format!(
-                    "{write_count} open write fds (max: {})",
-                    self.config.max_open_write_fds
-                ),
-            };
+        if self.config.block_if_open_write_fds {
+            let (exceeds_max, write_count) = self.has_open_write_fds(pid);
+            if exceeds_max {
+                debug!(pid, write_count, "process has open write fds");
+                return PreCheckResult::Blocked {
+                    check: PreCheck::CheckDataLossGate,
+                    reason: format!(
+                        "{write_count} open write fds (max: {})",
+                        self.config.max_open_write_fds
+                    ),
+                };
+            }
         }
 
         // Check locked files
@@ -663,6 +695,21 @@ impl PreCheckProvider for LivePreCheckProvider {
                 check: PreCheck::CheckDataLossGate,
                 reason: "process CWD is deleted".to_string(),
             };
+        }
+
+        // Check for recent I/O activity (best-effort).
+        if self.config.block_if_recent_io_seconds > 0 {
+            let window = Duration::from_secs(self.config.block_if_recent_io_seconds);
+            if self.has_recent_io(pid, window) {
+                debug!(pid, window_s = self.config.block_if_recent_io_seconds, "process has recent I/O activity");
+                return PreCheckResult::Blocked {
+                    check: PreCheck::CheckDataLossGate,
+                    reason: format!(
+                        "recent I/O activity within {}s window",
+                        self.config.block_if_recent_io_seconds
+                    ),
+                };
+            }
         }
 
         PreCheckResult::Passed

@@ -80,7 +80,9 @@ pub fn apply_outcome(
         Action::Throttle => &mut updated.throttle,
         Action::Kill => &mut updated.kill,
         Action::Restart => &mut updated.restart,
-        Action::Keep => return updated,
+        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze => {
+            return updated; // No causal priors yet
+        }
     };
     if let Some(priors) = target.as_ref() {
         let refreshed = update_intervention_priors(priors, outcome, eta);
@@ -111,7 +113,7 @@ pub fn recovery_table(priors: &Priors, action: Action) -> Option<RecoveryTable> 
         Action::Throttle => build_table(action, interventions.throttle.as_ref()),
         Action::Kill => build_table(action, interventions.kill.as_ref()),
         Action::Restart => build_table(action, interventions.restart.as_ref()),
-        Action::Keep => None,
+        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze => None,
     };
     table
 }
@@ -159,7 +161,7 @@ pub fn recovery_for_class(priors: &Priors, action: Action, class: ProcessClass) 
         Action::Throttle => interventions.throttle.as_ref(),
         Action::Kill => interventions.kill.as_ref(),
         Action::Restart => interventions.restart.as_ref(),
-        Action::Keep => None,
+        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze => None,
     }?;
     let beta = match class {
         ProcessClass::Useful => priors.useful.as_ref(),
@@ -217,7 +219,7 @@ fn expected_recovery_stats_for_action(
         Action::Throttle => interventions.throttle.as_ref(),
         Action::Kill => interventions.kill.as_ref(),
         Action::Restart => interventions.restart.as_ref(),
-        Action::Keep => None,
+        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze => None,
     }?;
 
     let useful_var = priors.useful.as_ref().and_then(beta_variance);
@@ -231,7 +233,7 @@ fn expected_recovery_stats_for_action(
                 + posterior.useful_bad * (ub_var + useful_bad * useful_bad)
                 + posterior.abandoned * (a_var + abandoned * abandoned)
                 + posterior.zombie * (z_var + zombie * zombie);
-            let mut variance = second_moment - mean * mean;
+            let mut variance: f64 = second_moment - mean * mean;
             if variance < 0.0 && variance > -1e-12 {
                 variance = 0.0;
             }

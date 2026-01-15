@@ -205,15 +205,39 @@ impl SignalActionRunner {
         self.wait_for_state_change(pid, true, None, timeout)
     }
 
-    /// Execute a resume action (SIGCONT) - not directly in Action enum, but may be needed.
+    /// Execute a resume action (SIGCONT) - raw version.
     #[cfg(unix)]
     pub fn resume(&self, pid: u32, use_group: bool, pgid: Option<u32>) -> Result<(), ActionError> {
         let target = if use_group { pgid.unwrap_or(pid) } else { pid };
         self.send_signal(target, libc::SIGCONT, use_group)
     }
 
+    /// Verify a resume action succeeded - raw version.
+    pub fn verify_resume_raw(&self, pid: u32) -> Result<(), ActionError> {
+        let timeout = Duration::from_millis(self.config.verify_timeout_ms);
+        // Process should not be stopped anymore
+        self.wait_for_state_change(pid, false, Some(false), timeout)
+    }
+
+    /// Execute a resume action (SIGCONT) from PlanAction.
+    #[cfg(unix)]
+    fn execute_resume(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let pid = action.target.pid.0;
+        let use_group = self.config.use_process_groups && action.target.pgid.is_some();
+        let target = if use_group {
+            action.target.pgid.unwrap_or(pid)
+        } else {
+            pid
+        };
+
+        self.send_signal(target, libc::SIGCONT, use_group)?;
+        Ok(())
+    }
+
     /// Verify a resume action succeeded.
-    pub fn verify_resume(&self, pid: u32) -> Result<(), ActionError> {
+    #[cfg(unix)]
+    fn verify_resume(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let pid = action.target.pid.0;
         let timeout = Duration::from_millis(self.config.verify_timeout_ms);
         // Process should not be stopped anymore
         self.wait_for_state_change(pid, false, Some(false), timeout)
@@ -225,6 +249,7 @@ impl ActionRunner for SignalActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
         match action.action {
             Action::Pause => self.execute_pause(action),
+            Action::Resume => self.execute_resume(action),
             Action::Kill => self.execute_kill(action),
             Action::Keep => Ok(()),
             Action::Throttle => {
@@ -239,15 +264,28 @@ impl ActionRunner for SignalActionRunner {
                     "restart requires supervisor support".to_string(),
                 ))
             }
+            Action::Renice => {
+                // Renice requires setpriority operations, not signals
+                Err(ActionError::Failed(
+                    "renice requires setpriority support".to_string(),
+                ))
+            }
+            Action::Freeze | Action::Unfreeze => {
+                // Freeze/Unfreeze require cgroup v2 freezer operations
+                Err(ActionError::Failed(
+                    "freeze/unfreeze requires cgroup v2 freezer support".to_string(),
+                ))
+            }
         }
     }
 
     fn verify(&self, action: &PlanAction) -> Result<(), ActionError> {
         match action.action {
             Action::Pause => self.verify_pause(action),
+            Action::Resume => self.verify_resume(action),
             Action::Kill => self.verify_kill(action),
             Action::Keep => Ok(()),
-            Action::Throttle | Action::Restart => Ok(()),
+            Action::Throttle | Action::Restart | Action::Renice | Action::Freeze | Action::Unfreeze => Ok(()),
         }
     }
 }
