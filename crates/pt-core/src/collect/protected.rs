@@ -495,6 +495,19 @@ impl ProtectedFilter {
     pub fn protected_pids(&self) -> &HashSet<u32> {
         &self.protected_pids
     }
+
+    /// Check if any pattern matches the given text.
+    ///
+    /// Returns the original pattern string if matched, None otherwise.
+    /// This is useful for pre-check validation without a full ProcessRecord.
+    pub fn matches_any_pattern(&self, text: &str) -> Option<&str> {
+        for pattern in &self.patterns {
+            if pattern.matches(text) {
+                return Some(&pattern.original);
+            }
+        }
+        None
+    }
 }
 
 /// Truncate command line for logging (avoid huge logs).

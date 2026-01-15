@@ -1,5 +1,6 @@
 //! Staged action execution protocol.
 
+use crate::action::prechecks::PreCheckProvider;
 use crate::plan::{Plan, PlanAction, PreCheck};
 use pt_common::ProcessIdentity;
 use serde::Serialize;
@@ -42,6 +43,11 @@ pub enum ActionStatus {
     Timeout,
     Failed,
     Skipped,
+    /// Pre-check failed (protected, data-loss risk, etc.)
+    PreCheckBlocked {
+        check: PreCheck,
+        reason: String,
+    },
 }
 
 /// Per-action result with timing and details.
@@ -120,6 +126,7 @@ impl IdentityProvider for StaticIdentityProvider {
 pub struct ActionExecutor<'a> {
     runner: &'a dyn ActionRunner,
     identity_provider: &'a dyn IdentityProvider,
+    pre_check_provider: Option<&'a dyn PreCheckProvider>,
     lock_path: PathBuf,
 }
 
@@ -132,8 +139,15 @@ impl<'a> ActionExecutor<'a> {
         Self {
             runner,
             identity_provider,
+            pre_check_provider: None,
             lock_path: lock_path.into(),
         }
+    }
+
+    /// Set the pre-check provider for safety gates.
+    pub fn with_pre_check_provider(mut self, provider: &'a dyn PreCheckProvider) -> Self {
+        self.pre_check_provider = Some(provider);
+        self
     }
 
     pub fn execute_plan(&self, plan: &Plan) -> Result<ExecutionResult, ExecutionError> {
@@ -176,11 +190,27 @@ impl<'a> ActionExecutor<'a> {
             return ActionStatus::Skipped;
         }
 
+        // Run identity verification pre-check first
         if action.pre_checks.contains(&PreCheck::VerifyIdentity) {
             match self.identity_provider.revalidate(&action.target) {
                 Ok(true) => {}
                 Ok(false) => return ActionStatus::IdentityMismatch,
                 Err(_) => return ActionStatus::IdentityMismatch,
+            }
+        }
+
+        // Run other pre-checks (protected, data-loss, supervisor, session safety)
+        if let Some(ref provider) = self.pre_check_provider {
+            let pid = action.target.pid.0;
+            let sid = action.target.sid;
+            let results = provider.run_checks(&action.pre_checks, pid, sid);
+
+            // If any pre-check fails, block the action
+            for result in results {
+                if let crate::action::prechecks::PreCheckResult::Blocked { check, reason } = result
+                {
+                    return ActionStatus::PreCheckBlocked { check, reason };
+                }
             }
         }
 
