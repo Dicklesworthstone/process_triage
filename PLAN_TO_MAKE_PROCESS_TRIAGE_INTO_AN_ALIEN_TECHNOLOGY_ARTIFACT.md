@@ -152,6 +152,71 @@ Z) Dependency impact weighting
 - Loss matrix scaled by live dependency graph (open sockets, clients, child process health)
 - Kill cost increases with critical dependencies
 
+AA) Hawkes processes (self-exciting point processes)
+- Model bursty CPU/IO/syscall events with exponential kernels
+- Closed-form likelihood for exponential kernels; conjugate updates for intensities
+
+AB) Marked point processes
+- Event times + magnitudes (syscall event + cost)
+- Closed-form likelihood in exponential family
+
+AC) Bayesian nonparametric survival (Beta-Stacy)
+- Flexible hazard modeling with closed-form updates on discrete time bins
+
+AD) Empirical Bayes shrinkage (Efron-Morris)
+- Hyperparameters tuned by marginal likelihood; still closed-form for conjugate families
+
+AE) Bayesian online change-point detection (BOCPD)
+- Exact run-length recursion with conjugate updates
+
+AF) Robust statistics (Huberization)
+- Robust likelihoods to reduce noise/adversarial effects on log-CPU or event rates
+
+AG) Large deviations / rate functions (Chernoff, Cramer)
+- Quantify rarity of observed CPU/IO traces under useful hypothesis
+
+AH) POMDP with belief-state approximation
+- Belief update in closed form with discrete states
+- Myopic Bayes-optimal action selection
+
+AI) Multivariate Hawkes processes (cross-excitation)
+- Model cross-metric bursts (syscalls -> IO -> network)
+- Closed-form likelihood for exponential kernels with Gamma priors
+
+AJ) Copula models for dependence (Archimedean/vine)
+- Joint CPU/IO/net dependence without independence assumptions
+- Closed-form densities for common copulas
+
+AK) Risk-sensitive control / coherent risk measures
+- CVaR and entropic risk to penalize tail-risk kills
+- Closed-form for discrete outcome models
+
+AL) Bayesian model averaging (BMA)
+- Weight multiple models by marginal likelihood
+- Avoids single-model brittleness; closed-form weights
+
+AM) Composite-hypothesis testing (mixture SPRT / GLR)
+- Generalized likelihood ratio for composite alternatives
+- Closed-form with conjugate mixtures
+
+AN) Linear Gaussian state-space (Kalman)
+- Smooth CPU/load signals; closed-form filtering/smoothing
+
+AO) Optimal transport / Wasserstein distances
+- Distribution-shift detection with analytic 1D OT distances
+
+AP) Martingale concentration / sequential bounds
+- Azuma/Freedman bounds for sustained anomaly detection
+
+AQ) Graph signal processing / Laplacian regularization
+- Smooth posteriors on PPID tree; MAP via MRF with closed-form quadratic form
+
+AR) Renewal reward / semi-regenerative processes
+- Model event rewards (CPU/IO) between renewals with conjugate updates
+
+AS) Conformal prediction (distribution-free coverage)
+- Prediction intervals for runtime/CPU with finite-sample guarantees
+
 R) Use-case interpretation of observed processes
 - bun test at 91% CPU for 18m in /data/projects/flywheel_gateway
 - gemini --yolo workers at 25m to 4h46m
@@ -178,6 +243,22 @@ All of these are integrated in the system design below.
   - optional: git -C cwd status -sb
   - optional: lsof /proc/PID/fd for live dependency graph signals (open sockets, files)
   - optional: ss -ntp correlation for live client count
+  - optional: perf (cycles, cache misses, branch mispredicts)
+  - optional: bpftrace / bcc (eBPF probes for syscalls, IO, scheduler latency)
+  - optional: pidstat / iostat / mpstat / vmstat (sysstat suite)
+  - optional: iotop (per-process IO)
+  - optional: nethogs / iftop (per-process network throughput)
+  - optional: sar (historical system metrics)
+  - optional: atop (historical per-process accounting)
+  - optional: sysdig (syscall stream capture)
+  - optional: bpftool (eBPF program and map stats)
+  - optional: turbostat / powertop (CPU frequency/residency)
+  - optional: numastat (NUMA locality)
+  - optional: smem (accurate RSS/USS/PSS)
+  - optional: systemd-cgtop / cgget (cgroup v2 stats)
+  - optional: conntrack-tools (connection tracking)
+  - optional: nvidia-smi / rocm-smi (GPU process metrics)
+  - optional: /proc/pressure/* (PSI) and /proc/schedstat
 - OS-level metrics for queueing cost and VOI:
   - loadavg, run-queue delay, iowait, memory pressure, swap activity
 
@@ -199,6 +280,20 @@ All of these are integrated in the system design below.
 - dependency impact score: live sockets, client count, open files, service bindings
 - user intent signal: active TTY + recent shell + editor focus + project activity window
 - belief transition probabilities for POMDP update
+- Hawkes intensity parameters for event bursts (syscall/IO)
+- Marked point process summaries (event magnitudes and rates)
+- BOCPD run-length posterior for CPU/IO regimes
+- Robust stats summaries (Huberized residuals for CPU/IO)
+- perf-derived indicators (cache miss ratio, branch mispredict rate)
+- eBPF-derived indicators (scheduler latency, syscall rate)
+- PSI metrics (CPU/IO/memory stall)
+- cgroup CPU/IO/memory pressure stats
+- stack sampling fingerprints (tight loop vs blocked)
+- NUMA locality indicators
+- GPU utilization per PID (if present)
+- copula dependence parameters across CPU/IO/net
+- Kalman-smoothed CPU/load trend estimates
+- martingale deviation bounds for sustained anomalies
 
 ---
 
@@ -250,10 +345,22 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - U_t ~ Beta(alpha_2, beta_2) after tau
 - geometric prior on tau; posterior via Beta-binomial
 
+### 4.7b Bayesian Online Change-Point Detection (BOCPD)
+- Run-length recursion with conjugate updates for CPU/IO event rates
+- Maintains posterior over change points for regime shifts
+
 ### 4.8 Information-Theoretic Abnormality
 - compute D_KL(p_hat || p_useful)
 - Chernoff bound: P(useful) <= exp(-t * I(p_hat))
 - large deviation rate functions for rare event detection
+
+### 4.8b Large Deviations / Rate Functions
+- Cramer/Chernoff bounds on event-rate deviations
+- Quantifies probability of observing bursts under useful model
+
+### 4.8c Copula Dependence Modeling
+- Use Archimedean/vine copulas to model joint CPU/IO/net dependence
+- Closed-form likelihoods for common copula families
 
 ### 4.9 Robust Bayes (Imprecise Priors)
 - P(C) in [lower, upper]
@@ -297,6 +404,50 @@ C in {useful, useful-but-bad, abandoned, zombie}
 ### 4.18 Time-to-Decision Bound
 - Define T_max based on VOI decay and CPU-cost budget
 - If no threshold crossing by T_max, default to pause + observe
+
+### 4.19 Hawkes Process Layer (Self-Exciting Events)
+- Model syscalls/IO/network events as Hawkes process with exponential kernels
+- Closed-form likelihood for exponential kernels; conjugate Gamma priors on intensity
+
+### 4.20 Marked Point Process Layer
+- Event times with magnitudes (bytes read/write, syscall cost)
+- Likelihood in exponential family; summarizes burst severity
+
+### 4.21 Bayesian Nonparametric Survival (Beta-Stacy)
+- Discrete-time hazard h_t with Beta priors; closed-form updates per bin
+- Captures long-tail stuckness beyond Gamma assumptions
+
+### 4.22 Robust Statistics (Huberized Likelihoods)
+- Huber loss on log-CPU/IO residuals to reduce noise sensitivity
+- Keeps inference stable under outliers and kernel noise
+
+### 4.23 Linear Gaussian State-Space (Kalman)
+- Smooth CPU/load signals; closed-form filtering and smoothing
+
+### 4.24 Optimal Transport Shift Detection
+- Use 1D Wasserstein distance between observed and baseline distributions
+- Closed-form for univariate distributions
+
+### 4.25 Martingale Sequential Bounds
+- Azuma/Freedman bounds for sustained anomaly evidence over time
+
+### 4.26 Graph Signal Regularization
+- Laplacian smoothing on PPID tree to reduce noisy per-process posteriors
+
+### 4.27 Renewal Reward Modeling
+- CPU/IO rewards per renewal interval; conjugate updates for reward rates
+
+### 4.28 Risk-Sensitive Control
+- CVaR and entropic risk to penalize tail outcomes in action selection
+
+### 4.29 Bayesian Model Averaging (BMA)
+- Combine models by marginal likelihood weights; robust to misspecification
+
+### 4.30 Composite-Hypothesis Testing
+- Mixture SPRT / GLR for composite alternatives with conjugate mixtures
+
+### 4.31 Conformal Prediction
+- Distribution-free prediction intervals for runtime/CPU
 
 ---
 
@@ -386,6 +537,18 @@ Decision engine selects action with minimum expected loss; kill requires explici
 - Time-to-decision bound with pause default
 - PAC-Bayes validation in shadow mode with confidence reporting
 - Coupled process-tree inference for correlated stuckness
+- Hawkes/marked point process burst detection for syscalls/IO
+- Robust stats to reduce false positives from noisy kernel events
+- Empirical Bayes shrinkage to stabilize rare command categories
+- BOCPD-based detection of regime shifts
+- Optional perf/eBPF instrumentation for high-fidelity signals
+- Copula-based joint dependence modeling
+- Kalman smoothing for noisy CPU/load signals
+- Wasserstein shift detection for distribution drift
+- Martingale bounds for persistent anomalies
+- Risk-sensitive control (CVaR/entropic risk)
+- Bayesian model averaging across inference layers
+- Conformal prediction for robust intervals
 
 ---
 
@@ -418,11 +581,84 @@ Use the model to interpret the observed snapshot:
 ### Phase 3: Evidence Collection
 - Quick scan: ps + basic features
 - Deep scan: /proc IO, CPU deltas, wchan, net, children, TTY
+- Optional system tools (auto-install):
+  - Linux: sysstat (pidstat/iostat/mpstat/vmstat/sar), perf, bpftrace/bcc, iotop, nethogs/iftop, lsof
+  - macOS: fs_usage, sample, nettop, powermetrics, dtruss (if permitted), lsof
+
+### Phase 3a: Tooling Install Strategy (Maximal Instrumentation by Default)
+Policy: always try to install everything and collect as much data as possible.
+
+Linux package managers:
+- Debian/Ubuntu (apt):
+  - sysstat (pidstat/iostat/mpstat/vmstat/sar)
+  - linux-tools-common + linux-tools-$(uname -r) (perf)
+  - bpftrace + bcc + bpftool (eBPF)
+  - iotop, nethogs, iftop, lsof
+  - atop, sysdig, smem, numactl
+  - turbostat, powertop
+  - strace, ltrace
+  - ethtool, iproute2 (ss)
+  - conntrack-tools, cgroup-tools
+- Fedora/RHEL (dnf):
+  - sysstat, perf, bpftrace, bcc, bpftool, iotop, nethogs, iftop, lsof
+  - atop, sysdig, smem, numactl
+  - turbostat, powertop
+  - strace, ltrace, ethtool, iproute, conntrack-tools, cgroup-tools
+- Arch (pacman):
+  - sysstat, perf, bpftrace, bcc, bpftool, iotop, nethogs, iftop, lsof
+  - atop, sysdig, smem, numactl
+  - turbostat, powertop
+  - strace, ltrace, ethtool, iproute2, conntrack-tools, cgroup-tools
+- Alpine (apk):
+  - sysstat, perf, bpftrace, iotop, nethogs, iftop, lsof
+  - atop, sysdig, smem, numactl
+  - strace, ltrace, iproute2
+  - conntrack-tools, cgroup-tools
+
+macOS (Homebrew):
+- core utils: lsof, iproute2mac (if needed), htop
+- tracing/metrics: fs_usage, sample, nettop, powermetrics (native tools)
+- if SIP allows: dtruss
+ - extra: sysstat (where available), gnu-time
+
+Install workflow:
+- Detect OS + package manager.
+- Attempt full install; if any package fails, continue installing the rest.
+- Record capabilities in a local cache (what is available vs missing).
+- Prefer richer signals when available (eBPF/perf), but never fail if missing.
+
+Capability matrix (signal -> tool -> OS support -> fallback):
+- syscalls/IO events: bpftrace/bcc (Linux), dtruss (macOS if permitted) -> fallback: strace
+- CPU cycles/cache/branch: perf (Linux), powermetrics (macOS) -> fallback: sample
+- per-PID IO bandwidth: iotop (Linux), fs_usage (macOS) -> fallback: /proc/PID/io
+- per-PID network: nethogs/iftop (Linux), nettop (macOS) -> fallback: ss + lsof
+- run-queue + CPU load: mpstat/vmstat/sar (Linux), powermetrics (macOS) -> fallback: uptime/loadavg
+- FD churn + sockets: lsof (Linux/macOS) -> fallback: /proc/PID/fd
+- scheduler latency: bpftrace/bcc (Linux) -> fallback: perf sched (Linux) or none
+- PSI stall pressure: /proc/pressure/* (Linux) -> fallback: none
+- cgroup pressure: systemd-cgtop/cgget (Linux) -> fallback: /sys/fs/cgroup
+- stack sampling: sample/spindump (macOS), perf/ftrace (Linux) -> fallback: none
+
+Data-to-math mapping (signal -> model layer):
+- CPU bursts + syscall spikes -> Hawkes / marked point process intensities
+- IO bandwidth + write/read deltas -> renewal reward model, Gamma-Poisson rates
+- CPU% time series -> Kalman smoothing + BOCPD change-point detection
+- PSI stall pressure -> queueing-theoretic cost term (Erlang-C) + hazard inflation
+- Cache miss / branch mispredict -> tight-loop likelihood boost (useful-but-bad vs abandoned)
+- Socket/client count -> dependency-weighted loss scaling + causal action cost
+- Orphan PPID + dead TTY -> Bayesian genealogy prior shift toward abandoned
+- PPID tree adjacency -> graph Laplacian smoothing / coupled priors
+- Network bursts -> Hawkes cross-excitation + copula dependence
+- Distribution drift vs baseline -> Wasserstein distance + large-deviation bounds
+- Rare-event persistence -> martingale concentration bounds
 
 ### Phase 4: Inference Integration
 - Combine evidence to compute P(C|x)
 - Add Bayes factor ledger output
 - Add confidence metrics
+- Add Hawkes / marked point process layers for bursty events
+- Add BOCPD run-length posterior for regime shifts
+- Add robust statistics summaries for noise suppression
 
 ### Phase 5: Decision Theory
 - Implement expected loss, SPRT threshold, VOI
@@ -454,6 +690,8 @@ Use the model to interpret the observed snapshot:
 - Shadow mode metrics: false kill rate, missed abandonment rate
 - PAC-Bayes bound reporting on false-kill rate
 - Calibration tests for empirical Bayes hyperparameters
+- Hawkes/marked point process fit sanity tests
+- BOCPD change-point detection regression tests
 
 ---
 
