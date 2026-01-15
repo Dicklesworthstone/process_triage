@@ -1,6 +1,8 @@
 //! Expected loss decisioning and SPRT-style boundary computation.
 
 use crate::config::policy::{LossMatrix, LossRow, Policy};
+use crate::config::priors::Priors;
+use crate::decision::causal_interventions::{expected_recovery_by_action, RecoveryExpectation};
 use crate::inference::ClassScores;
 use serde::Serialize;
 use thiserror::Error;
@@ -89,6 +91,7 @@ pub struct DecisionOutcome {
     pub optimal_action: Action,
     pub sprt_boundary: Option<SprtBoundary>,
     pub posterior_odds_abandoned_vs_useful: Option<f64>,
+    pub recovery_expectations: Option<Vec<RecoveryExpectation>>,
     pub rationale: DecisionRationale,
 }
 
@@ -146,6 +149,78 @@ pub fn decide_action(
         optimal_action,
         sprt_boundary,
         posterior_odds_abandoned_vs_useful: posterior_odds,
+        recovery_expectations: None,
+        rationale: DecisionRationale {
+            chosen_action: optimal_action,
+            tie_break,
+            disabled_actions: disabled,
+        },
+    })
+}
+
+/// Compute expected loss and optionally prefer actions with higher recovery likelihood.
+pub fn decide_action_with_recovery(
+    posterior: &ClassScores,
+    policy: &Policy,
+    feasibility: &ActionFeasibility,
+    priors: &Priors,
+    loss_tolerance: f64,
+) -> Result<DecisionOutcome, DecisionError> {
+    validate_posterior(posterior)?;
+
+    let mut expected_losses = Vec::new();
+    let mut disabled = feasibility.disabled.clone();
+
+    for action in Action::ALL {
+        if !feasibility.is_allowed(action) {
+            continue;
+        }
+        match expected_loss_for_action(action, posterior, &policy.loss_matrix) {
+            Ok(loss) => expected_losses.push(ExpectedLoss { action, loss }),
+            Err(DecisionError::MissingLoss { action, class }) => {
+                disabled.push(DisabledAction {
+                    action,
+                    reason: format!("policy missing loss for class {class}"),
+                });
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    if expected_losses.is_empty() {
+        return Err(DecisionError::NoFeasibleActions);
+    }
+
+    let recovery_expectations = expected_recovery_by_action(priors, posterior);
+    let (mut optimal_action, mut tie_break) = select_optimal_action(&expected_losses);
+    if !recovery_expectations.is_empty() {
+        let (candidate_action, used_recovery) = select_action_with_recovery(
+            &expected_losses,
+            &recovery_expectations,
+            loss_tolerance.max(0.0),
+            optimal_action,
+        );
+        if used_recovery {
+            if candidate_action != optimal_action {
+                tie_break = true;
+            }
+            optimal_action = candidate_action;
+        }
+    }
+
+    let sprt_boundary = compute_sprt_boundary(&policy.loss_matrix)?;
+    let posterior_odds = posterior_odds_abandoned_vs_useful(posterior);
+
+    Ok(DecisionOutcome {
+        expected_loss: expected_losses,
+        optimal_action,
+        sprt_boundary,
+        posterior_odds_abandoned_vs_useful: posterior_odds,
+        recovery_expectations: if recovery_expectations.is_empty() {
+            None
+        } else {
+            Some(recovery_expectations)
+        },
         rationale: DecisionRationale {
             chosen_action: optimal_action,
             tie_break,
@@ -217,6 +292,43 @@ fn select_optimal_action(expected: &[ExpectedLoss]) -> (Action, bool) {
         }
     }
     (best.action, tie_break)
+}
+
+fn select_action_with_recovery(
+    expected: &[ExpectedLoss],
+    recovery: &[RecoveryExpectation],
+    loss_tolerance: f64,
+    fallback: Action,
+) -> (Action, bool) {
+    let mut best_loss = f64::INFINITY;
+    for cand in expected {
+        if cand.loss < best_loss {
+            best_loss = cand.loss;
+        }
+    }
+
+    let mut best_recovery = -1.0;
+    let mut best_action = None;
+    for cand in expected {
+        if cand.loss > best_loss + loss_tolerance {
+            continue;
+        }
+        if let Some(prob) = recovery
+            .iter()
+            .find(|r| r.action == cand.action)
+            .map(|r| r.probability)
+        {
+            if prob > best_recovery {
+                best_recovery = prob;
+                best_action = Some(cand.action);
+            }
+        }
+    }
+
+    match best_action {
+        Some(action) => (action, true),
+        None => (fallback, false),
+    }
 }
 
 fn compute_sprt_boundary(loss_matrix: &LossMatrix) -> Result<Option<SprtBoundary>, DecisionError> {

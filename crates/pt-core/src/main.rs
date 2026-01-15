@@ -561,7 +561,7 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
     // Perform scan
     match quick_scan(&options) {
         Ok(result) => {
-            log_event!(ctx, INFO, event_names::SCAN_COMPLETED, Stage::Scan, "Scan finished successfully", 
+            log_event!(ctx, INFO, event_names::SCAN_FINISHED, Stage::Scan, "Scan finished successfully",
                 count = result.metadata.process_count,
                 duration_ms = result.metadata.duration_ms
             );
@@ -617,7 +617,7 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
             ExitCode::Clean
         }
         Err(e) => {
-            log_event!(ctx, ERROR, event_names::SCAN_FAILED, Stage::Scan, "Scan failed", error = e.to_string());
+            log_event!(ctx, ERROR, event_names::INTERNAL_ERROR, Stage::Scan, "Scan failed", error = e.to_string());
             eprintln!("Scan failed: {}", e);
             ExitCode::InternalError
         }

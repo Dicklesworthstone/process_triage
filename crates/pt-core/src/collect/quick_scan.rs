@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tracing::{debug, span, Level};
 
 /// Options for quick scan operation.
 #[derive(Debug, Clone, Default)]
@@ -64,6 +65,9 @@ pub enum QuickScanError {
 /// # Errors
 /// * `QuickScanError` if ps fails or output cannot be parsed
 pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanError> {
+    let _span = span!(Level::DEBUG, "quick_scan").entered();
+    debug!("Starting quick scan via ps");
+
     let start = Instant::now();
     let platform = detect_platform();
     let boot_id = read_boot_id();
@@ -113,6 +117,12 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
 
     let duration = start.elapsed();
     let process_count = processes.len();
+
+    debug!(
+        process_count = processes.len(),
+        duration_ms = duration.as_millis(),
+        "Quick scan completed"
+    );
 
     Ok(ScanResult {
         processes,

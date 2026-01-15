@@ -1,7 +1,8 @@
 //! Causal intervention outcome models (Beta-Bernoulli).
 
-use crate::config::priors::{BetaParams, InterventionPriors, Priors};
+use crate::config::priors::{BetaParams, CausalInterventions, InterventionPriors, Priors};
 use crate::decision::Action;
+use crate::inference::ClassScores;
 use serde::Serialize;
 
 /// Process class labels.
@@ -14,6 +15,13 @@ pub enum ProcessClass {
     Zombie,
 }
 
+/// Expected recovery probability for an action.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryExpectation {
+    pub action: Action,
+    pub probability: f64,
+}
+
 /// Expected recovery probability per class for an action.
 #[derive(Debug, Clone, Serialize)]
 pub struct RecoveryTable {
@@ -22,6 +30,16 @@ pub struct RecoveryTable {
     pub useful_bad: Option<f64>,
     pub abandoned: Option<f64>,
     pub zombie: Option<f64>,
+}
+
+/// Observed intervention outcome used to update priors.
+#[derive(Debug, Clone, Serialize)]
+pub struct InterventionOutcome {
+    pub action: Action,
+    pub class: ProcessClass,
+    pub recovered: bool,
+    /// Optional weight for aggregated observations (defaults to 1.0 in callers).
+    pub weight: f64,
 }
 
 /// Compute expected recovery probability from a Beta prior.
@@ -49,6 +67,27 @@ pub fn update_beta(
     }
 }
 
+/// Apply an observed outcome to causal intervention priors.
+pub fn apply_outcome(
+    interventions: &CausalInterventions,
+    outcome: &InterventionOutcome,
+    eta: f64,
+) -> CausalInterventions {
+    let mut updated = interventions.clone();
+    let target = match outcome.action {
+        Action::Pause => &mut updated.pause,
+        Action::Throttle => &mut updated.throttle,
+        Action::Kill => &mut updated.kill,
+        Action::Restart => &mut updated.restart,
+        Action::Keep => return updated,
+    };
+    if let Some(priors) = target.as_ref() {
+        let refreshed = update_intervention_priors(priors, outcome, eta);
+        *target = Some(refreshed);
+    }
+    updated
+}
+
 /// Get per-class recovery table for an action if configured.
 pub fn recovery_table(priors: &Priors, action: Action) -> Option<RecoveryTable> {
     let interventions = priors.causal_interventions.as_ref()?;
@@ -60,6 +99,41 @@ pub fn recovery_table(priors: &Priors, action: Action) -> Option<RecoveryTable> 
         Action::Keep => None,
     };
     table
+}
+
+/// Compute expected recovery probability for an action given the class posterior.
+pub fn expected_recovery_for_action(
+    priors: &Priors,
+    posterior: &ClassScores,
+    action: Action,
+) -> Option<f64> {
+    let table = recovery_table(priors, action)?;
+    let useful = table.useful?;
+    let useful_bad = table.useful_bad?;
+    let abandoned = table.abandoned?;
+    let zombie = table.zombie?;
+
+    Some(
+        posterior.useful * useful
+            + posterior.useful_bad * useful_bad
+            + posterior.abandoned * abandoned
+            + posterior.zombie * zombie,
+    )
+}
+
+/// Compute expected recovery probabilities for all configured actions.
+pub fn expected_recovery_by_action(
+    priors: &Priors,
+    posterior: &ClassScores,
+) -> Vec<RecoveryExpectation> {
+    let actions = [Action::Pause, Action::Throttle, Action::Restart, Action::Kill];
+    let mut expectations = Vec::new();
+    for action in actions {
+        if let Some(probability) = expected_recovery_for_action(priors, posterior, action) {
+            expectations.push(RecoveryExpectation { action, probability });
+        }
+    }
+    expectations
 }
 
 /// Get expected recovery probability for a specific action/class.
@@ -96,10 +170,51 @@ fn build_table(action: Action, priors: Option<&InterventionPriors>) -> Option<Re
     })
 }
 
+fn update_intervention_priors(
+    priors: &InterventionPriors,
+    outcome: &InterventionOutcome,
+    eta: f64,
+) -> InterventionPriors {
+    let successes = if outcome.recovered { outcome.weight.max(0.0) } else { 0.0 };
+    let trials = outcome.weight.max(0.0);
+    let updated = |value: &Option<BetaParams>| {
+        value
+            .as_ref()
+            .map(|beta| update_beta(beta, successes, trials, eta))
+    };
+    match outcome.class {
+        ProcessClass::Useful => InterventionPriors {
+            useful: updated(&priors.useful),
+            useful_bad: priors.useful_bad.clone(),
+            abandoned: priors.abandoned.clone(),
+            zombie: priors.zombie.clone(),
+        },
+        ProcessClass::UsefulBad => InterventionPriors {
+            useful: priors.useful.clone(),
+            useful_bad: updated(&priors.useful_bad),
+            abandoned: priors.abandoned.clone(),
+            zombie: priors.zombie.clone(),
+        },
+        ProcessClass::Abandoned => InterventionPriors {
+            useful: priors.useful.clone(),
+            useful_bad: priors.useful_bad.clone(),
+            abandoned: updated(&priors.abandoned),
+            zombie: priors.zombie.clone(),
+        },
+        ProcessClass::Zombie => InterventionPriors {
+            useful: priors.useful.clone(),
+            useful_bad: priors.useful_bad.clone(),
+            abandoned: priors.abandoned.clone(),
+            zombie: updated(&priors.zombie),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::priors::{Classes, ClassPriors, GammaParams};
+    use crate::inference::ClassScores;
 
     #[test]
     fn expected_recovery_matches_mean() {
@@ -149,6 +264,81 @@ mod tests {
             bocpd: None,
         };
         assert!(recovery_table(&priors, Action::Pause).is_none());
+    }
+
+    #[test]
+    fn expected_recovery_for_action_combines_posteriors() {
+        let priors = Priors {
+            schema_version: "1.0.0".to_string(),
+            description: None,
+            created_at: None,
+            updated_at: None,
+            host_profile: None,
+            classes: Classes {
+                useful: default_class(),
+                useful_bad: default_class(),
+                abandoned: default_class(),
+                zombie: default_class(),
+            },
+            hazard_regimes: vec![],
+            semi_markov: None,
+            change_point: None,
+            causal_interventions: Some(CausalInterventions {
+                pause: Some(InterventionPriors {
+                    useful: Some(BetaParams { alpha: 9.0, beta: 1.0 }),
+                    useful_bad: Some(BetaParams { alpha: 1.0, beta: 1.0 }),
+                    abandoned: Some(BetaParams { alpha: 2.0, beta: 6.0 }),
+                    zombie: Some(BetaParams { alpha: 1.0, beta: 9.0 }),
+                }),
+                throttle: None,
+                kill: None,
+                restart: None,
+            }),
+            command_categories: None,
+            state_flags: None,
+            hierarchical: None,
+            robust_bayes: None,
+            error_rate: None,
+            bocpd: None,
+        };
+        let posterior = ClassScores {
+            useful: 0.5,
+            useful_bad: 0.2,
+            abandoned: 0.2,
+            zombie: 0.1,
+        };
+        let expected = expected_recovery_for_action(&priors, &posterior, Action::Pause)
+            .expect("recovery");
+        let manual = 0.5 * 0.9 + 0.2 * 0.5 + 0.2 * (2.0 / 8.0) + 0.1 * 0.1;
+        assert!((expected - manual).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn apply_outcome_updates_matching_class() {
+        let interventions = CausalInterventions {
+            pause: Some(InterventionPriors {
+                useful: Some(BetaParams { alpha: 1.0, beta: 1.0 }),
+                useful_bad: None,
+                abandoned: None,
+                zombie: None,
+            }),
+            throttle: None,
+            kill: None,
+            restart: None,
+        };
+        let outcome = InterventionOutcome {
+            action: Action::Pause,
+            class: ProcessClass::Useful,
+            recovered: true,
+            weight: 1.0,
+        };
+        let updated = apply_outcome(&interventions, &outcome, 1.0);
+        let updated_beta = updated
+            .pause
+            .and_then(|p| p.useful)
+            .expect("beta");
+        assert!((updated_beta.alpha - 2.0).abs() <= 1e-12);
+        assert!((updated_beta.beta - 1.0).abs() <= 1e-12);
     }
 
     fn default_class() -> ClassPriors {
