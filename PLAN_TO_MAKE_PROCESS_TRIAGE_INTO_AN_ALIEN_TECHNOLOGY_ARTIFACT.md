@@ -905,6 +905,7 @@ What gets logged (raw + derived + outcomes):
 - `proc_features`: Hawkes/BOCPD/Kalman/IMM state, copula params, EVT tail stats, periodicity features, sketches/heavy-hitter summaries.
 - `proc_inference`: per-class log-likelihood terms, Bayes factors, posterior, lfdr, VOI, PPC flags, DRO drift scores.
 - `decisions`: recommended action, expected loss, thresholds, FDR/alpha-investing state, safety gates triggered.
+- `math_ledger`: optional “galaxy-brain” cards (equations + values + intuition) tied to `(session_id, pid, card_id)`; stored only when `--galaxy-brain` is requested.
 - `actions` + `outcomes`: what was actually done (if anything), and what happened next (recovery, regressions, user override).
 
 Partitioning rule (example):
@@ -980,6 +981,107 @@ Core options:
 - "If parent dies: P(abandoned) → 0.89"
 - Helps decide whether to wait/re-check or act now
 
+**Galaxy-brain math ledger (structured output)**:
+- `--galaxy-brain` adds a `galaxy_brain` object with explicit equations, substituted numbers, and rendered outputs.
+- Schema sketch (JSON):
+```json
+{
+  "galaxy_brain": {
+    "enabled": true,
+    "cards": [
+      {
+        "id": "posterior_core",
+        "title": "Posterior Core",
+        "equations": [
+          "log P(C|x) = log P(C) + Σ_j log P(x_j|C)",
+          "log odds = log P(abandoned|x) - log P(useful|x)",
+          "SPRT threshold = log[(L_kill,useful-L_keep,useful)/(L_keep,abandoned-L_kill,abandoned)]"
+        ],
+        "values": {
+          "log_prior_useful": -2.11,
+          "log_prior_abandoned": -3.02,
+          "terms": {"cpu": 1.37, "tty": 0.84, "io": -0.25},
+          "log_odds": 1.12,
+          "threshold": 0.90
+        },
+        "intuition": "CPU+TTY dominate; IO softens confidence."
+      },
+      {
+        "id": "hazard_time_varying",
+        "title": "Time-Varying Hazard",
+        "equations": [
+          "λ_r | data ~ Gamma(α_r + N_r, β_r + E_r)",
+          "S(t) = exp(-∑_r λ_r * E_r)"
+        ],
+        "values": {
+          "regimes": [
+            {"name":"tty_lost","alpha":2.0,"beta":1.0,"N":1,"E":3600,"lambda_mean":0.00083},
+            {"name":"io_flatline","alpha":1.0,"beta":1.0,"N":0,"E":1800,"lambda_mean":0.00028}
+          ],
+          "survival_t": 0.41
+        },
+        "intuition": "TTY loss increases abandonment hazard."
+      },
+      {
+        "id": "conformal_interval",
+        "title": "Conformal Interval (Runtime/CPU)",
+        "equations": [
+          "s_i = |y_i - ŷ_i|",
+          "q_{1-α} = quantile({s_i})",
+          "[ŷ_{n+1} - q_{1-α}, ŷ_{n+1} + q_{1-α}]"
+        ],
+        "values": {
+          "alpha": 0.1,
+          "window": 200,
+          "y_hat": 0.42,
+          "q": 0.09,
+          "interval": [0.33, 0.51]
+        }
+      },
+      {
+        "id": "conformal_class",
+        "title": "Conformal Class Set",
+        "equations": [
+          "p_c = (1 + #{i: s_i(c) ≥ s_{n+1}(c)}) / (n + 1)",
+          "Predict = {c : p_c > α}"
+        ],
+        "values": {
+          "alpha": 0.1,
+          "p_values": {"useful":0.04,"useful_bad":0.22,"abandoned":0.91,"zombie":0.03},
+          "prediction_set": ["abandoned","useful_bad"]
+        }
+      },
+      {
+        "id": "e_fdr",
+        "title": "e-FDR (Anytime-Valid)",
+        "equations": [
+          "e_i ≥ 0 with E[e_i | null] ≤ 1",
+          "choose k s.t. (1/k) * Σ_{i=1..k} (1 / e_(i)) ≤ α"
+        ],
+        "values": {"alpha":0.05,"k":3,"included_in_set":true}
+      },
+      {
+        "id": "alpha_investing",
+        "title": "Alpha-Investing Budget",
+        "equations": [
+          "W_i = W_{i-1} - α_i + ω (if confirmed-correct)",
+          "W_i = W_{i-1} - α_i (otherwise)"
+        ],
+        "values": {"W_prev":0.12,"alpha_spend":0.01,"omega_reward":0.03,"W_next":0.14}
+      },
+      {
+        "id": "voi",
+        "title": "Value of Information",
+        "equations": [
+          "VOI = E[loss_now - loss_after_measurement] - cost"
+        ],
+        "values": {"voi":0.7,"cost":0.2,"best_probe":"perf_sched"}
+      }
+    ]
+  }
+}
+```
+
 #### 3) Apply (execute, no UI)
 ```
 pt agent apply --session <id> [OPTIONS]
@@ -1030,6 +1132,9 @@ Options:
 - `--galaxy-brain` - Include full math ledger in report
 - `--embed-assets` - Inline CDN assets for offline viewing
 - `--encrypt` - Encrypt bundle for secure transport
+
+Report schema note:
+- When `--galaxy-brain` is enabled, the HTML report embeds the same `galaxy_brain.cards[]` structure used by `pt agent explain`, allowing one renderer to power TUI, CLI, and report views.
 
 **Human-friendly summaries** (for handoff to users):
 - `--format slack` produces narrative suitable for chat:
@@ -1116,6 +1221,59 @@ Schema invariants (for agents):
   - `novel_pattern: true` when full inference was required
 - Predictions are explicit (when `--include-predictions`):
   - `trajectory.trend`, `trajectory.time_to_threshold`, `trajectory.predicted_classification`
+- Galaxy-brain math is structured (when `--galaxy-brain`):
+  - `galaxy_brain.cards[]` uses stable `id` values and includes `equations`, `values`, and `intuition`
+  - Report generation reuses the same schema to avoid duplicate render logic
+
+Galaxy-brain JSON Schema sketch (agent/report outputs):
+```json
+{
+  "type": "object",
+  "required": ["schema_version", "session_id", "generated_at", "host_id", "summary"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "session_id": {"type": "string"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "host_id": {"type": "string"},
+    "summary": {"type": "object"},
+    "galaxy_brain": {
+      "type": "object",
+      "required": ["enabled", "cards"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "cards": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "equations", "values"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "enum": [
+                  "posterior_core",
+                  "hazard_time_varying",
+                  "conformal_interval",
+                  "conformal_class",
+                  "e_fdr",
+                  "alpha_investing",
+                  "voi"
+                ]
+              },
+              "title": {"type": "string"},
+              "equations": {"type": "array", "items": {"type": "string"}},
+              "values": {"type": "object"},
+              "intuition": {"type": "string"}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}
+```
 
 Exit codes are automation-friendly:
 - `0` clean / nothing to do
@@ -1244,7 +1402,8 @@ When operating across a fleet, FDR control must span all hosts:
 - Single-host FDR might allow 1 false kill per 100 processes
 - Fleet FDR prevents "1 false kill spread across 100 hosts" (unacceptable)
 - Implementation: treat the entire fleet as one multiple-testing domain
-- Stricter thresholds scale with fleet size: `α_fleet = α_single / sqrt(n_hosts)`
+- **Conservative option**: `α_per_host = α_fleet / n_hosts` (Bonferroni-style, provides strict guarantee)
+- **Adaptive option** (heuristic): `α_per_host ≈ α_fleet / sqrt(n_hosts)` scales more gently but lacks formal FDR guarantee; use only when shadow-mode calibration validates it for your fleet size and dependence structure
 
 #### Aggregated Telemetry
 Fleet mode can aggregate telemetry to a central store:
@@ -1913,7 +2072,8 @@ Goal: coordinate decisions across multiple hosts to maintain fleet-level safety 
 When applying FDR control across a fleet:
 - Pool all candidates across all hosts into a single FDR domain
 - Stricter per-host thresholds to maintain fleet-level guarantee
-- Formula: `α_per_host = α_fleet / n_hosts` (conservative) or `α_fleet / sqrt(n_hosts)` (adaptive)
+- Conservative: `α_per_host = α_fleet / n_hosts` (Bonferroni-style, strict guarantee)
+- Adaptive (heuristic, requires shadow-mode validation): `α_per_host ≈ α_fleet / sqrt(n_hosts)`
 
 #### Cross-Host Correlation
 Detect correlated patterns:
