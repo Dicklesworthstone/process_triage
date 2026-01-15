@@ -80,7 +80,8 @@ pub fn apply_outcome(
         Action::Throttle => &mut updated.throttle,
         Action::Kill => &mut updated.kill,
         Action::Restart => &mut updated.restart,
-        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze => {
+        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze
+        | Action::Quarantine | Action::Unquarantine => {
             return updated; // No causal priors yet
         }
     };
@@ -113,7 +114,8 @@ pub fn recovery_table(priors: &Priors, action: Action) -> Option<RecoveryTable> 
         Action::Throttle => build_table(action, interventions.throttle.as_ref()),
         Action::Kill => build_table(action, interventions.kill.as_ref()),
         Action::Restart => build_table(action, interventions.restart.as_ref()),
-        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze => None,
+        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze
+        | Action::Quarantine | Action::Unquarantine => None,
     };
     table
 }
@@ -161,7 +163,13 @@ pub fn recovery_for_class(priors: &Priors, action: Action, class: ProcessClass) 
         Action::Throttle => interventions.throttle.as_ref(),
         Action::Kill => interventions.kill.as_ref(),
         Action::Restart => interventions.restart.as_ref(),
-        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze => None,
+        Action::Keep
+        | Action::Renice
+        | Action::Resume
+        | Action::Freeze
+        | Action::Unfreeze
+        | Action::Quarantine
+        | Action::Unquarantine => None,
     }?;
     let beta = match class {
         ProcessClass::Useful => priors.useful.as_ref(),
@@ -219,7 +227,13 @@ fn expected_recovery_stats_for_action(
         Action::Throttle => interventions.throttle.as_ref(),
         Action::Kill => interventions.kill.as_ref(),
         Action::Restart => interventions.restart.as_ref(),
-        Action::Keep | Action::Renice | Action::Resume | Action::Freeze | Action::Unfreeze => None,
+        Action::Keep
+        | Action::Renice
+        | Action::Resume
+        | Action::Freeze
+        | Action::Unfreeze
+        | Action::Quarantine
+        | Action::Unquarantine => None,
     }?;
 
     let useful_var = priors.useful.as_ref().and_then(beta_variance);

@@ -44,7 +44,9 @@ use std::path::Path;
 use thiserror::Error;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds: priors (Beta distributions), expectations (lifetime/CPU),
+/// extended patterns (arg_patterns, working_dir_patterns), and match scoring.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Errors from signature loading.
 #[derive(Debug, Error)]
@@ -66,6 +68,242 @@ pub enum SignatureError {
 
     #[error("Invalid regex pattern '{pattern}': {error}")]
     InvalidRegex { pattern: String, error: String },
+}
+
+/// Beta distribution parameters for Bayesian priors.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct BetaParams {
+    /// Alpha (shape1) parameter, must be positive.
+    pub alpha: f64,
+    /// Beta (shape2) parameter, must be positive.
+    pub beta: f64,
+}
+
+impl BetaParams {
+    /// Create new Beta distribution parameters.
+    pub fn new(alpha: f64, beta: f64) -> Self {
+        Self { alpha, beta }
+    }
+
+    /// Create a uniform prior Beta(1, 1).
+    pub fn uniform() -> Self {
+        Self { alpha: 1.0, beta: 1.0 }
+    }
+
+    /// Create a weakly informative prior Beta(2, 2).
+    pub fn weakly_informative() -> Self {
+        Self { alpha: 2.0, beta: 2.0 }
+    }
+
+    /// Compute the mean of the distribution: alpha / (alpha + beta).
+    pub fn mean(&self) -> f64 {
+        self.alpha / (self.alpha + self.beta)
+    }
+
+    /// Compute the mode of the distribution (for alpha, beta > 1).
+    pub fn mode(&self) -> Option<f64> {
+        if self.alpha > 1.0 && self.beta > 1.0 {
+            Some((self.alpha - 1.0) / (self.alpha + self.beta - 2.0))
+        } else {
+            None
+        }
+    }
+
+    /// Compute variance of the distribution.
+    pub fn variance(&self) -> f64 {
+        let sum = self.alpha + self.beta;
+        (self.alpha * self.beta) / (sum * sum * (sum + 1.0))
+    }
+
+    /// Validate that parameters are positive.
+    pub fn validate(&self) -> Result<(), SignatureError> {
+        if self.alpha <= 0.0 || self.beta <= 0.0 {
+            return Err(SignatureError::Invalid(
+                "Beta parameters alpha and beta must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for BetaParams {
+    fn default() -> Self {
+        Self::uniform()
+    }
+}
+
+/// Bayesian priors for process state classification.
+/// These provide signature-specific overrides for the global priors.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SignaturePriors {
+    /// Prior probability that a matched process is abandoned.
+    /// Higher alpha relative to beta indicates higher abandonment probability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abandoned: Option<BetaParams>,
+
+    /// Prior probability that a matched process is useful (actively serving a purpose).
+    /// Higher alpha relative to beta indicates higher usefulness probability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub useful: Option<BetaParams>,
+
+    /// Prior probability that a matched process is in useful_bad state.
+    /// (Resource hog but still actively used.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub useful_bad: Option<BetaParams>,
+
+    /// Prior probability that a matched process is a zombie.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zombie: Option<BetaParams>,
+}
+
+impl SignaturePriors {
+    /// Create priors indicating high likelihood of usefulness.
+    pub fn likely_useful() -> Self {
+        Self {
+            useful: Some(BetaParams::new(9.0, 1.0)),      // ~90% useful
+            abandoned: Some(BetaParams::new(1.0, 9.0)),  // ~10% abandoned
+            ..Default::default()
+        }
+    }
+
+    /// Create priors indicating high likelihood of abandonment.
+    pub fn likely_abandoned() -> Self {
+        Self {
+            useful: Some(BetaParams::new(1.0, 4.0)),      // ~20% useful
+            abandoned: Some(BetaParams::new(4.0, 1.0)),  // ~80% abandoned
+            ..Default::default()
+        }
+    }
+
+    /// Check if any priors are set.
+    pub fn is_empty(&self) -> bool {
+        self.abandoned.is_none()
+            && self.useful.is_none()
+            && self.useful_bad.is_none()
+            && self.zombie.is_none()
+    }
+
+    /// Validate all set priors.
+    pub fn validate(&self) -> Result<(), SignatureError> {
+        if let Some(ref p) = self.abandoned {
+            p.validate()?;
+        }
+        if let Some(ref p) = self.useful {
+            p.validate()?;
+        }
+        if let Some(ref p) = self.useful_bad {
+            p.validate()?;
+        }
+        if let Some(ref p) = self.zombie {
+            p.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Expected behavioral characteristics for processes matching this signature.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProcessExpectations {
+    /// Typical runtime in seconds for normal operation.
+    /// Processes running much shorter may have failed; much longer may be stuck.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub typical_lifetime_seconds: Option<u64>,
+
+    /// Maximum normal lifetime in seconds before the process becomes suspicious.
+    /// Beyond this, the process should be flagged for review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_normal_lifetime_seconds: Option<u64>,
+
+    /// Expected CPU utilization during active work (0.0 - 1.0).
+    /// E.g., a build process might expect 0.7-0.9 during compilation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_during_run: Option<f64>,
+
+    /// Whether idle CPU (near 0%) is expected/normal for this process type.
+    /// True for daemons waiting for events, false for active computation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub idle_cpu_normal: bool,
+
+    /// Expected memory footprint in bytes (rough order of magnitude).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_memory_bytes: Option<u64>,
+
+    /// Whether network activity is expected.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expects_network: bool,
+
+    /// Whether file I/O activity is expected.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expects_disk_io: bool,
+}
+
+impl ProcessExpectations {
+    /// Create expectations for a short-lived build/compile task.
+    pub fn short_lived_task() -> Self {
+        Self {
+            typical_lifetime_seconds: Some(300),        // 5 minutes typical
+            max_normal_lifetime_seconds: Some(3600),   // 1 hour max
+            cpu_during_run: Some(0.8),
+            idle_cpu_normal: false,
+            expects_disk_io: true,
+            ..Default::default()
+        }
+    }
+
+    /// Create expectations for a long-running daemon.
+    pub fn daemon() -> Self {
+        Self {
+            typical_lifetime_seconds: None,             // No typical lifetime
+            max_normal_lifetime_seconds: None,         // Can run indefinitely
+            cpu_during_run: Some(0.05),                // Low CPU when serving
+            idle_cpu_normal: true,
+            expects_network: true,
+            ..Default::default()
+        }
+    }
+
+    /// Create expectations for an interactive development server.
+    pub fn dev_server() -> Self {
+        Self {
+            typical_lifetime_seconds: Some(3600),      // ~1 hour session
+            max_normal_lifetime_seconds: Some(28800), // 8 hours max
+            cpu_during_run: Some(0.3),
+            idle_cpu_normal: true,                      // Idle between requests
+            expects_network: true,
+            expects_disk_io: true,                      // File watching
+            ..Default::default()
+        }
+    }
+
+    /// Check if any expectations are set.
+    pub fn is_empty(&self) -> bool {
+        self.typical_lifetime_seconds.is_none()
+            && self.max_normal_lifetime_seconds.is_none()
+            && self.cpu_during_run.is_none()
+            && !self.idle_cpu_normal
+            && self.expected_memory_bytes.is_none()
+            && !self.expects_network
+            && !self.expects_disk_io
+    }
+
+    /// Validate expectations.
+    pub fn validate(&self) -> Result<(), SignatureError> {
+        if let Some(cpu) = self.cpu_during_run {
+            if !(0.0..=1.0).contains(&cpu) {
+                return Err(SignatureError::Invalid(
+                    "cpu_during_run must be between 0.0 and 1.0".into(),
+                ));
+            }
+        }
+        if let (Some(typical), Some(max)) = (self.typical_lifetime_seconds, self.max_normal_lifetime_seconds) {
+            if typical > max {
+                return Err(SignatureError::Invalid(
+                    "typical_lifetime_seconds cannot exceed max_normal_lifetime_seconds".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A unified supervisor signature combining all detection patterns.
@@ -91,6 +329,29 @@ pub struct SupervisorSignature {
     /// Whether this is a built-in signature (vs user-defined).
     #[serde(default, skip_serializing_if = "is_false")]
     pub builtin: bool,
+
+    /// Bayesian priors for process state classification (v2).
+    /// Overrides global priors when this signature matches.
+    #[serde(default, skip_serializing_if = "SignaturePriors::is_empty")]
+    pub priors: SignaturePriors,
+
+    /// Expected behavioral characteristics (v2).
+    /// Used to detect anomalies in matched processes.
+    #[serde(default, skip_serializing_if = "ProcessExpectations::is_empty")]
+    pub expectations: ProcessExpectations,
+
+    /// Match priority for conflict resolution (v2).
+    /// Higher priority signatures take precedence. Default is 100.
+    #[serde(default = "default_priority", skip_serializing_if = "is_default_priority")]
+    pub priority: u32,
+}
+
+fn default_priority() -> u32 {
+    100
+}
+
+fn is_default_priority(p: &u32) -> bool {
+    *p == 100
 }
 
 fn default_confidence() -> f64 {
@@ -108,10 +369,19 @@ pub struct SignaturePatterns {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_names: Vec<String>,
 
+    /// Regex patterns for command-line arguments matching.
+    /// All patterns must match for an arg match (AND semantics).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arg_patterns: Vec<String>,
+
     /// Environment variable patterns: var_name -> expected value regex.
     /// Use ".*" or empty string to match any value (existence check).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub environment_vars: HashMap<String, String>,
+
+    /// Regex patterns for working directory matching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_dir_patterns: Vec<String>,
 
     /// Path prefixes for IPC socket detection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -124,6 +394,19 @@ pub struct SignaturePatterns {
     /// Regex patterns for parent/ancestor process names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parent_patterns: Vec<String>,
+
+    /// Minimum number of pattern types that must match (default 1).
+    /// E.g., min_matches=2 means both process_name AND arg_patterns must match.
+    #[serde(default = "default_min_matches", skip_serializing_if = "is_one")]
+    pub min_matches: u32,
+}
+
+fn default_min_matches() -> u32 {
+    1
+}
+
+fn is_one(n: &u32) -> bool {
+    *n == 1
 }
 
 impl SupervisorSignature {
@@ -136,6 +419,9 @@ impl SupervisorSignature {
             confidence_weight: default_confidence(),
             notes: None,
             builtin: false,
+            priors: SignaturePriors::default(),
+            expectations: ProcessExpectations::default(),
+            priority: default_priority(),
         }
     }
 
@@ -181,6 +467,42 @@ impl SupervisorSignature {
         self
     }
 
+    /// Add argument patterns.
+    pub fn with_arg_patterns(mut self, patterns: Vec<&str>) -> Self {
+        self.patterns.arg_patterns = patterns.into_iter().map(String::from).collect();
+        self
+    }
+
+    /// Add working directory patterns.
+    pub fn with_working_dir_patterns(mut self, patterns: Vec<&str>) -> Self {
+        self.patterns.working_dir_patterns = patterns.into_iter().map(String::from).collect();
+        self
+    }
+
+    /// Set Bayesian priors for state classification.
+    pub fn with_priors(mut self, priors: SignaturePriors) -> Self {
+        self.priors = priors;
+        self
+    }
+
+    /// Set expected behavioral characteristics.
+    pub fn with_expectations(mut self, expectations: ProcessExpectations) -> Self {
+        self.expectations = expectations;
+        self
+    }
+
+    /// Set match priority (higher = more specific).
+    pub fn with_priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Set minimum number of pattern types that must match.
+    pub fn with_min_matches(mut self, min: u32) -> Self {
+        self.patterns.min_matches = min;
+        self
+    }
+
     /// Validate the signature.
     pub fn validate(&self) -> Result<(), SignatureError> {
         if self.name.is_empty() {
@@ -195,6 +517,20 @@ impl SupervisorSignature {
 
         // Validate regex patterns
         for pattern in &self.patterns.process_names {
+            regex::Regex::new(pattern).map_err(|e| SignatureError::InvalidRegex {
+                pattern: pattern.clone(),
+                error: e.to_string(),
+            })?;
+        }
+
+        for pattern in &self.patterns.arg_patterns {
+            regex::Regex::new(pattern).map_err(|e| SignatureError::InvalidRegex {
+                pattern: pattern.clone(),
+                error: e.to_string(),
+            })?;
+        }
+
+        for pattern in &self.patterns.working_dir_patterns {
             regex::Regex::new(pattern).map_err(|e| SignatureError::InvalidRegex {
                 pattern: pattern.clone(),
                 error: e.to_string(),
@@ -216,6 +552,12 @@ impl SupervisorSignature {
                 })?;
             }
         }
+
+        // Validate priors
+        self.priors.validate()?;
+
+        // Validate expectations
+        self.expectations.validate()?;
 
         Ok(())
     }
@@ -388,6 +730,176 @@ impl Default for SignatureSchema {
     }
 }
 
+/// Match priority levels for scoring.
+/// Higher values indicate more specific/confident matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchLevel {
+    /// No match at all.
+    None = 0,
+    /// Generic category fallback.
+    GenericCategory = 10,
+    /// Command pattern matched only.
+    CommandOnly = 20,
+    /// Command + args pattern matched.
+    CommandPlusArgs = 30,
+    /// Exact command match (no regex needed).
+    ExactCommand = 40,
+    /// Multiple pattern types matched (high confidence).
+    MultiPattern = 50,
+}
+
+/// Details about which patterns matched.
+#[derive(Debug, Clone, Default)]
+pub struct MatchDetails {
+    /// Whether process_names matched.
+    pub process_name_matched: bool,
+    /// Whether arg_patterns matched.
+    pub args_matched: bool,
+    /// Whether working_dir_patterns matched.
+    pub working_dir_matched: bool,
+    /// Whether environment_vars matched.
+    pub env_vars_matched: bool,
+    /// Whether socket_paths matched.
+    pub socket_matched: bool,
+    /// Whether parent_patterns matched.
+    pub parent_matched: bool,
+    /// Number of distinct pattern types that matched.
+    pub pattern_types_matched: u32,
+}
+
+impl MatchDetails {
+    /// Count how many pattern types matched.
+    pub fn count_matches(&self) -> u32 {
+        let mut count = 0;
+        if self.process_name_matched {
+            count += 1;
+        }
+        if self.args_matched {
+            count += 1;
+        }
+        if self.working_dir_matched {
+            count += 1;
+        }
+        if self.env_vars_matched {
+            count += 1;
+        }
+        if self.socket_matched {
+            count += 1;
+        }
+        if self.parent_matched {
+            count += 1;
+        }
+        count
+    }
+}
+
+/// Result of matching a process against signatures.
+#[derive(Debug, Clone)]
+pub struct SignatureMatch<'a> {
+    /// The matched signature.
+    pub signature: &'a SupervisorSignature,
+    /// Match level indicating confidence.
+    pub level: MatchLevel,
+    /// Computed match score (0.0 - 1.0).
+    pub score: f64,
+    /// Details about which patterns matched.
+    pub details: MatchDetails,
+}
+
+impl<'a> SignatureMatch<'a> {
+    /// Create a new match result.
+    pub fn new(signature: &'a SupervisorSignature, level: MatchLevel, details: MatchDetails) -> Self {
+        let score = Self::compute_score(signature, &level, &details);
+        Self {
+            signature,
+            level,
+            score,
+            details,
+        }
+    }
+
+    /// Compute overall match score based on level, details, and signature confidence.
+    fn compute_score(
+        signature: &SupervisorSignature,
+        level: &MatchLevel,
+        details: &MatchDetails,
+    ) -> f64 {
+        // Base score from match level
+        let level_score = match level {
+            MatchLevel::None => 0.0,
+            MatchLevel::GenericCategory => 0.2,
+            MatchLevel::CommandOnly => 0.5,
+            MatchLevel::CommandPlusArgs => 0.7,
+            MatchLevel::ExactCommand => 0.85,
+            MatchLevel::MultiPattern => 0.95,
+        };
+
+        // Bonus for multiple pattern types matching
+        let pattern_bonus = (details.count_matches() as f64 - 1.0).max(0.0) * 0.05;
+
+        // Apply signature confidence weight
+        let raw_score = (level_score + pattern_bonus).min(1.0);
+        raw_score * signature.confidence_weight
+    }
+}
+
+/// Context about a process for matching.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessMatchContext<'a> {
+    /// Process name (comm).
+    pub comm: &'a str,
+    /// Full command line arguments.
+    pub cmdline: Option<&'a str>,
+    /// Working directory path.
+    pub cwd: Option<&'a str>,
+    /// Environment variables (name -> value).
+    pub env_vars: Option<&'a HashMap<String, String>>,
+    /// Socket paths the process has open.
+    pub socket_paths: Option<&'a [String]>,
+    /// Parent process name.
+    pub parent_comm: Option<&'a str>,
+}
+
+impl<'a> ProcessMatchContext<'a> {
+    /// Create context with just the process name.
+    pub fn with_comm(comm: &'a str) -> Self {
+        Self {
+            comm,
+            ..Default::default()
+        }
+    }
+
+    /// Set command line arguments.
+    pub fn cmdline(mut self, cmdline: &'a str) -> Self {
+        self.cmdline = Some(cmdline);
+        self
+    }
+
+    /// Set working directory.
+    pub fn cwd(mut self, cwd: &'a str) -> Self {
+        self.cwd = Some(cwd);
+        self
+    }
+
+    /// Set environment variables.
+    pub fn env_vars(mut self, env: &'a HashMap<String, String>) -> Self {
+        self.env_vars = Some(env);
+        self
+    }
+
+    /// Set socket paths.
+    pub fn socket_paths(mut self, paths: &'a [String]) -> Self {
+        self.socket_paths = Some(paths);
+        self
+    }
+
+    /// Set parent process name.
+    pub fn parent_comm(mut self, parent: &'a str) -> Self {
+        self.parent_comm = Some(parent);
+        self
+    }
+}
+
 /// Unified signature database combining all detection methods.
 #[derive(Debug, Clone, Default)]
 pub struct SignatureDatabase {
@@ -395,6 +907,10 @@ pub struct SignatureDatabase {
     signatures: Vec<SupervisorSignature>,
     /// Compiled regex patterns for process names (cached).
     process_regexes: Vec<(usize, regex::Regex)>, // (signature_index, regex)
+    /// Compiled regex patterns for arguments (cached).
+    arg_regexes: Vec<(usize, regex::Regex)>,
+    /// Compiled regex patterns for working directories (cached).
+    working_dir_regexes: Vec<(usize, regex::Regex)>,
     /// Compiled regex patterns for parent processes (cached).
     parent_regexes: Vec<(usize, regex::Regex)>,
 }
@@ -405,6 +921,8 @@ impl SignatureDatabase {
         Self {
             signatures: vec![],
             process_regexes: vec![],
+            arg_regexes: vec![],
+            working_dir_regexes: vec![],
             parent_regexes: vec![],
         }
     }
@@ -440,6 +958,20 @@ impl SignatureDatabase {
         for pattern in &signature.patterns.process_names {
             if let Ok(re) = regex::Regex::new(pattern) {
                 self.process_regexes.push((idx, re));
+            }
+        }
+
+        // Compile argument regexes
+        for pattern in &signature.patterns.arg_patterns {
+            if let Ok(re) = regex::Regex::new(pattern) {
+                self.arg_regexes.push((idx, re));
+            }
+        }
+
+        // Compile working directory regexes
+        for pattern in &signature.patterns.working_dir_patterns {
+            if let Ok(re) = regex::Regex::new(pattern) {
+                self.working_dir_regexes.push((idx, re));
             }
         }
 
@@ -570,6 +1102,156 @@ impl SignatureDatabase {
             .iter()
             .filter(|sig| sig.patterns.pid_files.iter().any(|p| path == p || path.starts_with(p)))
             .collect()
+    }
+
+    /// Match a process against all signatures with comprehensive scoring.
+    ///
+    /// Returns all matching signatures sorted by score (best match first).
+    /// Uses priority rules:
+    /// 1. Exact match on command (highest priority)
+    /// 2. Pattern match on command plus args
+    /// 3. Pattern match on command only
+    /// 4. Fallback to generic category
+    ///
+    /// Performance target: <10ms for 50+ signatures.
+    pub fn match_process<'a>(&'a self, ctx: &ProcessMatchContext<'_>) -> Vec<SignatureMatch<'a>> {
+        let mut matches: Vec<SignatureMatch<'a>> = Vec::new();
+
+        for (sig_idx, sig) in self.signatures.iter().enumerate() {
+            let mut details = MatchDetails::default();
+
+            // Check process name patterns
+            let process_name_matched = self
+                .process_regexes
+                .iter()
+                .filter(|(idx, _)| *idx == sig_idx)
+                .any(|(_, re)| re.is_match(ctx.comm));
+            details.process_name_matched = process_name_matched;
+
+            // Check exact command match (higher priority than pattern)
+            let exact_command_match = sig
+                .patterns
+                .process_names
+                .iter()
+                .any(|p| p == &format!("^{}$", regex::escape(ctx.comm)));
+
+            // Check argument patterns
+            let args_matched = if let Some(cmdline) = ctx.cmdline {
+                if sig.patterns.arg_patterns.is_empty() {
+                    false
+                } else {
+                    // All arg patterns must match (AND semantics)
+                    self.arg_regexes
+                        .iter()
+                        .filter(|(idx, _)| *idx == sig_idx)
+                        .all(|(_, re)| re.is_match(cmdline))
+                        && !sig.patterns.arg_patterns.is_empty()
+                }
+            } else {
+                false
+            };
+            details.args_matched = args_matched;
+
+            // Check working directory patterns
+            let working_dir_matched = if let Some(cwd) = ctx.cwd {
+                self.working_dir_regexes
+                    .iter()
+                    .filter(|(idx, _)| *idx == sig_idx)
+                    .any(|(_, re)| re.is_match(cwd))
+            } else {
+                false
+            };
+            details.working_dir_matched = working_dir_matched;
+
+            // Check environment variables
+            let env_vars_matched = if let Some(env) = ctx.env_vars {
+                if sig.patterns.environment_vars.is_empty() {
+                    false
+                } else {
+                    sig.patterns.environment_vars.iter().any(|(var_name, pattern)| {
+                        if let Some(var_value) = env.get(var_name) {
+                            if pattern.is_empty() || pattern == ".*" {
+                                true
+                            } else {
+                                regex::Regex::new(pattern)
+                                    .map(|re| re.is_match(var_value))
+                                    .unwrap_or(false)
+                            }
+                        } else {
+                            false
+                        }
+                    })
+                }
+            } else {
+                false
+            };
+            details.env_vars_matched = env_vars_matched;
+
+            // Check socket paths
+            let socket_matched = if let Some(sockets) = ctx.socket_paths {
+                sig.patterns.socket_paths.iter().any(|prefix| {
+                    sockets.iter().any(|s| s.starts_with(prefix))
+                })
+            } else {
+                false
+            };
+            details.socket_matched = socket_matched;
+
+            // Check parent patterns
+            let parent_matched = if let Some(parent) = ctx.parent_comm {
+                self.parent_regexes
+                    .iter()
+                    .filter(|(idx, _)| *idx == sig_idx)
+                    .any(|(_, re)| re.is_match(parent))
+            } else {
+                false
+            };
+            details.parent_matched = parent_matched;
+
+            // Update pattern types matched count
+            details.pattern_types_matched = details.count_matches();
+
+            // Determine match level
+            let level = if details.pattern_types_matched == 0 {
+                continue; // No match, skip this signature
+            } else if details.pattern_types_matched >= 2 {
+                MatchLevel::MultiPattern
+            } else if exact_command_match && process_name_matched {
+                MatchLevel::ExactCommand
+            } else if process_name_matched && args_matched {
+                MatchLevel::CommandPlusArgs
+            } else if process_name_matched {
+                MatchLevel::CommandOnly
+            } else {
+                // Matched on something other than process name (env, socket, etc.)
+                MatchLevel::GenericCategory
+            };
+
+            // Check if min_matches requirement is satisfied
+            if details.pattern_types_matched < sig.patterns.min_matches {
+                continue;
+            }
+
+            matches.push(SignatureMatch::new(sig, level, details));
+        }
+
+        // Sort by score (descending), then by priority (descending)
+        matches.sort_by(|a, b| {
+            // First compare scores
+            let score_cmp = b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal);
+            if score_cmp != std::cmp::Ordering::Equal {
+                return score_cmp;
+            }
+            // Then compare priorities
+            b.signature.priority.cmp(&a.signature.priority)
+        });
+
+        matches
+    }
+
+    /// Get the best matching signature for a process, if any.
+    pub fn best_match<'a>(&'a self, ctx: &ProcessMatchContext<'_>) -> Option<SignatureMatch<'a>> {
+        self.match_process(ctx).into_iter().next()
     }
 
     /// Add all default bundled signatures.
@@ -1040,5 +1722,517 @@ mod tests {
 
         let patterns = sig.to_env_patterns();
         assert_eq!(patterns.len(), 2);
+    }
+
+    // ==================== v2 Feature Tests ====================
+
+    #[test]
+    fn test_beta_params_mean() {
+        let uniform = BetaParams::uniform();
+        assert!((uniform.mean() - 0.5).abs() < 0.001);
+
+        let skewed = BetaParams::new(9.0, 1.0);
+        assert!((skewed.mean() - 0.9).abs() < 0.001);
+
+        let opposite = BetaParams::new(1.0, 9.0);
+        assert!((opposite.mean() - 0.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_beta_params_mode() {
+        // Uniform has no mode (alpha == beta == 1)
+        let uniform = BetaParams::uniform();
+        assert!(uniform.mode().is_none());
+
+        // Weakly informative has mode at 0.5
+        let weak = BetaParams::weakly_informative();
+        let mode = weak.mode().unwrap();
+        assert!((mode - 0.5).abs() < 0.001);
+
+        // Skewed distribution
+        let skewed = BetaParams::new(9.0, 2.0);
+        let mode = skewed.mode().unwrap();
+        // Mode = (9 - 1) / (9 + 2 - 2) = 8 / 9 ≈ 0.889
+        assert!((mode - 0.889).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_beta_params_variance() {
+        let uniform = BetaParams::uniform();
+        // Variance of Beta(1,1) = 1*1 / (2*2*3) = 1/12 ≈ 0.0833
+        assert!((uniform.variance() - 0.0833).abs() < 0.001);
+
+        let concentrated = BetaParams::new(10.0, 10.0);
+        // More concentrated around the mean, lower variance
+        assert!(concentrated.variance() < uniform.variance());
+    }
+
+    #[test]
+    fn test_beta_params_validation() {
+        // Valid params
+        assert!(BetaParams::new(1.0, 1.0).validate().is_ok());
+        assert!(BetaParams::new(0.5, 0.5).validate().is_ok());
+
+        // Invalid: zero or negative
+        assert!(BetaParams::new(0.0, 1.0).validate().is_err());
+        assert!(BetaParams::new(1.0, 0.0).validate().is_err());
+        assert!(BetaParams::new(-1.0, 1.0).validate().is_err());
+    }
+
+    #[test]
+    fn test_signature_priors_likely_useful() {
+        let priors = SignaturePriors::likely_useful();
+
+        // Should have high usefulness prior
+        assert!(priors.useful.is_some());
+        let useful = priors.useful.unwrap();
+        assert!(useful.mean() > 0.8);
+
+        // Should have low abandonment prior
+        assert!(priors.abandoned.is_some());
+        let abandoned = priors.abandoned.unwrap();
+        assert!(abandoned.mean() < 0.2);
+    }
+
+    #[test]
+    fn test_signature_priors_likely_abandoned() {
+        let priors = SignaturePriors::likely_abandoned();
+
+        // Should have high abandonment prior
+        assert!(priors.abandoned.is_some());
+        let abandoned = priors.abandoned.unwrap();
+        assert!(abandoned.mean() > 0.7);
+
+        // Should have low usefulness prior
+        assert!(priors.useful.is_some());
+        let useful = priors.useful.unwrap();
+        assert!(useful.mean() < 0.3);
+    }
+
+    #[test]
+    fn test_signature_priors_is_empty() {
+        let empty = SignaturePriors::default();
+        assert!(empty.is_empty());
+
+        let with_useful = SignaturePriors {
+            useful: Some(BetaParams::uniform()),
+            ..Default::default()
+        };
+        assert!(!with_useful.is_empty());
+    }
+
+    #[test]
+    fn test_signature_priors_validation() {
+        // Valid priors
+        let valid = SignaturePriors::likely_useful();
+        assert!(valid.validate().is_ok());
+
+        // Invalid priors (negative alpha)
+        let invalid = SignaturePriors {
+            useful: Some(BetaParams::new(-1.0, 1.0)),
+            ..Default::default()
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn test_process_expectations_short_lived_task() {
+        let exp = ProcessExpectations::short_lived_task();
+
+        assert!(exp.typical_lifetime_seconds.is_some());
+        assert!(exp.max_normal_lifetime_seconds.is_some());
+        assert!(!exp.idle_cpu_normal);
+        assert!(exp.expects_disk_io);
+        assert!(!exp.is_empty());
+    }
+
+    #[test]
+    fn test_process_expectations_daemon() {
+        let exp = ProcessExpectations::daemon();
+
+        // Daemons have no typical lifetime
+        assert!(exp.typical_lifetime_seconds.is_none());
+        assert!(exp.max_normal_lifetime_seconds.is_none());
+        assert!(exp.idle_cpu_normal);
+        assert!(exp.expects_network);
+        assert!(!exp.is_empty());
+    }
+
+    #[test]
+    fn test_process_expectations_dev_server() {
+        let exp = ProcessExpectations::dev_server();
+
+        assert!(exp.typical_lifetime_seconds.is_some());
+        assert!(exp.idle_cpu_normal);
+        assert!(exp.expects_network);
+        assert!(exp.expects_disk_io);
+        assert!(!exp.is_empty());
+    }
+
+    #[test]
+    fn test_process_expectations_validation() {
+        // Valid expectations
+        let valid = ProcessExpectations::short_lived_task();
+        assert!(valid.validate().is_ok());
+
+        // Invalid: CPU out of range
+        let invalid_cpu = ProcessExpectations {
+            cpu_during_run: Some(1.5),
+            ..Default::default()
+        };
+        assert!(invalid_cpu.validate().is_err());
+
+        // Invalid: typical > max
+        let invalid_lifetime = ProcessExpectations {
+            typical_lifetime_seconds: Some(1000),
+            max_normal_lifetime_seconds: Some(500),
+            ..Default::default()
+        };
+        assert!(invalid_lifetime.validate().is_err());
+    }
+
+    #[test]
+    fn test_process_expectations_is_empty() {
+        let empty = ProcessExpectations::default();
+        assert!(empty.is_empty());
+
+        let with_cpu = ProcessExpectations {
+            cpu_during_run: Some(0.5),
+            ..Default::default()
+        };
+        assert!(!with_cpu.is_empty());
+    }
+
+    #[test]
+    fn test_match_details_count_matches() {
+        let empty = MatchDetails::default();
+        assert_eq!(empty.count_matches(), 0);
+
+        let one_match = MatchDetails {
+            process_name_matched: true,
+            ..Default::default()
+        };
+        assert_eq!(one_match.count_matches(), 1);
+
+        let two_matches = MatchDetails {
+            process_name_matched: true,
+            args_matched: true,
+            ..Default::default()
+        };
+        assert_eq!(two_matches.count_matches(), 2);
+
+        let all_matches = MatchDetails {
+            process_name_matched: true,
+            args_matched: true,
+            working_dir_matched: true,
+            env_vars_matched: true,
+            socket_matched: true,
+            parent_matched: true,
+            pattern_types_matched: 6,
+        };
+        assert_eq!(all_matches.count_matches(), 6);
+    }
+
+    #[test]
+    fn test_process_match_context_builder() {
+        let env = HashMap::from([("FOO".to_string(), "bar".to_string())]);
+        let sockets = vec!["/tmp/sock".to_string()];
+
+        let ctx = ProcessMatchContext::with_comm("test")
+            .cmdline("test --arg1 --arg2")
+            .cwd("/home/user/project")
+            .env_vars(&env)
+            .socket_paths(&sockets)
+            .parent_comm("parent");
+
+        assert_eq!(ctx.comm, "test");
+        assert_eq!(ctx.cmdline, Some("test --arg1 --arg2"));
+        assert_eq!(ctx.cwd, Some("/home/user/project"));
+        assert!(ctx.env_vars.is_some());
+        assert!(ctx.socket_paths.is_some());
+        assert_eq!(ctx.parent_comm, Some("parent"));
+    }
+
+    #[test]
+    fn test_match_process_basic() {
+        let db = SignatureDatabase::with_defaults();
+
+        // Test matching claude process
+        let ctx = ProcessMatchContext::with_comm("claude");
+        let matches = db.match_process(&ctx);
+
+        assert!(!matches.is_empty());
+        assert_eq!(matches[0].signature.name, "claude");
+        assert!(matches[0].level >= MatchLevel::CommandOnly);
+    }
+
+    #[test]
+    fn test_match_process_no_match() {
+        let db = SignatureDatabase::with_defaults();
+
+        // Non-supervisor process should not match
+        let ctx = ProcessMatchContext::with_comm("random_process_xyz");
+        let matches = db.match_process(&ctx);
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_match_process_with_env_var() {
+        let db = SignatureDatabase::with_defaults();
+
+        let env = HashMap::from([
+            ("VSCODE_PID".to_string(), "12345".to_string()),
+        ]);
+
+        // Even if process name doesn't match, env var should match vscode
+        let ctx = ProcessMatchContext::with_comm("some_shell")
+            .env_vars(&env);
+        let matches = db.match_process(&ctx);
+
+        // Should have a match from environment
+        assert!(matches.iter().any(|m| m.signature.name == "vscode"));
+    }
+
+    #[test]
+    fn test_match_process_with_socket() {
+        let db = SignatureDatabase::with_defaults();
+
+        let sockets = vec!["/tmp/claude-session-123".to_string()];
+
+        let ctx = ProcessMatchContext::with_comm("shell")
+            .socket_paths(&sockets);
+        let matches = db.match_process(&ctx);
+
+        // Should match claude via socket path
+        assert!(matches.iter().any(|m| m.signature.name == "claude"));
+    }
+
+    #[test]
+    fn test_match_process_multi_pattern() {
+        let db = SignatureDatabase::with_defaults();
+
+        let env = HashMap::from([
+            ("VSCODE_PID".to_string(), "12345".to_string()),
+        ]);
+        let sockets = vec!["/tmp/vscode-ipc-456.sock".to_string()];
+
+        // Match on process name, env var, and socket - should get MultiPattern level
+        let ctx = ProcessMatchContext::with_comm("code")
+            .env_vars(&env)
+            .socket_paths(&sockets);
+        let matches = db.match_process(&ctx);
+
+        assert!(!matches.is_empty());
+        let vscode_match = matches.iter().find(|m| m.signature.name == "vscode");
+        assert!(vscode_match.is_some());
+
+        // Should have MultiPattern level due to multiple pattern types
+        let m = vscode_match.unwrap();
+        assert_eq!(m.level, MatchLevel::MultiPattern);
+        assert!(m.details.pattern_types_matched >= 2);
+    }
+
+    #[test]
+    fn test_best_match() {
+        let db = SignatureDatabase::with_defaults();
+
+        let ctx = ProcessMatchContext::with_comm("claude");
+        let best = db.best_match(&ctx);
+
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().signature.name, "claude");
+    }
+
+    #[test]
+    fn test_best_match_none() {
+        let db = SignatureDatabase::with_defaults();
+
+        let ctx = ProcessMatchContext::with_comm("nonexistent_process_xyz");
+        let best = db.best_match(&ctx);
+
+        assert!(best.is_none());
+    }
+
+    #[test]
+    fn test_signature_with_priors_and_expectations() {
+        let sig = SupervisorSignature::new("test-server", SupervisorCategory::Ide)
+            .with_confidence(0.85)
+            .with_process_patterns(vec![r"^test-server$"])
+            .with_priors(SignaturePriors::likely_useful())
+            .with_expectations(ProcessExpectations::dev_server())
+            .with_priority(150);
+
+        assert!(sig.validate().is_ok());
+        assert!(!sig.priors.is_empty());
+        assert!(!sig.expectations.is_empty());
+        assert_eq!(sig.priority, 150);
+    }
+
+    #[test]
+    fn test_signature_priority_affects_sorting() {
+        let mut db = SignatureDatabase::new();
+
+        // Add two signatures that both match "node"
+        let _ = db.add(
+            SupervisorSignature::new("generic-node", SupervisorCategory::Other)
+                .with_process_patterns(vec![r"^node$"])
+                .with_priority(50) // Lower priority
+        );
+        let _ = db.add(
+            SupervisorSignature::new("specific-node", SupervisorCategory::Other)
+                .with_process_patterns(vec![r"^node$"])
+                .with_priority(150) // Higher priority
+        );
+
+        let ctx = ProcessMatchContext::with_comm("node");
+        let matches = db.match_process(&ctx);
+
+        assert_eq!(matches.len(), 2);
+        // Higher priority should come first when scores are equal
+        assert_eq!(matches[0].signature.name, "specific-node");
+        assert_eq!(matches[1].signature.name, "generic-node");
+    }
+
+    #[test]
+    fn test_min_matches_requirement() {
+        let mut db = SignatureDatabase::new();
+
+        // Signature requiring both process name AND arg patterns
+        let _ = db.add(
+            SupervisorSignature::new("strict-match", SupervisorCategory::Agent)
+                .with_process_patterns(vec![r"^myapp$"])
+                .with_arg_patterns(vec![r"--special-mode"])
+                .with_min_matches(2) // Require both to match
+        );
+
+        // Just process name - should NOT match (only 1 pattern type)
+        let ctx1 = ProcessMatchContext::with_comm("myapp");
+        let matches1 = db.match_process(&ctx1);
+        assert!(matches1.is_empty());
+
+        // Process name + args - should match (2 pattern types)
+        let ctx2 = ProcessMatchContext::with_comm("myapp")
+            .cmdline("myapp --special-mode --other");
+        let matches2 = db.match_process(&ctx2);
+        assert!(!matches2.is_empty());
+    }
+
+    #[test]
+    fn test_arg_patterns_matching() {
+        let mut db = SignatureDatabase::new();
+
+        let _ = db.add(
+            SupervisorSignature::new("jest-watch", SupervisorCategory::Other)
+                .with_process_patterns(vec![r"^node$"])
+                .with_arg_patterns(vec![r"jest", r"--watch"])
+        );
+
+        // With matching args
+        let ctx_match = ProcessMatchContext::with_comm("node")
+            .cmdline("node ./node_modules/.bin/jest --watch src/");
+        let matches = db.match_process(&ctx_match);
+        assert!(matches.iter().any(|m| m.signature.name == "jest-watch"));
+
+        // Without --watch (partial arg match - needs ALL)
+        let ctx_partial = ProcessMatchContext::with_comm("node")
+            .cmdline("node ./node_modules/.bin/jest src/test.js");
+        let matches_partial = db.match_process(&ctx_partial);
+        // Should not match because --watch is missing (AND semantics)
+        assert!(!matches_partial.iter().any(|m| m.signature.name == "jest-watch" && m.details.args_matched));
+    }
+
+    #[test]
+    fn test_working_dir_patterns_matching() {
+        let mut db = SignatureDatabase::new();
+
+        let _ = db.add(
+            SupervisorSignature::new("project-dev", SupervisorCategory::Other)
+                .with_process_patterns(vec![r"^node$"])
+                .with_working_dir_patterns(vec![r"/home/.*/projects/"])
+        );
+
+        let ctx_match = ProcessMatchContext::with_comm("node")
+            .cwd("/home/user/projects/myapp");
+        let matches = db.match_process(&ctx_match);
+
+        assert!(!matches.is_empty());
+        assert!(matches[0].details.working_dir_matched);
+    }
+
+    #[test]
+    fn test_schema_v2_json_roundtrip() {
+        let mut schema = SignatureSchema::new();
+        schema.add(
+            SupervisorSignature::new("test-v2", SupervisorCategory::Agent)
+                .with_confidence(0.90)
+                .with_process_patterns(vec![r"^test$"])
+                .with_priors(SignaturePriors::likely_useful())
+                .with_expectations(ProcessExpectations::dev_server())
+                .with_priority(200)
+        );
+
+        let json = schema.to_json().expect("should serialize to JSON");
+        let loaded = SignatureSchema::from_json(&json).expect("should parse JSON");
+
+        assert_eq!(loaded.signatures.len(), 1);
+        let sig = &loaded.signatures[0];
+        assert_eq!(sig.name, "test-v2");
+        assert_eq!(sig.priority, 200);
+        assert!(!sig.priors.is_empty());
+        assert!(!sig.expectations.is_empty());
+
+        // Verify priors survived roundtrip
+        let useful = sig.priors.useful.unwrap();
+        assert!(useful.mean() > 0.8);
+    }
+
+    #[test]
+    fn test_schema_v2_toml_roundtrip() {
+        let mut schema = SignatureSchema::new();
+        schema.add(
+            SupervisorSignature::new("test-v2-toml", SupervisorCategory::Ci)
+                .with_confidence(0.85)
+                .with_process_patterns(vec![r"^ci-runner$"])
+                .with_arg_patterns(vec![r"--pipeline"])
+                .with_working_dir_patterns(vec![r"/builds/"])
+                .with_min_matches(2)
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::short_lived_task())
+                .with_priority(75)
+        );
+
+        let toml_str = schema.to_toml().expect("should serialize to TOML");
+        let loaded = SignatureSchema::from_toml(&toml_str).expect("should parse TOML");
+
+        assert_eq!(loaded.signatures.len(), 1);
+        let sig = &loaded.signatures[0];
+        assert_eq!(sig.name, "test-v2-toml");
+        assert_eq!(sig.priority, 75);
+        assert_eq!(sig.patterns.min_matches, 2);
+        assert!(!sig.patterns.arg_patterns.is_empty());
+        assert!(!sig.patterns.working_dir_patterns.is_empty());
+    }
+
+    #[test]
+    fn test_match_score_ordering() {
+        // Test that scores are ordered correctly by match level
+        let sig = SupervisorSignature::new("test", SupervisorCategory::Agent)
+            .with_confidence(1.0); // Use 1.0 for easy score comparison
+
+        let details = MatchDetails {
+            process_name_matched: true,
+            ..Default::default()
+        };
+
+        let command_only = SignatureMatch::new(&sig, MatchLevel::CommandOnly, details.clone());
+        let multi = SignatureMatch::new(&sig, MatchLevel::MultiPattern, MatchDetails {
+            process_name_matched: true,
+            env_vars_matched: true,
+            pattern_types_matched: 2,
+            ..Default::default()
+        });
+
+        assert!(multi.score > command_only.score);
     }
 }

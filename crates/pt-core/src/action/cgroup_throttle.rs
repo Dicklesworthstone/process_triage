@@ -443,7 +443,7 @@ impl ActionRunner for CpuThrottleActionRunner {
             Action::Throttle => self.execute_throttle(action),
             Action::Keep => Ok(()),
             Action::Pause | Action::Resume | Action::Kill | Action::Renice | Action::Restart
-            | Action::Freeze | Action::Unfreeze => {
+            | Action::Freeze | Action::Unfreeze | Action::Quarantine | Action::Unquarantine => {
                 Err(ActionError::Failed(format!(
                     "{:?} is not a throttle action",
                     action.action
@@ -457,7 +457,7 @@ impl ActionRunner for CpuThrottleActionRunner {
             Action::Throttle => self.verify_throttle(action),
             Action::Keep => Ok(()),
             Action::Pause | Action::Resume | Action::Kill | Action::Renice | Action::Restart
-            | Action::Freeze | Action::Unfreeze => {
+            | Action::Freeze | Action::Unfreeze | Action::Quarantine | Action::Unquarantine => {
                 Ok(())
             }
         }
