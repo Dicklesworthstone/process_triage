@@ -2164,13 +2164,13 @@ Use the model to interpret the observed snapshot:
 
 ### Phase 3: Evidence Collection
 - Quick scan: ps + basic features
-- Deep scan: /proc IO, CPU deltas, wchan, net, children, TTY
+- Deep scan: /proc IO, /proc/PID/schedstat + sched, CPU deltas, wchan, cgroup stats, fd churn, net, children, TTY (plus stack/IO sampling on macOS when available)
 - Implement a tool runner in `pt-core` with timeouts, output-size caps, and backpressure so “collect everything” does not destabilize the machine.
 - Emit structured progress events (JSONL) so both the TUI and `pt agent tail` can show staged progress (scan → deep scan → infer → decide).
 - Persist raw tool events + parsed samples to Parquet as the scan runs (batched), so failures still leave an analyzable trail.
 - Maximal system tools (auto-install; attempt all, degrade gracefully):
-  - Linux: sysstat, perf, bpftrace/bcc/bpftool, iotop, nethogs/iftop, lsof, atop, sysdig, smem, numactl/numastat, turbostat/powertop, strace/ltrace, acct/psacct, auditd, pcp
-  - macOS: fs_usage, sample, spindump, nettop, powermetrics, lsof, dtruss (if permitted)
+  - Linux: sysstat, perf (incl. perf sched), bpftrace/bcc/bpftool, iotop, nethogs/iftop, lsof, atop, sysdig, smem, numactl/numastat, turbostat/powertop, strace/ltrace, acct/psacct, auditd, pcp
+  - macOS: fs_usage, sample, spindump, nettop, powermetrics, lsof, dtruss (if permitted), vm_stat
 
 ### Phase 3a: Tooling Install Strategy (Maximal Instrumentation by Default)
 Policy: always try to install everything and collect as much data as possible.
@@ -2260,6 +2260,7 @@ Data-to-math mapping (signal -> model layer):
 - CPU bursts + syscall spikes -> Hawkes / marked point process intensities
 - IO bandwidth + write/read deltas -> renewal reward model, Gamma-Poisson rates
 - CPU% time series -> Kalman smoothing + BOCPD change-point detection
+- Scheduler wait / run-queue latency / context-switch bursts -> useful-but-bad likelihood boost + hazard inflation
 - PSI stall pressure -> queueing-theoretic cost term (Erlang-C) + hazard inflation
 - Cache miss / branch mispredict -> tight-loop likelihood boost (useful-but-bad vs abandoned)
 - Socket/client count -> dependency-weighted loss scaling + causal action cost
