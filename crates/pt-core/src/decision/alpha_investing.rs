@@ -194,6 +194,12 @@ fn choose_alpha_spend(wealth: f64, policy: &AlphaInvestingPolicy) -> f64 {
     spend.min(wealth)
 }
 
+enum LockState {
+    Valid,
+    Stale,
+    Gone,
+}
+
 struct LockGuard {
     lock_path: PathBuf,
 }
@@ -210,50 +216,66 @@ impl LockGuard {
                 })
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Check if the lock is stale (holder process is dead)
-                if Self::is_stale_lock(path) {
-                    // Try to remove stale lock and acquire
-                    if fs::remove_file(path).is_ok() {
-                        return Self::acquire(path); // Retry acquisition
+                match Self::check_lock_state(path) {
+                    LockState::Gone => Self::acquire(path), // Lock file disappeared, retry
+                    LockState::Stale => {
+                        // Try to remove stale lock and acquire
+                        match fs::remove_file(path) {
+                            Ok(_) => Self::acquire(path),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::acquire(path),
+                            Err(_) => Err(AlphaInvestingError::LockUnavailable),
+                        }
                     }
+                    LockState::Valid => Err(AlphaInvestingError::LockUnavailable),
                 }
-                Err(AlphaInvestingError::LockUnavailable)
             }
             Err(err) => Err(AlphaInvestingError::Io(err)),
         }
     }
 
-    /// Check if a lock file is stale (holder process no longer exists).
-    fn is_stale_lock(path: &Path) -> bool {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if let Ok(pid) = contents.trim().parse::<u32>() {
-                // Check if process with this PID exists
-                // On Unix, sending signal 0 checks existence without affecting process
-                #[cfg(unix)]
-                {
-                    // kill(pid, 0) returns 0 if process exists, -1 if not
-                    let result = unsafe { libc::kill(pid as i32, 0) };
-                    if result == 0 {
-                        return false; // Process exists, lock not stale
-                    }
-                    // Check error: ESRCH = no such process, EPERM = exists but no permission
-                    let err = std::io::Error::last_os_error();
-                    return match err.raw_os_error() {
-                        Some(code) if code == libc::ESRCH => true,  // Process dead
-                        Some(code) if code == libc::EPERM => false, // Process alive
-                        _ => true,                                  // Unknown error, assume stale
-                    };
+    /// Check the state of the lock file.
+    fn check_lock_state(path: &Path) -> LockState {
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                let trimmed = contents.trim();
+                if trimmed.is_empty() {
+                    // File exists but is empty - likely being created/written to.
+                    // Treat as valid to avoid race condition where we delete a lock
+                    // that is actively being initialized.
+                    return LockState::Valid;
                 }
-                #[cfg(not(unix))]
-                {
-                    // On non-Unix, we can't easily check - assume not stale
-                    let _ = pid;
-                    return false;
+
+                if let Ok(pid) = trimmed.parse::<u32>() {
+                    // Check if process with this PID exists
+                    #[cfg(unix)]
+                    {
+                        // kill(pid, 0) returns 0 if process exists, -1 if not
+                        let result = unsafe { libc::kill(pid as i32, 0) };
+                        if result == 0 {
+                            return LockState::Valid; // Process exists
+                        }
+                        // Check error: ESRCH = no such process, EPERM = exists but no permission
+                        let err = std::io::Error::last_os_error();
+                        match err.raw_os_error() {
+                            Some(code) if code == libc::ESRCH => LockState::Stale,  // Process dead
+                            Some(code) if code == libc::EPERM => LockState::Valid, // Process alive
+                            _ => LockState::Stale,                                  // Unknown error
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // On non-Unix, we can't easily check - assume valid to be safe
+                        let _ = pid;
+                        LockState::Valid
+                    }
+                } else {
+                    // Can't parse PID - might be corrupted
+                    LockState::Stale
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => LockState::Gone,
+            Err(_) => LockState::Stale, // Can't read, assume stale/broken
         }
-        // Can't read/parse lock file - might be corrupted, treat as stale
-        true
     }
 }
 

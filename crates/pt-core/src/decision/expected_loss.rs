@@ -27,7 +27,7 @@ pub enum Action {
 
 impl Action {
     /// Actions available for decision-making (excludes Resume/Unfreeze, which are follow-up actions).
-    const ALL: [Action; 7] = [
+    pub(crate) const ALL: [Action; 7] = [
         Action::Keep,
         Action::Renice,
         Action::Pause,
@@ -177,7 +177,7 @@ impl ActionFeasibility {
 }
 
 /// Expected loss for an action.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpectedLoss {
     pub action: Action,
     pub loss: f64,
@@ -373,7 +373,9 @@ fn validate_posterior(posterior: &ClassScores) -> Result<(), DecisionError> {
     Ok(())
 }
 
-fn expected_loss_for_action(
+/// Compute expected loss for a single action given posterior and loss matrix.
+/// This is exposed for use by VOI computation.
+pub(crate) fn expected_loss_for_action(
     action: Action,
     posterior: &ClassScores,
     loss_matrix: &LossMatrix,
@@ -418,7 +420,10 @@ fn loss_for_action(
     }
 }
 
-fn select_optimal_action(expected: &[ExpectedLoss]) -> (Action, bool) {
+/// Select the optimal action from a list of expected losses.
+/// Returns (action, tie_break) where tie_break is true if multiple actions had equal loss.
+/// This is exposed for use by VOI computation.
+pub(crate) fn select_optimal_action(expected: &[ExpectedLoss]) -> (Action, bool) {
     let mut best = &expected[0];
     let mut tie_break = false;
     for cand in expected.iter().skip(1) {

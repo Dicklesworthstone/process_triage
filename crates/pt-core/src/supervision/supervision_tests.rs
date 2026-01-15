@@ -624,6 +624,88 @@ mod combined_detection_tests {
 }
 
 #[cfg(test)]
+mod terminal_multiplexer_integration_tests {
+    use super::super::{
+        detect_environ_supervision, detect_supervision, read_environ, SupervisorCategory,
+    };
+    use crate::test_utils::{ProcessHarness, TestTimer};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tmux_env_marks_supervised_terminal() {
+        if !ProcessHarness::is_available() {
+            return;
+        }
+        let harness = ProcessHarness::default();
+        let _timer = TestTimer::new("tmux_env_supervision");
+
+        let proc = harness
+            .spawn_shell(
+                "exec env -i TMUX=/tmp/tmux-1000/default,12345,0 PATH=/usr/bin:/bin sleep 20",
+            )
+            .expect("spawn tmux env process");
+
+        // Wait for exec to complete and environment to update
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let env = match read_environ(proc.pid()) {
+            Ok(env) if env.is_empty() => return,
+            Ok(env) => env,
+            Err(_) => return,
+        };
+        let env_result = detect_environ_supervision(proc.pid()).expect("detect env supervision");
+        assert!(env.contains_key("TMUX"));
+        assert!(env_result.is_supervised);
+        assert_eq!(env_result.category, Some(SupervisorCategory::Terminal));
+        assert_eq!(env_result.supervisor_name.as_deref(), Some("tmux"));
+
+        let result = detect_supervision(proc.pid()).expect("detect supervision");
+        assert!(result.is_supervised);
+        assert!(result
+            .environ
+            .as_ref()
+            .is_some_and(|env| env.supervisor_name.as_deref() == Some("tmux")));
+        assert!(proc.is_running());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_screen_env_marks_supervised_terminal() {
+        if !ProcessHarness::is_available() {
+            return;
+        }
+        let harness = ProcessHarness::default();
+        let _timer = TestTimer::new("screen_env_supervision");
+
+        let proc = harness
+            .spawn_shell("exec env -i STY=12345.pts-0.hostname PATH=/usr/bin:/bin sleep 20")
+            .expect("spawn screen env process");
+
+        // Wait for exec to complete and environment to update
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let env = match read_environ(proc.pid()) {
+            Ok(env) if env.is_empty() => return,
+            Ok(env) => env,
+            Err(_) => return,
+        };
+        let env_result = detect_environ_supervision(proc.pid()).expect("detect env supervision");
+        assert!(env.contains_key("STY"));
+        assert!(env_result.is_supervised);
+        assert_eq!(env_result.category, Some(SupervisorCategory::Terminal));
+        assert_eq!(env_result.supervisor_name.as_deref(), Some("screen"));
+
+        let result = detect_supervision(proc.pid()).expect("detect supervision");
+        assert!(result.is_supervised);
+        assert!(result
+            .environ
+            .as_ref()
+            .is_some_and(|env| env.supervisor_name.as_deref() == Some("screen")));
+        assert!(proc.is_running());
+    }
+}
+
+#[cfg(test)]
 mod logging_tests {
     //! Tests for logging/telemetry requirements.
     //!

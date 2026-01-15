@@ -7,6 +7,7 @@ pub mod enforcer;
 pub mod expected_loss;
 pub mod fdr_selection;
 pub mod robot_constraints;
+pub mod voi;
 
 pub use alpha_investing::{
     AlphaInvestingPolicy, AlphaInvestingStore, AlphaUpdate, AlphaWealthState,
@@ -37,4 +38,8 @@ pub use robot_constraints::{
     ConstraintCheckResult, ConstraintChecker, ConstraintKind, ConstraintMetrics,
     ConstraintSource, ConstraintSources, ConstraintViolation, RobotCandidate,
     RuntimeRobotConstraints,
+};
+pub use voi::{
+    compute_voi, select_probe_by_information_gain, ProbeCost, ProbeCostModel,
+    ProbeInformationGain, ProbeType, ProbeVoi, VoiAnalysis, VoiError,
 };
