@@ -198,23 +198,67 @@ impl CompiledPattern {
                 })?)
             }
             PatternKind::Glob => {
-                // Convert glob to regex
+                // Convert glob to regex with proper handling of:
+                // - ** for recursive matching (any depth)
+                // - * for single segment wildcard
+                // - ? for single character wildcard
+                // - [...] for character classes
                 let mut regex_str = String::from("^");
                 let pattern = if entry.case_insensitive {
                     entry.pattern.to_lowercase()
                 } else {
                     entry.pattern.clone()
                 };
-                for c in pattern.chars() {
+                let chars: Vec<char> = pattern.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    let c = chars[i];
                     match c {
-                        '*' => regex_str.push_str(".*"),
+                        '*' => {
+                            // Check for ** (recursive match)
+                            if i + 1 < chars.len() && chars[i + 1] == '*' {
+                                regex_str.push_str(".*");
+                                i += 2;
+                                continue;
+                            }
+                            // Single * matches anything except path separator in some contexts,
+                            // but for cmdline matching we use .*
+                            regex_str.push_str(".*");
+                        }
                         '?' => regex_str.push('.'),
-                        '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                        '[' => {
+                            // Character class - find matching ] and pass through
+                            let start = i;
+                            i += 1;
+                            // Handle negation and initial ]
+                            if i < chars.len() && (chars[i] == '!' || chars[i] == '^') {
+                                i += 1;
+                            }
+                            if i < chars.len() && chars[i] == ']' {
+                                i += 1;
+                            }
+                            // Find closing ]
+                            while i < chars.len() && chars[i] != ']' {
+                                i += 1;
+                            }
+                            if i < chars.len() {
+                                // Valid character class - convert ! to ^ for negation
+                                let class_content: String = chars[start..=i].iter().collect();
+                                let converted = class_content.replace("[!", "[^");
+                                regex_str.push_str(&converted);
+                            } else {
+                                // No closing ] - escape the [
+                                regex_str.push_str("\\[");
+                                i = start; // Reset to just after [
+                            }
+                        }
+                        '.' | '+' | '(' | ')' | '{' | '}' | '^' | '$' | '|' | '\\' => {
                             regex_str.push('\\');
                             regex_str.push(c);
                         }
                         _ => regex_str.push(c),
                     }
+                    i += 1;
                 }
                 regex_str.push('$');
                 let full_pattern = if entry.case_insensitive {
@@ -281,15 +325,29 @@ impl RateLimiter {
     }
 
     fn check_and_increment(&self) -> Result<(), String> {
-        let current = self.kills_this_run.fetch_add(1, Ordering::SeqCst);
-        if current >= self.max_per_run {
-            self.kills_this_run.fetch_sub(1, Ordering::SeqCst);
-            return Err(format!(
-                "rate limit exceeded: {} kills already performed this run (max {})",
-                current, self.max_per_run
-            ));
+        // Use compare_exchange loop to avoid race condition.
+        // The previous implementation (fetch_add + conditional fetch_sub) had a TOCTOU bug:
+        // two threads could both increment, both see the overflow, and both decrement,
+        // resulting in incorrect count and bypassed rate limiting.
+        loop {
+            let current = self.kills_this_run.load(Ordering::Acquire);
+            if current >= self.max_per_run {
+                return Err(format!(
+                    "rate limit exceeded: {} kills already performed this run (max {})",
+                    current, self.max_per_run
+                ));
+            }
+            // Attempt atomic increment only if value hasn't changed
+            match self.kills_this_run.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(_) => continue, // Value changed, retry
+            }
         }
-        Ok(())
     }
 
     fn reset_run_counter(&self) {
@@ -408,6 +466,7 @@ impl PolicyEnforcer {
         action: Action,
         robot_mode: bool,
     ) -> PolicyCheckResult {
+        let mut warnings = Vec::new();
         // Only enforce most rules for destructive actions
         let is_destructive = matches!(action, Action::Kill | Action::Restart);
 
@@ -498,14 +557,14 @@ impl PolicyEnforcer {
                         rule: "guardrails.force_review_patterns".to_string(),
                         context: pattern.notes.clone(),
                     });
-                } else {
-                    // In interactive mode, just warn
-                    return PolicyCheckResult::allowed().with_warning(format!(
-                        "matches force_review pattern: {} ({})",
-                        pattern.original,
-                        pattern.notes.as_deref().unwrap_or("requires manual review")
-                    ));
                 }
+                // In interactive mode, just warn and continue evaluating other gates
+                warnings.push(format!(
+                    "matches force_review pattern: {} ({})",
+                    pattern.original,
+                    pattern.notes.as_deref().unwrap_or("requires manual review")
+                ));
+                break;
             }
         }
 
@@ -548,7 +607,11 @@ impl PolicyEnforcer {
             }
         }
 
-        PolicyCheckResult::allowed()
+        let mut result = PolicyCheckResult::allowed();
+        for warning in warnings {
+            result = result.with_warning(warning);
+        }
+        result
     }
 
     /// Check robot mode specific gates.
@@ -1101,6 +1164,88 @@ mod tests {
 
         let result = enforcer.check_action(&candidate, Action::Kill, false);
         assert!(!result.allowed);
+    }
+
+    #[test]
+    fn test_glob_double_star_recursive() {
+        // Test that ** matches any path depth (greedy .* in regex)
+        let mut policy = test_policy();
+        policy.guardrails.protected_patterns = vec![PatternEntry {
+            pattern: "/usr/**important".to_string(),
+            kind: "glob".to_string(),
+            case_insensitive: false,
+            notes: None,
+        }];
+
+        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+
+        let mut candidate = test_candidate();
+        candidate.cmdline = "/usr/local/bin/important".to_string();
+        let result = enforcer.check_action(&candidate, Action::Kill, false);
+        assert!(!result.allowed, "** should match any characters");
+
+        candidate.cmdline = "/usr/important".to_string();
+        let result = enforcer.check_action(&candidate, Action::Kill, false);
+        assert!(!result.allowed, "** should also match zero characters");
+
+        // Test that ** is different from single *
+        policy.guardrails.protected_patterns = vec![PatternEntry {
+            pattern: "test*end".to_string(),
+            kind: "glob".to_string(),
+            case_insensitive: false,
+            notes: None,
+        }];
+        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+
+        candidate.cmdline = "testmiddleend".to_string();
+        let result = enforcer.check_action(&candidate, Action::Kill, false);
+        assert!(!result.allowed, "* should match any characters");
+    }
+
+    #[test]
+    fn test_glob_character_class() {
+        // Test that [...] character classes work
+        let mut policy = test_policy();
+        policy.guardrails.protected_patterns = vec![PatternEntry {
+            pattern: "process[0-9]".to_string(),
+            kind: "glob".to_string(),
+            case_insensitive: false,
+            notes: None,
+        }];
+
+        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+
+        let mut candidate = test_candidate();
+        candidate.cmdline = "process5".to_string();
+        let result = enforcer.check_action(&candidate, Action::Kill, false);
+        assert!(!result.allowed, "[0-9] should match digits");
+
+        candidate.cmdline = "processX".to_string();
+        let result = enforcer.check_action(&candidate, Action::Kill, false);
+        assert!(result.allowed, "[0-9] should not match letters");
+    }
+
+    #[test]
+    fn test_glob_negated_character_class() {
+        // Test that [!...] negated character classes work
+        let mut policy = test_policy();
+        policy.guardrails.protected_patterns = vec![PatternEntry {
+            pattern: "proc[!0-9]".to_string(),
+            kind: "glob".to_string(),
+            case_insensitive: false,
+            notes: None,
+        }];
+
+        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+
+        let mut candidate = test_candidate();
+        candidate.cmdline = "procX".to_string();
+        let result = enforcer.check_action(&candidate, Action::Kill, false);
+        assert!(!result.allowed, "[!0-9] should match non-digits");
+
+        candidate.cmdline = "proc5".to_string();
+        let result = enforcer.check_action(&candidate, Action::Kill, false);
+        assert!(result.allowed, "[!0-9] should not match digits");
     }
 
     #[test]

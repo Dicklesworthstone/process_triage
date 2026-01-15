@@ -217,16 +217,45 @@ impl ActionLock {
             .open(path);
         match file {
             Ok(mut handle) => {
-                let _ = handle.write_all(b"locked");
+                // Write PID to lock file for stale lock detection
+                let _ = handle.write_all(format!("{}", std::process::id()).as_bytes());
                 Ok(Self {
                     lock_path: path.to_path_buf(),
                 })
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Check if the lock is stale (holder process is dead)
+                if Self::is_stale_lock(path) {
+                    // Try to remove stale lock and acquire
+                    if fs::remove_file(path).is_ok() {
+                        return Self::acquire(path); // Retry acquisition
+                    }
+                }
                 Err(ExecutionError::LockUnavailable)
             }
             Err(err) => Err(ExecutionError::Io(err)),
         }
+    }
+
+    /// Check if a lock file is stale (holder process no longer exists).
+    fn is_stale_lock(path: &Path) -> bool {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                // Check if process with this PID exists
+                #[cfg(unix)]
+                {
+                    let result = unsafe { libc::kill(pid as i32, 0) };
+                    return result != 0;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = pid;
+                    return false;
+                }
+            }
+        }
+        // Can't read/parse lock file - might be corrupted, treat as stale
+        true
     }
 }
 

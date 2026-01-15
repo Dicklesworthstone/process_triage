@@ -206,16 +206,48 @@ impl LockGuard {
             .open(path);
         match file {
             Ok(mut handle) => {
-                let _ = handle.write_all(b"locked");
+                // Write PID to lock file for stale lock detection
+                let _ = handle.write_all(format!("{}", std::process::id()).as_bytes());
                 Ok(Self {
                     lock_path: path.to_path_buf(),
                 })
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Check if the lock is stale (holder process is dead)
+                if Self::is_stale_lock(path) {
+                    // Try to remove stale lock and acquire
+                    if fs::remove_file(path).is_ok() {
+                        return Self::acquire(path); // Retry acquisition
+                    }
+                }
                 Err(AlphaInvestingError::LockUnavailable)
             }
             Err(err) => Err(AlphaInvestingError::Io(err)),
         }
+    }
+
+    /// Check if a lock file is stale (holder process no longer exists).
+    fn is_stale_lock(path: &Path) -> bool {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                // Check if process with this PID exists
+                // On Unix, sending signal 0 checks existence without affecting process
+                #[cfg(unix)]
+                {
+                    // kill(pid, 0) returns 0 if process exists, -1 if not
+                    let result = unsafe { libc::kill(pid as i32, 0) };
+                    return result != 0;
+                }
+                #[cfg(not(unix))]
+                {
+                    // On non-Unix, we can't easily check - assume not stale
+                    let _ = pid;
+                    return false;
+                }
+            }
+        }
+        // Can't read/parse lock file - might be corrupted, treat as stale
+        true
     }
 }
 
