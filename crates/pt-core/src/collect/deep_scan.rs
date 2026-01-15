@@ -217,6 +217,14 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
     let mut warnings = Vec::new();
     let mut skipped_count = 0;
 
+    // Initialize user cache to avoid reading /etc/passwd for every process
+    let user_cache = UserCache::new();
+
+    // Read boot_id once
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_string());
+
     // Get list of PIDs to scan
     let pids = if options.pids.is_empty() {
         list_all_pids()?
@@ -225,7 +233,7 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
     };
 
     for pid in pids {
-        match scan_process(pid, options.include_environ) {
+        match scan_process(pid, options.include_environ, &user_cache, &boot_id) {
             Ok(record) => processes.push(record),
             Err(e) => {
                 if options.skip_inaccessible {
@@ -271,8 +279,44 @@ fn list_all_pids() -> Result<Vec<u32>, DeepScanError> {
     Ok(pids)
 }
 
+/// Cache for UID to username mapping.
+struct UserCache {
+    uid_map: std::collections::HashMap<u32, String>,
+}
+
+impl UserCache {
+    fn new() -> Self {
+        let mut uid_map = std::collections::HashMap::new();
+        // Best effort read of /etc/passwd
+        if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+            for line in passwd.lines() {
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() >= 3 {
+                    if let Ok(uid) = fields[2].parse::<u32>() {
+                        // Only keep the first mapping found for a UID
+                        uid_map.entry(uid).or_insert_with(|| fields[0].to_string());
+                    }
+                }
+            }
+        }
+        Self { uid_map }
+    }
+
+    fn resolve(&self, uid: u32) -> String {
+        self.uid_map
+            .get(&uid)
+            .cloned()
+            .unwrap_or_else(|| uid.to_string())
+    }
+}
+
 /// Scan a single process by PID.
-fn scan_process(pid: u32, include_environ: bool) -> Result<DeepScanRecord, DeepScanError> {
+fn scan_process(
+    pid: u32,
+    include_environ: bool,
+    user_cache: &UserCache,
+    boot_id: &Option<String>,
+) -> Result<DeepScanRecord, DeepScanError> {
     let proc_path = format!("/proc/{}", pid);
 
     // Check if process exists
@@ -292,7 +336,7 @@ fn scan_process(pid: u32, include_environ: bool) -> Result<DeepScanRecord, DeepS
     let status_content = fs::read_to_string(format!("{}/status", proc_path)).ok();
     let (uid, user, uid_known) = match status_content
         .as_ref()
-        .and_then(|c| parse_uid_from_status(c))
+        .and_then(|c| parse_uid_from_status(c, user_cache))
     {
         Some((uid, user)) => (uid, user, true),
         None => (0, "unknown".to_string(), false),
@@ -309,20 +353,15 @@ fn scan_process(pid: u32, include_environ: bool) -> Result<DeepScanRecord, DeepS
         .ok()
         .map(|p| p.to_string_lossy().to_string());
 
-    // Read boot_id for start_id computation
-    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|s| s.trim().to_string());
-
     // Compute identity quality based on available data
-    let identity_quality = match (&boot_id, stat_info.starttime, uid_known) {
+    let identity_quality = match (boot_id, stat_info.starttime, uid_known) {
         (_, _, false) => IdentityQuality::PidOnly,
         (Some(_), starttime, true) if starttime > 0 => IdentityQuality::Full,
         (None, starttime, true) if starttime > 0 => IdentityQuality::NoBootId,
         _ => IdentityQuality::PidOnly,
     };
 
-    let start_id = compute_start_id(&boot_id, stat_info.starttime, pid);
+    let start_id = compute_start_id(boot_id, stat_info.starttime, pid);
 
     // Collect optional detailed stats (may fail due to permissions)
     let io = parse_io(pid);
@@ -429,7 +468,7 @@ fn parse_stat(content: &str, pid: u32) -> Result<StatInfo, DeepScanError> {
 }
 
 /// Parse UID and username from /proc/[pid]/status.
-fn parse_uid_from_status(content: &str) -> Option<(u32, String)> {
+fn parse_uid_from_status(content: &str, user_cache: &UserCache) -> Option<(u32, String)> {
     let mut uid = None;
 
     for line in content.lines() {
@@ -445,27 +484,7 @@ fn parse_uid_from_status(content: &str) -> Option<(u32, String)> {
         }
     }
 
-    uid.map(|u| (u, resolve_username(u)))
-}
-
-/// Resolve username from UID.
-fn resolve_username(uid: u32) -> String {
-    // Try to read from /etc/passwd
-    if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
-        for line in passwd.lines() {
-            let fields: Vec<&str> = line.split(':').collect();
-            if fields.len() >= 3 {
-                if let Ok(line_uid) = fields[2].parse::<u32>() {
-                    if line_uid == uid {
-                        return fields[0].to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback to numeric UID
-    uid.to_string()
+    uid.map(|u| (u, user_cache.resolve(u)))
 }
 
 /// Compute start_id from available information.
@@ -539,17 +558,28 @@ Uid:	1000	1000	1000	1000
 Gid:	1000	1000	1000	1000
 "#;
 
-        let result = parse_uid_from_status(content);
+        // Mock cache for testing
+        let mut user_cache = UserCache {
+            uid_map: std::collections::HashMap::new(),
+        };
+        user_cache.uid_map.insert(1000, "testuser".to_string());
+
+        let result = parse_uid_from_status(content, &user_cache);
         assert!(result.is_some());
-        let (uid, _user) = result.unwrap();
+        let (uid, user) = result.unwrap();
         assert_eq!(uid, 1000);
+        assert_eq!(user, "testuser");
     }
 
     #[test]
     fn test_resolve_username_root() {
-        // Root should be resolvable on most systems
-        let user = resolve_username(0);
-        assert_eq!(user, "root");
+        // Root should be resolvable on most systems if /etc/passwd is readable
+        // This test relies on the environment, so we treat it gently
+        let user_cache = UserCache::new();
+        if std::path::Path::new("/etc/passwd").exists() {
+            let user = user_cache.resolve(0);
+            assert_eq!(user, "root");
+        }
     }
 
     #[test]
@@ -593,7 +623,9 @@ Gid:	1000	1000	1000	1000
     fn test_scan_self() {
         // Scan our own process - should always work
         let pid = std::process::id();
-        let record = scan_process(pid, false).unwrap();
+        let user_cache = UserCache::new();
+        let boot_id = None;
+        let record = scan_process(pid, false, &user_cache, &boot_id).unwrap();
 
         assert_eq!(record.pid.0, pid);
         assert!(record.ppid.0 > 0);
