@@ -156,7 +156,7 @@ Every parameter (prior shape, likelihood model, loss matrix) is explicit and int
 - **Likelihoods**: All likelihood models use these conjugate families.
 - **Posteriors**: All posteriors are analytically tractable (no MCMC, no variational inference).
 - **Decisions**: Expected loss is computed exactly from the posterior.
-- **Advanced layers**: More sophisticated models (Hawkes/marked point processes, BOCPD change-point detection, survival with time-varying covariates, conformal prediction for calibrated intervals, EVT tail modeling, copula dependence, robust M-estimation) are used as **feature extractors** that feed deterministic summaries into the closed-form core—they do not replace the core inference.
+- **Advanced layers**: More sophisticated models (Hawkes/marked point processes, BOCPD change-point detection, survival with time-varying covariates, EVT tail modeling, copula dependence, robust M-estimation) are used as **feature extractors** that feed deterministic summaries into the closed-form core—they do not replace the core inference. Separately, **conformal prediction** is used as a **calibration wrapper** that provides distribution-free coverage guarantees on prediction intervals without altering the core posteriors.
 
 ### The Four-State Classification Model
 
@@ -747,13 +747,13 @@ CC) Per-machine learned baselines
 - Anomaly detection relative to that machine's history, not global priors
 - "This machine typically has 200 processes; now it has 450" is more informative than absolute counts
 
-R) Use-case interpretation of observed processes
+CD) Use-case interpretation of observed processes (see also Section 9)
 - bun test at 91% CPU for 18m in /data/projects/flywheel_gateway
 - gemini --yolo workers at 25m to 4h46m
 - gunicorn workers at 45-50% CPU for ~1h
 - several claude processes active
 
-All of these are integrated in the system design below.
+All of the above ideas (A through CD) are integrated in the system design below.
 
 ---
 
@@ -1532,6 +1532,18 @@ C in {useful, useful-but-bad, abandoned, zombie}
 ### 4.21 Bayesian Nonparametric Survival (Beta-Stacy)
 - Discrete-time hazard h_t with Beta priors; closed-form updates per bin
 - Captures long-tail stuckness beyond Gamma assumptions
+- Explicit discrete-time form:
+  - Bin time into t = 1..T with exposure n_t (e.g., number of samples or elapsed time in bin) and event indicator d_t in {0,1}
+  - Prior: h_t ~ Beta(a_t, b_t)
+  - Posterior: h_t | data ~ Beta(a_t + d_t, b_t + n_t - d_t)
+  - Survival: S(t) = ∏_{j=1..t} (1 - h_j)
+- Time-varying covariates via piecewise-constant hazards (closed-form):
+  - Define regimes r based on covariate patterns (e.g., TTY lost, PPID=1, IO flatline)
+  - For each regime r, hazard λ_r ~ Gamma(α_r, β_r)
+  - With exposure E_r (time spent in regime r) and event count N_r, posterior:
+    λ_r | data ~ Gamma(α_r + N_r, β_r + E_r)
+  - Survival over a path of regimes: S(t) = exp(-∑_r λ_r * E_r)
+  - This yields a closed-form, interpretable hazard inflation when regimes shift (e.g., TTY loss increases λ_r)
 
 ### 4.22 Robust Statistics (Huberized Likelihoods)
 - Huber loss on log-CPU/IO residuals to reduce noise sensitivity
@@ -1564,6 +1576,18 @@ C in {useful, useful-but-bad, abandoned, zombie}
 
 ### 4.31 Conformal Prediction
 - Distribution-free (under exchangeability) prediction intervals for runtime/CPU; use time-blocked / online conformal variants to reduce temporal dependence issues
+- Regression-style conformal interval (runtime/CPU):
+  - Choose a point predictor ŷ_i and nonconformity score s_i = |y_i - ŷ_i| (or s_i = -log p(y_i|x_i))
+  - Let q_{1-α} be the (1-α) empirical quantile of {s_i} over a calibration window
+  - For new x_{n+1}, output interval: [ŷ_{n+1} - q_{1-α}, ŷ_{n+1} + q_{1-α}]
+  - Guarantees: P(y_{n+1} in interval) ≥ 1 - α under exchangeability
+- Classification-style conformal set (process state):
+  - Nonconformity for class c: s_i(c) = 1 - P(C=c | x_i) (or NLL)
+  - p-value for class c: p_c = (1 + #{i: s_i(c) ≥ s_{n+1}(c)}) / (n + 1)
+  - Predict set: {c : p_c > α}, providing finite-sample coverage
+- Time dependence handling:
+  - Use blocked or rolling-window conformal (calibration on recent window), or online conformal with decaying weights to reduce drift sensitivity
+  - Report window size and coverage target in the explainability ledger
 
 ### 4.32 FDR Control (Many-Process Safety)
 - Treat “kill-recommended” as multiple hypothesis tests across many PIDs
@@ -1572,6 +1596,11 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - If additionally emitting p-values/e-values from Bayes factors/likelihood ratios, apply the corresponding BH/BY (p-values) or e-FDR (e-values) procedure consistently
 - Dependence matters: process hypotheses are not independent (shared PPID tree, shared cgroups/units, shared IO bottlenecks). The default should be conservative under dependence (e.g., Benjamini–Yekutieli) or hierarchical/group FDR (family = process group / systemd unit / container).
 - Modern “anytime” framing (fits pt well): use e-values/e-processes derived from likelihood ratios/Bayes factors so optional stopping and sequential scanning remain valid, then apply an e-FDR control procedure (and connect it directly to online alpha-investing in section 4.40).
+- e-value definition and e-FDR rule (explicit):
+  - e_i ≥ 0 with E[e_i | null] ≤ 1 (e.g., e_i = BayesFactor_i or likelihood-ratio martingale)
+  - Sort e-values descending: e_(1) ≥ e_(2) ≥ ... ≥ e_(m)
+  - e-BH (one valid form): choose largest k such that (1/k) * Σ_{i=1..k} (1 / e_(i)) ≤ α
+  - Reject/kill the top k; this controls FDR under arbitrary dependence when e-values are valid
 
 ### 4.33 Restless Bandits / Whittle Index Scheduling
 - Each PID is an arm; actions are {quick-scan, deep-scan, instrument, pause, throttle}
@@ -1609,6 +1638,14 @@ C in {useful, useful-but-bad, abandoned, zombie}
 ### 4.40 Online FDR / Alpha-Investing
 - Maintain an error budget over time; allocate “kill attempts” only when posterior is extremely strong
 - Provides long-run safety even under repeated scans
+- Simple alpha-investing update (one canonical form):
+  - Maintain wealth W_t > 0, choose test level α_t ≤ W_{t-1}
+  - If decision is a “discovery” (kill validated in shadow/feedback): W_t = W_{t-1} - α_t + ω
+  - Otherwise: W_t = W_{t-1} - α_t
+  - ω sets the reward for correct actions; choose ω to target a long-run FDR bound
+- e-process integration:
+  - Use e-values as sequential evidence and update wealth with e-FDR control to ensure optional stopping validity
+  - Emit current wealth, spend, and reward in the audit ledger so the safety budget is transparent
 
 ### 4.41 Posterior Predictive Checks
 - Compare observed traces to posterior predictive distributions to detect misspecification
@@ -1745,6 +1782,9 @@ Goal: integrate pattern library matches (section 3.9) with Bayesian inference.
 - Choose the largest set K such that estimated FDR(K) <= alpha (e.g., estimated FDR(K) = (1/|K|) * Σ_{i∈K} lfdr_i; shadow-mode calibration can tighten/validate this)
 - This prevents “scan many processes and inevitably kill one useful one”
 - Under dependence (shared PPID/cgroups), default to conservative or structured FDR control (BY, group/hierarchical FDR by unit/container/process-group) rather than assuming independence.
+- If using e-values (anytime-valid), replace lfdr ranking with e-value ranking:
+  - Sort e_i descending; choose largest k such that (1/k) * Σ_{i=1..k} (1 / e_(i)) ≤ α
+  - Kill only that top-k set; this keeps the batch decision valid under optional stopping and repeated scans
 
 ### 5.9 Budgeted Instrumentation Policy (Whittle / VOI)
 - Under overhead constraints, allocate expensive probes to the highest expected VOI per unit cost
@@ -1757,6 +1797,11 @@ Goal: integrate pattern library matches (section 3.9) with Bayesian inference.
 ### 5.11 Online FDR Risk Budget (Alpha-Investing)
 - Maintain a global false-kill risk budget across time and across repeated scans
 - Spend budget only on extremely strong posterior odds; replenish with confirmed-correct actions
+- Canonical update (one valid scheme):
+  - Wealth W_0 set by policy (robot mode uses a small initial wealth)
+  - For decision i, choose α_i ≤ W_{i-1}
+  - If confirmed-correct: W_i = W_{i-1} - α_i + ω; else W_i = W_{i-1} - α_i
+  - Use ω to target a long-run FDR bound; clamp W_i ≥ 0 to avoid overspending
 
 ### 5.12 DRO / Worst-Case Expected Loss
 - When model misspecification is detected (via PPC) or drift is high (Wasserstein), switch to worst-case loss estimates
@@ -2071,6 +2116,31 @@ Requirement: at any time, the user can toggle a “galaxy-brain” view (keybind
   - Keybinding: `g` toggles “galaxy-brain” mode in the detail pane.
   - Shows: posterior by class, posterior odds vs thresholds (SPRT), expected-loss table, top Bayes factors, per-feature log-likelihood contributions, FDR/alpha-investing budget state, VOI calculations, and any robust/DRO tightening that changed the decision.
   - Shows both: formal equations + a short intuition line (“this term dominates because…”).
+  - Math cards (each rendered as equation + substituted numbers + output):
+    - **Posterior core**:
+      - log P(C|x) = log P(C) + Σ_j log P(x_j|C); display each term with numeric value
+      - Posterior odds + SPRT threshold with the exact loss-matrix-derived boundary
+    - **Time-varying hazard**:
+      - Regime hazards: λ_r | data ~ Gamma(α_r + N_r, β_r + E_r)
+      - Survival: S(t) = exp(-∑_r λ_r * E_r), with per-regime E_r and inferred λ_r shown
+      - “Hazard inflation” callout when regime switches (e.g., TTY lost, PPID=1, IO flatline)
+    - **Conformal interval** (runtime/CPU):
+      - s_i = |y_i - ŷ_i|; q_{1-α} = quantile({s_i})
+      - Interval: [ŷ_{n+1} - q_{1-α}, ŷ_{n+1} + q_{1-α}]
+      - Display calibration window size, α target, and achieved coverage estimate
+    - **Conformal class set** (state prediction):
+      - p_c = (1 + #{i: s_i(c) ≥ s_{n+1}(c)}) / (n + 1)
+      - Predicted set: {c : p_c > α}; show p_c per class
+    - **e-values / e-FDR** (anytime-valid selection):
+      - e_i (from Bayes factor or likelihood-ratio martingale)
+      - e-BH rule: choose largest k with (1/k) * Σ_{i=1..k} (1 / e_(i)) ≤ α
+      - Show current k, α, and whether the PID is inside the accepted set
+    - **Alpha-investing** (online budget):
+      - Wealth update: W_i = W_{i-1} - α_i + ω (if confirmed-correct), else W_i = W_{i-1} - α_i
+      - Show W_{i-1}, α_i spend, ω reward, and resulting W_i
+    - **VOI**:
+      - VOI = E[loss_now - loss_after_measurement] - cost
+      - Show the best next probe and whether VOI > 0
 - CLI behavior:
   - Flag: `--galaxy-brain` (or `--explain full`) adds the same math ledger to `pt agent explain` and to report generation.
 - Report behavior:
