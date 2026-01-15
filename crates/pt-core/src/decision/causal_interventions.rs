@@ -1,6 +1,6 @@
 //! Causal intervention outcome models (Beta-Bernoulli).
 
-use crate::config::priors::{BetaParams, CausalInterventions, InterventionPriors, Priors};
+use crate::config::priors::{BetaParams, InterventionPriors, Priors};
 use crate::decision::Action;
 use serde::Serialize;
 
@@ -40,9 +40,9 @@ pub fn update_beta(
     trials: f64,
     eta: f64,
 ) -> BetaParams {
-    let s = successes.max(0.0);
     let n = trials.max(0.0);
-    let eta = if eta > 0.0 { eta } else { 1.0 };
+    let s = successes.max(0.0).min(n);
+    let eta = if eta.is_finite() && eta > 0.0 { eta.min(1.0) } else { 1.0 };
     BetaParams {
         alpha: params.alpha + eta * s,
         beta: params.beta + eta * (n - s),
@@ -113,6 +113,14 @@ mod tests {
         let updated = update_beta(&beta, 3.0, 5.0, 1.0);
         assert!((updated.alpha - 4.0).abs() <= 1e-12);
         assert!((updated.beta - 3.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn update_beta_clamps_successes_to_trials() {
+        let beta = BetaParams { alpha: 1.0, beta: 1.0 };
+        let updated = update_beta(&beta, 10.0, 2.0, 1.0);
+        assert!((updated.alpha - 3.0).abs() <= 1e-12);
+        assert!((updated.beta - 1.0).abs() <= 1e-12);
     }
 
     #[test]

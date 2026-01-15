@@ -47,6 +47,8 @@ if [[ "$USE_COLOR" == "true" ]]; then
     readonly C_DIM=$'\e[90m'       # Gray
     readonly C_BOLD=$'\e[1m'
     readonly C_RESET=$'\e[0m'
+    readonly C_BLUE=$'\e[94m'      # Bright blue
+    readonly C_CYAN=$'\e[96m'      # Bright cyan
 else
     readonly C_KILL=''
     readonly C_REVIEW=''
@@ -54,6 +56,8 @@ else
     readonly C_DIM=''
     readonly C_BOLD=''
     readonly C_RESET=''
+    readonly C_BLUE=''
+    readonly C_CYAN=''
 fi
 
 # Scoring thresholds
@@ -76,11 +80,6 @@ declare -A TYPE_LIFETIME=(
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Gum should only be used in interactive TTY, not in CI
-GUM_AVAILABLE=false
-if [[ "$IS_TTY" == "true" ]] && [[ "$IS_CI" != "true" ]] && command -v gum &>/dev/null; then
-    GUM_AVAILABLE=true
-fi
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Dependency Management
 # ══════════════════════════════════════════════════════════════════════════════
@@ -90,7 +89,7 @@ ensure_gum() {
     if [[ "$IS_TTY" != "true" ]] || [[ "$IS_CI" == "true" ]]; then
         return 0
     fi
-    command -v gum &>/dev/null && { GUM_AVAILABLE=true; return 0; }
+    command -v gum &>/dev/null && return 0
     echo "Installing gum..."
     if command -v apt-get &>/dev/null; then
         sudo mkdir -p /etc/apt/keyrings 2>/dev/null || true
@@ -105,9 +104,7 @@ ensure_gum() {
         [[ "$arch" == "aarch64" ]] && arch="arm64"
         curl -fsSL "https://github.com/charmbracelet/gum/releases/download/v0.14.1/gum_0.14.1_linux_${arch}.tar.gz" | sudo tar xz -C /usr/local/bin gum
     fi
-    if command -v gum &>/dev/null; then
-        GUM_AVAILABLE=true
-    else
+    if ! command -v gum &>/dev/null; then
         echo "Failed to install gum (interactive features disabled)"
     fi
 }
@@ -128,6 +125,42 @@ ensure_deps_for_json() {
 # ══════════════════════════════════════════════════════════════════════════════
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging functions (all output to stderr, file logging preserved)
+# ──────────────────────────────────────────────────────────────────────────────
+
+log_info() {
+    printf '%b\n' "${C_BLUE}ℹ${C_RESET} $*" >&2
+}
+
+log_success() {
+    printf '%b\n' "${C_SPARE}✓${C_RESET} $*" >&2
+}
+
+log_warn() {
+    printf '%b\n' "${C_REVIEW}⚠${C_RESET} $*" >&2
+    log "WARN: $*"
+}
+
+log_error() {
+    printf '%b\n' "${C_KILL}✗${C_RESET} $*" >&2
+    log "ERROR: $*"
+}
+
+log_step() {
+    printf '%b\n' "${C_CYAN}→${C_RESET} $*" >&2
+}
+
+log_debug() {
+    [[ "${PT_DEBUG:-}" == "1" ]] || return 0
+    printf '%b\n' "${C_DIM}[DEBUG] $*${C_RESET}" >&2
+}
+
+log_verbose() {
+    [[ "${VERBOSE:-}" == "1" ]] || return 0
+    printf '%b\n' "${C_DIM}$*${C_RESET}" >&2
+}
 
 iso_timestamp() {
     # RFC3339-ish without timezone dependencies

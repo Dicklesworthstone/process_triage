@@ -236,7 +236,16 @@ impl LockGuard {
                 {
                     // kill(pid, 0) returns 0 if process exists, -1 if not
                     let result = unsafe { libc::kill(pid as i32, 0) };
-                    return result != 0;
+                    if result == 0 {
+                        return false; // Process exists, lock not stale
+                    }
+                    // Check error: ESRCH = no such process, EPERM = exists but no permission
+                    let err = std::io::Error::last_os_error();
+                    return match err.raw_os_error() {
+                        Some(code) if code == libc::ESRCH => true,  // Process dead
+                        Some(code) if code == libc::EPERM => false, // Process alive
+                        _ => true, // Unknown error, assume stale
+                    };
                 }
                 #[cfg(not(unix))]
                 {

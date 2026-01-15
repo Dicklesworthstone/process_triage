@@ -99,6 +99,83 @@ pub struct FdInfo {
     pub files: usize,
     /// Device count.
     pub devices: usize,
+    /// Open files with details (paths, modes).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub open_files: Vec<OpenFile>,
+    /// Critical open write handles (safety-relevant).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub critical_writes: Vec<CriticalFile>,
+}
+
+/// A single open file with metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenFile {
+    /// File descriptor number.
+    pub fd: u32,
+    /// Resolved path (may be empty for special FDs).
+    pub path: String,
+    /// File descriptor type.
+    pub fd_type: FdType,
+    /// Open mode flags.
+    pub mode: OpenMode,
+}
+
+/// Type of file descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FdType {
+    /// Regular file.
+    File,
+    /// Directory.
+    Directory,
+    /// Socket (TCP, UDP, Unix).
+    Socket,
+    /// Pipe or FIFO.
+    Pipe,
+    /// Character or block device.
+    Device,
+    /// Anonymous inode (eventfd, eventpoll, etc.).
+    AnonInode,
+    /// Unknown or unresolvable.
+    Unknown,
+}
+
+/// Open mode for a file descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OpenMode {
+    /// File is open for reading.
+    pub read: bool,
+    /// File is open for writing.
+    pub write: bool,
+}
+
+/// A critical file that affects kill safety.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriticalFile {
+    /// File descriptor number.
+    pub fd: u32,
+    /// File path.
+    pub path: String,
+    /// Why this file is critical.
+    pub category: CriticalFileCategory,
+}
+
+/// Categories of critical files that affect kill safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriticalFileCategory {
+    /// SQLite WAL or journal file.
+    SqliteWal,
+    /// Git index or object lock.
+    GitLock,
+    /// Package manager lock (apt, dpkg, rpm, etc.).
+    PackageLock,
+    /// Database file open for write.
+    DatabaseWrite,
+    /// Application-specific lock file.
+    AppLock,
+    /// Generic open write handle.
+    OpenWrite,
 }
 
 /// Cgroup membership information.
@@ -253,11 +330,12 @@ pub fn parse_statm_content(content: &str) -> Option<MemStats> {
 /// Counts and categorizes open file descriptors.
 pub fn parse_fd(pid: u32) -> Option<FdInfo> {
     let path = format!("/proc/{}/fd", pid);
-    parse_fd_dir(Path::new(&path))
+    let fdinfo_path = format!("/proc/{}/fdinfo", pid);
+    parse_fd_dir(Path::new(&path), Some(Path::new(&fdinfo_path)))
 }
 
 /// Parse fd directory (for testing with mock directories).
-pub fn parse_fd_dir(dir: &Path) -> Option<FdInfo> {
+pub fn parse_fd_dir(dir: &Path, fdinfo_dir: Option<&Path>) -> Option<FdInfo> {
     let mut info = FdInfo::default();
 
     let entries = fs::read_dir(dir).ok()?;
@@ -265,24 +343,167 @@ pub fn parse_fd_dir(dir: &Path) -> Option<FdInfo> {
     for entry in entries.flatten() {
         info.count += 1;
 
+        // Parse FD number from filename
+        let fd_num: u32 = entry.file_name().to_string_lossy().parse().unwrap_or(0);
+
         // Try to read the symlink to categorize
         if let Ok(target) = fs::read_link(entry.path()) {
-            let target_str = target.to_string_lossy();
-            let fd_type = categorize_fd(&target_str);
+            let target_str = target.to_string_lossy().to_string();
+            let fd_type_str = categorize_fd(&target_str);
+            let fd_type = parse_fd_type(&fd_type_str);
 
-            *info.by_type.entry(fd_type.clone()).or_insert(0) += 1;
+            *info.by_type.entry(fd_type_str.clone()).or_insert(0) += 1;
 
-            match fd_type.as_str() {
+            match fd_type_str.as_str() {
                 "socket" => info.sockets += 1,
                 "pipe" => info.pipes += 1,
                 "file" => info.files += 1,
                 "device" => info.devices += 1,
                 _ => {}
             }
+
+            // Get open mode from fdinfo if available
+            let mode = fdinfo_dir
+                .and_then(|d| parse_fdinfo_flags(d.join(fd_num.to_string()).as_path()))
+                .unwrap_or_default();
+
+            // Record open file details for regular files
+            if fd_type == FdType::File || fd_type == FdType::Directory {
+                info.open_files.push(OpenFile {
+                    fd: fd_num,
+                    path: target_str.clone(),
+                    fd_type,
+                    mode,
+                });
+
+                // Check for critical files if open for writing
+                if mode.write {
+                    if let Some(critical) = detect_critical_file(fd_num, &target_str) {
+                        info.critical_writes.push(critical);
+                    }
+                }
+            }
         }
     }
 
     Some(info)
+}
+
+/// Parse FD type string to enum.
+fn parse_fd_type(type_str: &str) -> FdType {
+    match type_str {
+        "socket" => FdType::Socket,
+        "pipe" => FdType::Pipe,
+        "file" => FdType::File,
+        "device" => FdType::Device,
+        s if s.starts_with("anon:") => FdType::AnonInode,
+        _ => FdType::Unknown,
+    }
+}
+
+/// Parse fdinfo file to extract open mode flags.
+fn parse_fdinfo_flags(path: &Path) -> Option<OpenMode> {
+    let content = fs::read_to_string(path).ok()?;
+    parse_fdinfo_content(&content)
+}
+
+/// Parse fdinfo content (for testing).
+pub fn parse_fdinfo_content(content: &str) -> Option<OpenMode> {
+    for line in content.lines() {
+        if let Some(flags_str) = line.strip_prefix("flags:") {
+            // flags is an octal number, parse it
+            let flags_str = flags_str.trim();
+            if let Ok(flags) = u32::from_str_radix(flags_str.trim_start_matches("0"), 8) {
+                // O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2
+                // Access mode is in the lowest 2 bits
+                let access_mode = flags & 0o3;
+                return Some(OpenMode {
+                    read: access_mode == 0 || access_mode == 2,  // O_RDONLY or O_RDWR
+                    write: access_mode == 1 || access_mode == 2, // O_WRONLY or O_RDWR
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Detect if a file path is a critical file for safety gates.
+fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
+    let path_lower = path.to_lowercase();
+
+    // SQLite WAL and journal files
+    if path_lower.ends_with("-wal")
+        || path_lower.ends_with("-journal")
+        || path_lower.ends_with("-shm")
+        || path_lower.ends_with(".sqlite-wal")
+        || path_lower.ends_with(".sqlite-journal")
+        || path_lower.ends_with(".db-wal")
+        || path_lower.ends_with(".db-journal")
+    {
+        return Some(CriticalFile {
+            fd,
+            path: path.to_string(),
+            category: CriticalFileCategory::SqliteWal,
+        });
+    }
+
+    // Git locks
+    if path.contains(".git/")
+        && (path_lower.ends_with(".lock")
+            || path_lower.ends_with("/index.lock")
+            || path_lower.contains("/objects/"))
+    {
+        return Some(CriticalFile {
+            fd,
+            path: path.to_string(),
+            category: CriticalFileCategory::GitLock,
+        });
+    }
+
+    // Package manager locks
+    let pkg_lock_patterns = [
+        "/var/lib/dpkg/lock",
+        "/var/cache/apt/archives/lock",
+        "/var/lib/rpm/.rpm.lock",
+        "/var/lib/pacman/db.lck",
+        "/var/cache/pacman/pkg/",
+        "/var/lib/dnf/",
+        "/run/lock/",
+    ];
+    for pattern in &pkg_lock_patterns {
+        if path.starts_with(pattern) || path.contains(pattern) {
+            return Some(CriticalFile {
+                fd,
+                path: path.to_string(),
+                category: CriticalFileCategory::PackageLock,
+            });
+        }
+    }
+
+    // Database files open for write
+    let db_extensions = [".db", ".sqlite", ".sqlite3", ".ldb", ".mdb"];
+    for ext in &db_extensions {
+        if path_lower.ends_with(ext) {
+            return Some(CriticalFile {
+                fd,
+                path: path.to_string(),
+                category: CriticalFileCategory::DatabaseWrite,
+            });
+        }
+    }
+
+    // Generic lock files
+    if path_lower.ends_with(".lock") || path_lower.ends_with(".lck") || path.contains("/lock/") {
+        return Some(CriticalFile {
+            fd,
+            path: path.to_string(),
+            category: CriticalFileCategory::AppLock,
+        });
+    }
+
+    // Any other open write handle is noteworthy but lower priority
+    // Return None to avoid cluttering critical_writes with every write handle
+    None
 }
 
 /// Categorize a file descriptor by its target.

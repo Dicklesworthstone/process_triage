@@ -64,7 +64,7 @@ impl WriterConfig {
     pub fn new(base_dir: PathBuf, session_id: String, host_id: String) -> Self {
         WriterConfig {
             base_dir,
-            compression: Compression::ZSTD(ZstdLevel::try_new(3).unwrap()),
+            compression: Compression::ZSTD(ZstdLevel::try_new(3).expect("valid zstd level")),
             row_group_size: 512 * 1024, // 512KB default
             batch_size: crate::DEFAULT_BATCH_SIZE,
             session_id,
@@ -157,6 +157,9 @@ impl BatchedWriter {
 
     /// Close the writer and finalize the file.
     pub fn close(mut self) -> Result<PathBuf, WriteError> {
+        if self.writer.is_none() && self.buffer.is_empty() {
+            return Err(WriteError::EmptyBuffer);
+        }
         // Flush any remaining data
         self.flush()?;
 
@@ -342,6 +345,23 @@ mod tests {
         assert!(output_path.exists());
         assert!(output_path.to_string_lossy().contains("audit"));
         assert!(output_path.to_string_lossy().ends_with(".parquet"));
+    }
+
+    #[test]
+    fn test_close_without_writes_returns_empty_buffer() {
+        let temp_dir = TempDir::new().unwrap();
+        let schema = Arc::new(crate::schema::audit_schema());
+        let config = WriterConfig::new(
+            temp_dir.path().to_path_buf(),
+            "pt-20260115-143022-test".to_string(),
+            "test-host".to_string(),
+        );
+        let writer = BatchedWriter::new(TableName::Audit, schema, config);
+        let err = writer.close().unwrap_err();
+        match err {
+            WriteError::EmptyBuffer => {}
+            _ => panic!("unexpected error"),
+        }
     }
 
     #[test]

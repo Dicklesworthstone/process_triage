@@ -122,10 +122,10 @@ impl EvidenceStrength {
         let abs_log_bf = log_bf.abs();
 
         // Jeffreys scale thresholds (in nats)
-        const LN_3_2: f64 = 1.163_150_809_678_640; // ln(3.2)
-        const LN_10: f64 = 2.302_585_092_994_046;  // ln(10)
+        const LN_3_2: f64 = 1.163_150_809_678_64; // ln(3.2)
         const LN_32: f64 = 3.465_735_902_799_727;  // ln(32)
         const LN_100: f64 = 4.605_170_185_988_092; // ln(100)
+        let ln_10 = std::f64::consts::LN_10;
 
         if abs_log_bf < LN_3_2 {
             if abs_log_bf < f64::EPSILON {
@@ -133,7 +133,7 @@ impl EvidenceStrength {
             } else {
                 EvidenceStrength::Anecdotal
             }
-        } else if abs_log_bf < LN_10 {
+        } else if abs_log_bf < ln_10 {
             EvidenceStrength::Substantial
         } else if abs_log_bf < LN_32 {
             EvidenceStrength::Strong

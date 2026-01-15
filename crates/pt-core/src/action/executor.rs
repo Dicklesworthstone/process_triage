@@ -245,7 +245,15 @@ impl ActionLock {
                 #[cfg(unix)]
                 {
                     let result = unsafe { libc::kill(pid as i32, 0) };
-                    return result != 0;
+                    if result == 0 {
+                        return false;
+                    }
+                    let err = std::io::Error::last_os_error();
+                    return match err.raw_os_error() {
+                        Some(code) if code == libc::ESRCH => true,
+                        Some(code) if code == libc::EPERM => false,
+                        _ => true,
+                    };
                 }
                 #[cfg(not(unix))]
                 {

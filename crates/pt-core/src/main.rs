@@ -457,12 +457,45 @@ enum TelemetryCommands {
     },
 }
 
+use pt_core::logging::{init_logging, LogConfig, LogFormat, LogLevel, LogContext, Stage, event_names};
+use pt_core::log_event;
+
 // ============================================================================
 // Main entry point
 // ============================================================================
 
 fn main() {
     let cli = Cli::parse();
+
+    // Initialize logging
+    let log_level = if cli.global.quiet {
+        LogLevel::Error
+    } else {
+        match cli.global.verbose {
+            0 => LogLevel::Info,
+            1 => LogLevel::Debug,
+            _ => LogLevel::Trace,
+        }
+    };
+
+    // Use JSONL logging if output format is JSON (to match machine-readable intent)
+    // or if explicitly requested via env var (handled by LogConfig::from_env, but we are overriding here).
+    // Actually, keeping stderr human-readable is usually better for CLI users even if stdout is JSON.
+    // Let's stick to Human for CLI use unless specifically requested otherwise.
+    // But wait, if I'm an agent parsing JSON stdout, I might want JSONL stderr too.
+    let log_format = if matches!(cli.global.format, OutputFormat::Json | OutputFormat::Jsonl) {
+        LogFormat::Jsonl
+    } else {
+        LogFormat::Human
+    };
+
+    let log_config = LogConfig {
+        level: log_level,
+        format: log_format,
+        timestamps: true,
+        source_location: false,
+    };
+    init_logging(&log_config);
 
     let exit_code = match cli.command {
         None => {
@@ -507,6 +540,13 @@ fn run_interactive(global: &GlobalOpts, _args: &RunArgs) -> ExitCode {
 use pt_core::collect::{quick_scan, QuickScanOptions};
 
 fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
+    let ctx = LogContext::new(
+        pt_core::logging::generate_run_id(),
+        pt_core::logging::get_host_id()
+    );
+    
+    log_event!(ctx, INFO, event_names::RUN_STARTED, Stage::Init, "Starting scan command");
+
     if args.deep {
         return run_deep_scan(global, &DeepScanArgs { pids: vec![], budget: None });
     }
@@ -521,6 +561,11 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
     // Perform scan
     match quick_scan(&options) {
         Ok(result) => {
+            log_event!(ctx, INFO, event_names::SCAN_COMPLETED, Stage::Scan, "Scan finished successfully", 
+                count = result.metadata.process_count,
+                duration_ms = result.metadata.duration_ms
+            );
+
             match global.format {
                 OutputFormat::Json => {
                     // Enrich with schema version and session ID
@@ -572,6 +617,7 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
             ExitCode::Clean
         }
         Err(e) => {
+            log_event!(ctx, ERROR, event_names::SCAN_FAILED, Stage::Scan, "Scan failed", error = e.to_string());
             eprintln!("Scan failed: {}", e);
             ExitCode::InternalError
         }
