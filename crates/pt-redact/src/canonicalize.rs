@@ -163,15 +163,17 @@ impl Canonicalizer {
             }
         }
 
-        // Replace temp directories
-        if result.starts_with("/tmp/") {
+        // Replace temp session directories first (more specific)
+        // Match patterns like /tmp/pytest-123, /tmp/session-abc, etc.
+        if let Some(caps) = RE_TMP_SESSION.find(&result) {
+            // Keep anything after the session directory
+            let after_session = &result[caps.end()..];
+            result = format!("[TMP]{}", after_session);
+        } else if result.starts_with("/tmp/") {
             result = format!("[TMP]{}", &result[4..]);
         } else if result.starts_with("/var/tmp/") {
             result = format!("[TMP]{}", &result[8..]);
         }
-
-        // Replace common temp session patterns
-        result = RE_TMP_SESSION.replace_all(&result, "[TMP]").to_string();
 
         result
     }
@@ -180,14 +182,30 @@ impl Canonicalizer {
     pub fn canonicalize_url(&self, url: &str) -> String {
         let mut result = url.to_string();
 
-        // Remove credentials
+        // Remove credentials first (before lowercasing)
         result = RE_URL_CRED.replace_all(&result, "://[CRED]@").to_string();
 
         // Normalize port numbers in URLs
         let re_url_port = Regex::new(r":(\d{2,5})(/|$)").unwrap();
         result = re_url_port.replace_all(&result, ":[PORT]$2").to_string();
 
-        result.to_lowercase()
+        // Lowercase everything except placeholders
+        let mut lowered = String::with_capacity(result.len());
+        let mut in_bracket = false;
+        for ch in result.chars() {
+            if ch == '[' {
+                in_bracket = true;
+                lowered.push(ch);
+            } else if ch == ']' {
+                in_bracket = false;
+                lowered.push(ch);
+            } else if in_bracket {
+                lowered.push(ch);
+            } else {
+                lowered.push(ch.to_ascii_lowercase());
+            }
+        }
+        lowered
     }
 }
 
