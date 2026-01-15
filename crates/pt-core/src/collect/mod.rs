@@ -17,6 +17,8 @@ pub mod cgroup;
 #[cfg(target_os = "linux")]
 pub mod container;
 #[cfg(target_os = "linux")]
+pub mod cpu_capacity;
+#[cfg(target_os = "linux")]
 mod deep_scan;
 #[cfg(target_os = "linux")]
 mod network;
@@ -69,4 +71,12 @@ pub use systemd::{
 pub use container::{
     detect_container_from_cgroup, detect_container_from_markers, detect_kubernetes_from_env,
     ContainerDetectionSource, ContainerInfo, ContainerProvenance, ContainerRuntime, KubernetesInfo,
+};
+
+// Re-export CPU capacity types
+#[cfg(target_os = "linux")]
+pub use cpu_capacity::{
+    compute_cpu_capacity, compute_n_eff, count_cpus_in_list, num_logical_cpus,
+    parse_cpus_allowed_list, AffinitySource, BindingConstraint, CpuCapacity, CpuCapacityProvenance,
+    CpusetSource, QuotaSource,
 };
