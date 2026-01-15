@@ -1044,8 +1044,17 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
         }
     };
 
-    let manifest = reader.manifest();
-    let files: Vec<_> = manifest.files.iter().map(|f| {
+    // Clone manifest data we need to avoid borrow issues with verify_all
+    let bundle_version = reader.manifest().bundle_version.clone();
+    let source_session = reader.manifest().session_id.clone();
+    let host_id = reader.manifest().host_id.clone();
+    let created_at = reader.manifest().created_at.clone();
+    let export_profile = reader.manifest().export_profile;
+    let pt_version = reader.manifest().pt_version.clone();
+    let description = reader.manifest().description.clone();
+    let file_count = reader.manifest().file_count();
+    let total_bytes = reader.manifest().total_bytes();
+    let files: Vec<_> = reader.manifest().files.iter().map(|f| {
         serde_json::json!({
             "path": f.path,
             "bytes": f.bytes,
@@ -1073,15 +1082,15 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
         "status": "ok",
         "bundle": {
             "path": path,
-            "bundle_version": manifest.bundle_version,
-            "source_session": manifest.session_id,
-            "host_id": manifest.host_id,
-            "created_at": manifest.created_at,
-            "export_profile": format!("{}", manifest.export_profile),
-            "pt_version": manifest.pt_version,
-            "description": manifest.description,
-            "file_count": manifest.file_count(),
-            "total_bytes": manifest.total_bytes(),
+            "bundle_version": bundle_version,
+            "source_session": source_session,
+            "host_id": host_id,
+            "created_at": created_at,
+            "export_profile": format!("{}", export_profile),
+            "pt_version": pt_version,
+            "description": description,
+            "file_count": file_count,
+            "total_bytes": total_bytes,
         },
         "files": files,
         "verification": verification,
@@ -1090,16 +1099,16 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
     match global.format {
         OutputFormat::Md => {
             println!("Bundle: {}", path);
-            println!("  Session: {}", manifest.session_id);
-            println!("  Created: {}", manifest.created_at);
-            println!("  Profile: {}", manifest.export_profile);
-            println!("  Files: {} ({} bytes)", manifest.file_count(), manifest.total_bytes());
-            if verify {
-                let failures = reader.verify_all();
-                if failures.is_empty() {
+            println!("  Session: {}", source_session);
+            println!("  Created: {}", created_at);
+            println!("  Profile: {}", export_profile);
+            println!("  Files: {} ({} bytes)", file_count, total_bytes);
+            if let Some(ref v) = verification {
+                if v["verified"].as_bool() == Some(true) {
                     println!("  Verification: PASSED");
                 } else {
-                    println!("  Verification: FAILED ({} files)", failures.len());
+                    let fail_count = v["failures"].as_array().map(|a| a.len()).unwrap_or(0);
+                    println!("  Verification: FAILED ({} files)", fail_count);
                 }
             }
         }
