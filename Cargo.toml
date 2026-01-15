@@ -1,5 +1,22 @@
 [workspace]
 members = [
+    "crates/pt-common",
+    "crates/pt-core",
     "crates/pt-math",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/process_triage"
+rust-version = "1.75"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+clap = { version = "4", features = ["derive", "env", "string"] }

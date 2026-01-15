@@ -1,0 +1,36 @@
+[package]
+name = "pt-core"
+version = "0.1.0"
+edition = "2021"
+description = "Process Triage core inference and decision engine"
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/process_triage"
+rust-version = "1.75"
+readme = "README.md"
+
+[[bin]]
+name = "pt-core"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env", "string"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+
+# Internal crates
+pt-common = { path = "../pt-common" }
+pt-math = { path = "../pt-math" }
+
+[features]
+default = []
+deep = []      # Enable expensive/privileged probes (lsof, ss, perf/eBPF)
+report = []    # HTML report generator
+daemon = []    # Dormant monitoring mode
+ui = []        # Premium TUI experience
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
