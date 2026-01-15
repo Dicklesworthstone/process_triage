@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+#
+# pt - Process Triage
+# Interactive zombie/abandoned process killer with learning memory
+#
+# Usage: pt [scan|history|clear|help]
+#
+set -euo pipefail
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+
+readonly VERSION="1.0.0"
+readonly CONFIG_DIR="${PROCESS_TRIAGE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/process_triage}"
+readonly DECISIONS_FILE="$CONFIG_DIR/decisions.json"
+readonly LOG_FILE="$CONFIG_DIR/triage.log"
+
+# Colors (using gum's ANSI support)
+readonly C_KILL=$'\e[91m'      # Bright red
+readonly C_REVIEW=$'\e[93m'    # Bright yellow
+readonly C_SPARE=$'\e[92m'     # Bright green
+readonly C_DIM=$'\e[90m'       # Gray
+readonly C_BOLD=$'\e[1m'       # Bold
+readonly C_RESET=$'\e[0m'      # Reset
+
+# Scoring thresholds
+readonly THRESHOLD_KILL=50
+readonly THRESHOLD_REVIEW=20
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dependency Management
+# ══════════════════════════════════════════════════════════════════════════════
+
+ensure_gum() {
+    command -v gum &>/dev/null && return 0
+
+    echo "Installing gum..."
+
+    if command -v apt-get &>/dev/null; then
+        sudo mkdir -p /etc/apt/keyrings 2>/dev/null || true
+        curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg 2>/dev/null
+        echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list >/dev/null
+        sudo apt-get update -qq && sudo apt-get install -y gum
+    elif command -v brew &>/dev/null; then
+        brew install gum
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm gum
+    else
+        # Direct binary download
+        local arch; arch=$(uname -m)
+        [[ "$arch" == "x86_64" ]] && arch="amd64"
+        [[ "$arch" == "aarch64" ]] && arch="arm64"
+        local url="https://github.com/charmbracelet/gum/releases/download/v0.14.1/gum_0.14.1_linux_${arch}.tar.gz"
+        curl -fsSL "$url" | sudo tar xz -C /usr/local/bin gum
+    fi
+
+    command -v gum &>/dev/null || { echo "Failed to install gum"; exit 1; }
+}
+
+ensure_config() {
+    mkdir -p "$CONFIG_DIR"
+    [[ -s "$DECISIONS_FILE" ]] || echo '{}' > "$DECISIONS_FILE"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Utility Functions
+# ══════════════════════════════════════════════════════════════════════════════
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+
+format_duration() {
+    local s=$1
+    if ((s < 60)); then echo "${s}s"
+    elif ((s < 3600)); then echo "$((s/60))m"
+    elif ((s < 86400)); then echo "$((s/3600))h"
+    else echo "$((s/86400))d"
+    fi
+}
+
+format_memory() {
+    local mb=$1
+    if ((mb < 1024)); then echo "${mb}M"
+    else printf "%.1fG" "$(echo "scale=1; $mb/1024" | bc)"
+    fi
+}
+
+get_process_info() {
+    # Returns: pid|ppid|age_seconds|mem_mb|cmd
+    ps -eo pid,ppid,etimes,rss,args --no-headers -u "$(whoami)" 2>/dev/null | while read -r pid ppid age rss cmd; do
+        [[ -z "$pid" || "$pid" == "PID" ]] && continue
+        local mem_mb=$((rss / 1024))
+        echo "$pid|$ppid|$age|$mem_mb|$cmd"
+    done
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Decision Memory
+# ══════════════════════════════════════════════════════════════════════════════
+
+normalize_pattern() {
+    # Create a stable pattern from a command for learning
+    echo "$1" | sed -E \
+        -e 's/[0-9]{5,}//g' \
+        -e 's/--port[= ]*[0-9]+/--port=PORT/g' \
+        -e 's/:[0-9]{4,5}/:PORT/g' \
+        -e 's/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/UUID/g' \
+        -e 's|/tmp/[^ ]+|/tmp/TMP|g' \
+        | tr -s ' ' | cut -c1-150
+}
+
+save_decision() {
+    local pattern=$1 decision=$2
+    command -v jq &>/dev/null || return 0
+    local escaped; escaped=$(echo "$pattern" | sed 's/"/\\"/g; s/\\/\\\\/g')
+    local tmp; tmp=$(mktemp)
+    jq --arg k "$escaped" --arg v "$decision" '.[$k] = $v' "$DECISIONS_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$DECISIONS_FILE"
+    log "Decision: $decision for: $pattern"
+}
+
+get_past_decision() {
+    local pattern=$1
+    command -v jq &>/dev/null || { echo "unknown"; return; }
+    local escaped; escaped=$(echo "$pattern" | sed 's/"/\\"/g; s/\\/\\\\/g')
+    jq -r --arg k "$escaped" '.[$k] // "unknown"' "$DECISIONS_FILE" 2>/dev/null || echo "unknown"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Process Scoring
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Cache for decisions (loaded once per run)
+declare -A DECISION_CACHE
+DECISION_CACHE_LOADED=false
+
+load_decisions_cache() {
+    [[ "$DECISION_CACHE_LOADED" == "true" ]] && return 0
+    DECISION_CACHE_LOADED=true
+
+    command -v jq &>/dev/null || return 0
+    [[ -s "$DECISIONS_FILE" ]] || return 0
+
+    while IFS=$'\t' read -r key value; do
+        [[ -n "$key" ]] && DECISION_CACHE["$key"]="$value"
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$DECISIONS_FILE" 2>/dev/null)
+}
+
+get_cached_decision() {
+    local pattern=$1
+    echo "${DECISION_CACHE[$pattern]:-unknown}"
+}
+
+score_process() {
+    local pid=$1 ppid=$2 age=$3 mem=$4 cmd=$5
+    local score=0
+    local reasons=()
+    local hours=$((age / 3600))
+
+    # Age scoring
+    if ((hours > 168)); then
+        ((score += 50)); reasons+=(">1wk")
+    elif ((hours > 48)); then
+        ((score += 30)); reasons+=(">2d")
+    elif ((hours > 24)); then
+        ((score += 20)); reasons+=(">1d")
+    fi
+
+    # Orphan detection
+    [[ "$ppid" == "1" ]] && { ((score += 25)); reasons+=("orphan"); }
+
+    # Pattern detection
+    if [[ "$cmd" =~ (bun\ test|jest|pytest|cargo\ test|npm\ test|vitest) ]] && ((age > 3600)); then
+        ((score += 40)); reasons+=("stuck test")
+    fi
+
+    if [[ "$cmd" =~ (--hot|--watch|next\ dev|vite\ dev) ]] && ((hours > 48)); then
+        ((score += 20)); reasons+=("old dev")
+    fi
+
+    if [[ "$cmd" =~ (claude|codex|gemini|anthropic) ]] && [[ "$cmd" =~ (bash|/bin/sh) ]] && ((hours > 24)); then
+        ((score += 35)); reasons+=("agent shell")
+    fi
+
+    # High memory hog
+    ((mem > 2000 && hours > 12)) && { ((score += 15)); reasons+=("high mem"); }
+
+    # Protected patterns
+    if [[ "$cmd" =~ ^(/usr/lib/systemd|/lib/systemd|sshd|/usr/sbin/cron|dockerd|containerd|dbus|pulseaudio|pipewire) ]]; then
+        ((score -= 200))
+    fi
+
+    # Learning from history (using cache)
+    local pattern; pattern=$(normalize_pattern "$cmd")
+    local past; past=$(get_cached_decision "$pattern")
+    case "$past" in
+        kill)  ((score += 20)); reasons+=("killed") ;;
+        spare) ((score -= 30)); reasons+=("spared") ;;
+    esac
+
+    # Build reason string
+    local reason_str=""
+    ((${#reasons[@]} > 0)) && reason_str=$(IFS=", "; echo "${reasons[*]}")
+
+    # Determine recommendation
+    local rec
+    if ((score >= THRESHOLD_KILL)); then rec="KILL"
+    elif ((score >= THRESHOLD_REVIEW)); then rec="REVIEW"
+    else rec="SPARE"
+    fi
+
+    echo "$score|$rec|$reason_str"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Process Collection
+# ══════════════════════════════════════════════════════════════════════════════
+
+collect_candidates() {
+    local min_age=${1:-3600}  # Default 1 hour
+    local candidates=()
+
+    # Load decisions cache once
+    load_decisions_cache
+
+    # Fast pre-filter: only keep processes older than min_age
+    # and skip obviously safe patterns
+    local procs
+    procs=$(ps -eo pid,ppid,etimes,rss,args --no-headers -u "$(whoami)" 2>/dev/null | awk -v min="$min_age" '
+        $3 >= min &&
+        $5 !~ /^\/usr\/lib\/systemd/ &&
+        $5 !~ /^\/lib\/systemd/ &&
+        $5 !~ /^sshd/ &&
+        $5 !~ /^\/usr\/sbin\/cron/ &&
+        $5 !~ /^dockerd/ &&
+        $5 !~ /^containerd/ &&
+        $5 !~ /dbus-daemon/ &&
+        $5 !~ /^\/usr\/bin\/pulseaudio/ &&
+        $5 !~ /^\/usr\/bin\/pipewire/
+        { print $1 "|" $2 "|" $3 "|" $4 "|" substr($0, index($0,$5)) }
+    ')
+
+    while IFS='|' read -r pid ppid age mem cmd; do
+        [[ -z "$pid" ]] && continue
+
+        local result; result=$(score_process "$pid" "$ppid" "$age" "${mem:-0}" "$cmd")
+        local score rec reasons
+        IFS='|' read -r score rec reasons <<< "$result"
+
+        # Use TAB as outer delimiter
+        ((score > 0)) && candidates+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$score" "$pid" "$age" "${mem:-0}" "$rec" "$reasons" "$cmd")")
+    done <<< "$procs"
+
+    # Sort by score descending (field 1, tab-delimited)
+    printf '%s\n' "${candidates[@]}" | sort -t$'\t' -k1 -nr
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI Components
+# ══════════════════════════════════════════════════════════════════════════════
+
+show_header() {
+    clear
+    gum style \
+        --border rounded \
+        --border-foreground 99 \
+        --padding "0 2" \
+        --margin "0 0 1 0" \
+        "$(gum style --foreground 99 --bold '  Process Triage')" \
+        "$(gum style --foreground 245 "  v$VERSION")"
+}
+
+show_system_stats() {
+    local load; load=$(cut -d' ' -f1-3 < /proc/loadavg)
+    local cores; cores=$(nproc)
+    local mem_info; mem_info=$(free -h | awk '/^Mem:/ {printf "%s / %s", $3, $2}')
+
+    gum style --foreground 245 "  Load: $load ($cores cores)  │  Memory: $mem_info"
+    echo
+}
+
+format_row() {
+    local score=$1 pid=$2 age_s=$3 mem_mb=$4 rec=$5 reasons=$6 cmd=$7
+
+    local age_fmt; age_fmt=$(format_duration "$age_s")
+    local mem_fmt; mem_fmt=$(format_memory "$mem_mb")
+    local cmd_short; cmd_short=$(echo "$cmd" | cut -c1-50)
+    [[ ${#cmd} -gt 50 ]] && cmd_short="${cmd_short}…"
+
+    # Color the recommendation badge
+    local badge
+    case "$rec" in
+        KILL)   badge="${C_KILL}KILL${C_RESET}" ;;
+        REVIEW) badge="${C_REVIEW}REVIEW${C_RESET}" ;;
+        SPARE)  badge="${C_SPARE}SPARE${C_RESET}" ;;
+        *)      badge="${C_DIM}????${C_RESET}" ;;
+    esac
+
+    printf "%6s │ %5s │ %6s │ %6s │ %s │ %s\n" \
+        "$badge" "$pid" "$age_fmt" "$mem_fmt" "$(printf '%3d' "$score")" "$cmd_short"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Commands
+# ══════════════════════════════════════════════════════════════════════════════
+
+cmd_scan() {
+    show_header
+    show_system_stats
+
+    gum spin --spinner dot --title "  Scanning processes..." -- sleep 0.3
+
+    local candidates=()
+    mapfile -t candidates < <(collect_candidates)
+
+    if [[ ${#candidates[@]} -eq 0 ]] || [[ -z "${candidates[0]}" ]]; then
+        gum style --foreground 82 --bold "  ✓ No suspicious processes found"
+        echo
+        exit 0
+    fi
+
+    gum style --foreground 245 "  Found ${#candidates[@]} candidate(s):"
+    echo
+    printf "  %6s │ %5s │ %6s │ %6s │ %3s │ %s\n" "STATUS" "PID" "AGE" "MEM" "SCR" "COMMAND"
+    echo "  ───────┼───────┼────────┼────────┼─────┼────────────────────────────────"
+
+    for c in "${candidates[@]}"; do
+        [[ -z "$c" ]] && continue
+        IFS=$'\t' read -r score pid age mem rec reasons cmd <<< "$c"
+        printf "  "
+        format_row "$score" "$pid" "$age" "$mem" "$rec" "$reasons" "$cmd"
+    done
+
+    echo
+    gum style --foreground 245 "  Run 'pt' for interactive mode"
+}
+
+cmd_run() {
+    show_header
+    show_system_stats
+
+    gum spin --spinner dot --title "  Scanning processes..." -- sleep 0.3
+
+    local candidates=()
+    mapfile -t candidates < <(collect_candidates)
+
+    if [[ ${#candidates[@]} -eq 0 ]] || [[ -z "${candidates[0]}" ]]; then
+        gum style --foreground 82 --bold "  ✓ System is clean"
+        echo
+        gum style --foreground 245 "  No suspicious processes found."
+        echo
+        exit 0
+    fi
+
+    # Build selection items
+    local items=()
+    local preselect=()
+    declare -A pid_map  # Map display line -> original data
+
+    for c in "${candidates[@]}"; do
+        [[ -z "$c" ]] && continue
+        IFS=$'\t' read -r score pid age mem rec reasons cmd <<< "$c"
+
+        local age_fmt; age_fmt=$(format_duration "$age")
+        local mem_fmt; mem_fmt=$(format_memory "$mem")
+        local cmd_short; cmd_short=$(echo "$cmd" | cut -c1-45)
+        [[ ${#cmd} -gt 45 ]] && cmd_short="${cmd_short}…"
+
+        # Create display line
+        local line
+        line=$(printf "[%-6s] PID:%-6s %5s %6s │ %s" "$rec" "$pid" "$age_fmt" "$mem_fmt" "$cmd_short")
+        items+=("$line")
+        pid_map["$line"]="$c"
+
+        # Pre-select KILL recommendations
+        [[ "$rec" == "KILL" ]] && preselect+=("$line")
+    done
+
+    echo
+    gum style --foreground 245 "  ${#candidates[@]} candidates found. Pre-selected: ${#preselect[@]} KILL recommendations"
+    echo
+    gum style --foreground 245 "  ${C_KILL}[KILL]${C_RESET} = recommended  ${C_REVIEW}[REVIEW]${C_RESET} = check  ${C_SPARE}[SPARE]${C_RESET} = safe"
+    echo
+
+    # Interactive selection
+    local selected
+    if [[ ${#preselect[@]} -gt 0 ]]; then
+        selected=$(printf '%s\n' "${items[@]}" | gum choose --no-limit --height 15 \
+            --cursor-prefix "[ ] " --selected-prefix "[✓] " --unselected-prefix "[ ] " \
+            --header "Select processes to KILL (↑↓ move, space toggle, enter confirm):" \
+            --selected.foreground 212 \
+            --cursor.foreground 212 \
+            --selected "${preselect[@]}" 2>/dev/null) || true
+    else
+        selected=$(printf '%s\n' "${items[@]}" | gum choose --no-limit --height 15 \
+            --cursor-prefix "[ ] " --selected-prefix "[✓] " --unselected-prefix "[ ] " \
+            --header "Select processes to KILL (↑↓ move, space toggle, enter confirm):" \
+            --selected.foreground 212 \
+            --cursor.foreground 212 2>/dev/null) || true
+    fi
+
+    if [[ -z "$selected" ]]; then
+        echo
+        gum style --foreground 214 "  No processes selected"
+        exit 0
+    fi
+
+    local count; count=$(echo "$selected" | wc -l)
+    echo
+    gum style --foreground 212 --bold "  Selected $count process(es) to terminate"
+    echo
+
+    # Confirmation
+    if ! gum confirm --affirmative "Kill" --negative "Cancel" "  Proceed with terminating $count process(es)?"; then
+        gum style --foreground 214 "  Cancelled"
+        exit 0
+    fi
+
+    echo
+    local killed=0 failed=0
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        # Extract PID from the line
+        local pid; pid=$(echo "$line" | grep -oE 'PID:[0-9]+' | cut -d: -f2)
+        [[ -z "$pid" ]] && continue
+
+        # Get original data (tab-delimited: score pid age mem rec reasons cmd)
+        local orig="${pid_map[$line]}"
+        local cmd; cmd=$(echo "$orig" | cut -d$'\t' -f7)
+
+        printf "  Killing PID %s... " "$pid"
+
+        if kill "$pid" 2>/dev/null; then
+            echo "${C_SPARE}✓${C_RESET}"
+            ((killed++))
+        elif kill -9 "$pid" 2>/dev/null; then
+            echo "${C_REVIEW}✓ (SIGKILL)${C_RESET}"
+            ((killed++))
+        else
+            echo "${C_KILL}✗ failed${C_RESET}"
+            ((failed++))
+            continue
+        fi
+
+        # Save decision
+        local pattern; pattern=$(normalize_pattern "$cmd")
+        save_decision "$pattern" "kill"
+    done <<< "$selected"
+
+    # Save spare decisions for unselected
+    for line in "${items[@]}"; do
+        if ! echo "$selected" | grep -qF "$line"; then
+            local orig="${pid_map[$line]}"
+            [[ -z "$orig" ]] && continue
+            local cmd; cmd=$(echo "$orig" | cut -d$'\t' -f7)
+            local pattern; pattern=$(normalize_pattern "$cmd")
+            save_decision "$pattern" "spare"
+        fi
+    done
+
+    echo
+    gum style --foreground 82 --bold "  Done! Killed: $killed  Failed: $failed"
+    echo
+    show_system_stats
+    log "Triage complete: killed=$killed failed=$failed"
+}
+
+cmd_history() {
+    show_header
+
+    if [[ ! -s "$DECISIONS_FILE" ]] || [[ "$(cat "$DECISIONS_FILE")" == "{}" ]]; then
+        gum style --foreground 214 "  No decision history yet"
+        echo
+        gum style --foreground 245 "  Run 'pt' to build up a decision history."
+        exit 0
+    fi
+
+    echo
+    gum style --foreground 245 "  Past Decisions:"
+    echo
+
+    if command -v jq &>/dev/null; then
+        jq -r 'to_entries | sort_by(.value) | .[] |
+            if .value == "kill" then "  \u001b[91mKILL\u001b[0m  │ \(.key)"
+            else "  \u001b[92mSPARE\u001b[0m │ \(.key)" end' \
+            "$DECISIONS_FILE" 2>/dev/null | head -30
+    else
+        cat "$DECISIONS_FILE"
+    fi
+    echo
+}
+
+cmd_clear() {
+    show_header
+
+    local count=0
+    if [[ -s "$DECISIONS_FILE" ]] && command -v jq &>/dev/null; then
+        count=$(jq 'length' "$DECISIONS_FILE" 2>/dev/null || echo 0)
+    fi
+
+    echo
+    if ((count == 0)); then
+        gum style --foreground 214 "  No decision history to clear"
+        exit 0
+    fi
+
+    gum style --foreground 245 "  Found $count saved decisions"
+    echo
+
+    if gum confirm --affirmative "Clear" --negative "Keep" "  Clear all decision history?"; then
+        echo '{}' > "$DECISIONS_FILE"
+        gum style --foreground 82 "  ✓ Decision history cleared"
+        log "Decision history cleared"
+    else
+        gum style --foreground 245 "  Kept existing decisions"
+    fi
+}
+
+cmd_help() {
+    cat << 'EOF'
+pt - Process Triage v1.0.0
+
+USAGE
+    pt              Interactive mode - scan, select, kill
+    pt scan         Show candidates without killing
+    pt history      Show past decisions
+    pt clear        Clear decision history
+    pt help         Show this help
+
+HOW IT WORKS
+    pt scores processes based on:
+    • Age (older = more suspicious)
+    • Parent PID (orphans are suspicious)
+    • Pattern matching (stuck tests, old dev servers)
+    • Past decisions (learns from your choices)
+
+    Recommendations:
+    • KILL   (score ≥50) - Pre-selected for killing
+    • REVIEW (score 20-49) - Worth checking
+    • SPARE  (score <20) - Probably safe
+
+EXAMPLES
+    pt                     # Interactive - select and kill
+    pt scan                # Just show what's suspicious
+    pt history             # See past decisions
+
+CONFIG
+    ~/.config/process_triage/decisions.json  - Learned decisions
+    ~/.config/process_triage/triage.log      - Operation log
+
+EOF
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
+
+main() {
+    ensure_gum
+    ensure_config
+
+    case "${1:-run}" in
+        run|"")   cmd_run ;;
+        scan)     cmd_scan ;;
+        history)  cmd_history ;;
+        clear)    cmd_clear ;;
+        help|-h|--help) cmd_help ;;
+        version|-v|--version) echo "pt version $VERSION" ;;
+        *)
+            echo "Unknown command: $1"
+            echo "Run 'pt help' for usage"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,20 @@
+# Process Triage - .gitignore
+
+# Logs
+*.log
+
+# Test artifacts
+.bats-run-*
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+
+# Temporary files
+*.tmp
