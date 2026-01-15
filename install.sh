@@ -250,6 +250,109 @@ install_pt() {
 }
 
 # ==============================================================================
+# PATH Management
+# ==============================================================================
+
+detect_shell() {
+    local shell_name
+
+    # Check $SHELL environment variable
+    shell_name="${SHELL##*/}"
+
+    # Validate it's a known shell
+    case "$shell_name" in
+        bash|zsh|fish|sh)
+            echo "$shell_name"
+            ;;
+        *)
+            # Fallback: check what's running
+            if [[ -n "${BASH_VERSION:-}" ]]; then
+                echo "bash"
+            elif [[ -n "${ZSH_VERSION:-}" ]]; then
+                echo "zsh"
+            else
+                echo "bash"  # Default assumption
+            fi
+            ;;
+    esac
+}
+
+get_shell_config() {
+    local shell_name="$1"
+
+    case "$shell_name" in
+        bash)
+            # Prefer .bashrc for interactive, .bash_profile for login
+            if [[ -f "$HOME/.bashrc" ]]; then
+                echo "$HOME/.bashrc"
+            elif [[ -f "$HOME/.bash_profile" ]]; then
+                echo "$HOME/.bash_profile"
+            else
+                echo "$HOME/.bashrc"  # Create it
+            fi
+            ;;
+        zsh)
+            echo "$HOME/.zshrc"
+            ;;
+        fish)
+            echo "$HOME/.config/fish/config.fish"
+            ;;
+        *)
+            echo "$HOME/.profile"
+            ;;
+    esac
+}
+
+add_to_path() {
+    local install_dir="$1"
+
+    # Check if already in PATH
+    if [[ ":$PATH:" == *":$install_dir:"* ]]; then
+        log_info "$install_dir already in PATH"
+        return 0
+    fi
+
+    # Detect shell and config file
+    local shell_name config_file
+    shell_name=$(detect_shell)
+    config_file=$(get_shell_config "$shell_name")
+
+    log_step "Adding $install_dir to PATH in $config_file"
+
+    # Create directory for fish config if needed
+    if [[ "$shell_name" == "fish" ]]; then
+        mkdir -p "${config_file%/*}"
+    fi
+
+    # Prepare PATH export line
+    local path_line
+    case "$shell_name" in
+        fish)
+            path_line="set -gx PATH \"$install_dir\" \$PATH"
+            ;;
+        *)
+            path_line="export PATH=\"$install_dir:\$PATH\""
+            ;;
+    esac
+
+    # Check if already added (avoid duplicates)
+    if [[ -f "$config_file" ]] && grep -qF "$install_dir" "$config_file" 2>/dev/null; then
+        log_info "PATH already configured in $config_file"
+        return 0
+    fi
+
+    # Add to config
+    {
+        echo ""
+        echo "# Added by pt installer"
+        echo "$path_line"
+    } >> "$config_file"
+
+    log_success "Added to $config_file"
+    log_info "Run 'source $config_file' or start a new terminal to use pt."
+}
+
+# ==============================================================================
 # Main
 # ==============================================================================
 
@@ -299,11 +402,14 @@ main() {
     # Install
     install_pt "$temp_dir/pt" "$dest"
 
-    # Check if dest is in PATH
-    if [[ ":$PATH:" != *":$dest:"* ]]; then
-        log_warn "$dest is not in your PATH"
-        log_info "Add it with: export PATH=\"$dest:\$PATH\""
-        log_info "Or re-run with PT_NO_PATH unset to auto-configure (coming soon)"
+    # Add to PATH if needed and not disabled
+    if [[ "${PT_NO_PATH:-}" != "1" ]]; then
+        add_to_path "$dest"
+    else
+        log_info "Skipping PATH modification (PT_NO_PATH=1)"
+        if [[ ":$PATH:" != *":$dest:"* ]]; then
+            log_info "Add manually: export PATH=\"$dest:\$PATH\""
+        fi
     fi
 
     echo ""
