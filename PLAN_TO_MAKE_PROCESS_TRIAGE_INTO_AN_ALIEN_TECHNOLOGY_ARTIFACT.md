@@ -1,5 +1,302 @@
 # PLAN_TO_MAKE_PROCESS_TRIAGE_INTO_AN_ALIEN_TECHNOLOGY_ARTIFACT.md
 
+---
+
+## Background Information and Context
+
+This section provides complete context for understanding this specification. The goal is to make this document fully self-contained so that a reader with no prior exposure to Process Triage can understand the problem, the current state, and the proposed transformation.
+
+### What is Process Triage?
+
+**Process Triage** (`pt`) is an interactive command-line tool for identifying and killing abandoned, stuck, or zombie processes on developer workstations. It scans the process table, scores each process based on heuristics (runtime, CPU usage, command patterns, orphan status), and presents candidates for termination in an interactive UI.
+
+The tool exists because modern development workflows generate an enormous number of long-running processes—test runners, dev servers, language servers, build watchers, AI coding assistants, background tasks—and these processes frequently outlive their usefulness. They accumulate silently, consuming memory, CPU, file descriptors, and ports until the developer notices their machine is sluggish or a port is unexpectedly occupied.
+
+**Current implementation**: `pt` is a single-file bash script (~1600 lines) that uses `gum` for interactive UI components. It applies hand-tuned heuristic scoring rules and maintains a simple JSON-based "decision memory" to learn from user choices. It is functional but limited: the heuristics are ad-hoc, the scoring is not principled, and there is no formal notion of confidence, evidence, or risk.
+
+### The Problem: Process Accumulation on Developer Machines
+
+Developer workstations are uniquely hostile environments for process management:
+
+1. **High process churn**: Developers start and stop processes constantly—running tests, launching dev servers, building projects, spawning language servers, running AI assistants. Many of these are designed to run indefinitely until manually stopped.
+
+2. **Orphan accumulation**: When a terminal is closed, an SSH session drops, or a parent process crashes, child processes may be reparented to PID 1 (init/systemd) and continue running indefinitely with no controlling terminal and no user awareness.
+   - Note: PPID=1 is not universally “orphan” (e.g., macOS `launchd` is PID 1 and legitimately parents many long-lived processes). Treat “reparented to init” as a weak signal that must be conditioned on supervision/session context.
+
+3. **Test runner zombies**: Test frameworks (Jest, pytest, bats, bun test, go test) can hang indefinitely on deadlocks, infinite loops, or resource exhaustion. A developer may Ctrl+C the parent, but child processes or worker threads persist.
+
+4. **Dev server proliferation**: `next dev`, `vite`, `webpack --watch`, `nodemon`, `flask run`—developers often start multiple dev servers across different projects and forget to stop them. Each consumes memory and binds ports.
+
+5. **AI assistant sprawl**: Modern AI coding tools (Claude, Copilot, Cursor, Gemini) spawn multiple processes—language servers, inference workers, file watchers—that may not clean up properly when sessions end.
+
+6. **Build system persistence**: Build tools (`cargo watch`, `tsc --watch`, `make -j`) may spawn worker processes that outlive the build session.
+
+7. **Container/VM leakage**: Docker containers, VMs, and their associated shim processes can accumulate when development sessions are abandoned.
+
+The result: a typical developer machine accumulates dozens of unnecessary processes over days or weeks of work, gradually degrading performance until the developer reboots or manually hunts down offenders.
+
+### Why This Problem is Hard
+
+Identifying which processes should be killed is a **classification problem under uncertainty** with **asymmetric costs**:
+
+**The classification challenge:**
+- A process running for 4 hours at 80% CPU might be a stuck test (should kill) or a legitimate long-running computation (should keep).
+- A process with no TTY might be an orphaned leftover (should kill) or a deliberately backgrounded daemon (should keep).
+- A process consuming 2GB of memory might be a memory leak (should kill) or a normal workload for that application (should keep).
+
+There is no single observable feature that definitively distinguishes "useful" from "abandoned." The classification requires combining multiple weak signals probabilistically.
+
+**The asymmetric cost challenge:**
+- **False kill (Type I error)**: Killing a useful process can cause data loss, interrupt work, crash dependent services, or corrupt state. The cost can range from minor annoyance to hours of lost work.
+- **False spare (Type II error)**: Leaving an abandoned process running wastes resources but usually causes no immediate harm.
+
+This asymmetry means the system must be **conservative by default**—it is far better to miss an abandoned process than to kill a useful one. But excessive conservatism renders the tool useless (it never recommends killing anything).
+
+**The observability challenge:**
+The operating system provides many signals about process state, but they are noisy, indirect, and platform-dependent:
+- CPU usage fluctuates based on scheduling and system load
+- Memory usage depends on allocation patterns and OS reclamation
+- I/O activity may be bursty or quiescent
+- Network connections come and go
+- Process state flags (R/S/D/Z/T) are coarse
+
+Extracting meaningful behavioral patterns from these signals requires statistical modeling.
+
+**The context challenge:**
+Whether a process is "useful" depends on context that is not directly observable:
+- Is this test runner part of a test suite the user is actively iterating on?
+- Is this dev server serving a browser tab the user has open?
+- Is this build process part of a CI run that hasn't finished?
+- Did the user intentionally background this process?
+
+The system must incorporate contextual signals (TTY attachment, working directory, recent user activity, process relationships) to make informed decisions.
+
+### Current Approaches and Their Limitations
+
+**Manual process management (`ps`, `top`, `htop`, `kill`):**
+- Requires the user to know what they're looking for
+- No guidance on what is safe to kill
+- Time-consuming for complex process trees
+- Easy to miss orphaned processes
+- Easy to accidentally kill something important
+
+**System-level monitors (systemd, launchd, supervisord):**
+- Only manage processes they supervise
+- Don't help with ad-hoc developer processes
+- No intelligence about "stuck" vs "working"
+
+**Simple heuristic tools (existing `pt`, custom scripts):**
+- Ad-hoc rules ("kill anything running > 24 hours")
+- No uncertainty quantification
+- No principled way to combine evidence
+- No learning from outcomes
+- High false positive/negative rates
+
+**Machine learning approaches:**
+- Require labeled training data (hard to obtain)
+- Black-box decisions (no explainability)
+- Risk of unexpected failures on distribution shift
+- Overkill for a problem with well-understood structure
+
+What's missing is a **principled probabilistic framework** that:
+1. Combines multiple weak signals into a coherent posterior belief
+2. Quantifies uncertainty explicitly
+3. Makes decisions based on expected costs, not arbitrary thresholds
+4. Explains its reasoning in human-understandable terms
+5. Learns from outcomes without requiring labeled data
+6. Provides formal safety guarantees
+
+### The Process Triage Vision: "Alien Technology Artifact"
+
+The goal of this specification is to transform `pt` from a simple heuristic script into what we call an **"alien technology artifact"**—a tool so principled, so rigorous, and so well-designed that it feels like technology from a more advanced civilization.
+
+This is not hyperbole or marketing. The term captures a specific aspiration:
+
+**An alien technology artifact is characterized by:**
+1. **Mathematical rigor**: Every decision is grounded in formal probability theory and decision theory, not ad-hoc heuristics.
+2. **Complete explainability**: The system can show exactly why it made each recommendation, down to individual likelihood terms and Bayes factors.
+3. **Formal safety guarantees**: The system provides provable bounds on error rates, not just empirical observations.
+4. **Graceful degradation**: The system works with whatever information is available, getting better with more data but never failing catastrophically.
+5. **Operational excellence**: The system is fast, reliable, and never becomes a problem itself (no hanging, no resource hogging, no silent failures).
+6. **Beautiful UX**: The interface is polished, intuitive, and makes the underlying sophistication accessible rather than intimidating.
+
+The "alien" quality comes from the combination: most tools have one or two of these properties; having all of them simultaneously is rare enough to feel otherworldly.
+
+### Why Closed-Form Bayesian Inference (Not Machine Learning)?
+
+A critical design decision in this specification is the commitment to **closed-form Bayesian inference** rather than machine learning. This is not anti-ML ideology; it is a pragmatic choice based on the problem structure:
+
+**1. The problem has well-understood structure.**
+
+We know what features matter (CPU, runtime, orphan status, command type, I/O activity, etc.) and we have reasonable prior beliefs about how they relate to process states. We don't need a neural network to discover that "high CPU + long runtime + orphan + no TTY" suggests abandonment—we can encode this directly.
+
+**2. Explainability is essential for trust.**
+
+A tool that kills processes must be explainable. "The model says kill" is not acceptable. Users need to understand *why* each recommendation is made so they can trust it, override it when appropriate, and debug false positives. Closed-form Bayesian inference produces a complete evidence ledger: "P(abandoned|evidence) = 0.94 because: runtime contributes +2.3 log-odds, orphan status contributes +1.8 log-odds, CPU pattern contributes -0.4 log-odds, ..."
+
+**3. Conjugate priors enable online learning.**
+
+With conjugate prior families (Beta-Binomial, Gamma-Poisson, Dirichlet-Multinomial), updating beliefs from new observations is a simple parameter update. The system can learn from user decisions and outcomes without retraining a model. This enables continuous calibration.
+
+**4. Formal guarantees are tractable.**
+
+With closed-form posteriors, we can compute exact credible intervals and exact Bayes factors. We can also apply formal error-control tools (PAC-Bayes bounds, FDR control, alpha-investing), but we must be explicit about their assumptions (e.g., approximate independence/exchangeability of trials); in always-on/optional-stopping settings we prefer anytime-valid e-values/e-process controls. ML models require empirical validation on held-out data; Bayesian models have built-in uncertainty quantification.
+
+**5. Numerical stability is achievable.**
+
+Log-domain computation with special functions (log-gamma, log-beta) is well-understood and numerically stable. We don't need to worry about vanishing gradients, mode collapse, or other pathologies of neural network training.
+
+**6. The system is auditable.**
+
+Every parameter (prior shape, likelihood model, loss matrix) is explicit and interpretable. If the system makes a mistake, we can trace it to a specific model assumption and fix it. ML models are opaque by comparison.
+
+**What "closed-form" means in practice:**
+
+- **Priors**: All prior distributions are from conjugate families (Beta, Gamma, Dirichlet).
+- **Likelihoods**: All likelihood models use these conjugate families.
+- **Posteriors**: All posteriors are analytically tractable (no MCMC, no variational inference).
+- **Decisions**: Expected loss is computed exactly from the posterior.
+- **Advanced layers**: More sophisticated models (Hawkes processes, change-point detection, etc.) are used as **feature extractors** that feed deterministic summaries into the closed-form core—they do not replace the core inference.
+
+### The Four-State Classification Model
+
+The core of the system is a four-state classification model for process states:
+
+| State | Description | Typical Characteristics | Appropriate Action |
+|-------|-------------|------------------------|-------------------|
+| **Useful** | Process is doing productive work that the user cares about | Active CPU/IO, responding to requests, part of active workflow | Keep |
+| **Useful-but-bad** | Process is doing something but is stuck, leaking, or misbehaving | High CPU but no progress, memory growth, spin-waiting | Investigate, possibly pause/restart |
+| **Abandoned** | Process was once useful but is no longer needed | Orphaned, no TTY, stale working directory, no recent activity | Kill (with confirmation) |
+| **Zombie** | Process has terminated but not been reaped | State = 'Z', exists only as process table entry | Cannot kill directly; must reap via parent |
+
+This four-state model is richer than a simple binary "useful/not-useful" classification:
+
+- **Useful-but-bad** captures processes that are technically running but exhibiting pathological behavior (infinite loops, memory leaks, deadlocks). These may benefit from intervention even though they are "in use."
+- **Zombie** is a distinct technical state requiring different handling—you cannot kill a zombie process; you must address the parent that failed to reap it.
+
+The posterior over these four states, combined with a loss matrix specifying the cost of each action in each state, yields a principled decision rule via expected loss minimization.
+
+### Key Design Principles
+
+**1. Safety by default, power on demand.**
+
+The system never auto-kills by default. The default workflow is: scan → analyze → present recommendations → require human confirmation. Automated execution (`--robot` mode) is explicitly opt-in and still subject to safety gates.
+
+**2. Progressive disclosure of complexity.**
+
+The default UX shows a simple "recommended action" with a one-line explanation. Users can drill down to see the full evidence ledger, and further to "galaxy-brain mode" showing the complete mathematical derivation. The sophistication is there but doesn't overwhelm.
+
+**3. Evidence over thresholds.**
+
+Rather than "kill if score > 50," the system maintains a full posterior distribution and decides based on expected loss. This naturally handles uncertainty: e.g., P(abandoned)=0.6 with tight concentration (many consistent samples) is treated differently from P(abandoned)=0.6 from sparse/noisy evidence; and even a high posterior can be down-weighted when robustness checks (PPC/drift/DRO gates) indicate model mismatch.
+
+**4. Maximal instrumentation, budgeted execution.**
+
+The system attempts to install and use every available diagnostic tool (perf, eBPF, strace, etc.) but carefully budgets their execution to avoid becoming a resource hog itself. More data is always better; the system gracefully degrades when tools are unavailable.
+
+**5. Everything is logged, everything is auditable.**
+
+Every observation, every inference step, every decision is logged to a structured telemetry store (Parquet partitions). This enables debugging ("why did it recommend killing that?"), calibration ("what's our actual false-kill rate?"), and learning ("how should we adjust priors based on outcomes?").
+
+**6. Formal safety guarantees where possible.**
+
+The system uses Bayesian credible bounds, PAC-Bayes, and (online) FDR/alpha-investing to control error rates *under explicit assumptions* (e.g., approximate independence/exchangeability of trials). Where those assumptions are dubious (strong temporal dependence, selection effects), the system defaults to conservative gating and anytime-valid e-process/e-value style controls rather than over-claiming guarantees. These are essential for trusting the system in `--robot` mode.
+
+### Target Users and Use Cases
+
+**Primary users:**
+- Software developers with long-running workstations (macOS, Linux)
+- Developers who run many concurrent projects
+- Users of AI coding assistants (which spawn many background processes)
+- DevOps engineers managing development/staging environments
+
+**Primary use cases:**
+
+1. **Interactive triage**: "My machine is slow. Help me find and kill abandoned processes."
+2. **Scheduled cleanup**: Run `pt` periodically (cron/launchd) to keep the process table clean.
+3. **Automated hygiene**: Run `pt --robot` in CI/CD environments or development containers to automatically clean up after test runs.
+4. **Investigation**: "This process is using a lot of CPU. Should I be worried?"
+5. **Learning**: "I always kill processes matching pattern X. Remember that."
+
+**Non-goals:**
+- Production server process management (use proper supervision)
+- Security monitoring (use proper audit tools)
+- General system administration (use proper admin tools)
+
+### Technical Context: What Signals Are Available?
+
+The operating system exposes rich information about processes, though the details vary by platform:
+
+**Universal (Linux and macOS):**
+- PID, PPID (parent process ID)
+- UID (owner)
+- Command line and arguments
+- Process state (running, sleeping, zombie, etc.)
+- CPU time (user + system)
+- Memory usage (RSS, virtual)
+- Start time / elapsed time
+- Controlling TTY (or none)
+- Current working directory
+- Open file descriptors (via lsof)
+- Network connections (via ss/netstat/lsof)
+- Child processes
+
+**Linux-specific:**
+- `/proc/PID/*` filesystem with detailed per-process info
+- cgroups (CPU/memory limits and accounting)
+- PSI (Pressure Stall Information) for system-wide pressure
+- perf (hardware performance counters)
+- eBPF (programmable kernel instrumentation)
+- systemd unit attribution
+
+**macOS-specific:**
+- `proc_pidinfo` API for detailed process info
+- `powermetrics` for energy/performance data
+- `sample`/`spindump` for stack sampling
+- `fs_usage` for file system activity
+- launchd service attribution
+
+The specification aims to use all available signals, with graceful degradation when specific tools are unavailable.
+
+### What Success Looks Like
+
+If this specification is fully realized, the result will be a tool that:
+
+1. **Just works**: Run `pt` and get a clear, actionable recommendation in seconds.
+
+2. **Earns trust**: Every recommendation comes with an explanation that makes sense. Users learn to trust the tool because they can verify its reasoning.
+
+3. **Never damages**: The false-kill rate is vanishingly low (<1%), and even when wrong, the system errs on the side of caution.
+
+4. **Improves over time**: The system learns from user decisions and outcomes, becoming more accurate with use.
+
+5. **Scales to automation**: The `--robot` mode is reliable enough to run unattended in CI/CD, development containers, and scheduled jobs.
+
+6. **Delights users**: The UX is polished, the output is beautiful, and the "galaxy-brain mode" makes the underlying mathematics accessible and even fun.
+
+7. **Feels like magic**: The combination of rigor, safety, and usability produces an experience that feels qualitatively different from other tools—hence "alien technology artifact."
+
+### Document Structure
+
+The remainder of this specification is organized as follows:
+
+- **Section 0**: Non-negotiable requirements (constraints that must not be violated)
+- **Section 1**: Mission and success criteria
+- **Section 2**: Complete inventory of mathematical techniques incorporated
+- **Section 3**: System architecture (collection, features, telemetry, CLI, UX)
+- **Section 4**: Inference engine (all Bayesian models and techniques)
+- **Section 5**: Decision theory and optimal stopping
+- **Section 6**: Action space (beyond just "kill")
+- **Section 7**: UX and explainability design
+- **Section 8**: Real-world enhancements and pitfalls to avoid
+- **Section 9**: Applied interpretation of example processes
+- **Section 10**: Phased implementation plan
+- **Section 11**: Testing and validation requirements
+- **Section 12**: Deliverables
+- **Section 13**: Final safety statement
+
+---
+
 ## 0) Non-Negotiable Requirement From User
 This plan MUST incorporate every idea and math formula from the conversation. The sections below explicitly enumerate and embed all of them. This is a closed-form Bayesian and decision-theoretic system with no ML.
 Operational requirement: `pt` must be able to run end-to-end in a full-auto mode (collect -> infer -> recommend -> (optionally) act) with no user interaction except (by default) a final TUI approval step for destructive actions. A `--robot` flag must exist to skip the approval UI and execute automatically.
@@ -15,12 +312,12 @@ Implementation stance (critical): keep `pt` as a thin bash wrapper/installer for
 Operational stance (critical): make every run operationally improvable by recording both raw observations and derived quantities to append-only Parquet partitions, with DuckDB as the query engine over those partitions for debugging, calibration, and visualization.
 
 Success criteria:
-- Decision quality: <1% false-kill rate in shadow mode, high capture of abandoned/zombie processes.
+- Decision quality: in shadow mode, the estimated false-kill rate of “recommended kill” actions is <1% (report as a credible upper bound at a stated confidence level); high capture of abandoned/zombie processes as judged by user labels and/or post-run outcomes.
 - Explainability: every decision has a full evidence ledger, posterior, and top Bayes factors.
 - Safety: no auto-kill by default; multi-stage mitigations; guardrails enforced by policy; `--robot` explicitly opts into automated execution.
-- Performance: quick scan <1s, deep scan <8s for typical process counts.
+- Performance: quick scan <1s; targeted deep scan on top suspects <8s for typical process counts (full instrumentation is budgeted and may take longer when explicitly enabled).
 - Closed-form Bayesian core: posterior/odds/expected-loss updates use conjugate priors; no ML.
-- Formal guarantees: PAC-Bayes bounds + Bayesian credible bounds on false-kill rate (shadow-mode calibrated) with explicit confidence.
+- Formal guarantees: Bayesian credible bounds + PAC-Bayes bounds on false-kill rate (shadow-mode calibrated) with explicit assumptions called out (and an anytime-valid e-process/e-value fallback for sequential/always-on settings).
 - Real-world impact weighting: kill-cost incorporates dependency and user-intent signals.
 - Operational learning loop: every decision is explainable and auditable from stored telemetry (raw + derived + outcomes).
 - Telemetry performance: logging is low-overhead (batched Parquet writes; no per-row inserts).
@@ -49,6 +346,7 @@ A) Basic closed-form Bayesian model (non-ML)
   - command/CWD categories g|C ~ Categorical(rho_C), rho_C ~ Dirichlet(alpha^{cmd}_C)
 - Posterior (Naive Bayes):
   P(C|x) proportional to P(C) * product_j P(x_j|C)
+  (conditional-independence approximation; mitigate correlated-signal double counting via conservative calibration and dependence summaries)
 - Log-posterior formula:
   log P(C|x) = log P(C) + log BetaBinomial(k_ticks; n_ticks, alpha_C, beta_C) + log GammaPDF(t; k_C, theta_C)
                 + log BetaBernoulliPred(o; a_{o,C}, b_{o,C}) + log DirichletCatPred(g; alpha^{cmd}_C) + ...
@@ -122,7 +420,7 @@ O) Gittins indices
 
 P) Process genealogy / Bayesian network
 - PPID tree as Bayesian network or Galton-Watson branching process
-- orphan prior: BF = P(PPID=1|abandoned) / P(PPID=1|useful)
+- orphan/reparenting evidence: BF = P(unexpected_reparenting|abandoned) / P(unexpected_reparenting|useful)
 - "cobweb" model for process tree causality
 
 Q) Practical enhancements
@@ -153,7 +451,7 @@ U) POMDP / belief-state decision
 
 V) Generalization guarantees (PAC-Bayes + Bayesian credible bounds)
 - Bayesian credible upper bound on false-kill rate from shadow-mode outcomes using a Beta posterior on the error rate
-- PAC-Bayes: distribution-free generalization bound relating empirical false-kill rate to true false-kill rate via KL(Q||P); report both
+- PAC-Bayes: distribution-free generalization bound relating empirical false-kill rate to true false-kill rate via KL(Q||P) under standard i.i.d./exchangeability assumptions; report both
 
 W) Empirical Bayes calibration
 - Fit hyperparameters by maximizing marginal likelihood of shadow-mode logs
@@ -372,6 +670,7 @@ All of these are integrated in the system design below.
 - Quick scan should also capture: uid, pgid, sid, and cgroup path (when available), since “who owns it?” and “what group/unit/container is it in?” strongly affect safe actions.
 - Process identity safety: quick scan should also capture a stable per-process start identifier (Linux: `/proc/PID/stat` starttime ticks since boot; macOS: proc start time) so action execution can revalidate identity and avoid PID-reuse footguns.
 - Deep scan inputs (slow):
+  - OS note: Linux uses `/proc` collectors; macOS uses `ps`/`proc_pidinfo` + native tooling (`sample`, `fs_usage`, `nettop`, `spindump`) rather than `/proc`.
   - /proc/PID/io (read/write deltas)
   - /proc/PID/stat (CPU tick deltas)
   - /proc/PID/status (RSS, threads)
@@ -423,7 +722,7 @@ All of these are integrated in the system design below.
 - u_cores: estimated cores used (can exceed 1): u_cores = k_ticks / (CLK_TCK * Δt)
 - n_samp: number of quick-scan samples in the window (used for trend/change-point features)
 - t: elapsed time (seconds)
-- o: orphan indicator (PPID=1)
+- o: “unexpected reparenting” indicator (PPID=1 AND not managed-by-supervisor/job); treat PPID=1 as a weak, OS-dependent signal (e.g., macOS `launchd` makes PPID=1 common)
 - s: state flags (R,S,Z,D)
 - g: command category (test, dev, agent, shell, build, daemon, unknown)
 - cwd category: repo root, temp, unknown
@@ -622,6 +921,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 
 ### 4.3 Posterior Computation (Closed-form)
 - P(C|x) proportional to P(C) * product_j P(x_j|C)
+- Modeling note: the product assumes conditional independence of features given C. To avoid overconfident “double counting” when signals are correlated (CPU/PSI/IO, PPID/TTY, etc.), use conservative calibration (n_eff, shrinkage), feature collapsing, or a single dependence correction term (e.g., copula-based summaries) rather than multiplying many redundant terms.
 - log posterior formula:
   log P(C|x) = log P(C)
                + log BetaBinomial(k_ticks; n_ticks, alpha_C, beta_C)
@@ -673,7 +973,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 
 ### 4.8c Copula Dependence Modeling
 - Use Archimedean/vine copulas to model joint CPU/IO/net dependence
-- Closed-form likelihoods for common copula families
+- Closed-form copula densities/likelihood evaluation for common families; fit parameters numerically (IFM/pseudo-likelihood) and feed dependence summaries into the decision core
 
 ### 4.9 Robust Bayes (Imprecise Priors)
 - P(C) in [lower, upper]
@@ -693,7 +993,8 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - PPID tree as Bayesian network
 - Galton-Watson branching model for expected child activity
 - Orphan Bayes factor:
-  BF_orphan = P(PPID=1|abandoned) / P(PPID=1|useful)
+  BF_orphan = P(unexpected_reparenting|abandoned) / P(unexpected_reparenting|useful)
+  (treat PPID=1 alone as weak evidence; condition on supervision/session context)
 - "cobweb" model to represent process tree causality
 
 ### 4.13 Coupled Tree Priors (Correlated States)
@@ -709,7 +1010,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 - Credible upper bound: P(e <= eps) >= 1 - δ where eps = BetaInvCDF(1-δ; a+k, b+n-k)
 
 ### 4.15b PAC-Bayes Generalization Bounds (Shadow Mode)
-- Use a PAC-Bayes bound to relate empirical false-kill rate to true false-kill rate with distribution-free guarantees.
+- Use a PAC-Bayes bound to relate empirical false-kill rate to true false-kill rate with distribution-free guarantees under standard i.i.d./exchangeability assumptions across trials (use blocked/anytime variants or e-process controls when dependence is strong).
 - One canonical form (Seeger-style): with probability ≥ 1-δ over n shadow-mode trials, for all posteriors Q over policies:
   KL( \hat{e}(Q) || e(Q) ) ≤ ( KL(Q||P) + ln( (2√n)/δ ) ) / n
   where P is a prior over policies, Q is the learned/selected posterior, \hat{e}(Q) is empirical false-kill rate, and e(Q) is true false-kill rate.
@@ -793,7 +1094,7 @@ C in {useful, useful-but-bad, abandoned, zombie}
 
 ### 4.35 Extreme Value Theory (POT/GPD) Tail Modeling
 - Model exceedances of CPU/IO/network bursts above a high threshold u0
-- Fit generalized Pareto tail parameters; treat heavy-tail behavior as evidence of pathological bursts (or known spiky workloads)
+- Fit generalized Pareto tail parameters (numeric MLE/PWM); treat heavy-tail behavior as evidence of pathological bursts (or known spiky workloads)
 
 ### 4.36 Streaming Sketches / Heavy-Hitter Summaries
 - When event streams are huge (syscalls, bytes), maintain sketches:
@@ -1094,6 +1395,7 @@ Use the model to interpret the observed snapshot:
 Policy: always try to install everything and collect as much data as possible.
 Implementation note: `pt` (bash) performs installation and capability discovery; it then launches `pt-core` with a cached capabilities manifest so inference/decisioning can gracefully degrade when tools are missing.
 Non-invasiveness rule: install tools aggressively, but avoid enabling persistent daemons or making irreversible system configuration changes by default; prefer on-demand sampling/tracing and record what could not be accessed due to permissions.
+Daemonized-package note: some packages (e.g., `auditd`, `pcp`) may start services on install. Default behavior should avoid surprise persistent daemons: prefer using them only if already running, or require an explicit opt-in policy/flag to enable/start them.
 
 Linux package managers:
 - Debian/Ubuntu (apt):
@@ -1180,7 +1482,7 @@ Data-to-math mapping (signal -> model layer):
 - PSI stall pressure -> queueing-theoretic cost term (Erlang-C) + hazard inflation
 - Cache miss / branch mispredict -> tight-loop likelihood boost (useful-but-bad vs abandoned)
 - Socket/client count -> dependency-weighted loss scaling + causal action cost
-- Orphan PPID + dead TTY -> Bayesian genealogy prior shift toward abandoned
+- Unexpected reparenting (PPID=1) + dead TTY (and not a managed service) -> Bayesian genealogy prior shift toward abandoned
 - PPID tree adjacency -> graph Laplacian smoothing / coupled priors
 - Network bursts -> Hawkes cross-excitation + copula dependence
 - Distribution drift vs baseline -> Wasserstein distance + large-deviation bounds
