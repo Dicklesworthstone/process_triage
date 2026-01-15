@@ -9,6 +9,10 @@ This plan MUST incorporate every idea and math formula from the conversation. Th
 
 Mission: transform Process Triage (pt) into an "alien technology artifact" that combines rigorous closed-form Bayesian inference, optimal stopping, and system-level decision theory with a stunningly explainable UX.
 
+Implementation stance (critical): keep `pt` as a thin bash wrapper/installer for cross-platform ergonomics, but move all inference, decisioning, logging, and UI into a monolithic Rust binary (`pt-core`) for numeric correctness, performance, and maintainability.
+
+Operational stance (critical): make every run operationally improvable by recording both raw observations and derived quantities to append-only Parquet partitions, with DuckDB as the query engine over those partitions for debugging, calibration, and visualization.
+
 Success criteria:
 - Decision quality: <1% false-kill rate in shadow mode, high capture of abandoned/zombie processes.
 - Explainability: every decision has a full evidence ledger, posterior, and top Bayes factors.
@@ -17,6 +21,10 @@ Success criteria:
 - Fully closed-form updates: conjugate priors only; no ML.
 - Formal guarantees: PAC-Bayes bound on false-kill rate with explicit confidence.
 - Real-world impact weighting: kill-cost incorporates dependency and user-intent signals.
+- Operational learning loop: every decision is explainable and auditable from stored telemetry (raw + derived + outcomes).
+- Telemetry performance: logging is low-overhead (batched Parquet writes; no per-row inserts).
+- Telemetry safety: secrets/PII are redacted or hashed by policy before persistence.
+- Concurrency safety: Parquet-first storage supports concurrent runs without DB write-lock contention.
 
 ---
 
@@ -265,6 +273,20 @@ BE) Submodular probe selection (near-optimal sensor scheduling)
 - When probes have overhead and mutual redundancy, choose a set maximizing coverage/information
 - Greedy selection with approximation guarantees; integrates with active sensing/Whittle policies
 
+BF) Telemetry & analytics (Parquet-first + DuckDB query engine)
+- Record raw tool outputs + normalized samples + derived quantities (features, likelihood terms, posteriors, VOI, actions, outcomes)
+- Write append-only Parquet partitions (batched) for low overhead and concurrency safety
+- Use DuckDB to query Parquet for calibration, debugging, visualization, and iterative manual improvement
+
+BG) Implementation architecture (bash wrapper + monolithic Rust core)
+- Keep `pt` as a cross-platform installer/orchestrator only
+- Implement `pt-core` as the single high-performance artifact that does collection orchestration, inference, decisioning, logging, and UI
+- Rationale: numeric stability (log-domain math, special functions), structured concurrency, high-throughput parsing, and multi-core feature/inference pipelines
+
+BH) Privacy/secrets governance for telemetry
+- Redact or hash sensitive fields (cmdline paths, env, endpoints) before persistence
+- Preserve analytic utility via categorization + stable hashes for grouping without leakage
+
 R) Use-case interpretation of observed processes
 - bun test at 91% CPU for 18m in /data/projects/flywheel_gateway
 - gemini --yolo workers at 25m to 4h46m
@@ -277,7 +299,16 @@ All of these are integrated in the system design below.
 
 ## 3) System Architecture (Full Stack)
 
+### 3.0 Execution & Packaging Architecture
+- `pt` (bash) remains for: OS detection, maximal tool installation, capability detection, and launching `pt-core`.
+- `pt-core` (Rust monolith) is the artifact: structured concurrency for collection, robust parsing, all inference/decision math, telemetry writing, and the explainable UI.
+- Subcommands (conceptual): `pt-core scan`, `pt-core deep-scan`, `pt-core infer`, `pt-core decide`, `pt-core ui`, `pt-core duck` (run standard analytics queries/reports).
+- Design rule: all cross-process boundaries are for external system tools only (perf/eBPF/etc.); internal boundaries stay in-process for performance and coherence.
+
 ### 3.1 Data Collection Layer
+- Collection is orchestrated in `pt-core` as a staged pipeline: quick scan -> candidate ranking -> deep scan/instrumentation (when warranted).
+- Every collector emits structured events with provenance (tool name/version, args, exit code, timing). Raw outputs are captured (subject to redaction) alongside parsed fields for auditability.
+- Installation is maximal, execution is budgeted: even if all tools are installed, expensive probes are scheduled via VOI/Whittle/submodular policies to control overhead.
 - Quick scan inputs (fast): ps pid, ppid, etimes, rss, %cpu, tty, args, state
 - Deep scan inputs (slow):
   - /proc/PID/io (read/write deltas)
@@ -319,6 +350,7 @@ All of these are integrated in the system design below.
   - loadavg, run-queue delay, iowait, memory pressure, swap activity
 
 ### 3.2 Feature Layer
+- Feature computation is deterministic and provenance-aware: each derived quantity records its input sources and time window so it can be recomputed and debugged from telemetry.
 - u: CPU usage normalized [0,1]
 - t: elapsed time (seconds)
 - o: orphan indicator (PPID=1)
@@ -350,6 +382,30 @@ All of these are integrated in the system design below.
 - copula dependence parameters across CPU/IO/net
 - Kalman-smoothed CPU/load trend estimates
 - martingale deviation bounds for sustained anomalies
+
+### 3.3 Telemetry & Analytics Layer (Parquet-first, DuckDB query engine)
+Telemetry is a first-class system component, not an afterthought. It is the substrate for shadow-mode calibration, PAC-Bayes guarantees, FDR tuning, empirical Bayes hyperparameters, and manual “why did it do that?” debugging.
+
+Storage approach:
+- Write append-only Parquet partitions as the primary sink (low overhead, compressible, concurrency-safe).
+- Query the Parquet lake with DuckDB (views over partitions). Optionally maintain a small `.duckdb` file for convenience views and macros, but do not rely on it for multi-writer ingestion.
+
+What gets logged (raw + derived + outcomes):
+- `runs`: run_id, host fingerprint, git commit, priors/policy snapshot hash, tool availability/capabilities, pt-core version.
+- `system_samples`: timestamped loadavg, PSI, memory pressure, swap, CPU frequency/residency, queueing proxies.
+- `proc_samples`: pid/ppid/state, cpu/rss/threads, tty/cwd/cmd categories, socket/client counts, cgroup identifiers.
+- `proc_features`: Hawkes/BOCPD/Kalman/IMM state, copula params, EVT tail stats, periodicity features, sketches/heavy-hitter summaries.
+- `proc_inference`: per-class log-likelihood terms, Bayes factors, posterior, lfdr, VOI, PPC flags, DRO drift scores.
+- `decisions`: recommended action, expected loss, thresholds, FDR/alpha-investing state, safety gates triggered.
+- `actions` + `outcomes`: what was actually done (if anything), and what happened next (recovery, regressions, user override).
+
+Partitioning rule (example):
+- Partition by `date` and `run_id` (and optionally `host_id`) so each run writes its own files and concurrent runs do not contend.
+
+### 3.4 Redaction, Hashing, and Data Governance
+- Before persistence, apply a redaction policy to sensitive fields (full cmdlines, paths, endpoints, env values).
+- Preserve analytical utility by logging: command/category tokens, stable hashes for grouping, and carefully scoped allowlists.
+- Keep an explicit “telemetry schema + redaction version” in `runs` so old data remains interpretable.
 
 ---
 
@@ -705,23 +761,32 @@ Use the model to interpret the observed snapshot:
 ## 10) Implementation Plan (Phased)
 
 ### Phase 1: Spec and Config
+- Define the packaging boundary: `pt` (bash wrapper/installer) vs `pt-core` (Rust monolith).
+- Define `pt-core` CLI surface (scan/deep-scan/infer/decide/ui/duck) and stable output formats (JSON + Parquet partitions).
 - Create priors.json schema for alpha/beta, gamma, dirichlet, hazard priors
 - Create policy.json for loss matrix and guardrails
 - Define command categories and CWD categories
+- Define telemetry schema + partitioning rules (section 3.3) and redaction/hashing policy (section 3.4); version these in `runs`.
+- Define a capabilities cache schema: tool availability, versions, permissions, and “safe fallbacks” per signal.
 
 ### Phase 2: Math Utilities
 - Implement BetaPDF, GammaPDF, Dirichlet-multinomial, Beta-Bernoulli
 - Implement Bayes factors, log-odds, posterior computation
+- Implement numerically-stable primitives (log-sum-exp, log-domain densities, stable special functions) to prevent underflow in Bayes factors/posteriors.
+- Implement Arrow/Parquet schemas for telemetry tables and a batched Parquet writer (append-only).
 
 ### Phase 3: Evidence Collection
 - Quick scan: ps + basic features
 - Deep scan: /proc IO, CPU deltas, wchan, net, children, TTY
+- Implement a tool runner in `pt-core` with timeouts, output-size caps, and backpressure so “collect everything” does not destabilize the machine.
+- Persist raw tool events + parsed samples to Parquet as the scan runs (batched), so failures still leave an analyzable trail.
 - Optional system tools (auto-install):
   - Linux: sysstat, perf, bpftrace/bcc/bpftool, iotop, nethogs/iftop, lsof, atop, sysdig, smem, numactl/numastat, turbostat/powertop, strace/ltrace, acct/psacct, auditd, pcp
   - macOS: fs_usage, sample, spindump, nettop, powermetrics, lsof, dtruss (if permitted)
 
 ### Phase 3a: Tooling Install Strategy (Maximal Instrumentation by Default)
 Policy: always try to install everything and collect as much data as possible.
+Implementation note: `pt` (bash) performs installation and capability discovery; it then launches `pt-core` with a cached capabilities manifest so inference/decisioning can gracefully degrade when tools are missing.
 
 Linux package managers:
 - Debian/Ubuntu (apt):
@@ -821,6 +886,8 @@ Data-to-math mapping (signal -> model layer):
 - Memory bandwidth / uncore -> likelihood refinement for “useful heavy compute” vs “pathological spin”
 - osquery inventory -> context priors (service classification, user/session context)
 
+Telemetry and data governance are specified in sections 3.3–3.4; the phases below implement them end-to-end (Parquet-first writes + DuckDB queries + redaction/hashing policy).
+
 ### Phase 4: Inference Integration
 - Combine evidence to compute P(C|x)
 - Add Bayes factor ledger output
@@ -862,8 +929,9 @@ Data-to-math mapping (signal -> model layer):
 
 ### Phase 9: Shadow Mode and Calibration
 - Advisory-only logging
-- Compare decisions vs human choices
-- Update priors with conjugate updates
+- Compare decisions vs human choices and outcomes using DuckDB queries over the Parquet telemetry lake
+- Compute PAC-Bayes bounds, FDR metrics, calibration curves, and posterior predictive check summaries as first-class artifacts
+- Update priors with conjugate updates and (when enabled) empirical Bayes hyperparameter refits from shadow-mode logs
 
 ---
 
@@ -871,6 +939,8 @@ Data-to-math mapping (signal -> model layer):
 
 - Unit tests: math functions (BetaPDF, GammaPDF, Bayes factors)
 - Integration tests: deterministic output for fixed inputs
+- Telemetry tests: Parquet schema stability, batched writes, and DuckDB view/query correctness
+- Redaction tests: confirm sensitive strings never appear in persisted telemetry
 - Shadow mode metrics: false kill rate, missed abandonment rate
 - PAC-Bayes bound reporting on false-kill rate
 - Calibration tests for empirical Bayes hyperparameters
@@ -891,10 +961,11 @@ Data-to-math mapping (signal -> model layer):
 
 ## 12) Deliverables
 
-- Updated pt with full Bayesian inference, evidence ledger, and action tray
-- priors.json and policy.json
-- Enhanced README with all math and safety guarantees
-- Expanded BATS tests for new modes
+- `pt` bash wrapper (maximal installer + launcher) and `pt-core` Rust monolith (scan/infer/decide/ui)
+- `priors.json`, `policy.json`, and a versioned redaction/hashing policy used by telemetry
+- Parquet-first telemetry lake (raw + derived + outcomes) with DuckDB views/macros for standard reports (calibration, PAC-Bayes bounds, FDR, “why” breakdown)
+- Enhanced README with math, safety guarantees, telemetry governance, and reproducible analysis workflow
+- Expanded tests: Rust unit/integration + wrapper smoke tests (BATS or equivalent)
 
 ---
 
