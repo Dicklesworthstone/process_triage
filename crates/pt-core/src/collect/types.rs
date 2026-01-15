@@ -57,6 +57,23 @@ impl ProcessState {
     pub fn is_zombie(&self) -> bool {
         matches!(self, ProcessState::Zombie)
     }
+
+    /// Whether this state indicates uninterruptible sleep (D-state).
+    ///
+    /// D-state processes are typically waiting on kernel I/O and may not
+    /// respond to signals including SIGKILL. Special handling is required.
+    pub fn is_disksleep(&self) -> bool {
+        matches!(self, ProcessState::DiskSleep)
+    }
+
+    /// Whether this state requires special handling for kill actions.
+    ///
+    /// Both zombie and D-state processes cannot be reliably killed:
+    /// - Zombies are already dead, only the parent can reap them
+    /// - D-state processes may ignore SIGKILL while in kernel I/O wait
+    pub fn is_unkillable(&self) -> bool {
+        matches!(self, ProcessState::Zombie | ProcessState::DiskSleep)
+    }
 }
 
 impl std::fmt::Display for ProcessState {
@@ -230,5 +247,24 @@ mod tests {
     fn test_process_state_is_zombie() {
         assert!(ProcessState::Zombie.is_zombie());
         assert!(!ProcessState::Running.is_zombie());
+    }
+
+    #[test]
+    fn test_process_state_is_disksleep() {
+        assert!(ProcessState::DiskSleep.is_disksleep());
+        assert!(!ProcessState::Running.is_disksleep());
+        assert!(!ProcessState::Zombie.is_disksleep());
+        assert!(!ProcessState::Sleeping.is_disksleep());
+    }
+
+    #[test]
+    fn test_process_state_is_unkillable() {
+        // Both zombie and D-state are unkillable
+        assert!(ProcessState::Zombie.is_unkillable());
+        assert!(ProcessState::DiskSleep.is_unkillable());
+        // Other states can be killed
+        assert!(!ProcessState::Running.is_unkillable());
+        assert!(!ProcessState::Sleeping.is_unkillable());
+        assert!(!ProcessState::Stopped.is_unkillable());
     }
 }
