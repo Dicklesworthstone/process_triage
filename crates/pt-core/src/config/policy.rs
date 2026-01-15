@@ -15,6 +15,9 @@ pub struct LossRow {
     /// Loss for throttling the process.
     #[serde(default)]
     pub throttle: Option<f64>,
+    /// Loss for renicing the process.
+    #[serde(default)]
+    pub renice: Option<f64>,
     /// Loss for killing the process.
     pub kill: f64,
     /// Loss for restarting the process.
@@ -220,6 +223,7 @@ impl Default for Policy {
             loss_matrix: LossMatrix {
                 useful: LossRow {
                     keep: 0.0,
+                    renice: Some(2.0),
                     pause: Some(5.0),
                     throttle: Some(8.0),
                     kill: 100.0,
@@ -227,6 +231,7 @@ impl Default for Policy {
                 },
                 useful_bad: LossRow {
                     keep: 10.0,
+                    renice: Some(4.0),
                     pause: Some(6.0),
                     throttle: Some(8.0),
                     kill: 20.0,
@@ -234,6 +239,7 @@ impl Default for Policy {
                 },
                 abandoned: LossRow {
                     keep: 30.0,
+                    renice: Some(12.0),
                     pause: Some(15.0),
                     throttle: Some(10.0),
                     kill: 1.0,
@@ -241,6 +247,7 @@ impl Default for Policy {
                 },
                 zombie: LossRow {
                     keep: 50.0,
+                    renice: Some(18.0),
                     pause: Some(20.0),
                     throttle: Some(15.0),
                     kill: 1.0,

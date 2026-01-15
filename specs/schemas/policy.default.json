@@ -6,6 +6,7 @@
   "loss_matrix": {
     "useful": {
       "keep": 0,
+      "renice": 2,
       "pause": 5,
       "throttle": 8,
       "kill": 100,
@@ -13,6 +14,7 @@
     },
     "useful_bad": {
       "keep": 10,
+      "renice": 4,
       "pause": 6,
       "throttle": 8,
       "kill": 20,
@@ -20,6 +22,7 @@
     },
     "abandoned": {
       "keep": 30,
+      "renice": 12,
       "pause": 15,
       "throttle": 10,
       "kill": 1,
@@ -27,6 +30,7 @@
     },
     "zombie": {
       "keep": 50,
+      "renice": 18,
       "pause": 20,
       "throttle": 15,
       "kill": 1,

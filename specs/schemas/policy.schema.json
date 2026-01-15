@@ -66,6 +66,7 @@
         "keep": { "type": "number", "minimum": 0 },
         "pause": { "type": "number", "minimum": 0 },
         "throttle": { "type": "number", "minimum": 0 },
+        "renice": { "type": "number", "minimum": 0 },
         "kill": { "type": "number", "minimum": 0 },
         "restart": { "type": "number", "minimum": 0 }
       }

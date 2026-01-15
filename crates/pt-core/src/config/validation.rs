@@ -395,6 +395,15 @@ fn validate_loss_row(row: &super::policy::LossRow, class: &str) -> Result<(), Va
             });
         }
     }
+    if let Some(renice) = row.renice {
+        if renice < 0.0 {
+            return Err(ValidationError::LossMatrixNegative {
+                class: class.to_string(),
+                action: "renice".to_string(),
+                value: renice,
+            });
+        }
+    }
     if let Some(restart) = row.restart {
         if restart < 0.0 {
             return Err(ValidationError::LossMatrixNegative {
