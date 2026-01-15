@@ -14,8 +14,7 @@ use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::events::{JsonlWriter, Phase, ProgressEmitter, ProgressEvent};
 use pt_core::exit_codes::ExitCode;
 use pt_core::session::{
-    CleanupResult, ListSessionsOptions, SessionContext, SessionManifest, SessionMode,
-    SessionState, SessionStore, SessionSummary,
+    ListSessionsOptions, SessionContext, SessionManifest, SessionMode, SessionState, SessionStore,
 };
 use std::path::PathBuf;
 use std::sync::Arc;

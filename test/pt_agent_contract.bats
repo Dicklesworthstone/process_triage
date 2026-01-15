@@ -586,3 +586,226 @@ extract_json() {
 
     BATS_TEST_COMPLETED=pass
 }
+
+#==============================================================================
+# AGENT SESSIONS COMMAND TESTS
+#==============================================================================
+
+@test "Contract: agent sessions output includes schema_version" {
+    require_jq
+    test_info "Testing: pt agent sessions schema_version"
+
+    run "$PT_CORE" agent sessions --standalone --format json
+
+    local json
+    json=$(extract_json "$output")
+
+    validate_schema_version "$json" "sessions output"
+    validate_timestamp "$json" "generated_at" "sessions output"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions list has sessions array" {
+    require_jq
+    test_info "Testing: sessions list output structure"
+
+    run "$PT_CORE" agent sessions --standalone --format json
+
+    assert_equals "0" "$status" "sessions should succeed"
+
+    local json
+    json=$(extract_json "$output")
+
+    # Must have sessions array
+    local has_sessions
+    has_sessions=$(echo "$json" | jq 'has("sessions")')
+    assert_equals "true" "$has_sessions" "should have sessions array"
+
+    # Sessions should be an array
+    local is_array
+    is_array=$(echo "$json" | jq '.sessions | type == "array"')
+    assert_equals "true" "$is_array" "sessions should be array"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions list has total_count" {
+    require_jq
+    test_info "Testing: sessions list total_count"
+
+    run "$PT_CORE" agent sessions --standalone --format json
+
+    local json
+    json=$(extract_json "$output")
+
+    # Must have total_count
+    local has_count
+    has_count=$(echo "$json" | jq 'has("total_count")')
+    assert_equals "true" "$has_count" "should have total_count"
+
+    # total_count should be a number
+    local count
+    count=$(echo "$json" | jq '.total_count')
+    [[ "$count" =~ ^[0-9]+$ ]]
+    test_info "total_count: $count"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions --status returns single session" {
+    require_jq
+    test_info "Testing: sessions --status for single session"
+
+    # First create a session via snapshot
+    run "$PT_CORE" agent snapshot --standalone --format json
+    assert_equals "0" "$status" "snapshot should succeed"
+
+    local snapshot_json
+    snapshot_json=$(extract_json "$output")
+    local session_id
+    session_id=$(echo "$snapshot_json" | jq -r '.session_id')
+    test_info "Created session: $session_id"
+
+    # Now query that session
+    run "$PT_CORE" agent sessions --status "$session_id" --standalone --format json
+    assert_equals "0" "$status" "sessions --status should succeed"
+
+    local json
+    json=$(extract_json "$output")
+
+    # Should have the same session_id
+    local returned_id
+    returned_id=$(echo "$json" | jq -r '.session_id')
+    assert_equals "$session_id" "$returned_id" "should return correct session"
+
+    # Should have state
+    local has_state
+    has_state=$(echo "$json" | jq 'has("state")')
+    assert_equals "true" "$has_state" "should have state"
+
+    # Should have resumable flag
+    local has_resumable
+    has_resumable=$(echo "$json" | jq 'has("resumable")')
+    assert_equals "true" "$has_resumable" "should have resumable"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions --status invalid session returns error" {
+    test_info "Testing: sessions --status with invalid session"
+
+    run "$PT_CORE" agent sessions --status pt-00000000-000000-xxxx --standalone --format json 2>&1
+
+    # Should fail with non-zero exit
+    [[ $status -ne 0 ]]
+    test_info "Invalid session exit code: $status"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions --state filter works" {
+    require_jq
+    test_info "Testing: sessions --state filter"
+
+    run "$PT_CORE" agent sessions --state created --standalone --format json
+
+    assert_equals "0" "$status" "sessions --state should succeed"
+
+    local json
+    json=$(extract_json "$output")
+
+    # All returned sessions should have state "created" (or empty list)
+    local sessions_count
+    sessions_count=$(echo "$json" | jq '.sessions | length')
+    test_info "Found $sessions_count sessions with state=created"
+
+    if [[ "$sessions_count" -gt 0 ]]; then
+        # Check first session has correct state
+        local first_state
+        first_state=$(echo "$json" | jq -r '.sessions[0].state')
+        assert_equals "created" "$first_state" "filtered sessions should have correct state"
+    fi
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions --limit works" {
+    require_jq
+    test_info "Testing: sessions --limit"
+
+    run "$PT_CORE" agent sessions --limit 5 --standalone --format json
+
+    assert_equals "0" "$status" "sessions --limit should succeed"
+
+    local json
+    json=$(extract_json "$output")
+
+    local sessions_count
+    sessions_count=$(echo "$json" | jq '.sessions | length')
+    test_info "Returned $sessions_count sessions (limit=5)"
+
+    # Should return at most 5
+    [[ "$sessions_count" -le 5 ]]
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions exits 0 on success" {
+    test_info "Testing sessions exit code"
+
+    run "$PT_CORE" agent sessions --standalone --format json
+
+    assert_equals "0" "$status" "sessions should exit 0"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions --help exits 0" {
+    test_info "Testing agent sessions --help"
+
+    run "$PT_CORE" agent sessions --help
+
+    assert_equals "0" "$status" "sessions --help should exit 0"
+    assert_contains "$output" "sessions" "should describe sessions"
+    assert_contains "$output" "status" "should mention --status"
+    assert_contains "$output" "cleanup" "should mention --cleanup"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions --format summary works" {
+    test_info "Testing sessions summary format"
+
+    run "$PT_CORE" agent sessions --standalone --format summary
+
+    assert_equals "0" "$status" "sessions summary should succeed"
+
+    # Summary should contain session count or "No sessions"
+    [[ "$output" =~ session || "$output" =~ "No sessions" ]]
+    test_info "Summary output: $output"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent sessions JSON includes host_id" {
+    require_jq
+    test_info "Testing: sessions host_id field"
+
+    run "$PT_CORE" agent sessions --standalone --format json
+
+    local json
+    json=$(extract_json "$output")
+
+    # Must have host_id at top level
+    local has_host
+    has_host=$(echo "$json" | jq 'has("host_id")')
+    assert_equals "true" "$has_host" "should have host_id"
+
+    local host_id
+    host_id=$(echo "$json" | jq -r '.host_id')
+    [[ -n "$host_id" ]]
+    test_info "host_id: $host_id"
+
+    BATS_TEST_COMPLETED=pass
+}

@@ -10,7 +10,7 @@
 //! NOTE: Higher-level commands (agent plan/apply/verify, etc.) build on these
 //! primitives. This module intentionally avoids any TUI assumptions.
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use pt_common::{schema::SCHEMA_VERSION, SessionId};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -181,6 +181,43 @@ impl SessionContext {
     }
 }
 
+/// Summary of a session for listing purposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub created_at: String,
+    pub state: SessionState,
+    pub mode: SessionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub host_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions_count: Option<u32>,
+    pub path: PathBuf,
+}
+
+/// Options for listing sessions.
+#[derive(Debug, Default)]
+pub struct ListSessionsOptions {
+    /// Maximum number of sessions to return.
+    pub limit: Option<u32>,
+    /// Filter by state.
+    pub state: Option<SessionState>,
+    /// Only return sessions older than this duration (for cleanup).
+    pub older_than: Option<Duration>,
+}
+
+/// Result of a cleanup operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupResult {
+    pub removed_count: u32,
+    pub removed_sessions: Vec<String>,
+    pub preserved_count: u32,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     sessions_root: PathBuf,
@@ -246,6 +283,147 @@ impl SessionStore {
             dir,
         })
     }
+
+    /// List sessions with optional filtering.
+    ///
+    /// Returns sessions sorted by creation time (newest first).
+    pub fn list_sessions(&self, options: &ListSessionsOptions) -> Result<Vec<SessionSummary>, SessionError> {
+        let mut summaries = Vec::new();
+
+        // If sessions root doesn't exist, return empty list
+        if !self.sessions_root.exists() {
+            return Ok(summaries);
+        }
+
+        let entries = std::fs::read_dir(&self.sessions_root).map_err(|e| SessionError::Io {
+            path: self.sessions_root.clone(),
+            source: e,
+        })?;
+
+        let now = Utc::now();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            // Directory name should be the session ID
+            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            // Validate session ID format (pt-YYYYMMDD-HHMMSS-XXXX)
+            if !dir_name.starts_with("pt-") || dir_name.len() < 20 {
+                continue;
+            }
+
+            let manifest_path = path.join(MANIFEST_FILE);
+            if !manifest_path.exists() {
+                continue;
+            }
+
+            // Read manifest
+            let content = match std::fs::read_to_string(&manifest_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let manifest: SessionManifest = match serde_json::from_str(&content) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            // Apply state filter
+            if let Some(state_filter) = &options.state {
+                if manifest.state != *state_filter {
+                    continue;
+                }
+            }
+
+            // Apply older_than filter
+            if let Some(older_than) = &options.older_than {
+                if let Ok(created) = DateTime::parse_from_rfc3339(&manifest.timing.created_at) {
+                    let created_utc = created.with_timezone(&Utc);
+                    if now.signed_duration_since(created_utc) < *older_than {
+                        continue;
+                    }
+                }
+            }
+
+            // Try to read context for host_id
+            let context_path = path.join(CONTEXT_FILE);
+            let host_id = std::fs::read_to_string(&context_path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<SessionContext>(&c).ok())
+                .map(|ctx| ctx.host_id);
+
+            // Count candidates and actions from session artifacts (optional)
+            let candidates_count = count_candidates(&path);
+            let actions_count = count_actions(&path);
+
+            summaries.push(SessionSummary {
+                session_id: manifest.session_id,
+                created_at: manifest.timing.created_at,
+                state: manifest.state,
+                mode: manifest.mode,
+                label: manifest.label,
+                host_id,
+                candidates_count,
+                actions_count,
+                path,
+            });
+        }
+
+        // Sort by created_at (newest first)
+        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        // Apply limit
+        if let Some(limit) = options.limit {
+            summaries.truncate(limit as usize);
+        }
+
+        Ok(summaries)
+    }
+
+    /// Remove old sessions while preserving telemetry and audit data.
+    ///
+    /// Sessions in the following states are preserved regardless of age:
+    /// - Executing (may be in progress)
+    /// - Planned (awaiting approval)
+    pub fn cleanup_sessions(&self, older_than: Duration) -> Result<CleanupResult, SessionError> {
+        let options = ListSessionsOptions {
+            older_than: Some(older_than),
+            ..Default::default()
+        };
+
+        let sessions = self.list_sessions(&options)?;
+        let mut result = CleanupResult {
+            removed_count: 0,
+            removed_sessions: Vec::new(),
+            preserved_count: 0,
+            errors: Vec::new(),
+        };
+
+        for session in sessions {
+            // Preserve sessions that might be in use
+            if matches!(session.state, SessionState::Executing | SessionState::Planned | SessionState::Scanning) {
+                result.preserved_count += 1;
+                continue;
+            }
+
+            // Remove the session directory
+            if let Err(e) = std::fs::remove_dir_all(&session.path) {
+                result.errors.push(format!("{}: {}", session.session_id, e));
+            } else {
+                result.removed_count += 1;
+                result.removed_sessions.push(session.session_id);
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +477,31 @@ impl SessionHandle {
         self.write_manifest(&manifest)?;
         Ok(manifest)
     }
+}
+
+/// Count candidates from plan.json if it exists.
+fn count_candidates(session_dir: &Path) -> Option<u32> {
+    let plan_path = session_dir.join(DECISION_DIR).join("plan.json");
+    if !plan_path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&plan_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .map(|arr| arr.len() as u32)
+}
+
+/// Count actions from outcomes.jsonl if it exists.
+fn count_actions(session_dir: &Path) -> Option<u32> {
+    let outcomes_path = session_dir.join(ACTION_DIR).join("outcomes.jsonl");
+    if !outcomes_path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&outcomes_path).ok()?;
+    let count = content.lines().filter(|l| !l.trim().is_empty()).count();
+    Some(count as u32)
 }
 
 fn resolve_sessions_root() -> Result<PathBuf, SessionError> {
