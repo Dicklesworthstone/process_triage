@@ -3,7 +3,7 @@
 # pt - Process Triage v2.0.0
 # Bayesian-inspired zombie/abandoned process detection with evidence gathering
 #
-# Usage: pt [scan|deep|history|clear|help]
+# Usage: pt [scan|deep|history|clear|help|robot]
 #
 set -euo pipefail
 
@@ -70,11 +70,21 @@ ensure_config() {
     [[ -s "$PRIORS_FILE" ]] || echo '{}' > "$PRIORS_FILE"
 }
 
+ensure_deps_for_json() {
+    # Robot/agent mode should never require gum. Keep JSON output dependency-light.
+    return 0
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Utility Functions
 # ══════════════════════════════════════════════════════════════════════════════
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+
+iso_timestamp() {
+    # RFC3339-ish without timezone dependencies
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
 
 format_duration() {
     local s=$1
@@ -90,6 +100,57 @@ format_memory() {
     if ((mb < 1024)); then echo "${mb}M"
     else printf "%.1fG" "$(echo "scale=1; $mb/1024" | bc)"
     fi
+}
+
+json_escape() {
+    # Minimal JSON string escape (sufficient for process args and evidence)
+    local s=${1-}
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    echo -n "$s"
+}
+
+split_csv() {
+    # split_csv "1,2, 3" -> lines
+    local s=${1-}
+    s=${s// /}
+    s=${s//,/\\n}
+    printf '%b\n' "$s" | awk 'NF'
+}
+
+get_system_stats_compact() {
+    # Output: load1 load5 load15|cores|mem_used|mem_total|procs
+    local load1="" load5="" load15="" cores="" mem_used="" mem_total="" procs=""
+
+    if [[ -r /proc/loadavg ]]; then
+        read -r load1 load5 load15 _ < /proc/loadavg 2>/dev/null || true
+    else
+        # macOS fallback: parse "load averages: 1.23 4.56 7.89"
+        local u
+        u=$(uptime 2>/dev/null || true)
+        if [[ "$u" == *"load average"* ]] || [[ "$u" == *"load averages"* ]]; then
+            # Extract last 3 numbers in the line (best-effort)
+            read -r load1 load5 load15 < <(printf '%s\n' "$u" | awk -F'load averages?:' '{print $2}' | tr -d ',' | awk '{print $(NF-2), $(NF-1), $NF}' 2>/dev/null || true)
+        fi
+    fi
+
+    if command -v nproc &>/dev/null; then
+        cores=$(nproc 2>/dev/null || true)
+    elif command -v sysctl &>/dev/null; then
+        cores=$(sysctl -n hw.ncpu 2>/dev/null || true)
+    fi
+
+    if command -v free &>/dev/null; then
+        mem_used=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3}' || true)
+        mem_total=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}' || true)
+    fi
+
+    procs=$(pgrep -cu "$(whoami)" 2>/dev/null || echo "0")
+
+    printf '%s %s %s|%s|%s|%s|%s\n' "${load1:-}" "${load5:-}" "${load15:-}" "${cores:-}" "${mem_used:-}" "${mem_total:-}" "${procs:-}"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -144,6 +205,19 @@ save_decision() {
 # ══════════════════════════════════════════════════════════════════════════════
 # Process Classification
 # ══════════════════════════════════════════════════════════════════════════════
+
+is_protected_cmd() {
+    local cmd=${1-}
+
+    [[ "$cmd" =~ (systemd|journald|logind|networkd|resolved|timesyncd) ]] ||
+    [[ "$cmd" =~ (dockerd|containerd|dbus-daemon|avahi-daemon) ]] ||
+    [[ "$cmd" =~ ^/usr/libexec/(upowerd|fwupd|power-profiles|rtkit|udisks|accounts-daemon|polkit) ]] ||
+    [[ "$cmd" =~ ^/usr/(sbin|bin)/(NetworkManager|ModemManager|rsyslogd|tailscaled|sddm|smartd|cron) ]] ||
+    [[ "$cmd" =~ ^/usr/lib/(polkit|postgresql|bluetooth) ]] ||
+    [[ "$cmd" =~ ^/usr/bin/(pulseaudio|pipewire) ]] ||
+    [[ "$cmd" =~ elasticsearch ]] ||
+    [[ "$cmd" =~ ^sshd ]]
+}
 
 classify_process() {
     local cmd=$1
@@ -491,14 +565,7 @@ score_process_bayesian() {
     # Protected patterns (never flag)
     # ═══════════════════════════════════════════════════════════════════════
 
-    if [[ "$cmd" =~ (systemd|journald|logind|networkd|resolved|timesyncd) ]] ||
-       [[ "$cmd" =~ (dockerd|containerd|dbus-daemon|avahi-daemon) ]] ||
-       [[ "$cmd" =~ ^/usr/libexec/(upowerd|fwupd|power-profiles|rtkit|udisks|accounts-daemon|polkit) ]] ||
-       [[ "$cmd" =~ ^/usr/(sbin|bin)/(NetworkManager|ModemManager|rsyslogd|tailscaled|sddm|smartd|cron) ]] ||
-       [[ "$cmd" =~ ^/usr/lib/(polkit|postgresql|bluetooth) ]] ||
-       [[ "$cmd" =~ ^/usr/bin/(pulseaudio|pipewire) ]] ||
-       [[ "$cmd" =~ elasticsearch ]] ||
-       [[ "$cmd" =~ ^sshd ]]; then
+    if is_protected_cmd "$cmd"; then
         ((score -= 200))
         evidence=("protected:system_service")
     fi
@@ -561,8 +628,8 @@ collect_candidates() {
         IFS='|' read -r score rec confidence ptype evidence <<< "$result"
 
         # Only include if score > 0
-        ((score > 0)) && candidates+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
-            "$score" "$pid" "$age" "${mem:-0}" "$rec" "$confidence" "$ptype" "$evidence" "$cmd")")
+        ((score > 0)) && candidates+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+            "$score" "$pid" "$ppid" "$age" "${mem:-0}" "${cpu:-0}" "${tty:-?}" "$rec" "$confidence" "$ptype" "$evidence" "$cmd")")
     done <<< "$procs"
 
     printf '%s\n' "${candidates[@]}" | sort -t$'\t' -k1 -nr
@@ -621,6 +688,528 @@ format_evidence() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Robot/Agent Mode (No TUI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+robot_help() {
+    cat << 'EOF'
+pt robot - Agent-optimized interface (no TUI)
+
+USAGE
+    pt robot [plan|apply|explain] [options]
+    pt agent [plan|apply|explain] [options]   # alias
+
+PLAN (scan + recommended actions)
+    pt robot plan [--deep] [--min-age SECONDS] [--format json|md] [--only all|kill|review|spare] [--limit N]
+
+APPLY (execute without TUI)
+    pt robot apply --recommended [--deep] [--min-age SECONDS] [--yes] [--format json|md]
+    pt robot apply --pids 123,456 [--yes] [--format json|md]
+
+EXPLAIN (single PID)
+    pt robot explain --pid 123 [--deep] [--format json|md]
+
+NOTES
+    - Default output is JSON (token-efficient for coding agents).
+    - Destructive actions require explicit --yes. (Interactive TUI confirmation remains the default in non-robot mode.)
+EOF
+}
+
+robot_emit_plan_json() {
+    local deep=$1 min_age=$2 only=$3 limit=$4
+    local now; now=$(iso_timestamp)
+
+    local sys
+    sys=$(get_system_stats_compact)
+
+    local candidates=()
+    mapfile -t candidates < <(collect_candidates "$min_age" "$deep")
+
+    local kill_count=0 review_count=0 spare_count=0 total=0
+    local kill_pids=() review_pids=() spare_pids=()
+
+    # Pre-filter + limit
+    local filtered=()
+    local c
+    for c in "${candidates[@]}"; do
+        [[ -z "$c" ]] && continue
+        local score pid ppid age mem cpu tty rec confidence ptype evidence cmd
+        IFS=$'\t' read -r score pid ppid age mem cpu tty rec confidence ptype evidence cmd <<< "$c"
+
+        case "$only" in
+            kill) [[ "$rec" != "KILL" ]] && continue ;;
+            review) [[ "$rec" != "REVIEW" ]] && continue ;;
+            spare) [[ "$rec" != "SPARE" ]] && continue ;;
+            all|"") ;;
+            *) ;;
+        esac
+
+        filtered+=("$c")
+        if ((limit > 0 && ${#filtered[@]} >= limit)); then
+            break
+        fi
+    done
+
+    # Count + pid lists (from filtered set)
+    for c in "${filtered[@]}"; do
+        [[ -z "$c" ]] && continue
+        local score pid ppid age mem cpu tty rec confidence ptype evidence cmd
+        IFS=$'\t' read -r score pid ppid age mem cpu tty rec confidence ptype evidence cmd <<< "$c"
+        ((total++))
+        case "$rec" in
+            KILL) ((kill_count++)); kill_pids+=("$pid") ;;
+            REVIEW) ((review_count++)); review_pids+=("$pid") ;;
+            SPARE) ((spare_count++)); spare_pids+=("$pid") ;;
+        esac
+    done
+
+    # Emit JSON
+    printf '{'
+    printf '"version":"%s",' "$(json_escape "$VERSION")"
+    printf '"mode":"robot_plan",'
+    printf '"generated_at":"%s",' "$(json_escape "$now")"
+    printf '"deep":%s,' "$deep"
+    printf '"min_age_s":%s,' "$min_age"
+
+    # system
+    local load cores mem_used mem_total procs
+    IFS='|' read -r load cores mem_used mem_total procs <<< "$sys"
+    # load is "l1 l5 l15"
+    local l1 l5 l15
+    read -r l1 l5 l15 <<< "${load:-}"
+    printf '"system":{'
+    printf '"user":"%s",' "$(json_escape "$(whoami)")"
+    printf '"cores":"%s",' "$(json_escape "${cores:-}")"
+    printf '"loadavg":["%s","%s","%s"],' "$(json_escape "${l1:-}")" "$(json_escape "${l5:-}")" "$(json_escape "${l15:-}")"
+    printf '"mem_used":"%s",' "$(json_escape "${mem_used:-}")"
+    printf '"mem_total":"%s",' "$(json_escape "${mem_total:-}")"
+    printf '"proc_count":"%s"' "$(json_escape "${procs:-}")"
+    printf '},'
+
+    # summary
+    printf '"summary":{"candidates":%s,"kill":%s,"review":%s,"spare":%s},' "$total" "$kill_count" "$review_count" "$spare_count"
+
+    # recommended pids (preselected = kill_pids)
+    printf '"recommended":{'
+    printf '"preselected_pids":['
+    local i
+    for i in "${!kill_pids[@]}"; do
+        ((i > 0)) && printf ','
+        printf '%s' "${kill_pids[$i]}"
+    done
+    printf '],'
+    printf '"kill_pids":['
+    for i in "${!kill_pids[@]}"; do
+        ((i > 0)) && printf ','
+        printf '%s' "${kill_pids[$i]}"
+    done
+    printf '],'
+    printf '"review_pids":['
+    for i in "${!review_pids[@]}"; do
+        ((i > 0)) && printf ','
+        printf '%s' "${review_pids[$i]}"
+    done
+    printf '],'
+    printf '"spare_pids":['
+    for i in "${!spare_pids[@]}"; do
+        ((i > 0)) && printf ','
+        printf '%s' "${spare_pids[$i]}"
+    done
+    printf ']'
+    printf '},'
+
+    # candidates
+    printf '"candidates":['
+    local first=1
+    for c in "${filtered[@]}"; do
+        [[ -z "$c" ]] && continue
+        local score pid ppid age mem cpu tty rec confidence ptype evidence cmd
+        IFS=$'\t' read -r score pid ppid age mem cpu tty rec confidence ptype evidence cmd <<< "$c"
+
+        ((first == 0)) && printf ','
+        first=0
+
+        local age_h mem_h
+        age_h=$(format_duration "${age:-0}")
+        mem_h=$(format_memory "${mem:-0}")
+
+        printf '{'
+        printf '"pid":%s,' "$pid"
+        printf '"ppid":%s,' "$ppid"
+        printf '"score":%s,' "$score"
+        printf '"rec":"%s",' "$(json_escape "$rec")"
+        printf '"preselected":%s,' "$([[ "$rec" == "KILL" ]] && echo "true" || echo "false")"
+        printf '"confidence":"%s",' "$(json_escape "$confidence")"
+        printf '"type":"%s",' "$(json_escape "$ptype")"
+        printf '"age_s":%s,' "$age"
+        printf '"age_h":"%s",' "$(json_escape "$age_h")"
+        printf '"mem_mb":%s,' "$mem"
+        printf '"mem_h":"%s",' "$(json_escape "$mem_h")"
+        printf '"cpu":"%s",' "$(json_escape "$cpu")"
+        printf '"tty":"%s",' "$(json_escape "$tty")"
+
+        # evidence array
+        printf '"evidence":['
+        local ev=()
+        IFS='|' read -ra ev <<< "$evidence"
+        for i in "${!ev[@]}"; do
+            ((i > 0)) && printf ','
+            printf '"%s"' "$(json_escape "${ev[$i]}")"
+        done
+        printf '],'
+
+        printf '"cmd":"%s"' "$(json_escape "$cmd")"
+        printf '}'
+    done
+    printf ']'
+
+    printf '}\n'
+}
+
+robot_emit_plan_md() {
+    local deep=$1 min_age=$2 only=$3 limit=$4
+    local now; now=$(iso_timestamp)
+
+    local sys
+    sys=$(get_system_stats_compact)
+
+    local candidates=()
+    mapfile -t candidates < <(collect_candidates "$min_age" "$deep")
+
+    local filtered=()
+    local c
+    for c in "${candidates[@]}"; do
+        [[ -z "$c" ]] && continue
+        local _score _pid _ppid _age _mem _cpu _tty _rec _confidence _ptype _evidence _cmd
+        IFS=$'\t' read -r _score _pid _ppid _age _mem _cpu _tty _rec _confidence _ptype _evidence _cmd <<< "$c"
+        case "$only" in
+            kill) [[ "$_rec" != "KILL" ]] && continue ;;
+            review) [[ "$_rec" != "REVIEW" ]] && continue ;;
+            spare) [[ "$_rec" != "SPARE" ]] && continue ;;
+            all|"") ;;
+        esac
+        filtered+=("$c")
+        if ((limit > 0 && ${#filtered[@]} >= limit)); then
+            break
+        fi
+    done
+
+    local load cores mem_used mem_total procs
+    IFS='|' read -r load cores mem_used mem_total procs <<< "$sys"
+
+    printf '# pt robot plan\n\n'
+    printf -- '- generated_at: `%s`\n' "$now"
+    printf -- '- deep: `%s`\n' "$deep"
+    printf -- '- min_age_s: `%s`\n' "$min_age"
+    printf -- '- user: `%s`\n' "$(whoami)"
+    printf -- '- loadavg: `%s`\n' "${load:-}"
+    printf -- '- cores: `%s`\n' "${cores:-}"
+    printf -- '- mem: `%s / %s`\n' "${mem_used:-}" "${mem_total:-}"
+    printf -- '- proc_count: `%s`\n\n' "${procs:-}"
+
+    printf '## Candidates\n\n'
+    printf '| rec | score | pid | ppid | age | mem | cpu | tty | type | evidence | cmd |\n'
+    printf '|---|---:|---:|---:|---:|---:|---:|---|---|---|---|\n'
+    for c in "${filtered[@]}"; do
+        [[ -z "$c" ]] && continue
+        local score pid ppid age mem cpu tty rec confidence ptype evidence cmd
+        IFS=$'\t' read -r score pid ppid age mem cpu tty rec confidence ptype evidence cmd <<< "$c"
+        local age_h mem_h cmd_short evidence_short
+        age_h=$(format_duration "${age:-0}")
+        mem_h=$(format_memory "${mem:-0}")
+        cmd_short=$(printf '%s' "$cmd" | cut -c1-60)
+        [[ ${#cmd} -gt 60 ]] && cmd_short="${cmd_short}…"
+        evidence_short=$(printf '%s' "${evidence//|/, }" | cut -c1-50)
+        [[ ${#evidence_short} -gt 50 ]] && evidence_short="${evidence_short}…"
+        printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n' \
+            "$rec" "$score" "$pid" "$ppid" "$age_h" "$mem_h" "$cpu" "$tty" "$ptype" "$evidence_short" "$cmd_short"
+    done
+}
+
+robot_explain_pid_json() {
+    local pid=$1 deep=$2
+
+    local line
+    line=$(ps -p "$pid" -o pid=,ppid=,etimes=,rss=,%cpu=,tty=,args= --no-headers 2>/dev/null || true)
+    if [[ -z "$line" ]]; then
+        printf '{"version":"%s","mode":"robot_explain","pid":%s,"error":"not_found"}\n' "$(json_escape "$VERSION")" "$pid"
+        return 0
+    fi
+
+    local spid ppid age rss cpu tty cmd
+    spid=$(printf '%s\n' "$line" | awk '{print $1}')
+    ppid=$(printf '%s\n' "$line" | awk '{print $2}')
+    age=$(printf '%s\n' "$line" | awk '{print $3}')
+    rss=$(printf '%s\n' "$line" | awk '{print $4}')
+    cpu=$(printf '%s\n' "$line" | awk '{print $5}')
+    tty=$(printf '%s\n' "$line" | awk '{print $6}')
+    cmd=$(printf '%s\n' "$line" | awk '{$1=$2=$3=$4=$5=$6=""; sub(/^ +/,""); print}')
+
+    local mem_mb
+    mem_mb=$((rss / 1024))
+
+    local result score rec confidence ptype evidence
+    result=$(score_process_bayesian "$spid" "$ppid" "$age" "$mem_mb" "$cpu" "$tty" "$cmd" "$deep")
+    IFS='|' read -r score rec confidence ptype evidence <<< "$result"
+
+    local now; now=$(iso_timestamp)
+    local age_h mem_h
+    age_h=$(format_duration "${age:-0}")
+    mem_h=$(format_memory "${mem_mb:-0}")
+
+    printf '{'
+    printf '"version":"%s",' "$(json_escape "$VERSION")"
+    printf '"mode":"robot_explain",'
+    printf '"generated_at":"%s",' "$(json_escape "$now")"
+    printf '"deep":%s,' "$deep"
+    printf '"pid":%s,' "$spid"
+    printf '"ppid":%s,' "$ppid"
+    printf '"score":%s,' "$score"
+    printf '"rec":"%s",' "$(json_escape "$rec")"
+    printf '"confidence":"%s",' "$(json_escape "$confidence")"
+    printf '"type":"%s",' "$(json_escape "$ptype")"
+    printf '"age_s":%s,' "$age"
+    printf '"age_h":"%s",' "$(json_escape "$age_h")"
+    printf '"mem_mb":%s,' "$mem_mb"
+    printf '"mem_h":"%s",' "$(json_escape "$mem_h")"
+    printf '"cpu":"%s",' "$(json_escape "$cpu")"
+    printf '"tty":"%s",' "$(json_escape "$tty")"
+    printf '"evidence":['
+    local ev=()
+    IFS='|' read -ra ev <<< "$evidence"
+    local i
+    for i in "${!ev[@]}"; do
+        ((i > 0)) && printf ','
+        printf '"%s"' "$(json_escape "${ev[$i]}")"
+    done
+    printf '],'
+    printf '"cmd":"%s"' "$(json_escape "$cmd")"
+    printf '}\n'
+}
+
+robot_apply_json() {
+    local deep=$1 min_age=$2 mode=$3 pids_csv=$4 yes=$5
+
+    local now; now=$(iso_timestamp)
+    local candidates=()
+    local selected=()
+    declare -A candidate_map_cmd=()
+
+    if [[ "$mode" == "recommended" ]]; then
+        mapfile -t candidates < <(collect_candidates "$min_age" "$deep")
+        local c
+        for c in "${candidates[@]}"; do
+            [[ -z "$c" ]] && continue
+            local score pid ppid age mem cpu tty rec confidence ptype evidence cmd
+            IFS=$'\t' read -r score pid ppid age mem cpu tty rec confidence ptype evidence cmd <<< "$c"
+            [[ "$rec" == "KILL" ]] && selected+=("$pid")
+        done
+    else
+        mapfile -t selected < <(split_csv "$pids_csv")
+    fi
+
+    if [[ "${#selected[@]}" -eq 0 ]]; then
+        printf '{"version":"%s","mode":"robot_apply","generated_at":"%s","deep":%s,"min_age_s":%s,"selected_pids":[],"note":"nothing_to_do"}\n' \
+            "$(json_escape "$VERSION")" "$(json_escape "$now")" "$deep" "$min_age"
+        return 0
+    fi
+
+    if [[ "$yes" != "true" ]]; then
+        # Safety: require explicit --yes for destructive actions.
+        printf '{"version":"%s","mode":"robot_apply","generated_at":"%s","deep":%s,"min_age_s":%s,"selected_pids":[' \
+            "$(json_escape "$VERSION")" "$(json_escape "$now")" "$deep" "$min_age"
+        local i
+        for i in "${!selected[@]}"; do
+            ((i > 0)) && printf ','
+            printf '%s' "${selected[$i]}"
+        done
+        printf '],"error":"confirmation_required","hint":"re-run with --yes to execute"}\n'
+        return 2
+    fi
+
+    local killed=0 failed=0 skipped=0
+    local results=()
+
+    # Build a map from pid -> cmd for learning when we scanned.
+    if [[ "$mode" == "recommended" ]]; then
+        local c
+        for c in "${candidates[@]}"; do
+            [[ -z "$c" ]] && continue
+            local _score _pid _ppid _age _mem _cpu _tty _rec _confidence _ptype _evidence _cmd
+            IFS=$'\t' read -r _score _pid _ppid _age _mem _cpu _tty _rec _confidence _ptype _evidence _cmd <<< "$c"
+            candidate_map_cmd["$_pid"]="$_cmd"
+        done
+    fi
+
+    local pid
+    for pid in "${selected[@]}"; do
+        [[ -z "$pid" ]] && continue
+
+        # Skip self
+        if [[ "$pid" == "$$" ]]; then
+            results+=("{\"pid\":$pid,\"status\":\"skipped\",\"reason\":\"self\"}")
+            ((skipped++))
+            continue
+        fi
+
+        # Fetch cmd if not available
+        local cmd=""
+        if [[ "$mode" == "recommended" ]]; then
+            cmd=${candidate_map_cmd["$pid"]:-}
+        fi
+        if [[ -z "$cmd" ]]; then
+            cmd=$(ps -p "$pid" -o args= --no-headers 2>/dev/null || true)
+        fi
+
+        if [[ -n "$cmd" ]] && is_protected_cmd "$cmd"; then
+            results+=("{\"pid\":$pid,\"status\":\"skipped\",\"reason\":\"protected\"}")
+            ((skipped++))
+            continue
+        fi
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            results+=("{\"pid\":$pid,\"status\":\"skipped\",\"reason\":\"not_running\"}")
+            ((skipped++))
+            continue
+        fi
+
+        if kill "$pid" 2>/dev/null; then
+            sleep 0.3
+            if kill -0 "$pid" 2>/dev/null; then
+                if kill -9 "$pid" 2>/dev/null; then
+                    results+=("{\"pid\":$pid,\"status\":\"killed\",\"signal\":\"KILL\"}")
+                    ((killed++))
+                else
+                    results+=("{\"pid\":$pid,\"status\":\"failed\",\"reason\":\"sigkill_failed\"}")
+                    ((failed++))
+                    continue
+                fi
+            else
+                results+=("{\"pid\":$pid,\"status\":\"killed\",\"signal\":\"TERM\"}")
+                ((killed++))
+            fi
+        elif kill -9 "$pid" 2>/dev/null; then
+            results+=("{\"pid\":$pid,\"status\":\"killed\",\"signal\":\"KILL\"}")
+            ((killed++))
+        else
+            results+=("{\"pid\":$pid,\"status\":\"failed\",\"reason\":\"signal_failed\"}")
+            ((failed++))
+            continue
+        fi
+
+        # Learning: record kill decisions when we can associate a stable pattern.
+        if [[ -n "$cmd" ]]; then
+            local pattern
+            pattern=$(normalize_pattern "$cmd")
+            save_decision "$pattern" "kill"
+        fi
+    done
+
+    # Learning: if we scanned a full candidate set and chose recommended-only kills, record spares for the rest.
+    if [[ "$mode" == "recommended" ]]; then
+        local c
+        for c in "${candidates[@]}"; do
+            [[ -z "$c" ]] && continue
+            local _score _pid _ppid _age _mem _cpu _tty _rec _confidence _ptype _evidence _cmd
+            IFS=$'\t' read -r _score _pid _ppid _age _mem _cpu _tty _rec _confidence _ptype _evidence _cmd <<< "$c"
+            if [[ "$_rec" != "KILL" ]]; then
+                local pattern
+                pattern=$(normalize_pattern "$_cmd")
+                save_decision "$pattern" "spare"
+            fi
+        done
+    fi
+
+    printf '{'
+    printf '"version":"%s",' "$(json_escape "$VERSION")"
+    printf '"mode":"robot_apply",'
+    printf '"generated_at":"%s",' "$(json_escape "$now")"
+    printf '"deep":%s,' "$deep"
+    printf '"min_age_s":%s,' "$min_age"
+    printf '"requested":{"mode":"%s","pids_csv":"%s"},' "$(json_escape "$mode")" "$(json_escape "$pids_csv")"
+    printf '"summary":{"killed":%s,"failed":%s,"skipped":%s},' "$killed" "$failed" "$skipped"
+    printf '"results":['
+    local i
+    for i in "${!results[@]}"; do
+        ((i > 0)) && printf ','
+        printf '%s' "${results[$i]}"
+    done
+    printf ']'
+    printf '}\n'
+}
+
+cmd_robot() {
+    local sub=${1:-plan}
+    if [[ "$sub" == "plan" || "$sub" == "apply" || "$sub" == "explain" ]]; then
+        shift || true
+    else
+        sub="plan"
+    fi
+
+    local deep=false
+    local min_age=3600
+    local format="json"
+    local only="all"
+    local limit=0
+    local yes="false"
+    local recommended="false"
+    local pids_csv=""
+    local explain_pid=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --deep) deep=true; shift ;;
+            --min-age) min_age=${2:-3600}; shift 2 ;;
+            --format) format=${2:-json}; shift 2 ;;
+            --json) format="json"; shift ;;
+            --md|--markdown) format="md"; shift ;;
+            --only) only=${2:-all}; shift 2 ;;
+            --limit) limit=${2:-0}; shift 2 ;;
+            --yes|--force) yes="true"; shift ;;
+            --recommended) recommended="true"; shift ;;
+            --pids) pids_csv=${2:-}; shift 2 ;;
+            --pid) explain_pid=${2:-}; shift 2 ;;
+            -h|--help) robot_help; return 0 ;;
+            *) shift ;;
+        esac
+    done
+
+    ensure_config
+    ensure_deps_for_json
+
+    case "$sub" in
+        plan)
+            if [[ "$format" == "md" ]]; then
+                robot_emit_plan_md "$deep" "$min_age" "$only" "$limit"
+            else
+                robot_emit_plan_json "$deep" "$min_age" "$only" "$limit"
+            fi
+            ;;
+        explain)
+            [[ -z "$explain_pid" ]] && { robot_help; return 1; }
+            if [[ "$format" == "md" ]]; then
+                printf '```json\n'
+                robot_explain_pid_json "$explain_pid" "$deep"
+                printf '```\n'
+            else
+                robot_explain_pid_json "$explain_pid" "$deep"
+            fi
+            ;;
+        apply)
+            local mode="pids"
+            if [[ "$recommended" == "true" ]]; then
+                mode="recommended"
+            fi
+            robot_apply_json "$deep" "$min_age" "$mode" "$pids_csv" "$yes"
+            ;;
+        *)
+            robot_help
+            return 1
+            ;;
+    esac
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Commands
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -649,7 +1238,7 @@ cmd_scan() {
     for c in "${candidates[@]}"; do
         [[ -z "$c" ]] && continue
         local rec
-        rec=$(echo "$c" | cut -d$'\t' -f5)
+        rec=$(echo "$c" | cut -d$'\t' -f8)
         case "$rec" in
             KILL) ((kill_count++)) ;;
             REVIEW) ((review_count++)) ;;
@@ -668,7 +1257,7 @@ cmd_scan() {
     for c in "${candidates[@]}"; do
         [[ -z "$c" ]] && continue
 
-        IFS=$'\t' read -r score pid age mem rec confidence ptype evidence cmd <<< "$c"
+        IFS=$'\t' read -r score pid ppid age mem cpu tty rec confidence ptype evidence cmd <<< "$c"
 
         local age_fmt; age_fmt=$(format_duration "$age")
         local mem_fmt; mem_fmt=$(format_memory "$mem")
@@ -736,7 +1325,7 @@ cmd_run() {
     for c in "${candidates[@]}"; do
         [[ -z "$c" ]] && continue
 
-        IFS=$'\t' read -r score pid age mem rec confidence ptype evidence cmd <<< "$c"
+        IFS=$'\t' read -r score pid ppid age mem cpu tty rec confidence ptype evidence cmd <<< "$c"
 
         local age_fmt; age_fmt=$(format_duration "$age")
         local mem_fmt; mem_fmt=$(format_memory "$mem")
@@ -806,7 +1395,7 @@ cmd_run() {
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         local orig="${pid_map[$line]}"
-        IFS=$'\t' read -r score pid age mem rec confidence ptype evidence cmd <<< "$orig"
+        IFS=$'\t' read -r score pid ppid age mem cpu tty rec confidence ptype evidence cmd <<< "$orig"
         local evidence_readable="${evidence//|/, }"
         printf "    PID %s: %s\n" "$pid" "${C_DIM}$evidence_readable${C_RESET}"
     done <<< "$selected"
@@ -830,7 +1419,7 @@ cmd_run() {
 
         local orig="${pid_map[$line]}"
         local cmd
-        cmd=$(echo "$orig" | cut -d$'\t' -f9)
+        cmd=$(echo "$orig" | cut -d$'\t' -f12)
 
         printf "  Killing PID %s... " "$pid"
 
@@ -858,7 +1447,7 @@ cmd_run() {
             local orig="${pid_map[$line]}"
             [[ -z "$orig" ]] && continue
             local cmd
-            cmd=$(echo "$orig" | cut -d$'\t' -f9)
+            cmd=$(echo "$orig" | cut -d$'\t' -f12)
             local pattern
             pattern=$(normalize_pattern "$cmd")
             save_decision "$pattern" "spare"
