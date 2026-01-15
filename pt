@@ -80,6 +80,11 @@ declare -A TYPE_LIFETIME=(
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Gum should only be used in interactive TTY, not in CI
+GUM_AVAILABLE=false
+if [[ "$IS_TTY" == "true" ]] && [[ "$IS_CI" != "true" ]] && command -v gum &>/dev/null; then
+    GUM_AVAILABLE=true
+fi
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Dependency Management
 # ══════════════════════════════════════════════════════════════════════════════
@@ -87,10 +92,17 @@ declare -A TYPE_LIFETIME=(
 ensure_gum() {
     # Skip gum install in non-interactive or CI environments
     if [[ "$IS_TTY" != "true" ]] || [[ "$IS_CI" == "true" ]]; then
+        GUM_AVAILABLE=false
         return 0
     fi
-    command -v gum &>/dev/null && return 0
-    echo "Installing gum..."
+
+    if command -v gum &>/dev/null; then
+        GUM_AVAILABLE=true
+        return 0
+    fi
+
+    log_info "gum not found, attempting to install for better UI..."
+
     if command -v apt-get &>/dev/null; then
         sudo mkdir -p /etc/apt/keyrings 2>/dev/null || true
         curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg 2>/dev/null
@@ -104,8 +116,13 @@ ensure_gum() {
         [[ "$arch" == "aarch64" ]] && arch="arm64"
         curl -fsSL "https://github.com/charmbracelet/gum/releases/download/v0.14.1/gum_0.14.1_linux_${arch}.tar.gz" | sudo tar xz -C /usr/local/bin gum
     fi
-    if ! command -v gum &>/dev/null; then
-        echo "Failed to install gum (interactive features disabled)"
+
+    if command -v gum &>/dev/null; then
+        GUM_AVAILABLE=true
+        log_success "gum installed successfully"
+    else
+        GUM_AVAILABLE=false
+        log_warn "Could not install gum, using fallback UI"
     fi
 }
 
@@ -160,6 +177,127 @@ log_debug() {
 log_verbose() {
     [[ "${VERBOSE:-}" == "1" ]] || return 0
     printf '%b\n' "${C_DIM}$*${C_RESET}" >&2
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gum wrapper functions with ANSI fallback
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Styled text/box wrapper
+gum_style() {
+    local text="$1"
+    local foreground="${2:-}"
+    local bold="${3:-}"
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        local args=()
+        [[ -n "$foreground" ]] && args+=(--foreground "$foreground")
+        [[ "$bold" == "true" ]] && args+=(--bold)
+        gum style "${args[@]}" "$text"
+    else
+        # ANSI fallback
+        local prefix="" suffix=""
+        if [[ "$bold" == "true" ]]; then
+            prefix="${C_BOLD}"
+            suffix="${C_RESET}"
+        fi
+        printf '%b\n' "${prefix}${text}${suffix}"
+    fi
+}
+
+# Styled box wrapper
+gum_box() {
+    local -a lines=("$@")
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style --border rounded --border-foreground 212 --padding "0 2" "${lines[@]}"
+    else
+        # ANSI fallback - simple box
+        local max_len=0
+        for line in "${lines[@]}"; do
+            local len=${#line}
+            ((len > max_len)) && max_len=$len
+        done
+        local width=$((max_len + 4))
+        local border_line
+        border_line=$(printf '─%.0s' $(seq 1 "$width"))
+        printf '%b\n' "${C_CYAN}╭${border_line}╮${C_RESET}"
+        for line in "${lines[@]}"; do
+            local padding=$((max_len - ${#line}))
+            printf '%b\n' "${C_CYAN}│${C_RESET}  ${line}$(printf ' %.0s' $(seq 1 "$padding"))  ${C_CYAN}│${C_RESET}"
+        done
+        printf '%b\n' "${C_CYAN}╰${border_line}╯${C_RESET}"
+    fi
+}
+
+# Spinner wrapper
+gum_spin() {
+    local title="$1"
+    shift
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum spin --spinner dot --title "$title" -- "$@"
+    else
+        # ANSI fallback - just show message and run command
+        log_step "$title"
+        "$@"
+    fi
+}
+
+# Confirm wrapper
+gum_confirm() {
+    local prompt="$1"
+    local affirmative="${2:-Yes}"
+    local negative="${3:-No}"
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum confirm --affirmative "$affirmative" --negative "$negative" "$prompt"
+        return $?
+    else
+        # ANSI fallback
+        printf '%s [y/N] ' "$prompt" >&2
+        local response
+        read -r response
+        case "${response,,}" in
+            y|yes) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+}
+
+# Multi-select wrapper
+gum_choose() {
+    local height="${1:-20}"
+    shift
+    local -a items=("$@")
+
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        printf '%s\n' "${items[@]}" | gum choose --no-limit --height "$height"
+    else
+        # ANSI fallback - numbered list with manual selection
+        log_info "Select items (space-separated numbers, 'all', or empty to cancel):"
+        local i=1
+        for item in "${items[@]}"; do
+            printf '  %d) %s\n' "$i" "$item" >&2
+            ((i++))
+        done
+
+        printf 'Selection: ' >&2
+        local selection
+        read -r selection
+
+        if [[ -z "$selection" ]]; then
+            return 0
+        elif [[ "$selection" == "all" ]]; then
+            printf '%s\n' "${items[@]}"
+        else
+            for num in $selection; do
+                if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#items[@]} )); then
+                    printf '%s\n' "${items[num-1]}"
+                fi
+            done
+        fi
+    fi
 }
 
 iso_timestamp() {
