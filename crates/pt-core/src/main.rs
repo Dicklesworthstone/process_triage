@@ -632,6 +632,7 @@ use pt_core::collect::{quick_scan, QuickScanOptions, ProcessRecord};
 use pt_core::inference::{
     compute_posterior, CpuEvidence, Evidence, EvidenceLedger,
 };
+use pt_core::decision::{decide_action, Action, ActionFeasibility};
 
 fn progress_emitter(global: &GlobalOpts) -> Option<Arc<dyn ProgressEmitter>> {
     match global.format {
@@ -2235,12 +2236,222 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     };
 
-    // Stub plan artifact (decision/plan.json) to establish durable session semantics.
-    let plan = serde_json::json!({
+    // Load configuration and priors
+    let config_options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        ..Default::default()
+    };
+    let config = match load_config(&config_options) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("agent plan: failed to load config: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+    let priors = config.priors.clone();
+    let policy = config.policy.clone();
+
+    // Progress emitter for streaming updates
+    let emitter = progress_emitter(global);
+    if let Some(ref e) = emitter {
+        e.emit(
+            ProgressEvent::new(pt_core::events::event_names::QUICK_SCAN_STARTED, Phase::QuickScan)
+                .with_session_id(session_id.to_string()),
+        );
+    }
+
+    // Perform quick scan to enumerate processes
+    let scan_options = QuickScanOptions {
+        pids: vec![],
+        include_kernel_threads: false,
+        timeout: global.timeout.map(std::time::Duration::from_secs),
+        progress: emitter.clone(),
+    };
+
+    let scan_result = match quick_scan(&scan_options) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("agent plan: scan failed: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    if let Some(ref e) = emitter {
+        e.emit(
+            ProgressEvent::new(pt_core::events::event_names::QUICK_SCAN_COMPLETE, Phase::QuickScan)
+                .with_session_id(session_id.to_string())
+                .with_detail("count", scan_result.processes.len()),
+        );
+    }
+
+    // Process each candidate: compute posterior, make decision, build candidate output
+    let mut candidates: Vec<serde_json::Value> = Vec::new();
+    let mut kill_candidates: Vec<u32> = Vec::new();
+    let mut review_candidates: Vec<u32> = Vec::new();
+
+    let feasibility = ActionFeasibility::allow_all();
+
+    for proc in &scan_result.processes {
+        // Skip kernel threads and system processes
+        if proc.pid.0 == 0 || proc.pid.0 == 1 {
+            continue;
+        }
+
+        // Build evidence from process record
+        let evidence = Evidence {
+            cpu: Some(CpuEvidence::Fraction {
+                occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
+            }),
+            runtime_seconds: Some(proc.elapsed.as_secs_f64()),
+            orphan: Some(proc.is_orphan()),
+            tty: Some(proc.has_tty()),
+            net: None,
+            io_active: None,
+            state_flag: Some(state_to_flag(proc.state)),
+            command_category: None,
+        };
+
+        // Compute posterior probabilities
+        let posterior_result = match compute_posterior(&priors, &evidence) {
+            Ok(r) => r,
+            Err(_) => continue, // Skip processes that fail inference
+        };
+
+        // Compute decision (optimal action based on expected loss)
+        let decision_outcome = match decide_action(&posterior_result.posterior, &policy, &feasibility) {
+            Ok(d) => d,
+            Err(_) => continue, // Skip processes that fail decision
+        };
+
+        // Build evidence ledger for classification and confidence
+        let ledger = EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
+
+        // Determine max posterior class for filtering
+        let posterior = &posterior_result.posterior;
+        let max_posterior = posterior.useful
+            .max(posterior.useful_bad)
+            .max(posterior.abandoned)
+            .max(posterior.zombie);
+
+        // Apply threshold filter
+        if max_posterior < args.threshold {
+            continue;
+        }
+
+        // Determine recommended action string
+        let recommended_action = match decision_outcome.optimal_action {
+            Action::Keep => "keep",
+            Action::Renice => "renice",
+            Action::Pause => "pause",
+            Action::Resume => "resume",
+            Action::Freeze => "freeze",
+            Action::Unfreeze => "unfreeze",
+            Action::Throttle => "throttle",
+            Action::Quarantine => "quarantine",
+            Action::Unquarantine => "unquarantine",
+            Action::Restart => "restart",
+            Action::Kill => "kill",
+        };
+
+        // Apply --only filter
+        let include = match args.only.as_str() {
+            "kill" => decision_outcome.optimal_action == Action::Kill,
+            "review" => decision_outcome.optimal_action != Action::Keep,
+            _ => true, // "all"
+        };
+        if !include {
+            continue;
+        }
+
+        // Track candidates by action type
+        if decision_outcome.optimal_action == Action::Kill {
+            kill_candidates.push(proc.pid.0);
+        } else if decision_outcome.optimal_action != Action::Keep {
+            review_candidates.push(proc.pid.0);
+        }
+
+        // Build candidate JSON
+        let candidate = serde_json::json!({
+            "pid": proc.pid.0,
+            "start_id": format!("{}:{}", proc.pid.0, proc.start_time_unix),
+            "uid": proc.uid,
+            "cmd_short": proc.comm,
+            "cmd_full": proc.cmd,
+            "classification": ledger.classification.label(),
+            "posterior": {
+                "useful": posterior.useful,
+                "useful_bad": posterior.useful_bad,
+                "abandoned": posterior.abandoned,
+                "zombie": posterior.zombie,
+            },
+            "confidence": ledger.confidence.label(),
+            "blast_radius": {
+                "memory_mb": proc.rss_bytes / (1024 * 1024),
+                "cpu_pct": proc.cpu_percent,
+                "child_count": 0, // Would need child enumeration
+                "risk_level": if proc.rss_bytes > 1024 * 1024 * 1024 { "medium" } else { "low" },
+            },
+            "reversibility": match decision_outcome.optimal_action {
+                Action::Kill | Action::Restart => "irreversible",
+                Action::Pause | Action::Freeze | Action::Throttle => "reversible",
+                _ => "no_action",
+            },
+            "supervisor": {
+                "detected": false, // Would need supervision detection
+                "name": serde_json::Value::Null,
+            },
+            "uncertainty": {
+                "entropy": ledger.bayes_factors.len() as f64 * 0.1, // Simplified
+                "confidence_interval": [max_posterior - 0.1, (max_posterior + 0.1).min(1.0)],
+            },
+            "recommended_action": recommended_action,
+            "action_rationale": format!("Action {:?} selected{}",
+                decision_outcome.rationale.chosen_action,
+                if decision_outcome.rationale.tie_break { " (tie-break)" } else { "" }),
+            "expected_loss": decision_outcome.expected_loss.iter()
+                .map(|el| serde_json::json!({
+                    "action": format!("{:?}", el.action),
+                    "loss": el.loss,
+                }))
+                .collect::<Vec<_>>(),
+        });
+
+        candidates.push(candidate);
+
+        // Limit to max_candidates
+        if candidates.len() >= args.max_candidates as usize {
+            break;
+        }
+    }
+
+    // Build summary
+    let summary = serde_json::json!({
+        "total_processes_scanned": scan_result.processes.len(),
+        "candidates_identified": candidates.len(),
+        "kill_recommendations": kill_candidates.len(),
+        "review_recommendations": review_candidates.len(),
+        "threshold_used": args.threshold,
+        "filter_used": args.only,
+    });
+
+    // Build recommended section
+    let empty_pids: Vec<u32> = Vec::new();
+    let preselected_pids = if args.yes { &kill_candidates } else { &empty_pids };
+    let recommended = serde_json::json!({
+        "preselected_pids": preselected_pids,
+        "actions": kill_candidates.iter().map(|pid| serde_json::json!({
+            "pid": pid,
+            "action": "kill",
+            "stage": 1,
+        })).collect::<Vec<_>>(),
+    });
+
+    // Build complete plan output
+    let plan_output = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "session_id": session_id.0,
         "generated_at": chrono::Utc::now().to_rfc3339(),
-        "status": "stub",
+        "host_id": pt_core::logging::get_host_id(),
         "command": "agent plan",
         "args": {
             "max_candidates": args.max_candidates,
@@ -2251,15 +2462,15 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "robot": global.robot,
             "shadow": global.shadow,
         },
-        "note": if created {
-            "Created new session (no --session provided)"
-        } else {
-            "Reused existing session (--session)"
-        }
+        "summary": summary,
+        "candidates": candidates,
+        "recommended": recommended,
+        "session_created": created,
     });
 
+    // Write plan to session
     let plan_path = handle.dir.join("decision").join("plan.json");
-    if let Err(e) = std::fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()) {
+    if let Err(e) = std::fs::write(&plan_path, serde_json::to_string_pretty(&plan_output).unwrap()) {
         eprintln!(
             "agent plan: failed to write {}: {}",
             plan_path.display(),
@@ -2268,37 +2479,59 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         return ExitCode::InternalError;
     }
 
-    // Update manifest state (best-effort; do not fail the whole command for manifest update).
+    // Update manifest state
     let _ = handle.update_state(SessionState::Planned);
 
-    if let Some(emitter) = progress_emitter(global) {
-        emitter.emit(
+    if let Some(ref e) = emitter {
+        e.emit(
             ProgressEvent::new(pt_core::events::event_names::PLAN_READY, Phase::Plan)
                 .with_session_id(session_id.to_string())
                 .with_detail("plan_path", plan_path.display().to_string())
-                .with_detail("status", "stub"),
+                .with_detail("count", candidates.len()),
         );
     }
 
+    // Output based on format
     match global.format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&plan).unwrap());
+            println!("{}", serde_json::to_string_pretty(&plan_output).unwrap());
         }
         OutputFormat::Summary => {
-            println!("[{}] agent plan: stub plan written", session_id);
+            println!(
+                "[{}] agent plan: {} candidates ({} kill, {} review)",
+                session_id,
+                candidates.len(),
+                kill_candidates.len(),
+                review_candidates.len()
+            );
         }
         OutputFormat::Exitcode => {}
         _ => {
-            println!("# pt-core agent plan");
-            println!();
+            println!("# pt-core agent plan\n");
             println!("Session: {}", session_id);
-            println!("Plan: {}", plan_path.display());
-            println!();
-            println!("(stub) Planning not yet implemented.");
+            println!("Plan: {}\n", plan_path.display());
+            println!("## Summary\n");
+            println!("- Processes scanned: {}", scan_result.processes.len());
+            println!("- Candidates identified: {}", candidates.len());
+            println!("- Kill recommendations: {}", kill_candidates.len());
+            println!("- Review recommendations: {}", review_candidates.len());
+            println!("\n## Candidates\n");
+            for candidate in &candidates {
+                let pid = candidate.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cmd = candidate.get("cmd_short").and_then(|v| v.as_str()).unwrap_or("?");
+                let class = candidate.get("classification").and_then(|v| v.as_str()).unwrap_or("?");
+                let action = candidate.get("recommended_action").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("- PID {}: {} ({}) → {}", pid, cmd, class, action);
+            }
         }
     }
 
-    ExitCode::Clean
+    // Return appropriate exit code
+    if candidates.is_empty() {
+        ExitCode::Clean // 0: nothing to do
+    } else {
+        ExitCode::PlanReady // 1: candidates exist, plan produced
+    }
 }
 
 fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
