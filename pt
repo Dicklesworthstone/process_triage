@@ -344,6 +344,71 @@ verify_update_checksum() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Script validation (prevents installing broken scripts)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Validate bash syntax using bash -n (parse without execute)
+validate_bash_syntax() {
+    local file="$1"
+
+    # bash -n parses but doesn't execute
+    if ! bash -n "$file" 2>/dev/null; then
+        log_error "Downloaded file is not valid bash"
+
+        # Show actual error for debugging
+        if [[ "${PT_DEBUG:-}" == "1" ]]; then
+            log_debug "Syntax check output:"
+            bash -n "$file" 2>&1 | while IFS= read -r line; do
+                log_debug "  $line"
+            done
+        fi
+
+        return 1
+    fi
+
+    log_debug "Bash syntax validation passed"
+    return 0
+}
+
+# Comprehensive script validation before replacement
+validate_script() {
+    local file="$1"
+
+    # 1. Check it's not empty
+    if [[ ! -s "$file" ]]; then
+        log_error "Downloaded file is empty"
+        return 1
+    fi
+
+    # 2. Check it starts with shebang
+    local first_line
+    first_line=$(head -n1 "$file")
+    if [[ "$first_line" != "#!"* ]]; then
+        log_error "Downloaded file doesn't start with shebang"
+        return 1
+    fi
+
+    # 3. Check bash syntax
+    if ! validate_bash_syntax "$file"; then
+        return 1
+    fi
+
+    # 4. Check it contains expected content (anti-tampering)
+    if ! grep -q 'VERSION=' "$file"; then
+        log_error "Downloaded file missing VERSION constant"
+        return 1
+    fi
+
+    if ! grep -q 'Process Triage' "$file"; then
+        log_error "Downloaded file missing expected identifier"
+        return 1
+    fi
+
+    log_success "Script validation passed"
+    return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Gum wrapper functions with ANSI fallback
 # ──────────────────────────────────────────────────────────────────────────────
 
