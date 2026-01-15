@@ -52,7 +52,7 @@ A) Basic closed-form Bayesian model (non-ML)
 - Log-posterior formula:
   log P(C|x) = log P(C) + log BetaBinomial(k_ticks; n_ticks, alpha_C, beta_C) + log GammaPDF(t; k_C, theta_C)
                 + log BetaBernoulliPred(o; a_{o,C}, b_{o,C}) + log DirichletCatPred(g; alpha^{cmd}_C) + ...
-  (categorical terms use Dirichlet-Multinomial posterior-predictives; decision core uses log-domain Beta/Gamma/Dirichlet special functions, not heuristic approximations)
+  (DirichletCatPred(g; α_vec) = α_vec[g]/sum(α_vec); categorical terms use Dirichlet-Multinomial posterior-predictives; decision core uses log-domain Beta/Gamma/Dirichlet special functions, not heuristic approximations)
 
 B) Decision rule via expected loss (Bayesian risk)
 - a* = argmin_a sum_C L(a,C) P(C|x)
