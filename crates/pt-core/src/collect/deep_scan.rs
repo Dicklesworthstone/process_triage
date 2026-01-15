@@ -291,10 +291,13 @@ fn scan_process(pid: u32, include_environ: bool) -> Result<DeepScanRecord, DeepS
 
     // Parse /proc/[pid]/status for UID and username
     let status_content = fs::read_to_string(format!("{}/status", proc_path)).ok();
-    let (uid, user) = status_content
+    let (uid, user, uid_known) = match status_content
         .as_ref()
         .and_then(|c| parse_uid_from_status(c))
-        .unwrap_or((u32::MAX, "unknown".to_string()));
+    {
+        Some((uid, user)) => (uid, user, true),
+        None => (0, "unknown".to_string(), false),
+    };
 
     // Read cmdline
     let cmdline = fs::read_to_string(format!("{}/cmdline", proc_path))
@@ -313,9 +316,10 @@ fn scan_process(pid: u32, include_environ: bool) -> Result<DeepScanRecord, DeepS
         .map(|s| s.trim().to_string());
 
     // Compute identity quality based on available data
-    let identity_quality = match (&boot_id, stat_info.starttime) {
-        (Some(_), starttime) if starttime > 0 => IdentityQuality::Full,
-        (None, starttime) if starttime > 0 => IdentityQuality::NoBootId,
+    let identity_quality = match (&boot_id, stat_info.starttime, uid_known) {
+        (_, _, false) => IdentityQuality::PidOnly,
+        (Some(_), starttime, true) if starttime > 0 => IdentityQuality::Full,
+        (None, starttime, true) if starttime > 0 => IdentityQuality::NoBootId,
         _ => IdentityQuality::PidOnly,
     };
 
