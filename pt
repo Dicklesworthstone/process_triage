@@ -129,33 +129,34 @@ get_past_decision() {
 # Process Scoring
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Cache for decisions (loaded once per run)
-declare -A DECISION_CACHE
-DECISION_CACHE_LOADED=false
+# Cache for decisions - stored as temp file for grep lookups
+DECISIONS_CACHE_FILE=""
+DECISIONS_CACHE_LOADED=false
 
 load_decisions_cache() {
-    [[ "$DECISION_CACHE_LOADED" == "true" ]] && return 0
-    DECISION_CACHE_LOADED=true
+    [[ "$DECISIONS_CACHE_LOADED" == "true" ]] && return 0
+    DECISIONS_CACHE_LOADED=true
 
     command -v jq &>/dev/null || return 0
     [[ -s "$DECISIONS_FILE" ]] || return 0
 
-    # Read decisions into cache, handling special chars safely
-    while IFS=$'\t' read -r key value; do
-        [[ -z "$key" ]] && continue
-        # Disable -u temporarily to safely assign to associative array
-        set +u
-        DECISION_CACHE["$key"]="$value"
-        set -u
-    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$DECISIONS_FILE" 2>/dev/null || true)
+    # Create temp file with pattern<TAB>decision format for fast grep lookups
+    DECISIONS_CACHE_FILE=$(mktemp)
+    jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$DECISIONS_FILE" > "$DECISIONS_CACHE_FILE" 2>/dev/null || true
 }
+
+cleanup_cache() {
+    [[ -n "$DECISIONS_CACHE_FILE" && -f "$DECISIONS_CACHE_FILE" ]] && rm -f "$DECISIONS_CACHE_FILE"
+    return 0
+}
+trap cleanup_cache EXIT
 
 get_cached_decision() {
     local pattern=$1
-    # Temporarily disable -u to safely handle missing keys and special chars
-    set +u
-    local result="${DECISION_CACHE[$pattern]}"
-    set -u
+    [[ -z "$DECISIONS_CACHE_FILE" || ! -s "$DECISIONS_CACHE_FILE" ]] && { echo "unknown"; return; }
+    # Use grep -F for fast literal matching
+    local result
+    result=$(grep -F -- "$pattern" "$DECISIONS_CACHE_FILE" 2>/dev/null | head -1 | cut -f2)
     echo "${result:-unknown}"
 }
 
@@ -193,8 +194,15 @@ score_process() {
     # High memory hog
     ((mem > 2000 && hours > 12)) && { ((score += 15)); reasons+=("high mem"); }
 
-    # Protected patterns
-    if [[ "$cmd" =~ ^(/usr/lib/systemd|/lib/systemd|sshd|/usr/sbin/cron|dockerd|containerd|dbus|pulseaudio|pipewire) ]]; then
+    # Protected patterns - system daemons and services
+    if [[ "$cmd" =~ (systemd|journald|logind|networkd|resolved|timesyncd) ]] ||
+       [[ "$cmd" =~ (dockerd|containerd|dbus-daemon|avahi-daemon) ]] ||
+       [[ "$cmd" =~ ^/usr/libexec/(upowerd|fwupd|power-profiles|rtkit|udisks|accounts-daemon|polkit|switcheroo|at-spi) ]] ||
+       [[ "$cmd" =~ ^/usr/(sbin|bin)/(NetworkManager|ModemManager|rsyslogd|tailscaled|sddm|smartd|wpa_supplicant|rpc\.|chronyd) ]] ||
+       [[ "$cmd" =~ ^/usr/lib/(polkit|postgresql|bluetooth) ]] ||
+       [[ "$cmd" =~ ^/usr/bin/(pulseaudio|pipewire) ]] ||
+       [[ "$cmd" =~ ^sshd ]] ||
+       [[ "$cmd" =~ /usr/sbin/cron ]]; then
         ((score -= 200))
     fi
 
@@ -236,16 +244,18 @@ collect_candidates() {
     local procs
     procs=$(ps -eo pid,ppid,etimes,rss,args --no-headers -u "$(whoami)" 2>/dev/null | awk -v min="$min_age" '
         $3 >= min &&
-        $5 !~ /^\/usr\/lib\/systemd/ &&
-        $5 !~ /^\/lib\/systemd/ &&
+        $5 !~ /systemd/ &&
         $5 !~ /^sshd/ &&
-        $5 !~ /^\/usr\/sbin\/cron/ &&
-        $5 !~ /^dockerd/ &&
-        $5 !~ /^containerd/ &&
+        $5 !~ /^\/usr\/sbin\/(cron|NetworkManager|rsyslogd|tailscaled|sddm|ModemManager|smartd|wpa_supplicant|rpc|chronyd|avahi)/ &&
+        $5 !~ /^\/usr\/libexec\/(upowerd|fwupd|power-profiles|rtkit|udisks|accounts-daemon|polkit|switcheroo|at-spi)/ &&
+        $5 !~ /^\/usr\/lib\/(polkit|postgresql|bluetooth)/ &&
+        $5 !~ /dockerd/ &&
+        $5 !~ /containerd/ &&
         $5 !~ /dbus-daemon/ &&
-        $5 !~ /^\/usr\/bin\/pulseaudio/ &&
-        $5 !~ /^\/usr\/bin\/pipewire/
-        { print $1 "|" $2 "|" $3 "|" $4 "|" substr($0, index($0,$5)) }
+        $5 !~ /avahi-daemon/ &&
+        $5 !~ /journald|logind|networkd|resolved|timesyncd/ &&
+        $5 !~ /^\/usr\/bin\/(pulseaudio|pipewire)/
+        { print $1 "|" $2 "|" $3 "|" int($4/1024) "|" substr($0, index($0,$5)) }
     ')
 
     while IFS='|' read -r pid ppid age mem cmd; do
