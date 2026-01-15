@@ -6,6 +6,7 @@ pub mod dependency_loss;
 pub mod enforcer;
 pub mod expected_loss;
 pub mod fdr_selection;
+pub mod robot_constraints;
 
 pub use alpha_investing::{
     AlphaInvestingPolicy, AlphaInvestingStore, AlphaUpdate, AlphaWealthState,
@@ -16,8 +17,8 @@ pub use causal_interventions::{
     ProcessClass, RecoveryExpectation, RecoveryTable,
 };
 pub use enforcer::{
-    EnforcerError, PolicyCheckResult, PolicyEnforcer, PolicyViolation, ProcessCandidate,
-    ViolationKind,
+    CriticalFilesSummary, EnforcerError, PolicyCheckResult, PolicyEnforcer, PolicyViolation,
+    ProcessCandidate, ViolationKind,
 };
 pub use expected_loss::{
     decide_action, decide_action_with_recovery, Action, ActionFeasibility, DecisionError,
@@ -30,4 +31,9 @@ pub use fdr_selection::{
 pub use dependency_loss::{
     compute_dependency_scaling, scale_kill_loss, DependencyFactors, DependencyScaling,
     DependencyScalingResult,
+};
+pub use robot_constraints::{
+    ConstraintCheckResult, ConstraintChecker, ConstraintKind, ConstraintMetrics,
+    ConstraintSource, ConstraintSources, ConstraintViolation, RobotCandidate,
+    RuntimeRobotConstraints,
 };

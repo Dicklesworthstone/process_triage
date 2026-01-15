@@ -709,6 +709,7 @@ fn test_enforcer_with_real_policy_fixture() {
         cwd_deleted: Some(false),
         process_state: None,
         wchan: None,
+        critical_files: Vec::new(),
     };
 
     let _result = enforcer.check_action(&candidate, Action::Kill, false);
@@ -772,6 +773,7 @@ fn test_enforcer_protected_patterns() {
             cwd_deleted: Some(false),
             process_state: None,
             wchan: None,
+            critical_files: Vec::new(),
         };
 
         let result = enforcer.check_action(&candidate, Action::Kill, false);
@@ -834,6 +836,7 @@ fn test_enforcer_rate_limiting() {
         cwd_deleted: Some(false),
         process_state: None,
         wchan: None,
+        critical_files: Vec::new(),
     };
 
     // First 3 kills should be allowed
@@ -890,6 +893,7 @@ fn test_enforcer_robot_mode_gates() {
         cwd_deleted: Some(false),
         process_state: None,
         wchan: None,
+        critical_files: Vec::new(),
     };
 
     let result = enforcer.check_action(&low_posterior_candidate, Action::Kill, true);
@@ -915,6 +919,7 @@ fn test_enforcer_robot_mode_gates() {
         cwd_deleted: Some(false),
         process_state: None,
         wchan: None,
+        critical_files: Vec::new(),
     };
 
     let result = enforcer.check_action(&high_memory_candidate, Action::Kill, true);
@@ -948,6 +953,7 @@ fn test_enforcer_data_loss_gates() {
         cwd_deleted: Some(false),
         process_state: None,
         wchan: None,
+        critical_files: Vec::new(),
     };
 
     let result = enforcer.check_action(&candidate_with_fds, Action::Kill, false);
@@ -973,6 +979,7 @@ fn test_enforcer_data_loss_gates() {
         cwd_deleted: Some(false),
         process_state: None,
         wchan: None,
+        critical_files: Vec::new(),
     };
 
     let result = enforcer.check_action(&candidate_locked, Action::Kill, false);
@@ -1007,6 +1014,7 @@ fn test_enforcer_min_age_gate() {
         cwd_deleted: Some(false),
         process_state: None,
         wchan: None,
+        critical_files: Vec::new(),
     };
 
     let result = enforcer.check_action(&young_candidate, Action::Kill, false);
@@ -1067,6 +1075,7 @@ fn test_enforcer_warnings() {
         cwd_deleted: Some(false),
         process_state: None,
         wchan: None,
+        critical_files: Vec::new(),
     };
 
     // In interactive mode, should be allowed with warning

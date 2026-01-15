@@ -22,7 +22,7 @@
 //! }
 //! ```
 
-use crate::collect::ProcessState;
+use crate::collect::{CriticalFile, DetectionStrength, ProcessState};
 use crate::config::policy::{DataLossGates, Guardrails, PatternEntry, Policy, RobotMode};
 use regex::Regex;
 use serde::Serialize;
@@ -92,6 +92,19 @@ pub struct PolicyViolation {
     pub context: Option<String>,
 }
 
+/// Summary of critical files detected for a process.
+#[derive(Debug, Clone, Serialize)]
+pub struct CriticalFilesSummary {
+    /// Number of hard (definite lock) detections.
+    pub hard_count: usize,
+    /// Number of soft (heuristic) detections.
+    pub soft_count: usize,
+    /// Rule IDs that matched.
+    pub rules: Vec<String>,
+    /// Human-readable remediation hints.
+    pub remediation_hints: Vec<String>,
+}
+
 /// Categories of policy violations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +172,8 @@ pub struct ProcessCandidate {
     pub process_state: Option<ProcessState>,
     /// Kernel wait channel (what D-state process is blocked on).
     pub wchan: Option<String>,
+    /// Critical files detected (for data-loss safety gate).
+    pub critical_files: Vec<CriticalFile>,
 }
 
 /// Compiled pattern for efficient matching.
@@ -747,16 +762,88 @@ impl PolicyEnforcer {
             }
         }
 
+        // Check for hard critical files - these always block kill-like actions in robot mode
+        // This is a data-loss safety gate: killing processes with active locks/writes is too risky
+        // for automation to handle without human review
+        if self.has_hard_critical_files(candidate) {
+            // Find the first hard critical file for the message
+            if let Some(cf) = candidate
+                .critical_files
+                .iter()
+                .find(|cf| cf.strength == DetectionStrength::Hard)
+            {
+                return Some(PolicyViolation {
+                    kind: ViolationKind::RobotModeGate,
+                    message: format!(
+                        "robot mode blocked: process has hard critical file '{}' (rule: {})",
+                        cf.path, cf.rule_id
+                    ),
+                    rule: "robot_mode.data_loss_gate".to_string(),
+                    context: Some(format!(
+                        "Detected {:?} lock. Remediation: {}",
+                        cf.category,
+                        cf.category.remediation_hint()
+                    )),
+                });
+            }
+        }
+
         None
     }
 
     /// Check data loss prevention gates.
+    ///
+    /// Returns a violation if any critical file patterns are detected or if generic
+    /// data loss conditions are met. Hard detections (definite locks) always block;
+    /// soft detections (heuristics) provide warnings with remediation hints.
     fn check_data_loss_gates(&self, candidate: &ProcessCandidate) -> Option<PolicyViolation> {
+        // Check critical files first - these provide the most specific information
+        // Hard detections block immediately with remediation guidance
+        for cf in &candidate.critical_files {
+            if cf.strength == DetectionStrength::Hard {
+                return Some(PolicyViolation {
+                    kind: ViolationKind::DataLossGate,
+                    message: format!(
+                        "process has critical lock: {} ({})",
+                        cf.path,
+                        cf.category.remediation_hint()
+                    ),
+                    rule: format!("data_loss_gates.critical_file.{}", cf.rule_id),
+                    context: Some(format!(
+                        "Detected {} with rule '{}'. Remediation: {}",
+                        format!("{:?}", cf.category).to_lowercase(),
+                        cf.rule_id,
+                        cf.category.remediation_hint()
+                    )),
+                });
+            }
+        }
+
         // Check open write FDs
         if self.data_loss_gates.block_if_open_write_fds {
             if let Some(fds) = candidate.open_write_fds {
                 let max_fds = self.data_loss_gates.max_open_write_fds.unwrap_or(0);
                 if fds > max_fds {
+                    // If we have soft critical files, include them in the message
+                    let soft_files: Vec<_> = candidate
+                        .critical_files
+                        .iter()
+                        .filter(|cf| cf.strength == DetectionStrength::Soft)
+                        .collect();
+
+                    let context = if soft_files.is_empty() {
+                        "killing may cause data loss".to_string()
+                    } else {
+                        let hints: Vec<_> = soft_files
+                            .iter()
+                            .map(|cf| format!("{}: {}", cf.path, cf.category.remediation_hint()))
+                            .collect();
+                        format!(
+                            "killing may cause data loss. Detected files:\n{}",
+                            hints.join("\n")
+                        )
+                    };
+
                     return Some(PolicyViolation {
                         kind: ViolationKind::DataLossGate,
                         message: format!(
@@ -764,7 +851,7 @@ impl PolicyEnforcer {
                             fds, max_fds
                         ),
                         rule: "data_loss_gates.block_if_open_write_fds".to_string(),
-                        context: Some("killing may cause data loss".to_string()),
+                        context: Some(context),
                     });
                 }
             }
@@ -820,6 +907,55 @@ impl PolicyEnforcer {
         }
 
         None
+    }
+
+    /// Check if any hard critical files are detected for this candidate.
+    ///
+    /// This is used for robot mode blocking - hard detections always block
+    /// kill-like actions in robot mode.
+    pub fn has_hard_critical_files(&self, candidate: &ProcessCandidate) -> bool {
+        candidate
+            .critical_files
+            .iter()
+            .any(|cf| cf.strength == DetectionStrength::Hard)
+    }
+
+    /// Get a summary of critical files for reporting.
+    pub fn critical_files_summary(&self, candidate: &ProcessCandidate) -> Option<CriticalFilesSummary> {
+        if candidate.critical_files.is_empty() {
+            return None;
+        }
+
+        let hard_count = candidate
+            .critical_files
+            .iter()
+            .filter(|cf| cf.strength == DetectionStrength::Hard)
+            .count();
+
+        let soft_count = candidate
+            .critical_files
+            .iter()
+            .filter(|cf| cf.strength == DetectionStrength::Soft)
+            .count();
+
+        let rules: Vec<_> = candidate
+            .critical_files
+            .iter()
+            .map(|cf| cf.rule_id.clone())
+            .collect();
+
+        let remediation_hints: Vec<_> = candidate
+            .critical_files
+            .iter()
+            .map(|cf| cf.category.remediation_hint().to_string())
+            .collect();
+
+        Some(CriticalFilesSummary {
+            hard_count,
+            soft_count,
+            rules,
+            remediation_hints,
+        })
     }
 
     /// Check process state constraints for zombie and D-state processes.
@@ -938,6 +1074,7 @@ mod tests {
             cwd_deleted: Some(false),
             process_state: None, // Normal processes have no special state
             wchan: None,
+            critical_files: Vec::new(),
         }
     }
 
