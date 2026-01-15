@@ -493,11 +493,16 @@ fn pre_checks_for(action: Action) -> Vec<PreCheck> {
             checks.push(PreCheck::CheckDataLossGate);
             checks.push(PreCheck::CheckSupervisor);
         }
-        Action::Pause | Action::Throttle | Action::Renice | Action::Freeze | Action::Unfreeze => {
+        Action::Pause
+        | Action::Throttle
+        | Action::Renice
+        | Action::Freeze
+        | Action::Unfreeze
+        | Action::Quarantine => {
             checks.push(PreCheck::CheckSupervisor);
         }
-        // Resume only need identity verification
-        Action::Resume => {}
+        // Resume/Unquarantine only need identity verification
+        Action::Resume | Action::Unquarantine => {}
         Action::Keep => {}
     }
     checks
@@ -560,6 +565,8 @@ fn action_str(action: Action) -> &'static str {
         Action::Kill => "kill",
         Action::Freeze => "freeze",
         Action::Unfreeze => "unfreeze",
+        Action::Quarantine => "quarantine",
+        Action::Unquarantine => "unquarantine",
     }
 }
 
@@ -605,8 +612,10 @@ fn action_tier(action: Action) -> u8 {
         Action::Pause => 1,
         Action::Resume => 1, // Same tier as Pause (reversible)
         Action::Throttle => 1,
-        Action::Freeze => 1,      // Reversible via Unfreeze
-        Action::Unfreeze => 1,    // Same tier as Freeze (reversible)
+        Action::Freeze => 1,         // Reversible via Unfreeze
+        Action::Unfreeze => 1,       // Same tier as Freeze (reversible)
+        Action::Quarantine => 1,     // Reversible via Unquarantine
+        Action::Unquarantine => 1,   // Same tier as Quarantine (reversible)
         Action::Restart => 2,
         Action::Kill => 3,
     }

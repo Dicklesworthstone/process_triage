@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 use pt_core::config::policy::Policy;
-use pt_core::decision::{decide_action, ActionFeasibility};
+use pt_core::decision::{compute_voi, decide_action, ActionFeasibility, ProbeCostModel};
 use pt_core::inference::ClassScores;
 
 fn posterior_strategy() -> impl Strategy<Value = ClassScores> {
@@ -53,6 +53,101 @@ proptest! {
                 optimal_loss <= loss.loss + 1e-9,
                 "optimal loss {optimal_loss} exceeds {}", loss.loss
             );
+        }
+    }
+
+    /// VOI property: high confidence posteriors should make probing less valuable.
+    /// When we're already very confident, VOI should be close to cost (probing has little benefit).
+    #[test]
+    fn voi_high_confidence_makes_probing_less_valuable(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let feasibility = ActionFeasibility::allow_all();
+        let cost_model = ProbeCostModel::default();
+
+        let result = compute_voi(
+            &posterior,
+            &policy,
+            &feasibility,
+            &cost_model,
+            None,
+        );
+
+        if let Ok(analysis) = result {
+            // Check if posterior is very confident (one class >> others)
+            let max_prob = posterior.useful
+                .max(posterior.useful_bad)
+                .max(posterior.abandoned)
+                .max(posterior.zombie);
+
+            if max_prob > 0.95 {
+                // When very confident, most probes should have VOI close to cost
+                // (little benefit from probing)
+                let worthwhile_count = analysis.probes.iter()
+                    .filter(|p| p.voi < -0.05)  // Significantly worthwhile
+                    .count();
+
+                // With high confidence, at most half of probes should be worthwhile
+                prop_assert!(
+                    worthwhile_count <= analysis.probes.len() / 2,
+                    "High-confidence posterior (max_prob={}) has {} worthwhile probes out of {} (expected fewer)",
+                    max_prob,
+                    worthwhile_count,
+                    analysis.probes.len()
+                );
+            }
+        }
+    }
+
+    /// VOI structural invariant: all probes should have finite, non-NaN values.
+    #[test]
+    fn voi_outputs_are_finite(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        let result = compute_voi(
+            &posterior,
+            &policy,
+            &feasibility,
+            &cost_model,
+            None,
+        );
+
+        if let Ok(analysis) = result {
+            prop_assert!(analysis.current_min_loss.is_finite());
+
+            for probe_voi in &analysis.probes {
+                prop_assert!(probe_voi.voi.is_finite(), "VOI for {} is not finite", probe_voi.probe.name());
+                prop_assert!(probe_voi.cost.is_finite(), "Cost for {} is not finite", probe_voi.probe.name());
+                prop_assert!(probe_voi.expected_loss_after.is_finite(), "Expected loss after {} is not finite", probe_voi.probe.name());
+            }
+        }
+    }
+
+    /// Property: probe cost should always be non-negative.
+    #[test]
+    fn probe_costs_are_non_negative(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        let result = compute_voi(
+            &posterior,
+            &policy,
+            &feasibility,
+            &cost_model,
+            None,
+        );
+
+        if let Ok(analysis) = result {
+            for probe_voi in &analysis.probes {
+                prop_assert!(
+                    probe_voi.cost >= -1e-12,
+                    "Probe {} has negative cost: {}",
+                    probe_voi.probe.name(),
+                    probe_voi.cost
+                );
+            }
         }
     }
 }
