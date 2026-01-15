@@ -238,13 +238,14 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
     }
 
     let duration = start.elapsed();
+    let process_count = processes.len();
 
     Ok(DeepScanResult {
-        processes: processes.clone(),
+        processes,
         metadata: DeepScanMetadata {
             started_at,
             duration_ms: duration.as_millis() as u64,
-            process_count: processes.len(),
+            process_count,
             skipped_count,
             warnings,
         },
@@ -389,7 +390,12 @@ fn parse_stat(content: &str, pid: u32) -> Result<StatInfo, DeepScanError> {
     })?;
 
     let comm = content[comm_start + 1..comm_end].to_string();
-    let after_comm = &content[comm_end + 2..]; // Skip ") "
+
+    // Safely skip ") " after comm - use get() to avoid panic on truncated content
+    let after_comm = content.get(comm_end + 2..).ok_or_else(|| DeepScanError::ParseError {
+        pid,
+        message: "Stat content truncated after comm".to_string(),
+    })?;
 
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     if fields.len() < 20 {
@@ -497,6 +503,20 @@ mod tests {
         let info = parse_stat(content, 9999).unwrap();
 
         assert_eq!(info.comm, "test (v2)");
+    }
+
+    #[test]
+    fn test_parse_stat_truncated() {
+        // Edge case: content ends right after closing paren - should error, not panic
+        let content = "1234 (test)";
+        let result = parse_stat(content, 1234);
+        assert!(result.is_err());
+
+        // Also test with just paren and no space after
+        let content2 = "1234 (test) ";
+        let result2 = parse_stat(content2, 1234);
+        // Should error due to insufficient fields
+        assert!(result2.is_err());
     }
 
     #[test]

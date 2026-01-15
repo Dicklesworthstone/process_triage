@@ -127,9 +127,18 @@ pub fn parse_io_content(content: &str) -> Option<IoStats> {
     let mut stats = IoStats::default();
 
     for line in content.lines() {
-        let mut parts = line.split(':');
-        let key = parts.next()?.trim();
-        let value: u64 = parts.next()?.trim().parse().ok()?;
+        // Skip empty lines or lines without colons
+        let Some(colon_pos) = line.find(':') else {
+            continue;
+        };
+
+        let key = line[..colon_pos].trim();
+        let value_str = line[colon_pos + 1..].trim();
+
+        // Skip lines where value can't be parsed as u64
+        let Ok(value) = value_str.parse::<u64>() else {
+            continue;
+        };
 
         match key {
             "rchar" => stats.rchar = value,
