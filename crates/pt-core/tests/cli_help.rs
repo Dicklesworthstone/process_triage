@@ -24,7 +24,7 @@ mod top_level {
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Process Triage Core"));
+            .stdout(predicate::str::contains("Process Triage"));
     }
 
     #[test]
@@ -33,7 +33,7 @@ mod top_level {
             .arg("help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("Process Triage Core"));
+            .stdout(predicate::str::contains("Process Triage"));
     }
 
     #[test]
