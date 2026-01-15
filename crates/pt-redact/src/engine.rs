@@ -4,7 +4,7 @@
 //! to values, using canonicalization, hashing, and secret detection.
 
 use crate::{
-    Action, Canonicalizer, FieldClass, KeyManager, KeyMaterial, RedactionError, RedactionPolicy,
+    Action, Canonicalizer, FieldClass, KeyManager, KeyMaterial, RedactionPolicy,
     Result, SecretDetector,
 };
 use serde::{Deserialize, Serialize};
