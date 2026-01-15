@@ -330,17 +330,22 @@ impl RateLimiter {
         }
     }
 
-    fn check_and_increment(&self) -> Result<(), String> {
+    fn check_and_increment(&self, override_limit: Option<u32>) -> Result<(), String> {
         // Use compare_exchange loop to avoid race condition.
         // The previous implementation (fetch_add + conditional fetch_sub) had a TOCTOU bug:
         // two threads could both increment, both see the overflow, and both decrement,
         // resulting in incorrect count and bypassed rate limiting.
+        let limit = match override_limit {
+            Some(l) => std::cmp::min(l, self.max_per_run),
+            None => self.max_per_run,
+        };
+
         loop {
             let current = self.kills_this_run.load(Ordering::Acquire);
-            if current >= self.max_per_run {
+            if current >= limit {
                 return Err(format!(
                     "rate limit exceeded: {} kills already performed this run (max {})",
-                    current, self.max_per_run
+                    current, limit
                 ));
             }
             // Attempt atomic increment only if value hasn't changed
@@ -604,7 +609,13 @@ impl PolicyEnforcer {
 
         // Check rate limits (only for kills)
         if action == Action::Kill {
-            if let Err(msg) = self.rate_limiter.check_and_increment() {
+            let limit = if robot_mode {
+                Some(self.robot_mode.max_kills)
+            } else {
+                None
+            };
+
+            if let Err(msg) = self.rate_limiter.check_and_increment(limit) {
                 return PolicyCheckResult::blocked(PolicyViolation {
                     kind: ViolationKind::RateLimitExceeded,
                     message: msg,
@@ -625,7 +636,7 @@ impl PolicyEnforcer {
     fn check_robot_mode_gates(
         &self,
         candidate: &ProcessCandidate,
-        action: Action,
+        _action: Action,
     ) -> Option<PolicyViolation> {
         // Robot mode must be enabled
         if !self.robot_mode.enabled {
@@ -714,22 +725,6 @@ impl PolicyEnforcer {
                         category
                     ),
                     rule: "robot_mode.allow_categories".to_string(),
-                    context: None,
-                });
-            }
-        }
-
-        // Check max kills in robot mode
-        if action == Action::Kill {
-            let current = self.rate_limiter.current_run_count();
-            if current >= self.robot_mode.max_kills {
-                return Some(PolicyViolation {
-                    kind: ViolationKind::RobotModeGate,
-                    message: format!(
-                        "robot_mode.max_kills ({}) reached",
-                        self.robot_mode.max_kills
-                    ),
-                    rule: "robot_mode.max_kills".to_string(),
                     context: None,
                 });
             }
@@ -1308,5 +1303,31 @@ mod tests {
         assert!(age.as_millis() < 1000); // Should be very recent
 
         assert!(!enforcer.should_reload(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn test_rate_limit_robot_mode() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.max_kills = 3;
+        policy.guardrails.max_kills_per_run = 10; // Global is higher
+
+        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let mut candidate = test_candidate();
+        candidate.posterior = Some(0.99); // Pass posterior gate
+
+        // 3 kills allowed
+        for i in 0..3 {
+            let result = enforcer.check_action(&candidate, Action::Kill, true);
+            assert!(result.allowed, "kill {} should be allowed", i + 1);
+        }
+
+        // 4th kill blocked by robot limit
+        let result = enforcer.check_action(&candidate, Action::Kill, true);
+        assert!(!result.allowed);
+        assert_eq!(
+            result.violation.as_ref().unwrap().kind,
+            ViolationKind::RateLimitExceeded
+        );
     }
 }
