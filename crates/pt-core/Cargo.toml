@@ -39,6 +39,7 @@ pt-common = { path = "../pt-common" }
 pt-config = { path = "../pt-config" }
 pt-math = { path = "../pt-math" }
 pt-redact = { path = "../pt-redact" }
+pt-bundle = { path = "../pt-bundle" }
 
 [features]
 default = []

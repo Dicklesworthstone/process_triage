@@ -809,3 +809,263 @@ extract_json() {
 
     BATS_TEST_COMPLETED=pass
 }
+
+#==============================================================================
+# AGENT LIST-PRIORS COMMAND TESTS
+#==============================================================================
+
+@test "Contract: agent list-priors output includes schema_version" {
+    require_jq
+    test_info "Testing: pt agent list-priors schema_version"
+
+    run "$PT_CORE" agent list-priors --standalone --format json
+
+    local json
+    json=$(extract_json "$output")
+
+    validate_schema_version "$json" "list-priors output"
+    validate_session_id "$json" "list-priors output"
+    validate_timestamp "$json" "generated_at" "list-priors output"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors has classes array" {
+    require_jq
+    test_info "Testing: list-priors classes output structure"
+
+    run "$PT_CORE" agent list-priors --standalone --format json
+
+    assert_equals "0" "$status" "list-priors should succeed"
+
+    local json
+    json=$(extract_json "$output")
+
+    # Must have classes array
+    local has_classes
+    has_classes=$(echo "$json" | jq 'has("classes")')
+    assert_equals "true" "$has_classes" "should have classes array"
+
+    # Classes should be an array
+    local is_array
+    is_array=$(echo "$json" | jq '.classes | type == "array"')
+    assert_equals "true" "$is_array" "classes should be array"
+
+    # By default should have 4 classes
+    local classes_count
+    classes_count=$(echo "$json" | jq '.classes | length')
+    assert_equals "4" "$classes_count" "should have 4 classes by default"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors classes have required Beta params" {
+    require_jq
+    test_info "Testing: list-priors class Beta parameters"
+
+    run "$PT_CORE" agent list-priors --standalone --format json
+
+    local json
+    json=$(extract_json "$output")
+
+    # Check first class (useful) has required beta params
+    local first_class
+    first_class=$(echo "$json" | jq '.classes[0]')
+
+    local class_name
+    class_name=$(echo "$first_class" | jq -r '.class')
+    test_info "Checking class: $class_name"
+
+    # Must have cpu_beta with alpha/beta
+    local has_cpu_beta
+    has_cpu_beta=$(echo "$first_class" | jq 'has("cpu_beta")')
+    assert_equals "true" "$has_cpu_beta" "should have cpu_beta"
+
+    local cpu_alpha cpu_beta
+    cpu_alpha=$(echo "$first_class" | jq '.cpu_beta.alpha')
+    cpu_beta=$(echo "$first_class" | jq '.cpu_beta.beta')
+    test_info "cpu_beta: alpha=$cpu_alpha beta=$cpu_beta"
+    [[ "$cpu_alpha" != "null" && "$cpu_beta" != "null" ]]
+
+    # Must have orphan_beta
+    local has_orphan_beta
+    has_orphan_beta=$(echo "$first_class" | jq 'has("orphan_beta")')
+    assert_equals "true" "$has_orphan_beta" "should have orphan_beta"
+
+    # Must have tty_beta
+    local has_tty_beta
+    has_tty_beta=$(echo "$first_class" | jq 'has("tty_beta")')
+    assert_equals "true" "$has_tty_beta" "should have tty_beta"
+
+    # Must have net_beta
+    local has_net_beta
+    has_net_beta=$(echo "$first_class" | jq 'has("net_beta")')
+    assert_equals "true" "$has_net_beta" "should have net_beta"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors --class filter works" {
+    require_jq
+    test_info "Testing: list-priors --class filter"
+
+    run "$PT_CORE" agent list-priors --class zombie --standalone --format json
+
+    assert_equals "0" "$status" "list-priors --class should succeed"
+
+    local json
+    json=$(extract_json "$output")
+
+    # Should have exactly 1 class
+    local classes_count
+    classes_count=$(echo "$json" | jq '.classes | length')
+    assert_equals "1" "$classes_count" "should have 1 class when filtered"
+
+    # That class should be "zombie"
+    local class_name
+    class_name=$(echo "$json" | jq -r '.classes[0].class')
+    assert_equals "zombie" "$class_name" "filtered class should be zombie"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors --class validates input" {
+    test_info "Testing: list-priors --class validation"
+
+    run "$PT_CORE" agent list-priors --class invalid_class --standalone --format json 2>&1
+
+    # Should fail with non-zero exit
+    [[ $status -ne 0 ]]
+    test_info "Invalid class exit code: $status"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors --extended adds extra sections" {
+    require_jq
+    test_info "Testing: list-priors --extended flag"
+
+    run "$PT_CORE" agent list-priors --extended --standalone --format json
+
+    assert_equals "0" "$status" "list-priors --extended should succeed"
+
+    local json
+    json=$(extract_json "$output")
+
+    # Extended mode should include bocpd section (from priors)
+    local has_bocpd
+    has_bocpd=$(echo "$json" | jq 'has("bocpd")')
+    test_info "has_bocpd: $has_bocpd"
+
+    # May also have other extended sections depending on config
+    # Just verify the basic structure is valid
+    validate_schema_version "$json"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors has source info" {
+    require_jq
+    test_info "Testing: list-priors source information"
+
+    run "$PT_CORE" agent list-priors --standalone --format json
+
+    local json
+    json=$(extract_json "$output")
+
+    # Must have source section
+    local has_source
+    has_source=$(echo "$json" | jq 'has("source")')
+    assert_equals "true" "$has_source" "should have source section"
+
+    # Source should describe where priors came from
+    local using_defaults
+    using_defaults=$(echo "$json" | jq '.source.using_defaults')
+    test_info "source.using_defaults: $using_defaults"
+    [[ "$using_defaults" == "true" || "$using_defaults" == "false" ]]
+
+    # Should have priors_schema_version
+    local schema_ver
+    schema_ver=$(echo "$json" | jq -r '.source.priors_schema_version')
+    test_info "source.priors_schema_version: $schema_ver"
+    [[ "$schema_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors exits 0 on success" {
+    test_info "Testing list-priors exit code"
+
+    run "$PT_CORE" agent list-priors --standalone --format json
+
+    assert_equals "0" "$status" "list-priors should exit 0"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors --help exits 0" {
+    test_info "Testing agent list-priors --help"
+
+    run "$PT_CORE" agent list-priors --help
+
+    assert_equals "0" "$status" "list-priors --help should exit 0"
+    assert_contains "$output" "list-priors" "should describe list-priors"
+    assert_contains "$output" "class" "should mention --class"
+    assert_contains "$output" "extended" "should mention --extended"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors --format summary works" {
+    test_info "Testing list-priors summary format"
+
+    run "$PT_CORE" agent list-priors --standalone --format summary
+
+    assert_equals "0" "$status" "list-priors summary should succeed"
+
+    # Summary should contain priors info
+    [[ -n "$output" ]]
+    test_info "Summary output: $output"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors --format md works" {
+    test_info "Testing list-priors markdown format"
+
+    run "$PT_CORE" agent list-priors --standalone --format md
+
+    assert_equals "0" "$status" "list-priors md should succeed"
+
+    # Markdown should have table structure
+    assert_contains "$output" "Parameter" "should have Parameter header"
+    assert_contains "$output" "Value" "should have Value header"
+    assert_contains "$output" "|" "should have markdown table pipes"
+
+    # Should have class section headers
+    assert_contains "$output" "## useful" "should have useful class section"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent list-priors JSON includes host_id" {
+    require_jq
+    test_info "Testing: list-priors host_id field"
+
+    run "$PT_CORE" agent list-priors --standalone --format json
+
+    local json
+    json=$(extract_json "$output")
+
+    # Must have host_id at top level
+    local has_host
+    has_host=$(echo "$json" | jq 'has("host_id")')
+    assert_equals "true" "$has_host" "should have host_id"
+
+    local host_id
+    host_id=$(echo "$json" | jq -r '.host_id')
+    [[ -n "$host_id" ]]
+    test_info "host_id: $host_id"
+
+    BATS_TEST_COMPLETED=pass
+}

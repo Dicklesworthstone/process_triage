@@ -208,11 +208,19 @@ struct BundleArgs {
 
 #[derive(Subcommand, Debug)]
 enum BundleCommands {
-    /// Create a new diagnostic bundle
+    /// Create a new diagnostic bundle from a session
     Create {
+        /// Session ID to export (default: latest)
+        #[arg(long)]
+        session: Option<String>,
+
         /// Output path for the bundle
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Export profile: minimal, safe (default), forensic
+        #[arg(long, default_value = "safe")]
+        profile: String,
 
         /// Include raw telemetry data
         #[arg(long)]
@@ -226,6 +234,10 @@ enum BundleCommands {
     Inspect {
         /// Path to the bundle file
         path: String,
+
+        /// Verify file checksums
+        #[arg(long)]
+        verify: bool,
     },
     /// Extract bundle contents
     Extract {
@@ -235,6 +247,10 @@ enum BundleCommands {
         /// Output directory
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Verify file checksums before extraction
+        #[arg(long)]
+        verify: bool,
     },
 }
 
@@ -763,9 +779,475 @@ fn run_query(global: &GlobalOpts, _args: &QueryArgs) -> ExitCode {
     ExitCode::Clean
 }
 
-fn run_bundle(global: &GlobalOpts, _args: &BundleArgs) -> ExitCode {
-    output_stub(global, "bundle", "Bundle mode not yet implemented");
+fn run_bundle(global: &GlobalOpts, args: &BundleArgs) -> ExitCode {
+    match &args.command {
+        BundleCommands::Create {
+            session,
+            output,
+            profile,
+            include_telemetry,
+            include_dumps,
+        } => run_bundle_create(global, session, output, profile, *include_telemetry, *include_dumps),
+        BundleCommands::Inspect { path, verify } => run_bundle_inspect(global, path, *verify),
+        BundleCommands::Extract { path, output, verify } => run_bundle_extract(global, path, output, *verify),
+    }
+}
+
+fn run_bundle_create(
+    global: &GlobalOpts,
+    session_arg: &Option<String>,
+    output_arg: &Option<String>,
+    profile_str: &str,
+    include_telemetry: bool,
+    _include_dumps: bool,
+) -> ExitCode {
+    use pt_bundle::{BundleWriter, FileType};
+    use pt_redact::ExportProfile;
+
+    let session_id = SessionId::new();
+    let host_id = pt_core::logging::get_host_id();
+
+    // Parse export profile
+    let export_profile = match ExportProfile::parse_str(profile_str) {
+        Some(p) => p,
+        None => {
+            let error_output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": session_id.0,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "command": "bundle create",
+                "status": "error",
+                "error": format!("Invalid profile '{}'. Valid options: minimal, safe, forensic", profile_str),
+            });
+            match global.format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+                OutputFormat::Md => eprintln!("Error: Invalid profile '{}'. Valid options: minimal, safe, forensic", profile_str),
+                OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            }
+            return ExitCode::ArgsError;
+        }
+    };
+
+    // Open session store
+    let store = match SessionStore::from_env() {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("bundle create: session store error: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    // Find session to export
+    let target_session = if let Some(raw) = session_arg {
+        match SessionId::parse(raw) {
+            Some(sid) => sid,
+            None => {
+                eprintln!("bundle create: invalid session ID '{}'", raw);
+                return ExitCode::ArgsError;
+            }
+        }
+    } else {
+        // Find latest session
+        let options = ListSessionsOptions { limit: Some(1), ..Default::default() };
+        match store.list_sessions(&options) {
+            Ok(sessions) if !sessions.is_empty() => SessionId(sessions[0].session_id.clone()),
+            Ok(_) => {
+                eprintln!("bundle create: no sessions found");
+                return ExitCode::ArgsError;
+            }
+            Err(e) => {
+                eprintln!("bundle create: failed to list sessions: {}", e);
+                return ExitCode::InternalError;
+            }
+        }
+    };
+
+    // Open the session
+    let handle = match store.open(&target_session) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("bundle create: {}", e);
+            return ExitCode::ArgsError;
+        }
+    };
+
+    // Create bundle writer
+    let mut writer = BundleWriter::new(&target_session.0, &host_id, export_profile)
+        .with_pt_version(env!("CARGO_PKG_VERSION"))
+        .with_description(format!("Export of session {}", target_session.0));
+
+    // Add manifest.json from session
+    let manifest_path = handle.manifest_path();
+    if let Ok(content) = std::fs::read(&manifest_path) {
+        writer.add_file("session/manifest.json", content, Some(FileType::Json));
+    }
+
+    // Add context.json from session
+    let context_path = handle.context_path();
+    if let Ok(content) = std::fs::read(&context_path) {
+        writer.add_file("session/context.json", content, Some(FileType::Json));
+    }
+
+    // Add plan.json if present
+    let plan_path = handle.dir.join("decision/plan.json");
+    if plan_path.exists() {
+        if let Ok(content) = std::fs::read(&plan_path) {
+            writer.add_file("plan.json", content, Some(FileType::Json));
+        }
+    }
+
+    // Add snapshot.json if present
+    let snapshot_path = handle.dir.join("scan/snapshot.json");
+    if snapshot_path.exists() {
+        if let Ok(content) = std::fs::read(&snapshot_path) {
+            writer.add_file("snapshot.json", content, Some(FileType::Json));
+        }
+    }
+
+    // Add inference results if present
+    let posteriors_path = handle.dir.join("inference/posteriors.json");
+    if posteriors_path.exists() {
+        if let Ok(content) = std::fs::read(&posteriors_path) {
+            writer.add_file("inference/posteriors.json", content, Some(FileType::Json));
+        }
+    }
+
+    // Add audit trail if present
+    let audit_path = handle.dir.join("action/outcomes.jsonl");
+    if audit_path.exists() {
+        if let Ok(content) = std::fs::read(&audit_path) {
+            writer.add_file("logs/outcomes.jsonl", content, Some(FileType::Log));
+        }
+    }
+
+    // Optionally include telemetry data
+    if include_telemetry {
+        let telemetry_dir = handle.dir.join("telemetry");
+        if telemetry_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&telemetry_dir) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.is_file() {
+                        if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                            if let Ok(content) = std::fs::read(&entry_path) {
+                                let file_type = if name.ends_with(".parquet") {
+                                    FileType::Parquet
+                                } else if name.ends_with(".jsonl") {
+                                    FileType::Log
+                                } else if name.ends_with(".json") {
+                                    FileType::Json
+                                } else {
+                                    FileType::Binary
+                                };
+                                writer.add_file(format!("telemetry/{}", name), content, Some(file_type));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Determine output path
+    let output_path = match output_arg {
+        Some(p) => PathBuf::from(p),
+        None => {
+            // Default: <session_id>.ptb in current directory
+            PathBuf::from(format!("{}.ptb", target_session.0))
+        }
+    };
+
+    // Write the bundle
+    match writer.write(&output_path) {
+        Ok(manifest) => {
+            let output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": session_id.0,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "command": "bundle create",
+                "status": "ok",
+                "bundle": {
+                    "path": output_path.display().to_string(),
+                    "source_session": target_session.0,
+                    "profile": format!("{}", export_profile),
+                    "files": manifest.file_count(),
+                    "total_bytes": manifest.total_bytes(),
+                },
+            });
+            match global.format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
+                OutputFormat::Md => println!("Bundle created: {} ({} files, {} bytes)",
+                    output_path.display(), manifest.file_count(), manifest.total_bytes()),
+                OutputFormat::Jsonl => println!("{}", serde_json::to_string(&output).unwrap()),
+            }
+            ExitCode::Clean
+        }
+        Err(e) => {
+            let error_output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": session_id.0,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "command": "bundle create",
+                "status": "error",
+                "error": e.to_string(),
+            });
+            match global.format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+                OutputFormat::Md => eprintln!("Error creating bundle: {}", e),
+                OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            }
+            ExitCode::InternalError
+        }
+    }
+}
+
+fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode {
+    use pt_bundle::BundleReader;
+
+    let session_id = SessionId::new();
+    let bundle_path = std::path::Path::new(path);
+
+    if !bundle_path.exists() {
+        let error_output = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id.0,
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "command": "bundle inspect",
+            "status": "error",
+            "error": format!("Bundle not found: {}", path),
+        });
+        match global.format {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+            OutputFormat::Md => eprintln!("Error: Bundle not found: {}", path),
+            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+        }
+        return ExitCode::ArgsError;
+    }
+
+    let mut reader = match BundleReader::open(bundle_path) {
+        Ok(r) => r,
+        Err(e) => {
+            let error_output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": session_id.0,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "command": "bundle inspect",
+                "status": "error",
+                "error": format!("Failed to open bundle: {}", e),
+            });
+            match global.format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+                OutputFormat::Md => eprintln!("Error: Failed to open bundle: {}", e),
+                OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            }
+            return ExitCode::InternalError;
+        }
+    };
+
+    let manifest = reader.manifest();
+    let files: Vec<_> = manifest.files.iter().map(|f| {
+        serde_json::json!({
+            "path": f.path,
+            "bytes": f.bytes,
+            "sha256": f.sha256,
+            "mime_type": f.mime_type,
+        })
+    }).collect();
+
+    // Optionally verify all files
+    let verification = if verify {
+        let failures = reader.verify_all();
+        Some(serde_json::json!({
+            "verified": failures.is_empty(),
+            "failures": failures,
+        }))
+    } else {
+        None
+    };
+
+    let output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id.0,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "bundle inspect",
+        "status": "ok",
+        "bundle": {
+            "path": path,
+            "bundle_version": manifest.bundle_version,
+            "source_session": manifest.session_id,
+            "host_id": manifest.host_id,
+            "created_at": manifest.created_at,
+            "export_profile": format!("{}", manifest.export_profile),
+            "pt_version": manifest.pt_version,
+            "description": manifest.description,
+            "file_count": manifest.file_count(),
+            "total_bytes": manifest.total_bytes(),
+        },
+        "files": files,
+        "verification": verification,
+    });
+
+    match global.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
+        OutputFormat::Md => {
+            println!("Bundle: {}", path);
+            println!("  Session: {}", manifest.session_id);
+            println!("  Created: {}", manifest.created_at);
+            println!("  Profile: {}", manifest.export_profile);
+            println!("  Files: {} ({} bytes)", manifest.file_count(), manifest.total_bytes());
+            if verify {
+                let failures = reader.verify_all();
+                if failures.is_empty() {
+                    println!("  Verification: PASSED");
+                } else {
+                    println!("  Verification: FAILED ({} files)", failures.len());
+                }
+            }
+        }
+        OutputFormat::Jsonl => println!("{}", serde_json::to_string(&output).unwrap()),
+    }
+
     ExitCode::Clean
+}
+
+fn run_bundle_extract(global: &GlobalOpts, path: &str, output_arg: &Option<String>, verify: bool) -> ExitCode {
+    use pt_bundle::BundleReader;
+
+    let session_id = SessionId::new();
+    let bundle_path = std::path::Path::new(path);
+
+    if !bundle_path.exists() {
+        let error_output = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id.0,
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "command": "bundle extract",
+            "status": "error",
+            "error": format!("Bundle not found: {}", path),
+        });
+        match global.format {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+            OutputFormat::Md => eprintln!("Error: Bundle not found: {}", path),
+            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+        }
+        return ExitCode::ArgsError;
+    }
+
+    let mut reader = match BundleReader::open(bundle_path) {
+        Ok(r) => r,
+        Err(e) => {
+            let error_output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "session_id": session_id.0,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "command": "bundle extract",
+                "status": "error",
+                "error": format!("Failed to open bundle: {}", e),
+            });
+            match global.format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+                OutputFormat::Md => eprintln!("Error: Failed to open bundle: {}", e),
+                OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            }
+            return ExitCode::InternalError;
+        }
+    };
+
+    // Determine output directory
+    let output_dir = match output_arg {
+        Some(p) => PathBuf::from(p),
+        None => {
+            // Default: use session ID from manifest
+            PathBuf::from(reader.session_id())
+        }
+    };
+
+    // Create output directory
+    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        let error_output = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id.0,
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "command": "bundle extract",
+            "status": "error",
+            "error": format!("Failed to create output directory: {}", e),
+        });
+        match global.format {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+            OutputFormat::Md => eprintln!("Error: Failed to create output directory: {}", e),
+            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+        }
+        return ExitCode::InternalError;
+    }
+
+    // Get list of files to extract
+    let file_paths: Vec<String> = reader.files().iter().map(|f| f.path.clone()).collect();
+    let mut extracted = 0;
+    let mut errors = Vec::new();
+
+    for file_path in &file_paths {
+        // Read file (with or without verification)
+        let data = if verify {
+            reader.read_verified(file_path)
+        } else {
+            reader.read_raw(file_path)
+        };
+
+        match data {
+            Ok(content) => {
+                let dest_path = output_dir.join(file_path);
+                // Create parent directories
+                if let Some(parent) = dest_path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        errors.push(format!("{}: {}", file_path, e));
+                        continue;
+                    }
+                }
+                // Write file
+                if let Err(e) = std::fs::write(&dest_path, content) {
+                    errors.push(format!("{}: {}", file_path, e));
+                } else {
+                    extracted += 1;
+                }
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", file_path, e));
+            }
+        }
+    }
+
+    let status = if errors.is_empty() { "ok" } else { "partial" };
+    let output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id.0,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "bundle extract",
+        "status": status,
+        "output_dir": output_dir.display().to_string(),
+        "extracted": extracted,
+        "total": file_paths.len(),
+        "errors": errors,
+    });
+
+    match global.format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
+        OutputFormat::Md => {
+            println!("Extracted {} of {} files to {}", extracted, file_paths.len(), output_dir.display());
+            if !errors.is_empty() {
+                eprintln!("Errors:");
+                for e in &errors {
+                    eprintln!("  {}", e);
+                }
+            }
+        }
+        OutputFormat::Jsonl => println!("{}", serde_json::to_string(&output).unwrap()),
+    }
+
+    if errors.is_empty() {
+        ExitCode::Clean
+    } else {
+        ExitCode::InternalError
+    }
 }
 
 fn run_report(global: &GlobalOpts, _args: &ReportArgs) -> ExitCode {

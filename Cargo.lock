@@ -1437,6 +1437,7 @@ dependencies = [
  "libc",
  "predicates",
  "proptest",
+ "pt-bundle",
  "pt-common",
  "pt-config",
  "pt-math",
