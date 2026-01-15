@@ -48,3 +48,4 @@ test-tempdir = []   # Enable tempdir helper in test utilities
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+regex = "1"

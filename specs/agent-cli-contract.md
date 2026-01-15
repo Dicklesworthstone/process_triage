@@ -185,7 +185,7 @@ The candidate object is the core data structure returned by `plan` and `explain`
 ```json
 {
   "pid": 45678,
-  "start_id": "45678:1736942820",
+  "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:1736942820:45678",
   "uid": 1000,
   "user": "developer",
   "cmd_short": "node",
@@ -274,7 +274,7 @@ When `--compact` is specified, optional fields are omitted:
 ```json
 {
   "pid": 45678,
-  "start_id": "45678:1736942820",
+  "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:1736942820:45678",
   "uid": 1000,
   "cmd_short": "node",
   "classification": "abandoned",
@@ -296,7 +296,7 @@ These fields MUST be present in every candidate, regardless of `--compact`:
 | Field | Type | Description |
 |-------|------|-------------|
 | `pid` | int | Process ID |
-| `start_id` | string | Stable identity: `pid:start_time_epoch` |
+| `start_id` | string | Stable identity: `<boot_id>:<start_time>:<pid>` |
 | `uid` | int | User ID |
 | `cmd_short` | string | Short command name (first 32 chars) |
 | `classification` | enum | `useful`, `useful_bad`, `abandoned`, `zombie` |
@@ -564,7 +564,7 @@ When `--galaxy-brain` is specified, the `galaxy_brain` field contains:
     "applied": [
       {
         "pid": 45678,
-        "start_id": "45678:1736942820",
+        "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:1736942820:45678",
         "action": "kill",
         "signal": "SIGTERM",
         "result": "success",
@@ -577,7 +577,7 @@ When `--galaxy-brain` is specified, the `galaxy_brain` field contains:
       },
       {
         "pid": 45679,
-        "start_id": "45679:1736942825",
+        "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:1736942825:45679",
         "action": "kill",
         "signal": "SIGTERM",
         "result": "success",
@@ -623,7 +623,7 @@ When `--galaxy-brain` is specified, the `galaxy_brain` field contains:
     "outcomes": [
       {
         "pid": 45678,
-        "start_id": "45678:1736942820",
+        "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:1736942820:45678",
         "action": "kill",
         "outcome": "confirmed_gone",
         "side_effects": [],
@@ -631,7 +631,7 @@ When `--galaxy-brain` is specified, the `galaxy_brain` field contains:
       },
       {
         "pid": 45679,
-        "start_id": "45679:1736942825",
+        "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:1736942825:45679",
         "action": "kill",
         "outcome": "confirmed_gone",
         "side_effects": [],
@@ -778,7 +778,7 @@ def select_pretoggled(candidates, policy, fdr_alpha):
   "pre_toggled": {
     "action": "kill",
     "pids": [45678, 45679, 45680],
-    "start_ids": ["45678:1736942820", "45679:1736942825", "45680:1736942830"],
+    "start_ids": ["9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:1736942820:45678", "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:1736942825:45679", "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:1736942830:45680"],
     "rationale": "3 candidates pass FDR gate (α=0.05) with avg lfdr=0.02",
     "gates_applied": ["fdr_control", "max_kills", "protected_patterns"],
     "excluded_by_gates": [

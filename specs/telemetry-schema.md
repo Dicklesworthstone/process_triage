@@ -134,7 +134,7 @@ Raw per-process measurements from each scan.
 | `uid` | `INT32` | No | Owner UID |
 | `euid` | `INT32` | Yes | Effective UID |
 | `start_time_boot` | `INT64` | No | Start time in clock ticks since boot |
-| `start_id` | `STRING` | No | Stable identity: `<boot_id>:<start_time>` |
+| `start_id` | `STRING` | No | Stable identity: `<boot_id>:<start_time>:<pid>` |
 | `age_s` | `INT64` | No | Process age in seconds |
 | `cmd` | `STRING` | No | Command name (comm) |
 | `cmdline` | `STRING` | Yes | Full command line (may be redacted) |

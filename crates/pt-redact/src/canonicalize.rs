@@ -56,6 +56,11 @@ static RE_URL_CRED: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"://[^:/@]+:[^@]+@").unwrap()
 });
 
+static RE_URL_PORT: Lazy<Regex> = Lazy::new(|| {
+    // Port numbers in URLs (2-5 digits followed by / or end)
+    Regex::new(r":(\d{2,5})(/|$)").unwrap()
+});
+
 static RE_MULTIPLE_SPACES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
 impl Canonicalizer {
@@ -186,8 +191,7 @@ impl Canonicalizer {
         result = RE_URL_CRED.replace_all(&result, "://[CRED]@").to_string();
 
         // Normalize port numbers in URLs
-        let re_url_port = Regex::new(r":(\d{2,5})(/|$)").unwrap();
-        result = re_url_port.replace_all(&result, ":[PORT]$2").to_string();
+        result = RE_URL_PORT.replace_all(&result, ":[PORT]$2").to_string();
 
         // Lowercase everything except placeholders
         let mut lowered = String::with_capacity(result.len());
