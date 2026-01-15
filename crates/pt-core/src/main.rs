@@ -303,6 +303,9 @@ enum AgentCommands {
 
     /// List and manage sessions
     Sessions(AgentSessionsArgs),
+
+    /// List current prior configuration
+    ListPriors(AgentListPriorsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -428,6 +431,17 @@ struct AgentSessionsArgs {
     /// Remove sessions older than duration (e.g., "7d", "30d")
     #[arg(long, default_value = "7d")]
     older_than: String,
+}
+
+#[derive(Args, Debug)]
+struct AgentListPriorsArgs {
+    /// Filter by class (useful, useful_bad, abandoned, zombie)
+    #[arg(long)]
+    class: Option<String>,
+
+    /// Include all hyperparameters (verbose output)
+    #[arg(long, short = 'v')]
+    verbose: bool,
 }
 
 #[derive(Args, Debug)]
@@ -895,6 +909,7 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
         AgentCommands::Verify(args) => run_agent_verify(global, args),
         AgentCommands::Diff(args) => run_agent_diff(global, args),
         AgentCommands::Sessions(args) => run_agent_sessions(global, args),
+        AgentCommands::ListPriors(args) => run_agent_list_priors(global, args),
         AgentCommands::Capabilities => {
             output_capabilities(global);
             ExitCode::Clean
@@ -1957,7 +1972,15 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
                             let bf_val = bf.get("bf").and_then(|v| v.as_f64()).unwrap_or(0.0);
                             let dir = bf.get("direction").and_then(|v| v.as_str()).unwrap_or("?");
                             let strength = bf.get("strength").and_then(|v| v.as_str()).unwrap_or("?");
-                            println!("| {} | {:.2} | {} | {} |", feat, bf_val, dir, strength);
+                            // Format BF: use scientific notation for extreme values
+                            let bf_str = if bf_val.is_infinite() || bf_val > 1e6 {
+                                format!("{:.2e}", bf_val)
+                            } else if bf_val < 1e-6 && bf_val > 0.0 {
+                                format!("{:.2e}", bf_val)
+                            } else {
+                                format!("{:.2}", bf_val)
+                            };
+                            println!("| {} | {} | {} | {} |", feat, bf_str, dir, strength);
                         }
                         println!();
                     }
@@ -2163,6 +2186,165 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         }
     }
     output_stub_with_session(global, &base, "agent diff", "Agent diff mode not yet implemented");
+    ExitCode::Clean
+}
+
+fn run_agent_list_priors(global: &GlobalOpts, args: &AgentListPriorsArgs) -> ExitCode {
+    let session_id = SessionId::new();
+    let host_id = pt_core::logging::get_host_id();
+
+    // Build config options from global opts
+    let options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        priors_path: None,
+        policy_path: None,
+    };
+
+    // Load configuration
+    let config = match load_config(&options) {
+        Ok(c) => c,
+        Err(e) => {
+            return output_config_error(global, &e);
+        }
+    };
+
+    let snapshot = config.snapshot();
+    let priors = &config.priors;
+
+    // Validate class filter if provided
+    let valid_classes = ["useful", "useful_bad", "abandoned", "zombie"];
+    if let Some(ref class_filter) = args.class {
+        if !valid_classes.contains(&class_filter.as_str()) {
+            eprintln!(
+                "agent list-priors: invalid --class '{}'. Must be one of: {}",
+                class_filter,
+                valid_classes.join(", ")
+            );
+            return ExitCode::ArgsError;
+        }
+    }
+
+    // Helper to build class prior JSON
+    let build_class_json = |name: &str, cp: &pt_core::config::priors::ClassPriors| -> serde_json::Value {
+        let mut obj = serde_json::json!({
+            "prior_prob": cp.prior_prob,
+            "cpu_beta": { "alpha": cp.cpu_beta.alpha, "beta": cp.cpu_beta.beta },
+            "orphan_beta": { "alpha": cp.orphan_beta.alpha, "beta": cp.orphan_beta.beta },
+            "tty_beta": { "alpha": cp.tty_beta.alpha, "beta": cp.tty_beta.beta },
+            "net_beta": { "alpha": cp.net_beta.alpha, "beta": cp.net_beta.beta },
+        });
+        if let Some(ref io) = cp.io_active_beta {
+            obj["io_active_beta"] = serde_json::json!({ "alpha": io.alpha, "beta": io.beta });
+        }
+        if let Some(ref rt) = cp.runtime_gamma {
+            obj["runtime_gamma"] = serde_json::json!({ "shape": rt.shape, "rate": rt.rate });
+        }
+        if let Some(ref hz) = cp.hazard_gamma {
+            obj["hazard_gamma"] = serde_json::json!({ "shape": hz.shape, "rate": hz.rate });
+        }
+        obj["class"] = serde_json::Value::String(name.to_string());
+        obj
+    };
+
+    // Build classes array (filtered or all)
+    let classes_data: Vec<serde_json::Value> = match args.class.as_deref() {
+        Some("useful") => vec![build_class_json("useful", &priors.classes.useful)],
+        Some("useful_bad") => vec![build_class_json("useful_bad", &priors.classes.useful_bad)],
+        Some("abandoned") => vec![build_class_json("abandoned", &priors.classes.abandoned)],
+        Some("zombie") => vec![build_class_json("zombie", &priors.classes.zombie)],
+        _ => vec![
+            build_class_json("useful", &priors.classes.useful),
+            build_class_json("useful_bad", &priors.classes.useful_bad),
+            build_class_json("abandoned", &priors.classes.abandoned),
+            build_class_json("zombie", &priors.classes.zombie),
+        ],
+    };
+
+    // Build response
+    let mut response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id.0,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "host_id": host_id,
+        "source": {
+            "path": snapshot.priors_path.as_ref().map(|p| p.display().to_string()),
+            "using_defaults": snapshot.priors_path.is_none(),
+            "priors_schema_version": &snapshot.priors_schema_version,
+        },
+        "classes": classes_data,
+    });
+
+    // Add extended sections in verbose mode
+    if args.verbose {
+        if !priors.hazard_regimes.is_empty() {
+            response["hazard_regimes"] = serde_json::to_value(&priors.hazard_regimes).unwrap_or_default();
+        }
+        if let Some(ref sm) = priors.semi_markov {
+            response["semi_markov"] = serde_json::to_value(sm).unwrap_or_default();
+        }
+        if let Some(ref cp) = priors.change_point {
+            response["change_point"] = serde_json::to_value(cp).unwrap_or_default();
+        }
+        if let Some(ref ci) = priors.causal_interventions {
+            response["causal_interventions"] = serde_json::to_value(ci).unwrap_or_default();
+        }
+        if let Some(ref hier) = priors.hierarchical {
+            response["hierarchical"] = serde_json::to_value(hier).unwrap_or_default();
+        }
+        if let Some(ref rb) = priors.robust_bayes {
+            response["robust_bayes"] = serde_json::to_value(rb).unwrap_or_default();
+        }
+        if let Some(ref er) = priors.error_rate {
+            response["error_rate"] = serde_json::to_value(er).unwrap_or_default();
+        }
+        if let Some(ref bocpd) = priors.bocpd {
+            response["bocpd"] = serde_json::to_value(bocpd).unwrap_or_default();
+        }
+    }
+
+    match global.format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        }
+        OutputFormat::Summary => {
+            let source = if snapshot.priors_path.is_some() { "custom" } else { "defaults" };
+            println!("[{}] priors: {} class(es) from {}", session_id, classes_data.len(), source);
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# Prior Configuration\n");
+            if let Some(ref path) = snapshot.priors_path {
+                println!("Source: {}", path.display());
+            } else {
+                println!("Source: **built-in defaults** (no priors.json found)");
+            }
+            println!("Schema version: {}\n", snapshot.priors_schema_version);
+
+            for class_json in &classes_data {
+                let class_name = class_json["class"].as_str().unwrap_or("?");
+                let prior_prob = class_json["prior_prob"].as_f64().unwrap_or(0.0);
+                println!("## {}\n", class_name);
+                println!("| Parameter | Value |");
+                println!("|-----------|-------|");
+                println!("| prior_prob | {:.4} |", prior_prob);
+                if let Some(cpu) = class_json.get("cpu_beta") {
+                    println!("| cpu_beta | α={:.2}, β={:.2} |", cpu["alpha"].as_f64().unwrap_or(0.0), cpu["beta"].as_f64().unwrap_or(0.0));
+                }
+                if let Some(orphan) = class_json.get("orphan_beta") {
+                    println!("| orphan_beta | α={:.2}, β={:.2} |", orphan["alpha"].as_f64().unwrap_or(0.0), orphan["beta"].as_f64().unwrap_or(0.0));
+                }
+                if let Some(tty) = class_json.get("tty_beta") {
+                    println!("| tty_beta | α={:.2}, β={:.2} |", tty["alpha"].as_f64().unwrap_or(0.0), tty["beta"].as_f64().unwrap_or(0.0));
+                }
+                if let Some(net) = class_json.get("net_beta") {
+                    println!("| net_beta | α={:.2}, β={:.2} |", net["alpha"].as_f64().unwrap_or(0.0), net["beta"].as_f64().unwrap_or(0.0));
+                }
+                println!();
+            }
+            println!("Session: {}", session_id);
+        }
+    }
+
     ExitCode::Clean
 }
 
