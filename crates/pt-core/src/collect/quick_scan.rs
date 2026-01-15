@@ -72,13 +72,13 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     let mut cmd = build_ps_command(&platform, options)?;
 
     // Execute and capture output
-    let output = cmd
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| QuickScanError::CommandFailed(e.to_string()))?;
 
-    let stdout = output.stdout.ok_or_else(|| {
+    let stdout = child.stdout.take().ok_or_else(|| {
         QuickScanError::CommandFailed("Failed to capture stdout".to_string())
     })?;
 
@@ -108,17 +108,21 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         }
     }
 
+    // Wait for child process to avoid leaving zombies
+    let _ = child.wait();
+
     let duration = start.elapsed();
+    let process_count = processes.len();
 
     Ok(ScanResult {
-        processes: processes.clone(),
+        processes,
         metadata: ScanMetadata {
             scan_type: "quick".to_string(),
             platform,
             boot_id,
             started_at: chrono::Utc::now().to_rfc3339(),
             duration_ms: duration.as_millis() as u64,
-            process_count: processes.len(),
+            process_count,
             warnings,
         },
     })
@@ -243,8 +247,8 @@ fn parse_ps_line(
     // macOS: "Tue Jan 14 10:30:00 2026"
     let (start_time_unix, elapsed) = parse_timing_fields(platform, &fields)?;
 
-    // Comm is field 13 (0-indexed: 13)
-    let comm_idx = if platform == "linux" { 13 } else { 13 };
+    // Comm is field 13 (0-indexed: 13) - same index for both Linux and macOS
+    let comm_idx = 13;
     let comm = fields.get(comm_idx).unwrap_or(&"").to_string();
 
     // Args/cmd is everything after comm (field 14+)

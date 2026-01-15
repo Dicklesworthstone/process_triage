@@ -25,10 +25,15 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "1"
 dirs = "5"
 
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
 # Internal crates
 pt-common = { path = "../pt-common" }
 pt-config = { path = "../pt-config" }
 pt-math = { path = "../pt-math" }
+pt-redact = { path = "../pt-redact" }
 
 [features]
 default = []
