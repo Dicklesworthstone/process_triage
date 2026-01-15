@@ -235,11 +235,11 @@ impl Policy {
             ))
         })?;
 
-        Self::from_str(&content)
+        Self::parse_json(&content)
     }
 
     /// Parse policy from a JSON string.
-    pub fn from_str(json: &str) -> Result<Self, crate::validate::ValidationError> {
+    pub fn parse_json(json: &str) -> Result<Self, crate::validate::ValidationError> {
         serde_json::from_str(json).map_err(|e| {
             crate::validate::ValidationError::ParseError(format!("Invalid JSON: {}", e))
         })
@@ -334,7 +334,7 @@ mod tests {
             }
         }"#;
 
-        let policy = Policy::from_str(json).unwrap();
+        let policy = Policy::parse_json(json).unwrap();
         assert_eq!(policy.schema_version, "1.0.0");
         assert!(!policy.is_robot_enabled());
         assert_eq!(policy.loss("useful", "kill"), Some(100.0));
@@ -378,7 +378,7 @@ mod tests {
             }
         }"#;
 
-        let policy = Policy::from_str(json).unwrap();
+        let policy = Policy::parse_json(json).unwrap();
         assert!(policy.is_protected("/usr/lib/systemd/systemd-logind"));
         assert!(!policy.is_protected("python my_script.py"));
     }

@@ -332,11 +332,11 @@ impl Priors {
             ))
         })?;
 
-        Self::from_str(&content)
+        Self::parse_json(&content)
     }
 
     /// Parse priors from a JSON string.
-    pub fn from_str(json: &str) -> Result<Self, crate::validate::ValidationError> {
+    pub fn parse_json(json: &str) -> Result<Self, crate::validate::ValidationError> {
         serde_json::from_str(json).map_err(|e| {
             crate::validate::ValidationError::ParseError(format!("Invalid JSON: {}", e))
         })
@@ -404,7 +404,7 @@ mod tests {
             }
         }"#;
 
-        let priors = Priors::from_str(json).unwrap();
+        let priors = Priors::parse_json(json).unwrap();
         assert_eq!(priors.schema_version, "1.0.0");
         assert!((priors.classes.useful.prior_prob - 0.7).abs() < 0.001);
         assert!(priors.priors_sum_to_one(0.01));

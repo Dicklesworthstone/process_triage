@@ -229,7 +229,7 @@ impl BatchedWriter {
             .join(format!("host_id={}", &self.config.host_id));
 
         // File name: <table>_<timestamp>_<session_suffix>.parquet
-        let session_suffix = self.config.session_id.split('-').last().unwrap_or("xxxx");
+        let session_suffix = self.config.session_id.split('-').next_back().unwrap_or("xxxx");
 
         let filename = format!("{}_{}.parquet", self.table.as_str(), session_suffix,);
 

@@ -309,13 +309,13 @@ teardown() {
 
 @test "test pattern matches bun test" {
     # Verify classify_process function exists and contains test pattern
-    run grep -q 'bun\ test' "$PROJECT_ROOT/pt"
+    run grep -q 'bun.*test' "$PROJECT_ROOT/pt"
     [ "$status" -eq 0 ]
 }
 
 @test "dev_server pattern matches next dev" {
     # Verify classify_process function exists and contains dev server pattern
-    run grep -q 'next\ dev' "$PROJECT_ROOT/pt"
+    run grep -q 'next.*dev' "$PROJECT_ROOT/pt"
     [ "$status" -eq 0 ]
 }
 

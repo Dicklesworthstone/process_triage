@@ -7,8 +7,14 @@ use serde_json::{Map, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const LOG_DIR_NAME: &str = "test-logs";
+
+fn log_lock() -> &'static Mutex<()> {
+    static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOG_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn target_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
@@ -28,6 +34,7 @@ fn log_file_path() -> PathBuf {
 }
 
 fn write_log_line(line: &str) {
+    let _guard = log_lock().lock().unwrap_or_else(|err| err.into_inner());
     let path = log_file_path();
     if let Some(parent) = path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {

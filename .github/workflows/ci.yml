@@ -8,6 +8,53 @@ on:
   workflow_dispatch:
 
 jobs:
+  version-check:
+    name: Version Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check VERSION file exists
+        run: |
+          if [[ ! -f VERSION ]]; then
+            echo "::error::VERSION file not found"
+            exit 1
+          fi
+
+      - name: Verify version consistency
+        run: |
+          file_version=$(cat VERSION | tr -d '\n')
+          script_version=$(grep 'readonly VERSION=' pt | head -1 | sed 's/.*VERSION="\([^"]*\)".*/\1/')
+
+          echo "VERSION file: $file_version"
+          echo "pt script:    $script_version"
+
+          if [[ "$file_version" != "$script_version" ]]; then
+            echo ""
+            echo "::error::Version mismatch!"
+            echo "VERSION file contains: $file_version"
+            echo "pt script contains:    $script_version"
+            echo ""
+            echo "Please update both to match."
+            exit 1
+          fi
+
+          echo "✓ Versions match: $file_version"
+
+      - name: Validate version format
+        run: |
+          version=$(cat VERSION | tr -d '\n')
+
+          # Check semver format (X.Y.Z)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version format: $version"
+            echo "Expected: X.Y.Z (e.g., 1.2.3)"
+            exit 1
+          fi
+
+          echo "✓ Version format valid: $version"
+
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest

@@ -15,9 +15,10 @@
 
 use super::cgroup::collect_cgroup_details;
 use super::cpu_capacity::{compute_cpu_capacity, CpuCapacity};
+use pt_common::{IdentityQuality, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// System clock ticks per second.
 /// On Linux, typically 100 (USER_HZ).
@@ -39,11 +40,77 @@ pub fn clk_tck() -> u64 {
     100 // Fallback for non-Unix
 }
 
+#[cfg(target_os = "linux")]
+fn read_boot_id() -> Option<String> {
+    static BOOT_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .clone()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_boot_id() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_uid(pid: u32) -> Option<u32> {
+    let path = format!("/proc/{}/status", pid);
+    let content = fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            let mut parts = rest.split_whitespace();
+            if let Some(uid_str) = parts.next() {
+                return uid_str.parse::<u32>().ok();
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_uid(_pid: u32) -> Option<u32> {
+    None
+}
+
+fn system_time_to_unix_us(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_micros() as u64)
+}
+
+fn build_identity(pid: u32, starttime: u64) -> ProcessIdentity {
+    let boot_id = read_boot_id();
+    let uid = read_uid(pid);
+    let uid_known = uid.is_some();
+    let uid = uid.unwrap_or(0);
+    let boot = boot_id.as_deref().unwrap_or("unknown");
+    #[cfg(target_os = "linux")]
+    let start_id = StartId::from_linux(boot, starttime, pid);
+    #[cfg(not(target_os = "linux"))]
+    let start_id = StartId::from_macos(boot, starttime, pid);
+
+    let mut identity = ProcessIdentity::new(pid, start_id, uid);
+    identity.quality = match (boot_id.is_some(), uid_known) {
+        (true, true) => IdentityQuality::Full,
+        (false, true) => IdentityQuality::NoBootId,
+        _ => IdentityQuality::PidOnly,
+    };
+    identity
+}
+
 /// Raw tick data from /proc/[pid]/stat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TickSnapshot {
     /// Process ID.
     pub pid: u32,
+
+    /// Process identity tuple (pid, start_id, uid).
+    pub identity: ProcessIdentity,
 
     /// User time in clock ticks.
     pub utime: u64,
@@ -85,6 +152,9 @@ pub struct TickDeltaFeatures {
     /// Sample window duration in seconds.
     pub delta_t_secs: f64,
 
+    /// Process identity tuple for the sample window.
+    pub identity: ProcessIdentity,
+
     /// CPU capacity information.
     pub cpu_capacity: CpuCapacity,
 
@@ -109,6 +179,24 @@ pub struct TickDeltaProvenance {
 
     /// n_eff correction policy applied.
     pub n_eff_policy: NEffPolicy,
+
+    /// Optional parameter for n_eff policy (e.g., reduction factor).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n_eff_param: Option<f64>,
+
+    /// Sample start timestamp in Unix microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_start_unix_us: Option<u64>,
+
+    /// Sample end timestamp in Unix microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_end_unix_us: Option<u64>,
+
+    /// Source of tick counts (k_ticks).
+    pub tick_source: String,
+
+    /// Source of thread count.
+    pub thread_source: String,
 
     /// Any warnings during computation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -196,9 +284,11 @@ pub fn parse_tick_snapshot(
     let stime: u64 = fields[12].parse().ok()?;
     let num_threads: u32 = fields[17].parse().ok()?;
     let starttime: u64 = fields[19].parse().ok()?;
+    let identity = build_identity(pid, starttime);
 
     Some(TickSnapshot {
         pid,
+        identity,
         utime,
         stime,
         total_ticks: utime + stime,
@@ -222,8 +312,8 @@ pub fn compute_tick_delta(
     after: &TickSnapshot,
     config: &TickDeltaConfig,
 ) -> Option<TickDeltaFeatures> {
-    // Validate same process (starttime should match)
-    if before.starttime != after.starttime {
+    // Validate same process identity (PID reuse protection)
+    if before.identity != after.identity {
         return None;
     }
 
@@ -284,13 +374,31 @@ pub fn compute_tick_delta(
         }
     };
 
+    let mut warnings = Vec::new();
+    if after.identity.quality != IdentityQuality::Full {
+        warnings.push(format!(
+            "identity quality is {}",
+            after.identity.quality
+        ));
+    }
+
+    let n_eff_param = match config.n_eff_policy {
+        NEffPolicy::FixedReduction => Some(config.reduction_factor),
+        _ => None,
+    };
+
     let provenance = TickDeltaProvenance {
         clk_tck: tck,
         threads: after.num_threads,
         n_eff_cores,
         budget_constraint,
         n_eff_policy: config.n_eff_policy,
-        warnings: Vec::new(),
+        n_eff_param,
+        sample_start_unix_us: system_time_to_unix_us(before.timestamp),
+        sample_end_unix_us: system_time_to_unix_us(after.timestamp),
+        tick_source: "proc_stat:utime+stime".to_string(),
+        thread_source: "proc_stat:num_threads".to_string(),
+        warnings,
     };
 
     Some(TickDeltaFeatures {
@@ -300,6 +408,7 @@ pub fn compute_tick_delta(
         u_cores,
         n_eff,
         delta_t_secs,
+        identity: after.identity.clone(),
         cpu_capacity,
         provenance,
     })
@@ -328,6 +437,13 @@ pub fn sample_tick_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_identity(pid: u32, starttime: u64) -> ProcessIdentity {
+        let mut identity =
+            ProcessIdentity::new(pid, StartId::from_linux("test-boot", starttime, pid), 1000);
+        identity.quality = IdentityQuality::Full;
+        identity
+    }
 
     #[test]
     fn test_clk_tck() {
@@ -381,6 +497,7 @@ mod tests {
     fn test_compute_tick_delta_basic() {
         let before = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 12345),
             utime: 100,
             stime: 50,
             total_ticks: 150,
@@ -391,6 +508,7 @@ mod tests {
 
         let after = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 12345),
             utime: 200,
             stime: 100,
             total_ticks: 300,
@@ -412,6 +530,7 @@ mod tests {
     fn test_compute_tick_delta_different_starttime() {
         let before = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 12345),
             utime: 100,
             stime: 50,
             total_ticks: 150,
@@ -422,6 +541,7 @@ mod tests {
 
         let after = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 99999),
             utime: 200,
             stime: 100,
             total_ticks: 300,
@@ -440,6 +560,7 @@ mod tests {
         // Create a scenario where k_ticks > n_ticks (shouldn't happen in reality)
         let before = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 12345),
             utime: 0,
             stime: 0,
             total_ticks: 0,
@@ -451,6 +572,7 @@ mod tests {
         // Very high tick consumption for short window
         let after = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 12345),
             utime: 10000,
             stime: 10000,
             total_ticks: 20000,
@@ -472,6 +594,7 @@ mod tests {
     fn test_n_eff_policies() {
         let before = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 12345),
             utime: 100,
             stime: 50,
             total_ticks: 150,
@@ -482,6 +605,7 @@ mod tests {
 
         let after = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 12345),
             utime: 200,
             stime: 100,
             total_ticks: 300,
@@ -513,6 +637,7 @@ mod tests {
         // When threads < N_eff_cores, threads should be the constraint
         let before = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 12345),
             utime: 100,
             stime: 50,
             total_ticks: 150,
@@ -523,6 +648,7 @@ mod tests {
 
         let after = TickSnapshot {
             pid: 1234,
+            identity: test_identity(1234, 12345),
             utime: 200,
             stime: 100,
             total_ticks: 300,
