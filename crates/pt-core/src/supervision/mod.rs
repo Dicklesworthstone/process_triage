@@ -47,6 +47,9 @@ mod environ;
 mod ipc;
 mod nohup;
 mod orphan;
+mod signature;
+#[cfg(test)]
+mod supervision_tests;
 mod types;
 
 pub use ancestry::{
@@ -68,6 +71,10 @@ pub use nohup::{
 pub use orphan::{
     detect_container, detect_unexpected_reparenting, is_orphaned, NohupSummary, OrphanAnalyzer,
     OrphanError, OrphanResult, ReparentingReason, SupervisionSummary,
+};
+pub use signature::{
+    SignatureDatabase, SignatureError, SignatureMetadata, SignaturePatterns, SignatureSchema,
+    SupervisorSignature, SCHEMA_VERSION,
 };
 pub use types::{
     AncestryEntry, EvidenceType, SupervisionEvidence, SupervisionResult, SupervisorCategory,

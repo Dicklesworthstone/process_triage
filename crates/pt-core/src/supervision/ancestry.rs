@@ -167,7 +167,8 @@ fn read_stat(pid: u32) -> Result<(u32, String), AncestryError> {
 }
 
 /// Parse /proc/<pid>/stat content to extract PPID and comm.
-fn parse_stat(content: &str, pid: u32) -> Result<(u32, String), AncestryError> {
+#[doc(hidden)]
+pub(crate) fn parse_stat(content: &str, pid: u32) -> Result<(u32, String), AncestryError> {
     // Format: pid (comm) state ppid ...
     // The comm can contain spaces and parentheses, so find the last ')' first
 
