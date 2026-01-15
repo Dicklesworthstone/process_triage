@@ -199,7 +199,7 @@ Plans include pre-computed recommendations.
     "preselected_pids": [1234, 5678, 9012],
     "actions": [
       {
-        "target": {"pid": 1234, "start_id": "1705312200.1234"},
+        "target": {"pid": 1234, "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:123456789:1234"},
         "action": "kill",
         "stage": 1,
         "gates": ["identity_valid", "not_protected"]
@@ -278,7 +278,7 @@ Every candidate in `pt agent plan` output includes these fields (never omitted):
 ```json
 {
   "pid": 1234,
-  "start_id": "1705312200.1234",
+  "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:123456789:1234",
   "uid": 1000,
   "ppid": 1,
   "cmd_short": "node jest --worker",
@@ -630,8 +630,8 @@ When supervised:
     "code": "IDENTITY_MISMATCH",
     "message": "PID 1234 identity changed since plan was created",
     "details": {
-      "expected_start_id": "1705312200.1234",
-      "actual_start_id": "1705315800.1234"
+      "expected_start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:123456789:1234",
+      "actual_start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:123456990:1234"
     },
     "recoverable": true,
     "recovery_action": "Generate fresh plan with: pt agent plan"
