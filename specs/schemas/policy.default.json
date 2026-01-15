@@ -35,10 +35,16 @@
   },
   "guardrails": {
     "protected_patterns": [
-      { "pattern": "\\b(systemd|journald|logind|dbus-daemon)\\b", "kind": "regex", "notes": "core system services" },
-      { "pattern": "\\b(sshd|cron|crond)\\b", "kind": "regex", "notes": "remote access and schedulers" },
-      { "pattern": "\\b(dockerd|containerd)\\b", "kind": "regex", "notes": "containers" },
-      { "pattern": "\\b(postgres|redis|nginx|elasticsearch)\\b", "kind": "regex", "notes": "databases and proxies" }
+      { "pattern": "\\b(systemd|journald|logind|dbus-daemon|dbus-broker)\\b", "kind": "regex", "notes": "core system services" },
+      { "pattern": "\\b(sshd|cron|crond|atd)\\b", "kind": "regex", "notes": "remote access and schedulers" },
+      { "pattern": "\\b(dockerd|containerd|runc)\\b", "kind": "regex", "notes": "containers" },
+      { "pattern": "\\b(postgres|redis|nginx|elasticsearch)\\b", "kind": "regex", "notes": "databases and proxies" },
+      { "pattern": "\\b(init|login|agetty|getty)\\b", "kind": "regex", "notes": "session management" },
+      { "pattern": "\\b(NetworkManager|dhclient|dhcpcd|wpa_supplicant)\\b", "kind": "regex", "notes": "networking" },
+      { "pattern": "\\b(rsyslogd|syslog-ng)\\b", "kind": "regex", "notes": "logging" },
+      { "pattern": "\\b(polkitd|sssd|auditd)\\b", "kind": "regex", "notes": "security" },
+      { "pattern": "/sbin/init", "kind": "literal", "notes": "PID 1 on non-systemd systems" },
+      { "pattern": "/usr/lib/systemd/*", "kind": "glob", "notes": "systemd binaries" }
     ],
     "force_review_patterns": [
       { "pattern": "\\b(kube|k8s|etcd)\\b", "kind": "regex", "notes": "cluster components" }

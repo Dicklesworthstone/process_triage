@@ -24,6 +24,7 @@ mod deep_scan;
 mod network;
 #[cfg(target_os = "linux")]
 mod proc_parsers;
+pub mod protected;
 mod quick_scan;
 #[cfg(target_os = "linux")]
 pub mod systemd;
@@ -43,8 +44,9 @@ pub use network::{
 };
 #[cfg(target_os = "linux")]
 pub use proc_parsers::{
-    CgroupInfo, CriticalFile, CriticalFileCategory, FdInfo, FdType, IoStats, MemStats, OpenFile,
-    OpenMode, SchedInfo, SchedStats,
+    parse_cgroup, parse_environ, parse_fd, parse_io, parse_sched, parse_schedstat, parse_statm,
+    parse_wchan, CgroupInfo, CriticalFile, CriticalFileCategory, FdInfo, FdType, IoStats, MemStats,
+    OpenFile, OpenMode, SchedInfo, SchedStats,
 };
 pub use quick_scan::{quick_scan, QuickScanError, QuickScanOptions};
 pub use tool_runner::{
@@ -53,6 +55,12 @@ pub use tool_runner::{
     DEFAULT_TIMEOUT_SECS,
 };
 pub use types::{ProcessRecord, ProcessState, ScanMetadata, ScanResult};
+
+// Re-export protected filter types
+pub use protected::{
+    CompiledProtectedPattern, FilterResult, MatchedField, PatternKind, ProtectedFilter,
+    ProtectedFilterError, ProtectedMatch,
+};
 
 // Re-export cgroup types
 #[cfg(target_os = "linux")]
