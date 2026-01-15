@@ -12,3 +12,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+hex = "0.4"
+dirs = "5"
+regex = "1"

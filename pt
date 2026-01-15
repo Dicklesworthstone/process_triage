@@ -3,7 +3,7 @@
 # pt - Process Triage v2.0.0
 # Bayesian-inspired zombie/abandoned process detection with evidence gathering
 #
-# Usage: pt [scan|deep|history|clear|help|robot]
+# Usage: pt [scan|deep|history|clear|help|robot|agent]
 #
 set -euo pipefail
 
@@ -1443,7 +1443,7 @@ cmd_run() {
 
     # Save spare decisions for unselected
     for line in "${items[@]}"; do
-        if ! echo "$selected" | grep -qF "$line"; then
+        if ! echo "$selected" | grep -qFx "$line"; then
             local orig="${pid_map[$line]}"
             [[ -z "$orig" ]] && continue
             local cmd
@@ -1528,6 +1528,8 @@ USAGE
     pt scan deep    Show candidates (deep scan)
     pt history      Show past decisions
     pt clear        Clear decision history
+    pt robot        Agent/robot plan/explain/apply (JSON/MD output)
+    pt agent        Alias for pt robot
     pt help         Show this help
 
 HOW IT WORKS
@@ -1573,17 +1575,26 @@ EOF
 # ══════════════════════════════════════════════════════════════════════════════
 
 main() {
-    ensure_gum
-    ensure_config
-
     case "${1:-run}" in
+        robot|agent)
+            ensure_config
+            ensure_deps_for_json
+            shift || true
+            cmd_robot "$@"
+            ;;
         run|"")
+            ensure_gum
+            ensure_config
             cmd_run false
             ;;
         deep)
+            ensure_gum
+            ensure_config
             cmd_run true
             ;;
         scan)
+            ensure_gum
+            ensure_config
             if [[ "${2:-}" == "deep" ]]; then
                 cmd_scan true
             else
@@ -1591,9 +1602,13 @@ main() {
             fi
             ;;
         history)
+            ensure_gum
+            ensure_config
             cmd_history
             ;;
         clear)
+            ensure_gum
+            ensure_config
             cmd_clear
             ;;
         help|-h|--help)

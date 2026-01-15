@@ -213,7 +213,7 @@ See `specs/schemas/target-identity.schema.json` for the identity object.
   "uid": 1000,
   "euid": 1000,
   "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:123456789:42137",
-  "cmdline_sha256": "ab12cd...",
+  "cmdline_sha256": "ab12cd34ef56ab78cd90ef12ab34cd56ef78ab90cd12ef34ab56cd78ef90ab12",
   "start_time_unix_ms": 1768485187123
 }
 ```
