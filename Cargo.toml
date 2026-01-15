@@ -5,6 +5,7 @@ members = [
     "crates/pt-core",
     "crates/pt-math",
     "crates/pt-redact",
+    "crates/pt-telemetry",
 ]
 resolver = "2"
 
