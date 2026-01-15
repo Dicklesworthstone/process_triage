@@ -2,6 +2,7 @@
 
 pub mod alpha_investing;
 pub mod causal_interventions;
+pub mod dependency_loss;
 pub mod enforcer;
 pub mod expected_loss;
 pub mod fdr_selection;
@@ -25,4 +26,8 @@ pub use expected_loss::{
 pub use fdr_selection::{
     by_correction_factor, select_fdr, CandidateSelection, FdrCandidate, FdrError, FdrMethod,
     FdrSelectionResult, TargetIdentity,
+};
+pub use dependency_loss::{
+    compute_dependency_scaling, scale_kill_loss, DependencyFactors, DependencyScaling,
+    DependencyScalingResult,
 };
