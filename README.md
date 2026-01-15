@@ -2,306 +2,516 @@
 
 <div align="center">
 
-**Process Triage** — Bayesian-inspired zombie/abandoned process killer
+**Process Triage** — Bayesian-inspired zombie/abandoned process detection and cleanup
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/Dicklesworthstone/process_triage/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/process_triage/actions/workflows/ci.yml)
 
 </div>
 
-`pt` is a CLI tool that identifies and kills abandoned processes on your system. It uses a Bayesian-inspired scoring engine with runtime evidence gathering, remembers your past decisions to improve future suggestions, and presents an interactive UI for reviewing and killing candidates.
+`pt` identifies and safely manages abandoned processes on your system using a four-class Bayesian inference model. It gathers runtime evidence, computes posterior probabilities, and presents recommendations with full transparency—you always see *why* a process is flagged before any action is taken.
 
-<div align="center">
-<h3>Quick Install</h3>
+**Non-negotiables:**
+- **Conservative by default**: No process is ever killed automatically without explicit confirmation
+- **Transparent decisions**: Every recommendation includes the evidence and reasoning behind it
+- **Safe operations**: Protected process lists, identity validation, staged kill signals
+
+---
+
+## Quick Install
 
 ```bash
-# Clone and add to PATH
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
+```
+
+This installs:
+- `pt` — The main bash wrapper for interactive use
+- `pt-core` — The Rust inference engine (downloaded automatically for your platform)
+
+<details>
+<summary>Manual installation / alternative methods</summary>
+
+```bash
+# Clone and symlink
 git clone https://github.com/Dicklesworthstone/process_triage.git
-ln -s $(pwd)/process_triage/pt ~/.local/bin/pt
+ln -s "$(pwd)/process_triage/pt" ~/.local/bin/pt
 
-# Or just run directly
-./pt
+# Or install to system-wide location
+PT_SYSTEM=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
+
+# Verify checksums
+VERIFY=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
 ```
 
-<p><em>Works on Linux. Requires gum (auto-installs if missing).</em></p>
-</div>
+**Platforms supported:**
+- Linux x86_64 (primary)
+- Linux aarch64 (ARM64)
+- macOS x86_64 (Intel)
+- macOS aarch64 (Apple Silicon)
+
+</details>
 
 ---
 
-## TL;DR
+## What Problem Does This Solve?
 
-**The Problem**: Long-running development machines accumulate zombie processes — stuck tests, abandoned dev servers, orphaned agent shells. These consume CPU and memory, and manually hunting them is tedious.
+Long-running development machines accumulate abandoned processes:
+- **Stuck tests**: Jest/pytest workers that hung but never terminated
+- **Forgotten dev servers**: Next.js/Vite processes from last week's feature branch
+- **Orphaned agents**: Claude/Copilot shell sessions that outlived their usefulness
+- **Build artifacts**: Cargo/webpack processes that completed but never exited
 
-**The Solution**: `pt` estimates abandonment probability from multiple evidence sources, pre-selects the most suspicious ones for killing, and learns from your decisions to improve future suggestions.
-
-### Why Use pt?
-
-| Feature | What It Does |
-|---------|--------------|
-| **Smart Scoring** | Bayesian-inspired evidence engine for stuck tests, old dev servers, orphaned processes |
-| **Learning Memory** | Remembers your kill/spare decisions for similar processes |
-| **Pre-selection** | Most suspicious processes are pre-selected for quick review |
-| **Interactive UI** | Gum-based interface with evidence and confidence indicators |
-| **Safe by Default** | Confirms before killing, tries SIGTERM before SIGKILL |
-| **System Aware** | Never flags system services (systemd, sshd, docker, etc.) |
-
-### Quick Example
-
-```bash
-# Interactive mode (default) - scan, review, kill
-pt
-
-# Quick scan without killing
-pt scan
-
-# Deep scan with runtime evidence
-pt deep
-
-# View past decisions
-pt history
-
-# Clear learned decisions
-pt clear
-```
+These processes consume RAM, CPU, and file descriptors. Manually hunting them through `ps aux | grep` is tedious and error-prone. `pt` automates the detection using statistical inference and presents candidates with confidence scores.
 
 ---
 
-## How It Works
+## Quickstart: The Golden Path
 
-### Process Scoring
-
-Each process receives a score based on multiple evidence sources:
-
-| Factor | Score Impact | Rationale |
-|--------|-------------|-----------|
-| Process type prior | +10 to +25 | Test/dev/agent/build types start more suspicious |
-| Age vs expected lifetime | +20 to +50 | Overdue relative to type lifetime |
-| Absolute age | +15 to +40 | Old processes still get flagged |
-| PPID = 1 (orphaned) | +35 | Parent died, likely abandoned |
-| Stuck patterns | +30 to +35 | Known stuck tests or shells |
-| High CPU or idle CPU | +20 to +30 | Suspected hang or spin |
-| High memory + old | +15 to +20 | Resource hogs deserve attention |
-| Past decisions | +30 kill / -40 spare | Bayesian update from history |
-| System service | -200 | Never kill these |
-
-### Recommendations
-
-Based on score:
-
-- **KILL** (score >= 60): Pre-selected for killing
-- **REVIEW** (score 30-59): Worth checking
-- **SPARE** (score < 30): Probably safe
-
-### Decision Memory
-
-When you kill or spare a process, `pt` remembers the pattern. For example, if you spare `gunicorn --workers 4`, similar gunicorn processes will be scored lower in the future.
-
-Patterns are normalized (PIDs removed, ports generalized) so decisions apply across sessions.
-
----
-
-## Commands
-
-### `pt` or `pt run`
-
-Interactive mode. Scans processes, presents candidates sorted by score, lets you select which to kill.
+### Interactive Mode (Recommended)
 
 ```bash
 pt
-pt run
 ```
 
-### `pt deep`
+This runs the full triage workflow:
+1. **Scan** — Enumerate processes, compute initial scores
+2. **Review** — Present candidates sorted by abandonment probability
+3. **Confirm** — Select which processes to terminate
+4. **Kill** — Send SIGTERM, wait, escalate to SIGKILL if needed
 
-Deep interactive scan. Uses runtime evidence (I/O, CPU progress, TTY state, children, network) for higher confidence.
-
-```bash
-pt deep
-```
-
-### `pt scan`
-
-Scan-only mode. Shows candidates without killing. Useful for reviewing system state.
+### Quick Scan (Information Only)
 
 ```bash
 pt scan
 ```
 
-### `pt scan deep`
+Shows candidates without offering to kill them. Useful for monitoring system state.
 
-Scan-only deep mode (evidence gathering, no killing).
-
-```bash
-pt scan deep
-```
-
-### `pt history`
-
-Show past kill/spare decisions.
+### Deep Scan (More Evidence)
 
 ```bash
-pt history
+pt deep
 ```
 
-### `pt clear`
+Runs additional probes: I/O activity, CPU progress over time, TTY state, network connections, child processes. Higher confidence scores but takes ~10-30 seconds longer.
 
-Clear all learned decisions (start fresh).
+### Other Commands
 
 ```bash
-pt clear
+pt history     # View past kill/spare decisions
+pt clear       # Clear learned decisions (fresh start)
+pt --version   # Show version
+pt --help      # Full command reference
 ```
 
-### `pt help`
+---
 
-Show help message.
+## Core Concepts
+
+### Four-State Classification Model
+
+Every process is classified into one of four states:
+
+| State | Description | Typical Action |
+|-------|-------------|----------------|
+| **Useful** | Actively doing productive work | Leave alone |
+| **Useful-but-bad** | Running but misbehaving (stuck, leaking) | Throttle, review |
+| **Abandoned** | Was useful, now forgotten | Kill (usually recoverable) |
+| **Zombie** | Terminated but not reaped by parent | Clean up |
+
+The inference engine computes `P(state | evidence)` for all four states using Bayesian posterior updates.
+
+### Evidence-Based Scoring
+
+Each process is evaluated against multiple evidence sources:
+
+| Evidence | What It Measures | Impact |
+|----------|------------------|--------|
+| Process type | Test runner? Dev server? Build tool? | Prior expectations |
+| Age vs lifetime | How long has it been running vs expected? | Overdue processes score higher |
+| Parent PID | Is it orphaned (PPID=1)? | Orphaned processes are suspicious |
+| CPU activity | Is it actively computing or idle? | Idle + old = likely abandoned |
+| I/O activity | Recent file/network I/O? | No I/O for hours = suspicious |
+| TTY state | Interactive? Detached? | Detached old processes are suspicious |
+| Memory usage | Consuming significant RAM? | High memory + old = priority target |
+| Past decisions | Have you spared similar processes before? | Learns from your patterns |
+
+### Confidence Levels
+
+Posterior probabilities translate to confidence:
+
+| Confidence | Posterior | Meaning |
+|------------|-----------|---------|
+| `very_high` | > 0.99 | Near certain, safe for automation |
+| `high` | > 0.95 | High confidence, recommend action |
+| `medium` | > 0.80 | Moderate confidence, worth reviewing |
+| `low` | < 0.80 | Uncertain, more evidence needed |
+
+### Evidence Ledger (Galaxy-Brain Mode)
+
+For full transparency, enable the evidence ledger:
 
 ```bash
-pt help
-pt --help
-pt -h
+pt deep --verbose
 ```
+
+This shows the Bayesian math behind each decision:
+- Prior probabilities for each class
+- Likelihood contributions from each evidence source
+- Final posterior computation
+- Decision rationale
+
+---
+
+## Safety Model
+
+### Identity Validation
+
+Before killing any process, `pt` validates the target identity:
+
+```
+<boot_id>:<start_time_ticks>:<pid>
+```
+
+This prevents:
+- **PID reuse attacks**: A new process reusing an old PID won't be killed
+- **Stale plan execution**: Plans from before a reboot are invalidated
+- **Race conditions**: If the process exits and PID is reused, the action is blocked
+
+### Protected Processes
+
+These processes are **never** flagged, regardless of score:
+
+- System services: `systemd`, `dbus`, `pulseaudio`, `pipewire`
+- Infrastructure: `sshd`, `cron`, `docker`, `containerd`
+- Databases: `postgres`, `mysql`, `redis`, `elasticsearch`
+- Web servers: `nginx`, `apache`, `caddy`
+- Any process owned by root (unless explicitly targeted)
+
+Protected patterns are configurable in `policy.json`.
+
+### Staged Kill Signals
+
+Process termination follows a graceful sequence:
+
+1. **SIGTERM** — Request graceful shutdown
+2. **Wait** — Allow time for cleanup (configurable timeout)
+3. **SIGKILL** — Force termination if SIGTERM fails
+
+### Blast Radius Assessment
+
+Every candidate includes impact analysis:
+
+```
+blast_radius:
+  memory_mb: 1200
+  cpu_pct: 98
+  child_count: 3
+  risk_level: low
+  summary: "Killing frees 1.2GB RAM, terminates 3 children; no external impact"
+```
+
+High blast-radius actions require explicit confirmation.
+
+### Robot/Agent Mode Gates
+
+For automated use (`pt agent` or `pt robot`), additional safety gates apply:
+
+| Gate | Default | Purpose |
+|------|---------|---------|
+| `min_posterior` | 0.95 | Minimum confidence for automation |
+| `max_kills` | 10 | Per-session kill limit |
+| `max_blast_radius` | 4GB | Maximum memory impact per session |
+| `fdr_budget` | 0.05 | False Discovery Rate control |
+| `protected_patterns` | (see above) | Always enforced |
 
 ---
 
 ## Configuration
+
+### Directory Layout
+
+```
+~/.config/process_triage/         # or $XDG_CONFIG_HOME/process_triage
+├── decisions.json                # Learned kill/spare decisions
+├── priors.json                   # Bayesian hyperparameters (advanced)
+├── policy.json                   # Safety policy configuration
+└── triage.log                    # Operation audit log
+
+~/.local/share/process_triage/    # or $XDG_DATA_HOME/process_triage
+└── sessions/                     # Session artifacts
+    └── pt-20260115-143022-a7xq/
+        ├── manifest.json         # Session metadata
+        ├── snapshot.json         # Initial process state
+        ├── plan.json             # Generated recommendations
+        └── audit.jsonl           # Action audit trail
+```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PROCESS_TRIAGE_CONFIG` | `~/.config/process_triage` | Config directory |
-| `XDG_CONFIG_HOME` | `~/.config` | XDG base (used if PROCESS_TRIAGE_CONFIG not set) |
+| `PROCESS_TRIAGE_DATA` | `~/.local/share/process_triage` | Data/session directory |
+| `XDG_CONFIG_HOME` | `~/.config` | XDG fallback for config |
+| `XDG_DATA_HOME` | `~/.local/share` | XDG fallback for data |
+| `NO_COLOR` | (unset) | Disable colored output |
 
-### Files
+### Priors Configuration (`priors.json`)
 
-| File | Purpose |
-|------|---------|
-| `~/.config/process_triage/decisions.json` | Learned kill/spare decisions |
-| `~/.config/process_triage/priors.json` | Process type priors (reserved) |
-| `~/.config/process_triage/triage.log` | Operation log |
+For advanced users, the Bayesian priors can be tuned:
 
----
-
-## Process Detection Patterns
-
-### Detected as Suspicious
-
-- **Test runners**: `bun test`, `jest`, `vitest`, `pytest`, `cargo test`, `npm test`, `go test`, `rspec`, `mocha`
-- **Dev servers**: `--hot`, `--watch`, `next dev`, `vite`, `webpack-dev`, `npm run dev`, `yarn dev`, `bun run dev`
-- **Agent shells**: `claude`, `codex`, `gemini`, `copilot`, `cursor`, `aider`
-- **Shell wrappers**: `shell-snapshot`, `/bin/sh -c`, `/bin/bash -c`, `zsh -c`
-- **Builds**: `cargo build`, `npm run build`, `tsc`, `rustc`, `gcc`, `clang`, `make`
-- **Orphaned processes**: PPID = 1
-
-### Protected (Never Flagged)
-
-- `systemd`, `dbus`, `pulseaudio`, `pipewire`
-- `sshd`, `cron`, `docker`, `elasticsearch`, `postgres`, `redis`, `nginx`
-
----
-
-## Dependencies
-
-- **gum**: Charm's CLI component toolkit (auto-installs if missing)
-- **jq**: JSON processor (optional, for decision memory)
-- **bash**: Version 4.0+ (for arrays and mapfile)
-- **standard utils**: `ps`, `kill`, `grep`, `awk`, `cut`, `sort`, `pgrep`, `who`, `ss`, `bc`
-
-### Gum Installation
-
-`pt` automatically installs gum if not found, supporting:
-
-- apt (Debian/Ubuntu)
-- brew (macOS/Linuxbrew)
-- Direct binary download (fallback)
-
----
-
-## Safety
-
-### What pt Does
-
-1. Uses SIGTERM first (graceful shutdown)
-2. Only uses SIGKILL if SIGTERM fails
-3. Requires confirmation before killing
-4. Logs all operations
-5. Saves decisions for future learning
-
-### What pt Never Does
-
-1. Kill system services (systemd, sshd, etc.)
-2. Kill without confirmation
-3. Modify any files outside its config directory
-
----
-
-## Example Session
-
+```json
+{
+  "schema_version": "1.0.0",
+  "classes": {
+    "useful": {
+      "prior_prob": 0.70,
+      "cpu_beta": { "alpha": 5.0, "beta": 3.0 }
+    },
+    "abandoned": {
+      "prior_prob": 0.15,
+      "cpu_beta": { "alpha": 1.0, "beta": 5.0 }
+    }
+  }
+}
 ```
-╔═══════════════════════════════════════════════╗
-║                                               ║
-║  Process Triage                               ║
-║  Interactive zombie/abandoned process killer  ║
-║                                               ║
-╚═══════════════════════════════════════════════╝
 
-  Load: 5.17 4.89 10.23 (64 cores) | Memory: 281Gi / 499Gi | Procs: 412
+See [docs/PRIORS_SCHEMA.md](docs/PRIORS_SCHEMA.md) for the full specification.
 
-Found 7 candidate(s) for review:
+### Policy Configuration (`policy.json`)
 
-KILL/REVIEW/SPARE reflect abandonment probability
-
-[KILL]  85 PID:12345 11d 2048M TEST │ bun test --watch...
-[KILL]  70 PID:23456 3d  512M  AGENT│ /bin/bash -c claude...
-[REVIEW]35 PID:34567 26h 128M  DEV  │ next dev --port 3000...
-[SPARE] 12 PID:45678 2h  64M   ???  │ gunicorn --workers 4...
-
-> Select processes to KILL (space to toggle, enter to confirm)
+```json
+{
+  "protected_patterns": [
+    "systemd", "sshd", "docker", "postgres"
+  ],
+  "min_process_age_seconds": 3600,
+  "robot_mode": {
+    "enabled": false,
+    "min_posterior": 0.99,
+    "max_kills_per_session": 5,
+    "max_blast_radius_mb": 2048
+  }
+}
 ```
+
+---
+
+## Telemetry and Data Governance
+
+### What Is Collected
+
+`pt` stores evidence and decisions locally for learning and reproducibility:
+
+| Data | Purpose | Retention |
+|------|---------|-----------|
+| Process metadata | Classification input | Session lifetime |
+| Evidence samples | Audit trail, debugging | Configurable (default: 7 days) |
+| Kill/spare decisions | Learning future suggestions | Indefinite (user-controlled) |
+| Session manifests | Reproducibility | Configurable (default: 30 days) |
+
+### Redaction Policy
+
+Sensitive data is hashed/redacted before persistence:
+
+- **Command arguments**: Paths with user directories are normalized
+- **Environment variables**: Never stored
+- **File contents**: Never read or stored
+- **Network data**: IP addresses are hashed
+
+Redaction profiles control the level of detail preserved:
+
+| Profile | Use Case | Data Preserved |
+|---------|----------|----------------|
+| `minimal` | Maximum privacy | Hashes only, no plaintext |
+| `standard` | Normal operation | Redacted paths, normalized commands |
+| `debug` | Troubleshooting | Full detail (local only) |
+| `share` | Sending to others | Redacted + anonymized |
+
+### Opting Out
+
+To minimize data collection:
+
+```bash
+# Set minimal retention
+export PROCESS_TRIAGE_RETENTION=1  # 1 day
+
+# Or disable session persistence entirely
+export PROCESS_TRIAGE_NO_PERSIST=1
+```
+
+---
+
+## Sharing and Reproducibility
+
+### Session Bundles (`.ptb`)
+
+Export a complete session for sharing or archival:
+
+```bash
+pt export --session pt-20260115-143022-a7xq --profile share
+```
+
+Creates a `.ptb` bundle containing:
+- Session manifest and plan
+- Redacted process metadata
+- Evidence summaries (no raw data)
+- Decision rationale
+
+Bundles are optionally encrypted for sensitive environments.
+
+### HTML Reports
+
+Generate a human-readable report:
+
+```bash
+pt report --session pt-20260115-143022-a7xq --output report.html
+```
+
+Reports include:
+- Executive summary
+- Candidate details with evidence
+- Actions taken and outcomes
+- System resource impact
+
+Two modes:
+- **CDN mode** (default): Smaller file, requires internet for styling
+- **Offline mode** (`--embed-assets`): Self-contained, works without network
 
 ---
 
 ## Troubleshooting
 
-### "gum: command not found" after install
+### "gum: command not found"
 
-The auto-installer may need sudo. Run manually:
+The interactive UI requires [gum](https://github.com/charmbracelet/gum). `pt` attempts auto-installation, but if that fails:
 
 ```bash
 # Debian/Ubuntu
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
+echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
 sudo apt update && sudo apt install gum
 
-# Or download binary
-curl -fsSL https://github.com/charmbracelet/gum/releases/download/v0.14.1/gum_0.14.1_linux_amd64.tar.gz | tar xz
+# macOS
+brew install gum
+
+# Direct binary
+curl -fsSL https://github.com/charmbracelet/gum/releases/latest/download/gum_Linux_x86_64.tar.gz | tar xz
 sudo mv gum /usr/local/bin/
 ```
 
-### No candidates found
+### "No candidates found"
 
-If `pt scan` shows no candidates:
+This is often expected! If your system is clean, `pt` won't invent problems. Common reasons:
+- **Minimum age threshold**: By default, only processes older than 1 hour are considered
+- **No matching patterns**: Your processes don't match known suspicious patterns
+- **Clean system**: Congratulations!
 
-1. Check minimum age — by default, only processes > 1 hour are considered
-2. Your system may be clean — congratulations!
-
-### Decision memory not working
-
-Ensure `jq` is installed:
+To lower thresholds for testing:
 
 ```bash
-sudo apt install jq  # or equivalent
+pt scan --min-age 60  # 1 minute instead of 1 hour
+```
+
+### Permission errors
+
+```bash
+# If pt-core can't read /proc
+sudo setcap cap_sys_ptrace=ep $(which pt-core)
+
+# Or run specific commands with elevated privileges
+sudo pt deep
+```
+
+### "pt-core not found"
+
+The Rust binary may not have installed correctly:
+
+```bash
+# Re-run installer
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
+
+# Check installation
+ls -la ~/.local/bin/pt-core
 ```
 
 ---
 
-## Origins & Authors
+## For AI Agents
 
-Created by **Jeffrey Emanuel** to tame the chaos of long-running development machines. Born from a session where 23 stuck `bun test` processes and a 31GB Hyprland instance brought a 64-core machine to its knees.
+`pt` includes a dedicated agent interface for programmatic integration:
+
+```bash
+pt agent plan --format json      # Generate actionable plan
+pt agent apply --session <id>    # Execute plan
+pt agent verify --session <id>   # Confirm outcomes
+```
+
+See [docs/AGENT_INTEGRATION_GUIDE.md](docs/AGENT_INTEGRATION_GUIDE.md) for:
+- Session lifecycle and mental model
+- JSON schema reference
+- Exit codes and error handling
+- Safety gates for automation
+- Complete workflow examples
+
+---
+
+## Development and Contributing
+
+### Running Tests
+
+```bash
+# BATS tests (bash wrapper)
+bats test/
+
+# Rust tests
+cargo test --workspace
+
+# Full CI suite
+./test/e2e_runner.sh
+```
+
+### Code Style
+
+- **Bash**: shellcheck clean, use `[[` over `[`, quote all variables
+- **Rust**: `cargo fmt` and `cargo clippy` with no warnings
+- **Tests**: Every new feature needs corresponding test coverage
+
+### Project Structure
+
+```
+├── pt                    # Main bash wrapper
+├── install.sh            # Installer script
+├── crates/               # Rust workspace
+│   ├── pt-core/          # Main inference engine
+│   ├── pt-common/        # Shared types
+│   ├── pt-math/          # Statistical computations
+│   └── ...
+├── docs/                 # User-facing documentation
+├── specs/                # Developer specifications
+└── test/                 # BATS test suite
+```
+
+---
+
+## Origins
+
+Created by **Jeffrey Emanuel** after a session where 23 stuck `bun test` workers and a 31GB Hyprland instance brought a 64-core workstation to its knees. Manual process hunting is tedious—statistical inference should do the work.
 
 ---
 
 ## License
 
-MIT - see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE) for details.
 
 ---
 
-Built with bash, gum, and hard-won frustration. `pt` is designed to keep your machine running smoothly without manual process hunting.
+<div align="center">
+
+Built with Rust, Bash, and hard-won frustration.
+
+[Documentation](docs/) · [Agent Guide](docs/AGENT_INTEGRATION_GUIDE.md) · [Issues](https://github.com/Dicklesworthstone/process_triage/issues)
+
+</div>
