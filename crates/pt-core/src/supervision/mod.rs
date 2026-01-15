@@ -43,10 +43,12 @@
 //! ```
 
 mod ancestry;
+mod container_supervision;
 mod environ;
 mod ipc;
 mod nohup;
 mod orphan;
+pub mod session;
 mod signature;
 #[cfg(test)]
 mod supervision_tests;
@@ -79,6 +81,16 @@ pub use signature::{
 pub use types::{
     AncestryEntry, EvidenceType, SupervisionEvidence, SupervisionResult, SupervisorCategory,
     SupervisorDatabase, SupervisorPattern,
+};
+pub use session::{
+    check_session_protection, is_in_protected_session, SessionAnalyzer, SessionConfig,
+    SessionError, SessionEvidence, SessionProtectionType, SessionResult, SshConnectionInfo,
+    TmuxInfo, ScreenInfo,
+};
+pub use container_supervision::{
+    detect_container_supervision, detect_container_supervision_with_actions,
+    ContainerAction, ContainerActionType, ContainerSupervisionAnalyzer,
+    ContainerSupervisionError, ContainerSupervisionResult,
 };
 
 use thiserror::Error;
