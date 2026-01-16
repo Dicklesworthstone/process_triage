@@ -11,6 +11,7 @@ pub mod evt;
 pub mod graph_smoothing;
 pub mod hawkes;
 pub mod hazard;
+pub mod hsmm;
 #[cfg(target_os = "linux")]
 pub mod impact;
 pub mod imm;
@@ -126,4 +127,8 @@ pub use impact::{
 pub use imm::{
     BatchImmAnalyzer, ImmAnalyzer, ImmConfig, ImmError, ImmEvidence, ImmResult, ImmState,
     ImmUpdateResult, ModeFilterState, Regime as ImmRegime,
+};
+pub use hsmm::{
+    BatchHsmmAnalyzer, DurationStats, GammaDuration, HsmmAnalyzer, HsmmConfig, HsmmError,
+    HsmmEvidence, HsmmResult, HsmmState, StateSwitch,
 };
