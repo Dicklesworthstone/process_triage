@@ -120,6 +120,13 @@ pub struct RobotMode {
     /// Categories excluded from robot action.
     #[serde(default)]
     pub exclude_categories: Vec<String>,
+    /// Whether to require human confirmation for supervised processes.
+    #[serde(default = "default_true")]
+    pub require_human_for_supervised: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Alpha investing parameters for FDR control.
@@ -462,6 +469,7 @@ impl Default for Policy {
                 require_policy_snapshot: Some(true),
                 allow_categories: vec![],
                 exclude_categories: vec!["daemon".to_string(), "system".to_string()],
+                require_human_for_supervised: true,
             },
             fdr_control: FdrControl {
                 enabled: true,

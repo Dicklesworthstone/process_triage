@@ -28,6 +28,8 @@ pub mod verify;
 
 // Re-export test utilities for integration tests
 #[cfg(any(test, feature = "test-utils"))]
+pub mod mock_process;
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_log;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;

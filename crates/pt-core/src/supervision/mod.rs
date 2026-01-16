@@ -54,6 +54,7 @@ pub mod signature;
 #[cfg(test)]
 mod supervision_tests;
 mod types;
+pub mod pattern_persistence;
 
 pub use ancestry::{
     analyze_supervision, analyze_supervision_batch, AncestryAnalyzer, AncestryConfig,
@@ -90,6 +91,11 @@ pub use session::{
 pub use signature::{
     SignatureDatabase, SignatureError, SignatureMetadata, SignaturePatterns, SignatureSchema,
     SupervisorSignature, SCHEMA_VERSION,
+};
+pub use pattern_persistence::{
+    AllPatternStats, ConflictResolution, ConfidenceSnapshot, DisabledPatterns, ImportConflict,
+    ImportResult, PatternLibrary, PatternLifecycle, PatternSource, PatternStats, PersistedPattern,
+    PersistedSchema, PersistenceError, SchemaMetadata, migrate_schema,
 };
 pub use types::{
     AncestryEntry, EvidenceType, SupervisionEvidence, SupervisionResult, SupervisorCategory,
@@ -148,6 +154,26 @@ impl CombinedResult {
             environ: None,
             ipc: None,
         }
+    }
+}
+
+/// Returns true if supervision should require human confirmation.
+///
+/// We treat AI agents, IDEs, CI, and terminal multiplexers as human-supervised
+/// contexts that should never be auto-acted on in robot mode.
+pub fn is_human_supervised(result: &CombinedResult) -> bool {
+    if !result.is_supervised {
+        return false;
+    }
+
+    match result.supervisor_type {
+        Some(SupervisorCategory::Agent)
+        | Some(SupervisorCategory::Ide)
+        | Some(SupervisorCategory::Ci)
+        | Some(SupervisorCategory::Terminal)
+        | Some(SupervisorCategory::Other)
+        | None => true,
+        Some(SupervisorCategory::Orchestrator) => false,
     }
 }
 
