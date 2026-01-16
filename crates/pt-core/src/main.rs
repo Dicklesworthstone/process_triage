@@ -11,11 +11,18 @@ use clap::{Args, Parser, Subcommand};
 use pt_common::{OutputFormat, SessionId, SCHEMA_VERSION};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::collect::protected::ProtectedFilter;
+#[cfg(target_os = "linux")]
+use pt_core::collect::{systemd::collect_systemd_unit, ContainerRuntime};
 use pt_core::config::{load_config, ConfigError, ConfigOptions, Priors};
 use pt_core::events::{JsonlWriter, Phase, ProgressEmitter, ProgressEvent};
 use pt_core::exit_codes::ExitCode;
 use pt_core::session::{
     ListSessionsOptions, SessionContext, SessionManifest, SessionMode, SessionState, SessionStore,
+};
+#[cfg(target_os = "linux")]
+use pt_core::supervision::{
+    detect_supervision, is_human_supervised, AppActionType, AppSupervisionAnalyzer,
+    AppSupervisorType, ContainerActionType, ContainerSupervisionAnalyzer,
 };
 use pt_core::verify::{parse_agent_plan, verify_plan, VerifyError};
 use std::path::PathBuf;
@@ -118,6 +125,9 @@ enum Commands {
 
     /// Telemetry management
     Telemetry(TelemetryArgs),
+
+    /// Signature management (list, add, remove user signatures)
+    Signature(pt_core::signature_cli::SignatureArgs),
 
     /// Print version information
     Version,
@@ -817,6 +827,9 @@ fn main() {
         #[cfg(feature = "daemon")]
         Some(Commands::Daemon(args)) => run_daemon(&cli.global, &args),
         Some(Commands::Telemetry(args)) => run_telemetry(&cli.global, &args),
+        Some(Commands::Signature(args)) => {
+            pt_core::signature_cli::run_signature(&cli.global.format, &args)
+        }
         Some(Commands::Version) => {
             print_version(&cli.global);
             ExitCode::Clean
@@ -2854,10 +2867,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 Action::Resume | Action::Unfreeze | Action::Unquarantine => "reversal",
                 Action::Keep | Action::Renice => "no_action",
             },
-            "supervisor": {
-                "detected": false, // Would need supervision detection
-                "name": serde_json::Value::Null,
-            },
+            "supervisor": supervisor_info_for_plan(proc.pid.0),
             "uncertainty": {
                 "entropy": ledger.bayes_factors.len() as f64 * 0.1, // Simplified
                 "confidence_interval": [(max_posterior - 0.1).max(0.0), (max_posterior + 0.1).min(1.0)],
@@ -3353,6 +3363,154 @@ fn state_to_flag(state: pt_core::collect::ProcessState) -> Option<usize> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
+    let mut detected = false;
+    let mut supervisor_type: Option<String> = None;
+    let mut unit: Option<String> = None;
+    let mut recommended_action = "kill".to_string();
+    let mut supervisor_command: Option<String> = None;
+
+    // Prefer container supervision if present
+    if let Ok(result) = ContainerSupervisionAnalyzer::new()
+        .with_action_recommendations()
+        .analyze(pid)
+    {
+        if result.is_supervised {
+            detected = true;
+            let runtime_label = if result.kubernetes.is_some() {
+                "kubernetes"
+            } else {
+                match result.runtime {
+                    ContainerRuntime::Docker => "docker",
+                    ContainerRuntime::Containerd => "containerd",
+                    ContainerRuntime::Podman => "podman",
+                    ContainerRuntime::Lxc => "lxc",
+                    ContainerRuntime::Crio => "crio",
+                    ContainerRuntime::Generic => "container",
+                    ContainerRuntime::None => "container",
+                }
+            };
+            supervisor_type = Some(runtime_label.to_string());
+            unit = result
+                .container_id_short
+                .clone()
+                .or(result.container_id.clone())
+                .or_else(|| result.kubernetes.as_ref().and_then(|k| k.pod_name.clone()));
+
+            if let Some(action) = result.recommended_action.as_ref() {
+                let action_label = match action.action_type {
+                    ContainerActionType::Stop => "stop",
+                    ContainerActionType::Restart => "restart",
+                    ContainerActionType::Remove => "remove",
+                    ContainerActionType::ScaleDown => "scale_down",
+                    ContainerActionType::DeletePod => "delete_pod",
+                    ContainerActionType::Inspect => "inspect",
+                };
+                recommended_action = format!("{}_{}", runtime_label, action_label);
+                supervisor_command = Some(action.command.clone());
+            } else {
+                recommended_action = format!("{}_review", runtime_label);
+            }
+        }
+    }
+
+    // App supervisors (pm2, supervisord, etc.)
+    if !detected {
+        if let Ok(result) = AppSupervisionAnalyzer::new().analyze(pid) {
+            if result.is_supervised && result.supervisor_type != AppSupervisorType::Unknown {
+                detected = true;
+                let supervisor_label = result.supervisor_type.to_string();
+                supervisor_type = Some(supervisor_label.clone());
+                unit = result
+                    .pm2_name
+                    .clone()
+                    .or(result.supervisord_program.clone())
+                    .or(result.supervisor_name.clone());
+
+                if let Some(action) = result.recommended_action.as_ref() {
+                    let action_label = match action.action_type {
+                        AppActionType::Stop => "stop",
+                        AppActionType::Restart => "restart",
+                        AppActionType::Delete => "delete",
+                        AppActionType::Status => "status",
+                        AppActionType::Logs => "logs",
+                    };
+                    recommended_action = format!("{}_{}", supervisor_label, action_label);
+                    supervisor_command = Some(action.command.clone());
+                } else {
+                    recommended_action = format!("{}_review", supervisor_label);
+                }
+            }
+        }
+    }
+
+    // systemd supervision
+    if !detected {
+        if let Some(unit_info) = collect_systemd_unit(pid, None) {
+            detected = true;
+            supervisor_type = Some("systemd".to_string());
+            unit = Some(unit_info.name.clone());
+            let (action_label, command) = match unit_info.unit_type {
+                pt_core::collect::systemd::SystemdUnitType::Scope => (
+                    "systemctl_stop",
+                    format!("systemctl stop {}", unit_info.name),
+                ),
+                _ => (
+                    "systemctl_restart",
+                    format!("systemctl restart {}", unit_info.name),
+                ),
+            };
+            recommended_action = action_label.to_string();
+            supervisor_command = Some(command);
+        }
+    }
+
+    // Human supervision (agents/IDEs/CI) for warning-only
+    if !detected {
+        if let Ok(result) = detect_supervision(pid) {
+            if is_human_supervised(&result) {
+                detected = true;
+                supervisor_type = result.supervisor_type.map(|t| t.to_string());
+                unit = result.supervisor_name.clone();
+                recommended_action = "review".to_string();
+            }
+        }
+    }
+
+    serde_json::json!({
+        "detected": detected,
+        "type": supervisor_type,
+        "unit": unit,
+        "recommended_action": recommended_action,
+        "supervisor_command": supervisor_command,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn supervisor_info_for_plan(_pid: u32) -> serde_json::Value {
+    serde_json::json!({
+        "detected": false,
+        "type": serde_json::Value::Null,
+        "unit": serde_json::Value::Null,
+        "recommended_action": "kill",
+        "supervisor_command": serde_json::Value::Null,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn is_supervised_for_robot(pid: u32) -> bool {
+    match detect_supervision(pid) {
+        Ok(result) => is_human_supervised(&result),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_supervised_for_robot(_pid: u32) -> bool {
+    false
+}
+
 fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     // Load configuration
     let config = match load_config(&config_options(global)) {
@@ -3467,7 +3625,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 category: None,
                 is_kill_action: action.action == Action::Kill,
                 has_policy_snapshot: true,
-                is_supervised: false,
+                is_supervised: is_supervised_for_robot(action.target.pid.0),
             };
             let check = checker.check_candidate(&candidate);
             if !check.allowed {
@@ -3493,7 +3651,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     category: None,
                     is_kill_action: action.action == Action::Kill,
                     has_policy_snapshot: true,
-                    is_supervised: false,
+                    is_supervised: is_supervised_for_robot(action.target.pid.0),
                 };
                 let check = checker.check_candidate(&candidate);
                 if !check.allowed {

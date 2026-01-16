@@ -23,6 +23,7 @@ pub mod inference;
 pub mod logging;
 pub mod plan;
 pub mod session;
+pub mod signature_cli;
 pub mod supervision;
 pub mod verify;
 
