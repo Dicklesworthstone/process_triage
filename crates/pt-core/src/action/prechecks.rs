@@ -16,6 +16,8 @@ use crate::collect::ProcessState;
 use crate::config::policy::{DataLossGates, Guardrails};
 use crate::plan::PreCheck;
 use crate::supervision::session::{SessionAnalyzer, SessionConfig, SessionProtectionType};
+#[cfg(target_os = "linux")]
+use crate::supervision::detect_supervision;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
@@ -206,6 +208,11 @@ pub trait PreCheckProvider {
         PreCheckResult::Passed
     }
 
+    /// Check if process is supervised by an AI agent and if action should be blocked.
+    fn check_agent_supervision(&self, _pid: u32) -> PreCheckResult {
+        PreCheckResult::Passed
+    }
+
     /// Run all applicable pre-checks for an action.
     fn run_checks(&self, checks: &[PreCheck], pid: u32, sid: Option<u32>) -> Vec<PreCheckResult> {
         checks
@@ -215,6 +222,7 @@ pub trait PreCheckProvider {
                 PreCheck::CheckNotProtected => Some(self.check_not_protected(pid)),
                 PreCheck::CheckDataLossGate => Some(self.check_data_loss(pid)),
                 PreCheck::CheckSupervisor => Some(self.check_supervisor(pid)),
+                PreCheck::CheckAgentSupervision => Some(self.check_agent_supervision(pid)),
                 PreCheck::CheckSessionSafety => Some(self.check_session_safety(pid, sid)),
                 PreCheck::VerifyProcessState => Some(self.check_process_state(pid)),
             })
@@ -737,6 +745,50 @@ impl PreCheckProvider for LivePreCheckProvider {
         PreCheckResult::Passed
     }
 
+    fn check_agent_supervision(&self, pid: u32) -> PreCheckResult {
+        trace!(pid, "checking AI agent supervision status");
+
+        // Use the supervision detection module to check if process is supervised
+        match detect_supervision(pid) {
+            Ok(result) => {
+                if result.is_supervised {
+                    let supervisor = result
+                        .supervisor_name
+                        .clone()
+                        .unwrap_or_else(|| "unknown AI agent".to_string());
+                    let category = result
+                        .supervisor_type
+                        .map(|t| format!("{:?}", t))
+                        .unwrap_or_else(|| "agent".to_string());
+
+                    debug!(
+                        pid,
+                        %supervisor,
+                        %category,
+                        confidence = result.confidence,
+                        "process is supervised by AI agent"
+                    );
+
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckAgentSupervision,
+                        reason: format!(
+                            "supervised by {} ({}, confidence: {:.0}%): requires human confirmation",
+                            supervisor,
+                            category,
+                            result.confidence * 100.0
+                        ),
+                    };
+                }
+            }
+            Err(e) => {
+                // Log but don't fail on detection errors - process may have exited
+                trace!(pid, error = %e, "agent supervision detection error, allowing action");
+            }
+        }
+
+        PreCheckResult::Passed
+    }
+
     fn get_supervisor_info(&self, pid: u32) -> Option<SupervisorInfo> {
         self.is_supervisor_managed(pid)
     }
@@ -885,6 +937,10 @@ impl PreCheckProvider for NoopPreCheckProvider {
     }
 
     fn check_supervisor(&self, _pid: u32) -> PreCheckResult {
+        PreCheckResult::Passed
+    }
+
+    fn check_agent_supervision(&self, _pid: u32) -> PreCheckResult {
         PreCheckResult::Passed
     }
 

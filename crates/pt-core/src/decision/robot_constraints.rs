@@ -764,6 +764,7 @@ mod tests {
             require_policy_snapshot: None,
             allow_categories: Vec::new(),
             exclude_categories: Vec::new(),
+            require_human_for_supervised: true,
         }
     }
 
