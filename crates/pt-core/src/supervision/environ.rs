@@ -3,6 +3,7 @@
 //! Detects supervision through environment variables injected by supervisors
 //! into child processes.
 
+use crate::collect::parse_environ_content;
 use super::types::{EvidenceType, SupervisionEvidence, SupervisorCategory};
 use std::collections::HashMap;
 use std::fs;
@@ -332,33 +333,12 @@ pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
         }
     })?;
 
-    Ok(parse_environ(&content))
+    Ok(parse_environ_content(&content).unwrap_or_default())
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn read_environ(_pid: u32) -> Result<HashMap<String, String>, EnvironError> {
     Ok(HashMap::new())
-}
-
-/// Parse environ content (NUL-separated key=value pairs).
-fn parse_environ(content: &[u8]) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-
-    for entry in content.split(|&b| b == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-
-        if let Ok(s) = std::str::from_utf8(entry) {
-            if let Some(eq_pos) = s.find('=') {
-                let key = &s[..eq_pos];
-                let value = &s[eq_pos + 1..];
-                env.insert(key.to_string(), value.to_string());
-            }
-        }
-    }
-
-    env
 }
 
 /// Analyzer for environment-based supervision detection.
@@ -401,16 +381,11 @@ impl EnvironAnalyzer {
 
         let evidence: Vec<SupervisionEvidence> = matches
             .iter()
-            .map(|(pattern, value)| SupervisionEvidence {
+            .map(|(pattern, _value)| SupervisionEvidence {
                 evidence_type: EvidenceType::Environment,
                 description: format!(
-                    "Environment variable {}={} indicates {} supervision",
+                    "Environment variable {} indicates {} supervision",
                     pattern.var_name,
-                    if value.len() > 50 {
-                        format!("{}...", &value[..50])
-                    } else {
-                        value.clone()
-                    },
                     pattern.supervisor_name
                 ),
                 weight: pattern.confidence,
@@ -451,7 +426,7 @@ mod tests {
     #[test]
     fn test_parse_environ() {
         let content = b"KEY1=value1\0KEY2=value2\0EMPTY=\0";
-        let env = parse_environ(content);
+        let env = parse_environ_content(content).unwrap();
 
         assert_eq!(env.get("KEY1"), Some(&"value1".to_string()));
         assert_eq!(env.get("KEY2"), Some(&"value2".to_string()));
@@ -461,7 +436,7 @@ mod tests {
     #[test]
     fn test_parse_environ_with_equals_in_value() {
         let content = b"PATH=/usr/bin:/bin\0OPTS=--flag=value\0";
-        let env = parse_environ(content);
+        let env = parse_environ_content(content).unwrap();
 
         assert_eq!(env.get("PATH"), Some(&"/usr/bin:/bin".to_string()));
         assert_eq!(env.get("OPTS"), Some(&"--flag=value".to_string()));
