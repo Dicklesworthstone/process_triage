@@ -439,10 +439,6 @@ use pt_core::decision::{RuntimeRobotConstraints, ConstraintChecker, RobotCandida
 #[cfg(target_os = "linux")]
 use pt_core::action::{ActionRunner, IdentityProvider, LiveIdentityProvider, SignalActionRunner, SignalConfig};
 
-use pt_core::plan::Plan;
-use pt_core::decision::{RuntimeRobotConstraints, ConstraintChecker, RobotCandidate};
-use pt_core::action::{LiveIdentityProvider, SignalActionRunner, SignalConfig, ActionRunner, IdentityProvider};
-
 #[derive(Args, Debug)]
 struct AgentApplyArgs {
     /// Session ID (required)
