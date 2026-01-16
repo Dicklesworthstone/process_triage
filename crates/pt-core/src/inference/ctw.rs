@@ -61,7 +61,7 @@ use thiserror::Error;
 /// Errors from CTW predictor.
 #[derive(Debug, Error)]
 pub enum CtwError {
-    #[error("invalid context depth: {0} (must be in 1..32)")]
+    #[error("invalid context depth: {0} (must be in 1..12)")]
     InvalidContextDepth(usize),
 
     #[error("invalid alphabet size: {0} (must be 2, 3, or 4)")]
@@ -116,7 +116,9 @@ impl Default for CtwConfig {
 impl CtwConfig {
     /// Validate configuration.
     pub fn validate(&self) -> Result<(), CtwError> {
-        if self.context_depth == 0 || self.context_depth > 32 {
+        // Limit context depth to 12 to prevent excessive memory usage
+        // (4^12 nodes is manageable, 2^32 is not)
+        if self.context_depth == 0 || self.context_depth > 12 {
             return Err(CtwError::InvalidContextDepth(self.context_depth));
         }
         if self.alphabet_size < 2 || self.alphabet_size > 4 {
@@ -364,9 +366,6 @@ impl KtEstimator {
 struct CtwNode {
     /// KT estimator for this context.
     kt: KtEstimator,
-    /// Log weighted probability (cached for future tree-pruning/stats).
-    #[allow(dead_code)]
-    log_pw: f64,
     /// Children nodes (indexed by symbol).
     children: Vec<Option<Box<CtwNode>>>,
 }
@@ -375,7 +374,6 @@ impl CtwNode {
     fn new(alphabet_size: usize) -> Self {
         Self {
             kt: KtEstimator::new(alphabet_size),
-            log_pw: 0.0,
             children: vec![None; alphabet_size],
         }
     }
