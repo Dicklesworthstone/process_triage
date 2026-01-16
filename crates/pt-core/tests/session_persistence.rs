@@ -117,3 +117,45 @@ fn plan_with_session_reuses_session_id_and_writes_plan_artifact() {
         plan_path.display()
     );
 }
+
+#[test]
+fn plan_writes_session_event_log() {
+    let data_dir = unique_data_dir();
+
+    let plan_output = pt_core_with_data_dir(&data_dir)
+        .args(["--format", "json", "agent", "plan"])
+        .assert()
+        .code(predicate::in_iter([0, 1]))
+        .get_output()
+        .stdout
+        .clone();
+
+    let plan: Value = serde_json::from_slice(&plan_output).unwrap();
+    let session_id = plan
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("session_id");
+
+    let log_path = data_dir
+        .join("sessions")
+        .join(session_id)
+        .join("logs")
+        .join("session.jsonl");
+
+    assert!(
+        log_path.exists(),
+        "session.jsonl should exist at {}",
+        log_path.display()
+    );
+
+    let content = fs::read_to_string(&log_path).expect("read session log");
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(!lines.is_empty(), "session log should not be empty");
+
+    let first: Value = serde_json::from_str(lines[0]).expect("event JSON");
+    assert!(first.get("event").is_some(), "event field missing");
+    assert_eq!(
+        first.get("session_id").and_then(|v| v.as_str()),
+        Some(session_id)
+    );
+}
