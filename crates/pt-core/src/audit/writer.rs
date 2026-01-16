@@ -201,6 +201,7 @@ impl AuditLog {
     }
 
     /// Log an action recommendation.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_recommend(
         &mut self,
         ctx: &AuditContext,
@@ -231,6 +232,7 @@ impl AuditLog {
     }
 
     /// Log an action execution.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_action(
         &mut self,
         ctx: &AuditContext,

@@ -35,20 +35,17 @@
 //! # Usage
 //!
 //! ```
-//! use pt_core::inference::kl_surprisal::{KlSurprisalAnalyzer, KlSurprisalConfig, BernoulliObservation};
+//! use pt_core::inference::kl_surprisal::{KlSurprisalAnalyzer, KlSurprisalConfig};
 //!
-//! let config = KlSurprisalConfig::default();
-//! let mut analyzer = KlSurprisalAnalyzer::new(config);
+//! let mut analyzer = KlSurprisalAnalyzer::new(KlSurprisalConfig::default());
+//! analyzer.update_weighted(true, 1.0); // event occurred
+//! analyzer.update_weighted(false, 1.0);
 //!
-//! // Feed binary observations (e.g., CPU busy indicator)
-//! for &obs in &[true, true, false, true, true, true, false, true, true, true] {
-//!     analyzer.update_bernoulli(obs);
+//! let result = analyzer.analyze(0.05); // reference rate
+//! if let Ok(res) = result {
+//!     println!("KL divergence: {:.4} nats", res.evidence.kl_divergence);
+//!     println!("Tail probability bound: {:.6}", res.rate_bound);
 //! }
-//!
-//! // Analyze against a reference rate (e.g., useful processes are busy 30% of time)
-//! let result = analyzer.analyze(0.3);
-//! println!("KL divergence: {:.4} nats", result.kl_divergence);
-//! println!("Tail probability bound: {:.6}", result.rate_bound);
 //! ```
 
 use serde::{Deserialize, Serialize};
