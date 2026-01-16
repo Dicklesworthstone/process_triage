@@ -270,6 +270,65 @@ impl Default for LoadAwareDecision {
     }
 }
 
+/// Time-to-decision bound configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionTimeBound {
+    /// Enable time-bounded decision making.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum probe time before applying fallback (seconds).
+    #[serde(default = "default_time_bound_min")]
+    pub min_seconds: u64,
+    /// Maximum probe time before forcing fallback (seconds).
+    #[serde(default = "default_time_bound_max")]
+    pub max_seconds: u64,
+    /// Half-life for VOI decay (seconds).
+    #[serde(default = "default_voi_half_life")]
+    pub voi_decay_half_life_seconds: u64,
+    /// VOI floor below which probing is not worthwhile.
+    #[serde(default = "default_voi_floor")]
+    pub voi_floor: f64,
+    /// Overhead budget for probe operations (seconds).
+    #[serde(default = "default_overhead_budget")]
+    pub overhead_budget_seconds: u64,
+    /// Fallback action when time bound is exceeded: keep, pause, freeze, etc.
+    #[serde(default = "default_fallback_action")]
+    pub fallback_action: String,
+}
+
+fn default_time_bound_min() -> u64 {
+    30
+}
+fn default_time_bound_max() -> u64 {
+    300
+}
+fn default_voi_half_life() -> u64 {
+    60
+}
+fn default_voi_floor() -> f64 {
+    0.01
+}
+fn default_overhead_budget() -> u64 {
+    120
+}
+fn default_fallback_action() -> String {
+    "pause".to_string()
+}
+
+impl Default for DecisionTimeBound {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_seconds: default_time_bound_min(),
+            max_seconds: default_time_bound_max(),
+            voi_decay_half_life_seconds: default_voi_half_life(),
+            voi_floor: default_voi_floor(),
+            overhead_budget_seconds: default_overhead_budget(),
+            fallback_action: default_fallback_action(),
+        }
+    }
+}
+
 /// Complete policy configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
@@ -303,6 +362,9 @@ pub struct Policy {
     /// Load-aware decision tuning.
     #[serde(default)]
     pub load_aware: LoadAwareDecision,
+    /// Decision time-bound settings.
+    #[serde(default)]
+    pub decision_time_bound: DecisionTimeBound,
     /// Freeform notes.
     #[serde(default)]
     pub notes: Option<String>,
@@ -422,6 +484,7 @@ impl Default for Policy {
                 block_if_recent_io_seconds: Some(60),
             },
             load_aware: LoadAwareDecision::default(),
+            decision_time_bound: DecisionTimeBound::default(),
             notes: None,
         }
     }

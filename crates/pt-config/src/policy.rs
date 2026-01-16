@@ -31,9 +31,37 @@ pub struct Policy {
     pub data_loss_gates: DataLossGates,
     #[serde(default)]
     pub load_aware: LoadAwareDecision,
+    #[serde(default)]
+    pub decision_time_bound: DecisionTimeBound,
 
     #[serde(default)]
     pub notes: Option<String>,
+}
+
+/// Time-to-decision bound configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionTimeBound {
+    pub enabled: bool,
+    pub min_seconds: u64,
+    pub max_seconds: u64,
+    pub voi_decay_half_life_seconds: u64,
+    pub voi_floor: f64,
+    pub overhead_budget_seconds: u64,
+    pub fallback_action: String,
+}
+
+impl Default for DecisionTimeBound {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_seconds: 60,
+            max_seconds: 600,
+            voi_decay_half_life_seconds: 120,
+            voi_floor: 0.01,
+            overhead_budget_seconds: 300,
+            fallback_action: "pause".to_string(),
+        }
+    }
 }
 
 /// Loss matrix by class for each action.

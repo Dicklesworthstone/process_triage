@@ -1114,3 +1114,267 @@ extract_json() {
 
     BATS_TEST_COMPLETED=pass
 }
+
+#==============================================================================
+# AGENT EXPORT-PRIORS COMMAND TESTS
+#==============================================================================
+
+@test "Contract: agent export-priors writes valid JSON to file" {
+    require_jq
+    test_info "Testing: pt agent export-priors basic export"
+
+    local output_file
+    output_file=$(mktemp -t exported_priors.XXXXXX.json)
+    trap "rm -f '$output_file'" RETURN
+
+    run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
+
+    assert_equals "0" "$status" "export-priors should succeed"
+
+    # Verify file was created and is valid JSON
+    [[ -f "$output_file" ]]
+    test_info "File exists: $output_file"
+
+    local file_json
+    file_json=$(cat "$output_file")
+    echo "$file_json" | jq '.' >/dev/null 2>&1
+    local jq_status=$?
+    assert_equals "0" "$jq_status" "exported file should be valid JSON"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent export-priors output has schema_version" {
+    require_jq
+    test_info "Testing: export-priors schema_version in exported file"
+
+    local output_file
+    output_file=$(mktemp -t exported_priors.XXXXXX.json)
+    trap "rm -f '$output_file'" RETURN
+
+    run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
+
+    assert_equals "0" "$status" "export-priors should succeed"
+
+    local file_json
+    file_json=$(cat "$output_file")
+
+    # Must have schema_version
+    local has_schema
+    has_schema=$(echo "$file_json" | jq 'has("schema_version")')
+    assert_equals "true" "$has_schema" "should have schema_version"
+
+    local schema_ver
+    schema_ver=$(echo "$file_json" | jq -r '.schema_version')
+    [[ "$schema_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+    test_info "schema_version: $schema_ver"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent export-priors output has classes" {
+    require_jq
+    test_info "Testing: export-priors classes in exported file"
+
+    local output_file
+    output_file=$(mktemp -t exported_priors.XXXXXX.json)
+    trap "rm -f '$output_file'" RETURN
+
+    run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
+
+    assert_equals "0" "$status" "export-priors should succeed"
+
+    local file_json
+    file_json=$(cat "$output_file")
+
+    # Must have priors.classes object (classes are nested inside priors)
+    local has_priors
+    has_priors=$(echo "$file_json" | jq 'has("priors")')
+    assert_equals "true" "$has_priors" "should have priors object"
+
+    local has_classes
+    has_classes=$(echo "$file_json" | jq '.priors | has("classes")')
+    assert_equals "true" "$has_classes" "should have classes inside priors"
+
+    # Classes should have 4 class definitions
+    local has_useful
+    has_useful=$(echo "$file_json" | jq '.priors.classes | has("useful")')
+    assert_equals "true" "$has_useful" "should have useful class"
+
+    local has_abandoned
+    has_abandoned=$(echo "$file_json" | jq '.priors.classes | has("abandoned")')
+    assert_equals "true" "$has_abandoned" "should have abandoned class"
+
+    local has_zombie
+    has_zombie=$(echo "$file_json" | jq '.priors.classes | has("zombie")')
+    assert_equals "true" "$has_zombie" "should have zombie class"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent export-priors --host-profile sets profile" {
+    require_jq
+    test_info "Testing: export-priors --host-profile flag"
+
+    local output_file
+    output_file=$(mktemp -t exported_priors.XXXXXX.json)
+    trap "rm -f '$output_file'" RETURN
+
+    run "$PT_CORE" agent export-priors --out "$output_file" --host-profile "dev-workstation" --standalone --format json
+
+    assert_equals "0" "$status" "export-priors with host-profile should succeed"
+
+    local file_json
+    file_json=$(cat "$output_file")
+
+    # Must have host_profile field
+    local host_profile
+    host_profile=$(echo "$file_json" | jq -r '.host_profile')
+    assert_equals "dev-workstation" "$host_profile" "host_profile should match"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent export-priors includes export metadata" {
+    require_jq
+    test_info "Testing: export-priors metadata fields"
+
+    local output_file
+    output_file=$(mktemp -t exported_priors.XXXXXX.json)
+    trap "rm -f '$output_file'" RETURN
+
+    run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
+
+    assert_equals "0" "$status" "export-priors should succeed"
+
+    local file_json
+    file_json=$(cat "$output_file")
+
+    # Check top-level metadata fields
+    local has_exported_at
+    has_exported_at=$(echo "$file_json" | jq 'has("exported_at")')
+    assert_equals "true" "$has_exported_at" "should have exported_at field"
+
+    local exported_at
+    exported_at=$(echo "$file_json" | jq -r '.exported_at')
+    [[ -n "$exported_at" && "$exported_at" != "null" ]]
+    test_info "exported_at: $exported_at"
+
+    local has_host_id
+    has_host_id=$(echo "$file_json" | jq 'has("host_id")')
+    assert_equals "true" "$has_host_id" "should have host_id field"
+
+    local host_id
+    host_id=$(echo "$file_json" | jq -r '.host_id')
+    [[ -n "$host_id" && "$host_id" != "null" ]]
+    test_info "host_id: $host_id"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent export-priors stdout response has status" {
+    require_jq
+    test_info "Testing: export-priors stdout response"
+
+    local output_file
+    output_file=$(mktemp -t exported_priors.XXXXXX.json)
+    trap "rm -f '$output_file'" RETURN
+
+    run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
+
+    assert_equals "0" "$status" "export-priors should succeed"
+
+    local json
+    json=$(extract_json "$output")
+
+    # Stdout response should have status field
+    local resp_status
+    resp_status=$(echo "$json" | jq -r '.status')
+    assert_equals "ok" "$resp_status" "response should show status ok"
+
+    # Should have session_id
+    validate_session_id "$json" "export-priors response"
+
+    # Should have output_path
+    local output_path
+    output_path=$(echo "$json" | jq -r '.output_path')
+    [[ -n "$output_path" && "$output_path" != "null" ]]
+    test_info "output_path: $output_path"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent export-priors --help exits 0" {
+    test_info "Testing agent export-priors --help"
+
+    run "$PT_CORE" agent export-priors --help
+
+    assert_equals "0" "$status" "export-priors --help should exit 0"
+    assert_contains "$output" "export-priors" "should describe export-priors"
+    assert_contains "$output" "out" "should mention --out"
+    assert_contains "$output" "host-profile" "should mention --host-profile"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent export-priors --format summary works" {
+    test_info "Testing export-priors summary format"
+
+    local output_file
+    output_file=$(mktemp -t exported_priors.XXXXXX.json)
+    trap "rm -f '$output_file'" RETURN
+
+    run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format summary
+
+    assert_equals "0" "$status" "export-priors summary should succeed"
+
+    # Summary should contain priors info
+    [[ -n "$output" ]]
+    assert_contains "$output" "exported" "should mention exported"
+    test_info "Summary output: $output"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent export-priors fails gracefully for invalid path" {
+    test_info "Testing export-priors invalid path handling"
+
+    run "$PT_CORE" agent export-priors --out "/nonexistent/deeply/nested/path/priors.json" --standalone --format json 2>&1
+
+    # Should fail with non-zero exit
+    [[ $status -ne 0 ]]
+    test_info "Invalid path exit code: $status"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent export-priors creates valid export file" {
+    require_jq
+    test_info "Testing export-priors creates complete export file"
+
+    local output_file
+    output_file=$(mktemp -t exported_priors.XXXXXX.json)
+    trap "rm -f '$output_file'" RETURN
+
+    run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
+
+    assert_equals "0" "$status" "export-priors should succeed"
+
+    local file_json
+    file_json=$(cat "$output_file")
+
+    # Verify all expected top-level fields
+    local has_schema
+    has_schema=$(echo "$file_json" | jq 'has("schema_version")')
+    assert_equals "true" "$has_schema" "should have schema_version"
+
+    local has_priors
+    has_priors=$(echo "$file_json" | jq 'has("priors")')
+    assert_equals "true" "$has_priors" "should have priors"
+
+    local has_snapshot
+    has_snapshot=$(echo "$file_json" | jq 'has("snapshot")')
+    assert_equals "true" "$has_snapshot" "should have snapshot"
+
+    BATS_TEST_COMPLETED=pass
+}

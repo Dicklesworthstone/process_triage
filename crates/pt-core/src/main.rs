@@ -378,6 +378,14 @@ struct AgentPlanArgs {
     /// Include kernel threads as candidates (default: exclude)
     #[arg(long)]
     include_kernel_threads: bool,
+
+    /// Force deep scan with all available probes
+    #[arg(long)]
+    deep: bool,
+
+    /// Only consider processes older than threshold (seconds)
+    #[arg(long)]
+    min_age: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -432,6 +440,14 @@ struct AgentApplyArgs {
     /// Skip safety gate confirmations
     #[arg(long)]
     yes: bool,
+
+    /// Apply all recommended actions
+    #[arg(long)]
+    recommended: bool,
+
+    /// Only consider processes older than threshold (seconds)
+    #[arg(long)]
+    min_age: Option<u64>,
 }
 
 #[derive(Args, Debug)]
