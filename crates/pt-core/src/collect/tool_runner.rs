@@ -594,6 +594,43 @@ impl ToolRunner {
     }
 
     /// Drain remaining data from a stream up to the limit.
+    ///
+    /// Uses non-blocking reads to avoid hanging on grandchild processes
+    /// that may still hold the pipe open after the direct child exits.
+    #[cfg(unix)]
+    fn drain_to_limit<R: Read + std::os::unix::io::AsRawFd>(
+        stream: &mut R,
+        buf: &mut Vec<u8>,
+        max: usize,
+        truncated: &mut bool,
+    ) -> std::io::Result<()> {
+        let mut chunk = vec![0u8; 8192];
+        // Use non-blocking reads to drain what's immediately available.
+        // This prevents hanging when a grandchild process still holds the pipe open.
+        loop {
+            match try_read_nonblocking(stream, &mut chunk) {
+                Ok(0) => break, // No more data available
+                Ok(n) => {
+                    let space = max.saturating_sub(buf.len());
+                    if space > 0 {
+                        let to_copy = n.min(space);
+                        buf.extend_from_slice(&chunk[..to_copy]);
+                        if n > space {
+                            *truncated = true;
+                        }
+                    } else {
+                        *truncated = true;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain remaining data from a stream up to the limit.
+    #[cfg(not(unix))]
     fn drain_to_limit(
         stream: &mut impl Read,
         buf: &mut Vec<u8>,
