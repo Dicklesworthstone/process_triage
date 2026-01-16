@@ -6,17 +6,17 @@ pub mod beta_stacy;
 pub mod bma;
 pub mod bocpd;
 pub mod compound_poisson;
+pub mod conformal;
 pub mod copula;
 pub mod ctw;
-pub mod conformal;
 pub mod evt;
 pub mod graph_smoothing;
 pub mod hawkes;
 pub mod hazard;
 pub mod hsmm;
+pub mod imm;
 #[cfg(target_os = "linux")]
 pub mod impact;
-pub mod imm;
 pub mod kalman;
 pub mod kl_surprisal;
 pub mod ledger;
@@ -39,30 +39,36 @@ pub use belief_state::{
     TransitionModel, NUM_STATES,
 };
 pub use beta_stacy::{
-    BetaParams, BetaStacyError, BetaStacyModel, BetaStacyBin, BinningKind, BinningScheme,
-    BinSpec, LifetimeSample,
+    BetaParams, BetaStacyBin, BetaStacyError, BetaStacyModel, BinSpec, BinningKind, BinningScheme,
+    LifetimeSample,
 };
 pub use bma::{combine_posteriors, BmaError, ModelAveragedPosterior, ModelPosterior, ModelWeight};
 pub use bocpd::{
     BatchResult, BocpdConfig, BocpdDetector, BocpdError, BocpdEvidence, BocpdUpdateResult,
     ChangePoint, EmissionModel,
 };
-pub use ctw::{
-    CtwBatchResult, CtwConfig, CtwError, CtwEvidence, CtwFeatures, CtwPredictor, CtwProvenance,
-    CtwUpdateResult, DiscretizationMode, Discretizer, DiscretizerConfig,
+pub use compound_poisson::{
+    BatchCompoundPoissonAnalyzer, BurstEvent, CompoundPoissonAnalyzer, CompoundPoissonConfig,
+    CompoundPoissonError, CompoundPoissonEvidence, CompoundPoissonParams, CompoundPoissonResult,
+    CompoundPoissonSummary, GammaParams as CpGammaParams, RegimeStats as CpRegimeStats,
 };
 pub use conformal::{
     AdaptiveConformalRegressor, BlockedConformalRegressor, ConformalClassifier, ConformalConfig,
     ConformalError, ConformalEvidence, ConformalInterval, ConformalPredictionSet,
     ConformalRegressor,
 };
+pub use copula::{summarize_copula_dependence, CopulaConfig, CopulaSummary};
+pub use ctw::{
+    CtwBatchResult, CtwConfig, CtwError, CtwEvidence, CtwFeatures, CtwPredictor, CtwProvenance,
+    CtwUpdateResult, DiscretizationMode, Discretizer, DiscretizerConfig,
+};
 pub use evt::{
     BatchEvtAnalyzer, EstimationMethod, EvtError, EvtEvidence, GpdConfig, GpdFitter, GpdResult,
     TailType, ThresholdMethod,
 };
 pub use graph_smoothing::{
-    build_neighbors, edges_from_clusters, smooth_values, GraphSmoothingConfig,
-    GraphSmoothingError, GraphSmoothingResult,
+    build_neighbors, edges_from_clusters, smooth_values, GraphSmoothingConfig, GraphSmoothingError,
+    GraphSmoothingResult,
 };
 pub use hawkes::{
     summarize_cross_excitation, BurstLevel, CrossExcitationConfig, CrossExcitationSummary,
@@ -72,12 +78,40 @@ pub use hazard::{
     GammaParams, HazardEvidence, HazardModel, HazardResult, Regime, RegimePriors, RegimeState,
     RegimeStats, RegimeTransition,
 };
+pub use hsmm::{
+    BatchHsmmAnalyzer, DurationStats, GammaDuration, HsmmAnalyzer, HsmmConfig, HsmmError,
+    HsmmEvidence, HsmmResult, HsmmState, StateSwitch,
+};
+pub use imm::{
+    BatchImmAnalyzer, ImmAnalyzer, ImmConfig, ImmError, ImmEvidence, ImmResult, ImmState,
+    ImmUpdateResult, ModeFilterState, Regime as ImmRegime,
+};
+#[cfg(target_os = "linux")]
+pub use impact::{
+    compute_impact_score, compute_impact_scores_batch, CriticalWriteCategory, ImpactComponents,
+    ImpactConfig, ImpactError, ImpactEvidence, ImpactResult, ImpactScorer, ImpactSeverity,
+    MissingDataSource, SupervisorLevel,
+};
 pub use kalman::{
     FilterState, KalmanConfig, KalmanEvidence, KalmanFilter, KalmanResult, KalmanSummary,
+};
+pub use kl_surprisal::{
+    kl_divergence_discrete, symmetric_kl_divergence, AbnormalitySeverity, BatchKlAnalyzer,
+    BernoulliObservation, DeviationDirection, DeviationType, KlSurprisalAnalyzer,
+    KlSurprisalConfig, KlSurprisalError, KlSurprisalEvidence, KlSurprisalFeatures,
+    KlSurprisalResult, ReferenceClass,
 };
 pub use ledger::{
     default_glyph_map, get_glyph, BayesFactorEntry, Classification, Confidence, Direction,
     EvidenceLedger, FeatureGlyph,
+};
+pub use martingale::{
+    BatchMartingaleAnalyzer, BoundParameters, BoundType, MartingaleAnalyzer, MartingaleConfig,
+    MartingaleError, MartingaleEvidence, MartingaleResult, MartingaleUpdateResult,
+};
+pub use mpp::{
+    BatchMppAnalyzer, BurstinessLevel, InterArrivalStats, MarkDistribution, MarkedEvent,
+    MarkedPointProcess, MppConfig, MppEvidence, MppSummary,
 };
 pub use posterior::{
     compute_posterior, ClassScores, CpuEvidence, Evidence, EvidenceTerm, PosteriorError,
@@ -96,47 +130,13 @@ pub use robust::{
 pub use robust_stats::{
     summarize as summarize_robust_stats, RobustStatsConfig, RobustStatsError, RobustSummary,
 };
-pub use wasserstein::{
-    wasserstein_1d, wasserstein_2_squared, AggregatedDriftEvidence, DriftAction, DriftMonitor,
-    DriftResult, DriftSeverity, WassersteinConfig, WassersteinDetector, WassersteinError,
-    WassersteinEvidence,
-};
 pub use sketches::{
     CountMinConfig, CountMinSketch, HeavyHitter, PercentileSummary, SketchError, SketchEvidence,
     SketchManager, SketchManagerConfig, SketchResult, SketchSummary, SpaceSaving,
     SpaceSavingConfig, TDigest, TDigestConfig,
 };
-pub use martingale::{
-    BatchMartingaleAnalyzer, BoundParameters, BoundType, MartingaleAnalyzer, MartingaleConfig,
-    MartingaleError, MartingaleEvidence, MartingaleResult, MartingaleUpdateResult,
+pub use wasserstein::{
+    wasserstein_1d, wasserstein_2_squared, AggregatedDriftEvidence, DriftAction, DriftMonitor,
+    DriftResult, DriftSeverity, WassersteinConfig, WassersteinDetector, WassersteinError,
+    WassersteinEvidence,
 };
-pub use kl_surprisal::{
-    kl_divergence_discrete, symmetric_kl_divergence, AbnormalitySeverity, BatchKlAnalyzer,
-    BernoulliObservation, DeviationDirection, DeviationType, KlSurprisalAnalyzer,
-    KlSurprisalConfig, KlSurprisalError, KlSurprisalEvidence, KlSurprisalFeatures,
-    KlSurprisalResult, ReferenceClass,
-};
-pub use mpp::{
-    BatchMppAnalyzer, BurstinessLevel, InterArrivalStats, MarkDistribution, MarkedEvent,
-    MarkedPointProcess, MppConfig, MppEvidence, MppSummary,
-};
-#[cfg(target_os = "linux")]
-pub use impact::{
-    compute_impact_score, compute_impact_scores_batch, CriticalWriteCategory, ImpactComponents,
-    ImpactConfig, ImpactError, ImpactEvidence, ImpactResult, ImpactScorer, ImpactSeverity,
-    MissingDataSource, SupervisorLevel,
-};
-pub use imm::{
-    BatchImmAnalyzer, ImmAnalyzer, ImmConfig, ImmError, ImmEvidence, ImmResult, ImmState,
-    ImmUpdateResult, ModeFilterState, Regime as ImmRegime,
-};
-pub use hsmm::{
-    BatchHsmmAnalyzer, DurationStats, GammaDuration, HsmmAnalyzer, HsmmConfig, HsmmError,
-    HsmmEvidence, HsmmResult, HsmmState, StateSwitch,
-};
-pub use compound_poisson::{
-    BatchCompoundPoissonAnalyzer, BurstEvent, CompoundPoissonAnalyzer, CompoundPoissonConfig,
-    CompoundPoissonError, CompoundPoissonEvidence, CompoundPoissonParams, CompoundPoissonResult,
-    CompoundPoissonSummary, GammaParams as CpGammaParams, RegimeStats as CpRegimeStats,
-};
-pub use copula::{summarize_copula_dependence, CopulaConfig, CopulaSummary};

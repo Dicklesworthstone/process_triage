@@ -154,9 +154,7 @@ pub fn summarize_copula_dependence(
     };
 
     let raw_multiplier = 1.0 / (1.0 + avg_abs_corr * (feature_count.saturating_sub(1) as f64));
-    let effective_multiplier = raw_multiplier
-        .clamp(config.min_multiplier, 1.0)
-        .min(1.0);
+    let effective_multiplier = raw_multiplier.clamp(config.min_multiplier, 1.0).min(1.0);
 
     if avg_abs_corr >= 0.7 {
         diagnostics.push("high_dependence".to_string());
@@ -317,6 +315,8 @@ mod tests {
 
         assert!(summary.pairs.is_empty());
         assert!(summary.effective_evidence_multiplier == 1.0);
-        assert!(summary.diagnostics.contains(&"insufficient_samples".to_string()));
+        assert!(summary
+            .diagnostics
+            .contains(&"insufficient_samples".to_string()));
     }
 }
