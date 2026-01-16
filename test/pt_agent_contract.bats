@@ -1125,7 +1125,6 @@ extract_json() {
 
     local output_file
     output_file=$(mktemp -t exported_priors.XXXXXX.json)
-    trap "rm -f '$output_file'" RETURN
 
     run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
 
@@ -1150,7 +1149,6 @@ extract_json() {
 
     local output_file
     output_file=$(mktemp -t exported_priors.XXXXXX.json)
-    trap "rm -f '$output_file'" RETURN
 
     run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
 
@@ -1178,7 +1176,6 @@ extract_json() {
 
     local output_file
     output_file=$(mktemp -t exported_priors.XXXXXX.json)
-    trap "rm -f '$output_file'" RETURN
 
     run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
 
@@ -1218,7 +1215,6 @@ extract_json() {
 
     local output_file
     output_file=$(mktemp -t exported_priors.XXXXXX.json)
-    trap "rm -f '$output_file'" RETURN
 
     run "$PT_CORE" agent export-priors --out "$output_file" --host-profile "dev-workstation" --standalone --format json
 
@@ -1241,7 +1237,6 @@ extract_json() {
 
     local output_file
     output_file=$(mktemp -t exported_priors.XXXXXX.json)
-    trap "rm -f '$output_file'" RETURN
 
     run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
 
@@ -1278,7 +1273,6 @@ extract_json() {
 
     local output_file
     output_file=$(mktemp -t exported_priors.XXXXXX.json)
-    trap "rm -f '$output_file'" RETURN
 
     run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
 
@@ -1319,7 +1313,6 @@ extract_json() {
 
     local output_file
     output_file=$(mktemp -t exported_priors.XXXXXX.json)
-    trap "rm -f '$output_file'" RETURN
 
     run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format summary
 
@@ -1351,7 +1344,6 @@ extract_json() {
 
     local output_file
     output_file=$(mktemp -t exported_priors.XXXXXX.json)
-    trap "rm -f '$output_file'" RETURN
 
     run "$PT_CORE" agent export-priors --out "$output_file" --standalone --format json
 
@@ -1373,5 +1365,6 @@ extract_json() {
     has_snapshot=$(echo "$file_json" | jq 'has("snapshot")')
     assert_equals "true" "$has_snapshot" "should have snapshot"
 
+    rm -f "$output_file"
     BATS_TEST_COMPLETED=pass
 }
