@@ -106,6 +106,7 @@ enum Commands {
     Check(CheckArgs),
 
     /// Agent/robot subcommands for automated operation
+    #[command(visible_alias = "robot")]
     Agent(AgentArgs),
 
     /// Configuration management
@@ -348,6 +349,9 @@ enum AgentCommands {
     /// View pending plans and notifications
     Inbox(AgentInboxArgs),
 
+    /// Export priors to file for transfer between machines
+    ExportPriors(AgentExportPriorsArgs),
+
     /// Generate HTML report from session
     #[cfg(feature = "report")]
     Report(AgentReportArgs),
@@ -526,6 +530,17 @@ struct AgentInboxArgs {
     /// Show only unread items
     #[arg(long)]
     unread: bool,
+}
+
+#[derive(Args, Debug)]
+struct AgentExportPriorsArgs {
+    /// Output file path for exported priors
+    #[arg(long, short = 'o')]
+    out: String,
+
+    /// Tag priors with host profile name for smart matching
+    #[arg(long)]
+    host_profile: Option<String>,
 }
 
 /// Arguments for the agent report command.
@@ -1660,6 +1675,7 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
         AgentCommands::Sessions(args) => run_agent_sessions(global, args),
         AgentCommands::ListPriors(args) => run_agent_list_priors(global, args),
         AgentCommands::Inbox(args) => run_agent_inbox(global, args),
+        AgentCommands::ExportPriors(args) => run_agent_export_priors(global, args),
         #[cfg(feature = "report")]
         AgentCommands::Report(args) => run_agent_report(global, args),
         AgentCommands::Capabilities => {
@@ -3685,6 +3701,89 @@ fn run_agent_list_priors(global: &GlobalOpts, args: &AgentListPriorsArgs) -> Exi
                 println!();
             }
             println!("Session: {}", session_id);
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_agent_export_priors(global: &GlobalOpts, args: &AgentExportPriorsArgs) -> ExitCode {
+    let host_id = pt_core::logging::get_host_id();
+
+    let options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        priors_path: None,
+        policy_path: None,
+    };
+
+    let config = match load_config(&options) {
+        Ok(c) => c,
+        Err(e) => {
+            return output_config_error(global, &e);
+        }
+    };
+
+    let export = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "host_id": host_id,
+        "host_profile": args.host_profile,
+        "priors": config.priors,
+        "snapshot": config.snapshot(),
+    });
+
+    let out_path = PathBuf::from(&args.out);
+    if let Some(parent) = out_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "agent export-priors: failed to create {}: {}",
+                parent.display(),
+                err
+            );
+            return ExitCode::IoError;
+        }
+    }
+
+    let tmp_path = out_path.with_extension("tmp");
+    let payload = match serde_json::to_vec_pretty(&export) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("agent export-priors: failed to serialize: {}", err);
+            return ExitCode::IoError;
+        }
+    };
+
+    if let Err(err) = std::fs::write(&tmp_path, payload) {
+        eprintln!(
+            "agent export-priors: failed to write {}: {}",
+            tmp_path.display(),
+            err
+        );
+        return ExitCode::IoError;
+    }
+
+    if let Err(err) = std::fs::rename(&tmp_path, &out_path) {
+        eprintln!(
+            "agent export-priors: failed to rename {} to {}: {}",
+            tmp_path.display(),
+            out_path.display(),
+            err
+        );
+        return ExitCode::IoError;
+    }
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Jsonl => {
+            let response = serde_json::json!({
+                "exported": true,
+                "path": out_path.display().to_string(),
+                "host_id": host_id,
+                "host_profile": args.host_profile,
+            });
+            println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        }
+        _ => {
+            println!("Exported priors to: {}", out_path.display());
         }
     }
 
