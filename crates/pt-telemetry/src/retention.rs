@@ -764,7 +764,7 @@ impl RetentionEnforcer {
             if path.is_dir() {
                 // Recurse into partition directories (year=YYYY/month=MM/day=DD/host_id=X)
                 self.scan_table_dir(&path, table, candidates)?;
-            } else if path.extension().map_or(false, |ext| ext == "parquet") {
+            } else if path.extension().is_some_and(|ext| ext == "parquet") {
                 let metadata = fs::metadata(&path)?;
                 let modified = metadata.modified()?;
                 let size = metadata.len();
@@ -922,8 +922,10 @@ mod tests {
     #[test]
     fn test_keep_everything_mode() {
         let dir = tempdir().unwrap();
-        let mut config = RetentionConfig::default();
-        config.keep_everything = true;
+        let config = RetentionConfig {
+            keep_everything: true,
+            ..Default::default()
+        };
 
         let enforcer = RetentionEnforcer::new(dir.path().to_path_buf(), config);
         let preview = enforcer.preview().unwrap();
@@ -1075,8 +1077,10 @@ mod tests {
         }
 
         // Set budget to 2MB (we have 3MB of files)
-        let mut config = RetentionConfig::default();
-        config.disk_budget_bytes = 2 * 1024 * 1024;
+        let config = RetentionConfig {
+            disk_budget_bytes: 2 * 1024 * 1024,
+            ..Default::default()
+        };
 
         let enforcer = RetentionEnforcer::with_host_id(
             root.to_path_buf(),
@@ -1107,8 +1111,10 @@ mod tests {
         create_fake_parquet(&old_file, 1024, 45).unwrap();
 
         let event_log_dir = root.join("retention_logs");
-        let mut config = RetentionConfig::default();
-        config.event_log_dir = Some(event_log_dir.clone());
+        let config = RetentionConfig {
+            event_log_dir: Some(event_log_dir.clone()),
+            ..Default::default()
+        };
 
         let mut enforcer = RetentionEnforcer::with_host_id(
             root.to_path_buf(),
@@ -1139,8 +1145,10 @@ mod tests {
 
         assert!(old_file.exists(), "File should exist before enforcement");
 
-        let mut config = RetentionConfig::default();
-        config.event_log_dir = Some(root.join("retention_logs"));
+        let config = RetentionConfig {
+            event_log_dir: Some(root.join("retention_logs")),
+            ..Default::default()
+        };
 
         let mut enforcer = RetentionEnforcer::with_host_id(
             root.to_path_buf(),
@@ -1220,8 +1228,10 @@ mod tests {
         }
 
         // Set budget to 4MB (we have 6MB total)
-        let mut config = RetentionConfig::default();
-        config.disk_budget_bytes = 4 * 1024 * 1024;
+        let config = RetentionConfig {
+            disk_budget_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        };
 
         let enforcer = RetentionEnforcer::with_host_id(
             root.to_path_buf(),
@@ -1250,8 +1260,10 @@ mod tests {
         create_fake_parquet(&old_file, 1024, 45).unwrap();
 
         let event_log_dir = root.join("retention_logs");
-        let mut config = RetentionConfig::default();
-        config.event_log_dir = Some(event_log_dir.clone());
+        let config = RetentionConfig {
+            event_log_dir: Some(event_log_dir.clone()),
+            ..Default::default()
+        };
 
         let mut enforcer = RetentionEnforcer::with_host_id(
             root.to_path_buf(),

@@ -1,4 +1,4 @@
-use pt_telemetry::shadow::{ShadowStorage, ShadowStorageConfig, Observation, StateSnapshot, BeliefState};
+use pt_telemetry::shadow::{ShadowStorage, ShadowStorageConfig, Observation, StateSnapshot};
 use tempfile::TempDir;
 use chrono::Utc;
 

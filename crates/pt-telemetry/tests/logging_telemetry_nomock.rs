@@ -99,7 +99,7 @@ fn validate_retention_event_schema(json: &str) -> Result<(), String> {
             "compacted",
         ];
         if !valid_reasons.iter().any(|r| reason.contains_key(*r)) {
-            return Err(format!("Unknown retention reason variant"));
+            return Err("Unknown retention reason variant".to_string());
         }
     }
 
@@ -303,8 +303,10 @@ fn test_retention_jsonl_log_file_format() {
     create_fake_parquet(&old_file, 2048, 45).expect("create fake parquet");
 
     let event_log_dir = root.join("retention_logs");
-    let mut config = RetentionConfig::default();
-    config.event_log_dir = Some(event_log_dir.clone());
+    let config = RetentionConfig {
+        event_log_dir: Some(event_log_dir.clone()),
+        ..Default::default()
+    };
 
     let mut enforcer = RetentionEnforcer::with_host_id(
         root.to_path_buf(),
@@ -320,7 +322,7 @@ fn test_retention_jsonl_log_file_format() {
     let log_files: Vec<_> = fs::read_dir(&event_log_dir)
         .expect("read log dir")
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "jsonl"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
 
     assert_eq!(log_files.len(), 1, "Should have 1 JSONL log file");
@@ -353,8 +355,10 @@ fn test_retention_dry_run_jsonl_log() {
     create_fake_parquet(&old_file, 4096, 40).expect("create fake parquet");
 
     let event_log_dir = root.join("retention_logs");
-    let mut config = RetentionConfig::default();
-    config.event_log_dir = Some(event_log_dir.clone());
+    let config = RetentionConfig {
+        event_log_dir: Some(event_log_dir.clone()),
+        ..Default::default()
+    };
 
     let mut enforcer = RetentionEnforcer::with_host_id(
         root.to_path_buf(),
@@ -377,7 +381,7 @@ fn test_retention_dry_run_jsonl_log() {
     let log_files: Vec<_> = fs::read_dir(&event_log_dir)
         .expect("read log dir")
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "jsonl"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
 
     assert_eq!(log_files.len(), 1, "Should have 1 JSONL log file");
@@ -413,8 +417,10 @@ fn test_retention_multiple_files_jsonl_log() {
     }
 
     let event_log_dir = root.join("retention_logs");
-    let mut config = RetentionConfig::default();
-    config.event_log_dir = Some(event_log_dir.clone());
+    let config = RetentionConfig {
+        event_log_dir: Some(event_log_dir.clone()),
+        ..Default::default()
+    };
 
     let mut enforcer = RetentionEnforcer::with_host_id(
         root.to_path_buf(),
@@ -429,7 +435,7 @@ fn test_retention_multiple_files_jsonl_log() {
     let log_files: Vec<_> = fs::read_dir(&event_log_dir)
         .expect("read log dir")
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "jsonl"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
 
     let validated_events =
@@ -442,7 +448,7 @@ fn test_retention_multiple_files_jsonl_log() {
     );
 
     // Verify each line is valid JSONL (no trailing comma issues, proper newlines)
-    let content = fs::read_to_string(&log_files[0].path()).expect("read log");
+    let content = fs::read_to_string(log_files[0].path()).expect("read log");
     for (i, line) in content.lines().enumerate() {
         let parsed: serde_json::Value =
             serde_json::from_str(line).unwrap_or_else(|e| {
@@ -472,9 +478,11 @@ fn test_retention_respects_keep_everything_mode() {
         root.join("proc_samples/year=2025/month=01/day=01/host_id=test/old.parquet");
     create_fake_parquet(&old_file, 1024, 100).expect("create fake parquet");
 
-    let mut config = RetentionConfig::default();
-    config.keep_everything = true;
-    config.event_log_dir = Some(root.join("retention_logs"));
+    let config = RetentionConfig {
+        keep_everything: true,
+        event_log_dir: Some(root.join("retention_logs")),
+        ..Default::default()
+    };
 
     let mut enforcer =
         RetentionEnforcer::with_host_id(root.to_path_buf(), config, "keep-all-host".to_string());
@@ -517,9 +525,11 @@ fn test_retention_disk_budget_limits_pruning() {
     }
 
     // Set budget to 4MB
-    let mut config = RetentionConfig::default();
-    config.disk_budget_bytes = 4 * 1024 * 1024;
-    config.event_log_dir = Some(root.join("retention_logs"));
+    let config = RetentionConfig {
+        disk_budget_bytes: 4 * 1024 * 1024,
+        event_log_dir: Some(root.join("retention_logs")),
+        ..Default::default()
+    };
 
     let mut enforcer =
         RetentionEnforcer::with_host_id(root.to_path_buf(), config, "budget-host".to_string());
@@ -543,7 +553,7 @@ fn test_retention_disk_budget_limits_pruning() {
     let log_files: Vec<_> = fs::read_dir(root.join("retention_logs"))
         .expect("read log dir")
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "jsonl"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
 
     let validated_events =
@@ -603,8 +613,10 @@ fn test_retention_log_artifacts_ci_compatible() {
     create_fake_parquet(&file, 1024, 45).expect("create fake parquet");
 
     let artifacts_dir = root.join("ci_artifacts");
-    let mut config = RetentionConfig::default();
-    config.event_log_dir = Some(artifacts_dir.clone());
+    let config = RetentionConfig {
+        event_log_dir: Some(artifacts_dir.clone()),
+        ..Default::default()
+    };
 
     let mut enforcer =
         RetentionEnforcer::with_host_id(root.to_path_buf(), config, "ci-test-host".to_string());
