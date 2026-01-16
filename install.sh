@@ -219,9 +219,59 @@ get_installed_version() {
     echo "${version:-unknown}"
 }
 
+detect_arch() {
+    local arch; arch=$(uname -m)
+    local os; os=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+    case "$arch" in
+        x86_64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    case "$os" in
+        linux) ;;
+        darwin) os="macos" ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    echo "${os}-${arch}"
+}
+
 # ==============================================================================
 # Verification (optional)
 # ==============================================================================
+
+# Download the consolidated checksums file from release
+download_checksums() {
+    local version="$1"
+    local output="$2"
+
+    local checksum_url="${RELEASES_URL}/download/v${version}/checksums.sha256"
+
+    curl -fsSL --connect-timeout 5 "$checksum_url" -o "$output" 2>/dev/null || {
+        log_warn "Could not download checksums file"
+        log_warn "URL: $checksum_url"
+        return 1
+    }
+}
+
+# Look up expected checksum for a file from checksums.sha256
+lookup_checksum() {
+    local checksums_file="$1"
+    local filename="$2"
+
+    if [[ ! -f "$checksums_file" ]]; then
+        return 1
+    fi
+
+    # Format: "hash  filename" (two spaces)
+    grep -E "^[a-f0-9]{64}  ${filename}$" "$checksums_file" | cut -d' ' -f1
+}
 
 verify_download() {
     local file="$1"
@@ -268,6 +318,47 @@ verify_download() {
         log_error ""
         log_error "The downloaded file may be corrupted or tampered with."
         log_error "Please report this issue if it persists."
+        return 1
+    fi
+}
+
+# Verify a file against checksums.sha256 file
+verify_file_checksum() {
+    local file="$1"
+    local filename="$2"
+    local checksums_file="$3"
+
+    if [[ "${VERIFY:-}" != "1" ]]; then
+        return 0  # Verification not requested
+    fi
+
+    log_step "Verifying ${filename} checksum..."
+
+    local expected
+    expected=$(lookup_checksum "$checksums_file" "$filename") || {
+        log_warn "No checksum found for ${filename}"
+        log_warn "Proceeding without verification"
+        return 0
+    }
+
+    if [[ -z "$expected" ]]; then
+        log_warn "Checksum not found for ${filename}"
+        return 0
+    fi
+
+    local actual
+    actual=$(sha256_file "$file") || {
+        log_warn "Could not compute checksum (no SHA256 tool)"
+        return 0
+    }
+
+    if [[ "$expected" == "$actual" ]]; then
+        log_success "${filename} checksum verified: ${actual:0:16}..."
+        return 0
+    else
+        log_error "Checksum mismatch for ${filename}!"
+        log_error "Expected: $expected"
+        log_error "Actual:   $actual"
         return 1
     fi
 }
