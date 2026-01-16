@@ -2465,7 +2465,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             tty: Some(proc.has_tty()),
             net: None,
             io_active: None,
-            state_flag: Some(state_to_flag(proc.state)),
+            state_flag: state_to_flag(proc.state),
             command_category: None,
         };
 
@@ -2934,7 +2934,7 @@ fn build_process_explanation(
         tty: Some(proc.has_tty()),
         net: None,      // Would need network scan
         io_active: None, // Would need /proc inspection
-        state_flag: Some(state_to_flag(proc.state)),
+        state_flag: state_to_flag(proc.state),
         command_category: None, // Would need category classifier
     };
 
@@ -3008,17 +3008,17 @@ fn build_process_explanation(
 }
 
 /// Map ProcessState to state flag index for priors.
-fn state_to_flag(state: pt_core::collect::ProcessState) -> usize {
+fn state_to_flag(state: pt_core::collect::ProcessState) -> Option<usize> {
     use pt_core::collect::ProcessState;
     match state {
-        ProcessState::Running => 0,
-        ProcessState::Sleeping => 1,
-        ProcessState::DiskSleep => 2,
-        ProcessState::Zombie => 3,
-        ProcessState::Stopped => 4,
-        ProcessState::Idle => 5,
-        ProcessState::Dead => 6,
-        ProcessState::Unknown => 7,
+        ProcessState::Running => Some(0),
+        ProcessState::Sleeping => Some(1),
+        ProcessState::DiskSleep => Some(2),
+        ProcessState::Zombie => Some(3),
+        ProcessState::Stopped => Some(4),
+        ProcessState::Idle => Some(5),
+        ProcessState::Dead => Some(6),
+        ProcessState::Unknown => None,
     }
 }
 
