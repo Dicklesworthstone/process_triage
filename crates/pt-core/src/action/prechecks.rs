@@ -382,7 +382,7 @@ impl LivePreCheckProvider {
             return false;
         };
 
-        let probe_ms = window.as_millis().min(200).max(10) as u64;
+        let probe_ms = window.as_millis().clamp(10u128, 200u128) as u64;
         std::thread::sleep(Duration::from_millis(probe_ms));
 
         let after = parse_io(pid);
@@ -841,10 +841,9 @@ impl PreCheckProvider for LivePreCheckProvider {
             debug!(pid, "process is a zombie (Z state)");
             return PreCheckResult::Blocked {
                 check: PreCheck::VerifyProcessState,
-                reason: format!(
-                    "process is a zombie (Z state): already dead, cannot be killed. \
+                reason: "process is a zombie (Z state): already dead, cannot be killed. \
                      The parent process must reap it."
-                ),
+                    .to_string(),
             };
         }
 

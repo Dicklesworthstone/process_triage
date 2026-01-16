@@ -176,7 +176,7 @@ pub struct SupervisorPlanAction {
 }
 
 /// Structured parameters for supervisor command execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SupervisorParameters {
     /// For systemd: unit name (e.g., "nginx.service")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,20 +205,6 @@ pub struct SupervisorParameters {
     /// Signal to send for kill operations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<String>,
-}
-
-impl Default for SupervisorParameters {
-    fn default() -> Self {
-        Self {
-            systemd_unit: None,
-            pm2_name: None,
-            container_id: None,
-            supervisord_program: None,
-            forever_uid: None,
-            force: false,
-            signal: None,
-        }
-    }
 }
 
 /// Configuration for supervisor action execution.
@@ -904,8 +890,10 @@ pub fn plan_action_from_container_supervision(
         .map(|a| a.command.clone())
         .unwrap_or_else(|| format!("{} {} {}", supervisor_type, command, container_id));
 
-    let mut parameters = SupervisorParameters::default();
-    parameters.container_id = Some(container_id);
+    let parameters = SupervisorParameters {
+        container_id: Some(container_id),
+        ..Default::default()
+    };
 
     Some(SupervisorPlanAction {
         action_id: action_id.to_string(),

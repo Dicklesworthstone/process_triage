@@ -200,7 +200,7 @@ impl<'a> ActionExecutor<'a> {
         }
 
         // Run other pre-checks (protected, data-loss, supervisor, session safety)
-        if let Some(ref provider) = self.pre_check_provider {
+        if let Some(provider) = self.pre_check_provider {
             let pid = action.target.pid.0;
             let sid = action.target.sid;
             let results = provider.run_checks(&action.pre_checks, pid, sid);
