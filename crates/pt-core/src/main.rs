@@ -5512,12 +5512,12 @@ fn parse_duration(s: &str) -> Option<chrono::Duration> {
         return None;
     }
 
-    let (num_str, unit) = if s.ends_with('d') {
-        (&s[..s.len() - 1], 'd')
-    } else if s.ends_with('h') {
-        (&s[..s.len() - 1], 'h')
-    } else if s.ends_with('m') {
-        (&s[..s.len() - 1], 'm')
+    let (num_str, unit) = if let Some(stripped) = s.strip_suffix('d') {
+        (stripped, 'd')
+    } else if let Some(stripped) = s.strip_suffix('h') {
+        (stripped, 'h')
+    } else if let Some(stripped) = s.strip_suffix('m') {
+        (stripped, 'm')
     } else {
         return None;
     };

@@ -526,8 +526,7 @@ impl SupervisorActionRunner {
         let domain = action
             .parameters
             .launchd_domain
-            .as_ref()
-            .map(|s| s.as_str())
+            .as_deref()
             .unwrap_or("system");
 
         // Build the service-target for kickstart/kill commands

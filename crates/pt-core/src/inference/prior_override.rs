@@ -12,7 +12,7 @@
 use crate::config::priors::Priors;
 use crate::config::priors::BetaParams;
 use crate::supervision::signature::{MatchLevel, SignatureMatch, SignaturePriors};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Source of a prior value in the override hierarchy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

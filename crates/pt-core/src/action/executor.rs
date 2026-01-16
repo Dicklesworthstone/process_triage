@@ -245,6 +245,7 @@ impl ActionLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // Keep lock file contents (advisory lock only)
             .open(path)?;
 
         #[cfg(unix)]

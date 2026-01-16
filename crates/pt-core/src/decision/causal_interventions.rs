@@ -292,26 +292,26 @@ fn update_intervention_priors(
     match outcome.class {
         ProcessClass::Useful => InterventionPriors {
             useful: updated(&priors.useful),
-            useful_bad: priors.useful_bad.clone(),
-            abandoned: priors.abandoned.clone(),
-            zombie: priors.zombie.clone(),
+            useful_bad: priors.useful_bad,
+            abandoned: priors.abandoned,
+            zombie: priors.zombie,
         },
         ProcessClass::UsefulBad => InterventionPriors {
-            useful: priors.useful.clone(),
+            useful: priors.useful,
             useful_bad: updated(&priors.useful_bad),
-            abandoned: priors.abandoned.clone(),
-            zombie: priors.zombie.clone(),
+            abandoned: priors.abandoned,
+            zombie: priors.zombie,
         },
         ProcessClass::Abandoned => InterventionPriors {
-            useful: priors.useful.clone(),
-            useful_bad: priors.useful_bad.clone(),
+            useful: priors.useful,
+            useful_bad: priors.useful_bad,
             abandoned: updated(&priors.abandoned),
-            zombie: priors.zombie.clone(),
+            zombie: priors.zombie,
         },
         ProcessClass::Zombie => InterventionPriors {
-            useful: priors.useful.clone(),
-            useful_bad: priors.useful_bad.clone(),
-            abandoned: priors.abandoned.clone(),
+            useful: priors.useful,
+            useful_bad: priors.useful_bad,
+            abandoned: priors.abandoned,
             zombie: updated(&priors.zombie),
         },
     }
