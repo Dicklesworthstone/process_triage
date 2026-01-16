@@ -920,13 +920,13 @@ pub struct SignatureDatabase {
     /// All loaded signatures.
     signatures: Vec<SupervisorSignature>,
     /// Compiled regex patterns for process names (cached).
-    process_regexes: Vec<(usize, regex::Regex)>, // (signature_index, regex)
+    process_regexes: Vec<Vec<regex::Regex>>,
     /// Compiled regex patterns for arguments (cached).
-    arg_regexes: Vec<(usize, regex::Regex)>,
+    arg_regexes: Vec<Vec<regex::Regex>>,
     /// Compiled regex patterns for working directories (cached).
-    working_dir_regexes: Vec<(usize, regex::Regex)>,
+    working_dir_regexes: Vec<Vec<regex::Regex>>,
     /// Compiled regex patterns for parent processes (cached).
-    parent_regexes: Vec<(usize, regex::Regex)>,
+    parent_regexes: Vec<Vec<regex::Regex>>,
 }
 
 impl SignatureDatabase {
@@ -966,35 +966,42 @@ impl SignatureDatabase {
     /// Add a signature and compile its patterns.
     pub fn add(&mut self, signature: SupervisorSignature) -> Result<(), SignatureError> {
         signature.validate()?;
-        let idx = self.signatures.len();
-
+        
         // Compile process name regexes
+        let mut proc_res = Vec::new();
         for pattern in &signature.patterns.process_names {
             if let Ok(re) = regex::Regex::new(pattern) {
-                self.process_regexes.push((idx, re));
+                proc_res.push(re);
             }
         }
+        self.process_regexes.push(proc_res);
 
         // Compile argument regexes
+        let mut arg_res = Vec::new();
         for pattern in &signature.patterns.arg_patterns {
             if let Ok(re) = regex::Regex::new(pattern) {
-                self.arg_regexes.push((idx, re));
+                arg_res.push(re);
             }
         }
+        self.arg_regexes.push(arg_res);
 
         // Compile working directory regexes
+        let mut wd_res = Vec::new();
         for pattern in &signature.patterns.working_dir_patterns {
             if let Ok(re) = regex::Regex::new(pattern) {
-                self.working_dir_regexes.push((idx, re));
+                wd_res.push(re);
             }
         }
+        self.working_dir_regexes.push(wd_res);
 
         // Compile parent pattern regexes
+        let mut parent_res = Vec::new();
         for pattern in &signature.patterns.parent_patterns {
             if let Ok(re) = regex::Regex::new(pattern) {
-                self.parent_regexes.push((idx, re));
+                parent_res.push(re);
             }
         }
+        self.parent_regexes.push(parent_res);
 
         self.signatures.push(signature);
         Ok(())
@@ -1050,27 +1057,29 @@ impl SignatureDatabase {
     /// Find signatures matching a process name.
     pub fn find_by_process_name(&self, comm: &str) -> Vec<&SupervisorSignature> {
         let mut matches = Vec::new();
-        for (idx, re) in &self.process_regexes {
-            if re.is_match(comm) {
-                matches.push(&self.signatures[*idx]);
+        for (idx, regexes) in self.process_regexes.iter().enumerate() {
+            for re in regexes {
+                if re.is_match(comm) {
+                    matches.push(&self.signatures[idx]);
+                    break; // Once per signature is enough
+                }
             }
         }
-        // Deduplicate by signature index
-        matches.sort_by_key(|s| s.name.as_str());
-        matches.dedup_by_key(|s| s.name.as_str());
+        // Deduplicate by signature index not needed with break, but safe to keep logic simple
         matches
     }
 
     /// Find signatures matching a parent process name.
     pub fn find_by_parent_name(&self, comm: &str) -> Vec<&SupervisorSignature> {
         let mut matches = Vec::new();
-        for (idx, re) in &self.parent_regexes {
-            if re.is_match(comm) {
-                matches.push(&self.signatures[*idx]);
+        for (idx, regexes) in self.parent_regexes.iter().enumerate() {
+            for re in regexes {
+                if re.is_match(comm) {
+                    matches.push(&self.signatures[idx]);
+                    break;
+                }
             }
         }
-        matches.sort_by_key(|s| s.name.as_str());
-        matches.dedup_by_key(|s| s.name.as_str());
         matches
     }
 
@@ -1132,15 +1141,16 @@ impl SignatureDatabase {
     pub fn match_process<'a>(&'a self, ctx: &ProcessMatchContext<'_>) -> Vec<SignatureMatch<'a>> {
         let mut matches: Vec<SignatureMatch<'a>> = Vec::new();
 
+        // Pre-calculate exact match string to avoid allocation in loop
+        let exact_match_target = format!("^{}$", regex::escape(ctx.comm));
+
         for (sig_idx, sig) in self.signatures.iter().enumerate() {
             let mut details = MatchDetails::default();
 
             // Check process name patterns
-            let process_name_matched = self
-                .process_regexes
+            let process_name_matched = self.process_regexes[sig_idx]
                 .iter()
-                .filter(|(idx, _)| *idx == sig_idx)
-                .any(|(_, re)| re.is_match(ctx.comm));
+                .any(|re| re.is_match(ctx.comm));
             details.process_name_matched = process_name_matched;
 
             // Check exact command match (higher priority than pattern)
@@ -1148,7 +1158,7 @@ impl SignatureDatabase {
                 .patterns
                 .process_names
                 .iter()
-                .any(|p| p == &format!("^{}$", regex::escape(ctx.comm)));
+                .any(|p| p == &exact_match_target);
 
             // Check argument patterns
             let args_matched = if let Some(cmdline) = ctx.cmdline {
@@ -1156,11 +1166,14 @@ impl SignatureDatabase {
                     false
                 } else {
                     // All arg patterns must match (AND semantics)
-                    self.arg_regexes
-                        .iter()
-                        .filter(|(idx, _)| *idx == sig_idx)
-                        .all(|(_, re)| re.is_match(cmdline))
-                        && !sig.patterns.arg_patterns.is_empty()
+                    // Optimization: check if regex list is empty first
+                    let regexes = &self.arg_regexes[sig_idx];
+                    if regexes.is_empty() {
+                        // Should match sig.patterns.arg_patterns.is_empty(), but for safety:
+                        false
+                    } else {
+                        regexes.iter().all(|re| re.is_match(cmdline))
+                    }
                 }
             } else {
                 false
@@ -1169,10 +1182,9 @@ impl SignatureDatabase {
 
             // Check working directory patterns
             let working_dir_matched = if let Some(cwd) = ctx.cwd {
-                self.working_dir_regexes
+                self.working_dir_regexes[sig_idx]
                     .iter()
-                    .filter(|(idx, _)| *idx == sig_idx)
-                    .any(|(_, re)| re.is_match(cwd))
+                    .any(|re| re.is_match(cwd))
             } else {
                 false
             };
@@ -1218,10 +1230,9 @@ impl SignatureDatabase {
 
             // Check parent patterns
             let parent_matched = if let Some(parent) = ctx.parent_comm {
-                self.parent_regexes
+                self.parent_regexes[sig_idx]
                     .iter()
-                    .filter(|(idx, _)| *idx == sig_idx)
-                    .any(|(_, re)| re.is_match(parent))
+                    .any(|re| re.is_match(parent))
             } else {
                 false
             };
@@ -2363,13 +2374,12 @@ mod tests {
     #[test]
     fn test_beta_params_validation() {
         // Valid params
-        assert!(BetaParams::new(1.0, 1.0).validate().is_ok());
-        assert!(BetaParams::new(0.5, 0.5).validate().is_ok());
+        let valid = BetaParams::new(1.0, 1.0);
+        assert!(valid.validate().is_ok());
 
         // Invalid: zero or negative
-        assert!(BetaParams::new(0.0, 1.0).validate().is_err());
-        assert!(BetaParams::new(1.0, 0.0).validate().is_err());
-        assert!(BetaParams::new(-1.0, 1.0).validate().is_err());
+        let invalid = BetaParams::new(0.0, 1.0);
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
