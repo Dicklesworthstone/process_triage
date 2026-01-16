@@ -30,8 +30,10 @@
 //! ```
 
 use crate::supervision::session::{
-    detect_screen_session, detect_ssh_connection, detect_tmux_session, read_proc_stat,
+    detect_screen_session, detect_ssh_connection, detect_tmux_session,
 };
+#[cfg(target_os = "linux")]
+use crate::collect::{parse_proc_stat as read_proc_stat, ProcessStat as ProcStat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -382,7 +384,8 @@ pub fn collect_user_intent(pid: u32, config: &UserIntentConfig) -> Option<UserIn
         .map(|d| d.as_micros() as u64);
 
     // Read process stat
-    let proc_stat = read_proc_stat(pid).ok()?;
+    // parse_proc_stat returns Option, so we don't need .ok()
+    let proc_stat = read_proc_stat(pid)?;
     data_sources.push("proc_stat".to_string());
 
     let mut signals_checked = 0u32;
@@ -504,7 +507,7 @@ pub fn collect_user_intent(pid: u32, _config: &UserIntentConfig) -> Option<UserI
 #[cfg(target_os = "linux")]
 fn detect_tty_signals(
     pid: u32,
-    proc_stat: &crate::supervision::session::ProcStat,
+    proc_stat: &ProcStat,
     config: &UserIntentConfig,
 ) -> Option<Vec<IntentEvidence>> {
     let mut evidence = Vec::new();
@@ -668,7 +671,7 @@ fn detect_shell_activity_signals(
     const MAX_DEPTH: u32 = 10;
 
     while depth < MAX_DEPTH {
-        let proc_stat = read_proc_stat(current_pid).ok()?;
+        let proc_stat = read_proc_stat(current_pid)?;
 
         // Check if this is a shell
         let comm_lower = proc_stat.comm.to_lowercase();
