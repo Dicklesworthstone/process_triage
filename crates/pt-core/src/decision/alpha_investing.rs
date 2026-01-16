@@ -295,7 +295,12 @@ mod tests {
 
     #[test]
     fn alpha_update_formula_matches() {
-        let policy = Policy::default();
+        let mut policy = Policy::default();
+        policy.fdr_control.alpha_investing = Some(AlphaInvesting {
+            w0: Some(0.05),
+            alpha_spend: Some(0.02),
+            alpha_earn: Some(0.01),
+        });
         let cfg = AlphaInvestingPolicy::from_policy(&policy).expect("policy");
         let update = {
             let wealth_prev = 0.05;
@@ -319,7 +324,12 @@ mod tests {
     fn store_persists_state() {
         let dir = tempdir().expect("tempdir");
         let store = AlphaInvestingStore::new(dir.path());
-        let policy = Policy::default();
+        let mut policy = Policy::default();
+        policy.fdr_control.alpha_investing = Some(AlphaInvesting {
+            w0: Some(0.05),
+            alpha_spend: Some(0.02),
+            alpha_earn: Some(0.01),
+        });
         let state = store.load_or_init(&policy, 1000).expect("init");
         assert!(state.wealth > 0.0);
         let update = store.update_wealth(&policy, 1000, 2).expect("update");

@@ -427,6 +427,7 @@ pub fn parse_proc_net_tcp_reader<R: BufRead>(reader: R, is_ipv6: bool) -> Vec<Tc
 }
 
 /// Parse TCP content (for testing).
+#[cfg(test)]
 pub fn parse_proc_net_tcp_content(content: &str, is_ipv6: bool) -> Vec<TcpConnection> {
     parse_proc_net_tcp_reader(content.as_bytes(), is_ipv6)
 }
@@ -470,6 +471,7 @@ pub fn parse_proc_net_udp_reader<R: BufRead>(reader: R, is_ipv6: bool) -> Vec<Ud
 }
 
 /// Parse UDP content (for testing).
+#[cfg(test)]
 pub fn parse_proc_net_udp_content(content: &str, is_ipv6: bool) -> Vec<UdpSocket> {
     parse_proc_net_udp_reader(content.as_bytes(), is_ipv6)
 }
@@ -521,6 +523,7 @@ pub fn parse_proc_net_unix_reader<R: BufRead>(reader: R) -> Vec<UnixSocket> {
 }
 
 /// Parse Unix socket content (for testing).
+#[cfg(test)]
 pub fn parse_proc_net_unix_content(content: &str) -> Vec<UnixSocket> {
     parse_proc_net_unix_reader(content.as_bytes())
 }

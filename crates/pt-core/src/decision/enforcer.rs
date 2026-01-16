@@ -1092,7 +1092,8 @@ mod tests {
 
     #[test]
     fn test_protected_pid_blocked() {
-        let policy = test_policy();
+        let mut policy = test_policy();
+        policy.guardrails.never_kill_pid = vec![1];
         let enforcer = PolicyEnforcer::new(&policy).unwrap();
 
         let mut candidate = test_candidate();
@@ -1124,7 +1125,13 @@ mod tests {
 
     #[test]
     fn test_protected_pattern_blocked() {
-        let policy = test_policy();
+        let mut policy = test_policy();
+        policy.guardrails.protected_patterns.push(PatternEntry {
+            pattern: "sshd".to_string(),
+            kind: PatternKind::Literal,
+            case_insensitive: true,
+            notes: Some("SSH daemon".to_string()),
+        });
         let enforcer = PolicyEnforcer::new(&policy).unwrap();
 
         let mut candidate = test_candidate();
@@ -1172,7 +1179,8 @@ mod tests {
 
     #[test]
     fn test_rate_limit() {
-        let policy = test_policy();
+        let mut policy = test_policy();
+        policy.guardrails.max_kills_per_run = 5;
         let enforcer = PolicyEnforcer::new(&policy).unwrap();
         let candidate = test_candidate();
 
@@ -1307,7 +1315,8 @@ mod tests {
 
     #[test]
     fn test_data_loss_gate_recent_io() {
-        let policy = test_policy();
+        let mut policy = test_policy();
+        policy.data_loss_gates.block_if_recent_io_seconds = Some(60);
         let enforcer = PolicyEnforcer::new(&policy).unwrap();
 
         let mut candidate = test_candidate();
@@ -1461,7 +1470,8 @@ mod tests {
 
     #[test]
     fn test_protected_category_blocked() {
-        let policy = test_policy(); // default has "daemon" and "system" protected
+        let mut policy = test_policy();
+        policy.guardrails.protected_categories = vec!["daemon".to_string()];
         let enforcer = PolicyEnforcer::new(&policy).unwrap();
 
         let mut candidate = test_candidate();

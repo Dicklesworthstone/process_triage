@@ -419,7 +419,23 @@ fn ids_match(expected: &str, current: &str) -> bool {
     }
 
     match (extract_starttime(expected), extract_starttime(current)) {
-        (Some(e), Some(c)) => e == c,
+        (Some(e), Some(c)) => {
+            // Try integer comparison with fuzzy window (to handle ps rounding)
+            if let (Ok(e_ticks), Ok(c_ticks)) = (e.parse::<u64>(), c.parse::<u64>()) {
+                // If diff is within 1 second (100Hz = 100 ticks), treat as match
+                // We use 150 to be safe against rounding + small drift
+                let diff = if e_ticks > c_ticks {
+                    e_ticks - c_ticks
+                } else {
+                    c_ticks - e_ticks
+                };
+                if diff <= 150 {
+                    return true;
+                }
+            }
+            // Fallback to exact string match
+            e == c
+        },
         _ => false,
     }
 }
@@ -450,6 +466,16 @@ mod tests {
     #[test]
     fn ids_match_different() {
         assert!(!ids_match("abc:123:456", "abc:999:456"));
+    }
+
+    #[test]
+    fn ids_match_fuzzy() {
+        // Within 1 second (100 ticks)
+        assert!(ids_match("abc:10000:456", "abc:10050:456"));
+        // Within 1.5 seconds (150 ticks)
+        assert!(ids_match("abc:10000:456", "abc:10150:456"));
+        // Too far (200 ticks)
+        assert!(!ids_match("abc:10000:456", "abc:10200:456"));
     }
 
     #[cfg(unix)]

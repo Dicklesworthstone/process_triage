@@ -23,7 +23,8 @@ fn plan_exit_codes() -> impl predicates::Predicate<i32> {
 /// Get a Command for pt-core binary with timeout.
 fn pt_core() -> Command {
     let mut cmd = cargo_bin_cmd!("pt-core");
-    cmd.timeout(Duration::from_secs(30));
+    // Extended timeout for debug builds where inference can be slow
+    cmd.timeout(Duration::from_secs(300));
     cmd
 }
 
@@ -299,7 +300,7 @@ mod stdin_tty_handling {
         pt_core()
             .args(["--robot", "--format", "json", "scan"])
             .write_stdin("")
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .assert()
             .success();
     }
@@ -310,7 +311,7 @@ mod stdin_tty_handling {
         pt_core()
             .args(["--robot", "--format", "json", "agent", "plan"])
             .write_stdin("")
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
             .assert()
             .code(plan_exit_codes());
     }

@@ -55,14 +55,14 @@ impl ClassScores {
 }
 
 /// Evidence term contribution per class.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceTerm {
     pub feature: String,
     pub log_likelihood: ClassScores,
 }
 
 /// Posterior computation result.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PosteriorResult {
     pub posterior: ClassScores,
     pub log_posterior: ClassScores,

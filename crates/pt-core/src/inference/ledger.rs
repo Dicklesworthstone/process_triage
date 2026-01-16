@@ -9,7 +9,7 @@ use crate::config::priors::Priors;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BayesFactorEntry {
     pub feature: String,
     pub bf: f64,
@@ -19,7 +19,7 @@ pub struct BayesFactorEntry {
     pub strength: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceLedger {
     pub posterior: PosteriorResult,
     pub classification: Classification,
@@ -65,12 +65,68 @@ impl EvidenceLedger {
             classification, confidence
         );
 
+        // Calculate Bayes Factors for Abandoned vs Useful
+        let mut bayes_factors = Vec::new();
+        for term in &result.evidence_terms {
+            // log(P(f|Abandoned) / P(f|Useful)) = log(P(f|A)) - log(P(f|U))
+            let log_bf = term.log_likelihood.abandoned - term.log_likelihood.useful;
+            
+            // Skip terms with negligible impact
+            if log_bf.abs() < 0.01 {
+                continue;
+            }
+
+            let bf = log_bf.exp();
+            let delta_bits = log_bf / std::f64::consts::LN_2;
+            
+            let direction = if log_bf > 0.0 {
+                "supports abandoned".to_string()
+            } else {
+                "supports useful".to_string()
+            };
+
+            let abs_bits = delta_bits.abs();
+            let strength = if abs_bits > 3.3 { // > 10:1
+                "decisive".to_string()
+            } else if abs_bits > 2.0 { // > 4:1
+                "strong".to_string()
+            } else if abs_bits > 1.0 { // > 2:1
+                "substantial".to_string()
+            } else {
+                "weak".to_string()
+            };
+
+            bayes_factors.push(BayesFactorEntry {
+                feature: term.feature.clone(),
+                bf,
+                log_bf,
+                delta_bits,
+                direction,
+                strength,
+            });
+        }
+
+        // Sort by absolute impact (descending)
+        bayes_factors.sort_by(|a, b| b.delta_bits.abs().partial_cmp(&a.delta_bits.abs()).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Generate top evidence summary
+        let mut top_evidence = Vec::new();
+        for bf in bayes_factors.iter().take(3) {
+            let desc = format!(
+                "{} ({:.1} bits {})", 
+                bf.feature, 
+                bf.delta_bits.abs(),
+                if bf.log_bf > 0.0 { "toward abandoned" } else { "toward useful" }
+            );
+            top_evidence.push(desc);
+        }
+
         Self {
             posterior: result.clone(),
             classification,
             confidence,
-            bayes_factors: vec![],
-            top_evidence: vec![],
+            bayes_factors,
+            top_evidence,
             why_summary: summary,
             evidence_glyphs: HashMap::new(),
         }
@@ -95,7 +151,7 @@ impl std::fmt::Display for Direction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     VeryHigh,

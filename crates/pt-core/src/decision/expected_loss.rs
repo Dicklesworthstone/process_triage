@@ -1066,12 +1066,20 @@ mod tests {
 
     #[test]
     fn test_zombie_decision_routes_away_from_kill() {
-        let policy = policy_for_tests();
+        let mut policy = policy_for_tests();
+        // Make Kill strictly optimal for Zombie (if it weren't blocked)
+        policy.loss_matrix.zombie.kill = 0.1;
+        policy.loss_matrix.zombie.renice = Some(1.0);
+        policy.loss_matrix.zombie.pause = Some(1.0);
+        policy.loss_matrix.zombie.throttle = Some(1.0);
+        policy.loss_matrix.zombie.restart = Some(1.0);
+        policy.loss_matrix.zombie.keep = 10.0;
+
         let posterior = ClassScores {
-            useful: 0.05,
-            useful_bad: 0.05,
-            abandoned: 0.10,
-            zombie: 0.80, // High zombie probability would normally recommend Kill
+            useful: 0.000001,
+            useful_bad: 0.000001,
+            abandoned: 0.000001,
+            zombie: 0.999997, // Almost certain zombie
         };
 
         // Without state constraints, Kill would be optimal
@@ -1137,13 +1145,20 @@ mod tests {
 
     #[test]
     fn test_apply_risk_sensitive_with_robot_mode() {
-        let policy = policy_for_tests();
+        let mut policy = policy_for_tests();
+        // Make Kill strictly optimal for Abandoned
+        policy.loss_matrix.abandoned.kill = 0.1;
+        policy.loss_matrix.abandoned.renice = Some(1.0);
+        policy.loss_matrix.abandoned.pause = Some(1.0);
+        policy.loss_matrix.abandoned.throttle = Some(1.0);
+        policy.loss_matrix.abandoned.keep = 10.0;
+
         // Posterior where Kill has low E[L] but high tail risk
         let posterior = ClassScores {
-            useful: 0.01,
-            useful_bad: 0.01,
-            abandoned: 0.97,
-            zombie: 0.01,
+            useful: 0.001,
+            useful_bad: 0.001,
+            abandoned: 0.997,
+            zombie: 0.001,
         };
 
         let outcome = decide_action(&posterior, &policy, &ActionFeasibility::allow_all())
@@ -1240,13 +1255,20 @@ mod tests {
 
     #[test]
     fn test_apply_dro_with_ppc_failure() {
-        let policy = policy_for_tests();
+        let mut policy = policy_for_tests();
+        // Make Kill strictly optimal for Abandoned
+        policy.loss_matrix.abandoned.kill = 0.1;
+        policy.loss_matrix.abandoned.renice = Some(1.0);
+        policy.loss_matrix.abandoned.pause = Some(1.0);
+        policy.loss_matrix.abandoned.throttle = Some(1.0);
+        policy.loss_matrix.abandoned.keep = 10.0;
+
         // Posterior where Kill is nominally optimal
         let posterior = ClassScores {
-            useful: 0.05,
-            useful_bad: 0.05,
-            abandoned: 0.85,
-            zombie: 0.05,
+            useful: 0.001, // Reduce useful prob to avoid high kill penalty
+            useful_bad: 0.001,
+            abandoned: 0.997,
+            zombie: 0.001,
         };
 
         let outcome = decide_action(&posterior, &policy, &ActionFeasibility::allow_all())

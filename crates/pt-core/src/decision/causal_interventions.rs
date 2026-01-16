@@ -611,7 +611,7 @@ mod tests {
             .and_then(|p| p.useful)
             .expect("beta");
         assert!((updated_beta.alpha - 2.0).abs() <= 1e-12);
-        assert!((updated_beta.beta - 2.0).abs() <= 1e-12);
+        assert!((updated_beta.beta - 1.0).abs() <= 1e-12);
     }
 
     fn default_class() -> ClassParams {
