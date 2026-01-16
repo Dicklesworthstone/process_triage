@@ -5,6 +5,7 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
+use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -83,6 +84,7 @@ fn plan_with_session_reuses_session_id_and_writes_plan_artifact() {
         .to_string();
 
     // Run plan against the same session.
+    // Exit code 0 = no candidates, 1 = candidates found (PlanReady), both are success
     let plan_output = pt_core_with_data_dir(&data_dir)
         .args([
             "--format",
@@ -93,7 +95,7 @@ fn plan_with_session_reuses_session_id_and_writes_plan_artifact() {
             &session_id,
         ])
         .assert()
-        .success()
+        .code(predicate::in_iter([0, 1]))
         .get_output()
         .stdout
         .clone();

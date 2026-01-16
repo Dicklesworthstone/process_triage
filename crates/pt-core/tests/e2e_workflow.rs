@@ -144,10 +144,11 @@ mod agent_workflow {
         assert!(snapshot.get("session_id").is_some());
 
         // Step 2: Create plan (would use snapshot session_id in real impl)
+        // Exit code 0 = no candidates, 1 = candidates found (PlanReady), both are success
         let plan_output = pt_core()
             .args(["--format", "json", "agent", "plan"])
             .assert()
-            .success()
+            .code(predicate::in_iter([0, 1]))
             .get_output()
             .stdout
             .clone();
@@ -160,10 +161,11 @@ mod agent_workflow {
     #[test]
     fn dry_run_workflow_does_not_modify_state() {
         // Run full pipeline with --dry-run
+        // Exit code 0 = no candidates, 1 = candidates found (PlanReady), both are success
         pt_core()
             .args(["--dry-run", "--format", "json", "agent", "plan"])
             .assert()
-            .success();
+            .code(predicate::in_iter([0, 1]));
 
         // Verify we can still run commands (no state corruption)
         pt_core()
@@ -175,19 +177,21 @@ mod agent_workflow {
     #[test]
     fn shadow_mode_workflow() {
         // Shadow mode should run full pipeline but never execute
+        // Exit code 0 = no candidates, 1 = candidates found (PlanReady), both are success
         pt_core()
             .args(["--shadow", "--format", "json", "agent", "plan"])
             .assert()
-            .success();
+            .code(predicate::in_iter([0, 1]));
     }
 
     #[test]
     fn robot_mode_with_dry_run() {
         // Robot mode + dry-run should generate plan but not execute
+        // Exit code 0 = no candidates, 1 = candidates found (PlanReady), both are success
         pt_core()
             .args(["--robot", "--dry-run", "--format", "json", "agent", "plan"])
             .assert()
-            .success();
+            .code(predicate::in_iter([0, 1]));
     }
 }
 
@@ -463,6 +467,7 @@ mod full_pipeline {
     #[test]
     fn all_json_outputs_have_consistent_schema() {
         // Commands that don't depend on config files
+        // Note: "agent plan" returns exit code 1 (PlanReady) when candidates exist, which is success
         let commands = vec![
             vec!["--format", "json", "scan"],
             vec!["--format", "json", "agent", "snapshot"],
@@ -471,13 +476,19 @@ mod full_pipeline {
         ];
 
         for args in commands {
-            let output = pt_core()
-                .args(&args)
-                .assert()
-                .success()
-                .get_output()
-                .stdout
-                .clone();
+            let is_agent_plan = args.contains(&"plan");
+            let assertion = pt_core().args(&args).assert();
+
+            // agent plan returns 0 (no candidates) or 1 (PlanReady, candidates found)
+            let output = if is_agent_plan {
+                assertion
+                    .code(predicate::in_iter([0, 1]))
+                    .get_output()
+                    .stdout
+                    .clone()
+            } else {
+                assertion.success().get_output().stdout.clone()
+            };
 
             let json: Value = serde_json::from_slice(&output)
                 .unwrap_or_else(|e| panic!("Invalid JSON from {:?}: {}", args, e));

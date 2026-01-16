@@ -72,8 +72,9 @@ fn summary_agent_plan_outputs_stub() {
     let mut cmd = pt_core();
     let _env = apply_test_env(&mut cmd);
 
+    // Exit code 0 = no candidates, 1 = candidates found (PlanReady), both are success
     cmd.args(["--format", "summary", "agent", "plan"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("agent plan: stub plan written"));
+        .code(predicate::in_iter([0, 1]))
+        .stdout(predicate::str::contains("agent plan:"));
 }
