@@ -2,6 +2,7 @@
 
 pub mod alpha_investing;
 pub mod causal_interventions;
+pub mod composite_test;
 pub mod cvar;
 pub mod dependency_loss;
 pub mod dro;
@@ -53,4 +54,9 @@ pub use voi::{
 pub use dro::{
     apply_dro_gate, compute_adaptive_epsilon, compute_wasserstein_dro, decide_with_dro,
     is_de_escalation, DroError, DroLoss, DroOutcome, DroTrigger,
+};
+pub use composite_test::{
+    glr_bernoulli, mixture_sprt_bernoulli, mixture_sprt_beta_sequential, mixture_sprt_multiclass,
+    needs_composite_test, CompositeEvidenceAggregator, CompositeTestError, CompositeTestOutcome,
+    GlrConfig, GlrResult, MixtureSprtConfig, MixtureSprtResult, MixtureSprtState,
 };
