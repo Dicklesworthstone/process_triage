@@ -80,20 +80,31 @@ pub fn plan_recovery(
                 }
             }
         }
-        ActionFailure::Failed => match action {
-            Action::Kill => RecoveryDecision {
-                kind: FailureKind::Escalate,
-                retry_action: Some(Action::Kill),
-                delay_ms: Some(policy.term_grace_ms),
-                attempts_left: Some(policy.max_retries.saturating_sub(attempt)),
-            },
-            _ => RecoveryDecision {
-                kind: FailureKind::Transient,
-                retry_action: Some(action),
-                delay_ms: Some(policy.base_backoff_ms),
-                attempts_left: Some(policy.max_retries.saturating_sub(attempt)),
-            },
-        },
+        ActionFailure::Failed => {
+            if attempt >= policy.max_retries {
+                RecoveryDecision {
+                    kind: FailureKind::Permanent,
+                    retry_action: None,
+                    delay_ms: None,
+                    attempts_left: Some(0),
+                }
+            } else {
+                match action {
+                    Action::Kill => RecoveryDecision {
+                        kind: FailureKind::Escalate,
+                        retry_action: Some(Action::Kill),
+                        delay_ms: Some(policy.term_grace_ms),
+                        attempts_left: Some(policy.max_retries.saturating_sub(attempt)),
+                    },
+                    _ => RecoveryDecision {
+                        kind: FailureKind::Transient,
+                        retry_action: Some(action),
+                        delay_ms: Some(policy.base_backoff_ms),
+                        attempts_left: Some(policy.max_retries.saturating_sub(attempt)),
+                    },
+                }
+            }
+        }
     }
 }
 
@@ -125,5 +136,16 @@ mod tests {
         assert_eq!(decision.kind, FailureKind::Escalate);
         assert_eq!(decision.retry_action, Some(Action::Kill));
         assert_eq!(decision.delay_ms, Some(policy.term_grace_ms));
+    }
+
+    #[test]
+    fn failed_respects_max_retries() {
+        let policy = RetryPolicy {
+            max_retries: 2,
+            ..Default::default()
+        };
+        // Attempt 3 (exceeds max_retries=2)
+        let decision = plan_recovery(Action::Pause, ActionFailure::Failed, 3, &policy);
+        assert_eq!(decision.kind, FailureKind::Permanent);
     }
 }
