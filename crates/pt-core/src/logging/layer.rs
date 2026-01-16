@@ -14,6 +14,8 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 use super::events::Level;
+use crate::logging::get_redactor;
+use pt_redact::FieldClass;
 
 /// Storage for span context data.
 #[derive(Debug, Clone, Default)]
@@ -44,11 +46,15 @@ impl JsonFieldVisitor {
 impl tracing::field::Visit for JsonFieldVisitor {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
-            self.message = Some(value.to_string());
+            // Messages are FreeText, subject to secret detection
+            let redacted = get_redactor().redact(value, FieldClass::FreeText);
+            self.message = Some(redacted.output);
         } else {
+            let class = guess_field_class(field.name());
+            let redacted = get_redactor().redact(value, class);
             self.fields.insert(
                 field.name().to_string(),
-                serde_json::Value::String(value.to_string()),
+                serde_json::Value::String(redacted.output),
             );
         }
     }
@@ -56,10 +62,14 @@ impl tracing::field::Visit for JsonFieldVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let s = format!("{:?}", value);
         if field.name() == "message" {
-            self.message = Some(s);
+            let redacted = get_redactor().redact(&s, FieldClass::FreeText);
+            self.message = Some(redacted.output);
         } else {
+            // Debug output is treated as FreeText by default unless we know better
+            let class = guess_field_class(field.name());
+            let redacted = get_redactor().redact(&s, class);
             self.fields
-                .insert(field.name().to_string(), serde_json::Value::String(s));
+                .insert(field.name().to_string(), serde_json::Value::String(redacted.output));
         }
     }
 
@@ -87,6 +97,28 @@ impl tracing::field::Visit for JsonFieldVisitor {
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
         self.fields
             .insert(field.name().to_string(), serde_json::Value::Bool(value));
+    }
+}
+
+/// Guess the field class based on the field name.
+fn guess_field_class(name: &str) -> FieldClass {
+    match name {
+        "cmd" | "command" | "exe" => FieldClass::Cmd,
+        "args" | "cmdline" => FieldClass::Cmdline,
+        "path" | "file" | "cwd" | "dir" => FieldClass::PathProject,
+        "home" => FieldClass::PathHome,
+        "tmp" | "temp" => FieldClass::PathTmp,
+        "env" | "environ" => FieldClass::EnvValue,
+        "user" | "username" => FieldClass::Username,
+        "host" | "hostname" => FieldClass::Hostname,
+        "ip" | "addr" | "address" => FieldClass::IpAddress,
+        "url" | "uri" => FieldClass::Url,
+        "pid" | "ppid" => FieldClass::Pid,
+        "uid" | "gid" => FieldClass::Uid,
+        "port" => FieldClass::Port,
+        "container" | "container_id" => FieldClass::ContainerId,
+        "unit" | "service" => FieldClass::SystemdUnit,
+        _ => FieldClass::FreeText,
     }
 }
 

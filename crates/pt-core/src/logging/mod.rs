@@ -38,9 +38,49 @@ pub use events::{event_names, Level, LogContext, LogEvent, Stage};
 pub use layer::JsonlLayer;
 
 use std::io::IsTerminal;
+use std::sync::OnceLock;
+use pt_redact::{RedactionEngine, RedactionPolicy};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
+
+static REDACTOR: OnceLock<RedactionEngine> = OnceLock::new();
+
+/// Get the global redaction engine.
+///
+/// Initializes with a default policy if not already set.
+pub fn get_redactor() -> &'static RedactionEngine {
+    REDACTOR.get_or_init(|| {
+        RedactionEngine::new(RedactionPolicy::default())
+            .expect("Failed to initialize default redaction engine")
+    })
+}
+
+/// Set the global redaction engine.
+///
+/// Should be called once configuration is loaded.
+pub fn set_redactor(engine: RedactionEngine) {
+    // If already initialized (e.g. by early logs), we can't replace it in OnceLock.
+    // Ideally we'd use RwLock/ArcSwap, but for now we accept that early logs use default policy.
+    // However, for correct behavior with custom policy, we should try to set it.
+    // If Set fails, it means we already used the default.
+    // For a CLI tool, we load config very early. Maybe we can defer logging init?
+    // Or just accept default policy for init logs.
+    // Better: check if set, if not set. If set, warn?
+    // Actually, OnceLock::set returns Result.
+    if REDACTOR.set(engine).is_err() {
+        // This happens if get_redactor() was called before set_redactor().
+        // In pt-core, logging init happens before config load.
+        // So early logs use default.
+        // We probably want a way to update it.
+        // But RedactionEngine is immutable?
+        // Let's leave it as "default policy only" for now to fix the security hole,
+        // and later refactor to ArcSwap if we need dynamic policy updates.
+        // Default policy handles secrets/PII correctly, just maybe not custom regexes.
+        // Actually, let's log a warning to stderr if we can't set it.
+        eprintln!("Warning: Redaction engine already initialized with default policy. Custom policy ignored for logs.");
+    }
+}
 
 /// Initialize the logging subsystem.
 ///
