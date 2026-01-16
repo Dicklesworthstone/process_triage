@@ -2747,10 +2747,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             pt_core::events::event_names::SESSION_STARTED,
             Phase::Session,
         ));
-        e.emit(ProgressEvent::new(
-            pt_core::events::event_names::QUICK_SCAN_STARTED,
-            Phase::QuickScan,
-        ));
     }
 
     // Perform quick scan to enumerate processes
@@ -2769,16 +2765,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     };
 
-    if let Some(ref e) = emitter {
-        e.emit(
-            ProgressEvent::new(
-                pt_core::events::event_names::QUICK_SCAN_COMPLETE,
-                Phase::QuickScan,
-            )
-            .with_session_id(session_id.to_string())
-            .with_detail("count", scan_result.processes.len()),
-        );
-    }
+    // Quick scan emits its own progress events via the shared emitter.
 
     // Create protected filter from policy guardrails
     let protected_filter = match ProtectedFilter::from_guardrails(&policy.guardrails) {
