@@ -1,0 +1,36 @@
+.TH PT-CONFIG 5 "January 2026" "Process Triage" "File Formats"
+.SH NAME
+pt-config \- Process Triage configuration files
+.SH DESCRIPTION
+Process Triage reads configuration from:
+
+.I ~/.config/process_triage/
+
+This directory contains JSON files that control priors, policy, and learned decisions.
+.SH FILES
+.TP
+.I priors.json
+Bayesian hyperparameters. See docs/PRIORS_SCHEMA.md and docs/schemas/priors.schema.json.
+.TP
+.I policy.json
+Safety policy (protected patterns, robot mode gates). See README and docs/PLAN_GUARDRAILS.md.
+.TP
+.I decisions.json
+Learned decisions history (kill/spare). Used to bias future recommendations.
+.TP
+.I signatures.json
+User-defined signatures. See pt-signatures(5).
+.TP
+.I triage.log
+Operation log (append-only).
+.SH ENVIRONMENT
+.TP
+.B PROCESS_TRIAGE_CONFIG
+Override config directory.
+.TP
+.B XDG_CONFIG_HOME
+XDG override (default: ~/.config).
+.SH SEE ALSO
+.BR pt (1),
+.BR pt-core (1),
+.BR pt-signatures (5)

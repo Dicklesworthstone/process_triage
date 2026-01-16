@@ -1,0 +1,50 @@
+.TH PT 1 "January 2026" "pt 0.1.0" "Process Triage"
+.SH NAME
+pt \- Process Triage wrapper
+.SH SYNOPSIS
+.B pt
+[COMMAND] [OPTIONS]
+.SH DESCRIPTION
+.B pt
+is a thin Bash wrapper that locates or installs the pt-core binary and forwards all arguments.
+It provides the default interactive workflow and never performs inference itself.
+
+Safety: pt never kills processes without explicit confirmation.
+.SH COMMANDS
+.TP
+.B pt
+Run the interactive workflow (scan \-> review \-> confirm \-> apply).
+.TP
+.B pt scan
+Quick scan only (no actions).
+.TP
+.B pt deep
+Deep scan (more evidence, slower).
+.TP
+.B pt robot <subcommand>
+Agent/robot interface (plan, explain, apply).
+.TP
+.B pt update
+Update the installed pt-core via the installer script.
+.TP
+.B pt help
+Show help.
+.SH OPTIONS
+pt forwards all options to pt-core. Run:
+
+.B pt --help
+
+for the full list of global options.
+.SH FILES
+.TP
+.I ~/.config/process_triage/
+Configuration directory (policy, priors, decisions).
+.TP
+.I ~/.local/share/process_triage/
+Session data and artifacts.
+.SH EXIT CODES
+pt forwards exit codes from pt-core. See
+.B pt-core(1)
+for details.
+.SH SEE ALSO
+.BR pt-core (1)

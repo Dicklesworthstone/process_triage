@@ -1,0 +1,111 @@
+.TH PT-CORE 1 "January 2026" "pt-core 0.1.0" "Process Triage"
+.SH NAME
+pt-core \- Process Triage inference and decision engine
+.SH SYNOPSIS
+.B pt-core
+[GLOBAL OPTIONS] <command> [ARGS]
+.SH DESCRIPTION
+.B pt-core
+scans processes, computes Bayesian posteriors, applies policy and decision theory,
+produces plans, and optionally executes actions with safety gates.
+
+No actions are taken unless explicitly requested.
+.SH GLOBAL OPTIONS
+.TP
+.BR -f , " --format" " <json|jsonl|md|summary|...>"
+Output format (default: json).
+.TP
+.BR --robot
+Enable non-interactive automation mode (still gated by policy).
+.TP
+.BR --shadow
+Run full pipeline but never execute actions.
+.TP
+.BR --dry-run
+Compute plan only (no execution even with --robot).
+.TP
+.BR --timeout " <seconds>"
+Abort if operation exceeds time limit.
+.TP
+.BR --config " <path>"
+Override config directory.
+.TP
+.BR --capabilities " <path>"
+Capabilities manifest from the wrapper.
+.SH COMMANDS
+.TP
+.B run
+Interactive golden path (scan \-> infer \-> plan \-> TUI approval \-> apply).
+.TP
+.B scan
+Quick scan only (no inference or action).
+.TP
+.B deep-scan
+Deep scan with /proc probes (Linux).
+.TP
+.B query
+Query telemetry and session history.
+.TP
+.B bundle
+Create or inspect diagnostic bundles.
+.TP
+.B report
+Generate HTML reports.
+.TP
+.B check
+Validate configuration and environment.
+.TP
+.B agent
+Agent/robot subcommands (plan, explain, apply, verify).
+.TP
+.B config
+Configuration management.
+.TP
+.B telemetry
+Telemetry management.
+.TP
+.B signature
+Signature management (list/add/remove/test/validate/export).
+.TP
+.B version
+Print version information.
+.SH EXIT CODES
+The following exit codes are stable:
+.TP
+.B 0
+OK_CLEAN (success, nothing to do)
+.TP
+.B 1
+OK_CANDIDATES (plan produced)
+.TP
+.B 2
+OK_APPLIED (actions executed)
+.TP
+.B 3
+ERR_PARTIAL (some actions failed)
+.TP
+.B 4
+ERR_BLOCKED (safety gate blocked)
+.TP
+.B 5
+ERR_GOAL_UNREACHABLE
+.TP
+.B 6
+ERR_INTERRUPTED (resumable)
+.TP
+.B 10-16
+ERR_ARGS, ERR_CAPABILITY, ERR_PERMISSION, ERR_VERSION, ERR_LOCK, ERR_SESSION, ERR_IDENTITY
+.TP
+.B 20-22
+ERR_INTERNAL, ERR_IO, ERR_TIMEOUT
+.SH FILES
+.TP
+.I ~/.config/process_triage/
+Configuration directory (policy.json, priors.json, signatures.json).
+.TP
+.I ~/.local/share/process_triage/sessions/
+Session artifacts.
+.SH SEE ALSO
+.BR pt (1),
+.BR pt-config (5),
+.BR pt-signatures (5)

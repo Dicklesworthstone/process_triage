@@ -98,6 +98,21 @@ jobs:
             fi
           done
 
+  manpages:
+    name: Man Pages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install groff
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y groff-base
+
+      - name: Generate and check man pages
+        run: scripts/check_manpages.sh
+
   rust_lint:
     name: Rust Lint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

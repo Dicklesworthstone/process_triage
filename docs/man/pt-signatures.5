@@ -1,0 +1,49 @@
+.TH PT-SIGNATURES 5 "January 2026" "Process Triage" "File Formats"
+.SH NAME
+pt-signatures \- Process Triage signature schema
+.SH DESCRIPTION
+Signatures identify known process patterns and optionally adjust priors and expectations.
+User signatures are stored in:
+
+.I ~/.config/process_triage/signatures.json
+
+Schema version: 2.
+.SH STRUCTURE
+Top-level object:
+
+- schema_version (number)
+- metadata (optional)
+- signatures (array)
+
+Signature fields (per entry):
+
+- name (string)
+- category (agent|ide|ci|orchestrator|terminal|other)
+- confidence_weight (0.0-1.0)
+- priority (integer, higher wins)
+- notes (optional)
+- patterns (object)
+- priors (optional)
+- expectations (optional)
+
+Pattern fields:
+
+- process_names (regex list)
+- arg_patterns (regex list, AND semantics)
+- environment_vars (map var -> regex)
+- working_dir_patterns (regex list)
+- socket_paths (path prefixes)
+- pid_files (path list)
+- parent_patterns (regex list)
+- min_matches (minimum pattern types)
+
+.SH CLI
+Manage signatures with:
+
+.B pt signature list|show|add|remove|test|validate|export
+
+.SH SEE ALSO
+.BR pt (1),
+.BR pt-core (1),
+.BR pt-config (5),
+.B docs/SIGNATURE_AUTHORING_GUIDE.md
