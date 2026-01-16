@@ -2,6 +2,7 @@
 
 pub mod alpha_investing;
 pub mod causal_interventions;
+pub mod cvar;
 pub mod dependency_loss;
 pub mod enforcer;
 pub mod expected_loss;
@@ -39,6 +40,9 @@ pub use load_aware::{apply_load_to_loss_matrix, compute_load_adjustment, LoadAdj
 pub use robot_constraints::{
     ConstraintCheckResult, ConstraintChecker, ConstraintKind, ConstraintMetrics, ConstraintSource,
     ConstraintSources, ConstraintViolation, RobotCandidate, RuntimeRobotConstraints,
+};
+pub use cvar::{
+    compute_cvar, decide_with_cvar, CvarError, CvarLoss, CvarTrigger, RiskSensitiveOutcome,
 };
 pub use voi::{
     compute_voi, select_probe_by_information_gain, ProbeCost, ProbeCostModel, ProbeInformationGain,
