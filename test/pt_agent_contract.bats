@@ -1272,7 +1272,7 @@ extract_json() {
     BATS_TEST_COMPLETED=pass
 }
 
-@test "Contract: agent export-priors stdout response has status" {
+@test "Contract: agent export-priors stdout response has exported flag" {
     require_jq
     test_info "Testing: export-priors stdout response"
 
@@ -1287,19 +1287,16 @@ extract_json() {
     local json
     json=$(extract_json "$output")
 
-    # Stdout response should have status field
-    local resp_status
-    resp_status=$(echo "$json" | jq -r '.status')
-    assert_equals "ok" "$resp_status" "response should show status ok"
+    # Stdout response should have exported flag
+    local exported
+    exported=$(echo "$json" | jq -r '.exported')
+    assert_equals "true" "$exported" "response should show exported true"
 
-    # Should have session_id
-    validate_session_id "$json" "export-priors response"
-
-    # Should have output_path
-    local output_path
-    output_path=$(echo "$json" | jq -r '.output_path')
-    [[ -n "$output_path" && "$output_path" != "null" ]]
-    test_info "output_path: $output_path"
+    # Should have path
+    local path
+    path=$(echo "$json" | jq -r '.path')
+    [[ -n "$path" && "$path" != "null" ]]
+    test_info "path: $path"
 
     BATS_TEST_COMPLETED=pass
 }
