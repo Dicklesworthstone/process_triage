@@ -6,6 +6,7 @@ pub mod beta_stacy;
 pub mod bma;
 pub mod bocpd;
 pub mod compound_poisson;
+pub mod copula;
 pub mod ctw;
 pub mod conformal;
 pub mod evt;
@@ -138,3 +139,4 @@ pub use compound_poisson::{
     CompoundPoissonError, CompoundPoissonEvidence, CompoundPoissonParams, CompoundPoissonResult,
     CompoundPoissonSummary, GammaParams as CpGammaParams, RegimeStats as CpRegimeStats,
 };
+pub use copula::{summarize_copula_dependence, CopulaConfig, CopulaSummary};

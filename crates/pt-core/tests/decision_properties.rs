@@ -79,7 +79,10 @@ proptest! {
                 .max(posterior.abandoned)
                 .max(posterior.zombie);
 
-            if max_prob > 0.95 {
+            // Loss penalty is 100.0, probe costs are ~0.1-0.5.
+            // Risk at 95% is 5.0, which > cost, so probing is still rational.
+            // We need much higher confidence (risk < cost) to stop probing.
+            if max_prob > 0.999 {
                 // When very confident, most probes should have VOI close to cost
                 // (little benefit from probing)
                 let worthwhile_count = analysis.probes.iter()

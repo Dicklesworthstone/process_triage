@@ -347,15 +347,12 @@ export PROCESS_TRIAGE_NO_PERSIST=1
 
 ## Sharing and Reproducibility
 
-> **Note**: The export and report commands below are part of the planned feature set and not yet implemented. Currently, use `pt robot plan --format json > plan.json` to capture session data.
-
-### Session Bundles (`.ptb`) — Planned
+### Session Bundles (`.ptb`)
 
 Export a complete session for sharing or archival:
 
 ```bash
-# Planned feature
-pt export --session pt-20260115-143022-a7xq --profile share
+pt bundle create --session pt-20260115-143022-a7xq --profile safe --output session.ptb
 ```
 
 Will create a `.ptb` bundle containing:
@@ -364,7 +361,22 @@ Will create a `.ptb` bundle containing:
 - Evidence summaries (no raw data)
 - Decision rationale
 
-Bundles will be optionally encrypted for sensitive environments.
+#### Optional Encryption
+
+Encrypt bundles explicitly with a passphrase:
+
+```bash
+pt bundle create --session pt-20260115-143022-a7xq --profile safe --encrypt \
+  --passphrase "correct horse battery staple"
+```
+
+You can also set `PT_BUNDLE_PASSPHRASE` to avoid passing the passphrase on the command line.
+
+Threat model and limitations:
+- Protects bundle contents at rest/in transit with passphrase-based encryption.
+- Does not hide bundle size or the fact that a bundle exists.
+- Does not protect data after decryption; keep decrypted outputs local and access-controlled.
+- Security depends on passphrase strength (use a strong, unique passphrase).
 
 ### HTML Reports — Planned
 

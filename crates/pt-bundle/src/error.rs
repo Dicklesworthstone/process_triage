@@ -60,6 +60,30 @@ pub enum BundleError {
     /// Manifest integrity check failed
     #[error("manifest integrity check failed")]
     ManifestIntegrityFailed,
+
+    /// Bundle is encrypted; passphrase required
+    #[error("bundle is encrypted; passphrase required")]
+    EncryptedBundleRequiresPassphrase,
+
+    /// Passphrase required but missing or empty
+    #[error("missing passphrase for bundle encryption/decryption")]
+    MissingPassphrase,
+
+    /// Encryption header is missing or invalid
+    #[error("invalid bundle encryption header")]
+    InvalidEncryptionHeader,
+
+    /// Bundle is not encrypted
+    #[error("bundle is not encrypted")]
+    NotEncrypted,
+
+    /// Encryption failed
+    #[error("bundle encryption failed")]
+    EncryptionFailed,
+
+    /// Decryption failed (bad key or tampered data)
+    #[error("bundle decryption failed")]
+    DecryptionFailed,
 }
 
 /// Result type alias for bundle operations.

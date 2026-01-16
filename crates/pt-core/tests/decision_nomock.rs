@@ -362,6 +362,10 @@ fn test_expected_loss_no_feasible_actions() {
                 reason: "test".to_string(),
             },
             DisabledAction {
+                action: Action::Quarantine,
+                reason: "test".to_string(),
+            },
+            DisabledAction {
                 action: Action::Restart,
                 reason: "test".to_string(),
             },

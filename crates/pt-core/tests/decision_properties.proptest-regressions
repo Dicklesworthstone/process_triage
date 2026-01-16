@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 7fe28ab74804c60a6c75011c4cbb849ba601cae22d8c25f12cbf97b2c5abdaf8 # shrinks to posterior = ClassScores { useful: 0.25, useful_bad: 0.25, abandoned: 0.25, zombie: 0.25 }
+cc f2792939f21c8d653f8037bbf43887c439a00e4e5be7d4dd5e36238b45fe29cf # shrinks to posterior = ClassScores { useful: 0.03114304201866514, useful_bad: 0.0, abandoned: 0.9688569579813349, zombie: 0.0 }

@@ -3,9 +3,10 @@
 //! Reads ZIP archives with integrity verification.
 
 use crate::{BundleError, BundleManifest, FileEntry, Result, BUNDLE_SCHEMA_VERSION};
+use crate::encryption;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
@@ -20,7 +21,15 @@ pub struct BundleReader<R: Read + std::io::Seek> {
 impl BundleReader<File> {
     /// Open a bundle from a file path.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
+        let mut magic = [0u8; 8];
+        let bytes_read = file.read(&mut magic)?;
+
+        if bytes_read == magic.len() && encryption::is_encrypted_prefix(&magic) {
+            return Err(BundleError::EncryptedBundleRequiresPassphrase);
+        }
+
+        file.seek(SeekFrom::Start(0))?;
         Self::from_reader(file)
     }
 }
@@ -30,6 +39,25 @@ impl BundleReader<Cursor<Vec<u8>>> {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let cursor = Cursor::new(bytes);
         Self::from_reader(cursor)
+    }
+
+    /// Open a bundle from a file path, optionally using a passphrase.
+    pub fn open_with_passphrase(path: &Path, passphrase: Option<&str>) -> Result<Self> {
+        let mut file = File::open(path)?;
+        let mut magic = [0u8; 8];
+        let bytes_read = file.read(&mut magic)?;
+
+        file.seek(SeekFrom::Start(0))?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+
+        if bytes_read == magic.len() && encryption::is_encrypted_prefix(&magic) {
+            let passphrase = passphrase.ok_or(BundleError::EncryptedBundleRequiresPassphrase)?;
+            let decrypted = encryption::decrypt_bytes(&data, passphrase)?;
+            return Self::from_bytes(decrypted);
+        }
+
+        Self::from_bytes(data)
     }
 }
 
@@ -253,7 +281,9 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BundleError;
     use crate::BundleWriter;
+    use crate::encryption::{decrypt_bytes, encrypt_bytes};
     use pt_redact::ExportProfile;
 
     fn create_test_bundle() -> Vec<u8> {
@@ -443,5 +473,55 @@ mod tests {
         // Verify all files
         let failures = reader.verify_all();
         assert!(failures.is_empty(), "Verification failed: {:?}", failures);
+    }
+
+    #[test]
+    fn test_bundle_reader_open_encrypted() {
+        let bytes = create_test_bundle();
+        let encrypted = encrypt_bytes(&bytes, "secret").unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let bundle_path = temp_dir.path().join("session.ptb");
+        std::fs::write(&bundle_path, encrypted).unwrap();
+
+        let reader = BundleReader::open_with_passphrase(&bundle_path, Some("secret")).unwrap();
+        assert_eq!(reader.session_id(), "session-123");
+    }
+
+    #[test]
+    fn test_bundle_reader_open_encrypted_requires_passphrase() {
+        let bytes = create_test_bundle();
+        let encrypted = encrypt_bytes(&bytes, "secret").unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let bundle_path = temp_dir.path().join("session.ptb");
+        std::fs::write(&bundle_path, encrypted).unwrap();
+
+        let result = BundleReader::open(&bundle_path);
+        assert!(matches!(
+            result,
+            Err(BundleError::EncryptedBundleRequiresPassphrase)
+        ));
+    }
+
+    #[test]
+    fn test_bundle_reader_open_encrypted_wrong_passphrase() {
+        let bytes = create_test_bundle();
+        let encrypted = encrypt_bytes(&bytes, "secret").unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let bundle_path = temp_dir.path().join("session.ptb");
+        std::fs::write(&bundle_path, encrypted).unwrap();
+
+        let result = BundleReader::open_with_passphrase(&bundle_path, Some("bad"));
+        assert!(matches!(result, Err(BundleError::DecryptionFailed)));
+    }
+
+    #[test]
+    fn test_bundle_reader_decrypt_roundtrip() {
+        let bytes = create_test_bundle();
+        let encrypted = encrypt_bytes(&bytes, "secret").unwrap();
+        let decrypted = decrypt_bytes(&encrypted, "secret").unwrap();
+        assert_eq!(decrypted, bytes);
     }
 }

@@ -25,7 +25,8 @@ use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+use std::thread;
 use std::time::Instant;
 use thiserror::Error;
 
@@ -234,10 +235,6 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
     let start = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
 
-    let mut processes = Vec::new();
-    let mut warnings = Vec::new();
-    let mut skipped_count = 0;
-
     // Initialize user cache to avoid reading /etc/passwd for every process
     let user_cache = UserCache::new();
 
@@ -266,46 +263,85 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
         );
     }
 
-    let mut scanned = 0usize;
     const PROGRESS_STEP: usize = 50;
+    let scanned_counter = AtomicUsize::new(0);
+    
+    // Determine parallelism
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16); // Cap threads
+    let chunk_size = (pids.len() + num_threads - 1) / num_threads.max(1);
+    let chunks: Vec<_> = pids.chunks(chunk_size).collect();
 
-    for pid in &pids {
-        match scan_process(
-            *pid,
-            options.include_environ,
-            &user_cache,
-            &boot_id,
-            &network_snapshot,
-        ) {
-            Ok(record) => processes.push(record),
-            Err(e) => {
-                if options.skip_inaccessible {
-                    skipped_count += 1;
-                } else {
-                    warnings.push(format!("PID {}: {}", pid, e));
+    let (processes, warnings, skipped_count) = thread::scope(|s| {
+        let mut handles = Vec::new();
+        
+        for chunk in chunks {
+            let user_cache_ref = &user_cache;
+            let network_snapshot_ref = &network_snapshot;
+            let boot_id_ref = &boot_id;
+            let progress_ref = options.progress.as_ref();
+            let counter_ref = &scanned_counter;
+
+            handles.push(s.spawn(move || {
+                let mut local_processes = Vec::new();
+                let mut local_warnings = Vec::new();
+                let mut local_skipped = 0;
+
+                for &pid in chunk {
+                    match scan_process(
+                        pid,
+                        options.include_environ,
+                        user_cache_ref,
+                        boot_id_ref,
+                        network_snapshot_ref,
+                    ) {
+                        Ok(record) => local_processes.push(record),
+                        Err(e) => {
+                            if options.skip_inaccessible {
+                                local_skipped += 1;
+                            } else {
+                                local_warnings.push(format!("PID {}: {}", pid, e));
+                            }
+                        }
+                    }
+
+                    let current = counter_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    if current % PROGRESS_STEP == 0 {
+                        if let Some(emitter) = progress_ref {
+                            emitter.emit(
+                                ProgressEvent::new(event_names::DEEP_SCAN_PROGRESS, Phase::DeepScan)
+                                    .with_progress(current as u64, Some(total_pids))
+                                    .with_detail("skipped", local_skipped), // Local skipped isn't global, but roughly indicative
+                            );
+                        }
+                    }
                 }
-            }
+                (local_processes, local_warnings, local_skipped)
+            }));
         }
 
-        scanned += 1;
-        if scanned % PROGRESS_STEP == 0 {
-            if let Some(emitter) = options.progress.as_ref() {
-                emitter.emit(
-                    ProgressEvent::new(event_names::DEEP_SCAN_PROGRESS, Phase::DeepScan)
-                        .with_progress(scanned as u64, Some(total_pids))
-                        .with_detail("skipped", skipped_count),
-                );
+        let mut all_processes = Vec::new();
+        let mut all_warnings = Vec::new();
+        let mut total_skipped = 0;
+
+        for handle in handles {
+            if let Ok((p, w, s)) = handle.join() {
+                all_processes.extend(p);
+                all_warnings.extend(w);
+                total_skipped += s;
             }
         }
-    }
+        
+        (all_processes, all_warnings, total_skipped)
+    });
 
     let duration = start.elapsed();
     let process_count = processes.len();
+    let scanned_total = scanned_counter.load(Ordering::Relaxed);
 
     if let Some(emitter) = options.progress.as_ref() {
         emitter.emit(
             ProgressEvent::new(event_names::DEEP_SCAN_COMPLETE, Phase::DeepScan)
-                .with_progress(scanned as u64, Some(total_pids))
+                .with_progress(scanned_total as u64, Some(total_pids))
                 .with_elapsed_ms(duration.as_millis() as u64)
                 .with_detail("process_count", process_count)
                 .with_detail("skipped", skipped_count)

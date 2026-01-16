@@ -242,7 +242,6 @@ impl CriticalFileCategory {
                 | Self::GitLock
                 | Self::GitRebase
                 | Self::SystemPackageLock
-                | Self::DatabaseWrite
         )
     }
 }
@@ -408,6 +407,9 @@ pub fn parse_fd_dir(dir: &Path, fdinfo_dir: Option<&Path>) -> Option<FdInfo> {
     let mut info = FdInfo::default();
 
     let entries = fs::read_dir(dir).ok()?;
+    let mut inspected_count = 0;
+    // Limit inspection to prevent stall on processes with massive FD counts (e.g. databases)
+    const MAX_INSPECT: usize = 2000;
 
     for entry in entries.flatten() {
         // Parse FD number from filename; skip non-numeric entries defensively.
@@ -417,6 +419,12 @@ pub fn parse_fd_dir(dir: &Path, fdinfo_dir: Option<&Path>) -> Option<FdInfo> {
         };
 
         info.count += 1;
+
+        // Skip expensive inspection if we've hit the limit
+        if inspected_count >= MAX_INSPECT {
+            continue;
+        }
+        inspected_count += 1;
 
         // Try to read the symlink to categorize
         if let Ok(target) = fs::read_link(entry.path()) {
@@ -1469,9 +1477,10 @@ nice                                         :                    0
         assert!(CriticalFileCategory::GitLock.is_hard_block());
         assert!(CriticalFileCategory::GitRebase.is_hard_block());
         assert!(CriticalFileCategory::SystemPackageLock.is_hard_block());
-        assert!(CriticalFileCategory::DatabaseWrite.is_hard_block());
+        
+        // Database write is Soft because it's a heuristic (might be read-only access despite FD flags)
+        assert!(!CriticalFileCategory::DatabaseWrite.is_hard_block());
 
-        // Soft block categories
         assert!(!CriticalFileCategory::NodePackageLock.is_hard_block());
         assert!(!CriticalFileCategory::CargoLock.is_hard_block());
         assert!(!CriticalFileCategory::AppLock.is_hard_block());

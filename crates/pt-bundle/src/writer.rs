@@ -3,6 +3,7 @@
 //! Creates ZIP archives with manifest and checksums.
 
 use crate::{BundleError, BundleManifest, FileEntry, Result};
+use crate::encryption;
 use pt_redact::ExportProfile;
 use std::fs::File;
 use std::io::{Cursor, Write};
@@ -220,6 +221,14 @@ impl BundleWriter {
         );
 
         Ok(self.manifest)
+    }
+
+    /// Write the bundle to a file, encrypted with a passphrase.
+    pub fn write_encrypted(self, path: &Path, passphrase: &str) -> Result<BundleManifest> {
+        let (bytes, manifest) = self.write_to_vec()?;
+        let encrypted = encryption::encrypt_bytes(&bytes, passphrase)?;
+        std::fs::write(path, encrypted)?;
+        Ok(manifest)
     }
 
     /// Write the bundle to a byte vector (for in-memory use).
