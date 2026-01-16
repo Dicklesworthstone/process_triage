@@ -10,6 +10,7 @@ pub mod enforcer;
 pub mod expected_loss;
 pub mod fdr_selection;
 pub mod load_aware;
+pub mod myopic_policy;
 pub mod robot_constraints;
 pub mod voi;
 
@@ -59,4 +60,12 @@ pub use composite_test::{
     glr_bernoulli, mixture_sprt_bernoulli, mixture_sprt_beta_sequential, mixture_sprt_multiclass,
     needs_composite_test, CompositeEvidenceAggregator, CompositeTestError, CompositeTestOutcome,
     GlrConfig, GlrResult, MixtureSprtConfig, MixtureSprtResult, MixtureSprtState,
+};
+pub use myopic_policy::{
+    belief_to_class_scores, class_scores_to_belief, compute_expected_loss_for_action,
+    compute_loss_table, decide_from_belief, decide_from_belief_constrained,
+    decide_from_belief_with_config, ActionLossBreakdown, AlphaInvestingSummary,
+    BeliefStateDisplay, BlastRadiusSummary, ConstraintSummary, FdrGateSummary,
+    MyopicDecision, MyopicPolicyConfig, MyopicPolicyError, PolicyCheckSummary,
+    RobotConstraintSummary, StateContributions,
 };
