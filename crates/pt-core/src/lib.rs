@@ -18,11 +18,13 @@ pub mod config;
 pub mod decision;
 pub mod events;
 pub mod exit_codes;
+pub mod inbox;
 pub mod inference;
 pub mod logging;
 pub mod plan;
 pub mod session;
 pub mod supervision;
+pub mod verify;
 
 // Re-export test utilities for integration tests
 #[cfg(any(test, feature = "test-utils"))]

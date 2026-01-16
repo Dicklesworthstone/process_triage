@@ -17,6 +17,7 @@ use pt_core::exit_codes::ExitCode;
 use pt_core::session::{
     ListSessionsOptions, SessionContext, SessionManifest, SessionMode, SessionState, SessionStore,
 };
+use pt_core::verify::{parse_agent_plan, verify_plan, VerifyError};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -343,6 +344,9 @@ enum AgentCommands {
 
     /// List current prior configuration
     ListPriors(AgentListPriorsArgs),
+
+    /// View pending plans and notifications
+    Inbox(AgentInboxArgs),
 }
 
 #[derive(Args, Debug)]
@@ -483,6 +487,25 @@ struct AgentListPriorsArgs {
     /// Include all hyperparameters (extended output)
     #[arg(long)]
     extended: bool,
+}
+
+#[derive(Args, Debug)]
+struct AgentInboxArgs {
+    /// Acknowledge/dismiss an item by ID
+    #[arg(long)]
+    ack: Option<String>,
+
+    /// Clear all acknowledged items
+    #[arg(long)]
+    clear: bool,
+
+    /// Clear all items (including unacknowledged)
+    #[arg(long)]
+    clear_all: bool,
+
+    /// Show only unread items
+    #[arg(long)]
+    unread: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1060,7 +1083,9 @@ fn run_bundle_create(
                     OutputFormat::Md => eprintln!(
                         "Error: Encryption requested but no passphrase provided (use --passphrase or PT_BUNDLE_PASSPHRASE)"
                     ),
-                    OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+                    OutputFormat::Jsonl => {
+                        println!("{}", serde_json::to_string(&error_output).unwrap())
+                    }
                     _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
                 }
                 return ExitCode::ArgsError;
@@ -1117,7 +1142,7 @@ fn run_bundle_create(
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
-            ExitCode::InternalError
+            return ExitCode::InternalError;
         }
     }
 }
@@ -1344,7 +1369,9 @@ fn run_bundle_extract(
         });
         match global.format {
             OutputFormat::Md => eprintln!("Error: Failed to create output directory: {}", e),
-            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            OutputFormat::Jsonl => {
+                println!("{}", serde_json::to_string(&error_output).unwrap())
+            }
             _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
         return ExitCode::InternalError;
@@ -1567,6 +1594,7 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
         AgentCommands::Diff(args) => run_agent_diff(global, args),
         AgentCommands::Sessions(args) => run_agent_sessions(global, args),
         AgentCommands::ListPriors(args) => run_agent_list_priors(global, args),
+        AgentCommands::Inbox(args) => run_agent_inbox(global, args),
         AgentCommands::Capabilities => {
             output_capabilities(global);
             ExitCode::Clean
@@ -1650,18 +1678,18 @@ fn run_config_show(global: &GlobalOpts, file_filter: Option<&str>) -> ExitCode {
                 "priors": {
                     "source": {
                         "path": snapshot.priors_path.as_ref().map(|p| p.display().to_string()),
-                        "hash": snapshot.priors_hash,
+                        "hash": &snapshot.priors_hash,
                         "using_defaults": snapshot.priors_path.is_none(),
-                        "schema_version": snapshot.priors_schema_version,
+                        "schema_version": &snapshot.priors_schema_version,
                     },
                     "values": &config.priors
                 },
                 "policy": {
                     "source": {
                         "path": snapshot.policy_path.as_ref().map(|p| p.display().to_string()),
-                        "hash": snapshot.policy_hash,
+                        "hash": &snapshot.policy_hash,
                         "using_defaults": snapshot.policy_path.is_none(),
-                        "schema_version": snapshot.policy_schema_version,
+                        "schema_version": &snapshot.policy_schema_version,
                     },
                     "values": &config.policy
                 }
@@ -2168,7 +2196,7 @@ fn collect_cpu_count() -> u32 {
 fn collect_memory_info() -> serde_json::Value {
     let (total_kb, available_kb) = std::fs::read_to_string("/proc/meminfo")
         .ok()
-        .map(|content| {
+        .and_then(|content| {
             let mut total: u64 = 0;
             let mut available: u64 = 0;
             for line in content.lines() {
@@ -2186,7 +2214,7 @@ fn collect_memory_info() -> serde_json::Value {
                         .unwrap_or(0);
                 }
             }
-            (total, available)
+            Some((total, available))
         })
         .unwrap_or((0, 0));
 
@@ -2962,7 +2990,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
                         .get("confidence")
                         .and_then(|v| v.as_str())
                         .unwrap_or("?");
-                    println!("[{}] PID {}: {} ({})", sid, pid, class, conf);
+                    println!("[{}] PID {}: {} ({})\n", sid, pid, class, conf);
                 }
             }
         }
@@ -3209,13 +3237,145 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         eprintln!("agent verify: {}", e);
         return ExitCode::ArgsError;
     }
-    output_stub_with_session(
-        global,
-        &sid,
-        "agent verify",
-        "Agent verify mode not yet implemented",
-    );
-    ExitCode::Clean
+    let handle = match store.open(&sid) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("agent verify: {}", e);
+            return ExitCode::ArgsError;
+        }
+    };
+
+    let plan_path = handle.dir.join("decision").join("plan.json");
+    if !plan_path.exists() {
+        eprintln!("agent verify: missing plan.json for session {}", sid);
+        return ExitCode::ArgsError;
+    }
+    let plan_content = match std::fs::read_to_string(&plan_path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("agent verify: failed to read {}: {}", plan_path.display(), e);
+            return ExitCode::IoError;
+        }
+    };
+    let plan = match parse_agent_plan(&plan_content) {
+        Ok(p) => p,
+        Err(VerifyError::InvalidPlan(msg)) => {
+            eprintln!("agent verify: invalid plan.json: {}", msg);
+            return ExitCode::InternalError;
+        }
+        Err(VerifyError::InvalidTimestamp(msg)) => {
+            eprintln!("agent verify: invalid timestamp: {}", msg);
+            return ExitCode::ArgsError;
+        }
+    };
+
+    let requested_at = chrono::Utc::now();
+
+    let scan_options = QuickScanOptions {
+        pids: vec![],
+        include_kernel_threads: false,
+        timeout: global.timeout.map(std::time::Duration::from_secs),
+        progress: None,
+    };
+    let scan_result = match quick_scan(&scan_options) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("agent verify: scan failed: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    let completed_at = chrono::Utc::now();
+    let report = verify_plan(&plan, &scan_result.processes, requested_at, completed_at);
+
+    let verify_dir = handle.dir.join("action");
+    if let Err(e) = std::fs::create_dir_all(&verify_dir) {
+        eprintln!(
+            "agent verify: failed to create {}: {}",
+            verify_dir.display(),
+            e
+        );
+        return ExitCode::IoError;
+    }
+    let verify_path = verify_dir.join("verifications.json");
+    if let Err(e) = std::fs::write(
+        &verify_path,
+        serde_json::to_string_pretty(&report).unwrap(),
+    ) {
+        eprintln!(
+            "agent verify: failed to write {}: {}",
+            verify_path.display(),
+            e
+        );
+        return ExitCode::IoError;
+    }
+
+    if let Ok(manifest) = handle.read_manifest() {
+        if manifest.state != SessionState::Completed {
+            let _ = handle.update_state(SessionState::Completed);
+        }
+    }
+
+    let total = report.action_outcomes.len();
+    let verified_count = report
+        .action_outcomes
+        .iter()
+        .filter(|o| o.verified.unwrap_or(false))
+        .count();
+    let failed_count = total.saturating_sub(verified_count);
+
+    let exit_code = match report.verification.overall_status.as_str() {
+        "success" => ExitCode::Clean,
+        "partial_success" => ExitCode::PartialFail,
+        "failure" => ExitCode::PartialFail,
+        _ => ExitCode::Clean,
+    };
+
+    match global.format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }
+        OutputFormat::Summary => {
+            let freed = report
+                .resource_summary
+                .as_ref()
+                .map(|s| s.memory_freed_mb)
+                .unwrap_or(0.0);
+            println!(
+                "[{}] agent verify: {} verified, {} failed (freed {} MB)",
+                sid, verified_count, failed_count, freed
+            );
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# pt-core agent verify
+");
+            println!("Session: {}", sid);
+            println!("Plan: {}", plan_path.display());
+            println!("Report: {}
+", verify_path.display());
+            println!(
+                "- Outcomes: {} verified, {} failed",
+                verified_count, failed_count
+            );
+            if let Some(summary) = &report.resource_summary {
+                println!(
+                    "- Memory freed: {} MB (expected {})",
+                    summary.memory_freed_mb, summary.expected_mb
+                );
+            }
+            if let Some(recommendations) = &report.recommendations {
+                if !recommendations.is_empty() {
+                    println!("\n## Recommendations\n");
+                    for rec in recommendations {
+                        println!("- {}", rec);
+                    }
+                }
+            }
+        }
+    }
+
+    exit_code
 }
 
 fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
@@ -3458,6 +3618,165 @@ fn run_agent_list_priors(global: &GlobalOpts, args: &AgentListPriorsArgs) -> Exi
                 println!();
             }
             println!("Session: {}", session_id);
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_agent_inbox(global: &GlobalOpts, args: &AgentInboxArgs) -> ExitCode {
+    use pt_core::inbox::{InboxResponse, InboxStore};
+
+    let store = match InboxStore::from_env() {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("agent inbox: failed to access inbox: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    // Handle acknowledgement
+    if let Some(ref item_id) = args.ack {
+        match store.acknowledge(item_id) {
+            Ok(item) => {
+                match global.format {
+                    OutputFormat::Json => {
+                        let response = serde_json::json!({
+                            "acknowledged": true,
+                            "item_id": item.id,
+                            "acknowledged_at": item.acknowledged_at,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&response).unwrap());
+                    }
+                    _ => {
+                        println!("Acknowledged: {}", item.id);
+                    }
+                }
+                return ExitCode::Clean;
+            }
+            Err(e) => {
+                eprintln!("agent inbox: {}", e);
+                return ExitCode::ArgsError;
+            }
+        }
+    }
+
+    // Handle clear all
+    if args.clear_all {
+        match store.clear_all() {
+            Ok(count) => {
+                match global.format {
+                    OutputFormat::Json => {
+                        let response = serde_json::json!({
+                            "cleared": count,
+                            "clear_type": "all",
+                        });
+                        println!("{}", serde_json::to_string_pretty(&response).unwrap());
+                    }
+                    _ => {
+                        println!("Cleared {} items", count);
+                    }
+                }
+                return ExitCode::Clean;
+            }
+            Err(e) => {
+                eprintln!("agent inbox: {}", e);
+                return ExitCode::InternalError;
+            }
+        }
+    }
+
+    // Handle clear acknowledged
+    if args.clear {
+        match store.clear_acknowledged() {
+            Ok(count) => {
+                match global.format {
+                    OutputFormat::Json => {
+                        let response = serde_json::json!({
+                            "cleared": count,
+                            "clear_type": "acknowledged",
+                        });
+                        println!("{}", serde_json::to_string_pretty(&response).unwrap());
+                    }
+                    _ => {
+                        println!("Cleared {} acknowledged items", count);
+                    }
+                }
+                return ExitCode::Clean;
+            }
+            Err(e) => {
+                eprintln!("agent inbox: {}", e);
+                return ExitCode::InternalError;
+            }
+        }
+    }
+
+    // List items (default action)
+    let items = match if args.unread {
+        store.list_unread()
+    } else {
+        store.list()
+    } {
+        Ok(items) => items,
+        Err(e) => {
+            eprintln!("agent inbox: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    let response = InboxResponse::new(items.clone());
+
+    match global.format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        }
+        OutputFormat::Jsonl => {
+            // One item per line
+            for item in &items {
+                println!("{}", serde_json::to_string(item).unwrap());
+            }
+        }
+        OutputFormat::Summary => {
+            if items.is_empty() {
+                println!("Inbox: 0 items");
+            } else {
+                println!(
+                    "Inbox: {} items ({} unread)",
+                    items.len(),
+                    response.unread_count
+                );
+            }
+        }
+        OutputFormat::Exitcode => {}
+        OutputFormat::Metrics => {
+            println!("inbox_total={}", items.len());
+            println!("inbox_unread={}", response.unread_count);
+        }
+        _ => {
+            // Human-readable output
+            if items.is_empty() {
+                println!("# Agent Inbox\n");
+                println!("No items in inbox.");
+            } else {
+                println!("# Agent Inbox\n");
+                println!(
+                    "{} item(s), {} unread\n",
+                    items.len(),
+                    response.unread_count
+                );
+                for item in &items {
+                    let status = if item.acknowledged { "✓" } else { "○" };
+                    println!("{} [{}] {} - {}", status, item.item_type, item.id, item.summary);
+                    if let Some(ref session_id) = item.session_id {
+                        println!("  Session: {}", session_id);
+                    }
+                    if let Some(ref cmd) = item.review_command {
+                        println!("  Review: {}", cmd);
+                    }
+                    println!("  Created: {}", item.created_at);
+                    println!();
+                }
+            }
         }
     }
 
