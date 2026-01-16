@@ -4079,7 +4079,7 @@ fn run_agent_list_priors(global: &GlobalOpts, args: &AgentListPriorsArgs) -> Exi
 
     // Helper to build class prior JSON
     let build_class_json =
-        |name: &str, cp: &pt_core::config::priors::ClassPriors| -> serde_json::Value {
+        |name: &str, cp: &pt_core::config::priors::ClassParams| -> serde_json::Value {
             let mut obj = serde_json::json!({
                 "prior_prob": cp.prior_prob,
                 "cpu_beta": { "alpha": cp.cpu_beta.alpha, "beta": cp.cpu_beta.beta },

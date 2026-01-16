@@ -65,6 +65,7 @@ pub fn update_beta(params: &BetaParams, successes: f64, trials: f64, eta: f64) -
     BetaParams {
         alpha: params.alpha + eta * s,
         beta: params.beta + eta * (n - s),
+        comment: None,
     }
 }
 
@@ -292,26 +293,26 @@ fn update_intervention_priors(
     match outcome.class {
         ProcessClass::Useful => InterventionPriors {
             useful: updated(&priors.useful),
-            useful_bad: priors.useful_bad,
-            abandoned: priors.abandoned,
-            zombie: priors.zombie,
+            useful_bad: priors.useful_bad.clone(),
+            abandoned: priors.abandoned.clone(),
+            zombie: priors.zombie.clone(),
         },
         ProcessClass::UsefulBad => InterventionPriors {
-            useful: priors.useful,
+            useful: priors.useful.clone(),
             useful_bad: updated(&priors.useful_bad),
-            abandoned: priors.abandoned,
-            zombie: priors.zombie,
+            abandoned: priors.abandoned.clone(),
+            zombie: priors.zombie.clone(),
         },
         ProcessClass::Abandoned => InterventionPriors {
-            useful: priors.useful,
-            useful_bad: priors.useful_bad,
+            useful: priors.useful.clone(),
+            useful_bad: priors.useful_bad.clone(),
             abandoned: updated(&priors.abandoned),
-            zombie: priors.zombie,
+            zombie: priors.zombie.clone(),
         },
         ProcessClass::Zombie => InterventionPriors {
-            useful: priors.useful,
-            useful_bad: priors.useful_bad,
-            abandoned: priors.abandoned,
+            useful: priors.useful.clone(),
+            useful_bad: priors.useful_bad.clone(),
+            abandoned: priors.abandoned.clone(),
             zombie: updated(&priors.zombie),
         },
     }
@@ -320,7 +321,7 @@ fn update_intervention_priors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::priors::{ClassPriors, Classes, GammaParams};
+    use crate::config::priors::{ClassParams, ClassPriors, GammaParams};
     use crate::inference::ClassScores;
 
     #[test]
@@ -328,6 +329,7 @@ mod tests {
         let beta = BetaParams {
             alpha: 2.0,
             beta: 6.0,
+            comment: None,
         };
         assert!((expected_recovery(&beta) - 0.25).abs() <= 1e-12);
     }
@@ -337,6 +339,7 @@ mod tests {
         let beta = BetaParams {
             alpha: 1.0,
             beta: 1.0,
+            comment: None,
         };
         let updated = update_beta(&beta, 3.0, 5.0, 1.0);
         assert!((updated.alpha - 4.0).abs() <= 1e-12);
@@ -348,6 +351,7 @@ mod tests {
         let beta = BetaParams {
             alpha: 1.0,
             beta: 1.0,
+            comment: None,
         };
         let updated = update_beta(&beta, 10.0, 2.0, 1.0);
         assert!((updated.alpha - 3.0).abs() <= 1e-12);
@@ -362,7 +366,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             host_profile: None,
-            classes: Classes {
+            classes: ClassPriors {
                 useful: default_class(),
                 useful_bad: default_class(),
                 abandoned: default_class(),
@@ -390,7 +394,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             host_profile: None,
-            classes: Classes {
+            classes: ClassPriors {
                 useful: default_class(),
                 useful_bad: default_class(),
                 abandoned: default_class(),
@@ -404,18 +408,22 @@ mod tests {
                     useful: Some(BetaParams {
                         alpha: 9.0,
                         beta: 1.0,
+                        comment: None,
                     }),
                     useful_bad: Some(BetaParams {
                         alpha: 1.0,
                         beta: 1.0,
+                        comment: None,
                     }),
                     abandoned: Some(BetaParams {
                         alpha: 2.0,
                         beta: 6.0,
+                        comment: None,
                     }),
                     zombie: Some(BetaParams {
                         alpha: 1.0,
                         beta: 9.0,
+                        comment: None,
                     }),
                 }),
                 throttle: None,
@@ -449,7 +457,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             host_profile: None,
-            classes: Classes {
+            classes: ClassPriors {
                 useful: default_class(),
                 useful_bad: default_class(),
                 abandoned: default_class(),
@@ -463,18 +471,22 @@ mod tests {
                     useful: Some(BetaParams {
                         alpha: 2.0,
                         beta: 2.0,
+                        comment: None,
                     }),
                     useful_bad: Some(BetaParams {
                         alpha: 2.0,
                         beta: 2.0,
+                        comment: None,
                     }),
                     abandoned: Some(BetaParams {
                         alpha: 2.0,
                         beta: 2.0,
+                        comment: None,
                     }),
                     zombie: Some(BetaParams {
                         alpha: 2.0,
                         beta: 2.0,
+                        comment: None,
                     }),
                 }),
                 throttle: None,
@@ -506,10 +518,7 @@ mod tests {
     fn apply_outcome_updates_matching_class() {
         let interventions = CausalInterventions {
             pause: Some(InterventionPriors {
-                useful: Some(BetaParams {
-                    alpha: 1.0,
-                    beta: 1.0,
-                }),
+                useful: Some(BetaParams::new(1.0, 1.0)),
                 useful_bad: None,
                 abandoned: None,
                 zombie: None,
@@ -538,7 +547,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             host_profile: None,
-            classes: Classes {
+            classes: ClassPriors {
                 useful: default_class(),
                 useful_bad: default_class(),
                 abandoned: default_class(),
@@ -549,10 +558,7 @@ mod tests {
             change_point: None,
             causal_interventions: Some(CausalInterventions {
                 pause: Some(InterventionPriors {
-                    useful: Some(BetaParams {
-                        alpha: 1.0,
-                        beta: 1.0,
-                    }),
+                    useful: Some(BetaParams::new(1.0, 1.0)),
                     useful_bad: None,
                     abandoned: None,
                     zombie: None,
@@ -569,14 +575,30 @@ mod tests {
             bocpd: None,
         };
         let outcomes = vec![
+            // Pause
             InterventionOutcome {
                 action: Action::Pause,
                 class: ProcessClass::Useful,
                 recovered: true,
                 weight: 1.0,
             },
+            // Throttle
             InterventionOutcome {
-                action: Action::Pause,
+                action: Action::Throttle,
+                class: ProcessClass::Useful,
+                recovered: false,
+                weight: 1.0,
+            },
+            // Kill
+            InterventionOutcome {
+                action: Action::Kill,
+                class: ProcessClass::Useful,
+                recovered: false,
+                weight: 1.0,
+            },
+            // Restart
+            InterventionOutcome {
+                action: Action::Restart,
                 class: ProcessClass::Useful,
                 recovered: false,
                 weight: 1.0,
@@ -592,28 +614,33 @@ mod tests {
         assert!((updated_beta.beta - 2.0).abs() <= 1e-12);
     }
 
-    fn default_class() -> ClassPriors {
-        ClassPriors {
+    fn default_class() -> ClassParams {
+        ClassParams {
             prior_prob: 0.25,
             cpu_beta: BetaParams {
                 alpha: 1.0,
                 beta: 1.0,
+                comment: None,
             },
             runtime_gamma: Some(GammaParams {
                 shape: 1.0,
                 rate: 1.0,
+                comment: None,
             }),
             orphan_beta: BetaParams {
                 alpha: 1.0,
                 beta: 1.0,
+                comment: None,
             },
             tty_beta: BetaParams {
                 alpha: 1.0,
                 beta: 1.0,
+                comment: None,
             },
             net_beta: BetaParams {
                 alpha: 1.0,
                 beta: 1.0,
+                comment: None,
             },
             io_active_beta: None,
             hazard_gamma: None,

@@ -7,16 +7,18 @@
 //! - Semantic validation (probability sums, positive params)
 //! - Config snapshot generation for session artifacts
 
-pub mod policy;
-pub mod priors;
-mod validation;
-
-use std::path::PathBuf;
-use thiserror::Error;
+// Re-export types from pt-config
+pub use pt_config::policy;
+pub use pt_config::priors;
 
 pub use policy::Policy;
 pub use priors::Priors;
-pub use validation::ValidationError;
+
+pub use pt_config::validate::ValidationError;
+use pt_config::validate::{validate_policy, validate_priors};
+
+use std::path::PathBuf;
+use thiserror::Error;
 
 /// Schema version for configuration files.
 pub const CONFIG_SCHEMA_VERSION: &str = "1.0.0";
@@ -130,8 +132,8 @@ pub fn load_config(options: &ConfigOptions) -> Result<ResolvedConfig, ConfigErro
     let (policy, policy_path, policy_hash) = load_policy(&config_dir, &options.policy_path)?;
 
     // Validate the configuration semantically
-    validation::validate_priors(&priors)?;
-    validation::validate_policy(&policy)?;
+    validate_priors(&priors)?;
+    validate_policy(&policy)?;
 
     Ok(ResolvedConfig {
         priors,

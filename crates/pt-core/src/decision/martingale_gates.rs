@@ -6,7 +6,8 @@
 use crate::config::Policy;
 use crate::decision::alpha_investing::{AlphaInvestingPolicy, AlphaWealthState};
 use crate::decision::fdr_selection::{
-    select_fdr, FdrCandidate, FdrError, FdrMethod, FdrSelectionResult, TargetIdentity,
+    select_fdr, FdrCandidate, FdrError, FdrMethod as SelectionFdrMethod, FdrSelectionResult,
+    TargetIdentity,
 };
 use crate::inference::martingale::{BoundType, MartingaleResult};
 use serde::{Deserialize, Serialize};
@@ -65,7 +66,7 @@ pub struct MartingaleGateResult {
 pub struct MartingaleGateSummary {
     pub alpha: f64,
     pub alpha_source: AlphaSource,
-    pub fdr_method: FdrMethod,
+    pub fdr_method: SelectionFdrMethod,
     pub fdr_result: Option<FdrSelectionResult>,
     pub results: Vec<MartingaleGateResult>,
 }
@@ -79,13 +80,13 @@ pub enum MartingaleGateError {
 }
 
 /// Resolve FDR method from policy.
-pub fn fdr_method_from_policy(policy: &Policy) -> FdrMethod {
+pub fn fdr_method_from_policy(policy: &Policy) -> SelectionFdrMethod {
     match policy.fdr_control.method.as_str() {
-        "bh" | "ebh" => FdrMethod::EBh,
-        "by" | "eby" => FdrMethod::EBy,
-        "none" => FdrMethod::None,
-        "alpha_investing" => FdrMethod::EBy,
-        _ => FdrMethod::EBy,
+        "bh" | "ebh" => SelectionFdrMethod::EBh,
+        "by" | "eby" => SelectionFdrMethod::EBy,
+        "none" => SelectionFdrMethod::None,
+        "alpha_investing" => SelectionFdrMethod::EBy,
+        _ => SelectionFdrMethod::EBy,
     }
 }
 
@@ -94,7 +95,7 @@ pub fn resolve_alpha(
     policy: &Policy,
     alpha_state: Option<&AlphaWealthState>,
 ) -> Result<(f64, AlphaSource), MartingaleGateError> {
-    if policy.fdr_control.method == "alpha_investing" {
+    if policy.fdr_control.method == pt_config::policy::FdrMethod::AlphaInvesting {
         if let Some(state) = alpha_state {
             if let Ok(cfg) = AlphaInvestingPolicy::from_policy(policy) {
                 let alpha = cfg.alpha_spend_for_wealth(state.wealth);
@@ -197,7 +198,7 @@ pub fn apply_martingale_gates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::policy::AlphaInvesting;
+    use crate::config::policy::{AlphaInvesting, FdrMethod};
     use crate::inference::martingale::{MartingaleAnalyzer, MartingaleConfig};
 
     fn make_target(pid: i32) -> TargetIdentity {
@@ -219,7 +220,7 @@ mod tests {
     #[test]
     fn test_alpha_investing_resolution() {
         let mut policy = Policy::default();
-        policy.fdr_control.method = "alpha_investing".to_string();
+        policy.fdr_control.method = FdrMethod::AlphaInvesting;
         policy.fdr_control.alpha = 0.5;
         policy.fdr_control.alpha_investing = Some(AlphaInvesting {
             w0: Some(0.2),

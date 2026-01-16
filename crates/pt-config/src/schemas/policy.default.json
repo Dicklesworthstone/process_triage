@@ -1,0 +1,60 @@
+{
+  "schema_version": "1.0.0",
+  "policy_id": "test-policy",
+  "description": "Test fixture policy for unit tests",
+  "loss_matrix": {
+    "useful": {
+      "keep": 0,
+      "pause": 5,
+      "throttle": 8,
+      "kill": 100,
+      "restart": 60
+    },
+    "useful_bad": {
+      "keep": 10,
+      "pause": 6,
+      "throttle": 8,
+      "kill": 20,
+      "restart": 12
+    },
+    "abandoned": {
+      "keep": 30,
+      "pause": 15,
+      "throttle": 10,
+      "kill": 1,
+      "restart": 8
+    },
+    "zombie": {
+      "keep": 50,
+      "pause": 20,
+      "throttle": 15,
+      "kill": 1,
+      "restart": 5
+    }
+  },
+  "guardrails": {
+    "protected_patterns": [],
+    "protected_users": ["root"],
+    "never_kill_ppid": [],
+    "max_kills_per_run": 5,
+    "min_process_age_seconds": 300,
+    "require_confirmation": true
+  },
+  "robot_mode": {
+    "enabled": false,
+    "min_posterior": 0.95,
+    "max_blast_radius_mb": 1000.0,
+    "max_kills": 3,
+    "require_known_signature": false
+  },
+  "fdr_control": {
+    "enabled": true,
+    "method": "bh",
+    "alpha": 0.05
+  },
+  "data_loss_gates": {
+    "block_if_open_write_fds": true,
+    "block_if_locked_files": true,
+    "block_if_active_tty": true
+  }
+}

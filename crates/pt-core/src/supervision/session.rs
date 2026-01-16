@@ -488,7 +488,7 @@ impl SessionAnalyzer {
                 .ok_or(SessionError::ProcessNotFound(pt_pid))?;
 
             // Check 1: Is target a session leader?
-            if target_stat.pid == target_stat.session {
+            if target_stat.pid == target_stat.session as u32 {
                 protection_types.push(SessionProtectionType::SessionLeader);
                 evidence.push(SessionEvidence {
                     protection_type: SessionProtectionType::SessionLeader,
@@ -549,7 +549,7 @@ impl SessionAnalyzer {
                 // pt's foreground process group
                 if pt_stat.tpgid > 0 {
                     // If target is in pt's terminal's foreground group
-                    if target_stat.pgrp == pt_stat.tpgid as u32 {
+                    if target_stat.pgrp == pt_stat.tpgid {
                         protection_types.push(SessionProtectionType::ForegroundGroup);
                         evidence.push(SessionEvidence {
                             protection_type: SessionProtectionType::ForegroundGroup,
@@ -714,7 +714,7 @@ impl SessionAnalyzer {
 
         #[cfg(target_os = "linux")]
         if let Some(stat) = self.get_stat(target_pid) {
-            result = result.with_session_info(stat.session, stat.pgrp, stat.tty_nr);
+            result = result.with_session_info(stat.session as u32, stat.pgrp as u32, stat.tty_nr);
         }
 
         Ok(result)
@@ -796,7 +796,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_proc_stat_parse() {
-        let content = "1234 (bash) S 1000 1234 1234 34816 1234 4194304 0 0 0 0 0 0 0 0 0 0 0 0 12345";
+        // Full /proc/[pid]/stat format with 22 fields after comm:
+        // state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
+        // utime stime cutime cstime priority nice num_threads itrealvalue starttime vsize rss
+        let content = "1234 (bash) S 1000 1234 1234 34816 1234 4194304 0 0 0 0 100 50 0 0 20 0 1 0 12345 1048576 256";
         let stat = parse_proc_stat_content(content).unwrap();
 
         assert_eq!(stat.pid, 1234);
@@ -810,7 +813,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_proc_stat_parse_with_spaces_in_comm() {
-        let content = "5678 (Web Content) S 1000 5678 5678 0 -1 4194304 0 0 0 0 0 0 0 0 0 0 0 0 12345";
+        // Full /proc/[pid]/stat format with spaces in comm field
+        let content = "5678 (Web Content) S 1000 5678 5678 0 -1 4194304 0 0 0 0 200 100 0 0 20 0 4 0 12345 2097152 512";
         let stat = parse_proc_stat_content(content).unwrap();
 
         assert_eq!(stat.pid, 5678);

@@ -6,7 +6,7 @@
 use thiserror::Error;
 
 use super::policy::Policy;
-use super::priors::{BetaParams, DirichletParams, GammaParams, Priors};
+use super::priors::{BetaParams, ClassParams, DirichletParams, GammaParams, Priors};
 
 /// Tolerance for floating point comparisons.
 const PROB_TOLERANCE: f64 = 0.001;
@@ -224,7 +224,7 @@ pub fn validate_priors(priors: &Priors) -> Result<(), ValidationError> {
 
 /// Validate class priors.
 fn validate_class_priors(
-    class: &super::priors::ClassPriors,
+    class: &ClassParams,
     name: &str,
 ) -> Result<(), ValidationError> {
     // Validate prior probability range

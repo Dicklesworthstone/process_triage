@@ -87,13 +87,69 @@ pub struct ClassParams {
 }
 
 /// Beta distribution parameters: Beta(alpha, beta).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BetaParams {
     pub alpha: f64,
     pub beta: f64,
 
     #[serde(rename = "_comment", default)]
     pub comment: Option<String>,
+}
+
+impl BetaParams {
+    pub fn new(alpha: f64, beta: f64) -> Self {
+        Self {
+            alpha,
+            beta,
+            comment: None,
+        }
+    }
+
+    /// Create uniform (uninformative) Beta(1, 1) priors.
+    pub fn uniform() -> Self {
+        Self::new(1.0, 1.0)
+    }
+
+    /// Calculate the mean of the Beta distribution: alpha / (alpha + beta).
+    pub fn mean(&self) -> f64 {
+        self.alpha / (self.alpha + self.beta)
+    }
+
+    /// Calculate the variance of the Beta distribution.
+    /// Formula: alpha * beta / ((alpha + beta)^2 * (alpha + beta + 1))
+    pub fn variance(&self) -> f64 {
+        let sum = self.alpha + self.beta;
+        (self.alpha * self.beta) / (sum * sum * (sum + 1.0))
+    }
+
+    /// Create weakly informative Beta(2, 2) priors with mode at 0.5.
+    pub fn weakly_informative() -> Self {
+        Self::new(2.0, 2.0)
+    }
+
+    /// Calculate the mode of the Beta distribution.
+    /// Returns None when alpha <= 1 or beta <= 1 (mode is undefined).
+    /// Formula: (alpha - 1) / (alpha + beta - 2) when alpha > 1 and beta > 1.
+    pub fn mode(&self) -> Option<f64> {
+        if self.alpha <= 1.0 || self.beta <= 1.0 {
+            None
+        } else {
+            Some((self.alpha - 1.0) / (self.alpha + self.beta - 2.0))
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.alpha <= 0.0 || self.beta <= 0.0 {
+            return Err("alpha and beta must be positive".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl Default for BetaParams {
+    fn default() -> Self {
+        Self::uniform()
+    }
 }
 
 /// Gamma distribution parameters: Gamma(shape, rate).
@@ -105,6 +161,16 @@ pub struct GammaParams {
 
     #[serde(rename = "_comment", default)]
     pub comment: Option<String>,
+}
+
+impl GammaParams {
+    pub fn new(shape: f64, rate: f64) -> Self {
+        Self {
+            shape,
+            rate,
+            comment: None,
+        }
+    }
 }
 
 /// Dirichlet distribution parameters.
@@ -361,6 +427,18 @@ impl Priors {
             + self.classes.zombie.prior_prob;
 
         (sum - 1.0).abs() < tolerance
+    }
+}
+
+/// Embedded default priors JSON for fallback.
+const DEFAULT_PRIORS_JSON: &str = include_str!("schemas/priors.default.json");
+
+impl Default for Priors {
+    fn default() -> Self {
+        // Parse the embedded default priors JSON
+        // This should never fail since the JSON is embedded at compile time
+        Self::parse_json(DEFAULT_PRIORS_JSON)
+            .expect("Embedded default priors JSON is invalid")
     }
 }
 

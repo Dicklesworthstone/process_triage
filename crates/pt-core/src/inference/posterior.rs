@@ -3,7 +3,7 @@
 //! Combines class priors with per-feature likelihoods in log-domain and
 //! returns normalized posteriors plus log-odds.
 
-use crate::config::priors::{ClassPriors, CommandCategories, DirichletParams, Priors, StateFlags};
+use crate::config::priors::{ClassParams, CommandCategories, DirichletParams, Priors, StateFlags};
 use pt_math::{log_beta, log_beta_pdf, log_gamma, normalize_log_probs};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -31,7 +31,7 @@ pub struct Evidence {
 }
 
 /// Per-class scores for the 4-state model.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClassScores {
     pub useful: f64,
     pub useful_bad: f64,
@@ -55,14 +55,14 @@ impl ClassScores {
 }
 
 /// Evidence term contribution per class.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EvidenceTerm {
     pub feature: String,
     pub log_likelihood: ClassScores,
 }
 
 /// Posterior computation result.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PosteriorResult {
     pub posterior: ClassScores,
     pub log_posterior: ClassScores,
@@ -325,7 +325,7 @@ fn ln_checked(value: f64, field: &'static str) -> Result<f64, PosteriorError> {
 
 fn log_lik_cpu(
     cpu: &CpuEvidence,
-    priors: &ClassPriors,
+    priors: &ClassParams,
     config: &Priors,
 ) -> Result<f64, PosteriorError> {
     match cpu {
@@ -377,7 +377,7 @@ fn log_lik_cpu(
     }
 }
 
-fn log_lik_runtime(runtime: f64, priors: &ClassPriors) -> Result<f64, PosteriorError> {
+fn log_lik_runtime(runtime: f64, priors: &ClassParams) -> Result<f64, PosteriorError> {
     let gamma = match &priors.runtime_gamma {
         Some(g) => g,
         None => return Ok(0.0),
@@ -526,39 +526,21 @@ impl DirichletAccess for CommandCategories {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::priors::{BetaParams, ClassPriors, Classes, GammaParams, Priors};
+    use crate::config::priors::{BetaParams, ClassPriors, GammaParams, Priors};
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() <= tol
     }
 
     fn base_priors() -> Priors {
-        let class = ClassPriors {
+        let class = ClassParams {
             prior_prob: 0.25,
-            cpu_beta: BetaParams {
-                alpha: 1.0,
-                beta: 1.0,
-            },
-            runtime_gamma: Some(GammaParams {
-                shape: 2.0,
-                rate: 1.0,
-            }),
-            orphan_beta: BetaParams {
-                alpha: 1.0,
-                beta: 1.0,
-            },
-            tty_beta: BetaParams {
-                alpha: 1.0,
-                beta: 1.0,
-            },
-            net_beta: BetaParams {
-                alpha: 1.0,
-                beta: 1.0,
-            },
-            io_active_beta: Some(BetaParams {
-                alpha: 1.0,
-                beta: 1.0,
-            }),
+            cpu_beta: BetaParams::new(1.0, 1.0),
+            runtime_gamma: Some(GammaParams::new(2.0, 1.0)),
+            orphan_beta: BetaParams::new(1.0, 1.0),
+            tty_beta: BetaParams::new(1.0, 1.0),
+            net_beta: BetaParams::new(1.0, 1.0),
+            io_active_beta: Some(BetaParams::new(1.0, 1.0)),
             hazard_gamma: None,
             competing_hazards: None,
         };
@@ -568,7 +550,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             host_profile: None,
-            classes: Classes {
+            classes: ClassPriors {
                 useful: class.clone(),
                 useful_bad: class.clone(),
                 abandoned: class.clone(),

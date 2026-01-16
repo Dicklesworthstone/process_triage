@@ -6,10 +6,10 @@
 use super::posterior::PosteriorResult;
 use crate::collect::ProcessRecord;
 use crate::config::priors::Priors;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BayesFactorEntry {
     pub feature: String,
     pub bf: f64,
@@ -19,7 +19,7 @@ pub struct BayesFactorEntry {
     pub strength: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EvidenceLedger {
     pub posterior: PosteriorResult,
     pub classification: Classification,
@@ -36,18 +36,19 @@ impl EvidenceLedger {
         _pid: Option<u32>,
         _reference: Option<Classification>,
     ) -> Self {
-        // Simplified implementation to satisfy the call site
-        
-        let classification = if result.posterior.abandoned > result.posterior.useful {
-            Classification::Abandoned
-        } else {
-            Classification::Useful
-        };
+        // Find the highest probability class
+        let scores = [
+            (Classification::Useful, result.posterior.useful),
+            (Classification::UsefulBad, result.posterior.useful_bad),
+            (Classification::Abandoned, result.posterior.abandoned),
+            (Classification::Zombie, result.posterior.zombie),
+        ];
 
-        let prob = match classification {
-            Classification::Abandoned => result.posterior.abandoned,
-            _ => result.posterior.useful,
-        };
+        let (classification, prob) = scores
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(c, p)| (*c, *p))
+            .unwrap_or((Classification::Useful, 0.0));
 
         let confidence = if prob > 0.99 {
             Confidence::VeryHigh
@@ -94,7 +95,7 @@ impl std::fmt::Display for Direction {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     VeryHigh,
@@ -220,7 +221,7 @@ fn evidence_to_json(evidence: &crate::inference::Evidence) -> serde_json::Value 
 }
 
 // Re-export Classification if needed by other modules
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Classification {
     Useful,

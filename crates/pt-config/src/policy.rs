@@ -88,6 +88,61 @@ pub struct LossRow {
 
     #[serde(default)]
     pub restart: Option<f64>,
+
+    #[serde(default)]
+    pub renice: Option<f64>,
+}
+
+impl Default for LossRow {
+    fn default() -> Self {
+        Self {
+            keep: 0.0,
+            pause: Some(0.5),
+            throttle: Some(1.0),
+            kill: 100.0,
+            restart: Some(50.0),
+            renice: None,
+        }
+    }
+}
+
+impl Default for LossMatrix {
+    fn default() -> Self {
+        Self {
+            useful: LossRow {
+                keep: 0.0,
+                pause: Some(0.5),
+                throttle: Some(1.0),
+                kill: 500.0,
+                restart: Some(10.0),
+                renice: Some(0.2),
+            },
+            useful_bad: LossRow {
+                keep: 0.0,
+                pause: Some(0.3),
+                throttle: Some(0.5),
+                kill: 100.0,
+                restart: Some(5.0),
+                renice: Some(0.1),
+            },
+            abandoned: LossRow {
+                keep: 5.0,
+                pause: Some(0.2),
+                throttle: Some(0.3),
+                kill: 0.1,
+                restart: Some(1.0),
+                renice: Some(0.1),
+            },
+            zombie: LossRow {
+                keep: 1.0,
+                pause: Some(0.1),
+                throttle: Some(0.1),
+                kill: 0.1,
+                restart: Some(0.1),
+                renice: Some(0.1),
+            },
+        }
+    }
 }
 
 /// Safety guardrails and protected patterns.
@@ -115,6 +170,9 @@ pub struct Guardrails {
     pub max_kills_per_run: u32,
 
     #[serde(default)]
+    pub max_kills_per_minute: Option<u32>,
+
+    #[serde(default)]
     pub max_kills_per_hour: Option<u32>,
 
     #[serde(default)]
@@ -124,6 +182,39 @@ pub struct Guardrails {
 
     #[serde(default)]
     pub require_confirmation: Option<bool>,
+}
+
+impl Default for Guardrails {
+    fn default() -> Self {
+        Self {
+            protected_patterns: vec![
+                PatternEntry {
+                    pattern: "^systemd$".to_string(),
+                    kind: PatternKind::Regex,
+                    case_insensitive: true,
+                    notes: Some("Init system".to_string()),
+                },
+                PatternEntry {
+                    pattern: "^sshd$".to_string(),
+                    kind: PatternKind::Regex,
+                    case_insensitive: true,
+                    notes: Some("SSH daemon".to_string()),
+                },
+            ],
+            force_review_patterns: Vec::new(),
+            protected_users: vec!["root".to_string()],
+            protected_groups: Vec::new(),
+            protected_categories: vec!["database".to_string(), "webserver".to_string()],
+            never_kill_ppid: vec![1],
+            never_kill_pid: Vec::new(),
+            max_kills_per_run: 10,
+            max_kills_per_minute: Some(5),
+            max_kills_per_hour: Some(20),
+            max_kills_per_day: Some(100),
+            min_process_age_seconds: 300,
+            require_confirmation: Some(true),
+        }
+    }
 }
 
 /// Pattern entry for matching commands/processes.
@@ -156,6 +247,16 @@ pub enum PatternKind {
     Regex,
     Glob,
     Literal,
+}
+
+impl PatternKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Regex => "regex",
+            Self::Glob => "glob",
+            Self::Literal => "literal",
+        }
+    }
 }
 
 /// Robot/agent automation gates.
@@ -223,6 +324,17 @@ pub enum FdrMethod {
     AlphaInvesting,
     /// No FDR control
     None,
+}
+
+impl FdrMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FdrMethod::Bh => "bh",
+            FdrMethod::By => "by",
+            FdrMethod::AlphaInvesting => "alpha_investing",
+            FdrMethod::None => "none",
+        }
+    }
 }
 
 /// Alpha-investing parameters.
@@ -337,6 +449,70 @@ impl Default for LoadAwareDecision {
             psi_avg10_high: default_psi_avg10_high(),
             weights: LoadWeights::default(),
             multipliers: LoadMultipliers::default(),
+        }
+    }
+}
+
+impl Default for RobotMode {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_posterior: 0.95,
+            min_confidence: None,
+            max_blast_radius_mb: 4096.0,
+            max_kills: 5,
+            require_known_signature: false,
+            require_policy_snapshot: None,
+            allow_categories: Vec::new(),
+            exclude_categories: Vec::new(),
+            require_human_for_supervised: true,
+        }
+    }
+}
+
+impl Default for FdrControl {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            method: FdrMethod::Bh,
+            alpha: 0.05,
+            min_candidates: None,
+            lfdr_null: Vec::new(),
+            alpha_investing: None,
+        }
+    }
+}
+
+impl Default for DataLossGates {
+    fn default() -> Self {
+        Self {
+            block_if_open_write_fds: true,
+            max_open_write_fds: None,
+            block_if_locked_files: true,
+            block_if_deleted_cwd: None,
+            block_if_active_tty: true,
+            block_if_recent_io_seconds: None,
+        }
+    }
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            schema_version: "1.0.0".to_string(),
+            policy_id: None,
+            description: None,
+            created_at: None,
+            updated_at: None,
+            inherits: Vec::new(),
+            loss_matrix: LossMatrix::default(),
+            guardrails: Guardrails::default(),
+            robot_mode: RobotMode::default(),
+            fdr_control: FdrControl::default(),
+            data_loss_gates: DataLossGates::default(),
+            load_aware: LoadAwareDecision::default(),
+            decision_time_bound: DecisionTimeBound::default(),
+            notes: None,
         }
     }
 }

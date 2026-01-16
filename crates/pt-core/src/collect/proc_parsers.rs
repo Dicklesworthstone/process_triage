@@ -63,6 +63,7 @@ pub struct SchedInfo {
     pub nice: Option<i32>,
 }
 
+
 /// Memory statistics from /proc/[pid]/statm.
 ///
 /// All values are in pages (typically 4KB on x86_64).
@@ -252,6 +253,102 @@ pub struct CgroupInfo {
     pub v1_paths: HashMap<String, String>,
     /// Whether process is in a container (heuristic).
     pub in_container: bool,
+}
+
+/// Process statistics from /proc/[pid]/stat.
+///
+/// Contains key fields parsed from the stat file.
+/// See proc(5) man page for full field documentation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProcessStat {
+    /// Process ID.
+    pub pid: u32,
+    /// Process name (comm) without parentheses.
+    pub comm: String,
+    /// Process state character (R, S, D, Z, T, etc.).
+    pub state: char,
+    /// Parent process ID.
+    pub ppid: u32,
+    /// Process group ID.
+    pub pgrp: i32,
+    /// Session ID.
+    pub session: i32,
+    /// Controlling terminal.
+    pub tty_nr: i32,
+    /// Terminal process group ID.
+    pub tpgid: i32,
+    /// User time in clock ticks.
+    pub utime: u64,
+    /// System time in clock ticks.
+    pub stime: u64,
+    /// Start time in clock ticks since boot.
+    pub starttime: u64,
+    /// Virtual memory size in bytes.
+    pub vsize: u64,
+    /// Resident set size in pages.
+    pub rss: i64,
+    /// Nice value.
+    pub nice: i32,
+    /// Number of threads.
+    pub num_threads: i32,
+}
+
+/// Parse /proc/[pid]/stat file.
+///
+/// Returns None if the file cannot be read or parsed.
+pub fn parse_proc_stat(pid: u32) -> Option<ProcessStat> {
+    let path = format!("/proc/{}/stat", pid);
+    let content = fs::read_to_string(&path).ok()?;
+    parse_proc_stat_content(&content)
+}
+
+/// Parse stat file content (for testing).
+///
+/// The stat file format is tricky because the comm field (process name)
+/// is enclosed in parentheses and can contain spaces or even parentheses.
+pub fn parse_proc_stat_content(content: &str) -> Option<ProcessStat> {
+    // Find the comm field boundaries (first '(' and last ')')
+    let open_paren = content.find('(')?;
+    let close_paren = content.rfind(')')?;
+    if close_paren <= open_paren {
+        return None;
+    }
+
+    // Parse pid (before the first '(')
+    let pid: u32 = content[..open_paren].trim().parse().ok()?;
+
+    // Extract comm (between parentheses)
+    let comm = content[open_paren + 1..close_paren].to_string();
+
+    // Parse remaining fields after the ')'
+    let rest = &content[close_paren + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+
+    // Need at least 22 fields after comm for the fields we want (we access up to index 21)
+    if fields.len() < 22 {
+        return None;
+    }
+
+    Some(ProcessStat {
+        pid,
+        comm,
+        state: fields[0].chars().next().unwrap_or('?'),
+        ppid: fields[1].parse().unwrap_or(0),
+        pgrp: fields[2].parse().unwrap_or(0),
+        session: fields[3].parse().unwrap_or(0),
+        tty_nr: fields[4].parse().unwrap_or(0),
+        tpgid: fields[5].parse().unwrap_or(0),
+        // Skip flags (6), minflt (7), cminflt (8), majflt (9), cmajflt (10)
+        utime: fields[11].parse().unwrap_or(0),
+        stime: fields[12].parse().unwrap_or(0),
+        // Skip cutime (13), cstime (14), priority (15)
+        nice: fields[16].parse().unwrap_or(0),
+        num_threads: fields[17].parse().unwrap_or(1),
+        // Skip itrealvalue (18)
+        starttime: fields[19].parse().unwrap_or(0),
+        vsize: fields[20].parse().unwrap_or(0),
+        rss: fields[21].parse().unwrap_or(0),
+    })
 }
 
 /// Parse /proc/[pid]/io file.
@@ -506,7 +603,7 @@ pub fn parse_fdinfo_content(content: &str) -> Option<OpenMode> {
 }
 
 /// Detect if a file path is a critical file for safety gates.
-fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
+pub(crate) fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
     let path_lower = path.to_lowercase();
 
     // SQLite WAL and journal files - HARD block (active transaction in progress)
@@ -591,7 +688,6 @@ fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
         ("/var/lib/pacman/db.lck", "pacman_lock"),
         ("/var/cache/pacman/pkg/", "pacman_cache"),
         ("/var/lib/dnf/", "dnf_lock"),
-        ("/run/lock/", "run_lock"),
     ];
     for (pattern, rule) in &system_pkg_locks {
         if path.starts_with(pattern) || path.contains(pattern) {
@@ -787,9 +883,39 @@ pub fn parse_environ_content(content: &[u8]) -> Option<HashMap<String, String>> 
     Some(env)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_proc_stat_content() {
+        // Sample /proc/[pid]/stat content
+        let content = "1234 (bash) S 1000 1234 1234 34816 5678 4194304 1234 5678 0 0 10 5 0 0 20 0 1 0 12345 67890 1000 18446744073709551615 0 0 0 0 0 0 0 0 65536 0 0 0 17 0 0 0 0 0 0";
+
+        let stat = parse_proc_stat_content(content).unwrap();
+        assert_eq!(stat.pid, 1234);
+        assert_eq!(stat.comm, "bash");
+        assert_eq!(stat.state, 'S');
+        assert_eq!(stat.ppid, 1000);
+        assert_eq!(stat.pgrp, 1234);
+        assert_eq!(stat.session, 1234);
+        assert_eq!(stat.tty_nr, 34816);
+        assert_eq!(stat.tpgid, 5678);
+    }
+
+    #[test]
+    fn test_parse_proc_stat_content_with_spaces_in_comm() {
+        // Command name with spaces
+        let content = "5678 (my app name) R 1000 5678 5678 0 -1 4194304 100 0 0 0 5 2 0 0 20 0 1 0 54321 12345 500 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+
+        let stat = parse_proc_stat_content(content).unwrap();
+        assert_eq!(stat.pid, 5678);
+        assert_eq!(stat.comm, "my app name");
+        assert_eq!(stat.state, 'R');
+        assert_eq!(stat.ppid, 1000);
+        assert_eq!(stat.tpgid, -1);
+    }
 
     #[test]
     fn test_parse_io_content() {
@@ -1498,5 +1624,18 @@ nice                                         :                    0
         assert!(!CriticalFileCategory::CargoLock.is_hard_block());
         assert!(!CriticalFileCategory::AppLock.is_hard_block());
         assert!(!CriticalFileCategory::OpenWrite.is_hard_block());
+    }
+
+    #[test]
+    fn test_repro_run_lock_misclassification() {
+        // A standard application lock file in /run/lock
+        let path = "/run/lock/my-custom-app.lock";
+        
+        let cf = detect_critical_file(123, path).expect("Should detect as critical file");
+        
+        // Expectation: This should be an AppLock (Soft), not SystemPackageLock (Hard)
+        // Fixed behavior:
+        assert_eq!(cf.category, CriticalFileCategory::AppLock, "Should be classified as generic AppLock");
+        assert_eq!(cf.strength, DetectionStrength::Soft, "Should be a Soft block");
     }
 }

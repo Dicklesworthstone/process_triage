@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Test fixture priors for unit tests",
+  "classes": {
+    "useful": {
+      "prior_prob": 0.70,
+      "cpu_beta": { "alpha": 5.0, "beta": 3.0 },
+      "runtime_gamma": { "shape": 2.0, "rate": 0.0001 },
+      "orphan_beta": { "alpha": 1.0, "beta": 20.0 },
+      "tty_beta": { "alpha": 8.0, "beta": 2.0 },
+      "net_beta": { "alpha": 5.0, "beta": 3.0 },
+      "io_active_beta": { "alpha": 6.0, "beta": 2.0 }
+    },
+    "useful_bad": {
+      "prior_prob": 0.05,
+      "cpu_beta": { "alpha": 9.0, "beta": 1.0 },
+      "runtime_gamma": { "shape": 1.5, "rate": 0.00005 },
+      "orphan_beta": { "alpha": 2.0, "beta": 8.0 },
+      "tty_beta": { "alpha": 4.0, "beta": 4.0 },
+      "net_beta": { "alpha": 3.0, "beta": 5.0 },
+      "io_active_beta": { "alpha": 2.0, "beta": 6.0 }
+    },
+    "abandoned": {
+      "prior_prob": 0.20,
+      "cpu_beta": { "alpha": 1.0, "beta": 8.0 },
+      "runtime_gamma": { "shape": 1.0, "rate": 0.00001 },
+      "orphan_beta": { "alpha": 6.0, "beta": 2.0 },
+      "tty_beta": { "alpha": 1.0, "beta": 8.0 },
+      "net_beta": { "alpha": 1.0, "beta": 6.0 },
+      "io_active_beta": { "alpha": 1.0, "beta": 10.0 }
+    },
+    "zombie": {
+      "prior_prob": 0.05,
+      "cpu_beta": { "alpha": 1.0, "beta": 100.0 },
+      "runtime_gamma": { "shape": 0.5, "rate": 0.00001 },
+      "orphan_beta": { "alpha": 10.0, "beta": 1.0 },
+      "tty_beta": { "alpha": 1.0, "beta": 20.0 },
+      "net_beta": { "alpha": 1.0, "beta": 50.0 },
+      "io_active_beta": { "alpha": 1.0, "beta": 100.0 }
+    }
+  },
+  "hierarchical": {
+    "shrinkage_enabled": true,
+    "shrinkage_strength": 0.3
+  }
+}

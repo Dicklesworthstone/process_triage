@@ -33,7 +33,7 @@ use crate::supervision::session::{
     detect_screen_session, detect_ssh_connection, detect_tmux_session,
 };
 #[cfg(target_os = "linux")]
-use crate::collect::{parse_proc_stat as read_proc_stat, ProcessStat as ProcStat};
+use crate::collect::parse_proc_stat as read_proc_stat;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -503,11 +503,14 @@ pub fn collect_user_intent(pid: u32, _config: &UserIntentConfig) -> Option<UserI
     Some(UserIntentFeatures::none(pid, privacy_mode))
 }
 
+#[cfg(target_os = "linux")]
+use crate::collect::ProcessStat;
+
 /// Detect TTY-related intent signals.
 #[cfg(target_os = "linux")]
 fn detect_tty_signals(
     pid: u32,
-    proc_stat: &ProcStat,
+    proc_stat: &ProcessStat,
     config: &UserIntentConfig,
 ) -> Option<Vec<IntentEvidence>> {
     let mut evidence = Vec::new();
@@ -523,7 +526,7 @@ fn detect_tty_signals(
         });
 
         // Check if process is foreground job
-        if proc_stat.tpgid > 0 && proc_stat.pgrp == proc_stat.tpgid as u32 {
+        if proc_stat.tpgid > 0 && proc_stat.pgrp == proc_stat.tpgid {
             evidence.push(IntentEvidence {
                 signal_type: IntentSignalType::ForegroundJob,
                 weight: config.weight_for(IntentSignalType::ForegroundJob),
@@ -532,7 +535,7 @@ fn detect_tty_signals(
                     proc_stat.pgrp, proc_stat.tpgid
                 ),
                 metadata: Some(IntentMetadata::Foreground {
-                    pgid: proc_stat.pgrp,
+                    pgid: proc_stat.pgrp as u32,
                     tpgid: proc_stat.tpgid,
                 }),
             });

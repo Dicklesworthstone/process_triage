@@ -195,16 +195,10 @@ enum PatternKind {
 
 impl CompiledPattern {
     fn compile(entry: &PatternEntry, path: &str) -> Result<Self, EnforcerError> {
-        let kind = match entry.kind.to_lowercase().as_str() {
-            "regex" => PatternKind::Regex,
-            "glob" => PatternKind::Glob,
-            "literal" => PatternKind::Literal,
-            other => {
-                return Err(EnforcerError::InvalidPattern {
-                    path: path.to_string(),
-                    message: format!("unknown pattern kind: {other}"),
-                })
-            }
+        let kind = match entry.kind {
+            crate::config::policy::PatternKind::Regex => PatternKind::Regex,
+            crate::config::policy::PatternKind::Glob => PatternKind::Glob,
+            crate::config::policy::PatternKind::Literal => PatternKind::Literal,
         };
 
         let regex = match kind {
@@ -469,9 +463,9 @@ impl PolicyEnforcer {
             .collect();
 
         let never_kill_pid: HashSet<i32> =
-            policy.guardrails.never_kill_pid.iter().copied().collect();
+            policy.guardrails.never_kill_pid.iter().map(|&p| p as i32).collect();
         let never_kill_ppid: HashSet<i32> =
-            policy.guardrails.never_kill_ppid.iter().copied().collect();
+            policy.guardrails.never_kill_ppid.iter().map(|&p| p as i32).collect();
 
         Ok(Self {
             protected_patterns,
@@ -1049,7 +1043,7 @@ impl PolicyEnforcer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::policy::Policy;
+    use crate::config::policy::{PatternKind, Policy};
 
     fn test_policy() -> Policy {
         Policy::default()
@@ -1329,7 +1323,7 @@ mod tests {
         let mut policy = test_policy();
         policy.guardrails.force_review_patterns = vec![PatternEntry {
             pattern: "kubectl".to_string(),
-            kind: "literal".to_string(),
+            kind: PatternKind::Literal,
             case_insensitive: true,
             notes: Some("k8s tool".to_string()),
         }];
@@ -1355,7 +1349,7 @@ mod tests {
         let mut policy = test_policy();
         policy.guardrails.protected_patterns = vec![PatternEntry {
             pattern: "*.test".to_string(),
-            kind: "glob".to_string(),
+            kind: PatternKind::Glob,
             case_insensitive: true,
             notes: None,
         }];
@@ -1374,7 +1368,7 @@ mod tests {
         let mut policy = test_policy();
         policy.guardrails.protected_patterns = vec![PatternEntry {
             pattern: "/usr/**important".to_string(),
-            kind: "glob".to_string(),
+            kind: PatternKind::Glob,
             case_insensitive: false,
             notes: None,
         }];
@@ -1392,7 +1386,7 @@ mod tests {
         // Test that ** is different from single *
         policy.guardrails.protected_patterns = vec![PatternEntry {
             pattern: "test*end".to_string(),
-            kind: "glob".to_string(),
+            kind: PatternKind::Glob,
             case_insensitive: false,
             notes: None,
         }];
@@ -1409,7 +1403,7 @@ mod tests {
         let mut policy = test_policy();
         policy.guardrails.protected_patterns = vec![PatternEntry {
             pattern: "process[0-9]".to_string(),
-            kind: "glob".to_string(),
+            kind: PatternKind::Glob,
             case_insensitive: false,
             notes: None,
         }];
@@ -1431,7 +1425,7 @@ mod tests {
         let mut policy = test_policy();
         policy.guardrails.protected_patterns = vec![PatternEntry {
             pattern: "proc[!0-9]".to_string(),
-            kind: "glob".to_string(),
+            kind: PatternKind::Glob,
             case_insensitive: false,
             notes: None,
         }];
@@ -1452,7 +1446,7 @@ mod tests {
         let mut policy = test_policy();
         policy.guardrails.protected_patterns = vec![PatternEntry {
             pattern: "critical-service".to_string(),
-            kind: "literal".to_string(),
+            kind: PatternKind::Literal,
             case_insensitive: true,
             notes: None,
         }];

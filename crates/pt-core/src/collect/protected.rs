@@ -338,7 +338,7 @@ impl ProtectedFilter {
             .map(|p| {
                 (
                     p.pattern.clone(),
-                    p.kind.clone(),
+                    p.kind.as_str().to_string(),
                     p.case_insensitive,
                     p.notes.clone(),
                 )

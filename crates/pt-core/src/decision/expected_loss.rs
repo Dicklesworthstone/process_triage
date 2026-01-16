@@ -702,7 +702,7 @@ mod tests {
     use super::*;
     use crate::config::policy::{LossMatrix, LossRow, Policy};
     use crate::config::priors::{
-        BetaParams, CausalInterventions, ClassPriors, Classes, InterventionPriors, Priors,
+        BetaParams, CausalInterventions, ClassParams, ClassPriors, InterventionPriors, Priors,
     };
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
@@ -837,25 +837,13 @@ mod tests {
             ..Policy::default()
         };
 
-        let class_priors = ClassPriors {
+        let class_params = ClassParams {
             prior_prob: 0.25,
-            cpu_beta: BetaParams {
-                alpha: 1.0,
-                beta: 1.0,
-            },
+            cpu_beta: BetaParams::new(1.0, 1.0),
             runtime_gamma: None,
-            orphan_beta: BetaParams {
-                alpha: 1.0,
-                beta: 1.0,
-            },
-            tty_beta: BetaParams {
-                alpha: 1.0,
-                beta: 1.0,
-            },
-            net_beta: BetaParams {
-                alpha: 1.0,
-                beta: 1.0,
-            },
+            orphan_beta: BetaParams::new(1.0, 1.0),
+            tty_beta: BetaParams::new(1.0, 1.0),
+            net_beta: BetaParams::new(1.0, 1.0),
             io_active_beta: None,
             hazard_gamma: None,
             competing_hazards: None,
@@ -867,52 +855,28 @@ mod tests {
             created_at: None,
             updated_at: None,
             host_profile: None,
-            classes: Classes {
-                useful: class_priors.clone(),
-                useful_bad: class_priors.clone(),
-                abandoned: class_priors.clone(),
-                zombie: class_priors,
+            classes: ClassPriors {
+                useful: class_params.clone(),
+                useful_bad: class_params.clone(),
+                abandoned: class_params.clone(),
+                zombie: class_params,
             },
             hazard_regimes: vec![],
             semi_markov: None,
             change_point: None,
             causal_interventions: Some(CausalInterventions {
                 pause: Some(InterventionPriors {
-                    useful: Some(BetaParams {
-                        alpha: 9.0,
-                        beta: 1.0,
-                    }),
-                    useful_bad: Some(BetaParams {
-                        alpha: 1.0,
-                        beta: 1.0,
-                    }),
-                    abandoned: Some(BetaParams {
-                        alpha: 1.0,
-                        beta: 1.0,
-                    }),
-                    zombie: Some(BetaParams {
-                        alpha: 1.0,
-                        beta: 1.0,
-                    }),
+                    useful: Some(BetaParams::new(9.0, 1.0)),
+                    useful_bad: Some(BetaParams::new(1.0, 1.0)),
+                    abandoned: Some(BetaParams::new(1.0, 1.0)),
+                    zombie: Some(BetaParams::new(1.0, 1.0)),
                 }),
                 throttle: None,
                 kill: Some(InterventionPriors {
-                    useful: Some(BetaParams {
-                        alpha: 1.0,
-                        beta: 9.0,
-                    }),
-                    useful_bad: Some(BetaParams {
-                        alpha: 1.0,
-                        beta: 1.0,
-                    }),
-                    abandoned: Some(BetaParams {
-                        alpha: 1.0,
-                        beta: 1.0,
-                    }),
-                    zombie: Some(BetaParams {
-                        alpha: 1.0,
-                        beta: 1.0,
-                    }),
+                    useful: Some(BetaParams::new(1.0, 9.0)),
+                    useful_bad: Some(BetaParams::new(1.0, 1.0)),
+                    abandoned: Some(BetaParams::new(1.0, 1.0)),
+                    zombie: Some(BetaParams::new(1.0, 1.0)),
                 }),
                 restart: None,
             }),

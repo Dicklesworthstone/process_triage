@@ -308,7 +308,21 @@ impl ToolRunner {
         // Validate command
         self.validate_command(&spec.command)?;
 
-        let timeout = spec.timeout.unwrap_or(self.config.default_timeout);
+        let requested_timeout = spec.timeout.unwrap_or(self.config.default_timeout);
+        
+        // Clamp timeout to remaining budget
+        let remaining_budget = self.remaining_budget_ms();
+        let timeout = if requested_timeout.as_millis() as u64 > remaining_budget {
+            debug!(
+                requested_ms = requested_timeout.as_millis(),
+                remaining_ms = remaining_budget,
+                "clamping timeout to remaining budget"
+            );
+            Duration::from_millis(remaining_budget)
+        } else {
+            requested_timeout
+        };
+
         let max_output = spec.max_output.unwrap_or(self.config.max_output_bytes);
 
         debug!(

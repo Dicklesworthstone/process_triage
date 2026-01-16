@@ -8,7 +8,7 @@
 //!
 //! See: process_triage-aii.7.5
 
-use pt_core::config::policy::Policy;
+use pt_core::config::policy::{PatternKind, Policy};
 use pt_core::config::priors::Priors;
 use pt_core::decision::{
     decide_action, decide_action_with_recovery, select_fdr, Action, ActionFeasibility,
@@ -775,19 +775,19 @@ fn test_enforcer_protected_patterns() {
     policy.guardrails.protected_patterns = vec![
         pt_core::config::policy::PatternEntry {
             pattern: "sshd".to_string(),
-            kind: "literal".to_string(),
+            kind: PatternKind::Literal,
             case_insensitive: true,
             notes: Some("SSH daemon".to_string()),
         },
         pt_core::config::policy::PatternEntry {
             pattern: r"^/usr/sbin/.*d$".to_string(),
-            kind: "regex".to_string(),
+            kind: PatternKind::Regex,
             case_insensitive: false,
             notes: Some("System daemons".to_string()),
         },
         pt_core::config::policy::PatternEntry {
             pattern: "nginx*".to_string(),
-            kind: "glob".to_string(),
+            kind: PatternKind::Glob,
             case_insensitive: true,
             notes: Some("Nginx".to_string()),
         },
@@ -1126,7 +1126,7 @@ fn test_enforcer_warnings() {
     let mut policy = Policy::default();
     policy.guardrails.force_review_patterns = vec![pt_core::config::policy::PatternEntry {
         pattern: "kubectl".to_string(),
-        kind: "literal".to_string(),
+        kind: PatternKind::Literal,
         case_insensitive: true,
         notes: Some("Kubernetes tool".to_string()),
     }];

@@ -11,6 +11,9 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 use zip::ZipArchive;
 
+/// Maximum allowed file size to read into memory (100 MB).
+const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Reader for .ptb session bundles with verification.
 pub struct BundleReader<R: Read + std::io::Seek> {
     manifest: BundleManifest,
@@ -92,6 +95,13 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
             .by_name("manifest.json")
             .map_err(|_| BundleError::MissingFile("manifest.json".to_string()))?;
 
+        if manifest_file.size() > MAX_FILE_SIZE {
+            return Err(BundleError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "manifest.json too large",
+            )));
+        }
+
         let mut json = String::new();
         manifest_file.read_to_string(&mut json)?;
 
@@ -143,7 +153,14 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
             .by_name(path)
             .map_err(|_| BundleError::FileNotFound(path.to_string()))?;
 
-        let mut data = Vec::new();
+        if file.size() > MAX_FILE_SIZE {
+            return Err(BundleError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("file {} too large ({} bytes)", path, file.size()),
+            )));
+        }
+
+        let mut data = Vec::with_capacity(file.size() as usize);
         file.read_to_end(&mut data)?;
 
         debug!(

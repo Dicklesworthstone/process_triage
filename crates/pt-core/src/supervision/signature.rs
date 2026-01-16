@@ -2728,7 +2728,7 @@ mod tests {
         assert!(!sig.expectations.is_empty());
 
         // Verify priors survived roundtrip
-        let useful = sig.priors.useful.unwrap();
+        let useful = sig.priors.useful.clone().unwrap();
         assert!(useful.mean() > 0.8);
     }
 
