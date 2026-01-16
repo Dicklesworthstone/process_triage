@@ -5,6 +5,7 @@ pub mod belief_state;
 pub mod beta_stacy;
 pub mod bma;
 pub mod bocpd;
+pub mod compound_poisson;
 pub mod ctw;
 pub mod conformal;
 pub mod evt;
@@ -131,4 +132,9 @@ pub use imm::{
 pub use hsmm::{
     BatchHsmmAnalyzer, DurationStats, GammaDuration, HsmmAnalyzer, HsmmConfig, HsmmError,
     HsmmEvidence, HsmmResult, HsmmState, StateSwitch,
+};
+pub use compound_poisson::{
+    BatchCompoundPoissonAnalyzer, BurstEvent, CompoundPoissonAnalyzer, CompoundPoissonConfig,
+    CompoundPoissonError, CompoundPoissonEvidence, CompoundPoissonParams, CompoundPoissonResult,
+    CompoundPoissonSummary, GammaParams as CpGammaParams, RegimeStats as CpRegimeStats,
 };
