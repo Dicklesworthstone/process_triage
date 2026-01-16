@@ -2823,6 +2823,25 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut all_candidates: Vec<(f64, serde_json::Value)> = Vec::new();
 
     let feasibility = ActionFeasibility::allow_all();
+    let total_processes = filter_result.passed.len() as u64;
+    let mut processed = 0u64;
+
+    if let Some(ref e) = emitter {
+        e.emit(
+            ProgressEvent::new(
+                pt_core::events::event_names::INFERENCE_STARTED,
+                Phase::Infer,
+            )
+            .with_progress(0, Some(total_processes)),
+        );
+        e.emit(
+            ProgressEvent::new(
+                pt_core::events::event_names::DECISION_STARTED,
+                Phase::Decide,
+            )
+            .with_progress(0, Some(total_processes)),
+        );
+    }
 
     // Use filtered processes for inference (not scan_result.processes)
     for proc in &filter_result.passed {
@@ -2830,6 +2849,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         if proc.pid.0 == 0 || proc.pid.0 == 1 {
             continue;
         }
+        processed = processed.saturating_add(1);
 
         // Build evidence from process record
         let evidence = Evidence {
@@ -2869,6 +2889,18 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .max(posterior.useful_bad)
             .max(posterior.abandoned)
             .max(posterior.zombie);
+
+        if let Some(ref e) = emitter {
+            if processed % 50 == 0 || processed == total_processes {
+                e.emit(
+                    ProgressEvent::new(
+                        pt_core::events::event_names::INFERENCE_PROGRESS,
+                        Phase::Infer,
+                    )
+                    .with_progress(processed, Some(total_processes)),
+                );
+            }
+        }
 
         // Apply threshold filter
         if max_posterior < args.threshold {
@@ -2949,6 +2981,23 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         // Store candidate with max_posterior for sorting (no early break!)
         all_candidates.push((max_posterior, candidate));
+    }
+
+    if let Some(ref e) = emitter {
+        e.emit(
+            ProgressEvent::new(
+                pt_core::events::event_names::INFERENCE_COMPLETE,
+                Phase::Infer,
+            )
+            .with_progress(processed, Some(total_processes)),
+        );
+        e.emit(
+            ProgressEvent::new(
+                pt_core::events::event_names::DECISION_COMPLETE,
+                Phase::Decide,
+            )
+            .with_progress(processed, Some(total_processes)),
+        );
     }
 
     // Sort candidates by max_posterior descending (highest confidence first)
