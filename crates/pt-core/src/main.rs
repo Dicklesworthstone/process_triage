@@ -9,6 +9,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use pt_common::{OutputFormat, SessionId, SCHEMA_VERSION};
+use pt_core::collect::protected::ProtectedFilter;
 use pt_core::config::{load_config, ConfigError, ConfigOptions, Priors};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::events::{JsonlWriter, Phase, ProgressEmitter, ProgressEvent};
@@ -156,6 +157,10 @@ struct ScanArgs {
     /// Interval between samples (milliseconds)
     #[arg(long, default_value = "500")]
     interval: u64,
+
+    /// Include kernel threads in scan output (default: exclude)
+    #[arg(long)]
+    include_kernel_threads: bool,
 }
 
 #[derive(Args, Debug)]
@@ -229,6 +234,14 @@ enum BundleCommands {
         /// Include full process dumps
         #[arg(long)]
         include_dumps: bool,
+
+        /// Encrypt the bundle with a passphrase (explicit opt-in)
+        #[arg(long)]
+        encrypt: bool,
+
+        /// Passphrase for bundle encryption/decryption (or use PT_BUNDLE_PASSPHRASE)
+        #[arg(long)]
+        passphrase: Option<String>,
     },
     /// Inspect an existing bundle
     Inspect {
@@ -238,6 +251,10 @@ enum BundleCommands {
         /// Verify file checksums
         #[arg(long)]
         verify: bool,
+
+        /// Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)
+        #[arg(long)]
+        passphrase: Option<String>,
     },
     /// Extract bundle contents
     Extract {
@@ -251,6 +268,10 @@ enum BundleCommands {
         /// Verify file checksums before extraction
         #[arg(long)]
         verify: bool,
+
+        /// Passphrase for encrypted bundles (or use PT_BUNDLE_PASSPHRASE)
+        #[arg(long)]
+        passphrase: Option<String>,
     },
 }
 
@@ -345,6 +366,10 @@ struct AgentPlanArgs {
     /// Skip safety gate confirmations (use with caution)
     #[arg(long)]
     yes: bool,
+
+    /// Include kernel threads as candidates (default: exclude)
+    #[arg(long)]
+    include_kernel_threads: bool,
 }
 
 #[derive(Args, Debug)]
@@ -628,7 +653,7 @@ fn run_interactive(global: &GlobalOpts, _args: &RunArgs) -> ExitCode {
     ExitCode::Clean
 }
 
-use pt_core::collect::{quick_scan, QuickScanOptions, ProcessRecord};
+use pt_core::collect::{quick_scan, ProtectedFilter, ProcessRecord, QuickScanOptions};
 use pt_core::inference::{
     compute_posterior, CpuEvidence, Evidence, EvidenceLedger,
 };
@@ -672,7 +697,7 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
     // Configure scan options
     let options = QuickScanOptions {
         pids: vec![],                  // Empty = all processes
-        include_kernel_threads: false, // Default to false for quick scan
+        include_kernel_threads: args.include_kernel_threads,
         timeout: global.timeout.map(std::time::Duration::from_secs),
         progress,
     };
@@ -770,6 +795,12 @@ fn bytes_to_human(bytes: u64) -> String {
     }
 }
 
+fn resolve_bundle_passphrase(passphrase_arg: &Option<String>) -> Option<String> {
+    passphrase_arg
+        .clone()
+        .or_else(|| std::env::var("PT_BUNDLE_PASSPHRASE").ok())
+}
+
 fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
     output_stub(global, "deep-scan", "Deep scan mode not yet implemented");
     ExitCode::Clean
@@ -788,9 +819,29 @@ fn run_bundle(global: &GlobalOpts, args: &BundleArgs) -> ExitCode {
             profile,
             include_telemetry,
             include_dumps,
-        } => run_bundle_create(global, session, output, profile, *include_telemetry, *include_dumps),
-        BundleCommands::Inspect { path, verify } => run_bundle_inspect(global, path, *verify),
-        BundleCommands::Extract { path, output, verify } => run_bundle_extract(global, path, output, *verify),
+            encrypt,
+            passphrase,
+        } => run_bundle_create(
+            global,
+            session,
+            output,
+            profile,
+            *include_telemetry,
+            *include_dumps,
+            *encrypt,
+            passphrase,
+        ),
+        BundleCommands::Inspect {
+            path,
+            verify,
+            passphrase,
+        } => run_bundle_inspect(global, path, *verify, passphrase),
+        BundleCommands::Extract {
+            path,
+            output,
+            verify,
+            passphrase,
+        } => run_bundle_extract(global, path, output, *verify, passphrase),
     }
 }
 
@@ -801,12 +852,34 @@ fn run_bundle_create(
     profile_str: &str,
     include_telemetry: bool,
     _include_dumps: bool,
+    encrypt: bool,
+    passphrase_arg: &Option<String>,
 ) -> ExitCode {
     use pt_bundle::{BundleWriter, FileType};
     use pt_redact::ExportProfile;
 
     let session_id = SessionId::new();
     let host_id = pt_core::logging::get_host_id();
+    let passphrase = resolve_bundle_passphrase(passphrase_arg);
+
+    if encrypt && passphrase.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
+        let error_output = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id.0,
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "command": "bundle create",
+            "status": "error",
+            "error": "Encryption requested but no passphrase provided (use --passphrase or PT_BUNDLE_PASSPHRASE)",
+        });
+        match global.format {
+            OutputFormat::Md => eprintln!(
+                "Error: Encryption requested but no passphrase provided (use --passphrase or PT_BUNDLE_PASSPHRASE)"
+            ),
+            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+        }
+        return ExitCode::ArgsError;
+    }
 
     // Parse export profile
     let export_profile = match ExportProfile::parse_str(profile_str) {
@@ -958,8 +1031,34 @@ fn run_bundle_create(
         }
     };
 
-    // Write the bundle
-    match writer.write(&output_path) {
+    let result = if encrypt {
+        let passphrase = match passphrase.as_deref() {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                let error_output = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "session_id": session_id.0,
+                    "generated_at": chrono::Utc::now().to_rfc3339(),
+                    "command": "bundle create",
+                    "status": "error",
+                    "error": "Encryption requested but no passphrase provided (use --passphrase or PT_BUNDLE_PASSPHRASE)",
+                });
+                match global.format {
+                    OutputFormat::Md => eprintln!(
+                        "Error: Encryption requested but no passphrase provided (use --passphrase or PT_BUNDLE_PASSPHRASE)"
+                    ),
+                    OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+                    _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+                }
+                return ExitCode::ArgsError;
+            }
+        };
+        writer.write_encrypted(&output_path, passphrase)
+    } else {
+        writer.write(&output_path)
+    };
+
+    match result {
         Ok(manifest) => {
             let output = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
@@ -973,11 +1072,17 @@ fn run_bundle_create(
                     "profile": format!("{}", export_profile),
                     "files": manifest.file_count(),
                     "total_bytes": manifest.total_bytes(),
+                    "encrypted": encrypt,
                 },
             });
             match global.format {
-                OutputFormat::Md => println!("Bundle created: {} ({} files, {} bytes)",
-                    output_path.display(), manifest.file_count(), manifest.total_bytes()),
+                OutputFormat::Md => println!(
+                    "Bundle created: {} ({} files, {} bytes{})",
+                    output_path.display(),
+                    manifest.file_count(),
+                    manifest.total_bytes(),
+                    if encrypt { ", encrypted" } else { "" }
+                ),
                 OutputFormat::Jsonl => println!("{}", serde_json::to_string(&output).unwrap()),
                 _ => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
             }
@@ -1002,7 +1107,12 @@ fn run_bundle_create(
     }
 }
 
-fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode {
+fn run_bundle_inspect(
+    global: &GlobalOpts,
+    path: &str,
+    verify: bool,
+    passphrase_arg: &Option<String>,
+) -> ExitCode {
     use pt_bundle::BundleReader;
 
     let session_id = SessionId::new();
@@ -1025,7 +1135,8 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
         return ExitCode::ArgsError;
     }
 
-    let mut reader = match BundleReader::open(bundle_path) {
+    let passphrase = resolve_bundle_passphrase(passphrase_arg);
+    let mut reader = match BundleReader::open_with_passphrase(bundle_path, passphrase.as_deref()) {
         Ok(r) => r,
         Err(e) => {
             let error_output = serde_json::json!({
@@ -1041,7 +1152,16 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
                 OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
-            return ExitCode::InternalError;
+            return if matches!(
+                e,
+                pt_bundle::BundleError::EncryptedBundleRequiresPassphrase
+                    | pt_bundle::BundleError::MissingPassphrase
+                    | pt_bundle::BundleError::DecryptionFailed
+            ) {
+                ExitCode::ArgsError
+            } else {
+                ExitCode::InternalError
+            };
         }
     };
 
@@ -1120,7 +1240,13 @@ fn run_bundle_inspect(global: &GlobalOpts, path: &str, verify: bool) -> ExitCode
     ExitCode::Clean
 }
 
-fn run_bundle_extract(global: &GlobalOpts, path: &str, output_arg: &Option<String>, verify: bool) -> ExitCode {
+fn run_bundle_extract(
+    global: &GlobalOpts,
+    path: &str,
+    output_arg: &Option<String>,
+    verify: bool,
+    passphrase_arg: &Option<String>,
+) -> ExitCode {
     use pt_bundle::BundleReader;
 
     let session_id = SessionId::new();
@@ -1143,7 +1269,8 @@ fn run_bundle_extract(global: &GlobalOpts, path: &str, output_arg: &Option<Strin
         return ExitCode::ArgsError;
     }
 
-    let mut reader = match BundleReader::open(bundle_path) {
+    let passphrase = resolve_bundle_passphrase(passphrase_arg);
+    let mut reader = match BundleReader::open_with_passphrase(bundle_path, passphrase.as_deref()) {
         Ok(r) => r,
         Err(e) => {
             let error_output = serde_json::json!({
@@ -1159,7 +1286,16 @@ fn run_bundle_extract(global: &GlobalOpts, path: &str, output_arg: &Option<Strin
                 OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
-            return ExitCode::InternalError;
+            return if matches!(
+                e,
+                pt_bundle::BundleError::EncryptedBundleRequiresPassphrase
+                    | pt_bundle::BundleError::MissingPassphrase
+                    | pt_bundle::BundleError::DecryptionFailed
+            ) {
+                ExitCode::ArgsError
+            } else {
+                ExitCode::InternalError
+            };
         }
     };
 
@@ -2263,7 +2399,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     // Perform quick scan to enumerate processes
     let scan_options = QuickScanOptions {
         pids: vec![],
-        include_kernel_threads: false,
+        include_kernel_threads: args.include_kernel_threads,
         timeout: global.timeout.map(std::time::Duration::from_secs),
         progress: emitter.clone(),
     };
@@ -2284,15 +2420,37 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
     }
 
+    // Create protected filter from policy guardrails
+    let protected_filter = match ProtectedFilter::from_guardrails(&policy.guardrails) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("agent plan: failed to create protected filter: {}", e);
+            return ExitCode::InternalError;
+        }
+    };
+
+    // Apply filter BEFORE inference loop to remove protected processes
+    let filter_result = protected_filter.filter_scan_result(&scan_result);
+    let protected_filtered_count = filter_result.filtered.len();
+    let total_scanned = filter_result.total_before;
+
+    tracing::info!(
+        total_scanned = total_scanned,
+        filtered_count = protected_filtered_count,
+        passed_count = filter_result.passed.len(),
+        "Protected filter applied"
+    );
+
     // Process each candidate: compute posterior, make decision, build candidate output
-    let mut candidates: Vec<serde_json::Value> = Vec::new();
-    let mut kill_candidates: Vec<u32> = Vec::new();
-    let mut review_candidates: Vec<u32> = Vec::new();
+    // Collect ALL candidates above threshold with their max_posterior for sorting
+    // Then sort by max_posterior descending and take top N
+    let mut all_candidates: Vec<(f64, serde_json::Value)> = Vec::new();
 
     let feasibility = ActionFeasibility::allow_all();
 
-    for proc in &scan_result.processes {
-        // Skip kernel threads and system processes
+    // Use filtered processes for inference (not scan_result.processes)
+    for proc in &filter_result.passed {
+        // Skip PID 0/1 (extra safety - should already be filtered)
         if proc.pid.0 == 0 || proc.pid.0 == 1 {
             continue;
         }
@@ -2363,18 +2521,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             continue;
         }
 
-        // Track candidates by action type
-        if decision_outcome.optimal_action == Action::Kill {
-            kill_candidates.push(proc.pid.0);
-        } else if decision_outcome.optimal_action != Action::Keep {
-            review_candidates.push(proc.pid.0);
-        }
-
-        // Build candidate JSON
+        // Build candidate JSON (action tracking moved to after sorting)
         let candidate = serde_json::json!({
             "pid": proc.pid.0,
+            "ppid": proc.ppid.0,
+            "state": proc.state.to_string(),
             "start_id": format!("{}:{}", proc.pid.0, proc.start_time_unix),
             "uid": proc.uid,
+            "user": &proc.user,
             "cmd_short": proc.comm,
             "cmd_full": proc.cmd,
             "classification": ledger.classification.label(),
@@ -2417,18 +2571,43 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 .collect::<Vec<_>>(),
         });
 
-        candidates.push(candidate);
+        // Store candidate with max_posterior for sorting (no early break!)
+        all_candidates.push((max_posterior, candidate));
+    }
 
-        // Limit to max_candidates
-        if candidates.len() >= args.max_candidates as usize {
-            break;
+    // Sort candidates by max_posterior descending (highest confidence first)
+    all_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Capture count before truncation for summary stats
+    let above_threshold_count = all_candidates.len();
+
+    // Take top N candidates (sorted by max posterior, not scan order!)
+    let candidates: Vec<serde_json::Value> = all_candidates
+        .into_iter()
+        .take(args.max_candidates as usize)
+        .map(|(_, c)| c)
+        .collect();
+
+    // Rebuild kill/review candidate lists from the final sorted candidates
+    let mut kill_candidates: Vec<u32> = Vec::new();
+    let mut review_candidates: Vec<u32> = Vec::new();
+    for candidate in &candidates {
+        let pid = candidate["pid"].as_u64().unwrap_or(0) as u32;
+        let action = candidate["recommended_action"].as_str().unwrap_or("");
+        if action == "kill" {
+            kill_candidates.push(pid);
+        } else if action != "keep" {
+            review_candidates.push(pid);
         }
     }
 
     // Build summary
     let summary = serde_json::json!({
-        "total_processes_scanned": scan_result.processes.len(),
-        "candidates_identified": candidates.len(),
+        "total_processes_scanned": total_scanned,
+        "protected_filtered": protected_filtered_count,
+        "candidates_evaluated": filter_result.passed.len(),
+        "above_threshold": above_threshold_count,  // Candidates meeting threshold before truncation
+        "candidates_returned": candidates.len(),   // After truncation to max_candidates
         "kill_recommendations": kill_candidates.len(),
         "review_recommendations": review_candidates.len(),
         "threshold_used": args.threshold,

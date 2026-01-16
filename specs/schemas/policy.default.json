@@ -55,7 +55,7 @@
     ],
     "protected_users": ["root"],
     "protected_categories": ["daemon", "system"],
-    "never_kill_ppid": [1],
+    "never_kill_ppid": [0, 1, 2],
     "never_kill_pid": [1],
     "max_kills_per_run": 5,
     "max_kills_per_hour": 20,

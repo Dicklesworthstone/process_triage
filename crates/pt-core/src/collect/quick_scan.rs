@@ -133,7 +133,21 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         }
 
         match parse_ps_line(&line, &platform, &boot_id) {
-            Ok(record) => processes.push(record),
+            Ok(record) => {
+                // Filter kernel threads if not requested AND not targeting specific PIDs.
+                // If user explicitly asks for specific PIDs, we respect that even for kernel threads.
+                let is_targeting_specific_pids = !options.pids.is_empty();
+                if !options.include_kernel_threads && !is_targeting_specific_pids && is_kernel_thread(&record) {
+                    debug!(
+                        pid = record.pid.0,
+                        ppid = record.ppid.0,
+                        comm = %record.comm,
+                        "Filtered kernel thread from scan"
+                    );
+                    continue;
+                }
+                processes.push(record);
+            }
             Err(e) => {
                 warnings.push(format!("Line {}: {}", line_num + 2, e));
             }
@@ -509,6 +523,29 @@ fn clock_ticks_per_second() -> Option<u64> {
     }
 }
 
+/// Detect kernel threads by PPID.
+///
+/// On Linux, kernel threads are either:
+/// - PPID 0: Direct children of the scheduler (swapper). Only kthreadd (PID 2) has PPID 0.
+/// - PPID 2: Children of kthreadd (kernel thread daemon). This includes ALL other kernel threads.
+///
+/// CRITICAL: Do NOT use bracket pattern (e.g., [kthreadd]) because
+/// zombie processes ALSO show bracketed names like [cat] <defunct>.
+/// PPID is the ONLY reliable indicator.
+///
+/// Note: PID 0 (swapper) never appears in ps output.
+/// Note: PID 1 (init/systemd) has PPID 0 but is NOT a kernel thread.
+fn is_kernel_thread(record: &ProcessRecord) -> bool {
+    let ppid = record.ppid.0;
+
+    // Special case: PID 1 (init/systemd) has PPID 0 but is NOT a kernel thread
+    if record.pid.0 == 1 {
+        return false;
+    }
+
+    ppid == 0 || ppid == 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +803,125 @@ mod tests {
             user = record.user.as_str(),
             rss_bytes = record.rss_bytes,
             vsz_bytes = record.vsz_bytes
+        );
+    }
+
+    // =====================================================
+    // Kernel thread detection tests
+    // =====================================================
+
+    fn make_record(pid: u32, ppid: u32, comm: &str, state: ProcessState) -> ProcessRecord {
+        ProcessRecord {
+            pid: ProcessId(pid),
+            ppid: ProcessId(ppid),
+            uid: 0,
+            user: "root".to_string(),
+            pgid: Some(0),
+            sid: Some(0),
+            start_id: StartId("test:0:0".to_string()),
+            comm: comm.to_string(),
+            cmd: comm.to_string(),
+            state,
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            vsz_bytes: 0,
+            tty: None,
+            start_time_unix: 0,
+            elapsed: Duration::from_secs(0),
+            source: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_is_kernel_thread_kthreadd() {
+        let kthreadd = make_record(2, 0, "[kthreadd]", ProcessState::Sleeping);
+        assert!(is_kernel_thread(&kthreadd), "kthreadd should be detected as kernel thread");
+    }
+
+    #[test]
+    fn test_is_kernel_thread_kworker() {
+        let kworker = make_record(42, 2, "[kworker/0:0-eve]", ProcessState::Idle);
+        assert!(is_kernel_thread(&kworker), "kworker should be detected as kernel thread");
+    }
+
+    #[test]
+    fn test_is_kernel_thread_init_excluded() {
+        // init (PID 1) has PPID 0 but is NOT a kernel thread
+        let init = make_record(1, 0, "init", ProcessState::Sleeping);
+        assert!(!is_kernel_thread(&init), "init should NOT be detected as kernel thread");
+    }
+
+    #[test]
+    fn test_zombie_not_kernel_thread() {
+        // Zombie with bracketed name but user-process parent
+        let zombie = make_record(9999, 1234, "[cat]", ProcessState::Zombie);
+        assert!(!is_kernel_thread(&zombie), "Zombie should NOT be detected as kernel thread");
+    }
+
+    #[test]
+    fn test_orphan_not_kernel_thread() {
+        // Orphaned process (PPID 1) is NOT a kernel thread
+        let orphan = make_record(5000, 1, "defunct_daemon", ProcessState::Sleeping);
+        assert!(!is_kernel_thread(&orphan), "Orphan should NOT be detected as kernel thread");
+    }
+
+    #[test]
+    fn test_normal_process_not_kernel_thread() {
+        let normal = make_record(5000, 1500, "bash", ProcessState::Running);
+        assert!(!is_kernel_thread(&normal), "Normal process should NOT be kernel thread");
+    }
+
+    #[test]
+    fn test_nomock_quick_scan_excludes_kernel_threads_by_default() {
+        let platform = detect_platform();
+        if platform != "linux" {
+            crate::test_log!(INFO, "Skipping kernel thread test: Linux only");
+            return;
+        }
+
+        let options = QuickScanOptions::default(); // include_kernel_threads: false
+        let result = quick_scan(&options);
+        assert!(result.is_ok(), "quick_scan failed: {:?}", result.err());
+        let scan = result.unwrap();
+
+        for proc in &scan.processes {
+            // PID 1 is allowed even with PPID 0
+            if proc.pid.0 == 1 {
+                continue;
+            }
+            assert!(
+                proc.ppid.0 != 0 && proc.ppid.0 != 2,
+                "Found kernel thread PID {} (PPID {}) with default options",
+                proc.pid.0, proc.ppid.0
+            );
+        }
+
+        crate::test_log!(
+            INFO,
+            "quick_scan excludes kernel threads by default",
+            process_count = scan.processes.len()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_nomock_quick_scan_includes_kernel_threads_when_requested() {
+        let options = QuickScanOptions {
+            include_kernel_threads: true,
+            ..Default::default()
+        };
+        let result = quick_scan(&options);
+        assert!(result.is_ok(), "quick_scan failed: {:?}", result.err());
+        let scan = result.unwrap();
+
+        let has_kthreads = scan.processes.iter().any(|p| p.ppid.0 == 2);
+        assert!(has_kthreads, "Expected kernel threads when include_kernel_threads=true");
+
+        crate::test_log!(
+            INFO,
+            "quick_scan includes kernel threads when requested",
+            process_count = scan.processes.len(),
+            has_kernel_threads = has_kthreads
         );
     }
 }

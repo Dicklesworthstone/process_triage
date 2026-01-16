@@ -134,7 +134,8 @@
         },
         "never_kill_ppid": {
           "type": "array",
-          "items": { "type": "integer", "minimum": 1 }
+          "items": { "type": "integer", "minimum": 0 },
+          "description": "Processes with these PPIDs are protected (0=kthreadd, 1=init, 2=kernel threads)"
         },
         "never_kill_pid": {
           "type": "array",
