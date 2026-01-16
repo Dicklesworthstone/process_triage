@@ -517,7 +517,11 @@ impl ShadowStorage {
             for &pid in pids {
                 if let Some(cache) = self.hot_cache.get(&pid) {
                     for obs in cache {
-                        if obs.timestamp >= start && obs.timestamp <= end {
+                        // Filter by identity_hash to handle PID reuse
+                        if obs.identity_hash == identity_hash
+                            && obs.timestamp >= start
+                            && obs.timestamp <= end
+                        {
                             observations.push(obs.clone());
                             if observations.len() >= limit {
                                 truncated = true;

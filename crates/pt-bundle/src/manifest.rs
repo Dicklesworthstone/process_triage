@@ -169,6 +169,23 @@ impl BundleManifest {
                     "file entry has empty path".to_string(),
                 ));
             }
+
+            // Security: reject absolute paths
+            if file.path.starts_with('/') || file.path.starts_with('\\') {
+                return Err(crate::BundleError::CorruptedManifest(format!(
+                    "file '{}' has absolute path (security violation)",
+                    file.path
+                )));
+            }
+
+            // Security: reject path traversal attempts
+            if file.path.contains("..") {
+                return Err(crate::BundleError::CorruptedManifest(format!(
+                    "file '{}' contains path traversal sequence (security violation)",
+                    file.path
+                )));
+            }
+
             if file.sha256.len() != 64 {
                 return Err(crate::BundleError::CorruptedManifest(format!(
                     "file '{}' has invalid checksum length",
