@@ -653,7 +653,7 @@ fn run_interactive(global: &GlobalOpts, _args: &RunArgs) -> ExitCode {
     ExitCode::Clean
 }
 
-use pt_core::collect::{quick_scan, ProtectedFilter, ProcessRecord, QuickScanOptions};
+use pt_core::collect::{quick_scan, ProcessRecord, QuickScanOptions};
 use pt_core::inference::{
     compute_posterior, CpuEvidence, Evidence, EvidenceLedger,
 };

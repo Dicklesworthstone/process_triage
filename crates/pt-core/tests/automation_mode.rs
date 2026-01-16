@@ -12,6 +12,14 @@ use predicates::prelude::*;
 use serde_json::Value;
 use std::time::Duration;
 
+/// Predicate for valid `agent plan` exit codes.
+/// Exit code 0 = Clean (no candidates)
+/// Exit code 1 = PlanReady (candidates exist, plan produced)
+/// Both are valid success states per exit_codes.rs.
+fn plan_exit_codes() -> impl predicates::Predicate<i32> {
+    predicate::in_iter([0, 1])
+}
+
 /// Get a Command for pt-core binary with timeout.
 fn pt_core() -> Command {
     let mut cmd = cargo_bin_cmd!("pt-core");
@@ -81,7 +89,7 @@ mod robot_mode {
         let output = pt_core()
             .args(["--robot", "--format", "json", "agent", "plan"])
             .assert()
-            .success()
+            .code(plan_exit_codes())
             .get_output()
             .stdout
             .clone();
@@ -125,7 +133,7 @@ mod shadow_mode {
         pt_core()
             .args(["--shadow", "--format", "json", "agent", "plan"])
             .assert()
-            .success();
+            .code(plan_exit_codes());
     }
 
     #[test]
@@ -133,7 +141,7 @@ mod shadow_mode {
         let output = pt_core()
             .args(["--shadow", "--format", "json", "agent", "plan"])
             .assert()
-            .success()
+            .code(plan_exit_codes())
             .get_output()
             .stdout
             .clone();
@@ -165,7 +173,7 @@ mod shadow_mode {
         pt_core()
             .args(["--shadow", "--format", "json", "agent", "plan"])
             .assert()
-            .success()
+            .code(plan_exit_codes())
             // Stderr should contain structured log events
             .stderr(predicate::str::contains("event"));
     }
@@ -184,7 +192,7 @@ mod dry_run_mode {
         let output = pt_core()
             .args(["--dry-run", "--format", "json", "agent", "plan"])
             .assert()
-            .success()
+            .code(plan_exit_codes())
             .get_output()
             .stdout
             .clone();
@@ -200,7 +208,7 @@ mod dry_run_mode {
         pt_core()
             .args(["--dry-run", "--format", "json", "agent", "plan"])
             .assert()
-            .success();
+            .code(plan_exit_codes());
 
         // Should be able to run again - no state corruption
         pt_core()
@@ -239,7 +247,7 @@ mod combined_modes {
         pt_core()
             .args(["--robot", "--shadow", "--format", "json", "agent", "plan"])
             .assert()
-            .success();
+            .code(plan_exit_codes());
     }
 
     #[test]
@@ -248,7 +256,7 @@ mod combined_modes {
         pt_core()
             .args(["--robot", "--dry-run", "--format", "json", "agent", "plan"])
             .assert()
-            .success();
+            .code(plan_exit_codes());
     }
 
     #[test]
@@ -257,7 +265,7 @@ mod combined_modes {
         pt_core()
             .args(["--shadow", "--dry-run", "--format", "json", "agent", "plan"])
             .assert()
-            .success();
+            .code(plan_exit_codes());
     }
 
     #[test]
@@ -274,7 +282,7 @@ mod combined_modes {
                 "plan",
             ])
             .assert()
-            .success();
+            .code(plan_exit_codes());
     }
 }
 
@@ -304,7 +312,7 @@ mod stdin_tty_handling {
             .write_stdin("")
             .timeout(Duration::from_secs(10))
             .assert()
-            .success();
+            .code(plan_exit_codes());
     }
 
     #[test]
