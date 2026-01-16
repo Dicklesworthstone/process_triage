@@ -42,11 +42,13 @@
 //! ```
 
 pub mod error;
+pub mod encryption;
 pub mod manifest;
 pub mod reader;
 pub mod writer;
 
 pub use error::{BundleError, Result};
+pub use encryption::{decrypt_bytes, encrypt_bytes, is_encrypted};
 pub use manifest::{BundleManifest, FileEntry, BUNDLE_SCHEMA_VERSION};
 pub use pt_redact::ExportProfile;
 pub use reader::BundleReader;
