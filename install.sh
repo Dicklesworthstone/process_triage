@@ -367,10 +367,11 @@ verify_file_checksum() {
 # Installation
 # ==============================================================================
 
-install_pt() {
+install_binary() {
     local source_file="$1"
     local dest_dir="$2"
-    local dest_file="${dest_dir}/pt"
+    local binary_name="$3"
+    local dest_file="${dest_dir}/${binary_name}"
 
     # Create destination directory if needed
     if [[ ! -d "$dest_dir" ]]; then
@@ -381,9 +382,11 @@ install_pt() {
     # Check for existing installation
     local current_version=""
     if [[ -f "$dest_file" ]]; then
-        current_version=$(get_installed_version "$dest_file")
-        if [[ -n "$current_version" && "$current_version" != "unknown" ]]; then
-            log_info "Current version: $current_version"
+        if [[ "$binary_name" == "pt" ]]; then
+            current_version=$(get_installed_version "$dest_file")
+            if [[ -n "$current_version" && "$current_version" != "unknown" ]]; then
+                log_info "Current $binary_name version: $current_version"
+            fi
         fi
     fi
 
@@ -530,7 +533,7 @@ main() {
     trap 'rm -rf "$temp_dir"' EXIT
 
     # Download pt script
-    log_step "Downloading pt..."
+    log_step "Downloading pt wrapper..."
     local download_url
     download_url=$(append_cache_buster "${RAW_URL}/pt")
     download "$download_url" "$temp_dir/pt" || {
@@ -544,8 +547,23 @@ main() {
         exit 1
     fi
 
-    # Install
-    install_pt "$temp_dir/pt" "$dest"
+    # Download pt-core
+    local target
+    if target=$(detect_arch); then
+        log_step "Downloading pt-core (${target})..."
+        local core_url="${RELEASES_URL}/download/v${version}/pt-core-${target}"
+        if download "$core_url" "$temp_dir/pt-core"; then
+            install_binary "$temp_dir/pt-core" "$dest" "pt-core"
+        else
+            log_warn "Failed to download pt-core binary for $target"
+            log_warn "You may need to install Rust and run: cargo install pt-core"
+        fi
+    else
+        log_warn "Skipping pt-core (unsupported architecture)"
+    fi
+
+    # Install pt wrapper
+    install_binary "$temp_dir/pt" "$dest" "pt"
 
     # Add to PATH if needed and not disabled
     if [[ "${PT_NO_PATH:-}" != "1" ]]; then
