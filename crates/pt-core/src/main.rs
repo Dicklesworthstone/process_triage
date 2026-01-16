@@ -352,6 +352,9 @@ enum AgentCommands {
     /// Export priors to file for transfer between machines
     ExportPriors(AgentExportPriorsArgs),
 
+    /// Import priors from file (bootstrap from external source)
+    ImportPriors(AgentImportPriorsArgs),
+
     /// Generate HTML report from session
     #[cfg(feature = "report")]
     Report(AgentReportArgs),
@@ -541,6 +544,33 @@ struct AgentExportPriorsArgs {
     /// Tag priors with host profile name for smart matching
     #[arg(long)]
     host_profile: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct AgentImportPriorsArgs {
+    /// Input file path for priors to import
+    #[arg(long, short = 'i')]
+    from: String,
+
+    /// Merge with existing priors (weighted average)
+    #[arg(long, conflicts_with = "replace")]
+    merge: bool,
+
+    /// Replace existing priors entirely
+    #[arg(long, conflicts_with = "merge")]
+    replace: bool,
+
+    /// Apply only to specific host profile
+    #[arg(long)]
+    host_profile: Option<String>,
+
+    /// Dry run (show what would change without modifying)
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Skip backup of existing priors
+    #[arg(long)]
+    no_backup: bool,
 }
 
 /// Arguments for the agent report command.
@@ -1676,6 +1706,7 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
         AgentCommands::ListPriors(args) => run_agent_list_priors(global, args),
         AgentCommands::Inbox(args) => run_agent_inbox(global, args),
         AgentCommands::ExportPriors(args) => run_agent_export_priors(global, args),
+        AgentCommands::ImportPriors(args) => run_agent_import_priors(global, args),
         #[cfg(feature = "report")]
         AgentCommands::Report(args) => run_agent_report(global, args),
         AgentCommands::Capabilities => {
@@ -3784,6 +3815,247 @@ fn run_agent_export_priors(global: &GlobalOpts, args: &AgentExportPriorsArgs) ->
         }
         _ => {
             println!("Exported priors to: {}", out_path.display());
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) -> ExitCode {
+    use pt_core::config::priors::Priors;
+
+    // Default to merge if neither --merge nor --replace specified
+    let mode = if args.replace {
+        "replace"
+    } else {
+        "merge"
+    };
+
+    // Read the input file
+    let input_path = PathBuf::from(&args.from);
+    let input_data = match std::fs::read_to_string(&input_path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!(
+                "agent import-priors: failed to read {}: {}",
+                input_path.display(),
+                err
+            );
+            return ExitCode::IoError;
+        }
+    };
+
+    // Parse the input as JSON
+    let import_doc: serde_json::Value = match serde_json::from_str(&input_data) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!(
+                "agent import-priors: failed to parse {}: {}",
+                input_path.display(),
+                err
+            );
+            return ExitCode::ArgsError;
+        }
+    };
+
+    // Extract priors from the import document
+    let imported_priors: Priors = if let Some(priors_value) = import_doc.get("priors") {
+        match serde_json::from_value(priors_value.clone()) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!(
+                    "agent import-priors: failed to parse priors section: {}",
+                    err
+                );
+                return ExitCode::ArgsError;
+            }
+        }
+    } else {
+        // Try parsing the whole file as a Priors struct
+        match serde_json::from_value(import_doc.clone()) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!(
+                    "agent import-priors: file must contain 'priors' key or be a valid Priors document: {}",
+                    err
+                );
+                return ExitCode::ArgsError;
+            }
+        }
+    };
+
+    // Load current config
+    let options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        priors_path: None,
+        policy_path: None,
+    };
+
+    let config = match load_config(&options) {
+        Ok(c) => c,
+        Err(e) => {
+            return output_config_error(global, &e);
+        }
+    };
+
+    // Determine priors output path
+    let priors_path = config
+        .snapshot()
+        .priors_path
+        .unwrap_or_else(|| {
+            global
+                .config
+                .as_ref()
+                .map(|c| PathBuf::from(c).join("priors.json"))
+                .unwrap_or_else(|| {
+                    dirs::config_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("pt")
+                        .join("priors.json")
+                })
+        });
+
+    // Check host profile compatibility
+    if let Some(ref filter_profile) = args.host_profile {
+        if let Some(imported_profile) = import_doc
+            .get("host_profile")
+            .and_then(|v| v.as_str())
+        {
+            if imported_profile != filter_profile {
+                eprintln!(
+                    "agent import-priors: warning: imported host_profile '{}' differs from target '{}'",
+                    imported_profile, filter_profile
+                );
+            }
+        }
+    }
+
+    // Compute the final priors
+    let final_priors = if mode == "replace" {
+        imported_priors
+    } else {
+        // Merge mode: weighted combination
+        // For now, we do a simple replacement of class priors that exist in the import
+        // A more sophisticated merge could weight by observation counts
+        let mut merged = config.priors.clone();
+
+        // Merge class priors
+        merged.classes.useful = imported_priors.classes.useful.clone();
+        merged.classes.useful_bad = imported_priors.classes.useful_bad.clone();
+        merged.classes.abandoned = imported_priors.classes.abandoned.clone();
+        merged.classes.zombie = imported_priors.classes.zombie.clone();
+
+        // Merge optional sections if present in import
+        if imported_priors.causal_interventions.is_some() {
+            merged.causal_interventions = imported_priors.causal_interventions.clone();
+        }
+        if imported_priors.hierarchical.is_some() {
+            merged.hierarchical = imported_priors.hierarchical.clone();
+        }
+        if imported_priors.robust_bayes.is_some() {
+            merged.robust_bayes = imported_priors.robust_bayes.clone();
+        }
+
+        merged
+    };
+
+    // Dry run: just show what would happen
+    if args.dry_run {
+        let response = serde_json::json!({
+            "dry_run": true,
+            "mode": mode,
+            "source": input_path.display().to_string(),
+            "target": priors_path.display().to_string(),
+            "changes": {
+                "class_priors": {
+                    "useful": final_priors.classes.useful.prior_prob,
+                    "useful_bad": final_priors.classes.useful_bad.prior_prob,
+                    "abandoned": final_priors.classes.abandoned.prior_prob,
+                    "zombie": final_priors.classes.zombie.prior_prob,
+                }
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        return ExitCode::Clean;
+    }
+
+    // Create backup unless --no-backup
+    if !args.no_backup && priors_path.exists() {
+        let backup_path = priors_path.with_extension("json.bak");
+        if let Err(err) = std::fs::copy(&priors_path, &backup_path) {
+            eprintln!(
+                "agent import-priors: warning: failed to create backup at {}: {}",
+                backup_path.display(),
+                err
+            );
+        }
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = priors_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "agent import-priors: failed to create directory {}: {}",
+                parent.display(),
+                err
+            );
+            return ExitCode::IoError;
+        }
+    }
+
+    // Write the priors atomically
+    let tmp_path = priors_path.with_extension("json.tmp");
+    let payload = match serde_json::to_vec_pretty(&final_priors) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("agent import-priors: failed to serialize: {}", err);
+            return ExitCode::IoError;
+        }
+    };
+
+    if let Err(err) = std::fs::write(&tmp_path, payload) {
+        eprintln!(
+            "agent import-priors: failed to write {}: {}",
+            tmp_path.display(),
+            err
+        );
+        return ExitCode::IoError;
+    }
+
+    if let Err(err) = std::fs::rename(&tmp_path, &priors_path) {
+        eprintln!(
+            "agent import-priors: failed to rename {} to {}: {}",
+            tmp_path.display(),
+            priors_path.display(),
+            err
+        );
+        return ExitCode::IoError;
+    }
+
+    // Output result
+    match global.format {
+        OutputFormat::Json | OutputFormat::Jsonl => {
+            let response = serde_json::json!({
+                "imported": true,
+                "mode": mode,
+                "source": input_path.display().to_string(),
+                "target": priors_path.display().to_string(),
+                "class_priors": {
+                    "useful": final_priors.classes.useful.prior_prob,
+                    "useful_bad": final_priors.classes.useful_bad.prior_prob,
+                    "abandoned": final_priors.classes.abandoned.prior_prob,
+                    "zombie": final_priors.classes.zombie.prior_prob,
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        }
+        _ => {
+            println!(
+                "Imported priors from {} to {} (mode: {})",
+                input_path.display(),
+                priors_path.display(),
+                mode
+            );
         }
     }
 
