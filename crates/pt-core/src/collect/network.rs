@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Network connection information for a process.
@@ -384,128 +385,152 @@ fn get_process_socket_inodes(pid: u32) -> Option<HashSet<u64>> {
 
 /// Parse /proc/net/tcp or /proc/net/tcp6 file.
 pub fn parse_proc_net_tcp(path: &str, is_ipv6: bool) -> Option<Vec<TcpConnection>> {
-    let content = fs::read_to_string(path).ok()?;
-    Some(parse_proc_net_tcp_content(&content, is_ipv6))
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    Some(parse_proc_net_tcp_reader(reader, is_ipv6))
 }
 
-/// Parse TCP content (for testing).
-pub fn parse_proc_net_tcp_content(content: &str, is_ipv6: bool) -> Vec<TcpConnection> {
+/// Parse TCP content from a reader.
+pub fn parse_proc_net_tcp_reader<R: BufRead>(reader: R, is_ipv6: bool) -> Vec<TcpConnection> {
     let mut connections = Vec::new();
 
-    for line in content.lines().skip(1) {
-        // Skip header line
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 10 {
-            continue;
+    for line in reader.lines().skip(1) {
+        // Skip header line (handled by skip(1) for the first line, but we need to handle iterator errors)
+        if let Ok(line) = line {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 10 {
+                continue;
+            }
+
+            // Format: sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode
+            let local = parts[1];
+            let remote = parts[2];
+            let state_hex = parts[3];
+            let inode_str = parts[9];
+
+            let (local_addr, local_port) = parse_addr_port(local, is_ipv6);
+            let (remote_addr, remote_port) = parse_addr_port(remote, is_ipv6);
+            let state = u8::from_str_radix(state_hex, 16)
+                .map(TcpState::from_hex)
+                .unwrap_or(TcpState::Unknown);
+            let inode = inode_str.parse().unwrap_or(0);
+
+            connections.push(TcpConnection {
+                local_addr,
+                local_port,
+                remote_addr,
+                remote_port,
+                state,
+                inode,
+                is_ipv6,
+            });
         }
-
-        // Format: sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode
-        let local = parts[1];
-        let remote = parts[2];
-        let state_hex = parts[3];
-        let inode_str = parts[9];
-
-        let (local_addr, local_port) = parse_addr_port(local, is_ipv6);
-        let (remote_addr, remote_port) = parse_addr_port(remote, is_ipv6);
-        let state = u8::from_str_radix(state_hex, 16)
-            .map(TcpState::from_hex)
-            .unwrap_or(TcpState::Unknown);
-        let inode = inode_str.parse().unwrap_or(0);
-
-        connections.push(TcpConnection {
-            local_addr,
-            local_port,
-            remote_addr,
-            remote_port,
-            state,
-            inode,
-            is_ipv6,
-        });
     }
 
     connections
 }
 
+/// Parse TCP content (for testing).
+pub fn parse_proc_net_tcp_content(content: &str, is_ipv6: bool) -> Vec<TcpConnection> {
+    parse_proc_net_tcp_reader(content.as_bytes(), is_ipv6)
+}
+
 /// Parse /proc/net/udp or /proc/net/udp6 file.
 pub fn parse_proc_net_udp(path: &str, is_ipv6: bool) -> Option<Vec<UdpSocket>> {
-    let content = fs::read_to_string(path).ok()?;
-    Some(parse_proc_net_udp_content(&content, is_ipv6))
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    Some(parse_proc_net_udp_reader(reader, is_ipv6))
+}
+
+/// Parse UDP content from a reader.
+pub fn parse_proc_net_udp_reader<R: BufRead>(reader: R, is_ipv6: bool) -> Vec<UdpSocket> {
+    let mut sockets = Vec::new();
+
+    for line in reader.lines().skip(1) {
+        if let Ok(line) = line {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 10 {
+                continue;
+            }
+
+            let local = parts[1];
+            let remote = parts[2];
+            let inode_str = parts[9];
+
+            let (local_addr, local_port) = parse_addr_port(local, is_ipv6);
+            let (remote_addr, remote_port) = parse_addr_port(remote, is_ipv6);
+            let inode = inode_str.parse().unwrap_or(0);
+
+            sockets.push(UdpSocket {
+                local_addr,
+                local_port,
+                remote_addr,
+                remote_port,
+                inode,
+                is_ipv6,
+            });
+        }
+    }
+
+    sockets
 }
 
 /// Parse UDP content (for testing).
 pub fn parse_proc_net_udp_content(content: &str, is_ipv6: bool) -> Vec<UdpSocket> {
-    let mut sockets = Vec::new();
-
-    for line in content.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 10 {
-            continue;
-        }
-
-        let local = parts[1];
-        let remote = parts[2];
-        let inode_str = parts[9];
-
-        let (local_addr, local_port) = parse_addr_port(local, is_ipv6);
-        let (remote_addr, remote_port) = parse_addr_port(remote, is_ipv6);
-        let inode = inode_str.parse().unwrap_or(0);
-
-        sockets.push(UdpSocket {
-            local_addr,
-            local_port,
-            remote_addr,
-            remote_port,
-            inode,
-            is_ipv6,
-        });
-    }
-
-    sockets
+    parse_proc_net_udp_reader(content.as_bytes(), is_ipv6)
 }
 
 /// Parse /proc/net/unix file.
 pub fn parse_proc_net_unix(path: &str) -> Option<Vec<UnixSocket>> {
-    let content = fs::read_to_string(path).ok()?;
-    Some(parse_proc_net_unix_content(&content))
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    Some(parse_proc_net_unix_reader(reader))
+}
+
+/// Parse Unix socket content from a reader.
+pub fn parse_proc_net_unix_reader<R: BufRead>(reader: R) -> Vec<UnixSocket> {
+    let mut sockets = Vec::new();
+
+    for line in reader.lines().skip(1) {
+        if let Ok(line) = line {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 7 {
+                continue;
+            }
+
+            // Format: Num RefCount Protocol Flags Type St Inode Path
+            let socket_type = parts[4]
+                .parse()
+                .ok()
+                .map(UnixSocketType::from_type)
+                .unwrap_or(UnixSocketType::Unknown);
+            let state = parts[5]
+                .parse()
+                .ok()
+                .map(UnixSocketState::from_state)
+                .unwrap_or(UnixSocketState::Unknown);
+            let inode = parts[6].parse().unwrap_or(0);
+            let path = if parts.len() > 7 {
+                Some(parts[7..].join(" "))
+            } else {
+                None
+            };
+
+            sockets.push(UnixSocket {
+                path,
+                socket_type,
+                state,
+                inode,
+            });
+        }
+    }
+
+    sockets
 }
 
 /// Parse Unix socket content (for testing).
 pub fn parse_proc_net_unix_content(content: &str) -> Vec<UnixSocket> {
-    let mut sockets = Vec::new();
-
-    for line in content.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 7 {
-            continue;
-        }
-
-        // Format: Num RefCount Protocol Flags Type St Inode Path
-        let socket_type = parts[4]
-            .parse()
-            .ok()
-            .map(UnixSocketType::from_type)
-            .unwrap_or(UnixSocketType::Unknown);
-        let state = parts[5]
-            .parse()
-            .ok()
-            .map(UnixSocketState::from_state)
-            .unwrap_or(UnixSocketState::Unknown);
-        let inode = parts[6].parse().unwrap_or(0);
-        let path = if parts.len() > 7 {
-            Some(parts[7..].join(" "))
-        } else {
-            None
-        };
-
-        sockets.push(UnixSocket {
-            path,
-            socket_type,
-            state,
-            inode,
-        });
-    }
-
-    sockets
+    parse_proc_net_unix_reader(content.as_bytes())
 }
 
 /// Parse address:port from /proc/net format (hex encoded).
