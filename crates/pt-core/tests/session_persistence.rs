@@ -159,3 +159,68 @@ fn plan_writes_session_event_log() {
         Some(session_id)
     );
 }
+
+#[test]
+fn agent_tail_reads_session_log() {
+    let data_dir = unique_data_dir();
+
+    let plan_output = pt_core_with_data_dir(&data_dir)
+        .args(["--format", "json", "agent", "plan"])
+        .assert()
+        .code(predicate::in_iter([0, 1]))
+        .get_output()
+        .stdout
+        .clone();
+
+    let plan: Value = serde_json::from_slice(&plan_output).unwrap();
+    let session_id = plan
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("session_id");
+
+    let tail_output = pt_core_with_data_dir(&data_dir)
+        .args(["agent", "tail", "--session", session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(tail_output).expect("utf8");
+    let mut events = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let value: Value = serde_json::from_str(line).expect("valid JSONL line");
+        events.push(value);
+    }
+
+    assert!(!events.is_empty(), "tail output should not be empty");
+
+    let mut has_session_started = false;
+    let mut has_session_ended = false;
+    let mut has_plan_ready = false;
+    let mut has_inference_started = false;
+    let mut has_decision_started = false;
+
+    for event in &events {
+        let name = event.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        let evt_session = event.get("session_id").and_then(|v| v.as_str());
+        assert_eq!(evt_session, Some(session_id));
+        match name {
+            "session_started" => has_session_started = true,
+            "session_ended" => has_session_ended = true,
+            "plan_ready" => has_plan_ready = true,
+            "inference_started" => has_inference_started = true,
+            "decision_started" => has_decision_started = true,
+            _ => {}
+        }
+    }
+
+    assert!(has_session_started, "missing session_started event");
+    assert!(has_session_ended, "missing session_ended event");
+    assert!(has_plan_ready, "missing plan_ready event");
+    assert!(
+        has_inference_started,
+        "missing inference_started event"
+    );
+    assert!(has_decision_started, "missing decision_started event");
+}
