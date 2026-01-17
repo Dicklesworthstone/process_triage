@@ -62,10 +62,10 @@ pub use network::{
 };
 #[cfg(target_os = "linux")]
 pub use proc_parsers::{
-    parse_cgroup, parse_environ, parse_environ_content, parse_fd, parse_io, parse_proc_stat,
-    parse_proc_stat_content, parse_sched, parse_schedstat, parse_statm, parse_wchan, CgroupInfo,
-    CriticalFile, CriticalFileCategory, DetectionStrength, FdInfo, FdType, IoStats, MemStats,
-    OpenFile, OpenMode, ProcessStat, SchedInfo, SchedStats,
+    parse_cgroup, parse_environ, parse_environ_content, parse_fd, parse_fd_dir, parse_io,
+    parse_proc_stat, parse_proc_stat_content, parse_sched, parse_schedstat, parse_statm,
+    parse_wchan, CgroupInfo, CriticalFile, CriticalFileCategory, DetectionStrength, FdInfo, FdType,
+    IoStats, MemStats, OpenFile, OpenMode, ProcessStat, SchedInfo, SchedStats,
 };
 pub use quick_scan::{quick_scan, QuickScanError, QuickScanOptions};
 pub use tool_runner::{

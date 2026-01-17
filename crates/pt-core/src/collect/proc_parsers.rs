@@ -90,6 +90,9 @@ pub struct MemStats {
 pub struct FdInfo {
     /// Total number of open file descriptors.
     pub count: usize,
+    /// Whether the inspection was truncated due to limit.
+    #[serde(default)]
+    pub truncated: bool,
     /// File descriptors by type.
     pub by_type: HashMap<String, usize>,
     /// Socket count.
@@ -517,6 +520,7 @@ pub fn parse_fd_dir(dir: &Path, fdinfo_dir: Option<&Path>) -> Option<FdInfo> {
 
         // Skip expensive inspection if we've hit the limit
         if inspected_count >= MAX_INSPECT {
+            info.truncated = true;
             continue;
         }
         inspected_count += 1;

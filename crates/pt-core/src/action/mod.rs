@@ -7,6 +7,10 @@ pub mod cpuset_quarantine;
 pub mod executor;
 #[cfg(target_os = "linux")]
 pub mod freeze;
+
+#[cfg(test)]
+mod repro_cpuset;
+
 pub mod prechecks;
 pub mod recovery;
 pub mod recovery_tree;

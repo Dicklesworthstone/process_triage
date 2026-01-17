@@ -610,7 +610,9 @@ fn count_cpus(cpuset: &str) -> u32 {
         let part = part.trim();
         if let Some((start, end)) = part.split_once('-') {
             if let (Ok(s), Ok(e)) = (start.parse::<u32>(), end.parse::<u32>()) {
-                count += e - s + 1;
+                if e >= s {
+                    count += e - s + 1;
+                }
             }
         } else if part.parse::<u32>().is_ok() {
             count += 1;

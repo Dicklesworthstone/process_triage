@@ -234,6 +234,8 @@ pub enum MissingDataSource {
     Network,
     /// File descriptor information unavailable.
     FileDescriptors,
+    /// File descriptor inspection truncated (too many FDs).
+    TruncatedFileDescriptors,
     /// Supervision detection failed.
     Supervision,
     /// Process tree information unavailable.
@@ -499,12 +501,21 @@ impl ImpactScorer {
         // Collect file descriptor information
         let fd_score = match parse_fd(pid) {
             Some(fd_info) => {
+                if fd_info.truncated {
+                    missing_data.push(MissingDataSource::TruncatedFileDescriptors);
+                }
                 let (score, total, write, critical, categories) = self.score_fds(&fd_info);
                 components.open_fds_count = total;
                 components.open_write_fds_count = write;
                 components.critical_writes_count = critical;
                 components.critical_write_categories = categories;
-                score
+                
+                // If truncated, ensure score is at least high enough to trigger caution
+                if fd_info.truncated {
+                    score.max(0.75) // Treat as Critical/High impact
+                } else {
+                    score
+                }
             }
             None => {
                 missing_data.push(MissingDataSource::FileDescriptors);
