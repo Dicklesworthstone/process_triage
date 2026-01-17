@@ -419,6 +419,10 @@ struct AgentPlanArgs {
     /// Only consider processes older than threshold (seconds)
     #[arg(long)]
     min_age: Option<u64>,
+
+    /// Limit inference to a random sample of N processes (for testing)
+    #[arg(long)]
+    sample_size: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -2810,7 +2814,20 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut all_candidates: Vec<(f64, serde_json::Value)> = Vec::new();
 
     let feasibility = ActionFeasibility::allow_all();
-    let total_processes = filter_result.passed.len() as u64;
+
+    // Apply sampling if requested (for testing)
+    let processes_to_infer: Vec<_> = if let Some(sample_size) = args.sample_size {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rng();
+        let mut sampled: Vec<_> = filter_result.passed.iter().collect();
+        sampled.shuffle(&mut rng);
+        sampled.truncate(sample_size);
+        sampled
+    } else {
+        filter_result.passed.iter().collect()
+    };
+
+    let total_processes = processes_to_infer.len() as u64;
     let mut processed = 0u64;
 
     if let Some(ref e) = emitter {
@@ -2830,8 +2847,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
     }
 
-    // Use filtered processes for inference (not scan_result.processes)
-    for proc in &filter_result.passed {
+    // Use filtered (and optionally sampled) processes for inference
+    for proc in processes_to_infer {
         // Skip PID 0/1 (extra safety - should already be filtered)
         if proc.pid.0 == 0 || proc.pid.0 == 1 {
             continue;
