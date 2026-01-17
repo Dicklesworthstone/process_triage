@@ -17,6 +17,9 @@ pub use priors::Priors;
 pub use pt_config::validate::ValidationError;
 use pt_config::validate::{validate_policy, validate_priors};
 
+// Re-export preset types
+pub use pt_config::preset::{get_preset, list_presets, PresetError, PresetInfo, PresetName};
+
 use std::path::PathBuf;
 use thiserror::Error;
 

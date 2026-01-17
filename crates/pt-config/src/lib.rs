@@ -5,14 +5,17 @@
 //! - Config resolution (CLI → env → XDG → defaults)
 //! - Schema and semantic validation
 //! - Config snapshots for session telemetry
+//! - Configuration presets for common deployment scenarios
 
 pub mod policy;
+pub mod preset;
 pub mod priors;
 pub mod resolve;
 pub mod snapshot;
 pub mod validate;
 
 pub use policy::Policy;
+pub use preset::{get_preset, list_presets, PresetError, PresetInfo, PresetName};
 pub use priors::Priors;
 pub use resolve::{resolve_config, ConfigPaths};
 pub use snapshot::ConfigSnapshot;

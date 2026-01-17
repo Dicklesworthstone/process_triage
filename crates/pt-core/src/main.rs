@@ -13,7 +13,9 @@ use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::collect::protected::ProtectedFilter;
 #[cfg(target_os = "linux")]
 use pt_core::collect::{systemd::collect_systemd_unit, ContainerRuntime};
-use pt_core::config::{load_config, ConfigError, ConfigOptions, Priors};
+use pt_core::config::{
+    get_preset, list_presets, load_config, ConfigError, ConfigOptions, PresetName, Priors,
+};
 use pt_core::events::{
     FanoutEmitter, JsonlWriter, Phase, ProgressEmitter, ProgressEvent, SessionEmitter,
 };
@@ -834,6 +836,27 @@ enum ConfigCommands {
     Validate {
         /// Specific file to validate
         path: Option<String>,
+    },
+    /// List available configuration presets
+    ListPresets,
+    /// Show configuration values for a preset
+    ShowPreset {
+        /// Preset name: developer, server, ci, or paranoid
+        preset: String,
+    },
+    /// Compare a preset with current configuration
+    DiffPreset {
+        /// Preset name to compare against
+        preset: String,
+    },
+    /// Export a preset to a file
+    ExportPreset {
+        /// Preset name to export
+        preset: String,
+
+        /// Output file path (stdout if not specified)
+        #[arg(short, long)]
+        output: Option<String>,
     },
 }
 
@@ -1991,6 +2014,12 @@ fn run_config(global: &GlobalOpts, args: &ConfigArgs) -> ExitCode {
             ExitCode::Clean
         }
         ConfigCommands::Validate { path } => run_config_validate(global, path.as_ref()),
+        ConfigCommands::ListPresets => run_config_list_presets(global),
+        ConfigCommands::ShowPreset { preset } => run_config_show_preset(global, preset),
+        ConfigCommands::DiffPreset { preset } => run_config_diff_preset(global, preset),
+        ConfigCommands::ExportPreset { preset, output } => {
+            run_config_export_preset(global, preset, output.as_deref())
+        }
     }
 }
 
@@ -2253,6 +2282,309 @@ fn output_config_error(global: &GlobalOpts, error: &ConfigError) -> ExitCode {
     }
 
     exit_code
+}
+
+/// List available configuration presets.
+fn run_config_list_presets(global: &GlobalOpts) -> ExitCode {
+    let session_id = SessionId::new();
+    let presets = list_presets();
+
+    match global.format {
+        OutputFormat::Json => {
+            let response = serde_json::json!({
+                "session_id": session_id.to_string(),
+                "presets": presets.iter().map(|p| {
+                    serde_json::json!({
+                        "name": p.name.to_string(),
+                        "description": p.description,
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        }
+        OutputFormat::Summary => {
+            println!("[{}] {} presets available", session_id, presets.len());
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# Available Configuration Presets");
+            println!();
+            for preset in &presets {
+                println!("  {} - {}", preset.name, preset.description);
+            }
+            println!();
+            println!("Use 'pt-core config show-preset <name>' to view preset values.");
+            println!("Use 'pt-core config export-preset <name>' to export to a file.");
+        }
+    }
+
+    ExitCode::Clean
+}
+
+/// Show configuration values for a preset.
+fn run_config_show_preset(global: &GlobalOpts, preset_name: &str) -> ExitCode {
+    let session_id = SessionId::new();
+
+    // Parse preset name
+    let preset_name = match preset_name.to_lowercase().as_str() {
+        "developer" | "dev" => PresetName::Developer,
+        "server" | "srv" | "production" | "prod" => PresetName::Server,
+        "ci" | "continuous-integration" => PresetName::Ci,
+        "paranoid" | "safe" | "cautious" => PresetName::Paranoid,
+        _ => {
+            let response = serde_json::json!({
+                "session_id": session_id.to_string(),
+                "error": format!("Unknown preset: {}. Available: developer, server, ci, paranoid", preset_name),
+            });
+            match global.format {
+                OutputFormat::Json => {
+                    eprintln!("{}", serde_json::to_string_pretty(&response).unwrap());
+                }
+                _ => {
+                    eprintln!("Error: Unknown preset '{}'. Available presets: developer, server, ci, paranoid", preset_name);
+                }
+            }
+            return ExitCode::ArgsError;
+        }
+    };
+
+    let policy = get_preset(preset_name);
+
+    match global.format {
+        OutputFormat::Json => {
+            let response = serde_json::json!({
+                "session_id": session_id.to_string(),
+                "preset": preset_name.to_string(),
+                "policy": policy,
+            });
+            println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        }
+        OutputFormat::Summary => {
+            println!("[{}] preset {}", session_id, preset_name);
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# Preset: {}", preset_name);
+            println!();
+            println!("{}", serde_json::to_string_pretty(&policy).unwrap());
+        }
+    }
+
+    ExitCode::Clean
+}
+
+/// Compare a preset with current configuration.
+fn run_config_diff_preset(global: &GlobalOpts, preset_name: &str) -> ExitCode {
+    let session_id = SessionId::new();
+
+    // Parse preset name
+    let preset_name_parsed = match preset_name.to_lowercase().as_str() {
+        "developer" | "dev" => PresetName::Developer,
+        "server" | "srv" | "production" | "prod" => PresetName::Server,
+        "ci" | "continuous-integration" => PresetName::Ci,
+        "paranoid" | "safe" | "cautious" => PresetName::Paranoid,
+        _ => {
+            let response = serde_json::json!({
+                "session_id": session_id.to_string(),
+                "error": format!("Unknown preset: {}. Available: developer, server, ci, paranoid", preset_name),
+            });
+            match global.format {
+                OutputFormat::Json => {
+                    eprintln!("{}", serde_json::to_string_pretty(&response).unwrap());
+                }
+                _ => {
+                    eprintln!("Error: Unknown preset '{}'. Available presets: developer, server, ci, paranoid", preset_name);
+                }
+            }
+            return ExitCode::ArgsError;
+        }
+    };
+
+    // Load current config
+    let options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        priors_path: None,
+        policy_path: None,
+    };
+
+    let current_policy = match load_config(&options) {
+        Ok(c) => c.policy,
+        Err(e) => {
+            return output_config_error(global, &e);
+        }
+    };
+
+    let preset_policy = get_preset(preset_name_parsed);
+
+    // Convert to JSON for comparison
+    let current_json = serde_json::to_value(&current_policy).unwrap();
+    let preset_json = serde_json::to_value(&preset_policy).unwrap();
+
+    // Find differences
+    let mut differences: Vec<serde_json::Value> = Vec::new();
+    find_json_differences("", &current_json, &preset_json, &mut differences);
+
+    match global.format {
+        OutputFormat::Json => {
+            let response = serde_json::json!({
+                "session_id": session_id.to_string(),
+                "preset": preset_name_parsed.to_string(),
+                "differences_count": differences.len(),
+                "differences": differences,
+            });
+            println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        }
+        OutputFormat::Summary => {
+            println!(
+                "[{}] {} differences between current and {} preset",
+                session_id,
+                differences.len(),
+                preset_name_parsed
+            );
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# Differences: current vs {} preset", preset_name_parsed);
+            println!();
+            if differences.is_empty() {
+                println!("No differences found.");
+            } else {
+                println!("{} difference(s) found:", differences.len());
+                println!();
+                for diff in &differences {
+                    println!(
+                        "  {}: {} -> {}",
+                        diff["path"], diff["current"], diff["preset"]
+                    );
+                }
+            }
+        }
+    }
+
+    ExitCode::Clean
+}
+
+/// Helper to find differences between two JSON values recursively.
+fn find_json_differences(
+    path: &str,
+    current: &serde_json::Value,
+    preset: &serde_json::Value,
+    differences: &mut Vec<serde_json::Value>,
+) {
+    match (current, preset) {
+        (serde_json::Value::Object(c_map), serde_json::Value::Object(p_map)) => {
+            // Check all keys in both
+            let mut all_keys: std::collections::HashSet<&String> = c_map.keys().collect();
+            all_keys.extend(p_map.keys());
+
+            for key in all_keys {
+                let new_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", path, key)
+                };
+
+                let c_val = c_map.get(key).unwrap_or(&serde_json::Value::Null);
+                let p_val = p_map.get(key).unwrap_or(&serde_json::Value::Null);
+
+                find_json_differences(&new_path, c_val, p_val, differences);
+            }
+        }
+        (serde_json::Value::Array(c_arr), serde_json::Value::Array(p_arr)) => {
+            if c_arr != p_arr {
+                differences.push(serde_json::json!({
+                    "path": path,
+                    "current": current,
+                    "preset": preset,
+                }));
+            }
+        }
+        _ => {
+            if current != preset {
+                differences.push(serde_json::json!({
+                    "path": path,
+                    "current": current,
+                    "preset": preset,
+                }));
+            }
+        }
+    }
+}
+
+/// Export a preset to a file.
+fn run_config_export_preset(global: &GlobalOpts, preset_name: &str, output: Option<&str>) -> ExitCode {
+    let session_id = SessionId::new();
+
+    // Parse preset name
+    let preset_name_parsed = match preset_name.to_lowercase().as_str() {
+        "developer" | "dev" => PresetName::Developer,
+        "server" | "srv" | "production" | "prod" => PresetName::Server,
+        "ci" | "continuous-integration" => PresetName::Ci,
+        "paranoid" | "safe" | "cautious" => PresetName::Paranoid,
+        _ => {
+            let response = serde_json::json!({
+                "session_id": session_id.to_string(),
+                "error": format!("Unknown preset: {}. Available: developer, server, ci, paranoid", preset_name),
+            });
+            match global.format {
+                OutputFormat::Json => {
+                    eprintln!("{}", serde_json::to_string_pretty(&response).unwrap());
+                }
+                _ => {
+                    eprintln!("Error: Unknown preset '{}'. Available presets: developer, server, ci, paranoid", preset_name);
+                }
+            }
+            return ExitCode::ArgsError;
+        }
+    };
+
+    let policy = get_preset(preset_name_parsed);
+    let json_content = serde_json::to_string_pretty(&policy).unwrap();
+
+    // Determine output destination
+    let output_path = output.map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(format!("policy.{}.json", preset_name_parsed.to_string().to_lowercase()))
+    });
+
+    // Write to file
+    match std::fs::write(&output_path, &json_content) {
+        Ok(()) => {
+            match global.format {
+                OutputFormat::Json => {
+                    let response = serde_json::json!({
+                        "session_id": session_id.to_string(),
+                        "preset": preset_name_parsed.to_string(),
+                        "output_path": output_path.display().to_string(),
+                        "status": "exported",
+                    });
+                    println!("{}", serde_json::to_string_pretty(&response).unwrap());
+                }
+                OutputFormat::Summary => {
+                    println!("[{}] exported {} to {}", session_id, preset_name_parsed, output_path.display());
+                }
+                OutputFormat::Exitcode => {}
+                _ => {
+                    println!("Exported {} preset to {}", preset_name_parsed, output_path.display());
+                }
+            }
+            ExitCode::Clean
+        }
+        Err(e) => {
+            match global.format {
+                OutputFormat::Json => {
+                    let response = serde_json::json!({
+                        "session_id": session_id.to_string(),
+                        "error": format!("Failed to write to {}: {}", output_path.display(), e),
+                    });
+                    eprintln!("{}", serde_json::to_string_pretty(&response).unwrap());
+                }
+                _ => {
+                    eprintln!("Error: Failed to write to {}: {}", output_path.display(), e);
+                }
+            }
+            ExitCode::IoError
+        }
+    }
 }
 
 #[cfg(feature = "daemon")]
