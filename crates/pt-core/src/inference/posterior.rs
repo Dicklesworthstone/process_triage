@@ -5,6 +5,7 @@
 
 use crate::config::priors::{ClassParams, CommandCategories, DirichletParams, Priors, StateFlags};
 use pt_math::{log_beta, log_beta_pdf, log_gamma, normalize_log_probs};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -31,7 +32,7 @@ pub struct Evidence {
 }
 
 /// Per-class scores for the 4-state model.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClassScores {
     pub useful: f64,
     pub useful_bad: f64,

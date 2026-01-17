@@ -219,6 +219,9 @@ enum Commands {
     /// Signature management (list, add, remove user signatures)
     Signature(pt_core::signature_cli::SignatureArgs),
 
+    /// Generate JSON schemas for agent output types
+    Schema(SchemaArgs),
+
     /// Print version information
     Version,
 }
@@ -461,6 +464,28 @@ enum AgentCommands {
     /// Generate HTML report from session
     #[cfg(feature = "report")]
     Report(AgentReportArgs),
+
+    /// Initialize pt for installed coding agents
+    Init(AgentInitArgs),
+}
+
+#[derive(Args, Debug)]
+struct AgentInitArgs {
+    /// Apply defaults without prompts
+    #[arg(long)]
+    yes: bool,
+
+    /// Show what would change without modifying files
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Configure specific agent only (claude, codex, copilot, cursor, windsurf)
+    #[arg(long)]
+    agent: Option<String>,
+
+    /// Skip creating backup files
+    #[arg(long)]
+    skip_backup: bool,
 }
 
 #[derive(Args, Debug)]
@@ -868,6 +893,25 @@ enum TelemetryCommands {
     },
 }
 
+#[derive(Args, Debug)]
+struct SchemaArgs {
+    /// Type name to generate schema for (e.g., Plan, DecisionOutcome)
+    #[arg(value_name = "TYPE")]
+    type_name: Option<String>,
+
+    /// List all available schema types
+    #[arg(long, short)]
+    list: bool,
+
+    /// Generate schemas for all types
+    #[arg(long, short)]
+    all: bool,
+
+    /// Output compact JSON (no pretty-printing)
+    #[arg(long)]
+    compact: bool,
+}
+
 use pt_core::log_event;
 use pt_core::logging::{
     event_names, init_logging, LogConfig, LogContext, LogFormat, LogLevel, Stage,
@@ -938,6 +982,7 @@ fn main() {
         Some(Commands::Signature(args)) => {
             pt_core::signature_cli::run_signature(&cli.global.format, &args)
         }
+        Some(Commands::Schema(args)) => run_schema(&cli.global, &args),
         Some(Commands::Version) => {
             print_version(&cli.global);
             ExitCode::Clean
@@ -1926,6 +1971,7 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
         AgentCommands::ImportPriors(args) => run_agent_import_priors(global, args),
         #[cfg(feature = "report")]
         AgentCommands::Report(args) => run_agent_report(global, args),
+        AgentCommands::Init(args) => run_agent_init(global, args),
         AgentCommands::Capabilities => {
             output_capabilities(global);
             ExitCode::Clean
@@ -2222,6 +2268,80 @@ fn run_telemetry(global: &GlobalOpts, _args: &TelemetryArgs) -> ExitCode {
         "Telemetry management not yet implemented",
     );
     ExitCode::Clean
+}
+
+fn run_schema(global: &GlobalOpts, args: &SchemaArgs) -> ExitCode {
+    use pt_core::schema::{available_schemas, format_schema, generate_all_schemas, generate_schema, SchemaFormat};
+
+    let format = if args.compact {
+        SchemaFormat::JsonCompact
+    } else {
+        SchemaFormat::Json
+    };
+
+    // List available types
+    if args.list {
+        match global.format {
+            OutputFormat::Json | OutputFormat::Jsonl => {
+                let types: Vec<_> = available_schemas()
+                    .into_iter()
+                    .map(|(name, desc)| serde_json::json!({"name": name, "description": desc}))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&types).unwrap());
+            }
+            _ => {
+                println!("Available schema types:\n");
+                for (name, desc) in available_schemas() {
+                    println!("  {:<25} {}", name, desc);
+                }
+                println!("\nUse 'pt schema <TYPE>' to generate a schema.");
+            }
+        }
+        return ExitCode::Clean;
+    }
+
+    // Generate all schemas
+    if args.all {
+        let schemas = generate_all_schemas();
+        match global.format {
+            OutputFormat::Json => {
+                println!("{}", serde_json::to_string_pretty(&schemas).unwrap());
+            }
+            OutputFormat::Jsonl => {
+                for (name, schema) in schemas {
+                    let entry = serde_json::json!({"type": name, "schema": schema});
+                    println!("{}", serde_json::to_string(&entry).unwrap());
+                }
+            }
+            _ => {
+                // Human-readable: output each schema separately
+                for (name, schema) in schemas {
+                    println!("# {}\n", name);
+                    println!("{}\n", format_schema(&schema, format));
+                }
+            }
+        }
+        return ExitCode::Clean;
+    }
+
+    // Generate schema for a specific type
+    if let Some(ref type_name) = args.type_name {
+        match generate_schema(type_name) {
+            Some(schema) => {
+                println!("{}", format_schema(&schema, format));
+                ExitCode::Clean
+            }
+            None => {
+                eprintln!("Unknown type: {}", type_name);
+                eprintln!("\nUse 'pt schema --list' to see available types.");
+                ExitCode::PartialFail
+            }
+        }
+    } else {
+        eprintln!("Usage: pt schema <TYPE> | --list | --all");
+        eprintln!("\nUse 'pt schema --list' to see available types.");
+        ExitCode::PartialFail
+    }
 }
 
 fn print_version(global: &GlobalOpts) {
@@ -4678,6 +4798,146 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
     }
 
     ExitCode::Clean
+}
+
+fn run_agent_init(global: &GlobalOpts, args: &AgentInitArgs) -> ExitCode {
+    use pt_core::agent_init::{
+        initialize_agents, AgentType, InitOptions,
+    };
+
+    // Parse agent filter
+    let agent_filter = args.agent.as_ref().and_then(|a| {
+        match a.to_lowercase().as_str() {
+            "claude" | "claude-code" | "claudecode" => Some(AgentType::ClaudeCode),
+            "codex" => Some(AgentType::Codex),
+            "copilot" | "github-copilot" => Some(AgentType::Copilot),
+            "cursor" => Some(AgentType::Cursor),
+            "windsurf" => Some(AgentType::Windsurf),
+            _ => {
+                eprintln!(
+                    "agent init: unknown agent '{}'. Valid options: claude, codex, copilot, cursor, windsurf",
+                    a
+                );
+                None
+            }
+        }
+    });
+
+    // If agent was specified but couldn't be parsed, exit
+    if args.agent.is_some() && agent_filter.is_none() {
+        return ExitCode::ArgsError;
+    }
+
+    let options = InitOptions {
+        non_interactive: args.yes,
+        dry_run: args.dry_run,
+        agent_filter,
+        skip_backup: args.skip_backup,
+    };
+
+    match initialize_agents(&options) {
+        Ok(result) => {
+            output_agent_init_result(global, &result);
+            // Empty configured list is a valid outcome - nothing to configure
+            ExitCode::Clean
+        }
+        Err(pt_core::agent_init::AgentInitError::NoAgentsFound) => {
+            match global.format {
+                OutputFormat::Json | OutputFormat::Jsonl => {
+                    let response = serde_json::json!({
+                        "error": "no_agents_found",
+                        "message": "No supported coding agents found. Install Claude Code, Codex, Copilot, Cursor, or Windsurf first.",
+                        "supported_agents": ["claude-code", "codex", "copilot", "cursor", "windsurf"]
+                    });
+                    println!("{}", serde_json::to_string_pretty(&response).unwrap());
+                }
+                _ => {
+                    eprintln!("No supported coding agents found.");
+                    eprintln!("Install one of: Claude Code, Codex, GitHub Copilot, Cursor, or Windsurf");
+                }
+            }
+            // No agents found is a capability error - user needs to install agents
+            ExitCode::CapabilityError
+        }
+        Err(pt_core::agent_init::AgentInitError::Config(
+            pt_core::agent_init::ConfigError::DryRun
+        )) => {
+            // Dry run is not an error
+            ExitCode::Clean
+        }
+        Err(e) => {
+            eprintln!("agent init: {}", e);
+            ExitCode::IoError
+        }
+    }
+}
+
+fn output_agent_init_result(global: &GlobalOpts, result: &pt_core::agent_init::InitResult) {
+    match global.format {
+        OutputFormat::Json | OutputFormat::Jsonl => {
+            println!("{}", serde_json::to_string_pretty(result).unwrap());
+        }
+        _ => {
+            println!("Agent Initialization Summary");
+            println!("============================\n");
+
+            println!("Detected agents:");
+            for agent in &result.detected {
+                let status = if agent.info.is_installed {
+                    "installed"
+                } else {
+                    "partial"
+                };
+                println!(
+                    "  - {} ({})",
+                    agent.agent_type.display_name(),
+                    status
+                );
+                if let Some(version) = &agent.info.version {
+                    println!("    Version: {}", version);
+                }
+            }
+            println!();
+
+            if !result.configured.is_empty() {
+                println!("Configured:");
+                for configured in &result.configured {
+                    println!("  - {}", configured.agent_type.display_name());
+                    println!("    Config: {}", configured.config_path.display());
+                    for change in &configured.changes {
+                        println!("    + {}", change);
+                    }
+                }
+                println!();
+            }
+
+            if !result.skipped.is_empty() {
+                println!("Skipped:");
+                for skipped in &result.skipped {
+                    println!(
+                        "  - {}: {}",
+                        skipped.agent_type.display_name(),
+                        skipped.reason
+                    );
+                }
+                println!();
+            }
+
+            if !result.backups.is_empty() {
+                println!("Backups created:");
+                for backup in &result.backups {
+                    println!("  {} -> {}", backup.original_path.display(), backup.backup_path.display());
+                }
+                println!();
+            }
+
+            if result.configured.is_empty() {
+                println!("No changes made. Use --dry-run to preview changes.");
+            } else {
+                println!("Configuration complete! Verify by restarting your coding agent.");
+            }
+        }
+    }
 }
 
 fn run_agent_inbox(global: &GlobalOpts, args: &AgentInboxArgs) -> ExitCode {

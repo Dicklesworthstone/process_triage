@@ -6,11 +6,12 @@ use crate::decision::causal_interventions::{expected_recovery_by_action, Recover
 use crate::decision::cvar::{decide_with_cvar, CvarTrigger, RiskSensitiveOutcome};
 use crate::decision::dro::{apply_dro_gate, DroOutcome, DroTrigger};
 use crate::inference::ClassScores;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Supported actions for early decisioning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     Keep,
@@ -85,14 +86,14 @@ impl Action {
 }
 
 /// Disabled action with a reason string.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DisabledAction {
     pub action: Action,
     pub reason: String,
 }
 
 /// Feasibility mask for actions.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ActionFeasibility {
     pub disabled: Vec<DisabledAction>,
 }
@@ -191,14 +192,14 @@ impl ActionFeasibility {
 }
 
 /// Expected loss for an action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExpectedLoss {
     pub action: Action,
     pub loss: f64,
 }
 
 /// SPRT-style boundary information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SprtBoundary {
     pub log_odds_threshold: f64,
     pub numerator: f64,
@@ -206,7 +207,7 @@ pub struct SprtBoundary {
 }
 
 /// Decision rationale summary.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DecisionRationale {
     pub chosen_action: Action,
     pub tie_break: bool,
@@ -227,7 +228,7 @@ pub struct DecisionRationale {
 }
 
 /// Decision output for a single candidate.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DecisionOutcome {
     pub expected_loss: Vec<ExpectedLoss>,
     pub optimal_action: Action,

@@ -54,11 +54,12 @@
 use crate::config::policy::{LossMatrix, LossRow, Policy};
 use crate::decision::expected_loss::Action;
 use crate::inference::ClassScores;
+use schemars::JsonSchema;
 use serde::Serialize;
 use thiserror::Error;
 
 /// DRO computation result for a single action.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DroLoss {
     /// The action evaluated.
     pub action: Action,
@@ -75,7 +76,7 @@ pub struct DroLoss {
 }
 
 /// DRO decision outcome.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DroOutcome {
     /// Whether DRO was applied.
     pub applied: bool,

@@ -3,10 +3,11 @@
 use crate::config::priors::{BetaParams, CausalInterventions, InterventionPriors, Priors};
 use crate::decision::Action;
 use crate::inference::ClassScores;
+use schemars::JsonSchema;
 use serde::Serialize;
 
 /// Process class labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessClass {
     Useful,
@@ -16,7 +17,7 @@ pub enum ProcessClass {
 }
 
 /// Expected recovery probability for an action.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RecoveryExpectation {
     pub action: Action,
     pub probability: f64,
@@ -25,7 +26,7 @@ pub struct RecoveryExpectation {
 }
 
 /// Expected recovery probability per class for an action.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RecoveryTable {
     pub action: Action,
     pub useful: Option<f64>,
@@ -35,7 +36,7 @@ pub struct RecoveryTable {
 }
 
 /// Observed intervention outcome used to update priors.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct InterventionOutcome {
     pub action: Action,
     pub class: ProcessClass,

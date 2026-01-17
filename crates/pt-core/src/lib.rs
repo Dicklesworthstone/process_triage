@@ -10,6 +10,7 @@
 //! The binary entry point is in `main.rs`.
 
 pub mod action;
+pub mod agent_init;
 pub mod audit;
 pub mod capabilities;
 pub mod cli;
@@ -23,6 +24,7 @@ pub mod inference;
 pub mod logging;
 pub mod output;
 pub mod plan;
+pub mod schema;
 pub mod session;
 pub mod signature_cli;
 pub mod supervision;

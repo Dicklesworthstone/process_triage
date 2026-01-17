@@ -3,11 +3,12 @@
 //! These types ensure safe process identification across the codebase.
 //! A process is uniquely identified by (pid, start_id, uid) tuple.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Process ID wrapper with display formatting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct ProcessId(pub u32);
 
@@ -29,7 +30,7 @@ impl From<u32> for ProcessId {
 /// or `<boot_id>:<start_time>:<pid>` (macOS)
 ///
 /// This disambiguates PID reuse across reboots and within a boot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct StartId(pub String);
 
@@ -76,7 +77,7 @@ impl fmt::Display for StartId {
 ///
 /// Format: `pt-YYYYMMDD-HHMMSS-XXXX`
 /// Example: `pt-20260115-143022-a7xq`
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct SessionId(pub String);
 
@@ -139,7 +140,7 @@ impl fmt::Display for SessionId {
 ///
 /// Indicates how reliable the identity tuple is for TOCTOU protection.
 /// When identity quality is degraded, safety gates should be tightened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum IdentityQuality {
     /// Full identity available: boot_id + start_time_ticks + pid.
     /// Strongest guarantee against PID reuse.
@@ -180,7 +181,7 @@ impl fmt::Display for IdentityQuality {
 ///
 /// The tuple (pid, start_id, uid, boot_id) is sufficient to detect
 /// PID reuse across time and across session resumes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct ProcessIdentity {
     /// Process ID.
     pub pid: ProcessId,

@@ -4,6 +4,7 @@
 //! designed for serialization to telemetry and feeding into inference.
 
 use pt_common::{ProcessId, StartId};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use std::time::Duration;
 /// - T: Stopped (by job control or trace)
 /// - I: Idle (kernel thread, Linux)
 /// - X: Dead (should never be seen)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProcessState {
     Running,
@@ -96,7 +97,7 @@ impl std::fmt::Display for ProcessState {
 ///
 /// Contains all fields collected during a quick or deep scan.
 /// Optional fields may be unavailable on some platforms or permission levels.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProcessRecord {
     // === Core identity ===
     /// Process ID.
@@ -178,7 +179,7 @@ impl ProcessRecord {
 }
 
 /// Result of a scan operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ScanResult {
     /// Collected process records.
     pub processes: Vec<ProcessRecord>,
@@ -188,7 +189,7 @@ pub struct ScanResult {
 }
 
 /// Metadata about a scan operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ScanMetadata {
     /// Scan type (quick, deep).
     pub scan_type: String,

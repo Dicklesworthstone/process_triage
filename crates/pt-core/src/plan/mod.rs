@@ -17,6 +17,7 @@ use crate::config::Policy;
 use crate::decision::{Action, DecisionOutcome, SprtBoundary};
 use chrono::Utc;
 use pt_common::{ProcessIdentity, SessionId};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Decision bundle input to the planner.
@@ -45,7 +46,7 @@ pub struct DecisionCandidate {
 }
 
 /// Diagnostics for D-state (uninterruptible sleep) processes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DStateDiagnostics {
     /// Kernel function where process is blocked (from /proc/[pid]/wchan).
     pub wchan: Option<String>,
@@ -58,7 +59,7 @@ pub struct DStateDiagnostics {
 }
 
 /// Action plan output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Plan {
     pub plan_id: String,
     pub session_id: String,
@@ -71,7 +72,7 @@ pub struct Plan {
 }
 
 /// High-level gate summary for the plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GatesSummary {
     pub total_candidates: usize,
     pub blocked_candidates: usize,
@@ -79,7 +80,7 @@ pub struct GatesSummary {
 }
 
 /// A single action in a plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PlanAction {
     pub action_id: String,
     pub target: ProcessIdentity,
@@ -127,7 +128,7 @@ fn is_normal_confidence(confidence: &ActionConfidence) -> bool {
 }
 
 /// Action timeouts for staged execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ActionTimeouts {
     pub preflight_ms: u64,
     pub execute_ms: u64,
@@ -145,7 +146,7 @@ impl Default for ActionTimeouts {
 }
 
 /// Preconditions that must be revalidated at apply time.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PreCheck {
     VerifyIdentity,
@@ -159,7 +160,7 @@ pub enum PreCheck {
 }
 
 /// Why an action was routed differently than the direct target.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionRouting {
     /// Direct action on the target process.
@@ -175,7 +176,7 @@ pub enum ActionRouting {
 }
 
 /// Confidence level for action success.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionConfidence {
     /// Normal confidence - action should succeed.
@@ -187,7 +188,7 @@ pub enum ActionConfidence {
 }
 
 /// Structured action rationale.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ActionRationale {
     pub expected_loss: Option<f64>,
     pub expected_recovery: Option<f64>,
@@ -202,7 +203,7 @@ pub struct ActionRationale {
 }
 
 /// Simple action hook for success/failure paths.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ActionHook {
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]

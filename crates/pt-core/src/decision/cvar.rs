@@ -29,11 +29,12 @@
 use crate::config::policy::{LossMatrix, Policy};
 use crate::decision::expected_loss::Action;
 use crate::inference::ClassScores;
+use schemars::JsonSchema;
 use serde::Serialize;
 use thiserror::Error;
 
 /// CVaR computation result for a single action.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CvarLoss {
     pub action: Action,
     /// CVaR at the specified confidence level (expected loss in worst tail).
@@ -47,7 +48,7 @@ pub struct CvarLoss {
 }
 
 /// Risk-sensitive decision outcome.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RiskSensitiveOutcome {
     /// Whether risk-sensitive control was applied.
     pub applied: bool,
