@@ -1,0 +1,270 @@
+name: Update Package Repos
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to update packages for (e.g., 1.0.0)'
+        required: true
+      dry_run:
+        description: 'Dry run (no PR creation)'
+        required: false
+        default: 'false'
+
+env:
+  # Package repository names
+  HOMEBREW_TAP_REPO: process-triage/homebrew-tap
+  SCOOP_BUCKET_REPO: process-triage/scoop-bucket
+
+jobs:
+  # ==========================================================================
+  # Generate package files from release
+  # ==========================================================================
+  generate-packages:
+    name: Generate Package Files
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      formula_sha: ${{ steps.upload.outputs.formula_sha }}
+      manifest_sha: ${{ steps.upload.outputs.manifest_sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            version="${{ github.event.release.tag_name }}"
+            version="${version#v}"  # Remove 'v' prefix
+          else
+            version="${{ github.event.inputs.version }}"
+          fi
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "Using version: $version"
+
+      - name: Download checksums from release
+        run: |
+          version="${{ steps.version.outputs.version }}"
+
+          # Download checksums file from GitHub release
+          curl -fsSL -o checksums.sha256 \
+            "https://github.com/${{ github.repository }}/releases/download/v${version}/checksums.sha256"
+
+          echo "Downloaded checksums:"
+          cat checksums.sha256
+
+      - name: Generate formula and manifest
+        id: generate
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p dist/packages
+
+          ./scripts/package/generate_packages.sh "$version" checksums.sha256 dist/packages
+
+          echo "Generated files:"
+          ls -la dist/packages/
+
+      - name: Upload package files
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-files
+          path: dist/packages/
+          retention-days: 7
+
+  # ==========================================================================
+  # Update Homebrew tap (create PR)
+  # ==========================================================================
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: generate-packages
+    runs-on: ubuntu-latest
+    if: github.event.inputs.dry_run != 'true'
+
+    steps:
+      - name: Download package files
+        uses: actions/download-artifact@v4
+        with:
+          name: package-files
+          path: packages
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HOMEBREW_TAP_REPO }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        run: |
+          version="${{ needs.generate-packages.outputs.version }}"
+
+          # Copy new formula
+          cp packages/pt.rb tap/Formula/pt.rb
+
+          # Create commit message
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Check if there are changes
+          if git diff --quiet; then
+            echo "No changes to formula"
+            exit 0
+          fi
+
+          # Create branch and commit
+          branch="update-pt-${version}"
+          git checkout -b "$branch"
+          git add Formula/pt.rb
+          git commit -m "Update pt to ${version}"
+
+          echo "branch=$branch" >> $GITHUB_ENV
+
+      - name: Create PR to Homebrew tap
+        if: env.branch != ''
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          branch: ${{ env.branch }}
+          title: "Update pt to ${{ needs.generate-packages.outputs.version }}"
+          body: |
+            Automated update of pt formula to version ${{ needs.generate-packages.outputs.version }}.
+
+            Release: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.generate-packages.outputs.version }}
+
+            **Installation:**
+            ```bash
+            brew tap process-triage/tap
+            brew install pt
+            ```
+          labels: automated,release
+
+  # ==========================================================================
+  # Update Scoop bucket (create PR)
+  # ==========================================================================
+  update-scoop:
+    name: Update Scoop Bucket
+    needs: generate-packages
+    runs-on: ubuntu-latest
+    if: github.event.inputs.dry_run != 'true'
+
+    steps:
+      - name: Download package files
+        uses: actions/download-artifact@v4
+        with:
+          name: package-files
+          path: packages
+
+      - name: Checkout Scoop bucket
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SCOOP_BUCKET_REPO }}
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          path: bucket
+
+      - name: Update manifest
+        run: |
+          version="${{ needs.generate-packages.outputs.version }}"
+
+          # Copy new manifest
+          cp packages/pt.json bucket/bucket/pt.json
+
+          # Create commit
+          cd bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Check if there are changes
+          if git diff --quiet; then
+            echo "No changes to manifest"
+            exit 0
+          fi
+
+          # Create branch and commit
+          branch="update-pt-${version}"
+          git checkout -b "$branch"
+          git add bucket/pt.json
+          git commit -m "Update pt to ${version}"
+
+          echo "branch=$branch" >> $GITHUB_ENV
+
+      - name: Create PR to Scoop bucket
+        if: env.branch != ''
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          path: bucket
+          branch: ${{ env.branch }}
+          title: "Update pt to ${{ needs.generate-packages.outputs.version }}"
+          body: |
+            Automated update of pt manifest to version ${{ needs.generate-packages.outputs.version }}.
+
+            Release: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.generate-packages.outputs.version }}
+
+            **Installation:**
+            ```powershell
+            scoop bucket add process-triage https://github.com/process-triage/scoop-bucket
+            scoop install pt
+            ```
+          labels: automated,release
+
+  # ==========================================================================
+  # Test package installation (dry run validation)
+  # ==========================================================================
+  test-packages:
+    name: Validate Package Files
+    needs: generate-packages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download package files
+        uses: actions/download-artifact@v4
+        with:
+          name: package-files
+          path: packages
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Validate Homebrew formula syntax
+        run: |
+          echo "Validating Ruby syntax..."
+          ruby -c packages/pt.rb
+          echo "Formula syntax: OK"
+
+      - name: Validate Scoop manifest JSON
+        run: |
+          echo "Validating JSON syntax..."
+          jq . packages/pt.json > /dev/null
+          echo "Manifest syntax: OK"
+
+          # Validate required fields
+          echo "Checking required fields..."
+          jq -e '.version' packages/pt.json > /dev/null
+          jq -e '.description' packages/pt.json > /dev/null
+          jq -e '.homepage' packages/pt.json > /dev/null
+          jq -e '.architecture."64bit".url' packages/pt.json > /dev/null
+          jq -e '.architecture."64bit".hash' packages/pt.json > /dev/null
+          echo "All required fields present"
+
+      - name: Validate URLs are reachable
+        run: |
+          version="${{ needs.generate-packages.outputs.version }}"
+
+          echo "Checking release URLs..."
+
+          # Check Linux x86_64 binary
+          url="https://github.com/${{ github.repository }}/releases/download/v${version}/pt-core-linux-x86_64-${version}.tar.gz"
+          if curl --head --fail --silent "$url" > /dev/null; then
+            echo "  Linux x86_64: OK"
+          else
+            echo "  Linux x86_64: MISSING (expected for dry runs)"
+          fi

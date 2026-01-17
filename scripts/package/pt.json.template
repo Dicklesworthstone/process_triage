@@ -1,0 +1,34 @@
+{
+    "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
+    "version": "{{VERSION}}",
+    "description": "Bayesian-inspired zombie/abandoned process detection and cleanup",
+    "homepage": "https://github.com/Dicklesworthstone/process_triage",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/Dicklesworthstone/process_triage/releases/download/v{{VERSION}}/pt-core-linux-x86_64-{{VERSION}}.tar.gz",
+            "hash": "{{SHA256_LINUX_X86_64}}",
+            "extract_dir": ""
+        }
+    },
+    "bin": "pt-core.exe",
+    "checkver": {
+        "github": "https://github.com/Dicklesworthstone/process_triage"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/Dicklesworthstone/process_triage/releases/download/v$version/pt-core-linux-x86_64-$version.tar.gz"
+            }
+        }
+    },
+    "notes": [
+        "Process Triage - Bayesian zombie process detection",
+        "",
+        "Quick start:",
+        "  pt-core scan      - Scan for zombie processes",
+        "  pt-core agent plan --format json  - Agent mode",
+        "",
+        "Documentation: https://github.com/Dicklesworthstone/process_triage"
+    ]
+}

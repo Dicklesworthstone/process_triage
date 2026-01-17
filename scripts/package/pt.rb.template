@@ -1,0 +1,70 @@
+# frozen_string_literal: true
+
+# Homebrew formula for Process Triage
+# Auto-generated from release workflow. Do not edit manually.
+
+class Pt < Formula
+  desc "Bayesian-inspired zombie/abandoned process detection and cleanup"
+  homepage "https://github.com/Dicklesworthstone/process_triage"
+  version "{{VERSION}}"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/Dicklesworthstone/process_triage/releases/download/v{{VERSION}}/pt-core-macos-aarch64-{{VERSION}}.tar.gz"
+      sha256 "{{SHA256_MACOS_AARCH64}}"
+    end
+    on_intel do
+      url "https://github.com/Dicklesworthstone/process_triage/releases/download/v{{VERSION}}/pt-core-macos-x86_64-{{VERSION}}.tar.gz"
+      sha256 "{{SHA256_MACOS_X86_64}}"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/Dicklesworthstone/process_triage/releases/download/v{{VERSION}}/pt-core-linux-aarch64-{{VERSION}}.tar.gz"
+      sha256 "{{SHA256_LINUX_AARCH64}}"
+    end
+    on_intel do
+      url "https://github.com/Dicklesworthstone/process_triage/releases/download/v{{VERSION}}/pt-core-linux-x86_64-{{VERSION}}.tar.gz"
+      sha256 "{{SHA256_LINUX_X86_64}}"
+    end
+  end
+
+  def install
+    bin.install "pt-core"
+
+    # Download the pt wrapper script
+    system "curl", "-fsSL", "-o", "pt",
+           "https://raw.githubusercontent.com/Dicklesworthstone/process_triage/v{{VERSION}}/pt"
+    chmod 0755, "pt"
+    bin.install "pt"
+  end
+
+  def caveats
+    <<~EOS
+      Process Triage has been installed.
+
+      Quick start:
+        pt            # Interactive mode
+        pt scan       # Scan for zombie processes
+        pt deep       # Deep scan with more evidence
+
+      For agent/automation use:
+        pt agent plan --format json
+
+      Documentation: https://github.com/Dicklesworthstone/process_triage
+    EOS
+  end
+
+  test do
+    # Verify binary runs and reports version
+    assert_match version.to_s, shell_output("#{bin}/pt-core --version")
+
+    # Verify wrapper exists and is executable
+    assert_predicate bin/"pt", :executable?
+
+    # Quick health check
+    system "#{bin}/pt-core", "check", "--format", "json"
+  end
+end

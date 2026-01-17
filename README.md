@@ -28,6 +28,20 @@ This installs:
 - `pt` — The main bash wrapper for interactive use
 - `pt-core` — The Rust inference engine (downloaded automatically for your platform)
 
+### Package Managers
+
+**Homebrew (macOS/Linux):**
+```bash
+brew tap process-triage/tap
+brew install pt
+```
+
+**Scoop (Windows via WSL2):**
+```powershell
+scoop bucket add process-triage https://github.com/process-triage/scoop-bucket
+scoop install pt
+```
+
 <details>
 <summary>Manual installation / alternative methods</summary>
 
