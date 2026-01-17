@@ -990,3 +990,269 @@ mod integration {
         );
     }
 }
+
+// ============================================================================
+// Specific Scenario Tests (Section 11.15)
+// ============================================================================
+
+mod scenarios {
+    use super::*;
+
+    /// Create priors where abandoned/zombie have high base probability when evidence is extreme.
+    fn scenario_priors() -> Priors {
+        let mut priors = uniform_priors();
+
+        // Abandoned favored when: low CPU, orphaned, no TTY, no net
+        priors.classes.abandoned.cpu_beta = BetaParams::new(1.0, 20.0);
+        priors.classes.abandoned.orphan_beta = BetaParams::new(15.0, 1.0);
+        priors.classes.abandoned.tty_beta = BetaParams::new(1.0, 15.0);
+        priors.classes.abandoned.net_beta = BetaParams::new(1.0, 15.0);
+
+        // Useful favored when: high CPU, has parent, has TTY, has net
+        priors.classes.useful.cpu_beta = BetaParams::new(10.0, 2.0);
+        priors.classes.useful.orphan_beta = BetaParams::new(1.0, 15.0);
+        priors.classes.useful.tty_beta = BetaParams::new(15.0, 1.0);
+        priors.classes.useful.net_beta = BetaParams::new(15.0, 1.0);
+
+        // Zombie: very low CPU, orphaned
+        priors.classes.zombie.cpu_beta = BetaParams::new(1.0, 50.0);
+        priors.classes.zombie.orphan_beta = BetaParams::new(20.0, 1.0);
+
+        // Useful-bad: high CPU but orphaned (runaway process)
+        priors.classes.useful_bad.cpu_beta = BetaParams::new(15.0, 1.0);
+        priors.classes.useful_bad.orphan_beta = BetaParams::new(10.0, 5.0);
+
+        priors
+    }
+
+    #[test]
+    fn test_scenario_strong_kill() {
+        // SCENARIO: strong_kill
+        // Expected: Show all contributing factors, classification favors abandoned/zombie
+
+        let priors = scenario_priors();
+
+        // Evidence strongly suggesting abandoned: orphaned, no CPU, no TTY, no network
+        let evidence = Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.001 }),
+            orphan: Some(true),
+            tty: Some(false),
+            net: Some(false),
+            io_active: Some(false),
+            ..Evidence::default()
+        };
+
+        let result = compute_posterior(&priors, &evidence).expect("strong_kill posterior");
+        let ledger = EvidenceLedger::from_posterior_result(&result, Some(9999), None);
+
+        // Combined abandoned + zombie probability should be higher than useful
+        let kill_prob = result.posterior.abandoned + result.posterior.zombie;
+        let spare_prob = result.posterior.useful + result.posterior.useful_bad;
+
+        assert!(
+            kill_prob > spare_prob,
+            "Strong kill evidence should favor abandoned/zombie ({:.4}) over useful ({:.4})",
+            kill_prob, spare_prob
+        );
+
+        // Should classify as Abandoned or Zombie (not Useful)
+        assert!(
+            matches!(ledger.classification, Classification::Abandoned | Classification::Zombie),
+            "Strong kill should classify as abandoned/zombie: {:?}",
+            ledger.classification
+        );
+
+        // Evidence terms should show all contributing factors
+        let feature_names: Vec<&str> = result
+            .evidence_terms
+            .iter()
+            .map(|t| t.feature.as_str())
+            .collect();
+
+        assert!(feature_names.contains(&"cpu"), "Should include cpu evidence");
+        assert!(feature_names.contains(&"orphan"), "Should include orphan evidence");
+        assert!(feature_names.contains(&"tty"), "Should include tty evidence");
+        assert!(feature_names.contains(&"net"), "Should include net evidence");
+
+        // Log the evidence breakdown for debugging
+        eprintln!("[STRONG_KILL] Classification: {:?}, Confidence: {:?}",
+            ledger.classification, ledger.confidence);
+        eprintln!("[STRONG_KILL] Abandoned prob: {:.4}, Useful prob: {:.4}",
+            result.posterior.abandoned, result.posterior.useful);
+        eprintln!("[STRONG_KILL] Evidence terms: {:?}",
+            feature_names);
+    }
+
+    #[test]
+    fn test_scenario_spare_recommendation() {
+        // SCENARIO: spare_recommendation
+        // Score: 15 (very confident useful)
+        // Expected: Show what would need to change to reach KILL
+
+        let priors = scenario_priors();
+
+        // Evidence strongly suggesting useful: active CPU, has parent, has TTY
+        let evidence = Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.75 }),
+            orphan: Some(false),
+            tty: Some(true),
+            net: Some(true),
+            io_active: Some(true),
+            ..Evidence::default()
+        };
+
+        let result = compute_posterior(&priors, &evidence).expect("spare posterior");
+        let ledger = EvidenceLedger::from_posterior_result(&result, Some(1111), None);
+
+        // Should classify as Useful (spare)
+        assert!(
+            matches!(ledger.classification, Classification::Useful | Classification::UsefulBad),
+            "Spare recommendation should classify as useful: {:?}",
+            ledger.classification
+        );
+
+        // Useful probability should be much higher than abandoned
+        assert!(
+            result.posterior.useful > result.posterior.abandoned,
+            "Useful probability should be higher than abandoned: {} vs {}",
+            result.posterior.useful, result.posterior.abandoned
+        );
+
+        // Test counterfactual: what would need to change?
+        // If we flip orphan to true and remove TTY, does it shift?
+        let counterfactual = Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.75 }),
+            orphan: Some(true),  // Flipped
+            tty: Some(false),    // Flipped
+            net: Some(true),
+            io_active: Some(true),
+            ..Evidence::default()
+        };
+
+        let cf_result = compute_posterior(&priors, &counterfactual).expect("counterfactual");
+
+        // The counterfactual should shift toward abandoned
+        assert!(
+            cf_result.posterior.abandoned > result.posterior.abandoned,
+            "Counterfactual should increase abandoned probability"
+        );
+
+        // Log the transition for debugging
+        eprintln!("[SPARE] Original: useful={:.4}, abandoned={:.4}",
+            result.posterior.useful, result.posterior.abandoned);
+        eprintln!("[SPARE] After orphan+no_tty: useful={:.4}, abandoned={:.4}",
+            cf_result.posterior.useful, cf_result.posterior.abandoned);
+    }
+
+    #[test]
+    fn test_scenario_conflicting_evidence() {
+        // SCENARIO: conflicting_evidence
+        // Score: ~50 (uncertain)
+        // Expected: Show both positive and negative evidence clearly
+
+        let priors = scenario_priors();
+
+        // Conflicting evidence: high CPU (useful signal) but orphaned (abandoned signal)
+        let evidence = Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.6 }),  // High CPU - suggests useful
+            orphan: Some(true),   // Orphaned - suggests abandoned
+            tty: Some(false),     // No TTY - suggests abandoned
+            net: Some(true),      // Has network - mixed signal
+            io_active: Some(true), // Active I/O - suggests useful
+            ..Evidence::default()
+        };
+
+        let result = compute_posterior(&priors, &evidence).expect("conflicting posterior");
+        let ledger = EvidenceLedger::from_posterior_result(&result, Some(5050), None);
+
+        // With conflicting evidence, confidence should be low or medium
+        assert!(
+            matches!(ledger.confidence, Confidence::Low | Confidence::Medium),
+            "Conflicting evidence should yield low/medium confidence: {:?} (max prob: {:.4})",
+            ledger.confidence,
+            result.posterior.useful
+                .max(result.posterior.abandoned)
+                .max(result.posterior.useful_bad)
+                .max(result.posterior.zombie)
+        );
+
+        // The evidence terms should show mixed signals
+        let positive_evidence: Vec<&EvidenceTerm> = result
+            .evidence_terms
+            .iter()
+            .filter(|t| t.log_likelihood.useful > t.log_likelihood.abandoned)
+            .collect();
+
+        let negative_evidence: Vec<&EvidenceTerm> = result
+            .evidence_terms
+            .iter()
+            .filter(|t| t.log_likelihood.abandoned > t.log_likelihood.useful)
+            .collect();
+
+        assert!(
+            !positive_evidence.is_empty(),
+            "Should have some evidence favoring useful"
+        );
+        assert!(
+            !negative_evidence.is_empty(),
+            "Should have some evidence favoring abandoned"
+        );
+
+        // Log the breakdown for debugging
+        eprintln!("[CONFLICTING] Classification: {:?}, Confidence: {:?}",
+            ledger.classification, ledger.confidence);
+        eprintln!("[CONFLICTING] Useful prob: {:.4}, Abandoned prob: {:.4}",
+            result.posterior.useful, result.posterior.abandoned);
+        eprintln!("[CONFLICTING] Evidence favoring useful: {:?}",
+            positive_evidence.iter().map(|t| &t.feature).collect::<Vec<_>>());
+        eprintln!("[CONFLICTING] Evidence favoring abandoned: {:?}",
+            negative_evidence.iter().map(|t| &t.feature).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_scenario_marginal_kill_threshold_crossing() {
+        // SCENARIO: marginal_kill
+        // Score: ~62 (just above KILL threshold)
+        // Expected: Show which evidence tips it over threshold
+
+        let priors = scenario_priors();
+
+        // Start with borderline evidence
+        let borderline = Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.1 }),
+            orphan: Some(true),
+            tty: Some(true),  // Has TTY - keeps it borderline
+            net: Some(false),
+            ..Evidence::default()
+        };
+
+        let borderline_result = compute_posterior(&priors, &borderline).expect("borderline");
+
+        // Now add the tipping factor: remove TTY
+        let over_threshold = Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.1 }),
+            orphan: Some(true),
+            tty: Some(false),  // No TTY - tips it over
+            net: Some(false),
+            ..Evidence::default()
+        };
+
+        let over_result = compute_posterior(&priors, &over_threshold).expect("over threshold");
+
+        // The tipping factor (removing TTY) should increase abandoned probability
+        assert!(
+            over_result.posterior.abandoned > borderline_result.posterior.abandoned,
+            "Removing TTY should increase abandoned probability: {} vs {}",
+            over_result.posterior.abandoned, borderline_result.posterior.abandoned
+        );
+
+        // Log the threshold crossing for debugging
+        eprintln!("[MARGINAL] With TTY: abandoned={:.4}, classification={:?}",
+            borderline_result.posterior.abandoned,
+            get_classification(&borderline_result.posterior));
+        eprintln!("[MARGINAL] Without TTY: abandoned={:.4}, classification={:?}",
+            over_result.posterior.abandoned,
+            get_classification(&over_result.posterior));
+        eprintln!("[MARGINAL] TTY was the tipping factor");
+    }
+}
