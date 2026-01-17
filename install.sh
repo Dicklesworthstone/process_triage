@@ -220,11 +220,35 @@ get_installed_version() {
     echo "${version:-unknown}"
 }
 
-# Detect platform (OS + architecture) for artifact naming
-# Returns: linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64
+# Detect if system uses musl libc (Alpine, etc.)
+# Returns: 0 if musl, 1 if glibc or unknown
+detect_musl() {
+    # Check for Alpine Linux
+    if [[ -f /etc/alpine-release ]]; then
+        return 0
+    fi
+
+    # Check ldd output for musl
+    if command -v ldd &>/dev/null; then
+        if ldd --version 2>&1 | grep -qi musl; then
+            return 0
+        fi
+    fi
+
+    # Check /lib for musl-libc
+    if [[ -f /lib/ld-musl-x86_64.so.1 ]] || [[ -f /lib/ld-musl-aarch64.so.1 ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Detect platform (OS + architecture + libc) for artifact naming
+# Returns: linux-x86_64, linux-x86_64-musl, linux-aarch64, macos-x86_64, etc.
 detect_platform() {
     local arch; arch=$(uname -m)
     local os; os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    local suffix=""
 
     case "$arch" in
         x86_64) arch="x86_64" ;;
@@ -236,7 +260,13 @@ detect_platform() {
     esac
 
     case "$os" in
-        linux) ;;
+        linux)
+            # Check for musl-based system
+            if detect_musl; then
+                suffix="-musl"
+                log_info "Detected musl-based system (using static binary)"
+            fi
+            ;;
         darwin) os="macos" ;;
         *)
             log_error "Unsupported OS: $os"
@@ -244,7 +274,32 @@ detect_platform() {
             ;;
     esac
 
-    echo "${os}-${arch}"
+    echo "${os}-${arch}${suffix}"
+}
+
+# Get artifact name with optional musl fallback
+# On glibc systems, first try glibc build, then musl as fallback
+get_artifact_with_fallback() {
+    local version="$1"
+    local platform="$2"
+
+    # Primary artifact name
+    echo "pt-core-${platform}-${version}.tar.gz"
+}
+
+# Try to get musl fallback artifact name (for glibc version mismatch)
+get_musl_fallback() {
+    local version="$1"
+    local platform="$2"
+
+    # Only applicable for Linux glibc builds
+    if [[ "$platform" == linux-x86_64 ]]; then
+        echo "pt-core-linux-x86_64-musl-${version}.tar.gz"
+    elif [[ "$platform" == linux-aarch64 ]]; then
+        echo "pt-core-linux-aarch64-musl-${version}.tar.gz"
+    else
+        echo ""
+    fi
 }
 
 # ==============================================================================
@@ -611,8 +666,26 @@ main() {
         log_step "Downloading pt-core (${target})..."
         local archive_name="pt-core-${target}-${core_version}.tar.gz"
         local core_url="${RELEASES_URL}/download/v${core_version}/${archive_name}"
+        local download_success=false
 
         if download "$core_url" "$temp_dir/$archive_name"; then
+            download_success=true
+        else
+            # Try musl fallback for Linux glibc systems
+            local musl_fallback
+            musl_fallback=$(get_musl_fallback "$core_version" "$target")
+            if [[ -n "$musl_fallback" ]]; then
+                log_info "Trying musl static binary as fallback..."
+                local musl_url="${RELEASES_URL}/download/v${core_version}/${musl_fallback}"
+                if download "$musl_url" "$temp_dir/$musl_fallback"; then
+                    archive_name="$musl_fallback"
+                    download_success=true
+                    log_success "Using musl static binary (works on any Linux)"
+                fi
+            fi
+        fi
+
+        if [[ "$download_success" == "true" ]]; then
             # Verify pt-core archive if requested
             if [[ "${VERIFY:-}" == "1" ]]; then
                 if [[ "$have_checksums" == "true" ]]; then

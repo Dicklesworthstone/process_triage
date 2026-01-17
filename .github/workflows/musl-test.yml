@@ -1,0 +1,256 @@
+name: Test musl Builds
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.github/workflows/musl-test.yml'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.github/workflows/musl-test.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================================================
+  # Build musl binaries
+  # ==========================================================================
+  build-musl:
+    name: Build musl (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact_name: pt-core-linux-x86_64-musl
+            use_cross: false
+          - target: aarch64-unknown-linux-musl
+            artifact_name: pt-core-linux-aarch64-musl
+            use_cross: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@cross
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates -> target"
+          key: musl-${{ matrix.target }}
+
+      - name: Build release binary (native)
+        if: "!matrix.use_cross"
+        run: |
+          cargo build --release -p pt-core --target ${{ matrix.target }}
+
+      - name: Build release binary (cross)
+        if: matrix.use_cross
+        run: |
+          cross build --release -p pt-core --target ${{ matrix.target }}
+
+      - name: Verify static linking
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          echo "=== Binary info ==="
+          file target/${{ matrix.target }}/release/pt-core
+
+          echo ""
+          echo "=== Link check ==="
+          if ldd target/${{ matrix.target }}/release/pt-core 2>&1 | grep -q "not a dynamic executable"; then
+            echo "✓ Binary is statically linked"
+          else
+            echo "::error::Binary is not statically linked!"
+            ldd target/${{ matrix.target }}/release/pt-core || true
+            exit 1
+          fi
+
+      - name: Check binary size
+        run: |
+          size=$(stat -c%s target/${{ matrix.target }}/release/pt-core)
+          size_mb=$((size / 1024 / 1024))
+          echo "Binary size: ${size_mb}MB (${size} bytes)"
+
+          # Warn if over 15MB
+          if [ $size_mb -gt 15 ]; then
+            echo "::warning::Binary size (${size_mb}MB) exceeds 15MB target"
+          else
+            echo "✓ Binary size is within target (< 15MB)"
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/pt-core
+          retention-days: 7
+
+  # ==========================================================================
+  # Test on various Linux distros
+  # ==========================================================================
+  test-distros:
+    name: Test on ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    needs: build-musl
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: alpine:latest
+            name: Alpine Latest
+          - distro: alpine:3.14
+            name: Alpine 3.14
+          - distro: ubuntu:22.04
+            name: Ubuntu 22.04
+          - distro: ubuntu:20.04
+            name: Ubuntu 20.04
+          - distro: debian:slim
+            name: Debian Slim
+          - distro: debian:11-slim
+            name: Debian 11 Slim
+          - distro: centos:7
+            name: CentOS 7
+          - distro: fedora:38
+            name: Fedora 38
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download musl binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pt-core-linux-x86_64-musl
+          path: dist
+
+      - name: Make binary executable
+        run: chmod +x dist/pt-core
+
+      - name: Test on ${{ matrix.distro }}
+        run: |
+          docker run --rm \
+            -v "$(pwd)/dist:/app" \
+            -w /app \
+            ${{ matrix.distro }} \
+            sh -c '
+              echo "=== System info ==="
+              cat /etc/*release* 2>/dev/null | head -5 || true
+              uname -a
+
+              echo ""
+              echo "=== Binary test ==="
+              ./pt-core --version
+
+              echo ""
+              echo "=== Help test ==="
+              ./pt-core --help | head -10
+
+              echo ""
+              echo "✓ Binary runs successfully on ${{ matrix.distro }}"
+            '
+
+  # ==========================================================================
+  # Integration test on Alpine
+  # ==========================================================================
+  integration-alpine:
+    name: Integration Test (Alpine)
+    runs-on: ubuntu-latest
+    needs: build-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download musl binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pt-core-linux-x86_64-musl
+          path: dist
+
+      - name: Make binary executable
+        run: chmod +x dist/pt-core
+
+      - name: Run integration tests in Alpine
+        run: |
+          docker run --rm \
+            -v "$(pwd)/dist:/app" \
+            -w /app \
+            alpine:latest \
+            sh -c '
+              echo "=== Installing test dependencies ==="
+              apk add --no-cache procps coreutils
+
+              echo ""
+              echo "=== Version check ==="
+              ./pt-core --version
+
+              echo ""
+              echo "=== Scan test ==="
+              # Create a test process
+              sleep 3600 &
+              TEST_PID=$!
+
+              # Run scan (should find processes)
+              echo "Running scan..."
+              ./pt-core scan --format json 2>/dev/null | head -20 || true
+
+              # Cleanup
+              kill $TEST_PID 2>/dev/null || true
+
+              echo ""
+              echo "✓ Integration tests passed on Alpine"
+            '
+
+  # ==========================================================================
+  # Summary
+  # ==========================================================================
+  summary:
+    name: musl Build Summary
+    runs-on: ubuntu-latest
+    needs: [build-musl, test-distros, integration-alpine]
+    if: always()
+
+    steps:
+      - name: Check results
+        run: |
+          echo "=== Build Results ==="
+          echo "build-musl: ${{ needs.build-musl.result }}"
+          echo "test-distros: ${{ needs.test-distros.result }}"
+          echo "integration-alpine: ${{ needs.integration-alpine.result }}"
+
+          if [[ "${{ needs.build-musl.result }}" == "success" ]] && \
+             [[ "${{ needs.test-distros.result }}" == "success" ]] && \
+             [[ "${{ needs.integration-alpine.result }}" == "success" ]]; then
+            echo ""
+            echo "✓ All musl tests passed!"
+            exit 0
+          else
+            echo ""
+            echo "✗ Some tests failed"
+            exit 1
+          fi

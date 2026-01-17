@@ -82,18 +82,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # glibc builds (standard)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: pt-core-linux-x86_64
+            is_musl: false
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: pt-core-linux-aarch64
+            is_musl: false
+          # musl builds (static, portable)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_name: pt-core-linux-x86_64-musl
+            is_musl: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact_name: pt-core-linux-aarch64-musl
+            is_musl: true
+          # macOS builds
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: pt-core-macos-x86_64
+            is_musl: false
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: pt-core-macos-aarch64
+            is_musl: false
 
     steps:
       - name: Checkout
@@ -104,18 +119,47 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross (for cross-compilation)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@cross
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "crates -> target"
           key: ${{ matrix.target }}
 
-      - name: Build release binary
+      - name: Build release binary (native)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
         run: |
           cargo build --release -p pt-core --target ${{ matrix.target }}
 
+      - name: Build release binary (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          cross build --release -p pt-core --target ${{ matrix.target }}
+
+      - name: Verify static linking (musl)
+        if: matrix.is_musl && matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          echo "Checking if binary is statically linked..."
+          file target/${{ matrix.target }}/release/pt-core
+          if ldd target/${{ matrix.target }}/release/pt-core 2>&1 | grep -q "not a dynamic executable"; then
+            echo "✓ Binary is statically linked"
+          else
+            echo "::error::Binary is not statically linked!"
+            ldd target/${{ matrix.target }}/release/pt-core
+            exit 1
+          fi
+
       - name: Verify binary version
-        if: matrix.target != 'aarch64-apple-darwin' && matrix.target != 'aarch64-unknown-linux-gnu'
+        if: matrix.target != 'aarch64-apple-darwin' && matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'aarch64-unknown-linux-musl'
         run: |
           binary_version=$(./target/${{ matrix.target }}/release/pt-core --version | awk '{print $2}')
           expected_version="${{ needs.validate-version.outputs.version }}"
@@ -232,8 +276,15 @@ jobs:
           ## Supported Platforms
           - Linux x86_64 (Intel/AMD 64-bit)
           - Linux aarch64 (ARM 64-bit)
+          - Linux x86_64 musl (static, portable)
+          - Linux aarch64 musl (static, portable)
           - macOS x86_64 (Intel Macs)
           - macOS aarch64 (Apple Silicon)
+
+          ### Static/musl Binaries
+          The \`-musl\` variants are statically linked and work on any Linux distro,
+          including Alpine, older glibc systems, and minimal containers. Use these
+          for maximum portability.
           EOF
 
           echo ""
