@@ -781,3 +781,513 @@ fn test_full_inference_to_galaxy_brain_pipeline() {
 
     log_test!("INFO", "Full pipeline test passed for all scenarios");
 }
+
+// ============================================================================
+// Expected Loss Consistency Tests (process_triage-aii.4)
+// ============================================================================
+
+#[test]
+fn test_galaxy_brain_expected_loss_numbers_match_decision() {
+    log_test!(
+        "INFO",
+        "Testing expected loss numbers match decision outcome"
+    );
+
+    use pt_core::config::policy::Policy;
+    use pt_core::decision::{decide_action, ActionFeasibility};
+
+    let priors = load_priors_fixture();
+    let policy_path = fixtures_dir().join("policy.json");
+    let policy_content = fs::read_to_string(&policy_path).expect("read policy fixture");
+    let policy: Policy = serde_json::from_str(&policy_content).expect("parse policy fixture");
+
+    // Compute posterior and decision for abandoned evidence
+    let evidence = create_test_evidence_abandoned();
+    let result = compute_posterior(&priors, &evidence).expect("compute_posterior failed");
+    let feasibility = ActionFeasibility::allow_all();
+    let decision = decide_action(&result.posterior, &policy, &feasibility)
+        .expect("decide_action failed");
+
+    // Verify expected loss is non-negative for all actions
+    for entry in &decision.expected_loss {
+        assert!(
+            entry.loss >= 0.0,
+            "Expected loss for {:?} is negative: {}",
+            entry.action,
+            entry.loss
+        );
+    }
+
+    // Verify optimal action has minimum expected loss
+    let optimal_loss = decision
+        .expected_loss
+        .iter()
+        .find(|e| e.action == decision.optimal_action)
+        .map(|e| e.loss)
+        .expect("optimal action not found in expected_loss");
+
+    for entry in &decision.expected_loss {
+        assert!(
+            optimal_loss <= entry.loss + 1e-9,
+            "Optimal loss {} exceeds loss {} for {:?}",
+            optimal_loss,
+            entry.loss,
+            entry.action
+        );
+    }
+
+    // Manually verify expected loss computation for Kill action:
+    // E[L|kill] = P(useful) * L(kill|useful) + P(useful_bad) * L(kill|useful_bad)
+    //           + P(abandoned) * L(kill|abandoned) + P(zombie) * L(kill|zombie)
+    // From policy.json: kill losses are useful=100, useful_bad=20, abandoned=1, zombie=1
+    let expected_kill_loss = result.posterior.useful * 100.0
+        + result.posterior.useful_bad * 20.0
+        + result.posterior.abandoned * 1.0
+        + result.posterior.zombie * 1.0;
+
+    if let Some(kill_entry) = decision.expected_loss.iter().find(|e| {
+        matches!(e.action, pt_core::decision::Action::Kill)
+    }) {
+        let tolerance = 1e-6;
+        assert!(
+            (kill_entry.loss - expected_kill_loss).abs() < tolerance,
+            "Kill expected loss mismatch: decision={}, computed={}",
+            kill_entry.loss,
+            expected_kill_loss
+        );
+    }
+
+    // Verify posteriors sum to 1 (sanity check for computation)
+    let sum = result.posterior.useful
+        + result.posterior.useful_bad
+        + result.posterior.abandoned
+        + result.posterior.zombie;
+    assert!(
+        (sum - 1.0).abs() < 1e-10,
+        "Posteriors don't sum to 1: {}",
+        sum
+    );
+
+    log_test!(
+        "INFO",
+        "Expected loss numbers verified",
+        optimal_action = format!("{:?}", decision.optimal_action),
+        optimal_loss = optimal_loss,
+    );
+}
+
+#[test]
+fn test_galaxy_brain_expected_loss_useful_process() {
+    log_test!(
+        "INFO",
+        "Testing expected loss for useful-classified process"
+    );
+
+    use pt_core::config::policy::Policy;
+    use pt_core::decision::{decide_action, Action, ActionFeasibility};
+
+    let priors = load_priors_fixture();
+    let policy_path = fixtures_dir().join("policy.json");
+    let policy_content = fs::read_to_string(&policy_path).expect("read policy fixture");
+    let policy: Policy = serde_json::from_str(&policy_content).expect("parse policy fixture");
+
+    // Use evidence that strongly suggests useful process
+    let evidence = create_test_evidence_useful();
+    let result = compute_posterior(&priors, &evidence).expect("compute_posterior failed");
+    let feasibility = ActionFeasibility::allow_all();
+    let decision = decide_action(&result.posterior, &policy, &feasibility)
+        .expect("decide_action failed");
+
+    // For a useful process, Keep should have low loss, Kill should have high loss
+    let keep_loss = decision
+        .expected_loss
+        .iter()
+        .find(|e| e.action == Action::Keep)
+        .map(|e| e.loss);
+    let kill_loss = decision
+        .expected_loss
+        .iter()
+        .find(|e| e.action == Action::Kill)
+        .map(|e| e.loss);
+
+    if let (Some(keep), Some(kill)) = (keep_loss, kill_loss) {
+        assert!(
+            keep < kill,
+            "For useful process, Keep loss ({}) should be less than Kill loss ({})",
+            keep,
+            kill
+        );
+    }
+
+    // Optimal action for useful process should NOT be Kill
+    assert_ne!(
+        decision.optimal_action,
+        Action::Kill,
+        "Optimal action for useful process should not be Kill"
+    );
+
+    log_test!(
+        "INFO",
+        "Verified useful process expected loss hierarchy",
+        optimal = format!("{:?}", decision.optimal_action),
+    );
+}
+
+// ============================================================================
+// FDR Selection Consistency Tests (process_triage-aii.4)
+// ============================================================================
+
+#[test]
+fn test_galaxy_brain_fdr_selection_matches_decision_output() {
+    log_test!(
+        "INFO",
+        "Testing FDR selection results match decision parameters"
+    );
+
+    use pt_core::decision::{
+        select_fdr, FdrCandidate, FdrMethod, TargetIdentity,
+    };
+
+    // Create test candidates with e-values (Bayes factors)
+    let candidates = vec![
+        FdrCandidate {
+            target: TargetIdentity {
+                pid: 1001,
+                start_id: "boot1:1001:1000".to_string(),
+                uid: 1000,
+            },
+            e_value: 50.0, // Strong evidence (BF >> 1)
+        },
+        FdrCandidate {
+            target: TargetIdentity {
+                pid: 1002,
+                start_id: "boot1:1002:1000".to_string(),
+                uid: 1000,
+            },
+            e_value: 10.0, // Moderate evidence
+        },
+        FdrCandidate {
+            target: TargetIdentity {
+                pid: 1003,
+                start_id: "boot1:1003:1000".to_string(),
+                uid: 1000,
+            },
+            e_value: 0.5, // Weak evidence (BF < 1)
+        },
+        FdrCandidate {
+            target: TargetIdentity {
+                pid: 1004,
+                start_id: "boot1:1004:1000".to_string(),
+                uid: 1000,
+            },
+            e_value: 100.0, // Very strong evidence
+        },
+    ];
+
+    let alpha = 0.05;
+    let result = select_fdr(&candidates, alpha, FdrMethod::EBy)
+        .expect("FDR selection failed");
+
+    // Verify result structure
+    assert_eq!(result.alpha, alpha, "Alpha mismatch");
+    assert_eq!(result.method, FdrMethod::EBy, "Method mismatch");
+    assert_eq!(result.m_candidates, 4, "Candidate count mismatch");
+
+    // Verify candidates are sorted by e-value descending
+    for i in 1..result.candidates.len() {
+        assert!(
+            result.candidates[i - 1].e_value >= result.candidates[i].e_value,
+            "Candidates not sorted by e-value descending"
+        );
+    }
+
+    // Verify p-values are correct: p = min(1, 1/e)
+    for candidate in &result.candidates {
+        let expected_p = (1.0 / candidate.e_value).min(1.0);
+        let tolerance = 1e-10;
+        assert!(
+            (candidate.p_value - expected_p).abs() < tolerance,
+            "P-value mismatch for PID {}: got {}, expected {}",
+            candidate.target.pid,
+            candidate.p_value,
+            expected_p
+        );
+    }
+
+    // Verify selection consistency: selected candidates should have high e-values
+    for candidate in &result.candidates {
+        if candidate.selected {
+            // Selected candidates should meet threshold
+            assert!(
+                candidate.e_value >= candidate.threshold,
+                "Selected candidate PID {} has e-value {} below threshold {}",
+                candidate.target.pid,
+                candidate.e_value,
+                candidate.threshold
+            );
+        }
+    }
+
+    // Verify selected_k matches actual selected count
+    let actual_selected = result.candidates.iter().filter(|c| c.selected).count();
+    assert_eq!(
+        result.selected_k, actual_selected,
+        "selected_k mismatch: reported {}, actual {}",
+        result.selected_k, actual_selected
+    );
+
+    // Verify selected_ids contains exactly the selected candidates
+    let selected_pids: HashSet<i32> = result.selected_ids.iter().map(|t| t.pid).collect();
+    for candidate in &result.candidates {
+        if candidate.selected {
+            assert!(
+                selected_pids.contains(&candidate.target.pid),
+                "Selected PID {} missing from selected_ids",
+                candidate.target.pid
+            );
+        }
+    }
+
+    log_test!(
+        "INFO",
+        "FDR selection verified",
+        selected_k = result.selected_k,
+        m_candidates = result.m_candidates,
+    );
+}
+
+#[test]
+fn test_galaxy_brain_fdr_monotonicity() {
+    log_test!(
+        "INFO",
+        "Testing FDR selection monotonicity: higher alpha -> more selections"
+    );
+
+    use pt_core::decision::{select_fdr, FdrCandidate, FdrMethod, TargetIdentity};
+
+    let candidates = vec![
+        FdrCandidate {
+            target: TargetIdentity {
+                pid: 1,
+                start_id: "boot:1:1000".to_string(),
+                uid: 1000,
+            },
+            e_value: 30.0,
+        },
+        FdrCandidate {
+            target: TargetIdentity {
+                pid: 2,
+                start_id: "boot:2:1000".to_string(),
+                uid: 1000,
+            },
+            e_value: 8.0,
+        },
+        FdrCandidate {
+            target: TargetIdentity {
+                pid: 3,
+                start_id: "boot:3:1000".to_string(),
+                uid: 1000,
+            },
+            e_value: 2.5,
+        },
+    ];
+
+    let result_strict = select_fdr(&candidates, 0.01, FdrMethod::EBy)
+        .expect("FDR selection failed for alpha=0.01");
+    let result_moderate = select_fdr(&candidates, 0.05, FdrMethod::EBy)
+        .expect("FDR selection failed for alpha=0.05");
+    let result_relaxed = select_fdr(&candidates, 0.10, FdrMethod::EBy)
+        .expect("FDR selection failed for alpha=0.10");
+
+    // Higher alpha should allow at least as many selections
+    assert!(
+        result_moderate.selected_k >= result_strict.selected_k,
+        "Monotonicity violated: alpha=0.05 selected {} < alpha=0.01 selected {}",
+        result_moderate.selected_k,
+        result_strict.selected_k
+    );
+    assert!(
+        result_relaxed.selected_k >= result_moderate.selected_k,
+        "Monotonicity violated: alpha=0.10 selected {} < alpha=0.05 selected {}",
+        result_relaxed.selected_k,
+        result_moderate.selected_k
+    );
+
+    log_test!(
+        "INFO",
+        "FDR monotonicity verified",
+        strict = result_strict.selected_k,
+        moderate = result_moderate.selected_k,
+        relaxed = result_relaxed.selected_k,
+    );
+}
+
+// ============================================================================
+// Cross-Surface Consistency Tests (process_triage-aii.4)
+// ============================================================================
+
+#[test]
+fn test_galaxy_brain_ledger_to_json_consistency() {
+    log_test!(
+        "INFO",
+        "Testing evidence ledger JSON representation consistency"
+    );
+
+    let priors = load_priors_fixture();
+    let evidence = create_test_evidence_abandoned();
+    let result = compute_posterior(&priors, &evidence).expect("compute_posterior failed");
+    let ledger = EvidenceLedger::from_posterior_result(&result, Some(12345), None);
+
+    // Serialize to JSON
+    let json = serde_json::to_string_pretty(&ledger).expect("ledger serialization failed");
+    let parsed: Value = serde_json::from_str(&json).expect("ledger parse failed");
+
+    // Verify all required fields are present
+    assert!(parsed.get("classification").is_some(), "Missing classification");
+    assert!(parsed.get("confidence").is_some(), "Missing confidence");
+    assert!(parsed.get("posterior").is_some(), "Missing posterior");
+    assert!(parsed.get("why_summary").is_some(), "Missing why_summary");
+
+    // Verify classification matches the ledger struct
+    let json_classification = parsed
+        .get("classification")
+        .and_then(|v| v.as_str())
+        .expect("classification not a string");
+    let expected_classification = format!("{:?}", ledger.classification).to_lowercase();
+    assert_eq!(
+        json_classification, expected_classification,
+        "Classification mismatch: JSON='{}', struct='{}'",
+        json_classification, expected_classification
+    );
+
+    // Verify posterior probabilities roundtrip correctly
+    // Note: ledger.posterior is PosteriorResult which contains posterior: ClassScores
+    if let Some(posterior_obj) = parsed.get("posterior").and_then(|v| v.as_object()) {
+        if let Some(inner) = posterior_obj.get("posterior").and_then(|v| v.as_object()) {
+            if let Some(abandoned) = inner.get("abandoned").and_then(|v| v.as_f64()) {
+                let tolerance = 1e-10;
+                assert!(
+                    (abandoned - ledger.posterior.posterior.abandoned).abs() < tolerance,
+                    "Posterior abandoned mismatch in JSON roundtrip"
+                );
+            }
+        }
+    }
+
+    // Deserialize back and compare
+    let restored: EvidenceLedger = serde_json::from_str(&json).expect("ledger deserialization failed");
+    assert_eq!(
+        ledger.classification, restored.classification,
+        "Classification changed after roundtrip"
+    );
+    assert_eq!(
+        ledger.confidence, restored.confidence,
+        "Confidence changed after roundtrip"
+    );
+
+    log_test!(
+        "INFO",
+        "Ledger JSON consistency verified",
+        json_size = json.len(),
+    );
+}
+
+#[test]
+fn test_galaxy_brain_multiple_scenarios_consistency() {
+    log_test!(
+        "INFO",
+        "Testing galaxy-brain consistency across multiple evidence scenarios"
+    );
+
+    let priors = load_priors_fixture();
+
+    // Test various evidence combinations
+    let scenarios: Vec<(&str, Evidence)> = vec![
+        ("abandoned_orphan", Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.001 }),
+            runtime_seconds: Some(172800.0), // 2 days
+            orphan: Some(true),
+            tty: Some(false),
+            net: Some(false),
+            io_active: Some(false),
+            state_flag: None,
+            command_category: None,
+        }),
+        ("useful_active", Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.75 }),
+            runtime_seconds: Some(300.0), // 5 minutes
+            orphan: Some(false),
+            tty: Some(true),
+            net: Some(true),
+            io_active: Some(true),
+            state_flag: None,
+            command_category: None,
+        }),
+        ("uncertain_mixed", Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.1 }),
+            runtime_seconds: Some(3600.0), // 1 hour
+            orphan: Some(false),
+            tty: Some(false),
+            net: Some(true),
+            io_active: Some(false),
+            state_flag: None,
+            command_category: None,
+        }),
+    ];
+
+    for (name, evidence) in scenarios {
+        let result = compute_posterior(&priors, &evidence).expect(&format!(
+            "compute_posterior failed for scenario {}",
+            name
+        ));
+        let data = build_galaxy_brain_data_for_posterior(&result);
+        let ledger = EvidenceLedger::from_posterior_result(&result, None, None);
+
+        // Verify posteriors sum to 1
+        let sum = result.posterior.useful
+            + result.posterior.useful_bad
+            + result.posterior.abandoned
+            + result.posterior.zombie;
+        assert!(
+            (sum - 1.0).abs() < 1e-10,
+            "Scenario {}: posteriors don't sum to 1 (sum={})",
+            name,
+            sum
+        );
+
+        // Verify classification matches highest posterior
+        let scores = [
+            (Classification::Useful, result.posterior.useful),
+            (Classification::UsefulBad, result.posterior.useful_bad),
+            (Classification::Abandoned, result.posterior.abandoned),
+            (Classification::Zombie, result.posterior.zombie),
+        ];
+        let expected_class = scores
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(c, _)| *c)
+            .unwrap();
+        assert_eq!(
+            ledger.classification, expected_class,
+            "Scenario {}: classification mismatch (ledger={:?}, expected={:?})",
+            name, ledger.classification, expected_class
+        );
+
+        // Verify galaxy-brain data has cards
+        assert!(
+            !data.cards.is_empty(),
+            "Scenario {}: no cards generated",
+            name
+        );
+
+        log_test!(
+            "DEBUG",
+            "Scenario passed",
+            name = name,
+            classification = format!("{:?}", ledger.classification),
+            confidence = format!("{:?}", ledger.confidence),
+        );
+    }
+
+    log_test!("INFO", "All multi-scenario consistency tests passed");
+}
