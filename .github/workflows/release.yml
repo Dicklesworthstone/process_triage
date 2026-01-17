@@ -11,6 +11,11 @@ on:
         required: false
         default: 'true'
 
+# Releases should not be cancelled mid-flight
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -21,6 +26,7 @@ jobs:
   validate-version:
     name: Validate Version
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.extract.outputs.version }}
     steps:
@@ -77,6 +83,7 @@ jobs:
   build-pt-core:
     name: Build pt-core (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     needs: validate-version
     strategy:
       fail-fast: false
@@ -200,6 +207,7 @@ jobs:
   assemble-release:
     name: Assemble Release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [validate-version, build-pt-core]
     permissions:
       contents: write
@@ -292,7 +300,7 @@ jobs:
 
       - name: Create GitHub Release
         if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.2.1
         with:
           name: v${{ needs.validate-version.outputs.version }}
           body_path: release-notes.md

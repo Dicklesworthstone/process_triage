@@ -18,6 +18,11 @@ on:
       - '.github/workflows/musl-test.yml'
   workflow_dispatch:
 
+# Cancel in-progress runs when a new commit is pushed to the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -28,6 +33,7 @@ jobs:
   build-musl:
     name: Build musl (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -116,6 +122,7 @@ jobs:
   test-distros:
     name: Test on ${{ matrix.distro }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: build-musl
     strategy:
       fail-fast: false
@@ -133,8 +140,8 @@ jobs:
             name: Debian Slim
           - distro: debian:11-slim
             name: Debian 11 Slim
-          - distro: centos:7
-            name: CentOS 7
+          - distro: rockylinux:8
+            name: Rocky Linux 8
           - distro: fedora:38
             name: Fedora 38
 
@@ -180,6 +187,7 @@ jobs:
   integration-alpine:
     name: Integration Test (Alpine)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: build-musl
 
     steps:
@@ -232,6 +240,7 @@ jobs:
   summary:
     name: musl Build Summary
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: [build-musl, test-distros, integration-alpine]
     if: always()
 

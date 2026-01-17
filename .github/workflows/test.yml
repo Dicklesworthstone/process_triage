@@ -7,6 +7,11 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+# Cancel in-progress runs when a new commit is pushed to the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -18,6 +23,7 @@ jobs:
   unit-tests:
     name: Unit Tests (${{ matrix.os }} / ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +67,7 @@ jobs:
   integration-tests:
     name: Integration Tests (${{ matrix.os }} / ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +114,7 @@ jobs:
   e2e-tests:
     name: E2E Tests (${{ matrix.os }} / ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -153,6 +161,7 @@ jobs:
   bats-tests:
     name: BATS Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -211,6 +220,7 @@ jobs:
   schema-tests:
     name: Schema Validation (ubuntu / stable)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -247,6 +257,7 @@ jobs:
   exit-code-tests:
     name: Exit Code Tests (ubuntu / stable)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -283,6 +294,7 @@ jobs:
   timing-report:
     name: Generate Timing Report
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: [unit-tests, integration-tests, e2e-tests, bats-tests]
     if: always()
 

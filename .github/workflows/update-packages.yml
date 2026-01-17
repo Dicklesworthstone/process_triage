@@ -13,6 +13,11 @@ on:
         required: false
         default: 'false'
 
+# Package updates should not be cancelled mid-flight
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # Package repository names
   HOMEBREW_TAP_REPO: process-triage/homebrew-tap
@@ -25,6 +30,7 @@ jobs:
   generate-packages:
     name: Generate Package Files
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
       formula_sha: ${{ steps.upload.outputs.formula_sha }}
@@ -83,6 +89,7 @@ jobs:
     name: Update Homebrew Tap
     needs: generate-packages
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: github.event.inputs.dry_run != 'true'
 
     steps:
@@ -127,7 +134,7 @@ jobs:
 
       - name: Create PR to Homebrew tap
         if: env.branch != ''
-        uses: peter-evans/create-pull-request@v5
+        uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
@@ -152,6 +159,7 @@ jobs:
     name: Update Scoop Bucket
     needs: generate-packages
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: github.event.inputs.dry_run != 'true'
 
     steps:
@@ -196,7 +204,7 @@ jobs:
 
       - name: Create PR to Scoop bucket
         if: env.branch != ''
-        uses: peter-evans/create-pull-request@v5
+        uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
           path: bucket
@@ -221,6 +229,7 @@ jobs:
     name: Validate Package Files
     needs: generate-packages
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Download package files
