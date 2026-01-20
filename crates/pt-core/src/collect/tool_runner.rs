@@ -291,39 +291,45 @@ impl ToolRunner {
     /// Run a tool from a specification.
     #[instrument(skip(self), fields(cmd = %spec.command))]
     pub fn run(&self, spec: &ToolSpec) -> Result<ToolOutput, ToolError> {
-        // Check budget before running
-        if self.budget_exhausted() {
-            let used = self.used_ms.load(Ordering::SeqCst);
-            warn!(
-                used_ms = used,
-                budget_ms = self.config.budget_ms,
-                "budget exhausted"
-            );
-            return Err(ToolError::BudgetExhausted {
-                used_ms: used,
-                budget_ms: self.config.budget_ms,
-            });
-        }
-
         // Validate command
         self.validate_command(&spec.command)?;
 
         let requested_timeout = spec.timeout.unwrap_or(self.config.default_timeout);
-        
-        // Clamp timeout to remaining budget
-        let remaining_budget = self.remaining_budget_ms();
-        let timeout = if requested_timeout.as_millis() as u64 > remaining_budget {
-            debug!(
-                requested_ms = requested_timeout.as_millis(),
-                remaining_ms = remaining_budget,
-                "clamping timeout to remaining budget"
-            );
-            Duration::from_millis(remaining_budget)
-        } else {
-            requested_timeout
-        };
-
         let max_output = spec.max_output.unwrap_or(self.config.max_output_bytes);
+
+        // Reserve budget to prevent parallel overcommitment
+        let mut allocated_ms: u64 = 0;
+        let mut current = self.used_ms.load(Ordering::SeqCst);
+
+        loop {
+            if current >= self.config.budget_ms {
+                warn!(
+                    used_ms = current,
+                    budget_ms = self.config.budget_ms,
+                    "budget exhausted"
+                );
+                return Err(ToolError::BudgetExhausted {
+                    used_ms: current,
+                    budget_ms: self.config.budget_ms,
+                });
+            }
+
+            let remaining = self.config.budget_ms - current;
+            let requested_ms = requested_timeout.as_millis() as u64;
+            allocated_ms = std::cmp::min(requested_ms, remaining);
+
+            match self.used_ms.compare_exchange_weak(
+                current,
+                current + allocated_ms,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(updated) => current = updated,
+            }
+        }
+
+        let timeout = Duration::from_millis(allocated_ms);
 
         debug!(
             command = %spec.command,
@@ -336,18 +342,30 @@ impl ToolRunner {
         let start = Instant::now();
 
         // Build command
-        let mut command = self.build_command(&spec.command, &spec.args)?;
+        let mut command = match self.build_command(&spec.command, &spec.args) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                // Refund budget if build fails
+                self.used_ms.fetch_sub(allocated_ms, Ordering::SeqCst);
+                return Err(e);
+            }
+        };
 
         // Spawn process
-        let mut child = command
+        let mut child = match command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
+            .spawn() 
+        {
+            Ok(child) => child,
+            Err(e) => {
+                // Refund budget if spawn fails
+                self.used_ms.fetch_sub(allocated_ms, Ordering::SeqCst);
                 error!(command = %spec.command, error = %e, "failed to spawn");
-                ToolError::SpawnFailed(e.to_string())
-            })?;
+                return Err(ToolError::SpawnFailed(e.to_string()));
+            }
+        };
 
         // Execute with timeout and output capture
         let result = self.execute_with_timeout(&mut child, timeout, max_output);
@@ -355,8 +373,18 @@ impl ToolRunner {
         let duration = start.elapsed();
         let duration_ms = duration.as_millis() as u64;
 
-        // Update budget
-        self.used_ms.fetch_add(duration_ms, Ordering::SeqCst);
+        // Adjust budget: refund unused portion or consume excess (if any)
+        // We reserved allocated_ms. We used duration_ms.
+        // If duration_ms < allocated_ms, we refund (allocated_ms - duration_ms).
+        // If duration_ms > allocated_ms, we consume extra (duration_ms - allocated_ms).
+        // The net effect is we want used_ms to increase by duration_ms total.
+        // Currently it has increased by allocated_ms.
+        // So we add (duration_ms - allocated_ms).
+        if duration_ms < allocated_ms {
+            self.used_ms.fetch_sub(allocated_ms - duration_ms, Ordering::SeqCst);
+        } else {
+            self.used_ms.fetch_add(duration_ms - allocated_ms, Ordering::SeqCst);
+        }
 
         info!(
             command = %spec.command,
@@ -1102,9 +1130,10 @@ mod tests {
         assert_eq!(result.unwrap().stdout_str().trim(), "convenience");
 
         // Test run_tools_parallel convenience function
+        // Use short timeout to fit within default 5000ms budget (2 * 1000ms < 5000ms)
         let specs = vec![
-            ToolSpec::new("echo", vec!["a".to_string()]),
-            ToolSpec::new("echo", vec!["b".to_string()]),
+            ToolSpec::new("echo", vec!["a".to_string()]).with_timeout(Duration::from_millis(1000)),
+            ToolSpec::new("echo", vec!["b".to_string()]).with_timeout(Duration::from_millis(1000)),
         ];
         let results = run_tools_parallel(&specs, Some(2));
         assert_eq!(results.len(), 2);
