@@ -749,7 +749,7 @@ fn test_alpha_investing_wealth_depletion() {
 #[test]
 fn test_enforcer_with_real_policy_fixture() {
     let policy = load_policy_fixture();
-    let enforcer = PolicyEnforcer::new(&policy).expect("create enforcer");
+    let enforcer = PolicyEnforcer::new(&policy, None).expect("create enforcer");
 
     // Create a basic candidate
     let candidate = ProcessCandidate {
@@ -808,7 +808,7 @@ fn test_enforcer_protected_patterns() {
         },
     ];
 
-    let enforcer = PolicyEnforcer::new(&policy).expect("create enforcer");
+    let enforcer = PolicyEnforcer::new(&policy, None).expect("create enforcer");
 
     let test_cases = vec![
         ("/usr/sbin/sshd -D", true, "sshd literal match"),
@@ -881,7 +881,7 @@ fn test_enforcer_rate_limiting() {
     let mut policy = Policy::default();
     policy.guardrails.max_kills_per_run = 3;
 
-    let enforcer = PolicyEnforcer::new(&policy).expect("create enforcer");
+    let enforcer = PolicyEnforcer::new(&policy, None).expect("create enforcer");
 
     let candidate = ProcessCandidate {
         pid: 9999,
@@ -939,7 +939,7 @@ fn test_enforcer_robot_mode_gates() {
     policy.robot_mode.max_kills = 10;
     policy.robot_mode.require_known_signature = false;
 
-    let enforcer = PolicyEnforcer::new(&policy).expect("create enforcer");
+    let enforcer = PolicyEnforcer::new(&policy, None).expect("create enforcer");
 
     // Test posterior gate
     let low_posterior_candidate = ProcessCandidate {
@@ -1013,7 +1013,7 @@ fn test_enforcer_robot_mode_gates() {
 #[test]
 fn test_enforcer_data_loss_gates() {
     let policy = Policy::default();
-    let enforcer = PolicyEnforcer::new(&policy).expect("create enforcer");
+    let enforcer = PolicyEnforcer::new(&policy, None).expect("create enforcer");
 
     // Test open write FDs gate
     let candidate_with_fds = ProcessCandidate {
@@ -1083,7 +1083,7 @@ fn test_enforcer_min_age_gate() {
     let mut policy = Policy::default();
     policy.guardrails.min_process_age_seconds = 3600; // 1 hour
 
-    let enforcer = PolicyEnforcer::new(&policy).expect("create enforcer");
+    let enforcer = PolicyEnforcer::new(&policy, None).expect("create enforcer");
 
     // Young process
     let young_candidate = ProcessCandidate {
@@ -1146,7 +1146,7 @@ fn test_enforcer_warnings() {
         notes: Some("Kubernetes tool".to_string()),
     }];
 
-    let enforcer = PolicyEnforcer::new(&policy).expect("create enforcer");
+    let enforcer = PolicyEnforcer::new(&policy, None).expect("create enforcer");
 
     let candidate = ProcessCandidate {
         pid: 1234,

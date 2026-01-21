@@ -219,6 +219,7 @@ impl PersistentState {
 }
 
 /// Internal state of the rate limiter.
+#[derive(Debug)]
 struct RateLimiterState {
     /// Persistent state (timestamps).
     persistent: PersistentState,
@@ -229,6 +230,7 @@ struct RateLimiterState {
 /// Sliding window rate limiter for kill operations.
 ///
 /// Thread-safe implementation using RwLock for concurrent access.
+#[derive(Debug, Clone)]
 pub struct SlidingWindowRateLimiter {
     /// Configuration.
     config: RateLimitConfig,

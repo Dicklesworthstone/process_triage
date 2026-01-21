@@ -13,6 +13,7 @@ pub mod fdr_selection;
 pub mod load_aware;
 pub mod martingale_gates;
 pub mod myopic_policy;
+pub mod rate_limit;
 pub mod robot_constraints;
 pub mod submodular;
 pub mod sequential;

@@ -23,16 +23,16 @@
 //! ```
 
 use crate::collect::{CriticalFile, DetectionStrength, ProcessState};
-use crate::config::policy::{DataLossGates, Guardrails, PatternEntry, Policy, RobotMode};
+use crate::config::policy::{DataLossGates, PatternEntry, Policy, RobotMode};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::Action;
+use crate::decision::rate_limit::{RateLimitError, SlidingWindowRateLimiter};
 
 /// Errors during policy enforcement.
 #[derive(Debug, Error)]
@@ -321,68 +321,6 @@ impl CompiledPattern {
     }
 }
 
-/// Rate limit tracker for kills.
-#[derive(Debug)]
-struct RateLimiter {
-    /// Kills in current run.
-    kills_this_run: AtomicU32,
-    /// Maximum kills per run.
-    max_per_run: u32,
-    /// Kills with timestamps (for hourly/daily limits).
-    /// In a real implementation, this would need synchronization and persistent storage.
-    #[allow(dead_code)]
-    hourly_limit: Option<u32>,
-    #[allow(dead_code)]
-    daily_limit: Option<u32>,
-}
-
-impl RateLimiter {
-    fn new(guardrails: &Guardrails) -> Self {
-        Self {
-            kills_this_run: AtomicU32::new(0),
-            max_per_run: guardrails.max_kills_per_run,
-            hourly_limit: guardrails.max_kills_per_hour,
-            daily_limit: guardrails.max_kills_per_day,
-        }
-    }
-
-    fn check_and_increment(&self, override_limit: Option<u32>) -> Result<(), String> {
-        // Use compare_exchange loop to avoid race condition.
-        let limit = match override_limit {
-            Some(l) => std::cmp::min(l, self.max_per_run),
-            None => self.max_per_run,
-        };
-
-        let mut current = self.kills_this_run.load(Ordering::Acquire);
-        loop {
-            if current >= limit {
-                return Err(format!(
-                    "rate limit exceeded: {} kills already performed this run (max {})",
-                    current, limit
-                ));
-            }
-            // Attempt atomic increment only if value hasn't changed
-            match self.kills_this_run.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(actual) => current = actual, // Retry with the actual value seen
-            }
-        }
-    }
-
-    fn reset_run_counter(&self) {
-        self.kills_this_run.store(0, Ordering::SeqCst);
-    }
-
-    fn current_run_count(&self) -> u32 {
-        self.kills_this_run.load(Ordering::SeqCst)
-    }
-}
-
 /// Policy enforcement engine.
 ///
 /// Thread-safe, designed for long-running daemon mode with hot-reload support.
@@ -406,7 +344,7 @@ pub struct PolicyEnforcer {
     /// Whether confirmation is required.
     require_confirmation: bool,
     /// Rate limiter.
-    rate_limiter: Arc<RateLimiter>,
+    rate_limiter: Arc<SlidingWindowRateLimiter>,
     /// Robot mode settings.
     robot_mode: RobotMode,
     /// Data loss gates.
@@ -417,7 +355,7 @@ pub struct PolicyEnforcer {
 
 impl PolicyEnforcer {
     /// Create a new enforcer from a policy.
-    pub fn new(policy: &Policy) -> Result<Self, EnforcerError> {
+    pub fn new(policy: &Policy, state_path: Option<&std::path::Path>) -> Result<Self, EnforcerError> {
         // Compile protected patterns
         let protected_patterns = policy
             .guardrails
@@ -467,6 +405,10 @@ impl PolicyEnforcer {
         let never_kill_ppid: HashSet<i32> =
             policy.guardrails.never_kill_ppid.iter().map(|&p| p as i32).collect();
 
+        // Initialize rate limiter
+        let rate_limiter = SlidingWindowRateLimiter::from_guardrails(&policy.guardrails, state_path)
+            .map_err(|e: RateLimitError| EnforcerError::PolicyInvalid(e.to_string()))?;
+
         Ok(Self {
             protected_patterns,
             force_review_patterns,
@@ -477,7 +419,7 @@ impl PolicyEnforcer {
             never_kill_ppid,
             min_age_seconds: policy.guardrails.min_process_age_seconds,
             require_confirmation: policy.guardrails.require_confirmation.unwrap_or(true),
-            rate_limiter: Arc::new(RateLimiter::new(&policy.guardrails)),
+            rate_limiter: Arc::new(rate_limiter),
             robot_mode: policy.robot_mode.clone(),
             data_loss_gates: policy.data_loss_gates.clone(),
             loaded_at: Instant::now(),
@@ -638,13 +580,49 @@ impl PolicyEnforcer {
                 None
             };
 
-            if let Err(msg) = self.rate_limiter.check_and_increment(limit) {
+            // Check if rate limit would be exceeded
+            // Note: This only CHECKS, it does not increment. 
+            // The actual increment should happen when the action is executed.
+            // However, PolicyEnforcer is often used as a gate before execution.
+            // If we want to strictly enforce here, we might need a way to reserve or check-only.
+            // SlidingWindowRateLimiter::check(false) does a check without recording.
+            // SlidingWindowRateLimiter::check_with_override(false, limit) does a check.
+            
+            if let Err(e) = self.rate_limiter.check_with_override(false, limit) {
+                // If it returns error (e.g. lock poisoned), we fail safe/open? Fail safe (block).
                 return PolicyCheckResult::blocked(PolicyViolation {
                     kind: ViolationKind::RateLimitExceeded,
-                    message: msg,
-                    rule: "guardrails.max_kills_per_run".to_string(),
+                    message: format!("rate limit check failed: {}", e),
+                    rule: "guardrails.rate_limit_error".to_string(),
                     context: None,
                 });
+            }
+            
+            // We need to unwrap the result from check_with_override to see if allowed
+            match self.rate_limiter.check_with_override(false, limit) {
+                Ok(result) => {
+                    if !result.allowed {
+                        let reason = result.block_reason.map(|b| b.message).unwrap_or_else(|| "rate limit exceeded".to_string());
+                        return PolicyCheckResult::blocked(PolicyViolation {
+                            kind: ViolationKind::RateLimitExceeded,
+                            message: reason,
+                            rule: "guardrails.max_kills_per_run".to_string(),
+                            context: None,
+                        });
+                    }
+                    // If allowed but warning
+                    if let Some(w) = result.warning {
+                        warnings.push(w.message);
+                    }
+                }
+                Err(e) => {
+                     return PolicyCheckResult::blocked(PolicyViolation {
+                        kind: ViolationKind::RateLimitExceeded,
+                        message: format!("rate limit check failed: {}", e),
+                        rule: "guardrails.rate_limit_error".to_string(),
+                        context: None,
+                    });
+                }
             }
         }
 
@@ -1016,12 +994,12 @@ impl PolicyEnforcer {
 
     /// Reset rate limit counters (call at start of new run).
     pub fn reset_run_counters(&self) {
-        self.rate_limiter.reset_run_counter();
+        let _ = self.rate_limiter.reset_run_counter();
     }
 
     /// Get current kill count for this run.
     pub fn current_run_kill_count(&self) -> u32 {
-        self.rate_limiter.current_run_count()
+        self.rate_limiter.current_run_count().unwrap_or(0)
     }
 
     /// Check if the enforcer requires confirmation for actions.
@@ -1075,14 +1053,14 @@ mod tests {
     #[test]
     fn test_enforcer_creation() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy);
+        let enforcer = PolicyEnforcer::new(&policy, None);
         assert!(enforcer.is_ok());
     }
 
     #[test]
     fn test_allowed_action() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
         let candidate = test_candidate();
 
         let result = enforcer.check_action(&candidate, Action::Keep, false);
@@ -1094,7 +1072,7 @@ mod tests {
     fn test_protected_pid_blocked() {
         let mut policy = test_policy();
         policy.guardrails.never_kill_pid = vec![1];
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.pid = 1; // init process
@@ -1110,7 +1088,7 @@ mod tests {
     #[test]
     fn test_protected_ppid_blocked() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.ppid = 1; // child of init
@@ -1132,7 +1110,7 @@ mod tests {
             case_insensitive: true,
             notes: Some("SSH daemon".to_string()),
         });
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.cmdline = "/usr/bin/sshd -D".to_string();
@@ -1148,7 +1126,7 @@ mod tests {
     #[test]
     fn test_protected_user_blocked() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.user = Some("root".to_string());
@@ -1164,7 +1142,7 @@ mod tests {
     #[test]
     fn test_min_age_blocked() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.age_seconds = 60; // 1 minute, below default 1 hour
@@ -1181,13 +1159,12 @@ mod tests {
     fn test_rate_limit() {
         let mut policy = test_policy();
         policy.guardrails.max_kills_per_run = 5;
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
         let candidate = test_candidate();
 
-        // Default max_kills_per_run is 5
-        for i in 0..5 {
-            let result = enforcer.check_action(&candidate, Action::Kill, false);
-            assert!(result.allowed, "kill {} should be allowed", i + 1);
+        // Record kills manually to simulate state
+        for _ in 0..5 {
+            enforcer.rate_limiter.record_kill().unwrap();
         }
 
         // 6th kill should be blocked
@@ -1202,12 +1179,12 @@ mod tests {
     #[test]
     fn test_rate_limit_reset() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
         let candidate = test_candidate();
 
         // Use up rate limit
         for _ in 0..5 {
-            enforcer.check_action(&candidate, Action::Kill, false);
+            enforcer.rate_limiter.record_kill().unwrap();
         }
 
         // Reset
@@ -1221,7 +1198,7 @@ mod tests {
     #[test]
     fn test_robot_mode_disabled_blocks() {
         let policy = test_policy(); // robot_mode.enabled = false by default
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
         let candidate = test_candidate();
 
         let result = enforcer.check_action(&candidate, Action::Kill, true);
@@ -1238,19 +1215,14 @@ mod tests {
         policy.robot_mode.enabled = true;
         policy.robot_mode.min_posterior = 0.99;
 
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.posterior = Some(0.95); // Below threshold
 
         let result = enforcer.check_action(&candidate, Action::Kill, true);
         assert!(!result.allowed);
-        assert!(result
-            .violation
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("posterior"));
+        assert!(result.violation.as_ref().unwrap().message.contains("posterior"));
     }
 
     #[test]
@@ -1260,7 +1232,7 @@ mod tests {
         policy.robot_mode.min_posterior = 0.90;
         policy.robot_mode.max_blast_radius_mb = 50.0;
 
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.posterior = Some(0.99);
@@ -1274,7 +1246,7 @@ mod tests {
     #[test]
     fn test_data_loss_gate_open_fds() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.open_write_fds = Some(5); // Has open write FDs
@@ -1290,7 +1262,7 @@ mod tests {
     #[test]
     fn test_data_loss_gate_locked_files() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.has_locked_files = Some(true);
@@ -1303,7 +1275,7 @@ mod tests {
     #[test]
     fn test_data_loss_gate_active_tty() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.has_active_tty = Some(true);
@@ -1317,7 +1289,7 @@ mod tests {
     fn test_data_loss_gate_recent_io() {
         let mut policy = test_policy();
         policy.data_loss_gates.block_if_recent_io_seconds = Some(60);
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.seconds_since_io = Some(30); // Recent I/O (threshold is 60s)
@@ -1337,7 +1309,7 @@ mod tests {
             notes: Some("k8s tool".to_string()),
         }];
 
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.cmdline = "kubectl get pods".to_string();
@@ -1362,7 +1334,7 @@ mod tests {
             case_insensitive: true,
             notes: None,
         }];
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.cmdline = "myapp.test".to_string();
@@ -1381,7 +1353,7 @@ mod tests {
             case_insensitive: false,
             notes: None,
         }];
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.cmdline = "/usr/local/bin/important".to_string();
@@ -1399,7 +1371,7 @@ mod tests {
             case_insensitive: false,
             notes: None,
         }];
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         candidate.cmdline = "testmiddleend".to_string();
         let result = enforcer.check_action(&candidate, Action::Kill, false);
@@ -1416,7 +1388,7 @@ mod tests {
             case_insensitive: false,
             notes: None,
         }];
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.cmdline = "process5".to_string();
@@ -1438,7 +1410,7 @@ mod tests {
             case_insensitive: false,
             notes: None,
         }];
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.cmdline = "procX".to_string();
@@ -1459,7 +1431,7 @@ mod tests {
             case_insensitive: true,
             notes: None,
         }];
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.cmdline = "/usr/bin/critical-service --daemon".to_string();
@@ -1472,7 +1444,7 @@ mod tests {
     fn test_protected_category_blocked() {
         let mut policy = test_policy();
         policy.guardrails.protected_categories = vec!["daemon".to_string()];
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.category = Some("daemon".to_string());
@@ -1488,12 +1460,12 @@ mod tests {
     #[test]
     fn test_keep_action_not_rate_limited() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
         let candidate = test_candidate();
 
         // Exhaust rate limit with kills
         for _ in 0..5 {
-            enforcer.check_action(&candidate, Action::Kill, false);
+            enforcer.rate_limiter.record_kill().unwrap();
         }
 
         // Keep should still work
@@ -1504,7 +1476,7 @@ mod tests {
     #[test]
     fn test_policy_age_tracking() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let age = enforcer.policy_age();
         assert!(age.as_millis() < 1000); // Should be very recent
@@ -1519,14 +1491,15 @@ mod tests {
         policy.robot_mode.max_kills = 3;
         policy.guardrails.max_kills_per_run = 10; // Global is higher
 
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
         let mut candidate = test_candidate();
         candidate.posterior = Some(0.99); // Pass posterior gate
 
         // 3 kills allowed
-        for i in 0..3 {
-            let result = enforcer.check_action(&candidate, Action::Kill, true);
-            assert!(result.allowed, "kill {} should be allowed", i + 1);
+        for _ in 0..3 {
+            enforcer.rate_limiter.record_kill().unwrap();
+            // Note: We check first in test, but also need to increment to hit limit
+            // check_action checks against current count
         }
 
         // 4th kill blocked by robot limit
@@ -1541,7 +1514,7 @@ mod tests {
     #[test]
     fn test_zombie_process_kill_blocked() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.process_state = Some(ProcessState::Zombie);
@@ -1570,7 +1543,7 @@ mod tests {
     #[test]
     fn test_zombie_process_pause_blocked() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.process_state = Some(ProcessState::Zombie);
@@ -1587,7 +1560,7 @@ mod tests {
     #[test]
     fn test_zombie_process_keep_allowed() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.process_state = Some(ProcessState::Zombie);
@@ -1600,7 +1573,7 @@ mod tests {
     #[test]
     fn test_disksleep_process_kill_blocked() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.process_state = Some(ProcessState::DiskSleep);
@@ -1630,7 +1603,7 @@ mod tests {
     #[test]
     fn test_disksleep_process_pause_allowed() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.process_state = Some(ProcessState::DiskSleep);
@@ -1644,7 +1617,7 @@ mod tests {
     #[test]
     fn test_disksleep_process_without_wchan() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.process_state = Some(ProcessState::DiskSleep);
@@ -1664,7 +1637,7 @@ mod tests {
     #[test]
     fn test_normal_running_process_allowed() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.process_state = Some(ProcessState::Running);
@@ -1677,7 +1650,7 @@ mod tests {
     #[test]
     fn test_sleeping_process_allowed() {
         let policy = test_policy();
-        let enforcer = PolicyEnforcer::new(&policy).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
 
         let mut candidate = test_candidate();
         candidate.process_state = Some(ProcessState::Sleeping);
