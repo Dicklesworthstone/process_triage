@@ -24,3 +24,12 @@
 
 # Rust build artifacts
 target/
+
+# NTM agent coordination
+.ntm/
+
+# Compiled binaries
+a.out
+
+# NTM agent coordination
+.ntm/
