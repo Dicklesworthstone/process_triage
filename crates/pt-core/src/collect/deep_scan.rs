@@ -70,6 +70,9 @@ pub enum DeepScanError {
 
     #[error("Permission denied accessing /proc/{0}")]
     PermissionDenied(u32),
+
+    #[error("Process {0} vanished during scan")]
+    ProcessVanished(u32),
 }
 
 /// Extended process record from deep scan.
@@ -300,6 +303,10 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
                         network_snapshot_ref,
                     ) {
                         Ok(record) => local_processes.push(record),
+                        Err(DeepScanError::ProcessVanished(_)) => {
+                            // Always skip vanished processes without warning
+                            local_skipped += 1;
+                        }
                         Err(e) => {
                             if options.skip_inaccessible {
                                 local_skipped += 1;
@@ -435,10 +442,7 @@ fn scan_process(
         Ok(c) => c,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {
-                return Err(DeepScanError::ParseError {
-                    pid,
-                    message: "Process does not exist".to_string(),
-                });
+                return Err(DeepScanError::ProcessVanished(pid));
             } else if e.kind() == std::io::ErrorKind::PermissionDenied {
                 return Err(DeepScanError::PermissionDenied(pid));
             } else {
