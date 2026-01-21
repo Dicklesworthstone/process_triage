@@ -20,6 +20,7 @@ pub enum TableName {
     ProcInference,
     Outcomes,
     Audit,
+    SignatureMatches,
 }
 
 impl TableName {
@@ -32,18 +33,20 @@ impl TableName {
             TableName::ProcInference => "proc_inference",
             TableName::Outcomes => "outcomes",
             TableName::Audit => "audit",
+            TableName::SignatureMatches => "signature_matches",
         }
     }
 
     /// Get the default row group size for this table.
     pub fn row_group_size(&self) -> usize {
         match self {
-            TableName::Runs => 64 * 1024,           // 64KB
-            TableName::ProcSamples => 1024 * 1024,  // 1MB
-            TableName::ProcFeatures => 512 * 1024,  // 512KB
-            TableName::ProcInference => 512 * 1024, // 512KB
-            TableName::Outcomes => 256 * 1024,      // 256KB
-            TableName::Audit => 256 * 1024,         // 256KB
+            TableName::Runs => 64 * 1024,              // 64KB
+            TableName::ProcSamples => 1024 * 1024,     // 1MB
+            TableName::ProcFeatures => 512 * 1024,     // 512KB
+            TableName::ProcInference => 512 * 1024,    // 512KB
+            TableName::Outcomes => 256 * 1024,         // 256KB
+            TableName::Audit => 256 * 1024,            // 256KB
+            TableName::SignatureMatches => 256 * 1024, // 256KB
         }
     }
 
@@ -56,6 +59,7 @@ impl TableName {
             TableName::ProcInference => 90,
             TableName::Outcomes => 365,
             TableName::Audit => 365,
+            TableName::SignatureMatches => 365, // Long retention for calibration analysis
         }
     }
 }
@@ -74,6 +78,7 @@ pub struct TelemetrySchema {
     pub proc_inference: Arc<Schema>,
     pub outcomes: Arc<Schema>,
     pub audit: Arc<Schema>,
+    pub signature_matches: Arc<Schema>,
 }
 
 impl TelemetrySchema {
@@ -86,6 +91,7 @@ impl TelemetrySchema {
             proc_inference: Arc::new(proc_inference_schema()),
             outcomes: Arc::new(outcomes_schema()),
             audit: Arc::new(audit_schema()),
+            signature_matches: Arc::new(signature_matches_schema()),
         }
     }
 
@@ -98,6 +104,7 @@ impl TelemetrySchema {
             TableName::ProcInference => self.proc_inference.clone(),
             TableName::Outcomes => self.outcomes.clone(),
             TableName::Audit => self.audit.clone(),
+            TableName::SignatureMatches => self.signature_matches.clone(),
         }
     }
 }
@@ -325,6 +332,11 @@ pub fn proc_inference_schema() -> Schema {
         Field::new("passed_safety_gates", DataType::Boolean, false),
         string_field("blocked_by_gate", true),
         string_field("safety_gate_details", true),
+        // Signature match info (for calibration tracking)
+        string_field("signature_id", true),
+        string_field("signature_category", true),
+        Field::new("signature_match_confidence", DataType::Float32, true),
+        Field::new("signature_fast_path_used", DataType::Boolean, true),
     ])
 }
 
@@ -378,6 +390,54 @@ pub fn audit_schema() -> Schema {
         string_field("target_start_id", true),
         string_field("message", false),
         string_field("details_json", true),
+        string_field("host_id", false),
+    ])
+}
+
+/// Schema for `signature_matches` table: Signature match calibration data.
+///
+/// This table tracks signature match outcomes for calibration analysis.
+/// It enables computing reliability curves, confusion matrices by signature
+/// category, and threshold tuning recommendations.
+pub fn signature_matches_schema() -> Schema {
+    Schema::new(vec![
+        // Identifiers
+        string_field("session_id", false),
+        timestamp_field("match_ts", false),
+        Field::new("pid", DataType::Int32, false),
+        string_field("start_id", false),
+        // Signature info
+        string_field("signature_id", false),
+        string_field("signature_category", false),
+        string_field("signature_name", true),
+        // Match details
+        Field::new("match_confidence", DataType::Float32, false),
+        Field::new("pattern_match_score", DataType::Float32, true),
+        Field::new("behavioral_match_score", DataType::Float32, true),
+        // Predicted outcome
+        Field::new("predicted_prob_abandoned", DataType::Float32, false),
+        Field::new("predicted_prob_legitimate", DataType::Float32, false),
+        string_field("prediction_class", false), // abandoned, legitimate, uncertain
+        Field::new("fast_path_used", DataType::Boolean, false),
+        // Thresholds used
+        Field::new("high_conf_threshold", DataType::Float32, true),
+        Field::new("min_match_threshold", DataType::Float32, true),
+        // Process context (redacted)
+        string_field("cmd", false),
+        string_field("cmdline_hash", true),
+        string_field("proc_type", false),
+        Field::new("age_s", DataType::Int64, false),
+        Field::new("cpu_pct", DataType::Float32, true),
+        Field::new("mem_mb", DataType::Float32, true),
+        // Actual outcome (filled in later)
+        Field::new("actual_abandoned", DataType::Boolean, true),
+        string_field("human_decision", true), // kill, spare, none
+        timestamp_field("outcome_ts", true),
+        string_field("outcome_source", true), // user_confirm, timeout, process_exit, etc.
+        // Calibration flags
+        Field::new("outcome_available", DataType::Boolean, false),
+        Field::new("included_in_calibration", DataType::Boolean, false),
+        // Host info
         string_field("host_id", false),
     ])
 }
@@ -440,6 +500,7 @@ mod tests {
         assert_eq!(TableName::Runs.as_str(), "runs");
         assert_eq!(TableName::ProcSamples.as_str(), "proc_samples");
         assert_eq!(TableName::Audit.as_str(), "audit");
+        assert_eq!(TableName::SignatureMatches.as_str(), "signature_matches");
     }
 
     #[test]
@@ -454,5 +515,26 @@ mod tests {
         assert_eq!(TableName::Runs.retention_days(), 90);
         assert_eq!(TableName::ProcSamples.retention_days(), 30);
         assert_eq!(TableName::Outcomes.retention_days(), 365);
+        assert_eq!(TableName::SignatureMatches.retention_days(), 365);
+    }
+
+    #[test]
+    fn test_signature_matches_schema() {
+        let schema = signature_matches_schema();
+        assert!(schema.field_with_name("signature_id").is_ok());
+        assert!(schema.field_with_name("match_confidence").is_ok());
+        assert!(schema.field_with_name("predicted_prob_abandoned").is_ok());
+        assert!(schema.field_with_name("actual_abandoned").is_ok());
+        assert!(schema.field_with_name("human_decision").is_ok());
+        assert!(schema.field_with_name("outcome_available").is_ok());
+    }
+
+    #[test]
+    fn test_proc_inference_signature_fields() {
+        let schema = proc_inference_schema();
+        assert!(schema.field_with_name("signature_id").is_ok());
+        assert!(schema.field_with_name("signature_category").is_ok());
+        assert!(schema.field_with_name("signature_match_confidence").is_ok());
+        assert!(schema.field_with_name("signature_fast_path_used").is_ok());
     }
 }

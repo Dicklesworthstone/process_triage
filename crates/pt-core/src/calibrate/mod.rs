@@ -29,11 +29,13 @@ pub mod metrics;
 pub mod curve;
 pub mod bias;
 pub mod report;
+pub mod queries;
 
 pub use metrics::*;
 pub use curve::*;
 pub use bias::*;
 pub use report::*;
+pub use queries::*;
 
 use serde::{Deserialize, Serialize};
 
