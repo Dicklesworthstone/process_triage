@@ -20,6 +20,7 @@ use pt_core::events::{
     FanoutEmitter, JsonlWriter, Phase, ProgressEmitter, ProgressEvent, SessionEmitter,
 };
 use pt_core::exit_codes::ExitCode;
+use pt_core::inference::signature_fast_path::{try_signature_fast_path, FastPathConfig};
 use pt_core::output::{CompactConfig, FieldSelector, TokenEfficientOutput};
 use pt_core::session::{
     ListSessionsOptions, SessionContext, SessionHandle, SessionManifest, SessionMode, SessionState,
@@ -34,6 +35,9 @@ use pt_core::verify::{parse_agent_plan, verify_plan, VerifyError};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use pt_core::signature_cli::load_user_signatures;
+use pt_core::supervision::pattern_persistence::DisabledPatterns;
+use pt_core::supervision::signature::{ProcessMatchContext, SignatureDatabase};
 
 /// Process Triage Core - Intelligent process classification and cleanup
 #[derive(Parser)]
