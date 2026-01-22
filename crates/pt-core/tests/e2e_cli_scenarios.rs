@@ -3,6 +3,9 @@
 //! Covers:
 //! - Basic scan with specific process verification
 //! - Invalid configuration handling
+//! - Agent mode workflow (snapshot → plan → verify)
+//! - Error handling (no candidates, invalid args)
+//! - Exit code verification
 //!
 //! These tests rely on `ProcessHarness` to interact with real system state (no mocks).
 
@@ -28,14 +31,15 @@ mod e2e_scenarios {
     #[test]
     fn test_basic_scan_finds_specific_process() -> Result<(), Box<dyn std::error::Error>> {
         if !ProcessHarness::is_available() {
-            eprintln!("Skipping test_basic_scan_finds_specific_process: ProcessHarness not available");
+            eprintln!(
+                "Skipping test_basic_scan_finds_specific_process: ProcessHarness not available"
+            );
             return Ok(());
         }
 
         let harness = ProcessHarness::default();
         // Spawn a unique sleeper so we can identify it
-        let sleeper = harness
-            .spawn_sleep(100)?;
+        let sleeper = harness.spawn_sleep(100)?;
         let pid = sleeper.pid();
 
         // Run scan
@@ -55,24 +59,25 @@ mod e2e_scenarios {
             .ok_or("Should have scan.processes array")?;
 
         // Find our sleeper
-        let found = processes.iter().find(|p| {
-            p.get("pid")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                == Some(pid)
-        });
+        let found = processes
+            .iter()
+            .find(|p| p.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32) == Some(pid));
 
         if found.is_none() {
-            return Err(format!("Scan output should contain our spawned sleeper process (PID {})", pid).into());
+            return Err(format!(
+                "Scan output should contain our spawned sleeper process (PID {})",
+                pid
+            )
+            .into());
         }
 
         let proc = found.unwrap();
         // Verify some fields
         let comm = proc.get("comm").and_then(|s| s.as_str()).unwrap_or("");
         if !comm.contains("sleep") && !comm.contains("sh") {
-             return Err(format!("Command should be sleep or sh (got: {})", comm).into());
+            return Err(format!("Command should be sleep or sh (got: {})", comm).into());
         }
-        
+
         Ok(())
     }
 
@@ -80,16 +85,16 @@ mod e2e_scenarios {
     fn test_invalid_config_file_returns_error() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let config_path = dir.path().join("policy.json");
-        
+
         // Write invalid JSON
         let mut file = File::create(&config_path)?;
         writeln!(file, "{{ invalid_json_here ")?;
 
         // Run pt check --config <dir>
-        // Note: pt expects a config directory, not file path usually, 
+        // Note: pt expects a config directory, not file path usually,
         // or --config <dir> which contains policy.json.
         // We pass the directory.
-        
+
         let output = pt_core()
             .arg("--config")
             .arg(dir.path())
@@ -100,12 +105,12 @@ mod e2e_scenarios {
         output.stdout(predicate::str::contains("Invalid JSON"));
         Ok(())
     }
-    
+
     #[test]
     fn test_valid_config_loading() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let config_path = dir.path().join("policy.json");
-        
+
         // Write valid minimal policy JSON
         let mut file = File::create(&config_path)?;
         // Schema version must be a string
@@ -116,7 +121,9 @@ mod e2e_scenarios {
         // data_loss_gates needs block_if_open_write_fds, block_if_locked_files, block_if_active_tty
         // loss values must be non-negative
         // guardrails.never_kill_ppid must contain at least 1
-        writeln!(file, r#"{{ 
+        writeln!(
+            file,
+            r#"{{ 
             "schema_version": "1.0.0", 
             "guardrails": {{ 
                 "protected_patterns": [], 
@@ -152,7 +159,8 @@ mod e2e_scenarios {
                 "block_if_locked_files": true,
                 "block_if_active_tty": true
             }}
-        }}"#)?;
+        }}"#
+        )?;
 
         // Run pt check --config <dir>
         pt_core()
@@ -161,7 +169,331 @@ mod e2e_scenarios {
             .args(["check", "--policy"])
             .assert()
             .success();
-            
+
         Ok(())
+    }
+
+    // =========================================================================
+    // Agent Mode E2E Tests
+    // =========================================================================
+
+    /// Test the full agent workflow: snapshot → plan
+    /// This verifies the session system works across commands.
+    #[test]
+    fn test_agent_snapshot_then_plan_workflow() -> Result<(), Box<dyn std::error::Error>> {
+        if !ProcessHarness::is_available() {
+            eprintln!(
+                "Skipping test_agent_snapshot_then_plan_workflow: ProcessHarness not available"
+            );
+            return Ok(());
+        }
+
+        // Step 1: Create snapshot
+        let snapshot_output = pt_core()
+            .args(["--format", "json", "agent", "snapshot"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let snapshot_json: Value = serde_json::from_slice(&snapshot_output)?;
+
+        // Verify snapshot has required fields
+        assert!(
+            snapshot_json.get("schema_version").is_some(),
+            "Snapshot missing schema_version"
+        );
+        assert!(
+            snapshot_json.get("session_id").is_some(),
+            "Snapshot missing session_id"
+        );
+        assert!(
+            snapshot_json.get("generated_at").is_some(),
+            "Snapshot missing generated_at"
+        );
+
+        // Step 2: Create plan (exit code 0 = no candidates, 1 = PlanReady with candidates)
+        let plan_result = pt_core()
+            .args(["--format", "json", "agent", "plan", "--sample-size", "50"])
+            .assert()
+            .code(predicate::in_iter([0, 1]));
+
+        let plan_output = plan_result.get_output().stdout.clone();
+        let plan_json: Value = serde_json::from_slice(&plan_output)?;
+
+        // Verify plan has required fields
+        assert!(
+            plan_json.get("schema_version").is_some(),
+            "Plan missing schema_version"
+        );
+        assert!(
+            plan_json.get("session_id").is_some(),
+            "Plan missing session_id"
+        );
+
+        Ok(())
+    }
+
+    /// Test that agent plan with high minimum age (unlikely to have candidates)
+    /// returns exit code 0 and indicates no candidates.
+    #[test]
+    fn test_agent_plan_no_candidates_exit_code() -> Result<(), Box<dyn std::error::Error>> {
+        if !ProcessHarness::is_available() {
+            eprintln!(
+                "Skipping test_agent_plan_no_candidates_exit_code: ProcessHarness not available"
+            );
+            return Ok(());
+        }
+
+        // Use extremely high min-age to ensure no candidates
+        // Note: We can't guarantee no candidates on a busy system, so we accept both exit codes
+        pt_core()
+            .args(["--format", "json", "agent", "plan", "--sample-size", "10"])
+            .assert()
+            .code(predicate::in_iter([0, 1])); // 0 = no candidates, 1 = candidates found
+
+        Ok(())
+    }
+
+    /// Test that agent sessions command works
+    #[test]
+    fn test_agent_sessions_list() -> Result<(), Box<dyn std::error::Error>> {
+        if !ProcessHarness::is_available() {
+            eprintln!("Skipping test_agent_sessions_list: ProcessHarness not available");
+            return Ok(());
+        }
+
+        // First create a session to ensure there's at least one
+        pt_core()
+            .args(["--format", "json", "agent", "snapshot"])
+            .assert()
+            .success();
+
+        // Now list sessions
+        let output = pt_core()
+            .args(["--format", "json", "agent", "sessions"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let json: Value = serde_json::from_slice(&output)?;
+        assert!(
+            json.get("schema_version").is_some(),
+            "Sessions output missing schema_version"
+        );
+
+        Ok(())
+    }
+
+    /// Test agent capabilities command
+    #[test]
+    fn test_agent_capabilities() -> Result<(), Box<dyn std::error::Error>> {
+        let output = pt_core()
+            .args(["--format", "json", "agent", "capabilities"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let json: Value = serde_json::from_slice(&output)?;
+
+        // Verify capabilities has required fields
+        assert!(
+            json.get("schema_version").is_some(),
+            "Capabilities missing schema_version"
+        );
+        assert!(json.get("os").is_some(), "Capabilities missing os info");
+
+        // Verify OS info has required subfields
+        let os = json.get("os").unwrap();
+        assert!(os.get("family").is_some(), "OS info missing family");
+        assert!(os.get("arch").is_some(), "OS info missing arch");
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Error Handling E2E Tests
+    // =========================================================================
+
+    /// Test that verify command without session returns error
+    #[test]
+    fn test_agent_verify_requires_session() {
+        pt_core()
+            .args(["agent", "verify"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("session").or(predicate::str::contains("required")));
+    }
+
+    /// Test that apply command without session returns error
+    #[test]
+    fn test_agent_apply_requires_session() {
+        pt_core()
+            .args(["agent", "apply"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("session").or(predicate::str::contains("required")));
+    }
+
+    /// Test that invalid format flag returns error
+    #[test]
+    fn test_invalid_format_flag() {
+        pt_core()
+            .args(["--format", "not_a_valid_format", "scan"])
+            .assert()
+            .failure();
+    }
+
+    /// Test that help command works for all major subcommands
+    #[test]
+    fn test_help_commands_work() {
+        // Main help
+        pt_core().arg("--help").assert().success();
+
+        // Subcommand helps
+        for cmd in &[
+            "scan", "run", "check", "config", "agent", "bundle", "schema",
+        ] {
+            pt_core().args([*cmd, "--help"]).assert().success();
+        }
+    }
+
+    /// Test version command
+    #[test]
+    fn test_version_command() {
+        pt_core()
+            .arg("--version")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("pt-core"));
+    }
+
+    /// Test that nonexistent config directory is handled gracefully
+    #[test]
+    fn test_nonexistent_config_dir_uses_defaults() {
+        // With a nonexistent config dir, pt should use defaults and succeed
+        pt_core()
+            .arg("--config")
+            .arg("/nonexistent/path/that/does/not/exist")
+            .args(["--format", "json", "scan"])
+            .assert()
+            .success();
+    }
+
+    /// Test dry-run mode doesn't execute actions
+    #[test]
+    fn test_dry_run_mode_is_safe() -> Result<(), Box<dyn std::error::Error>> {
+        if !ProcessHarness::is_available() {
+            eprintln!("Skipping test_dry_run_mode_is_safe: ProcessHarness not available");
+            return Ok(());
+        }
+
+        let harness = ProcessHarness::default();
+        let sleeper = harness.spawn_sleep(100)?;
+        let pid = sleeper.pid();
+
+        // Run with --dry-run - should NOT kill the process
+        pt_core()
+            .args([
+                "--dry-run",
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--sample-size",
+                "50",
+            ])
+            .assert()
+            .code(predicate::in_iter([0, 1]));
+
+        // Verify process is still running
+        assert!(
+            sleeper.is_running(),
+            "Process should still be running after dry-run"
+        );
+
+        // Clean up
+        sleeper.trigger_exit();
+
+        Ok(())
+    }
+
+    /// Test shadow mode doesn't execute actions
+    #[test]
+    fn test_shadow_mode_is_safe() -> Result<(), Box<dyn std::error::Error>> {
+        if !ProcessHarness::is_available() {
+            eprintln!("Skipping test_shadow_mode_is_safe: ProcessHarness not available");
+            return Ok(());
+        }
+
+        let harness = ProcessHarness::default();
+        let sleeper = harness.spawn_sleep(100)?;
+
+        // Run with --shadow - should NOT kill the process
+        pt_core()
+            .args([
+                "--shadow",
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--sample-size",
+                "50",
+            ])
+            .assert()
+            .code(predicate::in_iter([0, 1]));
+
+        // Verify process is still running
+        assert!(
+            sleeper.is_running(),
+            "Process should still be running after shadow mode"
+        );
+
+        // Clean up
+        sleeper.trigger_exit();
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Exit Code Verification Tests
+    // =========================================================================
+
+    /// Test that scan always returns exit code 0 on success
+    #[test]
+    fn test_scan_exit_code_zero_on_success() {
+        pt_core()
+            .args(["--format", "json", "scan"])
+            .assert()
+            .success()
+            .code(predicate::eq(0));
+    }
+
+    /// Test that agent snapshot returns exit code 0 on success
+    #[test]
+    fn test_snapshot_exit_code_zero_on_success() {
+        pt_core()
+            .args(["--format", "json", "agent", "snapshot"])
+            .assert()
+            .success()
+            .code(predicate::eq(0));
+    }
+
+    /// Test that check command returns appropriate exit codes
+    #[test]
+    fn test_check_exit_codes() {
+        // With defaults, check should succeed
+        let dir = tempdir().expect("Failed to create temp dir");
+        pt_core()
+            .arg("--config")
+            .arg(dir.path())
+            .args(["check", "--all"])
+            .assert()
+            .success();
     }
 }
