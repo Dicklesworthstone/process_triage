@@ -1,13 +1,17 @@
 # pt
 
 <div align="center">
+  <img src="pt_illustration.webp" alt="pt - Bayesian-inspired zombie/abandoned process detection and cleanup">
+</div>
 
-**Process Triage** — Bayesian-inspired zombie/abandoned process detection and cleanup
+<div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/Dicklesworthstone/process_triage/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/process_triage/actions/workflows/ci.yml)
 
 </div>
+
+**Process Triage** — Bayesian-inspired zombie/abandoned process detection and cleanup
 
 `pt` identifies and safely manages abandoned processes on your system using a four-class Bayesian inference model. It gathers runtime evidence, computes posterior probabilities, and presents recommendations with full transparency—you always see *why* a process is flagged before any action is taken.
 
