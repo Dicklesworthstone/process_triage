@@ -33,3 +33,5 @@ a.out
 
 # NTM agent coordination
 .ntm/
+._*
+*.png

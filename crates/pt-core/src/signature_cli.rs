@@ -11,8 +11,13 @@ use crate::supervision::{
     SCHEMA_VERSION as SIG_SCHEMA_VERSION,
 };
 use clap::{Args, Subcommand};
+use pt_bundle::BundleReader;
 use pt_common::{OutputFormat, SessionId, SCHEMA_VERSION};
 use std::collections::HashMap;
+use std::path::Path;
+
+/// Bundle path for exported user signatures.
+pub const BUNDLE_SIGNATURES_PATH: &str = "signatures/user_signatures.json";
 
 /// Arguments for the signature command
 #[derive(Args, Debug)]

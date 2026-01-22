@@ -335,12 +335,14 @@ mod tests {
         let runner = ReniceActionRunner::new(ReniceConfig {
             nice_value: 100,
             clamp_to_range: true,
+            capture_reversal: false,
         });
         assert_eq!(runner.effective_nice_value(), MAX_NICE_VALUE);
 
         let runner = ReniceActionRunner::new(ReniceConfig {
             nice_value: -100,
             clamp_to_range: true,
+            capture_reversal: false,
         });
         assert_eq!(runner.effective_nice_value(), -20);
     }
@@ -350,8 +352,20 @@ mod tests {
         let runner = ReniceActionRunner::new(ReniceConfig {
             nice_value: 100,
             clamp_to_range: false,
+            capture_reversal: false,
         });
         assert_eq!(runner.effective_nice_value(), 100);
+    }
+
+    #[test]
+    fn renice_config_with_capture_reversal() {
+        let config = ReniceConfig {
+            nice_value: 5,
+            clamp_to_range: true,
+            capture_reversal: true,
+        };
+        assert_eq!(config.nice_value, 5);
+        assert!(config.capture_reversal);
     }
 
     #[cfg(unix)]

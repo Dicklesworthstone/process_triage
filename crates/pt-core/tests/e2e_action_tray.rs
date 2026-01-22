@@ -27,7 +27,7 @@ use pt_core::action::prechecks::{
     LivePreCheckConfig, LivePreCheckProvider, NoopPreCheckProvider, PreCheckProvider,
     PreCheckResult,
 };
-use pt_core::action::{SignalActionRunner, SignalConfig};
+use pt_core::action::{ReniceActionRunner, ReniceConfig, SignalActionRunner, SignalConfig};
 use pt_core::collect::ProcessState;
 use pt_core::config::Policy;
 use pt_core::decision::{Action, DecisionOutcome, DecisionRationale, ExpectedLoss};
@@ -237,6 +237,33 @@ fn make_resume_action(pid: u32, pgid: Option<u32>, action_id: &str) -> PlanActio
         },
         order: 1,
         stage: 1,
+        timeouts: ActionTimeouts::default(),
+        pre_checks: vec![],
+        rationale: empty_rationale(),
+        on_success: vec![],
+        on_failure: vec![],
+        blocked: false,
+        routing: ActionRouting::Direct,
+        confidence: ActionConfidence::Normal,
+        original_zombie_target: None,
+        d_state_diagnostics: None,
+    }
+}
+
+fn make_renice_action(pid: u32, action_id: &str) -> PlanAction {
+    PlanAction {
+        action_id: action_id.to_string(),
+        action: Action::Renice,
+        target: ProcessIdentity {
+            pid: ProcessId(pid),
+            start_id: StartId("mock".to_string()),
+            uid: 1000,
+            pgid: None,
+            sid: None,
+            quality: IdentityQuality::Full,
+        },
+        order: 0,
+        stage: 0,
         timeouts: ActionTimeouts::default(),
         pre_checks: vec![],
         rationale: empty_rationale(),
@@ -916,32 +943,157 @@ mod safety_gates_robot_mode {
 
 mod renice_action {
     use super::*;
+    use pt_core::action::executor::ActionRunner;
 
-    /// Placeholder test for renice action
-    /// TODO: Implement when process_triage-sj6.4 is complete
+    #[cfg(target_os = "linux")]
+    fn read_nice_value(pid: u32) -> Option<i32> {
+        let stat_path = format!("/proc/{pid}/stat");
+        let content = std::fs::read_to_string(stat_path).ok()?;
+        let comm_end = content.rfind(')')?;
+        let after_comm = content.get(comm_end + 2..)?;
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        fields.get(16)?.parse::<i32>().ok()
+    }
+
     #[test]
-    #[ignore = "Pending implementation of renice action (sj6.4)"]
+    #[cfg(unix)]
     fn test_renice_priority_adjustment() {
+        if !ProcessHarness::is_available() {
+            eprintln!("Skipping test: ProcessHarness not available");
+            return;
+        }
+
         let mut ctx = TestContext::new();
         ctx.log(
             "test_start",
-            json!({ "test": "renice_priority_adjustment", "status": "pending" }),
+            json!({ "test": "renice_priority_adjustment" }),
         );
 
-        // TODO: Implementation
-        // 1. Spawn a CPU burner process
-        // 2. Apply renice to adjust priority
-        // 3. Verify nice value changes
-        // 4. Verify change is logged in structured output
+        let harness = ProcessHarness::default();
+        let proc = harness.spawn_sleep(60).expect("spawn sleep");
+        let pid = proc.pid();
 
-        ctx.log("test_complete", json!({ "result": "skipped" }));
+        ctx.log("process_spawned", json!({ "pid": pid, "type": "sleep" }));
+
+        #[cfg(target_os = "linux")]
+        let before = read_nice_value(pid);
+        #[cfg(target_os = "linux")]
+        ctx.log("nice_before", json!({ "pid": pid, "nice": before }));
+
+        let runner = ReniceActionRunner::with_defaults();
+        let action = make_renice_action(pid, "e2e-renice-1");
+
+        ctx.log_action_attempt(&action, "execute_renice");
+
+        let execute_result = runner.execute(&action);
+        match execute_result {
+            Ok(()) => {
+                let verify_result = runner.verify(&action);
+                if let Err(ref e) = verify_result {
+                    ctx.on_failure("renice_priority_adjustment", &format!("Verify failed: {:?}", e));
+                }
+                assert!(verify_result.is_ok(), "Renice verification should succeed");
+
+                #[cfg(target_os = "linux")]
+                if let Some(after) = read_nice_value(pid) {
+                    ctx.log(
+                        "nice_after",
+                        json!({ "pid": pid, "nice": after, "expected": pt_core::action::DEFAULT_NICE_VALUE }),
+                    );
+                    assert_eq!(
+                        after,
+                        pt_core::action::DEFAULT_NICE_VALUE,
+                        "expected nice value to change"
+                    );
+                } else {
+                    ctx.log("nice_after_unavailable", json!({ "pid": pid }));
+                }
+            }
+            Err(pt_core::action::ActionError::PermissionDenied) => {
+                ctx.log(
+                    "renice_permission_denied",
+                    json!({ "pid": pid, "note": "insufficient permissions; skipping assertions" }),
+                );
+                return;
+            }
+            Err(e) => {
+                ctx.on_failure("renice_priority_adjustment", &format!("Execute failed: {:?}", e));
+                panic!("renice execute failed: {:?}", e);
+            }
+        }
+
+        ctx.log("test_complete", json!({ "result": "passed" }));
     }
 
-    /// Placeholder for renice verification
     #[test]
-    #[ignore = "Pending implementation of renice action (sj6.4)"]
+    #[cfg(unix)]
     fn test_renice_verification() {
-        // TODO: Verify nice value is actually changed
+        if !ProcessHarness::is_available() {
+            eprintln!("Skipping test: ProcessHarness not available");
+            return;
+        }
+
+        let mut ctx = TestContext::new();
+        ctx.log("test_start", json!({ "test": "renice_verification" }));
+
+        let harness = ProcessHarness::default();
+        let proc = harness.spawn_sleep(60).expect("spawn sleep");
+        let pid = proc.pid();
+
+        let runner = ReniceActionRunner::with_defaults();
+        let action = make_renice_action(pid, "e2e-renice-verify");
+
+        let execute_result = runner.execute(&action);
+        if let Err(pt_core::action::ActionError::PermissionDenied) = execute_result {
+            ctx.log(
+                "renice_permission_denied",
+                json!({ "pid": pid, "note": "insufficient permissions; skipping verification" }),
+            );
+            return;
+        }
+        assert!(execute_result.is_ok(), "Renice execute should succeed");
+
+        let verify_ok = runner.verify(&action);
+        if let Err(ref e) = verify_ok {
+            ctx.on_failure("renice_verification", &format!("Verify failed: {:?}", e));
+        }
+        assert!(verify_ok.is_ok(), "Renice verify should succeed");
+
+        // Intentionally verify with a mismatched expectation to ensure failure path works.
+        #[cfg(target_os = "linux")]
+        {
+            if read_nice_value(pid).is_none() {
+                ctx.log("nice_unavailable", json!({ "pid": pid, "note": "skipping mismatch check" }));
+                return;
+            }
+            let mismatch_runner = ReniceActionRunner::new(ReniceConfig {
+                nice_value: pt_core::action::DEFAULT_NICE_VALUE + 5,
+                clamp_to_range: true,
+                capture_reversal: false,
+            });
+            let mismatch = mismatch_runner.verify(&action);
+            match mismatch {
+                Err(pt_core::action::ActionError::Failed(_)) => {
+                    ctx.log("mismatch_verify_failed", json!({ "pid": pid }));
+                }
+                Err(pt_core::action::ActionError::PermissionDenied) => {
+                    ctx.log(
+                        "renice_permission_denied",
+                        json!({ "pid": pid, "note": "verification denied; skipping mismatch check" }),
+                    );
+                }
+                Ok(()) => {
+                    ctx.on_failure("renice_verification", "mismatch verification unexpectedly succeeded");
+                    panic!("mismatch verification unexpectedly succeeded");
+                }
+                Err(e) => {
+                    ctx.on_failure("renice_verification", &format!("unexpected verify error: {:?}", e));
+                    panic!("unexpected verify error: {:?}", e);
+                }
+            }
+        }
+
+        ctx.log("test_complete", json!({ "result": "passed" }));
     }
 }
 

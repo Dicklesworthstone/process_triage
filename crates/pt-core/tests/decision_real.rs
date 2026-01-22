@@ -61,7 +61,7 @@ fn test_policy_load_and_enforce_real() {
     let policy_json = fs::read_to_string(&policy_path).expect("read policy");
     let policy: Policy = serde_json::from_str(&policy_json).expect("parse policy");
 
-    let enforcer = PolicyEnforcer::new(&policy).expect("create enforcer");
+    let enforcer = PolicyEnforcer::new(&policy, None).expect("create enforcer");
 
     // Test enforcement
     let candidate = ProcessCandidate {
