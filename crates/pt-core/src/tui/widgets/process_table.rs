@@ -523,6 +523,11 @@ impl ProcessTableState {
         self.selected.len()
     }
 
+    /// Get total count of processes (after filtering).
+    pub fn total_count(&self) -> usize {
+        self.rows.len()
+    }
+
     /// Set sort column and order.
     pub fn set_sort(&mut self, column: SortColumn, order: SortOrder) {
         self.sort_column = column;

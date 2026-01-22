@@ -36,7 +36,10 @@ pub use executor::{
 #[cfg(target_os = "linux")]
 pub use freeze::{is_freeze_available, FreezeActionRunner, FreezeConfig};
 pub use recovery::{plan_recovery, ActionFailure, FailureKind, RecoveryDecision, RetryPolicy};
-pub use renice::{ReniceActionRunner, ReniceConfig, DEFAULT_NICE_VALUE, MAX_NICE_VALUE};
+pub use renice::{
+    ReniceActionRunner, ReniceConfig, ReniceResult, ReniceReversalMetadata, DEFAULT_NICE_VALUE,
+    MAX_NICE_VALUE,
+};
 #[cfg(target_os = "linux")]
 pub use signal::LiveIdentityProvider;
 #[cfg(unix)]
