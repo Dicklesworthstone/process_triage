@@ -6671,6 +6671,28 @@ fn generate_prose_summary(prose_style: &str) -> String {
 }
 
 fn run_agent_sessions(global: &GlobalOpts, args: &AgentSessionsArgs) -> ExitCode {
+    // Validate flag combinations: --session mode is incompatible with list/cleanup options
+    if args.session.is_some() {
+        if args.cleanup {
+            eprintln!(
+                "agent sessions: --session cannot be combined with --cleanup"
+            );
+            return ExitCode::ArgsError;
+        }
+        if args.limit != 10 {
+            eprintln!(
+                "agent sessions: --session cannot be combined with --limit (limit only applies to list mode)"
+            );
+            return ExitCode::ArgsError;
+        }
+        if args.state.is_some() {
+            eprintln!(
+                "agent sessions: --session cannot be combined with --state (state filter only applies to list mode)"
+            );
+            return ExitCode::ArgsError;
+        }
+    }
+
     let store = match SessionStore::from_env() {
         Ok(store) => store,
         Err(e) => {

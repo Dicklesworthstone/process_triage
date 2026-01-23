@@ -135,12 +135,8 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     let mut warnings = Vec::new();
 
     // Parse output
-    let mut lines = reader.lines();
-
-    // Skip header line
-    if let Some(Ok(_header)) = lines.next() {
-        // Header skipped
-    }
+    let lines = reader.lines();
+    let mut header_checked = false;
 
     let mut processed = 0usize;
     const PROGRESS_STEP: usize = 200;
@@ -149,6 +145,13 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         let line = line_result?;
         if line.trim().is_empty() {
             continue;
+        }
+
+        if !header_checked {
+            header_checked = true;
+            if is_header_line(&line) {
+                continue;
+            }
         }
 
         match parse_ps_line(&line, &platform, &boot_id) {
@@ -171,7 +174,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
                 processes.push(record);
             }
             Err(e) => {
-                warnings.push(format!("Line {}: {}", line_num + 2, e));
+                warnings.push(format!("Line {}: {}", line_num + 1, e));
             }
         }
 
@@ -223,6 +226,14 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
             warnings,
         },
     })
+}
+
+fn is_header_line(line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some("PID"), Some("PPID")) | (Some("pid"), Some("ppid"))
+    )
 }
 
 /// Detect the current platform.
@@ -376,6 +387,7 @@ fn parse_ps_line(
         start_time_unix,
         elapsed,
         source: "quick_scan".to_string(),
+        container_info: None, // Container detection done as post-processing step
     })
 }
 
@@ -612,6 +624,14 @@ mod tests {
             parse_etime_format("2-12:30:15"),
             Some(2 * 86400 + 12 * 3600 + 30 * 60 + 15)
         );
+    }
+
+    #[test]
+    fn test_header_detection() {
+        assert!(is_header_line("PID PPID UID USER"));
+        assert!(is_header_line("pid ppid uid user"));
+        assert!(!is_header_line("123 1 0 root"));
+        assert!(!is_header_line("999 42 1000 alice"));
     }
 
     #[test]
@@ -878,6 +898,7 @@ mod tests {
             start_time_unix: 0,
             elapsed: Duration::from_secs(0),
             source: "test".to_string(),
+            container_info: None,
         }
     }
 

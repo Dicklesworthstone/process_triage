@@ -8,6 +8,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use super::container::ContainerInfo;
+
 /// Process state from ps output.
 ///
 /// Maps to standard Unix process states:
@@ -159,6 +161,11 @@ pub struct ProcessRecord {
     // === Provenance ===
     /// Source of this record (quick_scan, deep_scan, etc.).
     pub source: String,
+
+    // === Container ===
+    /// Container information (if running in a container).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_info: Option<ContainerInfo>,
 }
 
 impl ProcessRecord {

@@ -1368,3 +1368,90 @@ extract_json() {
     rm -f "$output_file"
     BATS_TEST_COMPLETED=pass
 }
+
+#==============================================================================
+# THRESHOLD NAMING TESTS (bd-2yz0)
+#==============================================================================
+# Verify --min-posterior is primary name, --threshold is alias
+
+@test "Contract: agent plan --min-posterior is primary flag" {
+    test_info "Testing --min-posterior is the primary flag name"
+
+    run "$PT_CORE" agent plan --help
+
+    assert_equals "0" "$status" "help should exit 0"
+    assert_contains "$output" "min-posterior" "help should show --min-posterior"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent plan --min-posterior flag works" {
+    test_info "Testing --min-posterior 0.95 is accepted"
+
+    run "$PT_CORE" agent plan --min-posterior 0.95 --format json --standalone
+
+    # Exit 0 (success) or 1 (no candidates) is acceptable
+    [[ $status -le 1 ]]
+    test_info "exit code: $status"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent plan --threshold alias works" {
+    test_info "Testing --threshold alias for backward compatibility"
+
+    run "$PT_CORE" agent plan --threshold 0.85 --format json --standalone
+
+    # Exit 0 (success) or 1 (no candidates) is acceptable
+    [[ $status -le 1 ]]
+    test_info "exit code: $status (threshold alias)"
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent plan --min-posterior and --threshold produce same structure" {
+    require_jq
+    test_info "Testing --min-posterior and --threshold produce equivalent output structure"
+
+    # Run with --min-posterior
+    run "$PT_CORE" agent plan --min-posterior 0.8 --format json --standalone
+    local output1="$output"
+    local status1=$status
+
+    # Run with --threshold
+    run "$PT_CORE" agent plan --threshold 0.8 --format json --standalone
+    local output2="$output"
+    local status2=$status
+
+    # Both should have same exit code behavior
+    [[ $status1 -le 1 && $status2 -le 1 ]]
+    test_info "min-posterior exit: $status1, threshold exit: $status2"
+
+    # Extract and compare keys (structure) - ignore volatile fields
+    local keys1
+    local keys2
+    keys1=$(echo "$output1" | jq -r 'keys | sort | .[]' 2>/dev/null | tr '\n' ' ' || echo "")
+    keys2=$(echo "$output2" | jq -r 'keys | sort | .[]' 2>/dev/null | tr '\n' ' ' || echo "")
+
+    # Structure should match (same fields)
+    if [[ -n "$keys1" && -n "$keys2" ]]; then
+        test_info "min-posterior keys: $keys1"
+        test_info "threshold keys: $keys2"
+        assert_equals "$keys1" "$keys2" "output structure should match"
+    fi
+
+    BATS_TEST_COMPLETED=pass
+}
+
+@test "Contract: agent plan default threshold is 0.7" {
+    require_jq
+    test_info "Testing default threshold value"
+
+    # The help text should show default_value = 0.7
+    run "$PT_CORE" agent plan --help
+
+    assert_equals "0" "$status" "help should exit 0"
+    assert_contains "$output" "0.7" "default threshold should be 0.7"
+
+    BATS_TEST_COMPLETED=pass
+}

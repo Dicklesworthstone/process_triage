@@ -481,6 +481,7 @@ impl MockProcessBuilder {
             start_time_unix: self.start_time_unix,
             elapsed: self.elapsed,
             source: self.source,
+            container_info: None,
         }
     }
 }

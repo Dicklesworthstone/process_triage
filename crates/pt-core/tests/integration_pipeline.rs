@@ -34,6 +34,7 @@ fn make_record(
         start_time_unix: 0,
         elapsed: Duration::from_secs(3600),
         source: "test".to_string(),
+        container_info: None,
     }
 }
 

@@ -465,6 +465,7 @@ mod tests {
             start_time_unix: start,
             elapsed: Duration::from_secs(60),
             source: "test".to_string(),
+            container_info: None,
         }
     }
 

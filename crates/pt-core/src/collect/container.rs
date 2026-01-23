@@ -11,12 +11,13 @@
 //! - Environment variables (for K8s)
 //! - Container-specific files
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 
 /// Container information for a process.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ContainerInfo {
     /// Whether process is running in a container.
     pub in_container: bool,
@@ -41,7 +42,7 @@ pub struct ContainerInfo {
 }
 
 /// Container runtime type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerRuntime {
     /// Docker container.
@@ -62,7 +63,7 @@ pub enum ContainerRuntime {
 }
 
 /// Kubernetes-specific container information.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct KubernetesInfo {
     /// Pod name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,7 +87,7 @@ pub struct KubernetesInfo {
 }
 
 /// Provenance tracking for container detection.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ContainerProvenance {
     /// Source of container detection.
     pub source: ContainerDetectionSource,
@@ -101,7 +102,7 @@ pub struct ContainerProvenance {
 }
 
 /// Source of container detection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerDetectionSource {
     /// Detected from cgroup path.
