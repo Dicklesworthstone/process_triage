@@ -10,7 +10,7 @@ process_triage (pt) is **exceptionally well-designed** for TOON integration. The
 
 1. One new enum variant
 2. One Display match arm
-3. CLI wrapper module (same pattern as slb)
+3. A small toon_rust helper (crate-based, no subprocess)
 
 **Estimated token savings**: 20-30% (based on slb measurements)
 
@@ -70,61 +70,29 @@ impl std::fmt::Display for OutputFormat {
 }
 ```
 
-### 2. CLI Wrapper Module
+### 2. TOON Helper Module (crate-based)
 
-Create `crates/pt-common/src/toon.rs` following slb pattern:
+Create `crates/pt-common/src/toon.rs` using the toon_rust crate (no subprocess):
 
 ```rust
-//! TOON encoding support via CLI wrapper.
-
-use std::io::Write;
-use std::process::{Command, Stdio};
-
-const TOON_BINARY: &str = "tru";
-const FALLBACK_PATHS: &[&str] = &[
-    "/data/projects/toon_rust/target/release/tr",
-    "/usr/local/bin/tru",
-];
-
-pub fn toon_available() -> bool {
-    find_binary().is_some()
-}
+//! TOON encoding support via toon_rust crate.
 
 pub fn encode_toon<T: serde::Serialize>(data: &T) -> Result<String, ToonError> {
-    let json = serde_json::to_string(data)?;
-    let binary = find_binary().ok_or(ToonError::BinaryNotFound)?;
-
-    let mut child = Command::new(&binary)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    child.stdin.as_mut().unwrap().write_all(json.as_bytes())?;
-    let output = child.wait_with_output()?;
-
-    if output.status.success() {
-        Ok(String::from_utf8(output.stdout)?)
-    } else {
-        Err(ToonError::EncodeFailed(String::from_utf8_lossy(&output.stderr).into()))
-    }
+    let value = serde_json::to_value(data)?;
+    Ok(toon_rust::encode(
+        value,
+        Some(toon_rust::EncodeOptions {
+            indent: None,
+            delimiter: None,
+            key_folding: Some(toon_rust::KeyFoldingMode::Safe),
+            flatten_depth: None,
+            replacer: None,
+        }),
+    ))
 }
 
-fn find_binary() -> Option<String> {
-    // Check TRU_PATH env, then PATH, then fallbacks
-    if let Ok(path) = std::env::var("TRU_PATH") {
-        if std::path::Path::new(&path).exists() {
-            return Some(path);
-        }
-    }
-
-    if let Ok(path) = which::which(TOON_BINARY) {
-        return Some(path.display().to_string());
-    }
-
-    FALLBACK_PATHS.iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|s| s.to_string())
+pub fn decode_toon(input: &str) -> Result<serde_json::Value, ToonError> {
+    toon_rust::try_decode(input, None).map_err(ToonError::from)
 }
 ```
 
@@ -136,7 +104,7 @@ TOON should **not** be the default. Recommendation:
 |---------|---------------|-----------|
 | Interactive (`pt`) | `md` or `summary` | Human readability |
 | Agent mode (`--robot`) | `json` | Universal compatibility |
-| Agent with TOON available | `toon` | Token savings |
+| Agent with TOON enabled | `toon` | Token savings |
 
 Suggested: Add `--toon` / `-T` shorthand flag (matching slb pattern).
 
@@ -172,10 +140,10 @@ If `docs/AGENT_INTEGRATION_GUIDE.md` exists, add:
 ```markdown
 ## Output Formats for Agents
 
-Use `--format toon` when TOON binary is available:
+Use `--format toon` when TOON support is enabled:
 - 22-30% token savings vs JSON
 - Full round-trip fidelity
-- Falls back gracefully to JSON if unavailable
+- No subprocess required
 ```
 
 ---
@@ -228,13 +196,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toon_availability_check() {
-        // Just verify function runs without panic
-        let _ = toon_available();
-    }
-
-    #[test]
-    #[ignore = "requires tru binary"]
     fn encode_simple_object() {
         let data = serde_json::json!({"key": "value"});
         let result = encode_toon(&data).unwrap();
@@ -243,7 +204,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires tru binary"]
     fn encode_nested_object() {
         let data = serde_json::json!({
             "candidates": [{"pid": 123, "name": "test"}]
@@ -251,6 +211,14 @@ mod tests {
         let result = encode_toon(&data).unwrap();
         assert!(result.contains("candidates"));
         assert!(result.contains("123"));
+    }
+
+    #[test]
+    fn roundtrip_simple_object() {
+        let data = serde_json::json!({"key": "value"});
+        let toon = encode_toon(&data).unwrap();
+        let decoded = decode_toon(&toon).unwrap();
+        assert_eq!(decoded, data);
     }
 }
 ```
@@ -285,23 +253,18 @@ Create `scripts/test_toon_e2e.sh`:
 #!/bin/bash
 set -euo pipefail
 
-# Phase 1: Check binary
-command -v tru || echo "WARN: tru not in PATH"
-
-# Phase 2: Format acceptance
+# Phase 1: Format acceptance
 pt-core --format toon --help
 
-# Phase 3: Actual output (if tru available)
-if command -v tru >/dev/null 2>&1; then
-    json_out=$(pt-core scan --format json 2>/dev/null || echo '{}')
-    toon_out=$(pt-core scan --format toon 2>/dev/null || echo '')
+# Phase 2: Actual output
+json_out=$(pt-core scan --format json 2>/dev/null || echo '{}')
+toon_out=$(pt-core scan --format toon 2>/dev/null || echo '')
 
-    json_len=${#json_out}
-    toon_len=${#toon_out}
+json_len=${#json_out}
+toon_len=${#toon_out}
 
-    if [[ $toon_len -lt $json_len ]]; then
-        echo "PASS: TOON output smaller ($toon_len < $json_len)"
-    fi
+if [[ $toon_len -lt $json_len ]]; then
+    echo "PASS: TOON output smaller ($toon_len < $json_len)"
 fi
 
 echo "TOON E2E tests complete"
@@ -313,16 +276,14 @@ echo "TOON E2E tests complete"
 
 1. **No pt-core modifications needed for basic integration** - The output formatting is already abstracted through the `OutputFormat` enum.
 
-2. **Graceful degradation** - If TOON binary unavailable, fall back to JSON with warning.
+2. **Graceful degradation** - If TOON feature is disabled at build time, fall back to JSON with warning.
 
-3. **Dependency choice**: Use `which` crate for PATH lookup (already common in Rust CLI tools).
-
-4. **Error handling**: TOON encoding failures should never crash pt - always fall back.
+3. **Error handling**: TOON encoding failures should never crash pt - always fall back.
 
 ---
 
 ## Conclusion
 
-process_triage is production-ready for TOON integration. The clean enum-based output system means adding TOON is a ~50-line change plus tests. The CLI wrapper approach (proven in slb) provides a reliable integration path.
+process_triage is production-ready for TOON integration. The clean enum-based output system means adding TOON is a ~50-line change plus tests. The crate-based approach keeps everything in-process with zero subprocess overhead.
 
 **Recommendation**: Proceed with implementation in a separate bead.

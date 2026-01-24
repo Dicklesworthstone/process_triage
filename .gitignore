@@ -30,7 +30,7 @@ target/
 
 # Compiled binaries
 a.out
-pt-core
+/pt-core
 
 # NTM agent coordination
 .ntm/

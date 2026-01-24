@@ -126,8 +126,10 @@ pub struct CommandNormalizer {
     path_stripper: Regex,
     /// Patterns for PID/number replacement.
     number_replacer: Regex,
-    /// Patterns for port detection.
-    port_pattern: Regex,
+    /// Patterns for port flags (e.g. --port 8080, -p8080).
+    port_flag_pattern: Regex,
+    /// Patterns for port suffixes (e.g. :8080).
+    port_suffix_pattern: Regex,
     /// Patterns for temp path detection.
     temp_path_pattern: Regex,
     /// Patterns for home directory detection.
@@ -153,8 +155,10 @@ impl CommandNormalizer {
             path_stripper: Regex::new(r"(^|\s)/(?:[^/\s]+/)+").unwrap(),
             // Match standalone numbers (PIDs, process IDs)
             number_replacer: Regex::new(r"\b\d{4,}\b").unwrap(),
-            // Match port numbers in common formats
-            port_pattern: Regex::new(r"(?:--?(?:port|p)\s*[=:]?\s*)\d+|:\d{2,5}\b").unwrap(),
+            // Match port flags in common formats (capture flag prefix)
+            port_flag_pattern: Regex::new(r"(--?(?:port|p)\s*[=:]?\s*)\d+").unwrap(),
+            // Match port suffixes like :8080
+            port_suffix_pattern: Regex::new(r":\d{2,5}\b").unwrap(),
             // Match temp paths
             temp_path_pattern: Regex::new(r"/(?:tmp|var/tmp|var/folders)/[^\s]+").unwrap(),
             // Match home directory paths
@@ -194,16 +198,17 @@ impl CommandNormalizer {
     /// Normalize a command argument at the exact level.
     fn normalize_arg_exact(&self, arg: &str) -> String {
         let mut result = arg.to_string();
+        let uuid_placeholder = "__UUID__";
 
         // Replace UUIDs with pattern
         result = self
             .uuid_pattern
-            .replace_all(&result, "[0-9a-f-]+")
+            .replace_all(&result, uuid_placeholder)
             .to_string();
 
         // Escape regex metacharacters but keep the replacements
         result = regex::escape(&result);
-        result = result.replace(r"\[0-9a-f-\]\+", "[0-9a-f-]+");
+        result = result.replace(uuid_placeholder, "[0-9a-f-]+");
 
         result
     }
@@ -230,10 +235,14 @@ impl CommandNormalizer {
             .replace_all(&result, ".*")
             .to_string();
 
-        // Replace port numbers
+        // Replace port numbers, preserving original form when possible
         result = self
-            .port_pattern
-            .replace_all(&result, r"--port=\d+")
+            .port_flag_pattern
+            .replace_all(&result, r"${1}\d+")
+            .to_string();
+        result = self
+            .port_suffix_pattern
+            .replace_all(&result, r":\d+")
             .to_string();
 
         // Replace long numbers (PIDs, etc.)

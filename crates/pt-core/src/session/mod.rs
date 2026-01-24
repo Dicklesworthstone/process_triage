@@ -508,6 +508,26 @@ fn count_candidates(session_dir: &Path) -> Option<u32> {
         .get("candidates")
         .and_then(|c| c.as_array())
         .map(|arr| arr.len() as u32)
+        .or_else(|| {
+            value
+                .get("summary")
+                .and_then(|s| s.get("candidates_returned"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+        })
+        .or_else(|| {
+            value
+                .get("gates_summary")
+                .and_then(|g| g.get("total_candidates"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+        })
+        .or_else(|| {
+            value
+                .get("actions")
+                .and_then(|a| a.as_array())
+                .map(|arr| arr.len() as u32)
+        })
 }
 
 /// Count actions from outcomes.jsonl if it exists.

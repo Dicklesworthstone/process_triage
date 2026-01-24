@@ -121,6 +121,10 @@ impl<'a> StatefulWidget for ConfigEditor<'a> {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        if inner.width < 2 || inner.height == 0 {
+            return;
+        }
+
         if state.fields.is_empty() {
             let msg = "No configuration fields";
             let style = if let Some(theme) = self.theme {
@@ -178,9 +182,10 @@ impl<'a> StatefulWidget for ConfigEditor<'a> {
             }
 
             // Separator
-            buf[(value_start.saturating_sub(1), y)]
-                .set_char(':')
-                .set_style(name_style);
+            let sep_x = value_start.saturating_sub(1);
+            if sep_x < inner.right() {
+                buf[(sep_x, y)].set_char(':').set_style(name_style);
+            }
 
             // Field value
             let value_style = if field.error.is_some() {
