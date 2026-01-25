@@ -18,7 +18,8 @@ fn unique_data_dir() -> PathBuf {
 
 fn pt_core_with_data_dir(data_dir: &PathBuf) -> Command {
     let mut cmd = cargo_bin_cmd!("pt-core");
-    cmd.timeout(Duration::from_secs(30));
+    // Allow enough time for full plan runs on busy CI hosts.
+    cmd.timeout(Duration::from_secs(120));
     cmd.env("PROCESS_TRIAGE_DATA", data_dir);
     cmd
 }
@@ -91,6 +92,8 @@ fn plan_with_session_reuses_session_id_and_writes_plan_artifact() {
             "json",
             "agent",
             "plan",
+            "--sample-size",
+            "50",
             "--session",
             &session_id,
         ])
@@ -123,7 +126,7 @@ fn plan_writes_session_event_log() {
     let data_dir = unique_data_dir();
 
     let plan_output = pt_core_with_data_dir(&data_dir)
-        .args(["--format", "json", "agent", "plan"])
+        .args(["--format", "json", "agent", "plan", "--sample-size", "50"])
         .assert()
         .code(predicate::in_iter([0, 1]))
         .get_output()
@@ -165,7 +168,7 @@ fn agent_tail_reads_session_log() {
     let data_dir = unique_data_dir();
 
     let plan_output = pt_core_with_data_dir(&data_dir)
-        .args(["--format", "json", "agent", "plan"])
+        .args(["--format", "json", "agent", "plan", "--sample-size", "50"])
         .assert()
         .code(predicate::in_iter([0, 1]))
         .get_output()

@@ -1192,12 +1192,15 @@ impl SignatureDatabase {
             // Determine match level
             let level = if details.pattern_types_matched == 0 {
                 continue; // No match, skip this signature
+            } else if exact_command_match
+                && process_name_matched
+                && details.pattern_types_matched == 1
+            {
+                MatchLevel::ExactCommand
+            } else if process_name_matched && args_matched && details.pattern_types_matched == 2 {
+                MatchLevel::CommandPlusArgs
             } else if details.pattern_types_matched >= 2 {
                 MatchLevel::MultiPattern
-            } else if exact_command_match && process_name_matched {
-                MatchLevel::ExactCommand
-            } else if process_name_matched && args_matched {
-                MatchLevel::CommandPlusArgs
             } else if process_name_matched {
                 MatchLevel::CommandOnly
             } else {
@@ -1602,7 +1605,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("cargo-test", SupervisorCategory::Other)
                 .with_confidence(0.85)
                 .with_notes("Cargo test runner for Rust")
-                .with_arg_patterns(vec![r"cargo.*test", r"cargo-nextest"])
+                .with_arg_patterns(vec![r"(cargo.*test|cargo-nextest)"])
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1644,7 +1647,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("junit", SupervisorCategory::Other)
                 .with_confidence(0.75)
                 .with_notes("JUnit Java test runner")
-                .with_arg_patterns(vec![r"junit", r"org\.junit"])
+                .with_arg_patterns(vec![r"(junit|org\.junit)"])
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1685,7 +1688,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("next-dev", SupervisorCategory::Other)
                 .with_confidence(0.85)
                 .with_notes("Next.js development server")
-                .with_arg_patterns(vec![r"next\s+dev", r"next-server"])
+                .with_arg_patterns(vec![r"(next\s+dev|next-server)"])
                 .with_env_patterns(HashMap::from([("NEXT_RUNTIME".into(), ".*".into())]))
                 .with_priors(SignaturePriors::likely_useful())
                 .with_expectations(ProcessExpectations::dev_server())
@@ -1707,7 +1710,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("webpack-dev-server", SupervisorCategory::Other)
                 .with_confidence(0.85)
                 .with_notes("Webpack development server")
-                .with_arg_patterns(vec![r"webpack-dev-server", r"webpack\s+serve"])
+                .with_arg_patterns(vec![r"(webpack-dev-server|webpack\s+serve)"])
                 .with_priors(SignaturePriors::likely_useful())
                 .with_expectations(ProcessExpectations::dev_server())
                 .as_builtin(),
@@ -1738,7 +1741,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("django", SupervisorCategory::Other)
                 .with_confidence(0.80)
                 .with_notes("Django Python web server")
-                .with_arg_patterns(vec![r"manage\.py\s+runserver", r"django"])
+                .with_arg_patterns(vec![r"(manage\.py\s+runserver|django)"])
                 .with_env_patterns(HashMap::from([(
                     "DJANGO_SETTINGS_MODULE".into(),
                     ".*".into(),
@@ -1752,7 +1755,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("rails", SupervisorCategory::Other)
                 .with_confidence(0.80)
                 .with_notes("Ruby on Rails server")
-                .with_arg_patterns(vec![r"rails\s+server", r"rails\s+s\b"])
+                .with_arg_patterns(vec![r"(rails\s+server|rails\s+s\b)"])
                 .with_env_patterns(HashMap::from([("RAILS_ENV".into(), ".*".into())]))
                 .with_priors(SignaturePriors::likely_useful())
                 .with_expectations(ProcessExpectations::dev_server())
@@ -1808,7 +1811,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("cargo-build", SupervisorCategory::Other)
                 .with_confidence(0.85)
                 .with_notes("Cargo build for Rust")
-                .with_arg_patterns(vec![r"cargo\s+build", r"cargo\s+check"])
+                .with_arg_patterns(vec![r"(cargo\s+build|cargo\s+check)"])
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1818,7 +1821,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("go-build", SupervisorCategory::Other)
                 .with_confidence(0.85)
                 .with_notes("Go build")
-                .with_arg_patterns(vec![r"go\s+build", r"go\s+install"])
+                .with_arg_patterns(vec![r"(go\s+build|go\s+install)"])
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),

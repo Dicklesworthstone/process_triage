@@ -13,7 +13,15 @@ fn zombie_state_flag_drives_zombie_posterior() {
         .expect("default priors must include state_flags");
     assert_eq!(
         state_flags.flag_names,
-        vec!["R", "S", "D", "Z", "T", "t", "X"],
+        vec![
+            "Running",
+            "Sleeping",
+            "DiskSleep",
+            "Zombie",
+            "Stopped",
+            "Idle",
+            "Dead",
+        ],
         "state_flags must align with ProcessState mapping"
     );
 

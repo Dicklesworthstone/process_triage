@@ -535,7 +535,7 @@ pub fn encode_toon_value(value: &Value) -> String {
         replacer: None,
     };
 
-    encode(value.clone().into(), Some(options))
+    encode(value.clone(), Some(options))
 }
 
 #[cfg(test)]
@@ -626,7 +626,7 @@ mod tests {
 
         let encoded = encode_toon_value(&input);
         let decoded = try_decode(&encoded, None).expect("decode TOON");
-        assert_eq!(decoded, input);
+        assert_eq!(decoded, input.into());
     }
 
     #[test]
