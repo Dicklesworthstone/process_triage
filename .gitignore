@@ -36,3 +36,7 @@ a.out
 .ntm/
 ._*
 *.png
+
+# Dependency upgrade progress (in-progress work)
+UPGRADE_LOG.md
+claude-upgrade-progress.json
