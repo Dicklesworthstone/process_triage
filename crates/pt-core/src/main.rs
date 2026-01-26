@@ -3538,6 +3538,169 @@ fn format_duration_human(seconds: u64) -> String {
     }
 }
 
+/// Generate a single-line rationale for a candidate process.
+/// Used by --brief mode to provide context without verbosity.
+fn generate_single_line_rationale(candidate: &serde_json::Value) -> String {
+    let classification = candidate
+        .get("classification")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let age_human = candidate
+        .get("age_human")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let score = candidate.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
+    let memory_mb = candidate
+        .get("memory_mb")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cpu_pct = candidate
+        .get("cpu_percent")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    // Extract top evidence factor if available
+    let top_factor = candidate
+        .get("evidence")
+        .and_then(|e| e.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|f| f.get("factor"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("inference");
+
+    // Build concise rationale
+    if cpu_pct < 0.1 && memory_mb > 100 {
+        format!(
+            "{} for {} ({}% conf), idle+{}MB, {}",
+            classification, age_human, score, memory_mb, top_factor
+        )
+    } else if cpu_pct < 0.1 {
+        format!(
+            "{} for {} ({}% conf), idle, {}",
+            classification, age_human, score, top_factor
+        )
+    } else {
+        format!(
+            "{} for {} ({}% conf), {:.1}% CPU, {}",
+            classification, age_human, score, cpu_pct, top_factor
+        )
+    }
+}
+
+/// Generate a human-readable narrative summary of the plan.
+/// Used by --narrative mode for human consumption.
+fn generate_narrative_summary(
+    session_id: &pt_common::SessionId,
+    candidates: &[serde_json::Value],
+    kill_candidates: &[u32],
+    review_candidates: &[u32],
+    total_scanned: usize,
+    expected_memory_freed_gb: f64,
+) -> String {
+    let mut output = String::new();
+
+    // Header
+    output.push_str(&format!(
+        "Process Triage Report (Session: {})\n",
+        session_id
+    ));
+    output.push_str(&"=".repeat(50));
+    output.push('\n');
+    output.push('\n');
+
+    // Executive summary
+    if candidates.is_empty() {
+        output.push_str("No problematic processes detected. Your system looks healthy.\n");
+        return output;
+    }
+
+    output.push_str(&format!(
+        "Scanned {} processes and identified {} candidates for review.\n\n",
+        total_scanned,
+        candidates.len()
+    ));
+
+    // Recommendations summary
+    if !kill_candidates.is_empty() {
+        output.push_str(&format!(
+            "KILL RECOMMENDED: {} process{} ({:.2} GB memory recoverable)\n",
+            kill_candidates.len(),
+            if kill_candidates.len() == 1 { "" } else { "es" },
+            expected_memory_freed_gb
+        ));
+    }
+    if !review_candidates.is_empty() {
+        output.push_str(&format!(
+            "REVIEW SUGGESTED: {} process{}\n",
+            review_candidates.len(),
+            if review_candidates.len() == 1 { "" } else { "es" }
+        ));
+    }
+    output.push('\n');
+
+    // Detailed candidate breakdown
+    output.push_str("Candidate Details:\n");
+    output.push_str(&"-".repeat(40));
+    output.push('\n');
+
+    for (i, candidate) in candidates.iter().enumerate() {
+        let pid = candidate.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cmd = candidate
+            .get("command_short")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let age_human = candidate
+            .get("age_human")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let classification = candidate
+            .get("classification")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let score = candidate.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
+        let recommendation = candidate
+            .get("recommendation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let memory_mb = candidate
+            .get("memory_mb")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        output.push_str(&format!(
+            "\n{}. PID {} - {} ({})\n",
+            i + 1,
+            pid,
+            cmd,
+            classification
+        ));
+        output.push_str(&format!("   Age: {}, Memory: {} MB\n", age_human, memory_mb));
+        output.push_str(&format!(
+            "   Confidence: {}%, Recommendation: {}\n",
+            score, recommendation
+        ));
+
+        // Top evidence factors
+        if let Some(evidence) = candidate.get("evidence").and_then(|e| e.as_array()) {
+            let top_factors: Vec<&str> = evidence
+                .iter()
+                .take(3)
+                .filter_map(|f| f.get("factor").and_then(|v| v.as_str()))
+                .collect();
+            if !top_factors.is_empty() {
+                output.push_str(&format!("   Key factors: {}\n", top_factors.join(", ")));
+            }
+        }
+    }
+
+    output.push('\n');
+    output.push_str(&"-".repeat(40));
+    output.push('\n');
+    output.push_str("Use 'pt agent apply --session <id>' to execute recommendations.\n");
+
+    output
+}
+
 fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode {
     let session_id = SessionId::new();
 
