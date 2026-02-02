@@ -8,11 +8,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::confidence_viz::{
-    CalibrationStatus, ConfidenceBadge, ConfidenceViz, ConfidenceVizInput, GateStatus,
+    CalibrationStatus, ConfidenceBadge, ConfidenceVizInput, GateStatus,
     SafetyBadge, compute_confidence_viz,
 };
-use super::explain::{ExplainConfig, NaturalExplanation, explain};
-use super::flip_conditions::{FlipAnalysis, FlipConfig, FlipScenario, compute_flip_conditions};
+use super::explain::{ExplainConfig, explain};
+use super::flip_conditions::{FlipAnalysis, FlipConfig, compute_flip_conditions};
 use super::ledger::{BayesFactorEntry, Classification, Confidence, EvidenceLedger};
 
 // ---------------------------------------------------------------------------

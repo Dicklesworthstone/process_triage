@@ -42,7 +42,8 @@ impl EvidenceCategory {
 pub fn categorize_feature(feature: &str) -> EvidenceCategory {
     let f = feature.to_lowercase();
     if f.contains("cpu") || f.contains("memory") || f.contains("rss")
-        || f.contains("vsz") || f.contains("io") || f.contains("fd")
+        || f.contains("vsz") || f.starts_with("io") || f.contains("_io")
+        || f.starts_with("fd") || f.contains("_fd")
     {
         EvidenceCategory::Resource
     } else if f.contains("age") || f.contains("elapsed") || f.contains("runtime")
