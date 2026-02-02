@@ -28,6 +28,7 @@ use pt_core::session::{
     ListSessionsOptions, SessionContext, SessionHandle, SessionManifest, SessionMode, SessionState,
     SessionStore,
 };
+use pt_core::fleet::inventory::load_inventory_from_path;
 use pt_core::session::fleet::{create_fleet_session, CandidateInfo, HostInput};
 use pt_core::shadow::ShadowRecorder;
 use pt_core::signature_cli::load_user_signatures;
@@ -610,8 +611,12 @@ enum AgentFleetCommands {
 #[derive(Args, Debug)]
 struct AgentFleetPlanArgs {
     /// Hosts spec (comma-separated list or file path)
-    #[arg(long)]
-    hosts: String,
+    #[arg(long, conflicts_with = "inventory")]
+    hosts: Option<String>,
+
+    /// Inventory file path (TOML/YAML/JSON)
+    #[arg(long, conflicts_with = "hosts")]
+    inventory: Option<String>,
 
     /// Max concurrent host connections
     #[arg(long, default_value = "10")]
@@ -2502,10 +2507,46 @@ fn parse_fleet_hosts(spec: &str) -> Result<Vec<String>, String> {
 }
 
 fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitCode {
-    let hosts = match parse_fleet_hosts(&args.hosts) {
-        Ok(h) => h,
-        Err(err) => {
-            return output_agent_error(global, "fleet plan", &err);
+    let (hosts, inventory) = match (&args.hosts, &args.inventory) {
+        (Some(hosts_spec), None) => {
+            let hosts = match parse_fleet_hosts(hosts_spec) {
+                Ok(h) => h,
+                Err(err) => {
+                    return output_agent_error(global, "fleet plan", &err);
+                }
+            };
+            (hosts, None)
+        }
+        (None, Some(path)) => {
+            let inventory = match load_inventory_from_path(Path::new(path)) {
+                Ok(inv) => inv,
+                Err(err) => {
+                    return output_agent_error(global, "fleet plan", &err.to_string());
+                }
+            };
+            let hosts: Vec<String> = inventory
+                .hosts
+                .iter()
+                .map(|h| h.hostname.clone())
+                .collect();
+            if hosts.is_empty() {
+                return output_agent_error(global, "fleet plan", "inventory contains no hosts");
+            }
+            (hosts, Some(inventory))
+        }
+        (None, None) => {
+            return output_agent_error(
+                global,
+                "fleet plan",
+                "either --hosts or --inventory is required",
+            );
+        }
+        (Some(_), Some(_)) => {
+            return output_agent_error(
+                global,
+                "fleet plan",
+                "--hosts and --inventory are mutually exclusive",
+            );
         }
     };
 
@@ -2539,6 +2580,7 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
         ],
         "inputs": {
             "hosts_spec": args.hosts,
+            "inventory_path": args.inventory,
             "hosts": hosts,
             "parallel": args.parallel,
             "timeout_secs": args.timeout,
@@ -2547,6 +2589,13 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
             "label": args.label,
             "max_fdr": args.max_fdr,
         },
+        "inventory": inventory.as_ref().map(|inv| {
+            serde_json::json!({
+                "schema_version": inv.schema_version,
+                "generated_at": inv.generated_at,
+                "host_count": inv.hosts.len(),
+            })
+        }),
         "fleet_session": fleet_session,
     });
 

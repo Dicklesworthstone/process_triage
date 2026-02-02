@@ -21,6 +21,7 @@ pub mod daemon;
 pub mod decision;
 pub mod events;
 pub mod exit_codes;
+pub mod fleet;
 pub mod inbox;
 pub mod inference;
 pub mod install;
