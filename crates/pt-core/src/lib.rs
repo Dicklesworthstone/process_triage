@@ -27,6 +27,7 @@ pub mod output;
 pub mod plan;
 pub mod schema;
 pub mod session;
+pub mod shadow;
 pub mod signature_cli;
 pub mod supervision;
 pub mod verify;

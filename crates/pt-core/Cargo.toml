@@ -51,6 +51,7 @@ pt-config = { path = "../pt-config" }
 pt-math = { path = "../pt-math" }
 pt-redact = { path = "../pt-redact" }
 pt-bundle = { path = "../pt-bundle" }
+pt-telemetry = { path = "../pt-telemetry" }
 pt-report = { path = "../pt-report", optional = true }
 
 [features]

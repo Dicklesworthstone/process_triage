@@ -28,6 +28,7 @@ use pt_core::session::{
     ListSessionsOptions, SessionContext, SessionHandle, SessionManifest, SessionMode, SessionState,
     SessionStore,
 };
+use pt_core::shadow::ShadowRecorder;
 use pt_core::signature_cli::load_user_signatures;
 use pt_core::supervision::pattern_persistence::DisabledPatterns;
 use pt_core::supervision::signature::{ProcessMatchContext, SignatureDatabase};
@@ -37,6 +38,7 @@ use pt_core::supervision::{
     AppSupervisorType, ContainerActionType, ContainerSupervisionAnalyzer,
 };
 use pt_core::verify::{parse_agent_plan, verify_plan, VerifyError};
+use pt_telemetry::shadow::{Observation, ShadowStorage, ShadowStorageConfig};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -287,6 +289,9 @@ enum Commands {
 
     /// Telemetry management
     Telemetry(TelemetryArgs),
+
+    /// Shadow mode observation management
+    Shadow(ShadowArgs),
 
     /// Signature management (list, add, remove user signatures)
     Signature(pt_core::signature_cli::SignatureArgs),
@@ -1118,6 +1123,85 @@ enum TelemetryCommands {
 }
 
 #[derive(Args, Debug)]
+struct ShadowArgs {
+    #[command(subcommand)]
+    command: ShadowCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum ShadowCommands {
+    /// Start shadow mode observation loop
+    Start(ShadowStartArgs),
+    /// Run a foreground shadow loop (internal)
+    #[command(hide = true)]
+    Run(ShadowStartArgs),
+    /// Stop background shadow observer
+    Stop,
+    /// Show shadow observer status and stats
+    Status,
+    /// Export shadow observations for calibration analysis
+    Export(ShadowExportArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct ShadowStartArgs {
+    /// Interval between scans (seconds)
+    #[arg(long, default_value = "300")]
+    interval: u64,
+
+    /// Number of iterations before exiting (0 = run forever)
+    #[arg(long, default_value = "0")]
+    iterations: u32,
+
+    /// Run in background (daemon-style)
+    #[arg(long)]
+    background: bool,
+
+    /// Maximum candidates to return per scan
+    #[arg(long, default_value = "20")]
+    max_candidates: u32,
+
+    /// Minimum posterior probability threshold
+    #[arg(long = "min-posterior", default_value = "0.7")]
+    min_posterior: f64,
+
+    /// Filter by recommendation (kill, review, all)
+    #[arg(long, default_value = "all")]
+    only: String,
+
+    /// Include kernel threads as candidates
+    #[arg(long)]
+    include_kernel_threads: bool,
+
+    /// Force deep scan with all available probes
+    #[arg(long)]
+    deep: bool,
+
+    /// Only consider processes older than threshold (seconds)
+    #[arg(long)]
+    min_age: Option<u64>,
+
+    /// Limit inference to a random sample of N processes
+    #[arg(long)]
+    sample_size: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+struct ShadowExportArgs {
+    /// Output path (stdout if omitted)
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// Export format (json, jsonl)
+    #[arg(long, default_value = "json")]
+    format: String,
+
+    /// Max observations to export (most recent first)
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Args, Debug)]
 struct SchemaArgs {
     /// Type name to generate schema for (e.g., Plan, DecisionOutcome)
     #[arg(value_name = "TYPE")]
@@ -1246,6 +1330,7 @@ fn main() {
         #[cfg(feature = "daemon")]
         Some(Commands::Daemon(args)) => run_daemon(&cli.global, &args),
         Some(Commands::Telemetry(args)) => run_telemetry(&cli.global, &args),
+        Some(Commands::Shadow(args)) => run_shadow(&cli.global, &args),
         Some(Commands::Signature(args)) => {
             pt_core::signature_cli::run_signature(&cli.global.format, &args)
         }
@@ -2883,6 +2968,470 @@ fn run_telemetry(global: &GlobalOpts, _args: &TelemetryArgs) -> ExitCode {
     ExitCode::Clean
 }
 
+fn run_shadow(global: &GlobalOpts, args: &ShadowArgs) -> ExitCode {
+    match &args.command {
+        ShadowCommands::Start(start) => run_shadow_start(global, start),
+        ShadowCommands::Run(start) => run_shadow_run(global, start),
+        ShadowCommands::Stop => run_shadow_stop(global),
+        ShadowCommands::Status => run_shadow_status(global),
+        ShadowCommands::Export(export) => run_shadow_export(global, export),
+    }
+}
+
+fn run_shadow_start(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
+    if args.background {
+        return run_shadow_background(global, args);
+    }
+    run_shadow_run(global, args)
+}
+
+fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("shadow start: failed to resolve executable: {}", err);
+            return ExitCode::InternalError;
+        }
+    };
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("shadow").arg("run");
+    apply_shadow_start_args(&mut cmd, args);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("shadow start: failed to spawn background worker: {}", err);
+            return ExitCode::IoError;
+        }
+    };
+
+    if let Err(err) = write_shadow_pid(child.id()) {
+        eprintln!("shadow start: failed to write pid file: {}", err);
+        return ExitCode::IoError;
+    }
+
+    let response = serde_json::json!({
+        "command": "shadow start",
+        "mode": "background",
+        "pid": child.id(),
+        "base_dir": shadow_base_dir().display().to_string(),
+    });
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+            println!("{}", format_structured_output(global, response));
+        }
+        _ => {
+            println!("Shadow observer started (pid {}).", child.id());
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
+    let mut iterations = args.iterations;
+    let mut run_count: u32 = 0;
+    loop {
+        run_count = run_count.saturating_add(1);
+        match run_shadow_iteration(args) {
+            Ok(status) => {
+                if !status.success() {
+                    eprintln!(
+                        "shadow run: iteration {} failed (exit={})",
+                        run_count,
+                        status.code().unwrap_or(-1)
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("shadow run: iteration {} failed: {}", run_count, err);
+            }
+        }
+
+        if iterations > 0 {
+            iterations = iterations.saturating_sub(1);
+            if iterations == 0 {
+                break;
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(args.interval));
+    }
+
+    let response = serde_json::json!({
+        "command": "shadow run",
+        "iterations": run_count,
+        "interval_seconds": args.interval,
+        "base_dir": shadow_base_dir().display().to_string(),
+    });
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+            println!("{}", format_structured_output(global, response));
+        }
+        _ => {
+            println!("Shadow run complete ({} iterations).", run_count);
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_shadow_iteration(
+    args: &ShadowStartArgs,
+) -> Result<std::process::ExitStatus, std::io::Error> {
+    let exe = std::env::current_exe()?;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--shadow")
+        .arg("--format")
+        .arg("json")
+        .arg("agent")
+        .arg("plan");
+    apply_shadow_plan_args(&mut cmd, args);
+
+    cmd.status()
+}
+
+fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
+    let pid = match read_shadow_pid() {
+        Ok(Some(pid)) => pid,
+        Ok(None) => {
+            let response = serde_json::json!({
+                "command": "shadow stop",
+                "running": false,
+                "message": "no shadow pid file found",
+            });
+            match global.format {
+                OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+                    println!("{}", format_structured_output(global, response));
+                }
+                _ => {
+                    println!("No shadow observer pid file found.");
+                }
+            }
+            return ExitCode::Clean;
+        }
+        Err(err) => {
+            eprintln!("shadow stop: failed to read pid file: {}", err);
+            return ExitCode::IoError;
+        }
+    };
+
+    if let Err(err) = terminate_process(pid) {
+        eprintln!("shadow stop: failed to signal pid {}: {}", pid, err);
+        return ExitCode::IoError;
+    }
+
+    if let Err(err) = remove_shadow_pid() {
+        eprintln!("shadow stop: failed to remove pid file: {}", err);
+    }
+
+    let response = serde_json::json!({
+        "command": "shadow stop",
+        "pid": pid,
+        "signaled": true,
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+            println!("{}", format_structured_output(global, response));
+        }
+        _ => {
+            println!("Shadow observer stopped (pid {}).", pid);
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_shadow_status(global: &GlobalOpts) -> ExitCode {
+    let pid = read_shadow_pid().ok().flatten();
+    let running = pid.map(is_process_running).unwrap_or(false);
+    let stale = pid.is_some() && !running;
+
+    let mut config = ShadowStorageConfig::default();
+    config.base_dir = shadow_base_dir();
+    let storage = ShadowStorage::new(config);
+
+    let stats_json = match storage {
+        Ok(storage) => serde_json::to_value(storage.stats()).unwrap_or_default(),
+        Err(_) => serde_json::json!({}),
+    };
+
+    let response = serde_json::json!({
+        "command": "shadow status",
+        "running": running,
+        "pid": pid,
+        "stale_pid_file": stale,
+        "base_dir": shadow_base_dir().display().to_string(),
+        "stats": stats_json,
+    });
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+            println!("{}", format_structured_output(global, response));
+        }
+        _ => {
+            if running {
+                println!("Shadow observer running (pid {}).", pid.unwrap_or(0));
+            } else {
+                println!("Shadow observer not running.");
+            }
+            if stale {
+                println!("Warning: stale pid file detected.");
+            }
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_shadow_export(global: &GlobalOpts, args: &ShadowExportArgs) -> ExitCode {
+    let base_dir = shadow_base_dir();
+    let observations = match collect_shadow_observations(&base_dir, args.limit) {
+        Ok(observations) => observations,
+        Err(err) => {
+            eprintln!("shadow export: {}", err);
+            return ExitCode::IoError;
+        }
+    };
+
+    let output = match args.format.as_str() {
+        "jsonl" => observations
+            .iter()
+            .map(|obs| serde_json::to_string(obs).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => serde_json::to_string_pretty(&observations).unwrap_or_default(),
+    };
+
+    let wrote_file = if let Some(ref path) = args.output {
+        if let Err(err) = std::fs::write(path, output) {
+            eprintln!("shadow export: failed to write {}: {}", path, err);
+            return ExitCode::IoError;
+        }
+        true
+    } else {
+        println!("{}", output);
+        false
+    };
+
+    if wrote_file {
+        let response = serde_json::json!({
+            "command": "shadow export",
+            "count": observations.len(),
+            "base_dir": base_dir.display().to_string(),
+            "output": args.output,
+        });
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+                println!("{}", format_structured_output(global, response));
+            }
+            _ => {
+                println!("Exported {} observations.", observations.len());
+            }
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn apply_shadow_start_args(cmd: &mut std::process::Command, args: &ShadowStartArgs) {
+    if args.interval != 300 {
+        cmd.arg("--interval").arg(args.interval.to_string());
+    }
+    if args.iterations != 0 {
+        cmd.arg("--iterations").arg(args.iterations.to_string());
+    }
+    if args.max_candidates != 20 {
+        cmd.arg("--max-candidates")
+            .arg(args.max_candidates.to_string());
+    }
+    if (args.min_posterior - 0.7).abs() > f64::EPSILON {
+        cmd.arg("--min-posterior")
+            .arg(args.min_posterior.to_string());
+    }
+    if args.only != "all" {
+        cmd.arg("--only").arg(&args.only);
+    }
+    if args.include_kernel_threads {
+        cmd.arg("--include-kernel-threads");
+    }
+    if args.deep {
+        cmd.arg("--deep");
+    }
+    if let Some(min_age) = args.min_age {
+        cmd.arg("--min-age").arg(min_age.to_string());
+    }
+    if let Some(sample_size) = args.sample_size {
+        cmd.arg("--sample-size").arg(sample_size.to_string());
+    }
+}
+
+fn apply_shadow_plan_args(cmd: &mut std::process::Command, args: &ShadowStartArgs) {
+    cmd.arg("--max-candidates")
+        .arg(args.max_candidates.to_string());
+    cmd.arg("--min-posterior")
+        .arg(args.min_posterior.to_string());
+    cmd.arg("--only").arg(&args.only);
+    if args.include_kernel_threads {
+        cmd.arg("--include-kernel-threads");
+    }
+    if args.deep {
+        cmd.arg("--deep");
+    }
+    if let Some(min_age) = args.min_age {
+        cmd.arg("--min-age").arg(min_age.to_string());
+    }
+    if let Some(sample_size) = args.sample_size {
+        cmd.arg("--sample-size").arg(sample_size.to_string());
+    }
+}
+
+fn shadow_base_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("PROCESS_TRIAGE_DATA") {
+        return PathBuf::from(dir).join("shadow");
+    }
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        return PathBuf::from(dir).join("process_triage").join("shadow");
+    }
+    ShadowStorageConfig::default().base_dir
+}
+
+fn shadow_pid_path() -> PathBuf {
+    shadow_base_dir().join("shadow.pid")
+}
+
+fn write_shadow_pid(pid: u32) -> std::io::Result<()> {
+    let path = shadow_pid_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, pid.to_string())
+}
+
+fn read_shadow_pid() -> std::io::Result<Option<u32>> {
+    let path = shadow_pid_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path)?;
+    Ok(content.trim().parse::<u32>().ok())
+}
+
+fn remove_shadow_pid() -> std::io::Result<()> {
+    let path = shadow_pid_path();
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> std::io::Result<()> {
+    let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process(_pid: u32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "terminate not supported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn is_process_running(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+}
+
+#[cfg(not(unix))]
+fn is_process_running(_pid: u32) -> bool {
+    false
+}
+
+#[derive(Debug)]
+enum ShadowExportError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+}
+
+impl std::fmt::Display for ShadowExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShadowExportError::Io(err) => write!(f, "I/O error: {}", err),
+            ShadowExportError::Json(err) => write!(f, "JSON error: {}", err),
+        }
+    }
+}
+
+impl From<std::io::Error> for ShadowExportError {
+    fn from(err: std::io::Error) -> Self {
+        ShadowExportError::Io(err)
+    }
+}
+
+impl From<serde_json::Error> for ShadowExportError {
+    fn from(err: serde_json::Error) -> Self {
+        ShadowExportError::Json(err)
+    }
+}
+
+fn collect_shadow_observations(
+    base_dir: &PathBuf,
+    limit: Option<usize>,
+) -> Result<Vec<Observation>, ShadowExportError> {
+    let mut files = Vec::new();
+    collect_shadow_files(base_dir, &mut files)?;
+
+    let mut observations: Vec<Observation> = Vec::new();
+    for path in files {
+        let content = std::fs::read_to_string(&path)?;
+        let mut batch: Vec<Observation> = serde_json::from_str(&content)?;
+        observations.append(&mut batch);
+    }
+
+    observations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    if let Some(max) = limit {
+        observations.truncate(max);
+    }
+    observations.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    Ok(observations)
+}
+
+fn collect_shadow_files(dir: &PathBuf, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_shadow_files(&path, files)?;
+        } else if path.is_file() {
+            if path.file_name().and_then(|s| s.to_str()) == Some("stats.json") {
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                files.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_schema(global: &GlobalOpts, args: &SchemaArgs) -> ExitCode {
     use pt_core::schema::{
         available_schemas, format_schema, generate_all_schemas, generate_schema, SchemaFormat,
@@ -3633,7 +4182,11 @@ fn generate_narrative_summary(
         output.push_str(&format!(
             "REVIEW SUGGESTED: {} process{}\n",
             review_candidates.len(),
-            if review_candidates.len() == 1 { "" } else { "es" }
+            if review_candidates.len() == 1 {
+                ""
+            } else {
+                "es"
+            }
         ));
     }
     output.push('\n');
@@ -3674,7 +4227,10 @@ fn generate_narrative_summary(
             cmd,
             classification
         ));
-        output.push_str(&format!("   Age: {}, Memory: {} MB\n", age_human, memory_mb));
+        output.push_str(&format!(
+            "   Age: {}, Memory: {} MB\n",
+            age_human, memory_mb
+        ));
         output.push_str(&format!(
             "   Confidence: {}%, Recommendation: {}\n",
             score, recommendation
@@ -4145,6 +4701,18 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut all_candidates: Vec<(f64, serde_json::Value)> = Vec::new();
 
     let feasibility = ActionFeasibility::allow_all();
+    let mut shadow_recorder = if global.shadow {
+        match ShadowRecorder::new() {
+            Ok(recorder) => Some(recorder),
+            Err(err) => {
+                eprintln!("shadow mode: failed to initialize storage: {:?}", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut shadow_recorded = 0u64;
 
     // Apply sampling if requested (for testing)
     let processes_to_infer: Vec<_> = if let Some(sample_size) = args.sample_size {
@@ -4225,6 +4793,33 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .max(posterior.abandoned)
             .max(posterior.zombie);
 
+        // Determine recommended action string (used for shadow recording and plan output)
+        let recommended_action = match decision_outcome.optimal_action {
+            Action::Keep => "keep",
+            Action::Renice => "renice",
+            Action::Pause => "pause",
+            Action::Resume => "resume",
+            Action::Freeze => "freeze",
+            Action::Unfreeze => "unfreeze",
+            Action::Throttle => "throttle",
+            Action::Quarantine => "quarantine",
+            Action::Unquarantine => "unquarantine",
+            Action::Restart => "restart",
+            Action::Kill => "kill",
+        };
+
+        if let Some(ref mut recorder) = shadow_recorder {
+            match recorder.record_candidate(proc, posterior, &ledger, &decision_outcome) {
+                Ok(()) => shadow_recorded = shadow_recorded.saturating_add(1),
+                Err(err) => {
+                    eprintln!(
+                        "shadow mode: failed to record observation for pid {}: {:?}",
+                        proc.pid.0, err
+                    );
+                }
+            }
+        }
+
         if let Some(ref e) = emitter {
             if processed % 50 == 0 || processed == total_processes {
                 e.emit(
@@ -4241,21 +4836,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         if max_posterior < args.min_posterior {
             continue;
         }
-
-        // Determine recommended action string
-        let recommended_action = match decision_outcome.optimal_action {
-            Action::Keep => "keep",
-            Action::Renice => "renice",
-            Action::Pause => "pause",
-            Action::Resume => "resume",
-            Action::Freeze => "freeze",
-            Action::Unfreeze => "unfreeze",
-            Action::Throttle => "throttle",
-            Action::Quarantine => "quarantine",
-            Action::Unquarantine => "unquarantine",
-            Action::Restart => "restart",
-            Action::Kill => "kill",
-        };
 
         // Apply --only filter
         let include = match args.only.as_str() {
@@ -4364,6 +4944,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
     }
 
+    if let Some(ref mut recorder) = shadow_recorder {
+        if let Err(err) = recorder.flush() {
+            eprintln!("shadow mode: failed to flush storage: {:?}", err);
+        }
+    }
+
     // Sort candidates by max_posterior descending (highest confidence first)
     all_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -4408,7 +4994,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     });
 
     // Build summary (legacy format for backward compatibility)
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "total_processes_scanned": total_scanned,
         "protected_filtered": protected_filtered_count,
         "candidates_evaluated": filter_result.passed.len(),
@@ -4419,6 +5005,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "threshold_used": args.min_posterior,
         "filter_used": args.only,
     });
+    if global.shadow {
+        summary["shadow_observations_recorded"] = serde_json::json!(shadow_recorded);
+    }
 
     // Build recommendations section (new structured format)
     let recommendations = serde_json::json!({
