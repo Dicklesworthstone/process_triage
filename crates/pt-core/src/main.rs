@@ -41,6 +41,7 @@ use pt_core::verify::{parse_agent_plan, verify_plan, VerifyError};
 use pt_telemetry::shadow::{Observation, ShadowStorage, ShadowStorageConfig};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Process Triage Core - Intelligent process classification and cleanup
@@ -1148,6 +1149,10 @@ struct ShadowStartArgs {
     /// Interval between scans (seconds)
     #[arg(long, default_value = "300")]
     interval: u64,
+
+    /// Interval between deep scans (seconds, 0 disables)
+    #[arg(long, default_value = "3600")]
+    deep_interval: u64,
 
     /// Number of iterations before exiting (0 = run forever)
     #[arg(long, default_value = "0")]
@@ -2968,6 +2973,74 @@ fn run_telemetry(global: &GlobalOpts, _args: &TelemetryArgs) -> ExitCode {
     ExitCode::Clean
 }
 
+#[derive(Debug)]
+struct ShadowSignalState {
+    stop: AtomicBool,
+    reload: AtomicBool,
+    force_scan: AtomicBool,
+}
+
+impl ShadowSignalState {
+    const fn new() -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            reload: AtomicBool::new(false),
+            force_scan: AtomicBool::new(false),
+        }
+    }
+
+    fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn request_reload(&self) {
+        self.reload.store(true, Ordering::Relaxed);
+    }
+
+    fn take_reload(&self) -> bool {
+        self.reload.swap(false, Ordering::Relaxed)
+    }
+
+    fn request_force_scan(&self) {
+        self.force_scan.store(true, Ordering::Relaxed);
+    }
+
+    fn take_force_scan(&self) -> bool {
+        self.force_scan.swap(false, Ordering::Relaxed)
+    }
+}
+
+static SHADOW_SIGNALS: ShadowSignalState = ShadowSignalState::new();
+
+#[cfg(unix)]
+fn install_shadow_signal_handlers() {
+    unsafe extern "C" fn handler(signal: i32) {
+        match signal {
+            libc::SIGTERM | libc::SIGINT => SHADOW_SIGNALS.request_stop(),
+            libc::SIGHUP => {
+                SHADOW_SIGNALS.request_reload();
+                SHADOW_SIGNALS.request_force_scan();
+            }
+            libc::SIGUSR1 => SHADOW_SIGNALS.request_force_scan(),
+            _ => {}
+        }
+    }
+
+    unsafe {
+        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, handler as libc::sighandler_t);
+        libc::signal(libc::SIGUSR1, handler as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_shadow_signal_handlers() {}
+
 fn run_shadow(global: &GlobalOpts, args: &ShadowArgs) -> ExitCode {
     match &args.command {
         ShadowCommands::Start(start) => run_shadow_start(global, start),
@@ -2986,6 +3059,14 @@ fn run_shadow_start(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
 }
 
 fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
+    if let Ok(Some(pid)) = read_shadow_pid() {
+        if is_process_running(pid) {
+            eprintln!("shadow start: existing shadow observer running (pid {})", pid);
+            return ExitCode::LockError;
+        }
+        let _ = remove_shadow_pid();
+    }
+
     let exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(err) => {
@@ -3034,11 +3115,44 @@ fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCod
 }
 
 fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
+    install_shadow_signal_handlers();
+    let own_pid = std::process::id();
+
     let mut iterations = args.iterations;
     let mut run_count: u32 = 0;
+    let mut next_deep_at = if args.deep || args.deep_interval == 0 {
+        None
+    } else {
+        Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(args.deep_interval),
+        )
+    };
+
     loop {
+        if SHADOW_SIGNALS.should_stop() {
+            break;
+        }
+
+        if SHADOW_SIGNALS.take_reload() {
+            SHADOW_SIGNALS.request_force_scan();
+        }
+
+        let now = std::time::Instant::now();
+        let mut force_deep = args.deep;
+        if !force_deep {
+            if let Some(deadline) = next_deep_at {
+                if now >= deadline {
+                    force_deep = true;
+                    next_deep_at = Some(
+                        now + std::time::Duration::from_secs(args.deep_interval),
+                    );
+                }
+            }
+        }
+
         run_count = run_count.saturating_add(1);
-        match run_shadow_iteration(args) {
+        match run_shadow_iteration(args, force_deep) {
             Ok(status) => {
                 if !status.success() {
                     eprintln!(
@@ -3060,8 +3174,20 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_secs(args.interval));
+        if SHADOW_SIGNALS.should_stop() {
+            break;
+        }
+
+        if SHADOW_SIGNALS.take_force_scan() {
+            continue;
+        }
+
+        if shadow_sleep_with_interrupt(args.interval) {
+            continue;
+        }
     }
+
+    cleanup_shadow_pid_if_owned(own_pid);
 
     let response = serde_json::json!({
         "command": "shadow run",
@@ -3084,6 +3210,7 @@ fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
 
 fn run_shadow_iteration(
     args: &ShadowStartArgs,
+    force_deep: bool,
 ) -> Result<std::process::ExitStatus, std::io::Error> {
     let exe = std::env::current_exe()?;
 
@@ -3093,7 +3220,7 @@ fn run_shadow_iteration(
         .arg("json")
         .arg("agent")
         .arg("plan");
-    apply_shadow_plan_args(&mut cmd, args);
+    apply_shadow_plan_args(&mut cmd, args, force_deep);
 
     cmd.status()
 }
@@ -3245,6 +3372,10 @@ fn apply_shadow_start_args(cmd: &mut std::process::Command, args: &ShadowStartAr
     if args.interval != 300 {
         cmd.arg("--interval").arg(args.interval.to_string());
     }
+    if args.deep_interval != 3600 {
+        cmd.arg("--deep-interval")
+            .arg(args.deep_interval.to_string());
+    }
     if args.iterations != 0 {
         cmd.arg("--iterations").arg(args.iterations.to_string());
     }
@@ -3273,7 +3404,11 @@ fn apply_shadow_start_args(cmd: &mut std::process::Command, args: &ShadowStartAr
     }
 }
 
-fn apply_shadow_plan_args(cmd: &mut std::process::Command, args: &ShadowStartArgs) {
+fn apply_shadow_plan_args(
+    cmd: &mut std::process::Command,
+    args: &ShadowStartArgs,
+    force_deep: bool,
+) {
     cmd.arg("--max-candidates")
         .arg(args.max_candidates.to_string());
     cmd.arg("--min-posterior")
@@ -3282,7 +3417,7 @@ fn apply_shadow_plan_args(cmd: &mut std::process::Command, args: &ShadowStartArg
     if args.include_kernel_threads {
         cmd.arg("--include-kernel-threads");
     }
-    if args.deep {
+    if args.deep || force_deep {
         cmd.arg("--deep");
     }
     if let Some(min_age) = args.min_age {
@@ -3290,6 +3425,33 @@ fn apply_shadow_plan_args(cmd: &mut std::process::Command, args: &ShadowStartArg
     }
     if let Some(sample_size) = args.sample_size {
         cmd.arg("--sample-size").arg(sample_size.to_string());
+    }
+}
+
+fn shadow_sleep_with_interrupt(seconds: u64) -> bool {
+    if seconds == 0 {
+        return false;
+    }
+    let mut remaining = seconds;
+    while remaining > 0 {
+        if SHADOW_SIGNALS.should_stop() {
+            return false;
+        }
+        if SHADOW_SIGNALS.take_force_scan() {
+            return true;
+        }
+        let step = remaining.min(1);
+        std::thread::sleep(std::time::Duration::from_secs(step));
+        remaining = remaining.saturating_sub(step);
+    }
+    false
+}
+
+fn cleanup_shadow_pid_if_owned(pid: u32) {
+    if let Ok(Some(current)) = read_shadow_pid() {
+        if current == pid {
+            let _ = remove_shadow_pid();
+        }
     }
 }
 
