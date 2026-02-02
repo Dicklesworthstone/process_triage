@@ -9,6 +9,7 @@ pub mod dependency_loss;
 pub mod dro;
 pub mod enforcer;
 pub mod escalation;
+pub mod goal_contribution;
 pub mod goal_optimizer;
 pub mod goal_parser;
 pub mod expected_loss;
