@@ -11,6 +11,7 @@
 //! primitives. This module intentionally avoids any TUI assumptions.
 
 pub mod diff;
+pub mod resume;
 pub mod snapshot_persist;
 
 use chrono::{DateTime, Duration, Utc};
