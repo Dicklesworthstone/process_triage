@@ -32,6 +32,7 @@ pub mod report;
 pub mod queries;
 pub mod bounds;
 pub mod pac_bayes;
+pub mod threshold;
 pub mod trend;
 pub mod tuning;
 pub mod empirical_bayes;
