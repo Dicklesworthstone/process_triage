@@ -36,6 +36,7 @@ pub mod trend;
 pub mod tuning;
 pub mod empirical_bayes;
 pub mod hierarchical;
+pub mod kalman;
 pub mod ppc;
 pub mod validation;
 
