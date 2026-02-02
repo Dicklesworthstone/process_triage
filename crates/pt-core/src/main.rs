@@ -28,6 +28,7 @@ use pt_core::session::{
     ListSessionsOptions, SessionContext, SessionHandle, SessionManifest, SessionMode, SessionState,
     SessionStore,
 };
+use pt_core::session::fleet::{create_fleet_session, CandidateInfo, HostInput};
 use pt_core::shadow::ShadowRecorder;
 use pt_core::signature_cli::load_user_signatures;
 use pt_core::supervision::pattern_persistence::DisabledPatterns;
@@ -40,7 +41,8 @@ use pt_core::supervision::{
 use pt_core::verify::{parse_agent_plan, verify_plan, VerifyError};
 use pt_telemetry::shadow::{Observation, ShadowStorage, ShadowStorageConfig};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -551,6 +553,9 @@ enum AgentCommands {
 
     /// Export session bundle (alias for bundle create)
     Export(AgentExportArgs),
+
+    /// Fleet-wide operations across multiple hosts
+    Fleet(AgentFleetArgs),
 }
 
 #[derive(Args, Debug)]
@@ -582,6 +587,96 @@ struct AgentExportArgs {
     /// Passphrase for bundle encryption (or use PT_BUNDLE_PASSPHRASE)
     #[arg(long)]
     passphrase: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetArgs {
+    #[command(subcommand)]
+    command: AgentFleetCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentFleetCommands {
+    /// Generate a fleet-wide plan across multiple hosts
+    Plan(AgentFleetPlanArgs),
+    /// Apply a fleet plan for a fleet session
+    Apply(AgentFleetApplyArgs),
+    /// Generate a fleet report from a fleet session
+    Report(AgentFleetReportArgs),
+    /// Show fleet session status
+    Status(AgentFleetStatusArgs),
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetPlanArgs {
+    /// Hosts spec (comma-separated list or file path)
+    #[arg(long)]
+    hosts: String,
+
+    /// Max concurrent host connections
+    #[arg(long, default_value = "10")]
+    parallel: u32,
+
+    /// Per-host timeout (seconds)
+    #[arg(long, default_value = "30")]
+    timeout: u64,
+
+    /// Continue if a host fails
+    #[arg(long)]
+    continue_on_error: bool,
+
+    /// Apply host-group priors
+    #[arg(long)]
+    host_profile: Option<String>,
+
+    /// Optional label for the fleet session
+    #[arg(long)]
+    label: Option<String>,
+
+    /// Fleet-wide max FDR budget
+    #[arg(long, default_value = "0.05")]
+    max_fdr: f64,
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetApplyArgs {
+    /// Fleet session ID
+    #[arg(long)]
+    fleet_session: String,
+
+    /// Max concurrent host connections
+    #[arg(long, default_value = "10")]
+    parallel: u32,
+
+    /// Per-host timeout (seconds)
+    #[arg(long, default_value = "30")]
+    timeout: u64,
+
+    /// Continue if a host fails
+    #[arg(long)]
+    continue_on_error: bool,
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetReportArgs {
+    /// Fleet session ID
+    #[arg(long)]
+    fleet_session: String,
+
+    /// Output path for report (optional for JSON output)
+    #[arg(long)]
+    out: Option<String>,
+
+    /// Redaction profile (minimal|safe|forensic)
+    #[arg(long, default_value = "safe")]
+    profile: String,
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetStatusArgs {
+    /// Fleet session ID
+    #[arg(long)]
+    fleet_session: String,
 }
 
 #[derive(Args, Debug)]
@@ -2354,7 +2449,149 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
         AgentCommands::Init(args) => run_agent_init(global, args),
         AgentCommands::Export(args) => run_agent_export(global, args),
         AgentCommands::Capabilities(args) => run_agent_capabilities(global, args),
+        AgentCommands::Fleet(args) => run_agent_fleet(global, args),
     }
+}
+
+fn run_agent_fleet(global: &GlobalOpts, args: &AgentFleetArgs) -> ExitCode {
+    match &args.command {
+        AgentFleetCommands::Plan(args) => run_agent_fleet_plan(global, args),
+        AgentFleetCommands::Apply(args) => run_agent_fleet_apply(global, args),
+        AgentFleetCommands::Report(args) => run_agent_fleet_report(global, args),
+        AgentFleetCommands::Status(args) => run_agent_fleet_status(global, args),
+    }
+}
+
+fn parse_fleet_hosts(spec: &str) -> Result<Vec<String>, String> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err("hosts spec is empty".to_string());
+    }
+
+    if trimmed.contains(',') {
+        let hosts: Vec<String> = trimmed
+            .split(',')
+            .map(|h| h.trim())
+            .filter(|h| !h.is_empty())
+            .map(|h| h.to_string())
+            .collect();
+        if hosts.is_empty() {
+            return Err("no hosts found in comma-separated list".to_string());
+        }
+        return Ok(hosts);
+    }
+
+    let path = Path::new(trimmed);
+    if path.exists() && path.is_file() {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read hosts file: {}", e))?;
+        let hosts: Vec<String> = content
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| line.to_string())
+            .collect();
+        if hosts.is_empty() {
+            return Err("hosts file contained no usable entries".to_string());
+        }
+        return Ok(hosts);
+    }
+
+    Ok(vec![trimmed.to_string()])
+}
+
+fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitCode {
+    let hosts = match parse_fleet_hosts(&args.hosts) {
+        Ok(h) => h,
+        Err(err) => {
+            return output_agent_error(global, "fleet plan", &err);
+        }
+    };
+
+    let mut host_inputs: Vec<HostInput> = Vec::new();
+    for host in &hosts {
+        host_inputs.push(HostInput {
+            host_id: host.to_string(),
+            session_id: SessionId::new().0,
+            scanned_at: chrono::Utc::now().to_rfc3339(),
+            total_processes: 0,
+            candidates: Vec::<CandidateInfo>::new(),
+        });
+    }
+
+    let fleet_session_id = SessionId::new();
+    let fleet_session = create_fleet_session(
+        &fleet_session_id.0,
+        args.label.as_deref(),
+        &host_inputs,
+        args.max_fdr,
+    );
+
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "fleet_session_id": fleet_session_id.0,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "agent fleet plan",
+        "status": "stubbed_plan",
+        "warnings": [
+            "remote scanning is not yet implemented; fleet plan contains empty candidates"
+        ],
+        "inputs": {
+            "hosts_spec": args.hosts,
+            "hosts": hosts,
+            "parallel": args.parallel,
+            "timeout_secs": args.timeout,
+            "continue_on_error": args.continue_on_error,
+            "host_profile": args.host_profile,
+            "label": args.label,
+            "max_fdr": args.max_fdr,
+        },
+        "fleet_session": fleet_session,
+    });
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# pt-core agent fleet plan");
+            println!();
+            println!("Hosts: {}", hosts.len());
+            println!("Fleet session: {}", fleet_session_id.0);
+            println!("Note: remote scanning not yet implemented.");
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> ExitCode {
+    let message = format!(
+        "Fleet apply not yet implemented (fleet_session={}, parallel={}, timeout={}, continue_on_error={})",
+        args.fleet_session, args.parallel, args.timeout, args.continue_on_error
+    );
+    output_stub(global, "agent fleet apply", &message);
+    ExitCode::Clean
+}
+
+fn run_agent_fleet_report(global: &GlobalOpts, args: &AgentFleetReportArgs) -> ExitCode {
+    let message = format!(
+        "Fleet report not yet implemented (fleet_session={}, out={:?}, profile={})",
+        args.fleet_session, args.out, args.profile
+    );
+    output_stub(global, "agent fleet report", &message);
+    ExitCode::Clean
+}
+
+fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> ExitCode {
+    let message = format!(
+        "Fleet status not yet implemented (fleet_session={})",
+        args.fleet_session
+    );
+    output_stub(global, "agent fleet status", &message);
+    ExitCode::Clean
 }
 
 fn run_config(global: &GlobalOpts, args: &ConfigArgs) -> ExitCode {
@@ -2637,6 +2874,32 @@ fn output_config_error(global: &GlobalOpts, error: &ConfigError) -> ExitCode {
     }
 
     exit_code
+}
+
+fn output_agent_error(global: &GlobalOpts, command: &str, message: &str) -> ExitCode {
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            let output = serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "command": command,
+                "status": "error",
+                "error": message,
+            });
+            println!("{}", format_structured_output(global, output));
+        }
+        OutputFormat::Summary => {
+            println!("[error] {}: {}", command, message);
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# pt-core {}", command);
+            println!();
+            println!("Error: {}", message);
+        }
+    }
+
+    ExitCode::ArgsError
 }
 
 /// List available configuration presets.
