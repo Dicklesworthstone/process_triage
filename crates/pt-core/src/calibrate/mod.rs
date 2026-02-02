@@ -38,6 +38,7 @@ pub mod empirical_bayes;
 pub mod hierarchical;
 pub mod kalman;
 pub mod mem_growth;
+pub mod cpu_trend;
 pub mod ppc;
 pub mod validation;
 
