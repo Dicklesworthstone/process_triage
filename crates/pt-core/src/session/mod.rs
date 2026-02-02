@@ -12,6 +12,8 @@
 
 pub mod compare;
 pub mod diff;
+#[cfg(test)]
+mod diff_tests;
 pub mod resume;
 pub mod snapshot_persist;
 
