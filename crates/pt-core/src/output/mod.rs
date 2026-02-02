@@ -3,6 +3,8 @@
 //! This module provides field selection, compact formats, and token estimation
 //! for optimizing output for AI agents with limited context windows.
 
+pub mod progressive;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
