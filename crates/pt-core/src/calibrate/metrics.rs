@@ -177,8 +177,8 @@ fn calibration_error(data: &[CalibrationData], num_bins: usize) -> (f64, f64) {
     }
 
     let n = data.len() as f64;
-    let mut ece = 0.0;
-    let mut mce = 0.0;
+    let mut ece: f64 = 0.0;
+    let mut mce: f64 = 0.0;
 
     for bin in &bins {
         if bin.is_empty() {

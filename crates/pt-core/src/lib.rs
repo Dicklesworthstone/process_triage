@@ -12,6 +12,7 @@
 pub mod action;
 pub mod agent_init;
 pub mod audit;
+pub mod calibrate;
 pub mod capabilities;
 pub mod cli;
 pub mod collect;

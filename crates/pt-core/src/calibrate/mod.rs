@@ -32,6 +32,7 @@ pub mod report;
 pub mod queries;
 pub mod bounds;
 pub mod pac_bayes;
+pub mod validation;
 
 pub use metrics::*;
 pub use curve::*;
@@ -40,6 +41,7 @@ pub use report::*;
 pub use queries::*;
 pub use bounds::*;
 pub use pac_bayes::*;
+pub use validation::*;
 
 use serde::{Deserialize, Serialize};
 

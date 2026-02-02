@@ -26,6 +26,15 @@ pub struct WindowSpec {
     pub label: Option<String>,
 }
 
+/// A single credible bound entry at a given delta level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredibleBoundEntry {
+    /// Tail probability delta.
+    pub delta: f64,
+    /// Upper bound on error rate at (1-delta) credibility.
+    pub upper: f64,
+}
+
 /// Computed credible bounds for an error rate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredibleBounds {
@@ -35,7 +44,21 @@ pub struct CredibleBounds {
     pub posterior_beta: f64,
     pub errors: u64,
     pub trials: u64,
+    /// Classification threshold used to determine kills vs spares.
+    pub threshold: f64,
+    /// Observed error rate (errors / trials), or 0 if no trials.
+    pub observed_rate: f64,
+    /// Posterior mean of the error rate.
+    pub posterior_mean: f64,
+    /// Per-delta upper bound entries.
+    pub bounds: Vec<CredibleBoundEntry>,
+    /// Definition of what counts as a "trial".
+    pub trial_definition: String,
+    /// Definition of what counts as an "error".
+    pub error_definition: String,
+    /// Legacy: raw delta values.
     pub deltas: Vec<f64>,
+    /// Legacy: raw upper bound values (parallel to deltas).
     pub upper_bounds: Vec<f64>,
     pub assumptions: CredibleBoundAssumptions,
 }
@@ -79,6 +102,19 @@ pub fn compute_credible_bounds(
         upper_bounds.push(bound);
     }
 
+    let observed_rate = if trials > 0 {
+        errors as f64 / trials as f64
+    } else {
+        0.0
+    };
+    let posterior_mean = posterior_alpha / (posterior_alpha + posterior_beta);
+
+    let bounds_entries: Vec<CredibleBoundEntry> = deltas
+        .iter()
+        .zip(upper_bounds.iter())
+        .map(|(&d, &u)| CredibleBoundEntry { delta: d, upper: u })
+        .collect();
+
     Ok(CredibleBounds {
         prior_alpha,
         prior_beta,
@@ -86,10 +122,53 @@ pub fn compute_credible_bounds(
         posterior_beta,
         errors,
         trials,
+        threshold: 0.5,
+        observed_rate,
+        posterior_mean,
+        bounds: bounds_entries,
+        trial_definition: assumptions.trial_definition.clone(),
+        error_definition: "predicted kill for a process that was actually useful".to_string(),
         deltas: deltas.to_vec(),
         upper_bounds,
         assumptions,
     })
+}
+
+/// Compute false-kill credible bounds from calibration data.
+///
+/// Counts how many predictions above `threshold` were actually not abandoned (false kills),
+/// then computes Bayesian credible bounds on the false-kill rate.
+pub fn false_kill_credible_bounds(
+    data: &[super::CalibrationData],
+    threshold: f64,
+    prior_alpha: f64,
+    prior_beta: f64,
+    deltas: &[f64],
+) -> Option<CredibleBounds> {
+    let mut errors: u64 = 0;
+    let mut trials: u64 = 0;
+
+    for d in data {
+        if d.predicted >= threshold {
+            trials += 1;
+            if !d.actual {
+                errors += 1;
+            }
+        }
+    }
+
+    if trials == 0 {
+        return None;
+    }
+
+    let assumptions = CredibleBoundAssumptions {
+        trial_definition: format!("predictions >= {:.2} threshold", threshold),
+        window: None,
+    };
+
+    let mut result = compute_credible_bounds(prior_alpha, prior_beta, errors, trials, deltas, assumptions).ok()?;
+    result.threshold = threshold;
+    Some(result)
 }
 
 #[cfg(test)]
