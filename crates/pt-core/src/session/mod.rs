@@ -14,6 +14,7 @@ pub mod compare;
 pub mod diff;
 #[cfg(test)]
 mod diff_tests;
+pub mod fleet;
 pub mod lifecycle;
 pub mod resume;
 #[cfg(test)]
