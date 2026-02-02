@@ -15,6 +15,8 @@ pub mod diff;
 #[cfg(test)]
 mod diff_tests;
 pub mod resume;
+#[cfg(test)]
+mod resume_tests;
 pub mod snapshot_persist;
 
 use chrono::{DateTime, Duration, Utc};
