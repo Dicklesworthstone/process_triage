@@ -34,6 +34,7 @@ pub mod bounds;
 pub mod pac_bayes;
 pub mod tuning;
 pub mod empirical_bayes;
+pub mod hierarchical;
 pub mod ppc;
 pub mod validation;
 
