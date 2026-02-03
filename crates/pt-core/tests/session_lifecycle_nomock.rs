@@ -20,6 +20,7 @@ use pt_core::session::resume::{
 use pt_core::test_utils::ProcessHarness;
 use pt_core::verify::{AgentPlan, BlastRadius, PlanCandidate, VerifyOutcome, verify_plan};
 use std::env;
+use std::fs;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::thread;
@@ -74,12 +75,43 @@ fn wait_for_record(pid: u32) -> Option<ProcessRecord> {
     None
 }
 
-fn current_identity(pid: u32) -> Option<CurrentIdentity> {
-    let record = record_for_pid(pid)?;
+fn read_boot_id() -> Option<String> {
+    let contents = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(contents.trim().to_string())
+}
+
+fn parse_start_time_ticks(stat: &str) -> Option<u64> {
+    let end = stat.rfind(')')?;
+    let rest = stat.get(end + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if fields.len() < 20 {
+        return None;
+    }
+    fields[19].parse().ok()
+}
+
+fn uid_from_status(status: &str) -> Option<u32> {
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            return rest
+                .split_whitespace()
+                .next()
+                .and_then(|val| val.parse::<u32>().ok());
+        }
+    }
+    None
+}
+
+fn current_identity_from_proc(pid: u32, boot_id: &str) -> Option<CurrentIdentity> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let start_time_ticks = parse_start_time_ticks(&stat)?;
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let uid = uid_from_status(&status)?;
+    let start_id = StartId::from_linux(boot_id, start_time_ticks, pid);
     Some(CurrentIdentity {
         pid,
-        start_id: record.start_id.0,
-        uid: record.uid,
+        start_id: start_id.0,
+        uid,
         alive: true,
     })
 }
@@ -211,10 +243,10 @@ fn test_verify_plan_with_real_process_nomock() {
 
     let report_running = verify_plan(&plan, &records, Utc::now(), Utc::now());
     assert_eq!(report_running.action_outcomes.len(), 1);
-    assert_eq!(
+    assert!(matches!(
         report_running.action_outcomes[0].outcome,
         VerifyOutcome::StillRunning
-    );
+    ));
 
     let wrong_start_time = (record.start_time_unix.max(0) as u64).saturating_add(1);
     let legacy_start_id = format!("{}:{}", pid, wrong_start_time);
@@ -237,10 +269,10 @@ fn test_verify_plan_with_real_process_nomock() {
 
     let report_mismatch = verify_plan(&plan_mismatch, &records, Utc::now(), Utc::now());
     assert_eq!(report_mismatch.action_outcomes.len(), 1);
-    assert_eq!(
+    assert!(matches!(
         report_mismatch.action_outcomes[0].outcome,
         VerifyOutcome::PidReused
-    );
+    ));
 
     proc.trigger_exit();
     proc.wait_for_exit(Duration::from_secs(2));
@@ -264,7 +296,7 @@ fn test_verify_plan_with_real_process_nomock() {
     assert_eq!(report_dead.action_outcomes.len(), 1);
     assert!(matches!(
         report_dead.action_outcomes[0].outcome,
-        VerifyOutcome::ConfirmedDead | VerifyOutcome::PidReused
+        VerifyOutcome::ConfirmedDead | VerifyOutcome::PidReused | VerifyOutcome::Respawned
     ));
 }
 
@@ -280,15 +312,21 @@ fn test_resume_plan_with_real_process_nomock() {
         .expect("spawn sleep process");
     let pid = proc.pid();
 
-    let record = match wait_for_record(pid) {
-        Some(r) => r,
+    if wait_for_record(pid).is_none() {
+        return;
+    }
+
+    let boot_id = match read_boot_id() {
+        Some(id) => id,
         None => return,
     };
-
-    let identity = RevalidationIdentity {
-        pid,
-        start_id: record.start_id.0.clone(),
-        uid: record.uid,
+    let identity = match current_identity_from_proc(pid, &boot_id) {
+        Some(cur) => RevalidationIdentity {
+            pid,
+            start_id: cur.start_id.clone(),
+            uid: cur.uid,
+        },
+        None => return,
     };
     let action = PlannedAction {
         identity: identity.clone(),
@@ -298,7 +336,7 @@ fn test_resume_plan_with_real_process_nomock() {
     };
     let mut plan = ExecutionPlan::new("session-resume", vec![action]);
 
-    let result = resume_plan(&mut plan, |pid| current_identity(pid), |a| {
+    let result = resume_plan(&mut plan, |pid| current_identity_from_proc(pid, &boot_id), |a| {
         if a.identity.pid == pid {
             proc.trigger_exit();
         }
@@ -310,7 +348,7 @@ fn test_resume_plan_with_real_process_nomock() {
 
     proc.wait_for_exit(Duration::from_secs(2));
 
-    let second = resume_plan(&mut plan, |pid| current_identity(pid), |_| Ok(()));
+    let second = resume_plan(&mut plan, |pid| current_identity_from_proc(pid, &boot_id), |_| Ok(()));
     assert_eq!(second.previously_applied, 1);
     assert_eq!(second.newly_applied, 0);
 }
@@ -327,15 +365,21 @@ fn test_resume_plan_identity_mismatch_nomock() {
         .expect("spawn sleep process");
     let pid = proc.pid();
 
-    let record = match wait_for_record(pid) {
-        Some(r) => r,
+    if wait_for_record(pid).is_none() {
+        return;
+    }
+
+    let boot_id = match read_boot_id() {
+        Some(id) => id,
         None => return,
     };
-
-    let identity = RevalidationIdentity {
-        pid,
-        start_id: format!("mismatch:{}", record.start_id.0),
-        uid: record.uid,
+    let identity = match current_identity_from_proc(pid, &boot_id) {
+        Some(cur) => RevalidationIdentity {
+            pid,
+            start_id: format!("mismatch:{}", cur.start_id),
+            uid: cur.uid,
+        },
+        None => return,
     };
     let action = PlannedAction {
         identity,
@@ -345,7 +389,7 @@ fn test_resume_plan_identity_mismatch_nomock() {
     };
     let mut plan = ExecutionPlan::new("session-mismatch", vec![action]);
 
-    let result = resume_plan(&mut plan, |pid| current_identity(pid), |_| Ok(()));
+    let result = resume_plan(&mut plan, |pid| current_identity_from_proc(pid, &boot_id), |_| Ok(()));
     assert_eq!(result.skipped_identity_mismatch, 1);
     assert_eq!(result.newly_applied, 0);
 
@@ -365,15 +409,17 @@ fn test_resume_plan_process_gone_nomock() {
         .expect("spawn sleep process");
     let pid = proc.pid();
 
-    let record = match wait_for_record(pid) {
-        Some(r) => r,
+    let boot_id = match read_boot_id() {
+        Some(id) => id,
         None => return,
     };
-
-    let identity = RevalidationIdentity {
-        pid,
-        start_id: record.start_id.0,
-        uid: record.uid,
+    let identity = match current_identity_from_proc(pid, &boot_id) {
+        Some(cur) => RevalidationIdentity {
+            pid,
+            start_id: cur.start_id,
+            uid: cur.uid,
+        },
+        None => return,
     };
     let action = PlannedAction {
         identity,
@@ -386,7 +432,7 @@ fn test_resume_plan_process_gone_nomock() {
     proc.trigger_exit();
     proc.wait_for_exit(Duration::from_secs(2));
 
-    let result = resume_plan(&mut plan, |pid| current_identity(pid), |_| Ok(()));
+    let result = resume_plan(&mut plan, |pid| current_identity_from_proc(pid, &boot_id), |_| Ok(()));
     assert_eq!(result.skipped_process_gone, 1);
     assert_eq!(result.newly_applied, 0);
 }

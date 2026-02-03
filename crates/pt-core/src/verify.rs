@@ -7,7 +7,6 @@ use crate::collect::{ProcessRecord, ProcessState};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub struct AgentPlan {
@@ -379,29 +378,26 @@ fn expected_outcome(action: &str) -> String {
 }
 
 fn parse_plan_start_id(raw: &str) -> PlanStartId {
-    let mut parts = raw.split(':');
-    let first = match parts.next() {
-        Some(v) => v,
-        None => return PlanStartId::Unknown,
-    };
-    let second = match parts.next() {
-        Some(v) => v,
-        None => return PlanStartId::Unknown,
-    };
-    if let (Ok(pid), Ok(start_time)) = (first.parse::<u32>(), second.parse::<u64>()) {
-        if parts.next().is_none() {
-            return PlanStartId::Legacy { pid, start_time };
+    let parts: Vec<&str> = raw.split(':').collect();
+    match parts.len() {
+        2 => {
+            if let (Ok(pid), Ok(start_time)) =
+                (parts[0].parse::<u32>(), parts[1].parse::<u64>())
+            {
+                return PlanStartId::Legacy { pid, start_time };
+            }
         }
-    }
-    if let Some(third) = parts.next() {
-        if parts.next().is_none() && Uuid::parse_str(first).is_ok() {
-            if let Ok(pid) = third.parse::<u32>() {
+        3 => {
+            if let (Ok(_start_time), Ok(pid)) =
+                (parts[1].parse::<u64>(), parts[2].parse::<u32>())
+            {
                 return PlanStartId::Full {
                     raw: raw.to_string(),
                     pid,
                 };
             }
         }
+        _ => {}
     }
     PlanStartId::Unknown
 }
@@ -487,6 +483,19 @@ mod tests {
         }
     }
 
+    fn make_proc_with_start_id(
+        pid: u32,
+        uid: u32,
+        cmd: &str,
+        start: i64,
+        state: ProcessState,
+        start_id: &str,
+    ) -> ProcessRecord {
+        let mut proc = make_proc(pid, uid, cmd, start, state);
+        proc.start_id = StartId(start_id.to_string());
+        proc
+    }
+
     #[test]
     fn verify_detects_respawn() {
         let plan = AgentPlan {
@@ -514,6 +523,39 @@ mod tests {
         assert!(matches!(
             report.action_outcomes[0].outcome,
             VerifyOutcome::Respawned
+        ));
+    }
+
+    #[test]
+    fn verify_detects_pid_reuse_with_non_uuid_start_id() {
+        let plan = AgentPlan {
+            session_id: "pt-20260115-000000-abcd".to_string(),
+            generated_at: Some("1970-01-01T00:00:10Z".to_string()),
+            candidates: vec![PlanCandidate {
+                pid: 321,
+                uid: 1000,
+                cmd_short: "sleep".to_string(),
+                cmd_full: "sleep 10".to_string(),
+                start_id: Some("unknown:100:321".to_string()),
+                recommended_action: "kill".to_string(),
+                blast_radius: None,
+            }],
+        };
+
+        let current = vec![make_proc_with_start_id(
+            321,
+            1000,
+            "sleep 10",
+            100,
+            ProcessState::Running,
+            "other:100:321",
+        )];
+
+        let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
+        assert_eq!(report.action_outcomes.len(), 1);
+        assert!(matches!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::PidReused
         ));
     }
 }
