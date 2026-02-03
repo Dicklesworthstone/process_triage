@@ -106,6 +106,17 @@ jobs:
             fi
           done
 
+  no_mock_policy:
+    name: No-Mock Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run no-mock policy check
+        run: scripts/check_no_mocks.sh
+
   manpages:
     name: Man Pages
     runs-on: ubuntu-latest
