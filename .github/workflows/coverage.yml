@@ -107,7 +107,9 @@ jobs:
 
       - name: Create coverage badge JSON
         run: |
-          percentage="${{ steps.coverage.outputs.percentage }}"
+          raw_percentage="${{ steps.coverage.outputs.percentage }}"
+          # Truncate to integer for bash comparison (e.g. 67.54 -> 67)
+          percentage="${raw_percentage%%.*}"
 
           # Determine color based on coverage
           if [ "$percentage" -ge 80 ]; then
@@ -122,7 +124,7 @@ jobs:
             color="red"
           fi
 
-          echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"${percentage}%\",\"color\":\"${color}\"}" > coverage-badge.json
+          echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"${raw_percentage}%\",\"color\":\"${color}\"}" > coverage-badge.json
           cat coverage-badge.json
 
       - name: Upload badge JSON
