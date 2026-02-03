@@ -14,6 +14,7 @@ use pt_common::{OutputFormat, SessionId, SCHEMA_VERSION};
 #[cfg(feature = "ui")]
 use pt_common::{IdentityQuality, ProcessIdentity};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
+use pt_core::calibrate::validation::ValidationEngine;
 use pt_core::collect::protected::ProtectedFilter;
 #[cfg(target_os = "linux")]
 use pt_core::collect::{systemd::collect_systemd_unit, ContainerRuntime};
@@ -1298,6 +1299,8 @@ enum ShadowCommands {
     Status,
     /// Export shadow observations for calibration analysis
     Export(ShadowExportArgs),
+    /// Generate a calibration/validation report from shadow observations
+    Report(ShadowReportArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1358,6 +1361,21 @@ struct ShadowExportArgs {
     format: String,
 
     /// Max observations to export (most recent first)
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+struct ShadowReportArgs {
+    /// Output path (stdout if omitted)
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// Classification threshold for kill recommendations
+    #[arg(long, default_value = "0.5")]
+    threshold: f64,
+
+    /// Max observations to analyze (most recent first)
     #[arg(long)]
     limit: Option<usize>,
 }
@@ -4081,6 +4099,7 @@ fn run_shadow(global: &GlobalOpts, args: &ShadowArgs) -> ExitCode {
         ShadowCommands::Stop => run_shadow_stop(global),
         ShadowCommands::Status => run_shadow_status(global),
         ShadowCommands::Export(export) => run_shadow_export(global, export),
+        ShadowCommands::Report(report) => run_shadow_report(global, report),
     }
 }
 
@@ -4394,6 +4413,64 @@ fn run_shadow_export(global: &GlobalOpts, args: &ShadowExportArgs) -> ExitCode {
             }
             _ => {
                 println!("Exported {} observations.", observations.len());
+            }
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_shadow_report(global: &GlobalOpts, args: &ShadowReportArgs) -> ExitCode {
+    let base_dir = shadow_base_dir();
+    let observations = match collect_shadow_observations(&base_dir, args.limit) {
+        Ok(observations) => observations,
+        Err(err) => {
+            eprintln!("shadow report: {}", err);
+            return ExitCode::IoError;
+        }
+    };
+
+    if observations.is_empty() {
+        eprintln!("shadow report: no observations found");
+        return ExitCode::NotFound;
+    }
+
+    let engine = ValidationEngine::from_shadow_observations(&observations, args.threshold);
+    let report = match engine.compute_report() {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("shadow report: {}", err);
+            return ExitCode::InternalError;
+        }
+    };
+
+    let report_json = serde_json::to_string_pretty(&report).unwrap_or_default();
+
+    let wrote_file = if let Some(ref path) = args.output {
+        if let Err(err) = std::fs::write(path, &report_json) {
+            eprintln!("shadow report: failed to write {}: {}", path, err);
+            return ExitCode::IoError;
+        }
+        true
+    } else {
+        println!("{}", report_json);
+        false
+    };
+
+    if wrote_file {
+        let response = serde_json::json!({
+            "command": "shadow report",
+            "count": observations.len(),
+            "threshold": args.threshold,
+            "base_dir": base_dir.display().to_string(),
+            "output": args.output,
+        });
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+                println!("{}", format_structured_output(global, response));
+            }
+            _ => {
+                println!("Report generated for {} observations.", observations.len());
             }
         }
     }
