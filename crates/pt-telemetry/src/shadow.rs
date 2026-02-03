@@ -263,6 +263,10 @@ pub enum EventType {
     BecameOrphan,
     /// Supervisor detected.
     SupervisorDetected,
+    /// Process exited or disappeared from observation.
+    ProcessExit,
+    /// Evidence snapshot captured for calibration linkage.
+    EvidenceSnapshot,
 }
 
 /// Belief state (posterior distribution over process classes).

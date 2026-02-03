@@ -7,14 +7,22 @@ use crate::decision::{Action, DecisionOutcome};
 use crate::inference::{ClassScores, Confidence, EvidenceLedger};
 use chrono::Utc;
 use pt_telemetry::shadow::{
-    BeliefState, Observation, ShadowStorage, ShadowStorageConfig, ShadowStorageError, StateSnapshot,
+    BeliefState, EventType, Observation, ProcessEvent, ShadowStorage, ShadowStorageConfig,
+    ShadowStorageError, StateSnapshot,
 };
 use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::PathBuf;
+
+const DEFAULT_MISS_THRESHOLD: u32 = 2;
 
 #[derive(Debug)]
 pub enum ShadowRecordError {
     Storage(ShadowStorageError),
+    Io(std::io::Error),
+    Json(serde_json::Error),
 }
 
 impl From<ShadowStorageError> for ShadowRecordError {
@@ -23,19 +31,60 @@ impl From<ShadowStorageError> for ShadowRecordError {
     }
 }
 
+impl From<std::io::Error> for ShadowRecordError {
+    fn from(err: std::io::Error) -> Self {
+        ShadowRecordError::Io(err)
+    }
+}
+
+impl From<serde_json::Error> for ShadowRecordError {
+    fn from(err: serde_json::Error) -> Self {
+        ShadowRecordError::Json(err)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingObservation {
+    identity_hash: String,
+    pid: u32,
+    last_seen: chrono::DateTime<chrono::Utc>,
+    miss_count: u32,
+    belief: BeliefState,
+    state: StateSnapshot,
+    comm: String,
+}
+
 /// Records shadow observations into local storage.
 pub struct ShadowRecorder {
     storage: ShadowStorage,
     recorded: u64,
+    pending: HashMap<String, PendingObservation>,
+    seen_identities: HashSet<String>,
+    pending_path: PathBuf,
+    miss_threshold: u32,
+    had_records: bool,
 }
 
 impl ShadowRecorder {
     pub fn new() -> Result<Self, ShadowRecordError> {
         let config = shadow_config_from_env();
         let storage = ShadowStorage::new(config)?;
+        let pending_path = storage.config().base_dir.join("pending.json");
+        let pending = match load_pending(&pending_path) {
+            Ok(pending) => pending,
+            Err(err) => {
+                eprintln!("shadow mode: failed to load pending outcomes: {:?}", err);
+                HashMap::new()
+            }
+        };
         Ok(Self {
             storage,
             recorded: 0,
+            pending,
+            seen_identities: HashSet::new(),
+            pending_path,
+            miss_threshold: DEFAULT_MISS_THRESHOLD,
+            had_records: false,
         })
     }
 
@@ -46,6 +95,7 @@ impl ShadowRecorder {
         ledger: &EvidenceLedger,
         decision: &DecisionOutcome,
     ) -> Result<(), ShadowRecordError> {
+        self.had_records = true;
         let identity_hash = compute_identity_hash(proc);
         let state_char = proc.state.to_string().chars().next().unwrap_or('?');
         let max_posterior = posterior
@@ -78,27 +128,100 @@ impl ShadowRecorder {
             child_count: 0,
         };
 
+        let mut events = Vec::new();
+        if let Some(event) = build_evidence_event(ledger) {
+            events.push(event);
+        }
+
         let observation = Observation {
             timestamp: Utc::now(),
             pid: proc.pid.0,
-            identity_hash,
-            state,
-            events: Vec::new(),
-            belief,
+            identity_hash: identity_hash.clone(),
+            state: state.clone(),
+            events,
+            belief: belief.clone(),
         };
 
         self.storage.record(observation)?;
         self.recorded = self.recorded.saturating_add(1);
+
+        self.seen_identities.insert(identity_hash.clone());
+        self.pending.insert(
+            identity_hash.clone(),
+            PendingObservation {
+                identity_hash,
+                pid: proc.pid.0,
+                last_seen: Utc::now(),
+                miss_count: 0,
+                belief,
+                state,
+                comm: proc.comm.clone(),
+            },
+        );
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<(), ShadowRecordError> {
+        self.record_outcomes_for_missing()?;
         self.storage.flush()?;
+        persist_pending(&self.pending_path, &self.pending)?;
         Ok(())
     }
 
     pub fn recorded_count(&self) -> u64 {
         self.recorded
+    }
+
+    fn record_outcomes_for_missing(&mut self) -> Result<(), ShadowRecordError> {
+        if !self.had_records {
+            self.seen_identities.clear();
+            return Ok(());
+        }
+
+        let now = Utc::now();
+        let mut resolved = Vec::new();
+
+        for entry in self.pending.values_mut() {
+            if self.seen_identities.contains(&entry.identity_hash) {
+                entry.miss_count = 0;
+                entry.last_seen = now;
+                continue;
+            }
+
+            entry.miss_count = entry.miss_count.saturating_add(1);
+            if entry.miss_count >= self.miss_threshold {
+                resolved.push(entry.clone());
+            }
+        }
+
+        for entry in resolved {
+            self.pending.remove(&entry.identity_hash);
+            let details = serde_json::json!({
+                "reason": "missing",
+                "miss_count": entry.miss_count,
+                "last_seen": entry.last_seen.to_rfc3339(),
+                "comm": entry.comm,
+            })
+            .to_string();
+            let event = ProcessEvent {
+                timestamp: now,
+                event_type: EventType::ProcessExit,
+                details: Some(details),
+            };
+            let observation = Observation {
+                timestamp: now,
+                pid: entry.pid,
+                identity_hash: entry.identity_hash,
+                state: entry.state,
+                events: vec![event],
+                belief: entry.belief,
+            };
+            self.storage.record(observation)?;
+        }
+
+        self.seen_identities.clear();
+        self.had_records = false;
+        Ok(())
     }
 }
 
@@ -136,6 +259,62 @@ fn compute_identity_hash(proc: &ProcessRecord) -> String {
     hex::encode(&digest[..8])
 }
 
+fn build_evidence_event(ledger: &EvidenceLedger) -> Option<ProcessEvent> {
+    let top: Vec<_> = ledger
+        .bayes_factors
+        .iter()
+        .take(3)
+        .map(|bf| {
+            serde_json::json!({
+                "feature": bf.feature,
+                "delta_bits": bf.delta_bits,
+                "direction": bf.direction,
+                "strength": bf.strength,
+            })
+        })
+        .collect();
+    if top.is_empty() && ledger.top_evidence.is_empty() {
+        return None;
+    }
+    let details = serde_json::json!({
+        "why_summary": ledger.why_summary,
+        "top_evidence": ledger.top_evidence,
+        "bayes_factors": top,
+    })
+    .to_string();
+    Some(ProcessEvent {
+        timestamp: Utc::now(),
+        event_type: EventType::EvidenceSnapshot,
+        details: Some(details),
+    })
+}
+
+fn load_pending(path: &PathBuf) -> Result<HashMap<String, PendingObservation>, ShadowRecordError> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let content = fs::read_to_string(path)?;
+    let records: Vec<PendingObservation> = serde_json::from_str(&content)?;
+    Ok(records
+        .into_iter()
+        .map(|record| (record.identity_hash.clone(), record))
+        .collect())
+}
+
+fn persist_pending(
+    path: &PathBuf,
+    pending: &HashMap<String, PendingObservation>,
+) -> Result<(), ShadowRecordError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut records: Vec<&PendingObservation> = pending.values().collect();
+    records.sort_by(|a, b| a.identity_hash.cmp(&b.identity_hash));
+    let content = serde_json::to_string_pretty(&records)?;
+    fs::write(path, content)?;
+    Ok(())
+}
+
 fn shadow_config_from_env() -> ShadowStorageConfig {
     let mut config = ShadowStorageConfig::default();
     if let Some(base) = resolve_data_dir_override() {
@@ -157,6 +336,7 @@ fn resolve_data_dir_override() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn identity_hash_is_stable_and_short() {
@@ -185,5 +365,49 @@ mod tests {
         let h2 = compute_identity_hash(&proc);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 16);
+    }
+
+    #[test]
+    fn missing_entries_emit_exit_event() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let old_env = std::env::var("PROCESS_TRIAGE_DATA").ok();
+        std::env::set_var("PROCESS_TRIAGE_DATA", temp_dir.path());
+
+        let mut recorder = ShadowRecorder::new().expect("recorder");
+        recorder.miss_threshold = 1;
+        recorder.had_records = true;
+
+        recorder.pending.insert(
+            "hash_exit".to_string(),
+            PendingObservation {
+                identity_hash: "hash_exit".to_string(),
+                pid: 1234,
+                last_seen: Utc::now() - chrono::Duration::minutes(10),
+                miss_count: 0,
+                belief: BeliefState::default(),
+                state: StateSnapshot::default(),
+                comm: "sleep".to_string(),
+            },
+        );
+
+        recorder
+            .record_outcomes_for_missing()
+            .expect("record outcomes");
+
+        let events = recorder.storage.get_events(
+            Utc::now() - chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::hours(1),
+            10,
+        );
+
+        assert!(events
+            .events
+            .iter()
+            .any(|(_, event)| event.event_type == EventType::ProcessExit));
+
+        match old_env {
+            Some(val) => std::env::set_var("PROCESS_TRIAGE_DATA", val),
+            None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
+        }
     }
 }
