@@ -60,6 +60,7 @@ pub struct ShadowRecorder {
     recorded: u64,
     pending: HashMap<String, PendingObservation>,
     seen_identities: HashSet<String>,
+    seen_pids: HashMap<u32, String>,
     pending_path: PathBuf,
     miss_threshold: u32,
     had_records: bool,
@@ -82,6 +83,7 @@ impl ShadowRecorder {
             recorded: 0,
             pending,
             seen_identities: HashSet::new(),
+            seen_pids: HashMap::new(),
             pending_path,
             miss_threshold: DEFAULT_MISS_THRESHOLD,
             had_records: false,
@@ -146,6 +148,8 @@ impl ShadowRecorder {
         self.recorded = self.recorded.saturating_add(1);
 
         self.seen_identities.insert(identity_hash.clone());
+        self.seen_pids
+            .insert(proc.pid.0, identity_hash.clone());
         self.pending.insert(
             identity_hash.clone(),
             PendingObservation {
@@ -175,6 +179,7 @@ impl ShadowRecorder {
     fn record_outcomes_for_missing(&mut self) -> Result<(), ShadowRecordError> {
         if !self.had_records {
             self.seen_identities.clear();
+            self.seen_pids.clear();
             return Ok(());
         }
 
@@ -196,11 +201,18 @@ impl ShadowRecorder {
 
         for entry in resolved {
             self.pending.remove(&entry.identity_hash);
+            let reuse = self
+                .seen_pids
+                .get(&entry.pid)
+                .map(|identity| identity != &entry.identity_hash)
+                .unwrap_or(false);
+            let reason = if reuse { "pid_reused" } else { "missing" };
             let details = serde_json::json!({
-                "reason": "missing",
+                "reason": reason,
                 "miss_count": entry.miss_count,
                 "last_seen": entry.last_seen.to_rfc3339(),
                 "comm": entry.comm,
+                "last_state": entry.state.state_char.to_string(),
             })
             .to_string();
             let event = ProcessEvent {
@@ -220,6 +232,7 @@ impl ShadowRecorder {
         }
 
         self.seen_identities.clear();
+        self.seen_pids.clear();
         self.had_records = false;
         Ok(())
     }

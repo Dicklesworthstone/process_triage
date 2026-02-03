@@ -4619,6 +4619,9 @@ fn collect_shadow_files(dir: &PathBuf, files: &mut Vec<PathBuf>) -> std::io::Res
             if path.file_name().and_then(|s| s.to_str()) == Some("stats.json") {
                 continue;
             }
+            if path.file_name().and_then(|s| s.to_str()) == Some("pending.json") {
+                continue;
+            }
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 files.push(path);
             }
