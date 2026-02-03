@@ -22,6 +22,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use pt_telemetry::shadow::{EventType, Observation, ProcessEvent};
+use serde_json::Value as JsonValue;
 
 use super::{
     CalibrationData, CalibrationError, CalibrationQuality,
@@ -96,6 +98,9 @@ pub struct ValidationRecord {
     /// Signal that terminated the process, if any.
     #[serde(default)]
     pub exit_signal: Option<i32>,
+    /// Source of the outcome (e.g., "user", "shadow:missing").
+    #[serde(default)]
+    pub outcome_source: Option<String>,
     /// Host ID for multi-host analysis.
     #[serde(default)]
     pub host_id: Option<String>,
@@ -245,6 +250,7 @@ impl ValidationEngine {
             resolved_at: None,
             exit_code: None,
             exit_signal: None,
+            outcome_source: None,
             host_id,
         });
     }
@@ -260,6 +266,24 @@ impl ValidationEngine {
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
     ) -> bool {
+        self.record_outcome_with_source(
+            identity_hash,
+            ground_truth,
+            exit_code,
+            exit_signal,
+            None,
+        )
+    }
+
+    /// Record a ground truth outcome with an optional source label.
+    pub fn record_outcome_with_source(
+        &mut self,
+        identity_hash: &str,
+        ground_truth: GroundTruth,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+        outcome_source: Option<String>,
+    ) -> bool {
         // Find the most recent unresolved prediction for this identity.
         let found = self
             .records
@@ -272,6 +296,9 @@ impl ValidationEngine {
             record.resolved_at = Some(Utc::now());
             record.exit_code = exit_code;
             record.exit_signal = exit_signal;
+            if outcome_source.is_some() {
+                record.outcome_source = outcome_source;
+            }
             true
         } else {
             false
@@ -286,6 +313,24 @@ impl ValidationEngine {
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
     ) -> bool {
+        self.record_outcome_by_pid_with_source(
+            pid,
+            ground_truth,
+            exit_code,
+            exit_signal,
+            None,
+        )
+    }
+
+    /// Record outcome by PID with an optional source label.
+    pub fn record_outcome_by_pid_with_source(
+        &mut self,
+        pid: u32,
+        ground_truth: GroundTruth,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+        outcome_source: Option<String>,
+    ) -> bool {
         let found = self
             .records
             .iter_mut()
@@ -297,6 +342,9 @@ impl ValidationEngine {
             record.resolved_at = Some(Utc::now());
             record.exit_code = exit_code;
             record.exit_signal = exit_signal;
+            if outcome_source.is_some() {
+                record.outcome_source = outcome_source;
+            }
             true
         } else {
             false
@@ -324,12 +372,120 @@ impl ValidationEngine {
             .collect()
     }
 
+    /// Build a validation engine from shadow-mode observations.
+    pub fn from_shadow_observations(observations: &[Observation], threshold: f64) -> Self {
+        let mut engine = ValidationEngine::new(threshold);
+        let mut ordered: Vec<&Observation> = observations.iter().collect();
+        ordered.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        for obs in ordered {
+            let exit_event = obs
+                .events
+                .iter()
+                .find(|event| event.event_type == EventType::ProcessExit);
+
+            if let Some(exit_event) = exit_event {
+                if !engine.has_unresolved_identity(&obs.identity_hash) {
+                    let comm = extract_comm_from_events(&obs.events)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    engine.upsert_prediction(
+                        obs.identity_hash.clone(),
+                        obs.pid,
+                        obs.belief.p_abandoned as f64,
+                        obs.belief.recommendation.clone(),
+                        None,
+                        comm,
+                        None,
+                        obs.timestamp,
+                    );
+                }
+
+                let (ground_truth, exit_code, exit_signal, outcome_source) =
+                    map_exit_event(exit_event);
+                engine.record_outcome_with_source(
+                    &obs.identity_hash,
+                    ground_truth,
+                    exit_code,
+                    exit_signal,
+                    outcome_source,
+                );
+                continue;
+            }
+
+            let comm = extract_comm_from_events(&obs.events)
+                .unwrap_or_else(|| "unknown".to_string());
+            engine.upsert_prediction(
+                obs.identity_hash.clone(),
+                obs.pid,
+                obs.belief.p_abandoned as f64,
+                obs.belief.recommendation.clone(),
+                None,
+                comm,
+                None,
+                obs.timestamp,
+            );
+        }
+
+        engine
+    }
+
     /// Convert resolved records to calibration data.
     fn to_calibration_data(&self) -> Vec<CalibrationData> {
         self.records
             .iter()
             .filter_map(|r| r.to_calibration_data())
             .collect()
+    }
+
+    fn has_unresolved_identity(&self, identity_hash: &str) -> bool {
+        self.records
+            .iter()
+            .rev()
+            .any(|r| r.identity_hash == identity_hash && r.ground_truth.is_none())
+    }
+
+    fn upsert_prediction(
+        &mut self,
+        identity_hash: String,
+        pid: u32,
+        predicted_abandoned: f64,
+        recommended_action: String,
+        proc_type: Option<String>,
+        comm: String,
+        host_id: Option<String>,
+        predicted_at: DateTime<Utc>,
+    ) {
+        if let Some(record) = self
+            .records
+            .iter_mut()
+            .rev()
+            .find(|r| r.identity_hash == identity_hash && r.ground_truth.is_none())
+        {
+            record.pid = pid;
+            record.predicted_abandoned = predicted_abandoned;
+            record.recommended_action = recommended_action;
+            record.proc_type = proc_type;
+            record.comm = comm;
+            record.predicted_at = predicted_at;
+            record.host_id = host_id;
+            return;
+        }
+
+        self.records.push(ValidationRecord {
+            identity_hash,
+            pid,
+            predicted_abandoned,
+            recommended_action,
+            proc_type,
+            comm,
+            predicted_at,
+            ground_truth: None,
+            resolved_at: None,
+            exit_code: None,
+            exit_signal: None,
+            outcome_source: None,
+            host_id,
+        });
     }
 
     /// Generate a full validation report.
@@ -574,9 +730,84 @@ impl ValidationEngine {
     }
 }
 
+fn extract_comm_from_events(events: &[ProcessEvent]) -> Option<String> {
+    let mut preferred: Option<String> = None;
+
+    for event in events {
+        if let Some(details) = &event.details {
+            if let Ok(value) = serde_json::from_str::<JsonValue>(details) {
+                if let Some(comm) = value.get("comm").and_then(|v| v.as_str()) {
+                    let comm = comm.to_string();
+                    if event.event_type == EventType::EvidenceSnapshot {
+                        return Some(comm);
+                    }
+                    preferred = Some(comm);
+                }
+            }
+        }
+    }
+
+    preferred
+}
+
+fn map_exit_event(
+    event: &ProcessEvent,
+) -> (GroundTruth, Option<i32>, Option<i32>, Option<String>) {
+    let mut exit_code: Option<i32> = None;
+    let mut exit_signal: Option<i32> = None;
+    let mut outcome_source: Option<String> = None;
+    let mut ground_truth: Option<GroundTruth> = None;
+
+    if let Some(details) = &event.details {
+        if let Ok(value) = serde_json::from_str::<JsonValue>(details) {
+            if let Some(code) = value.get("exit_code").and_then(|v| v.as_i64()) {
+                exit_code = Some(code as i32);
+            }
+            if let Some(sig) = value.get("exit_signal").and_then(|v| v.as_i64()) {
+                exit_signal = Some(sig as i32);
+            }
+            if let Some(hint) = value.get("outcome_hint").and_then(|v| v.as_str()) {
+                ground_truth = map_outcome_hint(hint);
+                outcome_source = Some(format!("shadow:hint:{}", hint));
+            } else if let Some(reason) = value.get("reason").and_then(|v| v.as_str()) {
+                outcome_source = Some(format!("shadow:{}", reason));
+            }
+        }
+    }
+
+    if ground_truth.is_none() {
+        if exit_signal.is_some() || exit_code.unwrap_or(0) != 0 {
+            ground_truth = Some(GroundTruth::Crash);
+            if outcome_source.is_none() {
+                outcome_source = Some("shadow:exit_status".to_string());
+            }
+        } else {
+            ground_truth = Some(GroundTruth::NormalExit);
+        }
+    }
+
+    (ground_truth.unwrap_or(GroundTruth::NormalExit), exit_code, exit_signal, outcome_source)
+}
+
+fn map_outcome_hint(hint: &str) -> Option<GroundTruth> {
+    match hint {
+        "user_killed" | "user_kill" => Some(GroundTruth::UserKilled),
+        "user_spared" | "user_spare" => Some(GroundTruth::UserSpared),
+        "normal_exit" => Some(GroundTruth::NormalExit),
+        "external_kill" => Some(GroundTruth::ExternalKill),
+        "system_shutdown" => Some(GroundTruth::SystemShutdown),
+        "crash" => Some(GroundTruth::Crash),
+        "still_running" => Some(GroundTruth::StillRunning),
+        "expired" => Some(GroundTruth::Expired),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
+    use pt_telemetry::shadow::{BeliefState, ProcessEvent, StateSnapshot};
 
     fn make_engine_with_data() -> ValidationEngine {
         let mut engine = ValidationEngine::new(0.5);
@@ -759,5 +990,105 @@ mod tests {
         let fn_ = &report.top_false_negatives[0];
         assert_eq!(fn_.pattern, "vite");
         assert_eq!(fn_.count, 1);
+    }
+
+    #[test]
+    fn test_from_shadow_observations_upserts_predictions() {
+        let now = Utc::now();
+        let obs1 = Observation {
+            timestamp: now,
+            pid: 10,
+            identity_hash: "hash_shadow".to_string(),
+            state: StateSnapshot::default(),
+            events: vec![ProcessEvent {
+                timestamp: now,
+                event_type: EventType::EvidenceSnapshot,
+                details: Some(
+                    serde_json::json!({"comm": "sleep"}).to_string(),
+                ),
+            }],
+            belief: BeliefState {
+                p_abandoned: 0.1,
+                recommendation: "keep".to_string(),
+                ..BeliefState::default()
+            },
+        };
+
+        let obs2 = Observation {
+            timestamp: now + Duration::seconds(5),
+            pid: 10,
+            identity_hash: "hash_shadow".to_string(),
+            state: StateSnapshot::default(),
+            events: vec![ProcessEvent {
+                timestamp: now + Duration::seconds(5),
+                event_type: EventType::EvidenceSnapshot,
+                details: Some(
+                    serde_json::json!({"comm": "sleep"}).to_string(),
+                ),
+            }],
+            belief: BeliefState {
+                p_abandoned: 0.9,
+                recommendation: "kill".to_string(),
+                ..BeliefState::default()
+            },
+        };
+
+        let engine = ValidationEngine::from_shadow_observations(&[obs1, obs2], 0.5);
+        assert_eq!(engine.pending_records().len(), 1);
+        let record = engine.pending_records()[0];
+        assert!((record.predicted_abandoned - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_from_shadow_observations_resolves_exit() {
+        let now = Utc::now();
+        let obs1 = Observation {
+            timestamp: now,
+            pid: 11,
+            identity_hash: "hash_exit".to_string(),
+            state: StateSnapshot::default(),
+            events: vec![ProcessEvent {
+                timestamp: now,
+                event_type: EventType::EvidenceSnapshot,
+                details: Some(
+                    serde_json::json!({"comm": "worker"}).to_string(),
+                ),
+            }],
+            belief: BeliefState {
+                p_abandoned: 0.8,
+                recommendation: "kill".to_string(),
+                ..BeliefState::default()
+            },
+        };
+
+        let obs2 = Observation {
+            timestamp: now + Duration::seconds(12),
+            pid: 11,
+            identity_hash: "hash_exit".to_string(),
+            state: StateSnapshot::default(),
+            events: vec![ProcessEvent {
+                timestamp: now + Duration::seconds(12),
+                event_type: EventType::ProcessExit,
+                details: Some(
+                    serde_json::json!({
+                        "reason": "missing",
+                        "comm": "worker"
+                    })
+                    .to_string(),
+                ),
+            }],
+            belief: BeliefState {
+                p_abandoned: 0.8,
+                recommendation: "kill".to_string(),
+                ..BeliefState::default()
+            },
+        };
+
+        let engine = ValidationEngine::from_shadow_observations(&[obs1, obs2], 0.5);
+        let resolved = engine.resolved_records();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].ground_truth, Some(GroundTruth::NormalExit));
+        assert_eq!(resolved[0].comm, "worker");
+        assert_eq!(resolved[0].outcome_source.as_deref(), Some("shadow:missing"));
     }
 }

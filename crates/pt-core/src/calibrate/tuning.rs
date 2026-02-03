@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::validation::{GroundTruth, ValidationRecord};
+use super::validation::ValidationRecord;
 use super::{CalibrationData, CalibrationError};
 use super::metrics::compute_metrics;
 
@@ -383,6 +383,7 @@ mod tests {
             resolved_at: Some(Utc::now()),
             exit_code: None,
             exit_signal: None,
+            outcome_source: None,
             host_id: None,
         }
     }
