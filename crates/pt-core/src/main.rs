@@ -4432,7 +4432,7 @@ fn run_shadow_report(global: &GlobalOpts, args: &ShadowReportArgs) -> ExitCode {
 
     if observations.is_empty() {
         eprintln!("shadow report: no observations found");
-        return ExitCode::NotFound;
+        return ExitCode::Clean;
     }
 
     let engine = ValidationEngine::from_shadow_observations(&observations, args.threshold);

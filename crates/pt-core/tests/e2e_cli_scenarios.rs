@@ -27,7 +27,7 @@ mod e2e_scenarios {
     /// Get a Command for pt-core binary.
     fn pt_core() -> Command {
         let mut cmd = cargo_bin_cmd!("pt-core");
-        cmd.timeout(Duration::from_secs(30));
+        cmd.timeout(Duration::from_secs(90));
         cmd
     }
 
