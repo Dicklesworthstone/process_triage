@@ -184,8 +184,16 @@ mod tests {
     #[test]
     fn test_ascii_output() {
         let data: Vec<CalibrationData> = vec![
-            CalibrationData { predicted: 0.1, actual: false, ..Default::default() },
-            CalibrationData { predicted: 0.9, actual: true, ..Default::default() },
+            CalibrationData {
+                predicted: 0.1,
+                actual: false,
+                ..Default::default()
+            },
+            CalibrationData {
+                predicted: 0.9,
+                actual: true,
+                ..Default::default()
+            },
         ];
         let curve = CalibrationCurve::from_data(&data, 10);
         let ascii = curve.ascii_curve(40, 10);

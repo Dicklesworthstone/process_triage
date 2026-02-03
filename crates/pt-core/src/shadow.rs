@@ -10,8 +10,8 @@ use pt_telemetry::shadow::{
     BeliefState, EventType, Observation, ProcessEvent, ShadowStorage, ShadowStorageConfig,
     ShadowStorageError, StateSnapshot,
 };
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -148,8 +148,7 @@ impl ShadowRecorder {
         self.recorded = self.recorded.saturating_add(1);
 
         self.seen_identities.insert(identity_hash.clone());
-        self.seen_pids
-            .insert(proc.pid.0, identity_hash.clone());
+        self.seen_pids.insert(proc.pid.0, identity_hash.clone());
         self.pending.insert(
             identity_hash.clone(),
             PendingObservation {

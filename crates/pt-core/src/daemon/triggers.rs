@@ -131,7 +131,12 @@ pub fn evaluate_triggers(
     let mut fired = Vec::new();
 
     // --- Load trigger ---
-    state.load_ewma = ewma(state.load_ewma, metrics.load_avg_1, alpha, state.total_ticks);
+    state.load_ewma = ewma(
+        state.load_ewma,
+        metrics.load_avg_1,
+        alpha,
+        state.total_ticks,
+    );
 
     if state.load_cooldown > 0 {
         state.load_cooldown -= 1;

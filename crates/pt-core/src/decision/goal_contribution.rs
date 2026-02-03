@@ -55,9 +55,7 @@ pub struct ContributionFactor {
 /// Estimate memory contribution from killing a process.
 pub fn estimate_memory_contribution(candidate: &ContributionCandidate) -> GoalContribution {
     // Base: use USS if available (true private memory), else RSS.
-    let base_bytes = candidate
-        .uss_bytes
-        .unwrap_or(candidate.rss_bytes) as f64;
+    let base_bytes = candidate.uss_bytes.unwrap_or(candidate.rss_bytes) as f64;
 
     let mut factors = Vec::new();
     let mut multiplier = 1.0;
@@ -90,11 +88,19 @@ pub fn estimate_memory_contribution(candidate: &ContributionCandidate) -> GoalCo
     let expected = base_bytes * multiplier;
 
     // Uncertainty: wider when USS unknown or respawn likely.
-    let uncertainty_factor = if candidate.uss_bytes.is_some() { 0.1 } else { 0.3 };
+    let uncertainty_factor = if candidate.uss_bytes.is_some() {
+        0.1
+    } else {
+        0.3
+    };
     let low = expected * (1.0 - uncertainty_factor);
     let high = base_bytes * (1.0 + uncertainty_factor * 0.5); // High can exceed expected
 
-    let confidence = if candidate.uss_bytes.is_some() { 0.9 } else { 0.6 };
+    let confidence = if candidate.uss_bytes.is_some() {
+        0.9
+    } else {
+        0.6
+    };
     let confidence = confidence * (1.0 - candidate.respawn_probability * 0.5);
 
     GoalContribution {
@@ -362,10 +368,7 @@ mod tests {
             estimate_port_contribution(&c, 3000),
             estimate_fd_contribution(&c),
         ] {
-            assert!(
-                contrib.low <= contrib.expected,
-                "low should be <= expected"
-            );
+            assert!(contrib.low <= contrib.expected, "low should be <= expected");
             assert!(
                 contrib.high >= contrib.expected || contrib.expected == 0.0,
                 "high should be >= expected"

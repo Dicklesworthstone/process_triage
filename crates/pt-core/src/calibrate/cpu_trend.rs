@@ -419,7 +419,9 @@ mod tests {
         };
         let result = analyze_cpu_trend(&samples, &config, Some(0.7)).unwrap();
         assert_eq!(result.label, CpuTrendLabel::Increasing);
-        let eta = result.threshold_eta.expect("Should have ETA for increasing trend");
+        let eta = result
+            .threshold_eta
+            .expect("Should have ETA for increasing trend");
         assert!(eta.eta_secs > 0.0);
         assert!(eta.confidence > 0.0);
     }

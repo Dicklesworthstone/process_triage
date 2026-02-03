@@ -25,33 +25,33 @@
 //! println!("{}", report.ascii_curve());
 //! ```
 
-pub mod metrics;
-pub mod curve;
 pub mod baseline;
 pub mod baseline_persist;
 pub mod bias;
-pub mod report;
-pub mod queries;
 pub mod bounds;
-pub mod pac_bayes;
-pub mod threshold;
-pub mod trend;
-pub mod tuning;
+pub mod cpu_trend;
+pub mod curve;
 pub mod empirical_bayes;
 pub mod hierarchical;
 pub mod kalman;
 pub mod mem_growth;
-pub mod cpu_trend;
+pub mod metrics;
+pub mod pac_bayes;
 pub mod ppc;
+pub mod queries;
+pub mod report;
+pub mod threshold;
+pub mod trend;
+pub mod tuning;
 pub mod validation;
 
-pub use metrics::*;
-pub use curve::*;
 pub use bias::*;
-pub use report::*;
-pub use queries::*;
 pub use bounds::*;
+pub use curve::*;
+pub use metrics::*;
 pub use pac_bayes::*;
+pub use queries::*;
+pub use report::*;
 pub use validation::*;
 
 use serde::{Deserialize, Serialize};
@@ -146,7 +146,10 @@ impl std::fmt::Display for CalibrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CalibrationError::NoData => write!(f, "No calibration data provided"),
-            CalibrationError::InsufficientData { count, min_required } => {
+            CalibrationError::InsufficientData {
+                count,
+                min_required,
+            } => {
                 write!(
                     f,
                     "Insufficient data: {} samples (minimum {} required)",

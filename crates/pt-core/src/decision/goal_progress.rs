@@ -126,7 +126,10 @@ pub fn measure_progress(
     session_id: Option<String>,
 ) -> GoalProgressReport {
     let observed = compute_observed_delta(metric, target_port, before, after);
-    let expected: f64 = action_outcomes.iter().map(|a| a.expected_contribution).sum();
+    let expected: f64 = action_outcomes
+        .iter()
+        .map(|a| a.expected_contribution)
+        .sum();
 
     let discrepancy = observed - expected;
     let discrepancy_fraction = if expected.abs() > 1e-12 {
@@ -137,12 +140,7 @@ pub fn measure_progress(
         0.0
     };
 
-    let classification = classify_discrepancy(
-        expected,
-        observed,
-        discrepancy_fraction,
-        config,
-    );
+    let classification = classify_discrepancy(expected, observed, discrepancy_fraction, config);
 
     let suspected_causes = diagnose_causes(&action_outcomes, classification, discrepancy_fraction);
 
@@ -323,7 +321,10 @@ mod tests {
             None,
         );
         assert_eq!(report.classification, DiscrepancyClass::Underperformance);
-        assert!(report.suspected_causes.iter().any(|c| c.cause.contains("respawn")));
+        assert!(report
+            .suspected_causes
+            .iter()
+            .any(|c| c.cause.contains("respawn")));
     }
 
     #[test]
@@ -423,7 +424,10 @@ mod tests {
             None,
         );
         assert_eq!(report.classification, DiscrepancyClass::Overperformance);
-        assert!(report.suspected_causes.iter().any(|c| c.cause.contains("child")));
+        assert!(report
+            .suspected_causes
+            .iter()
+            .any(|c| c.cause.contains("child")));
     }
 
     #[test]
@@ -441,6 +445,9 @@ mod tests {
             &ProgressConfig::default(),
             None,
         );
-        assert!(report.suspected_causes.iter().any(|c| c.cause.contains("failed")));
+        assert!(report
+            .suspected_causes
+            .iter()
+            .any(|c| c.cause.contains("failed")));
     }
 }

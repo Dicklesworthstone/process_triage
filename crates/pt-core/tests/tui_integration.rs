@@ -1,8 +1,8 @@
 #![cfg(feature = "ui")]
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use pt_core::tui::{App, AppState};
 use pt_core::tui::widgets::ProcessRow;
+use pt_core::tui::{App, AppState};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -45,8 +45,11 @@ fn app_renders_galaxy_brain_split() {
     let mut app = App::new();
     app.process_table.set_rows(vec![sample_row()]);
 
-    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)))
-        .unwrap();
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('g'),
+        KeyModifiers::NONE,
+    )))
+    .unwrap();
     assert_eq!(app.state, AppState::Normal);
 
     terminal.draw(|frame| app.render(frame)).unwrap();
@@ -64,8 +67,11 @@ fn app_help_overlay_renders() {
     let mut app = App::new();
     app.process_table.set_rows(vec![sample_row()]);
 
-    app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)))
-        .unwrap();
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('?'),
+        KeyModifiers::NONE,
+    )))
+    .unwrap();
     assert_eq!(app.state, AppState::Help);
 
     terminal.draw(|frame| app.render(frame)).unwrap();

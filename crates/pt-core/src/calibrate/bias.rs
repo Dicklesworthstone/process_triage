@@ -66,8 +66,7 @@ pub fn analyze_bias(data: &[CalibrationData]) -> Result<BiasAnalysis, Calibratio
 
     // Overall bias
     let overall_predicted: f64 = data.iter().map(|d| d.predicted).sum::<f64>() / data.len() as f64;
-    let overall_actual: f64 =
-        data.iter().filter(|d| d.actual).count() as f64 / data.len() as f64;
+    let overall_actual: f64 = data.iter().filter(|d| d.actual).count() as f64 / data.len() as f64;
     let overall_bias = overall_predicted - overall_actual;
 
     // Bias by process type
@@ -256,7 +255,9 @@ fn generate_recommendations(
     }
 
     if recs.is_empty() {
-        recs.push("Model calibration looks reasonable. No significant biases detected.".to_string());
+        recs.push(
+            "Model calibration looks reasonable. No significant biases detected.".to_string(),
+        );
     }
 
     recs

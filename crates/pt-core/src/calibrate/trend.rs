@@ -169,11 +169,7 @@ fn linear_regression(points: &[TimePoint]) -> Option<LinRegResult> {
 ///
 /// Splits the series at each point and compares means of left and right halves.
 /// A change point is detected when the difference exceeds threshold * std_dev.
-fn detect_change_points(
-    points: &[TimePoint],
-    threshold: f64,
-    std_dev: f64,
-) -> Vec<ChangePoint> {
+fn detect_change_points(points: &[TimePoint], threshold: f64, std_dev: f64) -> Vec<ChangePoint> {
     if points.len() < 6 || std_dev < 1e-15 {
         return Vec::new();
     }
@@ -183,10 +179,9 @@ fn detect_change_points(
     let mut best_idx = 0;
 
     for split in min_half..(points.len() - min_half) {
-        let left_mean: f64 =
-            points[..split].iter().map(|p| p.value).sum::<f64>() / split as f64;
-        let right_mean: f64 = points[split..].iter().map(|p| p.value).sum::<f64>()
-            / (points.len() - split) as f64;
+        let left_mean: f64 = points[..split].iter().map(|p| p.value).sum::<f64>() / split as f64;
+        let right_mean: f64 =
+            points[split..].iter().map(|p| p.value).sum::<f64>() / (points.len() - split) as f64;
         let diff = (right_mean - left_mean).abs();
 
         if diff > best_score {
@@ -303,8 +298,7 @@ pub fn classify_trend(
         TrendClass::ChangePoint
     } else if is_periodic {
         TrendClass::Periodic
-    } else if reg.r_squared >= config.min_r_squared
-        && relative_change >= config.min_relative_change
+    } else if reg.r_squared >= config.min_r_squared && relative_change >= config.min_relative_change
     {
         if reg.slope > 0.0 {
             TrendClass::Increasing
@@ -394,7 +388,9 @@ mod tests {
         let mut state = 12345u64;
         (0..n)
             .map(|i| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let frac = (state >> 33) as f64 / (1u64 << 31) as f64; // 0..1
                 let jitter = noise * (frac - 0.5);
                 TimePoint {
@@ -419,8 +415,7 @@ mod tests {
             .map(|i| TimePoint {
                 t: i as f64 * 60.0,
                 value: 100.0
-                    + amplitude
-                        * (2.0 * std::f64::consts::PI * i as f64 / period as f64).sin(),
+                    + amplitude * (2.0 * std::f64::consts::PI * i as f64 / period as f64).sin(),
             })
             .collect()
     }

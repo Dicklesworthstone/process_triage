@@ -57,7 +57,9 @@ fn default_schema_version() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderConfig {
-    Static { path: String },
+    Static {
+        path: String,
+    },
     Dns {
         service: String,
         #[serde(default)]
@@ -380,7 +382,9 @@ path = "fleet.toml"
             refresh_interval_secs: None,
             stale_while_revalidate_secs: None,
         };
-        let err = ProviderRegistry::from_config(&config).err().expect("expected error");
+        let err = ProviderRegistry::from_config(&config)
+            .err()
+            .expect("expected error");
         assert!(err.to_string().contains("no providers"));
     }
 }

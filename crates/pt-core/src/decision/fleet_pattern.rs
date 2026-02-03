@@ -139,10 +139,7 @@ pub fn correlate_fleet_patterns(
     // Group by pattern_key.
     let mut by_pattern: HashMap<&str, Vec<&PatternObservation>> = HashMap::new();
     for obs in observations {
-        by_pattern
-            .entry(&obs.pattern_key)
-            .or_default()
-            .push(obs);
+        by_pattern.entry(&obs.pattern_key).or_default().push(obs);
     }
 
     // Count total unique hosts.
@@ -181,7 +178,11 @@ pub fn correlate_fleet_patterns(
         if cpus.len() >= 2 {
             let mean_cpu = cpus.iter().sum::<f64>() / cpus.len() as f64;
             let var = cpus.iter().map(|c| (c - mean_cpu).powi(2)).sum::<f64>() / cpus.len() as f64;
-            let cv = if mean_cpu > 1e-6 { var.sqrt() / mean_cpu } else { 0.0 };
+            let cv = if mean_cpu > 1e-6 {
+                var.sqrt() / mean_cpu
+            } else {
+                0.0
+            };
             if cv < 0.5 {
                 correlations.push(CorrelationType::Behavioral);
             }
@@ -219,11 +220,8 @@ pub fn correlate_fleet_patterns(
             continue; // No meaningful correlation found.
         }
 
-        let recommendation = determine_recommendation(
-            &correlations,
-            fleet_abandoned,
-            common_deploy.is_some(),
-        );
+        let recommendation =
+            determine_recommendation(&correlations, fleet_abandoned, common_deploy.is_some());
 
         let summary = format!(
             "Pattern \"{}\" affects {}/{} hosts ({:.0}%), {} instances, {:.0}% abandoned{}",
@@ -360,7 +358,10 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].correlations.contains(&CorrelationType::Deploy));
         assert_eq!(alerts[0].deploy_sha, Some(sha.to_string()));
-        assert_eq!(alerts[0].recommendation, FleetRecommendation::RollbackDeploy);
+        assert_eq!(
+            alerts[0].recommendation,
+            FleetRecommendation::RollbackDeploy
+        );
     }
 
     #[test]
@@ -405,7 +406,9 @@ mod tests {
         };
         let alerts = correlate_fleet_patterns(&obs, &config);
         assert_eq!(alerts.len(), 1);
-        assert!(alerts[0].correlations.contains(&CorrelationType::Behavioral));
+        assert!(alerts[0]
+            .correlations
+            .contains(&CorrelationType::Behavioral));
     }
 
     #[test]

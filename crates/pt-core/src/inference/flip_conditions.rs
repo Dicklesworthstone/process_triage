@@ -68,10 +68,7 @@ pub struct FlipAnalysis {
 // ---------------------------------------------------------------------------
 
 /// Compute flip conditions from an evidence ledger.
-pub fn compute_flip_conditions(
-    ledger: &EvidenceLedger,
-    config: &FlipConfig,
-) -> FlipAnalysis {
+pub fn compute_flip_conditions(ledger: &EvidenceLedger, config: &FlipConfig) -> FlipAnalysis {
     let current_posterior = posterior_for_class(ledger);
     let margin = current_posterior - config.threshold;
 
@@ -85,44 +82,46 @@ pub fn compute_flip_conditions(
     // Total supporting log-odds.
     let total_support_log_bf: f64 = supporting.iter().map(|bf| bf.log_bf.abs()).sum();
 
-    let mut scenarios: Vec<FlipScenario> = supporting
-        .iter()
-        .map(|bf| {
-            let abs_bits = bf.delta_bits.abs();
-            let fraction = if total_support_log_bf > 0.0 {
-                bf.log_bf.abs() / total_support_log_bf
-            } else {
-                0.0
-            };
-            // Approximate delta_p if this feature were entirely removed.
-            let delta_p = fraction * margin.max(0.0);
+    let mut scenarios: Vec<FlipScenario> =
+        supporting
+            .iter()
+            .map(|bf| {
+                let abs_bits = bf.delta_bits.abs();
+                let fraction = if total_support_log_bf > 0.0 {
+                    bf.log_bf.abs() / total_support_log_bf
+                } else {
+                    0.0
+                };
+                // Approximate delta_p if this feature were entirely removed.
+                let delta_p = fraction * margin.max(0.0);
 
-            // How much would log_bf need to change to eliminate margin?
-            // Rough linear approximation: required_delta ≈ margin / fraction_per_unit.
-            let required_delta_log_bf = if fraction > 0.0 {
-                margin / fraction
-            } else {
-                f64::INFINITY
-            };
-            let required_delta_bits = required_delta_log_bf / std::f64::consts::LN_2;
+                // How much would log_bf need to change to eliminate margin?
+                // Rough linear approximation: required_delta ≈ margin / fraction_per_unit.
+                let required_delta_log_bf = if fraction > 0.0 {
+                    margin / fraction
+                } else {
+                    f64::INFINITY
+                };
+                let required_delta_bits = required_delta_log_bf / std::f64::consts::LN_2;
 
-            let explanation = format!(
+                let explanation =
+                    format!(
                 "If '{}' evidence were removed ({:.1} bits), posterior would drop ~{:.1}pp. \
                  To flip, this feature would need to shift by {:.1} bits.",
                 bf.feature, abs_bits, delta_p * 100.0, required_delta_bits.abs(),
             );
 
-            FlipScenario {
-                feature: bf.feature.clone(),
-                current_log_bf: bf.log_bf,
-                current_bits: bf.delta_bits,
-                required_delta_log_bf,
-                required_delta_bits,
-                delta_p_if_removed: delta_p,
-                explanation,
-            }
-        })
-        .collect();
+                FlipScenario {
+                    feature: bf.feature.clone(),
+                    current_log_bf: bf.log_bf,
+                    current_bits: bf.delta_bits,
+                    required_delta_log_bf,
+                    required_delta_bits,
+                    delta_p_if_removed: delta_p,
+                    explanation,
+                }
+            })
+            .collect();
 
     // Sort by required_delta_bits ascending (easiest flip first).
     scenarios.sort_by(|a, b| {
@@ -242,10 +241,7 @@ mod tests {
 
     #[test]
     fn test_basic_flip_analysis() {
-        let ledger = mock_ledger(vec![
-            bf("cpu_occupancy", 1.9),
-            bf("age_elapsed", 1.6),
-        ]);
+        let ledger = mock_ledger(vec![bf("cpu_occupancy", 1.9), bf("age_elapsed", 1.6)]);
         let analysis = compute_flip_conditions(&ledger, &FlipConfig::default());
 
         assert_eq!(analysis.classification, Classification::Abandoned);
@@ -290,8 +286,8 @@ mod tests {
     #[test]
     fn test_opposing_evidence_excluded() {
         let ledger = mock_ledger(vec![
-            bf("cpu_occupancy", 1.9),  // supports abandoned
-            bf("net_sockets", -1.2),   // opposes abandoned
+            bf("cpu_occupancy", 1.9), // supports abandoned
+            bf("net_sockets", -1.2),  // opposes abandoned
         ]);
         let analysis = compute_flip_conditions(&ledger, &FlipConfig::default());
 
@@ -336,8 +332,8 @@ mod tests {
             classification: Classification::Useful,
             confidence: Confidence::High,
             bayes_factors: vec![
-                bf("cpu_occupancy", -2.0),  // supports useful
-                bf("net_sockets", -1.5),    // supports useful
+                bf("cpu_occupancy", -2.0), // supports useful
+                bf("net_sockets", -1.5),   // supports useful
             ],
             top_evidence: vec![],
             why_summary: String::new(),

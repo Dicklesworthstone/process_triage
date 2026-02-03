@@ -151,7 +151,10 @@ impl<'a> Widget for ProcessDetail<'a> {
                 Span::styled(row.pid.to_string(), self.value_style()),
                 Span::styled("  ", self.value_style()),
                 Span::styled("Class: ", self.label_style()),
-                Span::styled(row.classification.clone(), self.classification_style(&row.classification)),
+                Span::styled(
+                    row.classification.clone(),
+                    self.classification_style(&row.classification),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Command: ", self.label_style()),
@@ -182,14 +185,26 @@ impl<'a> Widget for ProcessDetail<'a> {
             DetailView::Summary => (
                 {
                     let mut lines = Vec::new();
-                    lines.push(Line::from(vec![Span::styled("Evidence", self.label_style())]));
+                    lines.push(Line::from(vec![Span::styled(
+                        "Evidence",
+                        self.label_style(),
+                    )]));
                     if let Some(summary) = row.why_summary.as_ref() {
-                        lines.push(Line::from(vec![Span::styled(summary.clone(), self.value_style())]));
+                        lines.push(Line::from(vec![Span::styled(
+                            summary.clone(),
+                            self.value_style(),
+                        )]));
                     } else {
-                        lines.push(Line::from(vec![Span::styled("No evidence summary available", self.value_style())]));
+                        lines.push(Line::from(vec![Span::styled(
+                            "No evidence summary available",
+                            self.value_style(),
+                        )]));
                     }
                     for item in &row.top_evidence {
-                        lines.push(Line::from(vec![Span::styled(format!("• {}", item), self.value_style())]));
+                        lines.push(Line::from(vec![Span::styled(
+                            format!("• {}", item),
+                            self.value_style(),
+                        )]));
                     }
                     if lines.len() > evidence_height {
                         lines.truncate(evidence_height);
@@ -230,7 +245,10 @@ impl<'a> Widget for ProcessDetail<'a> {
             DetailView::GalaxyBrain => (
                 {
                     let mut lines = Vec::new();
-                    lines.push(Line::from(vec![Span::styled("Galaxy Brain", self.label_style())]));
+                    lines.push(Line::from(vec![Span::styled(
+                        "Galaxy Brain",
+                        self.label_style(),
+                    )]));
 
                     if let Some(trace) = row.galaxy_brain.as_deref() {
                         let trace_lines: Vec<&str> = trace.lines().collect();
@@ -245,26 +263,44 @@ impl<'a> Widget for ProcessDetail<'a> {
                             )]));
                         }
                     } else {
-                        lines.push(Line::from(vec![Span::styled("• math ledger pending", self.value_style())]));
-                        lines.push(Line::from(vec![Span::styled("• posterior odds pending", self.value_style())]));
+                        lines.push(Line::from(vec![Span::styled(
+                            "• math ledger pending",
+                            self.value_style(),
+                        )]));
+                        lines.push(Line::from(vec![Span::styled(
+                            "• posterior odds pending",
+                            self.value_style(),
+                        )]));
                     }
 
                     lines
                 },
                 vec![
                     Line::from(vec![Span::styled("Notes", self.label_style())]),
-                    Line::from(vec![Span::styled("• press g to toggle", self.value_style())]),
+                    Line::from(vec![Span::styled(
+                        "• press g to toggle",
+                        self.value_style(),
+                    )]),
                 ],
             ),
             DetailView::Genealogy => (
                 vec![
                     Line::from(vec![Span::styled("Genealogy", self.label_style())]),
-                    Line::from(vec![Span::styled("• process tree pending", self.value_style())]),
-                    Line::from(vec![Span::styled("• supervisor chain pending", self.value_style())]),
+                    Line::from(vec![Span::styled(
+                        "• process tree pending",
+                        self.value_style(),
+                    )]),
+                    Line::from(vec![Span::styled(
+                        "• supervisor chain pending",
+                        self.value_style(),
+                    )]),
                 ],
                 vec![
                     Line::from(vec![Span::styled("Notes", self.label_style())]),
-                    Line::from(vec![Span::styled("• press s to return", self.value_style())]),
+                    Line::from(vec![Span::styled(
+                        "• press s to return",
+                        self.value_style(),
+                    )]),
                 ],
             ),
         };

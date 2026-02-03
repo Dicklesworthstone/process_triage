@@ -100,10 +100,7 @@ pub struct AlternativePlan {
 }
 
 /// Greedy optimization: sort by efficiency, select until goals met.
-pub fn optimize_greedy(
-    candidates: &[OptCandidate],
-    goals: &[ResourceGoal],
-) -> OptimizationResult {
+pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> OptimizationResult {
     if candidates.is_empty() {
         let goal_achievement: Vec<GoalAchievement> = goals
             .iter()
@@ -263,8 +260,11 @@ pub fn optimize_dp(
 
     // Find the best solution that meets the target.
     let target_step = (target / resolution).ceil() as usize;
-    let best_j = (target_step..=max_steps)
-        .min_by(|a, b| dp[*a].partial_cmp(&dp[*b]).unwrap_or(std::cmp::Ordering::Equal));
+    let best_j = (target_step..=max_steps).min_by(|a, b| {
+        dp[*a]
+            .partial_cmp(&dp[*b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let (selected, total_loss) = match best_j {
         Some(j) if dp[j] < f64::INFINITY => {
@@ -292,10 +292,7 @@ pub fn optimize_dp(
         }
     };
 
-    let total_contributions: Vec<f64> = vec![selected
-        .iter()
-        .map(|s| s.contributions[0])
-        .sum()];
+    let total_contributions: Vec<f64> = vec![selected.iter().map(|s| s.contributions[0]).sum()];
 
     let achieved = total_contributions[0];
     let goal_achievement = vec![GoalAchievement {
@@ -324,10 +321,7 @@ pub fn local_search_improve(
     goals: &[ResourceGoal],
     max_iterations: usize,
 ) {
-    let eligible: Vec<&OptCandidate> = candidates
-        .iter()
-        .filter(|c| !c.blocked)
-        .collect();
+    let eligible: Vec<&OptCandidate> = candidates.iter().filter(|c| !c.blocked).collect();
 
     let selected_ids: HashSet<String> = result.selected.iter().map(|s| s.id.clone()).collect();
     let not_selected: Vec<&OptCandidate> = eligible
@@ -544,7 +538,10 @@ mod tests {
 
         let result = optimize_greedy(&candidates, &goals);
         // Should not include blocked candidates.
-        assert!(result.selected.iter().all(|s| s.id != "pid_4" && s.id != "pid_3"));
+        assert!(result
+            .selected
+            .iter()
+            .all(|s| s.id != "pid_4" && s.id != "pid_3"));
     }
 
     #[test]

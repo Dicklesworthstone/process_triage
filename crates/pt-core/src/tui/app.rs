@@ -314,10 +314,18 @@ impl App {
                     KeyCode::PageUp => {
                         self.process_table.page_up(10);
                     }
-                    KeyCode::Char('d') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    KeyCode::Char('d')
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
                         self.process_table.page_down(10);
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    KeyCode::Char('u')
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
                         self.process_table.page_up(10);
                     }
                     KeyCode::Char('n') => {
@@ -893,13 +901,19 @@ mod tests {
         let mut app = App::new();
         assert_eq!(app.detail_view, DetailView::Summary);
 
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)))
-            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
         assert_eq!(app.detail_view, DetailView::GalaxyBrain);
         assert!(app.detail_visible);
 
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)))
-            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
         assert_eq!(app.detail_view, DetailView::Summary);
     }
 
@@ -907,20 +921,29 @@ mod tests {
     fn test_toggle_detail_visibility_with_enter() {
         let mut app = App::new();
         let initial = app.detail_visible;
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
-            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
         assert_eq!(app.detail_visible, !initial);
     }
 
     #[test]
     fn test_help_overlay_toggle() {
         let mut app = App::new();
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)))
-            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
         assert_eq!(app.state, AppState::Help);
 
-        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)))
-            .unwrap();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
         assert_eq!(app.state, AppState::Normal);
     }
 }

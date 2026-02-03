@@ -166,7 +166,9 @@ pub fn false_kill_credible_bounds(
         window: None,
     };
 
-    let mut result = compute_credible_bounds(prior_alpha, prior_beta, errors, trials, deltas, assumptions).ok()?;
+    let mut result =
+        compute_credible_bounds(prior_alpha, prior_beta, errors, trials, deltas, assumptions)
+            .ok()?;
     result.threshold = threshold;
     Some(result)
 }

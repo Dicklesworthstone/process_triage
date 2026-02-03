@@ -408,10 +408,7 @@ mod tests {
         let input = BlastRadiusInput {
             target_pid: 100,
             target_comm: "server".to_string(),
-            process_table: make_table(&[
-                (100, "server", 1),
-                (200, "worker", 100),
-            ]),
+            process_table: make_table(&[(100, "server", 1), (200, "worker", 100)]),
             listen_ports: vec![ListeningPort {
                 port: 3000,
                 protocol: "tcp".to_string(),
@@ -446,11 +443,7 @@ mod tests {
         let input = BlastRadiusInput {
             target_pid: 100,
             target_comm: "app".to_string(),
-            process_table: make_table(&[
-                (100, "app", 1),
-                (200, "w1", 100),
-                (201, "w2", 100),
-            ]),
+            process_table: make_table(&[(100, "app", 1), (200, "w1", 100), (201, "w2", 100)]),
             listen_ports: vec![ListeningPort {
                 port: 443,
                 protocol: "tcp".to_string(),

@@ -131,7 +131,10 @@ fn phrase_feature(entry: &BayesFactorEntry) -> String {
         }
     } else {
         // Fallback for unknown features.
-        return format!("{} signal from {} ({})", strength_word, entry.feature, entry.direction);
+        return format!(
+            "{} signal from {} ({})",
+            strength_word, entry.feature, entry.direction
+        );
     };
 
     format!("{} ({} signal)", base, strength_word)
@@ -147,12 +150,12 @@ pub fn explain(ledger: &EvidenceLedger, config: &ExplainConfig) -> NaturalExplan
     let confidence = ledger.confidence;
 
     // Separate supporting vs countervailing factors.
-    let (supporting, opposing): (Vec<&BayesFactorEntry>, Vec<&BayesFactorEntry>) =
-        ledger.bayes_factors.iter().partition(|bf| {
-            match ledger.classification {
-                Classification::Abandoned | Classification::Zombie => bf.log_bf > 0.0,
-                Classification::Useful | Classification::UsefulBad => bf.log_bf < 0.0,
-            }
+    let (supporting, opposing): (Vec<&BayesFactorEntry>, Vec<&BayesFactorEntry>) = ledger
+        .bayes_factors
+        .iter()
+        .partition(|bf| match ledger.classification {
+            Classification::Abandoned | Classification::Zombie => bf.log_bf > 0.0,
+            Classification::Useful | Classification::UsefulBad => bf.log_bf < 0.0,
         });
 
     let contributing_factors: Vec<String> = supporting
@@ -253,10 +256,7 @@ fn build_detail(
 
     // Evidence for.
     if !factors.is_empty() {
-        parts.push(format!(
-            "Key evidence: {}.",
-            join_natural(factors),
-        ));
+        parts.push(format!("Key evidence: {}.", join_natural(factors),));
     }
 
     // Countervailing evidence.
@@ -264,7 +264,11 @@ fn build_detail(
         parts.push(format!(
             "However, {} {} against this classification.",
             join_natural(countervailing),
-            if countervailing.len() == 1 { "argues" } else { "argue" },
+            if countervailing.len() == 1 {
+                "argues"
+            } else {
+                "argue"
+            },
         ));
     }
 
@@ -430,8 +434,8 @@ mod tests {
             Classification::Abandoned,
             Confidence::Medium,
             vec![
-                bf("cpu_occupancy", 2.5),  // Supports abandoned
-                bf("net_sockets", -1.5),   // Opposes (has network)
+                bf("cpu_occupancy", 2.5), // Supports abandoned
+                bf("net_sockets", -1.5),  // Opposes (has network)
             ],
         );
         let explanation = explain(&ledger, &ExplainConfig::default());

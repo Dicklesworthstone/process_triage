@@ -92,13 +92,7 @@ impl CategoryObservations {
     }
 
     /// Record an observation.
-    pub fn record(
-        &mut self,
-        class: &str,
-        category: &str,
-        feature: &str,
-        success: bool,
-    ) {
+    pub fn record(&mut self, class: &str, category: &str, feature: &str, success: bool) {
         let key = (class.to_string(), category.to_string(), feature.to_string());
         let entry = self.counts.entry(key).or_default();
         entry.trials += 1;
@@ -273,10 +267,7 @@ mod tests {
             ("abandoned".to_string(), "cpu_beta".to_string()),
             (1.0, 10.0),
         );
-        m.insert(
-            ("useful".to_string(), "cpu_beta".to_string()),
-            (2.0, 5.0),
-        );
+        m.insert(("useful".to_string(), "cpu_beta".to_string()), (2.0, 5.0));
         m
     }
 

@@ -70,7 +70,9 @@ struct Mat2 {
 
 impl Mat2 {
     fn new(a: f64, b: f64, c: f64, d: f64) -> Self {
-        Self { m: [[a, b], [c, d]] }
+        Self {
+            m: [[a, b], [c, d]],
+        }
     }
 
     fn identity() -> Self {
@@ -247,10 +249,7 @@ impl KalmanFilter {
         let k = [p_pred.m[0][0] / s, p_pred.m[1][0] / s];
 
         // Update state.
-        self.x = [
-            x_pred[0] + k[0] * innovation,
-            x_pred[1] + k[1] * innovation,
-        ];
+        self.x = [x_pred[0] + k[0] * innovation, x_pred[1] + k[1] * innovation];
 
         // Update covariance: P = (I - K*H) * P_pred
         let kh = Mat2::new(k[0], 0.0, k[1], 0.0);

@@ -86,10 +86,7 @@ pub struct BaselineStore {
 }
 
 /// Fit a baseline summary from observations.
-pub fn fit_baseline(
-    observations: &[f64],
-    config: &BaselineConfig,
-) -> Option<BaselineSummary> {
+pub fn fit_baseline(observations: &[f64], config: &BaselineConfig) -> Option<BaselineSummary> {
     if observations.is_empty() {
         return None;
     }
@@ -207,7 +204,11 @@ fn estimate_percentile_rank(value: f64, percentiles: &[f64; 5]) -> f64 {
     }
     if value >= percentiles[4] {
         // Extrapolate conservatively above p95.
-        return (0.95 + 0.05 * ((value - percentiles[4]) / (percentiles[4] - percentiles[3]).max(1e-12)).min(1.0)).min(1.0);
+        return (0.95
+            + 0.05
+                * ((value - percentiles[4]) / (percentiles[4] - percentiles[3]).max(1e-12))
+                    .min(1.0))
+        .min(1.0);
     }
 
     for i in 0..4 {

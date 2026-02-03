@@ -11,6 +11,7 @@ pub mod freeze;
 #[cfg(test)]
 mod repro_cpuset;
 
+pub mod dispatch;
 pub mod prechecks;
 pub mod recovery;
 pub mod recovery_tree;
@@ -18,7 +19,6 @@ pub mod renice;
 #[cfg(unix)]
 pub mod signal;
 pub mod supervisor;
-pub mod dispatch;
 
 #[cfg(target_os = "linux")]
 pub use cgroup_throttle::{
@@ -30,11 +30,11 @@ pub use cpuset_quarantine::{
     can_quarantine_cpuset, CpusetQuarantineActionRunner, CpusetQuarantineConfig, QuarantineResult,
     QuarantineReversalMetadata, DEFAULT_QUARANTINE_CPUS, MIN_QUARANTINE_CPUS,
 };
+pub use dispatch::CompositeActionRunner;
 pub use executor::{
     ActionError, ActionExecutor, ActionResult, ActionRunner, ActionStatus, ExecutionError,
     ExecutionResult, ExecutionSummary, IdentityProvider, NoopActionRunner, StaticIdentityProvider,
 };
-pub use dispatch::CompositeActionRunner;
 #[cfg(target_os = "linux")]
 pub use freeze::{is_freeze_available, FreezeActionRunner, FreezeConfig};
 pub use recovery::{plan_recovery, ActionFailure, FailureKind, RecoveryDecision, RetryPolicy};

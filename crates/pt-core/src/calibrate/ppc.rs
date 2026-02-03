@@ -147,11 +147,7 @@ pub fn compute_ppc(observations: &[FeatureObservation]) -> PpcSummary {
             0.0
         };
 
-        let z_score = if se > 1e-10 {
-            discrepancy / se
-        } else {
-            0.0
-        };
+        let z_score = if se > 1e-10 { discrepancy / se } else { 0.0 };
 
         let significant = z_score.abs() > 2.0 && n >= 20;
 
@@ -357,7 +353,7 @@ mod tests {
         let observations: Vec<FeatureObservation> = (0..100)
             .map(|i| FeatureObservation {
                 feature: "cpu_zero".to_string(),
-                observed: i < 20, // 20% observed
+                observed: i < 20,    // 20% observed
                 predicted_prob: 0.8, // 80% predicted
                 classification: "abandoned".to_string(),
                 category: None,
@@ -378,7 +374,7 @@ mod tests {
         let observations: Vec<FeatureObservation> = (0..100)
             .map(|i| FeatureObservation {
                 feature: "orphaned".to_string(),
-                observed: i < 80, // 80% observed
+                observed: i < 80,    // 80% observed
                 predicted_prob: 0.3, // 30% predicted
                 classification: "abandoned".to_string(),
                 category: None,
@@ -415,7 +411,11 @@ mod tests {
         let cal = compute_multi_class_calibration(&predictions);
         assert!(!cal.classes.is_empty());
 
-        let abandoned = cal.classes.iter().find(|c| c.class_name == "abandoned").unwrap();
+        let abandoned = cal
+            .classes
+            .iter()
+            .find(|c| c.class_name == "abandoned")
+            .unwrap();
         assert_eq!(abandoned.n, 100);
         assert!(abandoned.brier_score < 0.5); // Should be reasonably calibrated
     }

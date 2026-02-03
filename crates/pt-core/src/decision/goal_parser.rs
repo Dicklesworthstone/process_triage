@@ -49,23 +49,10 @@ pub struct ResourceTarget {
 impl ResourceTarget {
     pub fn canonical(&self) -> String {
         match self.metric {
-            Metric::Memory => format!(
-                "memory {} {:.0} bytes",
-                self.comparator, self.value
-            ),
-            Metric::Cpu => format!(
-                "cpu {} {:.2}%",
-                self.comparator,
-                self.value * 100.0
-            ),
-            Metric::Port => format!(
-                "release port {}",
-                self.port.unwrap_or(0)
-            ),
-            Metric::FileDescriptors => format!(
-                "fds {} {:.0}",
-                self.comparator, self.value
-            ),
+            Metric::Memory => format!("memory {} {:.0} bytes", self.comparator, self.value),
+            Metric::Cpu => format!("cpu {} {:.2}%", self.comparator, self.value * 100.0),
+            Metric::Port => format!("release port {}", self.port.unwrap_or(0)),
+            Metric::FileDescriptors => format!("fds {} {:.0}", self.comparator, self.value),
         }
     }
 }

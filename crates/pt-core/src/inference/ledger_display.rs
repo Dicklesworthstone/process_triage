@@ -41,26 +41,48 @@ impl EvidenceCategory {
 /// Classify a feature name into a category.
 pub fn categorize_feature(feature: &str) -> EvidenceCategory {
     let f = feature.to_lowercase();
-    if f.contains("cpu") || f.contains("memory") || f.contains("rss")
-        || f.contains("vsz") || f.starts_with("io") || f.contains("_io")
-        || f.starts_with("fd") || f.contains("_fd")
+    if f.contains("cpu")
+        || f.contains("memory")
+        || f.contains("rss")
+        || f.contains("vsz")
+        || f.starts_with("io")
+        || f.contains("_io")
+        || f.starts_with("fd")
+        || f.contains("_fd")
     {
         EvidenceCategory::Resource
-    } else if f.contains("age") || f.contains("elapsed") || f.contains("runtime")
-        || f.contains("idle") || f.contains("burst") || f.contains("uptime")
+    } else if f.contains("age")
+        || f.contains("elapsed")
+        || f.contains("runtime")
+        || f.contains("idle")
+        || f.contains("burst")
+        || f.contains("uptime")
     {
         EvidenceCategory::Timing
-    } else if f.contains("ppid") || f.contains("orphan") || f.contains("cgroup")
-        || f.contains("user") || f.contains("parent") || f.contains("uid")
+    } else if f.contains("ppid")
+        || f.contains("orphan")
+        || f.contains("cgroup")
+        || f.contains("user")
+        || f.contains("parent")
+        || f.contains("uid")
     {
         EvidenceCategory::Context
-    } else if f.contains("state") || f.contains("zombie") || f.contains("signal")
-        || f.contains("restart") || f.contains("file") || f.contains("child")
-        || f.contains("thread") || f.contains("spawn")
+    } else if f.contains("state")
+        || f.contains("zombie")
+        || f.contains("signal")
+        || f.contains("restart")
+        || f.contains("file")
+        || f.contains("child")
+        || f.contains("thread")
+        || f.contains("spawn")
     {
         EvidenceCategory::Behavior
-    } else if f.contains("net") || f.contains("socket") || f.contains("port")
-        || f.contains("tcp") || f.contains("udp") || f.contains("listen")
+    } else if f.contains("net")
+        || f.contains("socket")
+        || f.contains("port")
+        || f.contains("tcp")
+        || f.contains("udp")
+        || f.contains("listen")
     {
         EvidenceCategory::Network
     } else {
@@ -404,7 +426,10 @@ mod tests {
 
     #[test]
     fn test_categorize_features() {
-        assert_eq!(categorize_feature("cpu_occupancy"), EvidenceCategory::Resource);
+        assert_eq!(
+            categorize_feature("cpu_occupancy"),
+            EvidenceCategory::Resource
+        );
         assert_eq!(categorize_feature("age_elapsed"), EvidenceCategory::Timing);
         assert_eq!(categorize_feature("orphan_ppid"), EvidenceCategory::Context);
         assert_eq!(categorize_feature("net_sockets"), EvidenceCategory::Network);
@@ -471,7 +496,9 @@ mod tests {
             ..Default::default()
         };
         let results = filter_evidence(&display, &filter);
-        assert!(results.iter().all(|i| i.category == EvidenceCategory::Resource));
+        assert!(results
+            .iter()
+            .all(|i| i.category == EvidenceCategory::Resource));
         assert!(!results.is_empty());
     }
 

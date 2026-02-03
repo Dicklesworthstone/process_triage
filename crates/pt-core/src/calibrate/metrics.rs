@@ -210,7 +210,11 @@ fn auc_roc(data: &[CalibrationData]) -> f64 {
 
     // Sort by predicted probability descending
     let mut sorted: Vec<_> = data.iter().collect();
-    sorted.sort_by(|a, b| b.predicted.partial_cmp(&a.predicted).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        b.predicted
+            .partial_cmp(&a.predicted)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Compute AUC using trapezoidal rule
     let mut auc = 0.0;
@@ -306,12 +310,7 @@ mod tests {
 
     #[test]
     fn test_auc_perfect() {
-        let data = make_data(&[
-            (0.9, true),
-            (0.8, true),
-            (0.3, false),
-            (0.2, false),
-        ]);
+        let data = make_data(&[(0.9, true), (0.8, true), (0.3, false), (0.2, false)]);
         let auc = auc_roc(&data);
         assert!((auc - 1.0).abs() < 1e-10);
     }

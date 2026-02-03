@@ -8,9 +8,9 @@
 use super::{
     bias::{analyze_bias, BiasAnalysis},
     bounds::{false_kill_credible_bounds, CredibleBounds},
-    pac_bayes::{pac_bayes_error_bounds, PacBayesSummary},
     curve::CalibrationCurve,
     metrics::{compute_metrics, CalibrationMetrics},
+    pac_bayes::{pac_bayes_error_bounds, PacBayesSummary},
     CalibrationData, CalibrationError, CalibrationQuality,
 };
 use serde::{Deserialize, Serialize};
@@ -48,9 +48,9 @@ impl CalibrationReport {
         let summary = generate_summary(&metrics, &bias, quality);
         let deltas = [0.05, 0.01];
         let credible_bounds = false_kill_credible_bounds(data, threshold, 1.0, 1.0, &deltas);
-        let pac_bayes = credible_bounds
-            .as_ref()
-            .and_then(|b| pac_bayes_error_bounds(b.errors as usize, b.trials as usize, 0.0, &deltas));
+        let pac_bayes = credible_bounds.as_ref().and_then(|b| {
+            pac_bayes_error_bounds(b.errors as usize, b.trials as usize, 0.0, &deltas)
+        });
 
         Ok(CalibrationReport {
             quality,
@@ -133,14 +133,8 @@ impl CalibrationReport {
         // Credible bounds (false-kill rate)
         output.push_str("─── False-Kill Credible Bounds ───────────────────────────\n");
         if let Some(bounds) = &self.credible_bounds {
-            output.push_str(&format!(
-                "  Trials (kill recs): {}\n",
-                bounds.trials
-            ));
-            output.push_str(&format!(
-                "  Errors (false kills): {}\n",
-                bounds.errors
-            ));
+            output.push_str(&format!("  Trials (kill recs): {}\n", bounds.trials));
+            output.push_str(&format!("  Errors (false kills): {}\n", bounds.errors));
             output.push_str(&format!("  Threshold: {:.2}\n", bounds.threshold));
             output.push_str(&format!(
                 "  Prior Beta(a,b):     ({:.2}, {:.2})\n",
@@ -234,8 +228,7 @@ impl CalibrationReport {
 
     /// Generate JSON report.
     pub fn json_report(&self) -> Result<String, CalibrationError> {
-        serde_json::to_string_pretty(self)
-            .map_err(|e| CalibrationError::IoError(e.to_string()))
+        serde_json::to_string_pretty(self).map_err(|e| CalibrationError::IoError(e.to_string()))
     }
 }
 

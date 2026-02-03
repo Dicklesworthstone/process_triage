@@ -173,14 +173,18 @@ pub fn parse_inventory_str(
             format: format.as_str().to_string(),
             message: e.to_string(),
         })?,
-        InventoryFormat::Yaml => serde_yaml::from_str(content).map_err(|e| InventoryError::Parse {
-            format: format.as_str().to_string(),
-            message: e.to_string(),
-        })?,
-        InventoryFormat::Json => serde_json::from_str(content).map_err(|e| InventoryError::Parse {
-            format: format.as_str().to_string(),
-            message: e.to_string(),
-        })?,
+        InventoryFormat::Yaml => {
+            serde_yaml::from_str(content).map_err(|e| InventoryError::Parse {
+                format: format.as_str().to_string(),
+                message: e.to_string(),
+            })?
+        }
+        InventoryFormat::Json => {
+            serde_json::from_str(content).map_err(|e| InventoryError::Parse {
+                format: format.as_str().to_string(),
+                message: e.to_string(),
+            })?
+        }
     };
 
     if config.hosts.is_empty() {

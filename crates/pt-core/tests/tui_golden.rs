@@ -4,7 +4,9 @@ use pt_core::inference::galaxy_brain::{self, GalaxyBrainConfig, MathMode, Verbos
 use pt_core::inference::ledger::EvidenceLedger;
 use pt_core::inference::posterior::{ClassScores, EvidenceTerm, PosteriorResult};
 use pt_core::tui::layout::{Breakpoint, ResponsiveLayout};
-use pt_core::tui::widgets::{DetailView, ProcessDetail, ProcessRow, ProcessTable, ProcessTableState};
+use pt_core::tui::widgets::{
+    DetailView, ProcessDetail, ProcessRow, ProcessTable, ProcessTableState,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{StatefulWidget, Widget};

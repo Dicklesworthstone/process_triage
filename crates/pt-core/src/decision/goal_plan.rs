@@ -141,7 +141,11 @@ pub fn optimize_goal_plan(
     let conservative = greedy_select(
         &eligible,
         constraints,
-        |a, b| a.risk.partial_cmp(&b.risk).unwrap_or(std::cmp::Ordering::Equal),
+        |a, b| {
+            a.risk
+                .partial_cmp(&b.risk)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        },
         PlanVariant::Conservative,
     );
     plans.push(conservative);
@@ -474,7 +478,11 @@ mod tests {
         let plans = optimize_goal_plan(&candidates, &constraints);
         // All variants should prefer pid=1 (better ratio).
         for plan in &plans {
-            assert_eq!(plan.actions[0].pid, 1, "Variant {:?} should pick pid=1", plan.variant);
+            assert_eq!(
+                plan.actions[0].pid, 1,
+                "Variant {:?} should pick pid=1",
+                plan.variant
+            );
         }
     }
 }

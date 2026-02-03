@@ -42,9 +42,9 @@
 //! }
 //! ```
 
-pub mod blast_radius;
 mod ancestry;
 mod app_supervision;
+pub mod blast_radius;
 mod container_supervision;
 mod environ;
 mod ipc;

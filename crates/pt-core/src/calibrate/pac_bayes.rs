@@ -137,9 +137,11 @@ mod tests {
 
     #[test]
     fn pac_bayes_bound_tighter_for_larger_delta() {
-        let summary =
-            pac_bayes_error_bounds(2, 50, 0.0, &[0.05, 0.2]).expect("summary");
-        let b05 = summary.bounds.iter().find(|b| (b.delta - 0.05).abs() < 1e-9);
+        let summary = pac_bayes_error_bounds(2, 50, 0.0, &[0.05, 0.2]).expect("summary");
+        let b05 = summary
+            .bounds
+            .iter()
+            .find(|b| (b.delta - 0.05).abs() < 1e-9);
         let b20 = summary.bounds.iter().find(|b| (b.delta - 0.2).abs() < 1e-9);
         assert!(b05.is_some());
         assert!(b20.is_some());

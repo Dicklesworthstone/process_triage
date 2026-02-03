@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::baseline::{BaselineConfig, BaselineSummary, BaselineStore};
+use super::baseline::{BaselineConfig, BaselineStore, BaselineSummary};
 
 /// On-disk format for persisted baselines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +61,11 @@ impl std::fmt::Display for BaselinePersistError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SchemaMismatch { expected, found } => {
-                write!(f, "Schema version mismatch: expected {}, found {}", expected, found)
+                write!(
+                    f,
+                    "Schema version mismatch: expected {}, found {}",
+                    expected, found
+                )
             }
             Self::SerializeError(msg) => write!(f, "Serialize error: {}", msg),
             Self::DeserializeError(msg) => write!(f, "Deserialize error: {}", msg),
@@ -172,8 +176,7 @@ impl BaselineManager {
     pub fn update_baseline(&mut self, key: String, summary: BaselineSummary, now: f64) {
         self.state.baselines.insert(key, summary);
         self.state.updated_at = now;
-        self.state.metadata.total_observations =
-            self.state.baselines.values().map(|b| b.n).sum();
+        self.state.metadata.total_observations = self.state.baselines.values().map(|b| b.n).sum();
     }
 
     /// Set the global fallback baseline.
@@ -192,14 +195,18 @@ impl BaselineManager {
 
     /// Check if the host is in cold-start mode (no baselines or all cold-start).
     pub fn is_cold_start(&self) -> bool {
-        self.state.baselines.is_empty()
-            || self.state.baselines.values().all(|b| b.cold_start)
+        self.state.baselines.is_empty() || self.state.baselines.values().all(|b| b.cold_start)
     }
 
     /// Summary string for display.
     pub fn summary(&self) -> String {
         let n_baselines = self.state.baselines.len();
-        let cold = self.state.baselines.values().filter(|b| b.cold_start).count();
+        let cold = self
+            .state
+            .baselines
+            .values()
+            .filter(|b| b.cold_start)
+            .count();
         let warm = n_baselines - cold;
         format!(
             "host={} baselines={} (warm={}, cold={}) obs={} resets={} schema=v{}",
@@ -306,7 +313,10 @@ mod tests {
         let imported = BaselineManager::import_json(&json, "host-target", 2000.0).unwrap();
 
         assert_eq!(imported.state.host_fingerprint, "host-target");
-        assert_eq!(imported.state.metadata.imported_from, Some("host-source".to_string()));
+        assert_eq!(
+            imported.state.metadata.imported_from,
+            Some("host-source".to_string())
+        );
         assert_eq!(imported.baseline_count(), 1);
         assert!(imported.state.global.is_some());
     }
@@ -330,7 +340,10 @@ mod tests {
         let json = serde_json::to_string(&mgr.state).unwrap();
         let err = BaselineManager::import_json(&json, "host-target", 2000.0).unwrap_err();
         match err {
-            BaselinePersistError::SchemaMismatch { expected: 1, found: 999 } => {}
+            BaselinePersistError::SchemaMismatch {
+                expected: 1,
+                found: 999,
+            } => {}
             _ => panic!("Expected SchemaMismatch, got {:?}", err),
         }
     }
@@ -371,7 +384,9 @@ mod tests {
     #[test]
     fn test_from_store() {
         let mut store = BaselineStore::default();
-        store.baselines.insert("cpu".to_string(), make_summary(50, 0.3));
+        store
+            .baselines
+            .insert("cpu".to_string(), make_summary(50, 0.3));
         store.global = Some(make_summary(500, 0.25));
 
         let mgr = BaselineManager::from_store(&store, "host-xyz".to_string(), 5000.0);

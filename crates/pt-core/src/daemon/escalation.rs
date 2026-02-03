@@ -98,10 +98,7 @@ impl EscalationState {
 // ---------------------------------------------------------------------------
 
 /// Check if escalation should proceed based on cooldown.
-pub fn check_cooldown(
-    config: &EscalationConfig,
-    state: &EscalationState,
-) -> Option<DeferReason> {
+pub fn check_cooldown(config: &EscalationConfig, state: &EscalationState) -> Option<DeferReason> {
     if let Some(ref last) = state.last_escalation_at {
         if let Ok(last_dt) = DateTime::parse_from_rfc3339(last) {
             let last_utc = last_dt.with_timezone(&Utc);

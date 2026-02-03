@@ -371,7 +371,10 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert_eq!(err, FleetRegistryError::AlreadyRegistered("host-1".to_string()));
+        assert_eq!(
+            err,
+            FleetRegistryError::AlreadyRegistered("host-1".to_string())
+        );
     }
 
     #[test]

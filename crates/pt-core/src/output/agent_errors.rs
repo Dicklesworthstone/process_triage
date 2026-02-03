@@ -207,10 +207,19 @@ mod tests {
 
     #[test]
     fn test_error_code_categories() {
-        assert_eq!(ErrorCode::PermissionDenied.category(), ErrorCategory::Permission);
-        assert_eq!(ErrorCode::ProcessNotFound.category(), ErrorCategory::Process);
+        assert_eq!(
+            ErrorCode::PermissionDenied.category(),
+            ErrorCategory::Permission
+        );
+        assert_eq!(
+            ErrorCode::ProcessNotFound.category(),
+            ErrorCategory::Process
+        );
         assert_eq!(ErrorCode::OutOfMemory.category(), ErrorCategory::System);
-        assert_eq!(ErrorCode::FdrBudgetExceeded.category(), ErrorCategory::Fleet);
+        assert_eq!(
+            ErrorCode::FdrBudgetExceeded.category(),
+            ErrorCategory::Fleet
+        );
         assert_eq!(ErrorCode::Internal.category(), ErrorCategory::Internal);
     }
 
@@ -225,9 +234,18 @@ mod tests {
 
     #[test]
     fn test_suggested_actions() {
-        assert_eq!(ErrorCode::PermissionDenied.suggested_action(), "retry_with_sudo");
-        assert_eq!(ErrorCode::ProcessNotFound.suggested_action(), "refresh_scan");
-        assert_eq!(ErrorCode::Timeout.suggested_action(), "retry_with_longer_timeout");
+        assert_eq!(
+            ErrorCode::PermissionDenied.suggested_action(),
+            "retry_with_sudo"
+        );
+        assert_eq!(
+            ErrorCode::ProcessNotFound.suggested_action(),
+            "refresh_scan"
+        );
+        assert_eq!(
+            ErrorCode::Timeout.suggested_action(),
+            "retry_with_longer_timeout"
+        );
     }
 
     #[test]

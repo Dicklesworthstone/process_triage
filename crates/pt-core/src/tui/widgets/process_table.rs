@@ -235,7 +235,8 @@ impl<'a> StatefulWidget for ProcessTable<'a> {
         let mut show_memory = true;
 
         let (_total_fixed, command_width) = loop {
-            let fixed_cols = 2 + u16::from(show_score) + u16::from(show_runtime) + u16::from(show_memory);
+            let fixed_cols =
+                2 + u16::from(show_score) + u16::from(show_runtime) + u16::from(show_memory);
             let total_fixed = self.col_widths[0]
                 + self.col_widths[2]
                 + if show_score { self.col_widths[1] } else { 0 }
@@ -307,7 +308,14 @@ impl<'a> StatefulWidget for ProcessTable<'a> {
 
         if show_runtime {
             let runtime_header = format!("Runtime{}", sort_indicator(SortColumn::Runtime));
-            Self::write_text(buf, inner.right(), x, inner.y, &runtime_header, header_style);
+            Self::write_text(
+                buf,
+                inner.right(),
+                x,
+                inner.y,
+                &runtime_header,
+                header_style,
+            );
             x += self.col_widths[3] + 1;
         }
 
@@ -318,7 +326,14 @@ impl<'a> StatefulWidget for ProcessTable<'a> {
         }
 
         let command_header = format!("Command{}", sort_indicator(SortColumn::Command));
-        Self::write_text(buf, inner.right(), x, inner.y, &command_header, header_style);
+        Self::write_text(
+            buf,
+            inner.right(),
+            x,
+            inner.y,
+            &command_header,
+            header_style,
+        );
 
         // Render separator line
         let sep_y = inner.y + 1;
@@ -363,7 +378,14 @@ impl<'a> StatefulWidget for ProcessTable<'a> {
             // Checkbox
             if self.show_selection {
                 let check_char = if is_selected { 'x' } else { ' ' };
-                Self::write_text(buf, inner.right(), x, y, &format!("[{}]", check_char), row_style);
+                Self::write_text(
+                    buf,
+                    inner.right(),
+                    x,
+                    y,
+                    &format!("[{}]", check_char),
+                    row_style,
+                );
                 x += checkbox_width + 1;
             }
 
@@ -461,10 +483,7 @@ impl ProcessTableState {
     pub fn apply_plan_preview(&mut self, plan: &Plan) {
         let mut by_pid: HashMap<u32, Vec<&PlanAction>> = HashMap::new();
         for action in &plan.actions {
-            by_pid
-                .entry(action.target.pid.0)
-                .or_default()
-                .push(action);
+            by_pid.entry(action.target.pid.0).or_default().push(action);
         }
         for list in by_pid.values_mut() {
             list.sort_by_key(|a| a.stage);

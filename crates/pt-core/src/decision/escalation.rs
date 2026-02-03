@@ -119,7 +119,7 @@ pub struct EscalationConfig {
 impl Default for EscalationConfig {
     fn default() -> Self {
         Self {
-            trigger_cooldown_secs: 300.0,  // 5 minutes
+            trigger_cooldown_secs: 300.0, // 5 minutes
             max_notifications_per_hour: 10,
             bundle_window_secs: 60.0,
             min_severity: Severity::Warning,
@@ -175,8 +175,7 @@ impl EscalationManager {
         }
 
         // Check global rate limit.
-        self.notification_log
-            .retain(|&ts| now - ts < 3600.0);
+        self.notification_log.retain(|&ts| now - ts < 3600.0);
         let remaining_budget = self
             .config
             .max_notifications_per_hour
@@ -198,17 +197,17 @@ impl EscalationManager {
         if drain.len() == 1 {
             let t = &drain[0];
             let notif = render_notification(t, false, 1);
-            self.last_notified
-                .insert(t.trigger_id.clone(), now);
+            self.last_notified.insert(t.trigger_id.clone(), now);
             self.notification_log.push(now);
             notifications.push(notif);
         } else {
             // Bundle all into one notification.
             let max_severity = drain.iter().map(|t| t.severity).max().unwrap();
             let session_id = drain.iter().find_map(|t| t.session_id.clone());
-            let summaries: Vec<String> = drain.iter().map(|t| {
-                format!("- [{}] {}", t.severity, t.summary)
-            }).collect();
+            let summaries: Vec<String> = drain
+                .iter()
+                .map(|t| format!("- [{}] {}", t.severity, t.summary))
+                .collect();
 
             let count = drain.len();
             for t in &drain {
@@ -255,15 +254,10 @@ impl EscalationManager {
     }
 }
 
-fn render_notification(
-    trigger: &EscalationTrigger,
-    bundled: bool,
-    count: usize,
-) -> Notification {
+fn render_notification(trigger: &EscalationTrigger, bundled: bool, count: usize) -> Notification {
     let title = format!(
         "Process Triage [{}]: {}",
-        trigger.severity,
-        trigger.trigger_type
+        trigger.severity, trigger.trigger_type
     );
     Notification {
         severity: trigger.severity,
@@ -400,7 +394,11 @@ mod tests {
 
         let n = &notifs[0];
         assert!(n.human_review_cmd.as_ref().unwrap().contains("pt review"));
-        assert!(n.agent_review_cmd.as_ref().unwrap().contains("pt agent plan"));
+        assert!(n
+            .agent_review_cmd
+            .as_ref()
+            .unwrap()
+            .contains("pt agent plan"));
         assert!(n.session_id.is_some());
     }
 

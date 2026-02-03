@@ -82,7 +82,10 @@ fn render_summary(
     let p = &posterior.posterior;
     format!(
         "P(C|x): U={:.3} UB={:.3} A={:.3} Z={:.3} {} {:?} ({})",
-        p.useful, p.useful_bad, p.abandoned, p.zombie,
+        p.useful,
+        p.useful_bad,
+        p.abandoned,
+        p.zombie,
         arrow,
         ledger.classification,
         ledger.confidence,
@@ -100,12 +103,20 @@ fn render_detail(
     let sep = sec.repeat(50);
 
     // Header.
-    lines.push(format!("{} Galaxy-Brain Mode {}", sym(config.math_mode, "🧠", "[*]"), sep));
+    lines.push(format!(
+        "{} Galaxy-Brain Mode {}",
+        sym(config.math_mode, "🧠", "[*]"),
+        sep
+    ));
 
     // 1) Prior.
     lines.push(String::new());
     lines.push(section_header("Prior Distribution", config));
-    lines.push(format_scores("P(C)", &prior_from_posterior(posterior), config));
+    lines.push(format_scores(
+        "P(C)",
+        &prior_from_posterior(posterior),
+        config,
+    ));
 
     // 2) Posterior.
     lines.push(String::new());
@@ -227,8 +238,7 @@ fn format_scores(label: &str, scores: &ClassScores, config: &GalaxyBrainConfig) 
     let approx = sym(config.math_mode, "≈", "~");
     format!(
         "  {}  {} [{:.4}, {:.4}, {:.4}, {:.4}]  (U, UB, A, Z)",
-        label, approx,
-        scores.useful, scores.useful_bad, scores.abandoned, scores.zombie,
+        label, approx, scores.useful, scores.useful_bad, scores.abandoned, scores.zombie,
     )
 }
 

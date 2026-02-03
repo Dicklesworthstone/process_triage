@@ -15,9 +15,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::metrics::compute_metrics;
 use super::validation::ValidationRecord;
 use super::{CalibrationData, CalibrationError};
-use super::metrics::compute_metrics;
 
 /// Configuration for prior tuning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,11 +171,7 @@ impl TuningEngine {
 
         // Compute class prior adjustments.
         let mut adjustments = Vec::new();
-        self.compute_class_prior_adjustments(
-            &resolved,
-            current_class_priors,
-            &mut adjustments,
-        );
+        self.compute_class_prior_adjustments(&resolved, current_class_priors, &mut adjustments);
 
         // Compute per-category bias adjustments.
         self.compute_category_bias_adjustments(&category_stats, &mut adjustments);
@@ -289,7 +285,10 @@ impl TuningEngine {
                 observation_count: resolved.len(),
                 reason: format!(
                     "Observed {} rate is {:.3} vs prior {:.3} (n={})",
-                    class_name, observed_rate, current_prior, resolved.len()
+                    class_name,
+                    observed_rate,
+                    current_prior,
+                    resolved.len()
                 ),
             });
         }
@@ -361,8 +360,8 @@ impl TuningEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::validation::GroundTruth;
+    use super::*;
     use chrono::Utc;
 
     fn make_record(
@@ -503,7 +502,7 @@ mod tests {
         let mut records = Vec::new();
         for i in 0..10 {
             records.push(make_record(
-                0.8, // High predicted abandonment
+                0.8,                     // High predicted abandonment
                 GroundTruth::NormalExit, // But they exit normally
                 Some("test_runner"),
                 &format!("jest_{}", i),
@@ -550,10 +549,7 @@ mod tests {
             ));
         }
 
-        let priors = vec![
-            ("abandoned".to_string(), 0.15),
-            ("useful".to_string(), 0.7),
-        ];
+        let priors = vec![("abandoned".to_string(), 0.15), ("useful".to_string(), 0.7)];
         let result = engine.compute_adjustments(&records, &priors).unwrap();
 
         // The observed abandoned rate is ~3/18 ≈ 0.167, close to prior of 0.15.

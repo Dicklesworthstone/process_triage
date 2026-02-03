@@ -89,7 +89,10 @@ pub fn classify_role(comm: &str, is_target: bool, is_pid1: bool) -> ProcessRole 
     }
 
     // Shells.
-    if matches!(c.as_str(), "bash" | "zsh" | "fish" | "sh" | "dash" | "ksh" | "csh" | "tcsh") {
+    if matches!(
+        c.as_str(),
+        "bash" | "zsh" | "fish" | "sh" | "dash" | "ksh" | "csh" | "tcsh"
+    ) {
         return ProcessRole::UserShell;
     }
 
@@ -236,10 +239,7 @@ pub fn render_narrative_with_style(chain: &[AncestryEntry], style: NarrativeStyl
 
     let mut narrative = format!(
         "Process '{}' (PID {}) was spawned by '{}' (PID {})",
-        target.comm,
-        target.pid.0,
-        chain[1].comm,
-        chain[1].pid.0
+        target.comm, target.pid.0, chain[1].comm, chain[1].pid.0
     );
 
     if chain.len() == 2 && chain[1].pid.0 == 1 {
@@ -358,11 +358,7 @@ mod tests {
 
     #[test]
     fn narrative_brief_truncates() {
-        let chain = vec![
-            entry(100, "node"),
-            entry(90, "bash"),
-            entry(1, "init"),
-        ];
+        let chain = vec![entry(100, "node"), entry(90, "bash"), entry(1, "init")];
         let narrative = render_narrative_with_style(&chain, NarrativeStyle::Brief);
         assert!(narrative.contains("and 1 more ancestor"));
     }
@@ -378,8 +374,14 @@ mod tests {
 
     #[test]
     fn classify_role_supervisors() {
-        assert_eq!(classify_role("systemd", false, false), ProcessRole::Supervisor);
-        assert_eq!(classify_role("supervisord", false, false), ProcessRole::Supervisor);
+        assert_eq!(
+            classify_role("systemd", false, false),
+            ProcessRole::Supervisor
+        );
+        assert_eq!(
+            classify_role("supervisord", false, false),
+            ProcessRole::Supervisor
+        );
     }
 
     #[test]
@@ -394,13 +396,22 @@ mod tests {
 
     #[test]
     fn classify_role_multiplexer() {
-        assert_eq!(classify_role("tmux: server", false, false), ProcessRole::Multiplexer);
-        assert_eq!(classify_role("screen", false, false), ProcessRole::Multiplexer);
+        assert_eq!(
+            classify_role("tmux: server", false, false),
+            ProcessRole::Multiplexer
+        );
+        assert_eq!(
+            classify_role("screen", false, false),
+            ProcessRole::Multiplexer
+        );
     }
 
     #[test]
     fn classify_role_test_runner() {
-        assert_eq!(classify_role("pytest", false, false), ProcessRole::TestRunner);
+        assert_eq!(
+            classify_role("pytest", false, false),
+            ProcessRole::TestRunner
+        );
     }
 
     #[test]
@@ -410,12 +421,18 @@ mod tests {
 
     #[test]
     fn classify_role_container() {
-        assert_eq!(classify_role("containerd-shim", false, false), ProcessRole::ContainerRuntime);
+        assert_eq!(
+            classify_role("containerd-shim", false, false),
+            ProcessRole::ContainerRuntime
+        );
     }
 
     #[test]
     fn classify_role_unknown() {
-        assert_eq!(classify_role("my_custom_app", false, false), ProcessRole::Unknown);
+        assert_eq!(
+            classify_role("my_custom_app", false, false),
+            ProcessRole::Unknown
+        );
     }
 
     // --- Genealogy tests ---
@@ -466,10 +483,7 @@ mod tests {
 
     #[test]
     fn genealogy_serialization() {
-        let chain = vec![
-            entry(100, "node"),
-            entry(90, "bash"),
-        ];
+        let chain = vec![entry(100, "node"), entry(90, "bash")];
         let gen = build_genealogy(&chain);
         let json = serde_json::to_string(&gen).unwrap();
         let restored: Genealogy = serde_json::from_str(&json).unwrap();

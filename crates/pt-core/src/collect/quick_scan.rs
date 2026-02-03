@@ -205,8 +205,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     if timed_out.load(Ordering::Relaxed) {
         debug!(
             duration_ms = duration.as_millis(),
-            process_count,
-            "Quick scan timed out"
+            process_count, "Quick scan timed out"
         );
         return Err(QuickScanError::Timeout(timeout));
     }

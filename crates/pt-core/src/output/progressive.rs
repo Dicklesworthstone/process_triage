@@ -120,8 +120,14 @@ pub fn render_table_row(row: &TableRow) -> String {
         .unwrap_or_default();
     format!(
         "[{}] PID:{}  {}  {}  {}  P({})={:.2}{}",
-        row.action, row.pid, row.age_display, row.memory_display,
-        row.command, row.top_class, row.top_posterior, del,
+        row.action,
+        row.pid,
+        row.age_display,
+        row.memory_display,
+        row.command,
+        row.top_class,
+        row.top_posterior,
+        del,
     )
 }
 
@@ -212,14 +218,12 @@ mod tests {
     fn sample_detail() -> DetailPane {
         DetailPane {
             expanded: sample_expanded(),
-            evidence_ledger: vec![
-                EvidenceEntry {
-                    feature: "cpu_occupancy".to_string(),
-                    bits: 2.74,
-                    direction: "supports abandoned".to_string(),
-                    strength: "strong".to_string(),
-                },
-            ],
+            evidence_ledger: vec![EvidenceEntry {
+                feature: "cpu_occupancy".to_string(),
+                bits: 2.74,
+                direction: "supports abandoned".to_string(),
+                strength: "strong".to_string(),
+            }],
             expected_loss_table: Some(LossTable {
                 keep: 28.2,
                 pause: 15.1,
@@ -273,7 +277,10 @@ mod tests {
         assert_eq!(DisclosureLevel::Table.next(), DisclosureLevel::Expanded);
         assert_eq!(DisclosureLevel::Expanded.next(), DisclosureLevel::Detail);
         assert_eq!(DisclosureLevel::Detail.next(), DisclosureLevel::GalaxyBrain);
-        assert_eq!(DisclosureLevel::GalaxyBrain.next(), DisclosureLevel::GalaxyBrain);
+        assert_eq!(
+            DisclosureLevel::GalaxyBrain.next(),
+            DisclosureLevel::GalaxyBrain
+        );
 
         assert_eq!(DisclosureLevel::Table.prev(), DisclosureLevel::Table);
         assert_eq!(DisclosureLevel::Expanded.prev(), DisclosureLevel::Table);

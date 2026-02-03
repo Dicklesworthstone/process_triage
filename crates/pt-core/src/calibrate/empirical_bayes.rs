@@ -219,7 +219,10 @@ pub fn compute_refit(
 ) -> RefitResult {
     let total_obs: u64 = beta_obs.iter().map(|o| o.trials).sum::<u64>()
         + gamma_obs.iter().map(|o| o.count).sum::<u64>()
-        + dirichlet_obs.iter().map(|o| o.counts.iter().sum::<u64>()).sum::<u64>();
+        + dirichlet_obs
+            .iter()
+            .map(|o| o.counts.iter().sum::<u64>())
+            .sum::<u64>();
 
     let snapshot_before = PriorSnapshot {
         version,
@@ -291,8 +294,7 @@ pub fn compute_refit(
     for obs in dirichlet_obs {
         if let Some(ParamValue::Dirichlet { alpha }) = current_params.get(&obs.path) {
             if alpha.len() == obs.counts.len() {
-                let (new_alpha, clamped) =
-                    conjugate_dirichlet_update(alpha, &obs.counts, config);
+                let (new_alpha, clamped) = conjugate_dirichlet_update(alpha, &obs.counts, config);
 
                 let changed = alpha
                     .iter()

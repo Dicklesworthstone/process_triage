@@ -20,16 +20,16 @@
 //! - Signature review flagging
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use pt_telemetry::shadow::{EventType, Observation, ProcessEvent};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 
 use super::{
-    CalibrationData, CalibrationError, CalibrationQuality,
     bias::{analyze_bias, BiasAnalysis},
     metrics::{compute_metrics, CalibrationMetrics},
     report::CalibrationReport,
+    CalibrationData, CalibrationError, CalibrationQuality,
 };
 
 /// How a process actually terminated.
@@ -266,13 +266,7 @@ impl ValidationEngine {
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
     ) -> bool {
-        self.record_outcome_with_source(
-            identity_hash,
-            ground_truth,
-            exit_code,
-            exit_signal,
-            None,
-        )
+        self.record_outcome_with_source(identity_hash, ground_truth, exit_code, exit_signal, None)
     }
 
     /// Record a ground truth outcome with an optional source label.
@@ -313,13 +307,7 @@ impl ValidationEngine {
         exit_code: Option<i32>,
         exit_signal: Option<i32>,
     ) -> bool {
-        self.record_outcome_by_pid_with_source(
-            pid,
-            ground_truth,
-            exit_code,
-            exit_signal,
-            None,
-        )
+        self.record_outcome_by_pid_with_source(pid, ground_truth, exit_code, exit_signal, None)
     }
 
     /// Record outcome by PID with an optional source label.
@@ -412,8 +400,8 @@ impl ValidationEngine {
                 continue;
             }
 
-            let comm = extract_comm_from_events(&obs.events)
-                .unwrap_or_else(|| "unknown".to_string());
+            let comm =
+                extract_comm_from_events(&obs.events).unwrap_or_else(|| "unknown".to_string());
             engine.upsert_prediction(
                 obs.identity_hash.clone(),
                 obs.pid,
@@ -508,7 +496,9 @@ impl ValidationEngine {
             None
         };
 
-        let quality = metrics.as_ref().map(|m| CalibrationQuality::from_metrics(m.ece, m.brier_score));
+        let quality = metrics
+            .as_ref()
+            .map(|m| CalibrationQuality::from_metrics(m.ece, m.brier_score));
 
         let bias = if cal_data.len() >= 20 {
             analyze_bias(&cal_data).ok()
@@ -561,7 +551,10 @@ impl ValidationEngine {
                 let total = self
                     .records
                     .iter()
-                    .filter(|r| r.proc_type.as_deref() == Some(&category) || (r.proc_type.is_none() && category == "unknown"))
+                    .filter(|r| {
+                        r.proc_type.as_deref() == Some(&category)
+                            || (r.proc_type.is_none() && category == "unknown")
+                    })
                     .count();
 
                 let mut tp = 0usize;
@@ -571,9 +564,7 @@ impl ValidationEngine {
 
                 for r in &records {
                     let predicted_kill = r.predicted_abandoned >= self.threshold;
-                    let actually_abandoned = r
-                        .ground_truth
-                        .map_or(false, |gt| gt.is_abandoned());
+                    let actually_abandoned = r.ground_truth.map_or(false, |gt| gt.is_abandoned());
 
                     match (predicted_kill, actually_abandoned) {
                         (true, true) => tp += 1,
@@ -629,16 +620,20 @@ impl ValidationEngine {
 
         for r in resolved {
             let predicted_kill = r.predicted_abandoned >= self.threshold;
-            let actually_abandoned = r
-                .ground_truth
-                .map_or(false, |gt| gt.is_abandoned());
+            let actually_abandoned = r.ground_truth.map_or(false, |gt| gt.is_abandoned());
 
             if predicted_kill && !actually_abandoned {
-                let entry = fp_patterns.entry(r.comm.clone()).or_insert((0, 0.0, r.proc_type.clone()));
+                let entry =
+                    fp_patterns
+                        .entry(r.comm.clone())
+                        .or_insert((0, 0.0, r.proc_type.clone()));
                 entry.0 += 1;
                 entry.1 += r.predicted_abandoned;
             } else if !predicted_kill && actually_abandoned {
-                let entry = fn_patterns.entry(r.comm.clone()).or_insert((0, 0.0, r.proc_type.clone()));
+                let entry =
+                    fn_patterns
+                        .entry(r.comm.clone())
+                        .or_insert((0, 0.0, r.proc_type.clone()));
                 entry.0 += 1;
                 entry.1 += r.predicted_abandoned;
             }
@@ -750,9 +745,7 @@ fn extract_comm_from_events(events: &[ProcessEvent]) -> Option<String> {
     preferred
 }
 
-fn map_exit_event(
-    event: &ProcessEvent,
-) -> (GroundTruth, Option<i32>, Option<i32>, Option<String>) {
+fn map_exit_event(event: &ProcessEvent) -> (GroundTruth, Option<i32>, Option<i32>, Option<String>) {
     let mut exit_code: Option<i32> = None;
     let mut exit_signal: Option<i32> = None;
     let mut outcome_source: Option<String> = None;
@@ -786,7 +779,12 @@ fn map_exit_event(
         }
     }
 
-    (ground_truth.unwrap_or(GroundTruth::NormalExit), exit_code, exit_signal, outcome_source)
+    (
+        ground_truth.unwrap_or(GroundTruth::NormalExit),
+        exit_code,
+        exit_signal,
+        outcome_source,
+    )
 }
 
 fn map_outcome_hint(hint: &str) -> Option<GroundTruth> {
@@ -814,24 +812,49 @@ mod tests {
 
         // Track some predictions.
         engine.track_prediction(
-            "hash_a".into(), 100, 0.9, "kill".into(),
-            Some("test_runner".into()), "jest".into(), None,
+            "hash_a".into(),
+            100,
+            0.9,
+            "kill".into(),
+            Some("test_runner".into()),
+            "jest".into(),
+            None,
         );
         engine.track_prediction(
-            "hash_b".into(), 200, 0.3, "keep".into(),
-            Some("dev_server".into()), "next".into(), None,
+            "hash_b".into(),
+            200,
+            0.3,
+            "keep".into(),
+            Some("dev_server".into()),
+            "next".into(),
+            None,
         );
         engine.track_prediction(
-            "hash_c".into(), 300, 0.8, "kill".into(),
-            Some("test_runner".into()), "pytest".into(), None,
+            "hash_c".into(),
+            300,
+            0.8,
+            "kill".into(),
+            Some("test_runner".into()),
+            "pytest".into(),
+            None,
         );
         engine.track_prediction(
-            "hash_d".into(), 400, 0.2, "keep".into(),
-            Some("dev_server".into()), "vite".into(), None,
+            "hash_d".into(),
+            400,
+            0.2,
+            "keep".into(),
+            Some("dev_server".into()),
+            "vite".into(),
+            None,
         );
         engine.track_prediction(
-            "hash_e".into(), 500, 0.7, "kill".into(),
-            Some("test_runner".into()), "bun".into(), None,
+            "hash_e".into(),
+            500,
+            0.7,
+            "kill".into(),
+            Some("test_runner".into()),
+            "bun".into(),
+            None,
         );
 
         // Record outcomes.
@@ -839,7 +862,7 @@ mod tests {
         engine.record_outcome("hash_b", GroundTruth::NormalExit, None, Some(0));
         engine.record_outcome("hash_c", GroundTruth::NormalExit, None, Some(0)); // false positive
         engine.record_outcome("hash_d", GroundTruth::ExternalKill, None, None); // false negative
-        // hash_e left unresolved
+                                                                                // hash_e left unresolved
 
         engine
     }
@@ -892,8 +915,13 @@ mod tests {
     fn test_record_outcome_by_identity_hash() {
         let mut engine = ValidationEngine::new(0.5);
         engine.track_prediction(
-            "hash_x".into(), 999, 0.85, "kill".into(),
-            None, "worker".into(), None,
+            "hash_x".into(),
+            999,
+            0.85,
+            "kill".into(),
+            None,
+            "worker".into(),
+            None,
         );
 
         assert!(engine.record_outcome("hash_x", GroundTruth::UserKilled, None, None));
@@ -905,8 +933,13 @@ mod tests {
     fn test_record_outcome_by_pid() {
         let mut engine = ValidationEngine::new(0.5);
         engine.track_prediction(
-            "hash_y".into(), 42, 0.6, "kill".into(),
-            None, "proc".into(), None,
+            "hash_y".into(),
+            42,
+            0.6,
+            "kill".into(),
+            None,
+            "proc".into(),
+            None,
         );
 
         assert!(engine.record_outcome_by_pid(42, GroundTruth::Crash, Some(1), None));
@@ -943,8 +976,13 @@ mod tests {
             };
 
             engine.track_prediction(
-                hash.clone(), i as u32 + 1000, prob, "keep".into(),
-                Some("test".into()), "proc".into(), None,
+                hash.clone(),
+                i as u32 + 1000,
+                prob,
+                "keep".into(),
+                Some("test".into()),
+                "proc".into(),
+                None,
             );
             engine.record_outcome(&hash, gt, None, None);
         }
@@ -1003,9 +1041,7 @@ mod tests {
             events: vec![ProcessEvent {
                 timestamp: now,
                 event_type: EventType::EvidenceSnapshot,
-                details: Some(
-                    serde_json::json!({"comm": "sleep"}).to_string(),
-                ),
+                details: Some(serde_json::json!({"comm": "sleep"}).to_string()),
             }],
             belief: BeliefState {
                 p_abandoned: 0.1,
@@ -1022,9 +1058,7 @@ mod tests {
             events: vec![ProcessEvent {
                 timestamp: now + Duration::seconds(5),
                 event_type: EventType::EvidenceSnapshot,
-                details: Some(
-                    serde_json::json!({"comm": "sleep"}).to_string(),
-                ),
+                details: Some(serde_json::json!({"comm": "sleep"}).to_string()),
             }],
             belief: BeliefState {
                 p_abandoned: 0.9,
@@ -1050,9 +1084,7 @@ mod tests {
             events: vec![ProcessEvent {
                 timestamp: now,
                 event_type: EventType::EvidenceSnapshot,
-                details: Some(
-                    serde_json::json!({"comm": "worker"}).to_string(),
-                ),
+                details: Some(serde_json::json!({"comm": "worker"}).to_string()),
             }],
             belief: BeliefState {
                 p_abandoned: 0.8,
@@ -1089,6 +1121,9 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].ground_truth, Some(GroundTruth::NormalExit));
         assert_eq!(resolved[0].comm, "worker");
-        assert_eq!(resolved[0].outcome_source.as_deref(), Some("shadow:missing"));
+        assert_eq!(
+            resolved[0].outcome_source.as_deref(),
+            Some("shadow:missing")
+        );
     }
 }

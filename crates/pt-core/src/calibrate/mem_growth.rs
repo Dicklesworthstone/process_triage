@@ -148,7 +148,10 @@ pub fn estimate_mem_growth(
     }
 
     let t_min = samples.iter().map(|s| s.t).fold(f64::INFINITY, f64::min);
-    let t_max = samples.iter().map(|s| s.t).fold(f64::NEG_INFINITY, f64::max);
+    let t_max = samples
+        .iter()
+        .map(|s| s.t)
+        .fold(f64::NEG_INFINITY, f64::max);
     let time_span = t_max - t_min;
 
     if time_span < config.min_time_span_secs {
@@ -180,8 +183,7 @@ pub fn estimate_mem_growth(
     let outlier_fraction = 1.0 - n_used as f64 / n as f64;
 
     // Compute regression on kept points.
-    let (slope, intercept, r_squared, slope_se) =
-        robust_linreg(&times, &values, &keep_indices)?;
+    let (slope, intercept, r_squared, slope_se) = robust_linreg(&times, &values, &keep_indices)?;
 
     // Residuals for diagnostics.
     let mut residuals: Vec<f64> = keep_indices
@@ -312,9 +314,12 @@ mod tests {
         (0..n)
             .map(|i| {
                 let t = i as f64 * 10.0; // 10-second intervals
-                // Add small deterministic noise so SE > 0.
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let noise = ((state >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * rate_bytes_per_sec * 2.0;
+                                         // Add small deterministic noise so SE > 0.
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let noise =
+                    ((state >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * rate_bytes_per_sec * 2.0;
                 let val = base as f64 + rate_bytes_per_sec * t + noise;
                 MemSample {
                     t,

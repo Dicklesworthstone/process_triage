@@ -242,12 +242,9 @@ impl MemPressureMonitor {
         let util = signals.utilization();
         let psi = signals.psi_some10.unwrap_or(0.0);
 
-        if util >= self.config.emergency_threshold
-            || psi >= self.config.psi_emergency_threshold
-        {
+        if util >= self.config.emergency_threshold || psi >= self.config.psi_emergency_threshold {
             PressureMode::Emergency
-        } else if util >= self.config.warning_threshold
-            || psi >= self.config.psi_warning_threshold
+        } else if util >= self.config.warning_threshold || psi >= self.config.psi_warning_threshold
         {
             PressureMode::Warning
         } else {

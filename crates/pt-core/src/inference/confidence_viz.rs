@@ -178,12 +178,8 @@ pub fn compute_confidence_viz(
         })
         .collect();
 
-    let status_line = build_status_line(
-        safety_badge,
-        confidence_badge,
-        input,
-        ledger.classification,
-    );
+    let status_line =
+        build_status_line(safety_badge, confidence_badge, input, ledger.classification);
 
     ConfidenceViz {
         safety: safety_badge,

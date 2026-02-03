@@ -301,11 +301,7 @@ impl FleetFdrCoordinator {
     }
 
     /// Combine evidence from multiple hosts for the same pattern.
-    pub fn pool_evidence(
-        &self,
-        pattern_id: &str,
-        host_e_values: &[(&str, f64)],
-    ) -> PooledEvidence {
+    pub fn pool_evidence(&self, pattern_id: &str, host_e_values: &[(&str, f64)]) -> PooledEvidence {
         // Product of e-values (valid under independence).
         let combined = host_e_values
             .iter()

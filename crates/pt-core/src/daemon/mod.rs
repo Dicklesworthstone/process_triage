@@ -155,7 +155,10 @@ pub fn process_tick<E>(
     escalate_fn: &mut E,
 ) -> TickOutcome
 where
-    E: FnMut(&escalation::EscalationConfig, &[triggers::FiredTrigger]) -> escalation::EscalationOutcome,
+    E: FnMut(
+        &escalation::EscalationConfig,
+        &[triggers::FiredTrigger],
+    ) -> escalation::EscalationOutcome,
 {
     state.tick_count += 1;
     let tick_number = state.tick_count;
@@ -164,11 +167,7 @@ where
     let mut events = Vec::new();
 
     // 1) Evaluate triggers.
-    let fired = triggers::evaluate_triggers(
-        &config.triggers,
-        trigger_state,
-        metrics,
-    );
+    let fired = triggers::evaluate_triggers(&config.triggers, trigger_state, metrics);
 
     for t in &fired {
         state.record_event(DaemonEventType::TriggerFired, &t.description);
@@ -213,7 +212,10 @@ where
         None
     };
 
-    state.record_event(DaemonEventType::TickCompleted, &format!("tick {}", tick_number));
+    state.record_event(
+        DaemonEventType::TickCompleted,
+        &format!("tick {}", tick_number),
+    );
 
     TickOutcome {
         tick_number,

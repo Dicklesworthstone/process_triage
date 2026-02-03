@@ -178,9 +178,7 @@ impl RespawnTracker {
             recent.iter().map(|e| e.respawn_delay_secs).sum::<f64>() / recent.len() as f64
         };
 
-        let has_supervisor = events
-            .iter()
-            .any(|e| e.supervisor_unit.is_some());
+        let has_supervisor = events.iter().any(|e| e.supervisor_unit.is_some());
 
         let recommendation = if !is_loop {
             RespawnRecommendation::KillOk
@@ -193,8 +191,7 @@ impl RespawnTracker {
         };
 
         let discount = if is_loop {
-            let ratio =
-                (loop_count as f64 / config.max_loops_for_discount as f64).min(1.0);
+            let ratio = (loop_count as f64 / config.max_loops_for_discount as f64).min(1.0);
             1.0 - config.kill_discount_factor * ratio
         } else {
             1.0
@@ -239,10 +236,7 @@ impl RespawnTracker {
 }
 
 /// Apply respawn loop discount to a kill utility score.
-pub fn discount_kill_utility(
-    base_utility: f64,
-    detection: &RespawnLoopDetection,
-) -> f64 {
+pub fn discount_kill_utility(base_utility: f64, detection: &RespawnLoopDetection) -> f64 {
     base_utility * detection.kill_utility_multiplier
 }
 

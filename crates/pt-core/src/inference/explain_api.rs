@@ -8,11 +8,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::confidence_viz::{
-    CalibrationStatus, ConfidenceBadge, ConfidenceVizInput, GateStatus,
-    SafetyBadge, compute_confidence_viz,
+    compute_confidence_viz, CalibrationStatus, ConfidenceBadge, ConfidenceVizInput, GateStatus,
+    SafetyBadge,
 };
-use super::explain::{ExplainConfig, explain};
-use super::flip_conditions::{FlipAnalysis, FlipConfig, compute_flip_conditions};
+use super::explain::{explain, ExplainConfig};
+use super::flip_conditions::{compute_flip_conditions, FlipAnalysis, FlipConfig};
 use super::ledger::{BayesFactorEntry, Classification, Confidence, EvidenceLedger};
 
 // ---------------------------------------------------------------------------
@@ -163,10 +163,13 @@ pub fn build_explanation(
         response.contributing_factors = Some(nl.contributing_factors.clone());
         response.countervailing = Some(nl.countervailing.clone());
 
-        let flip = compute_flip_conditions(ledger, &FlipConfig {
-            max_scenarios: config.max_counterfactuals,
-            ..Default::default()
-        });
+        let flip = compute_flip_conditions(
+            ledger,
+            &FlipConfig {
+                max_scenarios: config.max_counterfactuals,
+                ..Default::default()
+            },
+        );
         response.counterfactuals = Some(build_counterfactuals(&flip));
     }
 
@@ -197,10 +200,7 @@ fn posterior_for_class(ledger: &EvidenceLedger) -> f64 {
     }
 }
 
-fn build_evidence_factors(
-    bayes_factors: &[BayesFactorEntry],
-    max: usize,
-) -> Vec<EvidenceFactor> {
+fn build_evidence_factors(bayes_factors: &[BayesFactorEntry], max: usize) -> Vec<EvidenceFactor> {
     bayes_factors
         .iter()
         .take(max)
