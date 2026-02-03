@@ -18,6 +18,6 @@ mod search_input;
 
 pub use config_editor::{ConfigEditor, ConfigEditorState, ConfigField, ConfigFieldType};
 pub use confirm_dialog::{ConfirmChoice, ConfirmDialog, ConfirmDialogState};
-pub use process_detail::ProcessDetail;
+pub use process_detail::{DetailView, ProcessDetail};
 pub use process_table::{ProcessRow, ProcessTable, ProcessTableState, SortColumn, SortOrder};
 pub use search_input::{SearchInput, SearchInputState};

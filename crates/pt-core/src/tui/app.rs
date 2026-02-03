@@ -11,13 +11,18 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, layout::Rect, widgets::Paragraph, Frame, Terminal};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::Rect,
+    widgets::{Block, Borders, Paragraph, Wrap},
+    Frame, Terminal,
+};
 
-use super::events::{handle_event, AppAction, KeyBindings};
+use super::events::KeyBindings;
 use super::layout::{Breakpoint, LayoutState, ResponsiveLayout};
 use super::theme::Theme;
 use super::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmDialogState, ProcessDetail, ProcessTable,
+    ConfirmChoice, ConfirmDialog, ConfirmDialogState, DetailView, ProcessDetail, ProcessTable,
     ProcessTableState, SearchInput, SearchInputState,
 };
 use super::{TuiError, TuiResult};
@@ -71,6 +76,10 @@ pub struct App {
     needs_redraw: bool,
     /// Responsive layout state for tracking breakpoint changes.
     layout_state: LayoutState,
+    /// Whether the detail pane is visible.
+    detail_visible: bool,
+    /// Current detail view mode.
+    detail_view: DetailView,
 }
 
 impl Default for App {
@@ -97,6 +106,8 @@ impl App {
             needs_redraw: true,
             // Initialize with reasonable defaults; will be updated on first render
             layout_state: LayoutState::new(80, 24),
+            detail_visible: true,
+            detail_view: DetailView::Summary,
         }
     }
 
@@ -165,6 +176,20 @@ impl App {
             FocusTarget::Actions => FocusTarget::Search,
         };
         self.update_focus();
+    }
+
+    fn toggle_detail_visibility(&mut self) {
+        self.detail_visible = !self.detail_visible;
+        if self.detail_visible {
+            self.set_status("Detail pane opened");
+        } else {
+            self.set_status("Detail pane hidden");
+        }
+    }
+
+    fn set_detail_view(&mut self, view: DetailView) {
+        self.detail_view = view;
+        self.detail_visible = true;
     }
 
     /// Handle a terminal event.
@@ -245,10 +270,10 @@ impl App {
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.process_table.cursor_up();
                     }
-                    KeyCode::Char('g') => {
+                    KeyCode::Home => {
                         self.process_table.cursor_home();
                     }
-                    KeyCode::Char('G') => {
+                    KeyCode::End => {
                         self.process_table.cursor_end();
                     }
                     KeyCode::PageDown => {
@@ -257,13 +282,34 @@ impl App {
                     KeyCode::PageUp => {
                         self.process_table.page_up(10);
                     }
+                    KeyCode::Char('d') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                        self.process_table.page_down(10);
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                        self.process_table.page_up(10);
+                    }
+                    KeyCode::Char('n') => {
+                        self.process_table.cursor_down();
+                    }
+                    KeyCode::Char('N') => {
+                        self.process_table.cursor_up();
+                    }
 
                     // Selection
                     KeyCode::Char(' ') => {
                         self.process_table.toggle_selection();
                     }
                     KeyCode::Char('a') => {
+                        self.process_table.select_recommended();
+                    }
+                    KeyCode::Char('A') => {
                         self.process_table.select_all();
+                    }
+                    KeyCode::Char('u') => {
+                        self.process_table.deselect_all();
+                    }
+                    KeyCode::Char('x') => {
+                        self.process_table.invert_selection();
                     }
 
                     // Search
@@ -279,11 +325,27 @@ impl App {
                     }
 
                     // Actions
-                    KeyCode::Enter | KeyCode::Char('x') => {
+                    KeyCode::Enter => {
+                        self.toggle_detail_visibility();
+                    }
+                    KeyCode::Char('e') => {
                         self.show_execute_confirmation();
                     }
                     KeyCode::Char('r') => {
                         self.set_status("Refreshing process list...");
+                    }
+                    KeyCode::Char('s') => {
+                        self.set_detail_view(DetailView::Summary);
+                    }
+                    KeyCode::Char('t') => {
+                        self.set_detail_view(DetailView::Genealogy);
+                    }
+                    KeyCode::Char('g') => {
+                        if self.detail_view == DetailView::GalaxyBrain {
+                            self.set_detail_view(DetailView::Summary);
+                        } else {
+                            self.set_detail_view(DetailView::GalaxyBrain);
+                        }
                     }
 
                     // Help
@@ -394,12 +456,32 @@ impl App {
 
         // Render main content areas
         self.render_search(frame, areas.search);
-        self.render_process_table(frame, areas.list);
+        let list_area = if !self.detail_visible {
+            if let Some(detail) = areas.detail {
+                let extra_width = detail.width + areas.aux.map(|a| a.width).unwrap_or(0);
+                Rect::new(
+                    areas.list.x,
+                    areas.list.y,
+                    areas.list.width.saturating_add(extra_width),
+                    areas.list.height,
+                )
+            } else {
+                areas.list
+            }
+        } else {
+            areas.list
+        };
+        self.render_process_table(frame, list_area);
         self.render_status_bar(frame, areas.status);
 
         // Render detail pane when available (medium/large)
-        if let Some(detail) = areas.detail {
-            self.render_detail_pane(frame, detail);
+        if self.detail_visible {
+            if let Some(detail) = areas.detail {
+                self.render_detail_pane(frame, detail);
+            }
+            if let Some(aux) = areas.aux {
+                self.render_aux_pane(frame, aux);
+            }
         }
 
         // Render overlays using responsive popup areas
@@ -429,11 +511,55 @@ impl App {
         let selected = row
             .map(|r| self.process_table.selected.contains(&r.pid))
             .unwrap_or(false);
+        if self.detail_view == DetailView::GalaxyBrain {
+            let layout = ResponsiveLayout::new(area);
+            let gb = layout.galaxy_brain_areas();
+
+            let math_text = row
+                .and_then(|r| r.galaxy_brain.as_deref())
+                .unwrap_or("No math trace available.");
+
+            let math_block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Math Trace ")
+                .border_style(self.theme.style_border());
+
+            let math_panel = Paragraph::new(math_text)
+                .block(math_block)
+                .style(self.theme.style_normal())
+                .wrap(Wrap { trim: false });
+
+            frame.render_widget(math_panel, gb.math);
+
+            let summary = ProcessDetail::new()
+                .theme(&self.theme)
+                .row(row, selected)
+                .view(DetailView::Summary);
+            frame.render_widget(summary, gb.explanation);
+            return;
+        }
+
         let detail = ProcessDetail::new()
             .theme(&self.theme)
-            .row(row, selected);
+            .row(row, selected)
+            .view(self.detail_view);
 
         frame.render_widget(detail, area);
+    }
+
+    /// Render auxiliary pane (action preview/summary) when available.
+    fn render_aux_pane(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Actions ")
+            .border_style(self.theme.style_border());
+
+        let content = "Action preview pending";
+        let pane = Paragraph::new(content)
+            .block(block)
+            .style(self.theme.style_muted());
+
+        frame.render_widget(pane, area);
     }
 
     /// Render the search input.
@@ -490,13 +616,15 @@ impl App {
     fn render_help_overlay(&self, frame: &mut Frame, area: Rect) {
         // Adapt help text based on breakpoint
         let help_text = match self.layout_state.breakpoint() {
-            Breakpoint::Small => {
+            Breakpoint::Minimal => {
                 // Compact help for small terminals
                 r#"
-Navigation: j/k/g/G
+Navigation: j/k/Home/End
 Search: /
-Select: Space/a
-Execute: Enter/x
+Select: Space/a/A/u/x
+Execute: e
+Detail: Enter
+Views: s/t/g
 Help: ?  Quit: q
 "#
             }
@@ -508,16 +636,26 @@ Help: ?  Quit: q
   Navigation:
     j/Down      Move down
     k/Up        Move up
-    g           Go to top
-    G           Go to bottom
+    Home        Go to top
+    End         Go to bottom
+    Ctrl+d      Page down
+    Ctrl+u      Page up
     Tab         Cycle focus
+    n/N         Next/prev match
 
   Actions:
     /           Start search
     Space       Toggle selection
-    a           Select all
-    Enter/x     Execute action
+    a           Select recommended
+    A           Select all
+    u           Unselect all
+    x           Invert selection
+    e           Execute action
     r           Refresh list
+    Enter       Toggle detail pane
+    s           Summary view
+    t           Genealogy view
+    g           Galaxy-brain view
 
   General:
     ?           Toggle help
@@ -610,6 +748,7 @@ fn run_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
 
     #[test]
     fn test_app_new() {
@@ -665,5 +804,41 @@ mod tests {
 
         app.cycle_focus();
         assert_eq!(app.focus, FocusTarget::ProcessList);
+    }
+
+    #[test]
+    fn test_toggle_galaxy_brain_view() {
+        let mut app = App::new();
+        assert_eq!(app.detail_view, DetailView::Summary);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.detail_view, DetailView::GalaxyBrain);
+        assert!(app.detail_visible);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.detail_view, DetailView::Summary);
+    }
+
+    #[test]
+    fn test_toggle_detail_visibility_with_enter() {
+        let mut app = App::new();
+        let initial = app.detail_visible;
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.detail_visible, !initial);
+    }
+
+    #[test]
+    fn test_help_overlay_toggle() {
+        let mut app = App::new();
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.state, AppState::Help);
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)))
+            .unwrap();
+        assert_eq!(app.state, AppState::Normal);
     }
 }

@@ -57,6 +57,8 @@ pub struct ProcessRow {
     pub command: String,
     /// Whether this row is selected for action.
     pub selected: bool,
+    /// Optional galaxy-brain math trace for drill-down.
+    pub galaxy_brain: Option<String>,
 }
 
 /// Process table widget for displaying candidates.
@@ -114,11 +116,14 @@ impl<'a> ProcessTable<'a> {
 
         let title = if selected_count > 0 {
             format!(
-                " Processes [{}/{} selected] [Space: toggle, x: execute] ",
+                " Processes [{}/{} selected] [Space: toggle, a: rec, A: all, u: clear, x: invert, e: execute] ",
                 selected_count, total_count
             )
         } else {
-            format!(" Processes [{}] [Space: toggle, x: execute] ", total_count)
+            format!(
+                " Processes [{}] [Space: toggle, a: rec, A: all, u: clear, x: invert, e: execute] ",
+                total_count
+            )
         };
 
         let border_style = if let Some(theme) = self.theme {
@@ -157,6 +162,15 @@ impl<'a> ProcessTable<'a> {
                 "SPARE" => Style::default().fg(Color::Green),
                 _ => Style::default(),
             }
+        }
+    }
+
+    fn write_text(buf: &mut Buffer, max_x: u16, x: u16, y: u16, text: &str, style: Style) {
+        for (i, ch) in text.chars().enumerate() {
+            if x + i as u16 >= max_x {
+                break;
+            }
+            buf[(x + i as u16, y)].set_char(ch).set_style(style);
         }
     }
 }
@@ -201,10 +215,44 @@ impl<'a> StatefulWidget for ProcessTable<'a> {
             return;
         }
 
-        // Calculate column widths
-        let total_fixed = self.col_widths.iter().take(5).sum::<u16>();
+        // Calculate column visibility and widths
         let checkbox_width = if self.show_selection { 3 } else { 0 };
-        let command_width = inner.width.saturating_sub(total_fixed + checkbox_width + 5);
+        let min_command_width: u16 = 12;
+        let mut show_score = true;
+        let mut show_runtime = true;
+        let mut show_memory = true;
+
+        let (_total_fixed, command_width) = loop {
+            let fixed_cols = 2 + u16::from(show_score) + u16::from(show_runtime) + u16::from(show_memory);
+            let total_fixed = self.col_widths[0]
+                + self.col_widths[2]
+                + if show_score { self.col_widths[1] } else { 0 }
+                + if show_runtime { self.col_widths[3] } else { 0 }
+                + if show_memory { self.col_widths[4] } else { 0 };
+            let gaps = fixed_cols + if self.show_selection { 1 } else { 0 };
+            let command_width = inner
+                .width
+                .saturating_sub(total_fixed + checkbox_width + gaps);
+
+            if command_width >= min_command_width {
+                break (total_fixed, command_width);
+            }
+
+            if show_memory {
+                show_memory = false;
+                continue;
+            }
+            if show_runtime {
+                show_runtime = false;
+                continue;
+            }
+            if show_score {
+                show_score = false;
+                continue;
+            }
+
+            break (total_fixed, command_width);
+        };
 
         // Header row
         let header_style = if let Some(theme) = self.theme {
@@ -227,50 +275,38 @@ impl<'a> StatefulWidget for ProcessTable<'a> {
         // Render header
         let mut x = inner.x;
         if self.show_selection {
-            buf[(x, inner.y)].set_char('[').set_style(header_style);
-            buf[(x + 1, inner.y)].set_char(' ').set_style(header_style);
-            buf[(x + 2, inner.y)].set_char(']').set_style(header_style);
+            Self::write_text(buf, inner.right(), x, inner.y, "[ ]", header_style);
             x += checkbox_width + 1;
         }
 
-        let headers = [
-            (
-                format!("PID{}", sort_indicator(SortColumn::Pid)),
-                self.col_widths[0],
-            ),
-            (
-                format!("Score{}", sort_indicator(SortColumn::Score)),
-                self.col_widths[1],
-            ),
-            (
-                format!("Class{}", sort_indicator(SortColumn::Classification)),
-                self.col_widths[2],
-            ),
-            (
-                format!("Runtime{}", sort_indicator(SortColumn::Runtime)),
-                self.col_widths[3],
-            ),
-            (
-                format!("Memory{}", sort_indicator(SortColumn::Memory)),
-                self.col_widths[4],
-            ),
-            (
-                format!("Command{}", sort_indicator(SortColumn::Command)),
-                command_width,
-            ),
-        ];
+        let pid_header = format!("PID{}", sort_indicator(SortColumn::Pid));
+        Self::write_text(buf, inner.right(), x, inner.y, &pid_header, header_style);
+        x += self.col_widths[0] + 1;
 
-        for (header, width) in &headers {
-            for (i, ch) in header.chars().enumerate() {
-                if x + i as u16 >= inner.right() {
-                    break;
-                }
-                buf[(x + i as u16, inner.y)]
-                    .set_char(ch)
-                    .set_style(header_style);
-            }
-            x += width + 1;
+        if show_score {
+            let score_header = format!("Score{}", sort_indicator(SortColumn::Score));
+            Self::write_text(buf, inner.right(), x, inner.y, &score_header, header_style);
+            x += self.col_widths[1] + 1;
         }
+
+        let class_header = format!("Class{}", sort_indicator(SortColumn::Classification));
+        Self::write_text(buf, inner.right(), x, inner.y, &class_header, header_style);
+        x += self.col_widths[2] + 1;
+
+        if show_runtime {
+            let runtime_header = format!("Runtime{}", sort_indicator(SortColumn::Runtime));
+            Self::write_text(buf, inner.right(), x, inner.y, &runtime_header, header_style);
+            x += self.col_widths[3] + 1;
+        }
+
+        if show_memory {
+            let memory_header = format!("Memory{}", sort_indicator(SortColumn::Memory));
+            Self::write_text(buf, inner.right(), x, inner.y, &memory_header, header_style);
+            x += self.col_widths[4] + 1;
+        }
+
+        let command_header = format!("Command{}", sort_indicator(SortColumn::Command));
+        Self::write_text(buf, inner.right(), x, inner.y, &command_header, header_style);
 
         // Render separator line
         let sep_y = inner.y + 1;
@@ -315,31 +351,21 @@ impl<'a> StatefulWidget for ProcessTable<'a> {
             // Checkbox
             if self.show_selection {
                 let check_char = if is_selected { 'x' } else { ' ' };
-                buf[(x, y)].set_char('[').set_style(row_style);
-                buf[(x + 1, y)].set_char(check_char).set_style(row_style);
-                buf[(x + 2, y)].set_char(']').set_style(row_style);
+                Self::write_text(buf, inner.right(), x, y, &format!("[{}]", check_char), row_style);
                 x += checkbox_width + 1;
             }
 
             // PID
             let pid_str = row.pid.to_string();
-            for (j, ch) in pid_str.chars().enumerate() {
-                if x + j as u16 >= inner.right() {
-                    break;
-                }
-                buf[(x + j as u16, y)].set_char(ch).set_style(row_style);
-            }
+            Self::write_text(buf, inner.right(), x, y, &pid_str, row_style);
             x += self.col_widths[0] + 1;
 
             // Score
-            let score_str = row.score.to_string();
-            for (j, ch) in score_str.chars().enumerate() {
-                if x + j as u16 >= inner.right() {
-                    break;
-                }
-                buf[(x + j as u16, y)].set_char(ch).set_style(row_style);
+            if show_score {
+                let score_str = row.score.to_string();
+                Self::write_text(buf, inner.right(), x, y, &score_str, row_style);
+                x += self.col_widths[1] + 1;
             }
-            x += self.col_widths[1] + 1;
 
             // Classification (with color)
             let class_style = if is_cursor {
@@ -347,40 +373,24 @@ impl<'a> StatefulWidget for ProcessTable<'a> {
             } else {
                 self.classification_style(&row.classification)
             };
-            for (j, ch) in row.classification.chars().enumerate() {
-                if x + j as u16 >= inner.right() {
-                    break;
-                }
-                buf[(x + j as u16, y)].set_char(ch).set_style(class_style);
-            }
+            Self::write_text(buf, inner.right(), x, y, &row.classification, class_style);
             x += self.col_widths[2] + 1;
 
             // Runtime
-            for (j, ch) in row.runtime.chars().enumerate() {
-                if x + j as u16 >= inner.right() {
-                    break;
-                }
-                buf[(x + j as u16, y)].set_char(ch).set_style(row_style);
+            if show_runtime {
+                Self::write_text(buf, inner.right(), x, y, &row.runtime, row_style);
+                x += self.col_widths[3] + 1;
             }
-            x += self.col_widths[3] + 1;
 
             // Memory
-            for (j, ch) in row.memory.chars().enumerate() {
-                if x + j as u16 >= inner.right() {
-                    break;
-                }
-                buf[(x + j as u16, y)].set_char(ch).set_style(row_style);
+            if show_memory {
+                Self::write_text(buf, inner.right(), x, y, &row.memory, row_style);
+                x += self.col_widths[4] + 1;
             }
-            x += self.col_widths[4] + 1;
 
             // Command (truncated)
             let cmd_display: String = row.command.chars().take(command_width as usize).collect();
-            for (j, ch) in cmd_display.chars().enumerate() {
-                if x + j as u16 >= inner.right() {
-                    break;
-                }
-                buf[(x + j as u16, y)].set_char(ch).set_style(row_style);
-            }
+            Self::write_text(buf, inner.right(), x, y, &cmd_display, row_style);
         }
     }
 }
@@ -535,8 +545,34 @@ impl ProcessTableState {
 
     /// Select all visible rows.
     pub fn select_all(&mut self) {
-        for row in self.visible_rows() {
-            self.selected.insert(row.pid);
+        let pids: Vec<u32> = self.visible_rows().iter().map(|row| row.pid).collect();
+        for pid in pids {
+            self.selected.insert(pid);
+        }
+    }
+
+    /// Select all recommended rows (defaults to KILL classification).
+    pub fn select_recommended(&mut self) {
+        let pids: Vec<u32> = self
+            .visible_rows()
+            .iter()
+            .filter(|row| row.classification.eq_ignore_ascii_case("KILL"))
+            .map(|row| row.pid)
+            .collect();
+        for pid in pids {
+            self.selected.insert(pid);
+        }
+    }
+
+    /// Invert selection for all visible rows.
+    pub fn invert_selection(&mut self) {
+        let pids: Vec<u32> = self.visible_rows().iter().map(|row| row.pid).collect();
+        for pid in pids {
+            if self.selected.contains(&pid) {
+                self.selected.remove(&pid);
+            } else {
+                self.selected.insert(pid);
+            }
         }
     }
 
@@ -615,6 +651,7 @@ mod tests {
                 memory: "512 MB".to_string(),
                 command: "jest --worker".to_string(),
                 selected: false,
+                galaxy_brain: None,
             },
             ProcessRow {
                 pid: 5678,
@@ -624,6 +661,7 @@ mod tests {
                 memory: "256 MB".to_string(),
                 command: "node dev".to_string(),
                 selected: false,
+                galaxy_brain: None,
             },
             ProcessRow {
                 pid: 9012,
@@ -633,6 +671,7 @@ mod tests {
                 memory: "128 MB".to_string(),
                 command: "cargo build".to_string(),
                 selected: false,
+                galaxy_brain: None,
             },
         ]
     }
@@ -693,6 +732,21 @@ mod tests {
 
         state.select_all();
         assert_eq!(state.selected.len(), 3);
+    }
+
+    #[test]
+    fn test_select_recommended_and_invert() {
+        let mut state = ProcessTableState::new();
+        state.set_rows(sample_rows());
+
+        state.select_recommended();
+        assert!(state.selected.contains(&1234));
+        assert_eq!(state.selected.len(), 1);
+
+        state.invert_selection();
+        assert!(!state.selected.contains(&1234));
+        assert!(state.selected.contains(&5678));
+        assert!(state.selected.contains(&9012));
     }
 
     #[test]

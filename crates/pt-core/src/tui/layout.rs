@@ -6,9 +6,10 @@
 //!
 //! # Breakpoints
 //!
-//! - **Large** (>= 120 cols): Full layout with all panels visible
-//! - **Medium** (80-119 cols): Condensed layout with stacked panels
-//! - **Small** (< 80 cols): Minimal single-panel layout
+//! - **Wide** (>= 200 cols): Three-pane layout with aux panel
+//! - **Standard** (120-199 cols): Two-pane list + detail
+//! - **Compact** (80-119 cols): Two-pane with tighter spacing
+//! - **Minimal** (< 80 cols): Single-panel layout
 //!
 //! # Usage
 //!
@@ -24,42 +25,44 @@ use tracing::{debug, trace};
 /// Terminal size breakpoints for responsive layouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Breakpoint {
-    /// Small terminal (< 80 columns)
-    /// Single panel navigation, minimal UI
-    Small,
-    /// Medium terminal (80-119 columns)
-    /// Condensed layout, stacked panels
-    Medium,
-    /// Large terminal (>= 120 columns)
-    /// Full layout with sidebar and all panels
-    Large,
+    /// Minimal terminal (< 80 columns).
+    Minimal,
+    /// Compact terminal (80-119 columns).
+    Compact,
+    /// Standard terminal (120-199 columns).
+    Standard,
+    /// Wide terminal (>= 200 columns).
+    Wide,
 }
 
 impl Breakpoint {
     /// Determine breakpoint from terminal dimensions.
     pub fn from_size(width: u16, _height: u16) -> Self {
         match width {
-            w if w >= 120 => Breakpoint::Large,
-            w if w >= 80 => Breakpoint::Medium,
-            _ => Breakpoint::Small,
+            w if w >= 200 => Breakpoint::Wide,
+            w if w >= 120 => Breakpoint::Standard,
+            w if w >= 80 => Breakpoint::Compact,
+            _ => Breakpoint::Minimal,
         }
     }
 
     /// Minimum columns for this breakpoint.
     pub fn min_cols(&self) -> u16 {
         match self {
-            Breakpoint::Small => 0,
-            Breakpoint::Medium => 80,
-            Breakpoint::Large => 120,
+            Breakpoint::Minimal => 0,
+            Breakpoint::Compact => 80,
+            Breakpoint::Standard => 120,
+            Breakpoint::Wide => 200,
         }
     }
 
     /// Human-readable name for logging.
     pub fn name(&self) -> &'static str {
         match self {
-            Breakpoint::Small => "small",
-            Breakpoint::Medium => "medium",
-            Breakpoint::Large => "large",
+            Breakpoint::Minimal => "minimal",
+            Breakpoint::Compact => "compact",
+            Breakpoint::Standard => "standard",
+            Breakpoint::Wide => "wide",
         }
     }
 }
@@ -73,6 +76,8 @@ pub struct MainAreas {
     pub list: Rect,
     /// Optional detail pane area (two-pane layout).
     pub detail: Option<Rect>,
+    /// Optional auxiliary pane (action preview/summary).
+    pub aux: Option<Rect>,
     /// Status bar at bottom.
     pub status: Rect,
 }
@@ -143,14 +148,15 @@ impl ResponsiveLayout {
     /// Compute main view layout areas.
     pub fn main_areas(&self) -> MainAreas {
         match self.breakpoint {
-            Breakpoint::Large => self.main_areas_large(),
-            Breakpoint::Medium => self.main_areas_medium(),
-            Breakpoint::Small => self.main_areas_small(),
+            Breakpoint::Wide => self.main_areas_wide(),
+            Breakpoint::Standard => self.main_areas_standard(),
+            Breakpoint::Compact => self.main_areas_compact(),
+            Breakpoint::Minimal => self.main_areas_minimal(),
         }
     }
 
-    /// Large breakpoint: full layout with sidebar.
-    fn main_areas_large(&self) -> MainAreas {
+    /// Wide breakpoint: three-pane layout (list + detail + aux).
+    fn main_areas_wide(&self) -> MainAreas {
         // Vertical split: search | content | status
         let v_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -161,12 +167,13 @@ impl ResponsiveLayout {
             ])
             .split(self.area);
 
-        // Horizontal split of content: list | detail
+        // Horizontal split of content: list | detail | aux
         let content_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(55), // List
-                Constraint::Percentage(45), // Detail
+                Constraint::Percentage(45), // List
+                Constraint::Percentage(35), // Detail
+                Constraint::Percentage(20), // Aux
             ])
             .split(v_chunks[1]);
 
@@ -174,12 +181,13 @@ impl ResponsiveLayout {
             search: v_chunks[0],
             list: content_chunks[0],
             detail: Some(content_chunks[1]),
+            aux: Some(content_chunks[2]),
             status: v_chunks[2],
         }
     }
 
-    /// Medium breakpoint: no sidebar, standard layout.
-    fn main_areas_medium(&self) -> MainAreas {
+    /// Standard breakpoint: list + detail split.
+    fn main_areas_standard(&self) -> MainAreas {
         let v_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -202,12 +210,41 @@ impl ResponsiveLayout {
             search: v_chunks[0],
             list: content_chunks[0],
             detail: Some(content_chunks[1]),
+            aux: None,
             status: v_chunks[2],
         }
     }
 
-    /// Small breakpoint: compact layout.
-    fn main_areas_small(&self) -> MainAreas {
+    /// Compact breakpoint: list + detail with tighter spacing.
+    fn main_areas_compact(&self) -> MainAreas {
+        let v_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Search input
+                Constraint::Min(10),   // Process table
+                Constraint::Length(1), // Status bar
+            ])
+            .split(self.area);
+
+        let content_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(65), // List
+                Constraint::Percentage(35), // Detail
+            ])
+            .split(v_chunks[1]);
+
+        MainAreas {
+            search: v_chunks[0],
+            list: content_chunks[0],
+            detail: Some(content_chunks[1]),
+            aux: None,
+            status: v_chunks[2],
+        }
+    }
+
+    /// Minimal breakpoint: single-pane layout.
+    fn main_areas_minimal(&self) -> MainAreas {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -221,6 +258,7 @@ impl ResponsiveLayout {
             search: chunks[0],
             list: chunks[1],
             detail: None,
+            aux: None,
             status: chunks[2],
         }
     }
@@ -228,8 +266,10 @@ impl ResponsiveLayout {
     /// Compute evidence detail view areas.
     pub fn detail_areas(&self) -> DetailAreas {
         match self.breakpoint {
-            Breakpoint::Large | Breakpoint::Medium => self.detail_areas_standard(),
-            Breakpoint::Small => self.detail_areas_compact(),
+            Breakpoint::Standard | Breakpoint::Wide | Breakpoint::Compact => {
+                self.detail_areas_standard()
+            }
+            Breakpoint::Minimal => self.detail_areas_compact(),
         }
     }
 
@@ -272,8 +312,8 @@ impl ResponsiveLayout {
     /// Compute galaxy brain view areas.
     pub fn galaxy_brain_areas(&self) -> GalaxyBrainAreas {
         match self.breakpoint {
-            Breakpoint::Large => self.galaxy_brain_large(),
-            Breakpoint::Medium | Breakpoint::Small => self.galaxy_brain_stacked(),
+            Breakpoint::Wide | Breakpoint::Standard => self.galaxy_brain_large(),
+            Breakpoint::Compact | Breakpoint::Minimal => self.galaxy_brain_stacked(),
         }
     }
 
@@ -411,35 +451,38 @@ mod tests {
 
     #[test]
     fn test_breakpoint_detection() {
-        assert_eq!(Breakpoint::from_size(60, 24), Breakpoint::Small);
-        assert_eq!(Breakpoint::from_size(80, 24), Breakpoint::Medium);
-        assert_eq!(Breakpoint::from_size(100, 40), Breakpoint::Medium);
-        assert_eq!(Breakpoint::from_size(120, 40), Breakpoint::Large);
-        assert_eq!(Breakpoint::from_size(200, 60), Breakpoint::Large);
+        assert_eq!(Breakpoint::from_size(60, 24), Breakpoint::Minimal);
+        assert_eq!(Breakpoint::from_size(80, 24), Breakpoint::Compact);
+        assert_eq!(Breakpoint::from_size(100, 40), Breakpoint::Compact);
+        assert_eq!(Breakpoint::from_size(120, 40), Breakpoint::Standard);
+        assert_eq!(Breakpoint::from_size(200, 60), Breakpoint::Wide);
     }
 
     #[test]
     fn test_breakpoint_boundaries() {
         // Test exact boundaries
-        assert_eq!(Breakpoint::from_size(79, 24), Breakpoint::Small);
-        assert_eq!(Breakpoint::from_size(80, 24), Breakpoint::Medium);
-        assert_eq!(Breakpoint::from_size(119, 24), Breakpoint::Medium);
-        assert_eq!(Breakpoint::from_size(120, 24), Breakpoint::Large);
+        assert_eq!(Breakpoint::from_size(79, 24), Breakpoint::Minimal);
+        assert_eq!(Breakpoint::from_size(80, 24), Breakpoint::Compact);
+        assert_eq!(Breakpoint::from_size(119, 24), Breakpoint::Compact);
+        assert_eq!(Breakpoint::from_size(120, 24), Breakpoint::Standard);
+        assert_eq!(Breakpoint::from_size(199, 24), Breakpoint::Standard);
+        assert_eq!(Breakpoint::from_size(200, 24), Breakpoint::Wide);
     }
 
     #[test]
-    fn test_layout_main_areas_large() {
-        let area = Rect::new(0, 0, 200, 60);
+    fn test_layout_main_areas_wide() {
+        let area = Rect::new(0, 0, 220, 60);
         let layout = ResponsiveLayout::new(area);
 
-        assert_eq!(layout.breakpoint(), Breakpoint::Large);
+        assert_eq!(layout.breakpoint(), Breakpoint::Wide);
 
         let areas = layout.main_areas();
         assert!(areas.detail.is_some());
+        assert!(areas.aux.is_some());
 
-        // Detail should be ~45% of width
-        let detail = areas.detail.unwrap();
-        assert_eq!(detail.width, 90); // 45% of 200
+        // Aux should be ~20% of width
+        let aux = areas.aux.unwrap();
+        assert_eq!(aux.width, 44); // 20% of 220
 
         // Status bar should be 1 row at bottom
         assert_eq!(areas.status.height, 1);
@@ -447,14 +490,15 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_main_areas_medium() {
-        let area = Rect::new(0, 0, 100, 40);
+    fn test_layout_main_areas_standard() {
+        let area = Rect::new(0, 0, 140, 40);
         let layout = ResponsiveLayout::new(area);
 
-        assert_eq!(layout.breakpoint(), Breakpoint::Medium);
+        assert_eq!(layout.breakpoint(), Breakpoint::Standard);
 
         let areas = layout.main_areas();
         assert!(areas.detail.is_some());
+        assert!(areas.aux.is_none());
 
         // Search should be 3 rows
         assert_eq!(areas.search.height, 3);
@@ -464,11 +508,26 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_main_areas_small() {
+    fn test_layout_main_areas_compact() {
+        let area = Rect::new(0, 0, 100, 40);
+        let layout = ResponsiveLayout::new(area);
+
+        assert_eq!(layout.breakpoint(), Breakpoint::Compact);
+
+        let areas = layout.main_areas();
+        assert!(areas.detail.is_some());
+        assert!(areas.aux.is_none());
+
+        // Search should be 3 rows
+        assert_eq!(areas.search.height, 3);
+    }
+
+    #[test]
+    fn test_layout_main_areas_minimal() {
         let area = Rect::new(0, 0, 60, 20);
         let layout = ResponsiveLayout::new(area);
 
-        assert_eq!(layout.breakpoint(), Breakpoint::Small);
+        assert_eq!(layout.breakpoint(), Breakpoint::Minimal);
 
         let areas = layout.main_areas();
         assert!(areas.detail.is_none());
@@ -505,7 +564,7 @@ mod tests {
     #[test]
     fn test_layout_state_tracking() {
         let mut state = LayoutState::new(100, 40);
-        assert_eq!(state.breakpoint(), Breakpoint::Medium);
+        assert_eq!(state.breakpoint(), Breakpoint::Compact);
 
         // Same breakpoint
         let changed = state.update(110, 40);
@@ -516,7 +575,7 @@ mod tests {
         let changed = state.update(60, 20);
         assert!(changed);
         assert!(state.did_breakpoint_change());
-        assert_eq!(state.breakpoint(), Breakpoint::Small);
+        assert_eq!(state.breakpoint(), Breakpoint::Minimal);
     }
 
     #[test]
