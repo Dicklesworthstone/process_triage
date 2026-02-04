@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://process-triage.dev/schemas/fixture-manifest/1.0.0",
+  "title": "Process Triage Fixture Manifest",
+  "description": "Schema for deterministic, redacted test fixture manifests",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fixture_id",
+    "domain",
+    "capture_time",
+    "source",
+    "tool_versions",
+    "redaction_profile",
+    "artifacts",
+    "manifest_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+\\.[0-9]+$",
+      "description": "Schema version (major version must be 1)"
+    },
+    "fixture_id": {
+      "type": "string",
+      "description": "Unique fixture identifier"
+    },
+    "domain": {
+      "type": "string",
+      "description": "Fixture domain (config, pt-core, manifest-examples, etc.)"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable fixture description"
+    },
+    "capture_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 capture timestamp"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin"],
+      "properties": {
+        "origin": {"type": "string"},
+        "command": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "paths": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "notes": {"type": "string"}
+      }
+    },
+    "tool_versions": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "redaction_profile": {
+      "type": "string",
+      "enum": ["minimal", "safe", "forensic", "custom"]
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/artifact_entry"}
+    },
+    "manifest_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA-256 of the canonical manifest JSON with this field removed"
+    }
+  },
+  "$defs": {
+    "artifact_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind", "sha256", "bytes", "redaction_profile"],
+      "properties": {
+        "path": {"type": "string"},
+        "kind": {
+          "type": "string",
+          "enum": [
+            "policy",
+            "priors",
+            "config",
+            "snapshot",
+            "plan",
+            "telemetry",
+            "log",
+            "manifest",
+            "other"
+          ]
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "bytes": {"type": "integer", "minimum": 0},
+        "redaction_profile": {
+          "type": "string",
+          "enum": ["minimal", "safe", "forensic", "custom"]
+        }
+      }
+    }
+  }
+}
