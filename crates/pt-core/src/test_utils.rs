@@ -72,7 +72,7 @@ macro_rules! assert_approx_eq {
 // ============================================================================
 
 /// Fixture directory relative to crate root.
-pub const FIXTURES_DIR: &str = "tests/fixtures";
+pub const FIXTURES_DIR: &str = "../../test/fixtures/pt-core";
 
 /// Get the path to a test fixture file.
 ///

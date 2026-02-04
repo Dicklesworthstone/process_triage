@@ -30,7 +30,7 @@ setup() {
         export TEST_LOG_FILE_SECONDARY="$ARTIFACT_LOG_DIR/config_matrix.jsonl"
     fi
 
-    FIXTURES_DIR="$PROJECT_ROOT/crates/pt-config/tests/fixtures"
+    FIXTURES_DIR="$PROJECT_ROOT/test/fixtures/config"
 
     test_start "config matrix" "resolution precedence + validation"
     test_info "Artifacts: $ARTIFACT_DIR"

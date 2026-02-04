@@ -21,8 +21,11 @@ static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
+        .join("..")
+        .join("..")
+        .join("test")
         .join("fixtures")
+        .join("config")
 }
 
 fn load_priors_fixture(name: &str) -> Priors {

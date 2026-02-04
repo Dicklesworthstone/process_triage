@@ -26,7 +26,11 @@ use tempfile::tempdir;
 
 fn fixtures_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
+        .join("..")
+        .join("..")
+        .join("test")
+        .join("fixtures")
+        .join("pt-core")
         .leak()
 }
 
