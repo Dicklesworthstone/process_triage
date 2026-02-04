@@ -132,6 +132,7 @@ run_cmd_logged() {
     local cmd="$2"
     local config_override="${3:-}"
     local fixture_path="${4:-}"
+    local allow_failure="${5:-false}"
     local out_file="$ARTIFACT_STDOUT_DIR/${case_id}.stdout"
     local err_file="$ARTIFACT_STDERR_DIR/${case_id}.stderr"
 
@@ -170,6 +171,11 @@ run_cmd_logged() {
     log_case_event "config_matrix" "$case_id" "$cmd" "$exit_code" "$duration_ms" \
         "$out_file" "$err_file" "$schema_version" "$config_snapshot_path" "$validation_error" \
         "$fixture_path"
+
+    LAST_CMD_STATUS="$exit_code"
+    if [[ "$allow_failure" == "true" ]]; then
+        return 0
+    fi
 
     return "$exit_code"
 }
@@ -258,8 +264,8 @@ run_cmd_logged() {
     export PROCESS_TRIAGE_CONFIG="$bad_dir"
 
     local cmd="pt --format json config validate"
-    run_cmd_logged "invalid_policy" "$cmd" "$bad_dir" "$bad_dir/policy.json"
-    [ "$status" -ne 0 ]
+    run_cmd_logged "invalid_policy" "$cmd" "$bad_dir" "$bad_dir/policy.json" "true"
+    [ "$LAST_CMD_STATUS" -ne 0 ]
 
     local err_file="$ARTIFACT_STDERR_DIR/invalid_policy.stderr"
     local error_msg
