@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0.0",
+  "policy_id": "fixture-invalid-bad-alpha",
+  "loss_matrix": {
+    "useful": { "keep": 0, "kill": 100 },
+    "useful_bad": { "keep": 10, "kill": 20 },
+    "abandoned": { "keep": 30, "kill": 1 },
+    "zombie": { "keep": 50, "kill": 1 }
+  },
+  "guardrails": {
+    "protected_patterns": [],
+    "never_kill_ppid": [1],
+    "max_kills_per_run": 5,
+    "min_process_age_seconds": 3600
+  },
+  "robot_mode": {
+    "enabled": false,
+    "min_posterior": 0.99,
+    "max_blast_radius_mb": 4096,
+    "max_kills": 5,
+    "require_known_signature": false
+  },
+  "fdr_control": {
+    "enabled": true,
+    "method": "bh",
+    "alpha": 1.5
+  },
+  "data_loss_gates": {
+    "block_if_open_write_fds": true,
+    "block_if_locked_files": true,
+    "block_if_active_tty": true
+  }
+}
