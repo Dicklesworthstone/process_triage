@@ -70,6 +70,8 @@ impl Breakpoint {
 /// Layout areas for the main view.
 #[derive(Debug, Clone, Copy)]
 pub struct MainAreas {
+    /// Optional header area (goal summary).
+    pub header: Option<Rect>,
     /// Search input area at top.
     pub search: Rect,
     /// Main list area (process table).
@@ -147,24 +149,32 @@ impl ResponsiveLayout {
 
     /// Compute main view layout areas.
     pub fn main_areas(&self) -> MainAreas {
+        self.main_areas_with_header(0)
+    }
+
+    /// Compute main view layout areas with an optional header row.
+    pub fn main_areas_with_header(&self, header_height: u16) -> MainAreas {
         match self.breakpoint {
-            Breakpoint::Wide => self.main_areas_wide(),
-            Breakpoint::Standard => self.main_areas_standard(),
-            Breakpoint::Compact => self.main_areas_compact(),
-            Breakpoint::Minimal => self.main_areas_minimal(),
+            Breakpoint::Wide => self.main_areas_wide(header_height),
+            Breakpoint::Standard => self.main_areas_standard(header_height),
+            Breakpoint::Compact => self.main_areas_compact(header_height),
+            Breakpoint::Minimal => self.main_areas_minimal(header_height),
         }
     }
 
     /// Wide breakpoint: three-pane layout (list + detail + aux).
-    fn main_areas_wide(&self) -> MainAreas {
-        // Vertical split: search | content | status
+    fn main_areas_wide(&self, header_height: u16) -> MainAreas {
+        let mut constraints = Vec::new();
+        if header_height > 0 {
+            constraints.push(Constraint::Length(header_height));
+        }
+        constraints.push(Constraint::Length(3)); // Search input
+        constraints.push(Constraint::Min(10)); // Process table
+        constraints.push(Constraint::Length(1)); // Status bar
+
         let v_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Search input
-                Constraint::Min(10),   // Process table
-                Constraint::Length(1), // Status bar
-            ])
+            .constraints(constraints)
             .split(self.area);
 
         // Horizontal split of content: list | detail | aux
@@ -177,24 +187,35 @@ impl ResponsiveLayout {
             ])
             .split(v_chunks[1]);
 
+        let (header, search, content, status) = if header_height > 0 {
+            (Some(v_chunks[0]), v_chunks[1], v_chunks[2], v_chunks[3])
+        } else {
+            (None, v_chunks[0], v_chunks[1], v_chunks[2])
+        };
+
         MainAreas {
-            search: v_chunks[0],
+            header,
+            search,
             list: content_chunks[0],
             detail: Some(content_chunks[1]),
             aux: Some(content_chunks[2]),
-            status: v_chunks[2],
+            status,
         }
     }
 
     /// Standard breakpoint: list + detail split.
-    fn main_areas_standard(&self) -> MainAreas {
+    fn main_areas_standard(&self, header_height: u16) -> MainAreas {
+        let mut constraints = Vec::new();
+        if header_height > 0 {
+            constraints.push(Constraint::Length(header_height));
+        }
+        constraints.push(Constraint::Length(3)); // Search input
+        constraints.push(Constraint::Min(10)); // Process table
+        constraints.push(Constraint::Length(1)); // Status bar
+
         let v_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Search input
-                Constraint::Min(10),   // Process table
-                Constraint::Length(1), // Status bar
-            ])
+            .constraints(constraints)
             .split(self.area);
 
         // Horizontal split of content: list | detail
@@ -206,24 +227,35 @@ impl ResponsiveLayout {
             ])
             .split(v_chunks[1]);
 
+        let (header, search, content, status) = if header_height > 0 {
+            (Some(v_chunks[0]), v_chunks[1], v_chunks[2], v_chunks[3])
+        } else {
+            (None, v_chunks[0], v_chunks[1], v_chunks[2])
+        };
+
         MainAreas {
-            search: v_chunks[0],
+            header,
+            search,
             list: content_chunks[0],
             detail: Some(content_chunks[1]),
             aux: None,
-            status: v_chunks[2],
+            status,
         }
     }
 
     /// Compact breakpoint: list + detail with tighter spacing.
-    fn main_areas_compact(&self) -> MainAreas {
+    fn main_areas_compact(&self, header_height: u16) -> MainAreas {
+        let mut constraints = Vec::new();
+        if header_height > 0 {
+            constraints.push(Constraint::Length(header_height));
+        }
+        constraints.push(Constraint::Length(3)); // Search input
+        constraints.push(Constraint::Min(10)); // Process table
+        constraints.push(Constraint::Length(1)); // Status bar
+
         let v_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Search input
-                Constraint::Min(10),   // Process table
-                Constraint::Length(1), // Status bar
-            ])
+            .constraints(constraints)
             .split(self.area);
 
         let content_chunks = Layout::default()
@@ -234,32 +266,50 @@ impl ResponsiveLayout {
             ])
             .split(v_chunks[1]);
 
+        let (header, search, content, status) = if header_height > 0 {
+            (Some(v_chunks[0]), v_chunks[1], v_chunks[2], v_chunks[3])
+        } else {
+            (None, v_chunks[0], v_chunks[1], v_chunks[2])
+        };
+
         MainAreas {
-            search: v_chunks[0],
+            header,
+            search,
             list: content_chunks[0],
             detail: Some(content_chunks[1]),
             aux: None,
-            status: v_chunks[2],
+            status,
         }
     }
 
     /// Minimal breakpoint: single-pane layout.
-    fn main_areas_minimal(&self) -> MainAreas {
+    fn main_areas_minimal(&self, header_height: u16) -> MainAreas {
+        let mut constraints = Vec::new();
+        if header_height > 0 {
+            constraints.push(Constraint::Length(header_height));
+        }
+        constraints.push(Constraint::Length(1)); // Compact search
+        constraints.push(Constraint::Min(5)); // Process list
+        constraints.push(Constraint::Length(1)); // Status
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // Compact search
-                Constraint::Min(5),    // Process list
-                Constraint::Length(1), // Status
-            ])
+            .constraints(constraints)
             .split(self.area);
 
+        let (header, search, list, status) = if header_height > 0 {
+            (Some(chunks[0]), chunks[1], chunks[2], chunks[3])
+        } else {
+            (None, chunks[0], chunks[1], chunks[2])
+        };
+
         MainAreas {
-            search: chunks[0],
-            list: chunks[1],
+            header,
+            search,
+            list,
             detail: None,
             aux: None,
-            status: chunks[2],
+            status,
         }
     }
 

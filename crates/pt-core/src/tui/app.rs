@@ -84,6 +84,8 @@ pub struct App {
     detail_visible: bool,
     /// Current detail view mode.
     detail_view: DetailView,
+    /// Optional goal summary lines to display.
+    goal_summary: Option<Vec<String>>,
 }
 
 impl Default for App {
@@ -114,7 +116,20 @@ impl App {
             layout_state: LayoutState::new(80, 24),
             detail_visible: true,
             detail_view: DetailView::Summary,
+            goal_summary: None,
         }
+    }
+
+    /// Set goal summary lines for display.
+    pub fn set_goal_summary(&mut self, lines: Vec<String>) {
+        self.goal_summary = if lines.is_empty() { None } else { Some(lines) };
+        self.needs_redraw = true;
+    }
+
+    /// Clear goal summary display.
+    pub fn clear_goal_summary(&mut self) {
+        self.goal_summary = None;
+        self.needs_redraw = true;
     }
 
     /// Get the current layout breakpoint.
@@ -388,6 +403,15 @@ impl App {
                             self.set_detail_view(DetailView::GalaxyBrain);
                         }
                     }
+                    KeyCode::Char('v') => {
+                        if self.process_table.has_goal_order() {
+                            self.process_table.toggle_view_mode();
+                            let label = self.process_table.view_mode_label();
+                            self.set_status(format!("View mode: {}", label));
+                        } else {
+                            self.set_status("Goal view unavailable");
+                        }
+                    }
 
                     // Help
                     KeyCode::Char('?') => {
@@ -493,9 +517,16 @@ impl App {
         }
 
         // Get layout areas based on current breakpoint
-        let areas = layout.main_areas();
+        let areas = if self.goal_summary.as_ref().map_or(false, |v| !v.is_empty()) {
+            layout.main_areas_with_header(2)
+        } else {
+            layout.main_areas()
+        };
 
         // Render main content areas
+        if let Some(header) = areas.header {
+            self.render_goal_summary(frame, header);
+        }
         self.render_search(frame, areas.search);
         let list_area = if !self.detail_visible {
             if let Some(detail) = areas.detail {
@@ -535,6 +566,29 @@ impl App {
             let help_area = layout.popup_area(50, 60);
             self.render_help_overlay(frame, help_area);
         }
+    }
+
+    /// Render the goal summary header.
+    fn render_goal_summary(&self, frame: &mut Frame, area: Rect) {
+        let Some(lines) = self.goal_summary.as_ref() else {
+            return;
+        };
+        if lines.is_empty() {
+            return;
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Goal ")
+            .border_style(self.theme.style_border());
+
+        let content = lines.join("\n");
+        let paragraph = Paragraph::new(content)
+            .block(block)
+            .style(self.theme.style_normal())
+            .wrap(Wrap { trim: true });
+
+        frame.render_widget(paragraph, area);
     }
 
     /// Render message when terminal is too small.
@@ -679,7 +733,7 @@ Search: /
 Select: Space/a/A/u/x
 Execute: e
 Detail: Enter
-Views: s/t/g
+Views: s/t/g  View mode: v
 Help: ?  Quit: q
 "#
             }
@@ -711,6 +765,7 @@ Help: ?  Quit: q
     s           Summary view
     t           Genealogy view
     g           Galaxy-brain view
+    v           Toggle goal view
 
   General:
     ?           Toggle help
