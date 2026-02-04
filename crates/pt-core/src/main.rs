@@ -1609,6 +1609,7 @@ fn main() {
                     signatures: None,
                     community_signatures: false,
                     min_age: None,
+                    goal: None,
                 },
             )
         }
@@ -2441,7 +2442,7 @@ fn build_tui_rows(
     }
 }
 
-use pt_core::collect::{quick_scan, ProcessRecord, QuickScanOptions, QuickScanResult};
+use pt_core::collect::{quick_scan, ProcessRecord, QuickScanOptions, ScanResult};
 use pt_core::decision::{
     apply_load_to_loss_matrix, compute_load_adjustment, decide_action, Action, ActionFeasibility,
     LoadSignals,
@@ -2933,7 +2934,7 @@ fn goal_summary_json(
 fn build_goal_advisory_from_scan(
     goal_str: &str,
     goal: &Goal,
-    result: &QuickScanResult,
+    result: &ScanResult,
 ) -> serde_json::Value {
     let total_mem_mb: f64 = result
         .processes
