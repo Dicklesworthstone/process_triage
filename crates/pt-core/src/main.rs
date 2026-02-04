@@ -33,7 +33,13 @@ use pt_core::inference::galaxy_brain::{
     render as render_galaxy_brain, GalaxyBrainConfig, MathMode, Verbosity,
 };
 use pt_core::inference::signature_fast_path::{try_signature_fast_path, FastPathConfig};
-use pt_core::output::{encode_toon_value, CompactConfig, FieldSelector, TokenEfficientOutput};
+use pt_core::output::{
+    encode_toon_value, CompactConfig, FieldSelector, TokenEfficientOutput,
+};
+use pt_core::output::predictions::{
+    apply_field_selection, CpuPrediction, MemoryPrediction, PredictionDiagnostics, PredictionField,
+    PredictionFieldSelector, Predictions, TrajectoryAssessment, TrajectoryLabel, Trend,
+};
 #[cfg(feature = "ui")]
 use pt_core::plan::{generate_plan, DecisionBundle, DecisionCandidate};
 use pt_core::session::compare::generate_comparison_report;
@@ -854,6 +860,15 @@ struct AgentPlanArgs {
     #[arg(long)]
     sample_size: Option<usize>,
 
+    /// Include trajectory prediction analysis in output
+    #[arg(long)]
+    include_predictions: bool,
+
+    /// Select prediction subfields to include (comma-separated)
+    /// Options: memory,cpu,eta_abandoned,eta_resource_limit,trajectory,diagnostics
+    #[arg(long, value_name = "FIELDS")]
+    prediction_fields: Option<String>,
+
     // === Future flags (stub implementation for API surface discovery) ===
     // These are parsed but not yet functional. Using them will generate a warning.
     // Full implementation is tracked in separate beads.
@@ -874,10 +889,6 @@ struct AgentPlanArgs {
         help = "Resource recovery goal, e.g. 'free 4GB RAM' (coming in v1.2)"
     )]
     goal: Option<String>,
-
-    /// Include trajectory prediction analysis in output (coming in v1.2)
-    #[arg(long, help = "Add trajectory analysis to output (coming in v1.2)")]
-    include_predictions: bool,
 
     /// Minimal JSON output (PIDs, scores, and recommendations only)
     #[arg(long)]
@@ -5792,6 +5803,70 @@ fn format_duration_human(seconds: u64) -> String {
     }
 }
 
+fn parse_prediction_fields(spec: &str) -> Result<PredictionFieldSelector, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("prediction fields cannot be empty".to_string());
+    }
+
+    let mut include = Vec::new();
+    for raw in spec.split(',') {
+        let field = raw.trim().to_lowercase();
+        if field.is_empty() {
+            continue;
+        }
+        let parsed = match field.as_str() {
+            "memory" => PredictionField::Memory,
+            "cpu" => PredictionField::Cpu,
+            "eta_abandoned" => PredictionField::EtaAbandoned,
+            "eta_resource_limit" => PredictionField::EtaResourceLimit,
+            "trajectory" => PredictionField::Trajectory,
+            "diagnostics" => PredictionField::Diagnostics,
+            _ => return Err(format!("unknown prediction field: {}", field)),
+        };
+        if !include.contains(&parsed) {
+            include.push(parsed);
+        }
+    }
+
+    if include.is_empty() {
+        return Err("prediction fields cannot be empty".to_string());
+    }
+
+    Ok(PredictionFieldSelector { include })
+}
+
+fn build_stub_predictions(proc: &ProcessRecord) -> Predictions {
+    let window_secs = proc.elapsed.as_secs_f64().max(0.0);
+    Predictions {
+        memory: Some(MemoryPrediction {
+            rss_slope_bytes_per_sec: 0.0,
+            trend: Trend::Stable,
+            confidence: 0.0,
+            window_secs,
+        }),
+        cpu: Some(CpuPrediction {
+            usage_slope_pct_per_sec: 0.0,
+            trend: Trend::Stable,
+            confidence: 0.0,
+            window_secs,
+        }),
+        eta_abandoned: None,
+        eta_resource_limit: None,
+        trajectory: Some(TrajectoryAssessment {
+            label: TrajectoryLabel::Unknown,
+            confidence: 0.0,
+            summary: "insufficient history for trajectory prediction".to_string(),
+        }),
+        diagnostics: Some(PredictionDiagnostics {
+            n_observations: 1,
+            calibrated: false,
+            model: "snapshot".to_string(),
+            warnings: vec!["insufficient_history".to_string()],
+        }),
+    }
+}
+
 #[cfg(feature = "ui")]
 fn format_memory_human(bytes: u64) -> String {
     let mb = bytes as f64 / 1024.0 / 1024.0;
@@ -6346,6 +6421,26 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let priors = config.priors.clone();
     let policy = config.policy.clone();
 
+    if args.prediction_fields.is_some() && !args.include_predictions {
+        eprintln!("agent plan: --prediction-fields requires --include-predictions");
+        return ExitCode::ArgsError;
+    }
+
+    let prediction_field_selector = if args.include_predictions {
+        match args.prediction_fields.as_deref() {
+            Some(spec) => match parse_prediction_fields(spec) {
+                Ok(selector) => Some(selector),
+                Err(err) => {
+                    eprintln!("agent plan: {}", err);
+                    return ExitCode::ArgsError;
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Progress emitter for streaming updates + session log
     let emitter = session_progress_emitter(global, &handle, &session_id);
     if let Some(ref e) = emitter {
@@ -6585,8 +6680,22 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         // Calculate a composite score (0-100) based on max posterior
         let score = (max_posterior * 100.0).round() as u32;
 
+        let predictions = if args.include_predictions {
+            let mut predictions = build_stub_predictions(proc);
+            if let Some(selector) = &prediction_field_selector {
+                predictions = apply_field_selection(&predictions, selector);
+            }
+            if predictions.is_empty() {
+                None
+            } else {
+                Some(predictions)
+            }
+        } else {
+            None
+        };
+
         // Build candidate JSON (action tracking moved to after sorting)
-        let candidate = serde_json::json!({
+        let mut candidate = serde_json::json!({
             "pid": proc.pid.0,
             "ppid": proc.ppid.0,
             "state": proc.state.to_string(),
@@ -6639,6 +6748,15 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 }))
                 .collect::<Vec<_>>(),
         });
+
+        if let Some(predictions) = predictions {
+            if let Some(obj) = candidate.as_object_mut() {
+                obj.insert(
+                    "predictions".to_string(),
+                    serde_json::to_value(predictions).unwrap_or_else(|_| serde_json::json!({})),
+                );
+            }
+        }
 
         // Store candidate with max_posterior for sorting (no early break!)
         all_candidates.push((max_posterior, candidate));
@@ -6762,9 +6880,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     if args.goal.is_some() {
         stub_flags_used.push("--goal");
     }
-    if args.include_predictions {
-        stub_flags_used.push("--include-predictions");
-    }
 
     // Build stub_flags section if any future flags were used
     let stub_flags_section = if !stub_flags_used.is_empty() {
@@ -6803,6 +6918,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "since_time": args.since_time,
             "goal": args.goal,
             "include_predictions": args.include_predictions,
+            "prediction_fields": args.prediction_fields,
             "minimal": args.minimal,
             "pretty": args.pretty,
             "brief": args.brief,

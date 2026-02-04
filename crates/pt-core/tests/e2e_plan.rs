@@ -232,6 +232,79 @@ mod plan_options {
 }
 
 // ============================================================================
+// Prediction Output Tests
+// ============================================================================
+
+mod plan_predictions {
+    use super::*;
+
+    #[test]
+    fn plan_with_predictions_includes_field_when_candidates_exist() {
+        let output = pt_core_fast()
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--include-predictions",
+                "--sample-size",
+                TEST_SAMPLE_SIZE,
+            ])
+            .assert()
+            .code(predicate::in_iter([0, 1]))
+            .get_output()
+            .stdout
+            .clone();
+
+        let json: Value = serde_json::from_slice(&output).expect("valid JSON");
+        let candidates = json
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if let Some(candidate) = candidates.first() {
+            assert!(
+                candidate.get("predictions").is_some(),
+                "predictions should be included when flag is set"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_without_predictions_omits_field_when_candidates_exist() {
+        let output = pt_core_fast()
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--sample-size",
+                TEST_SAMPLE_SIZE,
+            ])
+            .assert()
+            .code(predicate::in_iter([0, 1]))
+            .get_output()
+            .stdout
+            .clone();
+
+        let json: Value = serde_json::from_slice(&output).expect("valid JSON");
+        let candidates = json
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if let Some(candidate) = candidates.first() {
+            assert!(
+                candidate.get("predictions").is_none(),
+                "predictions should be omitted by default"
+            );
+        }
+    }
+}
+
+// ============================================================================
 // Output Format Tests
 // ============================================================================
 
