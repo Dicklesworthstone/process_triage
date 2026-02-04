@@ -44,6 +44,16 @@ pub enum SortOrder {
     Descending,
 }
 
+/// Primary view ordering for the process table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// Sort by suspicion/score (default).
+    #[default]
+    SuspicionFirst,
+    /// Sort by goal contribution/selection.
+    GoalFirst,
+}
+
 /// A process row for display in the table.
 #[derive(Debug, Clone)]
 pub struct ProcessRow {
@@ -125,16 +135,20 @@ impl<'a> ProcessTable<'a> {
     fn styled_block(&self, focused: bool, state: &ProcessTableState) -> Block<'a> {
         let selected_count = state.selected.len();
         let total_count = state.visible_rows().len();
+        let view_label = match state.view_mode {
+            ViewMode::SuspicionFirst => "score",
+            ViewMode::GoalFirst => "goal",
+        };
 
         let title = if selected_count > 0 {
             format!(
-                " Processes [{}/{} selected] [Space: toggle, a: rec, A: all, u: clear, x: invert, e: execute] ",
-                selected_count, total_count
+                " Processes [{}/{} selected] [view: {}] [Space: toggle, a: rec, A: all, u: clear, x: invert, e: execute] ",
+                selected_count, total_count, view_label
             )
         } else {
             format!(
-                " Processes [{}] [Space: toggle, a: rec, A: all, u: clear, x: invert, e: execute] ",
-                total_count
+                " Processes [{}] [view: {}] [Space: toggle, a: rec, A: all, u: clear, x: invert, e: execute] ",
+                total_count, view_label
             )
         };
 
@@ -448,6 +462,10 @@ pub struct ProcessTableState {
     pub sort_order: SortOrder,
     /// Current filter query (lowercase).
     pub filter: Option<String>,
+    /// Current view mode (score vs goal ordering).
+    pub view_mode: ViewMode,
+    /// Optional goal-based ordering (pid -> rank).
+    goal_rank: Option<HashMap<u32, usize>>,
 }
 
 impl Default for ProcessTableState {
@@ -468,6 +486,8 @@ impl ProcessTableState {
             sort_column: SortColumn::Score,
             sort_order: SortOrder::Descending,
             filter: None,
+            view_mode: ViewMode::SuspicionFirst,
+            goal_rank: None,
         }
     }
 
@@ -477,6 +497,43 @@ impl ProcessTableState {
         self.cursor = 0;
         self.scroll_offset = 0;
         self.sort();
+    }
+
+    /// Set goal ordering for goal-first view.
+    pub fn set_goal_order(&mut self, order: Option<HashMap<u32, usize>>) {
+        self.goal_rank = order;
+        if self.goal_rank.is_none() && self.view_mode == ViewMode::GoalFirst {
+            self.view_mode = ViewMode::SuspicionFirst;
+        }
+        self.sort();
+    }
+
+    /// Toggle view mode (score vs goal).
+    pub fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::SuspicionFirst => {
+                if self.goal_rank.is_some() {
+                    ViewMode::GoalFirst
+                } else {
+                    ViewMode::SuspicionFirst
+                }
+            }
+            ViewMode::GoalFirst => ViewMode::SuspicionFirst,
+        };
+        self.sort();
+    }
+
+    /// Return true if goal ordering data is available.
+    pub fn has_goal_order(&self) -> bool {
+        self.goal_rank.is_some()
+    }
+
+    /// Human-readable label for current view mode.
+    pub fn view_mode_label(&self) -> &'static str {
+        match self.view_mode {
+            ViewMode::SuspicionFirst => "score",
+            ViewMode::GoalFirst => "goal",
+        }
     }
 
     /// Apply a generated plan preview to the rows.
@@ -674,6 +731,16 @@ impl ProcessTableState {
     fn sort(&mut self) {
         let order = self.sort_order;
         self.rows.sort_by(|a, b| {
+            if self.view_mode == ViewMode::GoalFirst {
+                if let Some(ranks) = self.goal_rank.as_ref() {
+                    let ra = ranks.get(&a.pid).copied().unwrap_or(usize::MAX);
+                    let rb = ranks.get(&b.pid).copied().unwrap_or(usize::MAX);
+                    let cmp = ra.cmp(&rb);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return cmp;
+                    }
+                }
+            }
             let cmp = match self.sort_column {
                 SortColumn::Pid => a.pid.cmp(&b.pid),
                 SortColumn::Score => a.score.cmp(&b.score),

@@ -1876,6 +1876,8 @@ struct PlanCandidateInput {
 struct TuiBuildOutput {
     rows: Vec<ProcessRow>,
     plan_candidates: HashMap<u32, PlanCandidateInput>,
+    goal_summary: Option<Vec<String>>,
+    goal_order: Option<HashMap<u32, usize>>,
 }
 
 #[cfg(feature = "ui")]
@@ -1909,6 +1911,7 @@ fn build_tui_data_from_live_scan(
         deep_signals.as_ref(),
         priors,
         policy,
+        args.goal.as_deref(),
     ))
 }
 
@@ -2173,6 +2176,7 @@ fn build_tui_rows(
     deep_signals: Option<&HashMap<u32, DeepSignals>>,
     priors: &Priors,
     policy: &pt_core::config::Policy,
+    goal_str: Option<&str>,
 ) -> TuiBuildOutput {
     const MIN_POSTERIOR: f64 = 0.7;
     const MAX_CANDIDATES: usize = 50;
@@ -2196,6 +2200,8 @@ fn build_tui_rows(
     let feasibility = ActionFeasibility::allow_all();
     let mut rows = Vec::new();
     let mut plan_candidates = HashMap::new();
+    let mut goal_candidates: HashMap<u32, serde_json::Value> = HashMap::new();
+    let mut cpu_total = 0.0;
 
     for proc in processes {
         if proc.pid.0 == 0 || proc.pid.0 == 1 {
@@ -2294,13 +2300,144 @@ fn build_tui_rows(
             confidence: Some(ledger.confidence.label().to_string()),
             plan_preview: Vec::new(),
         });
+
+        cpu_total += proc.cpu_percent;
+
+        let expected_loss_entries: Vec<serde_json::Value> = decision_outcome
+            .expected_loss
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "action": format!("{:?}", entry.action).to_lowercase(),
+                    "loss": entry.loss,
+                })
+            })
+            .collect();
+
+        let recommended_action = match decision_outcome.optimal_action {
+            Action::Kill => "kill",
+            Action::Keep => "keep",
+            _ => "review",
+        };
+
+        let memory_mb = (proc.rss_bytes / (1024 * 1024)) as u64;
+        goal_candidates.insert(
+            proc.pid.0,
+            serde_json::json!({
+                "pid": proc.pid.0,
+                "recommended_action": recommended_action,
+                "memory_mb": memory_mb,
+                "cpu_percent": proc.cpu_percent,
+                "expected_loss": expected_loss_entries,
+            }),
+        );
     }
 
     rows.sort_by(|a, b| b.score.cmp(&a.score));
     rows.truncate(MAX_CANDIDATES);
+
+    let mut goal_summary: Option<Vec<String>> = None;
+    let mut goal_order: Option<HashMap<u32, usize>> = None;
+
+    if let Some(goal_str) = goal_str {
+        match parse_goal(goal_str) {
+            Ok(parsed) => {
+                let mut candidates_for_goal = Vec::new();
+                for row in &rows {
+                    if let Some(candidate) = goal_candidates.get(&row.pid) {
+                        candidates_for_goal.push(candidate.clone());
+                    }
+                }
+
+                if !candidates_for_goal.is_empty() {
+                    match build_goal_plan_from_candidates(
+                        goal_str,
+                        &parsed,
+                        cpu_total,
+                        &candidates_for_goal,
+                    ) {
+                        Ok(output) => {
+                            let mut lines = Vec::new();
+                            lines.push(format!("Goal: {}", goal_str));
+                            lines.push(format!(
+                                "Status: {}",
+                                if output.result.feasible {
+                                    "achievable"
+                                } else {
+                                    "partial"
+                                }
+                            ));
+                            for entry in &output.result.goal_achievement {
+                                let fraction = if entry.target > 0.0 {
+                                    (entry.achieved / entry.target).min(1.0)
+                                } else {
+                                    1.0
+                                };
+                                lines.push(format!(
+                                    "{}: {:.1}/{:.1} ({:.0}%)",
+                                    entry.resource,
+                                    entry.achieved,
+                                    entry.target,
+                                    fraction * 100.0
+                                ));
+                            }
+                            lines.push(format!(
+                                "Expected loss: {:.2} • Selected: {}",
+                                output.result.total_loss,
+                                output.selected_pids.len()
+                            ));
+                            if !output.warnings.is_empty() {
+                                lines.push(format!(
+                                    "Warnings: {}",
+                                    output.warnings.join(", ")
+                                ));
+                            }
+                            goal_summary = Some(lines);
+
+                            let mut rank_map = HashMap::new();
+                            let mut rank = 0usize;
+                            for pid in &output.selected_pids {
+                                if rows.iter().any(|row| row.pid == *pid) {
+                                    rank_map.insert(*pid, rank);
+                                    rank = rank.saturating_add(1);
+                                }
+                            }
+                            for row in &rows {
+                                if !rank_map.contains_key(&row.pid) {
+                                    rank_map.insert(row.pid, rank);
+                                    rank = rank.saturating_add(1);
+                                }
+                            }
+                            goal_order = Some(rank_map);
+                        }
+                        Err(err) => {
+                            goal_summary = Some(vec![
+                                format!("Goal: {}", goal_str),
+                                format!("Error: {}", err),
+                            ]);
+                        }
+                    }
+                } else {
+                    goal_summary = Some(vec![
+                        format!("Goal: {}", goal_str),
+                        "No candidates available for goal optimization".to_string(),
+                    ]);
+                }
+            }
+            Err(err) => {
+                goal_summary = Some(vec![
+                    format!("Goal: {}", goal_str),
+                    format!("Error: {}", err),
+                ]);
+            }
+        }
+    }
+
     TuiBuildOutput {
         rows,
         plan_candidates,
+        goal_summary,
+        goal_order,
     }
 }
 
