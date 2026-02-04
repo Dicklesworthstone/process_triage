@@ -200,10 +200,21 @@ teardown_test_env() {
 
     # Log any test artifacts before cleanup
     if [[ -f "$TEST_LOG_FILE" ]]; then
+        # Avoid recursive writes while reading the log file.
+        local saved_log_file="$TEST_LOG_FILE"
+        local saved_log_file_secondary="${TEST_LOG_FILE_SECONDARY:-}"
+        TEST_LOG_FILE=""
+        TEST_LOG_FILE_SECONDARY=""
+
         test_debug "Test log contents:"
         while read -r line; do
             test_debug "  $line"
-        done < "$TEST_LOG_FILE"
+        done < "$saved_log_file"
+
+        TEST_LOG_FILE="$saved_log_file"
+        if [[ -n "$saved_log_file_secondary" ]]; then
+            TEST_LOG_FILE_SECONDARY="$saved_log_file_secondary"
+        fi
     fi
 
     # Intentionally do not delete any files/directories here.
