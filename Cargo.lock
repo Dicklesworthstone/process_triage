@@ -3662,12 +3662,15 @@ dependencies = [
 name = "pt-report"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "askama",
  "base64",
  "chrono",
  "minify-html",
+ "parquet",
  "pt-bundle",
  "pt-redact",
+ "pt-telemetry",
  "regex",
  "serde",
  "serde_json",
