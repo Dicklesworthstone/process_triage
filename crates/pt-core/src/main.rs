@@ -369,6 +369,10 @@ struct RunArgs {
     /// Only consider processes older than threshold (seconds)
     #[arg(long)]
     min_age: Option<u64>,
+
+    /// Resource recovery goal for goal-oriented optimization
+    #[arg(long, help = "Resource recovery goal, e.g. 'free 4GB RAM'")]
+    goal: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -388,6 +392,10 @@ struct ScanArgs {
     /// Include kernel threads in scan output (default: exclude)
     #[arg(long)]
     include_kernel_threads: bool,
+
+    /// Resource recovery goal (advisory only)
+    #[arg(long)]
+    goal: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -886,11 +894,8 @@ struct AgentPlanArgs {
     )]
     since_time: Option<String>,
 
-    /// Resource recovery goal for goal-oriented optimization (coming in v1.2)
-    #[arg(
-        long,
-        help = "Resource recovery goal, e.g. 'free 4GB RAM' (coming in v1.2)"
-    )]
+    /// Resource recovery goal for goal-oriented optimization
+    #[arg(long, help = "Resource recovery goal, e.g. 'free 4GB RAM'")]
     goal: Option<String>,
 
     /// Minimal JSON output (PIDs, scores, and recommendations only)
@@ -953,7 +958,11 @@ struct AgentExplainArgs {
 use pt_core::action::{
     ActionRunner, IdentityProvider, LiveIdentityProvider, SignalActionRunner, SignalConfig,
 };
-use pt_core::decision::{ConstraintChecker, RobotCandidate, RuntimeRobotConstraints};
+use pt_core::decision::{
+    goal_optimizer::{optimize_greedy, optimize_ilp, OptCandidate, OptimizationResult, ResourceGoal},
+    goal_parser::{parse_goal, Comparator, Goal, Metric, ResourceTarget},
+    ConstraintChecker, RobotCandidate, RuntimeRobotConstraints,
+};
 use pt_core::plan::{Plan, PlanAction};
 
 #[derive(Args, Debug)]
@@ -2295,7 +2304,7 @@ fn build_tui_rows(
     }
 }
 
-use pt_core::collect::{quick_scan, ProcessRecord, QuickScanOptions};
+use pt_core::collect::{quick_scan, ProcessRecord, QuickScanOptions, QuickScanResult};
 use pt_core::decision::{
     apply_load_to_loss_matrix, compute_load_adjustment, decide_action, Action, ActionFeasibility,
     LoadSignals,
@@ -2403,16 +2412,31 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
                 duration_ms = result.metadata.duration_ms
             );
 
+            let goal_advisory = if let Some(goal_str) = &args.goal {
+                match parse_goal(goal_str) {
+                    Ok(parsed) => Some(build_goal_advisory_from_scan(goal_str, &parsed, &result)),
+                    Err(err) => {
+                        eprintln!("scan: invalid --goal {}: {}", goal_str, err);
+                        return ExitCode::ArgsError;
+                    }
+                }
+            } else {
+                None
+            };
+
             match global.format {
                 OutputFormat::Json | OutputFormat::Toon => {
                     // Enrich with schema version and session ID
                     let session_id = SessionId::new();
-                    let output = serde_json::json!({
+                    let mut output = serde_json::json!({
                         "schema_version": SCHEMA_VERSION,
                         "session_id": session_id.0,
                         "generated_at": chrono::Utc::now().to_rfc3339(),
                         "scan": result
                     });
+                    if let Some(goal_advisory) = goal_advisory {
+                        output["goal_advisory"] = goal_advisory;
+                    }
                     // Apply token-efficient processing if options specified
                     println!("{}", format_structured_output(global, output));
                 }
@@ -2421,6 +2445,9 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
                         "Scanned {} processes in {}ms",
                         result.metadata.process_count, result.metadata.duration_ms
                     );
+                    if let Some(goal_advisory) = goal_advisory {
+                        println!("Goal advisory: {}", goal_advisory);
+                    }
                 }
                 OutputFormat::Exitcode => {} // Silent
                 _ => {
@@ -2453,6 +2480,11 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
                     if result.processes.len() > 20 {
                         println!("... and {} more", result.processes.len() - 20);
                     }
+                    if let Some(goal_advisory) = goal_advisory {
+                        println!();
+                        println!("## Goal Advisory");
+                        println!("{}", goal_advisory);
+                    }
                 }
             }
             ExitCode::Clean
@@ -2482,6 +2514,332 @@ fn bytes_to_human(bytes: u64) -> String {
     } else {
         format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
+}
+
+struct GoalPlanOutput {
+    goals: Vec<ResourceGoal>,
+    result: OptimizationResult,
+    selected_pids: Vec<u32>,
+    strategy: String,
+    warnings: Vec<String>,
+}
+
+fn resource_goal_from_target(
+    target: &ResourceTarget,
+    current_cpu_pct: f64,
+) -> Result<(ResourceGoal, Vec<String>), String> {
+    let mut warnings = Vec::new();
+    let goal = match target.metric {
+        Metric::Memory => ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: target.value / (1024.0 * 1024.0),
+            weight: 1.0,
+        },
+        Metric::Cpu => {
+            let target_pct = target.value * 100.0;
+            let desired = match target.comparator {
+                Comparator::ReduceBelow => {
+                    let required = (current_cpu_pct - target_pct).max(0.0);
+                    if required <= 0.0 {
+                        warnings.push("cpu_target_already_met".to_string());
+                    }
+                    required
+                }
+                Comparator::FreeAtLeast => target_pct,
+                Comparator::Release => target_pct,
+            };
+            ResourceGoal {
+                resource: "cpu_pct".to_string(),
+                target: desired,
+                weight: 1.0,
+            }
+        }
+        Metric::Port => {
+            warnings.push("port_goal_requires_socket_inspection".to_string());
+            ResourceGoal {
+                resource: format!("port_{}", target.port.unwrap_or(0)),
+                target: 1.0,
+                weight: 1.0,
+            }
+        }
+        Metric::FileDescriptors => {
+            warnings.push("fd_goal_requires_fd_counts".to_string());
+            ResourceGoal {
+                resource: "fd_count".to_string(),
+                target: target.value,
+                weight: 1.0,
+            }
+        }
+    };
+    Ok((goal, warnings))
+}
+
+fn build_resource_goals(
+    goal: &Goal,
+    current_cpu_pct: f64,
+) -> Result<(Vec<ResourceGoal>, Vec<String>), String> {
+    let mut warnings = Vec::new();
+    let mut goals = Vec::new();
+    match goal {
+        Goal::Target(t) => {
+            let (g, mut w) = resource_goal_from_target(t, current_cpu_pct)?;
+            warnings.append(&mut w);
+            goals.push(g);
+        }
+        Goal::And(parts) => {
+            for sub in parts {
+                let Goal::Target(t) = sub else {
+                    return Err("nested composite goals not supported".to_string());
+                };
+                let (g, mut w) = resource_goal_from_target(t, current_cpu_pct)?;
+                warnings.append(&mut w);
+                goals.push(g);
+            }
+        }
+        Goal::Or(_) => {
+            return Err("OR goals require selection strategy".to_string());
+        }
+    }
+    Ok((goals, warnings))
+}
+
+fn parse_kill_loss(candidate: &serde_json::Value) -> f64 {
+    candidate
+        .get("expected_loss")
+        .and_then(|v| v.as_array())
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                let action = entry.get("action")?.as_str()?;
+                if action.eq_ignore_ascii_case("kill") {
+                    entry.get("loss").and_then(|v| v.as_f64())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(0.0)
+}
+
+fn build_opt_candidates_for_goals(
+    candidates: &[serde_json::Value],
+    goals: &[ResourceGoal],
+) -> Vec<OptCandidate> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let pid = candidate.get("pid")?.as_u64()? as u32;
+            let action = candidate
+                .get("recommended_action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let blocked = action.eq_ignore_ascii_case("keep");
+            let memory_mb = candidate
+                .get("memory_mb")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as f64;
+            let cpu_pct = candidate
+                .get("cpu_percent")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+
+            let contributions: Vec<f64> = goals
+                .iter()
+                .map(|goal| match goal.resource.as_str() {
+                    "memory_mb" => memory_mb,
+                    "cpu_pct" => cpu_pct,
+                    "fd_count" => 0.0,
+                    r if r.starts_with("port_") => 0.0,
+                    _ => 0.0,
+                })
+                .collect();
+
+            Some(OptCandidate {
+                id: pid.to_string(),
+                expected_loss: parse_kill_loss(candidate),
+                contributions,
+                blocked,
+                block_reason: None,
+            })
+        })
+        .collect()
+}
+
+fn goal_progress_json(result: &OptimizationResult) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = result
+        .goal_achievement
+        .iter()
+        .map(|g| {
+            let fraction = if g.target > 0.0 {
+                (g.achieved / g.target).min(1.0)
+            } else {
+                1.0
+            };
+            serde_json::json!({
+                "resource": g.resource,
+                "achieved": g.achieved,
+                "target": g.target,
+                "shortfall": g.shortfall,
+                "met": g.met,
+                "fraction": fraction,
+            })
+        })
+        .collect();
+    serde_json::json!({ "entries": entries })
+}
+
+fn build_goal_plan_from_candidates(
+    goal_str: &str,
+    goal: &Goal,
+    current_cpu_pct: f64,
+    candidates: &[serde_json::Value],
+) -> Result<GoalPlanOutput, String> {
+    let mut warnings = Vec::new();
+    let (goals, mut w) = match goal {
+        Goal::Or(parts) => {
+            let mut best: Option<(OptimizationResult, Vec<ResourceGoal>)> = None;
+            let mut best_score = -1.0;
+            for sub in parts {
+                let Goal::Target(t) = sub else {
+                    continue;
+                };
+                let (g, mut w) = resource_goal_from_target(t, current_cpu_pct)?;
+                warnings.append(&mut w);
+                let goals = vec![g.clone()];
+                let opt_candidates = build_opt_candidates_for_goals(candidates, &goals);
+                let result = optimize_ilp(&opt_candidates, &goals);
+                let achieved = result
+                    .goal_achievement
+                    .get(0)
+                    .map(|g| if g.target > 0.0 { g.achieved / g.target } else { 1.0 })
+                    .unwrap_or(0.0);
+                let score = if result.feasible { 1.0 + achieved } else { achieved };
+                if score > best_score
+                    || (score - best_score).abs() < 1e-9 && best.as_ref().map_or(true, |b| result.total_loss < b.0.total_loss)
+                {
+                    best_score = score;
+                    best = Some((result, goals));
+                }
+            }
+            let Some((result, goals)) = best else {
+                return Err("no valid OR goal candidates".to_string());
+            };
+            return Ok(GoalPlanOutput {
+                goals,
+                selected_pids: result
+                    .selected
+                    .iter()
+                    .filter_map(|s| s.id.parse::<u32>().ok())
+                    .collect(),
+                result,
+                strategy: "or_best".to_string(),
+                warnings,
+            });
+        }
+        _ => build_resource_goals(goal, current_cpu_pct)?,
+    };
+    warnings.append(&mut w);
+
+    let opt_candidates = build_opt_candidates_for_goals(candidates, &goals);
+    let result = if goals.len() == 1 {
+        optimize_ilp(&opt_candidates, &goals)
+    } else {
+        optimize_greedy(&opt_candidates, &goals)
+    };
+
+    let selected_pids = result
+        .selected
+        .iter()
+        .filter_map(|s| s.id.parse::<u32>().ok())
+        .collect();
+
+    Ok(GoalPlanOutput {
+        goals,
+        result,
+        selected_pids,
+        strategy: "and".to_string(),
+        warnings,
+    })
+}
+
+fn goal_summary_json(
+    goal_str: &str,
+    goal: &Goal,
+    output: &GoalPlanOutput,
+) -> serde_json::Value {
+    let targets: Vec<serde_json::Value> = output
+        .goals
+        .iter()
+        .map(|g| serde_json::json!({"resource": g.resource, "target": g.target}))
+        .collect();
+    let goal_achievement = serde_json::to_value(&output.result.goal_achievement)
+        .unwrap_or_else(|_| serde_json::json!([]));
+    let alternatives =
+        serde_json::to_value(&output.result.alternatives).unwrap_or_else(|_| serde_json::json!([]));
+    let log_events =
+        serde_json::to_value(&output.result.log_events).unwrap_or_else(|_| serde_json::json!([]));
+    serde_json::json!({
+        "goal": goal_str,
+        "parsed": goal.canonical(),
+        "strategy": output.strategy,
+        "achievable": output.result.feasible,
+        "targets": targets,
+        "projected_recovery": output.result.total_contributions,
+        "total_expected_loss": output.result.total_loss,
+        "selected_pids": output.selected_pids,
+        "goal_achievement": goal_achievement,
+        "alternatives": alternatives,
+        "log_events": log_events,
+        "warnings": output.warnings,
+    })
+}
+
+fn build_goal_advisory_from_scan(
+    goal_str: &str,
+    goal: &Goal,
+    result: &QuickScanResult,
+) -> serde_json::Value {
+    let total_mem_mb: f64 = result
+        .processes
+        .iter()
+        .map(|p| p.rss_bytes as f64 / (1024.0 * 1024.0))
+        .sum();
+    let total_cpu_pct: f64 = result.processes.iter().map(|p| p.cpu_percent).sum();
+
+    let (goals, warnings) = match build_resource_goals(goal, total_cpu_pct) {
+        Ok(v) => v,
+        Err(err) => {
+            return serde_json::json!({
+                "goal": goal_str,
+                "parsed": goal.canonical(),
+                "error": err,
+            });
+        }
+    };
+
+    let achievements: Vec<serde_json::Value> = goals
+        .iter()
+        .map(|g| {
+            let achieved = match g.resource.as_str() {
+                "memory_mb" => total_mem_mb,
+                "cpu_pct" => total_cpu_pct,
+                _ => 0.0,
+            };
+            serde_json::json!({
+                "resource": g.resource,
+                "target": g.target,
+                "achieved": achieved,
+                "shortfall": (g.target - achieved).max(0.0),
+                "met": achieved >= g.target,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "goal": goal_str,
+        "parsed": goal.canonical(),
+        "achievements": achievements,
+        "warnings": warnings,
+    })
 }
 
 fn resolve_bundle_passphrase(passphrase_arg: &Option<String>) -> Option<String> {
@@ -7623,6 +7981,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     } else {
         filter_result.passed.iter().collect()
     };
+
+    let current_cpu_pct: f64 = processes_to_infer
+        .iter()
+        .map(|p| p.cpu_percent)
+        .sum();
 
     let total_processes = processes_to_infer.len() as u64;
     let mut processed = 0u64;

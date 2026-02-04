@@ -13,6 +13,7 @@
 //! When goals are infeasible, reports the shortfall and best-effort plan.
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 /// A resource goal the user wants to achieve.
@@ -69,6 +70,8 @@ pub struct OptimizationResult {
     pub algorithm: String,
     /// Alternative plans (Pareto tradeoffs).
     pub alternatives: Vec<AlternativePlan>,
+    /// Structured optimization log events.
+    pub log_events: Vec<OptimizationLogEvent>,
 }
 
 /// Achievement status for a single goal.
@@ -99,8 +102,140 @@ pub struct AlternativePlan {
     pub goal_achievement: Vec<GoalAchievement>,
 }
 
+/// Structured log event emitted by optimizers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizationLogEvent {
+    pub event: String,
+    pub algorithm: String,
+    pub candidate_id: Option<String>,
+    pub loss: Option<f64>,
+    pub score: Option<f64>,
+    pub total_loss: Option<f64>,
+    pub total_contributions: Vec<f64>,
+    pub target: Option<f64>,
+    pub current_contribution: Option<f64>,
+    pub remaining_max: Option<f64>,
+    pub note: Option<String>,
+}
+
+impl OptimizationLogEvent {
+    fn new(event: &str, algorithm: &str) -> Self {
+        Self {
+            event: event.to_string(),
+            algorithm: algorithm.to_string(),
+            candidate_id: None,
+            loss: None,
+            score: None,
+            total_loss: None,
+            total_contributions: Vec::new(),
+            target: None,
+            current_contribution: None,
+            remaining_max: None,
+            note: None,
+        }
+    }
+}
+
+/// Result of checking whether to re-optimize after candidate set changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReoptimizationDecision {
+    pub reoptimized: bool,
+    pub reason: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub result: OptimizationResult,
+}
+
+/// User preference model (risk tolerance) learned from plan choices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreferenceModel {
+    /// Risk tolerance in [0,1]. 0 = conservative, 1 = aggressive.
+    pub risk_tolerance: f64,
+    /// Learning rate for preference updates.
+    pub learning_rate: f64,
+}
+
+impl Default for PreferenceModel {
+    fn default() -> Self {
+        Self {
+            risk_tolerance: 0.5,
+            learning_rate: 0.2,
+        }
+    }
+}
+
+/// Result of a preference update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreferenceUpdate {
+    pub prior: f64,
+    pub observed: f64,
+    pub updated: f64,
+}
+
+impl PreferenceModel {
+    /// Update preference model from a chosen alternative plan.
+    pub fn update_from_choice(
+        &mut self,
+        chosen: &AlternativePlan,
+        alternatives: &[AlternativePlan],
+    ) -> PreferenceUpdate {
+        let prior = self.risk_tolerance.clamp(0.0, 1.0);
+        let (min_loss, max_loss) = alternatives
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), alt| {
+                (min.min(alt.total_loss), max.max(alt.total_loss))
+            });
+        let observed = if max_loss > min_loss {
+            (chosen.total_loss - min_loss) / (max_loss - min_loss)
+        } else {
+            0.5
+        };
+        let updated = (prior * (1.0 - self.learning_rate)
+            + observed * self.learning_rate)
+            .clamp(0.0, 1.0);
+        self.risk_tolerance = updated;
+        PreferenceUpdate {
+            prior,
+            observed,
+            updated,
+        }
+    }
+
+    /// Adjust loss based on risk tolerance (penalize higher loss for conservative users).
+    pub fn adjust_loss(&self, loss: f64) -> f64 {
+        let risk = self.risk_tolerance.clamp(0.0, 1.0);
+        let exponent = 1.0 + (1.0 - risk);
+        loss.powf(exponent).max(1e-12)
+    }
+}
+
 /// Greedy optimization: sort by efficiency, select until goals met.
 pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> OptimizationResult {
+    optimize_greedy_internal(candidates, goals, None, "greedy")
+}
+
+/// Greedy optimization with a user preference model applied to loss sensitivity.
+pub fn optimize_greedy_with_preferences(
+    candidates: &[OptCandidate],
+    goals: &[ResourceGoal],
+    prefs: &PreferenceModel,
+) -> OptimizationResult {
+    optimize_greedy_internal(candidates, goals, Some(prefs), "greedy_pref")
+}
+
+fn optimize_greedy_internal(
+    candidates: &[OptCandidate],
+    goals: &[ResourceGoal],
+    prefs: Option<&PreferenceModel>,
+    algorithm_label: &str,
+) -> OptimizationResult {
+    let mut log_events = Vec::new();
+    let mut start_event = OptimizationLogEvent::new("optimizer_start", algorithm_label);
+    start_event.note = Some(format!("candidates={} goals={}", candidates.len(), goals.len()));
+    log_events.push(start_event);
+
+    let adjust_loss = |loss: f64| prefs.map_or(loss, |p| p.adjust_loss(loss));
+
     if candidates.is_empty() {
         let goal_achievement: Vec<GoalAchievement> = goals
             .iter()
@@ -118,8 +253,9 @@ pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> O
             total_contributions: vec![0.0; goals.len()],
             goal_achievement,
             feasible: goals.iter().all(|g| g.target <= 0.0),
-            algorithm: "greedy".to_string(),
+            algorithm: algorithm_label.to_string(),
             alternatives: Vec::new(),
+            log_events,
         };
     }
 
@@ -135,8 +271,14 @@ pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> O
         .enumerate()
         .filter(|(_, c)| !c.blocked && c.expected_loss >= 0.0)
         .collect();
+    let blocked_count = candidates.iter().filter(|c| c.blocked).count();
+    if blocked_count > 0 {
+        let mut event = OptimizationLogEvent::new("constraint_violation", algorithm_label);
+        event.note = Some(format!("blocked_candidates={}", blocked_count));
+        log_events.push(event);
+    }
 
-    // Compute scalarized efficiency: weighted_contribution / loss.
+    // Compute scalarized efficiency: weighted_contribution / adjusted_loss.
     let scalarize = |c: &OptCandidate| -> f64 {
         let weighted_contrib: f64 = c
             .contributions
@@ -144,8 +286,9 @@ pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> O
             .zip(goals.iter())
             .map(|(contrib, goal)| contrib * goal.weight)
             .sum();
-        if c.expected_loss > 1e-15 {
-            weighted_contrib / c.expected_loss
+        let loss = adjust_loss(c.expected_loss);
+        if loss > 1e-15 {
+            weighted_contrib / loss
         } else {
             weighted_contrib * 1e10 // Free lunch: near-zero loss
         }
@@ -166,6 +309,13 @@ pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> O
         if remaining_targets.iter().all(|t| *t <= 0.0) {
             break;
         }
+
+        let mut eval = OptimizationLogEvent::new("objective_eval", algorithm_label);
+        eval.candidate_id = Some(cand.id.clone());
+        eval.loss = Some(cand.expected_loss);
+        eval.score = Some(scalarize(cand));
+        eval.total_contributions = cand.contributions.clone();
+        log_events.push(eval);
 
         selected.push(SelectedAction {
             id: cand.id.clone(),
@@ -199,7 +349,11 @@ pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> O
     let feasible = goal_achievement.iter().all(|g| g.met);
 
     // Generate alternatives: fewer actions (conservative), more actions (aggressive).
-    let alternatives = generate_alternatives(&selected, goals, &eligible);
+    let alternatives = generate_alternatives(&selected, goals, &eligible, &mut log_events);
+    let mut converged = OptimizationLogEvent::new("converged", algorithm_label);
+    converged.total_loss = Some(total_loss);
+    converged.total_contributions = total_contributions.clone();
+    log_events.push(converged);
 
     OptimizationResult {
         selected,
@@ -207,8 +361,9 @@ pub fn optimize_greedy(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> O
         total_contributions,
         goal_achievement,
         feasible,
-        algorithm: "greedy".to_string(),
+        algorithm: algorithm_label.to_string(),
         alternatives,
+        log_events,
     }
 }
 
@@ -221,9 +376,22 @@ pub fn optimize_dp(
     goals: &[ResourceGoal],
     resolution: f64,
 ) -> OptimizationResult {
+    let mut log_events = Vec::new();
+    let mut start_event = OptimizationLogEvent::new("optimizer_start", "dp_exact");
+    start_event.note = Some(format!(
+        "candidates={} goals={} resolution={}",
+        candidates.len(),
+        goals.len(),
+        resolution
+    ));
+    log_events.push(start_event);
+
     // Only supports single-goal for DP.
     if goals.len() != 1 || candidates.is_empty() {
-        return optimize_greedy(candidates, goals);
+        let mut greedy = optimize_greedy(candidates, goals);
+        greedy.algorithm = "dp_exact (unsupported, greedy fallback)".to_string();
+        greedy.log_events.extend(log_events);
+        return greedy;
     }
 
     let eligible: Vec<&OptCandidate> = candidates
@@ -232,7 +400,10 @@ pub fn optimize_dp(
         .collect();
 
     if eligible.len() > 30 {
-        return optimize_greedy(candidates, goals);
+        let mut greedy = optimize_greedy(candidates, goals);
+        greedy.algorithm = "dp_exact (too_many_candidates, greedy fallback)".to_string();
+        greedy.log_events.extend(log_events);
+        return greedy;
     }
 
     let target = goals[0].target;
@@ -284,11 +455,13 @@ pub fn optimize_dp(
         }
         _ => {
             // Infeasible; fall back to greedy best-effort.
-            let greedy = optimize_greedy(candidates, goals);
-            return OptimizationResult {
-                algorithm: "dp (infeasible, greedy fallback)".to_string(),
-                ..greedy
-            };
+            let mut greedy = optimize_greedy(candidates, goals);
+            let mut event = OptimizationLogEvent::new("constraint_violation", "dp_exact");
+            event.note = Some("dp_infeasible".to_string());
+            log_events.push(event);
+            greedy.algorithm = "dp_exact (infeasible, greedy fallback)".to_string();
+            greedy.log_events.extend(log_events);
+            return greedy;
         }
     };
 
@@ -311,6 +484,270 @@ pub fn optimize_dp(
         feasible: achieved >= target,
         algorithm: "dp_exact".to_string(),
         alternatives: Vec::new(),
+        log_events,
+    }
+}
+
+/// ILP-style exact optimization via branch-and-bound (single goal).
+///
+/// Uses constraint propagation to prune infeasible branches: if the remaining
+/// maximum possible contribution cannot reach the target, the branch is cut.
+pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> OptimizationResult {
+    let mut log_events = Vec::new();
+    let mut start_event = OptimizationLogEvent::new("optimizer_start", "ilp_branch_bound");
+    start_event.note = Some(format!("candidates={} goals={}", candidates.len(), goals.len()));
+    log_events.push(start_event);
+
+    if goals.len() != 1 || candidates.is_empty() {
+        let mut greedy = optimize_greedy(candidates, goals);
+        greedy.algorithm = "ilp_branch_bound (unsupported, greedy fallback)".to_string();
+        greedy.log_events.extend(log_events);
+        return greedy;
+    }
+
+    let eligible: Vec<&OptCandidate> = candidates
+        .iter()
+        .filter(|c| !c.blocked && c.expected_loss >= 0.0)
+        .collect();
+
+    if eligible.is_empty() {
+        let mut greedy = optimize_greedy(candidates, goals);
+        greedy.algorithm = "ilp_branch_bound (no_candidates, greedy fallback)".to_string();
+        greedy.log_events.extend(log_events);
+        return greedy;
+    }
+
+    let target = goals[0].target;
+    let mut ordered = eligible;
+    ordered.sort_by(|a, b| {
+        pareto_efficiency(b, goals)
+            .partial_cmp(&pareto_efficiency(a, goals))
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let n = ordered.len();
+    let mut suffix_max = vec![0.0; n + 1];
+    for i in (0..n).rev() {
+        suffix_max[i] = suffix_max[i + 1] + ordered[i].contributions[0];
+    }
+
+    let mut best_loss = f64::INFINITY;
+    let mut best_selection: Vec<usize> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+
+    fn dfs(
+        idx: usize,
+        ordered: &[&OptCandidate],
+        target: f64,
+        suffix_max: &[f64],
+        current_loss: f64,
+        current_contrib: f64,
+        current: &mut Vec<usize>,
+        best_loss: &mut f64,
+        best_selection: &mut Vec<usize>,
+        log_events: &mut Vec<OptimizationLogEvent>,
+    ) {
+        if current_contrib >= target {
+            if current_loss < *best_loss {
+                *best_loss = current_loss;
+                *best_selection = current.clone();
+                let mut event = OptimizationLogEvent::new("objective_improved", "ilp_branch_bound");
+                event.total_loss = Some(current_loss);
+                event.current_contribution = Some(current_contrib);
+                event.target = Some(target);
+                log_events.push(event);
+            }
+            return;
+        }
+
+        if idx >= ordered.len() {
+            return;
+        }
+
+        if current_loss >= *best_loss {
+            return;
+        }
+
+        if current_contrib + suffix_max[idx] < target {
+            let mut event = OptimizationLogEvent::new("constraint_prune", "ilp_branch_bound");
+            event.current_contribution = Some(current_contrib);
+            event.remaining_max = Some(suffix_max[idx]);
+            event.target = Some(target);
+            log_events.push(event);
+            return;
+        }
+
+        // Include candidate.
+        current.push(idx);
+        dfs(
+            idx + 1,
+            ordered,
+            target,
+            suffix_max,
+            current_loss + ordered[idx].expected_loss,
+            current_contrib + ordered[idx].contributions[0],
+            current,
+            best_loss,
+            best_selection,
+            log_events,
+        );
+        current.pop();
+
+        // Exclude candidate.
+        dfs(
+            idx + 1,
+            ordered,
+            target,
+            suffix_max,
+            current_loss,
+            current_contrib,
+            current,
+            best_loss,
+            best_selection,
+            log_events,
+        );
+    }
+
+    dfs(
+        0,
+        &ordered,
+        target,
+        &suffix_max,
+        0.0,
+        0.0,
+        &mut current,
+        &mut best_loss,
+        &mut best_selection,
+        &mut log_events,
+    );
+
+    if best_loss == f64::INFINITY {
+        let mut greedy = optimize_greedy(candidates, goals);
+        let mut event = OptimizationLogEvent::new("constraint_violation", "ilp_branch_bound");
+        event.note = Some("ilp_infeasible".to_string());
+        log_events.push(event);
+        greedy.algorithm = "ilp_branch_bound (infeasible, greedy fallback)".to_string();
+        greedy.log_events.extend(log_events);
+        return greedy;
+    }
+
+    let selected: Vec<SelectedAction> = best_selection
+        .iter()
+        .map(|&idx| {
+            let c = ordered[idx];
+            SelectedAction {
+                id: c.id.clone(),
+                expected_loss: c.expected_loss,
+                contributions: c.contributions.clone(),
+            }
+        })
+        .collect();
+
+    let total_contributions = vec![selected.iter().map(|s| s.contributions[0]).sum()];
+    let achieved = total_contributions[0];
+    let goal_achievement = vec![GoalAchievement {
+        resource: goals[0].resource.clone(),
+        target,
+        achieved,
+        shortfall: (target - achieved).max(0.0),
+        met: achieved >= target,
+    }];
+
+    OptimizationResult {
+        selected,
+        total_loss: best_loss,
+        total_contributions,
+        goal_achievement,
+        feasible: achieved >= target,
+        algorithm: "ilp_branch_bound".to_string(),
+        alternatives: Vec::new(),
+        log_events,
+    }
+}
+
+/// Re-optimize when the candidate set changes materially.
+///
+/// Returns the previous plan if changes are minor; otherwise recomputes.
+pub fn reoptimize_on_change(
+    previous: &OptimizationResult,
+    prev_candidates: &[OptCandidate],
+    new_candidates: &[OptCandidate],
+    goals: &[ResourceGoal],
+) -> ReoptimizationDecision {
+    const CHURN_THRESHOLD: f64 = 0.2;
+
+    let prev_ids: HashSet<&str> = prev_candidates.iter().map(|c| c.id.as_str()).collect();
+    let new_ids: HashSet<&str> = new_candidates.iter().map(|c| c.id.as_str()).collect();
+
+    let mut added: Vec<String> = new_ids
+        .iter()
+        .filter(|id| !prev_ids.contains(*id))
+        .map(|id| (*id).to_string())
+        .collect();
+    let mut removed: Vec<String> = prev_ids
+        .iter()
+        .filter(|id| !new_ids.contains(*id))
+        .map(|id| (*id).to_string())
+        .collect();
+    added.sort();
+    removed.sort();
+
+    let missing_selected: Vec<String> = previous
+        .selected
+        .iter()
+        .filter(|s| !new_ids.contains(s.id.as_str()))
+        .map(|s| s.id.clone())
+        .collect();
+
+    let reopt_reason = if added.is_empty() && removed.is_empty() {
+        "no_change".to_string()
+    } else if !missing_selected.is_empty() {
+        "selected_missing".to_string()
+    } else if prev_ids.is_empty() {
+        "prev_empty".to_string()
+    } else {
+        let churn = (added.len() + removed.len()) as f64 / prev_ids.len() as f64;
+        if churn >= CHURN_THRESHOLD {
+            "churn_threshold".to_string()
+        } else {
+            "stable".to_string()
+        }
+    };
+
+    if matches!(reopt_reason.as_str(), "stable" | "no_change") {
+        let mut result = previous.clone();
+        let mut event = OptimizationLogEvent::new("reopt_skip", "reopt");
+        event.note = Some(reopt_reason.clone());
+        event.total_loss = Some(result.total_loss);
+        event.total_contributions = result.total_contributions.clone();
+        result.log_events.push(event);
+        return ReoptimizationDecision {
+            reoptimized: false,
+            reason: reopt_reason,
+            added,
+            removed,
+            result,
+        };
+    }
+
+    let mut result = if goals.len() == 1 {
+        optimize_ilp(new_candidates, goals)
+    } else {
+        optimize_greedy(new_candidates, goals)
+    };
+
+    let mut event = OptimizationLogEvent::new("reoptimized", "reopt");
+    event.note = Some(reopt_reason.clone());
+    event.total_loss = Some(result.total_loss);
+    event.total_contributions = result.total_contributions.clone();
+    result.log_events.push(event);
+
+    ReoptimizationDecision {
+        reoptimized: true,
+        reason: reopt_reason,
+        added,
+        removed,
+        result,
     }
 }
 
@@ -399,32 +836,28 @@ fn generate_alternatives(
     selected: &[SelectedAction],
     goals: &[ResourceGoal],
     eligible: &[(usize, &OptCandidate)],
+    log_events: &mut Vec<OptimizationLogEvent>,
 ) -> Vec<AlternativePlan> {
-    let mut alts = Vec::new();
+    let mut alts: Vec<AlternativePlan> = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut push_unique = |alt: AlternativePlan| {
+        let key = alternative_key(&alt);
+        if seen.insert(key) {
+            alts.push(alt);
+        }
+    };
+
+    let goals_len = goals.len();
 
     if selected.len() > 1 {
         // Conservative: use fewer actions (first N-1).
         let fewer = &selected[..selected.len() - 1];
         let loss: f64 = fewer.iter().map(|s| s.expected_loss).sum();
-        let achievements: Vec<GoalAchievement> = goals
-            .iter()
-            .enumerate()
-            .map(|(g, goal)| {
-                let achieved: f64 = fewer
-                    .iter()
-                    .map(|s| s.contributions.get(g).copied().unwrap_or(0.0))
-                    .sum();
-                GoalAchievement {
-                    resource: goal.resource.clone(),
-                    target: goal.target,
-                    achieved,
-                    shortfall: (goal.target - achieved).max(0.0),
-                    met: achieved >= goal.target,
-                }
-            })
-            .collect();
+        let totals = total_contributions_from_actions(fewer, goals_len);
+        let achievements = compute_goal_achievements(goals, &totals);
 
-        alts.push(AlternativePlan {
+        push_unique(AlternativePlan {
             description: "Conservative: fewer actions, potentially under target".to_string(),
             action_count: fewer.len(),
             total_loss: loss,
@@ -447,25 +880,10 @@ fn generate_alternatives(
                 contributions: extra.contributions.clone(),
             });
             let loss: f64 = more.iter().map(|s| s.expected_loss).sum();
-            let achievements: Vec<GoalAchievement> = goals
-                .iter()
-                .enumerate()
-                .map(|(g, goal)| {
-                    let achieved: f64 = more
-                        .iter()
-                        .map(|s| s.contributions.get(g).copied().unwrap_or(0.0))
-                        .sum();
-                    GoalAchievement {
-                        resource: goal.resource.clone(),
-                        target: goal.target,
-                        achieved,
-                        shortfall: (goal.target - achieved).max(0.0),
-                        met: achieved >= goal.target,
-                    }
-                })
-                .collect();
+            let totals = total_contributions_from_actions(&more, goals_len);
+            let achievements = compute_goal_achievements(goals, &totals);
 
-            alts.push(AlternativePlan {
+            push_unique(AlternativePlan {
                 description: "Aggressive: more headroom, higher total loss".to_string(),
                 action_count: more.len(),
                 total_loss: loss,
@@ -474,7 +892,218 @@ fn generate_alternatives(
         }
     }
 
+    for alt in compute_pareto_frontier(eligible, goals, 8, log_events) {
+        push_unique(alt);
+    }
+
     alts
+}
+
+fn alternative_key(alt: &AlternativePlan) -> String {
+    let mut parts = Vec::with_capacity(alt.goal_achievement.len() + 2);
+    parts.push(format!("actions={}", alt.action_count));
+    parts.push(format!("loss={:.6}", alt.total_loss));
+    for g in &alt.goal_achievement {
+        parts.push(format!("{}={:.6}", g.resource, g.achieved));
+    }
+    parts.join("|")
+}
+
+fn total_contributions_from_actions(actions: &[SelectedAction], goals_len: usize) -> Vec<f64> {
+    let mut totals = vec![0.0; goals_len];
+    for action in actions {
+        for (g, contrib) in action.contributions.iter().enumerate().take(goals_len) {
+            totals[g] += *contrib;
+        }
+    }
+    totals
+}
+
+fn compute_goal_achievements(goals: &[ResourceGoal], totals: &[f64]) -> Vec<GoalAchievement> {
+    goals
+        .iter()
+        .enumerate()
+        .map(|(g, goal)| {
+            let achieved = totals.get(g).copied().unwrap_or(0.0);
+            GoalAchievement {
+                resource: goal.resource.clone(),
+                target: goal.target,
+                achieved,
+                shortfall: (goal.target - achieved).max(0.0),
+                met: achieved >= goal.target,
+            }
+        })
+        .collect()
+}
+
+fn compute_pareto_frontier(
+    eligible: &[(usize, &OptCandidate)],
+    goals: &[ResourceGoal],
+    max_sets: usize,
+    log_events: &mut Vec<OptimizationLogEvent>,
+) -> Vec<AlternativePlan> {
+    if eligible.is_empty() || goals.is_empty() || max_sets == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<&OptCandidate> = eligible.iter().map(|(_, c)| *c).collect();
+    let goals_len = goals.len();
+
+    if candidates.len() > 16 {
+        let mut event = OptimizationLogEvent::new("constraint_violation", "pareto_frontier");
+        event.note = Some(format!(
+            "candidate_cap: {} -> {}",
+            candidates.len(),
+            16
+        ));
+        log_events.push(event);
+        candidates.sort_by(|a, b| {
+            pareto_efficiency(b, goals)
+                .partial_cmp(&pareto_efficiency(a, goals))
+                .unwrap_or(Ordering::Equal)
+        });
+        candidates.truncate(16);
+    }
+
+    let n = candidates.len();
+    let mut sets: Vec<ParetoSet> = Vec::new();
+
+    for mask in 1..(1_u32 << n) {
+        let mut actions = Vec::new();
+        let mut total_loss = 0.0;
+        let mut totals = vec![0.0; goals_len];
+
+        for i in 0..n {
+            if (mask & (1_u32 << i)) != 0 {
+                let cand = candidates[i];
+                actions.push(SelectedAction {
+                    id: cand.id.clone(),
+                    expected_loss: cand.expected_loss,
+                    contributions: cand.contributions.clone(),
+                });
+                total_loss += cand.expected_loss;
+                for (g, contrib) in cand.contributions.iter().enumerate().take(goals_len) {
+                    totals[g] += *contrib;
+                }
+            }
+        }
+
+        sets.push(ParetoSet {
+            actions,
+            total_loss,
+            total_contributions: totals,
+        });
+    }
+
+    let mut frontier = Vec::new();
+    for i in 0..sets.len() {
+        let mut dominated = false;
+        for j in 0..sets.len() {
+            if i == j {
+                continue;
+            }
+            if pareto_dominates(&sets[j], &sets[i]) {
+                dominated = true;
+                break;
+            }
+        }
+        if !dominated {
+            frontier.push(sets[i].clone());
+        }
+    }
+
+    frontier.sort_by(|a, b| {
+        let loss_cmp = a
+            .total_loss
+            .partial_cmp(&b.total_loss)
+            .unwrap_or(Ordering::Equal);
+        if loss_cmp != Ordering::Equal {
+            return loss_cmp;
+        }
+        let sum_a: f64 = a.total_contributions.iter().sum();
+        let sum_b: f64 = b.total_contributions.iter().sum();
+        sum_b.partial_cmp(&sum_a).unwrap_or(Ordering::Equal)
+    });
+
+    let mut alternatives: Vec<AlternativePlan> = frontier
+        .into_iter()
+        .map(|set| {
+            let sum_contrib: f64 = set.total_contributions.iter().sum();
+            let mut event = OptimizationLogEvent::new("pareto_point", "pareto_frontier");
+            event.total_loss = Some(set.total_loss);
+            event.total_contributions = set.total_contributions.clone();
+            log_events.push(event);
+            AlternativePlan {
+                description: format!("Pareto: loss {:.3}, contribution {:.3}", set.total_loss, sum_contrib),
+                action_count: set.actions.len(),
+                total_loss: set.total_loss,
+                goal_achievement: compute_goal_achievements(goals, &set.total_contributions),
+            }
+        })
+        .collect();
+
+    if alternatives.len() > max_sets {
+        let mut reduced = Vec::with_capacity(max_sets);
+        if max_sets == 1 {
+            reduced.push(alternatives[0].clone());
+            return reduced;
+        }
+        let step = (alternatives.len() - 1) as f64 / (max_sets - 1) as f64;
+        let mut last_idx = None;
+        for i in 0..max_sets {
+            let idx = (i as f64 * step).round() as usize;
+            if last_idx == Some(idx) {
+                continue;
+            }
+            reduced.push(alternatives[idx].clone());
+            last_idx = Some(idx);
+        }
+        alternatives = reduced;
+    }
+
+    alternatives
+}
+
+#[derive(Clone)]
+struct ParetoSet {
+    actions: Vec<SelectedAction>,
+    total_loss: f64,
+    total_contributions: Vec<f64>,
+}
+
+fn pareto_efficiency(candidate: &OptCandidate, goals: &[ResourceGoal]) -> f64 {
+    let weighted: f64 = candidate
+        .contributions
+        .iter()
+        .zip(goals.iter())
+        .map(|(c, g)| c * g.weight)
+        .sum();
+    if candidate.expected_loss > 1e-12 {
+        weighted / candidate.expected_loss
+    } else {
+        weighted * 1e8
+    }
+}
+
+fn pareto_dominates(a: &ParetoSet, b: &ParetoSet) -> bool {
+    let eps = 1e-9;
+    if a.total_loss > b.total_loss + eps {
+        return false;
+    }
+    let mut strictly_better = a.total_loss + eps < b.total_loss;
+    for (a_c, b_c) in a
+        .total_contributions
+        .iter()
+        .zip(b.total_contributions.iter())
+    {
+        if *a_c + eps < *b_c {
+            return false;
+        }
+        if *a_c > *b_c + eps {
+            strictly_better = true;
+        }
+    }
+    strictly_better
 }
 
 #[cfg(test)]
@@ -662,6 +1291,7 @@ mod tests {
             feasible: true,
             algorithm: "greedy".to_string(),
             alternatives: Vec::new(),
+            log_events: Vec::new(),
         };
 
         local_search_improve(&mut result, &candidates, &goals, 10);
