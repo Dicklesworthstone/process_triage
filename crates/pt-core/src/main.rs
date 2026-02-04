@@ -69,11 +69,13 @@ use pt_core::verify::{parse_agent_plan, verify_plan, VerifyError};
 use pt_telemetry::retention::{RetentionConfig, RetentionEnforcer, RetentionError};
 use pt_telemetry::shadow::{Observation, ShadowStorage, ShadowStorageConfig};
 use pt_telemetry::writer::default_telemetry_dir;
+#[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+#[cfg(feature = "daemon")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "ui")]
@@ -1317,7 +1319,7 @@ enum ConfigCommands {
 #[derive(Args, Debug)]
 struct DaemonArgs {
     #[command(subcommand)]
-    command: DaemonCommands,
+    command: Option<DaemonCommands>,
 }
 
 #[cfg(feature = "daemon")]
@@ -4110,9 +4112,10 @@ fn run_config_export_preset(
 #[cfg(feature = "daemon")]
 fn run_daemon(global: &GlobalOpts, args: &DaemonArgs) -> ExitCode {
     match &args.command {
-        DaemonCommands::Start { foreground } => run_daemon_start(global, *foreground),
-        DaemonCommands::Stop => run_daemon_stop(global),
-        DaemonCommands::Status => run_daemon_status(global),
+        Some(DaemonCommands::Start { foreground }) => run_daemon_start(global, *foreground),
+        Some(DaemonCommands::Stop) => run_daemon_stop(global),
+        Some(DaemonCommands::Status) => run_daemon_status(global),
+        None => run_daemon_start(global, true),
     }
 }
 
@@ -4205,6 +4208,24 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
     install_daemon_signal_handlers();
     apply_daemon_nice();
     let own_pid = std::process::id();
+    let mut last_cpu_sample: Option<(f64, std::time::Instant)> = None;
+
+    match read_daemon_pid() {
+        Ok(Some(pid)) if pid != own_pid && is_process_running(pid) => {
+            eprintln!("daemon start: existing daemon running (pid {})", pid);
+            return ExitCode::LockError;
+        }
+        Ok(Some(pid)) if pid != own_pid => {
+            let _ = remove_daemon_pid();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("daemon start: failed to read pid file: {}", err);
+        }
+    }
+    if let Err(err) = write_daemon_pid(own_pid) {
+        eprintln!("daemon start: failed to write pid file: {}", err);
+    }
 
     let state_path = daemon_state_path();
     let mut state_bundle = load_daemon_state(&state_path, config);
@@ -4230,6 +4251,27 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
 
         let metrics = collect_daemon_metrics();
         let mut budget_exceeded = false;
+        let now = std::time::Instant::now();
+        if let Some(cpu_total) = current_cpu_seconds() {
+            if let Some((prev_cpu, prev_time)) = last_cpu_sample {
+                let wall = now.duration_since(prev_time).as_secs_f64();
+                let cpu_delta = cpu_total - prev_cpu;
+                if wall > 0.0 && cpu_delta >= 0.0 {
+                    let cpu_pct = (cpu_delta / wall) * 100.0;
+                    if cpu_pct > config.max_cpu_percent {
+                        budget_exceeded = true;
+                        state_bundle.daemon.record_event(
+                            pt_core::daemon::DaemonEventType::OverheadBudgetExceeded,
+                            &format!(
+                                "cpu {:.2}% exceeds budget {}",
+                                cpu_pct, config.max_cpu_percent
+                            ),
+                        );
+                    }
+                }
+            }
+            last_cpu_sample = Some((cpu_total, now));
+        }
         if let Some(rss_mb) = current_rss_mb() {
             if rss_mb > config.max_rss_mb {
                 budget_exceeded = true;
@@ -4249,6 +4291,10 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
         if budget_exceeded {
             daemon_state.tick_count += 1;
             daemon_state.last_tick_at = Some(metrics.timestamp.clone());
+            daemon_state.record_event(
+                pt_core::daemon::DaemonEventType::TickCompleted,
+                "tick (budget exceeded)",
+            );
         } else {
             let mut escalation_inbox = inbox.clone();
             let outcome = pt_core::daemon::process_tick(
@@ -4318,12 +4364,10 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                     outcome
                 },
             );
-
-            if outcome.escalation.is_some() {
-                state_bundle
-                    .daemon
-                    .record_event(pt_core::daemon::DaemonEventType::TickCompleted, "tick");
-            }
+            let _ = outcome;
+            state_bundle
+                .daemon
+                .record_event(pt_core::daemon::DaemonEventType::TickCompleted, "tick");
         }
 
         let _ = save_daemon_state(&state_path, &state_bundle);
@@ -4812,10 +4856,11 @@ fn install_shadow_signal_handlers() {
     }
 
     unsafe {
-        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
-        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, handler as libc::sighandler_t);
-        libc::signal(libc::SIGUSR1, handler as libc::sighandler_t);
+        let handler_ptr = handler as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler_ptr);
+        libc::signal(libc::SIGINT, handler_ptr);
+        libc::signal(libc::SIGHUP, handler_ptr);
+        libc::signal(libc::SIGUSR1, handler_ptr);
     }
 }
 
@@ -5447,10 +5492,11 @@ fn install_daemon_signal_handlers() {
     }
 
     unsafe {
-        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
-        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, handler as libc::sighandler_t);
-        libc::signal(libc::SIGUSR1, handler as libc::sighandler_t);
+        let handler_ptr = handler as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler_ptr);
+        libc::signal(libc::SIGINT, handler_ptr);
+        libc::signal(libc::SIGHUP, handler_ptr);
+        libc::signal(libc::SIGUSR1, handler_ptr);
     }
 }
 
@@ -5757,6 +5803,24 @@ fn collect_orphan_count() -> u32 {
 
 #[cfg(all(feature = "daemon", not(target_os = "linux")))]
 fn current_rss_mb() -> Option<u64> {
+    None
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn current_cpu_seconds() -> Option<f64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let user = usage.ru_utime.tv_sec as f64 + (usage.ru_utime.tv_usec as f64 / 1_000_000.0);
+    let system = usage.ru_stime.tv_sec as f64 + (usage.ru_stime.tv_usec as f64 / 1_000_000.0);
+    Some(user + system)
+}
+
+#[cfg(all(feature = "daemon", not(unix)))]
+fn current_cpu_seconds() -> Option<f64> {
     None
 }
 
