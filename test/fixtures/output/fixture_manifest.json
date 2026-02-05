@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.0.0",
+  "fixture_id": "output-20260205",
+  "domain": "output",
+  "capture_time": "2026-02-05T02:29:59.675977Z",
+  "source": {
+    "origin": "manual-curated",
+    "command": [
+      "output fixtures"
+    ],
+    "paths": [
+      "test/fixtures/output"
+    ]
+  },
+  "tool_versions": {
+    "fixture_capture": "1.0.0",
+    "pt": "2.0.0",
+    "schema": "fixture-manifest@1"
+  },
+  "redaction_profile": "safe",
+  "artifacts": [
+    {
+      "path": "explain_expected_minimal.json",
+      "kind": "config",
+      "sha256": "7c4b7340ef712a03cd96074eff3406fc8c2feded4ad3f9e6c8aaf046018ccf58",
+      "bytes": 349,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "explain_input.json",
+      "kind": "config",
+      "sha256": "9903a9a3c03e00ed2679bcc3d6f26b45e87967e04deebbc390270eb3695adeb7",
+      "bytes": 456,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "logs/output_formatting.jsonl",
+      "kind": "log",
+      "sha256": "448ad7f342195fdc37bc532bfa4ec6ba240fee1f3f2624cfcfa567c1403548b5",
+      "bytes": 1399,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "plan_expected_compact.json",
+      "kind": "config",
+      "sha256": "02a2619b23e718fb60ddf7104bf33a4c2f014fb75bd9b295fd6c94f9c546072f",
+      "bytes": 1200,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "plan_expected_minimal.json",
+      "kind": "config",
+      "sha256": "77aff6367e0ab5a4c94905e3debd9f45f2f4388efe30e7b013fd28ec5bf6e9d3",
+      "bytes": 1398,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "plan_expected_truncated.json",
+      "kind": "config",
+      "sha256": "c4ffb9be7001e0fe015baef99d15b945601f186b505d59ee9a96b9d7e6e503ee",
+      "bytes": 637,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "plan_input.json",
+      "kind": "config",
+      "sha256": "ed20d0983a89de2fc24d66fa1930b3416c9dd87cb13157a0ddad29d46de1c09f",
+      "bytes": 1502,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "scan_expected_compact.json",
+      "kind": "config",
+      "sha256": "873241b4b56295c6ba26abdd3a85c18a32946942eac8eab9796c353ab25ea59c",
+      "bytes": 362,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "scan_expected_minimal.json",
+      "kind": "config",
+      "sha256": "42b92e2c2fced7f10ad4fae90cd939e86241188cd7949f5b6918ec886f16592b",
+      "bytes": 388,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "scan_input.json",
+      "kind": "config",
+      "sha256": "3c61b055b3e01f3c9fe0069cad9524571f90acc6d05220f5c01dbd1f819ff5dd",
+      "bytes": 492,
+      "redaction_profile": "safe"
+    }
+  ],
+  "description": "Output formatting fixtures (scan/plan/explain)",
+  "manifest_sha256": "bdbbd8a43478655d21c2ad7a3c28ea190ed396c5c297757efd7346f354df8e0e"
+}

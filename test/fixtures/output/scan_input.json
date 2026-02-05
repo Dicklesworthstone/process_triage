@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0.0",
+  "session_id": "sess-scan-001",
+  "generated_at": "2026-02-05T01:45:00Z",
+  "processes": [
+    {
+      "pid": 101,
+      "classification": "abandoned",
+      "confidence": 0.91,
+      "cmd_short": "pytest -k slow",
+      "recommended_action": "kill"
+    },
+    {
+      "pid": 202,
+      "classification": "useful",
+      "confidence": 0.88,
+      "cmd_short": "bash",
+      "recommended_action": "keep"
+    }
+  ],
+  "summary": {
+    "candidate_count": 2
+  }
+}

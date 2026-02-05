@@ -1,0 +1,21 @@
+{
+  "results": [
+    {
+      "pid": 111,
+      "classification": "abandoned",
+      "confidence": 0.97,
+      "expected_loss": 0.12,
+      "entropy": 0.1
+    },
+    {
+      "pid": 222,
+      "classification": "useful",
+      "confidence": 0.82,
+      "expected_loss": 0.03,
+      "entropy": 0.2
+    }
+  ],
+  "summary": {
+    "result_count": 2
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "sv": "1.0.0",
+  "sid": "sess-plan-001",
+  "ts": "2026-02-05T01:46:00Z",
+  "candidates": [
+    {
+      "p": 111,
+      "c": "A",
+      "cf": 0.97,
+      "cmd": "pytest -k slow",
+      "act": "kill",
+      "post": {
+        "useful": 0.01,
+        "useful_bad": 0.02,
+        "abandoned": 0.95,
+        "zombie": 0.02
+      },
+      "br": {
+        "mem": 512,
+        "cpu": 3.2,
+        "ch": 1,
+        "risk": "low"
+      }
+    },
+    {
+      "p": 222,
+      "c": "U",
+      "cf": 0.82,
+      "cmd": "next dev",
+      "act": "keep",
+      "post": {
+        "useful": 0.82,
+        "useful_bad": 0.05,
+        "abandoned": 0.1,
+        "zombie": 0.03
+      },
+      "br": {
+        "mem": 128,
+        "cpu": 0.5,
+        "ch": 0,
+        "risk": "low"
+      }
+    },
+    {
+      "p": 333,
+      "c": "UB",
+      "cf": 0.76,
+      "cmd": "node dev-server",
+      "act": "review",
+      "post": {
+        "useful": 0.2,
+        "useful_bad": 0.55,
+        "abandoned": 0.2,
+        "zombie": 0.05
+      },
+      "br": {
+        "mem": 256,
+        "cpu": 1.1,
+        "ch": 2,
+        "risk": "medium"
+      }
+    }
+  ],
+  "summary": {
+    "candidate_count": 3,
+    "recommended_kills": 1
+  }
+}

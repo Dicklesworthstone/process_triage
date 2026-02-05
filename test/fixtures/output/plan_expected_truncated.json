@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0.0",
+  "session_id": "sess-plan-001",
+  "generated_at": "2026-02-05T01:46:00Z",
+  "candidates": [
+    {
+      "pid": 111,
+      "classification": "abandoned",
+      "confidence": 0.97,
+      "cmd_short": "pytest -k slow",
+      "recommended_action": "kill",
+      "posterior": {
+        "useful": 0.01,
+        "useful_bad": 0.02,
+        "abandoned": 0.95,
+        "zombie": 0.02
+      },
+      "blast_radius": {
+        "memory_mb": 512,
+        "cpu_pct": 3.2,
+        "child_count": 1,
+        "risk_level": "low"
+      }
+    }
+  ],
+  "summary": {
+    "candidate_count": 3,
+    "recommended_kills": 1
+  }
+}

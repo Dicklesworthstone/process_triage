@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "pid": 111,
+      "classification": "abandoned",
+      "confidence": 0.97,
+      "cmd_short": "pytest -k slow",
+      "recommended_action": "kill",
+      "posterior": {
+        "useful": 0.01,
+        "useful_bad": 0.02,
+        "abandoned": 0.95,
+        "zombie": 0.02
+      },
+      "blast_radius": {
+        "memory_mb": 512,
+        "cpu_pct": 3.2,
+        "child_count": 1,
+        "risk_level": "low"
+      }
+    },
+    {
+      "pid": 222,
+      "classification": "useful",
+      "confidence": 0.82,
+      "cmd_short": "next dev",
+      "recommended_action": "keep",
+      "posterior": {
+        "useful": 0.82,
+        "useful_bad": 0.05,
+        "abandoned": 0.1,
+        "zombie": 0.03
+      },
+      "blast_radius": {
+        "memory_mb": 128,
+        "cpu_pct": 0.5,
+        "child_count": 0,
+        "risk_level": "low"
+      }
+    },
+    {
+      "pid": 333,
+      "classification": "useful_bad",
+      "confidence": 0.76,
+      "cmd_short": "node dev-server",
+      "recommended_action": "review",
+      "posterior": {
+        "useful": 0.2,
+        "useful_bad": 0.55,
+        "abandoned": 0.2,
+        "zombie": 0.05
+      },
+      "blast_radius": {
+        "memory_mb": 256,
+        "cpu_pct": 1.1,
+        "child_count": 2,
+        "risk_level": "medium"
+      }
+    }
+  ],
+  "summary": {
+    "candidate_count": 3,
+    "recommended_kills": 1
+  }
+}

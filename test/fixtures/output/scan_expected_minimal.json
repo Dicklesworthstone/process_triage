@@ -1,0 +1,21 @@
+{
+  "processes": [
+    {
+      "pid": 101,
+      "classification": "abandoned",
+      "confidence": 0.91,
+      "cmd_short": "pytest -k slow",
+      "recommended_action": "kill"
+    },
+    {
+      "pid": 202,
+      "classification": "useful",
+      "confidence": 0.88,
+      "cmd_short": "bash",
+      "recommended_action": "keep"
+    }
+  ],
+  "summary": {
+    "candidate_count": 2
+  }
+}

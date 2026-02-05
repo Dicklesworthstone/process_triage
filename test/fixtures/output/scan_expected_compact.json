@@ -1,0 +1,24 @@
+{
+  "sv": "1.0.0",
+  "sid": "sess-scan-001",
+  "ts": "2026-02-05T01:45:00Z",
+  "processes": [
+    {
+      "p": 101,
+      "c": "A",
+      "cf": 0.91,
+      "cmd": "pytest -k slow",
+      "act": "kill"
+    },
+    {
+      "p": 202,
+      "c": "U",
+      "cf": 0.88,
+      "cmd": "bash",
+      "act": "keep"
+    }
+  ],
+  "summary": {
+    "candidate_count": 2
+  }
+}
