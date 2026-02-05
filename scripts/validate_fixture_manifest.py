@@ -23,6 +23,17 @@ UUID_RE = re.compile(
     re.IGNORECASE,
 )
 HEX_RE = re.compile(r"\b[0-9a-f]{32,}\b", re.IGNORECASE)
+IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+URL_HOST_RE = re.compile(r"https?://([^/\s]+)")
+USER_HOST_RE = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+)")
+HOST_FLAG_RE = re.compile(r"(?P<prefix>--host(?:name)?(?:=|\s+))(?P<host>[^\s]+)")
+
+
+def is_redacted_host(host: str) -> bool:
+    base = host.strip()
+    if ":" in base:
+        base = base.split(":", 1)[0]
+    return base in {"<HOST>", "<IP>", "localhost", "127.0.0.1"}
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -98,6 +109,17 @@ def check_redaction(value: str, label: str, errors: List[str]) -> None:
         errors.append(f"{label} contains unredacted UUID")
     if HEX_RE.search(value):
         errors.append(f"{label} contains unredacted hex id")
+    if IPV4_RE.search(value):
+        errors.append(f"{label} contains unredacted IP address")
+    for match in URL_HOST_RE.finditer(value):
+        if not is_redacted_host(match.group(1)):
+            errors.append(f"{label} contains unredacted hostname in URL")
+    for match in USER_HOST_RE.finditer(value):
+        if not is_redacted_host(match.group(1)):
+            errors.append(f"{label} contains unredacted user@host")
+    for match in HOST_FLAG_RE.finditer(value):
+        if not is_redacted_host(match.group("host")):
+            errors.append(f"{label} contains unredacted --host value")
 
 
 def validate_source(source: Dict[str, Any], errors: List[str]) -> None:

@@ -21,6 +21,10 @@ UUID_RE = re.compile(
     re.IGNORECASE,
 )
 HEX_RE = re.compile(r"\b[0-9a-f]{32,}\b", re.IGNORECASE)
+IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+URL_HOST_RE = re.compile(r"(https?://)([^/\s]+)")
+USER_HOST_RE = re.compile(r"([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+)")
+HOST_FLAG_RE = re.compile(r"(?P<prefix>--host(?:name)?(?:=|\s+))(?P<host>[^\s]+)")
 
 
 def sha256_file(path: Path) -> str:
@@ -51,6 +55,15 @@ def redact_id(value: str) -> str:
 def redact_cmdline(value: str) -> str:
     value = redact_path(value)
     value = redact_id(value)
+    value = redact_hostname(value)
+    return value
+
+
+def redact_hostname(value: str) -> str:
+    value = URL_HOST_RE.sub(lambda match: f"{match.group(1)}<HOST>", value)
+    value = USER_HOST_RE.sub(lambda match: f"{match.group(1)}@<HOST>", value)
+    value = HOST_FLAG_RE.sub(lambda match: f"{match.group('prefix')}<HOST>", value)
+    value = IPV4_RE.sub("<IP>", value)
     return value
 
 
