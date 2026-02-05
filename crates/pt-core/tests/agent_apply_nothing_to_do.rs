@@ -1,0 +1,158 @@
+//! Agent apply no-op tests.
+//!
+//! Ensures agent apply returns Clean and a nothing_to_do note when no actions match.
+
+use assert_cmd::cargo::cargo_bin_cmd;
+use assert_cmd::Command;
+use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, SessionId, StartId};
+use pt_core::decision::Action;
+use pt_core::exit_codes::ExitCode;
+use pt_core::plan::{
+    ActionConfidence, ActionHook, ActionRationale, ActionRouting, ActionTimeouts, GatesSummary,
+    Plan, PlanAction,
+};
+use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionStore};
+use serde_json::Value;
+use std::env;
+use std::fs;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use tempfile::TempDir;
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn with_temp_data_dir<T>(f: impl FnOnce(&TempDir) -> T) -> T {
+    let _guard = ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env lock poisoned");
+
+    let old = env::var("PROCESS_TRIAGE_DATA").ok();
+    let dir = TempDir::new().expect("create temp data dir");
+    env::set_var("PROCESS_TRIAGE_DATA", dir.path());
+
+    let result = f(&dir);
+
+    match old {
+        Some(val) => env::set_var("PROCESS_TRIAGE_DATA", val),
+        None => env::remove_var("PROCESS_TRIAGE_DATA"),
+    }
+
+    result
+}
+
+fn pt_core_fast() -> Command {
+    let mut cmd = cargo_bin_cmd!("pt-core");
+    cmd.timeout(Duration::from_secs(120));
+    cmd
+}
+
+#[test]
+fn agent_apply_returns_nothing_to_do_when_no_actions_match() {
+    with_temp_data_dir(|dir| {
+        let store = SessionStore::from_env().expect("session store from env");
+        let session_id = SessionId::new();
+        let manifest = SessionManifest::new(&session_id, None, SessionMode::RobotPlan, None);
+        let handle = store.create(&manifest).expect("create session");
+        let ctx = SessionContext::new(
+            &session_id,
+            "host-test".to_string(),
+            "run-test".to_string(),
+            None,
+        );
+        handle.write_context(&ctx).expect("write context");
+
+        let plan_pid = 555_555u32;
+        let identity = ProcessIdentity {
+            pid: ProcessId(plan_pid),
+            start_id: StartId("boot:1:555555".to_string()),
+            uid: 1000,
+            pgid: None,
+            sid: None,
+            quality: IdentityQuality::Full,
+        };
+
+        let plan = Plan {
+            plan_id: "plan-test".to_string(),
+            session_id: session_id.0.clone(),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            policy_id: None,
+            policy_version: "1.0.0".to_string(),
+            actions: vec![PlanAction {
+                action_id: "action-1".to_string(),
+                target: identity,
+                action: Action::Kill,
+                order: 0,
+                stage: 0,
+                timeouts: ActionTimeouts::default(),
+                pre_checks: vec![],
+                rationale: ActionRationale {
+                    expected_loss: None,
+                    expected_recovery: None,
+                    expected_recovery_stddev: None,
+                    posterior_odds_abandoned_vs_useful: None,
+                    sprt_boundary: None,
+                    posterior: None,
+                    memory_mb: None,
+                    has_known_signature: None,
+                    category: None,
+                },
+                on_success: Vec::<ActionHook>::new(),
+                on_failure: Vec::<ActionHook>::new(),
+                blocked: false,
+                routing: ActionRouting::Direct,
+                confidence: ActionConfidence::Normal,
+                original_zombie_target: None,
+                d_state_diagnostics: None,
+            }],
+            pre_toggled: Vec::new(),
+            gates_summary: GatesSummary {
+                total_candidates: 1,
+                blocked_candidates: 0,
+                pre_toggled_actions: 0,
+            },
+        };
+
+        let decision_dir = handle.dir.join("decision");
+        fs::create_dir_all(&decision_dir).expect("create decision dir");
+        let plan_path = decision_dir.join("plan.json");
+        fs::write(
+            &plan_path,
+            serde_json::to_string_pretty(&plan).expect("serialize plan"),
+        )
+        .expect("write plan");
+
+        let missing_pid = 999_999u32;
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "apply",
+                "--session",
+                &session_id.0,
+                "--pids",
+                &missing_pid.to_string(),
+            ])
+            .assert()
+            .code(ExitCode::Clean.as_i32())
+            .get_output()
+            .stdout
+            .clone();
+
+        let json: Value = serde_json::from_slice(&output).expect("Output should be valid JSON");
+        assert_eq!(
+            json.get("note").and_then(|v| v.as_str()),
+            Some("nothing_to_do"),
+            "Expected nothing_to_do note"
+        );
+        assert_eq!(
+            json.get("summary")
+                .and_then(|v| v.get("attempted"))
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "Expected summary.attempted to be 0"
+        );
+    });
+}
