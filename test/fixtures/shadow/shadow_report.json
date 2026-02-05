@@ -1,0 +1,34 @@
+{
+  "from": "2026-02-05T01:00:00Z",
+  "to": "2026-02-05T01:10:00Z",
+  "total_predictions": 2,
+  "resolved_predictions": 1,
+  "pending_predictions": 1,
+  "metrics": null,
+  "quality": null,
+  "by_category": [
+    {
+      "category": "unknown",
+      "total": 2,
+      "resolved": 1,
+      "true_positives": 0,
+      "false_positives": 1,
+      "true_negatives": 0,
+      "false_negatives": 0,
+      "accuracy": 0.0,
+      "precision": 0.0,
+      "recall": 0.0
+    }
+  ],
+  "bias": null,
+  "top_false_positives": [
+    {
+      "pattern": "pytest",
+      "count": 1,
+      "mean_predicted": 0.699999988079071,
+      "category": null
+    }
+  ],
+  "top_false_negatives": [],
+  "recommendations": []
+}

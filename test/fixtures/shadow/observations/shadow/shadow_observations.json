@@ -1,0 +1,101 @@
+[
+  {
+    "timestamp": "2026-02-05T01:00:00Z",
+    "pid": 4242,
+    "identity_hash": "hash_shadow_4242",
+    "state": {
+      "cpu_percent": 12.5,
+      "memory_bytes": 104857600,
+      "rss_bytes": 52428800,
+      "fd_count": 12,
+      "thread_count": 4,
+      "state_char": "S",
+      "io_read_bytes": 2048,
+      "io_write_bytes": 1024,
+      "has_tty": true,
+      "child_count": 0
+    },
+    "events": [
+      {
+        "timestamp": "2026-02-05T01:00:00Z",
+        "event_type": "EvidenceSnapshot",
+        "details": "{\"comm\":\"pytest\"}"
+      }
+    ],
+    "belief": {
+      "p_abandoned": 0.7,
+      "p_legitimate": 0.15,
+      "p_zombie": 0.05,
+      "p_useful_but_bad": 0.1,
+      "confidence": 0.9,
+      "score": 75.0,
+      "recommendation": "kill"
+    }
+  },
+  {
+    "timestamp": "2026-02-05T01:05:00Z",
+    "pid": 4242,
+    "identity_hash": "hash_shadow_4242",
+    "state": {
+      "cpu_percent": 8.0,
+      "memory_bytes": 104857600,
+      "rss_bytes": 52428800,
+      "fd_count": 10,
+      "thread_count": 3,
+      "state_char": "S",
+      "io_read_bytes": 4096,
+      "io_write_bytes": 2048,
+      "has_tty": true,
+      "child_count": 0
+    },
+    "events": [
+      {
+        "timestamp": "2026-02-05T01:05:00Z",
+        "event_type": "ProcessExit",
+        "details": "{\"exit_code\":0,\"outcome_hint\":\"user_spared\",\"reason\":\"user\",\"comm\":\"pytest\"}"
+      }
+    ],
+    "belief": {
+      "p_abandoned": 0.65,
+      "p_legitimate": 0.2,
+      "p_zombie": 0.05,
+      "p_useful_but_bad": 0.1,
+      "confidence": 0.85,
+      "score": 70.0,
+      "recommendation": "kill"
+    }
+  },
+  {
+    "timestamp": "2026-02-05T01:10:00Z",
+    "pid": 4343,
+    "identity_hash": "hash_shadow_4343",
+    "state": {
+      "cpu_percent": 2.5,
+      "memory_bytes": 52428800,
+      "rss_bytes": 26214400,
+      "fd_count": 8,
+      "thread_count": 2,
+      "state_char": "R",
+      "io_read_bytes": 1024,
+      "io_write_bytes": 512,
+      "has_tty": false,
+      "child_count": 1
+    },
+    "events": [
+      {
+        "timestamp": "2026-02-05T01:10:00Z",
+        "event_type": "EvidenceSnapshot",
+        "details": "{\"comm\":\"nginx\"}"
+      }
+    ],
+    "belief": {
+      "p_abandoned": 0.1,
+      "p_legitimate": 0.8,
+      "p_zombie": 0.05,
+      "p_useful_but_bad": 0.05,
+      "confidence": 0.6,
+      "score": 20.0,
+      "recommendation": "keep"
+    }
+  }
+]

@@ -1,0 +1,2 @@
+{"event":"shadow_fixture_capture","timestamp":"2026-02-05T01:12:00Z","run_id":"shadow-fixture-20260205","retention_tier":"hot","duration_ms":4,"artifacts":[{"path":"observations/shadow/shadow_observations.json","kind":"observations"}]}
+{"event":"shadow_fixture_report","timestamp":"2026-02-05T01:12:02Z","run_id":"shadow-fixture-20260205","retention_tier":"hot","duration_ms":6,"artifacts":[{"path":"shadow_report.json","kind":"report"}]}

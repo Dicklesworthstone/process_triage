@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0.0",
+  "fixture_id": "shadow-20260205",
+  "domain": "shadow",
+  "capture_time": "2026-02-05T02:52:30.007980Z",
+  "source": {
+    "origin": "manual-curated",
+    "command": [
+      "shadow fixtures"
+    ],
+    "paths": [
+      "test/fixtures/shadow"
+    ]
+  },
+  "tool_versions": {
+    "fixture_capture": "1.0.0",
+    "pt": "2.0.0",
+    "schema": "fixture-manifest@1"
+  },
+  "redaction_profile": "safe",
+  "artifacts": [
+    {
+      "path": "logs/shadow_fixture.jsonl",
+      "kind": "log",
+      "sha256": "95cb9cddf664983777d279153f66e2fa73e208932623912415f1296033dba48c",
+      "bytes": 439,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "observations/shadow/shadow_observations.json",
+      "kind": "config",
+      "sha256": "dfa04918c7c558294d06269daced0817e933fe260950cd0f54201196551396d9",
+      "bytes": 2382,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "shadow_report.json",
+      "kind": "config",
+      "sha256": "ea550a39fdb7941ad89db63d01ceb23da8236cee17d292839d8c28f7c8e00dec",
+      "bytes": 695,
+      "redaction_profile": "safe"
+    }
+  ],
+  "description": "Shadow mode fixtures (observations + report)",
+  "manifest_sha256": "147f8e5779e202d2e6ac40b4d613e842ca63d16079baa076e13f67afab8aa8f1"
+}
