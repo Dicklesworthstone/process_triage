@@ -253,10 +253,13 @@ fn test_inference_fixture_golden_outputs() {
 
     for case in &input.cases {
         let actual = build_expected_case(case, &priors);
-        let expected_case = expected_map
-            .get(&case.case_id)
-            .unwrap_or_else(|| panic!("missing expected case {}", case.case_id));
-        assert_case_matches(expected_case, &actual);
+        let expected_case = expected_map.get(&case.case_id);
+        assert!(
+            expected_case.is_some(),
+            "missing expected case {}",
+            case.case_id
+        );
+        assert_case_matches(expected_case.unwrap(), &actual);
     }
 }
 
@@ -330,6 +333,27 @@ fn test_missing_evidence_graceful() {
         result.posterior.zombie,
     ] {
         assert!(value.is_finite());
+    }
+}
+
+#[test]
+fn test_nan_evidence_rejected() {
+    let priors = load_priors_fixture();
+    let evidence = Evidence {
+        cpu: Some(CpuEvidence::Fraction { occupancy: f64::NAN }),
+        ..Evidence::default()
+    };
+    let err = compute_posterior(&priors, &evidence).unwrap_err();
+    match err {
+        pt_core::inference::PosteriorError::InvalidEvidence { field, .. } => {
+            assert_eq!(field, "cpu.occupancy");
+        }
+        _ => {
+            assert!(
+                matches!(err, pt_core::inference::PosteriorError::InvalidEvidence { .. }),
+                "unexpected error for nan evidence"
+            );
+        }
     }
 }
 
