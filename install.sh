@@ -19,6 +19,20 @@ readonly GITHUB_REPO="Dicklesworthstone/process_triage"
 readonly RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/master"
 readonly RELEASES_URL="https://github.com/${GITHUB_REPO}/releases"
 
+# Minimal downloader for early bootstrapping (stdout).
+fetch_stdout() {
+    local url="$1"
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL --connect-timeout 10 --max-time 120 "$url"
+    elif command -v wget &>/dev/null; then
+        wget -q --timeout=10 -O - "$url"
+    else
+        printf 'Neither curl nor wget available\n' >&2
+        return 1
+    fi
+}
+
 # ==============================================================================
 # Self-Refresh: Re-download when piped to avoid CDN cache issues
 # ==============================================================================
@@ -28,7 +42,7 @@ maybe_self_refresh() {
     if [[ -p /dev/stdin ]] && [[ -z "${PT_REFRESHED:-}" ]]; then
         export PT_REFRESHED=1
         # Re-execute with cache-busted URL
-        exec bash <(curl -fsSL "${RAW_URL}/install.sh?cb=$(date +%s)")
+        exec bash <(fetch_stdout "${RAW_URL}/install.sh?cb=$(date +%s)")
     fi
 }
 
@@ -191,7 +205,7 @@ get_latest_version() {
     version_url=$(append_cache_buster "${RAW_URL}/VERSION")
 
     local version
-    version=$(curl -fsSL --connect-timeout 5 "$version_url" 2>/dev/null | tr -d '[:space:]') || {
+    version=$(fetch_stdout "$version_url" 2>/dev/null | tr -d '[:space:]') || {
         log_error "Could not fetch VERSION file"
         log_error "URL: ${RAW_URL}/VERSION"
         return 1
@@ -313,7 +327,7 @@ download_checksums() {
 
     local checksum_url="${RELEASES_URL}/download/v${version}/checksums.sha256"
 
-    curl -fsSL --connect-timeout 5 "$checksum_url" -o "$output" 2>/dev/null || {
+    download "$checksum_url" "$output" 2>/dev/null || {
         log_warn "Could not download checksums file"
         log_warn "URL: $checksum_url"
         return 1

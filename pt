@@ -65,14 +65,34 @@ main() {
         echo "Error: 'pt-core' binary not found." >&2
         echo "Please install it via:" >&2
         echo "  curl -fsSL $INSTALL_URL | bash" >&2
+        echo "  # or" >&2
+        echo "  wget -qO- $INSTALL_URL | bash" >&2
         exit 1
     }
+
+    local installer_cmd
+    if command -v curl &>/dev/null; then
+        installer_cmd="curl -fsSL $INSTALL_URL | bash"
+    elif command -v wget &>/dev/null; then
+        installer_cmd="wget -qO- $INSTALL_URL | bash"
+    else
+        installer_cmd=""
+    fi
 
     # Special handling for 'update' (wrapper-level)
     if [[ "${1:-}" == "update" ]]; then
         echo "Updating Process Triage..."
-        curl -fsSL "$INSTALL_URL" | bash
+        if [[ -z "$installer_cmd" ]]; then
+            echo "Error: neither curl nor wget is available to run installer." >&2
+            exit 1
+        fi
+        bash -c "set -euo pipefail; $installer_cmd"
         exit $?
+    fi
+
+    if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+        printf 'pt %s\n' "$VERSION"
+        exit 0
     fi
 
     # Forward to pt-core

@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0.0",
-  "fixture_id": "pt-core-20260204",
+  "fixture_id": "pt-core-20260205",
   "domain": "pt-core",
-  "capture_time": "2026-02-04T21:15:51.996879Z",
+  "capture_time": "2026-02-05T06:39:14.214866Z",
   "source": {
     "origin": "manual-copy",
     "command": [
@@ -20,10 +20,31 @@
   "redaction_profile": "safe",
   "artifacts": [
     {
+      "path": "inference_cases_expected.json",
+      "kind": "config",
+      "sha256": "28d121c895a775665d0ab39d0fcfe74eabf5105d588a80eeb0276eb954423e5d",
+      "bytes": 2613,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "inference_cases_input.json",
+      "kind": "config",
+      "sha256": "3adea54563c1b90e80f4867ec42fd09011f465836a37e7c3212a8f6083880ef1",
+      "bytes": 844,
+      "redaction_profile": "safe"
+    },
+    {
       "path": "invalid_priors.json",
       "kind": "priors",
       "sha256": "d0fc4561cd303b37081f5beaf71f01f365ada05ec1f276a0111559fd4401dbd8",
       "bytes": 526,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "logs/inference_regression.jsonl",
+      "kind": "log",
+      "sha256": "130e070239d652cb13e9d9c8c171a6202efc94963bfb4d1bee41f667a21aaf2e",
+      "bytes": 1200,
       "redaction_profile": "safe"
     },
     {
@@ -48,6 +69,6 @@
       "redaction_profile": "safe"
     }
   ],
-  "description": "pt-core policy/priors fixtures for no-mock tests",
-  "manifest_sha256": "b26eb549828a93842e9cde0965051ccbf8041c00e8d47101eea181c2b5155a35"
+  "description": "pt-core policy/priors + inference fixtures",
+  "manifest_sha256": "ca0a1e2951c55a956c8b158db7dc5d77f9d72e204f7e6b98067fa87e8144983e"
 }
