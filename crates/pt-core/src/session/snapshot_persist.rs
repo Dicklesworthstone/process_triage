@@ -43,16 +43,14 @@ pub struct ArtifactEnvelope<T> {
 }
 
 impl<T: Serialize> ArtifactEnvelope<T> {
-    /// Create a new envelope, computing the integrity hash from the payload.
+    /// Create a new envelope with integrity computed at persistence time.
     pub fn new(session_id: &str, host_id: &str, payload: T) -> Self {
-        let payload_json = serde_json::to_string(&payload).unwrap_or_default();
-        let integrity = sha256_hex(payload_json.as_bytes());
         Self {
             schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
             session_id: session_id.to_string(),
             generated_at: chrono::Utc::now().to_rfc3339(),
             host_id: host_id.to_string(),
-            integrity_sha256: integrity,
+            integrity_sha256: String::new(),
             payload,
         }
     }
@@ -225,10 +223,11 @@ pub fn redact_cmd(cmd: &str, policy: RedactionPolicy) -> String {
 fn persist_artifact<T: Serialize>(
     handle: &SessionHandle,
     rel_path: &str,
-    envelope: &ArtifactEnvelope<T>,
+    mut envelope: ArtifactEnvelope<T>,
 ) -> Result<PathBuf, SessionError> {
     let path = handle.dir.join(rel_path);
-    super::write_json_pretty_atomic(&path, envelope)?;
+    envelope.integrity_sha256 = payload_sha256(&envelope.payload, &path)?;
+    super::write_json_pretty_atomic(&path, &envelope)?;
     Ok(path)
 }
 
@@ -263,8 +262,11 @@ fn load_artifact<T: serde::de::DeserializeOwned + Serialize>(
     }
 
     // Validate integrity hash.
-    let payload_json = serde_json::to_string(&envelope.payload).unwrap_or_default();
-    let computed = sha256_hex(payload_json.as_bytes());
+    let payload_json = serde_json::to_vec(&envelope.payload).map_err(|e| SessionError::Json {
+        path: path.clone(),
+        source: e,
+    })?;
+    let computed = sha256_hex(&payload_json);
     if computed != envelope.integrity_sha256 {
         return Err(SessionError::Json {
             path,
@@ -276,6 +278,14 @@ fn load_artifact<T: serde::de::DeserializeOwned + Serialize>(
     }
 
     Ok(envelope)
+}
+
+fn payload_sha256<T: Serialize>(payload: &T, path: &PathBuf) -> Result<String, SessionError> {
+    let payload_json = serde_json::to_vec(payload).map_err(|e| SessionError::Json {
+        path: path.clone(),
+        source: e,
+    })?;
+    Ok(sha256_hex(&payload_json))
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +300,7 @@ pub fn persist_inventory(
     artifact: InventoryArtifact,
 ) -> Result<PathBuf, SessionError> {
     let envelope = ArtifactEnvelope::new(session_id, host_id, artifact);
-    persist_artifact(handle, INVENTORY_FILE, &envelope)
+    persist_artifact(handle, INVENTORY_FILE, envelope)
 }
 
 /// Write the inference artifact for a session.
@@ -301,7 +311,7 @@ pub fn persist_inference(
     artifact: InferenceArtifact,
 ) -> Result<PathBuf, SessionError> {
     let envelope = ArtifactEnvelope::new(session_id, host_id, artifact);
-    persist_artifact(handle, INFERENCE_FILE, &envelope)
+    persist_artifact(handle, INFERENCE_FILE, envelope)
 }
 
 /// Write the plan artifact for a session.
@@ -312,7 +322,7 @@ pub fn persist_plan(
     artifact: PlanArtifact,
 ) -> Result<PathBuf, SessionError> {
     let envelope = ArtifactEnvelope::new(session_id, host_id, artifact);
-    persist_artifact(handle, PLAN_FILE, &envelope)
+    persist_artifact(handle, PLAN_FILE, envelope)
 }
 
 /// Write run metadata for a session.
@@ -323,7 +333,7 @@ pub fn persist_run_metadata(
     metadata: RunMetadata,
 ) -> Result<PathBuf, SessionError> {
     let envelope = ArtifactEnvelope::new(session_id, host_id, metadata);
-    persist_artifact(handle, META_FILE, &envelope)
+    persist_artifact(handle, META_FILE, envelope)
 }
 
 /// Load the inventory artifact with validation.

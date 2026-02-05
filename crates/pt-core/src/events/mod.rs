@@ -143,14 +143,14 @@ impl EventBus {
     /// Subscribe to receive progress events.
     pub fn subscribe(&self) -> mpsc::Receiver<ProgressEvent> {
         let (tx, rx) = mpsc::channel();
-        let mut senders = self.senders.lock().unwrap();
+        let mut senders = self.senders.lock().unwrap_or_else(|err| err.into_inner());
         senders.push(tx);
         rx
     }
 
     /// Emit a progress event to all subscribers.
     pub fn emit(&self, event: ProgressEvent) {
-        let mut senders = self.senders.lock().unwrap();
+        let mut senders = self.senders.lock().unwrap_or_else(|err| err.into_inner());
         senders.retain(|sender| sender.send(event.clone()).is_ok());
     }
 }
