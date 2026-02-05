@@ -490,10 +490,15 @@ pt-core agent watch [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--notify-exec <cmd>` | Execute on threshold crossing |
+| `--notify-exec <cmd>` | Execute via shell on threshold crossing |
+| `--notify-cmd <cmd>` | Execute directly (no shell) on threshold crossing |
+| `--notify-arg <arg>` | Repeatable args for `--notify-cmd` |
 | `--format jsonl` | Stream events |
 | `--threshold low\|medium\|high\|critical` | Trigger sensitivity |
 | `--interval <seconds>` | Check frequency (default: 60) |
+
+Notes:
+- If both `--notify-cmd` and `--notify-exec` are set, `--notify-cmd` takes precedence.
 
 **Events Emitted:**
 

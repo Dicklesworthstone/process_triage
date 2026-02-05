@@ -104,7 +104,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     // Execute and capture output
     let mut child = cmd
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| QuickScanError::CommandFailed(e.to_string()))?;
 

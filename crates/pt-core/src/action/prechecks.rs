@@ -338,10 +338,25 @@ impl LivePreCheckProvider {
 
     /// Create with default config.
     pub fn with_defaults() -> Self {
+        let protected_filter = ProtectedFilter::from_guardrails(&Guardrails::default()).ok();
+        let known_supervisors: HashSet<String> = [
+            "systemd",
+            "init",
+            "upstart",
+            "supervisord",
+            "runit",
+            "s6-supervise",
+            "runsv",
+            "containerd-shim",
+            "docker-containerd",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         Self {
-            protected_filter: None,
+            protected_filter,
             config: LivePreCheckConfig::default(),
-            known_supervisors: HashSet::new(),
+            known_supervisors,
         }
     }
 
