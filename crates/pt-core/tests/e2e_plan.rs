@@ -532,6 +532,67 @@ mod plan_schema {
             );
         }
     }
+
+    #[test]
+    fn candidates_include_policy_fields() {
+        let output = pt_core_fast()
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--threshold",
+                "0",
+                "--max-candidates",
+                "5",
+                "--sample-size",
+                TEST_SAMPLE_SIZE,
+            ])
+            .assert()
+            // Exit code 0 = no candidates, 1 = candidates found (both are operational success)
+            .code(predicate::in_iter([0, 1]))
+            .get_output()
+            .stdout
+            .clone();
+
+        let json: Value = serde_json::from_slice(&output).expect("Output should be valid JSON");
+        let summary = json
+            .get("summary")
+            .expect("Missing summary in agent plan output");
+        assert!(
+            summary.get("policy_blocked").is_some(),
+            "summary missing policy_blocked field"
+        );
+        assert!(
+            summary.get("policy_blocked").unwrap().is_number(),
+            "summary.policy_blocked should be a number"
+        );
+
+        let candidates = json
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .expect("candidates must be an array");
+
+        assert!(
+            !candidates.is_empty(),
+            "expected at least one candidate at threshold 0"
+        );
+
+        for candidate in candidates {
+            assert!(
+                candidate.get("policy_blocked").is_some(),
+                "candidate missing policy_blocked field"
+            );
+            let policy = candidate
+                .get("policy")
+                .expect("candidate missing policy field");
+            assert!(policy.is_object(), "candidate.policy should be an object");
+            assert!(
+                policy.get("allowed").is_some(),
+                "candidate.policy.allowed missing"
+            );
+        }
+    }
 }
 
 // ============================================================================
