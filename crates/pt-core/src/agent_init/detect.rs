@@ -186,9 +186,9 @@ fn detect_single_agent(agent_type: &AgentType, home: &Path) -> Option<DetectedAg
 
     // Special handling for Copilot (gh extension)
     if *agent_type == AgentType::Copilot {
-        if let Some(copilot_status) = check_copilot_extension() {
+        if let Some((installed, copilot_status)) = check_copilot_extension() {
             info.notes.push(copilot_status);
-            info.is_installed = info.notes.iter().any(|n| n.contains("installed"));
+            info.is_installed = installed;
         }
     } else {
         // For other agents, require either config dir or executable
@@ -245,7 +245,7 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Check for GitHub Copilot CLI extension.
-fn check_copilot_extension() -> Option<String> {
+fn check_copilot_extension() -> Option<(bool, String)> {
     let output = Command::new("gh")
         .args(["extension", "list"])
         .output()
@@ -254,9 +254,12 @@ fn check_copilot_extension() -> Option<String> {
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if stdout.contains("copilot") {
-            Some("Copilot extension installed".to_string())
+            Some((true, "Copilot extension installed".to_string()))
         } else {
-            Some("gh found but Copilot extension not installed".to_string())
+            Some((
+                false,
+                "gh found but Copilot extension not installed".to_string(),
+            ))
         }
     } else {
         None
