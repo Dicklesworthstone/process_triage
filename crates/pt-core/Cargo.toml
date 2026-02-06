@@ -85,3 +85,7 @@ harness = false
 [[bench]]
 name = "session_diff"
 harness = false
+
+[[bench]]
+name = "quick_scan_synthetic"
+harness = false

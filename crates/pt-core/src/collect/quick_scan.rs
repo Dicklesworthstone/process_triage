@@ -247,6 +247,52 @@ fn is_header_line(line: &str) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic parsing helpers (bench + tests)
+// ---------------------------------------------------------------------------
+
+/// Deterministically parse Linux `ps` output into `ProcessRecord`s without
+/// consulting `/proc` for boot_id/uptime-derived ticks.
+///
+/// This exists to support **CI-stable benchmarks** (and potential fixture-based
+/// tests). It is not part of the end-user CLI surface.
+#[doc(hidden)]
+pub fn parse_ps_output_synthetic_linux(
+    output: &str,
+) -> Result<Vec<ProcessRecord>, QuickScanError> {
+    // A fixed reference time makes elapsed/start_time values deterministic.
+    const NOW_UNIX: i64 = 1_700_000_000;
+    const PLATFORM: &str = "linux";
+    let boot_id = Some("synthetic".to_string());
+
+    let mut processes = Vec::new();
+    let mut header_checked = false;
+
+    for (line_num, line) in output.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if !header_checked {
+            header_checked = true;
+            if is_header_line(line) {
+                continue;
+            }
+        }
+
+        let record = parse_ps_line_synthetic(line, PLATFORM, &boot_id, NOW_UNIX).map_err(|e| {
+            QuickScanError::ParseError {
+                message: e,
+                line_num: line_num + 1,
+            }
+        })?;
+        processes.push(record);
+    }
+
+    Ok(processes)
+}
+
 /// Detect the current platform.
 fn detect_platform() -> String {
     #[cfg(target_os = "linux")]
@@ -402,6 +448,83 @@ fn parse_ps_line(
     })
 }
 
+/// Parse a single line of ps output like `parse_ps_line`, but with deterministic
+/// timing + start_id derivation and no `/proc` reads (bench/test helper).
+fn parse_ps_line_synthetic(
+    line: &str,
+    platform: &str,
+    boot_id: &Option<String>,
+    now_unix: i64,
+) -> Result<ProcessRecord, String> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+
+    let comm_idx = 17;
+    if fields.len() <= comm_idx {
+        return Err(format!(
+            "Insufficient fields: expected {}+, got {}",
+            comm_idx + 1,
+            fields.len()
+        ));
+    }
+
+    let pid: u32 = fields[0].parse().map_err(|_| "Invalid PID")?;
+    let ppid: u32 = fields[1].parse().map_err(|_| "Invalid PPID")?;
+    let uid: u32 = fields[2].parse().map_err(|_| "Invalid UID")?;
+    let user = fields[3].to_string();
+    let pgid: u32 = fields[4].parse().map_err(|_| "Invalid PGID")?;
+    let sid: u32 = fields[5].parse().map_err(|_| "Invalid SID")?;
+
+    let state_char = fields[6].chars().next().unwrap_or('?');
+    let state = ProcessState::from_char(state_char);
+
+    let cpu_percent: f64 = fields[7].parse().unwrap_or(0.0);
+
+    let rss_kb: u64 = fields[8].parse().unwrap_or(0);
+    let rss_bytes = rss_kb * 1024;
+
+    let vsz_kb: u64 = fields[9].parse().unwrap_or(0);
+    let vsz_bytes = vsz_kb * 1024;
+
+    let tty_raw = fields[10];
+    let tty = if tty_raw == "?" || tty_raw == "-" {
+        None
+    } else {
+        Some(tty_raw.to_string())
+    };
+
+    let (start_time_unix, elapsed) = parse_timing_fields_at(platform, &fields, now_unix)?;
+
+    let comm = fields.get(comm_idx).unwrap_or(&"").to_string();
+    let cmd = if fields.len() > comm_idx + 1 {
+        fields[comm_idx + 1..].join(" ")
+    } else {
+        comm.clone()
+    };
+
+    let start_id = compute_start_id_synthetic(platform, boot_id, start_time_unix, pid);
+
+    Ok(ProcessRecord {
+        pid: ProcessId(pid),
+        ppid: ProcessId(ppid),
+        uid,
+        user,
+        pgid: Some(pgid),
+        sid: Some(sid),
+        start_id,
+        comm,
+        cmd,
+        state,
+        cpu_percent,
+        rss_bytes,
+        vsz_bytes,
+        tty,
+        start_time_unix,
+        elapsed,
+        source: "quick_scan".to_string(),
+        container_info: None,
+    })
+}
+
 /// Parse timing fields from ps output.
 fn parse_timing_fields(platform: &str, fields: &[&str]) -> Result<(i64, Duration), String> {
     // lstart is fields 11-15 (day month date time year) for Linux
@@ -431,6 +554,43 @@ fn parse_timing_fields(platform: &str, fields: &[&str]) -> Result<(i64, Duration
     let start_time_unix = now - elapsed_secs as i64;
 
     Ok((start_time_unix, elapsed))
+}
+
+fn parse_timing_fields_at(
+    platform: &str,
+    fields: &[&str],
+    now_unix: i64,
+) -> Result<(i64, Duration), String> {
+    let lstart_idx = 11;
+    let etimes_idx = lstart_idx + 5;
+    let etimes_str = fields
+        .get(etimes_idx)
+        .ok_or_else(|| format!("Missing etimes field for platform {platform}"))?;
+
+    let elapsed_secs: u64 = if etimes_str.contains(':') {
+        parse_etime_format(etimes_str).unwrap_or(0)
+    } else {
+        etimes_str.parse().unwrap_or(0)
+    };
+
+    let elapsed = Duration::from_secs(elapsed_secs);
+    let start_time_unix = now_unix - elapsed_secs as i64;
+    Ok((start_time_unix, elapsed))
+}
+
+fn compute_start_id_synthetic(
+    platform: &str,
+    boot_id: &Option<String>,
+    start_time_unix: i64,
+    pid: u32,
+) -> StartId {
+    let boot = boot_id.as_deref().unwrap_or("synthetic");
+    let ticks = start_time_unix.max(0) as u64;
+    match platform {
+        "linux" => StartId::from_linux(boot, ticks, pid),
+        "macos" => StartId::from_macos(boot, ticks, pid),
+        _ => StartId(format!("{boot}:{ticks}:{pid}")),
+    }
 }
 
 /// Parse etime format: [[dd-]hh:]mm:ss

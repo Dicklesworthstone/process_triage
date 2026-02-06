@@ -63,6 +63,7 @@ assert_le_ns() {
 
 echo "[bench_smoke] Running criterion benches (smoke)..."
 bench_one pt-core collect_parsers
+bench_one pt-core quick_scan_synthetic
 bench_one pt-core inference_posteriors
 bench_one pt-core session_diff
 bench_one pt-math beta_ops
@@ -101,6 +102,12 @@ assert_le_ns \
 assert_le_ns \
   "pt-core compute_posterior_10k" \
   "target/criterion/posterior/compute_posterior_10k/new/estimates.json" \
+  1000000000
+
+# pt-core quick scan synthetic parsing (10k lines, includes allocations)
+assert_le_ns \
+  "pt-core parse_ps_output_synthetic_10k" \
+  "target/criterion/quick_scan/parse_ps_output_synthetic_10k/new/estimates.json" \
   1000000000
 
 # pt-core session diff (10k entries, large-ish HashMap + delta build)
