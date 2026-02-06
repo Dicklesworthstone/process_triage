@@ -32,6 +32,58 @@ fn pt_core() -> Command {
     cmd
 }
 
+/// Parse any JSON values embedded in stdout by scanning for `{` / `[` and
+/// attempting JSON deserialization from that byte offset.
+///
+/// Some `pt-core` subcommands may emit progress JSONL or other informational
+/// lines alongside structured JSON output; this keeps tests resilient by
+/// extracting the structured payload(s) from mixed stdout.
+fn parse_embedded_json_values(stdout: &[u8]) -> Vec<Value> {
+    let text = String::from_utf8_lossy(stdout);
+    let bytes = text.as_bytes();
+    let mut values = Vec::new();
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'{' || b == b'[' {
+            let sub = &text[i..];
+            let mut stream = serde_json::Deserializer::from_str(sub).into_iter::<Value>();
+            if let Some(Ok(v)) = stream.next() {
+                let consumed = stream.byte_offset();
+                values.push(v);
+                i += consumed.max(1);
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    values
+}
+
+/// Parse the last structured JSON object from stdout.
+fn parse_last_json_object(stdout: &[u8]) -> Value {
+    parse_embedded_json_values(stdout)
+        .into_iter()
+        .rev()
+        .find(|v| v.is_object())
+        .expect("expected at least one JSON object in stdout")
+}
+
+/// Parse the last structured JSON object that matches `{"command": <value>}`.
+fn parse_last_json_object_with_command(stdout: &[u8], command: &str) -> Value {
+    let values = parse_embedded_json_values(stdout);
+    for v in values.into_iter().rev() {
+        if v.get("command").and_then(|c| c.as_str()) == Some(command) {
+            return v;
+        }
+    }
+
+    // Fallback: accept any JSON object so tests fail with more context later.
+    parse_last_json_object(stdout)
+}
+
 /// Create a minimal observation JSON file in a shadow storage dir.
 /// Returns the path to the created file.
 fn write_fixture_observations(base_dir: &std::path::Path, count: usize) -> std::path::PathBuf {
@@ -621,7 +673,8 @@ fn test_shadow_start_foreground_one_iteration() {
         .stdout
         .clone();
 
-    let json: Value = serde_json::from_slice(&output).expect("parse JSON");
+    // Shadow run inherits stdout from iteration subprocess, so parse the last JSON object
+    let json = parse_last_json_object_with_command(&output, "shadow run");
     assert_eq!(json["command"], "shadow run");
     assert_eq!(json["iterations"], 1, "should have completed 1 iteration");
     assert!(
@@ -759,7 +812,8 @@ fn test_shadow_lifecycle_foreground_workflow() {
         .stdout
         .clone();
 
-    let run_json: Value = serde_json::from_slice(&run_output).expect("parse");
+    // Shadow run inherits stdout from iteration subprocess
+    let run_json = parse_last_json_object_with_command(&run_output, "shadow run");
     assert_eq!(run_json["command"], "shadow run");
     assert_eq!(run_json["iterations"], 1);
 
