@@ -251,8 +251,16 @@ mod e2e_scenarios {
 
         // Use extremely high min-age to ensure no candidates
         // Note: We can't guarantee no candidates on a busy system, so we accept both exit codes
-        pt_core()
-            .args(["--format", "json", "agent", "plan", "--sample-size", "10"])
+        pt_core().args([
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--sample-size",
+            "10",
+            "--min-age",
+            "315360000",
+        ])
             .assert()
             .code(predicate::in_iter([0, 1])); // 0 = no candidates, 1 = candidates found
 

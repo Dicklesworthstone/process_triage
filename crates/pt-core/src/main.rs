@@ -8126,16 +8126,27 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     };
     let mut shadow_recorded = 0u64;
 
+    // Apply min-age filter before sampling (if configured)
+    let eligible_processes: Vec<_> = if let Some(min_age) = args.min_age {
+        filter_result
+            .passed
+            .iter()
+            .filter(|proc| proc.elapsed.as_secs() >= min_age)
+            .collect()
+    } else {
+        filter_result.passed.iter().collect()
+    };
+
     // Apply sampling if requested (for testing)
     let processes_to_infer: Vec<_> = if let Some(sample_size) = args.sample_size {
         use rand::seq::SliceRandom;
         let mut rng = rand::rng();
-        let mut sampled: Vec<_> = filter_result.passed.iter().collect();
+        let mut sampled: Vec<_> = eligible_processes;
         sampled.shuffle(&mut rng);
         sampled.truncate(sample_size);
         sampled
     } else {
-        filter_result.passed.iter().collect()
+        eligible_processes
     };
 
     let current_cpu_pct: f64 = processes_to_infer
@@ -8143,7 +8154,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         .map(|p| p.cpu_percent)
         .sum();
 
-    let total_processes = processes_to_infer.len() as u64;
+    let candidates_evaluated = processes_to_infer.len();
+    let total_processes = candidates_evaluated as u64;
     let mut processed = 0u64;
 
     if let Some(ref e) = emitter {
@@ -8490,7 +8502,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut summary = serde_json::json!({
         "total_processes_scanned": total_scanned,
         "protected_filtered": protected_filtered_count,
-        "candidates_evaluated": filter_result.passed.len(),
+        "candidates_evaluated": candidates_evaluated,
         "above_threshold": above_threshold_count,  // Candidates meeting threshold before truncation
         "candidates_returned": candidates.len(),   // After truncation to max_candidates
         "kill_recommendations": kill_candidates.len(),
@@ -8573,6 +8585,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "dry_run": global.dry_run,
             "robot": global.robot,
             "shadow": global.shadow,
+            "min_age": args.min_age,
+            "sample_size": args.sample_size,
+            "include_kernel_threads": args.include_kernel_threads,
+            "deep": args.deep,
             "since": args.since,
             "since_time": args.since_time,
             "goal": args.goal,
@@ -9409,7 +9425,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     // Determine which actions to apply
     let use_recommended =
         args.recommended || (args.resume && args.pids.is_empty() && args.targets.is_empty());
-    let target_pids: Vec<u32> = if use_recommended {
+    let mut target_pids: Vec<u32> = if use_recommended {
         plan.actions
             .iter()
             .filter(|a| !a.blocked)
@@ -9426,6 +9442,31 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         eprintln!("agent apply: must specify --recommended, --pids, or --targets");
         return ExitCode::ArgsError;
     };
+
+    if let Some(min_age) = args.min_age {
+        if !target_pids.is_empty() {
+            let scan_options = QuickScanOptions {
+                pids: target_pids.clone(),
+                include_kernel_threads: false,
+                timeout: global.timeout.map(std::time::Duration::from_secs),
+                progress: None,
+            };
+            let scan_result = match quick_scan(&scan_options) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("agent apply: min-age scan failed: {}", e);
+                    return ExitCode::InternalError;
+                }
+            };
+            let eligible: HashSet<u32> = scan_result
+                .processes
+                .iter()
+                .filter(|proc| proc.elapsed.as_secs() >= min_age)
+                .map(|proc| proc.pid.0)
+                .collect();
+            target_pids.retain(|pid| eligible.contains(pid));
+        }
+    }
 
     if target_pids.is_empty() {
         if let Some(ref e) = emitter {
