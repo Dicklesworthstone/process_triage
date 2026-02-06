@@ -38,37 +38,37 @@ fn agent_plan_json(extra_args: &[&str]) -> Value {
     cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
 
     let mut args = vec![
-        "--format", "json",
-        "agent", "plan",
-        "--sample-size", "5",
-        "--min-posterior", "0.0",
+        "--format",
+        "json",
+        "agent",
+        "plan",
+        "--sample-size",
+        "5",
+        "--min-posterior",
+        "0.0",
     ];
     args.extend_from_slice(extra_args);
 
-    let output = cmd
-        .args(&args)
-        .assert()
-        .get_output()
-        .stdout
-        .clone();
+    let output = cmd.args(&args).assert().get_output().stdout.clone();
 
     serde_json::from_slice(&output).expect("parse agent plan JSON")
 }
 
 /// Export a preset policy, modify its guardrails, and write to a file.
 /// This ensures all required fields (loss_matrix, fdr_control, etc.) are present.
-fn export_preset_with_guardrails(
-    dir: &std::path::Path,
-    guardrails: Value,
-) -> std::path::PathBuf {
+fn export_preset_with_guardrails(dir: &std::path::Path, guardrails: Value) -> std::path::PathBuf {
     let export_path = dir.join("base_policy.json");
 
     // Export the developer preset as a base
     pt_core()
         .args([
-            "--format", "json",
-            "config", "export-preset", "developer",
-            "--output", export_path.to_str().unwrap(),
+            "--format",
+            "json",
+            "config",
+            "export-preset",
+            "developer",
+            "--output",
+            export_path.to_str().unwrap(),
         ])
         .assert()
         .success();
@@ -153,9 +153,7 @@ fn test_agent_plan_supervisor_structure() {
 
     eprintln!(
         "[INFO] supervisor: detected={}, type={}, action={}",
-        supervisor["detected"],
-        supervisor["type"],
-        supervisor["recommended_action"]
+        supervisor["detected"], supervisor["type"], supervisor["recommended_action"]
     );
 }
 
@@ -269,9 +267,12 @@ fn test_agent_plan_candidates_have_action_rationale() {
 fn test_capabilities_check_action_sigterm() {
     let output = pt_core()
         .args([
-            "--format", "json",
-            "agent", "capabilities",
-            "--check-action", "sigterm",
+            "--format",
+            "json",
+            "agent",
+            "capabilities",
+            "--check-action",
+            "sigterm",
         ])
         .assert()
         .success()
@@ -291,19 +292,19 @@ fn test_capabilities_check_action_sigterm() {
         json["supported"].is_boolean(),
         "supported should be boolean"
     );
-    assert!(
-        json.get("reason").is_some(),
-        "should have 'reason' field"
-    );
+    assert!(json.get("reason").is_some(), "should have 'reason' field");
 }
 
 #[test]
 fn test_capabilities_check_action_sigkill() {
     let output = pt_core()
         .args([
-            "--format", "json",
-            "agent", "capabilities",
-            "--check-action", "sigkill",
+            "--format",
+            "json",
+            "agent",
+            "capabilities",
+            "--check-action",
+            "sigkill",
         ])
         .assert()
         .success()
@@ -320,9 +321,12 @@ fn test_capabilities_check_action_sigkill() {
 fn test_capabilities_check_action_nice() {
     let output = pt_core()
         .args([
-            "--format", "json",
-            "agent", "capabilities",
-            "--check-action", "nice",
+            "--format",
+            "json",
+            "agent",
+            "capabilities",
+            "--check-action",
+            "nice",
         ])
         .assert()
         .success()
@@ -353,13 +357,16 @@ fn test_capabilities_supervisors_structure() {
     );
 
     let supervisors = &json["supervisors"];
-    assert!(
-        supervisors.is_object(),
-        "supervisors should be an object"
-    );
+    assert!(supervisors.is_object(), "supervisors should be an object");
 
     // Each supervisor type should be a boolean (available/not)
-    let expected_keys = ["systemd", "docker_daemon", "pm2", "supervisord", "kubernetes"];
+    let expected_keys = [
+        "systemd",
+        "docker_daemon",
+        "pm2",
+        "supervisord",
+        "kubernetes",
+    ];
     for key in expected_keys {
         assert!(
             supervisors.get(key).is_some(),
@@ -417,8 +424,10 @@ fn test_config_validate_custom_guardrails() {
 
     pt_core()
         .args([
-            "--format", "json",
-            "config", "validate",
+            "--format",
+            "json",
+            "config",
+            "validate",
             policy_path.to_str().unwrap(),
         ])
         .assert()
@@ -451,8 +460,10 @@ fn test_config_validate_accepts_invalid_regex_in_guardrails() {
 
     pt_core()
         .args([
-            "--format", "json",
-            "config", "validate",
+            "--format",
+            "json",
+            "config",
+            "validate",
             policy_path.to_str().unwrap(),
         ])
         .assert()
@@ -483,8 +494,10 @@ fn test_config_validate_empty_pattern_in_guardrails() {
 
     pt_core()
         .args([
-            "--format", "json",
-            "config", "validate",
+            "--format",
+            "json",
+            "config",
+            "validate",
             policy_path.to_str().unwrap(),
         ])
         .assert()
@@ -526,11 +539,16 @@ fn test_agent_plan_with_aggressive_protected_patterns() {
 
     let output = cmd
         .args([
-            "--format", "json",
-            "--config", dir.path().to_str().unwrap(),
-            "agent", "plan",
-            "--sample-size", "5",
-            "--min-posterior", "0.0",
+            "--format",
+            "json",
+            "--config",
+            dir.path().to_str().unwrap(),
+            "agent",
+            "plan",
+            "--sample-size",
+            "5",
+            "--min-posterior",
+            "0.0",
         ])
         .assert()
         .get_output()
@@ -555,9 +573,7 @@ fn test_agent_plan_with_aggressive_protected_patterns() {
     );
 
     // No candidates should remain
-    let candidates = json["candidates"]
-        .as_array()
-        .expect("candidates array");
+    let candidates = json["candidates"].as_array().expect("candidates array");
     assert_eq!(
         candidates.len(),
         0,
@@ -695,14 +711,10 @@ fn test_agent_plan_only_kill_filter() {
     );
 
     // All returned candidates should have kill recommendation
-    let candidates = json["candidates"]
-        .as_array()
-        .expect("candidates array");
+    let candidates = json["candidates"].as_array().expect("candidates array");
 
     for (i, candidate) in candidates.iter().enumerate() {
-        let action = candidate["recommended_action"]
-            .as_str()
-            .unwrap_or("");
+        let action = candidate["recommended_action"].as_str().unwrap_or("");
         assert!(
             action == "kill" || action == "restart",
             "candidate[{}] with --only kill should have kill/restart action, got '{}'",
@@ -736,10 +748,14 @@ fn test_agent_plan_works_with_all_formats() {
 
         let assert = cmd
             .args([
-                "--format", format,
-                "agent", "plan",
-                "--sample-size", "3",
-                "--min-posterior", "0.0",
+                "--format",
+                format,
+                "agent",
+                "plan",
+                "--sample-size",
+                "3",
+                "--min-posterior",
+                "0.0",
             ])
             .assert();
 
@@ -752,6 +768,9 @@ fn test_agent_plan_works_with_all_formats() {
             code
         );
 
-        eprintln!("[INFO] agent plan works with format '{}' (exit {})", format, code);
+        eprintln!(
+            "[INFO] agent plan works with format '{}' (exit {})",
+            format, code
+        );
     }
 }
