@@ -9,7 +9,8 @@ use pt_core::collect::parse_ps_output_synthetic_linux;
 
 fn build_synthetic_ps_output_10k() -> String {
     // Header is optional; parser should skip it if present.
-    let mut out = String::from("PID PPID UID USER PGID SID STATE %CPU RSS VSZ TTY LSTART ETIMES COMM ARGS\n");
+    let mut out =
+        String::from("PID PPID UID USER PGID SID STATE %CPU RSS VSZ TTY LSTART ETIMES COMM ARGS\n");
 
     for i in 0..10_000u32 {
         let pid = 1000 + i;
@@ -50,4 +51,3 @@ fn bench_quick_scan_parse(c: &mut Criterion) {
 
 criterion_group!(benches, bench_quick_scan_parse);
 criterion_main!(benches);
-

@@ -15,7 +15,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-
 use super::resume::{
     revalidate_identity, CurrentIdentity, RevalidationIdentity, RevalidationOutcome,
 };

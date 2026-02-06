@@ -107,4 +107,3 @@ fn bench_compute_diff(c: &mut Criterion) {
 
 criterion_group!(benches, bench_compute_diff);
 criterion_main!(benches);
-

@@ -257,9 +257,7 @@ fn is_header_line(line: &str) -> bool {
 /// This exists to support **CI-stable benchmarks** (and potential fixture-based
 /// tests). It is not part of the end-user CLI surface.
 #[doc(hidden)]
-pub fn parse_ps_output_synthetic_linux(
-    output: &str,
-) -> Result<Vec<ProcessRecord>, QuickScanError> {
+pub fn parse_ps_output_synthetic_linux(output: &str) -> Result<Vec<ProcessRecord>, QuickScanError> {
     // A fixed reference time makes elapsed/start_time values deterministic.
     const NOW_UNIX: i64 = 1_700_000_000;
     const PLATFORM: &str = "linux";

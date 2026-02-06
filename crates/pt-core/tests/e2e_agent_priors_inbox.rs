@@ -88,7 +88,14 @@ fn list_priors_default_returns_json() {
 #[test]
 fn list_priors_filter_by_class() {
     let output = pt_core_fast()
-        .args(["--format", "json", "agent", "list-priors", "--class", "zombie"])
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "list-priors",
+            "--class",
+            "zombie",
+        ])
         .assert()
         .success()
         .get_output()
@@ -174,7 +181,10 @@ fn export_priors_creates_file() {
         assert!(out_path.exists(), "Exported file should exist");
         let content = fs::read_to_string(&out_path).expect("read exported file");
         let exported: Value = serde_json::from_str(&content).expect("valid JSON in exported file");
-        assert!(exported.get("priors").is_some(), "Exported file should contain priors");
+        assert!(
+            exported.get("priors").is_some(),
+            "Exported file should contain priors"
+        );
         assert!(
             exported.get("schema_version").is_some(),
             "Exported file should have schema_version",
@@ -263,10 +273,7 @@ fn import_priors_dry_run() {
 
         let json: Value = serde_json::from_slice(&output).expect("valid JSON");
         assert_eq!(json.get("dry_run").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            json.get("mode").and_then(|v| v.as_str()),
-            Some("replace"),
-        );
+        assert_eq!(json.get("mode").and_then(|v| v.as_str()), Some("replace"),);
     });
 }
 
@@ -390,10 +397,7 @@ fn inbox_empty_returns_ok() {
             .and_then(|v| v.as_array())
             .expect("items array");
         assert!(items.is_empty(), "Empty inbox should have no items");
-        assert_eq!(
-            json.get("unread_count").and_then(|v| v.as_u64()),
-            Some(0),
-        );
+        assert_eq!(json.get("unread_count").and_then(|v| v.as_u64()), Some(0),);
     });
 }
 
@@ -452,10 +456,7 @@ fn inbox_clear_empty_returns_ok() {
             .clone();
 
         let json: Value = serde_json::from_slice(&output).expect("valid JSON");
-        assert_eq!(
-            json.get("cleared").and_then(|v| v.as_u64()),
-            Some(0),
-        );
+        assert_eq!(json.get("cleared").and_then(|v| v.as_u64()), Some(0),);
     });
 }
 
@@ -473,10 +474,7 @@ fn inbox_clear_all_empty_returns_ok() {
             .clone();
 
         let json: Value = serde_json::from_slice(&output).expect("valid JSON");
-        assert_eq!(
-            json.get("cleared").and_then(|v| v.as_u64()),
-            Some(0),
-        );
+        assert_eq!(json.get("cleared").and_then(|v| v.as_u64()), Some(0),);
     });
 }
 
@@ -505,10 +503,7 @@ fn init_dry_run_produces_json() {
             Err(_) => {
                 // Locate the last top-level JSON object (multi-line)
                 // by finding the position of the last `\n{` boundary.
-                let last_obj_start = stdout_str
-                    .rfind("\n{")
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
+                let last_obj_start = stdout_str.rfind("\n{").map(|i| i + 1).unwrap_or(0);
                 serde_json::from_str(&stdout_str[last_obj_start..])
                     .expect("valid JSON in init output tail")
             }
@@ -565,10 +560,7 @@ fn init_specific_agent_claude() {
             .clone();
 
         let stdout_str = String::from_utf8_lossy(&output);
-        let json_lines: Vec<&str> = stdout_str
-            .lines()
-            .filter(|l| l.starts_with('{'))
-            .collect();
+        let json_lines: Vec<&str> = stdout_str.lines().filter(|l| l.starts_with('{')).collect();
 
         assert!(!json_lines.is_empty(), "Expected JSON output from init");
     });

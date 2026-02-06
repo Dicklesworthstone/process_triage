@@ -384,11 +384,16 @@ fn test_agent_plan_label_in_json_output() {
     let output = pt_core_with_data(data_dir)
         .timeout(Duration::from_secs(300))
         .args([
-            "--format", "json",
-            "agent", "plan",
-            "--sample-size", "5",
-            "--min-posterior", "0.0",
-            "--label", "my-label",
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--sample-size",
+            "5",
+            "--min-posterior",
+            "0.0",
+            "--label",
+            "my-label",
         ])
         .assert()
         .get_output()

@@ -52,11 +52,7 @@ fn pt_core_fast() -> Command {
 }
 
 /// Create a test session with a plan containing the given process identity.
-fn create_session_with_plan(
-    _dir: &TempDir,
-    identity: ProcessIdentity,
-    blocked: bool,
-) -> SessionId {
+fn create_session_with_plan(_dir: &TempDir, identity: ProcessIdentity, blocked: bool) -> SessionId {
     let store = SessionStore::from_env().expect("session store from env");
     let session_id = SessionId::new();
     let manifest = SessionManifest::new(&session_id, None, SessionMode::RobotPlan, None);
@@ -261,10 +257,7 @@ fn explain_live_process_returns_explanation() {
         assert_eq!(explanations.len(), 1, "Expected one explanation");
 
         let expl = &explanations[0];
-        assert_eq!(
-            expl.get("pid").and_then(|v| v.as_u64()),
-            Some(pid as u64),
-        );
+        assert_eq!(expl.get("pid").and_then(|v| v.as_u64()), Some(pid as u64),);
         // Process was live, so we expect a full explanation with classification
         // (classification is a string like "useful", "abandoned", "zombie")
         // OR if the process exited between spawn and scan, we get an error entry.
@@ -276,10 +269,7 @@ fn explain_live_process_returns_explanation() {
                 "Expected classification string for live process, got: {}",
                 expl,
             );
-            assert!(
-                expl.get("posterior").is_some(),
-                "Expected posterior field",
-            );
+            assert!(expl.get("posterior").is_some(), "Expected posterior field",);
         }
     });
 }
@@ -425,10 +415,7 @@ fn sessions_list_empty_returns_ok() {
 
         let json: Value = serde_json::from_slice(&output).expect("valid JSON");
         assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("ok"));
-        assert_eq!(
-            json.get("total_count").and_then(|v| v.as_u64()),
-            Some(0),
-        );
+        assert_eq!(json.get("total_count").and_then(|v| v.as_u64()), Some(0),);
         let sessions = json
             .get("sessions")
             .and_then(|v| v.as_array())
@@ -452,10 +439,7 @@ fn sessions_list_shows_created_session() {
             .clone();
 
         let json: Value = serde_json::from_slice(&output).expect("valid JSON");
-        assert_eq!(
-            json.get("total_count").and_then(|v| v.as_u64()),
-            Some(1),
-        );
+        assert_eq!(json.get("total_count").and_then(|v| v.as_u64()), Some(1),);
 
         let sessions = json
             .get("sessions")
@@ -560,7 +544,11 @@ fn sessions_list_with_limit() {
             .get("sessions")
             .and_then(|v| v.as_array())
             .expect("sessions array");
-        assert_eq!(sessions.len(), 2, "Expected exactly 2 sessions with --limit 2");
+        assert_eq!(
+            sessions.len(),
+            2,
+            "Expected exactly 2 sessions with --limit 2"
+        );
     });
 }
 
@@ -585,10 +573,7 @@ fn sessions_cleanup_empty_store() {
             .clone();
 
         let json: Value = serde_json::from_slice(&output).expect("valid JSON");
-        assert_eq!(
-            json.get("removed_count").and_then(|v| v.as_u64()),
-            Some(0),
-        );
+        assert_eq!(json.get("removed_count").and_then(|v| v.as_u64()), Some(0),);
     });
 }
 
@@ -682,7 +667,10 @@ fn verify_with_plan_produces_json() {
             json.get("session_id").and_then(|v| v.as_str()),
             Some(session_id.0.as_str()),
         );
-        assert!(json.get("verification").is_some(), "Expected verification field");
+        assert!(
+            json.get("verification").is_some(),
+            "Expected verification field"
+        );
     });
 }
 

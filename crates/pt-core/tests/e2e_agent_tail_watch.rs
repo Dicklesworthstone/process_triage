@@ -4,9 +4,9 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
+use pt_common::SessionId;
 use pt_core::exit_codes::ExitCode;
 use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionStore};
-use pt_common::SessionId;
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -65,10 +65,7 @@ fn create_session(_dir: &TempDir) -> SessionId {
 
 #[test]
 fn tail_requires_session_flag() {
-    pt_core_fast()
-        .args(["agent", "tail"])
-        .assert()
-        .failure();
+    pt_core_fast().args(["agent", "tail"]).assert().failure();
 }
 
 #[test]
@@ -121,11 +118,7 @@ fn tail_reads_existing_log() {
             r#"{"event":"scan_started","timestamp":"2026-01-01T00:00:00Z","count":10}"#,
             r#"{"event":"inference_complete","timestamp":"2026-01-01T00:00:01Z","candidates":3}"#,
         ];
-        fs::write(
-            logs_dir.join("session.jsonl"),
-            events.join("\n") + "\n",
-        )
-        .expect("write log");
+        fs::write(logs_dir.join("session.jsonl"), events.join("\n") + "\n").expect("write log");
 
         let output = pt_core_fast()
             .env("PROCESS_TRIAGE_DATA", dir.path())
@@ -162,11 +155,7 @@ fn tail_stops_on_session_ended_event() {
             r#"{"event":"session_ended","timestamp":"2026-01-01T00:00:01Z"}"#,
             r#"{"event":"should_not_appear","timestamp":"2026-01-01T00:00:02Z"}"#,
         ];
-        fs::write(
-            logs_dir.join("session.jsonl"),
-            events.join("\n") + "\n",
-        )
-        .expect("write log");
+        fs::write(logs_dir.join("session.jsonl"), events.join("\n") + "\n").expect("write log");
 
         let output = pt_core_fast()
             .env("PROCESS_TRIAGE_DATA", dir.path())

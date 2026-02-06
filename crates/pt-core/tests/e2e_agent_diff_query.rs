@@ -5,9 +5,9 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
+use pt_common::SessionId;
 use pt_core::exit_codes::ExitCode;
 use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionStore};
-use pt_common::SessionId;
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -102,10 +102,7 @@ fn make_candidate(pid: u32, classification: &str, action: &str, score: f64) -> V
 
 #[test]
 fn diff_requires_base_flag() {
-    pt_core_fast()
-        .args(["agent", "diff"])
-        .assert()
-        .failure();
+    pt_core_fast().args(["agent", "diff"]).assert().failure();
 }
 
 #[test]
@@ -136,8 +133,7 @@ fn diff_base_without_plan_returns_args_error() {
         // Create session but no plan.json
         let store = SessionStore::from_env().expect("store");
         let session_id = SessionId::new();
-        let manifest =
-            SessionManifest::new(&session_id, None, SessionMode::RobotPlan, None);
+        let manifest = SessionManifest::new(&session_id, None, SessionMode::RobotPlan, None);
         let handle = store.create(&manifest).expect("create");
         let ctx = SessionContext::new(
             &session_id,
@@ -196,17 +192,14 @@ fn diff_two_sessions_produces_json() {
 
         let output = pt_core_fast()
             .env("PROCESS_TRIAGE_DATA", dir.path())
-            .args([
-                "agent", "diff", "--base", &base.0, "--compare", &compare.0,
-            ])
+            .args(["agent", "diff", "--base", &base.0, "--compare", &compare.0])
             .assert()
             .success()
             .get_output()
             .stdout
             .clone();
 
-        let json: Value =
-            serde_json::from_slice(&output).expect("output should be valid JSON");
+        let json: Value = serde_json::from_slice(&output).expect("output should be valid JSON");
 
         // Check structure
         assert!(json.get("comparison").is_some(), "should have comparison");
@@ -329,7 +322,10 @@ fn diff_focus_removed() {
         let delta = &json["delta"];
         // PID 200 was removed
         let resolved = delta["resolved"].as_array().unwrap();
-        assert!(!resolved.is_empty(), "should have at least one resolved entry");
+        assert!(
+            !resolved.is_empty(),
+            "should have at least one resolved entry"
+        );
 
         // Other categories should be empty with focus=removed
         assert!(delta["new"].as_array().unwrap().is_empty());
@@ -433,9 +429,7 @@ fn diff_empty_candidates() {
 
         let output = pt_core_fast()
             .env("PROCESS_TRIAGE_DATA", dir.path())
-            .args([
-                "agent", "diff", "--base", &base.0, "--compare", &compare.0,
-            ])
+            .args(["agent", "diff", "--base", &base.0, "--compare", &compare.0])
             .assert()
             .success()
             .get_output()
@@ -457,10 +451,7 @@ fn diff_empty_candidates() {
 #[test]
 fn query_returns_success() {
     // query is a stub but should return Clean exit code
-    pt_core_fast()
-        .args(["query"])
-        .assert()
-        .success();
+    pt_core_fast().args(["query"]).assert().success();
 }
 
 #[test]
@@ -473,10 +464,7 @@ fn query_sessions_subcommand() {
 
 #[test]
 fn query_actions_subcommand() {
-    pt_core_fast()
-        .args(["query", "actions"])
-        .assert()
-        .success();
+    pt_core_fast().args(["query", "actions"]).assert().success();
 }
 
 #[test]

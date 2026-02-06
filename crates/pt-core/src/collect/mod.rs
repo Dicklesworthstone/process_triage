@@ -67,7 +67,9 @@ pub use proc_parsers::{
     parse_wchan, CgroupInfo, CriticalFile, CriticalFileCategory, DetectionStrength, FdInfo, FdType,
     IoStats, MemStats, OpenFile, OpenMode, ProcessStat, SchedInfo, SchedStats,
 };
-pub use quick_scan::{parse_ps_output_synthetic_linux, quick_scan, QuickScanError, QuickScanOptions};
+pub use quick_scan::{
+    parse_ps_output_synthetic_linux, quick_scan, QuickScanError, QuickScanOptions,
+};
 pub use tool_runner::{
     run_tool, run_tools_parallel, ToolConfig, ToolError, ToolOutput, ToolRunner, ToolRunnerBuilder,
     ToolSpec, DEFAULT_BUDGET_MS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_PARALLEL,

@@ -7,9 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ledger::{Classification, Confidence, EvidenceLedger};
 #[cfg(test)]
 use super::ledger::BayesFactorEntry;
+use super::ledger::{Classification, Confidence, EvidenceLedger};
 
 // ---------------------------------------------------------------------------
 // Evidence categories
