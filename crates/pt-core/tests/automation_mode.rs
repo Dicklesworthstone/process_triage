@@ -25,6 +25,8 @@ fn pt_core() -> Command {
     let mut cmd = cargo_bin_cmd!("pt-core");
     // Extended timeout for debug builds where inference can be slow
     cmd.timeout(Duration::from_secs(300));
+    // Avoid lock contention when tests run in parallel
+    cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
     cmd
 }
 

@@ -21,6 +21,8 @@ fn pt_core_with_data_dir(data_dir: &PathBuf) -> Command {
     // Allow enough time for full plan runs on busy CI hosts.
     cmd.timeout(Duration::from_secs(120));
     cmd.env("PROCESS_TRIAGE_DATA", data_dir);
+    // Avoid lock contention when tests run in parallel
+    cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
     cmd
 }
 

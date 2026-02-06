@@ -44,6 +44,8 @@ fn with_temp_data_dir<T>(f: impl FnOnce(&TempDir) -> T) -> T {
 fn pt_core_fast() -> Command {
     let mut cmd = cargo_bin_cmd!("pt-core");
     cmd.timeout(Duration::from_secs(120));
+    // Avoid lock contention when tests run in parallel
+    cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
     cmd
 }
 

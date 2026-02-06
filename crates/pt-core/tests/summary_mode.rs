@@ -12,7 +12,10 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 
 fn pt_core() -> Command {
-    cargo_bin_cmd!("pt-core")
+    let mut cmd = cargo_bin_cmd!("pt-core");
+    // Avoid lock contention when tests run in parallel
+    cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
+    cmd
 }
 
 fn apply_test_env(cmd: &mut Command) -> (tempfile::TempDir, tempfile::TempDir) {

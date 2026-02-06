@@ -13,6 +13,8 @@ use std::time::Duration;
 fn pt_core_clean() -> Command {
     let mut cmd = cargo_bin_cmd!("pt-core");
     cmd.timeout(Duration::from_secs(300));
+    // Avoid lock contention when tests run in parallel
+    cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
     // Use a non-existent config dir to force defaults
     cmd.arg("--config")
         .arg("/tmp/pt-core-test-nonexistent-config");
@@ -23,6 +25,8 @@ fn pt_core_clean() -> Command {
 fn pt_core() -> Command {
     let mut cmd = cargo_bin_cmd!("pt-core");
     cmd.timeout(Duration::from_secs(300));
+    // Avoid lock contention when tests run in parallel
+    cmd.env("PT_SKIP_GLOBAL_LOCK", "1");
     cmd
 }
 
