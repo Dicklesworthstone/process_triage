@@ -67,8 +67,13 @@ fleet-dns = []      # Enable DNS-based fleet discovery (scaffold)
 
 [dev-dependencies]
 assert_cmd = "2"
+criterion = "0.5"
 predicates = "3"
 tempfile = "3"
 regex = "1"
 proptest = "1"
 filetime = "0.2"
+
+[[bench]]
+name = "collect_parsers"
+harness = false

@@ -13,4 +13,9 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
+
+[[bench]]
+name = "beta_ops"
+harness = false
