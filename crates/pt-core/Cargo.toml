@@ -81,3 +81,7 @@ harness = false
 [[bench]]
 name = "inference_posteriors"
 harness = false
+
+[[bench]]
+name = "session_diff"
+harness = false
