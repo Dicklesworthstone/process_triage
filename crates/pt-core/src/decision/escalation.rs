@@ -12,10 +12,16 @@ use std::collections::HashMap;
 pub struct EscalationTrigger {
     /// Unique trigger ID for dedup/cooldown.
     pub trigger_id: String,
+    /// Stable dedupe key (process identity + finding type). Defaults to trigger_id.
+    #[serde(default)]
+    pub dedupe_key: String,
     /// Type of trigger.
     pub trigger_type: TriggerType,
     /// Severity level.
     pub severity: Severity,
+    /// Confidence (0-1) if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
     /// Human-readable summary (redaction-safe).
     pub summary: String,
     /// Timestamp when the trigger was detected.
@@ -75,9 +81,23 @@ impl std::fmt::Display for Severity {
 /// Notification channel type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationChannel {
+    /// Durable local inbox (always available).
+    Inbox,
     Desktop,
     Email,
+    Sms,
+    PagerDuty,
     Webhook,
+}
+
+/// Escalation ladder level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationLevel {
+    L1,
+    L2,
+    L3,
+    L4,
 }
 
 /// A rendered notification ready for delivery.
@@ -85,6 +105,10 @@ pub enum NotificationChannel {
 pub struct Notification {
     /// Severity.
     pub severity: Severity,
+    /// Escalation level.
+    pub level: EscalationLevel,
+    /// Channels to deliver on (best-effort; delivery layer may not support all).
+    pub channels: Vec<NotificationChannel>,
     /// Title line.
     pub title: String,
     /// Body text (redaction-safe).
@@ -101,6 +125,8 @@ pub struct Notification {
     pub bundled: bool,
     /// Number of triggers bundled.
     pub trigger_count: usize,
+    /// Stable dedupe key for the notification bundle.
+    pub dedupe_key: String,
 }
 
 /// Configuration for the escalation system.
@@ -114,6 +140,17 @@ pub struct EscalationConfig {
     pub bundle_window_secs: f64,
     /// Minimum severity to send notifications.
     pub min_severity: Severity,
+
+    /// Level 2 delay (seconds) since first_seen.
+    pub level2_after_secs: f64,
+    /// Level 3 delay (seconds) since first_seen.
+    pub level3_after_secs: f64,
+    /// Level 4 delay (seconds) since first_seen.
+    pub level4_after_secs: f64,
+
+    /// Minimum confidence to allow escalation to Level 2+ (if confidence is present).
+    /// If confidence is None, escalation is allowed based on severity alone.
+    pub min_confidence_for_escalation: f64,
 }
 
 impl Default for EscalationConfig {
@@ -123,29 +160,41 @@ impl Default for EscalationConfig {
             max_notifications_per_hour: 10,
             bundle_window_secs: 60.0,
             min_severity: Severity::Warning,
+            level2_after_secs: 3600.0,      // 1 hour
+            level3_after_secs: 24.0 * 3600.0, // 24 hours
+            level4_after_secs: 48.0 * 3600.0, // 48 hours
+            min_confidence_for_escalation: 0.7,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct TriggerState {
+    first_seen_at: f64,
+    last_seen_at: f64,
+    last_sent_at: Option<f64>,
+    last_sent_level: Option<EscalationLevel>,
 }
 
 /// Manages escalation state and rate limiting.
 #[derive(Debug, Clone)]
 pub struct EscalationManager {
     config: EscalationConfig,
-    /// Last notification time per trigger_id.
-    last_notified: HashMap<String, f64>,
+    /// State per dedupe_key.
+    states: HashMap<String, TriggerState>,
     /// Notification timestamps for global rate limiting.
     notification_log: Vec<f64>,
-    /// Pending triggers waiting for bundle window.
-    pending_triggers: Vec<EscalationTrigger>,
+    /// Pending triggers since last flush (keyed by dedupe_key).
+    pending_triggers: HashMap<String, EscalationTrigger>,
 }
 
 impl EscalationManager {
     pub fn new(config: EscalationConfig) -> Self {
         Self {
             config,
-            last_notified: HashMap::new(),
+            states: HashMap::new(),
             notification_log: Vec::new(),
-            pending_triggers: Vec::new(),
+            pending_triggers: HashMap::new(),
         }
     }
 
@@ -156,14 +205,22 @@ impl EscalationManager {
             return false;
         }
 
-        // Check per-trigger cooldown.
-        if let Some(&last) = self.last_notified.get(&trigger.trigger_id) {
-            if trigger.detected_at - last < self.config.trigger_cooldown_secs {
-                return false;
-            }
-        }
+        let dedupe_key = if trigger.dedupe_key.is_empty() {
+            trigger.trigger_id.clone()
+        } else {
+            trigger.dedupe_key.clone()
+        };
 
-        self.pending_triggers.push(trigger);
+        let st = self.states.entry(dedupe_key.clone()).or_insert(TriggerState {
+            first_seen_at: trigger.detected_at,
+            last_seen_at: trigger.detected_at,
+            last_sent_at: None,
+            last_sent_level: None,
+        });
+        st.last_seen_at = trigger.detected_at;
+
+        // Keep the most recent trigger details for the dedupe_key.
+        self.pending_triggers.insert(dedupe_key, trigger);
         true
     }
 
@@ -185,54 +242,87 @@ impl EscalationManager {
             return vec![];
         }
 
-        // Sort pending by severity (critical first).
-        self.pending_triggers
-            .sort_by(|a, b| b.severity.cmp(&a.severity));
+        let mut drain: Vec<(String, EscalationTrigger)> = self.pending_triggers.drain().collect();
+        // Sort pending by severity (critical first) for deterministic bundling.
+        drain.sort_by(|a, b| b.1.severity.cmp(&a.1.severity));
 
-        let mut notifications = Vec::new();
+        // Determine which triggers should emit a notification now (respect cooldown per level,
+        // but allow higher-level escalation even within the cooldown window).
+        let mut emit: Vec<(String, EscalationTrigger, EscalationLevel)> = Vec::new();
+        for (key, t) in drain {
+            let st = match self.states.get(&key) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            let desired = desired_level(&self.config, &t, &st, now);
 
-        // Try to bundle triggers within the bundle window.
-        let drain: Vec<EscalationTrigger> = self.pending_triggers.drain(..).collect();
+            let should_emit = match (st.last_sent_at, st.last_sent_level) {
+                (None, None) => true,
+                (Some(last_ts), Some(last_level)) => {
+                    if desired > last_level {
+                        true
+                    } else if desired == last_level {
+                        now - last_ts >= self.config.trigger_cooldown_secs
+                    } else {
+                        // Don't de-escalate notifications automatically.
+                        false
+                    }
+                }
+                _ => true,
+            };
 
-        if drain.len() == 1 {
-            let t = &drain[0];
-            let notif = render_notification(t, false, 1);
-            self.last_notified.insert(t.trigger_id.clone(), now);
-            self.notification_log.push(now);
-            notifications.push(notif);
-        } else {
-            // Bundle all into one notification.
-            let max_severity = drain.iter().map(|t| t.severity).max().unwrap();
-            let session_id = drain.iter().find_map(|t| t.session_id.clone());
-            let summaries: Vec<String> = drain
-                .iter()
-                .map(|t| format!("- [{}] {}", t.severity, t.summary))
-                .collect();
-
-            let count = drain.len();
-            for t in &drain {
-                self.last_notified.insert(t.trigger_id.clone(), now);
+            if should_emit {
+                emit.push((key, t, desired));
             }
-            self.notification_log.push(now);
-
-            notifications.push(Notification {
-                severity: max_severity,
-                title: format!("Process Triage: {} alerts", count),
-                body: summaries.join("\n"),
-                human_review_cmd: session_id
-                    .as_ref()
-                    .map(|sid| format!("pt review --session {}", sid)),
-                agent_review_cmd: session_id
-                    .as_ref()
-                    .map(|sid| format!("pt agent plan --session {}", sid)),
-                session_id,
-                created_at: now,
-                bundled: true,
-                trigger_count: count,
-            });
         }
 
-        notifications
+        if emit.is_empty() {
+            return vec![];
+        }
+
+        // Consume one budget unit for this flush. If we ever want multiple notifications per
+        // flush, we'd need to account budget per emitted notification.
+        self.notification_log.push(now);
+
+        if emit.len() == 1 {
+            let (key, t, level) = emit.remove(0);
+            self.update_state_sent(&key, now, level);
+            return vec![render_notification(&t, level, false, 1)];
+        }
+
+        // Bundle all into one notification.
+        let max_severity = emit.iter().map(|(_, t, _)| t.severity).max().unwrap();
+        let session_id = emit.iter().find_map(|(_, t, _)| t.session_id.clone());
+        let max_level = emit.iter().map(|(_, _, l)| *l).max().unwrap_or(EscalationLevel::L1);
+        let summaries: Vec<String> = emit
+            .iter()
+            .map(|(_, t, level)| format!("- [{}/{}] {}", t.severity, level_string(*level), t.summary))
+            .collect();
+
+        let count = emit.len();
+        let dedupe_key = "bundle".to_string();
+        for (key, _, level) in emit {
+            self.update_state_sent(&key, now, level);
+        }
+
+        vec![Notification {
+            severity: max_severity,
+            level: max_level,
+            channels: channels_for_level(max_level),
+            title: format!("Process Triage: {} alerts", count),
+            body: summaries.join("\n"),
+            human_review_cmd: session_id
+                .as_ref()
+                .map(|sid| format!("pt review --session {}", sid)),
+            agent_review_cmd: session_id
+                .as_ref()
+                .map(|sid| format!("pt agent plan --session {}", sid)),
+            session_id,
+            created_at: now,
+            bundled: true,
+            trigger_count: count,
+            dedupe_key,
+        }]
     }
 
     /// Number of pending triggers.
@@ -248,19 +338,99 @@ impl EscalationManager {
     /// Prune old rate-limit state.
     pub fn prune(&mut self, now: f64) {
         self.notification_log.retain(|&ts| now - ts < 3600.0);
-        let cooldown = self.config.trigger_cooldown_secs;
-        self.last_notified
-            .retain(|_, &mut ts| now - ts < cooldown * 2.0);
+        // Drop trigger states after they haven't been seen for a long time.
+        // This keeps the map bounded in long-running daemon mode.
+        let stale_after = 7.0 * 24.0 * 3600.0; // 7 days
+        self.states
+            .retain(|_, st| now - st.last_seen_at < stale_after);
     }
 }
 
-fn render_notification(trigger: &EscalationTrigger, bundled: bool, count: usize) -> Notification {
+fn desired_level(
+    config: &EscalationConfig,
+    trigger: &EscalationTrigger,
+    state: &TriggerState,
+    now: f64,
+) -> EscalationLevel {
+    let age = now - state.first_seen_at;
+    let confidence_ok = trigger
+        .confidence
+        .map(|c| c >= config.min_confidence_for_escalation)
+        .unwrap_or(true);
+
+    // Severity can override confidence gating.
+    let severity_override = trigger.severity >= Severity::Critical;
+
+    if age >= config.level4_after_secs && (confidence_ok || severity_override) {
+        EscalationLevel::L4
+    } else if age >= config.level3_after_secs && (confidence_ok || severity_override) {
+        EscalationLevel::L3
+    } else if age >= config.level2_after_secs && (confidence_ok || severity_override) {
+        EscalationLevel::L2
+    } else {
+        EscalationLevel::L1
+    }
+}
+
+fn channels_for_level(level: EscalationLevel) -> Vec<NotificationChannel> {
+    match level {
+        EscalationLevel::L1 => vec![NotificationChannel::Inbox, NotificationChannel::Desktop],
+        EscalationLevel::L2 => vec![
+            NotificationChannel::Inbox,
+            NotificationChannel::Desktop,
+            NotificationChannel::Email,
+        ],
+        EscalationLevel::L3 => vec![
+            NotificationChannel::Inbox,
+            NotificationChannel::Desktop,
+            NotificationChannel::Email,
+            NotificationChannel::Webhook,
+            NotificationChannel::PagerDuty,
+            NotificationChannel::Sms,
+        ],
+        EscalationLevel::L4 => vec![
+            NotificationChannel::Inbox,
+            NotificationChannel::Desktop,
+            NotificationChannel::Email,
+            NotificationChannel::Webhook,
+            NotificationChannel::PagerDuty,
+            NotificationChannel::Sms,
+        ],
+    }
+}
+
+fn level_string(level: EscalationLevel) -> &'static str {
+    match level {
+        EscalationLevel::L1 => "L1",
+        EscalationLevel::L2 => "L2",
+        EscalationLevel::L3 => "L3",
+        EscalationLevel::L4 => "L4",
+    }
+}
+
+impl EscalationManager {
+    fn update_state_sent(&mut self, dedupe_key: &str, now: f64, level: EscalationLevel) {
+        if let Some(st) = self.states.get_mut(dedupe_key) {
+            st.last_sent_at = Some(now);
+            st.last_sent_level = Some(level);
+        }
+    }
+}
+
+fn render_notification(
+    trigger: &EscalationTrigger,
+    level: EscalationLevel,
+    bundled: bool,
+    count: usize,
+) -> Notification {
     let title = format!(
         "Process Triage [{}]: {}",
         trigger.severity, trigger.trigger_type
     );
     Notification {
         severity: trigger.severity,
+        level,
+        channels: channels_for_level(level),
         title,
         body: trigger.summary.clone(),
         human_review_cmd: trigger
@@ -275,6 +445,11 @@ fn render_notification(trigger: &EscalationTrigger, bundled: bool, count: usize)
         created_at: trigger.detected_at,
         bundled,
         trigger_count: count,
+        dedupe_key: if trigger.dedupe_key.is_empty() {
+            trigger.trigger_id.clone()
+        } else {
+            trigger.dedupe_key.clone()
+        },
     }
 }
 
@@ -285,8 +460,10 @@ mod tests {
     fn make_trigger(id: &str, severity: Severity, ts: f64) -> EscalationTrigger {
         EscalationTrigger {
             trigger_id: id.to_string(),
+            dedupe_key: id.to_string(),
             trigger_type: TriggerType::MemoryPressure,
             severity,
+            confidence: Some(0.95),
             summary: format!("Test trigger {}", id),
             detected_at: ts,
             session_id: Some("pt-20260201-120000-abcd".to_string()),
@@ -301,6 +478,7 @@ mod tests {
         assert_eq!(notifs.len(), 1);
         assert!(!notifs[0].bundled);
         assert!(notifs[0].human_review_cmd.is_some());
+        assert_eq!(notifs[0].level, EscalationLevel::L1);
     }
 
     #[test]
@@ -313,10 +491,14 @@ mod tests {
         mgr.flush(1000.0);
 
         // Same trigger within cooldown → rejected.
-        assert!(!mgr.submit_trigger(make_trigger("t1", Severity::Warning, 1100.0)));
+        assert!(mgr.submit_trigger(make_trigger("t1", Severity::Warning, 1100.0)));
+        let notifs = mgr.flush(1100.0);
+        assert!(notifs.is_empty());
 
         // After cooldown → accepted.
         assert!(mgr.submit_trigger(make_trigger("t1", Severity::Warning, 1400.0)));
+        let notifs = mgr.flush(1400.0);
+        assert_eq!(notifs.len(), 1);
     }
 
     #[test]
@@ -433,5 +615,37 @@ mod tests {
 
         // Different trigger ID → no cooldown.
         assert!(mgr.submit_trigger(make_trigger("t2", Severity::Warning, 1001.0)));
+    }
+
+    #[test]
+    fn test_time_based_escalation_levels() {
+        let mut mgr = EscalationManager::new(EscalationConfig {
+            trigger_cooldown_secs: 0.0,
+            level2_after_secs: 10.0,
+            level3_after_secs: 20.0,
+            level4_after_secs: 30.0,
+            ..Default::default()
+        });
+
+        mgr.submit_trigger(make_trigger("t1", Severity::Warning, 0.0));
+        let n1 = mgr.flush(0.0);
+        assert_eq!(n1.len(), 1);
+        assert_eq!(n1[0].level, EscalationLevel::L1);
+
+        // Same trigger later: escalates to L2
+        mgr.submit_trigger(make_trigger("t1", Severity::Warning, 12.0));
+        let n2 = mgr.flush(12.0);
+        assert_eq!(n2.len(), 1);
+        assert_eq!(n2[0].level, EscalationLevel::L2);
+
+        mgr.submit_trigger(make_trigger("t1", Severity::Warning, 25.0));
+        let n3 = mgr.flush(25.0);
+        assert_eq!(n3.len(), 1);
+        assert_eq!(n3[0].level, EscalationLevel::L3);
+
+        mgr.submit_trigger(make_trigger("t1", Severity::Warning, 31.0));
+        let n4 = mgr.flush(31.0);
+        assert_eq!(n4.len(), 1);
+        assert_eq!(n4[0].level, EscalationLevel::L4);
     }
 }
