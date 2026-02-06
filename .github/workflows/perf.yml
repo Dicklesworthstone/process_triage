@@ -41,6 +41,10 @@ jobs:
         run: |
           ./scripts/bench_smoke.sh
 
+      - name: Run memory/RSS smoke (synthetic workload)
+        run: |
+          cargo test -p pt-core --test memory_smoke --quiet
+
       - name: Upload criterion results
         if: always()
         uses: actions/upload-artifact@v4
