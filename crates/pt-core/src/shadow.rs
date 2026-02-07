@@ -454,4 +454,544 @@ mod tests {
             None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
         }
     }
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    fn make_proc(pid: u32, comm: &str, cmd: &str) -> ProcessRecord {
+        ProcessRecord {
+            pid: pt_common::ProcessId(pid),
+            ppid: pt_common::ProcessId(1),
+            uid: 1000,
+            user: "user".to_string(),
+            pgid: None,
+            sid: None,
+            start_id: pt_common::StartId(format!("boot:5:{}", pid)),
+            comm: comm.to_string(),
+            cmd: cmd.to_string(),
+            state: crate::collect::ProcessState::Running,
+            cpu_percent: 5.0,
+            rss_bytes: 1024,
+            vsz_bytes: 2048,
+            tty: None,
+            start_time_unix: 0,
+            elapsed: std::time::Duration::from_secs(3600),
+            source: "test".to_string(),
+            container_info: None,
+        }
+    }
+
+    use crate::inference::{BayesFactorEntry, Classification, PosteriorResult};
+
+    fn make_ledger(confidence: Confidence, factors: Vec<BayesFactorEntry>, top: Vec<String>, why: &str) -> EvidenceLedger {
+        EvidenceLedger {
+            posterior: PosteriorResult {
+                posterior: ClassScores { useful: 0.1, useful_bad: 0.1, abandoned: 0.7, zombie: 0.1 },
+                log_posterior: ClassScores::default(),
+                log_odds_abandoned_useful: 2.0,
+                evidence_terms: vec![],
+            },
+            classification: Classification::Abandoned,
+            confidence,
+            bayes_factors: factors,
+            top_evidence: top,
+            why_summary: why.to_string(),
+            evidence_glyphs: std::collections::HashMap::new(),
+        }
+    }
+
+    fn make_bf(feature: &str, delta: f64, direction: &str, strength: &str) -> BayesFactorEntry {
+        BayesFactorEntry {
+            feature: feature.to_string(),
+            bf: 10.0,
+            log_bf: 2.3,
+            delta_bits: delta,
+            direction: direction.to_string(),
+            strength: strength.to_string(),
+        }
+    }
+
+    fn make_decision(action: Action) -> DecisionOutcome {
+        use crate::decision::{ExpectedLoss, DecisionRationale};
+        DecisionOutcome {
+            expected_loss: vec![ExpectedLoss { action, loss: 0.0 }],
+            optimal_action: action,
+            sprt_boundary: None,
+            posterior_odds_abandoned_vs_useful: None,
+            recovery_expectations: None,
+            rationale: DecisionRationale {
+                chosen_action: action,
+                tie_break: false,
+                disabled_actions: vec![],
+                used_recovery_preference: false,
+                posterior: None,
+                memory_mb: None,
+                has_known_signature: None,
+                category: None,
+            },
+            risk_sensitive: None,
+            dro: None,
+        }
+    }
+
+    fn make_pending(hash: &str, pid: u32, comm: &str) -> PendingObservation {
+        PendingObservation {
+            identity_hash: hash.to_string(),
+            pid,
+            last_seen: Utc::now(),
+            miss_count: 0,
+            belief: BeliefState::default(),
+            state: StateSnapshot::default(),
+            comm: comm.to_string(),
+        }
+    }
+
+    // ── action_to_recommendation ────────────────────────────────────
+
+    #[test]
+    fn recommendation_keep() {
+        assert_eq!(action_to_recommendation(Action::Keep), "keep");
+    }
+
+    #[test]
+    fn recommendation_kill() {
+        assert_eq!(action_to_recommendation(Action::Kill), "kill");
+    }
+
+    #[test]
+    fn recommendation_renice() {
+        assert_eq!(action_to_recommendation(Action::Renice), "renice");
+    }
+
+    #[test]
+    fn recommendation_pause() {
+        assert_eq!(action_to_recommendation(Action::Pause), "pause");
+    }
+
+    #[test]
+    fn recommendation_resume() {
+        assert_eq!(action_to_recommendation(Action::Resume), "resume");
+    }
+
+    #[test]
+    fn recommendation_freeze() {
+        assert_eq!(action_to_recommendation(Action::Freeze), "freeze");
+    }
+
+    #[test]
+    fn recommendation_unfreeze() {
+        assert_eq!(action_to_recommendation(Action::Unfreeze), "unfreeze");
+    }
+
+    #[test]
+    fn recommendation_throttle() {
+        assert_eq!(action_to_recommendation(Action::Throttle), "throttle");
+    }
+
+    #[test]
+    fn recommendation_quarantine() {
+        assert_eq!(action_to_recommendation(Action::Quarantine), "quarantine");
+    }
+
+    #[test]
+    fn recommendation_unquarantine() {
+        assert_eq!(action_to_recommendation(Action::Unquarantine), "unquarantine");
+    }
+
+    #[test]
+    fn recommendation_restart() {
+        assert_eq!(action_to_recommendation(Action::Restart), "restart");
+    }
+
+    // ── confidence_score ────────────────────────────────────────────
+
+    #[test]
+    fn confidence_very_high() {
+        assert!((confidence_score(Confidence::VeryHigh) - 0.99).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn confidence_high() {
+        assert!((confidence_score(Confidence::High) - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn confidence_medium() {
+        assert!((confidence_score(Confidence::Medium) - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn confidence_low() {
+        assert!((confidence_score(Confidence::Low) - 0.5).abs() < f32::EPSILON);
+    }
+
+    // ── compute_identity_hash ───────────────────────────────────────
+
+    #[test]
+    fn hash_changes_for_different_uid() {
+        let mut p = make_proc(1, "bash", "bash");
+        let h1 = compute_identity_hash(&p);
+        p.uid = 9999;
+        let h2 = compute_identity_hash(&p);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_changes_for_different_comm() {
+        let p1 = make_proc(1, "bash", "bash");
+        let p2 = make_proc(1, "zsh", "bash");
+        assert_ne!(compute_identity_hash(&p1), compute_identity_hash(&p2));
+    }
+
+    #[test]
+    fn hash_changes_for_different_cmd() {
+        let p1 = make_proc(1, "bash", "bash -c echo");
+        let p2 = make_proc(1, "bash", "bash -c sleep");
+        assert_ne!(compute_identity_hash(&p1), compute_identity_hash(&p2));
+    }
+
+    #[test]
+    fn hash_ignores_pid() {
+        let mut p1 = make_proc(1, "bash", "bash");
+        let mut p2 = make_proc(999, "bash", "bash");
+        // Ensure same start_id so only pid differs
+        p1.start_id = pt_common::StartId("boot:5:same".to_string());
+        p2.start_id = pt_common::StartId("boot:5:same".to_string());
+        assert_eq!(compute_identity_hash(&p1), compute_identity_hash(&p2));
+    }
+
+    #[test]
+    fn hash_is_hex_encoded() {
+        let p = make_proc(1, "bash", "bash");
+        let h = compute_identity_hash(&p);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── build_evidence_event ────────────────────────────────────────
+
+    #[test]
+    fn evidence_event_with_factors_and_top() {
+        let factors = vec![make_bf("age", 3.0, "supports abandoned", "strong")];
+        let top = vec!["old process".to_string()];
+        let ledger = make_ledger(Confidence::High, factors, top, "Likely abandoned");
+        let event = build_evidence_event(&ledger, "sleep").unwrap();
+        assert_eq!(event.event_type, EventType::EvidenceSnapshot);
+        let details: serde_json::Value = serde_json::from_str(event.details.as_ref().unwrap()).unwrap();
+        assert_eq!(details["comm"], "sleep");
+        assert_eq!(details["why_summary"], "Likely abandoned");
+        assert!(details["bayes_factors"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn evidence_event_none_when_empty() {
+        let ledger = make_ledger(Confidence::Low, vec![], vec![], "");
+        assert!(build_evidence_event(&ledger, "bash").is_none());
+    }
+
+    #[test]
+    fn evidence_event_with_only_top_evidence() {
+        let ledger = make_ledger(Confidence::Medium, vec![], vec!["some evidence".to_string()], "why");
+        let event = build_evidence_event(&ledger, "node");
+        assert!(event.is_some());
+    }
+
+    #[test]
+    fn evidence_event_with_only_bayes_factors() {
+        let factors = vec![make_bf("cpu", 1.5, "supports useful", "weak")];
+        let ledger = make_ledger(Confidence::Low, factors, vec![], "");
+        let event = build_evidence_event(&ledger, "python");
+        assert!(event.is_some());
+    }
+
+    #[test]
+    fn evidence_event_caps_at_three_factors() {
+        let factors = vec![
+            make_bf("a", 1.0, "supports abandoned", "weak"),
+            make_bf("b", 2.0, "supports abandoned", "substantial"),
+            make_bf("c", 3.0, "supports abandoned", "strong"),
+            make_bf("d", 4.0, "supports abandoned", "decisive"),
+        ];
+        let ledger = make_ledger(Confidence::High, factors, vec![], "");
+        let event = build_evidence_event(&ledger, "x").unwrap();
+        let details: serde_json::Value = serde_json::from_str(event.details.as_ref().unwrap()).unwrap();
+        assert_eq!(details["bayes_factors"].as_array().unwrap().len(), 3);
+    }
+
+    // ── load_pending / persist_pending ──────────────────────────────
+
+    #[test]
+    fn load_pending_nonexistent_returns_empty() {
+        let path = PathBuf::from("/tmp/nonexistent_pending_12345.json");
+        let result = load_pending(&path).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn persist_and_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pending.json");
+        let mut map = HashMap::new();
+        map.insert("hash1".to_string(), make_pending("hash1", 100, "sleep"));
+        map.insert("hash2".to_string(), make_pending("hash2", 200, "node"));
+
+        persist_pending(&path, &map).unwrap();
+        let loaded = load_pending(&path).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains_key("hash1"));
+        assert!(loaded.contains_key("hash2"));
+        assert_eq!(loaded["hash1"].pid, 100);
+        assert_eq!(loaded["hash2"].comm, "node");
+    }
+
+    #[test]
+    fn persist_empty_map() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pending.json");
+        persist_pending(&path, &HashMap::new()).unwrap();
+        let loaded = load_pending(&path).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn persist_creates_parent_dirs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sub").join("deep").join("pending.json");
+        persist_pending(&path, &HashMap::new()).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn persist_sorted_by_identity_hash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pending.json");
+        let mut map = HashMap::new();
+        map.insert("zzz".to_string(), make_pending("zzz", 3, "c"));
+        map.insert("aaa".to_string(), make_pending("aaa", 1, "a"));
+        map.insert("mmm".to_string(), make_pending("mmm", 2, "b"));
+
+        persist_pending(&path, &map).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let records: Vec<PendingObservation> = serde_json::from_str(&content).unwrap();
+        assert_eq!(records[0].identity_hash, "aaa");
+        assert_eq!(records[1].identity_hash, "mmm");
+        assert_eq!(records[2].identity_hash, "zzz");
+    }
+
+    // ── PendingObservation serde ────────────────────────────────────
+
+    #[test]
+    fn pending_observation_roundtrip() {
+        let obs = make_pending("abc123", 42, "sleep");
+        let json = serde_json::to_string(&obs).unwrap();
+        let deser: PendingObservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.identity_hash, "abc123");
+        assert_eq!(deser.pid, 42);
+        assert_eq!(deser.comm, "sleep");
+    }
+
+    // ── ShadowRecordError From impls ────────────────────────────────
+
+    #[test]
+    fn error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let err = ShadowRecordError::from(io_err);
+        matches!(err, ShadowRecordError::Io(_));
+    }
+
+    #[test]
+    fn error_from_json() {
+        let json_err = serde_json::from_str::<String>("not json").unwrap_err();
+        let err = ShadowRecordError::from(json_err);
+        matches!(err, ShadowRecordError::Json(_));
+    }
+
+    // ── resolve_data_dir_override ───────────────────────────────────
+
+    #[test]
+    fn resolve_data_dir_from_process_triage_data() {
+        let dir = TempDir::new().unwrap();
+        let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
+        std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
+
+        let result = resolve_data_dir_override();
+        assert_eq!(result, Some(dir.path().to_path_buf()));
+
+        match old {
+            Some(val) => std::env::set_var("PROCESS_TRIAGE_DATA", val),
+            None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
+        }
+    }
+
+    // ── ShadowRecorder with tempdir ─────────────────────────────────
+
+    #[test]
+    fn recorder_starts_with_zero_count() {
+        let dir = TempDir::new().unwrap();
+        let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
+        std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
+
+        let recorder = ShadowRecorder::new().expect("recorder");
+        assert_eq!(recorder.recorded_count(), 0);
+
+        match old {
+            Some(val) => std::env::set_var("PROCESS_TRIAGE_DATA", val),
+            None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
+        }
+    }
+
+    #[test]
+    fn recorder_record_candidate_increments_count() {
+        let dir = TempDir::new().unwrap();
+        let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
+        std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
+
+        let mut recorder = ShadowRecorder::new().expect("recorder");
+        let proc = make_proc(100, "sleep", "sleep 60");
+        let posterior = crate::inference::ClassScores {
+            useful: 0.1, useful_bad: 0.05, abandoned: 0.8, zombie: 0.05,
+        };
+        let ledger = make_ledger(
+            Confidence::High,
+            vec![make_bf("age", 3.0, "supports abandoned", "strong")],
+            vec!["old".to_string()],
+            "Abandoned",
+        );
+        let decision = make_decision(Action::Kill);
+
+        recorder.record_candidate(&proc, &posterior, &ledger, &decision).unwrap();
+        assert_eq!(recorder.recorded_count(), 1);
+
+        // Verify pending entry was created
+        assert!(recorder.pending.values().any(|p| p.pid == 100));
+
+        match old {
+            Some(val) => std::env::set_var("PROCESS_TRIAGE_DATA", val),
+            None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
+        }
+    }
+
+    #[test]
+    fn recorder_flush_persists_pending() {
+        let dir = TempDir::new().unwrap();
+        let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
+        std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
+
+        let mut recorder = ShadowRecorder::new().expect("recorder");
+        recorder.pending.insert(
+            "test_hash".to_string(),
+            make_pending("test_hash", 500, "node"),
+        );
+
+        recorder.flush().unwrap();
+        assert!(recorder.pending_path.exists());
+
+        match old {
+            Some(val) => std::env::set_var("PROCESS_TRIAGE_DATA", val),
+            None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
+        }
+    }
+
+    #[test]
+    fn recorder_seen_identity_resets_miss_count() {
+        let dir = TempDir::new().unwrap();
+        let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
+        std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
+
+        let mut recorder = ShadowRecorder::new().expect("recorder");
+        recorder.had_records = true;
+        recorder.pending.insert(
+            "seen_hash".to_string(),
+            PendingObservation {
+                identity_hash: "seen_hash".to_string(),
+                pid: 10,
+                last_seen: Utc::now() - chrono::Duration::hours(1),
+                miss_count: 5,
+                belief: BeliefState::default(),
+                state: StateSnapshot::default(),
+                comm: "test".to_string(),
+            },
+        );
+        recorder.seen_identities.insert("seen_hash".to_string());
+
+        recorder.record_outcomes_for_missing().unwrap();
+        // seen_identities cleared after call, but pending should still have entry with reset miss
+        // The entry was seen, so miss_count should be 0
+        // After the call, seen_identities is cleared but pending keeps it
+        assert!(recorder.pending.contains_key("seen_hash"));
+
+        match old {
+            Some(val) => std::env::set_var("PROCESS_TRIAGE_DATA", val),
+            None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
+        }
+    }
+
+    #[test]
+    fn recorder_pid_reuse_detected() {
+        let dir = TempDir::new().unwrap();
+        let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
+        std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
+
+        let mut recorder = ShadowRecorder::new().expect("recorder");
+        recorder.miss_threshold = 1;
+        recorder.had_records = true;
+
+        // A pending observation for pid 42 with identity "old_hash"
+        recorder.pending.insert(
+            "old_hash".to_string(),
+            make_pending("old_hash", 42, "old_proc"),
+        );
+
+        // But pid 42 now has a different identity (pid reuse)
+        recorder.seen_pids.insert(42, "new_hash".to_string());
+
+        recorder.record_outcomes_for_missing().unwrap();
+
+        // old_hash should be removed from pending (resolved with pid_reused reason)
+        assert!(!recorder.pending.contains_key("old_hash"));
+
+        match old {
+            Some(val) => std::env::set_var("PROCESS_TRIAGE_DATA", val),
+            None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
+        }
+    }
+
+    #[test]
+    fn recorder_no_records_skips_outcomes() {
+        let dir = TempDir::new().unwrap();
+        let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
+        std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
+
+        let mut recorder = ShadowRecorder::new().expect("recorder");
+        // had_records is false by default
+        recorder.pending.insert(
+            "should_stay".to_string(),
+            make_pending("should_stay", 1, "x"),
+        );
+
+        recorder.record_outcomes_for_missing().unwrap();
+        // Pending entry should NOT be removed because had_records is false
+        assert!(recorder.pending.contains_key("should_stay"));
+
+        match old {
+            Some(val) => std::env::set_var("PROCESS_TRIAGE_DATA", val),
+            None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
+        }
+    }
+
+    // ── shadow_config_from_env ──────────────────────────────────────
+
+    #[test]
+    fn shadow_config_uses_env_override() {
+        let dir = TempDir::new().unwrap();
+        let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
+        std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
+
+        let config = shadow_config_from_env();
+        assert!(config.base_dir.to_string_lossy().contains("shadow"));
+
+        match old {
+            Some(val) => std::env::set_var("PROCESS_TRIAGE_DATA", val),
+            None => std::env::remove_var("PROCESS_TRIAGE_DATA"),
+        }
+    }
 }

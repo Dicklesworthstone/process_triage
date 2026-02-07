@@ -514,4 +514,461 @@ mod tests {
         let config = generate_config(&AgentType::Copilot);
         assert!(config.settings.get("aliases").is_some());
     }
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    use crate::agent_init::AgentInfo;
+
+    fn make_agent(agent_type: AgentType, config_dir: Option<PathBuf>) -> DetectedAgent {
+        DetectedAgent {
+            agent_type,
+            info: AgentInfo {
+                executable_path: None,
+                config_dir,
+                version: None,
+                is_installed: false,
+                notes: vec![],
+            },
+        }
+    }
+
+    fn make_options(dry_run: bool, skip_backup: bool) -> InitOptions {
+        InitOptions {
+            non_interactive: true,
+            dry_run,
+            agent_filter: None,
+            skip_backup,
+        }
+    }
+
+    // ── generate_config ─────────────────────────────────────────────
+
+    #[test]
+    fn generate_config_cursor() {
+        let config = generate_config(&AgentType::Cursor);
+        assert!(config.settings.get("extensions").is_some());
+    }
+
+    #[test]
+    fn generate_config_windsurf() {
+        let config = generate_config(&AgentType::Windsurf);
+        // Windsurf same structure as Cursor
+        assert!(config.settings.get("extensions").is_some());
+    }
+
+    #[test]
+    fn generate_config_tool_definition_has_commands() {
+        let config = generate_config(&AgentType::ClaudeCode);
+        let commands = config.tool_definition.get("commands").unwrap();
+        assert!(commands.get("scan").is_some());
+        assert!(commands.get("plan").is_some());
+        assert!(commands.get("apply").is_some());
+        assert!(commands.get("verify").is_some());
+    }
+
+    #[test]
+    fn generate_config_tool_definition_has_capabilities() {
+        let config = generate_config(&AgentType::Codex);
+        let caps = config.tool_definition.get("capabilities").unwrap();
+        assert_eq!(caps["process_management"], true);
+        assert_eq!(caps["system_monitoring"], true);
+        assert_eq!(caps["resource_cleanup"], true);
+    }
+
+    #[test]
+    fn generate_config_claude_has_mcp_server() {
+        let config = generate_config(&AgentType::ClaudeCode);
+        let mcp = config.settings.get("mcpServers").unwrap();
+        let pt = mcp.get("process_triage").unwrap();
+        assert_eq!(pt["command"], "pt");
+        assert_eq!(pt["args"][0], "mcp");
+        assert_eq!(pt["args"][1], "serve");
+    }
+
+    #[test]
+    fn generate_config_codex_has_tool_entry() {
+        let config = generate_config(&AgentType::Codex);
+        let tools = config.settings.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "process_triage");
+        assert_eq!(tools[0]["type"], "mcp");
+    }
+
+    #[test]
+    fn generate_config_copilot_has_aliases() {
+        let config = generate_config(&AgentType::Copilot);
+        let aliases = config.settings.get("aliases").unwrap();
+        assert!(aliases.get("pt-scan").is_some());
+        assert!(aliases.get("pt-plan").is_some());
+        assert!(aliases.get("pt-apply").is_some());
+    }
+
+    // ── AgentConfig serde ───────────────────────────────────────────
+
+    #[test]
+    fn agent_config_roundtrip() {
+        let config = generate_config(&AgentType::ClaudeCode);
+        let json = serde_json::to_string(&config).unwrap();
+        let deser: AgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deser.tool_definition.get("name").unwrap().as_str().unwrap(),
+            "process_triage"
+        );
+    }
+
+    // ── ConfigResult / BackupInfo serde ─────────────────────────────
+
+    #[test]
+    fn config_result_serde_roundtrip() {
+        let result = ConfigResult {
+            config_path: PathBuf::from("/tmp/settings.json"),
+            changes: vec!["Added tool".to_string()],
+            backup: Some(BackupInfo {
+                original_path: PathBuf::from("/tmp/settings.json"),
+                backup_path: PathBuf::from("/tmp/settings.json.bak"),
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: ConfigResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.changes.len(), 1);
+        assert!(deser.backup.is_some());
+    }
+
+    #[test]
+    fn config_result_no_backup() {
+        let result = ConfigResult {
+            config_path: PathBuf::from("/tmp/x.json"),
+            changes: vec![],
+            backup: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: ConfigResult = serde_json::from_str(&json).unwrap();
+        assert!(deser.backup.is_none());
+    }
+
+    // ── ConfigError display ─────────────────────────────────────────
+
+    #[test]
+    fn config_error_no_config_dir_display() {
+        let err = ConfigError::NoConfigDir;
+        assert_eq!(err.to_string(), "no config directory found for agent");
+    }
+
+    #[test]
+    fn config_error_backup_failed_display() {
+        let err = ConfigError::BackupFailed("permission denied".to_string());
+        assert!(err.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn config_error_not_writable_display() {
+        let err = ConfigError::NotWritable(PathBuf::from("/etc/config.json"));
+        assert!(err.to_string().contains("/etc/config.json"));
+    }
+
+    #[test]
+    fn config_error_dry_run_display() {
+        let err = ConfigError::DryRun;
+        assert_eq!(err.to_string(), "dry run - no changes made");
+    }
+
+    // ── write_json_config ───────────────────────────────────────────
+
+    #[test]
+    fn write_json_config_creates_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.json");
+        let val = json!({"key": "value"});
+        write_json_config(&path, &val).unwrap();
+        assert!(path.exists());
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"key\""));
+        assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn write_json_config_pretty_formatted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("pretty.json");
+        let val = json!({"a": 1, "b": 2});
+        write_json_config(&path, &val).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        // Pretty format uses newlines
+        assert!(content.contains('\n'));
+    }
+
+    // ── create_backup ───────────────────────────────────────────────
+
+    #[test]
+    fn create_backup_copies_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orig = dir.path().join("settings.json");
+        fs::write(&orig, "{\"hello\": true}").unwrap();
+
+        let info = create_backup(&orig).unwrap();
+        assert!(info.backup_path.exists());
+        assert_eq!(info.original_path, orig);
+
+        let backup_content = fs::read_to_string(&info.backup_path).unwrap();
+        assert_eq!(backup_content, "{\"hello\": true}");
+    }
+
+    #[test]
+    fn create_backup_name_has_timestamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orig = dir.path().join("config.json");
+        fs::write(&orig, "{}").unwrap();
+
+        let info = create_backup(&orig).unwrap();
+        let name = info.backup_path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("config.json."));
+        assert!(name.ends_with(".bak"));
+    }
+
+    // ── configure_claude_code ───────────────────────────────────────
+
+    #[test]
+    fn configure_claude_code_fresh_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(false, true);
+
+        let result = configure_claude_code(dir.path(), &options).unwrap();
+        assert!(result.config_path.exists());
+        assert!(!result.changes.is_empty());
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        assert!(content.get("allowedTools").is_some());
+        assert!(content.get("mcpServers").is_some());
+        let mcp = content["mcpServers"]["process_triage"].as_object().unwrap();
+        assert_eq!(mcp["command"], "pt");
+    }
+
+    #[test]
+    fn configure_claude_code_existing_config_preserves_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, r#"{"theme": "dark", "allowedTools": ["other_tool"]}"#).unwrap();
+
+        let options = make_options(false, true);
+        let result = configure_claude_code(dir.path(), &options).unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        assert_eq!(content["theme"], "dark");
+        let tools = content["allowedTools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t == "other_tool"));
+        assert!(tools.iter().any(|t| t == "process_triage"));
+    }
+
+    #[test]
+    fn configure_claude_code_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(false, true);
+
+        configure_claude_code(dir.path(), &options).unwrap();
+        let result2 = configure_claude_code(dir.path(), &options).unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&result2.config_path).unwrap()).unwrap();
+        let tools = content["allowedTools"].as_array().unwrap();
+        let pt_count = tools.iter().filter(|t| t.as_str() == Some("process_triage")).count();
+        assert_eq!(pt_count, 1, "process_triage should appear exactly once");
+    }
+
+    #[test]
+    fn configure_claude_code_dry_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(true, true);
+        let err = configure_claude_code(dir.path(), &options).unwrap_err();
+        matches!(err, ConfigError::DryRun);
+        // File should not be created
+        assert!(!dir.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn configure_claude_code_with_backup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, "{}").unwrap();
+
+        let options = make_options(false, false); // skip_backup = false
+        let result = configure_claude_code(dir.path(), &options).unwrap();
+        assert!(result.backup.is_some());
+    }
+
+    #[test]
+    fn configure_claude_code_replaces_non_object_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, "\"not an object\"").unwrap();
+
+        let options = make_options(false, true);
+        let result = configure_claude_code(dir.path(), &options).unwrap();
+        assert!(result.changes.iter().any(|c| c.contains("non-object")));
+    }
+
+    #[test]
+    fn configure_claude_code_replaces_non_object_mcp_servers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, r#"{"mcpServers": "invalid"}"#).unwrap();
+
+        let options = make_options(false, true);
+        let result = configure_claude_code(dir.path(), &options).unwrap();
+        assert!(result.changes.iter().any(|c| c.contains("Replaced invalid mcpServers")));
+    }
+
+    // ── configure_codex ─────────────────────────────────────────────
+
+    #[test]
+    fn configure_codex_fresh_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(false, true);
+
+        let result = configure_codex(dir.path(), &options).unwrap();
+        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let tools = content["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "process_triage");
+    }
+
+    #[test]
+    fn configure_codex_existing_tools_preserved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.json");
+        fs::write(&config, r#"{"tools": [{"name": "other", "type": "mcp"}]}"#).unwrap();
+
+        let options = make_options(false, true);
+        let result = configure_codex(dir.path(), &options).unwrap();
+        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let tools = content["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn configure_codex_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(false, true);
+
+        configure_codex(dir.path(), &options).unwrap();
+        configure_codex(dir.path(), &options).unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(dir.path().join("config.json")).unwrap()).unwrap();
+        let tools = content["tools"].as_array().unwrap();
+        let pt_count = tools.iter().filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("process_triage")).count();
+        assert_eq!(pt_count, 1);
+    }
+
+    #[test]
+    fn configure_codex_dry_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(true, true);
+        let err = configure_codex(dir.path(), &options).unwrap_err();
+        matches!(err, ConfigError::DryRun);
+    }
+
+    #[test]
+    fn configure_codex_replaces_non_array_tools() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.json");
+        fs::write(&config, r#"{"tools": "invalid"}"#).unwrap();
+
+        let options = make_options(false, true);
+        let result = configure_codex(dir.path(), &options).unwrap();
+        assert!(result.changes.iter().any(|c| c.contains("Replaced invalid tools")));
+    }
+
+    // ── configure_cursor ────────────────────────────────────────────
+
+    #[test]
+    fn configure_cursor_fresh_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(false, true);
+
+        let result = configure_cursor(dir.path(), &options).unwrap();
+        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let ext = content["extensions"]["process_triage"].as_object().unwrap();
+        assert_eq!(ext["enabled"], true);
+        assert_eq!(ext["command"], "pt");
+    }
+
+    #[test]
+    fn configure_cursor_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(false, true);
+
+        configure_cursor(dir.path(), &options).unwrap();
+        let result = configure_cursor(dir.path(), &options).unwrap();
+
+        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let exts = content["extensions"].as_object().unwrap();
+        assert_eq!(exts.len(), 1);
+    }
+
+    #[test]
+    fn configure_cursor_replaces_non_object_extensions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, r#"{"extensions": 42}"#).unwrap();
+
+        let options = make_options(false, true);
+        let result = configure_cursor(dir.path(), &options).unwrap();
+        assert!(result.changes.iter().any(|c| c.contains("Replaced invalid extensions")));
+    }
+
+    // ── configure_copilot ───────────────────────────────────────────
+
+    #[test]
+    fn configure_copilot_creates_md_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(false, true);
+
+        let result = configure_copilot(dir.path(), &options).unwrap();
+        assert!(result.config_path.exists());
+        let content = fs::read_to_string(&result.config_path).unwrap();
+        assert!(content.contains("Process Triage"));
+        assert!(content.contains("pt-scan"));
+        assert!(result.backup.is_none());
+    }
+
+    #[test]
+    fn configure_copilot_dry_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(true, true);
+        let err = configure_copilot(dir.path(), &options).unwrap_err();
+        matches!(err, ConfigError::DryRun);
+    }
+
+    // ── configure_windsurf delegates to cursor ──────────────────────
+
+    #[test]
+    fn configure_windsurf_same_as_cursor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = make_options(false, true);
+
+        let result = configure_windsurf(dir.path(), &options).unwrap();
+        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        assert!(content.get("extensions").is_some());
+    }
+
+    // ── configure_agent dispatch ────────────────────────────────────
+
+    #[test]
+    fn configure_agent_claude() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = make_agent(AgentType::ClaudeCode, Some(dir.path().to_path_buf()));
+        let options = make_options(false, true);
+
+        let result = configure_agent(&agent, &options).unwrap();
+        assert!(result.config_path.exists());
+    }
+
+    #[test]
+    fn configure_agent_codex() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent = make_agent(AgentType::Codex, Some(dir.path().to_path_buf()));
+        let options = make_options(false, true);
+
+        let result = configure_agent(&agent, &options).unwrap();
+        assert!(result.config_path.exists());
+    }
 }
