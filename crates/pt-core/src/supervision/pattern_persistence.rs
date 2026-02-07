@@ -1280,4 +1280,1011 @@ mod tests {
         assert_eq!(exported.patterns.len(), 1);
         assert_eq!(exported.patterns[0].signature.name, "export_test");
     }
+
+    // ── PatternLifecycle ────────────────────────────────────────────
+
+    #[test]
+    fn test_lifecycle_is_active() {
+        assert!(PatternLifecycle::New.is_active());
+        assert!(PatternLifecycle::Learning.is_active());
+        assert!(PatternLifecycle::Stable.is_active());
+        assert!(!PatternLifecycle::Deprecated.is_active());
+        assert!(!PatternLifecycle::Removed.is_active());
+    }
+
+    #[test]
+    fn test_lifecycle_should_warn() {
+        assert!(!PatternLifecycle::New.should_warn());
+        assert!(!PatternLifecycle::Learning.should_warn());
+        assert!(!PatternLifecycle::Stable.should_warn());
+        assert!(PatternLifecycle::Deprecated.should_warn());
+        assert!(!PatternLifecycle::Removed.should_warn());
+    }
+
+    #[test]
+    fn test_lifecycle_from_stats_boundaries() {
+        // Low confidence, low count → New
+        assert_eq!(PatternLifecycle::from_stats(0.0, 0), PatternLifecycle::New);
+        assert_eq!(
+            PatternLifecycle::from_stats(0.49, 100),
+            PatternLifecycle::New
+        );
+
+        // Moderate confidence → Learning
+        assert_eq!(
+            PatternLifecycle::from_stats(0.5, 0),
+            PatternLifecycle::Learning
+        );
+        assert_eq!(
+            PatternLifecycle::from_stats(0.79, 100),
+            PatternLifecycle::Learning
+        );
+        // High confidence but low count → Learning
+        assert_eq!(
+            PatternLifecycle::from_stats(0.8, 9),
+            PatternLifecycle::Learning
+        );
+        assert_eq!(
+            PatternLifecycle::from_stats(0.99, 9),
+            PatternLifecycle::Learning
+        );
+
+        // High confidence + count threshold → Stable
+        assert_eq!(
+            PatternLifecycle::from_stats(0.8, 10),
+            PatternLifecycle::Stable
+        );
+        assert_eq!(
+            PatternLifecycle::from_stats(1.0, 100),
+            PatternLifecycle::Stable
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_same_state_transitions() {
+        use PatternLifecycle::*;
+        for s in [New, Learning, Stable, Deprecated, Removed] {
+            assert!(s.can_transition_to(s), "same-state transition for {s:?}");
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_deprecation_from_any_active() {
+        use PatternLifecycle::*;
+        assert!(New.can_transition_to(Deprecated));
+        assert!(Learning.can_transition_to(Deprecated));
+        assert!(Stable.can_transition_to(Deprecated));
+    }
+
+    #[test]
+    fn test_lifecycle_reactivation_from_deprecated() {
+        use PatternLifecycle::*;
+        assert!(Deprecated.can_transition_to(New));
+        assert!(Deprecated.can_transition_to(Learning));
+        assert!(Deprecated.can_transition_to(Stable));
+    }
+
+    #[test]
+    fn test_lifecycle_invalid_transitions() {
+        use PatternLifecycle::*;
+        assert!(!New.can_transition_to(Stable)); // skip Learning
+        assert!(!New.can_transition_to(Removed)); // skip deprecation
+        assert!(!Learning.can_transition_to(Removed)); // skip deprecation
+        assert!(!Stable.can_transition_to(New)); // no backward
+        assert!(!Stable.can_transition_to(Learning)); // no backward
+        assert!(!Removed.can_transition_to(New));
+        assert!(!Removed.can_transition_to(Learning));
+        assert!(!Removed.can_transition_to(Stable));
+        assert!(!Removed.can_transition_to(Deprecated));
+    }
+
+    #[test]
+    fn test_lifecycle_default() {
+        assert_eq!(PatternLifecycle::default(), PatternLifecycle::New);
+    }
+
+    // ── PatternSource ───────────────────────────────────────────────
+
+    #[test]
+    fn test_source_is_mutable() {
+        assert!(!PatternSource::BuiltIn.is_mutable());
+        assert!(PatternSource::Learned.is_mutable());
+        assert!(PatternSource::Custom.is_mutable());
+        assert!(PatternSource::Community.is_mutable());
+        assert!(PatternSource::Imported.is_mutable());
+    }
+
+    #[test]
+    fn test_source_filename() {
+        assert_eq!(PatternSource::BuiltIn.filename(), Some("built_in.json"));
+        assert_eq!(PatternSource::Learned.filename(), Some("learned.json"));
+        assert_eq!(PatternSource::Custom.filename(), Some("custom.json"));
+        assert_eq!(PatternSource::Imported.filename(), Some("custom.json"));
+        assert_eq!(PatternSource::Community.filename(), None);
+    }
+
+    #[test]
+    fn test_source_default() {
+        assert_eq!(PatternSource::default(), PatternSource::Custom);
+    }
+
+    // ── PatternStats ────────────────────────────────────────────────
+
+    #[test]
+    fn test_stats_acceptance_rate_no_matches() {
+        let stats = PatternStats::default();
+        assert!(stats.acceptance_rate().is_none());
+    }
+
+    #[test]
+    fn test_stats_acceptance_rate_all_accepted() {
+        let mut stats = PatternStats::default();
+        stats.record_match(true);
+        stats.record_match(true);
+        stats.record_match(true);
+        assert!((stats.acceptance_rate().unwrap() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_stats_acceptance_rate_all_rejected() {
+        let mut stats = PatternStats::default();
+        stats.record_match(false);
+        stats.record_match(false);
+        assert!((stats.acceptance_rate().unwrap() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_stats_laplace_smoothing() {
+        let mut stats = PatternStats::default();
+        // Single accept: (1+1)/(1+2) = 2/3 ≈ 0.667
+        stats.record_match(true);
+        assert!((stats.computed_confidence.unwrap() - 2.0 / 3.0).abs() < 0.001);
+
+        // Two accepts: (2+1)/(2+2) = 3/4 = 0.75
+        stats.record_match(true);
+        assert!((stats.computed_confidence.unwrap() - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_stats_update_confidence_no_matches() {
+        let mut stats = PatternStats::default();
+        stats.update_confidence();
+        assert!(stats.computed_confidence.is_none());
+    }
+
+    #[test]
+    fn test_stats_suggested_lifecycle() {
+        let mut stats = PatternStats::default();
+        // No matches → confidence 0 → New
+        assert_eq!(stats.suggested_lifecycle(), PatternLifecycle::New);
+
+        // Record enough accepts to get high confidence
+        for _ in 0..15 {
+            stats.record_match(true);
+        }
+        // (15+1)/(15+2) = 0.941 with count 15 → Stable
+        assert_eq!(stats.suggested_lifecycle(), PatternLifecycle::Stable);
+    }
+
+    #[test]
+    fn test_stats_first_seen_set_once() {
+        let mut stats = PatternStats::default();
+        stats.record_match(true);
+        let first = stats.first_seen.unwrap();
+        stats.record_match(true);
+        assert_eq!(stats.first_seen.unwrap(), first);
+    }
+
+    #[test]
+    fn test_stats_last_match_updated() {
+        let mut stats = PatternStats::default();
+        stats.record_match(true);
+        let last = stats.last_match.unwrap();
+        assert!(last > 0);
+    }
+
+    // ── PersistedPattern ────────────────────────────────────────────
+
+    #[test]
+    fn test_persisted_pattern_new() {
+        let sig = make_test_signature("pp_new");
+        let pp = PersistedPattern::new(sig, PatternSource::Custom);
+        assert_eq!(pp.lifecycle, PatternLifecycle::New);
+        assert_eq!(pp.source, PatternSource::Custom);
+        assert_eq!(pp.version, "1.0.0");
+        assert!(pp.created_at.is_some());
+        assert!(pp.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_persisted_pattern_builtin() {
+        let sig = make_test_signature("pp_builtin");
+        let pp = PersistedPattern::builtin(sig);
+        assert_eq!(pp.lifecycle, PatternLifecycle::Stable);
+        assert_eq!(pp.source, PatternSource::BuiltIn);
+    }
+
+    #[test]
+    fn test_persisted_pattern_touch() {
+        let sig = make_test_signature("pp_touch");
+        let mut pp = PersistedPattern::new(sig, PatternSource::Custom);
+        let before = pp.updated_at;
+        pp.touch();
+        // Timestamps are second-granularity so may be equal; just check it's Some
+        assert!(pp.updated_at.is_some());
+        assert!(pp.updated_at >= before);
+    }
+
+    #[test]
+    fn test_persisted_pattern_transition_lifecycle_valid() {
+        let sig = make_test_signature("pp_trans");
+        let mut pp = PersistedPattern::new(sig, PatternSource::Custom);
+        assert_eq!(pp.lifecycle, PatternLifecycle::New);
+
+        pp.transition_lifecycle(PatternLifecycle::Learning).unwrap();
+        assert_eq!(pp.lifecycle, PatternLifecycle::Learning);
+
+        pp.transition_lifecycle(PatternLifecycle::Stable).unwrap();
+        assert_eq!(pp.lifecycle, PatternLifecycle::Stable);
+    }
+
+    #[test]
+    fn test_persisted_pattern_transition_lifecycle_invalid() {
+        let sig = make_test_signature("pp_trans_inv");
+        let mut pp = PersistedPattern::new(sig, PatternSource::Custom);
+        // New → Stable is invalid (must go through Learning)
+        let err = pp.transition_lifecycle(PatternLifecycle::Stable);
+        assert!(err.is_err());
+        // State unchanged
+        assert_eq!(pp.lifecycle, PatternLifecycle::New);
+    }
+
+    // ── PersistedSchema ─────────────────────────────────────────────
+
+    #[test]
+    fn test_schema_new_defaults() {
+        let schema = PersistedSchema::new();
+        assert_eq!(schema.schema_version, SCHEMA_VERSION);
+        assert!(schema.patterns.is_empty());
+        assert!(schema.metadata.is_none());
+    }
+
+    #[test]
+    fn test_schema_default_equals_new() {
+        let a = PersistedSchema::new();
+        let b = PersistedSchema::default();
+        assert_eq!(a.schema_version, b.schema_version);
+        assert_eq!(a.patterns.len(), b.patterns.len());
+    }
+
+    #[test]
+    fn test_schema_json_roundtrip() {
+        let sig = make_test_signature("roundtrip");
+        let schema = PersistedSchema {
+            schema_version: SCHEMA_VERSION,
+            patterns: vec![PersistedPattern::new(sig, PatternSource::Custom)],
+            metadata: Some(SchemaMetadata {
+                description: Some("test".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let json = schema.to_json().unwrap();
+        let reloaded = PersistedSchema::from_json(&json).unwrap();
+        assert_eq!(reloaded.patterns.len(), 1);
+        assert_eq!(reloaded.patterns[0].signature.name, "roundtrip");
+    }
+
+    #[test]
+    fn test_schema_file_roundtrip() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("test_schema.json");
+
+        let sig = make_test_signature("file_rt");
+        let schema = PersistedSchema {
+            schema_version: SCHEMA_VERSION,
+            patterns: vec![PersistedPattern::new(sig, PatternSource::Custom)],
+            metadata: None,
+        };
+
+        schema.save_to_file(&path).unwrap();
+        let loaded = PersistedSchema::from_file(&path).unwrap();
+        assert_eq!(loaded.patterns.len(), 1);
+        assert_eq!(loaded.patterns[0].signature.name, "file_rt");
+    }
+
+    #[test]
+    fn test_schema_to_signature_schema_filters_inactive() {
+        let mut p1 = PersistedPattern::new(
+            make_test_signature("active_one"),
+            PatternSource::Custom,
+        );
+        p1.lifecycle = PatternLifecycle::Stable;
+
+        let mut p2 = PersistedPattern::new(
+            make_test_signature("deprecated_one"),
+            PatternSource::Custom,
+        );
+        p2.lifecycle = PatternLifecycle::Deprecated;
+
+        let mut p3 = PersistedPattern::new(
+            make_test_signature("removed_one"),
+            PatternSource::Custom,
+        );
+        p3.lifecycle = PatternLifecycle::Removed;
+
+        let schema = PersistedSchema {
+            schema_version: SCHEMA_VERSION,
+            patterns: vec![p1, p2, p3],
+            metadata: None,
+        };
+
+        let sig_schema = schema.to_signature_schema();
+        // Only the Stable (active) pattern should be included
+        assert_eq!(sig_schema.signatures.len(), 1);
+        assert_eq!(sig_schema.signatures[0].name, "active_one");
+    }
+
+    #[test]
+    fn test_schema_validate_future_version() {
+        let schema = PersistedSchema {
+            schema_version: SCHEMA_VERSION + 1,
+            patterns: vec![],
+            metadata: None,
+        };
+        assert!(schema.validate().is_err());
+    }
+
+    // ── DisabledPatterns ────────────────────────────────────────────
+
+    #[test]
+    fn test_disabled_default_empty() {
+        let dp = DisabledPatterns::default();
+        assert!(!dp.is_disabled("anything"));
+        assert!(dp.disabled.is_empty());
+    }
+
+    #[test]
+    fn test_disabled_disable_with_reason() {
+        let mut dp = DisabledPatterns::default();
+        dp.disable("test_pat", Some("too noisy"));
+        assert!(dp.is_disabled("test_pat"));
+        assert_eq!(dp.reasons.get("test_pat").unwrap(), "too noisy");
+        assert!(dp.disabled_at.contains_key("test_pat"));
+    }
+
+    #[test]
+    fn test_disabled_disable_without_reason() {
+        let mut dp = DisabledPatterns::default();
+        dp.disable("test_pat", None);
+        assert!(dp.is_disabled("test_pat"));
+        assert!(!dp.reasons.contains_key("test_pat"));
+    }
+
+    #[test]
+    fn test_disabled_enable_removes_all() {
+        let mut dp = DisabledPatterns::default();
+        dp.disable("test_pat", Some("reason"));
+        dp.enable("test_pat");
+        assert!(!dp.is_disabled("test_pat"));
+        assert!(!dp.reasons.contains_key("test_pat"));
+        assert!(!dp.disabled_at.contains_key("test_pat"));
+    }
+
+    #[test]
+    fn test_disabled_file_roundtrip() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("disabled.json");
+
+        let mut dp = DisabledPatterns::default();
+        dp.disable("pat_a", Some("too noisy"));
+        dp.disable("pat_b", None);
+        dp.save_to_file(&path).unwrap();
+
+        let loaded = DisabledPatterns::from_file(&path).unwrap();
+        assert!(loaded.is_disabled("pat_a"));
+        assert!(loaded.is_disabled("pat_b"));
+        assert_eq!(loaded.reasons.get("pat_a").unwrap(), "too noisy");
+    }
+
+    // ── AllPatternStats ─────────────────────────────────────────────
+
+    #[test]
+    fn test_all_stats_get_nonexistent() {
+        let stats = AllPatternStats::default();
+        assert!(stats.get("missing").is_none());
+    }
+
+    #[test]
+    fn test_all_stats_get_or_create() {
+        let mut stats = AllPatternStats::default();
+        let entry = stats.get_or_create("new_pattern");
+        assert_eq!(entry.match_count, 0);
+        // Should now exist
+        assert!(stats.get("new_pattern").is_some());
+    }
+
+    #[test]
+    fn test_all_stats_record_match() {
+        let mut stats = AllPatternStats::default();
+        stats.record_match("test_sig", true);
+        stats.record_match("test_sig", false);
+
+        let s = stats.get("test_sig").unwrap();
+        assert_eq!(s.match_count, 2);
+        assert_eq!(s.accept_count, 1);
+        assert_eq!(s.reject_count, 1);
+        assert!(stats.last_updated.is_some());
+    }
+
+    #[test]
+    fn test_all_stats_file_roundtrip() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("stats.json");
+
+        let mut stats = AllPatternStats::default();
+        stats.record_match("sig_a", true);
+        stats.record_match("sig_b", false);
+        stats.save_to_file(&path).unwrap();
+
+        let loaded = AllPatternStats::from_file(&path).unwrap();
+        assert!(loaded.get("sig_a").is_some());
+        assert_eq!(loaded.get("sig_a").unwrap().match_count, 1);
+        assert_eq!(loaded.get("sig_b").unwrap().reject_count, 1);
+    }
+
+    // ── PatternLibrary: add_learned ─────────────────────────────────
+
+    #[test]
+    fn test_library_add_learned_new() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let sig = make_test_signature("learned_new");
+        lib.add_learned(sig).expect("add_learned");
+
+        let pattern = lib.get_pattern("learned_new");
+        assert!(pattern.is_some());
+        assert_eq!(pattern.unwrap().source, PatternSource::Learned);
+    }
+
+    #[test]
+    fn test_library_add_learned_update_existing() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let mut sig = make_test_signature("learned_update");
+        sig.confidence_weight = 0.5;
+        lib.add_learned(sig).expect("add");
+
+        let mut sig2 = make_test_signature("learned_update");
+        sig2.confidence_weight = 0.9;
+        lib.add_learned(sig2).expect("update");
+
+        // Should be only one pattern with updated confidence
+        let count = lib
+            .learned
+            .patterns
+            .iter()
+            .filter(|p| p.signature.name == "learned_update")
+            .count();
+        assert_eq!(count, 1);
+        let p = lib.get_pattern("learned_update").unwrap();
+        assert!((p.signature.confidence_weight - 0.9).abs() < 0.001);
+    }
+
+    // ── PatternLibrary: remove_pattern ──────────────────────────────
+
+    #[test]
+    fn test_library_remove_custom() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        lib.add_custom(make_test_signature("to_remove")).unwrap();
+        lib.remove_pattern("to_remove").unwrap();
+        assert!(lib.get_pattern("to_remove").is_none());
+    }
+
+    #[test]
+    fn test_library_remove_learned() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        lib.add_learned(make_test_signature("learned_rm")).unwrap();
+        lib.remove_pattern("learned_rm").unwrap();
+        assert!(lib.get_pattern("learned_rm").is_none());
+    }
+
+    #[test]
+    fn test_library_remove_builtin_fails() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        // Manually inject a built-in pattern
+        lib.built_in
+            .patterns
+            .push(PersistedPattern::builtin(make_test_signature("builtin_rm")));
+
+        let err = lib.remove_pattern("builtin_rm");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("built-in"));
+    }
+
+    #[test]
+    fn test_library_remove_not_found() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let err = lib.remove_pattern("nonexistent");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("not found"));
+    }
+
+    // ── PatternLibrary: duplicate prevention ────────────────────────
+
+    #[test]
+    fn test_library_add_custom_duplicate_fails() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        lib.add_custom(make_test_signature("dup_test")).unwrap();
+        let err = lib.add_custom(make_test_signature("dup_test"));
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("already exists"));
+    }
+
+    // ── PatternLibrary: disable/enable edge cases ───────────────────
+
+    #[test]
+    fn test_library_disable_nonexistent_fails() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let err = lib.disable_pattern("no_such", None);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_library_enable_not_disabled_fails() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let err = lib.enable_pattern("not_disabled");
+        assert!(err.is_err());
+    }
+
+    // ── PatternLibrary: stats and lifecycle ──────────────────────────
+
+    #[test]
+    fn test_library_record_and_get_stats() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        lib.record_match("stat_test", true);
+        lib.record_match("stat_test", true);
+        lib.record_match("stat_test", false);
+
+        let stats = lib.get_stats("stat_test").unwrap();
+        assert_eq!(stats.match_count, 3);
+        assert_eq!(stats.accept_count, 2);
+    }
+
+    #[test]
+    fn test_library_update_lifecycles_skips_invalid_jump() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let sig = make_test_signature("lifecycle_update");
+        lib.add_learned(sig).unwrap();
+
+        // Record 15 accepts: from_stats gives Stable (conf 0.941, count 15)
+        // But New→Stable is invalid (must go New→Learning→Stable stepwise)
+        for _ in 0..15 {
+            lib.record_match("lifecycle_update", true);
+        }
+
+        let transitions = lib.update_lifecycles();
+        assert!(transitions.is_empty(), "New→Stable should be rejected");
+
+        let p = lib.get_pattern("lifecycle_update").unwrap();
+        assert_eq!(p.lifecycle, PatternLifecycle::New);
+    }
+
+    #[test]
+    fn test_library_update_lifecycles_step_by_step() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let sig = make_test_signature("step_lifecycle");
+        lib.add_learned(sig).unwrap();
+
+        // Step 1: Record 2 accepts → confidence (2+1)/(2+2) = 0.75, count 2 → Learning
+        lib.record_match("step_lifecycle", true);
+        lib.record_match("step_lifecycle", true);
+
+        let t1 = lib.update_lifecycles();
+        assert_eq!(t1.len(), 1);
+        assert_eq!(t1[0].1, PatternLifecycle::New);
+        assert_eq!(t1[0].2, PatternLifecycle::Learning);
+
+        // Step 2: Record more accepts until stable (need count >= 10, conf >= 0.8)
+        for _ in 0..10 {
+            lib.record_match("step_lifecycle", true);
+        }
+        // Now: 12 accepts, conf (12+1)/(12+2)=0.929, count 12 → Stable
+
+        let t2 = lib.update_lifecycles();
+        assert_eq!(t2.len(), 1);
+        assert_eq!(t2[0].1, PatternLifecycle::Learning);
+        assert_eq!(t2[0].2, PatternLifecycle::Stable);
+    }
+
+    // ── PatternLibrary: get_pattern_mut ─────────────────────────────
+
+    #[test]
+    fn test_library_get_pattern_mut_custom() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        lib.add_custom(make_test_signature("mut_custom")).unwrap();
+        let p = lib.get_pattern_mut("mut_custom");
+        assert!(p.is_some());
+        p.unwrap().lifecycle = PatternLifecycle::Learning;
+
+        // Verify the change stuck
+        assert_eq!(
+            lib.get_pattern("mut_custom").unwrap().lifecycle,
+            PatternLifecycle::Learning
+        );
+    }
+
+    #[test]
+    fn test_library_get_pattern_mut_builtin_returns_none() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        lib.built_in
+            .patterns
+            .push(PersistedPattern::builtin(make_test_signature("bi_mut")));
+
+        // Built-in patterns are NOT returned by get_pattern_mut
+        assert!(lib.get_pattern_mut("bi_mut").is_none());
+    }
+
+    // ── PatternLibrary: all_active_patterns ─────────────────────────
+
+    #[test]
+    fn test_library_active_patterns_sorted_by_priority() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let mut sig_low = make_test_signature("low_pri");
+        sig_low.priority = 200;
+        lib.add_custom(sig_low).unwrap();
+
+        let mut sig_high = make_test_signature("high_pri");
+        sig_high.priority = 10;
+        lib.add_custom(sig_high).unwrap();
+
+        let active = lib.all_active_patterns();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].signature.name, "high_pri");
+        assert_eq!(active[1].signature.name, "low_pri");
+    }
+
+    #[test]
+    fn test_library_active_patterns_excludes_disabled_and_removed() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        lib.add_custom(make_test_signature("active_sig")).unwrap();
+        lib.add_custom(make_test_signature("disabled_sig")).unwrap();
+
+        lib.disable_pattern("disabled_sig", None).unwrap();
+
+        let names: Vec<_> = lib
+            .all_active_patterns()
+            .iter()
+            .map(|p| p.signature.name.clone())
+            .collect();
+        assert!(names.contains(&"active_sig".to_string()));
+        assert!(!names.contains(&"disabled_sig".to_string()));
+    }
+
+    // ── PatternLibrary: import with all strategies ──────────────────
+
+    #[test]
+    fn test_import_keep_existing() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let mut existing = make_test_signature("import_ke");
+        existing.confidence_weight = 0.5;
+        lib.add_custom(existing).unwrap();
+
+        let mut imported = make_test_signature("import_ke");
+        imported.confidence_weight = 0.9;
+
+        let schema = PersistedSchema {
+            schema_version: SCHEMA_VERSION,
+            patterns: vec![PersistedPattern::new(imported, PatternSource::Imported)],
+            metadata: None,
+        };
+
+        let result = lib
+            .import(schema, ConflictResolution::KeepExisting)
+            .unwrap();
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.updated, 0);
+
+        // Confidence unchanged
+        let p = lib.get_pattern("import_ke").unwrap();
+        assert!((p.signature.confidence_weight - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_import_replace_with_imported() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let mut existing = make_test_signature("import_rp");
+        existing.confidence_weight = 0.5;
+        lib.add_custom(existing).unwrap();
+
+        let mut imported = make_test_signature("import_rp");
+        imported.confidence_weight = 0.3; // lower but still replaces
+        let schema = PersistedSchema {
+            schema_version: SCHEMA_VERSION,
+            patterns: vec![PersistedPattern::new(imported, PatternSource::Imported)],
+            metadata: None,
+        };
+
+        let result = lib
+            .import(schema, ConflictResolution::ReplaceWithImported)
+            .unwrap();
+        assert_eq!(result.updated, 1);
+
+        let p = lib.get_pattern("import_rp").unwrap();
+        assert!((p.signature.confidence_weight - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_import_keep_higher_confidence_keeps_existing() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let mut existing = make_test_signature("import_hc");
+        existing.confidence_weight = 0.9;
+        lib.add_custom(existing).unwrap();
+
+        let mut imported = make_test_signature("import_hc");
+        imported.confidence_weight = 0.3;
+        let schema = PersistedSchema {
+            schema_version: SCHEMA_VERSION,
+            patterns: vec![PersistedPattern::new(imported, PatternSource::Imported)],
+            metadata: None,
+        };
+
+        let result = lib
+            .import(schema, ConflictResolution::KeepHigherConfidence)
+            .unwrap();
+        assert_eq!(result.skipped, 1);
+
+        let p = lib.get_pattern("import_hc").unwrap();
+        assert!((p.signature.confidence_weight - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_import_merge() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let mut existing = make_test_signature("import_mg");
+        existing.confidence_weight = 0.5;
+        lib.add_custom(existing).unwrap();
+
+        let mut imported = make_test_signature("import_mg");
+        imported.confidence_weight = 0.9;
+        let schema = PersistedSchema {
+            schema_version: SCHEMA_VERSION,
+            patterns: vec![PersistedPattern::new(imported, PatternSource::Imported)],
+            metadata: None,
+        };
+
+        let result = lib.import(schema, ConflictResolution::Merge).unwrap();
+        assert_eq!(result.updated, 1);
+
+        // Should have the higher confidence
+        let p = lib.get_pattern("import_mg").unwrap();
+        assert!((p.signature.confidence_weight - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_import_no_conflict() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let sig = make_test_signature("brand_new");
+        let schema = PersistedSchema {
+            schema_version: SCHEMA_VERSION,
+            patterns: vec![PersistedPattern::new(sig, PatternSource::Imported)],
+            metadata: None,
+        };
+
+        let result = lib
+            .import(schema, ConflictResolution::KeepExisting)
+            .unwrap();
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.conflicts.len(), 0);
+        assert!(lib.get_pattern("brand_new").is_some());
+    }
+
+    // ── PatternLibrary: to_signature_schema ─────────────────────────
+
+    #[test]
+    fn test_library_to_signature_schema() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        lib.add_custom(make_test_signature("sig_a")).unwrap();
+        lib.add_learned(make_test_signature("sig_b")).unwrap();
+
+        let schema = lib.to_signature_schema();
+        assert_eq!(schema.signatures.len(), 2);
+    }
+
+    // ── PatternLibrary: initialize_built_in ─────────────────────────
+
+    #[test]
+    fn test_library_initialize_built_in() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let sigs = vec![
+            make_test_signature("bi_1"),
+            make_test_signature("bi_2"),
+        ];
+        lib.initialize_built_in(sigs).unwrap();
+
+        // Should be loadable as built-in
+        assert_eq!(lib.built_in.patterns.len(), 2);
+        assert_eq!(
+            lib.built_in.patterns[0].lifecycle,
+            PatternLifecycle::Stable
+        );
+
+        // File should exist
+        let path = dir.path().join("patterns").join("built_in.json");
+        assert!(path.exists());
+    }
+
+    // ── PatternLibrary: dirty flag ──────────────────────────────────
+
+    #[test]
+    fn test_library_dirty_flag() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        assert!(!lib.dirty);
+
+        lib.add_custom(make_test_signature("dirty_test")).unwrap();
+        assert!(lib.dirty);
+
+        lib.save().unwrap();
+        assert!(!lib.dirty);
+
+        // Save when not dirty is a no-op (should succeed)
+        lib.save().unwrap();
+    }
+
+    // ── PatternLibrary: get_pattern search order ────────────────────
+
+    #[test]
+    fn test_library_get_pattern_search_order() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        // Add same name to custom and learned: custom wins because
+        // get_pattern checks custom first
+        let mut sig_custom = make_test_signature("search_order");
+        sig_custom.confidence_weight = 0.1;
+        lib.custom.patterns.push(PersistedPattern::new(
+            sig_custom,
+            PatternSource::Custom,
+        ));
+
+        let mut sig_learned = make_test_signature("search_order");
+        sig_learned.confidence_weight = 0.9;
+        lib.learned.patterns.push(PersistedPattern::new(
+            sig_learned,
+            PatternSource::Learned,
+        ));
+
+        let p = lib.get_pattern("search_order").unwrap();
+        // Custom is checked first
+        assert_eq!(p.source, PatternSource::Custom);
+    }
+
+    // ── migrate_schema ──────────────────────────────────────────────
+
+    #[test]
+    fn test_migrate_same_version() {
+        let mut schema = PersistedSchema::new();
+        migrate_schema(&mut schema, SCHEMA_VERSION).unwrap();
+        assert_eq!(schema.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_future_version_fails() {
+        let mut schema = PersistedSchema::new();
+        schema.schema_version = SCHEMA_VERSION + 10;
+        let err = migrate_schema(&mut schema, SCHEMA_VERSION + 10);
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("downgrade"));
+    }
+
+    // ── Serialization ───────────────────────────────────────────────
+
+    #[test]
+    fn test_lifecycle_serde_roundtrip() {
+        let states = vec![
+            PatternLifecycle::New,
+            PatternLifecycle::Learning,
+            PatternLifecycle::Stable,
+            PatternLifecycle::Deprecated,
+            PatternLifecycle::Removed,
+        ];
+        for state in states {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: PatternLifecycle = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state, "roundtrip failed for {state:?}");
+        }
+    }
+
+    #[test]
+    fn test_source_serde_roundtrip() {
+        let sources = vec![
+            PatternSource::BuiltIn,
+            PatternSource::Learned,
+            PatternSource::Custom,
+            PatternSource::Community,
+            PatternSource::Imported,
+        ];
+        for source in sources {
+            let json = serde_json::to_string(&source).unwrap();
+            let back: PatternSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, source, "roundtrip failed for {source:?}");
+        }
+    }
+
+    #[test]
+    fn test_schema_metadata_serde() {
+        let meta = SchemaMetadata {
+            description: Some("test desc".to_string()),
+            author: Some("tester".to_string()),
+            exported_at: Some(12345),
+            source_system: None,
+            checksum: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: SchemaMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.description.unwrap(), "test desc");
+        assert_eq!(back.author.unwrap(), "tester");
+        assert_eq!(back.exported_at.unwrap(), 12345);
+        // None fields should not appear in JSON
+        assert!(!json.contains("source_system"));
+        assert!(!json.contains("checksum"));
+    }
+
+    #[test]
+    fn test_conflict_resolution_default() {
+        assert_eq!(
+            ConflictResolution::default(),
+            ConflictResolution::KeepHigherConfidence
+        );
+    }
 }
