@@ -361,7 +361,7 @@ impl EscalationManager {
         if emit.len() == 1 {
             let (key, t, level) = emit.remove(0);
             self.update_state_sent(&key, now, level);
-            return vec![render_notification(&t, level, false, 1)];
+            return vec![render_notification(&t, level, false, 1, now)];
         }
 
         // Bundle all into one notification.
@@ -526,6 +526,7 @@ fn render_notification(
     level: EscalationLevel,
     bundled: bool,
     count: usize,
+    created_at: f64,
 ) -> Notification {
     let title = format!(
         "Process Triage [{}]: {}",
@@ -546,7 +547,7 @@ fn render_notification(
             .as_ref()
             .map(|sid| format!("pt agent plan --session {}", sid)),
         session_id: trigger.session_id.clone(),
-        created_at: trigger.detected_at,
+        created_at,
         bundled,
         trigger_count: count,
         dedupe_key: if trigger.dedupe_key.is_empty() {
@@ -583,6 +584,16 @@ mod tests {
         assert!(!notifs[0].bundled);
         assert!(notifs[0].human_review_cmd.is_some());
         assert_eq!(notifs[0].level, EscalationLevel::L1);
+        assert_eq!(notifs[0].created_at, 1000.0);
+    }
+
+    #[test]
+    fn test_single_notification_created_at_uses_flush_time() {
+        let mut mgr = EscalationManager::new(EscalationConfig::default());
+        assert!(mgr.submit_trigger(make_trigger("t1", Severity::Warning, 1000.0)));
+        let notifs = mgr.flush(1500.0);
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(notifs[0].created_at, 1500.0);
     }
 
     #[test]

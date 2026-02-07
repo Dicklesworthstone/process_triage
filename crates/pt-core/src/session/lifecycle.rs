@@ -136,7 +136,10 @@ pub fn create_session(
     let now = Utc::now();
     let expires_at = options
         .ttl_seconds
-        .map(|ttl| (now + Duration::seconds(ttl as i64)).to_rfc3339());
+        .map(|ttl| {
+            seconds_to_duration(ttl, &handle.dir).map(|duration| (now + duration).to_rfc3339())
+        })
+        .transpose()?;
 
     let lifecycle = LifecycleInfo {
         session_id: session_id.0.clone(),
@@ -226,11 +229,23 @@ pub fn extend_session(
         .filter(|dt| *dt > now)
         .unwrap_or(now);
 
-    let new_expiry = base + Duration::seconds(additional_seconds as i64);
+    let extension = seconds_to_duration(additional_seconds, &handle.dir)?;
+    let new_expiry = base + extension;
     let new_expiry_str = new_expiry.to_rfc3339();
 
     lifecycle.expires_at = Some(new_expiry_str.clone());
-    lifecycle.ttl_seconds = Some(lifecycle.ttl_seconds.unwrap_or(0) + additional_seconds);
+    lifecycle.ttl_seconds = Some(
+        lifecycle
+            .ttl_seconds
+            .and_then(|ttl| ttl.checked_add(additional_seconds))
+            .ok_or_else(|| SessionError::Io {
+                path: handle.dir.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ttl extension overflow",
+                ),
+            })?,
+    );
     lifecycle.extend_count += 1;
     write_lifecycle(handle, &lifecycle)?;
 
@@ -244,6 +259,7 @@ pub fn end_session(
 ) -> Result<EndSessionSummary, SessionError> {
     let manifest = handle.read_manifest()?;
     let now = Utc::now();
+    let mut state_transitions = manifest.state_history.len();
 
     // Determine final state.
     let final_state = if is_terminal(manifest.state) {
@@ -255,6 +271,7 @@ pub fn end_session(
     // Update manifest state.
     if !is_terminal(manifest.state) {
         handle.update_state(final_state)?;
+        state_transitions += 1;
     }
 
     // Update lifecycle.
@@ -273,7 +290,7 @@ pub fn end_session(
         session_id: manifest.session_id,
         final_state,
         duration_seconds,
-        state_transitions: manifest.state_history.len(),
+        state_transitions,
         ended_at: now.to_rfc3339(),
         reason: reason.map(|s| s.to_string()),
     })
@@ -357,6 +374,17 @@ fn is_terminal(state: SessionState) -> bool {
 
 fn lifecycle_path(handle: &SessionHandle) -> std::path::PathBuf {
     handle.dir.join(LIFECYCLE_FILE)
+}
+
+fn seconds_to_duration(seconds: u64, path: &std::path::Path) -> Result<Duration, SessionError> {
+    let seconds_i64 = i64::try_from(seconds).map_err(|_| SessionError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("ttl_seconds {} exceeds supported range", seconds),
+        ),
+    })?;
+    Ok(Duration::seconds(seconds_i64))
 }
 
 fn write_lifecycle(handle: &SessionHandle, info: &LifecycleInfo) -> Result<(), SessionError> {
@@ -527,6 +555,7 @@ mod tests {
         let summary = end_session(&handle, Some("workflow complete")).unwrap();
         assert_eq!(summary.final_state, SessionState::Completed);
         assert!(summary.duration_seconds >= 0);
+        assert_eq!(summary.state_transitions, 2);
         assert_eq!(summary.reason.as_deref(), Some("workflow complete"));
 
         let status = session_status(&handle).unwrap();
@@ -634,5 +663,27 @@ mod tests {
         let (_sid, handle) = create_session(store, &opts).unwrap();
         let status = session_status(&handle).unwrap();
         assert!(status.agent_metadata.is_none());
+    }
+
+    #[test]
+    fn test_create_session_huge_ttl_fails() {
+        let ts = test_store();
+        let store = &ts.store;
+        let mut opts = default_options();
+        opts.ttl_seconds = Some(u64::MAX);
+
+        let result = create_session(store, &opts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extend_huge_ttl_fails() {
+        let ts = test_store();
+        let store = &ts.store;
+        let opts = default_options();
+        let (_sid, handle) = create_session(store, &opts).unwrap();
+
+        let result = extend_session(&handle, u64::MAX);
+        assert!(result.is_err());
     }
 }

@@ -132,6 +132,30 @@ pub fn detect_container_from_cgroup(cgroup_path: &str) -> ContainerInfo {
         ..Default::default()
     };
 
+    // Kubernetes patterns: /kubepods/... or /kubepods.slice/...
+    // Check this before runtime-specific extractors so we preserve Kubernetes metadata
+    // for docker/containerd/crio paths nested under kubepods.
+    if let Some(k8s_info) = extract_kubernetes_info(cgroup_path) {
+        info.in_container = true;
+        info.runtime = if cgroup_path.contains("crio") {
+            ContainerRuntime::Crio
+        } else if cgroup_path.contains("containerd") {
+            ContainerRuntime::Containerd
+        } else if cgroup_path.contains("docker") {
+            ContainerRuntime::Docker
+        } else {
+            ContainerRuntime::Generic
+        };
+        info.container_id = k8s_info.container_id.clone();
+        info.container_id_short = k8s_info
+            .container_id
+            .as_ref()
+            .map(|id| id[..12.min(id.len())].to_string());
+        info.kubernetes = Some(k8s_info.k8s);
+        info.provenance.source = ContainerDetectionSource::CgroupPath;
+        return info;
+    }
+
     // Docker pattern: /docker/<container_id> or /docker-<container_id>
     if let Some(id) = extract_docker_id(cgroup_path) {
         info.in_container = true;
@@ -168,28 +192,6 @@ pub fn detect_container_from_cgroup(cgroup_path: &str) -> ContainerInfo {
         info.runtime = ContainerRuntime::Lxc;
         info.container_id_short = Some(id.clone());
         info.container_id = Some(id);
-        info.provenance.source = ContainerDetectionSource::CgroupPath;
-        return info;
-    }
-
-    // Kubernetes patterns: /kubepods/... or /kubepods.slice/...
-    if let Some(k8s_info) = extract_kubernetes_info(cgroup_path) {
-        info.in_container = true;
-        info.runtime = if cgroup_path.contains("crio") {
-            ContainerRuntime::Crio
-        } else if cgroup_path.contains("containerd") {
-            ContainerRuntime::Containerd
-        } else if cgroup_path.contains("docker") {
-            ContainerRuntime::Docker
-        } else {
-            ContainerRuntime::Generic
-        };
-        info.container_id = k8s_info.container_id.clone();
-        info.container_id_short = k8s_info
-            .container_id
-            .as_ref()
-            .map(|id| id[..12.min(id.len())].to_string());
-        info.kubernetes = Some(k8s_info.k8s);
         info.provenance.source = ContainerDetectionSource::CgroupPath;
         return info;
     }
@@ -566,6 +568,17 @@ mod tests {
 
         let k8s = info.kubernetes.unwrap();
         assert_eq!(k8s.qos_class, Some("BestEffort".to_string()));
+    }
+
+    #[test]
+    fn test_detect_kubernetes_docker_runtime_preserves_k8s_metadata() {
+        let path = "/kubepods/burstable/pod12345678-1234-1234-1234-123456789012/docker-abc123def456789012345678901234567890123456789012345678901234.scope";
+        let info = detect_container_from_cgroup(path);
+
+        assert!(info.in_container);
+        assert_eq!(info.runtime, ContainerRuntime::Docker);
+        assert!(info.kubernetes.is_some());
+        assert!(info.container_id.is_some());
     }
 
     #[test]
