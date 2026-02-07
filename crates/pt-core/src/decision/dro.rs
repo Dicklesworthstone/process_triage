@@ -837,4 +837,573 @@ mod tests {
             dro_kill.robust_loss
         );
     }
+
+    // ── DroLoss serde ───────────────────────────────────────────────
+
+    #[test]
+    fn dro_loss_serialize() {
+        let loss = DroLoss {
+            action: Action::Pause,
+            robust_loss: 12.5,
+            nominal_loss: 10.0,
+            epsilon: 0.1,
+            inflation: 2.5,
+            lipschitz: 25.0,
+        };
+        let json = serde_json::to_string(&loss).unwrap();
+        assert!(json.contains(r#""action":"pause""#));
+        assert!(json.contains("12.5"));
+        assert!(json.contains("25.0"));
+    }
+
+    // ── DroOutcome serde ────────────────────────────────────────────
+
+    #[test]
+    fn dro_outcome_serialize() {
+        let outcome = DroOutcome {
+            applied: true,
+            reason: "drift".to_string(),
+            ambiguity_radius: 0.15,
+            original_action: Action::Kill,
+            robust_action: Action::Pause,
+            worst_case_expected_loss: 20.0,
+            action_changed: true,
+            dro_losses: vec![],
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains(r#""applied":true"#));
+        assert!(json.contains(r#""action_changed":true"#));
+        assert!(json.contains(r#""original_action":"kill""#));
+        assert!(json.contains(r#""robust_action":"pause""#));
+    }
+
+    // ── DroError display ────────────────────────────────────────────
+
+    #[test]
+    fn dro_error_display_invalid_posterior() {
+        let err = DroError::InvalidPosterior {
+            message: "bad values".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid posterior"));
+        assert!(msg.contains("bad values"));
+    }
+
+    #[test]
+    fn dro_error_display_invalid_epsilon() {
+        let err = DroError::InvalidEpsilon { epsilon: -0.5 };
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid epsilon"));
+        assert!(msg.contains("-0.5"));
+    }
+
+    #[test]
+    fn dro_error_display_no_feasible_actions() {
+        let err = DroError::NoFeasibleActions;
+        let msg = format!("{}", err);
+        assert!(msg.contains("no feasible actions"));
+    }
+
+    // ── DroTrigger serde ────────────────────────────────────────────
+
+    #[test]
+    fn dro_trigger_serialize() {
+        let trigger = DroTrigger {
+            ppc_failure: true,
+            drift_detected: false,
+            wasserstein_divergence: Some(0.42),
+            eta_tempering_reduced: false,
+            explicit_conservative: true,
+            low_model_confidence: false,
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        assert!(json.contains(r#""ppc_failure":true"#));
+        assert!(json.contains(r#""drift_detected":false"#));
+        assert!(json.contains("0.42"));
+        assert!(json.contains(r#""explicit_conservative":true"#));
+    }
+
+    #[test]
+    fn dro_trigger_default_is_none() {
+        let trigger = DroTrigger::default();
+        assert!(!trigger.should_apply());
+        assert!(!trigger.ppc_failure);
+        assert!(!trigger.drift_detected);
+        assert!(trigger.wasserstein_divergence.is_none());
+        assert!(!trigger.eta_tempering_reduced);
+        assert!(!trigger.explicit_conservative);
+        assert!(!trigger.low_model_confidence);
+    }
+
+    // ── DroTrigger individual trigger reasons ───────────────────────
+
+    #[test]
+    fn dro_trigger_eta_tempering_reason() {
+        let trigger = DroTrigger {
+            eta_tempering_reduced: true,
+            ..DroTrigger::none()
+        };
+        assert!(trigger.should_apply());
+        assert!(trigger.reason().contains("eta_tempering_reduced"));
+    }
+
+    #[test]
+    fn dro_trigger_low_confidence_reason() {
+        let trigger = DroTrigger {
+            low_model_confidence: true,
+            ..DroTrigger::none()
+        };
+        assert!(trigger.should_apply());
+        assert!(trigger.reason().contains("low_model_confidence"));
+    }
+
+    #[test]
+    fn dro_trigger_drift_without_divergence() {
+        let trigger = DroTrigger {
+            drift_detected: true,
+            wasserstein_divergence: None,
+            ..DroTrigger::none()
+        };
+        let reason = trigger.reason();
+        assert!(reason.contains("drift_detected"));
+        assert!(!reason.contains("W="));
+    }
+
+    // ── loss_for_action_class edge cases ────────────────────────────
+
+    #[test]
+    fn dro_resume_has_no_loss() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(5.0),
+            throttle: Some(8.0),
+            renice: Some(2.0),
+            kill: 100.0,
+            restart: Some(60.0),
+        };
+        let result = loss_for_action_class(Action::Resume, &row);
+        assert!(matches!(result, Err(DroError::InvalidPosterior { .. })));
+    }
+
+    #[test]
+    fn dro_unfreeze_has_no_loss() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(5.0),
+            throttle: Some(8.0),
+            renice: Some(2.0),
+            kill: 100.0,
+            restart: Some(60.0),
+        };
+        let result = loss_for_action_class(Action::Unfreeze, &row);
+        assert!(matches!(result, Err(DroError::InvalidPosterior { .. })));
+    }
+
+    #[test]
+    fn dro_unquarantine_has_no_loss() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(5.0),
+            throttle: Some(8.0),
+            renice: Some(2.0),
+            kill: 100.0,
+            restart: Some(60.0),
+        };
+        let result = loss_for_action_class(Action::Unquarantine, &row);
+        assert!(matches!(result, Err(DroError::InvalidPosterior { .. })));
+    }
+
+    #[test]
+    fn dro_missing_pause_loss() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: None,
+            throttle: None,
+            renice: None,
+            kill: 1.0,
+            restart: None,
+        };
+        let result = loss_for_action_class(Action::Pause, &row);
+        assert!(matches!(result, Err(DroError::InvalidPosterior { .. })));
+    }
+
+    #[test]
+    fn dro_missing_renice_loss() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(5.0),
+            throttle: Some(8.0),
+            renice: None,
+            kill: 1.0,
+            restart: Some(3.0),
+        };
+        let result = loss_for_action_class(Action::Renice, &row);
+        assert!(matches!(result, Err(DroError::InvalidPosterior { .. })));
+    }
+
+    #[test]
+    fn dro_missing_restart_loss() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(5.0),
+            throttle: Some(8.0),
+            renice: Some(2.0),
+            kill: 1.0,
+            restart: None,
+        };
+        let result = loss_for_action_class(Action::Restart, &row);
+        assert!(matches!(result, Err(DroError::InvalidPosterior { .. })));
+    }
+
+    #[test]
+    fn dro_missing_throttle_loss() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(5.0),
+            throttle: None,
+            renice: Some(2.0),
+            kill: 1.0,
+            restart: Some(3.0),
+        };
+        let result = loss_for_action_class(Action::Throttle, &row);
+        assert!(matches!(result, Err(DroError::InvalidPosterior { .. })));
+    }
+
+    // ── tie_break_rank ordering ─────────────────────────────────────
+
+    #[test]
+    fn tie_break_rank_ordering() {
+        assert!(tie_break_rank(Action::Keep) < tie_break_rank(Action::Renice));
+        assert!(tie_break_rank(Action::Renice) < tie_break_rank(Action::Pause));
+        assert!(tie_break_rank(Action::Pause) < tie_break_rank(Action::Quarantine));
+        assert!(tie_break_rank(Action::Quarantine) < tie_break_rank(Action::Restart));
+        assert!(tie_break_rank(Action::Restart) < tie_break_rank(Action::Kill));
+    }
+
+    #[test]
+    fn tie_break_rank_equivalences() {
+        // Pause, Resume, Freeze, Unfreeze are all rank 2
+        assert_eq!(tie_break_rank(Action::Pause), tie_break_rank(Action::Resume));
+        assert_eq!(tie_break_rank(Action::Pause), tie_break_rank(Action::Freeze));
+        assert_eq!(tie_break_rank(Action::Pause), tie_break_rank(Action::Unfreeze));
+        // Quarantine, Unquarantine, Throttle are all rank 3
+        assert_eq!(
+            tie_break_rank(Action::Quarantine),
+            tie_break_rank(Action::Unquarantine)
+        );
+        assert_eq!(
+            tie_break_rank(Action::Quarantine),
+            tie_break_rank(Action::Throttle)
+        );
+    }
+
+    // ── select_min_robust_loss tie-breaking ──────────────────────────
+
+    #[test]
+    fn select_min_robust_loss_picks_safer_on_tie() {
+        let losses = vec![
+            DroLoss {
+                action: Action::Kill,
+                robust_loss: 10.0,
+                nominal_loss: 8.0,
+                epsilon: 0.1,
+                inflation: 2.0,
+                lipschitz: 20.0,
+            },
+            DroLoss {
+                action: Action::Keep,
+                robust_loss: 10.0, // Same as Kill
+                nominal_loss: 10.0,
+                epsilon: 0.1,
+                inflation: 0.0,
+                lipschitz: 0.0,
+            },
+        ];
+        let selected = select_min_robust_loss(&losses);
+        assert_eq!(
+            selected,
+            Action::Keep,
+            "should prefer Keep over Kill on tie"
+        );
+    }
+
+    #[test]
+    fn select_min_robust_loss_picks_lowest() {
+        let losses = vec![
+            DroLoss {
+                action: Action::Keep,
+                robust_loss: 15.0,
+                nominal_loss: 15.0,
+                epsilon: 0.1,
+                inflation: 0.0,
+                lipschitz: 0.0,
+            },
+            DroLoss {
+                action: Action::Kill,
+                robust_loss: 5.0,
+                nominal_loss: 3.0,
+                epsilon: 0.1,
+                inflation: 2.0,
+                lipschitz: 20.0,
+            },
+        ];
+        let selected = select_min_robust_loss(&losses);
+        assert_eq!(
+            selected,
+            Action::Kill,
+            "should pick Kill with lower robust loss"
+        );
+    }
+
+    // ── apply_dro_gate empty feasible actions ───────────────────────
+
+    #[test]
+    fn apply_dro_gate_empty_feasible_actions() {
+        let posterior = ClassScores {
+            useful: 0.5,
+            useful_bad: 0.1,
+            abandoned: 0.3,
+            zombie: 0.1,
+        };
+        let policy = Policy {
+            loss_matrix: test_loss_matrix(),
+            ..Policy::default()
+        };
+        let trigger = DroTrigger {
+            ppc_failure: true,
+            ..DroTrigger::none()
+        };
+
+        let outcome = apply_dro_gate(Action::Kill, &posterior, &policy, &trigger, 0.1, &[]);
+
+        assert!(!outcome.applied);
+        assert_eq!(outcome.reason, "no_feasible_actions");
+        assert_eq!(outcome.robust_action, Action::Kill);
+    }
+
+    // ── apply_dro_gate computation failure fallback ──────────────────
+
+    #[test]
+    fn apply_dro_gate_follows_up_actions_only_fallback() {
+        let posterior = ClassScores {
+            useful: 0.5,
+            useful_bad: 0.1,
+            abandoned: 0.3,
+            zombie: 0.1,
+        };
+        let policy = Policy {
+            loss_matrix: test_loss_matrix(),
+            ..Policy::default()
+        };
+        let trigger = DroTrigger {
+            ppc_failure: true,
+            ..DroTrigger::none()
+        };
+
+        // Only follow-up actions (Resume, Unfreeze, Unquarantine) — all fail in loss_for_action_class
+        let outcome = apply_dro_gate(
+            Action::Kill,
+            &posterior,
+            &policy,
+            &trigger,
+            0.1,
+            &[Action::Resume, Action::Unfreeze, Action::Unquarantine],
+        );
+
+        assert!(!outcome.applied);
+        assert_eq!(outcome.reason, "dro_computation_failed");
+        assert_eq!(outcome.robust_action, Action::Kill);
+    }
+
+    // ── adaptive epsilon individual triggers ─────────────────────────
+
+    #[test]
+    fn adaptive_epsilon_drift_with_large_divergence() {
+        let base = 0.1;
+        let trigger = DroTrigger {
+            drift_detected: true,
+            wasserstein_divergence: Some(2.0), // Clamped to 1.0
+            ..DroTrigger::none()
+        };
+        let eps = compute_adaptive_epsilon(base, &trigger, 1.0);
+        // scale = 1.0 + min(2.0, 1.0) = 2.0, so eps = 0.1 * 2.0 = 0.2
+        assert!((eps - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn adaptive_epsilon_eta_tempering() {
+        let base = 0.1;
+        let trigger = DroTrigger {
+            eta_tempering_reduced: true,
+            ..DroTrigger::none()
+        };
+        let eps = compute_adaptive_epsilon(base, &trigger, 1.0);
+        assert!((eps - 0.12).abs() < 1e-9, "eta should give 1.2x: {}", eps);
+    }
+
+    #[test]
+    fn adaptive_epsilon_low_confidence() {
+        let base = 0.1;
+        let trigger = DroTrigger {
+            low_model_confidence: true,
+            ..DroTrigger::none()
+        };
+        let eps = compute_adaptive_epsilon(base, &trigger, 1.0);
+        assert!((eps - 0.14).abs() < 1e-9, "low confidence should give 1.4x: {}", eps);
+    }
+
+    #[test]
+    fn adaptive_epsilon_max_cap_applied() {
+        let base = 0.5;
+        let trigger = DroTrigger {
+            ppc_failure: true,
+            drift_detected: true,
+            wasserstein_divergence: Some(1.0),
+            eta_tempering_reduced: true,
+            explicit_conservative: false,
+            low_model_confidence: true,
+        };
+        let max = 0.3;
+        let eps = compute_adaptive_epsilon(base, &trigger, max);
+        assert!(
+            (eps - max).abs() < 1e-9,
+            "should be capped at max {}, got {}",
+            max,
+            eps
+        );
+    }
+
+    // ── is_de_escalation additional cases ────────────────────────────
+
+    #[test]
+    fn is_de_escalation_pause_to_keep() {
+        assert!(is_de_escalation(Action::Pause, Action::Keep));
+    }
+
+    #[test]
+    fn is_de_escalation_pause_to_kill_is_escalation() {
+        assert!(!is_de_escalation(Action::Pause, Action::Kill));
+    }
+
+    #[test]
+    fn is_de_escalation_same_rank_is_false() {
+        // Pause and Freeze have same rank (2)
+        assert!(!is_de_escalation(Action::Pause, Action::Freeze));
+    }
+
+    // ── decide_with_dro empty feasible actions ──────────────────────
+
+    #[test]
+    fn decide_with_dro_empty_feasible_actions_errors() {
+        let posterior = ClassScores {
+            useful: 0.5,
+            useful_bad: 0.1,
+            abandoned: 0.3,
+            zombie: 0.1,
+        };
+        let policy = Policy {
+            loss_matrix: test_loss_matrix(),
+            ..Policy::default()
+        };
+
+        let result = decide_with_dro(&posterior, &policy, &[], 0.1, Action::Keep, "test");
+        assert!(matches!(result, Err(DroError::NoFeasibleActions)));
+    }
+
+    // ── DRO Keep has zero inflation when all classes have same keep loss = 0 ─
+
+    #[test]
+    fn dro_keep_lipschitz_with_uniform_keep_losses() {
+        let loss_matrix = LossMatrix {
+            useful: LossRow {
+                keep: 0.0,
+                pause: Some(5.0),
+                throttle: Some(8.0),
+                renice: Some(2.0),
+                kill: 100.0,
+                restart: Some(60.0),
+            },
+            useful_bad: LossRow {
+                keep: 0.0, // Same as useful
+                pause: Some(6.0),
+                throttle: Some(8.0),
+                renice: Some(4.0),
+                kill: 20.0,
+                restart: Some(12.0),
+            },
+            abandoned: LossRow {
+                keep: 0.0, // Same
+                pause: Some(15.0),
+                throttle: Some(10.0),
+                renice: Some(12.0),
+                kill: 1.0,
+                restart: Some(8.0),
+            },
+            zombie: LossRow {
+                keep: 0.0, // Same
+                pause: Some(20.0),
+                throttle: Some(15.0),
+                renice: Some(18.0),
+                kill: 1.0,
+                restart: Some(5.0),
+            },
+        };
+        let posterior = ClassScores {
+            useful: 0.25,
+            useful_bad: 0.25,
+            abandoned: 0.25,
+            zombie: 0.25,
+        };
+
+        let dro = compute_wasserstein_dro(Action::Keep, &posterior, &loss_matrix, 0.5).unwrap();
+        // All keep losses are 0, so Lipschitz = 0, inflation = 0
+        assert!(dro.lipschitz.abs() < 1e-10);
+        assert!(dro.inflation.abs() < 1e-10);
+    }
+
+    // ── DRO Freeze maps to Pause loss ───────────────────────────────
+
+    #[test]
+    fn dro_freeze_uses_pause_loss() {
+        let posterior = ClassScores {
+            useful: 0.25,
+            useful_bad: 0.25,
+            abandoned: 0.25,
+            zombie: 0.25,
+        };
+        let loss_matrix = test_loss_matrix();
+
+        let dro_freeze =
+            compute_wasserstein_dro(Action::Freeze, &posterior, &loss_matrix, 0.1).unwrap();
+        let dro_pause =
+            compute_wasserstein_dro(Action::Pause, &posterior, &loss_matrix, 0.1).unwrap();
+
+        assert!(
+            (dro_freeze.nominal_loss - dro_pause.nominal_loss).abs() < 1e-10,
+            "Freeze should use Pause loss"
+        );
+    }
+
+    // ── DRO Quarantine maps to Throttle loss ────────────────────────
+
+    #[test]
+    fn dro_quarantine_uses_throttle_loss() {
+        let posterior = ClassScores {
+            useful: 0.25,
+            useful_bad: 0.25,
+            abandoned: 0.25,
+            zombie: 0.25,
+        };
+        let loss_matrix = test_loss_matrix();
+
+        let dro_q =
+            compute_wasserstein_dro(Action::Quarantine, &posterior, &loss_matrix, 0.1).unwrap();
+        let dro_t =
+            compute_wasserstein_dro(Action::Throttle, &posterior, &loss_matrix, 0.1).unwrap();
+
+        assert!(
+            (dro_q.nominal_loss - dro_t.nominal_loss).abs() < 1e-10,
+            "Quarantine should use Throttle loss"
+        );
+    }
 }

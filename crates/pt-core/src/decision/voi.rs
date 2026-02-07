@@ -902,4 +902,456 @@ mod tests {
             "confident posterior should have lower entropy"
         );
     }
+
+    // ── ProbeType ALL constant + name() ─────────────────────────────
+
+    #[test]
+    fn probe_type_all_contains_all_nine() {
+        assert_eq!(ProbeType::ALL.len(), 9);
+    }
+
+    #[test]
+    fn probe_type_name_returns_snake_case() {
+        let names: Vec<&str> = ProbeType::ALL.iter().map(|p| p.name()).collect();
+        let expected = vec![
+            "wait_15min",
+            "wait_5min",
+            "quick_scan",
+            "deep_scan",
+            "stack_sample",
+            "strace",
+            "net_snapshot",
+            "io_snapshot",
+            "cgroup_inspect",
+        ];
+        assert_eq!(names, expected);
+    }
+
+    // ── ProbeType serde snake_case ──────────────────────────────────
+
+    #[test]
+    fn probe_type_serde_all_variants() {
+        for &probe in ProbeType::ALL {
+            let json = serde_json::to_string(&probe).unwrap();
+            let back: ProbeType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, probe);
+            // Verify snake_case
+            let raw: String = serde_json::from_str(&json).unwrap();
+            assert!(
+                raw.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_'),
+                "expected snake_case for {:?}, got {}",
+                probe,
+                raw
+            );
+        }
+    }
+
+    // ── ProbeCost total() ───────────────────────────────────────────
+
+    #[test]
+    fn probe_cost_total_default() {
+        let cost = ProbeCost::default();
+        let total = cost.total();
+        assert!(total > 0.0, "default probe cost total should be positive");
+        assert!(total < 1.0, "default probe cost total should be < 1.0");
+    }
+
+    #[test]
+    fn probe_cost_total_zero_components() {
+        let cost = ProbeCost {
+            time_seconds: 1.0,
+            overhead: 0.0,
+            intrusiveness: 0.0,
+            risk: 0.0,
+        };
+        let total = cost.total();
+        // Only time component contributes: time_weight * (ln(1)/8.5).min(1.0) = 0.3 * 0 = 0
+        assert!(
+            total.abs() < 1e-6,
+            "zero components with 1s time should have near-zero total, got {}",
+            total
+        );
+    }
+
+    #[test]
+    fn probe_cost_total_max_components() {
+        let cost = ProbeCost {
+            time_seconds: 4000.0, // High time (above e^8.5 ~ 4914)
+            overhead: 1.0,
+            intrusiveness: 1.0,
+            risk: 1.0,
+        };
+        let total = cost.total();
+        // Should approach sum of weights (0.3+0.3+0.2+0.2 = 1.0)
+        assert!(
+            total > 0.9 && total <= 1.0,
+            "max cost total should be near 1.0, got {}",
+            total
+        );
+    }
+
+    #[test]
+    fn probe_cost_serde_roundtrip() {
+        let cost = ProbeCost {
+            time_seconds: 10.0,
+            overhead: 0.5,
+            intrusiveness: 0.3,
+            risk: 0.1,
+        };
+        let json = serde_json::to_string(&cost).unwrap();
+        let back: ProbeCost = serde_json::from_str(&json).unwrap();
+        assert!((back.time_seconds - 10.0).abs() < 1e-9);
+        assert!((back.overhead - 0.5).abs() < 1e-9);
+    }
+
+    // ── ProbeCostModel cost() + cost_details() ──────────────────────
+
+    #[test]
+    fn probe_cost_model_cost_known_probe() {
+        let model = ProbeCostModel::default();
+        let cost = model.cost(ProbeType::QuickScan);
+        assert!(cost > 0.0, "QuickScan cost should be positive");
+    }
+
+    #[test]
+    fn probe_cost_model_cost_details_known() {
+        let model = ProbeCostModel::default();
+        let details = model.cost_details(ProbeType::Strace);
+        assert!((details.intrusiveness - 0.7).abs() < 1e-9);
+        assert!((details.risk - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn probe_cost_model_cost_details_missing_returns_default() {
+        let model = ProbeCostModel {
+            costs: HashMap::new(), // empty
+            base_multiplier: 1.0,
+        };
+        let details = model.cost_details(ProbeType::Strace);
+        // Should return ProbeCost::default()
+        assert!((details.time_seconds - 1.0).abs() < 1e-9);
+        assert!((details.overhead - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn probe_cost_model_base_multiplier_scales() {
+        let mut model = ProbeCostModel::default();
+        let cost_1x = model.cost(ProbeType::DeepScan);
+        model.base_multiplier = 2.0;
+        let cost_2x = model.cost(ProbeType::DeepScan);
+        assert!(
+            (cost_2x - 2.0 * cost_1x).abs() < 1e-9,
+            "2x multiplier should double cost"
+        );
+    }
+
+    #[test]
+    fn probe_cost_model_serde_roundtrip() {
+        let model = ProbeCostModel::default();
+        let json = serde_json::to_string(&model).unwrap();
+        let back: ProbeCostModel = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.costs.len(), model.costs.len());
+        assert!((back.base_multiplier - 1.0).abs() < 1e-9);
+    }
+
+    // ── ProbeInformationGain serde ──────────────────────────────────
+
+    #[test]
+    fn probe_information_gain_serde() {
+        let pig = ProbeInformationGain {
+            probe: ProbeType::DeepScan,
+            entropy_reduction: 0.5,
+            posterior_shift: 0.1,
+            action_change_prob: 0.3,
+        };
+        let json = serde_json::to_string(&pig).unwrap();
+        let back: ProbeInformationGain = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.probe, ProbeType::DeepScan);
+        assert!((back.entropy_reduction - 0.5).abs() < 1e-9);
+    }
+
+    // ── ProbeVoi serde ──────────────────────────────────────────────
+
+    #[test]
+    fn probe_voi_serde_roundtrip() {
+        let pv = ProbeVoi {
+            probe: ProbeType::StackSample,
+            voi: -0.3,
+            cost: 0.15,
+            ratio: 2.0,
+            expected_loss_after: 5.0,
+        };
+        let json = serde_json::to_string(&pv).unwrap();
+        let back: ProbeVoi = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.probe, ProbeType::StackSample);
+        assert!((back.voi - (-0.3)).abs() < 1e-9);
+    }
+
+    // ── VoiAnalysis serde ───────────────────────────────────────────
+
+    #[test]
+    fn voi_analysis_serde_roundtrip() {
+        let analysis = VoiAnalysis {
+            current_expected_loss: vec![ExpectedLoss {
+                action: Action::Keep,
+                loss: 2.0,
+            }],
+            current_optimal_action: Action::Keep,
+            current_min_loss: 2.0,
+            probes: vec![],
+            best_probe: Some(ProbeType::QuickScan),
+            act_now: false,
+            rationale: "probe recommended".to_string(),
+        };
+        let json = serde_json::to_string(&analysis).unwrap();
+        let back: VoiAnalysis = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.current_optimal_action, Action::Keep);
+        assert!(!back.act_now);
+        assert_eq!(back.best_probe, Some(ProbeType::QuickScan));
+    }
+
+    // ── VoiError display ────────────────────────────────────────────
+
+    #[test]
+    fn voi_error_display_invalid_posterior() {
+        let err = VoiError::InvalidPosterior {
+            message: "negative values".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid posterior"));
+        assert!(msg.contains("negative values"));
+    }
+
+    #[test]
+    fn voi_error_display_no_probes() {
+        let err = VoiError::NoProbesAvailable;
+        let msg = format!("{}", err);
+        assert!(msg.contains("no probes available"));
+    }
+
+    // ── empty probes list rejected ──────────────────────────────────
+
+    #[test]
+    fn compute_voi_empty_probes_errors() {
+        let posterior = test_posterior();
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+
+        let result = compute_voi(
+            &posterior,
+            &policy,
+            &ActionFeasibility::allow_all(),
+            &cost_model,
+            Some(&[]), // empty
+        );
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VoiError::NoProbesAvailable));
+    }
+
+    // ── negative posterior rejected ──────────────────────────────────
+
+    #[test]
+    fn compute_voi_negative_posterior_rejected() {
+        let invalid = ClassScores {
+            useful: -0.1,
+            useful_bad: 0.4,
+            abandoned: 0.4,
+            zombie: 0.3,
+        };
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+
+        let result = compute_voi(
+            &invalid,
+            &policy,
+            &ActionFeasibility::allow_all(),
+            &cost_model,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    // ── infinite posterior rejected ──────────────────────────────────
+
+    #[test]
+    fn compute_voi_infinite_posterior_rejected() {
+        let invalid = ClassScores {
+            useful: f64::INFINITY,
+            useful_bad: 0.0,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+
+        let result = compute_voi(
+            &invalid,
+            &policy,
+            &ActionFeasibility::allow_all(),
+            &cost_model,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    // ── estimate_posterior_after_probe shifts posterior ───────────────
+
+    #[test]
+    fn estimate_posterior_after_probe_shifts() {
+        let posterior = test_posterior(); // 0.4 useful, 0.4 abandoned
+        let shifted = estimate_posterior_after_probe(&posterior, ProbeType::DeepScan);
+
+        // Should still sum to ~1.0
+        let total = shifted.useful + shifted.useful_bad + shifted.abandoned + shifted.zombie;
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "shifted posterior should sum to 1.0, got {}",
+            total
+        );
+
+        // Should be different from original
+        assert!(
+            (shifted.useful - posterior.useful).abs() > 1e-6
+                || (shifted.abandoned - posterior.abandoned).abs() > 1e-6,
+            "deep scan should shift the posterior"
+        );
+    }
+
+    #[test]
+    fn estimate_posterior_after_probe_quick_scan_small_shift() {
+        let posterior = test_posterior();
+        let shifted = estimate_posterior_after_probe(&posterior, ProbeType::QuickScan);
+
+        // QuickScan has small shifts (0.02), so the change should be small
+        let useful_delta = (shifted.useful - posterior.useful).abs();
+        assert!(
+            useful_delta < 0.1,
+            "QuickScan shift should be small, got {}",
+            useful_delta
+        );
+    }
+
+    // ── shannon_entropy edge cases ──────────────────────────────────
+
+    #[test]
+    fn shannon_entropy_certain() {
+        let certain = ClassScores {
+            useful: 1.0,
+            useful_bad: 0.0,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        let entropy = shannon_entropy(&certain);
+        assert!(
+            entropy.abs() < 1e-6,
+            "certain distribution should have 0 entropy, got {}",
+            entropy
+        );
+    }
+
+    #[test]
+    fn shannon_entropy_near_zero_probs() {
+        let near_zero = ClassScores {
+            useful: 1e-15,
+            useful_bad: 1e-15,
+            abandoned: 1.0 - 2e-15,
+            zombie: 1e-15,
+        };
+        let entropy = shannon_entropy(&near_zero);
+        assert!(entropy.is_finite());
+        assert!(entropy >= 0.0);
+    }
+
+    // ── select_probe_by_information_gain edge cases ─────────────────
+
+    #[test]
+    fn select_probe_by_information_gain_single_probe() {
+        let posterior = test_posterior();
+        let cost_model = ProbeCostModel::default();
+
+        let best =
+            select_probe_by_information_gain(&posterior, &cost_model, Some(&[ProbeType::IoSnapshot]));
+        assert_eq!(best, Some(ProbeType::IoSnapshot));
+    }
+
+    #[test]
+    fn select_probe_by_information_gain_confident() {
+        let posterior = confident_useful_posterior();
+        let cost_model = ProbeCostModel::default();
+
+        // Should still pick something even for confident posteriors
+        let best = select_probe_by_information_gain(&posterior, &cost_model, None);
+        assert!(best.is_some());
+    }
+
+    // ── VOI rationale content ───────────────────────────────────────
+
+    #[test]
+    fn voi_act_now_rationale_mentions_cost() {
+        let posterior = confident_abandoned_posterior();
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+
+        let result = compute_voi(
+            &posterior,
+            &policy,
+            &ActionFeasibility::allow_all(),
+            &cost_model,
+            None,
+        )
+        .unwrap();
+
+        if result.act_now {
+            assert!(
+                result.rationale.contains("Act now") || result.rationale.contains("cost"),
+                "act_now rationale should mention 'Act now' or 'cost': {}",
+                result.rationale
+            );
+        }
+    }
+
+    // ── ProbeCostModel default has all 9 probes ─────────────────────
+
+    #[test]
+    fn probe_cost_model_default_complete() {
+        let model = ProbeCostModel::default();
+        assert_eq!(
+            model.costs.len(),
+            9,
+            "default model should have costs for all 9 probe types"
+        );
+        for &probe in ProbeType::ALL {
+            assert!(
+                model.costs.contains_key(&probe),
+                "missing cost for {:?}",
+                probe
+            );
+        }
+    }
+
+    // ── Wait probes have zero overhead/intrusiveness/risk ────────────
+
+    #[test]
+    fn wait_probes_zero_overhead() {
+        let model = ProbeCostModel::default();
+        for &wait_probe in &[ProbeType::Wait15Min, ProbeType::Wait5Min] {
+            let details = model.cost_details(wait_probe);
+            assert!(
+                details.overhead.abs() < 1e-9,
+                "{:?} should have zero overhead",
+                wait_probe
+            );
+            assert!(
+                details.intrusiveness.abs() < 1e-9,
+                "{:?} should have zero intrusiveness",
+                wait_probe
+            );
+            assert!(
+                details.risk.abs() < 1e-9,
+                "{:?} should have zero risk",
+                wait_probe
+            );
+        }
+    }
 }

@@ -769,4 +769,404 @@ mod tests {
         assert!(json.contains("\"run\":1"));
         assert!(json.contains("\"minute\":2"));
     }
+
+    // ── RateLimitConfig serde ───────────────────────────────────────
+
+    #[test]
+    fn rate_limit_config_serde_roundtrip() {
+        let config = RateLimitConfig {
+            max_per_run: 10,
+            max_per_minute: Some(3),
+            max_per_hour: Some(30),
+            max_per_day: Some(200),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: RateLimitConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_per_run, 10);
+        assert_eq!(back.max_per_minute, Some(3));
+        assert_eq!(back.max_per_hour, Some(30));
+        assert_eq!(back.max_per_day, Some(200));
+    }
+
+    #[test]
+    fn rate_limit_config_serde_none_optionals() {
+        let config = RateLimitConfig {
+            max_per_run: 5,
+            max_per_minute: None,
+            max_per_hour: None,
+            max_per_day: None,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: RateLimitConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.max_per_minute.is_none());
+        assert!(back.max_per_hour.is_none());
+        assert!(back.max_per_day.is_none());
+    }
+
+    // ── RateLimitConfig::from_guardrails ────────────────────────────
+
+    #[test]
+    fn rate_limit_config_from_guardrails() {
+        use crate::config::policy::Guardrails;
+        let guardrails = Guardrails::default();
+        let config = RateLimitConfig::from_guardrails(&guardrails);
+        assert_eq!(config.max_per_run, guardrails.max_kills_per_run);
+        assert_eq!(config.max_per_hour, guardrails.max_kills_per_hour);
+        assert_eq!(config.max_per_day, guardrails.max_kills_per_day);
+    }
+
+    // ── RateLimitResult serde ───────────────────────────────────────
+
+    #[test]
+    fn rate_limit_result_serde() {
+        let result = RateLimitResult {
+            allowed: true,
+            forced: false,
+            warning: None,
+            block_reason: None,
+            counts: RateLimitCounts::default(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains(r#""allowed":true"#));
+        assert!(json.contains(r#""forced":false"#));
+    }
+
+    #[test]
+    fn rate_limit_result_serde_with_warning() {
+        let result = RateLimitResult {
+            allowed: true,
+            forced: false,
+            warning: Some(RateLimitWarning {
+                window: RateLimitWindow::Run,
+                current: 4,
+                limit: 5,
+                percent_used: 80.0,
+                message: "approaching limit".to_string(),
+            }),
+            block_reason: None,
+            counts: RateLimitCounts::default(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("approaching limit"));
+        assert!(json.contains(r#""window":"run""#));
+    }
+
+    #[test]
+    fn rate_limit_result_serde_with_block() {
+        let result = RateLimitResult {
+            allowed: false,
+            forced: false,
+            warning: None,
+            block_reason: Some(RateLimitBlock {
+                window: RateLimitWindow::Minute,
+                current: 3,
+                limit: 2,
+                message: "exceeded".to_string(),
+            }),
+            counts: RateLimitCounts::default(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains(r#""allowed":false"#));
+        assert!(json.contains(r#""window":"minute""#));
+    }
+
+    // ── RateLimitWindow serde + Display ─────────────────────────────
+
+    #[test]
+    fn rate_limit_window_serde_all_variants() {
+        let variants = [
+            (RateLimitWindow::Run, "run"),
+            (RateLimitWindow::Minute, "minute"),
+            (RateLimitWindow::Hour, "hour"),
+            (RateLimitWindow::Day, "day"),
+        ];
+        for (variant, expected_str) in &variants {
+            let json = serde_json::to_string(variant).unwrap();
+            let raw: String = serde_json::from_str(&json).unwrap();
+            assert_eq!(&raw, expected_str, "serde name mismatch for {:?}", variant);
+
+            let back: RateLimitWindow = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, variant);
+        }
+    }
+
+    #[test]
+    fn rate_limit_window_display_all() {
+        assert_eq!(format!("{}", RateLimitWindow::Run), "run");
+        assert_eq!(format!("{}", RateLimitWindow::Minute), "minute");
+        assert_eq!(format!("{}", RateLimitWindow::Hour), "hour");
+        assert_eq!(format!("{}", RateLimitWindow::Day), "day");
+    }
+
+    // ── RateLimitCounts default ─────────────────────────────────────
+
+    #[test]
+    fn rate_limit_counts_default_all_zero() {
+        let counts = RateLimitCounts::default();
+        assert_eq!(counts.run, 0);
+        assert_eq!(counts.minute, 0);
+        assert_eq!(counts.hour, 0);
+        assert_eq!(counts.day, 0);
+    }
+
+    // ── RateLimitError display ──────────────────────────────────────
+
+    #[test]
+    fn rate_limit_error_display_load_state() {
+        let err = RateLimitError::LoadState("corrupt json".to_string());
+        assert!(format!("{}", err).contains("failed to load state"));
+        assert!(format!("{}", err).contains("corrupt json"));
+    }
+
+    #[test]
+    fn rate_limit_error_display_save_state() {
+        let err = RateLimitError::SaveState("disk full".to_string());
+        assert!(format!("{}", err).contains("failed to save state"));
+    }
+
+    #[test]
+    fn rate_limit_error_display_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let err = RateLimitError::Io(io_err);
+        assert!(format!("{}", err).contains("io error"));
+    }
+
+    #[test]
+    fn rate_limit_error_display_json() {
+        let json_str = "{invalid";
+        let json_err = serde_json::from_str::<serde_json::Value>(json_str).unwrap_err();
+        let err = RateLimitError::Json(json_err);
+        assert!(format!("{}", err).contains("json error"));
+    }
+
+    // ── Per-hour limit ──────────────────────────────────────────────
+
+    #[test]
+    fn test_per_hour_limit() {
+        let config = RateLimitConfig {
+            max_per_run: 100,
+            max_per_minute: None,
+            max_per_hour: Some(3),
+            max_per_day: None,
+        };
+        let limiter = SlidingWindowRateLimiter::new(config, None::<&str>).unwrap();
+
+        for _ in 0..3 {
+            limiter.record_kill().unwrap();
+        }
+
+        let result = limiter.check(false).unwrap();
+        assert!(!result.allowed);
+        assert_eq!(
+            result.block_reason.as_ref().unwrap().window,
+            RateLimitWindow::Hour
+        );
+    }
+
+    // ── Per-day limit ───────────────────────────────────────────────
+
+    #[test]
+    fn test_per_day_limit() {
+        let config = RateLimitConfig {
+            max_per_run: 100,
+            max_per_minute: None,
+            max_per_hour: None,
+            max_per_day: Some(2),
+        };
+        let limiter = SlidingWindowRateLimiter::new(config, None::<&str>).unwrap();
+
+        limiter.record_kill().unwrap();
+        limiter.record_kill().unwrap();
+
+        let result = limiter.check(false).unwrap();
+        assert!(!result.allowed);
+        assert_eq!(
+            result.block_reason.as_ref().unwrap().window,
+            RateLimitWindow::Day
+        );
+    }
+
+    // ── override_per_run takes minimum ──────────────────────────────
+
+    #[test]
+    fn test_override_per_run_takes_minimum() {
+        let config = RateLimitConfig {
+            max_per_run: 3,
+            max_per_minute: None,
+            max_per_hour: None,
+            max_per_day: None,
+        };
+        let limiter = SlidingWindowRateLimiter::new(config, None::<&str>).unwrap();
+
+        limiter.record_kill().unwrap();
+        limiter.record_kill().unwrap();
+        limiter.record_kill().unwrap();
+
+        // Override with 10 — should still be blocked at config's 3
+        let result = limiter.check_with_override(false, Some(10)).unwrap();
+        assert!(!result.allowed);
+    }
+
+    // ── check_and_record when blocked ───────────────────────────────
+
+    #[test]
+    fn test_check_and_record_when_blocked_does_not_record() {
+        let config = RateLimitConfig {
+            max_per_run: 1,
+            max_per_minute: None,
+            max_per_hour: None,
+            max_per_day: None,
+        };
+        let limiter = SlidingWindowRateLimiter::new(config, None::<&str>).unwrap();
+
+        // First check_and_record succeeds
+        let r1 = limiter.check_and_record(false, None).unwrap();
+        assert!(r1.allowed);
+        assert_eq!(limiter.current_run_count().unwrap(), 1);
+
+        // Second is blocked — should NOT increment
+        let r2 = limiter.check_and_record(false, None).unwrap();
+        assert!(!r2.allowed);
+        assert_eq!(limiter.current_run_count().unwrap(), 1);
+    }
+
+    // ── check_and_record force override records even when blocked ────
+
+    #[test]
+    fn test_check_and_record_force_records() {
+        let config = RateLimitConfig {
+            max_per_run: 1,
+            max_per_minute: None,
+            max_per_hour: None,
+            max_per_day: None,
+        };
+        let limiter = SlidingWindowRateLimiter::new(config, None::<&str>).unwrap();
+
+        limiter.record_kill().unwrap();
+
+        // Force override — should still record
+        let result = limiter.check_and_record(true, None).unwrap();
+        assert!(result.allowed);
+        assert!(result.forced);
+        assert_eq!(limiter.current_run_count().unwrap(), 2);
+    }
+
+    // ── get_counts reflects state ───────────────────────────────────
+
+    #[test]
+    fn test_get_counts_reflects_kills() {
+        let limiter = SlidingWindowRateLimiter::new(test_config(), None::<&str>).unwrap();
+
+        limiter.record_kill().unwrap();
+        limiter.record_kill().unwrap();
+
+        let counts = limiter.get_counts().unwrap();
+        assert_eq!(counts.run, 2);
+        assert_eq!(counts.minute, 2);
+        assert_eq!(counts.hour, 2);
+        assert_eq!(counts.day, 2);
+    }
+
+    // ── config accessor ─────────────────────────────────────────────
+
+    #[test]
+    fn test_config_accessor() {
+        let config = test_config();
+        let limiter = SlidingWindowRateLimiter::new(config.clone(), None::<&str>).unwrap();
+
+        assert_eq!(limiter.config().max_per_run, 5);
+        assert_eq!(limiter.config().max_per_minute, Some(2));
+    }
+
+    // ── clone is independent ────────────────────────────────────────
+
+    #[test]
+    fn test_limiter_clone_shares_state() {
+        let limiter = SlidingWindowRateLimiter::new(test_config(), None::<&str>).unwrap();
+        let clone = limiter.clone();
+
+        limiter.record_kill().unwrap();
+
+        // Clone should see the same state (Arc<RwLock> shared)
+        assert_eq!(clone.current_run_count().unwrap(), 1);
+    }
+
+    // ── warning on per-minute approaching limit ─────────────────────
+
+    #[test]
+    fn test_per_minute_warning() {
+        let config = RateLimitConfig {
+            max_per_run: 100,
+            max_per_minute: Some(5),
+            max_per_hour: None,
+            max_per_day: None,
+        };
+        let limiter = SlidingWindowRateLimiter::new(config, None::<&str>).unwrap();
+
+        // 80% of 5 = 4, so after 4 kills we should get a warning
+        for _ in 0..4 {
+            limiter.record_kill().unwrap();
+        }
+
+        let result = limiter.check(false).unwrap();
+        assert!(result.allowed);
+        assert!(
+            result.warning.is_some(),
+            "should warn at 80% of per-minute limit"
+        );
+        assert_eq!(
+            result.warning.as_ref().unwrap().window,
+            RateLimitWindow::Minute
+        );
+    }
+
+    // ── block message format ────────────────────────────────────────
+
+    #[test]
+    fn test_block_message_contains_counts() {
+        let config = RateLimitConfig {
+            max_per_run: 2,
+            max_per_minute: None,
+            max_per_hour: None,
+            max_per_day: None,
+        };
+        let limiter = SlidingWindowRateLimiter::new(config, None::<&str>).unwrap();
+
+        limiter.record_kill().unwrap();
+        limiter.record_kill().unwrap();
+
+        let result = limiter.check(false).unwrap();
+        let block = result.block_reason.unwrap();
+        assert!(block.message.contains("2 kills already performed"));
+        assert!(block.message.contains("run"));
+        assert!(block.message.contains("max 2"));
+    }
+
+    // ── persistence with corrupt state file ─────────────────────────
+
+    #[test]
+    fn test_persistence_corrupt_state_uses_default() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("rate_limit.json");
+
+        // Write corrupt JSON
+        std::fs::write(&state_path, "not valid json").unwrap();
+
+        // Should fall back to default state
+        let config = test_config();
+        let limiter = SlidingWindowRateLimiter::new(config, Some(&state_path)).unwrap();
+
+        assert_eq!(limiter.current_run_count().unwrap(), 0);
+        let counts = limiter.get_counts().unwrap();
+        assert_eq!(counts.day, 0);
+    }
+
+    // ── SlidingWindowRateLimiter debug ──────────────────────────────
+
+    #[test]
+    fn test_limiter_debug() {
+        let limiter = SlidingWindowRateLimiter::new(test_config(), None::<&str>).unwrap();
+        let dbg = format!("{:?}", limiter);
+        assert!(dbg.contains("SlidingWindowRateLimiter"));
+    }
 }
