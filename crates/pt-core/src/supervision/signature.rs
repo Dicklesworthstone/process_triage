@@ -1987,6 +1987,17 @@ impl SignatureDatabase {
 
         // Package Managers / Installers
         let _ = self.add(
+            SupervisorSignature::new("bun", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Bun JavaScript runtime / test runner / bundler")
+                .with_process_patterns(vec![r"^bun$"])
+                .with_arg_patterns(vec![r"bun\s+(test|run|install|build)"])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::short_lived_task())
+                .as_builtin(),
+        );
+
+        let _ = self.add(
             SupervisorSignature::new("npm", SupervisorCategory::Other)
                 .with_confidence(0.70)
                 .with_notes("npm package manager")

@@ -1778,3 +1778,600 @@ mod serialization_tests {
         assert_eq!(p2_stats.match_count, 1);
     }
 }
+
+// ============================================================================
+// Spec Gap Coverage: Bun Test Runner Detection (process_triage-wwxs)
+// ============================================================================
+
+mod builtin_bun_tests {
+    use super::*;
+
+    fn get_default_db() -> SignatureDatabase {
+        SignatureDatabase::with_defaults()
+    }
+
+    #[test]
+    fn test_bun_detection_by_process_name() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("bun");
+        let matches = db.match_process(&ctx);
+        assert!(!matches.is_empty(), "Should detect bun by process name");
+        assert_eq!(matches[0].signature.name, "bun");
+    }
+
+    #[test]
+    fn test_bun_test_detection_by_cmdline() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("bun").cmdline("bun test --watch");
+        let matches = db.match_process(&ctx);
+
+        let bun_match = matches.iter().find(|m| m.signature.name == "bun");
+        assert!(bun_match.is_some(), "Should detect bun test invocation");
+    }
+
+    #[test]
+    fn test_bun_has_abandoned_priors() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("bun");
+        let matches = db.match_process(&ctx);
+
+        assert!(!matches.is_empty(), "Should detect bun");
+        let priors = &matches[0].signature.priors;
+        assert!(!priors.is_empty(), "bun should have priors defined");
+
+        if let Some(abandoned) = &priors.abandoned {
+            assert!(
+                abandoned.mean() > 0.5,
+                "bun should have high abandoned prior (mean: {})",
+                abandoned.mean()
+            );
+        }
+    }
+
+    #[test]
+    fn test_bun_has_short_lived_expectations() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("bun");
+        let matches = db.match_process(&ctx);
+
+        assert!(!matches.is_empty(), "Should detect bun");
+        let expectations = &matches[0].signature.expectations;
+        assert!(
+            !expectations.is_empty(),
+            "bun should have expectations defined"
+        );
+        assert!(
+            expectations.typical_lifetime_seconds.is_some(),
+            "bun should have typical_lifetime defined"
+        );
+    }
+}
+
+// ============================================================================
+// Spec Gap Coverage: Lifetime Expectation Validation (process_triage-wwxs)
+// ============================================================================
+
+mod lifetime_expectation_tests {
+    use super::*;
+
+    fn get_default_db() -> SignatureDatabase {
+        SignatureDatabase::with_defaults()
+    }
+
+    #[test]
+    fn test_test_runner_max_lifetime_is_one_hour() {
+        let db = get_default_db();
+
+        // Spec: test runners should have expected_lifetime ~1h (3600s max)
+        let test_runners = ["jest", "pytest", "vitest", "mocha", "rspec"];
+
+        for runner in test_runners {
+            let ctx = ProcessMatchContext::with_comm(runner);
+            let matches = db.match_process(&ctx);
+
+            if !matches.is_empty() {
+                let expectations = &matches[0].signature.expectations;
+                if let Some(max_lifetime) = expectations.max_normal_lifetime_seconds {
+                    assert_eq!(
+                        max_lifetime, 3600,
+                        "{} should have max_normal_lifetime of 3600s (1hr), got {}",
+                        runner, max_lifetime
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_test_runner_typical_lifetime_is_five_minutes() {
+        let db = get_default_db();
+
+        let test_runners = ["jest", "pytest", "vitest", "mocha", "rspec"];
+
+        for runner in test_runners {
+            let ctx = ProcessMatchContext::with_comm(runner);
+            let matches = db.match_process(&ctx);
+
+            if !matches.is_empty() {
+                let expectations = &matches[0].signature.expectations;
+                if let Some(typical) = expectations.typical_lifetime_seconds {
+                    assert_eq!(
+                        typical, 300,
+                        "{} should have typical_lifetime of 300s (5min), got {}",
+                        runner, typical
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dev_server_max_lifetime_is_eight_hours() {
+        let db = get_default_db();
+
+        // Spec: dev servers should have max ~8h (28800s)
+        let ctx = ProcessMatchContext::with_comm("vite");
+        let matches = db.match_process(&ctx);
+
+        if !matches.is_empty() {
+            let expectations = &matches[0].signature.expectations;
+            if let Some(max_lifetime) = expectations.max_normal_lifetime_seconds {
+                assert_eq!(
+                    max_lifetime, 28800,
+                    "vite should have max_normal_lifetime of 28800s (8hr), got {}",
+                    max_lifetime
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dev_server_typical_lifetime_is_one_hour() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("vite");
+        let matches = db.match_process(&ctx);
+
+        if !matches.is_empty() {
+            let expectations = &matches[0].signature.expectations;
+            if let Some(typical) = expectations.typical_lifetime_seconds {
+                assert_eq!(
+                    typical, 3600,
+                    "vite should have typical_lifetime of 3600s (1hr), got {}",
+                    typical
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_tools_max_lifetime_is_one_hour() {
+        let db = get_default_db();
+
+        // Build tools should also use short_lived_task expectations
+        let build_tools = ["webpack", "tsc", "esbuild", "make"];
+
+        for tool in build_tools {
+            let ctx = ProcessMatchContext::with_comm(tool);
+            let matches = db.match_process(&ctx);
+
+            if !matches.is_empty() {
+                let expectations = &matches[0].signature.expectations;
+                if let Some(max_lifetime) = expectations.max_normal_lifetime_seconds {
+                    assert_eq!(
+                        max_lifetime, 3600,
+                        "{} should have max_normal_lifetime of 3600s (1hr), got {}",
+                        tool, max_lifetime
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_bun_max_lifetime_is_one_hour() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("bun");
+        let matches = db.match_process(&ctx);
+
+        assert!(!matches.is_empty(), "Should detect bun");
+        let expectations = &matches[0].signature.expectations;
+        if let Some(max_lifetime) = expectations.max_normal_lifetime_seconds {
+            assert_eq!(
+                max_lifetime, 3600,
+                "bun should have max_normal_lifetime of 3600s (1hr), got {}",
+                max_lifetime
+            );
+        }
+    }
+
+    #[test]
+    fn test_dev_servers_expect_network() {
+        let db = get_default_db();
+
+        let dev_servers = ["vite"];
+
+        for server in dev_servers {
+            let ctx = ProcessMatchContext::with_comm(server);
+            let matches = db.match_process(&ctx);
+
+            if !matches.is_empty() {
+                let expectations = &matches[0].signature.expectations;
+                if !expectations.is_empty() {
+                    assert!(
+                        expectations.expects_network,
+                        "{} should expect network activity",
+                        server
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dev_servers_expect_disk_io() {
+        let db = get_default_db();
+
+        // Dev servers with file watching should expect disk I/O
+        let ctx = ProcessMatchContext::with_comm("vite");
+        let matches = db.match_process(&ctx);
+
+        if !matches.is_empty() {
+            let expectations = &matches[0].signature.expectations;
+            if !expectations.is_empty() {
+                assert!(
+                    expectations.expects_disk_io,
+                    "vite should expect disk I/O (file watching)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_daemon_has_no_max_lifetime() {
+        let db = get_default_db();
+
+        // Daemons (like postgres) should have no max lifetime
+        let ctx = ProcessMatchContext::with_comm("postgres");
+        let matches = db.match_process(&ctx);
+
+        if !matches.is_empty() {
+            let expectations = &matches[0].signature.expectations;
+            if !expectations.is_empty() {
+                assert!(
+                    expectations.max_normal_lifetime_seconds.is_none(),
+                    "postgres (daemon) should have no max lifetime"
+                );
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Spec Gap Coverage: Pattern Lifecycle Transition Edge Cases
+// ============================================================================
+
+mod lifecycle_edge_case_tests {
+    use super::*;
+
+    #[test]
+    fn test_lifecycle_boundary_at_confidence_thresholds() {
+        // Test exact boundary between New and Learning
+        // from_stats uses confidence thresholds
+        assert_eq!(PatternLifecycle::from_stats(0.49, 5), PatternLifecycle::New);
+        assert_eq!(
+            PatternLifecycle::from_stats(0.50, 5),
+            PatternLifecycle::Learning
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_boundary_at_count_thresholds() {
+        // High confidence but varying counts
+        assert_eq!(
+            PatternLifecycle::from_stats(0.85, 9),
+            PatternLifecycle::Learning,
+            "Below count threshold should remain Learning"
+        );
+        assert_eq!(
+            PatternLifecycle::from_stats(0.85, 10),
+            PatternLifecycle::Stable,
+            "At count threshold with high confidence should be Stable"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_extreme_values() {
+        // Zero values
+        assert_eq!(PatternLifecycle::from_stats(0.0, 0), PatternLifecycle::New);
+
+        // Perfect confidence, zero count: confidence >= 0.5 → Learning
+        // (count threshold only gates Learning → Stable)
+        assert_eq!(
+            PatternLifecycle::from_stats(1.0, 0),
+            PatternLifecycle::Learning,
+            "High confidence with zero count should be Learning (count only gates Stable)"
+        );
+
+        // Perfect confidence, high count
+        assert_eq!(
+            PatternLifecycle::from_stats(1.0, 100),
+            PatternLifecycle::Stable
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_removed_is_terminal() {
+        use PatternLifecycle::*;
+
+        // Removed should not transition to anything
+        assert!(!Removed.can_transition_to(New));
+        assert!(!Removed.can_transition_to(Learning));
+        assert!(!Removed.can_transition_to(Stable));
+        assert!(!Removed.can_transition_to(Deprecated));
+    }
+
+    #[test]
+    fn test_stats_confidence_laplace_smoothing() {
+        // Verify the Laplace smoothing formula: (accept + 1) / (total + 2)
+        let mut stats = PatternStats::default();
+
+        // 0 observations: (0+1)/(0+2) = 0.5
+        assert!(stats.computed_confidence.is_none());
+
+        stats.record_match(true);
+        // 1 accept, 1 total: (1+1)/(1+2) = 0.667
+        assert!((stats.computed_confidence.unwrap() - 2.0 / 3.0).abs() < 0.001);
+
+        stats.record_match(false);
+        // 1 accept, 2 total: (1+1)/(2+2) = 0.5
+        assert!((stats.computed_confidence.unwrap() - 0.5).abs() < 0.001);
+
+        // Many accepts push confidence high
+        for _ in 0..100 {
+            stats.record_match(true);
+        }
+        // 101 accept, 102 total: (101+1)/(102+2) ≈ 0.981
+        assert!(
+            stats.computed_confidence.unwrap() > 0.95,
+            "Many accepts should push confidence >0.95, got {}",
+            stats.computed_confidence.unwrap()
+        );
+    }
+
+    #[test]
+    fn test_pattern_library_learned_lifecycle_progression() {
+        let dir = tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+
+        let sig = SupervisorSignature::new("lifecycle-test", SupervisorCategory::Other)
+            .with_process_patterns(vec![r"^lifecycle$"]);
+
+        lib.add_learned(sig).expect("add learned");
+
+        // New pattern should start with New lifecycle
+        let pattern = lib.get_pattern("lifecycle-test").unwrap();
+        assert_eq!(
+            pattern.lifecycle,
+            PatternLifecycle::New,
+            "Learned patterns should start in New lifecycle"
+        );
+        assert_eq!(pattern.source, PatternSource::Learned);
+    }
+}
+
+// ============================================================================
+// Spec Gap Coverage: All Built-in Runners in Priors/Expectations Lists
+// ============================================================================
+
+mod comprehensive_builtin_coverage {
+    use super::*;
+
+    fn get_default_db() -> SignatureDatabase {
+        SignatureDatabase::with_defaults()
+    }
+
+    #[test]
+    fn test_all_spec_test_runners_detected() {
+        let db = get_default_db();
+
+        // All test runners from the bead spec (process_triage-wwxs)
+        let spec_runners: Vec<(&str, &str, &str)> = vec![
+            ("bun", "bun", "bun test --watch"),
+            ("jest", "jest", ""),
+            ("pytest", "pytest", ""),
+            ("vitest", "vitest", ""),
+            ("cargo-test", "cargo", "cargo test --lib"),
+            ("go-test", "go", "go test ./..."),
+            ("mocha", "mocha", ""),
+            ("rspec", "rspec", ""),
+        ];
+
+        for (name, comm, cmdline) in spec_runners {
+            let ctx = if cmdline.is_empty() {
+                ProcessMatchContext::with_comm(comm)
+            } else {
+                ProcessMatchContext::with_comm(comm).cmdline(cmdline)
+            };
+            let matches = db.match_process(&ctx);
+
+            let found = matches.iter().find(|m| m.signature.name == name);
+            assert!(
+                found.is_some(),
+                "Spec requires detection of test runner '{}' (comm={}, cmdline={})",
+                name,
+                comm,
+                cmdline
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_spec_test_runners_have_abandoned_priors() {
+        let db = get_default_db();
+
+        // Broader list including bun
+        let test_runners = ["jest", "pytest", "vitest", "mocha", "rspec", "bun"];
+
+        for runner in test_runners {
+            let ctx = ProcessMatchContext::with_comm(runner);
+            let matches = db.match_process(&ctx);
+
+            assert!(
+                !matches.is_empty(),
+                "{} should be detected",
+                runner
+            );
+
+            let priors = &matches[0].signature.priors;
+            assert!(
+                !priors.is_empty(),
+                "{} should have priors defined",
+                runner
+            );
+
+            if let Some(abandoned) = &priors.abandoned {
+                assert!(
+                    abandoned.mean() > 0.5,
+                    "{} should have high abandoned prior (mean: {})",
+                    runner,
+                    abandoned.mean()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_spec_test_runners_have_expectations() {
+        let db = get_default_db();
+
+        let test_runners = ["jest", "pytest", "vitest", "mocha", "rspec", "bun"];
+
+        for runner in test_runners {
+            let ctx = ProcessMatchContext::with_comm(runner);
+            let matches = db.match_process(&ctx);
+
+            assert!(
+                !matches.is_empty(),
+                "{} should be detected",
+                runner
+            );
+
+            let expectations = &matches[0].signature.expectations;
+            assert!(
+                !expectations.is_empty(),
+                "{} should have expectations defined",
+                runner
+            );
+            assert!(
+                expectations.typical_lifetime_seconds.is_some(),
+                "{} should have typical_lifetime defined",
+                runner
+            );
+            assert!(
+                expectations.max_normal_lifetime_seconds.is_some(),
+                "{} should have max_normal_lifetime defined",
+                runner
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_spec_dev_servers_detected() {
+        let db = get_default_db();
+
+        // Dev servers from the bead spec
+        let dev_servers: Vec<(&str, &str, &str)> = vec![
+            ("next-dev", "node", "node ./node_modules/.bin/next dev"),
+            ("vite", "vite", ""),
+            (
+                "webpack-dev-server",
+                "node",
+                "node ./node_modules/.bin/webpack serve",
+            ),
+            ("flask", "python", "python -m flask run"),
+            ("django", "python", "python manage.py runserver"),
+            ("rails", "ruby", "ruby rails server"),
+        ];
+
+        for (name, comm, cmdline) in dev_servers {
+            let ctx = if cmdline.is_empty() {
+                ProcessMatchContext::with_comm(comm)
+            } else {
+                ProcessMatchContext::with_comm(comm).cmdline(cmdline)
+            };
+            let matches = db.match_process(&ctx);
+
+            let found = matches.iter().find(|m| m.signature.name == name);
+            assert!(
+                found.is_some(),
+                "Spec requires detection of dev server '{}' (comm={}, cmdline={})",
+                name,
+                comm,
+                cmdline
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_spec_dev_servers_have_useful_priors() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("vite");
+        let matches = db.match_process(&ctx);
+
+        if !matches.is_empty() {
+            let priors = &matches[0].signature.priors;
+            if let Some(useful) = &priors.useful {
+                assert!(
+                    useful.mean() > 0.5,
+                    "Dev servers should have high useful prior (mean: {})",
+                    useful.mean()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_npm_test_with_explicit_test_flag() {
+        let db = get_default_db();
+
+        // npm with explicit "test" subcommand is detected via the npm signature's
+        // arg_patterns which match npm run/install/ci
+        let ctx = ProcessMatchContext::with_comm("npm").cmdline("npm test");
+        let matches = db.match_process(&ctx);
+
+        // npm should at least be detected by process name
+        assert!(
+            !matches.is_empty(),
+            "Should detect npm with 'npm test' invocation"
+        );
+    }
+
+    #[test]
+    fn test_bun_run_detection() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("bun").cmdline("bun run dev");
+        let matches = db.match_process(&ctx);
+
+        let bun_match = matches.iter().find(|m| m.signature.name == "bun");
+        assert!(bun_match.is_some(), "Should detect bun run invocation");
+    }
+
+    #[test]
+    fn test_bun_install_detection() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("bun").cmdline("bun install");
+        let matches = db.match_process(&ctx);
+
+        let bun_match = matches.iter().find(|m| m.signature.name == "bun");
+        assert!(bun_match.is_some(), "Should detect bun install invocation");
+    }
+}
