@@ -267,4 +267,318 @@ mod tests {
         let any_selected = summary.results.iter().any(|r| r.selected_by_fdr);
         assert!(any_selected, "expected at least one selection");
     }
+
+    // ── MartingaleGateConfig defaults ─────────────────────────────
+
+    #[test]
+    fn config_default_min_observations() {
+        let cfg = MartingaleGateConfig::default();
+        assert_eq!(cfg.min_observations, 3);
+    }
+
+    #[test]
+    fn config_default_require_anomaly() {
+        let cfg = MartingaleGateConfig::default();
+        assert!(cfg.require_anomaly);
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let cfg = MartingaleGateConfig {
+            min_observations: 7,
+            require_anomaly: false,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: MartingaleGateConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.min_observations, 7);
+        assert!(!back.require_anomaly);
+    }
+
+    // ── AlphaSource ───────────────────────────────────────────────
+
+    #[test]
+    fn alpha_source_serde_policy() {
+        let json = serde_json::to_string(&AlphaSource::Policy).unwrap();
+        assert_eq!(json, "\"policy\"");
+        let back: AlphaSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, AlphaSource::Policy);
+    }
+
+    #[test]
+    fn alpha_source_serde_alpha_investing() {
+        let json = serde_json::to_string(&AlphaSource::AlphaInvesting).unwrap();
+        assert_eq!(json, "\"alpha_investing\"");
+        let back: AlphaSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, AlphaSource::AlphaInvesting);
+    }
+
+    #[test]
+    fn alpha_source_eq() {
+        assert_eq!(AlphaSource::Policy, AlphaSource::Policy);
+        assert_ne!(AlphaSource::Policy, AlphaSource::AlphaInvesting);
+    }
+
+    // ── fdr_method_from_policy ────────────────────────────────────
+
+    #[test]
+    fn fdr_method_bh() {
+        let mut policy = Policy::default();
+        policy.fdr_control.method = FdrMethod::Bh;
+        let m = fdr_method_from_policy(&policy);
+        assert_eq!(m, SelectionFdrMethod::EBh);
+    }
+
+    #[test]
+    fn fdr_method_by() {
+        let mut policy = Policy::default();
+        policy.fdr_control.method = FdrMethod::By;
+        let m = fdr_method_from_policy(&policy);
+        assert_eq!(m, SelectionFdrMethod::EBy);
+    }
+
+    #[test]
+    fn fdr_method_none() {
+        let mut policy = Policy::default();
+        policy.fdr_control.method = FdrMethod::None;
+        let m = fdr_method_from_policy(&policy);
+        assert_eq!(m, SelectionFdrMethod::None);
+    }
+
+    #[test]
+    fn fdr_method_alpha_investing() {
+        let mut policy = Policy::default();
+        policy.fdr_control.method = FdrMethod::AlphaInvesting;
+        let m = fdr_method_from_policy(&policy);
+        assert_eq!(m, SelectionFdrMethod::EBy);
+    }
+
+    // ── resolve_alpha ─────────────────────────────────────────────
+
+    #[test]
+    fn resolve_alpha_from_policy_default() {
+        let policy = Policy::default();
+        let (alpha, source) = resolve_alpha(&policy, None).unwrap();
+        assert_eq!(source, AlphaSource::Policy);
+        assert!((alpha - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_alpha_custom_policy_alpha() {
+        let mut policy = Policy::default();
+        policy.fdr_control.alpha = 0.10;
+        let (alpha, _) = resolve_alpha(&policy, None).unwrap();
+        assert!((alpha - 0.10).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_alpha_zero_alpha_error() {
+        let mut policy = Policy::default();
+        policy.fdr_control.alpha = 0.0;
+        let result = resolve_alpha(&policy, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_alpha_negative_alpha_error() {
+        let mut policy = Policy::default();
+        policy.fdr_control.alpha = -0.1;
+        let result = resolve_alpha(&policy, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_alpha_above_one_error() {
+        let mut policy = Policy::default();
+        policy.fdr_control.alpha = 1.5;
+        let result = resolve_alpha(&policy, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_alpha_exactly_one_ok() {
+        let mut policy = Policy::default();
+        policy.fdr_control.alpha = 1.0;
+        let (alpha, source) = resolve_alpha(&policy, None).unwrap();
+        assert_eq!(source, AlphaSource::Policy);
+        assert!((alpha - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_alpha_investing_without_state_falls_back() {
+        let mut policy = Policy::default();
+        policy.fdr_control.method = FdrMethod::AlphaInvesting;
+        policy.fdr_control.alpha = 0.05;
+        // No alpha_state → falls back to policy alpha
+        let (alpha, source) = resolve_alpha(&policy, None).unwrap();
+        assert_eq!(source, AlphaSource::Policy);
+        assert!((alpha - 0.05).abs() < 1e-12);
+    }
+
+    // ── apply_martingale_gates ─────────────────────────────────────
+
+    #[test]
+    fn apply_empty_candidates() {
+        let policy = Policy::default();
+        let config = MartingaleGateConfig::default();
+        let summary = apply_martingale_gates(&[], &policy, &config, None).unwrap();
+        assert!(summary.results.is_empty());
+        assert_eq!(summary.alpha_source, AlphaSource::Policy);
+    }
+
+    #[test]
+    fn apply_ineligible_low_observations() {
+        let mut result = high_evalue_result();
+        result.n = 1; // below min_observations=3
+        let candidates = vec![MartingaleGateCandidate {
+            target: make_target(10),
+            result,
+        }];
+        let policy = Policy::default();
+        let config = MartingaleGateConfig::default();
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        assert_eq!(summary.results.len(), 1);
+        assert!(!summary.results[0].eligible);
+        assert!(!summary.results[0].gate_passed);
+    }
+
+    #[test]
+    fn apply_ineligible_no_anomaly() {
+        let mut analyzer = MartingaleAnalyzer::new(MartingaleConfig::default());
+        // Feed values close to 0 so anomaly_detected stays false
+        for _ in 0..5 {
+            analyzer.update(0.01);
+        }
+        let result = analyzer.summary();
+        let candidates = vec![MartingaleGateCandidate {
+            target: make_target(20),
+            result,
+        }];
+        let policy = Policy::default();
+        let config = MartingaleGateConfig::default();
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        // With require_anomaly=true and no anomaly, not eligible
+        assert!(!summary.results[0].eligible);
+    }
+
+    #[test]
+    fn apply_eligible_without_anomaly_requirement() {
+        let mut analyzer = MartingaleAnalyzer::new(MartingaleConfig::default());
+        for _ in 0..5 {
+            analyzer.update(0.01);
+        }
+        let result = analyzer.summary();
+        let candidates = vec![MartingaleGateCandidate {
+            target: make_target(30),
+            result,
+        }];
+        let policy = Policy::default();
+        let config = MartingaleGateConfig {
+            min_observations: 3,
+            require_anomaly: false,
+        };
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        // require_anomaly=false, n >= 3, so eligible
+        assert!(summary.results[0].eligible);
+    }
+
+    #[test]
+    fn apply_fdr_disabled_falls_through() {
+        let mut policy = Policy::default();
+        policy.fdr_control.enabled = false;
+        let config = MartingaleGateConfig::default();
+        let candidates = vec![
+            MartingaleGateCandidate {
+                target: make_target(1),
+                result: high_evalue_result(),
+            },
+            MartingaleGateCandidate {
+                target: make_target(2),
+                result: high_evalue_result(),
+            },
+        ];
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        assert!(summary.fdr_result.is_none());
+        // selected_by_fdr matches gate_passed when FDR is disabled
+        for r in &summary.results {
+            assert_eq!(r.selected_by_fdr, r.gate_passed);
+        }
+    }
+
+    #[test]
+    fn apply_below_min_candidates_skips_fdr() {
+        let mut policy = Policy::default();
+        policy.fdr_control.min_candidates = Some(10);
+        let config = MartingaleGateConfig::default();
+        let candidates = vec![MartingaleGateCandidate {
+            target: make_target(1),
+            result: high_evalue_result(),
+        }];
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        // Only 1 eligible candidate but min_candidates=10, so no FDR
+        assert!(summary.fdr_result.is_none());
+    }
+
+    #[test]
+    fn summary_alpha_matches_policy() {
+        let mut policy = Policy::default();
+        policy.fdr_control.alpha = 0.01;
+        let config = MartingaleGateConfig::default();
+        let summary = apply_martingale_gates(&[], &policy, &config, None).unwrap();
+        assert!((summary.alpha - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gate_result_fields_from_high_evalue() {
+        let policy = Policy::default();
+        let config = MartingaleGateConfig::default();
+        let candidates = vec![MartingaleGateCandidate {
+            target: make_target(42),
+            result: high_evalue_result(),
+        }];
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        let r = &summary.results[0];
+        assert_eq!(r.target.pid, 42);
+        assert_eq!(r.n, 20);
+        assert!(r.e_value > 0.0);
+        assert!(r.confidence_radius >= 0.0);
+    }
+
+    #[test]
+    fn summary_serializes_to_json() {
+        let policy = Policy::default();
+        let config = MartingaleGateConfig::default();
+        let candidates = vec![MartingaleGateCandidate {
+            target: make_target(1),
+            result: high_evalue_result(),
+        }];
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"alpha\""));
+        assert!(json.contains("\"alpha_source\""));
+        assert!(json.contains("\"results\""));
+    }
+
+    // ── MartingaleGateError ───────────────────────────────────────
+
+    #[test]
+    fn error_display_invalid_alpha() {
+        let err = MartingaleGateError::InvalidAlpha;
+        let msg = err.to_string();
+        assert!(msg.contains("invalid alpha"));
+    }
+
+    #[test]
+    fn error_display_fdr() {
+        let fdr_err = FdrError::NoCandidates;
+        let err = MartingaleGateError::from(fdr_err);
+        let msg = err.to_string();
+        assert!(msg.contains("FDR error"));
+    }
+
+    #[test]
+    fn error_from_fdr_error() {
+        let fdr_err = FdrError::NoCandidates;
+        let gate_err: MartingaleGateError = fdr_err.into();
+        assert!(matches!(gate_err, MartingaleGateError::Fdr(_)));
+    }
 }
