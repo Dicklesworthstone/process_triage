@@ -265,10 +265,7 @@ fn infeasible_goal_reports_shortfall() {
 #[test]
 fn composite_goal_parser_accepts_and() {
     let goal = parse_goal("free 4GB RAM AND release port 3000").unwrap();
-    match goal {
-        Goal::And(parts) => assert_eq!(parts.len(), 2),
-        _ => panic!("expected AND goal"),
-    }
+    assert!(matches!(goal, Goal::And(ref parts) if parts.len() == 2));
 }
 
 #[test]
@@ -457,6 +454,127 @@ fn telemetry_emits_constraint_prune() {
         .log_events
         .iter()
         .any(|e| e.event == "constraint_prune"));
+}
+
+#[test]
+fn weighted_multi_goal_priority_changes_selection_order() {
+    let candidates = vec![
+        OptCandidate {
+            id: "A".to_string(),
+            expected_loss: 2.0,
+            contributions: vec![10.0, 0.0],
+            blocked: false,
+            block_reason: None,
+        },
+        OptCandidate {
+            id: "B".to_string(),
+            expected_loss: 1.0,
+            contributions: vec![2.0, 5.0],
+            blocked: false,
+            block_reason: None,
+        },
+    ];
+
+    let memory_heavy_goals = vec![
+        ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 8.0,
+            weight: 10.0,
+        },
+        ResourceGoal {
+            resource: "cpu_pct".to_string(),
+            target: 1.0,
+            weight: 1.0,
+        },
+    ];
+    let cpu_heavy_goals = vec![
+        ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 1.0,
+            weight: 1.0,
+        },
+        ResourceGoal {
+            resource: "cpu_pct".to_string(),
+            target: 1.0,
+            weight: 10.0,
+        },
+    ];
+
+    let memory_first = optimize_greedy(&candidates, &memory_heavy_goals);
+    let cpu_first = optimize_greedy(&candidates, &cpu_heavy_goals);
+
+    assert_eq!(memory_first.selected[0].id, "A");
+    assert_eq!(cpu_first.selected[0].id, "B");
+}
+
+#[test]
+fn blocked_candidates_are_excluded_and_logged() {
+    let candidates = vec![
+        OptCandidate {
+            id: "blocked".to_string(),
+            expected_loss: 0.1,
+            contributions: vec![100.0],
+            blocked: true,
+            block_reason: Some("protected".to_string()),
+        },
+        OptCandidate {
+            id: "allowed".to_string(),
+            expected_loss: 1.0,
+            contributions: vec![6.0],
+            blocked: false,
+            block_reason: None,
+        },
+    ];
+
+    let goals = vec![ResourceGoal {
+        resource: "memory_mb".to_string(),
+        target: 5.0,
+        weight: 1.0,
+    }];
+
+    let result = optimize_greedy(&candidates, &goals);
+    assert!(result.selected.iter().all(|s| s.id != "blocked"));
+    assert!(result
+        .log_events
+        .iter()
+        .any(|e| e.event == "constraint_violation"
+            && e.note.as_deref() == Some("blocked_candidates=1")));
+}
+
+#[test]
+fn ilp_constraint_prune_event_has_diagnostics() {
+    let candidates = vec![
+        OptCandidate {
+            id: "A".to_string(),
+            expected_loss: 1.0,
+            contributions: vec![1.0],
+            blocked: false,
+            block_reason: None,
+        },
+        OptCandidate {
+            id: "B".to_string(),
+            expected_loss: 1.0,
+            contributions: vec![1.0],
+            blocked: false,
+            block_reason: None,
+        },
+    ];
+
+    let goals = vec![ResourceGoal {
+        resource: "memory_mb".to_string(),
+        target: 5.0,
+        weight: 1.0,
+    }];
+
+    let result = optimize_ilp(&candidates, &goals);
+    let prune_event = result
+        .log_events
+        .iter()
+        .find(|e| e.event == "constraint_prune")
+        .expect("expected constraint_prune event");
+    assert!(prune_event.current_contribution.is_some());
+    assert!(prune_event.remaining_max.is_some());
+    assert_eq!(prune_event.target, Some(5.0));
 }
 
 #[test]
