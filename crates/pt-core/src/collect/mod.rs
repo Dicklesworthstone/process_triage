@@ -33,6 +33,7 @@ mod deep_scan;
 pub mod network;
 #[cfg(target_os = "linux")]
 pub mod proc_parsers;
+pub mod incremental;
 pub mod protected;
 mod quick_scan;
 #[cfg(target_os = "linux")]
@@ -126,6 +127,12 @@ pub use user_intent::{
     collect_user_intent, collect_user_intent_batch, IntentEvidence, IntentMetadata,
     IntentSignalType, PrivacyMode, ScoringMethod, UserIntentConfig, UserIntentFeatures,
     UserIntentProvenance, USER_INTENT_SCHEMA_VERSION,
+};
+
+// Re-export incremental scanning types
+pub use incremental::{
+    compute_identity_hash, DeltaKind, DeltaSummary, IncrementalConfig, IncrementalEngine,
+    InventoryEntry, ProcessDelta,
 };
 
 // Re-export macOS collection types
