@@ -1560,4 +1560,296 @@ mod tests {
         let result = analyzer.update(&[0.1, 0.2]);
         assert!(matches!(result, Err(HsmmError::DimensionMismatch { .. })));
     }
+
+    // ── HsmmState serde ───────────────────────────────────────────────
+
+    #[test]
+    fn hsmm_state_serde_roundtrip() {
+        for s in HsmmState::ALL {
+            let json = serde_json::to_string(&s).unwrap();
+            let back: HsmmState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, s);
+        }
+    }
+
+    #[test]
+    fn hsmm_state_serde_snake_case() {
+        let json = serde_json::to_string(&HsmmState::UsefulBad).unwrap();
+        assert_eq!(json, "\"useful_bad\"");
+    }
+
+    #[test]
+    fn hsmm_state_display() {
+        assert_eq!(HsmmState::Useful.to_string(), "useful");
+        assert_eq!(HsmmState::UsefulBad.to_string(), "useful_bad");
+        assert_eq!(HsmmState::Abandoned.to_string(), "abandoned");
+        assert_eq!(HsmmState::Zombie.to_string(), "zombie");
+    }
+
+    #[test]
+    fn hsmm_state_from_index_out_of_bounds() {
+        assert!(HsmmState::from_index(4).is_none());
+        assert!(HsmmState::from_index(99).is_none());
+    }
+
+    #[test]
+    fn hsmm_state_to_classification_roundtrip() {
+        for s in HsmmState::ALL {
+            let cls = s.to_classification();
+            assert_eq!(cls.label(), s.name());
+        }
+    }
+
+    // ── GammaDuration extras ──────────────────────────────────────────
+
+    #[test]
+    fn gamma_duration_default() {
+        let gd = GammaDuration::default();
+        assert!(gd.shape > 0.0);
+        assert!(gd.rate > 0.0);
+        assert!(gd.mean() > 0.0);
+    }
+
+    #[test]
+    fn gamma_duration_serde_roundtrip() {
+        let gd = GammaDuration::new(3.0, 0.05);
+        let json = serde_json::to_string(&gd).unwrap();
+        let back: GammaDuration = serde_json::from_str(&json).unwrap();
+        assert!(approx_eq(back.shape, 3.0, 1e-9));
+        assert!(approx_eq(back.rate, 0.05, 1e-9));
+    }
+
+    #[test]
+    fn gamma_duration_std_dev() {
+        let gd = GammaDuration::new(4.0, 0.1);
+        let expected_var: f64 = 4.0 / (0.1 * 0.1); // = 400
+        assert!(approx_eq(gd.std_dev(), expected_var.sqrt(), 1e-6));
+    }
+
+    #[test]
+    fn gamma_duration_log_pdf_negative_or_zero_returns_neg_inf() {
+        let gd = GammaDuration::new(2.0, 0.5);
+        assert_eq!(gd.log_pdf(0.0), f64::NEG_INFINITY);
+        assert_eq!(gd.log_pdf(-1.0), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn gamma_duration_log_pdf_positive() {
+        let gd = GammaDuration::new(2.0, 1.0);
+        let lpdf = gd.log_pdf(1.0);
+        // For Gamma(2,1), f(1) = 1 * exp(-1) = e^-1, so log = -1
+        assert!(approx_eq(lpdf, -1.0, 0.01));
+    }
+
+    #[test]
+    fn gamma_duration_hazard_rate_zero() {
+        // shape > 1: hazard at 0 should be 0
+        let gd = GammaDuration::new(3.0, 0.1);
+        assert_eq!(gd.hazard_rate(0.0), 0.0);
+
+        // shape <= 1: hazard at 0 should be infinity
+        let gd2 = GammaDuration::new(0.5, 0.1);
+        assert_eq!(gd2.hazard_rate(0.0), f64::INFINITY);
+    }
+
+    #[test]
+    fn gamma_duration_hazard_rate_asymptotic() {
+        let gd = GammaDuration::new(2.0, 0.5);
+        // For very large d, hazard → rate
+        let h = gd.hazard_rate(1000.0);
+        assert!(approx_eq(h, 0.5, 0.01));
+    }
+
+    #[test]
+    fn gamma_duration_mode_at_boundary() {
+        // shape exactly 1: mode = 0
+        let gd = GammaDuration::new(1.0, 0.1);
+        assert_eq!(gd.mode(), Some(0.0));
+    }
+
+    #[test]
+    fn gamma_duration_survival_negative_returns_one() {
+        let gd = GammaDuration::new(2.0, 0.5);
+        assert!(approx_eq(gd.survival(-1.0), 1.0, 1e-9));
+    }
+
+    // ── HsmmConfig extras ─────────────────────────────────────────────
+
+    #[test]
+    fn hsmm_config_serde_roundtrip() {
+        let config = HsmmConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: HsmmConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.num_features, 4);
+        assert!(back.normalize_posteriors);
+    }
+
+    #[test]
+    fn hsmm_config_short_lived_vs_default() {
+        let short = HsmmConfig::short_lived();
+        let default = HsmmConfig::default();
+        // Short-lived useful has shorter mean duration
+        assert!(short.duration_priors[0].mean() < default.duration_priors[0].mean());
+    }
+
+    #[test]
+    fn hsmm_config_long_running_vs_default() {
+        let long = HsmmConfig::long_running();
+        let default = HsmmConfig::default();
+        // Long-running useful has longer mean duration
+        assert!(long.duration_priors[0].mean() > default.duration_priors[0].mean());
+        // Long-running starts more likely as useful
+        assert!(long.initial_probs[0] > default.initial_probs[0]);
+    }
+
+    #[test]
+    fn hsmm_config_invalid_duration_prior() {
+        let mut config = HsmmConfig::default();
+        config.duration_priors[1] = GammaDuration::new(-1.0, 0.1);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn hsmm_config_invalid_initial_probs() {
+        let mut config = HsmmConfig::default();
+        config.initial_probs = [0.5, 0.5, 0.5, 0.5]; // Sum = 2.0
+        assert!(config.validate().is_err());
+    }
+
+    // ── HsmmError display ─────────────────────────────────────────────
+
+    #[test]
+    fn hsmm_error_display_all_variants() {
+        let e1 = HsmmError::InvalidConfig("bad".to_string());
+        assert!(e1.to_string().contains("Invalid HSMM config"));
+
+        let e2 = HsmmError::DimensionMismatch {
+            expected: 4,
+            got: 2,
+        };
+        assert!(e2.to_string().contains("expected 4"));
+        assert!(e2.to_string().contains("got 2"));
+
+        let e3 = HsmmError::NoObservations;
+        assert!(e3.to_string().contains("No observations"));
+
+        let e4 = HsmmError::NumericalInstability("overflow".to_string());
+        assert!(e4.to_string().contains("Numerical instability"));
+    }
+
+    #[test]
+    fn hsmm_error_is_std_error() {
+        let err = HsmmError::NoObservations;
+        let _: &dyn std::error::Error = &err;
+    }
+
+    // ── StateSwitch serde ─────────────────────────────────────────────
+
+    #[test]
+    fn state_switch_serde_roundtrip() {
+        let sw = StateSwitch {
+            time_index: 5,
+            from_state: HsmmState::Useful,
+            to_state: HsmmState::Abandoned,
+            confidence: 0.85,
+            previous_duration: 10,
+        };
+        let json = serde_json::to_string(&sw).unwrap();
+        let back: StateSwitch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.time_index, 5);
+        assert_eq!(back.from_state, HsmmState::Useful);
+        assert_eq!(back.to_state, HsmmState::Abandoned);
+    }
+
+    // ── DurationStats serde ───────────────────────────────────────────
+
+    #[test]
+    fn duration_stats_serde_roundtrip() {
+        let ds = DurationStats {
+            state: HsmmState::Zombie,
+            posterior: GammaDuration::new(5.0, 0.05),
+            total_duration: 42,
+            num_entries: 3,
+            current_dwell: Some(10),
+            current_hazard: 0.05,
+        };
+        let json = serde_json::to_string(&ds).unwrap();
+        let back: DurationStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.state, HsmmState::Zombie);
+        assert_eq!(back.total_duration, 42);
+    }
+
+    // ── HsmmResult extras ─────────────────────────────────────────────
+
+    #[test]
+    fn hsmm_result_dominant_state_from_analysis() {
+        let config = HsmmConfig::default();
+        let mut analyzer = HsmmAnalyzer::new(config).unwrap();
+
+        for _ in 0..20 {
+            analyzer.update(&[0.3, 0.3, 0.2, 0.5]).unwrap();
+        }
+
+        let result = analyzer.summarize().unwrap();
+        // Dominant state should be the one with most total_duration
+        let dom = result.dominant_state();
+        let max_dur = result
+            .duration_stats
+            .iter()
+            .map(|s| s.total_duration)
+            .max()
+            .unwrap();
+        assert_eq!(result.duration_stats[dom.index()].total_duration, max_dur);
+    }
+
+    #[test]
+    fn hsmm_result_serde_roundtrip() {
+        let config = HsmmConfig::default();
+        let mut analyzer = HsmmAnalyzer::new(config).unwrap();
+
+        for _ in 0..5 {
+            analyzer.update(&[0.3, 0.3, 0.2, 0.5]).unwrap();
+        }
+
+        let result = analyzer.summarize().unwrap();
+        let json = serde_json::to_string(&result).unwrap();
+        let back: HsmmResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.num_observations, 5);
+        assert_eq!(back.state_sequence.len(), 5);
+    }
+
+    // ── HsmmEvidence log_bf ───────────────────────────────────────────
+
+    #[test]
+    fn hsmm_evidence_log_bf_for_triage() {
+        let config = HsmmConfig::default();
+        let mut analyzer = HsmmAnalyzer::new(config.clone()).unwrap();
+
+        for _ in 0..10 {
+            analyzer.update(&[0.05, 0.02, 0.3, 0.9]).unwrap(); // abandoned-like
+        }
+
+        let result = analyzer.summarize().unwrap();
+        let evidence = HsmmEvidence::from_result(&result, &config);
+        // Should be finite
+        assert!(evidence.log_bf_for_triage().is_finite());
+    }
+
+    // ── Batch analyzer error ──────────────────────────────────────────
+
+    #[test]
+    fn batch_analyzer_empty_observations() {
+        let config = HsmmConfig::default();
+        let batch = BatchHsmmAnalyzer::new(config).unwrap();
+        let result = batch.analyze(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn batch_analyzer_dimension_mismatch() {
+        let config = HsmmConfig::default();
+        let batch = BatchHsmmAnalyzer::new(config).unwrap();
+        let result = batch.analyze(&[vec![0.1, 0.2]]); // 2 features, needs 4
+        assert!(result.is_err());
+    }
 }

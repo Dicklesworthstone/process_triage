@@ -1572,4 +1572,341 @@ mod tests {
         assert!(json.contains("retry_with_sudo"));
         assert!(json.contains("escalate_to_user"));
     }
+
+    // ── FailureCategory ───────────────────────────────────────────────
+
+    #[test]
+    fn failure_category_serde_roundtrip() {
+        let variants = [
+            FailureCategory::PermissionDenied,
+            FailureCategory::ProcessNotFound,
+            FailureCategory::ProcessProtected,
+            FailureCategory::Timeout,
+            FailureCategory::SupervisorConflict,
+            FailureCategory::ResourceConflict,
+            FailureCategory::IdentityMismatch,
+            FailureCategory::PreCheckBlocked,
+            FailureCategory::UnexpectedError,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: FailureCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn failure_category_display_all() {
+        assert_eq!(FailureCategory::ProcessNotFound.to_string(), "process_not_found");
+        assert_eq!(FailureCategory::ProcessProtected.to_string(), "process_protected");
+        assert_eq!(FailureCategory::Timeout.to_string(), "timeout");
+        assert_eq!(FailureCategory::ResourceConflict.to_string(), "resource_conflict");
+        assert_eq!(FailureCategory::IdentityMismatch.to_string(), "identity_mismatch");
+        assert_eq!(FailureCategory::PreCheckBlocked.to_string(), "pre_check_blocked");
+        assert_eq!(FailureCategory::UnexpectedError.to_string(), "unexpected_error");
+    }
+
+    // ── RecoveryAction serde ──────────────────────────────────────────
+
+    #[test]
+    fn recovery_action_serde_roundtrip() {
+        let actions = vec![
+            RecoveryAction::Retry,
+            RecoveryAction::RetryWithSudo,
+            RecoveryAction::StopSupervisor,
+            RecoveryAction::MaskAndStop,
+            RecoveryAction::VerifyGoal,
+            RecoveryAction::CheckRespawn,
+            RecoveryAction::Investigate,
+            RecoveryAction::EscalateToUser,
+            RecoveryAction::Skip,
+            RecoveryAction::Escalate(Action::Kill),
+            RecoveryAction::WaitAndRetry { delay_ms: 500 },
+            RecoveryAction::Custom {
+                command: "test".to_string(),
+            },
+        ];
+        for action in actions {
+            let json = serde_json::to_string(&action).unwrap();
+            let back: RecoveryAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, action);
+        }
+    }
+
+    // ── Requirement serde ─────────────────────────────────────────────
+
+    #[test]
+    fn requirement_serde_roundtrip() {
+        let reqs = vec![
+            Requirement::SudoAvailable,
+            Requirement::ProcessExists,
+            Requirement::SystemdSupervised,
+            Requirement::DockerSupervised,
+            Requirement::Pm2Supervised,
+            Requirement::InDState,
+            Requirement::RetryBudgetAvailable,
+            Requirement::UserConfirmation,
+            Requirement::CgroupV2Available,
+        ];
+        for r in reqs {
+            let json = serde_json::to_string(&r).unwrap();
+            let back: Requirement = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, r);
+        }
+    }
+
+    // ── Remaining trees ───────────────────────────────────────────────
+
+    #[test]
+    fn renice_tree_permission_denied() {
+        let tree = RecoveryTree::renice_tree();
+        assert_eq!(tree.action, Action::Renice);
+        let branch = tree.get_branch(FailureCategory::PermissionDenied);
+        assert!(
+            branch
+                .alternatives
+                .iter()
+                .any(|a| a.action == RecoveryAction::RetryWithSudo)
+        );
+    }
+
+    #[test]
+    fn renice_tree_resource_conflict() {
+        let tree = RecoveryTree::renice_tree();
+        let branch = tree.get_branch(FailureCategory::ResourceConflict);
+        assert!(!branch.alternatives.is_empty());
+    }
+
+    #[test]
+    fn throttle_tree_action() {
+        let tree = RecoveryTree::throttle_tree();
+        assert_eq!(tree.action, Action::Throttle);
+    }
+
+    #[test]
+    fn restart_tree_action() {
+        let tree = RecoveryTree::restart_tree();
+        assert_eq!(tree.action, Action::Restart);
+    }
+
+    #[test]
+    fn restart_tree_permission_denied_has_alternatives() {
+        let tree = RecoveryTree::restart_tree();
+        let branch = tree.get_branch(FailureCategory::PermissionDenied);
+        assert!(!branch.alternatives.is_empty());
+    }
+
+    #[test]
+    fn restart_tree_supervisor_conflict() {
+        let tree = RecoveryTree::restart_tree();
+        let branch = tree.get_branch(FailureCategory::SupervisorConflict);
+        assert!(!branch.alternatives.is_empty());
+    }
+
+    // ── get_branch default fallback ───────────────────────────────────
+
+    #[test]
+    fn get_branch_unmapped_returns_default() {
+        let tree = RecoveryTree::kill_tree();
+        // ResourceConflict is not in kill_tree branches
+        let branch = tree.get_branch(FailureCategory::ResourceConflict);
+        // Should return the default branch
+        assert!(!branch.alternatives.is_empty());
+        assert!(branch.diagnosis.contains("Unexpected"));
+    }
+
+    // ── RecoveryBranch serde ──────────────────────────────────────────
+
+    #[test]
+    fn recovery_branch_serde_roundtrip() {
+        let branch = RecoveryBranch {
+            diagnosis: "test".to_string(),
+            alternatives: vec![RecoveryAlternative {
+                action: RecoveryAction::Retry,
+                explanation: "try again".to_string(),
+                requirements: vec![Requirement::ProcessExists],
+                reversible: true,
+                command_hint: Some("retry".to_string()),
+                notes: None,
+            }],
+            verification: Some("check it worked".to_string()),
+            max_attempts: 3,
+        };
+        let json = serde_json::to_string(&branch).unwrap();
+        let back: RecoveryBranch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_attempts, 3);
+        assert_eq!(back.alternatives.len(), 1);
+    }
+
+    // ── RequirementContext extras ──────────────────────────────────────
+
+    #[test]
+    fn requirement_context_default() {
+        let ctx = RequirementContext::default();
+        assert!(!ctx.sudo_available);
+        assert!(!ctx.process_exists);
+        assert_eq!(ctx.retry_budget, 0);
+    }
+
+    #[test]
+    fn requirement_context_supervisor_requirements() {
+        let ctx = RequirementContext {
+            systemd_supervised: true,
+            docker_supervised: false,
+            pm2_supervised: true,
+            ..Default::default()
+        };
+        assert!(ctx.is_met(&Requirement::SystemdSupervised));
+        assert!(!ctx.is_met(&Requirement::DockerSupervised));
+        assert!(ctx.is_met(&Requirement::Pm2Supervised));
+    }
+
+    #[test]
+    fn requirement_context_cgroup_v2() {
+        let ctx = RequirementContext {
+            cgroup_v2_available: true,
+            ..Default::default()
+        };
+        assert!(ctx.is_met(&Requirement::CgroupV2Available));
+    }
+
+    #[test]
+    fn requirement_context_user_confirmation() {
+        let ctx = RequirementContext {
+            user_confirmation_available: true,
+            ..Default::default()
+        };
+        assert!(ctx.is_met(&Requirement::UserConfirmation));
+    }
+
+    // ── RecoveryTreeDatabase ──────────────────────────────────────────
+
+    #[test]
+    fn database_lookup_nonexistent_action() {
+        let db = RecoveryTreeDatabase::new();
+        // Resume doesn't have a tree
+        assert!(db.get_tree(Action::Resume).is_none());
+    }
+
+    #[test]
+    fn database_lookup_kill_timeout() {
+        let db = RecoveryTreeDatabase::new();
+        let branch = db.lookup(Action::Kill, FailureCategory::Timeout);
+        assert!(branch.is_some());
+        let branch = branch.unwrap();
+        assert!(branch.alternatives.len() >= 1);
+    }
+
+    #[test]
+    fn database_lookup_no_tree_returns_none() {
+        let db = RecoveryTreeDatabase::new();
+        assert!(db.lookup(Action::Keep, FailureCategory::Timeout).is_none());
+    }
+
+    // ── AttemptResult serde ───────────────────────────────────────────
+
+    #[test]
+    fn attempt_result_serde_roundtrip() {
+        let variants = vec![
+            AttemptResult::Success,
+            AttemptResult::Failed {
+                category: FailureCategory::Timeout,
+            },
+            AttemptResult::Skipped {
+                reason: "not needed".to_string(),
+            },
+        ];
+        for v in &variants {
+            let json = serde_json::to_string(v).unwrap();
+            let _: AttemptResult = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    // ── RecoveryExecutor extras ───────────────────────────────────────
+
+    #[test]
+    fn recovery_executor_with_max_attempts() {
+        let db = RecoveryTreeDatabase::new();
+        let checker = NoopRequirementChecker::default();
+        let executor = RecoveryExecutor::new(&db, &checker).with_max_attempts(10);
+        let session = executor.create_session(999, None);
+        assert_eq!(session.max_total_attempts, 10);
+    }
+
+    #[test]
+    fn recovery_executor_get_best_alternative() {
+        let db = RecoveryTreeDatabase::new();
+        let checker = NoopRequirementChecker {
+            default_context: RequirementContext {
+                sudo_available: true,
+                process_exists: true,
+                retry_budget: 3,
+                ..Default::default()
+            },
+        };
+        let executor = RecoveryExecutor::new(&db, &checker);
+        let session = executor.create_session(1234, None);
+
+        let best = executor.get_best_alternative(
+            Action::Kill,
+            FailureCategory::PermissionDenied,
+            1234,
+            &session,
+        );
+        assert!(best.is_some());
+        assert_eq!(best.unwrap().action, RecoveryAction::RetryWithSudo);
+    }
+
+    #[test]
+    fn recovery_executor_classify_process_not_found() {
+        let db = RecoveryTreeDatabase::new();
+        let checker = NoopRequirementChecker::default();
+        let executor = RecoveryExecutor::new(&db, &checker);
+        assert_eq!(
+            executor.classify_failure("not_found", 1, false),
+            FailureCategory::ProcessNotFound
+        );
+    }
+
+    #[test]
+    fn recovery_executor_classify_protected() {
+        let db = RecoveryTreeDatabase::new();
+        let checker = NoopRequirementChecker::default();
+        let executor = RecoveryExecutor::new(&db, &checker);
+        assert_eq!(
+            executor.classify_failure("protected", 1, false),
+            FailureCategory::ProcessProtected
+        );
+    }
+
+    // ── RecoveryHint serde ────────────────────────────────────────────
+
+    #[test]
+    fn recovery_hint_serde_roundtrip() {
+        let hint = RecoveryHint {
+            recommended_action: RecoveryAction::Retry,
+            explanation: "try again".to_string(),
+            reversibility: Some("undo it".to_string()),
+            agent_next_step: "diagnosis: retry".to_string(),
+        };
+        let json = serde_json::to_string(&hint).unwrap();
+        let back: RecoveryHint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.recommended_action, RecoveryAction::Retry);
+    }
+
+    // ── ActionAttempt serde ───────────────────────────────────────────
+
+    #[test]
+    fn action_attempt_serde_roundtrip() {
+        let attempt = ActionAttempt {
+            action: Action::Kill,
+            result: AttemptResult::Success,
+            time_ms: 50,
+            attempt_number: 1,
+        };
+        let json = serde_json::to_string(&attempt).unwrap();
+        let back: ActionAttempt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.attempt_number, 1);
+        assert!(matches!(back.result, AttemptResult::Success));
+    }
 }
