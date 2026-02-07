@@ -379,4 +379,293 @@ mod tests {
             _ => panic!("unexpected error"),
         }
     }
+
+    // ── ActionStatus serde ──────────────────────────────────────────
+
+    #[test]
+    fn action_status_serde_success() {
+        let json = serde_json::to_string(&ActionStatus::Success).unwrap();
+        assert_eq!(json, r#""success""#);
+    }
+
+    #[test]
+    fn action_status_serde_identity_mismatch() {
+        let json = serde_json::to_string(&ActionStatus::IdentityMismatch).unwrap();
+        assert_eq!(json, r#""identity_mismatch""#);
+    }
+
+    #[test]
+    fn action_status_serde_permission_denied() {
+        let json = serde_json::to_string(&ActionStatus::PermissionDenied).unwrap();
+        assert_eq!(json, r#""permission_denied""#);
+    }
+
+    #[test]
+    fn action_status_serde_timeout() {
+        let json = serde_json::to_string(&ActionStatus::Timeout).unwrap();
+        assert_eq!(json, r#""timeout""#);
+    }
+
+    #[test]
+    fn action_status_serde_failed() {
+        let json = serde_json::to_string(&ActionStatus::Failed).unwrap();
+        assert_eq!(json, r#""failed""#);
+    }
+
+    #[test]
+    fn action_status_serde_skipped() {
+        let json = serde_json::to_string(&ActionStatus::Skipped).unwrap();
+        assert_eq!(json, r#""skipped""#);
+    }
+
+    #[test]
+    fn action_status_serde_pre_check_blocked() {
+        let status = ActionStatus::PreCheckBlocked {
+            check: PreCheck::VerifyIdentity,
+            reason: "pid changed".to_string(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("pre_check_blocked"));
+        assert!(json.contains("pid changed"));
+    }
+
+    #[test]
+    fn action_status_eq() {
+        assert_eq!(ActionStatus::Success, ActionStatus::Success);
+        assert_ne!(ActionStatus::Success, ActionStatus::Failed);
+    }
+
+    // ── status_from_error ───────────────────────────────────────────
+
+    #[test]
+    fn status_from_error_identity_mismatch() {
+        assert_eq!(status_from_error(ActionError::IdentityMismatch), ActionStatus::IdentityMismatch);
+    }
+
+    #[test]
+    fn status_from_error_permission_denied() {
+        assert_eq!(status_from_error(ActionError::PermissionDenied), ActionStatus::PermissionDenied);
+    }
+
+    #[test]
+    fn status_from_error_timeout() {
+        assert_eq!(status_from_error(ActionError::Timeout), ActionStatus::Timeout);
+    }
+
+    #[test]
+    fn status_from_error_failed() {
+        assert_eq!(status_from_error(ActionError::Failed("err".into())), ActionStatus::Failed);
+    }
+
+    // ── ActionError display ─────────────────────────────────────────
+
+    #[test]
+    fn action_error_display() {
+        assert_eq!(ActionError::IdentityMismatch.to_string(), "identity mismatch");
+        assert_eq!(ActionError::PermissionDenied.to_string(), "permission denied");
+        assert_eq!(ActionError::Timeout.to_string(), "timeout");
+        assert!(ActionError::Failed("oops".into()).to_string().contains("oops"));
+    }
+
+    // ── ExecutionError display ──────────────────────────────────────
+
+    #[test]
+    fn execution_error_display() {
+        assert!(ExecutionError::LockUnavailable.to_string().contains("lock"));
+    }
+
+    // ── NoopActionRunner ────────────────────────────────────────────
+
+    #[test]
+    fn noop_runner_execute_succeeds() {
+        let runner = NoopActionRunner;
+        let plan = make_plan();
+        assert!(runner.execute(&plan.actions[0]).is_ok());
+    }
+
+    #[test]
+    fn noop_runner_verify_succeeds() {
+        let runner = NoopActionRunner;
+        let plan = make_plan();
+        assert!(runner.verify(&plan.actions[0]).is_ok());
+    }
+
+    // ── StaticIdentityProvider ──────────────────────────────────────
+
+    #[test]
+    fn static_identity_provider_empty_returns_false() {
+        let provider = StaticIdentityProvider::default();
+        let identity = ProcessIdentity {
+            pid: ProcessId(1),
+            start_id: StartId("boot:1:1".to_string()),
+            uid: 1000,
+            pgid: None,
+            sid: None,
+            quality: IdentityQuality::Full,
+        };
+        assert!(!provider.revalidate(&identity).unwrap());
+    }
+
+    #[test]
+    fn static_identity_provider_with_matching_identity() {
+        let identity = ProcessIdentity {
+            pid: ProcessId(123),
+            start_id: StartId("boot:1:123".to_string()),
+            uid: 1000,
+            pgid: None,
+            sid: None,
+            quality: IdentityQuality::Full,
+        };
+        let provider = StaticIdentityProvider::default().with_identity(identity.clone());
+        assert!(provider.revalidate(&identity).unwrap());
+    }
+
+    #[test]
+    fn static_identity_provider_pid_not_found() {
+        let identity_in = ProcessIdentity {
+            pid: ProcessId(123),
+            start_id: StartId("boot:1:123".to_string()),
+            uid: 1000,
+            pgid: None,
+            sid: None,
+            quality: IdentityQuality::Full,
+        };
+        let provider = StaticIdentityProvider::default().with_identity(identity_in);
+        let query = ProcessIdentity {
+            pid: ProcessId(999),
+            start_id: StartId("boot:1:999".to_string()),
+            uid: 1000,
+            pgid: None,
+            sid: None,
+            quality: IdentityQuality::Full,
+        };
+        assert!(!provider.revalidate(&query).unwrap());
+    }
+
+    // ── ActionLock ──────────────────────────────────────────────────
+
+    #[test]
+    fn action_lock_acquires_and_writes_pid() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("action.lock");
+        {
+            let _lock = ActionLock::acquire(&path).unwrap();
+            assert!(path.exists());
+            let content = std::fs::read_to_string(&path).unwrap();
+            let pid: u32 = content.trim().parse().unwrap();
+            assert_eq!(pid, std::process::id());
+        }
+        // After drop, lock file is NOT removed (per design comment in code)
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn action_lock_double_acquire_fails() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("double.lock");
+        let _lock1 = ActionLock::acquire(&path).unwrap();
+        let result = ActionLock::acquire(&path);
+        assert!(result.is_err());
+    }
+
+    // ── ActionResult serialization ──────────────────────────────────
+
+    #[test]
+    fn action_result_serializes() {
+        let r = ActionResult {
+            action_id: "act-1".to_string(),
+            status: ActionStatus::Success,
+            time_ms: 42,
+            details: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("act-1"));
+        assert!(json.contains("success"));
+        assert!(!json.contains("details")); // skip_serializing_if None
+    }
+
+    #[test]
+    fn action_result_with_details() {
+        let r = ActionResult {
+            action_id: "act-2".to_string(),
+            status: ActionStatus::Failed,
+            time_ms: 100,
+            details: Some("something went wrong".to_string()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("something went wrong"));
+    }
+
+    // ── ExecutionResult serialization ────────────────────────────────
+
+    #[test]
+    fn execution_result_serializes() {
+        let r = ExecutionResult {
+            summary: ExecutionSummary {
+                actions_attempted: 3,
+                actions_succeeded: 2,
+                actions_failed: 1,
+            },
+            outcomes: vec![],
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"actions_attempted\":3"));
+        assert!(json.contains("\"actions_succeeded\":2"));
+    }
+
+    // ── ActionExecutor success path ─────────────────────────────────
+
+    #[test]
+    fn executor_success_with_matching_identity() {
+        let plan = make_plan();
+        let dir = tempdir().unwrap();
+        let runner = NoopActionRunner;
+        let target_identity = plan.actions[0].target.clone();
+        let identity_provider = StaticIdentityProvider::default().with_identity(target_identity);
+        let executor = ActionExecutor::new(&runner, &identity_provider, dir.path().join("lock"));
+        let result = executor.execute_plan(&plan).unwrap();
+        assert_eq!(result.outcomes[0].status, ActionStatus::Success);
+        assert_eq!(result.summary.actions_succeeded, 1);
+        assert_eq!(result.summary.actions_failed, 0);
+    }
+
+    #[test]
+    fn executor_blocked_action_skipped() {
+        let mut plan = make_plan();
+        plan.actions[0].blocked = true;
+        let dir = tempdir().unwrap();
+        let runner = NoopActionRunner;
+        let identity_provider = StaticIdentityProvider::default();
+        let executor = ActionExecutor::new(&runner, &identity_provider, dir.path().join("lock"));
+        let result = executor.execute_plan(&plan).unwrap();
+        assert_eq!(result.outcomes[0].status, ActionStatus::Skipped);
+        // Skipped actions don't count as succeeded or failed
+        assert_eq!(result.summary.actions_succeeded, 0);
+        assert_eq!(result.summary.actions_failed, 0);
+    }
+
+    #[test]
+    fn executor_empty_plan() {
+        let mut plan = make_plan();
+        plan.actions.clear();
+        let dir = tempdir().unwrap();
+        let runner = NoopActionRunner;
+        let identity_provider = StaticIdentityProvider::default();
+        let executor = ActionExecutor::new(&runner, &identity_provider, dir.path().join("lock"));
+        let result = executor.execute_plan(&plan).unwrap();
+        assert_eq!(result.summary.actions_attempted, 0);
+        assert!(result.outcomes.is_empty());
+    }
+
+    #[test]
+    fn executor_has_timing() {
+        let plan = make_plan();
+        let dir = tempdir().unwrap();
+        let runner = NoopActionRunner;
+        let identity_provider = StaticIdentityProvider::default();
+        let executor = ActionExecutor::new(&runner, &identity_provider, dir.path().join("lock"));
+        let result = executor.execute_plan(&plan).unwrap();
+        // time_ms should be a small non-negative number (noop is fast)
+        assert!(result.outcomes[0].time_ms < 1000);
+    }
 }
