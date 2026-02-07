@@ -1369,4 +1369,689 @@ mod tests {
         assert!(!result.feasible);
         assert!(result.selected.is_empty());
     }
+
+    // --- Serde roundtrip tests ---
+
+    #[test]
+    fn resource_goal_serde_roundtrip() {
+        let goal = ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 512.0,
+            weight: 2.5,
+        };
+        let json = serde_json::to_string(&goal).unwrap();
+        let deser: ResourceGoal = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.resource, "memory_mb");
+        assert!((deser.target - 512.0).abs() < 1e-9);
+        assert!((deser.weight - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn opt_candidate_serde_roundtrip() {
+        let cand = OptCandidate {
+            id: "pid_42".to_string(),
+            expected_loss: 0.75,
+            contributions: vec![100.0, 50.0],
+            blocked: true,
+            block_reason: Some("protected".to_string()),
+        };
+        let json = serde_json::to_string(&cand).unwrap();
+        let deser: OptCandidate = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.id, "pid_42");
+        assert!(deser.blocked);
+        assert_eq!(deser.block_reason.as_deref(), Some("protected"));
+        assert_eq!(deser.contributions.len(), 2);
+    }
+
+    #[test]
+    fn selected_action_serde_roundtrip() {
+        let sa = SelectedAction {
+            id: "pid_1".to_string(),
+            expected_loss: 0.3,
+            contributions: vec![200.0],
+        };
+        let json = serde_json::to_string(&sa).unwrap();
+        let deser: SelectedAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.id, "pid_1");
+        assert!((deser.expected_loss - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn goal_achievement_serde_roundtrip() {
+        let ga = GoalAchievement {
+            resource: "cpu_pct".to_string(),
+            target: 50.0,
+            achieved: 45.0,
+            shortfall: 5.0,
+            met: false,
+        };
+        let json = serde_json::to_string(&ga).unwrap();
+        let deser: GoalAchievement = serde_json::from_str(&json).unwrap();
+        assert!(!deser.met);
+        assert!((deser.shortfall - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn alternative_plan_serde_roundtrip() {
+        let alt = AlternativePlan {
+            description: "Conservative plan".to_string(),
+            action_count: 2,
+            total_loss: 0.5,
+            goal_achievement: vec![GoalAchievement {
+                resource: "memory_mb".to_string(),
+                target: 100.0,
+                achieved: 80.0,
+                shortfall: 20.0,
+                met: false,
+            }],
+        };
+        let json = serde_json::to_string(&alt).unwrap();
+        let deser: AlternativePlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.action_count, 2);
+        assert_eq!(deser.goal_achievement.len(), 1);
+    }
+
+    #[test]
+    fn optimization_log_event_new_defaults() {
+        let event = OptimizationLogEvent::new("test_event", "test_algo");
+        assert_eq!(event.event, "test_event");
+        assert_eq!(event.algorithm, "test_algo");
+        assert!(event.candidate_id.is_none());
+        assert!(event.loss.is_none());
+        assert!(event.score.is_none());
+        assert!(event.total_loss.is_none());
+        assert!(event.total_contributions.is_empty());
+        assert!(event.target.is_none());
+        assert!(event.current_contribution.is_none());
+        assert!(event.remaining_max.is_none());
+        assert!(event.note.is_none());
+    }
+
+    #[test]
+    fn optimization_log_event_serde_roundtrip() {
+        let mut event = OptimizationLogEvent::new("converged", "greedy");
+        event.total_loss = Some(1.5);
+        event.total_contributions = vec![300.0, 50.0];
+        let json = serde_json::to_string(&event).unwrap();
+        let deser: OptimizationLogEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.event, "converged");
+        assert_eq!(deser.total_contributions.len(), 2);
+    }
+
+    // --- PreferenceModel tests ---
+
+    #[test]
+    fn preference_model_default() {
+        let pm = PreferenceModel::default();
+        assert!((pm.risk_tolerance - 0.5).abs() < 1e-9);
+        assert!((pm.learning_rate - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn preference_model_adjust_loss_conservative() {
+        // risk_tolerance = 0 => exponent = 2.0 => loss^2
+        let pm = PreferenceModel {
+            risk_tolerance: 0.0,
+            learning_rate: 0.2,
+        };
+        let adjusted = pm.adjust_loss(0.5);
+        // 0.5^2 = 0.25
+        assert!((adjusted - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn preference_model_adjust_loss_aggressive() {
+        // risk_tolerance = 1.0 => exponent = 1.0 => loss^1 = loss
+        let pm = PreferenceModel {
+            risk_tolerance: 1.0,
+            learning_rate: 0.2,
+        };
+        let adjusted = pm.adjust_loss(0.5);
+        assert!((adjusted - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn preference_model_adjust_loss_min_floor() {
+        let pm = PreferenceModel::default();
+        let adjusted = pm.adjust_loss(0.0);
+        // Should be at least 1e-12
+        assert!(adjusted >= 1e-12);
+    }
+
+    #[test]
+    fn preference_model_update_from_choice_learns() {
+        let mut pm = PreferenceModel {
+            risk_tolerance: 0.5,
+            learning_rate: 0.5,
+        };
+
+        let chosen = AlternativePlan {
+            description: "aggressive".to_string(),
+            action_count: 5,
+            total_loss: 8.0, // high loss = aggressive
+            goal_achievement: vec![],
+        };
+        let alternatives = vec![
+            AlternativePlan {
+                description: "safe".to_string(),
+                action_count: 1,
+                total_loss: 2.0,
+                goal_achievement: vec![],
+            },
+            AlternativePlan {
+                description: "aggressive".to_string(),
+                action_count: 5,
+                total_loss: 8.0,
+                goal_achievement: vec![],
+            },
+        ];
+
+        let update = pm.update_from_choice(&chosen, &alternatives);
+        assert!((update.prior - 0.5).abs() < 1e-9);
+        assert!((update.observed - 1.0).abs() < 1e-9); // (8-2)/(8-2) = 1.0
+        // updated = 0.5 * 0.5 + 1.0 * 0.5 = 0.75
+        assert!((update.updated - 0.75).abs() < 1e-9);
+        assert!((pm.risk_tolerance - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn preference_model_update_equal_alternatives() {
+        let mut pm = PreferenceModel::default();
+        let chosen = AlternativePlan {
+            description: "only".to_string(),
+            action_count: 1,
+            total_loss: 5.0,
+            goal_achievement: vec![],
+        };
+        let alternatives = vec![AlternativePlan {
+            description: "only".to_string(),
+            action_count: 1,
+            total_loss: 5.0,
+            goal_achievement: vec![],
+        }];
+        let update = pm.update_from_choice(&chosen, &alternatives);
+        // min == max => observed = 0.5
+        assert!((update.observed - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn preference_update_serde_roundtrip() {
+        let pu = PreferenceUpdate {
+            prior: 0.5,
+            observed: 0.8,
+            updated: 0.56,
+        };
+        let json = serde_json::to_string(&pu).unwrap();
+        let deser: PreferenceUpdate = serde_json::from_str(&json).unwrap();
+        assert!((deser.prior - 0.5).abs() < 1e-9);
+    }
+
+    // --- optimize_greedy_with_preferences ---
+
+    #[test]
+    fn greedy_with_preferences_conservative() {
+        let candidates = make_candidates(5);
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 300.0,
+            weight: 1.0,
+        }];
+        let prefs = PreferenceModel {
+            risk_tolerance: 0.0, // very conservative
+            learning_rate: 0.2,
+        };
+        let result = optimize_greedy_with_preferences(&candidates, &goals, &prefs);
+        assert_eq!(result.algorithm, "greedy_pref");
+        assert!(result.feasible);
+    }
+
+    // --- DP fallback tests ---
+
+    #[test]
+    fn dp_multi_goal_falls_back_to_greedy() {
+        let goals = vec![
+            ResourceGoal {
+                resource: "memory_mb".to_string(),
+                target: 100.0,
+                weight: 1.0,
+            },
+            ResourceGoal {
+                resource: "cpu_pct".to_string(),
+                target: 50.0,
+                weight: 1.0,
+            },
+        ];
+        // Multi-goal candidates need matching contribution vectors
+        let candidates = vec![OptCandidate {
+            id: "a".to_string(),
+            expected_loss: 0.5,
+            contributions: vec![200.0, 80.0],
+            blocked: false,
+            block_reason: None,
+        }];
+        let result = optimize_dp(&candidates, &goals, 10.0);
+        assert!(result.algorithm.contains("greedy fallback"));
+    }
+
+    #[test]
+    fn dp_empty_candidates_falls_back() {
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 100.0,
+            weight: 1.0,
+        }];
+        let result = optimize_dp(&[], &goals, 10.0);
+        assert!(result.algorithm.contains("greedy fallback"));
+        assert!(!result.feasible);
+    }
+
+    #[test]
+    fn dp_infeasible_falls_back() {
+        let candidates = vec![OptCandidate {
+            id: "small".to_string(),
+            expected_loss: 0.1,
+            contributions: vec![10.0],
+            blocked: false,
+            block_reason: None,
+        }];
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 10000.0, // way more than 10
+            weight: 1.0,
+        }];
+        let result = optimize_dp(&candidates, &goals, 1.0);
+        // Should be infeasible; either DP or greedy fallback but not feasible
+        assert!(!result.feasible);
+    }
+
+    // --- ILP tests ---
+
+    #[test]
+    fn ilp_single_goal_basic() {
+        let candidates = vec![
+            OptCandidate {
+                id: "A".to_string(),
+                expected_loss: 1.0,
+                contributions: vec![200.0],
+                blocked: false,
+                block_reason: None,
+            },
+            OptCandidate {
+                id: "B".to_string(),
+                expected_loss: 0.5,
+                contributions: vec![150.0],
+                blocked: false,
+                block_reason: None,
+            },
+            OptCandidate {
+                id: "C".to_string(),
+                expected_loss: 0.3,
+                contributions: vec![100.0],
+                blocked: false,
+                block_reason: None,
+            },
+        ];
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 250.0,
+            weight: 1.0,
+        }];
+        let result = optimize_ilp(&candidates, &goals);
+        assert!(result.feasible);
+        assert_eq!(result.algorithm, "ilp_branch_bound");
+        // B+C = 250 at cost 0.8 is optimal
+        assert!(result.total_loss <= 0.81);
+    }
+
+    #[test]
+    fn ilp_multi_goal_falls_back_to_greedy() {
+        let candidates = vec![OptCandidate {
+            id: "a".to_string(),
+            expected_loss: 0.5,
+            contributions: vec![200.0, 80.0],
+            blocked: false,
+            block_reason: None,
+        }];
+        let goals = vec![
+            ResourceGoal {
+                resource: "mem".to_string(),
+                target: 100.0,
+                weight: 1.0,
+            },
+            ResourceGoal {
+                resource: "cpu".to_string(),
+                target: 50.0,
+                weight: 1.0,
+            },
+        ];
+        let result = optimize_ilp(&candidates, &goals);
+        assert!(result.algorithm.contains("greedy fallback"));
+    }
+
+    #[test]
+    fn ilp_empty_candidates_falls_back() {
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 100.0,
+            weight: 1.0,
+        }];
+        let result = optimize_ilp(&[], &goals);
+        assert!(result.algorithm.contains("greedy fallback"));
+    }
+
+    #[test]
+    fn ilp_all_blocked_falls_back() {
+        let candidates = vec![OptCandidate {
+            id: "blocked".to_string(),
+            expected_loss: 0.5,
+            contributions: vec![200.0],
+            blocked: true,
+            block_reason: Some("protected".to_string()),
+        }];
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 100.0,
+            weight: 1.0,
+        }];
+        let result = optimize_ilp(&candidates, &goals);
+        assert!(result.algorithm.contains("greedy fallback"));
+    }
+
+    #[test]
+    fn ilp_infeasible_falls_back() {
+        let candidates = vec![OptCandidate {
+            id: "tiny".to_string(),
+            expected_loss: 0.1,
+            contributions: vec![5.0],
+            blocked: false,
+            block_reason: None,
+        }];
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 10000.0,
+            weight: 1.0,
+        }];
+        let result = optimize_ilp(&candidates, &goals);
+        assert!(!result.feasible);
+    }
+
+    // --- Reoptimization tests ---
+
+    #[test]
+    fn reoptimize_no_change() {
+        let candidates = make_candidates(3);
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 200.0,
+            weight: 1.0,
+        }];
+        let prev = optimize_greedy(&candidates, &goals);
+        let decision = reoptimize_on_change(&prev, &candidates, &candidates, &goals);
+        assert!(!decision.reoptimized);
+        assert_eq!(decision.reason, "no_change");
+        assert!(decision.added.is_empty());
+        assert!(decision.removed.is_empty());
+    }
+
+    #[test]
+    fn reoptimize_stable_below_threshold() {
+        let candidates = make_candidates(10);
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 200.0,
+            weight: 1.0,
+        }];
+        let prev = optimize_greedy(&candidates, &goals);
+
+        // Add 1 candidate to 10 = 10% churn, below 20% threshold
+        let mut new_candidates = candidates.clone();
+        new_candidates.push(OptCandidate {
+            id: "pid_10".to_string(),
+            expected_loss: 0.5,
+            contributions: vec![100.0],
+            blocked: false,
+            block_reason: None,
+        });
+        let decision = reoptimize_on_change(&prev, &candidates, &new_candidates, &goals);
+        assert!(!decision.reoptimized);
+        assert_eq!(decision.reason, "stable");
+    }
+
+    #[test]
+    fn reoptimize_churn_threshold_exceeded() {
+        let candidates = make_candidates(5);
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 200.0,
+            weight: 1.0,
+        }];
+        let prev = optimize_greedy(&candidates, &goals);
+
+        // Replace 2 of 5 candidates = 40% churn, exceeds 20% threshold
+        let mut new_candidates = candidates[..3].to_vec();
+        new_candidates.push(OptCandidate {
+            id: "new_a".to_string(),
+            expected_loss: 0.2,
+            contributions: vec![150.0],
+            blocked: false,
+            block_reason: None,
+        });
+        new_candidates.push(OptCandidate {
+            id: "new_b".to_string(),
+            expected_loss: 0.3,
+            contributions: vec![200.0],
+            blocked: false,
+            block_reason: None,
+        });
+        let decision = reoptimize_on_change(&prev, &candidates, &new_candidates, &goals);
+        assert!(decision.reoptimized);
+        assert_eq!(decision.reason, "churn_threshold");
+    }
+
+    #[test]
+    fn reoptimize_selected_missing() {
+        let candidates = make_candidates(5);
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 300.0,
+            weight: 1.0,
+        }];
+        let prev = optimize_greedy(&candidates, &goals);
+
+        // Remove some candidates that are in the selected set
+        let selected_ids: HashSet<String> = prev.selected.iter().map(|s| s.id.clone()).collect();
+        let new_candidates: Vec<OptCandidate> = candidates
+            .into_iter()
+            .filter(|c| !selected_ids.contains(&c.id))
+            .collect();
+        // Only run if we actually removed selected candidates
+        if !new_candidates.is_empty() {
+            let decision = reoptimize_on_change(&prev, &make_candidates(5), &new_candidates, &goals);
+            assert!(decision.reoptimized);
+            assert_eq!(decision.reason, "selected_missing");
+        }
+    }
+
+    #[test]
+    fn reoptimize_prev_empty() {
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 200.0,
+            weight: 1.0,
+        }];
+        // Start with empty prev
+        let prev = optimize_greedy(&[], &goals);
+        let new_candidates = make_candidates(3);
+        let decision = reoptimize_on_change(&prev, &[], &new_candidates, &goals);
+        assert!(decision.reoptimized);
+        assert_eq!(decision.reason, "prev_empty");
+    }
+
+    #[test]
+    fn reoptimization_decision_serde_roundtrip() {
+        let candidates = make_candidates(3);
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 200.0,
+            weight: 1.0,
+        }];
+        let prev = optimize_greedy(&candidates, &goals);
+        let decision = reoptimize_on_change(&prev, &candidates, &candidates, &goals);
+        let json = serde_json::to_string(&decision).unwrap();
+        let deser: ReoptimizationDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.reoptimized, decision.reoptimized);
+        assert_eq!(deser.reason, decision.reason);
+    }
+
+    // --- Local search edge cases ---
+
+    #[test]
+    fn local_search_no_improvement_possible() {
+        // Already optimal: only one candidate
+        let candidates = vec![OptCandidate {
+            id: "only".to_string(),
+            expected_loss: 0.1,
+            contributions: vec![200.0],
+            blocked: false,
+            block_reason: None,
+        }];
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 100.0,
+            weight: 1.0,
+        }];
+        let mut result = optimize_greedy(&candidates, &goals);
+        let original_loss = result.total_loss;
+        local_search_improve(&mut result, &candidates, &goals, 10);
+        // No change since there's nothing to swap with
+        assert!((result.total_loss - original_loss).abs() < 1e-9);
+    }
+
+    // --- Log events presence ---
+
+    #[test]
+    fn greedy_emits_log_events() {
+        let candidates = make_candidates(3);
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 200.0,
+            weight: 1.0,
+        }];
+        let result = optimize_greedy(&candidates, &goals);
+        assert!(!result.log_events.is_empty());
+        // Should have at least optimizer_start and converged
+        assert!(result.log_events.iter().any(|e| e.event == "optimizer_start"));
+        assert!(result.log_events.iter().any(|e| e.event == "converged"));
+    }
+
+    #[test]
+    fn greedy_zero_target_is_feasible() {
+        let candidates = make_candidates(3);
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 0.0,
+            weight: 1.0,
+        }];
+        let result = optimize_greedy(&candidates, &goals);
+        assert!(result.feasible);
+        assert!(result.selected.is_empty());
+    }
+
+    #[test]
+    fn optimization_result_serde_roundtrip() {
+        let candidates = make_candidates(3);
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 200.0,
+            weight: 1.0,
+        }];
+        let result = optimize_greedy(&candidates, &goals);
+        let json = serde_json::to_string(&result).unwrap();
+        let deser: OptimizationResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.algorithm, "greedy");
+        assert_eq!(deser.feasible, result.feasible);
+        assert_eq!(deser.selected.len(), result.selected.len());
+    }
+
+    #[test]
+    fn greedy_negative_loss_candidates_excluded() {
+        // Negative expected_loss should be filtered out (eligible filter requires >= 0.0)
+        let candidates = vec![
+            OptCandidate {
+                id: "negative".to_string(),
+                expected_loss: -1.0,
+                contributions: vec![500.0],
+                blocked: false,
+                block_reason: None,
+            },
+            OptCandidate {
+                id: "positive".to_string(),
+                expected_loss: 0.1,
+                contributions: vec![200.0],
+                blocked: false,
+                block_reason: None,
+            },
+        ];
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 100.0,
+            weight: 1.0,
+        }];
+        let result = optimize_greedy(&candidates, &goals);
+        // Only "positive" should be selected (negative loss is excluded)
+        assert!(result.selected.iter().all(|s| s.id != "negative"));
+    }
+
+    #[test]
+    fn pareto_dominates_basic() {
+        let a = ParetoSet {
+            actions: vec![],
+            total_loss: 1.0,
+            total_contributions: vec![200.0],
+        };
+        let b = ParetoSet {
+            actions: vec![],
+            total_loss: 2.0,
+            total_contributions: vec![100.0],
+        };
+        // a dominates b: lower loss AND higher contribution
+        assert!(pareto_dominates(&a, &b));
+        assert!(!pareto_dominates(&b, &a));
+    }
+
+    #[test]
+    fn pareto_dominates_neither() {
+        let a = ParetoSet {
+            actions: vec![],
+            total_loss: 1.0,
+            total_contributions: vec![100.0],
+        };
+        let b = ParetoSet {
+            actions: vec![],
+            total_loss: 2.0,
+            total_contributions: vec![200.0],
+        };
+        // Neither dominates: a has lower loss, b has higher contribution
+        assert!(!pareto_dominates(&a, &b));
+        assert!(!pareto_dominates(&b, &a));
+    }
+
+    #[test]
+    fn pareto_efficiency_zero_loss() {
+        let cand = OptCandidate {
+            id: "free".to_string(),
+            expected_loss: 0.0,
+            contributions: vec![100.0],
+            blocked: false,
+            block_reason: None,
+        };
+        let goals = vec![ResourceGoal {
+            resource: "memory_mb".to_string(),
+            target: 50.0,
+            weight: 1.0,
+        }];
+        let eff = pareto_efficiency(&cand, &goals);
+        // Near-zero loss => efficiency = weighted * 1e8
+        assert!(eff > 1e6);
+    }
 }

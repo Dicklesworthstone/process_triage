@@ -1126,4 +1126,459 @@ mod tests {
             Some("shadow:missing")
         );
     }
+
+    // --- GroundTruth serde roundtrip ---
+
+    #[test]
+    fn ground_truth_serde_all_variants() {
+        let variants = [
+            GroundTruth::UserKilled,
+            GroundTruth::UserSpared,
+            GroundTruth::NormalExit,
+            GroundTruth::Crash,
+            GroundTruth::ExternalKill,
+            GroundTruth::SystemShutdown,
+            GroundTruth::StillRunning,
+            GroundTruth::Expired,
+        ];
+        for gt in &variants {
+            let json = serde_json::to_string(gt).unwrap();
+            let deser: GroundTruth = serde_json::from_str(&json).unwrap();
+            assert_eq!(*gt, deser);
+        }
+    }
+
+    #[test]
+    fn ground_truth_is_abandoned_complete() {
+        // Verify exhaustively which are abandoned
+        assert!(GroundTruth::UserKilled.is_abandoned());
+        assert!(GroundTruth::ExternalKill.is_abandoned());
+        assert!(!GroundTruth::UserSpared.is_abandoned());
+        assert!(!GroundTruth::NormalExit.is_abandoned());
+        assert!(!GroundTruth::Crash.is_abandoned());
+        assert!(!GroundTruth::SystemShutdown.is_abandoned());
+        assert!(!GroundTruth::StillRunning.is_abandoned());
+        assert!(!GroundTruth::Expired.is_abandoned());
+    }
+
+    #[test]
+    fn ground_truth_is_resolved_complete() {
+        assert!(GroundTruth::UserKilled.is_resolved());
+        assert!(GroundTruth::UserSpared.is_resolved());
+        assert!(GroundTruth::NormalExit.is_resolved());
+        assert!(GroundTruth::Crash.is_resolved());
+        assert!(GroundTruth::ExternalKill.is_resolved());
+        assert!(GroundTruth::SystemShutdown.is_resolved());
+        assert!(!GroundTruth::StillRunning.is_resolved());
+        assert!(!GroundTruth::Expired.is_resolved());
+    }
+
+    // --- ValidationRecord serde ---
+
+    #[test]
+    fn validation_record_serde_roundtrip() {
+        let record = ValidationRecord {
+            identity_hash: "hash_test".to_string(),
+            pid: 12345,
+            predicted_abandoned: 0.85,
+            recommended_action: "kill".to_string(),
+            proc_type: Some("test_runner".to_string()),
+            comm: "jest".to_string(),
+            predicted_at: Utc::now(),
+            ground_truth: Some(GroundTruth::UserKilled),
+            resolved_at: Some(Utc::now()),
+            exit_code: Some(0),
+            exit_signal: None,
+            outcome_source: Some("user".to_string()),
+            host_id: Some("host1".to_string()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deser: ValidationRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.identity_hash, "hash_test");
+        assert_eq!(deser.pid, 12345);
+        assert!((deser.predicted_abandoned - 0.85).abs() < 1e-9);
+        assert_eq!(deser.ground_truth, Some(GroundTruth::UserKilled));
+        assert_eq!(deser.outcome_source.as_deref(), Some("user"));
+        assert_eq!(deser.host_id.as_deref(), Some("host1"));
+    }
+
+    #[test]
+    fn validation_record_to_calibration_data_unresolved() {
+        let record = ValidationRecord {
+            identity_hash: "hash_unr".to_string(),
+            pid: 100,
+            predicted_abandoned: 0.5,
+            recommended_action: "kill".to_string(),
+            proc_type: None,
+            comm: "proc".to_string(),
+            predicted_at: Utc::now(),
+            ground_truth: None, // unresolved
+            resolved_at: None,
+            exit_code: None,
+            exit_signal: None,
+            outcome_source: None,
+            host_id: None,
+        };
+        assert!(record.to_calibration_data().is_none());
+    }
+
+    #[test]
+    fn validation_record_to_calibration_data_still_running() {
+        let record = ValidationRecord {
+            identity_hash: "hash_sr".to_string(),
+            pid: 101,
+            predicted_abandoned: 0.6,
+            recommended_action: "kill".to_string(),
+            proc_type: None,
+            comm: "proc".to_string(),
+            predicted_at: Utc::now(),
+            ground_truth: Some(GroundTruth::StillRunning),
+            resolved_at: None,
+            exit_code: None,
+            exit_signal: None,
+            outcome_source: None,
+            host_id: None,
+        };
+        // StillRunning is not resolved, so no calibration data
+        assert!(record.to_calibration_data().is_none());
+    }
+
+    // --- CategoryValidation serde ---
+
+    #[test]
+    fn category_validation_serde_roundtrip() {
+        let cv = CategoryValidation {
+            category: "test_runner".to_string(),
+            total: 50,
+            resolved: 40,
+            true_positives: 15,
+            false_positives: 5,
+            true_negatives: 15,
+            false_negatives: 5,
+            accuracy: 0.75,
+            precision: 0.75,
+            recall: 0.75,
+        };
+        let json = serde_json::to_string(&cv).unwrap();
+        let deser: CategoryValidation = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.category, "test_runner");
+        assert_eq!(deser.true_positives, 15);
+    }
+
+    // --- FalseOutcome serde ---
+
+    #[test]
+    fn false_outcome_serde_roundtrip() {
+        let fo = FalseOutcome {
+            pattern: "pytest".to_string(),
+            count: 3,
+            mean_predicted: 0.82,
+            category: Some("test_runner".to_string()),
+        };
+        let json = serde_json::to_string(&fo).unwrap();
+        let deser: FalseOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.pattern, "pytest");
+        assert_eq!(deser.count, 3);
+    }
+
+    // --- PriorAdjustment serde ---
+
+    #[test]
+    fn prior_adjustment_serde_roundtrip() {
+        let pa = PriorAdjustment {
+            target: "prior.test_runner.abandoned".to_string(),
+            current: 0.5,
+            suggested: 0.3,
+            reason: "Model overestimates".to_string(),
+            confidence: 0.85,
+        };
+        let json = serde_json::to_string(&pa).unwrap();
+        let deser: PriorAdjustment = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.target, "prior.test_runner.abandoned");
+        assert!((deser.confidence - 0.85).abs() < 1e-9);
+    }
+
+    // --- map_outcome_hint coverage ---
+
+    #[test]
+    fn map_outcome_hint_all_variants() {
+        assert_eq!(map_outcome_hint("user_killed"), Some(GroundTruth::UserKilled));
+        assert_eq!(map_outcome_hint("user_kill"), Some(GroundTruth::UserKilled));
+        assert_eq!(map_outcome_hint("user_spared"), Some(GroundTruth::UserSpared));
+        assert_eq!(map_outcome_hint("user_spare"), Some(GroundTruth::UserSpared));
+        assert_eq!(map_outcome_hint("normal_exit"), Some(GroundTruth::NormalExit));
+        assert_eq!(map_outcome_hint("external_kill"), Some(GroundTruth::ExternalKill));
+        assert_eq!(map_outcome_hint("system_shutdown"), Some(GroundTruth::SystemShutdown));
+        assert_eq!(map_outcome_hint("crash"), Some(GroundTruth::Crash));
+        assert_eq!(map_outcome_hint("still_running"), Some(GroundTruth::StillRunning));
+        assert_eq!(map_outcome_hint("expired"), Some(GroundTruth::Expired));
+        assert_eq!(map_outcome_hint("unknown_hint"), None);
+    }
+
+    // --- map_exit_event coverage ---
+
+    #[test]
+    fn map_exit_event_with_outcome_hint() {
+        let event = ProcessEvent {
+            timestamp: Utc::now(),
+            event_type: EventType::ProcessExit,
+            details: Some(
+                serde_json::json!({
+                    "outcome_hint": "user_killed",
+                    "exit_code": 137
+                })
+                .to_string(),
+            ),
+        };
+        let (gt, exit_code, _signal, source) = map_exit_event(&event);
+        assert_eq!(gt, GroundTruth::UserKilled);
+        assert_eq!(exit_code, Some(137));
+        assert!(source.unwrap().contains("hint:user_killed"));
+    }
+
+    #[test]
+    fn map_exit_event_signal_implies_crash() {
+        let event = ProcessEvent {
+            timestamp: Utc::now(),
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"exit_signal": 9}).to_string()),
+        };
+        let (gt, _code, signal, source) = map_exit_event(&event);
+        assert_eq!(gt, GroundTruth::Crash);
+        assert_eq!(signal, Some(9));
+        assert_eq!(source.as_deref(), Some("shadow:exit_status"));
+    }
+
+    #[test]
+    fn map_exit_event_nonzero_exit_implies_crash() {
+        let event = ProcessEvent {
+            timestamp: Utc::now(),
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"exit_code": 1}).to_string()),
+        };
+        let (gt, code, _signal, _source) = map_exit_event(&event);
+        assert_eq!(gt, GroundTruth::Crash);
+        assert_eq!(code, Some(1));
+    }
+
+    #[test]
+    fn map_exit_event_zero_exit_is_normal() {
+        let event = ProcessEvent {
+            timestamp: Utc::now(),
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"exit_code": 0}).to_string()),
+        };
+        let (gt, code, _signal, _source) = map_exit_event(&event);
+        assert_eq!(gt, GroundTruth::NormalExit);
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn map_exit_event_no_details() {
+        let event = ProcessEvent {
+            timestamp: Utc::now(),
+            event_type: EventType::ProcessExit,
+            details: None,
+        };
+        let (gt, code, signal, _source) = map_exit_event(&event);
+        assert_eq!(gt, GroundTruth::NormalExit);
+        assert!(code.is_none());
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn map_exit_event_with_reason_only() {
+        let event = ProcessEvent {
+            timestamp: Utc::now(),
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"reason": "oom"}).to_string()),
+        };
+        let (gt, _code, _signal, source) = map_exit_event(&event);
+        // No exit_code or signal, defaults to NormalExit
+        assert_eq!(gt, GroundTruth::NormalExit);
+        assert_eq!(source.as_deref(), Some("shadow:oom"));
+    }
+
+    // --- Engine construction and accessors ---
+
+    #[test]
+    fn engine_from_records() {
+        let records = vec![ValidationRecord {
+            identity_hash: "h1".to_string(),
+            pid: 1,
+            predicted_abandoned: 0.7,
+            recommended_action: "kill".to_string(),
+            proc_type: None,
+            comm: "sleep".to_string(),
+            predicted_at: Utc::now(),
+            ground_truth: Some(GroundTruth::UserKilled),
+            resolved_at: Some(Utc::now()),
+            exit_code: None,
+            exit_signal: None,
+            outcome_source: None,
+            host_id: None,
+        }];
+        let engine = ValidationEngine::from_records(records, 0.5);
+        assert_eq!(engine.records().len(), 1);
+        assert_eq!(engine.resolved_records().len(), 1);
+        assert!(engine.pending_records().is_empty());
+    }
+
+    #[test]
+    fn engine_pending_records() {
+        let mut engine = ValidationEngine::new(0.5);
+        engine.track_prediction("h1".into(), 1, 0.8, "kill".into(), None, "p1".into(), None);
+        engine.track_prediction("h2".into(), 2, 0.3, "keep".into(), None, "p2".into(), None);
+        assert_eq!(engine.pending_records().len(), 2);
+        engine.record_outcome("h1", GroundTruth::UserKilled, None, None);
+        assert_eq!(engine.pending_records().len(), 1);
+    }
+
+    // --- record_outcome_with_source ---
+
+    #[test]
+    fn record_outcome_with_source_sets_source() {
+        let mut engine = ValidationEngine::new(0.5);
+        engine.track_prediction("h1".into(), 1, 0.9, "kill".into(), None, "proc".into(), None);
+        let found = engine.record_outcome_with_source(
+            "h1",
+            GroundTruth::UserKilled,
+            None,
+            None,
+            Some("manual_confirm".to_string()),
+        );
+        assert!(found);
+        assert_eq!(
+            engine.records()[0].outcome_source.as_deref(),
+            Some("manual_confirm")
+        );
+    }
+
+    #[test]
+    fn record_outcome_with_source_not_found() {
+        let mut engine = ValidationEngine::new(0.5);
+        let found = engine.record_outcome_with_source(
+            "nonexistent",
+            GroundTruth::NormalExit,
+            None,
+            None,
+            None,
+        );
+        assert!(!found);
+    }
+
+    // --- record_outcome_by_pid_with_source ---
+
+    #[test]
+    fn record_outcome_by_pid_with_source_sets_source() {
+        let mut engine = ValidationEngine::new(0.5);
+        engine.track_prediction("h1".into(), 42, 0.6, "kill".into(), None, "proc".into(), None);
+        let found = engine.record_outcome_by_pid_with_source(
+            42,
+            GroundTruth::Crash,
+            Some(1),
+            None,
+            Some("shadow:exit".to_string()),
+        );
+        assert!(found);
+        assert_eq!(
+            engine.records()[0].outcome_source.as_deref(),
+            Some("shadow:exit")
+        );
+    }
+
+    #[test]
+    fn record_outcome_by_pid_not_found() {
+        let mut engine = ValidationEngine::new(0.5);
+        let found = engine.record_outcome_by_pid(999, GroundTruth::NormalExit, None, None);
+        assert!(!found);
+    }
+
+    // --- extract_comm_from_events ---
+
+    #[test]
+    fn extract_comm_prefers_evidence_snapshot() {
+        let events = vec![
+            ProcessEvent {
+                timestamp: Utc::now(),
+                event_type: EventType::ProcessExit,
+                details: Some(serde_json::json!({"comm": "exit_comm"}).to_string()),
+            },
+            ProcessEvent {
+                timestamp: Utc::now(),
+                event_type: EventType::EvidenceSnapshot,
+                details: Some(serde_json::json!({"comm": "snapshot_comm"}).to_string()),
+            },
+        ];
+        let comm = extract_comm_from_events(&events);
+        assert_eq!(comm, Some("snapshot_comm".to_string()));
+    }
+
+    #[test]
+    fn extract_comm_falls_back_to_other_event() {
+        let events = vec![ProcessEvent {
+            timestamp: Utc::now(),
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"comm": "fallback_comm"}).to_string()),
+        }];
+        let comm = extract_comm_from_events(&events);
+        assert_eq!(comm, Some("fallback_comm".to_string()));
+    }
+
+    #[test]
+    fn extract_comm_no_comm_field() {
+        let events = vec![ProcessEvent {
+            timestamp: Utc::now(),
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"pid": 42}).to_string()),
+        }];
+        let comm = extract_comm_from_events(&events);
+        assert!(comm.is_none());
+    }
+
+    #[test]
+    fn extract_comm_empty_events() {
+        let comm = extract_comm_from_events(&[]);
+        assert!(comm.is_none());
+    }
+
+    // --- compute_report edge cases ---
+
+    #[test]
+    fn compute_report_empty_engine() {
+        let engine = ValidationEngine::new(0.5);
+        let report = engine.compute_report().unwrap();
+        assert_eq!(report.total_predictions, 0);
+        assert_eq!(report.resolved_predictions, 0);
+        assert!(report.metrics.is_none());
+    }
+
+    #[test]
+    fn calibration_report_no_data_errors() {
+        let engine = ValidationEngine::new(0.5);
+        let result = engine.calibration_report();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validation_record_host_id_in_calibration_data() {
+        let record = ValidationRecord {
+            identity_hash: "h_host".to_string(),
+            pid: 50,
+            predicted_abandoned: 0.9,
+            recommended_action: "kill".to_string(),
+            proc_type: None,
+            comm: "p".to_string(),
+            predicted_at: Utc::now(),
+            ground_truth: Some(GroundTruth::UserKilled),
+            resolved_at: Some(Utc::now()),
+            exit_code: None,
+            exit_signal: None,
+            outcome_source: None,
+            host_id: Some("node-3".to_string()),
+        };
+        let cal = record.to_calibration_data().unwrap();
+        assert_eq!(cal.host_id.as_deref(), Some("node-3"));
+        assert!(cal.actual); // UserKilled is abandoned
+    }
 }

@@ -796,4 +796,478 @@ mod tests {
         assert!(config.apply_blast_radius);
         assert!((config.fdr_threshold - 0.1).abs() < 1e-10);
     }
+
+    // --- MyopicPolicyError display ---
+
+    #[test]
+    fn error_no_feasible_actions_display() {
+        let err = MyopicPolicyError::NoFeasibleActions;
+        let msg = format!("{}", err);
+        assert!(msg.contains("no feasible actions"));
+    }
+
+    #[test]
+    fn error_invalid_belief_state_display() {
+        let err = MyopicPolicyError::InvalidBeliefState;
+        let msg = format!("{}", err);
+        assert!(msg.contains("probabilities must sum to 1.0"));
+    }
+
+    #[test]
+    fn error_enforcement_display() {
+        let err = MyopicPolicyError::Enforcement("test violation".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("test violation"));
+    }
+
+    #[test]
+    fn error_decision_display() {
+        let inner = DecisionError::MissingLoss {
+            action: Action::Renice,
+            class: "useful",
+        };
+        let err = MyopicPolicyError::Decision(inner);
+        let msg = format!("{}", err);
+        assert!(msg.contains("decision error"));
+    }
+
+    // --- StateContributions ---
+
+    #[test]
+    fn state_contributions_total() {
+        let sc = StateContributions {
+            useful: 0.1,
+            useful_bad: 0.2,
+            abandoned: 0.3,
+            zombie: 0.4,
+        };
+        assert!((sc.total() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn state_contributions_total_zero() {
+        let sc = StateContributions {
+            useful: 0.0,
+            useful_bad: 0.0,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        assert!((sc.total()).abs() < 1e-10);
+    }
+
+    // --- BeliefStateDisplay ---
+
+    #[test]
+    fn belief_state_display_from_belief() {
+        let belief = BeliefState::from_probs([0.1, 0.2, 0.3, 0.4]).unwrap();
+        let display = BeliefStateDisplay::from(&belief);
+        assert!((display.useful - 0.1).abs() < 1e-10);
+        assert!((display.useful_bad - 0.2).abs() < 1e-10);
+        assert!((display.abandoned - 0.3).abs() < 1e-10);
+        assert!((display.zombie - 0.4).abs() < 1e-10);
+        assert!(display.entropy > 0.0);
+        assert!(display.most_likely.to_lowercase().contains("zombie"));
+    }
+
+    #[test]
+    fn belief_state_display_serialize() {
+        let belief = BeliefState::from_probs([0.9, 0.05, 0.03, 0.02]).unwrap();
+        let display = BeliefStateDisplay::from(&belief);
+        let json = serde_json::to_string(&display).unwrap();
+        assert!(json.contains("\"useful\""));
+        assert!(json.contains("\"entropy\""));
+        assert!(json.contains("\"most_likely\""));
+    }
+
+    // --- MyopicPolicyConfig ---
+
+    #[test]
+    fn config_minimal_defaults() {
+        let config = MyopicPolicyConfig::minimal();
+        assert!(!config.apply_fdr_gate);
+        assert!(!config.apply_alpha_investing);
+        assert!(!config.apply_blast_radius);
+        assert!(config.max_memory_mb.is_none());
+        assert!(config.max_cpu_pct.is_none());
+    }
+
+    #[test]
+    fn config_default_is_minimal() {
+        let config = MyopicPolicyConfig::default();
+        assert!(!config.apply_fdr_gate);
+        assert!(!config.apply_alpha_investing);
+    }
+
+    // --- class_scores_to_belief roundtrip ---
+
+    #[test]
+    fn class_scores_to_belief_roundtrip() {
+        let belief = BeliefState::from_probs([0.25, 0.25, 0.25, 0.25]).unwrap();
+        let scores = belief_to_class_scores(&belief);
+        let back = class_scores_to_belief(&scores).unwrap();
+        assert!((back.prob(ProcessState::Useful) - 0.25).abs() < 1e-10);
+        assert!((back.prob(ProcessState::Abandoned) - 0.25).abs() < 1e-10);
+    }
+
+    // --- get_action_cost coverage ---
+
+    #[test]
+    fn get_action_cost_keep() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(0.3),
+            throttle: Some(0.2),
+            renice: Some(0.1),
+            kill: 1.0,
+            restart: Some(0.8),
+        };
+        assert!((get_action_cost(Action::Keep, &row, "useful").unwrap()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn get_action_cost_freeze_uses_pause() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(0.3),
+            throttle: Some(0.2),
+            renice: Some(0.1),
+            kill: 1.0,
+            restart: Some(0.8),
+        };
+        let cost = get_action_cost(Action::Freeze, &row, "useful").unwrap();
+        assert!((cost - 0.3).abs() < 1e-10); // Freeze uses pause cost
+    }
+
+    #[test]
+    fn get_action_cost_unfreeze_uses_pause() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(0.5),
+            throttle: Some(0.2),
+            renice: Some(0.1),
+            kill: 1.0,
+            restart: Some(0.8),
+        };
+        let cost = get_action_cost(Action::Unfreeze, &row, "useful").unwrap();
+        assert!((cost - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn get_action_cost_quarantine_uses_throttle() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(0.3),
+            throttle: Some(0.2),
+            renice: Some(0.1),
+            kill: 1.0,
+            restart: Some(0.8),
+        };
+        let cost = get_action_cost(Action::Quarantine, &row, "useful").unwrap();
+        assert!((cost - 0.2).abs() < 1e-10); // Quarantine uses throttle cost
+    }
+
+    #[test]
+    fn get_action_cost_unquarantine_uses_throttle() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(0.3),
+            throttle: Some(0.4),
+            renice: Some(0.1),
+            kill: 1.0,
+            restart: Some(0.8),
+        };
+        let cost = get_action_cost(Action::Unquarantine, &row, "useful").unwrap();
+        assert!((cost - 0.4).abs() < 1e-10);
+    }
+
+    #[test]
+    fn get_action_cost_missing_pause_errors() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: None,
+            throttle: Some(0.2),
+            renice: Some(0.1),
+            kill: 1.0,
+            restart: Some(0.8),
+        };
+        let result = get_action_cost(Action::Pause, &row, "useful");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_action_cost_missing_throttle_errors() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(0.3),
+            throttle: None,
+            renice: Some(0.1),
+            kill: 1.0,
+            restart: Some(0.8),
+        };
+        let result = get_action_cost(Action::Throttle, &row, "useful");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_action_cost_missing_restart_errors() {
+        let row = LossRow {
+            keep: 0.0,
+            pause: Some(0.3),
+            throttle: Some(0.2),
+            renice: Some(0.1),
+            kill: 1.0,
+            restart: None,
+        };
+        let result = get_action_cost(Action::Restart, &row, "useful");
+        assert!(result.is_err());
+    }
+
+    // --- compute_loss_table with disabled actions ---
+
+    #[test]
+    fn loss_table_marks_disabled_actions() {
+        let belief = BeliefState::uniform();
+        let matrix = default_loss_matrix();
+        let feasibility = ActionFeasibility {
+            disabled: vec![
+                DisabledAction {
+                    action: Action::Kill,
+                    reason: "protected".to_string(),
+                },
+                DisabledAction {
+                    action: Action::Restart,
+                    reason: "no supervisor".to_string(),
+                },
+            ],
+        };
+        let table = compute_loss_table(&belief, &matrix, &feasibility);
+        let kill_entry = table.iter().find(|b| b.action == Action::Kill).unwrap();
+        assert!(!kill_entry.feasible);
+        assert_eq!(kill_entry.disabled_reason.as_deref(), Some("protected"));
+
+        let restart_entry = table.iter().find(|b| b.action == Action::Restart).unwrap();
+        assert!(!restart_entry.feasible);
+    }
+
+    // --- decide_from_belief with zombie state ---
+
+    #[test]
+    fn decide_zombie_state_recommends_kill() {
+        let belief = BeliefState::from_probs([0.02, 0.03, 0.05, 0.9]).unwrap();
+        let policy = minimal_policy();
+        let feasibility = ActionFeasibility::allow_all();
+        let decision = decide_from_belief(&belief, &policy, &feasibility).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+    }
+
+    // --- decide_from_belief with useful_bad state ---
+
+    #[test]
+    fn decide_useful_bad_recommends_throttle_or_renice() {
+        let belief = BeliefState::from_probs([0.05, 0.85, 0.05, 0.05]).unwrap();
+        let policy = minimal_policy();
+        let feasibility = ActionFeasibility::allow_all();
+        let decision = decide_from_belief(&belief, &policy, &feasibility).unwrap();
+        // With 85% useful_bad, the lowest loss actions are throttle(0.1) or renice(0.1)
+        assert!(
+            decision.optimal_action == Action::Throttle
+                || decision.optimal_action == Action::Renice
+        );
+    }
+
+    // --- decide_from_belief_constrained with alpha-investing ---
+
+    #[test]
+    fn constrained_alpha_investing_blocks_kill() {
+        let belief = BeliefState::from_probs([0.02, 0.03, 0.9, 0.05]).unwrap();
+        let policy = minimal_policy();
+        let feasibility = ActionFeasibility::allow_all();
+        let config = MyopicPolicyConfig {
+            apply_alpha_investing: true,
+            ..MyopicPolicyConfig::default()
+        };
+        let alpha_state = AlphaWealthState {
+            wealth: 0.001, // very low, below required_spend of 0.01
+            last_updated: "2026-01-01".to_string(),
+            policy_id: None,
+            policy_version: "1".to_string(),
+            host_id: "test".to_string(),
+            user_id: 1000,
+        };
+        let decision = decide_from_belief_constrained(
+            &belief,
+            &policy,
+            &feasibility,
+            &config,
+            None,
+            None,
+            Some(&alpha_state),
+            None,
+        )
+        .unwrap();
+        // Kill should be blocked, so it should pick something else
+        assert_ne!(decision.optimal_action, Action::Kill);
+        assert!(decision.constraint_override);
+        assert_eq!(decision.unconstrained_optimal, Some(Action::Kill));
+    }
+
+    // --- decide_from_belief_constrained with blast-radius ---
+
+    #[test]
+    fn constrained_blast_radius_blocks_kill() {
+        let belief = BeliefState::from_probs([0.02, 0.03, 0.9, 0.05]).unwrap();
+        let policy = minimal_policy();
+        let feasibility = ActionFeasibility::allow_all();
+        let config = MyopicPolicyConfig {
+            apply_blast_radius: true,
+            max_memory_mb: Some(500.0),
+            max_cpu_pct: Some(50.0),
+            ..MyopicPolicyConfig::default()
+        };
+        let decision = decide_from_belief_constrained(
+            &belief,
+            &policy,
+            &feasibility,
+            &config,
+            None,
+            None,
+            None,
+            Some((1000.0, 80.0)), // exceeds limits
+        )
+        .unwrap();
+        // Kill should be blocked due to blast-radius
+        assert_ne!(decision.optimal_action, Action::Kill);
+        assert!(decision.constraint_override);
+    }
+
+    #[test]
+    fn constrained_blast_radius_within_limits() {
+        let belief = BeliefState::from_probs([0.02, 0.03, 0.9, 0.05]).unwrap();
+        let policy = minimal_policy();
+        let feasibility = ActionFeasibility::allow_all();
+        let config = MyopicPolicyConfig {
+            apply_blast_radius: true,
+            max_memory_mb: Some(2000.0),
+            max_cpu_pct: Some(90.0),
+            ..MyopicPolicyConfig::default()
+        };
+        let decision = decide_from_belief_constrained(
+            &belief,
+            &policy,
+            &feasibility,
+            &config,
+            None,
+            None,
+            None,
+            Some((500.0, 30.0)), // within limits
+        )
+        .unwrap();
+        // Kill should still be selected (within limits)
+        assert_eq!(decision.optimal_action, Action::Kill);
+        assert!(!decision.constraint_override);
+    }
+
+    // --- Rationale for different entropy levels ---
+
+    #[test]
+    fn rationale_moderate_confidence() {
+        let belief = BeliefState::from_probs([0.7, 0.15, 0.1, 0.05]).unwrap();
+        let table = vec![ActionLossBreakdown {
+            action: Action::Keep,
+            expected_loss: 0.3,
+            state_contributions: StateContributions {
+                useful: 0.0,
+                useful_bad: 0.1,
+                abandoned: 0.1,
+                zombie: 0.1,
+            },
+            feasible: true,
+            disabled_reason: None,
+        }];
+        let rationale = build_rationale(&belief, Action::Keep, &table);
+        assert!(rationale.contains("Moderate confidence") || rationale.contains("High confidence"));
+    }
+
+    #[test]
+    fn rationale_high_uncertainty() {
+        let belief = BeliefState::uniform();
+        let table = vec![ActionLossBreakdown {
+            action: Action::Keep,
+            expected_loss: 0.5,
+            state_contributions: StateContributions {
+                useful: 0.0,
+                useful_bad: 0.125,
+                abandoned: 0.25,
+                zombie: 0.25,
+            },
+            feasible: true,
+            disabled_reason: None,
+        }];
+        let rationale = build_rationale(&belief, Action::Keep, &table);
+        assert!(rationale.contains("uncertainty") || rationale.contains("entropy"));
+    }
+
+    #[test]
+    fn rationale_action_not_in_table() {
+        let belief = BeliefState::from_probs([0.9, 0.05, 0.03, 0.02]).unwrap();
+        let table = vec![]; // empty table
+        let rationale = build_rationale(&belief, Action::Keep, &table);
+        assert!(rationale.contains("unknown loss"));
+    }
+
+    // --- Serialize summaries ---
+
+    #[test]
+    fn constraint_summary_serialize() {
+        let summary = ConstraintSummary {
+            policy_check: None,
+            robot_constraints: None,
+            fdr_gate: Some(FdrGateSummary {
+                passed: true,
+                e_value: 0.05,
+                threshold: 0.1,
+            }),
+            alpha_investing: None,
+            blast_radius: None,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("fdr_gate"));
+        assert!(json.contains("0.05"));
+    }
+
+    #[test]
+    fn myopic_decision_serialize() {
+        let belief = BeliefState::from_probs([0.9, 0.05, 0.03, 0.02]).unwrap();
+        let policy = minimal_policy();
+        let feasibility = ActionFeasibility::allow_all();
+        let decision = decide_from_belief(&belief, &policy, &feasibility).unwrap();
+        let json = serde_json::to_string(&decision).unwrap();
+        assert!(json.contains("optimal_action"));
+        assert!(json.contains("rationale"));
+        assert!(json.contains("loss_table"));
+    }
+
+    #[test]
+    fn select_optimal_from_table_empty() {
+        let result = select_optimal_from_table(&[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn select_optimal_from_table_all_disabled() {
+        let table = vec![ActionLossBreakdown {
+            action: Action::Kill,
+            expected_loss: 0.1,
+            state_contributions: StateContributions {
+                useful: 0.0,
+                useful_bad: 0.0,
+                abandoned: 0.05,
+                zombie: 0.05,
+            },
+            feasible: false,
+            disabled_reason: Some("blocked".to_string()),
+        }];
+        let result = select_optimal_from_table(&table);
+        assert!(result.is_none());
+    }
 }

@@ -508,4 +508,191 @@ esac
         assert!(content.contains("Update failed with error X"));
         assert!(content.contains("GitHub releases"));
     }
+
+    // --- RollbackResult constructors ---
+
+    #[test]
+    fn rollback_result_success_constructor() {
+        let result = RollbackResult::success("1.2.3".to_string(), PathBuf::from("/usr/bin/pt"));
+        assert!(result.success);
+        assert_eq!(result.restored_version.as_deref(), Some("1.2.3"));
+        assert!(result.error.is_none());
+        assert_eq!(result.restored_path, Some(PathBuf::from("/usr/bin/pt")));
+    }
+
+    #[test]
+    fn rollback_result_failure_constructor() {
+        let result = RollbackResult::failure("checksum mismatch".to_string());
+        assert!(!result.success);
+        assert!(result.restored_version.is_none());
+        assert_eq!(result.error.as_deref(), Some("checksum mismatch"));
+        assert!(result.restored_path.is_none());
+    }
+
+    #[test]
+    fn rollback_result_debug() {
+        let result = RollbackResult::success("1.0.0".to_string(), PathBuf::from("/bin/pt"));
+        let dbg = format!("{:?}", result);
+        assert!(dbg.contains("RollbackResult"));
+        assert!(dbg.contains("1.0.0"));
+    }
+
+    // --- UpdateResult methods ---
+
+    #[test]
+    fn update_result_debug() {
+        let temp = TempDir::new().unwrap();
+        let binary = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("backups");
+
+        let manager = RollbackManager::with_backup_dir(binary.clone(), "pt-core", backup_dir);
+        let backup = manager.backup_current("1.0.0").unwrap();
+        let vr = verify_binary(&binary, None).unwrap();
+
+        let ur = UpdateResult::Success {
+            verification: vr,
+            backup,
+        };
+        let dbg = format!("{:?}", ur);
+        assert!(dbg.contains("Success"));
+    }
+
+    #[test]
+    fn update_result_is_success_true() {
+        let temp = TempDir::new().unwrap();
+        let binary = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("backups");
+        let manager = RollbackManager::with_backup_dir(binary.clone(), "pt-core", backup_dir);
+        let backup = manager.backup_current("1.0.0").unwrap();
+        let vr = verify_binary(&binary, None).unwrap();
+
+        let ur = UpdateResult::Success {
+            verification: vr,
+            backup,
+        };
+        assert!(ur.is_success());
+    }
+
+    #[test]
+    fn update_result_verification_accessor() {
+        let temp = TempDir::new().unwrap();
+        let binary = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("backups");
+        let manager = RollbackManager::with_backup_dir(binary.clone(), "pt-core", backup_dir);
+        let backup = manager.backup_current("1.0.0").unwrap();
+        let vr = verify_binary(&binary, None).unwrap();
+
+        let ur = UpdateResult::Success {
+            verification: vr,
+            backup,
+        };
+        let _v = ur.verification();
+        // Just verify it doesn't panic and returns a reference
+    }
+
+    // --- RollbackManager accessors ---
+
+    #[test]
+    fn rollback_manager_target_path() {
+        let temp = TempDir::new().unwrap();
+        let binary = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let manager = RollbackManager::new(binary.clone(), "pt-core");
+        assert_eq!(manager.target_path(), binary.as_path());
+    }
+
+    #[test]
+    fn rollback_manager_backup_manager_accessor() {
+        let temp = TempDir::new().unwrap();
+        let binary = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("backups");
+        let manager = RollbackManager::with_backup_dir(binary, "pt-core", backup_dir.clone());
+        let bm = manager.backup_manager();
+        assert_eq!(bm.backup_dir(), backup_dir);
+    }
+
+    // --- backup_current error cases ---
+
+    #[test]
+    fn backup_current_missing_target() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("nonexistent");
+        let backup_dir = temp.path().join("backups");
+        let manager = RollbackManager::with_backup_dir(missing, "pt-core", backup_dir);
+        let result = manager.backup_current("1.0.0");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    // --- rollback_to_version not found ---
+
+    #[test]
+    fn rollback_to_version_not_found() {
+        let temp = TempDir::new().unwrap();
+        let binary = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("backups");
+        let manager = RollbackManager::with_backup_dir(binary, "pt-core", backup_dir);
+
+        let result = manager.rollback_to_version("99.99.99").unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("99.99.99"));
+    }
+
+    // --- list_backups empty ---
+
+    #[test]
+    fn list_backups_empty() {
+        let temp = TempDir::new().unwrap();
+        let binary = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("backups");
+        let manager = RollbackManager::with_backup_dir(binary, "pt-core", backup_dir);
+
+        let backups = manager.list_backups().unwrap();
+        assert!(backups.is_empty());
+    }
+
+    // --- recovery instructions content structure ---
+
+    #[test]
+    fn recovery_instructions_content_structure() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("RECOVERY.md");
+        write_recovery_instructions(&path, "test details").unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+
+        // Verify structural elements
+        assert!(content.contains("# Process Triage Recovery Instructions"));
+        assert!(content.contains("## Details"));
+        assert!(content.contains("test details"));
+        assert!(content.contains("## Manual Recovery Steps"));
+        assert!(content.contains("chmod +x"));
+        assert!(content.contains("pt-core --version"));
+        assert!(content.contains("issues"));
+    }
+
+    // --- multiple backups and ordering ---
+
+    #[test]
+    fn multiple_backups_listed() {
+        let temp = TempDir::new().unwrap();
+        let binary = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("backups");
+        let manager = RollbackManager::with_backup_dir(binary.clone(), "pt-core", backup_dir);
+
+        let _ = manager.backup_current("1.0.0").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&binary, "v2 content").unwrap();
+        let _ = manager.backup_current("2.0.0").unwrap();
+
+        let backups = manager.list_backups().unwrap();
+        assert_eq!(backups.len(), 2);
+    }
+
+    #[test]
+    fn rollback_manager_new_default_backup_dir() {
+        let manager = RollbackManager::new(PathBuf::from("/tmp/pt-core"), "pt-core");
+        assert_eq!(manager.target_path(), Path::new("/tmp/pt-core"));
+        // backup_manager should have been created with default dir
+        let _bm = manager.backup_manager();
+    }
 }
