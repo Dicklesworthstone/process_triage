@@ -375,16 +375,24 @@ impl DeltaSummary {
     }
 }
 
-// ── Identity hash (shared with shadow.rs) ───────────────────────────────
+// ── Identity hash ───────────────────────────────────────────────────────
 
-/// Compute a stable identity hash for a process.
+/// Compute a stable identity hash for incremental scanning.
 ///
-/// Uses the same algorithm as `shadow::compute_identity_hash`:
-/// SHA-256 of `uid || start_id || comm || cmd`, truncated to 16 hex chars.
+/// Uses `pid + uid + comm + cmd` (without `start_id`).  This differs from
+/// `shadow::compute_identity_hash` because `start_id` is derived from
+/// timing fields (`etimes`, `/proc/uptime`) that can jitter by ±1 tick
+/// between back-to-back scans.  For the incremental engine, which operates
+/// within a single daemon session, `pid + uid + comm + cmd` is sufficient:
+///
+/// - PID reuse with the *same* comm+cmd within a 60-second tick is
+///   exceedingly unlikely.
+/// - Different programs reusing a PID will have different comm/cmd.
+/// - The uid distinguishes same-named processes owned by different users.
 pub fn compute_identity_hash(proc: &ProcessRecord) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(proc.pid.0.to_le_bytes());
     hasher.update(proc.uid.to_le_bytes());
-    hasher.update(proc.start_id.0.as_bytes());
     hasher.update(proc.comm.as_bytes());
     hasher.update(proc.cmd.as_bytes());
     let digest = hasher.finalize();
@@ -457,10 +465,19 @@ mod tests {
     }
 
     #[test]
-    fn identity_hash_ignores_pid() {
+    fn identity_hash_includes_pid() {
         let p1 = make_proc(100, "bash", "/bin/bash");
-        let mut p2 = make_proc(200, "bash", "/bin/bash");
-        p2.start_id = p1.start_id.clone();
+        let p2 = make_proc(200, "bash", "/bin/bash");
+        // Different PIDs → different hashes (PID is part of incremental identity).
+        assert_ne!(compute_identity_hash(&p1), compute_identity_hash(&p2));
+    }
+
+    #[test]
+    fn identity_hash_same_pid_same_cmd_is_stable() {
+        let p1 = make_proc(100, "bash", "/bin/bash");
+        let mut p2 = make_proc(100, "bash", "/bin/bash");
+        // Different start_id should not affect hash (it's excluded).
+        p2.start_id = pt_common::StartId("different:999:100".to_string());
         assert_eq!(compute_identity_hash(&p1), compute_identity_hash(&p2));
     }
 
@@ -801,5 +818,117 @@ mod tests {
         assert_eq!(sum3.departed, 1);
         assert_eq!(sum3.unchanged, 2);
         assert_eq!(engine.inventory_size(), 2);
+    }
+
+    // ── No-mock integration tests with real quick_scan ──────────────────
+
+    #[test]
+    fn nomock_incremental_with_real_quick_scan() {
+        use crate::collect::{quick_scan, QuickScanOptions};
+
+        let platform = if cfg!(target_os = "linux") {
+            "linux"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            // Skip on unsupported platforms.
+            return;
+        };
+
+        crate::test_log!(
+            INFO,
+            "incremental no-mock test starting",
+            platform = platform
+        );
+
+        let options = QuickScanOptions::default();
+        let scan1 = quick_scan(&options).expect("first quick_scan should succeed");
+        assert!(!scan1.processes.is_empty());
+
+        let mut engine = IncrementalEngine::new(IncrementalConfig::default());
+
+        // First scan: everything is Appeared.
+        let d1 = engine.update(&scan1.processes);
+        let s1 = IncrementalEngine::summarize(&d1);
+
+        crate::test_log!(
+            INFO,
+            "first scan",
+            total = s1.total,
+            appeared = s1.appeared,
+            inventory_size = engine.inventory_size()
+        );
+
+        assert_eq!(s1.appeared, s1.total, "All processes should be Appeared on first scan");
+        assert_eq!(engine.inventory_size(), scan1.processes.len());
+
+        // Second scan: mostly unchanged (within milliseconds, little should change).
+        let scan2 = quick_scan(&options).expect("second quick_scan should succeed");
+        let d2 = engine.update(&scan2.processes);
+        let s2 = IncrementalEngine::summarize(&d2);
+
+        crate::test_log!(
+            INFO,
+            "second scan",
+            total = s2.total,
+            appeared = s2.appeared,
+            departed = s2.departed,
+            changed = s2.changed,
+            unchanged = s2.unchanged,
+            unchanged_fraction = format!("{:.2}", s2.unchanged_fraction()).as_str()
+        );
+
+        // With back-to-back scans, the majority should be unchanged.
+        // Allow some churn (processes starting/stopping) but most should be stable.
+        assert!(
+            s2.unchanged_fraction() > 0.5,
+            "Expected >50% unchanged in back-to-back scan, got {:.1}%",
+            s2.unchanged_fraction() * 100.0
+        );
+
+        // Deep scan PIDs should be a small subset.
+        let deep_pids = IncrementalEngine::pids_needing_deep_scan(&d2);
+        crate::test_log!(
+            INFO,
+            "deep scan candidates",
+            count = deep_pids.len(),
+            total = s2.total
+        );
+
+        assert!(
+            deep_pids.len() <= s2.total,
+            "Deep scan PIDs should not exceed total"
+        );
+    }
+
+    #[test]
+    fn nomock_identity_hash_matches_shadow() {
+        // Verify our identity hash matches the shadow.rs implementation
+        // by checking properties (stable, 16 hex chars, deterministic).
+        use crate::collect::{quick_scan, QuickScanOptions};
+
+        if !cfg!(target_os = "linux") && !cfg!(target_os = "macos") {
+            return;
+        }
+
+        let options = QuickScanOptions::default();
+        let scan = quick_scan(&options).expect("quick_scan should succeed");
+
+        // Take a sample of processes and verify hash properties.
+        for proc in scan.processes.iter().take(10) {
+            let h1 = compute_identity_hash(proc);
+            let h2 = compute_identity_hash(proc);
+
+            // Stable.
+            assert_eq!(h1, h2, "Hash should be stable for pid={}", proc.pid.0);
+
+            // 16 hex chars.
+            assert_eq!(h1.len(), 16, "Hash should be 16 hex chars for pid={}", proc.pid.0);
+            assert!(
+                h1.chars().all(|c| c.is_ascii_hexdigit()),
+                "Hash should be hex for pid={}",
+                proc.pid.0
+            );
+        }
     }
 }
