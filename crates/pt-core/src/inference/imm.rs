@@ -528,6 +528,7 @@ impl ImmAnalyzer {
     }
 
     /// Processes a single observation and updates the filter state.
+    #[allow(clippy::needless_range_loop)]
     pub fn update(&mut self, observation: f64) -> Result<ImmUpdateResult, ImmError> {
         let n = self.config.num_modes;
 

@@ -613,6 +613,7 @@ impl HsmmAnalyzer {
         let mut log_prob = 0.0;
 
         let num_features = observation.len().min(self.config.num_features);
+        #[allow(clippy::needless_range_loop)]
         for f in 0..num_features {
             let mean = self.config.emission_means[s][f];
             let var = self.config.emission_vars[s][f];
@@ -653,12 +654,14 @@ impl HsmmAnalyzer {
 
         // Compute emission likelihoods
         let mut emissions = [0.0; 4];
+        #[allow(clippy::needless_range_loop)]
         for s in 0..4 {
             emissions[s] = self.emission_prob(observation, HsmmState::from_index(s).unwrap());
         }
 
         // Compute duration factors
         let mut duration_factors = [0.0; 4];
+        #[allow(clippy::needless_range_loop)]
         for s in 0..4 {
             if s == self.current_state.index() {
                 // Probability of staying (survival)

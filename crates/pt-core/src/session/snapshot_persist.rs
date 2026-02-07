@@ -311,7 +311,7 @@ fn load_artifact_unchecked<T: serde::de::DeserializeOwned + Serialize>(
 
 fn payload_sha256<T: serde::de::DeserializeOwned + Serialize>(
     payload: &T,
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<String, SessionError> {
     let payload_json = canonical_payload_bytes(payload, path)?;
     Ok(sha256_hex(&payload_json))

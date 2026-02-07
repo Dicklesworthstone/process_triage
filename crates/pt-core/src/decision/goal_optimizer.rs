@@ -977,6 +977,7 @@ fn compute_pareto_frontier(
         let mut total_loss = 0.0;
         let mut totals = vec![0.0; goals_len];
 
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             if (mask & (1_u32 << i)) != 0 {
                 let cand = candidates[i];

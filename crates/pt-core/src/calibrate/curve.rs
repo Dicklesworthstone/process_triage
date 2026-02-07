@@ -117,6 +117,7 @@ impl CalibrationCurve {
         let mut grid = vec![vec![' '; width]; height];
 
         // Draw diagonal (perfect calibration)
+        #[allow(clippy::needless_range_loop)]
         for i in 0..width.min(height) {
             let y = height - 1 - (i * height / width);
             if y < height {
