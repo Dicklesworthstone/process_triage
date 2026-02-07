@@ -343,4 +343,315 @@ mod tests {
         };
         assert!(validate_gamma_params("test", &invalid).is_err());
     }
+
+    // ── validate_beta_params ────────────────────────────────────
+
+    #[test]
+    fn beta_zero_beta_param() {
+        let b = crate::priors::BetaParams { alpha: 1.0, beta: 0.0, comment: None };
+        let err = validate_beta_params("f", &b).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("beta")));
+    }
+
+    #[test]
+    fn beta_negative_alpha() {
+        let b = crate::priors::BetaParams { alpha: -0.5, beta: 1.0, comment: None };
+        let err = validate_beta_params("f", &b).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("alpha")));
+    }
+
+    #[test]
+    fn beta_both_negative() {
+        let b = crate::priors::BetaParams { alpha: -1.0, beta: -1.0, comment: None };
+        // alpha checked first
+        let err = validate_beta_params("f", &b).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("alpha")));
+    }
+
+    // ── validate_gamma_params ───────────────────────────────────
+
+    #[test]
+    fn gamma_negative_rate() {
+        let g = crate::priors::GammaParams { shape: 1.0, rate: -1.0, comment: None };
+        let err = validate_gamma_params("f", &g).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("rate")));
+    }
+
+    #[test]
+    fn gamma_negative_shape() {
+        let g = crate::priors::GammaParams { shape: -1.0, rate: 1.0, comment: None };
+        let err = validate_gamma_params("f", &g).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("shape")));
+    }
+
+    // ── ValidationError ─────────────────────────────────────────
+
+    #[test]
+    fn error_code_io() {
+        assert_eq!(ValidationError::IoError("x".into()).code(), 60);
+    }
+
+    #[test]
+    fn error_code_parse() {
+        assert_eq!(ValidationError::ParseError("x".into()).code(), 61);
+    }
+
+    #[test]
+    fn error_code_schema() {
+        assert_eq!(ValidationError::SchemaError("x".into()).code(), 62);
+    }
+
+    #[test]
+    fn error_code_semantic() {
+        assert_eq!(ValidationError::SemanticError("x".into()).code(), 63);
+    }
+
+    #[test]
+    fn error_code_missing_field() {
+        assert_eq!(ValidationError::MissingField("x".into()).code(), 64);
+    }
+
+    #[test]
+    fn error_code_invalid_value() {
+        let e = ValidationError::InvalidValue { field: "f".into(), message: "m".into() };
+        assert_eq!(e.code(), 65);
+    }
+
+    #[test]
+    fn error_code_version_mismatch() {
+        let e = ValidationError::VersionMismatch { expected: "1".into(), actual: "2".into() };
+        assert_eq!(e.code(), 66);
+    }
+
+    #[test]
+    fn error_display_io() {
+        let e = ValidationError::IoError("disk full".into());
+        assert!(e.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn error_display_parse() {
+        let e = ValidationError::ParseError("bad json".into());
+        assert!(e.to_string().contains("bad json"));
+    }
+
+    #[test]
+    fn error_display_version_mismatch() {
+        let e = ValidationError::VersionMismatch { expected: "1.0".into(), actual: "2.0".into() };
+        let s = e.to_string();
+        assert!(s.contains("1.0"));
+        assert!(s.contains("2.0"));
+    }
+
+    // ── validate_priors ─────────────────────────────────────────
+
+    #[test]
+    fn default_priors_pass() {
+        let priors = crate::priors::Priors::default();
+        assert!(validate_priors(&priors).is_ok());
+    }
+
+    #[test]
+    fn priors_bad_sum() {
+        let mut priors = crate::priors::Priors::default();
+        priors.classes.useful.prior_prob = 0.9;
+        let err = validate_priors(&priors).unwrap_err();
+        assert!(matches!(err, ValidationError::SemanticError(ref s) if s.contains("sum")));
+    }
+
+    #[test]
+    fn priors_negative_prior_prob() {
+        let mut priors = crate::priors::Priors::default();
+        let orig = priors.classes.zombie.prior_prob;
+        priors.classes.zombie.prior_prob = -0.01;
+        // compensate sum: add back orig and the negative value
+        priors.classes.useful.prior_prob += orig + 0.01;
+        let err = validate_priors(&priors).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("zombie")));
+    }
+
+    #[test]
+    fn priors_bad_cpu_beta() {
+        let mut priors = crate::priors::Priors::default();
+        priors.classes.useful.cpu_beta.alpha = 0.0;
+        let err = validate_priors(&priors).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("cpu_beta")));
+    }
+
+    #[test]
+    fn priors_bad_orphan_beta() {
+        let mut priors = crate::priors::Priors::default();
+        priors.classes.abandoned.orphan_beta.beta = -1.0;
+        let err = validate_priors(&priors).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("orphan_beta")));
+    }
+
+    #[test]
+    fn priors_bad_tty_beta() {
+        let mut priors = crate::priors::Priors::default();
+        priors.classes.useful_bad.tty_beta.alpha = 0.0;
+        let err = validate_priors(&priors).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("tty_beta")));
+    }
+
+    #[test]
+    fn priors_bad_net_beta() {
+        let mut priors = crate::priors::Priors::default();
+        priors.classes.zombie.net_beta.beta = -1.0;
+        let err = validate_priors(&priors).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("net_beta")));
+    }
+
+    #[test]
+    fn priors_wrong_schema_version() {
+        let mut priors = crate::priors::Priors::default();
+        priors.schema_version = "0.0.0".into();
+        let err = validate_priors(&priors).unwrap_err();
+        assert!(matches!(err, ValidationError::VersionMismatch { .. }));
+    }
+
+    // ── validate_policy ─────────────────────────────────────────
+
+    #[test]
+    fn default_policy_pass() {
+        let policy = crate::policy::Policy::default();
+        assert!(validate_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn policy_bad_fdr_alpha() {
+        let mut policy = crate::policy::Policy::default();
+        policy.fdr_control.alpha = -0.1;
+        let err = validate_policy(&policy).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("fdr_control")));
+    }
+
+    #[test]
+    fn policy_fdr_alpha_above_one() {
+        let mut policy = crate::policy::Policy::default();
+        policy.fdr_control.alpha = 1.5;
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn policy_bad_robot_posterior() {
+        let mut policy = crate::policy::Policy::default();
+        policy.robot_mode.min_posterior = -0.1;
+        let err = validate_policy(&policy).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("robot_mode")));
+    }
+
+    #[test]
+    fn policy_robot_posterior_above_one() {
+        let mut policy = crate::policy::Policy::default();
+        policy.robot_mode.min_posterior = 1.5;
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn policy_guardrails_empty() {
+        let mut policy = crate::policy::Policy::default();
+        policy.guardrails.never_kill_ppid = vec![];
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn policy_guardrails_missing_pid1() {
+        let mut policy = crate::policy::Policy::default();
+        policy.guardrails.never_kill_ppid = vec![2, 3];
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn policy_wrong_schema_version() {
+        let mut policy = crate::policy::Policy::default();
+        policy.schema_version = "0.0.0".into();
+        let err = validate_policy(&policy).unwrap_err();
+        assert!(matches!(err, ValidationError::VersionMismatch { .. }));
+    }
+
+    #[test]
+    fn policy_negative_loss_keep() {
+        let mut policy = crate::policy::Policy::default();
+        policy.loss_matrix.useful.keep = -1.0;
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn policy_negative_loss_kill() {
+        let mut policy = crate::policy::Policy::default();
+        policy.loss_matrix.zombie.kill = -1.0;
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    // ── validate_load_aware ─────────────────────────────────────
+
+    #[test]
+    fn load_aware_disabled_always_ok() {
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = false;
+        policy.load_aware.weights.queue = 0.0;
+        policy.load_aware.weights.load = 0.0;
+        policy.load_aware.weights.memory = 0.0;
+        policy.load_aware.weights.psi = 0.0;
+        assert!(validate_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn load_aware_enabled_defaults_valid() {
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = true;
+        assert!(validate_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn load_aware_zero_weight_sum() {
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.weights.queue = 0.0;
+        policy.load_aware.weights.load = 0.0;
+        policy.load_aware.weights.memory = 0.0;
+        policy.load_aware.weights.psi = 0.0;
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn load_aware_queue_high_zero() {
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.queue_high = 0;
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn load_aware_keep_max_below_one() {
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.multipliers.keep_max = 0.5;
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn load_aware_risky_max_below_one() {
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.multipliers.risky_max = 0.5;
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn load_aware_reversible_min_zero() {
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.multipliers.reversible_min = 0.0;
+        assert!(validate_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn load_aware_reversible_min_above_one() {
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.multipliers.reversible_min = 1.5;
+        assert!(validate_policy(&policy).is_err());
+    }
 }

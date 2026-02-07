@@ -621,4 +621,388 @@ mod tests {
         assert!((cm.recall() - 0.727).abs() < 0.01);
         assert!((cm.accuracy() - 0.75).abs() < 0.01);
     }
+
+    // ── ConfusionMatrix extended ────────────────────────────────
+
+    #[test]
+    fn confusion_default_all_zero() {
+        let cm = ConfusionMatrix::default();
+        assert_eq!(cm.true_positives, 0);
+        assert_eq!(cm.false_positives, 0);
+        assert_eq!(cm.true_negatives, 0);
+        assert_eq!(cm.false_negatives, 0);
+    }
+
+    #[test]
+    fn confusion_all_zeros_metrics() {
+        let cm = ConfusionMatrix::default();
+        assert_eq!(cm.precision(), 0.0);
+        assert_eq!(cm.recall(), 0.0);
+        assert_eq!(cm.f1(), 0.0);
+        assert_eq!(cm.accuracy(), 0.0);
+    }
+
+    #[test]
+    fn confusion_perfect_classifier() {
+        let cm = ConfusionMatrix {
+            true_positives: 50,
+            false_positives: 0,
+            true_negatives: 50,
+            false_negatives: 0,
+        };
+        assert_eq!(cm.precision(), 1.0);
+        assert_eq!(cm.recall(), 1.0);
+        assert_eq!(cm.f1(), 1.0);
+        assert_eq!(cm.accuracy(), 1.0);
+    }
+
+    #[test]
+    fn confusion_no_positives_predicted() {
+        let cm = ConfusionMatrix {
+            true_positives: 0,
+            false_positives: 0,
+            true_negatives: 90,
+            false_negatives: 10,
+        };
+        assert_eq!(cm.precision(), 0.0);
+        assert_eq!(cm.recall(), 0.0);
+        assert_eq!(cm.f1(), 0.0);
+        assert!((cm.accuracy() - 0.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn confusion_f1_symmetry() {
+        let cm = ConfusionMatrix {
+            true_positives: 40,
+            false_positives: 10,
+            true_negatives: 40,
+            false_negatives: 10,
+        };
+        let p = cm.precision();
+        let r = cm.recall();
+        assert!((p - r).abs() < 0.01); // symmetric case
+        assert!((cm.f1() - p).abs() < 0.01); // f1 = precision = recall
+    }
+
+    #[test]
+    fn confusion_serde_roundtrip() {
+        let cm = ConfusionMatrix {
+            true_positives: 1,
+            false_positives: 2,
+            true_negatives: 3,
+            false_negatives: 4,
+        };
+        let json = serde_json::to_string(&cm).unwrap();
+        let back: ConfusionMatrix = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.true_positives, 1);
+        assert_eq!(back.false_negatives, 4);
+    }
+
+    // ── generate_summary ────────────────────────────────────────
+
+    fn make_data_10() -> Vec<CalibrationData> {
+        make_data(&[
+            (0.9, true), (0.85, true), (0.8, true), (0.7, true), (0.6, true),
+            (0.4, false), (0.3, false), (0.2, false), (0.15, false), (0.1, false),
+        ])
+    }
+
+    #[test]
+    fn summary_excellent_quality() {
+        let data = make_data_10();
+        let metrics = compute_metrics(&data, 0.5).unwrap();
+        let bias = analyze_bias(&data).unwrap();
+        let s = generate_summary(&metrics, &bias, CalibrationQuality::Excellent);
+        assert!(s.contains("excellent"));
+    }
+
+    #[test]
+    fn summary_poor_quality() {
+        let data = make_data_10();
+        let metrics = compute_metrics(&data, 0.5).unwrap();
+        let bias = analyze_bias(&data).unwrap();
+        let s = generate_summary(&metrics, &bias, CalibrationQuality::Poor);
+        assert!(s.contains("poor"));
+    }
+
+    #[test]
+    fn summary_good_quality() {
+        let data = make_data_10();
+        let metrics = compute_metrics(&data, 0.5).unwrap();
+        let bias = analyze_bias(&data).unwrap();
+        let s = generate_summary(&metrics, &bias, CalibrationQuality::Good);
+        assert!(s.contains("good"));
+    }
+
+    #[test]
+    fn summary_fair_quality() {
+        let data = make_data_10();
+        let metrics = compute_metrics(&data, 0.5).unwrap();
+        let bias = analyze_bias(&data).unwrap();
+        let s = generate_summary(&metrics, &bias, CalibrationQuality::Fair);
+        assert!(s.contains("fair"));
+    }
+
+    // ── CalibrationReport methods ───────────────────────────────
+
+    #[test]
+    fn json_report_valid_json() {
+        let data = make_data(&[
+            (0.9, true), (0.8, true), (0.7, true), (0.6, true), (0.5, true),
+            (0.4, false), (0.3, false), (0.2, false), (0.1, false), (0.05, false),
+        ]);
+        let report = CalibrationReport::from_data(&data, 10, 0.5).unwrap();
+        let json = report.json_report().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_object());
+        assert!(parsed.get("quality").is_some());
+        assert!(parsed.get("metrics").is_some());
+        assert!(parsed.get("curve").is_some());
+        assert!(parsed.get("bias").is_some());
+    }
+
+    #[test]
+    fn ascii_report_contains_all_sections() {
+        let data = make_data(&[
+            (0.9, true), (0.8, true), (0.7, true), (0.6, true), (0.5, true),
+            (0.4, false), (0.3, false), (0.2, false), (0.1, false), (0.05, false),
+        ]);
+        let report = CalibrationReport::from_data(&data, 10, 0.5).unwrap();
+        let ascii = report.ascii_report(40, 10);
+        assert!(ascii.contains("Metrics"));
+        assert!(ascii.contains("Classification"));
+        assert!(ascii.contains("Data Summary"));
+        assert!(ascii.contains("Score Bucket"));
+        assert!(ascii.contains("False-Kill Credible Bounds"));
+        assert!(ascii.contains("PAC-Bayes"));
+        assert!(ascii.contains("Summary"));
+    }
+
+    #[test]
+    fn ascii_report_quality_badge() {
+        let data = make_data(&[
+            (0.9, true), (0.8, true), (0.1, false), (0.2, false),
+            (0.85, true), (0.15, false), (0.95, true), (0.05, false),
+            (0.7, true), (0.3, false),
+        ]);
+        let report = CalibrationReport::from_data(&data, 10, 0.5).unwrap();
+        let ascii = report.ascii_report(40, 10);
+        // Should contain one of the quality badges
+        assert!(
+            ascii.contains("EXCELLENT") || ascii.contains("GOOD")
+            || ascii.contains("FAIR") || ascii.contains("POOR")
+        );
+    }
+
+    #[test]
+    fn report_no_kill_recs_means_no_bounds_in_ascii() {
+        // All predictions below threshold => no kill recommendations => no credible bounds
+        let data = make_data(&[
+            (0.1, false), (0.2, false), (0.3, false), (0.4, false),
+            (0.15, false), (0.25, false), (0.35, false), (0.45, false),
+            (0.05, false), (0.12, false),
+        ]);
+        let report = CalibrationReport::from_data(&data, 10, 0.5).unwrap();
+        let ascii = report.ascii_report(40, 10);
+        assert!(ascii.contains("bounds unavailable"));
+    }
+
+    #[test]
+    fn report_serde_roundtrip() {
+        let data = make_data(&[
+            (0.9, true), (0.8, true), (0.3, false), (0.2, false),
+            (0.7, true), (0.1, false), (0.85, true), (0.15, false),
+            (0.6, true), (0.4, false),
+        ]);
+        let report = CalibrationReport::from_data(&data, 5, 0.5).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        let back: CalibrationReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.quality, report.quality);
+        assert!((back.metrics.brier_score - report.metrics.brier_score).abs() < 1e-10);
+    }
+
+    #[test]
+    fn report_from_data_too_few_samples() {
+        let data = make_data(&[]);
+        let result = CalibrationReport::from_data(&data, 10, 0.5);
+        assert!(result.is_err());
+    }
+
+    // ── SignatureCalibrationData ─────────────────────────────────
+
+    #[test]
+    fn sig_cal_data_serde_roundtrip() {
+        let d = SignatureCalibrationData {
+            signature_id: "test_runner_npm".into(),
+            category: "test_runner".into(),
+            match_confidence: 0.9,
+            predicted_prob: 0.85,
+            actual_abandoned: true,
+            human_decision: Some(true),
+            timestamp: 1700000000,
+            pid: 42,
+            command: "npm test".into(),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: SignatureCalibrationData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.signature_id, "test_runner_npm");
+        assert_eq!(back.actual_abandoned, true);
+        assert_eq!(back.human_decision, Some(true));
+    }
+
+    #[test]
+    fn sig_cal_data_without_human_decision() {
+        let d = SignatureCalibrationData {
+            signature_id: "x".into(),
+            category: "y".into(),
+            match_confidence: 0.5,
+            predicted_prob: 0.5,
+            actual_abandoned: false,
+            human_decision: None,
+            timestamp: 0,
+            pid: 1,
+            command: "cmd".into(),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: SignatureCalibrationData = serde_json::from_str(&json).unwrap();
+        assert!(back.human_decision.is_none());
+    }
+
+    // ── analyze_signature_calibration ───────────────────────────
+
+    fn make_sig_data(pairs: &[(f64, bool)], sig_id: &str) -> Vec<SignatureCalibrationData> {
+        pairs.iter().enumerate().map(|(i, &(prob, actual))| {
+            SignatureCalibrationData {
+                signature_id: sig_id.into(),
+                category: "test".into(),
+                match_confidence: 0.9,
+                predicted_prob: prob,
+                actual_abandoned: actual,
+                human_decision: None,
+                timestamp: i as i64,
+                pid: i as u32,
+                command: "cmd".into(),
+            }
+        }).collect()
+    }
+
+    #[test]
+    fn analyze_empty_data() {
+        let result = analyze_signature_calibration(&[], 0.5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn analyze_single_signature() {
+        let data = make_sig_data(&[(0.9, true), (0.1, false), (0.8, true), (0.2, false)], "sig_a");
+        let result = analyze_signature_calibration(&data, 0.5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].signature_id, "sig_a");
+        assert_eq!(result[0].match_count, 4);
+    }
+
+    #[test]
+    fn analyze_confusion_matrix_correct() {
+        let data = make_sig_data(
+            &[(0.9, true), (0.8, true), (0.1, false), (0.2, false)],
+            "sig_b",
+        );
+        let result = analyze_signature_calibration(&data, 0.5);
+        let cm = &result[0].confusion;
+        assert_eq!(cm.true_positives, 2);
+        assert_eq!(cm.true_negatives, 2);
+        assert_eq!(cm.false_positives, 0);
+        assert_eq!(cm.false_negatives, 0);
+    }
+
+    #[test]
+    fn analyze_with_false_positives() {
+        let data = make_sig_data(
+            &[(0.9, false), (0.8, false), (0.1, true), (0.2, true)],
+            "sig_c",
+        );
+        let result = analyze_signature_calibration(&data, 0.5);
+        let cm = &result[0].confusion;
+        assert_eq!(cm.false_positives, 2);
+        assert_eq!(cm.false_negatives, 2);
+    }
+
+    #[test]
+    fn analyze_needs_review_low_precision() {
+        // All predictions positive, half wrong => precision 0.5 < 0.7 => needs_review
+        let data = make_sig_data(
+            &[(0.9, true), (0.9, false), (0.9, true), (0.9, false)],
+            "sig_d",
+        );
+        let result = analyze_signature_calibration(&data, 0.5);
+        assert!(result[0].needs_review);
+    }
+
+    #[test]
+    fn analyze_no_review_needed_perfect() {
+        let data = make_sig_data(
+            &[(0.9, true), (0.8, true), (0.1, false), (0.2, false)],
+            "sig_e",
+        );
+        let result = analyze_signature_calibration(&data, 0.5);
+        assert!(!result[0].needs_review);
+    }
+
+    #[test]
+    fn analyze_suggested_threshold_none_for_small_sample() {
+        let data = make_sig_data(
+            &[(0.9, true), (0.1, false)],
+            "sig_f",
+        );
+        let result = analyze_signature_calibration(&data, 0.5);
+        assert!(result[0].suggested_threshold.is_none());
+    }
+
+    #[test]
+    fn analyze_multiple_signatures() {
+        let mut data = make_sig_data(&[(0.9, true), (0.1, false)], "sig_x");
+        data.extend(make_sig_data(&[(0.8, true), (0.2, false)], "sig_y"));
+        let result = analyze_signature_calibration(&data, 0.5);
+        assert_eq!(result.len(), 2);
+        let ids: Vec<_> = result.iter().map(|r| &r.signature_id).collect();
+        assert!(ids.contains(&&"sig_x".to_string()));
+        assert!(ids.contains(&&"sig_y".to_string()));
+    }
+
+    #[test]
+    fn analyze_metrics_present_with_enough_samples() {
+        // Need at least 10 samples for metrics
+        let pairs: Vec<(f64, bool)> = (0..12).map(|i| {
+            if i < 6 { (0.8, true) } else { (0.2, false) }
+        }).collect();
+        let data = make_sig_data(&pairs, "sig_g");
+        let result = analyze_signature_calibration(&data, 0.5);
+        assert!(result[0].metrics.is_some());
+    }
+
+    #[test]
+    fn analyze_metrics_absent_with_few_samples() {
+        let data = make_sig_data(&[(0.9, true), (0.1, false)], "sig_h");
+        let result = analyze_signature_calibration(&data, 0.5);
+        assert!(result[0].metrics.is_none());
+    }
+
+    // ── SignatureCalibration serde ───────────────────────────────
+
+    #[test]
+    fn signature_calibration_serde() {
+        let sc = SignatureCalibration {
+            signature_id: "test".into(),
+            match_count: 100,
+            mean_confidence: 0.85,
+            metrics: None,
+            confusion: ConfusionMatrix::default(),
+            needs_review: false,
+            suggested_threshold: Some(0.6),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let back: SignatureCalibration = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.signature_id, "test");
+        assert_eq!(back.suggested_threshold, Some(0.6));
+    }
 }
