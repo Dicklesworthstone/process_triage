@@ -966,6 +966,38 @@ impl PreCheckProvider for NoopPreCheckProvider {
 mod tests {
     use super::*;
 
+    // ── PreCheckResult ──────────────────────────────────────────────
+
+    #[test]
+    fn precheck_result_passed_is_passed() {
+        assert!(PreCheckResult::Passed.is_passed());
+    }
+
+    #[test]
+    fn precheck_result_blocked_is_not_passed() {
+        let blocked = PreCheckResult::Blocked {
+            check: PreCheck::CheckNotProtected,
+            reason: "test".to_string(),
+        };
+        assert!(!blocked.is_passed());
+    }
+
+    #[test]
+    fn precheck_result_blocked_preserves_check_and_reason() {
+        let blocked = PreCheckResult::Blocked {
+            check: PreCheck::CheckDataLossGate,
+            reason: "open write fds".to_string(),
+        };
+        if let PreCheckResult::Blocked { check, reason } = blocked {
+            assert!(matches!(check, PreCheck::CheckDataLossGate));
+            assert_eq!(reason, "open write fds");
+        } else {
+            panic!("expected Blocked");
+        }
+    }
+
+    // ── NoopPreCheckProvider ────────────────────────────────────────
+
     #[test]
     fn noop_provider_passes_all() {
         let provider = NoopPreCheckProvider;
@@ -976,33 +1008,226 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_action_display() {
+    fn noop_provider_passes_agent_supervision() {
+        let provider = NoopPreCheckProvider;
+        assert!(provider.check_agent_supervision(123).is_passed());
+    }
+
+    #[test]
+    fn noop_provider_session_safety_with_sid() {
+        let provider = NoopPreCheckProvider;
+        assert!(provider.check_session_safety(123, Some(100)).is_passed());
+        // Even when pid == sid (session leader), noop still passes
+        assert!(provider.check_session_safety(123, Some(123)).is_passed());
+    }
+
+    #[test]
+    fn noop_provider_default_trait_methods() {
+        let provider = NoopPreCheckProvider;
+        // Default implementations from the trait
+        assert!(provider.get_supervisor_info(123).is_none());
+        assert!(provider.check_process_state(123).is_passed());
+    }
+
+    // ── NoopPreCheckProvider::run_checks ─────────────────────────────
+
+    #[test]
+    fn noop_run_checks_empty() {
+        let provider = NoopPreCheckProvider;
+        let results = provider.run_checks(&[], 123, None);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn noop_run_checks_verify_identity_skipped() {
+        let provider = NoopPreCheckProvider;
+        let results = provider.run_checks(&[PreCheck::VerifyIdentity], 123, None);
+        // VerifyIdentity is handled separately, should be filtered out
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn noop_run_checks_all_types() {
+        let provider = NoopPreCheckProvider;
+        let checks = vec![
+            PreCheck::CheckNotProtected,
+            PreCheck::CheckDataLossGate,
+            PreCheck::CheckSupervisor,
+            PreCheck::CheckAgentSupervision,
+            PreCheck::CheckSessionSafety,
+            PreCheck::VerifyProcessState,
+        ];
+        let results = provider.run_checks(&checks, 123, None);
+        assert_eq!(results.len(), 6);
+        assert!(results.iter().all(|r| r.is_passed()));
+    }
+
+    #[test]
+    fn noop_run_checks_mixed_with_identity() {
+        let provider = NoopPreCheckProvider;
+        let checks = vec![
+            PreCheck::VerifyIdentity,
+            PreCheck::CheckNotProtected,
+            PreCheck::VerifyIdentity,
+            PreCheck::CheckSupervisor,
+        ];
+        let results = provider.run_checks(&checks, 123, None);
+        // VerifyIdentity entries are filtered, only 2 results
+        assert_eq!(results.len(), 2);
+    }
+
+    // ── SupervisorAction Display ────────────────────────────────────
+
+    #[test]
+    fn supervisor_action_display_restart() {
         let restart = SupervisorAction::RestartUnit {
             command: "systemctl restart nginx.service".to_string(),
         };
-        assert!(restart.to_string().contains("restart"));
-        assert!(restart.to_string().contains("nginx.service"));
+        let s = restart.to_string();
+        assert!(s.contains("restart"));
+        assert!(s.contains("nginx.service"));
+    }
 
+    #[test]
+    fn supervisor_action_display_stop() {
         let stop = SupervisorAction::StopUnit {
             command: "systemctl stop test.scope".to_string(),
         };
-        assert!(stop.to_string().contains("stop"));
+        let s = stop.to_string();
+        assert!(s.contains("stop"));
+        assert!(s.contains("test.scope"));
+    }
 
+    #[test]
+    fn supervisor_action_display_kill() {
         let kill = SupervisorAction::KillProcess;
         assert!(kill.to_string().contains("kill"));
     }
+
+    // ── SupervisorInfo construction ─────────────────────────────────
 
     #[test]
     fn supervisor_info_from_parent() {
         let info = SupervisorInfo::from_parent_supervisor("supervisord");
         assert_eq!(info.supervisor, "supervisord");
         assert!(info.unit_name.is_none());
+        assert!(info.unit_type.is_none());
         assert!(!info.is_main_process);
+        assert!(info.systemd_unit.is_none());
         assert!(matches!(
             info.recommended_action,
             SupervisorAction::KillProcess
         ));
     }
+
+    #[test]
+    fn supervisor_info_from_systemd_unit_service() {
+        let unit = SystemdUnit {
+            name: "nginx.service".to_string(),
+            unit_type: SystemdUnitType::Service,
+            active_state: crate::collect::systemd::SystemdActiveState::Active,
+            sub_state: None,
+            main_pid: Some(1234),
+            control_pid: None,
+            fragment_path: None,
+            description: None,
+            is_main_process: true,
+            provenance: crate::collect::systemd::SystemdProvenance {
+                source: crate::collect::systemd::SystemdDataSource::default(),
+                warnings: vec![],
+            },
+        };
+
+        let info = SupervisorInfo::from_systemd_unit(unit, 1234);
+        assert_eq!(info.supervisor, "systemd");
+        assert_eq!(info.unit_name.as_deref(), Some("nginx.service"));
+        assert_eq!(info.unit_type, Some(SystemdUnitType::Service));
+        assert!(info.is_main_process);
+        assert!(matches!(
+            info.recommended_action,
+            SupervisorAction::RestartUnit { .. }
+        ));
+    }
+
+    #[test]
+    fn supervisor_info_from_systemd_unit_scope() {
+        let unit = SystemdUnit {
+            name: "session-1.scope".to_string(),
+            unit_type: SystemdUnitType::Scope,
+            active_state: crate::collect::systemd::SystemdActiveState::Active,
+            sub_state: None,
+            main_pid: None,
+            control_pid: None,
+            fragment_path: None,
+            description: None,
+            is_main_process: false,
+            provenance: crate::collect::systemd::SystemdProvenance {
+                source: crate::collect::systemd::SystemdDataSource::default(),
+                warnings: vec![],
+            },
+        };
+
+        let info = SupervisorInfo::from_systemd_unit(unit, 5678);
+        assert_eq!(info.unit_type, Some(SystemdUnitType::Scope));
+        assert!(!info.is_main_process);
+        // Scopes get StopUnit instead of RestartUnit
+        assert!(matches!(
+            info.recommended_action,
+            SupervisorAction::StopUnit { .. }
+        ));
+    }
+
+    #[test]
+    fn supervisor_info_from_systemd_unit_timer_gets_kill() {
+        let unit = SystemdUnit {
+            name: "cleanup.timer".to_string(),
+            unit_type: SystemdUnitType::Timer,
+            active_state: crate::collect::systemd::SystemdActiveState::Active,
+            sub_state: None,
+            main_pid: None,
+            control_pid: None,
+            fragment_path: None,
+            description: None,
+            is_main_process: false,
+            provenance: crate::collect::systemd::SystemdProvenance {
+                source: crate::collect::systemd::SystemdDataSource::default(),
+                warnings: vec![],
+            },
+        };
+
+        let info = SupervisorInfo::from_systemd_unit(unit, 9999);
+        // Non-service, non-scope types fall through to KillProcess
+        assert!(matches!(
+            info.recommended_action,
+            SupervisorAction::KillProcess
+        ));
+    }
+
+    #[test]
+    fn supervisor_info_is_main_process_from_main_pid() {
+        // When is_main_process is false but main_pid matches pid
+        let unit = SystemdUnit {
+            name: "test.service".to_string(),
+            unit_type: SystemdUnitType::Service,
+            active_state: crate::collect::systemd::SystemdActiveState::Active,
+            sub_state: None,
+            main_pid: Some(42),
+            control_pid: None,
+            fragment_path: None,
+            description: None,
+            is_main_process: false,
+            provenance: crate::collect::systemd::SystemdProvenance {
+                source: crate::collect::systemd::SystemdDataSource::default(),
+                warnings: vec![],
+            },
+        };
+
+        let info = SupervisorInfo::from_systemd_unit(unit, 42);
+        // is_main = unit.is_main_process || unit.main_pid == Some(pid)
+        assert!(info.is_main_process);
+    }
+
+    // ── SupervisorInfo block reasons ────────────────────────────────
 
     #[test]
     fn supervisor_info_block_reason_restart() {
@@ -1021,6 +1246,7 @@ mod tests {
         assert!(reason.contains("systemd"));
         assert!(reason.contains("nginx.service"));
         assert!(reason.contains("systemctl restart"));
+        assert!(reason.contains("respawn"));
     }
 
     #[test]
@@ -1041,6 +1267,210 @@ mod tests {
         assert!(reason.contains("session-1.scope"));
     }
 
+    #[test]
+    fn supervisor_info_block_reason_kill_process() {
+        let info = SupervisorInfo::from_parent_supervisor("runit");
+        let reason = info.to_block_reason();
+        assert!(reason.contains("runit"));
+        assert!(reason.contains("respawn"));
+    }
+
+    #[test]
+    fn supervisor_info_block_reason_missing_unit_name() {
+        let info = SupervisorInfo {
+            supervisor: "systemd".to_string(),
+            unit_name: None,
+            unit_type: None,
+            is_main_process: false,
+            recommended_action: SupervisorAction::RestartUnit {
+                command: "systemctl restart unknown".to_string(),
+            },
+            systemd_unit: None,
+        };
+
+        let reason = info.to_block_reason();
+        assert!(reason.contains("unknown"));
+    }
+
+    // ── SupervisorInfo Display ──────────────────────────────────────
+
+    #[test]
+    fn supervisor_info_display_with_unit() {
+        let info = SupervisorInfo {
+            supervisor: "systemd".to_string(),
+            unit_name: Some("nginx.service".to_string()),
+            unit_type: Some(SystemdUnitType::Service),
+            is_main_process: true,
+            recommended_action: SupervisorAction::KillProcess,
+            systemd_unit: None,
+        };
+        let s = format!("{info}");
+        assert!(s.contains("systemd"));
+        assert!(s.contains("nginx.service"));
+    }
+
+    #[test]
+    fn supervisor_info_display_without_unit() {
+        let info = SupervisorInfo::from_parent_supervisor("supervisord");
+        let s = format!("{info}");
+        assert_eq!(s, "supervisord");
+    }
+
+    #[test]
+    fn supervisor_info_display_with_empty_unit() {
+        let info = SupervisorInfo {
+            supervisor: "systemd".to_string(),
+            unit_name: Some(String::new()),
+            unit_type: None,
+            is_main_process: false,
+            recommended_action: SupervisorAction::KillProcess,
+            systemd_unit: None,
+        };
+        let s = format!("{info}");
+        // Empty unit name: falls through to just supervisor name
+        assert_eq!(s, "systemd");
+    }
+
+    // ── LivePreCheckConfig defaults ─────────────────────────────────
+
+    #[test]
+    fn live_config_defaults() {
+        let config = LivePreCheckConfig::default();
+        assert!(config.block_if_open_write_fds);
+        assert_eq!(config.max_open_write_fds, 0);
+        assert!(config.block_if_locked_files);
+        assert!(config.block_if_active_tty);
+        assert!(config.block_if_deleted_cwd);
+        assert_eq!(config.block_if_recent_io_seconds, 60);
+        assert!(config.enhanced_session_safety);
+        assert!(config.protect_same_session);
+        assert!(config.protect_ssh_chains);
+        assert!(config.protect_multiplexers);
+        assert!(config.protect_parent_shells);
+    }
+
+    #[test]
+    fn live_config_from_data_loss_gates_defaults() {
+        let gates = DataLossGates {
+            block_if_open_write_fds: true,
+            max_open_write_fds: None,
+            block_if_locked_files: false,
+            block_if_deleted_cwd: None,
+            block_if_active_tty: false,
+            block_if_recent_io_seconds: None,
+        };
+        let config = LivePreCheckConfig::from(&gates);
+        assert!(config.block_if_open_write_fds);
+        assert_eq!(config.max_open_write_fds, 0); // None → 0
+        assert!(!config.block_if_locked_files);
+        assert!(config.block_if_deleted_cwd); // None → true
+        assert!(!config.block_if_active_tty);
+        assert_eq!(config.block_if_recent_io_seconds, 60); // None → 60
+        // Session safety defaults are always enabled
+        assert!(config.enhanced_session_safety);
+    }
+
+    #[test]
+    fn live_config_from_data_loss_gates_with_values() {
+        let gates = DataLossGates {
+            block_if_open_write_fds: false,
+            max_open_write_fds: Some(5),
+            block_if_locked_files: true,
+            block_if_deleted_cwd: Some(false),
+            block_if_active_tty: true,
+            block_if_recent_io_seconds: Some(120),
+        };
+        let config = LivePreCheckConfig::from(&gates);
+        assert!(!config.block_if_open_write_fds);
+        assert_eq!(config.max_open_write_fds, 5);
+        assert!(config.block_if_locked_files);
+        assert!(!config.block_if_deleted_cwd);
+        assert!(config.block_if_active_tty);
+        assert_eq!(config.block_if_recent_io_seconds, 120);
+    }
+
+    // ── PreCheckError Display ───────────────────────────────────────
+
+    #[test]
+    fn precheck_error_display() {
+        let err = PreCheckError::Protected {
+            reason: "systemd".to_string(),
+        };
+        assert!(err.to_string().contains("protected"));
+        assert!(err.to_string().contains("systemd"));
+
+        let err = PreCheckError::DataLossRisk {
+            reason: "write fds".to_string(),
+        };
+        assert!(err.to_string().contains("data loss"));
+
+        let err = PreCheckError::SupervisorConflict {
+            reason: "nginx".to_string(),
+        };
+        assert!(err.to_string().contains("supervisor"));
+
+        let err = PreCheckError::SessionSafety {
+            reason: "leader".to_string(),
+        };
+        assert!(err.to_string().contains("session"));
+
+        let err = PreCheckError::Failed("unknown".to_string());
+        assert!(err.to_string().contains("check failed"));
+    }
+
+    // ── Serialization ───────────────────────────────────────────────
+
+    #[test]
+    fn precheck_result_serializes_passed() {
+        let result = PreCheckResult::Passed;
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("Passed"));
+    }
+
+    #[test]
+    fn precheck_result_serializes_blocked() {
+        let result = PreCheckResult::Blocked {
+            check: PreCheck::CheckNotProtected,
+            reason: "test reason".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("Blocked"));
+        assert!(json.contains("test reason"));
+    }
+
+    #[test]
+    fn supervisor_action_serializes() {
+        let restart = SupervisorAction::RestartUnit {
+            command: "systemctl restart nginx".to_string(),
+        };
+        let json = serde_json::to_string(&restart).unwrap();
+        assert!(json.contains("restart_unit"));
+
+        let stop = SupervisorAction::StopUnit {
+            command: "systemctl stop foo".to_string(),
+        };
+        let json = serde_json::to_string(&stop).unwrap();
+        assert!(json.contains("stop_unit"));
+
+        let kill = SupervisorAction::KillProcess;
+        let json = serde_json::to_string(&kill).unwrap();
+        assert!(json.contains("kill_process"));
+    }
+
+    #[test]
+    fn supervisor_info_serializes() {
+        let info = SupervisorInfo::from_parent_supervisor("runit");
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("runit"));
+        assert!(json.contains("supervisor"));
+        // unit_name is None → should be present as null
+        assert!(json.contains("unit_name"));
+        // systemd_unit skipped when None
+        assert!(!json.contains("systemd_unit"));
+    }
+
+    // ── Linux-specific tests ────────────────────────────────────────
+
     #[cfg(target_os = "linux")]
     mod linux_tests {
         use super::*;
@@ -1048,55 +1478,210 @@ mod tests {
         #[test]
         fn live_provider_defaults() {
             let provider = LivePreCheckProvider::with_defaults();
-            // Self should pass basic checks (we're not protected)
             let pid = std::process::id();
-            // Now reads from /proc automatically
             assert!(provider.check_not_protected(pid).is_passed());
+        }
+
+        #[test]
+        fn live_provider_new_with_guardrails() {
+            let guardrails = Guardrails::default();
+            let config = LivePreCheckConfig::default();
+            let provider = LivePreCheckProvider::new(Some(&guardrails), config);
+            assert!(provider.is_ok());
+            let provider = provider.unwrap();
+            assert!(provider.protected_filter.is_some());
+        }
+
+        #[test]
+        fn live_provider_new_without_guardrails() {
+            let config = LivePreCheckConfig::default();
+            let provider = LivePreCheckProvider::new(None, config);
+            assert!(provider.is_ok());
+            let provider = provider.unwrap();
+            assert!(provider.protected_filter.is_none());
+        }
+
+        #[test]
+        fn live_provider_known_supervisors() {
+            let provider = LivePreCheckProvider::with_defaults();
+            assert!(provider.known_supervisors.contains("systemd"));
+            assert!(provider.known_supervisors.contains("supervisord"));
+            assert!(provider.known_supervisors.contains("runit"));
+            assert!(provider.known_supervisors.contains("containerd-shim"));
+            assert!(!provider.known_supervisors.contains("bash"));
+        }
+
+        #[test]
+        fn live_provider_read_comm_self() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            let comm = provider.read_comm(pid);
+            assert!(comm.is_some());
+            // The comm should not be empty
+            assert!(!comm.unwrap().is_empty());
+        }
+
+        #[test]
+        fn live_provider_read_comm_nonexistent() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let comm = provider.read_comm(u32::MAX);
+            assert!(comm.is_none());
+        }
+
+        #[test]
+        fn live_provider_read_cmdline_self() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            let cmdline = provider.read_cmdline(pid);
+            assert!(cmdline.is_some());
+        }
+
+        #[test]
+        fn live_provider_read_user_self() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            let user = provider.read_user(pid);
+            assert!(user.is_some());
+        }
+
+        #[test]
+        fn live_provider_read_process_state_self() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            let state = provider.read_process_state(pid);
+            assert!(state.is_some());
+            // Test process should be running or sleeping, not zombie
+            let state = state.unwrap();
+            assert!(!state.is_zombie());
+        }
+
+        #[test]
+        fn live_provider_read_process_state_nonexistent() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let state = provider.read_process_state(u32::MAX);
+            assert!(state.is_none());
+        }
+
+        #[test]
+        fn live_provider_check_process_state_self() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            // Our own process should pass state checks
+            assert!(provider.check_process_state(pid).is_passed());
+        }
+
+        #[test]
+        fn live_provider_check_process_state_nonexistent() {
+            let provider = LivePreCheckProvider::with_defaults();
+            // Nonexistent process should pass (treat as gone)
+            assert!(provider.check_process_state(u32::MAX).is_passed());
         }
 
         #[test]
         fn live_provider_detects_tty() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-
-            // Check TTY detection (may or may not have TTY depending on test environment)
-            let has_tty = provider.has_active_tty(pid);
             // Just verify the function doesn't panic
-            let _ = has_tty;
+            let _ = provider.has_active_tty(pid);
         }
 
         #[test]
         fn live_provider_detects_write_fds() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
+            let (_, count) = provider.has_open_write_fds(pid);
+            // Should return a count without panicking
+            let _ = count;
+        }
 
-            // We should have some file descriptors open
-            let (exceeds, count) = provider.has_open_write_fds(pid);
-            // With max_open_write_fds = 0, any write fd would exceed
-            // The test binary likely has stdout/stderr which may or may not count
-            let _ = (exceeds, count);
+        #[test]
+        fn live_provider_has_deleted_cwd_self() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            // Our CWD should not be deleted
+            assert!(!provider.has_deleted_cwd(pid));
+        }
+
+        #[test]
+        fn live_provider_has_locked_files_self() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            // Just verify the function doesn't panic
+            let _ = provider.has_locked_files(pid);
         }
 
         #[test]
         fn live_provider_extract_cgroup_unit() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-
-            // Try to extract cgroup unit for self - may or may not have one
-            let unit = provider.extract_cgroup_unit(pid);
             // Just verify the function doesn't panic
-            let _ = unit;
+            let _ = provider.extract_cgroup_unit(pid);
         }
 
         #[test]
-        fn live_provider_get_supervisor_info() {
+        fn live_provider_get_supervisor_info_self() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
+            // Just verify the function doesn't panic
+            let _ = provider.get_supervisor_info(pid);
+        }
 
-            // Get supervisor info for self - should handle gracefully
-            let info = provider.get_supervisor_info(pid);
-            // Just verify the function returns without panicking
-            let _ = info;
+        #[test]
+        fn live_provider_read_wchan_self() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            // Just verify the function doesn't panic
+            let _ = provider.read_wchan(pid);
+        }
+
+        #[test]
+        fn live_provider_run_all_checks_self() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            let checks = vec![
+                PreCheck::CheckNotProtected,
+                PreCheck::VerifyProcessState,
+            ];
+            let results = provider.run_checks(&checks, pid, None);
+            assert_eq!(results.len(), 2);
+            // Self should not be protected
+            assert!(results[0].is_passed());
+            // Self should have valid process state
+            assert!(results[1].is_passed());
+        }
+
+        #[test]
+        fn live_provider_check_session_safety_self_as_leader() {
+            let provider = LivePreCheckProvider::with_defaults();
+            let pid = std::process::id();
+            // If we pass our own PID as the session ID, it means we're the session leader
+            let result = provider.check_session_safety(pid, Some(pid));
+            // Should be blocked as session leader
+            assert!(!result.is_passed());
+            if let PreCheckResult::Blocked { reason, .. } = result {
+                assert!(reason.contains("session leader"));
+            }
+        }
+
+        #[test]
+        fn live_provider_data_loss_disabled_config() {
+            let config = LivePreCheckConfig {
+                block_if_open_write_fds: false,
+                max_open_write_fds: 0,
+                block_if_locked_files: false,
+                block_if_active_tty: false,
+                block_if_deleted_cwd: false,
+                block_if_recent_io_seconds: 0,
+                enhanced_session_safety: false,
+                protect_same_session: false,
+                protect_ssh_chains: false,
+                protect_multiplexers: false,
+                protect_parent_shells: false,
+            };
+            let provider = LivePreCheckProvider::new(None, config).unwrap();
+            let pid = std::process::id();
+            // All data loss gates disabled → should pass
+            assert!(provider.check_data_loss(pid).is_passed());
         }
     }
 }
