@@ -1070,4 +1070,330 @@ mod tests {
 
         assert!(detected_change, "Should detect mean shift");
     }
+
+    // ── EmissionModel ──────────────────────────────────────────────
+
+    #[test]
+    fn emission_model_default_is_poisson_gamma() {
+        let em = EmissionModel::default();
+        assert!(matches!(em, EmissionModel::PoissonGamma { alpha, beta } if approx_eq(alpha, 1.0, 1e-12) && approx_eq(beta, 1.0, 1e-12)));
+    }
+
+    #[test]
+    fn emission_model_serde_poisson_gamma() {
+        let em = EmissionModel::PoissonGamma {
+            alpha: 2.0,
+            beta: 3.0,
+        };
+        let json = serde_json::to_string(&em).unwrap();
+        let back: EmissionModel = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, EmissionModel::PoissonGamma { alpha, beta } if approx_eq(alpha, 2.0, 1e-12) && approx_eq(beta, 3.0, 1e-12)));
+    }
+
+    #[test]
+    fn emission_model_serde_normal_gamma() {
+        let em = EmissionModel::NormalGamma {
+            mu0: 1.0,
+            kappa0: 2.0,
+            alpha0: 3.0,
+            beta0: 4.0,
+        };
+        let json = serde_json::to_string(&em).unwrap();
+        let back: EmissionModel = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, EmissionModel::NormalGamma { mu0, kappa0, alpha0, beta0 }
+            if approx_eq(mu0, 1.0, 1e-12) && approx_eq(kappa0, 2.0, 1e-12)
+            && approx_eq(alpha0, 3.0, 1e-12) && approx_eq(beta0, 4.0, 1e-12)));
+    }
+
+    #[test]
+    fn emission_model_serde_beta_bernoulli() {
+        let em = EmissionModel::BetaBernoulli {
+            alpha: 1.5,
+            beta: 2.5,
+        };
+        let json = serde_json::to_string(&em).unwrap();
+        let back: EmissionModel = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, EmissionModel::BetaBernoulli { alpha, beta }
+            if approx_eq(alpha, 1.5, 1e-12) && approx_eq(beta, 2.5, 1e-12)));
+    }
+
+    // ── BocpdConfig ────────────────────────────────────────────────
+
+    #[test]
+    fn config_default_values() {
+        let cfg = BocpdConfig::default();
+        assert!(approx_eq(cfg.hazard_rate, 0.01, 1e-12));
+        assert_eq!(cfg.max_run_length, 1000);
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let cfg = BocpdConfig {
+            hazard_rate: 0.05,
+            max_run_length: 200,
+            emission_model: EmissionModel::BetaBernoulli {
+                alpha: 2.0,
+                beta: 2.0,
+            },
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: BocpdConfig = serde_json::from_str(&json).unwrap();
+        assert!(approx_eq(back.hazard_rate, 0.05, 1e-12));
+        assert_eq!(back.max_run_length, 200);
+    }
+
+    #[test]
+    fn config_validate_negative_hazard() {
+        let cfg = BocpdConfig {
+            hazard_rate: -0.1,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_hazard_one() {
+        let cfg = BocpdConfig {
+            hazard_rate: 1.0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_poisson_negative_alpha() {
+        let cfg = BocpdConfig {
+            emission_model: EmissionModel::PoissonGamma {
+                alpha: -1.0,
+                beta: 1.0,
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_poisson_zero_beta() {
+        let cfg = BocpdConfig {
+            emission_model: EmissionModel::PoissonGamma {
+                alpha: 1.0,
+                beta: 0.0,
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_normal_gamma_zero_kappa() {
+        let cfg = BocpdConfig {
+            emission_model: EmissionModel::NormalGamma {
+                mu0: 0.0,
+                kappa0: 0.0,
+                alpha0: 1.0,
+                beta0: 1.0,
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_validate_beta_bernoulli_negative() {
+        let cfg = BocpdConfig {
+            emission_model: EmissionModel::BetaBernoulli {
+                alpha: -1.0,
+                beta: 1.0,
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── BocpdError ─────────────────────────────────────────────────
+
+    #[test]
+    fn error_display_hazard() {
+        let err = BocpdError::InvalidHazardRate(0.0);
+        assert!(err.to_string().contains("hazard rate"));
+    }
+
+    #[test]
+    fn error_display_max_run() {
+        let err = BocpdError::InvalidMaxRunLength(0);
+        assert!(err.to_string().contains("max run length"));
+    }
+
+    #[test]
+    fn error_display_emission() {
+        let err = BocpdError::InvalidEmissionParameter {
+            message: "test".to_string(),
+        };
+        assert!(err.to_string().contains("emission model"));
+    }
+
+    #[test]
+    fn error_display_observation() {
+        let err = BocpdError::InvalidObservation(f64::NAN);
+        assert!(err.to_string().contains("observation"));
+    }
+
+    // ── BocpdDetector ──────────────────────────────────────────────
+
+    #[test]
+    fn default_detector() {
+        let detector = BocpdDetector::default_detector();
+        assert!(approx_eq(detector.config().hazard_rate, 0.01, 1e-12));
+    }
+
+    #[test]
+    fn update_non_finite_returns_current_state() {
+        let mut detector = BocpdDetector::default_detector();
+        detector.update(5.0);
+        let result = detector.update(f64::NAN);
+        // Step should not advance for NaN
+        assert_eq!(result.step, 1); // Still at step after first update
+    }
+
+    #[test]
+    fn update_step_increments() {
+        let mut detector = BocpdDetector::default_detector();
+        let r0 = detector.update(5.0);
+        assert_eq!(r0.step, 0);
+        let r1 = detector.update(5.0);
+        assert_eq!(r1.step, 1);
+        let r2 = detector.update(5.0);
+        assert_eq!(r2.step, 2);
+    }
+
+    #[test]
+    fn update_result_probabilities_valid() {
+        let mut detector = BocpdDetector::default_detector();
+        for i in 0..5 {
+            let result = detector.update(5.0);
+            assert!(result.change_point_probability >= 0.0);
+            assert!(result.change_point_probability <= 1.0);
+            assert!(result.expected_run_length >= 0.0);
+            assert_eq!(result.step, i);
+        }
+    }
+
+    #[test]
+    fn update_result_serializes() {
+        let mut detector = BocpdDetector::default_detector();
+        let result = detector.update(5.0);
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"step\""));
+        assert!(json.contains("\"change_point_probability\""));
+    }
+
+    #[test]
+    fn detect_change_points_below_threshold() {
+        let results = vec![BocpdUpdateResult {
+            step: 0,
+            change_point_probability: 0.1,
+            map_run_length: 0,
+            expected_run_length: 0.0,
+            log_evidence: 0.0,
+            run_length_posterior: vec![],
+        }];
+        let cps = BocpdDetector::detect_change_points(&results, 0.5);
+        assert!(cps.is_empty());
+    }
+
+    #[test]
+    fn detect_change_points_above_threshold() {
+        let results = vec![BocpdUpdateResult {
+            step: 5,
+            change_point_probability: 0.8,
+            map_run_length: 0,
+            expected_run_length: 0.5,
+            log_evidence: -1.0,
+            run_length_posterior: vec![],
+        }];
+        let cps = BocpdDetector::detect_change_points(&results, 0.5);
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].step, 5);
+    }
+
+    // ── BocpdEvidence ──────────────────────────────────────────────
+
+    #[test]
+    fn evidence_from_empty_batch() {
+        let batch = BatchResult {
+            results: vec![],
+            change_points: vec![],
+        };
+        let evidence = BocpdEvidence::from_batch(&batch, 5);
+        assert!(!evidence.recent_change);
+        assert!(approx_eq(evidence.change_probability, 0.0, 1e-12));
+        assert_eq!(evidence.regime_length, 0);
+        assert_eq!(evidence.change_count, 0);
+    }
+
+    #[test]
+    fn evidence_regime_confidence_bounded() {
+        let mut detector = BocpdDetector::default_detector();
+        let observations = vec![5.0; 20];
+        let batch = detector.process_batch(&observations, 0.5);
+        let evidence = BocpdEvidence::from_batch(&batch, 10);
+        assert!(evidence.regime_confidence >= 0.0);
+        assert!(evidence.regime_confidence <= 1.0);
+    }
+
+    #[test]
+    fn change_point_serializes() {
+        let cp = ChangePoint {
+            step: 10,
+            probability: 0.9,
+            expected_run_length: 1.5,
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        assert!(json.contains("\"step\":10"));
+    }
+
+    // ── log_sum_exp edge cases ─────────────────────────────────────
+
+    #[test]
+    fn log_sum_exp_empty() {
+        assert_eq!(log_sum_exp(&[]), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn log_sum_exp_single() {
+        assert!(approx_eq(log_sum_exp(&[5.0]), 5.0, 1e-10));
+    }
+
+    #[test]
+    fn log_sum_exp_all_neg_inf() {
+        assert_eq!(
+            log_sum_exp(&[f64::NEG_INFINITY, f64::NEG_INFINITY]),
+            f64::NEG_INFINITY
+        );
+    }
+
+    // ── ln_gamma edge cases ────────────────────────────────────────
+
+    #[test]
+    fn ln_gamma_negative_is_nan() {
+        assert!(ln_gamma(-1.0).is_nan());
+    }
+
+    #[test]
+    fn ln_gamma_zero_is_nan() {
+        assert!(ln_gamma(0.0).is_nan());
+    }
+
+    #[test]
+    fn ln_gamma_half() {
+        // Gamma(0.5) = sqrt(pi) ≈ 1.7724538509
+        let expected = std::f64::consts::PI.sqrt().ln();
+        assert!(approx_eq(ln_gamma(0.5), expected, 1e-4));
+    }
+
+    #[test]
+    fn ln_gamma_five() {
+        // Gamma(5) = 4! = 24
+        assert!(approx_eq(ln_gamma(5.0), 24.0_f64.ln(), 1e-6));
+    }
 }

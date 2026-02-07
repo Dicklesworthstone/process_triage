@@ -1096,4 +1096,264 @@ mod tests {
         assert!(summary.mark_distribution.min.is_finite());
         assert!(summary.mark_distribution.max.is_finite());
     }
+
+    // ── MppConfig ──────────────────────────────────────────────────
+
+    #[test]
+    fn config_default_values() {
+        let cfg = MppConfig::default();
+        assert_eq!(cfg.min_events, 3);
+        assert!((cfg.min_time_span - 0.1).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_stored_events, 10_000);
+        assert!((cfg.fano_high_threshold - 2.0).abs() < f64::EPSILON);
+        assert!((cfg.fano_very_high_threshold - 5.0).abs() < f64::EPSILON);
+        assert!((cfg.cv_high_threshold - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let cfg = MppConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: MppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.min_events, 3);
+        assert_eq!(back.max_stored_events, 10_000);
+    }
+
+    // ── BurstinessLevel ────────────────────────────────────────────
+
+    #[test]
+    fn burstiness_display() {
+        assert_eq!(BurstinessLevel::Regular.to_string(), "regular");
+        assert_eq!(BurstinessLevel::Mild.to_string(), "mild");
+        assert_eq!(BurstinessLevel::Moderate.to_string(), "moderate");
+        assert_eq!(BurstinessLevel::High.to_string(), "high");
+        assert_eq!(BurstinessLevel::VeryHigh.to_string(), "very_high");
+    }
+
+    #[test]
+    fn burstiness_serde() {
+        for level in &[
+            BurstinessLevel::Regular,
+            BurstinessLevel::Mild,
+            BurstinessLevel::Moderate,
+            BurstinessLevel::High,
+            BurstinessLevel::VeryHigh,
+        ] {
+            let json = serde_json::to_string(level).unwrap();
+            let back: BurstinessLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(*level, back);
+        }
+    }
+
+    #[test]
+    fn burstiness_log_odds_ordering() {
+        // Regular should be negative, VeryHigh should be most positive
+        assert!(BurstinessLevel::Regular.log_odds_contribution() < 0.0);
+        assert!((BurstinessLevel::Mild.log_odds_contribution() - 0.0).abs() < f64::EPSILON);
+        assert!(BurstinessLevel::Moderate.log_odds_contribution() > 0.0);
+        assert!(BurstinessLevel::High.log_odds_contribution() > BurstinessLevel::Moderate.log_odds_contribution());
+        assert!(BurstinessLevel::VeryHigh.log_odds_contribution() > BurstinessLevel::High.log_odds_contribution());
+    }
+
+    #[test]
+    fn burstiness_from_indices_mild() {
+        let config = MppConfig::default();
+        // Fano > 1.1, CV > 1.0 => Mild
+        let level = BurstinessLevel::from_indices(1.15, 1.05, &config);
+        assert_eq!(level, BurstinessLevel::Mild);
+    }
+
+    #[test]
+    fn burstiness_from_indices_moderate() {
+        let config = MppConfig::default();
+        // Fano >= 1.5 or CV > 1.2 => Moderate
+        let level = BurstinessLevel::from_indices(1.6, 0.8, &config);
+        assert_eq!(level, BurstinessLevel::Moderate);
+    }
+
+    // ── MarkedEvent ────────────────────────────────────────────────
+
+    #[test]
+    fn marked_event_new() {
+        let e = MarkedEvent::new(1.5, 42.0);
+        assert!((e.timestamp - 1.5).abs() < f64::EPSILON);
+        assert!((e.mark - 42.0).abs() < f64::EPSILON);
+    }
+
+    // ── MarkDistribution / InterArrivalStats defaults ──────────────
+
+    #[test]
+    fn mark_distribution_default() {
+        let md = MarkDistribution::default();
+        assert_eq!(md.count, 0);
+        assert!((md.sum - 0.0).abs() < f64::EPSILON);
+        assert!((md.mean - 0.0).abs() < f64::EPSILON);
+        assert!(md.percentiles.is_none());
+    }
+
+    #[test]
+    fn inter_arrival_default() {
+        let ia = InterArrivalStats::default();
+        assert_eq!(ia.count, 0);
+        assert!((ia.cv - 0.0).abs() < f64::EPSILON);
+        assert!(ia.percentiles.is_none());
+    }
+
+    // ── MppSummary::invalid ────────────────────────────────────────
+
+    #[test]
+    fn summary_invalid() {
+        let s = MppSummary::invalid("test reason");
+        assert!(!s.is_valid);
+        assert_eq!(s.invalid_reason.as_deref(), Some("test reason"));
+        assert_eq!(s.event_count, 0);
+        assert!((s.fano_factor - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ── MppEvidence ────────────────────────────────────────────────
+
+    #[test]
+    fn evidence_from_invalid_summary() {
+        let summary = MppSummary::invalid("insufficient data");
+        let evidence = MppEvidence::from_summary(summary);
+        assert!((evidence.severity - 0.0).abs() < f64::EPSILON);
+        assert!(evidence.description.contains("insufficient data"));
+    }
+
+    #[test]
+    fn evidence_severity_bounded() {
+        let mut mpp = MarkedPointProcess::with_defaults();
+        for i in 0..50 {
+            mpp.add_event(i as f64 * 0.1, 100.0);
+        }
+        let evidence = mpp.evidence(5.0);
+        assert!(evidence.severity >= 0.0);
+        assert!(evidence.severity <= 1.0);
+    }
+
+    // ── MarkedPointProcess ─────────────────────────────────────────
+
+    #[test]
+    fn mpp_add_arrays() {
+        let mut mpp = MarkedPointProcess::with_defaults();
+        let ts = vec![0.0, 0.1, 0.2, 0.3, 0.4];
+        let marks = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        mpp.add_arrays(&ts, &marks);
+        assert_eq!(mpp.event_count(), 5);
+    }
+
+    #[test]
+    fn mpp_time_span_too_short() {
+        let mut mpp = MarkedPointProcess::with_defaults();
+        // All events at same time
+        for _ in 0..5 {
+            mpp.add_event(0.0, 100.0);
+        }
+        let summary = mpp.summarize(0.01); // Very short window
+        assert!(!summary.is_valid);
+    }
+
+    #[test]
+    fn mpp_mark_variance() {
+        let mut mpp = MarkedPointProcess::with_defaults();
+        // Constant marks should have zero variance
+        for i in 0..10 {
+            mpp.add_event(i as f64 * 0.1, 100.0);
+        }
+        let summary = mpp.summarize(1.0);
+        assert!(summary.is_valid);
+        assert!((summary.mark_distribution.variance - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn mpp_inter_arrival_cv() {
+        let mut mpp = MarkedPointProcess::with_defaults();
+        // Regular inter-arrivals of 0.1s
+        for i in 0..20 {
+            mpp.add_event(i as f64 * 0.1, 100.0);
+        }
+        let summary = mpp.summarize(2.0);
+        assert!(summary.is_valid);
+        // CV should be near 0 for perfectly regular arrivals
+        assert!(summary.cv_inter_arrival < 0.1);
+    }
+
+    #[test]
+    fn mpp_marked_intensity() {
+        let mut mpp = MarkedPointProcess::with_defaults();
+        for i in 0..10 {
+            mpp.add_event(i as f64 * 0.1, 50.0);
+        }
+        let summary = mpp.summarize(1.0);
+        assert!(summary.is_valid);
+        // marked_intensity = rate * mean_mark = 10/1.0 * 50.0 = 500
+        assert!((summary.marked_intensity - 500.0).abs() < 1.0);
+    }
+
+    // ── BatchMppAnalyzer ───────────────────────────────────────────
+
+    #[test]
+    fn batch_analyzer_get_or_create() {
+        let mut analyzer = BatchMppAnalyzer::with_defaults();
+        analyzer.get_or_create("cpu").add_event(0.0, 50.0);
+        analyzer.get_or_create("cpu").add_event(0.1, 60.0);
+        assert_eq!(analyzer.get_or_create("cpu").event_count(), 2);
+    }
+
+    #[test]
+    fn batch_analyzer_add_processor() {
+        let mut analyzer = BatchMppAnalyzer::with_defaults();
+        analyzer.add_processor("net");
+        analyzer.add_event("net", 0.0, 1024.0);
+        let summaries = analyzer.summarize_all(1.0);
+        assert_eq!(summaries.len(), 1);
+    }
+
+    #[test]
+    fn batch_analyzer_aggregate_severity() {
+        let mut analyzer = BatchMppAnalyzer::with_defaults();
+        for i in 0..10 {
+            analyzer.add_event("cpu", i as f64 * 0.1, 50.0);
+            analyzer.add_event("io", i as f64 * 0.1, 100.0);
+        }
+        let severity = analyzer.aggregate_severity(1.0);
+        assert!(severity >= 0.0);
+        assert!(severity <= 1.0);
+    }
+
+    #[test]
+    fn batch_analyzer_empty_severity() {
+        let mut analyzer = BatchMppAnalyzer::with_defaults();
+        let severity = analyzer.aggregate_severity(1.0);
+        assert!((severity - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn batch_analyzer_evidence_all() {
+        let mut analyzer = BatchMppAnalyzer::with_defaults();
+        for i in 0..5 {
+            analyzer.add_event("stream1", i as f64 * 0.1, 100.0);
+        }
+        let evidences = analyzer.evidence_all(1.0);
+        assert_eq!(evidences.len(), 1);
+        assert_eq!(evidences[0].0, "stream1");
+    }
+
+    // ── format_description ─────────────────────────────────────────
+
+    #[test]
+    fn format_description_rate_categories() {
+        // Low rate
+        let mut mpp = MarkedPointProcess::new(MppConfig {
+            min_events: 3,
+            min_time_span: 0.0,
+            ..Default::default()
+        });
+        for i in 0..3 {
+            mpp.add_event(i as f64 * 10.0, 100.0); // rate = 3/30 = 0.1
+        }
+        let summary = mpp.summarize(30.0);
+        let evidence = MppEvidence::from_summary(summary);
+        assert!(evidence.description.contains("moderate") || evidence.description.contains("low"));
+    }
 }
