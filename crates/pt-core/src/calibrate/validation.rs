@@ -228,6 +228,7 @@ impl ValidationEngine {
     }
 
     /// Record a new prediction for tracking.
+    #[allow(clippy::too_many_arguments)]
     pub fn track_prediction(
         &mut self,
         identity_hash: String,
@@ -348,7 +349,7 @@ impl ValidationEngine {
     pub fn resolved_records(&self) -> Vec<&ValidationRecord> {
         self.records
             .iter()
-            .filter(|r| r.ground_truth.map_or(false, |gt| gt.is_resolved()))
+            .filter(|r| r.ground_truth.is_some_and(|gt| gt.is_resolved()))
             .collect()
     }
 
@@ -364,7 +365,7 @@ impl ValidationEngine {
     pub fn from_shadow_observations(observations: &[Observation], threshold: f64) -> Self {
         let mut engine = ValidationEngine::new(threshold);
         let mut ordered: Vec<&Observation> = observations.iter().collect();
-        ordered.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        ordered.sort_by_key(|a| a.timestamp);
 
         for obs in ordered {
             let exit_event = obs
@@ -432,6 +433,7 @@ impl ValidationEngine {
             .any(|r| r.identity_hash == identity_hash && r.ground_truth.is_none())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_prediction(
         &mut self,
         identity_hash: String,
@@ -564,7 +566,7 @@ impl ValidationEngine {
 
                 for r in &records {
                     let predicted_kill = r.predicted_abandoned >= self.threshold;
-                    let actually_abandoned = r.ground_truth.map_or(false, |gt| gt.is_abandoned());
+                    let actually_abandoned = r.ground_truth.is_some_and(|gt| gt.is_abandoned());
 
                     match (predicted_kill, actually_abandoned) {
                         (true, true) => tp += 1,
@@ -607,7 +609,7 @@ impl ValidationEngine {
             })
             .collect();
 
-        results.sort_by(|a, b| b.resolved.cmp(&a.resolved));
+        results.sort_by_key(|b| std::cmp::Reverse(b.resolved));
         results
     }
 
@@ -620,7 +622,7 @@ impl ValidationEngine {
 
         for r in resolved {
             let predicted_kill = r.predicted_abandoned >= self.threshold;
-            let actually_abandoned = r.ground_truth.map_or(false, |gt| gt.is_abandoned());
+            let actually_abandoned = r.ground_truth.is_some_and(|gt| gt.is_abandoned());
 
             if predicted_kill && !actually_abandoned {
                 let entry =
@@ -648,7 +650,7 @@ impl ValidationEngine {
                 category: cat,
             })
             .collect();
-        fps.sort_by(|a, b| b.count.cmp(&a.count));
+        fps.sort_by_key(|b| std::cmp::Reverse(b.count));
         fps.truncate(10);
 
         let mut fns: Vec<FalseOutcome> = fn_patterns
@@ -660,7 +662,7 @@ impl ValidationEngine {
                 category: cat,
             })
             .collect();
-        fns.sort_by(|a, b| b.count.cmp(&a.count));
+        fns.sort_by_key(|b| std::cmp::Reverse(b.count));
         fns.truncate(10);
 
         (fps, fns)

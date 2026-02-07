@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{SessionError, SessionHandle, SNAPSHOT_SCHEMA_VERSION};
 
@@ -167,20 +167,17 @@ pub struct RunMetadata {
 
 /// Redaction policy for snapshot persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum RedactionPolicy {
     /// Keep all strings as-is (for local-only storage).
     None,
     /// Redact command lines that match sensitive patterns.
+    #[default]
     Standard,
     /// Redact all command lines unconditionally.
     Full,
 }
 
-impl Default for RedactionPolicy {
-    fn default() -> Self {
-        Self::Standard
-    }
-}
 
 /// Sensitive substrings that trigger redaction under `Standard` policy.
 const SENSITIVE_PATTERNS: &[&str] = &[
@@ -322,15 +319,15 @@ fn payload_sha256<T: serde::de::DeserializeOwned + Serialize>(
 
 fn canonical_payload_bytes<T: Serialize>(
     payload: &T,
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<Vec<u8>, SessionError> {
     let mut value = serde_json::to_value(payload).map_err(|e| SessionError::Json {
-        path: path.clone(),
+        path: path.to_path_buf(),
         source: e,
     })?;
     canonicalize_json(&mut value);
     serde_json::to_vec(&value).map_err(|e| SessionError::Json {
-        path: path.clone(),
+        path: path.to_path_buf(),
         source: e,
     })
 }

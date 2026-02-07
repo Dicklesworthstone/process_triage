@@ -127,7 +127,7 @@ pub fn optimize_goal_plan(
             !c.is_protected
                 && c.confidence >= constraints.min_confidence
                 && c.expected_contribution > 0.0
-                && constraints.same_uid.map_or(true, |uid| c.uid == uid)
+                && constraints.same_uid.is_none_or(|uid| c.uid == uid)
         })
         .collect();
 

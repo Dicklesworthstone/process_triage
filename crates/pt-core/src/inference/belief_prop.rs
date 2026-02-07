@@ -229,7 +229,7 @@ impl ProcessTree {
     pub fn leaves(&self) -> Vec<u32> {
         self.nodes
             .iter()
-            .filter(|&pid| self.children.get(pid).map_or(true, |c| c.is_empty()))
+            .filter(|&pid| self.children.get(pid).is_none_or(|c| c.is_empty()))
             .copied()
             .collect()
     }

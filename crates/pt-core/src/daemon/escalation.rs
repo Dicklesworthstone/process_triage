@@ -82,6 +82,12 @@ pub struct EscalationState {
     pub consecutive_deferrals: u32,
 }
 
+impl Default for EscalationState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EscalationState {
     pub fn new() -> Self {
         Self {

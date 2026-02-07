@@ -288,7 +288,7 @@ fn build_fast_path_ledger(
 
     EvidenceLedger {
         posterior: PosteriorResult {
-            posterior: posterior.clone(),
+            posterior: *posterior,
             log_posterior,
             log_odds_abandoned_useful: log_odds,
             evidence_terms: vec![],

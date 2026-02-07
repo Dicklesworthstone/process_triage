@@ -140,6 +140,12 @@ pub struct DaemonState {
     pub recent_events: VecDeque<DaemonEvent>,
 }
 
+impl Default for DaemonState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DaemonState {
     pub fn new() -> Self {
         Self {

@@ -200,7 +200,7 @@ fn estimate_percentile_rank(value: f64, percentiles: &[f64; 5]) -> f64 {
     let pcts = [0.05, 0.25, 0.50, 0.75, 0.95];
 
     if value <= percentiles[0] {
-        return 0.05 * (value / percentiles[0].max(1e-12)).max(0.0).min(1.0);
+        return 0.05 * (value / percentiles[0].max(1e-12)).clamp(0.0, 1.0);
     }
     if value >= percentiles[4] {
         // Extrapolate conservatively above p95.

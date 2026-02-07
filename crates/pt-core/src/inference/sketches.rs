@@ -380,7 +380,7 @@ impl<K: Clone + Eq + Hash + std::fmt::Debug> SpaceSaving<K> {
             })
             .collect();
 
-        results.sort_by(|a, b| b.count.cmp(&a.count));
+        results.sort_by_key(|b| std::cmp::Reverse(b.count));
         results.truncate(k);
         results
     }
@@ -630,7 +630,7 @@ impl TDigest {
 
     /// Estimate a quantile (0 to 1).
     pub fn quantile(&mut self, q: f64) -> SketchResult<f64> {
-        if q < 0.0 || q > 1.0 {
+        if !(0.0..=1.0).contains(&q) {
             return Err(SketchError::InvalidQuantile(q));
         }
 
@@ -809,6 +809,7 @@ pub struct PercentileSummary {
 
 /// Configuration for a combined sketch manager.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct SketchManagerConfig {
     /// Count-Min Sketch config for frequency estimation.
     pub count_min: CountMinConfig,
@@ -818,15 +819,6 @@ pub struct SketchManagerConfig {
     pub tdigest: TDigestConfig,
 }
 
-impl Default for SketchManagerConfig {
-    fn default() -> Self {
-        Self {
-            count_min: CountMinConfig::default(),
-            space_saving: SpaceSavingConfig::default(),
-            tdigest: TDigestConfig::default(),
-        }
-    }
-}
 
 /// Combined sketch manager for tracking multiple metrics.
 ///
@@ -992,10 +984,10 @@ impl SketchManager {
         let age_percentile =
             self.estimate_percentile(&mut self.age_quantiles.clone(), age_seconds)?;
 
-        let description = if heavy_hitter_rank.is_some() {
+        let description = if let Some(rank) = heavy_hitter_rank {
             format!(
                 "Heavy hitter (rank {}), CPU p{:.0}, mem p{:.0}, age p{:.0}",
-                heavy_hitter_rank.unwrap(),
+                rank,
                 cpu_percentile * 100.0,
                 memory_percentile * 100.0,
                 age_percentile * 100.0

@@ -439,9 +439,9 @@ impl MartingaleAnalyzer {
         // Time-uniform radius using stitched boundary
         // Based on Howard et al. (2021) "Time-uniform, nonparametric..."
         let log_term = ((n + 1.0).sqrt() / alpha).ln();
-        let radius = bound * (2.0 * (1.0 + 1.0 / n) * log_term / n).sqrt();
+        
 
-        radius
+        bound * (2.0 * (1.0 + 1.0 / n) * log_term / n).sqrt()
     }
 
     /// Compute e-value from the martingale.
@@ -507,7 +507,7 @@ impl MartingaleAnalyzer {
         }
 
         let e_value = (1.0 / tail_probability.max(1e-300)).min(1e15);
-        let anomaly_score = e_value.ln().max(0.0).min(30.0); // Cap at 30 nats ≈ 13 bits
+        let anomaly_score = e_value.ln().clamp(0.0, 30.0); // Cap at 30 nats ≈ 13 bits
         let anomaly_detected = tail_probability < self.config.confidence_level;
 
         let sample_mean = if self.n > 0 {

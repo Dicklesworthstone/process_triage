@@ -244,14 +244,13 @@ fn generate_recommendations(
 
     // Score range recommendations
     for result in by_score_range {
-        if result.significant && result.bias.abs() > 0.15 {
-            if result.bias > 0.0 {
+        if result.significant && result.bias.abs() > 0.15
+            && result.bias > 0.0 {
                 recs.push(format!(
                     "Overconfident in {} range (bias={:.2}). Model may need calibration.",
                     result.stratum, result.bias
                 ));
             }
-        }
     }
 
     if recs.is_empty() {

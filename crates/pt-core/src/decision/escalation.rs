@@ -318,7 +318,7 @@ impl EscalationManager {
 
         let mut drain: Vec<(String, EscalationTrigger)> = self.pending_triggers.drain().collect();
         // Sort pending by severity (critical first) for deterministic bundling.
-        drain.sort_by(|a, b| b.1.severity.cmp(&a.1.severity));
+        drain.sort_by_key(|b| std::cmp::Reverse(b.1.severity));
 
         // Determine which triggers should emit a notification now (respect cooldown per level,
         // but allow higher-level escalation even within the cooldown window).

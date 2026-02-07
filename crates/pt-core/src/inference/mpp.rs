@@ -619,7 +619,7 @@ impl MarkedPointProcess {
         // Choose bin size to get reasonable number of bins
         // Aim for ~10-100 bins with at least a few events each
         let n_events = self.events.len();
-        let target_bins = (n_events as f64).sqrt().max(5.0).min(50.0);
+        let target_bins = (n_events as f64).sqrt().clamp(5.0, 50.0);
         let bin_size = time_span / target_bins;
 
         if bin_size <= 0.0 {

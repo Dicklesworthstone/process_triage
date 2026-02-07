@@ -198,7 +198,7 @@ pub fn save_disabled_patterns(disabled: &DisabledPatterns) -> Result<(), std::io
     // Convert PersistenceError to io::Error for compatibility
     disabled
         .save_to_file(&path)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Parse a category string into SupervisorCategory
@@ -1013,10 +1013,10 @@ fn run_signature_stats(format: &OutputFormat, min_matches: u32, sort_by: &str) -
     // Sort based on sort_by parameter
     match sort_by {
         "accepts" => {
-            stat_entries.sort_by(|a, b| b.1.accept_count.cmp(&a.1.accept_count));
+            stat_entries.sort_by_key(|b| std::cmp::Reverse(b.1.accept_count));
         }
         "rejects" => {
-            stat_entries.sort_by(|a, b| b.1.reject_count.cmp(&a.1.reject_count));
+            stat_entries.sort_by_key(|b| std::cmp::Reverse(b.1.reject_count));
         }
         "rate" => {
             stat_entries.sort_by(|a, b| {
@@ -1029,7 +1029,7 @@ fn run_signature_stats(format: &OutputFormat, min_matches: u32, sort_by: &str) -
         }
         _ => {
             // Default: sort by matches
-            stat_entries.sort_by(|a, b| b.1.match_count.cmp(&a.1.match_count));
+            stat_entries.sort_by_key(|b| std::cmp::Reverse(b.1.match_count));
         }
     }
 

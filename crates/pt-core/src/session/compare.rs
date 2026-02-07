@@ -286,7 +286,7 @@ fn find_recurring_offenders(
     }
 
     // Sort by new score descending (most suspicious first).
-    offenders.sort_by(|a, b| b.new_score.unwrap_or(0).cmp(&a.new_score.unwrap_or(0)));
+    offenders.sort_by_key(|b| std::cmp::Reverse(b.new_score.unwrap_or(0)));
 
     offenders
 }

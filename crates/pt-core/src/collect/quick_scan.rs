@@ -182,7 +182,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         }
 
         processed += 1;
-        if processed % PROGRESS_STEP == 0 {
+        if processed.is_multiple_of(PROGRESS_STEP) {
             if let Some(emitter) = options.progress.as_ref() {
                 emitter.emit(
                     ProgressEvent::new(event_names::QUICK_SCAN_PROGRESS, Phase::QuickScan)

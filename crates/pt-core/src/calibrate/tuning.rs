@@ -132,7 +132,7 @@ impl TuningEngine {
         // Filter to resolved records only.
         let resolved: Vec<&ValidationRecord> = records
             .iter()
-            .filter(|r| r.ground_truth.map_or(false, |gt| gt.is_resolved()))
+            .filter(|r| r.ground_truth.is_some_and(|gt| gt.is_resolved()))
             .collect();
 
         if resolved.is_empty() {
@@ -202,7 +202,7 @@ impl TuningEngine {
                 let count = recs.len();
                 let abandoned_count = recs
                     .iter()
-                    .filter(|r| r.ground_truth.map_or(false, |gt| gt.is_abandoned()))
+                    .filter(|r| r.ground_truth.is_some_and(|gt| gt.is_abandoned()))
                     .count();
                 let actual_rate = if count > 0 {
                     abandoned_count as f64 / count as f64
@@ -226,7 +226,7 @@ impl TuningEngine {
             })
             .collect();
 
-        stats.sort_by(|a, b| b.count.cmp(&a.count));
+        stats.sort_by_key(|b| std::cmp::Reverse(b.count));
         stats
     }
 
@@ -244,7 +244,7 @@ impl TuningEngine {
         let total = resolved.len() as f64;
         let abandoned_count = resolved
             .iter()
-            .filter(|r| r.ground_truth.map_or(false, |gt| gt.is_abandoned()))
+            .filter(|r| r.ground_truth.is_some_and(|gt| gt.is_abandoned()))
             .count();
         let useful_count = resolved.len() - abandoned_count;
 
@@ -341,7 +341,7 @@ impl TuningEngine {
     /// Returns (clamped_value, was_clamped).
     fn clamp_change(&self, current: f64, proposed: f64) -> (f64, bool) {
         if current <= 0.0 {
-            return (proposed.max(0.0).min(1.0), false);
+            return (proposed.clamp(0.0, 1.0), false);
         }
 
         let max_delta = current * self.config.max_change_fraction;

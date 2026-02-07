@@ -317,7 +317,7 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
                     }
 
                     let current = counter_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                    if current % PROGRESS_STEP == 0 {
+                    if current.is_multiple_of(PROGRESS_STEP) {
                         if let Some(emitter) = progress_ref {
                             emitter.emit(
                                 ProgressEvent::new(

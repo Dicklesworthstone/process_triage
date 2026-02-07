@@ -678,7 +678,7 @@ impl PpcChecker {
         }
 
         // Ensure we're in (0, 1)
-        result.max(1e-10).min(1.0 - 1e-10)
+        result.clamp(1e-10, 1.0 - 1e-10)
     }
 
     /// Approximate Beta quantile function using Newton-Raphson.

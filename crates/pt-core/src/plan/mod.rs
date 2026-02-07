@@ -107,17 +107,7 @@ pub struct PlanAction {
     pub d_state_diagnostics: Option<DStateDiagnostics>,
 }
 
-impl Default for ActionRouting {
-    fn default() -> Self {
-        ActionRouting::Direct
-    }
-}
 
-impl Default for ActionConfidence {
-    fn default() -> Self {
-        ActionConfidence::Normal
-    }
-}
 
 fn is_direct_routing(routing: &ActionRouting) -> bool {
     *routing == ActionRouting::Direct
@@ -162,8 +152,10 @@ pub enum PreCheck {
 /// Why an action was routed differently than the direct target.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ActionRouting {
     /// Direct action on the target process.
+    #[default]
     Direct,
     /// Zombie: routed to parent process.
     ZombieToParent,
@@ -178,8 +170,10 @@ pub enum ActionRouting {
 /// Confidence level for action success.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ActionConfidence {
     /// Normal confidence - action should succeed.
+    #[default]
     Normal,
     /// Low confidence - action may fail due to process state (D-state).
     Low,
@@ -405,11 +399,8 @@ fn plan_zombie_actions(candidate: &DecisionCandidate, blocked: bool) -> Option<V
             // Signal the parent to reap the zombie
             // For Kill -> signal parent with SIGCHLD or restart it
             // For Restart -> restart the parent
-            let parent_action = if original_action == Action::Kill {
-                Action::Restart // Restart parent to force zombie reap
-            } else {
-                Action::Restart
-            };
+            // Regardless of original action, restart parent to force zombie reap
+            let parent_action = Action::Restart;
 
             let action_id = action_id_for(parent_action, parent_identity, 0);
 

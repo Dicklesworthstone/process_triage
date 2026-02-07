@@ -350,13 +350,13 @@ impl SufficientStats {
                     return f64::NEG_INFINITY;
                 }
 
-                let log_pdf = log_gamma_half_nu_plus_half
+                
+
+                log_gamma_half_nu_plus_half
                     - log_gamma_half_nu
                     - 0.5 * (nu * std::f64::consts::PI).ln()
                     - scale.ln()
-                    - ((nu + 1.0) / 2.0) * (1.0 + z * z / nu).ln();
-
-                log_pdf
+                    - ((nu + 1.0) / 2.0) * (1.0 + z * z / nu).ln()
             }
             SufficientStats::PoissonGamma { alpha, beta, .. } => {
                 // Negative binomial predictive distribution
@@ -379,9 +379,9 @@ impl SufficientStats {
                     return f64::NEG_INFINITY;
                 }
 
-                let log_pmf = term1 - term2 - term3 + r * p.ln() + x * (1.0 - p).ln();
+                
 
-                log_pmf
+                term1 - term2 - term3 + r * p.ln() + x * (1.0 - p).ln()
             }
             SufficientStats::BetaBernoulli { alpha, beta } => {
                 // Bernoulli predictive with posterior mean

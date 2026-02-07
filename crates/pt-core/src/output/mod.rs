@@ -25,20 +25,17 @@ pub struct FieldSelector {
 /// Predefined field presets for common use cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum FieldPreset {
     /// Minimal: pid and classification only
     Minimal,
     /// Standard: pid, classification, score, command (default)
+    #[default]
     Standard,
     /// Full: all available fields
     Full,
 }
 
-impl Default for FieldPreset {
-    fn default() -> Self {
-        Self::Standard
-    }
-}
 
 impl FieldSelector {
     /// Create a new field selector with specific fields.
@@ -219,7 +216,7 @@ impl CompactConfig {
     }
 
     /// Key abbreviation mappings.
-    pub fn abbreviate_key<'a>(key: &'a str) -> &'a str {
+    pub fn abbreviate_key(key: &str) -> &str {
         match key {
             "pid" => "p",
             "ppid" => "pp",
@@ -245,7 +242,7 @@ impl CompactConfig {
     }
 
     /// Classification abbreviations.
-    pub fn abbreviate_classification<'a>(classification: &'a str) -> &'a str {
+    pub fn abbreviate_classification(classification: &str) -> &str {
         match classification {
             "useful" => "U",
             "useful_bad" => "UB",

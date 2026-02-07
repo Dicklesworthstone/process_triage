@@ -234,7 +234,7 @@ fn read_ppid(pid: u32) -> Result<u32, OrphanError> {
     // Format: pid (comm) state ppid ...
     let close_paren = content
         .rfind(')')
-        .ok_or_else(|| OrphanError::ProcessNotFound(pid))?;
+        .ok_or(OrphanError::ProcessNotFound(pid))?;
     let rest = &content[close_paren + 2..];
     let fields: Vec<&str> = rest.split_whitespace().collect();
 

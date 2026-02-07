@@ -345,12 +345,12 @@ impl AppSupervisionAnalyzer {
             confidence = confidence.max(0.8);
         }
 
-        if supervisor_process_name.is_some() {
+        if let Some(name) = &supervisor_process_name {
             evidence.push(SupervisionEvidence {
                 evidence_type: EvidenceType::Environment,
                 description: format!(
                     "SUPERVISOR_PROCESS_NAME={}",
-                    supervisor_process_name.as_ref().unwrap()
+                    name
                 ),
                 weight: 0.9,
             });
@@ -402,9 +402,7 @@ impl AppSupervisionAnalyzer {
         // nodemon sets NODEMON_CONFIG or can be detected via parent
         let nodemon_config = env.get("NODEMON_CONFIG");
 
-        if nodemon_config.is_none() {
-            return None;
-        }
+        nodemon_config?;
 
         let evidence = vec![SupervisionEvidence {
             evidence_type: EvidenceType::Environment,
@@ -460,10 +458,10 @@ impl AppSupervisionAnalyzer {
             confidence = confidence.max(0.8);
         }
 
-        if forever_uid.is_some() {
+        if let Some(uid) = &forever_uid {
             evidence.push(SupervisionEvidence {
                 evidence_type: EvidenceType::Environment,
-                description: format!("FOREVER_UID={}", forever_uid.as_ref().unwrap()),
+                description: format!("FOREVER_UID={}", uid),
                 weight: 0.85,
             });
             confidence = confidence.max(0.85);

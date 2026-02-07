@@ -62,20 +62,24 @@ impl ConfidenceBadge {
 /// Calibration status indicator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CalibrationStatus {
     /// Model is in a calibrated regime.
     Calibrated,
     /// Outside calibrated regime — exercise caution.
     Uncalibrated,
     /// No calibration data available.
+    #[default]
     Unknown,
 }
 
 /// Robustness gate status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum GateStatus {
     /// All gates passed.
+    #[default]
     Clear,
     /// Some gates raised warnings.
     Warning,
@@ -116,17 +120,7 @@ pub struct ConfidenceVizInput {
     pub expected_losses: Option<ExpectedLosses>,
 }
 
-impl Default for CalibrationStatus {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
-impl Default for GateStatus {
-    fn default() -> Self {
-        Self::Clear
-    }
-}
 
 /// Expected loss values for possible actions.
 #[derive(Debug, Clone, Serialize, Deserialize)]

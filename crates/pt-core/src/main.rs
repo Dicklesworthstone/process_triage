@@ -2872,8 +2872,7 @@ fn build_goal_plan_from_candidates(
                 let opt_candidates = build_opt_candidates_for_goals(candidates, &goals);
                 let result = optimize_ilp(&opt_candidates, &goals);
                 let achieved = result
-                    .goal_achievement
-                    .get(0)
+                    .goal_achievement.first()
                     .map(|g| {
                         if g.target > 0.0 {
                             g.achieved / g.target
@@ -2891,7 +2890,7 @@ fn build_goal_plan_from_candidates(
                     || (score - best_score).abs() < 1e-9
                         && best
                             .as_ref()
-                            .map_or(true, |b| result.total_loss < b.0.total_loss)
+                            .is_none_or(|b| result.total_loss < b.0.total_loss)
                 {
                     best_score = score;
                     best = Some((result, goals));
@@ -3066,6 +3065,7 @@ fn run_bundle(global: &GlobalOpts, args: &BundleArgs) -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bundle_create(
     global: &GlobalOpts,
     session_arg: &Option<String>,
@@ -3339,7 +3339,7 @@ fn run_bundle_create(
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
-            return ExitCode::InternalError;
+            ExitCode::InternalError
         }
     }
 }
@@ -3408,7 +3408,7 @@ fn run_bundle_inspect(
     let bundle_version = reader.manifest().bundle_version.clone();
     let source_session = reader.manifest().session_id.clone();
     let host_id = reader.manifest().host_id.clone();
-    let created_at = reader.manifest().created_at.clone();
+    let created_at = reader.manifest().created_at;
     let export_profile = reader.manifest().export_profile;
     let pt_version = reader.manifest().pt_version.clone();
     let description = reader.manifest().description.clone();
@@ -4238,13 +4238,13 @@ fn run_config_validate(global: &GlobalOpts, path: Option<&String>) -> ExitCode {
                     println!("# Configuration Validation");
                     println!();
                     println!("Status: ✓ Valid");
-                    if snapshot.priors_path.is_some() {
-                        println!("Priors: {}", snapshot.priors_path.unwrap().display());
+                    if let Some(priors_path) = snapshot.priors_path {
+                        println!("Priors: {}", priors_path.display());
                     } else {
                         println!("Priors: using built-in defaults");
                     }
-                    if snapshot.policy_path.is_some() {
-                        println!("Policy: {}", snapshot.policy_path.unwrap().display());
+                    if let Some(policy_path) = snapshot.policy_path {
+                        println!("Policy: {}", policy_path.display());
                     } else {
                         println!("Policy: using built-in defaults");
                     }
@@ -5883,8 +5883,10 @@ fn run_shadow_status(global: &GlobalOpts) -> ExitCode {
     let running = pid.map(is_process_running).unwrap_or(false);
     let stale = pid.is_some() && !running;
 
-    let mut config = ShadowStorageConfig::default();
-    config.base_dir = shadow_base_dir();
+    let config = ShadowStorageConfig {
+        base_dir: shadow_base_dir(),
+        ..Default::default()
+    };
     let storage = ShadowStorage::new(config);
 
     let stats_json = match storage {
@@ -6978,11 +6980,11 @@ fn collect_shadow_observations(
         observations.append(&mut batch);
     }
 
-    observations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    observations.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
     if let Some(max) = limit {
         observations.truncate(max);
     }
-    observations.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    observations.sort_by_key(|a| a.timestamp);
 
     Ok(observations)
 }
@@ -7532,7 +7534,7 @@ fn collect_cpu_count() -> u32 {
 fn collect_memory_info() -> serde_json::Value {
     let (total_kb, available_kb) = std::fs::read_to_string("/proc/meminfo")
         .ok()
-        .and_then(|content| {
+        .map(|content| {
             let mut total: u64 = 0;
             let mut available: u64 = 0;
             for line in content.lines() {
@@ -7550,7 +7552,7 @@ fn collect_memory_info() -> serde_json::Value {
                         .unwrap_or(0);
                 }
             }
-            Some((total, available))
+            (total, available)
         })
         .unwrap_or((0, 0));
 
@@ -8793,7 +8795,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
 
         if let Some(ref e) = emitter {
-            if processed % 50 == 0 || processed == total_processes {
+            if processed.is_multiple_of(50) || processed == total_processes {
                 e.emit(
                     ProgressEvent::new(
                         pt_core::events::event_names::INFERENCE_PROGRESS,
@@ -9752,9 +9754,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
                             let strength =
                                 bf.get("strength").and_then(|v| v.as_str()).unwrap_or("?");
                             // Format BF: use scientific notation for extreme values
-                            let bf_str = if bf_val.is_infinite() || bf_val > 1e6 {
-                                format!("{:.2e}", bf_val)
-                            } else if bf_val < 1e-6 && bf_val > 0.0 {
+                            let bf_str = if bf_val.is_infinite() || bf_val > 1e6 || (bf_val < 1e-6 && bf_val > 0.0) {
                                 format!("{:.2e}", bf_val)
                             } else {
                                 format!("{:.2}", bf_val)
@@ -11397,13 +11397,13 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     }
 
     // If respawned processes were detected, indicate partial failure
-    let exit_code = if args.check_respawn && respawned_count > 0 {
+    
+
+    if args.check_respawn && respawned_count > 0 {
         ExitCode::PartialFail
     } else {
         exit_code
-    };
-
-    exit_code
+    }
 }
 
 fn resolve_diff_sessions(
@@ -11650,7 +11650,7 @@ fn format_diff_plain(
 ) -> String {
     let mut output = String::new();
 
-    output.push_str(&format!("# pt diff\n\n"));
+    output.push_str("# pt diff\n\n");
     output.push_str(&format!("Base: {} {}\n", base_id.0, base_ts));
     output.push_str(&format!("Compare: {} {}\n\n", compare_id.0, compare_ts));
 
@@ -13743,9 +13743,7 @@ fn check_baseline_anomaly(
     state: &serde_json::Value,
     baseline: Option<&WatchBaseline>,
 ) -> Option<serde_json::Value> {
-    let Some(baseline) = baseline else {
-        return None;
-    };
+    let baseline = baseline?;
     if baseline.load1 > 0.0 {
         if let Some(load1) = read_load1(state) {
             if load1 > baseline.load1 * 1.5 {

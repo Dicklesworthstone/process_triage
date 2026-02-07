@@ -504,7 +504,7 @@ impl SupervisorSignature {
             })?;
         }
 
-        for (_, value_pattern) in &self.patterns.environment_vars {
+        for value_pattern in self.patterns.environment_vars.values() {
             if !value_pattern.is_empty() {
                 regex::Regex::new(value_pattern).map_err(|e| SignatureError::InvalidRegex {
                     pattern: value_pattern.clone(),

@@ -285,6 +285,7 @@ impl TransitionModel {
     /// Create an identity transition model (no state changes).
     pub fn identity() -> Self {
         let mut matrix = [[0.0; NUM_STATES]; NUM_STATES];
+        #[allow(clippy::needless_range_loop)]
         for i in 0..NUM_STATES {
             matrix[i][i] = 1.0;
         }
@@ -437,6 +438,7 @@ pub fn update_belief(
 
     // Step 2: Update - multiply by observation likelihood (in log space)
     let mut log_updated = [0.0; NUM_STATES];
+    #[allow(clippy::needless_range_loop)]
     for i in 0..NUM_STATES {
         log_updated[i] = predicted.log_probs[i] + observation.log_likelihoods[i];
     }

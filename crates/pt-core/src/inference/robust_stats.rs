@@ -121,7 +121,7 @@ fn median(samples: &[f64]) -> f64 {
     let mut values = samples.to_vec();
     values.sort_by(|a, b| a.total_cmp(b));
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]
@@ -132,7 +132,7 @@ fn mad(samples: &[f64], center: f64) -> f64 {
     let mut deviations: Vec<f64> = samples.iter().map(|v| (v - center).abs()).collect();
     deviations.sort_by(|a, b| a.total_cmp(b));
     let mid = deviations.len() / 2;
-    if deviations.len() % 2 == 0 {
+    if deviations.len().is_multiple_of(2) {
         (deviations[mid - 1] + deviations[mid]) / 2.0
     } else {
         deviations[mid]

@@ -180,7 +180,7 @@ impl ContainerSupervisionAnalyzer {
     ) -> Result<ContainerSupervisionResult, ContainerSupervisionError> {
         // Get cgroup details for the process
         let cgroup_details = collect_cgroup_details(pid)
-            .ok_or_else(|| ContainerSupervisionError::ProcessNotFound(pid))?;
+            .ok_or(ContainerSupervisionError::ProcessNotFound(pid))?;
 
         // Get cgroup path to analyze
         let cgroup_path = self.get_cgroup_path(&cgroup_details);

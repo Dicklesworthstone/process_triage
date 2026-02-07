@@ -450,6 +450,7 @@ pub fn decide_from_belief_with_config(
 /// - Robot constraint checker for robot mode gates
 /// - Alpha-investing state for budget control
 /// - Process metadata for blast-radius checks
+#[allow(clippy::too_many_arguments)]
 pub fn decide_from_belief_constrained(
     belief: &BeliefState,
     policy: &Policy,
@@ -514,8 +515,8 @@ pub fn decide_from_belief_constrained(
     // Apply blast-radius caps
     if config.apply_blast_radius {
         if let Some((mem_mb, cpu_pct)) = blast_radius {
-            let within_limits = config.max_memory_mb.map_or(true, |max| mem_mb <= max)
-                && config.max_cpu_pct.map_or(true, |max| cpu_pct <= max);
+            let within_limits = config.max_memory_mb.is_none_or(|max| mem_mb <= max)
+                && config.max_cpu_pct.is_none_or(|max| cpu_pct <= max);
             let summary = BlastRadiusSummary {
                 within_limits,
                 memory_mb: mem_mb,

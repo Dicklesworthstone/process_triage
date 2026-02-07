@@ -467,7 +467,7 @@ impl SessionAnalyzer {
 
     /// Check if a process name is a shell.
     fn is_shell(&self, comm: &str) -> bool {
-        SHELL_NAMES.iter().any(|&s| comm == s)
+        SHELL_NAMES.contains(&comm)
     }
 
     /// Analyze whether a target PID is in the protected session chain of pt_pid.

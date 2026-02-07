@@ -100,8 +100,10 @@ pub enum PersistenceError {
 /// Pattern lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PatternLifecycle {
     /// First observation, confidence < 0.5
+    #[default]
     New,
     /// Building confidence, 0.5 ≤ confidence < 0.8
     Learning,
@@ -113,11 +115,6 @@ pub enum PatternLifecycle {
     Removed,
 }
 
-impl Default for PatternLifecycle {
-    fn default() -> Self {
-        Self::New
-    }
-}
 
 impl PatternLifecycle {
     /// Check if this lifecycle allows matching processes.
@@ -165,12 +162,14 @@ impl PatternLifecycle {
 /// Source of a pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PatternSource {
     /// Shipped with pt-core.
     BuiltIn,
     /// Learned from user decisions.
     Learned,
     /// User-defined custom pattern.
+    #[default]
     Custom,
     /// Fetched from community registry.
     Community,
@@ -178,11 +177,6 @@ pub enum PatternSource {
     Imported,
 }
 
-impl Default for PatternSource {
-    fn default() -> Self {
-        Self::Custom
-    }
-}
 
 impl PatternSource {
     /// Check if patterns from this source can be modified.
@@ -586,22 +580,19 @@ impl AllPatternStats {
 
 /// Conflict resolution strategy for imports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ConflictResolution {
     /// Keep the existing pattern.
     KeepExisting,
     /// Replace with imported pattern.
     ReplaceWithImported,
     /// Keep the higher-confidence pattern.
+    #[default]
     KeepHigherConfidence,
     /// Merge: keep higher confidence, combine counts.
     Merge,
 }
 
-impl Default for ConflictResolution {
-    fn default() -> Self {
-        Self::KeepHigherConfidence
-    }
-}
 
 /// Result of an import operation.
 #[derive(Debug, Clone, Default)]

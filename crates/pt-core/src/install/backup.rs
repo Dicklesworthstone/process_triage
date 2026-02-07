@@ -189,7 +189,7 @@ impl BackupManager {
             let path = entry.path();
 
             // Look for metadata files
-            if path.extension().map_or(false, |e| e == "json") {
+            if path.extension().is_some_and(|e| e == "json") {
                 let filename = path.file_stem().unwrap_or_default().to_string_lossy();
                 if filename.starts_with(&prefix) {
                     if let Ok(metadata) = BackupMetadata::load(&path) {

@@ -542,6 +542,7 @@ pub fn optimize_ilp(candidates: &[OptCandidate], goals: &[ResourceGoal]) -> Opti
     let mut best_selection: Vec<usize> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn dfs(
         idx: usize,
         ordered: &[&OptCandidate],

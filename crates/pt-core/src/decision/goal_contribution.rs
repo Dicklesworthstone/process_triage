@@ -107,7 +107,7 @@ pub fn estimate_memory_contribution(candidate: &ContributionCandidate) -> GoalCo
         expected,
         low: low.max(0.0),
         high,
-        confidence: confidence.max(0.0).min(1.0),
+        confidence: confidence.clamp(0.0, 1.0),
         factors,
     }
 }
@@ -140,8 +140,7 @@ pub fn estimate_cpu_contribution(candidate: &ContributionCandidate) -> GoalContr
         low: low.max(0.0),
         high: high.min(1.0),
         confidence: (0.8 * (1.0 - candidate.respawn_probability * 0.5))
-            .max(0.0)
-            .min(1.0),
+            .clamp(0.0, 1.0),
         factors,
     }
 }
@@ -180,8 +179,7 @@ pub fn estimate_port_contribution(
         low: prob * 0.9,
         high: 1.0,
         confidence: (0.9 * (1.0 - candidate.respawn_probability * 0.5))
-            .max(0.0)
-            .min(1.0),
+            .clamp(0.0, 1.0),
         factors,
     }
 }

@@ -178,6 +178,7 @@ impl FleetRegistry {
     }
 
     /// Register a new host.
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &mut self,
         host_id: String,

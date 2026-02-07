@@ -422,11 +422,7 @@ fn ids_match(expected: &str, current: &str) -> bool {
             if let (Ok(e_ticks), Ok(c_ticks)) = (e.parse::<u64>(), c.parse::<u64>()) {
                 // If diff is within 1 second (100Hz = 100 ticks), treat as match
                 // We use 150 to be safe against rounding + small drift
-                let diff = if e_ticks > c_ticks {
-                    e_ticks - c_ticks
-                } else {
-                    c_ticks - e_ticks
-                };
+                let diff = e_ticks.abs_diff(c_ticks);
                 if diff <= 150 {
                     return true;
                 }
