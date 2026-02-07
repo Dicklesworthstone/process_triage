@@ -51,12 +51,15 @@ mod pattern_compilation_tests {
         let sig = SupervisorSignature::new("test-invalid", SupervisorCategory::Other)
             .with_process_patterns(vec![r"[invalid"]);
 
-        match sig.validate() {
-            Err(SignatureError::InvalidRegex { pattern, .. }) => {
-                assert_eq!(pattern, "[invalid");
-            }
-            other => panic!("Expected InvalidRegex error, got {:?}", other),
-        }
+        let result = sig.validate();
+        assert!(
+            matches!(
+                &result,
+                Err(SignatureError::InvalidRegex { pattern, .. }) if pattern == "[invalid"
+            ),
+            "Expected InvalidRegex error for '[invalid', got {:?}",
+            result
+        );
 
         // Invalid arg pattern
         let sig2 = SupervisorSignature::new("test-invalid2", SupervisorCategory::Other)
@@ -412,13 +415,15 @@ mod versioning_tests {
         let future_json = r#"{"schema_version": 999, "signatures": []}"#;
         let result = SignatureSchema::from_json(future_json);
 
-        match result {
-            Err(SignatureError::UnsupportedVersion { found, expected }) => {
-                assert_eq!(found, 999);
-                assert_eq!(expected, SCHEMA_VERSION);
-            }
-            other => panic!("Expected UnsupportedVersion error, got {:?}", other),
-        }
+        assert!(
+            matches!(
+                &result,
+                Err(SignatureError::UnsupportedVersion { found, expected })
+                if *found == 999 && *expected == SCHEMA_VERSION
+            ),
+            "Expected UnsupportedVersion error for schema_version=999, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -464,7 +469,7 @@ mod builtin_test_runner_tests {
 
         // By arg pattern (node running jest)
         let ctx2 = ProcessMatchContext::with_comm("node").cmdline("node ./node_modules/.bin/jest");
-        let matches2 = db.match_process(&ctx2);
+        let _matches2 = db.match_process(&ctx2);
         // Note: May not match if only arg_patterns are defined (needs process_name match too)
 
         // By environment variable
@@ -534,6 +539,17 @@ mod builtin_test_runner_tests {
 
         let go_test_match = matches.iter().find(|m| m.signature.name == "go-test");
         assert!(go_test_match.is_some(), "Should detect go test");
+    }
+
+    #[test]
+    fn test_npm_test_detection() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("npm").cmdline("npm test -- --watch");
+        let matches = db.match_process(&ctx);
+
+        let npm_match = matches.iter().find(|m| m.signature.name == "npm");
+        assert!(npm_match.is_some(), "Should detect npm test invocation");
     }
 
     #[test]
@@ -675,6 +691,23 @@ mod builtin_dev_server_tests {
     }
 
     #[test]
+    fn test_webpack_hot_watch_detection() {
+        let db = get_default_db();
+
+        let ctx = ProcessMatchContext::with_comm("node")
+            .cmdline("node ./node_modules/.bin/webpack serve --hot --watch");
+        let matches = db.match_process(&ctx);
+
+        let webpack_match = matches
+            .iter()
+            .find(|m| m.signature.name == "webpack-dev-server");
+        assert!(
+            webpack_match.is_some(),
+            "Should detect webpack-dev-server with --hot/--watch flags"
+        );
+    }
+
+    #[test]
     fn test_flask_detection() {
         let db = get_default_db();
 
@@ -767,7 +800,7 @@ mod builtin_agent_tests {
 
         // By socket path
         let sockets = vec!["/tmp/claude-session-123.sock".to_string()];
-        let ctx2 = ProcessMatchContext::with_comm("anyprocess").socket_paths(&sockets);
+        let _ctx2 = ProcessMatchContext::with_comm("anyprocess").socket_paths(&sockets);
         let matches2 = db.find_by_socket_path("/tmp/claude-session-123.sock");
         assert!(
             matches2.iter().any(|s| s.name == "claude"),
