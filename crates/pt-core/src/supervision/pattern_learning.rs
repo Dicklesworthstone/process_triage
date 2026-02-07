@@ -791,4 +791,567 @@ mod tests {
                 < SpecificityLevel::Broad.priority_offset()
         );
     }
+
+    // ── SpecificityLevel ────────────────────────────────────────────
+
+    #[test]
+    fn test_specificity_priority_values() {
+        assert_eq!(SpecificityLevel::Exact.priority_offset(), 0);
+        assert_eq!(SpecificityLevel::Standard.priority_offset(), 10);
+        assert_eq!(SpecificityLevel::Broad.priority_offset(), 20);
+    }
+
+    // ── PatternCandidate::generate_name ─────────────────────────────
+
+    #[test]
+    fn test_candidate_generate_name() {
+        let exact = PatternCandidate {
+            level: SpecificityLevel::Exact,
+            process_pattern: "^node$".to_string(),
+            arg_patterns: vec![],
+            description: String::new(),
+        };
+        assert_eq!(exact.generate_name("node"), "learned_node_exact");
+
+        let std = PatternCandidate {
+            level: SpecificityLevel::Standard,
+            process_pattern: "node".to_string(),
+            arg_patterns: vec![],
+            description: String::new(),
+        };
+        assert_eq!(std.generate_name("jest"), "learned_jest_std");
+
+        let broad = PatternCandidate {
+            level: SpecificityLevel::Broad,
+            process_pattern: "node.*".to_string(),
+            arg_patterns: vec![],
+            description: String::new(),
+        };
+        assert_eq!(broad.generate_name("node"), "learned_node_broad");
+    }
+
+    // ── CommandNormalizer: process name ──────────────────────────────
+
+    #[test]
+    fn test_normalize_process_name_plain() {
+        let n = CommandNormalizer::new();
+        assert_eq!(n.normalize_process_name("bash"), "bash");
+        assert_eq!(n.normalize_process_name("nginx"), "nginx");
+    }
+
+    #[test]
+    fn test_normalize_process_name_with_path() {
+        let n = CommandNormalizer::new();
+        assert_eq!(n.normalize_process_name("/usr/bin/python3"), "python.*");
+        assert_eq!(n.normalize_process_name("/usr/local/bin/node"), "node");
+    }
+
+    #[test]
+    fn test_normalize_process_name_versioned_interpreters() {
+        let n = CommandNormalizer::new();
+        assert_eq!(n.normalize_process_name("python3"), "python.*");
+        assert_eq!(n.normalize_process_name("python3.11"), "python.*");
+        assert_eq!(n.normalize_process_name("ruby3"), "ruby.*");
+        assert_eq!(n.normalize_process_name("perl5"), "perl.*");
+        assert_eq!(n.normalize_process_name("node18"), "node.*");
+    }
+
+    #[test]
+    fn test_normalize_process_name_non_versioned() {
+        let n = CommandNormalizer::new();
+        // These should NOT be treated as versioned interpreters
+        assert_eq!(n.normalize_process_name("python"), "python");
+        assert_eq!(n.normalize_process_name("cargo"), "cargo");
+        assert_eq!(n.normalize_process_name("rustc"), "rustc");
+    }
+
+    // ── CommandNormalizer: is_significant_arg ────────────────────────
+
+    #[test]
+    fn test_is_significant_arg_empty() {
+        let n = CommandNormalizer::new();
+        assert!(!n.is_significant_arg(""));
+    }
+
+    #[test]
+    fn test_is_significant_arg_flags() {
+        let n = CommandNormalizer::new();
+        assert!(n.is_significant_arg("--watch"));
+        assert!(n.is_significant_arg("-v"));
+        assert!(n.is_significant_arg("--port=8080"));
+    }
+
+    #[test]
+    fn test_is_significant_arg_path_with_script() {
+        let n = CommandNormalizer::new();
+        assert!(n.is_significant_arg("/home/user/test.py"));
+        assert!(n.is_significant_arg("/home/user/app.js"));
+        assert!(n.is_significant_arg("/home/user/app.ts"));
+        assert!(n.is_significant_arg("/home/user/app.rb"));
+        assert!(n.is_significant_arg("/usr/bin/node"));
+    }
+
+    #[test]
+    fn test_is_significant_arg_pure_path_not_significant() {
+        let n = CommandNormalizer::new();
+        // A pure directory path without script extension is not significant
+        assert!(!n.is_significant_arg("/home/user/data/something"));
+    }
+
+    #[test]
+    fn test_is_significant_arg_regular_word() {
+        let n = CommandNormalizer::new();
+        assert!(n.is_significant_arg("test"));
+        assert!(n.is_significant_arg("build"));
+    }
+
+    // ── CommandNormalizer: is_key_arg ────────────────────────────────
+
+    #[test]
+    fn test_is_key_arg_flags() {
+        let n = CommandNormalizer::new();
+        assert!(n.is_key_arg("--watch"));
+        assert!(n.is_key_arg("-v"));
+        assert!(n.is_key_arg("-m"));
+    }
+
+    #[test]
+    fn test_is_key_arg_subcommands() {
+        let n = CommandNormalizer::new();
+        assert!(n.is_key_arg("test"));
+        assert!(n.is_key_arg("serve"));
+        assert!(n.is_key_arg("dev"));
+        assert!(n.is_key_arg("build"));
+        assert!(n.is_key_arg("watch"));
+        assert!(n.is_key_arg("run"));
+        assert!(n.is_key_arg("start"));
+        assert!(n.is_key_arg("lint"));
+        assert!(n.is_key_arg("check"));
+        assert!(n.is_key_arg("compile"));
+        assert!(n.is_key_arg("bundle"));
+    }
+
+    #[test]
+    fn test_is_key_arg_case_insensitive() {
+        let n = CommandNormalizer::new();
+        assert!(n.is_key_arg("Test"));
+        assert!(n.is_key_arg("BUILD"));
+    }
+
+    #[test]
+    fn test_is_key_arg_non_key() {
+        let n = CommandNormalizer::new();
+        assert!(!n.is_key_arg("foo"));
+        assert!(!n.is_key_arg("myfile.txt"));
+        assert!(!n.is_key_arg("/some/path"));
+    }
+
+    // ── CommandNormalizer: is_primary_flag ───────────────────────────
+
+    #[test]
+    fn test_is_primary_flag_known_flags() {
+        let n = CommandNormalizer::new();
+        assert!(n.is_primary_flag("--watch"));
+        assert!(n.is_primary_flag("-w"));
+        assert!(n.is_primary_flag("--hot"));
+        assert!(n.is_primary_flag("--dev"));
+        assert!(n.is_primary_flag("--serve"));
+        assert!(n.is_primary_flag("--test"));
+        assert!(n.is_primary_flag("--build"));
+        assert!(n.is_primary_flag("--verbose"));
+        assert!(n.is_primary_flag("-v"));
+        assert!(n.is_primary_flag("--debug"));
+        assert!(n.is_primary_flag("-m"));
+    }
+
+    #[test]
+    fn test_is_primary_flag_unknown_double_dash() {
+        let n = CommandNormalizer::new();
+        // Unknown --flag without = is still a primary flag
+        assert!(n.is_primary_flag("--custom-flag"));
+        // With = is NOT a primary flag (it's a key=value pair)
+        assert!(!n.is_primary_flag("--port=8080"));
+    }
+
+    #[test]
+    fn test_is_primary_flag_non_flags() {
+        let n = CommandNormalizer::new();
+        assert!(!n.is_primary_flag("test"));
+        assert!(!n.is_primary_flag("/path/to/file"));
+        assert!(!n.is_primary_flag("8080"));
+    }
+
+    // ── CommandNormalizer: normalize_arg_exact ───────────────────────
+
+    #[test]
+    fn test_normalize_arg_exact_plain() {
+        let n = CommandNormalizer::new();
+        let result = n.normalize_arg_exact("--watch");
+        assert_eq!(result, "\\-\\-watch");
+    }
+
+    #[test]
+    fn test_normalize_arg_exact_uuid() {
+        let n = CommandNormalizer::new();
+        let result = n.normalize_arg_exact("id=550e8400-e29b-41d4-a716-446655440000");
+        assert!(result.contains("[0-9a-f-]+"));
+        assert!(!result.contains("550e8400"));
+    }
+
+    // ── CommandNormalizer: normalize_arg_standard ────────────────────
+
+    #[test]
+    fn test_normalize_arg_standard_path_stripping() {
+        let n = CommandNormalizer::new();
+        let result = n.normalize_arg_standard("/home/user/project/src/main.rs");
+        assert!(result.contains(".*"));
+    }
+
+    #[test]
+    fn test_normalize_arg_standard_port() {
+        let n = CommandNormalizer::new();
+        let result = n.normalize_arg_standard("--port 8080");
+        assert!(result.contains("\\d+") || result.contains("8080"));
+    }
+
+    #[test]
+    fn test_normalize_arg_standard_long_number() {
+        let n = CommandNormalizer::new();
+        let result = n.normalize_arg_standard("pid=12345");
+        assert!(result.contains("\\d+"));
+        assert!(!result.contains("12345"));
+    }
+
+    // ── CommandNormalizer: normalize_arg_broad ───────────────────────
+
+    #[test]
+    fn test_normalize_arg_broad_strips_paths() {
+        let n = CommandNormalizer::new();
+        // /usr/bin/something → path prefix stripped → "something"
+        let result = n.normalize_arg_broad("/usr/bin/something");
+        assert_eq!(result, "something");
+
+        // Relative path with slash → replaced by .*
+        let result = n.normalize_arg_broad("src/main.rs");
+        assert!(result.contains(".*"));
+    }
+
+    #[test]
+    fn test_normalize_arg_broad_replaces_numbers() {
+        let n = CommandNormalizer::new();
+        let result = n.normalize_arg_broad("port 8080");
+        assert!(result.contains("\\d+"));
+    }
+
+    // ── generate_candidates: edge cases ─────────────────────────────
+
+    #[test]
+    fn test_generate_candidates_empty_cmdline() {
+        let n = CommandNormalizer::new();
+        let candidates = n.generate_candidates("node", "");
+        // Should still get at least Standard and Broad
+        assert!(candidates.len() >= 2);
+    }
+
+    #[test]
+    fn test_generate_candidates_only_command() {
+        let n = CommandNormalizer::new();
+        let candidates = n.generate_candidates("node", "node");
+        // Command-only: first arg is stripped as the process name
+        assert!(candidates.len() >= 2);
+    }
+
+    #[test]
+    fn test_generate_candidates_always_includes_standard_and_broad() {
+        let n = CommandNormalizer::new();
+        let candidates = n.generate_candidates("cargo", "cargo build --release");
+        let levels: Vec<_> = candidates.iter().map(|c| c.level).collect();
+        assert!(levels.contains(&SpecificityLevel::Standard));
+        assert!(levels.contains(&SpecificityLevel::Broad));
+    }
+
+    #[test]
+    fn test_generate_candidates_exact_only_with_significant_args() {
+        let n = CommandNormalizer::new();
+        // With significant args → should have Exact
+        let candidates = n.generate_candidates("node", "node --watch test.js");
+        let levels: Vec<_> = candidates.iter().map(|c| c.level).collect();
+        assert!(levels.contains(&SpecificityLevel::Exact));
+    }
+
+    #[test]
+    fn test_generate_candidates_broad_uses_base_name() {
+        let n = CommandNormalizer::new();
+        let candidates = n.generate_candidates("python3", "python3 -m pytest");
+        let broad = candidates
+            .iter()
+            .find(|c| c.level == SpecificityLevel::Broad)
+            .unwrap();
+        // Broad pattern uses base name before dot: "python" from "python.*"
+        assert!(broad.process_pattern.starts_with("python"));
+    }
+
+    // ── DecisionAction ──────────────────────────────────────────────
+
+    #[test]
+    fn test_decision_action_equality() {
+        assert_eq!(DecisionAction::Kill, DecisionAction::Kill);
+        assert_eq!(DecisionAction::Spare, DecisionAction::Spare);
+        assert_ne!(DecisionAction::Kill, DecisionAction::Spare);
+    }
+
+    // ── PatternLearner ──────────────────────────────────────────────
+
+    #[test]
+    fn test_learner_observation_count_starts_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let learner = PatternLearner::new(&mut lib);
+        assert_eq!(learner.observation_count("node"), 0);
+    }
+
+    #[test]
+    fn test_learner_record_decision_increments_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let mut learner = PatternLearner::new(&mut lib);
+
+        learner
+            .record_decision("node", "node --watch", true)
+            .unwrap();
+        assert_eq!(learner.observation_count("node"), 1);
+
+        learner
+            .record_decision("node", "node --watch", false)
+            .unwrap();
+        assert_eq!(learner.observation_count("node"), 2);
+    }
+
+    #[test]
+    fn test_learner_record_below_min_observations_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let mut learner = PatternLearner::new(&mut lib);
+
+        // Default min_observations is 3, so first 2 should return None
+        let result = learner
+            .record_decision("node", "node --watch", true)
+            .unwrap();
+        assert!(result.is_none());
+
+        let result = learner
+            .record_decision("node", "node --watch", true)
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_learner_creates_pattern_at_min_observations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let mut learner = PatternLearner::new(&mut lib);
+
+        // Record 3 decisions (default min)
+        learner
+            .record_decision("node", "node --watch", true)
+            .unwrap();
+        learner
+            .record_decision("node", "node --watch", true)
+            .unwrap();
+        let result = learner
+            .record_decision("node", "node --watch", true)
+            .unwrap();
+
+        // Should have created a pattern
+        assert!(result.is_some());
+        let name = result.unwrap();
+        assert!(name.starts_with("learned_node_"));
+    }
+
+    #[test]
+    fn test_learner_with_min_observations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let mut learner = PatternLearner::new(&mut lib).with_min_observations(1);
+
+        // With min_observations=1, first decision should create pattern
+        let result = learner
+            .record_decision("cargo", "cargo test", true)
+            .unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_learner_clear_observations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let mut learner = PatternLearner::new(&mut lib);
+
+        learner
+            .record_decision("node", "node test", true)
+            .unwrap();
+        assert_eq!(learner.observation_count("node"), 1);
+
+        learner.clear_observations("node");
+        assert_eq!(learner.observation_count("node"), 0);
+    }
+
+    #[test]
+    fn test_learner_clear_observations_nonexistent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let mut learner = PatternLearner::new(&mut lib);
+
+        // Should not panic
+        learner.clear_observations("nonexistent");
+        assert_eq!(learner.observation_count("nonexistent"), 0);
+    }
+
+    // ── PatternLearner: infer_category ──────────────────────────────
+
+    #[test]
+    fn test_infer_category_test_runners() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let learner = PatternLearner::new(&mut lib);
+
+        assert_eq!(learner.infer_category("jest"), SupervisorCategory::Ci);
+        assert_eq!(learner.infer_category("pytest"), SupervisorCategory::Ci);
+        assert_eq!(learner.infer_category("mocha"), SupervisorCategory::Ci);
+        assert_eq!(learner.infer_category("bats"), SupervisorCategory::Ci);
+        assert_eq!(
+            learner.infer_category("test-runner"),
+            SupervisorCategory::Ci
+        );
+    }
+
+    #[test]
+    fn test_infer_category_dev_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let learner = PatternLearner::new(&mut lib);
+
+        assert_eq!(
+            learner.infer_category("vite"),
+            SupervisorCategory::Orchestrator
+        );
+        assert_eq!(
+            learner.infer_category("webpack"),
+            SupervisorCategory::Orchestrator
+        );
+        assert_eq!(
+            learner.infer_category("next"),
+            SupervisorCategory::Orchestrator
+        );
+    }
+
+    #[test]
+    fn test_infer_category_agents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let learner = PatternLearner::new(&mut lib);
+
+        assert_eq!(
+            learner.infer_category("claude"),
+            SupervisorCategory::Agent
+        );
+        assert_eq!(
+            learner.infer_category("codex"),
+            SupervisorCategory::Agent
+        );
+        assert_eq!(
+            learner.infer_category("copilot"),
+            SupervisorCategory::Agent
+        );
+    }
+
+    #[test]
+    fn test_infer_category_ides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let learner = PatternLearner::new(&mut lib);
+
+        assert_eq!(learner.infer_category("code"), SupervisorCategory::Ide);
+        assert_eq!(learner.infer_category("vim"), SupervisorCategory::Ide);
+        assert_eq!(learner.infer_category("emacs"), SupervisorCategory::Ide);
+    }
+
+    #[test]
+    fn test_infer_category_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let learner = PatternLearner::new(&mut lib);
+
+        assert_eq!(learner.infer_category("nginx"), SupervisorCategory::Other);
+        assert_eq!(learner.infer_category("cargo"), SupervisorCategory::Other);
+    }
+
+    // ── PatternLearner: pattern reuse ───────────────────────────────
+
+    #[test]
+    fn test_learner_reuses_existing_pattern() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let mut learner = PatternLearner::new(&mut lib).with_min_observations(1);
+
+        // Create pattern on first decision
+        let first = learner
+            .record_decision("node", "node --watch", true)
+            .unwrap();
+        assert!(first.is_some());
+        let first_name = first.unwrap();
+
+        // Second decision should reuse the same pattern
+        let second = learner
+            .record_decision("node", "node --watch", true)
+            .unwrap();
+        assert!(second.is_some());
+        assert_eq!(second.unwrap(), first_name);
+    }
+
+    // ── PatternLearner: mixed actions select broader patterns ───────
+
+    #[test]
+    fn test_learner_mixed_actions_prefers_broader_pattern() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lib = PatternLibrary::new(dir.path());
+        let mut learner = PatternLearner::new(&mut lib).with_min_observations(3);
+
+        // Mix of kills and spares → should prefer Standard or Broad
+        learner
+            .record_decision("node", "node --watch test.js", true)
+            .unwrap();
+        learner
+            .record_decision("node", "node --watch app.js", false)
+            .unwrap();
+        let result = learner
+            .record_decision("node", "node --watch index.js", true)
+            .unwrap();
+
+        // Should create a pattern (enough observations)
+        assert!(result.is_some());
+        let name = result.unwrap();
+        // With mixed actions (66% kill), should be broad or std
+        assert!(name.contains("_broad") || name.contains("_std"));
+    }
+
+    // ── CommandNormalizer Default ────────────────────────────────────
+
+    #[test]
+    fn test_normalizer_default_trait() {
+        let n = CommandNormalizer::default();
+        // Should work identically to new()
+        assert_eq!(n.normalize_process_name("node"), "node");
+    }
+
+    // ── LearningError ───────────────────────────────────────────────
+
+    #[test]
+    fn test_learning_error_display() {
+        let err = LearningError::InvalidCommand("empty".to_string());
+        assert!(err.to_string().contains("Invalid command"));
+
+        let err = LearningError::PatternCompilation("bad regex".to_string());
+        assert!(err.to_string().contains("Pattern compilation"));
+    }
 }
