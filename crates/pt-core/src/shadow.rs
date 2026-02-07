@@ -350,7 +350,12 @@ fn resolve_data_dir_override() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Mutex to serialize tests that manipulate PROCESS_TRIAGE_DATA env var.
+    /// Without this, parallel tests race on set_var/remove_var causing flaky failures.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn identity_hash_is_stable_and_short() {
@@ -413,6 +418,7 @@ mod tests {
 
     #[test]
     fn missing_entries_emit_exit_event() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().expect("temp dir");
         let old_env = std::env::var("PROCESS_TRIAGE_DATA").ok();
         std::env::set_var("PROCESS_TRIAGE_DATA", temp_dir.path());
@@ -809,6 +815,7 @@ mod tests {
 
     #[test]
     fn resolve_data_dir_from_process_triage_data() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
         std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
@@ -826,6 +833,7 @@ mod tests {
 
     #[test]
     fn recorder_starts_with_zero_count() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
         std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
@@ -841,6 +849,7 @@ mod tests {
 
     #[test]
     fn recorder_record_candidate_increments_count() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
         std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
@@ -872,6 +881,7 @@ mod tests {
 
     #[test]
     fn recorder_flush_persists_pending() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
         std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
@@ -893,6 +903,7 @@ mod tests {
 
     #[test]
     fn recorder_seen_identity_resets_miss_count() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
         std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
@@ -927,6 +938,7 @@ mod tests {
 
     #[test]
     fn recorder_pid_reuse_detected() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
         std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
@@ -957,6 +969,7 @@ mod tests {
 
     #[test]
     fn recorder_no_records_skips_outcomes() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
         std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
@@ -982,6 +995,7 @@ mod tests {
 
     #[test]
     fn shadow_config_uses_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         let old = std::env::var("PROCESS_TRIAGE_DATA").ok();
         std::env::set_var("PROCESS_TRIAGE_DATA", dir.path());
