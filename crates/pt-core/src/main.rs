@@ -28,7 +28,7 @@ use pt_core::exit_codes::ExitCode;
 use pt_core::fleet::discovery::{
     FleetDiscoveryConfig, InventoryProvider, ProviderRegistry, StaticInventoryProvider,
 };
-use pt_core::fleet::ssh_scan::{ssh_scan_fleet, scan_result_to_host_input, SshScanConfig};
+use pt_core::fleet::ssh_scan::{scan_result_to_host_input, ssh_scan_fleet, SshScanConfig};
 #[cfg(feature = "ui")]
 use pt_core::inference::galaxy_brain::{
     render as render_galaxy_brain, GalaxyBrainConfig, MathMode, Verbosity,
@@ -70,9 +70,10 @@ use pt_telemetry::shadow::{Observation, ShadowStorage, ShadowStorageConfig};
 use pt_telemetry::writer::default_telemetry_dir;
 #[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(feature = "ui")]
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -688,6 +689,8 @@ enum AgentFleetCommands {
     Report(AgentFleetReportArgs),
     /// Show fleet session status
     Status(AgentFleetStatusArgs),
+    /// Transfer learning data (priors + signatures) between hosts
+    Transfer(AgentFleetTransferArgs),
 }
 
 #[derive(Args, Debug)]
@@ -768,6 +771,87 @@ struct AgentFleetStatusArgs {
     /// Fleet session ID
     #[arg(long)]
     fleet_session: String,
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetTransferArgs {
+    #[command(subcommand)]
+    command: AgentFleetTransferCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentFleetTransferCommands {
+    /// Export priors and signatures as a transfer bundle
+    Export(AgentFleetTransferExportArgs),
+    /// Import a transfer bundle (priors + signatures)
+    Import(AgentFleetTransferImportArgs),
+    /// Show diff between local state and an incoming bundle
+    Diff(AgentFleetTransferDiffArgs),
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetTransferExportArgs {
+    /// Output path (.json or .ptb)
+    #[arg(short, long)]
+    out: String,
+
+    /// Tag export with host profile name
+    #[arg(long)]
+    host_profile: Option<String>,
+
+    /// Include signatures in bundle
+    #[arg(long, default_value = "true")]
+    include_signatures: bool,
+
+    /// Include priors in bundle
+    #[arg(long, default_value = "true")]
+    include_priors: bool,
+
+    /// Redaction profile (minimal|safe|forensic)
+    #[arg(long)]
+    export_profile: Option<String>,
+
+    /// Passphrase for .ptb encryption
+    #[arg(long)]
+    passphrase: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetTransferImportArgs {
+    /// Input bundle path (.json or .ptb)
+    #[arg(long)]
+    from: String,
+
+    /// Merge strategy: weighted, replace, keep-local
+    #[arg(long)]
+    merge_strategy: Option<String>,
+
+    /// Show what would change without modifying
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Skip backup of existing priors
+    #[arg(long)]
+    no_backup: bool,
+
+    /// Passphrase for .ptb decryption
+    #[arg(long)]
+    passphrase: Option<String>,
+
+    /// Normalize incoming priors using baseline stats
+    #[arg(long)]
+    normalize_baseline: bool,
+}
+
+#[derive(Args, Debug)]
+struct AgentFleetTransferDiffArgs {
+    /// Path to incoming transfer bundle
+    #[arg(long)]
+    from: String,
+
+    /// Passphrase for .ptb decryption
+    #[arg(long)]
+    passphrase: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1709,7 +1793,10 @@ mod output_format_tests {
         assert_eq!(parse_output_format("summary"), Some(OutputFormat::Summary));
         assert_eq!(parse_output_format("metrics"), Some(OutputFormat::Metrics));
         assert_eq!(parse_output_format("slack"), Some(OutputFormat::Slack));
-        assert_eq!(parse_output_format("exitcode"), Some(OutputFormat::Exitcode));
+        assert_eq!(
+            parse_output_format("exitcode"),
+            Some(OutputFormat::Exitcode)
+        );
         assert_eq!(parse_output_format("prose"), Some(OutputFormat::Prose));
     }
 
@@ -1719,8 +1806,14 @@ mod output_format_tests {
         assert_eq!(parse_output_format("lines"), Some(OutputFormat::Jsonl));
         assert_eq!(parse_output_format("json_lines"), Some(OutputFormat::Jsonl));
         assert_eq!(parse_output_format("brief"), Some(OutputFormat::Summary));
-        assert_eq!(parse_output_format("key-value"), Some(OutputFormat::Metrics));
-        assert_eq!(parse_output_format("exit-code"), Some(OutputFormat::Exitcode));
+        assert_eq!(
+            parse_output_format("key-value"),
+            Some(OutputFormat::Metrics)
+        );
+        assert_eq!(
+            parse_output_format("exit-code"),
+            Some(OutputFormat::Exitcode)
+        );
         assert_eq!(parse_output_format("narrative"), Some(OutputFormat::Prose));
     }
 
@@ -2929,7 +3022,8 @@ fn build_goal_plan_from_candidates(
                 let opt_candidates = build_opt_candidates_for_goals(candidates, &goals);
                 let result = optimize_ilp(&opt_candidates, &goals);
                 let achieved = result
-                    .goal_achievement.first()
+                    .goal_achievement
+                    .first()
                     .map(|g| {
                         if g.target > 0.0 {
                             g.achieved / g.target
@@ -3881,6 +3975,7 @@ fn run_agent_fleet(global: &GlobalOpts, args: &AgentFleetArgs) -> ExitCode {
         AgentFleetCommands::Apply(args) => run_agent_fleet_apply(global, args),
         AgentFleetCommands::Report(args) => run_agent_fleet_report(global, args),
         AgentFleetCommands::Status(args) => run_agent_fleet_status(global, args),
+        AgentFleetCommands::Transfer(args) => run_agent_fleet_transfer(global, args),
     }
 }
 
@@ -4043,8 +4138,7 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
 
     // Persist fleet session to disk
     let persist_result = (|| -> Result<PathBuf, String> {
-        let store = SessionStore::from_env()
-            .map_err(|e| format!("session store error: {}", e))?;
+        let store = SessionStore::from_env().map_err(|e| format!("session store error: {}", e))?;
         let manifest = SessionManifest::new(
             &fleet_session_id,
             None,
@@ -4138,8 +4232,7 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
 fn load_fleet_session(
     fleet_session_id: &str,
 ) -> Result<(pt_core::session::fleet::FleetSession, PathBuf), String> {
-    let store =
-        SessionStore::from_env().map_err(|e| format!("session store error: {}", e))?;
+    let store = SessionStore::from_env().map_err(|e| format!("session store error: {}", e))?;
     let sid = SessionId(fleet_session_id.to_string());
     let handle = store
         .open(&sid)
@@ -4230,18 +4323,430 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
                 fleet.safety_budget.pooled_fdr.rejected_kills,
             );
             println!();
-            println!("Note: Remote execution not yet implemented. Use --format json for full details.");
+            println!(
+                "Note: Remote execution not yet implemented. Use --format json for full details."
+            );
         }
     }
 
     ExitCode::Clean
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FleetReportProfile {
+    Minimal,
+    Safe,
+    Forensic,
+}
+
+impl FleetReportProfile {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "minimal" => Ok(Self::Minimal),
+            "safe" => Ok(Self::Safe),
+            "forensic" => Ok(Self::Forensic),
+            other => Err(format!(
+                "invalid --profile '{}'. Use one of: minimal, safe, forensic",
+                other
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Safe => "safe",
+            Self::Forensic => "forensic",
+        }
+    }
+}
+
+fn deterministic_token(prefix: &str, raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    let hex = hex::encode(digest);
+    format!("{}{}", prefix, &hex[..12])
+}
+
+fn redact_host_id_for_profile(host_id: &str, profile: FleetReportProfile) -> String {
+    match profile {
+        FleetReportProfile::Forensic => host_id.to_string(),
+        FleetReportProfile::Minimal | FleetReportProfile::Safe => {
+            deterministic_token("host_", host_id)
+        }
+    }
+}
+
+fn redact_signature_for_profile(signature: &str, profile: FleetReportProfile) -> String {
+    match profile {
+        FleetReportProfile::Forensic | FleetReportProfile::Safe => signature.to_string(),
+        FleetReportProfile::Minimal => deterministic_token("sig_", signature),
+    }
+}
+
+fn ordered_u32_map(input: &HashMap<String, u32>) -> BTreeMap<String, u32> {
+    input.iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
+
+fn redacted_f64_map(
+    input: &HashMap<String, f64>,
+    profile: FleetReportProfile,
+) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    for (host_id, value) in input {
+        let redacted = redact_host_id_for_profile(host_id, profile);
+        out.insert(redacted, *value);
+    }
+    out
+}
+
+fn redacted_u32_map(
+    input: &HashMap<String, u32>,
+    profile: FleetReportProfile,
+) -> BTreeMap<String, u32> {
+    let mut out = BTreeMap::new();
+    for (host_id, value) in input {
+        let redacted = redact_host_id_for_profile(host_id, profile);
+        *out.entry(redacted).or_insert(0) += *value;
+    }
+    out
+}
+
+fn build_safety_budget_report(
+    budget: &pt_core::session::fleet::SafetyBudget,
+    profile: FleetReportProfile,
+) -> serde_json::Value {
+    serde_json::json!({
+        "max_fdr": budget.max_fdr,
+        "alpha_spent": budget.alpha_spent,
+        "alpha_remaining": budget.alpha_remaining,
+        "host_allocations": redacted_f64_map(&budget.host_allocations, profile),
+        "pooled_fdr": {
+            "method": budget.pooled_fdr.method,
+            "alpha": budget.pooled_fdr.alpha,
+            "total_kill_candidates": budget.pooled_fdr.total_kill_candidates,
+            "selected_kills": budget.pooled_fdr.selected_kills,
+            "rejected_kills": budget.pooled_fdr.rejected_kills,
+            "selection_threshold": budget.pooled_fdr.selection_threshold,
+            "correction_factor": budget.pooled_fdr.correction_factor,
+            "selected_by_host": redacted_u32_map(&budget.pooled_fdr.selected_by_host, profile),
+            "rejected_by_host": redacted_u32_map(&budget.pooled_fdr.rejected_by_host, profile),
+        }
+    })
+}
+
+fn mean_std(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance =
+        values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / values.len() as f64;
+    (mean, variance.sqrt())
+}
+
+fn build_fleet_top_offenders(
+    fleet: &pt_core::session::fleet::FleetSession,
+    profile: FleetReportProfile,
+) -> Vec<serde_json::Value> {
+    let mut patterns = fleet.aggregate.recurring_patterns.clone();
+    patterns.sort_by(|a, b| {
+        b.total_instances
+            .cmp(&a.total_instances)
+            .then_with(|| b.host_count.cmp(&a.host_count))
+            .then_with(|| a.signature.cmp(&b.signature))
+            .then_with(|| a.dominant_action.cmp(&b.dominant_action))
+    });
+
+    patterns
+        .into_iter()
+        .enumerate()
+        .map(|(idx, p)| {
+            let mut hosts: Vec<String> = p
+                .hosts
+                .iter()
+                .map(|h| redact_host_id_for_profile(h, profile))
+                .collect();
+            hosts.sort();
+            hosts.dedup();
+            serde_json::json!({
+                "rank": idx + 1,
+                "signature": redact_signature_for_profile(&p.signature, profile),
+                "host_count": p.host_count,
+                "total_instances": p.total_instances,
+                "dominant_action": p.dominant_action,
+                "hosts": hosts,
+            })
+        })
+        .collect()
+}
+
+fn build_host_comparison(
+    fleet: &pt_core::session::fleet::FleetSession,
+    profile: FleetReportProfile,
+) -> Vec<serde_json::Value> {
+    let mut rows: Vec<serde_json::Value> = fleet
+        .hosts
+        .iter()
+        .map(|h| {
+            let process_count = h.process_count.max(1);
+            let candidate_count = h.candidate_count;
+            let kill_count = *h.summary.action_counts.get("kill").unwrap_or(&0);
+            let candidate_density = candidate_count as f64 / process_count as f64;
+            let kill_rate = if candidate_count == 0 {
+                0.0
+            } else {
+                kill_count as f64 / candidate_count as f64
+            };
+            let risk_index =
+                candidate_density * 100.0 + h.summary.mean_candidate_score * 10.0 + kill_rate * 5.0;
+            let risk_tier = if risk_index >= 35.0 {
+                "high"
+            } else if risk_index >= 15.0 {
+                "medium"
+            } else {
+                "low"
+            };
+            serde_json::json!({
+                "host_id": redact_host_id_for_profile(&h.host_id, profile),
+                "process_count": h.process_count,
+                "candidate_count": h.candidate_count,
+                "candidate_density": candidate_density,
+                "mean_candidate_score": h.summary.mean_candidate_score,
+                "max_candidate_score": h.summary.max_candidate_score,
+                "kill_count": kill_count,
+                "kill_rate": kill_rate,
+                "risk_index": risk_index,
+                "risk_tier": risk_tier,
+                "class_counts": ordered_u32_map(&h.summary.class_counts),
+                "action_counts": ordered_u32_map(&h.summary.action_counts),
+            })
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        b["risk_index"]
+            .as_f64()
+            .partial_cmp(&a["risk_index"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b["candidate_count"]
+                    .as_u64()
+                    .cmp(&a["candidate_count"].as_u64())
+            })
+            .then_with(|| {
+                a["host_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["host_id"].as_str().unwrap_or(""))
+            })
+    });
+
+    for (idx, row) in rows.iter_mut().enumerate() {
+        row["rank"] = serde_json::json!(idx + 1);
+    }
+
+    rows
+}
+
+fn build_cross_host_anomalies(
+    fleet: &pt_core::session::fleet::FleetSession,
+    profile: FleetReportProfile,
+) -> serde_json::Value {
+    let mut candidate_counts = Vec::with_capacity(fleet.hosts.len());
+    let mut candidate_densities = Vec::with_capacity(fleet.hosts.len());
+    let mut mean_scores = Vec::with_capacity(fleet.hosts.len());
+    let mut kill_rates = Vec::with_capacity(fleet.hosts.len());
+
+    for h in &fleet.hosts {
+        let process_count = h.process_count.max(1);
+        let kill_count = *h.summary.action_counts.get("kill").unwrap_or(&0);
+        let density = h.candidate_count as f64 / process_count as f64;
+        let kill_rate = if h.candidate_count == 0 {
+            0.0
+        } else {
+            kill_count as f64 / h.candidate_count as f64
+        };
+        candidate_counts.push(h.candidate_count as f64);
+        candidate_densities.push(density);
+        mean_scores.push(h.summary.mean_candidate_score);
+        kill_rates.push(kill_rate);
+    }
+
+    let (count_mean, count_std) = mean_std(&candidate_counts);
+    let (density_mean, density_std) = mean_std(&candidate_densities);
+    let (score_mean, score_std) = mean_std(&mean_scores);
+    let (kill_mean, kill_std) = mean_std(&kill_rates);
+    let threshold_z = 1.5f64;
+
+    let mut host_outliers: Vec<serde_json::Value> = Vec::new();
+    for h in &fleet.hosts {
+        let process_count = h.process_count.max(1);
+        let kill_count = *h.summary.action_counts.get("kill").unwrap_or(&0);
+        let density = h.candidate_count as f64 / process_count as f64;
+        let kill_rate = if h.candidate_count == 0 {
+            0.0
+        } else {
+            kill_count as f64 / h.candidate_count as f64
+        };
+
+        let z_count = if count_std > 0.0 {
+            (h.candidate_count as f64 - count_mean) / count_std
+        } else {
+            0.0
+        };
+        let z_density = if density_std > 0.0 {
+            (density - density_mean) / density_std
+        } else {
+            0.0
+        };
+        let z_score = if score_std > 0.0 {
+            (h.summary.mean_candidate_score - score_mean) / score_std
+        } else {
+            0.0
+        };
+        let z_kill_rate = if kill_std > 0.0 {
+            (kill_rate - kill_mean) / kill_std
+        } else {
+            0.0
+        };
+
+        let mut signals = Vec::new();
+        if z_count >= threshold_z {
+            signals.push(serde_json::json!({
+                "metric": "candidate_count",
+                "value": h.candidate_count,
+                "z_score": z_count,
+            }));
+        }
+        if z_density >= threshold_z {
+            signals.push(serde_json::json!({
+                "metric": "candidate_density",
+                "value": density,
+                "z_score": z_density,
+            }));
+        }
+        if z_score >= threshold_z {
+            signals.push(serde_json::json!({
+                "metric": "mean_candidate_score",
+                "value": h.summary.mean_candidate_score,
+                "z_score": z_score,
+            }));
+        }
+        if z_kill_rate >= threshold_z {
+            signals.push(serde_json::json!({
+                "metric": "kill_rate",
+                "value": kill_rate,
+                "z_score": z_kill_rate,
+            }));
+        }
+        if signals.is_empty() {
+            continue;
+        }
+
+        let max_z = [z_count, z_density, z_score, z_kill_rate]
+            .into_iter()
+            .fold(0.0f64, f64::max);
+        host_outliers.push(serde_json::json!({
+            "host_id": redact_host_id_for_profile(&h.host_id, profile),
+            "signal_count": signals.len(),
+            "max_z_score": max_z,
+            "signals": signals,
+        }));
+    }
+
+    host_outliers.sort_by(|a, b| {
+        b["signal_count"]
+            .as_u64()
+            .cmp(&a["signal_count"].as_u64())
+            .then_with(|| {
+                b["max_z_score"]
+                    .as_f64()
+                    .partial_cmp(&a["max_z_score"].as_f64())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a["host_id"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["host_id"].as_str().unwrap_or(""))
+            })
+    });
+
+    let mut pattern_hotspots: Vec<serde_json::Value> = fleet
+        .aggregate
+        .recurring_patterns
+        .iter()
+        .filter(|p| p.host_count > 1)
+        .map(|p| {
+            serde_json::json!({
+                "signature": redact_signature_for_profile(&p.signature, profile),
+                "host_count": p.host_count,
+                "total_instances": p.total_instances,
+                "dominant_action": p.dominant_action,
+            })
+        })
+        .collect();
+    pattern_hotspots.sort_by(|a, b| {
+        b["host_count"]
+            .as_u64()
+            .cmp(&a["host_count"].as_u64())
+            .then_with(|| {
+                b["total_instances"]
+                    .as_u64()
+                    .cmp(&a["total_instances"].as_u64())
+            })
+            .then_with(|| {
+                a["signature"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["signature"].as_str().unwrap_or(""))
+            })
+    });
+
+    serde_json::json!({
+        "threshold_z_score": threshold_z,
+        "host_outliers": host_outliers,
+        "pattern_hotspots": pattern_hotspots,
+    })
+}
+
+fn write_report_output_file(path: &str, rendered: &str) -> Result<(), String> {
+    let out_path = PathBuf::from(path);
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create output directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    std::fs::write(&out_path, rendered).map_err(|e| {
+        format!(
+            "failed to write report output {}: {}",
+            out_path.display(),
+            e
+        )
+    })
+}
+
 fn run_agent_fleet_report(global: &GlobalOpts, args: &AgentFleetReportArgs) -> ExitCode {
+    let profile = match FleetReportProfile::parse(&args.profile) {
+        Ok(p) => p,
+        Err(e) => return output_agent_error(global, "fleet report", &e),
+    };
+
     let (fleet, session_dir) = match load_fleet_session(&args.fleet_session) {
         Ok(f) => f,
         Err(e) => return output_agent_error(global, "fleet report", &e),
     };
+
+    let top_offenders = build_fleet_top_offenders(&fleet, profile);
+    let host_comparison = build_host_comparison(&fleet, profile);
+    let cross_host_anomalies = build_cross_host_anomalies(&fleet, profile);
+    let safety_budget = build_safety_budget_report(&fleet.safety_budget, profile);
 
     let response = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -4250,63 +4755,103 @@ fn run_agent_fleet_report(global: &GlobalOpts, args: &AgentFleetReportArgs) -> E
         "command": "agent fleet report",
         "session_dir": session_dir.display().to_string(),
         "report": {
+            "profile": profile.as_str(),
             "created_at": fleet.created_at,
             "label": fleet.label,
-            "aggregate": fleet.aggregate,
-            "safety_budget": fleet.safety_budget,
-            "hosts": fleet.hosts.iter().map(|h| {
-                serde_json::json!({
-                    "host_id": h.host_id,
-                    "process_count": h.process_count,
-                    "candidate_count": h.candidate_count,
-                    "summary": h.summary,
-                })
-            }).collect::<Vec<_>>(),
+            "aggregate": {
+                "total_hosts": fleet.aggregate.total_hosts,
+                "total_processes": fleet.aggregate.total_processes,
+                "total_candidates": fleet.aggregate.total_candidates,
+                "class_counts": ordered_u32_map(&fleet.aggregate.class_counts),
+                "action_counts": ordered_u32_map(&fleet.aggregate.action_counts),
+                "mean_candidate_score": fleet.aggregate.mean_candidate_score,
+                "max_candidate_score": fleet.aggregate.max_candidate_score,
+                "recurring_patterns": top_offenders.clone(),
+            },
+            "safety_budget": safety_budget,
+            "hosts": host_comparison.clone(),
+            "top_offenders": top_offenders,
+            "host_comparison": host_comparison,
+            "cross_host_anomalies": cross_host_anomalies,
         },
     });
 
-    match global.format {
+    let rendered_for_file = match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
-            println!("{}", format_structured_output(global, response));
+            let rendered = format_structured_output(global, response.clone());
+            println!("{}", rendered);
+            Some(rendered)
         }
-        OutputFormat::Exitcode => {}
+        OutputFormat::Exitcode => Some(serde_json::to_string_pretty(&response).unwrap_or_default()),
         _ => {
             println!("# Fleet Report: {}", fleet.fleet_session_id);
             if let Some(label) = &fleet.label {
                 println!("Label: {}", label);
             }
             println!("Created: {}", fleet.created_at);
+            println!("Profile: {}", profile.as_str());
             println!();
             println!("## Aggregate");
             println!("  Hosts:      {}", fleet.aggregate.total_hosts);
             println!("  Processes:  {}", fleet.aggregate.total_processes);
             println!("  Candidates: {}", fleet.aggregate.total_candidates);
-            println!(
-                "  Mean score: {:.3}",
-                fleet.aggregate.mean_candidate_score
-            );
-            println!(
-                "  Max score:  {:.3}",
-                fleet.aggregate.max_candidate_score
-            );
+            println!("  Mean score: {:.3}", fleet.aggregate.mean_candidate_score);
+            println!("  Max score:  {:.3}", fleet.aggregate.max_candidate_score);
             println!();
-            if !fleet.aggregate.recurring_patterns.is_empty() {
-                println!("## Recurring Patterns");
-                for p in &fleet.aggregate.recurring_patterns {
-                    println!(
-                        "  {} — {} hosts, {} instances (action: {})",
-                        p.signature, p.host_count, p.total_instances, p.dominant_action
-                    );
-                }
-                println!();
-            }
-            println!("## Per-Host Summary");
-            for h in &fleet.hosts {
+            println!("## Top Offenders");
+            for offender in response["report"]["top_offenders"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(8)
+            {
                 println!(
-                    "  {} — {} processes, {} candidates",
-                    h.host_id, h.process_count, h.candidate_count
+                    "  #{} {} — {} hosts, {} instances (action: {})",
+                    offender["rank"].as_u64().unwrap_or(0),
+                    offender["signature"].as_str().unwrap_or("?"),
+                    offender["host_count"].as_u64().unwrap_or(0),
+                    offender["total_instances"].as_u64().unwrap_or(0),
+                    offender["dominant_action"].as_str().unwrap_or("?"),
                 );
             }
+            println!();
+            println!("## Per-Host Comparison");
+            for host in response["report"]["host_comparison"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(12)
+            {
+                println!(
+                    "  #{} {} — {} candidates / {} processes (risk: {}, index {:.2})",
+                    host["rank"].as_u64().unwrap_or(0),
+                    host["host_id"].as_str().unwrap_or("?"),
+                    host["candidate_count"].as_u64().unwrap_or(0),
+                    host["process_count"].as_u64().unwrap_or(0),
+                    host["risk_tier"].as_str().unwrap_or("?"),
+                    host["risk_index"].as_f64().unwrap_or(0.0),
+                );
+            }
+            println!();
+            let outliers = response["report"]["cross_host_anomalies"]["host_outliers"]
+                .as_array()
+                .map(|arr| arr.len())
+                .unwrap_or(0);
+            println!(
+                "## Cross-Host Anomalies\n  Outlier hosts: {} (z-score threshold {:.1})",
+                outliers,
+                response["report"]["cross_host_anomalies"]["threshold_z_score"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+            );
+
+            Some(serde_json::to_string_pretty(&response).unwrap_or_default())
+        }
+    };
+
+    if let (Some(path), Some(rendered)) = (args.out.as_deref(), rendered_for_file.as_deref()) {
+        if let Err(err) = write_report_output_file(path, rendered) {
+            return output_agent_error(global, "fleet report", &err);
         }
     }
 
@@ -4375,6 +4920,559 @@ fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> E
                 fleet.safety_budget.pooled_fdr.selected_kills,
                 fleet.safety_budget.pooled_fdr.rejected_kills
             );
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_agent_fleet_transfer(global: &GlobalOpts, args: &AgentFleetTransferArgs) -> ExitCode {
+    match &args.command {
+        AgentFleetTransferCommands::Export(a) => run_agent_fleet_transfer_export(global, a),
+        AgentFleetTransferCommands::Import(a) => run_agent_fleet_transfer_import(global, a),
+        AgentFleetTransferCommands::Diff(a) => run_agent_fleet_transfer_diff(global, a),
+    }
+}
+
+fn run_agent_fleet_transfer_export(
+    global: &GlobalOpts,
+    args: &AgentFleetTransferExportArgs,
+) -> ExitCode {
+    use pt_core::fleet::transfer::export_bundle;
+    use pt_core::supervision::pattern_persistence::{
+        PatternLibrary, PatternSource, PersistedSchema,
+    };
+
+    let host_id = pt_core::logging::get_host_id();
+
+    let options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        priors_path: None,
+        policy_path: None,
+    };
+
+    let config = match load_config(&options) {
+        Ok(c) => c,
+        Err(e) => return output_config_error(global, &e),
+    };
+
+    let priors_opt = if args.include_priors {
+        Some(&config.priors)
+    } else {
+        None
+    };
+
+    let signatures_opt: Option<PersistedSchema> = if args.include_signatures {
+        let config_dir = global
+            .config
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| dirs::config_dir().map(|d| d.join("process_triage")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut lib = PatternLibrary::new(&config_dir);
+        if lib.load().is_ok() {
+            Some(lib.export(&[
+                PatternSource::Learned,
+                PatternSource::Custom,
+                PatternSource::Imported,
+            ]))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let bundle = match export_bundle(
+        priors_opt,
+        signatures_opt.as_ref(),
+        None,
+        &host_id,
+        args.host_profile.as_deref(),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            return output_agent_error(global, "fleet transfer export", &e.to_string());
+        }
+    };
+
+    let out_path = PathBuf::from(&args.out);
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "fleet transfer export: failed to create {}: {}",
+                    parent.display(),
+                    err
+                );
+                return ExitCode::IoError;
+            }
+        }
+    }
+
+    let is_ptb = out_path.extension().map(|e| e == "ptb").unwrap_or(false);
+
+    if is_ptb {
+        use pt_bundle::{BundleWriter, FileType};
+        use pt_redact::ExportProfile;
+
+        let json_bytes = match serde_json::to_vec_pretty(&bundle) {
+            Ok(b) => b,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer export", &e.to_string());
+            }
+        };
+        let export_profile = match args.export_profile.as_deref() {
+            Some("minimal") => ExportProfile::Minimal,
+            Some("forensic") => ExportProfile::Forensic,
+            _ => ExportProfile::Safe,
+        };
+        let mut writer = BundleWriter::new("transfer", &host_id, export_profile)
+            .with_description("Fleet transfer bundle");
+        writer.add_file("transfer_bundle.json", json_bytes, Some(FileType::Json));
+
+        let passphrase = args
+            .passphrase
+            .clone()
+            .or_else(|| std::env::var("PT_BUNDLE_PASSPHRASE").ok());
+
+        let result = if let Some(ref pass) = passphrase {
+            writer.write_encrypted(&out_path, pass)
+        } else {
+            writer.write(&out_path)
+        };
+
+        if let Err(e) = result {
+            return output_agent_error(global, "fleet transfer export", &e.to_string());
+        }
+    } else {
+        let tmp_path = out_path.with_extension("json.tmp");
+        let payload = match serde_json::to_vec_pretty(&bundle) {
+            Ok(b) => b,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer export", &e.to_string());
+            }
+        };
+        if let Err(e) = std::fs::write(&tmp_path, &payload) {
+            eprintln!("fleet transfer export: write failed: {}", e);
+            return ExitCode::IoError;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
+            eprintln!("fleet transfer export: rename failed: {}", e);
+            return ExitCode::IoError;
+        }
+    }
+
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "command": "agent fleet transfer export",
+        "exported": true,
+        "path": out_path.display().to_string(),
+        "host_id": host_id,
+        "host_profile": args.host_profile,
+        "include_priors": args.include_priors,
+        "include_signatures": args.include_signatures,
+        "format": if is_ptb { "ptb" } else { "json" },
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Jsonl => {
+            println!("{}", serde_json::to_string(&response).unwrap());
+        }
+        _ => {
+            println!("Exported transfer bundle to: {}", out_path.display());
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_agent_fleet_transfer_import(
+    global: &GlobalOpts,
+    args: &AgentFleetTransferImportArgs,
+) -> ExitCode {
+    use pt_core::fleet::transfer::{
+        compute_diff, merge_priors, normalize_baseline, validate_bundle, MergeStrategy,
+        TransferBundle,
+    };
+    use pt_core::supervision::pattern_persistence::{ConflictResolution, PatternLibrary};
+
+    let input_path = PathBuf::from(&args.from);
+    let is_ptb = input_path.extension().map(|e| e == "ptb").unwrap_or(false);
+
+    let bundle: TransferBundle = if is_ptb {
+        use pt_bundle::BundleReader;
+
+        let passphrase = args
+            .passphrase
+            .clone()
+            .or_else(|| std::env::var("PT_BUNDLE_PASSPHRASE").ok());
+
+        let mut reader =
+            match BundleReader::open_with_passphrase(&input_path, passphrase.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    return output_agent_error(global, "fleet transfer import", &e.to_string());
+                }
+            };
+
+        let data = match reader.read_verified("transfer_bundle.json") {
+            Ok(d) => d,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            }
+        };
+        match serde_json::from_slice(&data) {
+            Ok(b) => b,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            }
+        }
+    } else {
+        let data = match std::fs::read_to_string(&input_path) {
+            Ok(d) => d,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            }
+        };
+        match serde_json::from_str(&data) {
+            Ok(b) => b,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            }
+        }
+    };
+
+    let warnings = match validate_bundle(&bundle) {
+        Ok(w) => w,
+        Err(e) => {
+            return output_agent_error(global, "fleet transfer import", &e.to_string());
+        }
+    };
+
+    let strategy: MergeStrategy = args
+        .merge_strategy
+        .as_deref()
+        .unwrap_or("weighted")
+        .parse()
+        .unwrap_or(MergeStrategy::Weighted);
+
+    let options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        priors_path: None,
+        policy_path: None,
+    };
+    let config = match load_config(&options) {
+        Ok(c) => c,
+        Err(e) => return output_config_error(global, &e),
+    };
+
+    let merged_priors = if let Some(ref incoming_priors) = bundle.priors {
+        let mut incoming = incoming_priors.clone();
+        if args.normalize_baseline {
+            if let Some(ref source_stats) = bundle.baseline_stats {
+                let target_stats = pt_core::fleet::transfer::BaselineStats {
+                    total_processes_seen: 5000,
+                    observation_window_hours: 72.0,
+                    class_distribution: std::collections::BTreeMap::new(),
+                    mean_cpu_utilization: 50.0,
+                    host_type: None,
+                };
+                normalize_baseline(&mut incoming, source_stats, &target_stats);
+            }
+        }
+        match merge_priors(&config.priors, &incoming, strategy) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            }
+        }
+    } else {
+        None
+    };
+
+    let diff = compute_diff(Some(&config.priors), None, &bundle);
+
+    if args.dry_run {
+        let response = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "command": "agent fleet transfer import",
+            "dry_run": true,
+            "strategy": format!("{:?}", strategy),
+            "source": input_path.display().to_string(),
+            "source_host_id": bundle.source_host_id,
+            "warnings": warnings,
+            "diff": {
+                "priors_changes": diff.priors_changes.len(),
+                "signature_changes": diff.signature_changes.len(),
+                "details": diff,
+            },
+        });
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                println!("{}", format_structured_output(global, response));
+            }
+            _ => {
+                println!("Dry run — no changes applied.");
+                println!(
+                    "Source: {} (host {})",
+                    input_path.display(),
+                    bundle.source_host_id
+                );
+                println!("Strategy: {:?}", strategy);
+                println!("Prior changes: {}", diff.priors_changes.len());
+                println!("Signature changes: {}", diff.signature_changes.len());
+                if !warnings.is_empty() {
+                    println!("Warnings:");
+                    for w in &warnings {
+                        println!("  [{}] {}", w.code, w.message);
+                    }
+                }
+            }
+        }
+        return ExitCode::Clean;
+    }
+
+    if let Some(ref final_priors) = merged_priors {
+        let priors_path = config.snapshot().priors_path.unwrap_or_else(|| {
+            global
+                .config
+                .as_ref()
+                .map(|c| PathBuf::from(c).join("priors.json"))
+                .unwrap_or_else(|| {
+                    dirs::config_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("pt")
+                        .join("priors.json")
+                })
+        });
+
+        if !args.no_backup && priors_path.exists() {
+            let backup = priors_path.with_extension("json.bak");
+            if let Err(e) = std::fs::copy(&priors_path, &backup) {
+                eprintln!("warning: failed to create backup: {}", e);
+            }
+        }
+
+        if let Some(parent) = priors_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let tmp = priors_path.with_extension("json.tmp");
+        match serde_json::to_vec_pretty(final_priors) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(&tmp, &bytes) {
+                    eprintln!("fleet transfer import: write failed: {}", e);
+                    return ExitCode::IoError;
+                }
+                if let Err(e) = std::fs::rename(&tmp, &priors_path) {
+                    eprintln!("fleet transfer import: rename failed: {}", e);
+                    return ExitCode::IoError;
+                }
+            }
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            }
+        }
+    }
+
+    let sig_result = if let Some(ref incoming_sigs) = bundle.signatures {
+        let config_dir = global
+            .config
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| dirs::config_dir().map(|d| d.join("process_triage")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut lib = PatternLibrary::new(&config_dir);
+        let _ = lib.load();
+
+        let resolution = match strategy {
+            MergeStrategy::Replace => ConflictResolution::ReplaceWithImported,
+            MergeStrategy::KeepLocal => ConflictResolution::KeepExisting,
+            MergeStrategy::Weighted => ConflictResolution::KeepHigherConfidence,
+        };
+
+        match lib.import(incoming_sigs.clone(), resolution) {
+            Ok(result) => {
+                let _ = lib.save();
+                Some(serde_json::json!({
+                    "imported": result.imported,
+                    "updated": result.updated,
+                    "skipped": result.skipped,
+                    "conflicts": result.conflicts.len(),
+                }))
+            }
+            Err(e) => {
+                eprintln!("warning: signature import failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "command": "agent fleet transfer import",
+        "imported": true,
+        "source": input_path.display().to_string(),
+        "source_host_id": bundle.source_host_id,
+        "strategy": format!("{:?}", strategy),
+        "priors_merged": merged_priors.is_some(),
+        "signatures": sig_result,
+        "warnings": warnings,
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Jsonl => {
+            println!("{}", serde_json::to_string(&response).unwrap());
+        }
+        _ => {
+            println!(
+                "Imported transfer bundle from {} (strategy: {:?})",
+                input_path.display(),
+                strategy
+            );
+            if merged_priors.is_some() {
+                println!("  Priors: merged");
+            }
+            if let Some(ref sr) = sig_result {
+                println!("  Signatures: {}", sr);
+            }
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn run_agent_fleet_transfer_diff(
+    global: &GlobalOpts,
+    args: &AgentFleetTransferDiffArgs,
+) -> ExitCode {
+    use pt_core::fleet::transfer::{compute_diff, validate_bundle, TransferBundle};
+
+    let input_path = PathBuf::from(&args.from);
+    let is_ptb = input_path.extension().map(|e| e == "ptb").unwrap_or(false);
+
+    let bundle: TransferBundle = if is_ptb {
+        use pt_bundle::BundleReader;
+
+        let passphrase = args
+            .passphrase
+            .clone()
+            .or_else(|| std::env::var("PT_BUNDLE_PASSPHRASE").ok());
+
+        let mut reader =
+            match BundleReader::open_with_passphrase(&input_path, passphrase.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    return output_agent_error(global, "fleet transfer diff", &e.to_string());
+                }
+            };
+
+        let data = match reader.read_verified("transfer_bundle.json") {
+            Ok(d) => d,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer diff", &e.to_string());
+            }
+        };
+        match serde_json::from_slice(&data) {
+            Ok(b) => b,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer diff", &e.to_string());
+            }
+        }
+    } else {
+        let data = match std::fs::read_to_string(&input_path) {
+            Ok(d) => d,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer diff", &e.to_string());
+            }
+        };
+        match serde_json::from_str(&data) {
+            Ok(b) => b,
+            Err(e) => {
+                return output_agent_error(global, "fleet transfer diff", &e.to_string());
+            }
+        }
+    };
+
+    let warnings = match validate_bundle(&bundle) {
+        Ok(w) => w,
+        Err(e) => {
+            return output_agent_error(global, "fleet transfer diff", &e.to_string());
+        }
+    };
+
+    let options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        priors_path: None,
+        policy_path: None,
+    };
+    let config = match load_config(&options) {
+        Ok(c) => c,
+        Err(e) => return output_config_error(global, &e),
+    };
+
+    let diff = compute_diff(Some(&config.priors), None, &bundle);
+
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "command": "agent fleet transfer diff",
+        "source": input_path.display().to_string(),
+        "source_host_id": bundle.source_host_id,
+        "source_host_profile": bundle.source_host_profile,
+        "warnings": warnings,
+        "diff": {
+            "priors_changes": diff.priors_changes,
+            "signature_changes": diff.signature_changes,
+            "baseline_adjustments": diff.baseline_adjustments,
+        },
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Jsonl => {
+            println!("{}", serde_json::to_string(&response).unwrap());
+        }
+        _ => {
+            println!("Transfer diff: {} → local", input_path.display());
+            println!("Source host: {}", bundle.source_host_id);
+            if let Some(ref profile) = bundle.source_host_profile {
+                println!("Source profile: {}", profile);
+            }
+            println!();
+            if diff.priors_changes.is_empty() && diff.signature_changes.is_empty() {
+                println!("No differences found.");
+            } else {
+                if !diff.priors_changes.is_empty() {
+                    println!("Prior changes ({}):", diff.priors_changes.len());
+                    for c in &diff.priors_changes {
+                        println!(
+                            "  {}.{}: {:.4} → {:.4}",
+                            c.class, c.field, c.local_value, c.incoming_value
+                        );
+                    }
+                }
+                if !diff.signature_changes.is_empty() {
+                    println!("Signature changes ({}):", diff.signature_changes.len());
+                    for c in &diff.signature_changes {
+                        println!("  {} [{:?}]", c.name, c.change_type);
+                    }
+                }
+            }
+            if !warnings.is_empty() {
+                println!();
+                println!("Warnings:");
+                for w in &warnings {
+                    println!("  [{}] {}", w.code, w.message);
+                }
+            }
         }
     }
 
@@ -10132,7 +11230,10 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
                             let strength =
                                 bf.get("strength").and_then(|v| v.as_str()).unwrap_or("?");
                             // Format BF: use scientific notation for extreme values
-                            let bf_str = if bf_val.is_infinite() || bf_val > 1e6 || (bf_val < 1e-6 && bf_val > 0.0) {
+                            let bf_str = if bf_val.is_infinite()
+                                || bf_val > 1e6
+                                || (bf_val < 1e-6 && bf_val > 0.0)
+                            {
                                 format!("{:.2e}", bf_val)
                             } else {
                                 format!("{:.2}", bf_val)
@@ -11775,7 +12876,6 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     }
 
     // If respawned processes were detected, indicate partial failure
-    
 
     if args.check_respawn && respawned_count > 0 {
         ExitCode::PartialFail
