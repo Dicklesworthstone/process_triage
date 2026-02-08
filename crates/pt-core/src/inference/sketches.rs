@@ -808,8 +808,7 @@ pub struct PercentileSummary {
 // ============================================================================
 
 /// Configuration for a combined sketch manager.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SketchManagerConfig {
     /// Count-Min Sketch config for frequency estimation.
     pub count_min: CountMinConfig,
@@ -818,7 +817,6 @@ pub struct SketchManagerConfig {
     /// T-Digest config for quantile estimation.
     pub tdigest: TDigestConfig,
 }
-
 
 /// Combined sketch manager for tracking multiple metrics.
 ///

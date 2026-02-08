@@ -120,8 +120,6 @@ pub struct ConfidenceVizInput {
     pub expected_losses: Option<ExpectedLosses>,
 }
 
-
-
 /// Expected loss values for possible actions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpectedLosses {

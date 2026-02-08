@@ -1017,7 +1017,11 @@ mod tests {
             ..Evidence::default()
         };
         let result = compute_posterior(&priors, &evidence).expect("posterior");
-        let feature_names: Vec<&str> = result.evidence_terms.iter().map(|t| t.feature.as_str()).collect();
+        let feature_names: Vec<&str> = result
+            .evidence_terms
+            .iter()
+            .map(|t| t.feature.as_str())
+            .collect();
         assert!(feature_names.contains(&"prior"));
         assert!(feature_names.contains(&"orphan"));
         assert!(feature_names.contains(&"tty"));
@@ -1070,7 +1074,9 @@ mod tests {
     fn posterior_cpu_nan_errors() {
         let priors = base_priors();
         let evidence = Evidence {
-            cpu: Some(CpuEvidence::Fraction { occupancy: f64::NAN }),
+            cpu: Some(CpuEvidence::Fraction {
+                occupancy: f64::NAN,
+            }),
             ..Evidence::default()
         };
         assert!(compute_posterior(&priors, &evidence).is_err());
@@ -1090,7 +1096,11 @@ mod tests {
     fn posterior_cpu_binomial_valid() {
         let priors = base_priors();
         let evidence = Evidence {
-            cpu: Some(CpuEvidence::Binomial { k: 3.0, n: 10.0, eta: None }),
+            cpu: Some(CpuEvidence::Binomial {
+                k: 3.0,
+                n: 10.0,
+                eta: None,
+            }),
             ..Evidence::default()
         };
         let result = compute_posterior(&priors, &evidence).expect("posterior");
@@ -1105,7 +1115,11 @@ mod tests {
     fn posterior_cpu_binomial_invalid_k_errors() {
         let priors = base_priors();
         let evidence = Evidence {
-            cpu: Some(CpuEvidence::Binomial { k: 15.0, n: 10.0, eta: None }),
+            cpu: Some(CpuEvidence::Binomial {
+                k: 15.0,
+                n: 10.0,
+                eta: None,
+            }),
             ..Evidence::default()
         };
         assert!(compute_posterior(&priors, &evidence).is_err());
@@ -1115,7 +1129,11 @@ mod tests {
     fn posterior_cpu_binomial_with_eta() {
         let priors = base_priors();
         let evidence = Evidence {
-            cpu: Some(CpuEvidence::Binomial { k: 3.0, n: 10.0, eta: Some(0.5) }),
+            cpu: Some(CpuEvidence::Binomial {
+                k: 3.0,
+                n: 10.0,
+                eta: Some(0.5),
+            }),
             ..Evidence::default()
         };
         let result = compute_posterior(&priors, &evidence).expect("posterior");
@@ -1126,7 +1144,11 @@ mod tests {
     fn posterior_cpu_binomial_zero_eta_errors() {
         let priors = base_priors();
         let evidence = Evidence {
-            cpu: Some(CpuEvidence::Binomial { k: 3.0, n: 10.0, eta: Some(0.0) }),
+            cpu: Some(CpuEvidence::Binomial {
+                k: 3.0,
+                n: 10.0,
+                eta: Some(0.0),
+            }),
             ..Evidence::default()
         };
         assert!(compute_posterior(&priors, &evidence).is_err());

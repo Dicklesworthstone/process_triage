@@ -479,11 +479,7 @@ mod tests {
         // Probe B: covers cpu+io for cost 5; ratio = 2/5 = 0.4
         let probes = vec![
             ProbeProfile::new(ProbeType::QuickScan, 1.0, vec!["cpu".into()]),
-            ProbeProfile::new(
-                ProbeType::DeepScan,
-                5.0,
-                vec!["cpu".into(), "io".into()],
-            ),
+            ProbeProfile::new(ProbeType::DeepScan, 5.0, vec!["cpu".into(), "io".into()]),
         ];
         let result = greedy_select_with_budget(&probes, &weights(), 6.0);
         // Greedy picks QuickScan first (better ratio), then DeepScan for marginal io

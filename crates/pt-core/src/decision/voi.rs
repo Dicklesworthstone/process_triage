@@ -938,7 +938,8 @@ mod tests {
             // Verify snake_case
             let raw: String = serde_json::from_str(&json).unwrap();
             assert!(
-                raw.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_'),
+                raw.chars()
+                    .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_'),
                 "expected snake_case for {:?}, got {}",
                 probe,
                 raw
@@ -1270,8 +1271,11 @@ mod tests {
         let posterior = test_posterior();
         let cost_model = ProbeCostModel::default();
 
-        let best =
-            select_probe_by_information_gain(&posterior, &cost_model, Some(&[ProbeType::IoSnapshot]));
+        let best = select_probe_by_information_gain(
+            &posterior,
+            &cost_model,
+            Some(&[ProbeType::IoSnapshot]),
+        );
         assert_eq!(best, Some(ProbeType::IoSnapshot));
     }
 

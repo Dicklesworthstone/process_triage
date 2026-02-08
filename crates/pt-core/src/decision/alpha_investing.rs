@@ -414,27 +414,43 @@ mod tests {
 
     #[test]
     fn alpha_spend_proportional_to_wealth() {
-        let cfg = AlphaInvestingPolicy { w0: 0.05, alpha_spend: 0.02, alpha_earn: 0.01 };
+        let cfg = AlphaInvestingPolicy {
+            w0: 0.05,
+            alpha_spend: 0.02,
+            alpha_earn: 0.01,
+        };
         let spend = cfg.alpha_spend_for_wealth(0.05);
         assert!((spend - 0.001).abs() < f64::EPSILON); // 0.02 * 0.05 = 0.001
     }
 
     #[test]
     fn alpha_spend_zero_wealth() {
-        let cfg = AlphaInvestingPolicy { w0: 0.05, alpha_spend: 0.02, alpha_earn: 0.01 };
+        let cfg = AlphaInvestingPolicy {
+            w0: 0.05,
+            alpha_spend: 0.02,
+            alpha_earn: 0.01,
+        };
         assert!((cfg.alpha_spend_for_wealth(0.0) - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn alpha_spend_negative_wealth() {
-        let cfg = AlphaInvestingPolicy { w0: 0.05, alpha_spend: 0.02, alpha_earn: 0.01 };
+        let cfg = AlphaInvestingPolicy {
+            w0: 0.05,
+            alpha_spend: 0.02,
+            alpha_earn: 0.01,
+        };
         assert!((cfg.alpha_spend_for_wealth(-1.0) - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn alpha_spend_capped_at_wealth() {
         // If alpha_spend is very high, spend is capped at wealth
-        let cfg = AlphaInvestingPolicy { w0: 0.05, alpha_spend: 2.0, alpha_earn: 0.01 };
+        let cfg = AlphaInvestingPolicy {
+            w0: 0.05,
+            alpha_spend: 2.0,
+            alpha_earn: 0.01,
+        };
         let spend = cfg.alpha_spend_for_wealth(0.05);
         // 2.0 * 0.05 = 0.10, but min(0.10, 0.05) = 0.05
         assert!((spend - 0.05).abs() < f64::EPSILON);
@@ -442,7 +458,11 @@ mod tests {
 
     #[test]
     fn alpha_spend_large_wealth() {
-        let cfg = AlphaInvestingPolicy { w0: 0.05, alpha_spend: 0.02, alpha_earn: 0.01 };
+        let cfg = AlphaInvestingPolicy {
+            w0: 0.05,
+            alpha_spend: 0.02,
+            alpha_earn: 0.01,
+        };
         let spend = cfg.alpha_spend_for_wealth(10.0);
         assert!((spend - 0.2).abs() < f64::EPSILON); // 0.02 * 10 = 0.2
     }
@@ -596,8 +616,14 @@ mod tests {
 
     #[test]
     fn alpha_investing_error_display() {
-        assert!(AlphaInvestingError::MissingPolicy.to_string().contains("not configured"));
-        assert!(AlphaInvestingError::InvalidPolicy("bad".into()).to_string().contains("bad"));
-        assert!(AlphaInvestingError::LockUnavailable.to_string().contains("lock"));
+        assert!(AlphaInvestingError::MissingPolicy
+            .to_string()
+            .contains("not configured"));
+        assert!(AlphaInvestingError::InvalidPolicy("bad".into())
+            .to_string()
+            .contains("bad"));
+        assert!(AlphaInvestingError::LockUnavailable
+            .to_string()
+            .contains("lock"));
     }
 }

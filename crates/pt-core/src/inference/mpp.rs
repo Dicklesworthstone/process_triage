@@ -1151,8 +1151,14 @@ mod tests {
         assert!(BurstinessLevel::Regular.log_odds_contribution() < 0.0);
         assert!((BurstinessLevel::Mild.log_odds_contribution() - 0.0).abs() < f64::EPSILON);
         assert!(BurstinessLevel::Moderate.log_odds_contribution() > 0.0);
-        assert!(BurstinessLevel::High.log_odds_contribution() > BurstinessLevel::Moderate.log_odds_contribution());
-        assert!(BurstinessLevel::VeryHigh.log_odds_contribution() > BurstinessLevel::High.log_odds_contribution());
+        assert!(
+            BurstinessLevel::High.log_odds_contribution()
+                > BurstinessLevel::Moderate.log_odds_contribution()
+        );
+        assert!(
+            BurstinessLevel::VeryHigh.log_odds_contribution()
+                > BurstinessLevel::High.log_odds_contribution()
+        );
     }
 
     #[test]

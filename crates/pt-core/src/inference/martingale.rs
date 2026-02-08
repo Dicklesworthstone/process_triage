@@ -439,7 +439,6 @@ impl MartingaleAnalyzer {
         // Time-uniform radius using stitched boundary
         // Based on Howard et al. (2021) "Time-uniform, nonparametric..."
         let log_term = ((n + 1.0).sqrt() / alpha).ln();
-        
 
         bound * (2.0 * (1.0 + 1.0 / n) * log_term / n).sqrt()
     }

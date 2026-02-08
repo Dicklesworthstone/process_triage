@@ -1083,9 +1083,18 @@ mod tests {
     #[test]
     fn tie_break_rank_equivalences() {
         // Pause, Resume, Freeze, Unfreeze are all rank 2
-        assert_eq!(tie_break_rank(Action::Pause), tie_break_rank(Action::Resume));
-        assert_eq!(tie_break_rank(Action::Pause), tie_break_rank(Action::Freeze));
-        assert_eq!(tie_break_rank(Action::Pause), tie_break_rank(Action::Unfreeze));
+        assert_eq!(
+            tie_break_rank(Action::Pause),
+            tie_break_rank(Action::Resume)
+        );
+        assert_eq!(
+            tie_break_rank(Action::Pause),
+            tie_break_rank(Action::Freeze)
+        );
+        assert_eq!(
+            tie_break_rank(Action::Pause),
+            tie_break_rank(Action::Unfreeze)
+        );
         // Quarantine, Unquarantine, Throttle are all rank 3
         assert_eq!(
             tie_break_rank(Action::Quarantine),
@@ -1249,7 +1258,11 @@ mod tests {
             ..DroTrigger::none()
         };
         let eps = compute_adaptive_epsilon(base, &trigger, 1.0);
-        assert!((eps - 0.14).abs() < 1e-9, "low confidence should give 1.4x: {}", eps);
+        assert!(
+            (eps - 0.14).abs() < 1e-9,
+            "low confidence should give 1.4x: {}",
+            eps
+        );
     }
 
     #[test]

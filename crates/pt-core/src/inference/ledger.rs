@@ -316,7 +316,12 @@ mod tests {
     use super::*;
     use crate::inference::posterior::{ClassScores, EvidenceTerm, PosteriorResult};
 
-    fn make_posterior(useful: f64, useful_bad: f64, abandoned: f64, zombie: f64) -> PosteriorResult {
+    fn make_posterior(
+        useful: f64,
+        useful_bad: f64,
+        abandoned: f64,
+        zombie: f64,
+    ) -> PosteriorResult {
         PosteriorResult {
             posterior: ClassScores {
                 useful,
@@ -398,8 +403,14 @@ mod tests {
 
     #[test]
     fn classification_serde_snake_case() {
-        assert_eq!(serde_json::to_string(&Classification::UsefulBad).unwrap(), r#""useful_bad""#);
-        assert_eq!(serde_json::to_string(&Classification::Abandoned).unwrap(), r#""abandoned""#);
+        assert_eq!(
+            serde_json::to_string(&Classification::UsefulBad).unwrap(),
+            r#""useful_bad""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Classification::Abandoned).unwrap(),
+            r#""abandoned""#
+        );
     }
 
     // ── Confidence ──────────────────────────────────────────────────
@@ -422,7 +433,12 @@ mod tests {
 
     #[test]
     fn confidence_serde_roundtrip() {
-        for c in [Confidence::VeryHigh, Confidence::High, Confidence::Medium, Confidence::Low] {
+        for c in [
+            Confidence::VeryHigh,
+            Confidence::High,
+            Confidence::Medium,
+            Confidence::Low,
+        ] {
             let json = serde_json::to_string(&c).unwrap();
             let back: Confidence = serde_json::from_str(&json).unwrap();
             assert_eq!(c, back);
@@ -431,23 +447,41 @@ mod tests {
 
     #[test]
     fn confidence_serde_snake_case() {
-        assert_eq!(serde_json::to_string(&Confidence::VeryHigh).unwrap(), r#""very_high""#);
+        assert_eq!(
+            serde_json::to_string(&Confidence::VeryHigh).unwrap(),
+            r#""very_high""#
+        );
     }
 
     // ── Direction ───────────────────────────────────────────────────
 
     #[test]
     fn direction_display() {
-        assert_eq!(format!("{}", Direction::TowardPredicted), "toward_predicted");
-        assert_eq!(format!("{}", Direction::TowardReference), "toward_reference");
+        assert_eq!(
+            format!("{}", Direction::TowardPredicted),
+            "toward_predicted"
+        );
+        assert_eq!(
+            format!("{}", Direction::TowardReference),
+            "toward_reference"
+        );
         assert_eq!(format!("{}", Direction::Neutral), "neutral");
     }
 
     #[test]
     fn direction_serde() {
-        assert_eq!(serde_json::to_string(&Direction::TowardPredicted).unwrap(), r#""toward_predicted""#);
-        assert_eq!(serde_json::to_string(&Direction::TowardReference).unwrap(), r#""toward_reference""#);
-        assert_eq!(serde_json::to_string(&Direction::Neutral).unwrap(), r#""neutral""#);
+        assert_eq!(
+            serde_json::to_string(&Direction::TowardPredicted).unwrap(),
+            r#""toward_predicted""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Direction::TowardReference).unwrap(),
+            r#""toward_reference""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Direction::Neutral).unwrap(),
+            r#""neutral""#
+        );
     }
 
     // ── get_glyph / default_glyph_map ───────────────────────────────
@@ -669,9 +703,7 @@ mod tests {
 
     #[test]
     fn ledger_top_evidence_toward_abandoned() {
-        let terms = vec![
-            make_term("runtime", 0.0, -3.0),
-        ];
+        let terms = vec![make_term("runtime", 0.0, -3.0)];
         let result = make_posterior_with_terms(0.1, 0.9, terms);
         let ledger = EvidenceLedger::from_posterior_result(&result, None, None);
         assert!(ledger.top_evidence[0].contains("runtime"));

@@ -509,7 +509,11 @@ mod tests {
             "p1",
             uncertain_posterior(),
             ActionFeasibility::allow_all(),
-            vec![ProbeType::QuickScan, ProbeType::DeepScan, ProbeType::NetSnapshot],
+            vec![
+                ProbeType::QuickScan,
+                ProbeType::DeepScan,
+                ProbeType::NetSnapshot,
+            ],
         )];
         let policy = Policy::default();
         let cost_model = ProbeCostModel::default();

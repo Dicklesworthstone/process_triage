@@ -627,7 +627,9 @@ mod tests {
     #[test]
     fn model_new_zero_bins_errors() {
         let scheme = BinningScheme::fixed(10.0, 0);
-        let err = BetaStacyModel::new(scheme, BetaParams::default()).err().unwrap();
+        let err = BetaStacyModel::new(scheme, BetaParams::default())
+            .err()
+            .unwrap();
         matches!(err, BetaStacyError::NoBins);
     }
 

@@ -1551,7 +1551,7 @@ mod tests {
         let update = pm.update_from_choice(&chosen, &alternatives);
         assert!((update.prior - 0.5).abs() < 1e-9);
         assert!((update.observed - 1.0).abs() < 1e-9); // (8-2)/(8-2) = 1.0
-        // updated = 0.5 * 0.5 + 1.0 * 0.5 = 0.75
+                                                       // updated = 0.5 * 0.5 + 1.0 * 0.5 = 0.75
         assert!((update.updated - 0.75).abs() < 1e-9);
         assert!((pm.risk_tolerance - 0.75).abs() < 1e-9);
     }
@@ -1868,7 +1868,8 @@ mod tests {
             .collect();
         // Only run if we actually removed selected candidates
         if !new_candidates.is_empty() {
-            let decision = reoptimize_on_change(&prev, &make_candidates(5), &new_candidates, &goals);
+            let decision =
+                reoptimize_on_change(&prev, &make_candidates(5), &new_candidates, &goals);
             assert!(decision.reoptimized);
             assert_eq!(decision.reason, "selected_missing");
         }
@@ -1942,7 +1943,10 @@ mod tests {
         let result = optimize_greedy(&candidates, &goals);
         assert!(!result.log_events.is_empty());
         // Should have at least optimizer_start and converged
-        assert!(result.log_events.iter().any(|e| e.event == "optimizer_start"));
+        assert!(result
+            .log_events
+            .iter()
+            .any(|e| e.event == "optimizer_start"));
         assert!(result.log_events.iter().any(|e| e.event == "converged"));
     }
 

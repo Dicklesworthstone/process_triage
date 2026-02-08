@@ -350,8 +350,6 @@ impl SufficientStats {
                     return f64::NEG_INFINITY;
                 }
 
-                
-
                 log_gamma_half_nu_plus_half
                     - log_gamma_half_nu
                     - 0.5 * (nu * std::f64::consts::PI).ln()
@@ -378,8 +376,6 @@ impl SufficientStats {
                 if !term1.is_finite() || !term2.is_finite() || !term3.is_finite() {
                     return f64::NEG_INFINITY;
                 }
-
-                
 
                 term1 - term2 - term3 + r * p.ln() + x * (1.0 - p).ln()
             }
@@ -1076,7 +1072,9 @@ mod tests {
     #[test]
     fn emission_model_default_is_poisson_gamma() {
         let em = EmissionModel::default();
-        assert!(matches!(em, EmissionModel::PoissonGamma { alpha, beta } if approx_eq(alpha, 1.0, 1e-12) && approx_eq(beta, 1.0, 1e-12)));
+        assert!(
+            matches!(em, EmissionModel::PoissonGamma { alpha, beta } if approx_eq(alpha, 1.0, 1e-12) && approx_eq(beta, 1.0, 1e-12))
+        );
     }
 
     #[test]
@@ -1087,7 +1085,9 @@ mod tests {
         };
         let json = serde_json::to_string(&em).unwrap();
         let back: EmissionModel = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, EmissionModel::PoissonGamma { alpha, beta } if approx_eq(alpha, 2.0, 1e-12) && approx_eq(beta, 3.0, 1e-12)));
+        assert!(
+            matches!(back, EmissionModel::PoissonGamma { alpha, beta } if approx_eq(alpha, 2.0, 1e-12) && approx_eq(beta, 3.0, 1e-12))
+        );
     }
 
     #[test]
@@ -1100,9 +1100,11 @@ mod tests {
         };
         let json = serde_json::to_string(&em).unwrap();
         let back: EmissionModel = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, EmissionModel::NormalGamma { mu0, kappa0, alpha0, beta0 }
+        assert!(
+            matches!(back, EmissionModel::NormalGamma { mu0, kappa0, alpha0, beta0 }
             if approx_eq(mu0, 1.0, 1e-12) && approx_eq(kappa0, 2.0, 1e-12)
-            && approx_eq(alpha0, 3.0, 1e-12) && approx_eq(beta0, 4.0, 1e-12)));
+            && approx_eq(alpha0, 3.0, 1e-12) && approx_eq(beta0, 4.0, 1e-12))
+        );
     }
 
     #[test]

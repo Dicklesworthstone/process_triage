@@ -450,8 +450,18 @@ mod tests {
         let post = confident_posterior();
 
         let candidates = vec![
-            EsnCandidate::new("z", post.clone(), feasibility.clone(), vec![ProbeType::QuickScan]),
-            EsnCandidate::new("a", post.clone(), feasibility.clone(), vec![ProbeType::QuickScan]),
+            EsnCandidate::new(
+                "z",
+                post.clone(),
+                feasibility.clone(),
+                vec![ProbeType::QuickScan],
+            ),
+            EsnCandidate::new(
+                "a",
+                post.clone(),
+                feasibility.clone(),
+                vec![ProbeType::QuickScan],
+            ),
         ];
 
         let r1 = prioritize_by_esn(&candidates, &policy, &cost_model).unwrap();
@@ -475,14 +485,8 @@ mod tests {
         let cost_model = ProbeCostModel::default();
         let feasibility = ActionFeasibility::allow_all();
 
-        let (decision, _) = decide_sequential(
-            &zombie,
-            &policy,
-            &feasibility,
-            &cost_model,
-            None,
-        )
-        .unwrap();
+        let (decision, _) =
+            decide_sequential(&zombie, &policy, &feasibility, &cost_model, None).unwrap();
 
         // High-confidence zombie — should not recommend probing
         assert!(

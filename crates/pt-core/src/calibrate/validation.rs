@@ -1304,15 +1304,36 @@ mod tests {
 
     #[test]
     fn map_outcome_hint_all_variants() {
-        assert_eq!(map_outcome_hint("user_killed"), Some(GroundTruth::UserKilled));
+        assert_eq!(
+            map_outcome_hint("user_killed"),
+            Some(GroundTruth::UserKilled)
+        );
         assert_eq!(map_outcome_hint("user_kill"), Some(GroundTruth::UserKilled));
-        assert_eq!(map_outcome_hint("user_spared"), Some(GroundTruth::UserSpared));
-        assert_eq!(map_outcome_hint("user_spare"), Some(GroundTruth::UserSpared));
-        assert_eq!(map_outcome_hint("normal_exit"), Some(GroundTruth::NormalExit));
-        assert_eq!(map_outcome_hint("external_kill"), Some(GroundTruth::ExternalKill));
-        assert_eq!(map_outcome_hint("system_shutdown"), Some(GroundTruth::SystemShutdown));
+        assert_eq!(
+            map_outcome_hint("user_spared"),
+            Some(GroundTruth::UserSpared)
+        );
+        assert_eq!(
+            map_outcome_hint("user_spare"),
+            Some(GroundTruth::UserSpared)
+        );
+        assert_eq!(
+            map_outcome_hint("normal_exit"),
+            Some(GroundTruth::NormalExit)
+        );
+        assert_eq!(
+            map_outcome_hint("external_kill"),
+            Some(GroundTruth::ExternalKill)
+        );
+        assert_eq!(
+            map_outcome_hint("system_shutdown"),
+            Some(GroundTruth::SystemShutdown)
+        );
         assert_eq!(map_outcome_hint("crash"), Some(GroundTruth::Crash));
-        assert_eq!(map_outcome_hint("still_running"), Some(GroundTruth::StillRunning));
+        assert_eq!(
+            map_outcome_hint("still_running"),
+            Some(GroundTruth::StillRunning)
+        );
         assert_eq!(map_outcome_hint("expired"), Some(GroundTruth::Expired));
         assert_eq!(map_outcome_hint("unknown_hint"), None);
     }
@@ -1441,7 +1462,15 @@ mod tests {
     #[test]
     fn record_outcome_with_source_sets_source() {
         let mut engine = ValidationEngine::new(0.5);
-        engine.track_prediction("h1".into(), 1, 0.9, "kill".into(), None, "proc".into(), None);
+        engine.track_prediction(
+            "h1".into(),
+            1,
+            0.9,
+            "kill".into(),
+            None,
+            "proc".into(),
+            None,
+        );
         let found = engine.record_outcome_with_source(
             "h1",
             GroundTruth::UserKilled,
@@ -1474,7 +1503,15 @@ mod tests {
     #[test]
     fn record_outcome_by_pid_with_source_sets_source() {
         let mut engine = ValidationEngine::new(0.5);
-        engine.track_prediction("h1".into(), 42, 0.6, "kill".into(), None, "proc".into(), None);
+        engine.track_prediction(
+            "h1".into(),
+            42,
+            0.6,
+            "kill".into(),
+            None,
+            "proc".into(),
+            None,
+        );
         let found = engine.record_outcome_by_pid_with_source(
             42,
             GroundTruth::Crash,
