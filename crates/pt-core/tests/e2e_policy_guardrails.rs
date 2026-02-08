@@ -43,7 +43,14 @@ const TEST_SAMPLE_SIZE: &str = "10";
 fn plan_json_with_config(config_dir: &std::path::Path, extra_args: &[&str]) -> (Value, i32) {
     let output = pt_core_fast()
         .env("PT_CONFIG_DIR", config_dir.display().to_string())
-        .args(["--format", "json", "agent", "plan", "--sample-size", TEST_SAMPLE_SIZE])
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--sample-size",
+            TEST_SAMPLE_SIZE,
+        ])
         .args(extra_args)
         .assert()
         .code(predicate::in_iter([0, 1]))
@@ -112,10 +119,7 @@ mod rate_limit {
 
         // All candidates should exist and have required fields
         for candidate in &candidates {
-            assert!(
-                candidate.get("pid").is_some(),
-                "candidate should have pid"
-            );
+            assert!(candidate.get("pid").is_some(), "candidate should have pid");
             assert!(
                 candidate.get("policy").is_some(),
                 "candidate should have policy check result"
@@ -370,7 +374,9 @@ mod protected_patterns {
             .unwrap_or_default();
 
         for candidate in &candidates {
-            let policy = candidate.get("policy").expect("candidate should have policy field");
+            let policy = candidate
+                .get("policy")
+                .expect("candidate should have policy field");
             assert!(policy.is_object(), "policy should be an object");
             assert!(
                 policy.get("allowed").is_some(),
@@ -747,12 +753,13 @@ mod jsonl_events {
             }
 
             // Should have plan_ready event
-            let has_plan_ready = event_lines
-                .iter()
-                .any(|l| l.contains("plan_ready"));
+            let has_plan_ready = event_lines.iter().any(|l| l.contains("plan_ready"));
             assert!(has_plan_ready, "should emit plan_ready event");
 
-            eprintln!("[INFO] {} JSONL progress events on stderr", event_lines.len());
+            eprintln!(
+                "[INFO] {} JSONL progress events on stderr",
+                event_lines.len()
+            );
         }
     }
 
@@ -941,10 +948,7 @@ mod combined {
             json.get("session_id").is_some(),
             "plan should complete successfully with all guardrails"
         );
-        assert!(
-            json.get("summary").is_some(),
-            "plan should have summary"
-        );
+        assert!(json.get("summary").is_some(), "plan should have summary");
 
         eprintln!(
             "[INFO] combined guardrails plan completed: candidates={}",

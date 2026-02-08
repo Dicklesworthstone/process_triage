@@ -178,7 +178,11 @@ mod sliding_window {
             "Warning should contain count/limit: {}",
             msg
         );
-        assert!(msg.contains("run"), "Warning should mention window: {}", msg);
+        assert!(
+            msg.contains("run"),
+            "Warning should mention window: {}",
+            msg
+        );
     }
 
     #[test]
@@ -665,8 +669,7 @@ mod enforcer_integration {
             "Should have rate limit warning at 80%"
         );
         assert!(
-            result.warnings[0].contains("rate limit")
-                || result.warnings[0].contains("approaching"),
+            result.warnings[0].contains("rate limit") || result.warnings[0].contains("approaching"),
             "Warning should mention rate limit: {}",
             result.warnings[0]
         );

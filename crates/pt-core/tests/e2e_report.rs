@@ -72,11 +72,7 @@ fn create_session(data_dir: &std::path::Path) -> (Value, String) {
 }
 
 /// Generate an HTML report from a session and return the HTML string.
-fn generate_report(
-    data_dir: &std::path::Path,
-    session_id: &str,
-    extra_args: &[&str],
-) -> String {
+fn generate_report(data_dir: &std::path::Path, session_id: &str, extra_args: &[&str]) -> String {
     let output = pt_core()
         .env("PROCESS_TRIAGE_DATA", data_dir.display().to_string())
         .args(["agent", "report", "--session", session_id])
@@ -164,17 +160,13 @@ mod args_validation {
         let tmp = tempdir().unwrap();
         pt_core()
             .env("PROCESS_TRIAGE_DATA", tmp.path().display().to_string())
-            .args([
-                "agent",
-                "report",
-                "--session",
-                "pt-99991231-235959-zzzz",
-            ])
+            .args(["agent", "report", "--session", "pt-99991231-235959-zzzz"])
             .assert()
             .failure()
-            .stderr(predicate::str::contains("session not found").or(
-                predicate::str::contains("invalid session ID"),
-            ));
+            .stderr(
+                predicate::str::contains("session not found")
+                    .or(predicate::str::contains("invalid session ID")),
+            );
     }
 }
 
@@ -259,8 +251,7 @@ mod cdn_mode {
         let (_, session_id) = create_session(tmp.path());
         let html = generate_report(tmp.path(), &session_id, &[]);
 
-        let link_re =
-            Regex::new(r#"<link[^>]+href="[^"]*cdn\.jsdelivr\.net[^"]*"[^>]*>"#).unwrap();
+        let link_re = Regex::new(r#"<link[^>]+href="[^"]*cdn\.jsdelivr\.net[^"]*"[^>]*>"#).unwrap();
 
         for m in link_re.find_iter(&html) {
             let tag = m.as_str();
@@ -297,11 +288,7 @@ mod cdn_mode {
                 hash
             );
             let hash_part = hash.split('-').nth(1).unwrap();
-            assert!(
-                hash_part.len() >= 32,
-                "SRI hash too short: {}",
-                hash
-            );
+            assert!(hash_part.len() >= 32, "SRI hash too short: {}", hash);
         }
 
         assert!(found, "Report should contain SRI integrity hashes");

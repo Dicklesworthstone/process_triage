@@ -2222,18 +2222,10 @@ mod comprehensive_builtin_coverage {
             let ctx = ProcessMatchContext::with_comm(runner);
             let matches = db.match_process(&ctx);
 
-            assert!(
-                !matches.is_empty(),
-                "{} should be detected",
-                runner
-            );
+            assert!(!matches.is_empty(), "{} should be detected", runner);
 
             let priors = &matches[0].signature.priors;
-            assert!(
-                !priors.is_empty(),
-                "{} should have priors defined",
-                runner
-            );
+            assert!(!priors.is_empty(), "{} should have priors defined", runner);
 
             if let Some(abandoned) = &priors.abandoned {
                 assert!(
@@ -2256,11 +2248,7 @@ mod comprehensive_builtin_coverage {
             let ctx = ProcessMatchContext::with_comm(runner);
             let matches = db.match_process(&ctx);
 
-            assert!(
-                !matches.is_empty(),
-                "{} should be detected",
-                runner
-            );
+            assert!(!matches.is_empty(), "{} should be detected", runner);
 
             let expectations = &matches[0].signature.expectations;
             assert!(

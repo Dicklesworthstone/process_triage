@@ -111,7 +111,10 @@ mod prometheus_format {
         let help_names: Vec<&str> = body
             .lines()
             .filter(|l| l.starts_with("# HELP "))
-            .filter_map(|l| l.strip_prefix("# HELP ").and_then(|s| s.split_whitespace().next()))
+            .filter_map(|l| {
+                l.strip_prefix("# HELP ")
+                    .and_then(|s| s.split_whitespace().next())
+            })
             .collect();
 
         // Every HELP should have a matching TYPE
@@ -142,11 +145,7 @@ mod prometheus_format {
                 .strip_prefix("# HELP ")
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("");
-            assert!(
-                seen.insert(name),
-                "Duplicate HELP for metric: {}",
-                name
-            );
+            assert!(seen.insert(name), "Duplicate HELP for metric: {}", name);
         }
         server.shutdown();
     }
@@ -250,10 +249,7 @@ mod metric_values {
             body.contains("pt_process_count 450"),
             "process_count mismatch"
         );
-        assert!(
-            body.contains("pt_orphan_count 12"),
-            "orphan_count mismatch"
-        );
+        assert!(body.contains("pt_orphan_count 12"), "orphan_count mismatch");
         server.shutdown();
     }
 

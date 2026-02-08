@@ -14,7 +14,7 @@ use pt_core::collect::{
 // GPU detection types
 use pt_core::collect::gpu::{
     parse_nvidia_device_csv, parse_nvidia_process_csv, parse_rocm_json, parse_rocm_process_json,
-    parse_rocm_text, GpuDevice, GpuDetectionSource, GpuProvenance, GpuSnapshot, GpuType,
+    parse_rocm_text, GpuDetectionSource, GpuDevice, GpuProvenance, GpuSnapshot, GpuType,
     ProcessGpuUsage,
 };
 use pt_core::collect::{gpu_usage_for_pid, total_vram_mib_for_pid};
@@ -25,8 +25,9 @@ use pt_core::collect::{gpu_usage_for_pid, total_vram_mib_for_pid};
 
 #[test]
 fn container_detect_docker_standard_cgroup() {
-    let info =
-        detect_container_from_cgroup("/system.slice/docker-abc123def456789012345678901234567890123456789012345678901234.scope");
+    let info = detect_container_from_cgroup(
+        "/system.slice/docker-abc123def456789012345678901234567890123456789012345678901234.scope",
+    );
     assert!(info.in_container);
     assert_eq!(info.runtime, ContainerRuntime::Docker);
     assert!(info.container_id.is_some());
@@ -36,8 +37,9 @@ fn container_detect_docker_standard_cgroup() {
 
 #[test]
 fn container_detect_docker_short_path() {
-    let info =
-        detect_container_from_cgroup("/docker/abc123def456789012345678901234567890123456789012345678901234");
+    let info = detect_container_from_cgroup(
+        "/docker/abc123def456789012345678901234567890123456789012345678901234",
+    );
     assert!(info.in_container);
     assert_eq!(info.runtime, ContainerRuntime::Docker);
     assert!(info.container_id.is_some());
@@ -406,7 +408,7 @@ fn gpu_rocm_json_single_card() {
     assert_eq!(devices[0].temperature_c, Some(42));
     assert_eq!(devices[0].utilization_percent, Some(85));
     assert_eq!(devices[0].memory_total_mib, Some(65536)); // 68719476736 / 1048576
-    assert_eq!(devices[0].memory_used_mib, Some(16384));  // 17179869184 / 1048576
+    assert_eq!(devices[0].memory_used_mib, Some(16384)); // 17179869184 / 1048576
     assert_eq!(devices[0].uuid.as_deref(), Some("0x12345"));
 }
 
@@ -645,7 +647,7 @@ fn gpu_collect_snapshot_no_gpu_tools() {
     let snapshot = pt_core::collect::collect_gpu_snapshot();
     // Can be has_gpu=true or false depending on system
     assert!(snapshot.devices.len() <= 100); // Sanity check
-    // Provenance should be set
+                                            // Provenance should be set
     assert!(
         snapshot.provenance.source == GpuDetectionSource::NvidiaSmi
             || snapshot.provenance.source == GpuDetectionSource::RocmSmi
@@ -677,10 +679,7 @@ fn container_detect_from_markers_does_not_panic() {
 fn process_record_with_container_info_serializes() {
     use pt_core::mock_process::MockProcessBuilder;
 
-    let process = MockProcessBuilder::new()
-        .pid(100)
-        .comm("nginx")
-        .build();
+    let process = MockProcessBuilder::new().pid(100).comm("nginx").build();
 
     // ProcessRecord has container_info field — verify it's serializable.
     let json = serde_json::to_string(&process).unwrap();
