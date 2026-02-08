@@ -42,6 +42,10 @@ base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
+# Prometheus metrics (optional, behind "metrics" feature)
+prometheus = { version = "0.13", optional = true }
+tiny_http = { version = "0.12", optional = true }
+
 # TUI dependencies (optional, behind "ui" feature)
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
@@ -60,6 +64,7 @@ default = []
 deep = []           # Enable expensive/privileged probes (lsof, ss, perf/eBPF)
 report = ["pt-report"]  # HTML report generator
 daemon = []         # Dormant monitoring mode
+metrics = ["prometheus", "tiny_http"]  # Prometheus /metrics endpoint for daemon
 ui = ["ratatui", "crossterm"]  # Premium TUI experience
 test-utils = []     # Export test utilities for integration tests
 test-tempdir = []   # Enable tempdir helper in test utilities

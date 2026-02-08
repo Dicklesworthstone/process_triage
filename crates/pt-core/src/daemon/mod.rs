@@ -12,6 +12,8 @@
 //! systemd integration lives in CLI/service layer code.
 
 pub mod escalation;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod triggers;
 
 use chrono::Utc;
