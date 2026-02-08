@@ -387,7 +387,10 @@ mod tests {
         assert_eq!(ExitCode::ActionsOk.code_name(), "OK_APPLIED");
         assert_eq!(ExitCode::PartialFail.code_name(), "ERR_PARTIAL");
         assert_eq!(ExitCode::PolicyBlocked.code_name(), "ERR_BLOCKED");
-        assert_eq!(ExitCode::GoalUnreachable.code_name(), "ERR_GOAL_UNREACHABLE");
+        assert_eq!(
+            ExitCode::GoalUnreachable.code_name(),
+            "ERR_GOAL_UNREACHABLE"
+        );
         assert_eq!(ExitCode::Interrupted.code_name(), "ERR_INTERRUPTED");
         assert_eq!(ExitCode::ArgsError.code_name(), "ERR_ARGS");
         assert_eq!(ExitCode::CapabilityError.code_name(), "ERR_CAPABILITY");

@@ -348,40 +348,70 @@ mod tests {
 
     #[test]
     fn beta_zero_beta_param() {
-        let b = crate::priors::BetaParams { alpha: 1.0, beta: 0.0, comment: None };
+        let b = crate::priors::BetaParams {
+            alpha: 1.0,
+            beta: 0.0,
+            comment: None,
+        };
         let err = validate_beta_params("f", &b).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("beta")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("beta"))
+        );
     }
 
     #[test]
     fn beta_negative_alpha() {
-        let b = crate::priors::BetaParams { alpha: -0.5, beta: 1.0, comment: None };
+        let b = crate::priors::BetaParams {
+            alpha: -0.5,
+            beta: 1.0,
+            comment: None,
+        };
         let err = validate_beta_params("f", &b).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("alpha")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("alpha"))
+        );
     }
 
     #[test]
     fn beta_both_negative() {
-        let b = crate::priors::BetaParams { alpha: -1.0, beta: -1.0, comment: None };
+        let b = crate::priors::BetaParams {
+            alpha: -1.0,
+            beta: -1.0,
+            comment: None,
+        };
         // alpha checked first
         let err = validate_beta_params("f", &b).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("alpha")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("alpha"))
+        );
     }
 
     // ── validate_gamma_params ───────────────────────────────────
 
     #[test]
     fn gamma_negative_rate() {
-        let g = crate::priors::GammaParams { shape: 1.0, rate: -1.0, comment: None };
+        let g = crate::priors::GammaParams {
+            shape: 1.0,
+            rate: -1.0,
+            comment: None,
+        };
         let err = validate_gamma_params("f", &g).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("rate")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("rate"))
+        );
     }
 
     #[test]
     fn gamma_negative_shape() {
-        let g = crate::priors::GammaParams { shape: -1.0, rate: 1.0, comment: None };
+        let g = crate::priors::GammaParams {
+            shape: -1.0,
+            rate: 1.0,
+            comment: None,
+        };
         let err = validate_gamma_params("f", &g).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("shape")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("shape"))
+        );
     }
 
     // ── ValidationError ─────────────────────────────────────────
@@ -413,13 +443,19 @@ mod tests {
 
     #[test]
     fn error_code_invalid_value() {
-        let e = ValidationError::InvalidValue { field: "f".into(), message: "m".into() };
+        let e = ValidationError::InvalidValue {
+            field: "f".into(),
+            message: "m".into(),
+        };
         assert_eq!(e.code(), 65);
     }
 
     #[test]
     fn error_code_version_mismatch() {
-        let e = ValidationError::VersionMismatch { expected: "1".into(), actual: "2".into() };
+        let e = ValidationError::VersionMismatch {
+            expected: "1".into(),
+            actual: "2".into(),
+        };
         assert_eq!(e.code(), 66);
     }
 
@@ -437,7 +473,10 @@ mod tests {
 
     #[test]
     fn error_display_version_mismatch() {
-        let e = ValidationError::VersionMismatch { expected: "1.0".into(), actual: "2.0".into() };
+        let e = ValidationError::VersionMismatch {
+            expected: "1.0".into(),
+            actual: "2.0".into(),
+        };
         let s = e.to_string();
         assert!(s.contains("1.0"));
         assert!(s.contains("2.0"));
@@ -467,7 +506,9 @@ mod tests {
         // compensate sum: add back orig and the negative value
         priors.classes.useful.prior_prob += orig + 0.01;
         let err = validate_priors(&priors).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("zombie")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("zombie"))
+        );
     }
 
     #[test]
@@ -475,7 +516,9 @@ mod tests {
         let mut priors = crate::priors::Priors::default();
         priors.classes.useful.cpu_beta.alpha = 0.0;
         let err = validate_priors(&priors).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("cpu_beta")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("cpu_beta"))
+        );
     }
 
     #[test]
@@ -483,7 +526,9 @@ mod tests {
         let mut priors = crate::priors::Priors::default();
         priors.classes.abandoned.orphan_beta.beta = -1.0;
         let err = validate_priors(&priors).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("orphan_beta")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("orphan_beta"))
+        );
     }
 
     #[test]
@@ -491,7 +536,9 @@ mod tests {
         let mut priors = crate::priors::Priors::default();
         priors.classes.useful_bad.tty_beta.alpha = 0.0;
         let err = validate_priors(&priors).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("tty_beta")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("tty_beta"))
+        );
     }
 
     #[test]
@@ -499,7 +546,9 @@ mod tests {
         let mut priors = crate::priors::Priors::default();
         priors.classes.zombie.net_beta.beta = -1.0;
         let err = validate_priors(&priors).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("net_beta")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("net_beta"))
+        );
     }
 
     #[test]
@@ -523,7 +572,9 @@ mod tests {
         let mut policy = crate::policy::Policy::default();
         policy.fdr_control.alpha = -0.1;
         let err = validate_policy(&policy).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("fdr_control")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("fdr_control"))
+        );
     }
 
     #[test]
@@ -538,7 +589,9 @@ mod tests {
         let mut policy = crate::policy::Policy::default();
         policy.robot_mode.min_posterior = -0.1;
         let err = validate_policy(&policy).unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("robot_mode")));
+        assert!(
+            matches!(err, ValidationError::InvalidValue { ref field, .. } if field.contains("robot_mode"))
+        );
     }
 
     #[test]

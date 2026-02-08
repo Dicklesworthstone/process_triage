@@ -614,8 +614,16 @@ mod tests {
     #[test]
     fn not_supervised_with_ancestry() {
         let chain = vec![
-            AncestryEntry { pid: ProcessId(1), comm: "init".into(), cmdline: None },
-            AncestryEntry { pid: ProcessId(500), comm: "bash".into(), cmdline: None },
+            AncestryEntry {
+                pid: ProcessId(1),
+                comm: "init".into(),
+                cmdline: None,
+            },
+            AncestryEntry {
+                pid: ProcessId(500),
+                comm: "bash".into(),
+                cmdline: None,
+            },
         ];
         let result = SupervisionResult::not_supervised(chain);
         assert!(!result.is_supervised);
@@ -718,7 +726,12 @@ mod tests {
     #[test]
     fn database_add_inserts_pattern() {
         let mut db = SupervisorDatabase::new();
-        db.add(SupervisorPattern::new("custom", SupervisorCategory::Other, vec!["^x$"], 0.5));
+        db.add(SupervisorPattern::new(
+            "custom",
+            SupervisorCategory::Other,
+            vec!["^x$"],
+            0.5,
+        ));
         assert_eq!(db.patterns.len(), 1);
         assert_eq!(db.patterns[0].name, "custom");
     }
@@ -732,7 +745,9 @@ mod tests {
     #[test]
     fn database_with_defaults_has_agents() {
         let db = SupervisorDatabase::with_defaults();
-        let agents: Vec<_> = db.patterns.iter()
+        let agents: Vec<_> = db
+            .patterns
+            .iter()
             .filter(|p| p.category == SupervisorCategory::Agent)
             .collect();
         assert!(agents.len() >= 4); // claude, codex, aider, cursor
@@ -741,7 +756,9 @@ mod tests {
     #[test]
     fn database_with_defaults_has_ides() {
         let db = SupervisorDatabase::with_defaults();
-        let ides: Vec<_> = db.patterns.iter()
+        let ides: Vec<_> = db
+            .patterns
+            .iter()
             .filter(|p| p.category == SupervisorCategory::Ide)
             .collect();
         assert!(ides.len() >= 3); // vscode, jetbrains, nvim-lsp
@@ -750,7 +767,9 @@ mod tests {
     #[test]
     fn database_with_defaults_has_ci() {
         let db = SupervisorDatabase::with_defaults();
-        let ci: Vec<_> = db.patterns.iter()
+        let ci: Vec<_> = db
+            .patterns
+            .iter()
             .filter(|p| p.category == SupervisorCategory::Ci)
             .collect();
         assert!(ci.len() >= 3); // github-actions, gitlab-runner, jenkins
@@ -799,7 +818,9 @@ mod tests {
     #[test]
     fn find_matches_jetbrains_variants() {
         let db = SupervisorDatabase::with_defaults();
-        for name in &["idea", "pycharm", "webstorm", "goland", "clion", "rider", "rubymine", "phpstorm"] {
+        for name in &[
+            "idea", "pycharm", "webstorm", "goland", "clion", "rider", "rubymine", "phpstorm",
+        ] {
             let m = db.find_matches(name);
             assert!(!m.is_empty(), "expected match for {}", name);
             assert_eq!(m[0].category, SupervisorCategory::Ide);
@@ -888,7 +909,11 @@ mod tests {
     fn all_default_patterns_have_positive_weight() {
         let db = SupervisorDatabase::with_defaults();
         for p in &db.patterns {
-            assert!(p.confidence_weight > 0.0, "pattern {} has non-positive weight", p.name);
+            assert!(
+                p.confidence_weight > 0.0,
+                "pattern {} has non-positive weight",
+                p.name
+            );
         }
     }
 
@@ -904,7 +929,11 @@ mod tests {
     fn all_default_patterns_have_nonempty_patterns() {
         let db = SupervisorDatabase::with_defaults();
         for p in &db.patterns {
-            assert!(!p.process_patterns.is_empty(), "pattern {} has no regexes", p.name);
+            assert!(
+                !p.process_patterns.is_empty(),
+                "pattern {} has no regexes",
+                p.name
+            );
         }
     }
 }

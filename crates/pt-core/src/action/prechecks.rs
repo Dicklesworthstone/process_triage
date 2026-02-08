@@ -1366,7 +1366,7 @@ mod tests {
         assert!(config.block_if_deleted_cwd); // None → true
         assert!(!config.block_if_active_tty);
         assert_eq!(config.block_if_recent_io_seconds, 60); // None → 60
-        // Session safety defaults are always enabled
+                                                           // Session safety defaults are always enabled
         assert!(config.enhanced_session_safety);
     }
 
@@ -1638,10 +1638,7 @@ mod tests {
         fn live_provider_run_all_checks_self() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-            let checks = vec![
-                PreCheck::CheckNotProtected,
-                PreCheck::VerifyProcessState,
-            ];
+            let checks = vec![PreCheck::CheckNotProtected, PreCheck::VerifyProcessState];
             let results = provider.run_checks(&checks, pid, None);
             assert_eq!(results.len(), 2);
             // Self should not be protected

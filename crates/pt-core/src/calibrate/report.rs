@@ -702,8 +702,16 @@ mod tests {
 
     fn make_data_10() -> Vec<CalibrationData> {
         make_data(&[
-            (0.9, true), (0.85, true), (0.8, true), (0.7, true), (0.6, true),
-            (0.4, false), (0.3, false), (0.2, false), (0.15, false), (0.1, false),
+            (0.9, true),
+            (0.85, true),
+            (0.8, true),
+            (0.7, true),
+            (0.6, true),
+            (0.4, false),
+            (0.3, false),
+            (0.2, false),
+            (0.15, false),
+            (0.1, false),
         ])
     }
 
@@ -748,8 +756,16 @@ mod tests {
     #[test]
     fn json_report_valid_json() {
         let data = make_data(&[
-            (0.9, true), (0.8, true), (0.7, true), (0.6, true), (0.5, true),
-            (0.4, false), (0.3, false), (0.2, false), (0.1, false), (0.05, false),
+            (0.9, true),
+            (0.8, true),
+            (0.7, true),
+            (0.6, true),
+            (0.5, true),
+            (0.4, false),
+            (0.3, false),
+            (0.2, false),
+            (0.1, false),
+            (0.05, false),
         ]);
         let report = CalibrationReport::from_data(&data, 10, 0.5).unwrap();
         let json = report.json_report().unwrap();
@@ -764,8 +780,16 @@ mod tests {
     #[test]
     fn ascii_report_contains_all_sections() {
         let data = make_data(&[
-            (0.9, true), (0.8, true), (0.7, true), (0.6, true), (0.5, true),
-            (0.4, false), (0.3, false), (0.2, false), (0.1, false), (0.05, false),
+            (0.9, true),
+            (0.8, true),
+            (0.7, true),
+            (0.6, true),
+            (0.5, true),
+            (0.4, false),
+            (0.3, false),
+            (0.2, false),
+            (0.1, false),
+            (0.05, false),
         ]);
         let report = CalibrationReport::from_data(&data, 10, 0.5).unwrap();
         let ascii = report.ascii_report(40, 10);
@@ -781,16 +805,25 @@ mod tests {
     #[test]
     fn ascii_report_quality_badge() {
         let data = make_data(&[
-            (0.9, true), (0.8, true), (0.1, false), (0.2, false),
-            (0.85, true), (0.15, false), (0.95, true), (0.05, false),
-            (0.7, true), (0.3, false),
+            (0.9, true),
+            (0.8, true),
+            (0.1, false),
+            (0.2, false),
+            (0.85, true),
+            (0.15, false),
+            (0.95, true),
+            (0.05, false),
+            (0.7, true),
+            (0.3, false),
         ]);
         let report = CalibrationReport::from_data(&data, 10, 0.5).unwrap();
         let ascii = report.ascii_report(40, 10);
         // Should contain one of the quality badges
         assert!(
-            ascii.contains("EXCELLENT") || ascii.contains("GOOD")
-            || ascii.contains("FAIR") || ascii.contains("POOR")
+            ascii.contains("EXCELLENT")
+                || ascii.contains("GOOD")
+                || ascii.contains("FAIR")
+                || ascii.contains("POOR")
         );
     }
 
@@ -798,9 +831,16 @@ mod tests {
     fn report_no_kill_recs_means_no_bounds_in_ascii() {
         // All predictions below threshold => no kill recommendations => no credible bounds
         let data = make_data(&[
-            (0.1, false), (0.2, false), (0.3, false), (0.4, false),
-            (0.15, false), (0.25, false), (0.35, false), (0.45, false),
-            (0.05, false), (0.12, false),
+            (0.1, false),
+            (0.2, false),
+            (0.3, false),
+            (0.4, false),
+            (0.15, false),
+            (0.25, false),
+            (0.35, false),
+            (0.45, false),
+            (0.05, false),
+            (0.12, false),
         ]);
         let report = CalibrationReport::from_data(&data, 10, 0.5).unwrap();
         let ascii = report.ascii_report(40, 10);
@@ -810,9 +850,16 @@ mod tests {
     #[test]
     fn report_serde_roundtrip() {
         let data = make_data(&[
-            (0.9, true), (0.8, true), (0.3, false), (0.2, false),
-            (0.7, true), (0.1, false), (0.85, true), (0.15, false),
-            (0.6, true), (0.4, false),
+            (0.9, true),
+            (0.8, true),
+            (0.3, false),
+            (0.2, false),
+            (0.7, true),
+            (0.1, false),
+            (0.85, true),
+            (0.15, false),
+            (0.6, true),
+            (0.4, false),
         ]);
         let report = CalibrationReport::from_data(&data, 5, 0.5).unwrap();
         let json = serde_json::to_string(&report).unwrap();
@@ -871,8 +918,10 @@ mod tests {
     // ── analyze_signature_calibration ───────────────────────────
 
     fn make_sig_data(pairs: &[(f64, bool)], sig_id: &str) -> Vec<SignatureCalibrationData> {
-        pairs.iter().enumerate().map(|(i, &(prob, actual))| {
-            SignatureCalibrationData {
+        pairs
+            .iter()
+            .enumerate()
+            .map(|(i, &(prob, actual))| SignatureCalibrationData {
                 signature_id: sig_id.into(),
                 category: "test".into(),
                 match_confidence: 0.9,
@@ -882,8 +931,8 @@ mod tests {
                 timestamp: i as i64,
                 pid: i as u32,
                 command: "cmd".into(),
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -894,7 +943,10 @@ mod tests {
 
     #[test]
     fn analyze_single_signature() {
-        let data = make_sig_data(&[(0.9, true), (0.1, false), (0.8, true), (0.2, false)], "sig_a");
+        let data = make_sig_data(
+            &[(0.9, true), (0.1, false), (0.8, true), (0.2, false)],
+            "sig_a",
+        );
         let result = analyze_signature_calibration(&data, 0.5);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].signature_id, "sig_a");
@@ -950,10 +1002,7 @@ mod tests {
 
     #[test]
     fn analyze_suggested_threshold_none_for_small_sample() {
-        let data = make_sig_data(
-            &[(0.9, true), (0.1, false)],
-            "sig_f",
-        );
+        let data = make_sig_data(&[(0.9, true), (0.1, false)], "sig_f");
         let result = analyze_signature_calibration(&data, 0.5);
         assert!(result[0].suggested_threshold.is_none());
     }
@@ -972,9 +1021,9 @@ mod tests {
     #[test]
     fn analyze_metrics_present_with_enough_samples() {
         // Need at least 10 samples for metrics
-        let pairs: Vec<(f64, bool)> = (0..12).map(|i| {
-            if i < 6 { (0.8, true) } else { (0.2, false) }
-        }).collect();
+        let pairs: Vec<(f64, bool)> = (0..12)
+            .map(|i| if i < 6 { (0.8, true) } else { (0.2, false) })
+            .collect();
         let data = make_sig_data(&pairs, "sig_g");
         let result = analyze_signature_calibration(&data, 0.5);
         assert!(result[0].metrics.is_some());

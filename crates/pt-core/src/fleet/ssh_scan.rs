@@ -300,9 +300,7 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
 }
 
 /// Convert a HostScanResult into a HostInput for fleet session aggregation.
-pub fn scan_result_to_host_input(
-    result: &HostScanResult,
-) -> crate::session::fleet::HostInput {
+pub fn scan_result_to_host_input(result: &HostScanResult) -> crate::session::fleet::HostInput {
     use crate::session::fleet::{CandidateInfo, HostInput};
 
     match &result.scan {
@@ -405,7 +403,9 @@ mod tests {
         assert!(args.contains(&"ConnectTimeout=10".to_string()));
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(args.contains(&"myhost".to_string()));
-        assert!(args.iter().any(|a| a.contains("pt-core scan --format json")));
+        assert!(args
+            .iter()
+            .any(|a| a.contains("pt-core scan --format json")));
     }
 
     #[test]
@@ -447,7 +447,9 @@ mod tests {
             ..SshScanConfig::default()
         };
         let args = build_ssh_args("myhost", &config);
-        assert!(args.iter().any(|a| a.contains("/opt/pt/bin/pt-core scan --format json")));
+        assert!(args
+            .iter()
+            .any(|a| a.contains("/opt/pt/bin/pt-core scan --format json")));
     }
 
     #[test]

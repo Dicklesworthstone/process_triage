@@ -166,8 +166,7 @@ pub struct RunMetadata {
 // ---------------------------------------------------------------------------
 
 /// Redaction policy for snapshot persistence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RedactionPolicy {
     /// Keep all strings as-is (for local-only storage).
     None,
@@ -177,7 +176,6 @@ pub enum RedactionPolicy {
     /// Redact all command lines unconditionally.
     Full,
 }
-
 
 /// Sensitive substrings that trigger redaction under `Standard` policy.
 const SENSITIVE_PATTERNS: &[&str] = &[

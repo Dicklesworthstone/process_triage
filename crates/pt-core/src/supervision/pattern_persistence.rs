@@ -115,7 +115,6 @@ pub enum PatternLifecycle {
     Removed,
 }
 
-
 impl PatternLifecycle {
     /// Check if this lifecycle allows matching processes.
     pub fn is_active(&self) -> bool {
@@ -176,7 +175,6 @@ pub enum PatternSource {
     /// Imported from another system.
     Imported,
 }
-
 
 impl PatternSource {
     /// Check if patterns from this source can be modified.
@@ -579,8 +577,7 @@ impl AllPatternStats {
 }
 
 /// Conflict resolution strategy for imports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConflictResolution {
     /// Keep the existing pattern.
     KeepExisting,
@@ -592,7 +589,6 @@ pub enum ConflictResolution {
     /// Merge: keep higher confidence, combine counts.
     Merge,
 }
-
 
 /// Result of an import operation.
 #[derive(Debug, Clone, Default)]
@@ -1586,22 +1582,16 @@ mod tests {
 
     #[test]
     fn test_schema_to_signature_schema_filters_inactive() {
-        let mut p1 = PersistedPattern::new(
-            make_test_signature("active_one"),
-            PatternSource::Custom,
-        );
+        let mut p1 =
+            PersistedPattern::new(make_test_signature("active_one"), PatternSource::Custom);
         p1.lifecycle = PatternLifecycle::Stable;
 
-        let mut p2 = PersistedPattern::new(
-            make_test_signature("deprecated_one"),
-            PatternSource::Custom,
-        );
+        let mut p2 =
+            PersistedPattern::new(make_test_signature("deprecated_one"), PatternSource::Custom);
         p2.lifecycle = PatternLifecycle::Deprecated;
 
-        let mut p3 = PersistedPattern::new(
-            make_test_signature("removed_one"),
-            PatternSource::Custom,
-        );
+        let mut p3 =
+            PersistedPattern::new(make_test_signature("removed_one"), PatternSource::Custom);
         p3.lifecycle = PatternLifecycle::Removed;
 
         let schema = PersistedSchema {
@@ -2134,18 +2124,12 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let mut lib = PatternLibrary::new(dir.path());
 
-        let sigs = vec![
-            make_test_signature("bi_1"),
-            make_test_signature("bi_2"),
-        ];
+        let sigs = vec![make_test_signature("bi_1"), make_test_signature("bi_2")];
         lib.initialize_built_in(sigs).unwrap();
 
         // Should be loadable as built-in
         assert_eq!(lib.built_in.patterns.len(), 2);
-        assert_eq!(
-            lib.built_in.patterns[0].lifecycle,
-            PatternLifecycle::Stable
-        );
+        assert_eq!(lib.built_in.patterns[0].lifecycle, PatternLifecycle::Stable);
 
         // File should exist
         let path = dir.path().join("patterns").join("built_in.json");
@@ -2182,17 +2166,15 @@ mod tests {
         // get_pattern checks custom first
         let mut sig_custom = make_test_signature("search_order");
         sig_custom.confidence_weight = 0.1;
-        lib.custom.patterns.push(PersistedPattern::new(
-            sig_custom,
-            PatternSource::Custom,
-        ));
+        lib.custom
+            .patterns
+            .push(PersistedPattern::new(sig_custom, PatternSource::Custom));
 
         let mut sig_learned = make_test_signature("search_order");
         sig_learned.confidence_weight = 0.9;
-        lib.learned.patterns.push(PersistedPattern::new(
-            sig_learned,
-            PatternSource::Learned,
-        ));
+        lib.learned
+            .patterns
+            .push(PersistedPattern::new(sig_learned, PatternSource::Learned));
 
         let p = lib.get_pattern("search_order").unwrap();
         // Custom is checked first

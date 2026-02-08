@@ -1597,13 +1597,31 @@ mod tests {
 
     #[test]
     fn failure_category_display_all() {
-        assert_eq!(FailureCategory::ProcessNotFound.to_string(), "process_not_found");
-        assert_eq!(FailureCategory::ProcessProtected.to_string(), "process_protected");
+        assert_eq!(
+            FailureCategory::ProcessNotFound.to_string(),
+            "process_not_found"
+        );
+        assert_eq!(
+            FailureCategory::ProcessProtected.to_string(),
+            "process_protected"
+        );
         assert_eq!(FailureCategory::Timeout.to_string(), "timeout");
-        assert_eq!(FailureCategory::ResourceConflict.to_string(), "resource_conflict");
-        assert_eq!(FailureCategory::IdentityMismatch.to_string(), "identity_mismatch");
-        assert_eq!(FailureCategory::PreCheckBlocked.to_string(), "pre_check_blocked");
-        assert_eq!(FailureCategory::UnexpectedError.to_string(), "unexpected_error");
+        assert_eq!(
+            FailureCategory::ResourceConflict.to_string(),
+            "resource_conflict"
+        );
+        assert_eq!(
+            FailureCategory::IdentityMismatch.to_string(),
+            "identity_mismatch"
+        );
+        assert_eq!(
+            FailureCategory::PreCheckBlocked.to_string(),
+            "pre_check_blocked"
+        );
+        assert_eq!(
+            FailureCategory::UnexpectedError.to_string(),
+            "unexpected_error"
+        );
     }
 
     // ── RecoveryAction serde ──────────────────────────────────────────
@@ -1662,12 +1680,10 @@ mod tests {
         let tree = RecoveryTree::renice_tree();
         assert_eq!(tree.action, Action::Renice);
         let branch = tree.get_branch(FailureCategory::PermissionDenied);
-        assert!(
-            branch
-                .alternatives
-                .iter()
-                .any(|a| a.action == RecoveryAction::RetryWithSudo)
-        );
+        assert!(branch
+            .alternatives
+            .iter()
+            .any(|a| a.action == RecoveryAction::RetryWithSudo));
     }
 
     #[test]

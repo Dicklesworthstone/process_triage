@@ -1187,9 +1187,7 @@ mod tests {
         let mut lib = PatternLibrary::new(dir.path());
         let mut learner = PatternLearner::new(&mut lib);
 
-        learner
-            .record_decision("node", "node test", true)
-            .unwrap();
+        learner.record_decision("node", "node test", true).unwrap();
         assert_eq!(learner.observation_count("node"), 1);
 
         learner.clear_observations("node");
@@ -1251,18 +1249,9 @@ mod tests {
         let mut lib = PatternLibrary::new(dir.path());
         let learner = PatternLearner::new(&mut lib);
 
-        assert_eq!(
-            learner.infer_category("claude"),
-            SupervisorCategory::Agent
-        );
-        assert_eq!(
-            learner.infer_category("codex"),
-            SupervisorCategory::Agent
-        );
-        assert_eq!(
-            learner.infer_category("copilot"),
-            SupervisorCategory::Agent
-        );
+        assert_eq!(learner.infer_category("claude"), SupervisorCategory::Agent);
+        assert_eq!(learner.infer_category("codex"), SupervisorCategory::Agent);
+        assert_eq!(learner.infer_category("copilot"), SupervisorCategory::Agent);
     }
 
     #[test]

@@ -348,10 +348,7 @@ impl AppSupervisionAnalyzer {
         if let Some(name) = &supervisor_process_name {
             evidence.push(SupervisionEvidence {
                 evidence_type: EvidenceType::Environment,
-                description: format!(
-                    "SUPERVISOR_PROCESS_NAME={}",
-                    name
-                ),
+                description: format!("SUPERVISOR_PROCESS_NAME={}", name),
                 weight: 0.9,
             });
             confidence = confidence.max(0.9);
@@ -985,10 +982,7 @@ mod tests {
     #[test]
     fn test_forever_detected_with_both() {
         let analyzer = AppSupervisionAnalyzer::new();
-        let env = make_env(&[
-            ("FOREVER_ROOT", "/opt/.forever"),
-            ("FOREVER_UID", "xyz789"),
-        ]);
+        let env = make_env(&[("FOREVER_ROOT", "/opt/.forever"), ("FOREVER_UID", "xyz789")]);
         let r = analyzer.detect_forever(400, &env).unwrap();
         assert_eq!(r.confidence, 0.85, "Max of 0.8 and 0.85 is 0.85");
         assert_eq!(r.evidence.len(), 2);
@@ -1037,7 +1031,11 @@ mod tests {
     fn test_pm2_action_has_all_alternatives() {
         let analyzer = AppSupervisionAnalyzer::new();
         let action = analyzer.generate_pm2_action(&Some("app".to_string()), &None);
-        assert_eq!(action.alternatives.len(), 4, "Should have restart, delete, show, logs");
+        assert_eq!(
+            action.alternatives.len(),
+            4,
+            "Should have restart, delete, show, logs"
+        );
         assert!(action.alternatives[0].command.contains("restart"));
         assert!(action.alternatives[1].command.contains("delete"));
         assert!(action.alternatives[2].command.contains("show"));
@@ -1048,10 +1046,7 @@ mod tests {
     fn test_pm2_action_not_safe() {
         let analyzer = AppSupervisionAnalyzer::new();
         let action = analyzer.generate_pm2_action(&None, &None);
-        assert!(
-            !action.is_safe,
-            "PM2 stop is not safe (may respawn)"
-        );
+        assert!(!action.is_safe, "PM2 stop is not safe (may respawn)");
     }
 
     #[test]
@@ -1072,7 +1067,11 @@ mod tests {
     fn test_supervisord_action_has_alternatives() {
         let analyzer = AppSupervisionAnalyzer::new();
         let action = analyzer.generate_supervisord_action(&Some("web".to_string()), &None);
-        assert_eq!(action.alternatives.len(), 3, "Should have restart, status, tail");
+        assert_eq!(
+            action.alternatives.len(),
+            3,
+            "Should have restart, status, tail"
+        );
         assert!(action.alternatives[0].command.contains("restart"));
         assert!(action.alternatives[1].command.contains("status"));
         assert!(action.alternatives[2].command.contains("tail"));
@@ -1083,8 +1082,15 @@ mod tests {
         let analyzer = AppSupervisionAnalyzer::new();
         let action = analyzer.generate_nodemon_action();
         assert_eq!(action.action_type, AppActionType::Stop);
-        assert!(action.is_safe, "nodemon is safe (dev tool, no crash respawn)");
-        assert!(action.respawn_hint.as_ref().unwrap().contains("file changes"));
+        assert!(
+            action.is_safe,
+            "nodemon is safe (dev tool, no crash respawn)"
+        );
+        assert!(action
+            .respawn_hint
+            .as_ref()
+            .unwrap()
+            .contains("file changes"));
     }
 
     #[test]
@@ -1105,7 +1111,11 @@ mod tests {
     fn test_forever_action_has_alternatives() {
         let analyzer = AppSupervisionAnalyzer::new();
         let action = analyzer.generate_forever_action(&None);
-        assert_eq!(action.alternatives.len(), 3, "Should have restart, list, stopall");
+        assert_eq!(
+            action.alternatives.len(),
+            3,
+            "Should have restart, list, stopall"
+        );
         assert!(action.alternatives[2].command.contains("stopall"));
     }
 
@@ -1253,10 +1263,7 @@ mod tests {
         // If both PM2 and supervisord vars are present, PM2 should win
         // because detect_pm2 is called first in analyze()
         let analyzer = AppSupervisionAnalyzer::new();
-        let env = make_env(&[
-            ("PM2_HOME", "/home/.pm2"),
-            ("SUPERVISOR_ENABLED", "1"),
-        ]);
+        let env = make_env(&[("PM2_HOME", "/home/.pm2"), ("SUPERVISOR_ENABLED", "1")]);
         // PM2 should match first
         assert!(analyzer.detect_pm2(100, &env).is_some());
     }

@@ -463,7 +463,12 @@ port = 8080
 "#;
         let config = FleetDiscoveryConfig::parse_str(input, DiscoveryConfigFormat::Toml).unwrap();
         match &config.providers[0] {
-            ProviderConfig::Dns { service, domain, use_srv, port } => {
+            ProviderConfig::Dns {
+                service,
+                domain,
+                use_srv,
+                port,
+            } => {
                 assert_eq!(service, "myservice");
                 assert_eq!(domain.as_deref(), Some("example.com"));
                 assert!(!use_srv);
@@ -543,10 +548,14 @@ path = "fleet.toml"
 
     #[test]
     fn provider_config_aws_serde() {
-        let input = r#"{"providers":[{"type":"aws","region":"us-east-1","tag_filters":{"env":"prod"}}]}"#;
+        let input =
+            r#"{"providers":[{"type":"aws","region":"us-east-1","tag_filters":{"env":"prod"}}]}"#;
         let config = FleetDiscoveryConfig::parse_str(input, DiscoveryConfigFormat::Json).unwrap();
         match &config.providers[0] {
-            ProviderConfig::Aws { region, tag_filters } => {
+            ProviderConfig::Aws {
+                region,
+                tag_filters,
+            } => {
                 assert_eq!(region.as_deref(), Some("us-east-1"));
                 assert_eq!(tag_filters.get("env").map(|s| s.as_str()), Some("prod"));
             }
@@ -556,7 +565,8 @@ path = "fleet.toml"
 
     #[test]
     fn provider_config_gcp_serde() {
-        let input = r#"{"providers":[{"type":"gcp","project":"my-proj","labels":{"team":"infra"}}]}"#;
+        let input =
+            r#"{"providers":[{"type":"gcp","project":"my-proj","labels":{"team":"infra"}}]}"#;
         let config = FleetDiscoveryConfig::parse_str(input, DiscoveryConfigFormat::Json).unwrap();
         match &config.providers[0] {
             ProviderConfig::Gcp { project, labels } => {
@@ -569,10 +579,14 @@ path = "fleet.toml"
 
     #[test]
     fn provider_config_k8s_serde() {
-        let input = r#"{"providers":[{"type":"k8s","namespace":"prod","label_selector":"app=web"}]}"#;
+        let input =
+            r#"{"providers":[{"type":"k8s","namespace":"prod","label_selector":"app=web"}]}"#;
         let config = FleetDiscoveryConfig::parse_str(input, DiscoveryConfigFormat::Json).unwrap();
         match &config.providers[0] {
-            ProviderConfig::K8s { namespace, label_selector } => {
+            ProviderConfig::K8s {
+                namespace,
+                label_selector,
+            } => {
                 assert_eq!(namespace.as_deref(), Some("prod"));
                 assert_eq!(label_selector.as_deref(), Some("app=web"));
             }
@@ -585,7 +599,12 @@ path = "fleet.toml"
         let input = r#"{"providers":[{"type":"dns","service":"svc"}]}"#;
         let config = FleetDiscoveryConfig::parse_str(input, DiscoveryConfigFormat::Json).unwrap();
         match &config.providers[0] {
-            ProviderConfig::Dns { use_srv, domain, port, .. } => {
+            ProviderConfig::Dns {
+                use_srv,
+                domain,
+                port,
+                ..
+            } => {
                 assert!(*use_srv); // default_use_srv is true
                 assert!(domain.is_none());
                 assert!(port.is_none());
@@ -601,7 +620,9 @@ path = "fleet.toml"
         let config = FleetDiscoveryConfig {
             schema_version: DISCOVERY_SCHEMA_VERSION.to_string(),
             generated_at: Some("2026-01-15T00:00:00Z".to_string()),
-            providers: vec![ProviderConfig::Static { path: "fleet.toml".to_string() }],
+            providers: vec![ProviderConfig::Static {
+                path: "fleet.toml".to_string(),
+            }],
             cache_ttl_secs: Some(600),
             refresh_interval_secs: None,
             stale_while_revalidate_secs: None,
@@ -620,7 +641,9 @@ path = "fleet.toml"
         let config = FleetDiscoveryConfig {
             schema_version: DISCOVERY_SCHEMA_VERSION.to_string(),
             generated_at: None,
-            providers: vec![ProviderConfig::Static { path: "fleet.toml".to_string() }],
+            providers: vec![ProviderConfig::Static {
+                path: "fleet.toml".to_string(),
+            }],
             cache_ttl_secs: None,
             refresh_interval_secs: None,
             stale_while_revalidate_secs: None,
@@ -653,7 +676,10 @@ path = "fleet.toml"
         let config = FleetDiscoveryConfig {
             schema_version: DISCOVERY_SCHEMA_VERSION.to_string(),
             generated_at: None,
-            providers: vec![ProviderConfig::Aws { region: None, tag_filters: HashMap::new() }],
+            providers: vec![ProviderConfig::Aws {
+                region: None,
+                tag_filters: HashMap::new(),
+            }],
             cache_ttl_secs: None,
             refresh_interval_secs: None,
             stale_while_revalidate_secs: None,
@@ -667,7 +693,10 @@ path = "fleet.toml"
         let config = FleetDiscoveryConfig {
             schema_version: DISCOVERY_SCHEMA_VERSION.to_string(),
             generated_at: None,
-            providers: vec![ProviderConfig::Gcp { project: None, labels: HashMap::new() }],
+            providers: vec![ProviderConfig::Gcp {
+                project: None,
+                labels: HashMap::new(),
+            }],
             cache_ttl_secs: None,
             refresh_interval_secs: None,
             stale_while_revalidate_secs: None,
@@ -681,7 +710,10 @@ path = "fleet.toml"
         let config = FleetDiscoveryConfig {
             schema_version: DISCOVERY_SCHEMA_VERSION.to_string(),
             generated_at: None,
-            providers: vec![ProviderConfig::K8s { namespace: None, label_selector: None }],
+            providers: vec![ProviderConfig::K8s {
+                namespace: None,
+                label_selector: None,
+            }],
             cache_ttl_secs: None,
             refresh_interval_secs: None,
             stale_while_revalidate_secs: None,
@@ -776,8 +808,14 @@ path = "fleet.toml"
         let result = merge_inventories(&[inv1, inv2]);
         assert_eq!(result.hosts.len(), 1);
         // Tags merged
-        assert_eq!(result.hosts[0].tags.get("env").map(|s| s.as_str()), Some("prod"));
-        assert_eq!(result.hosts[0].tags.get("role").map(|s| s.as_str()), Some("web"));
+        assert_eq!(
+            result.hosts[0].tags.get("env").map(|s| s.as_str()),
+            Some("prod")
+        );
+        assert_eq!(
+            result.hosts[0].tags.get("role").map(|s| s.as_str()),
+            Some("web")
+        );
         // last_seen filled from second
         assert!(result.hosts[0].last_seen.is_some());
     }
@@ -833,14 +871,20 @@ path = "fleet.toml"
     #[test]
     fn load_from_path_json() {
         let tmp = tempfile::NamedTempFile::with_suffix(".json").unwrap();
-        std::fs::write(tmp.path(), r#"{"providers":[{"type":"static","path":"hosts.json"}]}"#).unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"{"providers":[{"type":"static","path":"hosts.json"}]}"#,
+        )
+        .unwrap();
         let config = FleetDiscoveryConfig::load_from_path(tmp.path()).unwrap();
         assert_eq!(config.providers.len(), 1);
     }
 
     #[test]
     fn load_from_path_nonexistent() {
-        let result = FleetDiscoveryConfig::load_from_path(Path::new("/tmp/nonexistent-pt-discovery-test.json"));
+        let result = FleetDiscoveryConfig::load_from_path(Path::new(
+            "/tmp/nonexistent-pt-discovery-test.json",
+        ));
         assert!(result.is_err());
     }
 }

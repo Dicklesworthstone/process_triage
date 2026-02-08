@@ -757,9 +757,18 @@ mod tests {
 
     #[test]
     fn session_state_snake_case() {
-        assert_eq!(serde_json::to_string(&SessionState::Created).unwrap(), r#""created""#);
-        assert_eq!(serde_json::to_string(&SessionState::Scanning).unwrap(), r#""scanning""#);
-        assert_eq!(serde_json::to_string(&SessionState::Completed).unwrap(), r#""completed""#);
+        assert_eq!(
+            serde_json::to_string(&SessionState::Created).unwrap(),
+            r#""created""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionState::Scanning).unwrap(),
+            r#""scanning""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionState::Completed).unwrap(),
+            r#""completed""#
+        );
     }
 
     // ── SessionMode serde ───────────────────────────────────────────
@@ -782,9 +791,18 @@ mod tests {
 
     #[test]
     fn session_mode_snake_case() {
-        assert_eq!(serde_json::to_string(&SessionMode::RobotPlan).unwrap(), r#""robot_plan""#);
-        assert_eq!(serde_json::to_string(&SessionMode::DaemonAlert).unwrap(), r#""daemon_alert""#);
-        assert_eq!(serde_json::to_string(&SessionMode::ScanOnly).unwrap(), r#""scan_only""#);
+        assert_eq!(
+            serde_json::to_string(&SessionMode::RobotPlan).unwrap(),
+            r#""robot_plan""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionMode::DaemonAlert).unwrap(),
+            r#""daemon_alert""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionMode::ScanOnly).unwrap(),
+            r#""scan_only""#
+        );
     }
 
     // ── SessionManifest ─────────────────────────────────────────────
@@ -815,7 +833,12 @@ mod tests {
     fn manifest_new_with_parent_and_label() {
         let sid = SessionId("pt-child".to_string());
         let parent = SessionId("pt-parent".to_string());
-        let m = SessionManifest::new(&sid, Some(&parent), SessionMode::RobotApply, Some("test run".to_string()));
+        let m = SessionManifest::new(
+            &sid,
+            Some(&parent),
+            SessionMode::RobotApply,
+            Some("test run".to_string()),
+        );
         assert_eq!(m.parent_session_id.as_deref(), Some("pt-parent"));
         assert_eq!(m.label.as_deref(), Some("test run"));
     }
@@ -881,7 +904,12 @@ mod tests {
     #[test]
     fn context_new_with_label() {
         let sid = SessionId("pt-test".to_string());
-        let ctx = SessionContext::new(&sid, "h".to_string(), "r".to_string(), Some("my run".to_string()));
+        let ctx = SessionContext::new(
+            &sid,
+            "h".to_string(),
+            "r".to_string(),
+            Some("my run".to_string()),
+        );
         assert_eq!(ctx.label.as_deref(), Some("my run"));
     }
 
@@ -929,7 +957,9 @@ mod tests {
         let msg = format!("{}", e);
         assert!(msg.contains("XDG"));
 
-        let e = SessionError::NotFound { session_id: "pt-123".to_string() };
+        let e = SessionError::NotFound {
+            session_id: "pt-123".to_string(),
+        };
         let msg = format!("{}", e);
         assert!(msg.contains("pt-123"));
     }
@@ -1000,7 +1030,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path());
         let sid = SessionId("pt-20260115-120000-test".to_string());
-        let manifest = SessionManifest::new(&sid, None, SessionMode::RobotPlan, Some("test".to_string()));
+        let manifest =
+            SessionManifest::new(&sid, None, SessionMode::RobotPlan, Some("test".to_string()));
         let handle = store.create(&manifest).unwrap();
         let read_back = handle.read_manifest().unwrap();
         assert_eq!(read_back.session_id, "pt-20260115-120000-test");
@@ -1031,7 +1062,9 @@ mod tests {
         let sid = SessionId("pt-20260115-120000-cap".to_string());
         let manifest = SessionManifest::new(&sid, None, SessionMode::Interactive, None);
         let handle = store.create(&manifest).unwrap();
-        handle.write_capabilities_json(r#"{"can_kill":true}"#).unwrap();
+        handle
+            .write_capabilities_json(r#"{"can_kill":true}"#)
+            .unwrap();
         assert!(handle.capabilities_path().exists());
         let content = std::fs::read_to_string(handle.capabilities_path()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -1101,14 +1134,18 @@ mod tests {
     fn list_sessions_empty_root() {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path());
-        let result = store.list_sessions(&ListSessionsOptions::default()).unwrap();
+        let result = store
+            .list_sessions(&ListSessionsOptions::default())
+            .unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn list_sessions_nonexistent_root() {
         let store = make_store(Path::new("/tmp/nonexistent-pt-test-root-12345"));
-        let result = store.list_sessions(&ListSessionsOptions::default()).unwrap();
+        let result = store
+            .list_sessions(&ListSessionsOptions::default())
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -1125,7 +1162,9 @@ mod tests {
         let m2 = SessionManifest::new(&sid2, None, SessionMode::RobotPlan, None);
         store.create(&m2).unwrap();
 
-        let result = store.list_sessions(&ListSessionsOptions::default()).unwrap();
+        let result = store
+            .list_sessions(&ListSessionsOptions::default())
+            .unwrap();
         assert_eq!(result.len(), 2);
     }
 
@@ -1140,7 +1179,10 @@ mod tests {
             store.create(&m).unwrap();
         }
 
-        let opts = ListSessionsOptions { limit: Some(3), ..Default::default() };
+        let opts = ListSessionsOptions {
+            limit: Some(3),
+            ..Default::default()
+        };
         let result = store.list_sessions(&opts).unwrap();
         assert_eq!(result.len(), 3);
     }
@@ -1178,7 +1220,9 @@ mod tests {
         // Create a dir too short to be session ID
         std::fs::create_dir(tmp.path().join("pt-short")).unwrap();
 
-        let result = store.list_sessions(&ListSessionsOptions::default()).unwrap();
+        let result = store
+            .list_sessions(&ListSessionsOptions::default())
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -1249,7 +1293,8 @@ mod tests {
         std::fs::write(
             action_dir.join("outcomes.jsonl"),
             "{\"action\":\"kill\"}\n{\"action\":\"spare\"}\n",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(count_actions(tmp.path()), Some(2));
     }
 
@@ -1261,7 +1306,8 @@ mod tests {
         std::fs::write(
             action_dir.join("outcomes.jsonl"),
             "{\"a\":1}\n\n{\"a\":2}\n  \n",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(count_actions(tmp.path()), Some(2));
     }
 

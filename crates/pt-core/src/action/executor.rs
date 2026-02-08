@@ -439,32 +439,52 @@ mod tests {
 
     #[test]
     fn status_from_error_identity_mismatch() {
-        assert_eq!(status_from_error(ActionError::IdentityMismatch), ActionStatus::IdentityMismatch);
+        assert_eq!(
+            status_from_error(ActionError::IdentityMismatch),
+            ActionStatus::IdentityMismatch
+        );
     }
 
     #[test]
     fn status_from_error_permission_denied() {
-        assert_eq!(status_from_error(ActionError::PermissionDenied), ActionStatus::PermissionDenied);
+        assert_eq!(
+            status_from_error(ActionError::PermissionDenied),
+            ActionStatus::PermissionDenied
+        );
     }
 
     #[test]
     fn status_from_error_timeout() {
-        assert_eq!(status_from_error(ActionError::Timeout), ActionStatus::Timeout);
+        assert_eq!(
+            status_from_error(ActionError::Timeout),
+            ActionStatus::Timeout
+        );
     }
 
     #[test]
     fn status_from_error_failed() {
-        assert_eq!(status_from_error(ActionError::Failed("err".into())), ActionStatus::Failed);
+        assert_eq!(
+            status_from_error(ActionError::Failed("err".into())),
+            ActionStatus::Failed
+        );
     }
 
     // ── ActionError display ─────────────────────────────────────────
 
     #[test]
     fn action_error_display() {
-        assert_eq!(ActionError::IdentityMismatch.to_string(), "identity mismatch");
-        assert_eq!(ActionError::PermissionDenied.to_string(), "permission denied");
+        assert_eq!(
+            ActionError::IdentityMismatch.to_string(),
+            "identity mismatch"
+        );
+        assert_eq!(
+            ActionError::PermissionDenied.to_string(),
+            "permission denied"
+        );
         assert_eq!(ActionError::Timeout.to_string(), "timeout");
-        assert!(ActionError::Failed("oops".into()).to_string().contains("oops"));
+        assert!(ActionError::Failed("oops".into())
+            .to_string()
+            .contains("oops"));
     }
 
     // ── ExecutionError display ──────────────────────────────────────
