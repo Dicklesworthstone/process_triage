@@ -47,8 +47,8 @@ pub fn read_resource(uri: &str) -> Result<Vec<ResourceContent>, String> {
 
 fn resource_priors(uri: &str) -> Result<Vec<ResourceContent>, String> {
     let options = crate::config::ConfigOptions::default();
-    let config = crate::config::load_config(&options)
-        .map_err(|e| format!("Config load error: {}", e))?;
+    let config =
+        crate::config::load_config(&options).map_err(|e| format!("Config load error: {}", e))?;
 
     let priors = serde_json::json!({
         "description": "Bayesian prior configuration for process scoring",
@@ -67,8 +67,8 @@ fn resource_priors(uri: &str) -> Result<Vec<ResourceContent>, String> {
 
 fn resource_policy(uri: &str) -> Result<Vec<ResourceContent>, String> {
     let options = crate::config::ConfigOptions::default();
-    let config = crate::config::load_config(&options)
-        .map_err(|e| format!("Config load error: {}", e))?;
+    let config =
+        crate::config::load_config(&options).map_err(|e| format!("Config load error: {}", e))?;
 
     let policy = serde_json::json!({
         "description": "Action policy and safety configuration",

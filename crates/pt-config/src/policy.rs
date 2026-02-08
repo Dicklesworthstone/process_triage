@@ -896,7 +896,12 @@ mod tests {
 
     #[test]
     fn fdr_method_serde_roundtrip() {
-        for method in &[FdrMethod::Bh, FdrMethod::By, FdrMethod::AlphaInvesting, FdrMethod::None] {
+        for method in &[
+            FdrMethod::Bh,
+            FdrMethod::By,
+            FdrMethod::AlphaInvesting,
+            FdrMethod::None,
+        ] {
             let json = serde_json::to_string(method).unwrap();
             let back: FdrMethod = serde_json::from_str(&json).unwrap();
             assert_eq!(*method, back);
@@ -913,7 +918,11 @@ mod tests {
 
     #[test]
     fn confidence_level_serde() {
-        for level in &[ConfidenceLevel::Low, ConfidenceLevel::Medium, ConfidenceLevel::High] {
+        for level in &[
+            ConfidenceLevel::Low,
+            ConfidenceLevel::Medium,
+            ConfidenceLevel::High,
+        ] {
             let json = serde_json::to_string(level).unwrap();
             let back: ConfidenceLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(*level, back);
@@ -922,9 +931,18 @@ mod tests {
 
     #[test]
     fn confidence_level_serde_names() {
-        assert_eq!(serde_json::to_string(&ConfidenceLevel::Low).unwrap(), "\"low\"");
-        assert_eq!(serde_json::to_string(&ConfidenceLevel::Medium).unwrap(), "\"medium\"");
-        assert_eq!(serde_json::to_string(&ConfidenceLevel::High).unwrap(), "\"high\"");
+        assert_eq!(
+            serde_json::to_string(&ConfidenceLevel::Low).unwrap(),
+            "\"low\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConfidenceLevel::Medium).unwrap(),
+            "\"medium\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConfidenceLevel::High).unwrap(),
+            "\"high\""
+        );
     }
 
     // ── Sub-struct defaults ────────────────────────────────────────

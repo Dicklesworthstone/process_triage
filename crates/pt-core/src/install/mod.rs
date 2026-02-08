@@ -27,7 +27,6 @@ pub const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 5;
 
 /// Get the default rollback directory path
 pub fn default_rollback_dir() -> PathBuf {
-    
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("process_triage")

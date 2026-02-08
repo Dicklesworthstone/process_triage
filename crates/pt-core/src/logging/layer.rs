@@ -455,7 +455,10 @@ mod tests {
 
     // ── Full layer event recording ──────────────────────────────────
 
-    fn make_buffer_layer() -> (Arc<Mutex<Vec<u8>>>, impl Layer<tracing_subscriber::Registry>) {
+    fn make_buffer_layer() -> (
+        Arc<Mutex<Vec<u8>>>,
+        impl Layer<tracing_subscriber::Registry>,
+    ) {
         let buffer = Arc::new(Mutex::new(Vec::new()));
         struct BufWriter(Arc<Mutex<Vec<u8>>>);
         impl Write for BufWriter {

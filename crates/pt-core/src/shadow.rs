@@ -488,10 +488,20 @@ mod tests {
 
     use crate::inference::{BayesFactorEntry, Classification, PosteriorResult};
 
-    fn make_ledger(confidence: Confidence, factors: Vec<BayesFactorEntry>, top: Vec<String>, why: &str) -> EvidenceLedger {
+    fn make_ledger(
+        confidence: Confidence,
+        factors: Vec<BayesFactorEntry>,
+        top: Vec<String>,
+        why: &str,
+    ) -> EvidenceLedger {
         EvidenceLedger {
             posterior: PosteriorResult {
-                posterior: ClassScores { useful: 0.1, useful_bad: 0.1, abandoned: 0.7, zombie: 0.1 },
+                posterior: ClassScores {
+                    useful: 0.1,
+                    useful_bad: 0.1,
+                    abandoned: 0.7,
+                    zombie: 0.1,
+                },
                 log_posterior: ClassScores::default(),
                 log_odds_abandoned_useful: 2.0,
                 evidence_terms: vec![],
@@ -517,7 +527,7 @@ mod tests {
     }
 
     fn make_decision(action: Action) -> DecisionOutcome {
-        use crate::decision::{ExpectedLoss, DecisionRationale};
+        use crate::decision::{DecisionRationale, ExpectedLoss};
         DecisionOutcome {
             expected_loss: vec![ExpectedLoss { action, loss: 0.0 }],
             optimal_action: action,
@@ -600,7 +610,10 @@ mod tests {
 
     #[test]
     fn recommendation_unquarantine() {
-        assert_eq!(action_to_recommendation(Action::Unquarantine), "unquarantine");
+        assert_eq!(
+            action_to_recommendation(Action::Unquarantine),
+            "unquarantine"
+        );
     }
 
     #[test]
@@ -681,7 +694,8 @@ mod tests {
         let ledger = make_ledger(Confidence::High, factors, top, "Likely abandoned");
         let event = build_evidence_event(&ledger, "sleep").unwrap();
         assert_eq!(event.event_type, EventType::EvidenceSnapshot);
-        let details: serde_json::Value = serde_json::from_str(event.details.as_ref().unwrap()).unwrap();
+        let details: serde_json::Value =
+            serde_json::from_str(event.details.as_ref().unwrap()).unwrap();
         assert_eq!(details["comm"], "sleep");
         assert_eq!(details["why_summary"], "Likely abandoned");
         assert!(details["bayes_factors"].as_array().unwrap().len() == 1);
@@ -695,7 +709,12 @@ mod tests {
 
     #[test]
     fn evidence_event_with_only_top_evidence() {
-        let ledger = make_ledger(Confidence::Medium, vec![], vec!["some evidence".to_string()], "why");
+        let ledger = make_ledger(
+            Confidence::Medium,
+            vec![],
+            vec!["some evidence".to_string()],
+            "why",
+        );
         let event = build_evidence_event(&ledger, "node");
         assert!(event.is_some());
     }
@@ -718,7 +737,8 @@ mod tests {
         ];
         let ledger = make_ledger(Confidence::High, factors, vec![], "");
         let event = build_evidence_event(&ledger, "x").unwrap();
-        let details: serde_json::Value = serde_json::from_str(event.details.as_ref().unwrap()).unwrap();
+        let details: serde_json::Value =
+            serde_json::from_str(event.details.as_ref().unwrap()).unwrap();
         assert_eq!(details["bayes_factors"].as_array().unwrap().len(), 3);
     }
 
@@ -857,7 +877,10 @@ mod tests {
         let mut recorder = ShadowRecorder::new().expect("recorder");
         let proc = make_proc(100, "sleep", "sleep 60");
         let posterior = crate::inference::ClassScores {
-            useful: 0.1, useful_bad: 0.05, abandoned: 0.8, zombie: 0.05,
+            useful: 0.1,
+            useful_bad: 0.05,
+            abandoned: 0.8,
+            zombie: 0.05,
         };
         let ledger = make_ledger(
             Confidence::High,
@@ -867,7 +890,9 @@ mod tests {
         );
         let decision = make_decision(Action::Kill);
 
-        recorder.record_candidate(&proc, &posterior, &ledger, &decision).unwrap();
+        recorder
+            .record_candidate(&proc, &posterior, &ledger, &decision)
+            .unwrap();
         assert_eq!(recorder.recorded_count(), 1);
 
         // Verify pending entry was created

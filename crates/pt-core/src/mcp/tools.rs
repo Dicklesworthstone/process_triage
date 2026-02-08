@@ -70,7 +70,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "pt_signatures".to_string(),
-            description: "List available process signatures (built-in and user-defined).".to_string(),
+            description: "List available process signatures (built-in and user-defined)."
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -102,10 +103,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 }
 
 /// Dispatch a tool call by name and return content blocks.
-pub fn call_tool(
-    name: &str,
-    params: &serde_json::Value,
-) -> Result<Vec<ToolContent>, String> {
+pub fn call_tool(name: &str, params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     match name {
         "pt_scan" => tool_scan(params),
         "pt_explain" => tool_explain(params),
@@ -123,8 +121,8 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         .unwrap_or(0.0);
 
     let options = crate::collect::QuickScanOptions::default();
-    let scan_result = crate::collect::quick_scan(&options)
-        .map_err(|e| format!("Scan failed: {}", e))?;
+    let scan_result =
+        crate::collect::quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?;
 
     // Filter by score if requested, using state as a basic score proxy
     let candidates: Vec<&crate::collect::ProcessRecord> = scan_result
@@ -185,8 +183,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 
     // Run a quick scan to find the process
     let options = crate::collect::QuickScanOptions::default();
-    let scan = crate::collect::quick_scan(&options)
-        .map_err(|e| format!("Scan failed: {}", e))?;
+    let scan = crate::collect::quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?;
 
     let process = scan.processes.iter().find(|p| {
         if let Some(target_pid) = pid {
@@ -274,10 +271,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 }
 
 fn tool_history(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
     let store = crate::session::SessionStore::from_env()
         .map_err(|e| format!("Session store error: {}", e))?;
@@ -388,8 +382,7 @@ fn tool_capabilities(_params: &serde_json::Value) -> Result<Vec<ToolContent>, St
     let caps = crate::capabilities::get_capabilities();
 
     // Capabilities derives Serialize, so serialize it directly
-    let result = serde_json::to_value(&caps)
-        .map_err(|e| format!("Serialization error: {}", e))?;
+    let result = serde_json::to_value(&caps).map_err(|e| format!("Serialization error: {}", e))?;
 
     Ok(vec![ToolContent {
         content_type: "text".to_string(),

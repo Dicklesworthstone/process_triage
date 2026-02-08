@@ -954,8 +954,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let mut log = AuditLog::open_or_create_with_config(config).unwrap();
-        let ctx = AuditContext::new("run-mix", "host-mix")
-            .with_session_id("pt-20260207-mix");
+        let ctx = AuditContext::new("run-mix", "host-mix").with_session_id("pt-20260207-mix");
 
         log.log_scan(&ctx, "started", None, None, Some("full"), None)
             .unwrap();

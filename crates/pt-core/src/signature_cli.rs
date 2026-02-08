@@ -937,7 +937,11 @@ fn run_signature_import(
                 println!("{}", format_signature_output(format, output));
             }
             _ => {
-                println!("Dry run — {} new, {} already exist:", added.len(), skipped.len());
+                println!(
+                    "Dry run — {} new, {} already exist:",
+                    added.len(),
+                    skipped.len()
+                );
                 for name in &added {
                     println!("  + {}", name);
                 }
@@ -1010,11 +1014,10 @@ fn load_signatures_from_bundle(
         .read_verified(BUNDLE_SIGNATURES_PATH)
         .map_err(|e| format!("No signatures in bundle: {}", e))?;
 
-    let text = String::from_utf8(content)
-        .map_err(|e| format!("Invalid UTF-8 in signatures: {}", e))?;
+    let text =
+        String::from_utf8(content).map_err(|e| format!("Invalid UTF-8 in signatures: {}", e))?;
 
-    serde_json::from_str(&text)
-        .map_err(|e| format!("Failed to parse signatures: {}", e))
+    serde_json::from_str(&text).map_err(|e| format!("Failed to parse signatures: {}", e))
 }
 
 fn run_signature_disable(format: &OutputFormat, name: &str, reason: Option<&str>) -> ExitCode {
@@ -1328,12 +1331,18 @@ mod tests {
 
     #[test]
     fn parse_category_orchestrator() {
-        assert_eq!(parse_category("orchestrator"), Some(SupervisorCategory::Orchestrator));
+        assert_eq!(
+            parse_category("orchestrator"),
+            Some(SupervisorCategory::Orchestrator)
+        );
     }
 
     #[test]
     fn parse_category_terminal() {
-        assert_eq!(parse_category("terminal"), Some(SupervisorCategory::Terminal));
+        assert_eq!(
+            parse_category("terminal"),
+            Some(SupervisorCategory::Terminal)
+        );
     }
 
     #[test]
@@ -1356,7 +1365,10 @@ mod tests {
         assert_eq!(parse_category("Agent"), Some(SupervisorCategory::Agent));
         assert_eq!(parse_category("IDE"), Some(SupervisorCategory::Ide));
         assert_eq!(parse_category("CI"), Some(SupervisorCategory::Ci));
-        assert_eq!(parse_category("ORCHESTRATOR"), Some(SupervisorCategory::Orchestrator));
+        assert_eq!(
+            parse_category("ORCHESTRATOR"),
+            Some(SupervisorCategory::Orchestrator)
+        );
     }
 
     // ── format_signature_output ─────────────────────────────────────
@@ -1658,11 +1670,7 @@ mod tests {
         writer.write(&bundle_path).unwrap();
 
         // Read back via our helper
-        let loaded = load_signatures_from_bundle(
-            bundle_path.to_str().unwrap(),
-            None,
-        )
-        .unwrap();
+        let loaded = load_signatures_from_bundle(bundle_path.to_str().unwrap(), None).unwrap();
 
         assert_eq!(loaded.signatures.len(), 2);
         assert_eq!(loaded.signatures[0].name, "bundle_sig_a");
@@ -1683,10 +1691,7 @@ mod tests {
         writer.add_file("other.txt", b"hello".to_vec(), None);
         writer.write(&bundle_path).unwrap();
 
-        let result = load_signatures_from_bundle(
-            bundle_path.to_str().unwrap(),
-            None,
-        );
+        let result = load_signatures_from_bundle(bundle_path.to_str().unwrap(), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("does not contain signatures"));
     }
@@ -1752,18 +1757,12 @@ mod tests {
         writer.write_encrypted(&bundle_path, "test-pass").unwrap();
 
         // Should fail without passphrase
-        let no_pw = load_signatures_from_bundle(
-            bundle_path.to_str().unwrap(),
-            None,
-        );
+        let no_pw = load_signatures_from_bundle(bundle_path.to_str().unwrap(), None);
         assert!(no_pw.is_err());
 
         // Should succeed with correct passphrase
-        let loaded = load_signatures_from_bundle(
-            bundle_path.to_str().unwrap(),
-            Some("test-pass"),
-        )
-        .unwrap();
+        let loaded =
+            load_signatures_from_bundle(bundle_path.to_str().unwrap(), Some("test-pass")).unwrap();
         assert_eq!(loaded.signatures.len(), 1);
         assert_eq!(loaded.signatures[0].name, "enc_sig");
     }

@@ -125,10 +125,8 @@ impl DaemonMetrics {
         registry.register(Box::new(errors_total.clone()))?;
 
         // -- Gauges --
-        let daemon_uptime_seconds = IntGauge::new(
-            "pt_daemon_uptime_seconds",
-            "Daemon uptime in seconds",
-        )?;
+        let daemon_uptime_seconds =
+            IntGauge::new("pt_daemon_uptime_seconds", "Daemon uptime in seconds")?;
         registry.register(Box::new(daemon_uptime_seconds.clone()))?;
 
         let last_scan_timestamp = GaugeVec::new(
@@ -144,8 +142,7 @@ impl DaemonMetrics {
             IntGauge::new("pt_escalation_count", "Total successful escalations")?;
         registry.register(Box::new(escalation_count.clone()))?;
 
-        let deferred_count =
-            IntGauge::new("pt_deferred_count", "Total deferred escalations")?;
+        let deferred_count = IntGauge::new("pt_deferred_count", "Total deferred escalations")?;
         registry.register(Box::new(deferred_count.clone()))?;
 
         let load_average = GaugeVec::new(
@@ -157,8 +154,7 @@ impl DaemonMetrics {
         let memory_used_mb = IntGauge::new("pt_memory_used_mb", "System memory used (MB)")?;
         registry.register(Box::new(memory_used_mb.clone()))?;
 
-        let memory_total_mb =
-            IntGauge::new("pt_memory_total_mb", "System total memory (MB)")?;
+        let memory_total_mb = IntGauge::new("pt_memory_total_mb", "System total memory (MB)")?;
         registry.register(Box::new(memory_total_mb.clone()))?;
 
         let swap_used_mb = IntGauge::new("pt_swap_used_mb", "System swap used (MB)")?;
@@ -171,7 +167,10 @@ impl DaemonMetrics {
         registry.register(Box::new(orphan_count.clone()))?;
 
         let candidates_current = IntGaugeVec::new(
-            Opts::new("pt_candidates_current", "Current candidate count by classification"),
+            Opts::new(
+                "pt_candidates_current",
+                "Current candidate count by classification",
+            ),
             &["classification"],
         )?;
         registry.register(Box::new(candidates_current.clone()))?;
@@ -185,8 +184,11 @@ impl DaemonMetrics {
         registry.register(Box::new(scan_duration_seconds.clone()))?;
 
         let tick_duration_seconds = HistogramVec::new(
-            HistogramOpts::new("pt_tick_duration_seconds", "Tick processing duration in seconds")
-                .buckets(vec![0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]),
+            HistogramOpts::new(
+                "pt_tick_duration_seconds",
+                "Tick processing duration in seconds",
+            )
+            .buckets(vec![0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]),
             &["outcome"],
         )?;
         registry.register(Box::new(tick_duration_seconds.clone()))?;
@@ -237,8 +239,7 @@ impl DaemonMetrics {
         self.load_average
             .with_label_values(&["5m"])
             .set(tick_metrics.load_avg_5);
-        self.memory_used_mb
-            .set(tick_metrics.memory_used_mb as i64);
+        self.memory_used_mb.set(tick_metrics.memory_used_mb as i64);
         self.memory_total_mb
             .set(tick_metrics.memory_total_mb as i64);
         self.swap_used_mb.set(tick_metrics.swap_used_mb as i64);
@@ -388,8 +389,8 @@ fn serve_loop(
         };
 
         if shutdown.load(Ordering::SeqCst) {
-            let _ = request.respond(tiny_http::Response::from_string("shutting down")
-                .with_status_code(503));
+            let _ = request
+                .respond(tiny_http::Response::from_string("shutting down").with_status_code(503));
             break;
         }
 
@@ -399,12 +400,11 @@ fn serve_loop(
         if url == path || url == format!("{}/", path) {
             match metrics.render() {
                 Ok(body) => {
-                    let response = tiny_http::Response::from_string(body)
-                        .with_header(
-                            "Content-Type: text/plain; version=0.0.4; charset=utf-8"
-                                .parse::<tiny_http::Header>()
-                                .unwrap(),
-                        );
+                    let response = tiny_http::Response::from_string(body).with_header(
+                        "Content-Type: text/plain; version=0.0.4; charset=utf-8"
+                            .parse::<tiny_http::Header>()
+                            .unwrap(),
+                    );
                     if let Err(e) = request.respond(response) {
                         warn!(error = %e, "failed to send metrics response");
                     }
@@ -420,9 +420,8 @@ fn serve_loop(
         } else if url == "/health" || url == "/healthz" {
             let _ = request.respond(tiny_http::Response::from_string("ok"));
         } else {
-            let _ = request.respond(
-                tiny_http::Response::from_string("not found").with_status_code(404),
-            );
+            let _ = request
+                .respond(tiny_http::Response::from_string("not found").with_status_code(404));
         }
     }
 }
@@ -567,13 +566,24 @@ mod tests {
         let resp = std::net::TcpStream::connect(server.addr());
         if let Ok(mut stream) = resp {
             use std::io::{Read, Write};
-            let _ = stream.write_all(format!("GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes());
+            let _ = stream
+                .write_all(format!("GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes());
             let mut buf = String::new();
             let _ = stream.read_to_string(&mut buf);
 
-            assert!(buf.contains("200 OK"), "Expected 200 OK, got: {}", &buf[..100.min(buf.len())]);
-            assert!(buf.contains("pt_build_info"), "Expected pt_build_info in response");
-            assert!(buf.contains("pt_scans_total"), "Expected pt_scans_total in response");
+            assert!(
+                buf.contains("200 OK"),
+                "Expected 200 OK, got: {}",
+                &buf[..100.min(buf.len())]
+            );
+            assert!(
+                buf.contains("pt_build_info"),
+                "Expected pt_build_info in response"
+            );
+            assert!(
+                buf.contains("pt_scans_total"),
+                "Expected pt_scans_total in response"
+            );
         }
 
         // Fetch /health

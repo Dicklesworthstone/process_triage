@@ -619,7 +619,10 @@ mod tests {
 
     #[test]
     fn normalize_cmd_collapses_whitespace() {
-        assert_eq!(normalize_cmd("node   server.js   --port  3000"), "node server.js --port 3000");
+        assert_eq!(
+            normalize_cmd("node   server.js   --port  3000"),
+            "node server.js --port 3000"
+        );
     }
 
     #[test]
@@ -647,7 +650,8 @@ mod tests {
     #[test]
     fn candidate_command_prefers_cmd_full() {
         let c = PlanCandidate {
-            pid: 1, uid: 0,
+            pid: 1,
+            uid: 0,
             cmd_short: "node".to_string(),
             cmd_full: "node server.js".to_string(),
             start_id: None,
@@ -660,7 +664,8 @@ mod tests {
     #[test]
     fn candidate_command_falls_back_to_cmd_short() {
         let c = PlanCandidate {
-            pid: 1, uid: 0,
+            pid: 1,
+            uid: 0,
             cmd_short: "node".to_string(),
             cmd_full: "".to_string(),
             start_id: None,
@@ -673,7 +678,8 @@ mod tests {
     #[test]
     fn candidate_command_both_empty() {
         let c = PlanCandidate {
-            pid: 1, uid: 0,
+            pid: 1,
+            uid: 0,
             cmd_short: "".to_string(),
             cmd_full: "".to_string(),
             start_id: None,
@@ -742,28 +748,43 @@ mod tests {
 
     #[test]
     fn parse_plan_start_id_unknown_single_part() {
-        assert!(matches!(parse_plan_start_id("just-a-string"), PlanStartId::Unknown));
+        assert!(matches!(
+            parse_plan_start_id("just-a-string"),
+            PlanStartId::Unknown
+        ));
     }
 
     #[test]
     fn parse_plan_start_id_unknown_four_parts() {
-        assert!(matches!(parse_plan_start_id("a:b:c:d"), PlanStartId::Unknown));
+        assert!(matches!(
+            parse_plan_start_id("a:b:c:d"),
+            PlanStartId::Unknown
+        ));
     }
 
     #[test]
     fn parse_plan_start_id_two_part_non_numeric() {
-        assert!(matches!(parse_plan_start_id("abc:def"), PlanStartId::Unknown));
+        assert!(matches!(
+            parse_plan_start_id("abc:def"),
+            PlanStartId::Unknown
+        ));
     }
 
     #[test]
     fn parse_plan_start_id_three_part_non_numeric_middle() {
         // Middle part must be parseable as u64
-        assert!(matches!(parse_plan_start_id("boot:abc:42"), PlanStartId::Unknown));
+        assert!(matches!(
+            parse_plan_start_id("boot:abc:42"),
+            PlanStartId::Unknown
+        ));
     }
 
     #[test]
     fn parse_plan_start_id_three_part_non_numeric_pid() {
-        assert!(matches!(parse_plan_start_id("boot:5000:abc"), PlanStartId::Unknown));
+        assert!(matches!(
+            parse_plan_start_id("boot:5000:abc"),
+            PlanStartId::Unknown
+        ));
     }
 
     // ── start_id_matches ────────────────────────────────────────────
@@ -771,42 +792,62 @@ mod tests {
     #[test]
     fn start_id_matches_legacy_match() {
         let proc = make_proc(42, 0, "cat", 1000, ProcessState::Running);
-        let parsed = PlanStartId::Legacy { pid: 42, start_time: 1000 };
+        let parsed = PlanStartId::Legacy {
+            pid: 42,
+            start_time: 1000,
+        };
         assert!(start_id_matches(parsed, &proc));
     }
 
     #[test]
     fn start_id_matches_legacy_pid_mismatch() {
         let proc = make_proc(42, 0, "cat", 1000, ProcessState::Running);
-        let parsed = PlanStartId::Legacy { pid: 99, start_time: 1000 };
+        let parsed = PlanStartId::Legacy {
+            pid: 99,
+            start_time: 1000,
+        };
         assert!(!start_id_matches(parsed, &proc));
     }
 
     #[test]
     fn start_id_matches_legacy_start_time_mismatch() {
         let proc = make_proc(42, 0, "cat", 1000, ProcessState::Running);
-        let parsed = PlanStartId::Legacy { pid: 42, start_time: 999 };
+        let parsed = PlanStartId::Legacy {
+            pid: 42,
+            start_time: 999,
+        };
         assert!(!start_id_matches(parsed, &proc));
     }
 
     #[test]
     fn start_id_matches_legacy_negative_start_time() {
         let proc = make_proc(42, 0, "cat", -1, ProcessState::Running);
-        let parsed = PlanStartId::Legacy { pid: 42, start_time: 0 };
+        let parsed = PlanStartId::Legacy {
+            pid: 42,
+            start_time: 0,
+        };
         assert!(!start_id_matches(parsed, &proc));
     }
 
     #[test]
     fn start_id_matches_full_match() {
-        let proc = make_proc_with_start_id(99, 0, "cat", 5000, ProcessState::Running, "boot:5000:99");
-        let parsed = PlanStartId::Full { raw: "boot:5000:99".to_string(), pid: 99 };
+        let proc =
+            make_proc_with_start_id(99, 0, "cat", 5000, ProcessState::Running, "boot:5000:99");
+        let parsed = PlanStartId::Full {
+            raw: "boot:5000:99".to_string(),
+            pid: 99,
+        };
         assert!(start_id_matches(parsed, &proc));
     }
 
     #[test]
     fn start_id_matches_full_mismatch() {
-        let proc = make_proc_with_start_id(99, 0, "cat", 5000, ProcessState::Running, "other:5000:99");
-        let parsed = PlanStartId::Full { raw: "boot:5000:99".to_string(), pid: 99 };
+        let proc =
+            make_proc_with_start_id(99, 0, "cat", 5000, ProcessState::Running, "other:5000:99");
+        let parsed = PlanStartId::Full {
+            raw: "boot:5000:99".to_string(),
+            pid: 99,
+        };
         assert!(!start_id_matches(parsed, &proc));
     }
 
@@ -820,25 +861,37 @@ mod tests {
 
     #[test]
     fn matches_pid_legacy_match() {
-        let parsed = PlanStartId::Legacy { pid: 42, start_time: 100 };
+        let parsed = PlanStartId::Legacy {
+            pid: 42,
+            start_time: 100,
+        };
         assert!(matches_pid(&parsed, 42));
     }
 
     #[test]
     fn matches_pid_legacy_mismatch() {
-        let parsed = PlanStartId::Legacy { pid: 42, start_time: 100 };
+        let parsed = PlanStartId::Legacy {
+            pid: 42,
+            start_time: 100,
+        };
         assert!(!matches_pid(&parsed, 99));
     }
 
     #[test]
     fn matches_pid_full_match() {
-        let parsed = PlanStartId::Full { raw: "boot:100:42".to_string(), pid: 42 };
+        let parsed = PlanStartId::Full {
+            raw: "boot:100:42".to_string(),
+            pid: 42,
+        };
         assert!(matches_pid(&parsed, 42));
     }
 
     #[test]
     fn matches_pid_full_mismatch() {
-        let parsed = PlanStartId::Full { raw: "boot:100:42".to_string(), pid: 42 };
+        let parsed = PlanStartId::Full {
+            raw: "boot:100:42".to_string(),
+            pid: 42,
+        };
         assert!(!matches_pid(&parsed, 99));
     }
 
@@ -925,10 +978,14 @@ mod tests {
         let procs = vec![make_proc(456, 1000, "node app", 200, ProcessState::Running)];
         let mut by_cmd: HashMap<(u32, String), Vec<&ProcessRecord>> = HashMap::new();
         for p in &procs {
-            by_cmd.entry((p.uid, normalize_cmd(&p.cmd))).or_default().push(p);
+            by_cmd
+                .entry((p.uid, normalize_cmd(&p.cmd)))
+                .or_default()
+                .push(p);
         }
         let key = (1000_u32, "node app".to_string());
-        let plan_ts = DateTime::parse_from_rfc3339("1970-01-01T00:00:10Z").ok()
+        let plan_ts = DateTime::parse_from_rfc3339("1970-01-01T00:00:10Z")
+            .ok()
             .map(|dt| dt.with_timezone(&Utc));
         let result = detect_respawn(&by_cmd, &key, plan_ts);
         assert!(result.is_some());
@@ -939,10 +996,19 @@ mod tests {
 
     #[test]
     fn detect_respawn_not_found_different_cmd() {
-        let procs = vec![make_proc(456, 1000, "python app", 200, ProcessState::Running)];
+        let procs = vec![make_proc(
+            456,
+            1000,
+            "python app",
+            200,
+            ProcessState::Running,
+        )];
         let mut by_cmd: HashMap<(u32, String), Vec<&ProcessRecord>> = HashMap::new();
         for p in &procs {
-            by_cmd.entry((p.uid, normalize_cmd(&p.cmd))).or_default().push(p);
+            by_cmd
+                .entry((p.uid, normalize_cmd(&p.cmd)))
+                .or_default()
+                .push(p);
         }
         let key = (1000_u32, "node app".to_string());
         assert!(detect_respawn(&by_cmd, &key, None).is_none());
@@ -953,10 +1019,14 @@ mod tests {
         let procs = vec![make_proc(456, 1000, "node app", 5, ProcessState::Running)];
         let mut by_cmd: HashMap<(u32, String), Vec<&ProcessRecord>> = HashMap::new();
         for p in &procs {
-            by_cmd.entry((p.uid, normalize_cmd(&p.cmd))).or_default().push(p);
+            by_cmd
+                .entry((p.uid, normalize_cmd(&p.cmd)))
+                .or_default()
+                .push(p);
         }
         let key = (1000_u32, "node app".to_string());
-        let plan_ts = DateTime::parse_from_rfc3339("1970-01-01T00:00:10Z").ok()
+        let plan_ts = DateTime::parse_from_rfc3339("1970-01-01T00:00:10Z")
+            .ok()
             .map(|dt| dt.with_timezone(&Utc));
         // start_time_unix=5 < plan_unix=10, so no respawn detected
         assert!(detect_respawn(&by_cmd, &key, plan_ts).is_none());
@@ -967,7 +1037,10 @@ mod tests {
         let procs = vec![make_proc(456, 1000, "node app", 5, ProcessState::Running)];
         let mut by_cmd: HashMap<(u32, String), Vec<&ProcessRecord>> = HashMap::new();
         for p in &procs {
-            by_cmd.entry((p.uid, normalize_cmd(&p.cmd))).or_default().push(p);
+            by_cmd
+                .entry((p.uid, normalize_cmd(&p.cmd)))
+                .or_default()
+                .push(p);
         }
         let key = (1000_u32, "node app".to_string());
         // Without plan_ts, any matching cmd is considered respawn
@@ -993,7 +1066,10 @@ mod tests {
             cmd_full: format!("cmd{} --flag", pid),
             start_id: Some(format!("boot:5:{}", pid)),
             recommended_action: action.to_string(),
-            blast_radius: Some(BlastRadius { memory_mb: 100.0, cpu_pct: 2.0 }),
+            blast_radius: Some(BlastRadius {
+                memory_mb: 100.0,
+                cpu_pct: 2.0,
+            }),
         }
     }
 
@@ -1013,8 +1089,14 @@ mod tests {
         let current: Vec<ProcessRecord> = vec![];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         assert_eq!(report.action_outcomes.len(), 1);
-        assert!(matches!(report.action_outcomes[0].outcome, VerifyOutcome::ConfirmedDead));
-        assert_eq!(report.action_outcomes[0].actual.as_deref(), Some("not_found"));
+        assert!(matches!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::ConfirmedDead
+        ));
+        assert_eq!(
+            report.action_outcomes[0].actual.as_deref(),
+            Some("not_found")
+        );
         assert_eq!(report.action_outcomes[0].verified, Some(true));
         assert_eq!(report.verification.overall_status, "success");
     }
@@ -1023,10 +1105,20 @@ mod tests {
     fn verify_plan_still_running_kill_action() {
         let plan = make_plan(vec![make_candidate(42, 1000, "kill")]);
         // PID 42 still running with matching start_id
-        let current = vec![make_proc_with_start_id(42, 1000, "cmd42 --flag", 5, ProcessState::Running, "boot:5:42")];
+        let current = vec![make_proc_with_start_id(
+            42,
+            1000,
+            "cmd42 --flag",
+            5,
+            ProcessState::Running,
+            "boot:5:42",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         assert_eq!(report.action_outcomes.len(), 1);
-        assert!(matches!(report.action_outcomes[0].outcome, VerifyOutcome::StillRunning));
+        assert!(matches!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::StillRunning
+        ));
         assert_eq!(report.action_outcomes[0].verified, Some(false));
         assert_eq!(report.verification.overall_status, "failure");
         assert_eq!(report.follow_up_needed, Some(true));
@@ -1035,48 +1127,107 @@ mod tests {
     #[test]
     fn verify_plan_kill_zombie_is_confirmed_dead() {
         let plan = make_plan(vec![make_candidate(42, 1000, "kill")]);
-        let current = vec![make_proc_with_start_id(42, 1000, "cmd42 --flag", 5, ProcessState::Zombie, "boot:5:42")];
+        let current = vec![make_proc_with_start_id(
+            42,
+            1000,
+            "cmd42 --flag",
+            5,
+            ProcessState::Zombie,
+            "boot:5:42",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         assert_eq!(report.action_outcomes.len(), 1);
-        assert!(matches!(report.action_outcomes[0].outcome, VerifyOutcome::ConfirmedDead));
+        assert!(matches!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::ConfirmedDead
+        ));
         assert_eq!(report.action_outcomes[0].verified, Some(true));
     }
 
     #[test]
     fn verify_plan_pause_stopped_is_confirmed_stopped() {
         let plan = make_plan(vec![make_candidate(42, 1000, "pause")]);
-        let current = vec![make_proc_with_start_id(42, 1000, "cmd42 --flag", 5, ProcessState::Stopped, "boot:5:42")];
+        let current = vec![make_proc_with_start_id(
+            42,
+            1000,
+            "cmd42 --flag",
+            5,
+            ProcessState::Stopped,
+            "boot:5:42",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         assert_eq!(report.action_outcomes.len(), 1);
-        assert!(matches!(report.action_outcomes[0].outcome, VerifyOutcome::ConfirmedStopped));
-        assert_eq!(report.action_outcomes[0].expected.as_deref(), Some("stopped"));
+        assert!(matches!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::ConfirmedStopped
+        ));
+        assert_eq!(
+            report.action_outcomes[0].expected.as_deref(),
+            Some("stopped")
+        );
         assert_eq!(report.action_outcomes[0].verified, Some(true));
     }
 
     #[test]
     fn verify_plan_freeze_not_stopped_is_still_running() {
         let plan = make_plan(vec![make_candidate(42, 1000, "freeze")]);
-        let current = vec![make_proc_with_start_id(42, 1000, "cmd42 --flag", 5, ProcessState::Running, "boot:5:42")];
+        let current = vec![make_proc_with_start_id(
+            42,
+            1000,
+            "cmd42 --flag",
+            5,
+            ProcessState::Running,
+            "boot:5:42",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
-        assert!(matches!(report.action_outcomes[0].outcome, VerifyOutcome::StillRunning));
+        assert!(matches!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::StillRunning
+        ));
     }
 
     #[test]
     fn verify_plan_restart_still_running() {
         let plan = make_plan(vec![make_candidate(42, 1000, "restart")]);
-        let current = vec![make_proc_with_start_id(42, 1000, "cmd42 --flag", 5, ProcessState::Running, "boot:5:42")];
+        let current = vec![make_proc_with_start_id(
+            42,
+            1000,
+            "cmd42 --flag",
+            5,
+            ProcessState::Running,
+            "boot:5:42",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
-        assert!(matches!(report.action_outcomes[0].outcome, VerifyOutcome::StillRunning));
-        assert_eq!(report.action_outcomes[0].expected.as_deref(), Some("terminated"));
+        assert!(matches!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::StillRunning
+        ));
+        assert_eq!(
+            report.action_outcomes[0].expected.as_deref(),
+            Some("terminated")
+        );
     }
 
     #[test]
     fn verify_plan_unknown_action_is_still_running() {
         let plan = make_plan(vec![make_candidate(42, 1000, "investigate")]);
-        let current = vec![make_proc_with_start_id(42, 1000, "cmd42 --flag", 5, ProcessState::Running, "boot:5:42")];
+        let current = vec![make_proc_with_start_id(
+            42,
+            1000,
+            "cmd42 --flag",
+            5,
+            ProcessState::Running,
+            "boot:5:42",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
-        assert!(matches!(report.action_outcomes[0].outcome, VerifyOutcome::StillRunning));
-        assert_eq!(report.action_outcomes[0].expected.as_deref(), Some("unknown"));
+        assert!(matches!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::StillRunning
+        ));
+        assert_eq!(
+            report.action_outcomes[0].expected.as_deref(),
+            Some("unknown")
+        );
     }
 
     #[test]
@@ -1095,22 +1246,42 @@ mod tests {
             make_candidate(2, 1000, "kill"),
         ]);
         // PID 1 not found (confirmed dead), PID 2 still running
-        let current = vec![make_proc_with_start_id(2, 1000, "cmd2 --flag", 5, ProcessState::Running, "boot:5:2")];
+        let current = vec![make_proc_with_start_id(
+            2,
+            1000,
+            "cmd2 --flag",
+            5,
+            ProcessState::Running,
+            "boot:5:2",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         assert_eq!(report.action_outcomes.len(), 2);
-        assert!(matches!(report.action_outcomes[0].outcome, VerifyOutcome::ConfirmedDead));
-        assert!(matches!(report.action_outcomes[1].outcome, VerifyOutcome::StillRunning));
+        assert!(matches!(
+            report.action_outcomes[0].outcome,
+            VerifyOutcome::ConfirmedDead
+        ));
+        assert!(matches!(
+            report.action_outcomes[1].outcome,
+            VerifyOutcome::StillRunning
+        ));
         assert_eq!(report.verification.overall_status, "partial_success");
     }
 
     #[test]
     fn verify_plan_resource_summary_tracking() {
         let plan = make_plan(vec![
-            make_candidate(1, 1000, "kill"),   // 100 MB expected, will be freed
-            make_candidate(2, 1000, "kill"),   // 100 MB expected, won't be freed
+            make_candidate(1, 1000, "kill"), // 100 MB expected, will be freed
+            make_candidate(2, 1000, "kill"), // 100 MB expected, won't be freed
         ]);
         // PID 1 gone (freed), PID 2 still running (not freed)
-        let current = vec![make_proc_with_start_id(2, 1000, "cmd2 --flag", 5, ProcessState::Running, "boot:5:2")];
+        let current = vec![make_proc_with_start_id(
+            2,
+            1000,
+            "cmd2 --flag",
+            5,
+            ProcessState::Running,
+            "boot:5:2",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         let summary = report.resource_summary.as_ref().unwrap();
         assert!((summary.expected_mb - 200.0).abs() < f64::EPSILON);
@@ -1132,7 +1303,14 @@ mod tests {
     #[test]
     fn verify_plan_pause_does_not_count_expected_mb() {
         let plan = make_plan(vec![make_candidate(1, 1000, "pause")]);
-        let current = vec![make_proc_with_start_id(1, 1000, "cmd1 --flag", 5, ProcessState::Stopped, "boot:5:1")];
+        let current = vec![make_proc_with_start_id(
+            1,
+            1000,
+            "cmd1 --flag",
+            5,
+            ProcessState::Stopped,
+            "boot:5:1",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         let summary = report.resource_summary.as_ref().unwrap();
         // pause action doesn't add to expected_mb
@@ -1154,7 +1332,14 @@ mod tests {
     #[test]
     fn verify_plan_no_resources_freed_when_still_running() {
         let plan = make_plan(vec![make_candidate(42, 1000, "kill")]);
-        let current = vec![make_proc_with_start_id(42, 1000, "cmd42 --flag", 5, ProcessState::Running, "boot:5:42")];
+        let current = vec![make_proc_with_start_id(
+            42,
+            1000,
+            "cmd42 --flag",
+            5,
+            ProcessState::Running,
+            "boot:5:42",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         assert!(report.action_outcomes[0].resources_freed.is_none());
     }
@@ -1162,10 +1347,19 @@ mod tests {
     #[test]
     fn verify_plan_recommendations_for_still_running() {
         let plan = make_plan(vec![make_candidate(42, 1000, "kill")]);
-        let current = vec![make_proc_with_start_id(42, 1000, "cmd42 --flag", 5, ProcessState::Running, "boot:5:42")];
+        let current = vec![make_proc_with_start_id(
+            42,
+            1000,
+            "cmd42 --flag",
+            5,
+            ProcessState::Running,
+            "boot:5:42",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         let recs = report.recommendations.as_ref().unwrap();
-        assert!(recs.iter().any(|r| r.contains("PID 42") && r.contains("still active")));
+        assert!(recs
+            .iter()
+            .any(|r| r.contains("PID 42") && r.contains("still active")));
     }
 
     #[test]
@@ -1174,7 +1368,8 @@ mod tests {
             session_id: "s".to_string(),
             generated_at: Some("1970-01-01T00:00:10Z".to_string()),
             candidates: vec![PlanCandidate {
-                pid: 42, uid: 1000,
+                pid: 42,
+                uid: 1000,
                 cmd_short: "sleep".to_string(),
                 cmd_full: "sleep 100".to_string(),
                 start_id: Some("boot:5:42".to_string()),
@@ -1182,10 +1377,19 @@ mod tests {
                 blast_radius: None,
             }],
         };
-        let current = vec![make_proc_with_start_id(42, 1000, "sleep 100", 5, ProcessState::Running, "other:5:42")];
+        let current = vec![make_proc_with_start_id(
+            42,
+            1000,
+            "sleep 100",
+            5,
+            ProcessState::Running,
+            "other:5:42",
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         let recs = report.recommendations.as_ref().unwrap();
-        assert!(recs.iter().any(|r| r.contains("PID 42") && r.contains("reused")));
+        assert!(recs
+            .iter()
+            .any(|r| r.contains("PID 42") && r.contains("reused")));
     }
 
     #[test]
@@ -1211,7 +1415,8 @@ mod tests {
     #[test]
     fn verify_plan_target_empty_cmd_is_none() {
         let plan = make_plan(vec![PlanCandidate {
-            pid: 1, uid: 1000,
+            pid: 1,
+            uid: 1000,
             cmd_short: "".to_string(),
             cmd_full: "".to_string(),
             start_id: None,
@@ -1245,8 +1450,12 @@ mod tests {
 
     #[test]
     fn verify_plan_verification_window_timestamps() {
-        let req = DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z").unwrap().with_timezone(&Utc);
-        let comp = DateTime::parse_from_rfc3339("2026-01-15T10:00:05Z").unwrap().with_timezone(&Utc);
+        let req = DateTime::parse_from_rfc3339("2026-01-15T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let comp = DateTime::parse_from_rfc3339("2026-01-15T10:00:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let plan = make_plan(vec![]);
         let report = verify_plan(&plan, &[], req, comp);
         assert!(report.verification.requested_at.contains("2026-01-15"));
@@ -1256,7 +1465,8 @@ mod tests {
     #[test]
     fn verify_plan_no_blast_radius_zero_memory() {
         let plan = make_plan(vec![PlanCandidate {
-            pid: 1, uid: 1000,
+            pid: 1,
+            uid: 1000,
             cmd_short: "proc".to_string(),
             cmd_full: "proc".to_string(),
             start_id: Some("boot:5:1".to_string()),
@@ -1301,7 +1511,8 @@ mod tests {
             session_id: "s".to_string(),
             generated_at: Some("1970-01-01T00:00:10Z".to_string()),
             candidates: vec![PlanCandidate {
-                pid: 123, uid: 1000,
+                pid: 123,
+                uid: 1000,
                 cmd_short: "node".to_string(),
                 cmd_full: "node server".to_string(),
                 start_id: Some("123:5".to_string()),
@@ -1309,7 +1520,13 @@ mod tests {
                 blast_radius: None,
             }],
         };
-        let current = vec![make_proc(456, 1000, "node server", 20, ProcessState::Running)];
+        let current = vec![make_proc(
+            456,
+            1000,
+            "node server",
+            20,
+            ProcessState::Running,
+        )];
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"respawn_detected\""));
@@ -1318,7 +1535,10 @@ mod tests {
 
     #[test]
     fn resource_freed_serializes() {
-        let rf = ResourceFreed { memory_mb: Some(512.3), cpu_pct: None };
+        let rf = ResourceFreed {
+            memory_mb: Some(512.3),
+            cpu_pct: None,
+        };
         let json = serde_json::to_string(&rf).unwrap();
         assert!(json.contains("512.3"));
         assert!(!json.contains("cpu_pct"));

@@ -32,11 +32,11 @@ pub mod cpu_capacity;
 mod deep_scan;
 #[cfg(target_os = "linux")]
 pub mod gpu;
+pub mod incremental;
 #[cfg(target_os = "linux")]
 pub mod network;
 #[cfg(target_os = "linux")]
 pub mod proc_parsers;
-pub mod incremental;
 pub mod protected;
 mod quick_scan;
 #[cfg(target_os = "linux")]
@@ -136,8 +136,8 @@ pub use user_intent::{
 #[cfg(target_os = "linux")]
 pub use gpu::{
     collect_gpu_snapshot, gpu_usage_for_pid, is_nvidia_available, is_rocm_available,
-    total_vram_mib_for_pid, GpuDetectionSource, GpuDevice, GpuError, GpuProvenance,
-    GpuSnapshot, GpuType, ProcessGpuUsage,
+    total_vram_mib_for_pid, GpuDetectionSource, GpuDevice, GpuError, GpuProvenance, GpuSnapshot,
+    GpuType, ProcessGpuUsage,
 };
 
 // Re-export incremental scanning types

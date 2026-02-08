@@ -1169,7 +1169,12 @@ mod tests {
 
     #[test]
     fn fdr_method_serde() {
-        for method in &[FdrMethod::Bh, FdrMethod::By, FdrMethod::AlphaInvesting, FdrMethod::None] {
+        for method in &[
+            FdrMethod::Bh,
+            FdrMethod::By,
+            FdrMethod::AlphaInvesting,
+            FdrMethod::None,
+        ] {
             let json = serde_json::to_string(method).unwrap();
             let back: FdrMethod = serde_json::from_str(&json).unwrap();
             assert_eq!(*method, back);
@@ -1180,7 +1185,11 @@ mod tests {
 
     #[test]
     fn confidence_level_serde() {
-        for level in &[ConfidenceLevel::Low, ConfidenceLevel::Medium, ConfidenceLevel::High] {
+        for level in &[
+            ConfidenceLevel::Low,
+            ConfidenceLevel::Medium,
+            ConfidenceLevel::High,
+        ] {
             let json = serde_json::to_string(level).unwrap();
             let back: ConfidenceLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(*level, back);

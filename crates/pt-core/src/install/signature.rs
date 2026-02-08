@@ -186,11 +186,7 @@ impl SignatureVerifier {
     }
 
     /// Verify `data` against a base64-encoded DER signature.
-    pub fn verify_base64(
-        &self,
-        data: &[u8],
-        sig_base64: &str,
-    ) -> Result<String, SignatureError> {
+    pub fn verify_base64(&self, data: &[u8], sig_base64: &str) -> Result<String, SignatureError> {
         let sig = parse_base64_signature(sig_base64)?;
         self.verify(data, &sig)
     }
@@ -574,7 +570,10 @@ mod tests {
         verifier.add_key(vk);
 
         let result = verifier.verify_file(&binary_path);
-        assert!(matches!(result, Err(SignatureError::SignatureFileNotFound(_))));
+        assert!(matches!(
+            result,
+            Err(SignatureError::SignatureFileNotFound(_))
+        ));
     }
 
     #[test]
@@ -610,8 +609,12 @@ mod tests {
         let (_, vk1) = test_keypair();
         let (_, vk2) = test_keypair();
         let mut verifier = SignatureVerifier::new();
-        verifier.add_base64_key(&BASE64.encode(vk1.to_sec1_bytes())).unwrap();
-        verifier.add_base64_key(&BASE64.encode(vk2.to_sec1_bytes())).unwrap();
+        verifier
+            .add_base64_key(&BASE64.encode(vk1.to_sec1_bytes()))
+            .unwrap();
+        verifier
+            .add_base64_key(&BASE64.encode(vk2.to_sec1_bytes()))
+            .unwrap();
         assert_eq!(verifier.key_count(), 2);
     }
 
@@ -682,7 +685,7 @@ mod tests {
         // AlgorithmIdentifier SEQUENCE
         spki.push(0x30);
         spki.push(0x13); // length 19
-        // OID 1.2.840.10045.2.1 (ecPublicKey)
+                         // OID 1.2.840.10045.2.1 (ecPublicKey)
         spki.extend_from_slice(&[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
         // OID 1.2.840.10045.3.1.7 (prime256v1 / P-256)
         spki.extend_from_slice(&[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]);

@@ -1278,7 +1278,9 @@ mod tests {
             .iter()
             .map(|pe| pe.pattern.as_str())
             .collect();
-        assert!(names.iter().any(|n| n.contains("gitlab-runner") || n.contains("actions-runner")));
+        assert!(names
+            .iter()
+            .any(|n| n.contains("gitlab-runner") || n.contains("actions-runner")));
     }
 
     #[test]

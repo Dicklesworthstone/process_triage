@@ -165,7 +165,8 @@ mod tests {
 
     #[test]
     fn jsonrpc_response_success_serialize() {
-        let resp = JsonRpcResponse::success(Some(serde_json::json!(1)), serde_json::json!({"ok": true}));
+        let resp =
+            JsonRpcResponse::success(Some(serde_json::json!(1)), serde_json::json!({"ok": true}));
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"result\""));
         assert!(!json.contains("\"error\""));
@@ -173,7 +174,8 @@ mod tests {
 
     #[test]
     fn jsonrpc_response_error_serialize() {
-        let resp = JsonRpcResponse::error(Some(serde_json::json!(1)), METHOD_NOT_FOUND, "not found");
+        let resp =
+            JsonRpcResponse::error(Some(serde_json::json!(1)), METHOD_NOT_FOUND, "not found");
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("\"result\""));
         assert!(json.contains("-32601"));

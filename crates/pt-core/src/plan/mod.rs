@@ -107,8 +107,6 @@ pub struct PlanAction {
     pub d_state_diagnostics: Option<DStateDiagnostics>,
 }
 
-
-
 fn is_direct_routing(routing: &ActionRouting) -> bool {
     *routing == ActionRouting::Direct
 }

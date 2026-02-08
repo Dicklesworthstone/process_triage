@@ -310,7 +310,14 @@ pub fn parse_nvidia_process_csv(
 /// Run rocm-smi and collect GPU device information.
 fn query_rocm_devices() -> Result<Vec<GpuDevice>, GpuError> {
     let output = Command::new("rocm-smi")
-        .args(["--showid", "--showtemp", "--showuse", "--showmeminfo", "vram", "--json"])
+        .args([
+            "--showid",
+            "--showtemp",
+            "--showuse",
+            "--showmeminfo",
+            "vram",
+            "--json",
+        ])
         .output()
         .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi: {e}")))?;
 
@@ -411,9 +418,8 @@ pub fn parse_rocm_json(json_str: &str) -> Result<Vec<GpuDevice>, GpuError> {
 /// 0    42c   45.0W   300Mhz 1200Mhz 0%  auto    250.0W  10%    0%
 /// ```
 pub fn parse_rocm_text(output: &str) -> Result<Vec<GpuDevice>, GpuError> {
-    static ROW_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^\s*(\d+)\s+(\d+)c?\s+").expect("rocm text row regex")
-    });
+    static ROW_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*(\d+)\s+(\d+)c?\s+").expect("rocm text row regex"));
 
     let mut devices = Vec::new();
     for caps in ROW_RE.captures_iter(output) {
@@ -592,12 +598,10 @@ pub fn gpu_usage_for_pid(snapshot: &GpuSnapshot, pid: u32) -> Option<&Vec<Proces
 
 /// Compute total VRAM used by a PID across all GPUs.
 pub fn total_vram_mib_for_pid(snapshot: &GpuSnapshot, pid: u32) -> Option<u64> {
-    snapshot.process_usage.get(&pid).map(|usages| {
-        usages
-            .iter()
-            .filter_map(|u| u.used_gpu_memory_mib)
-            .sum()
-    })
+    snapshot
+        .process_usage
+        .get(&pid)
+        .map(|usages| usages.iter().filter_map(|u| u.used_gpu_memory_mib).sum())
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,12 +1059,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
         let nvidia = is_nvidia_available();
         let rocm = is_rocm_available();
 
-        crate::test_log!(
-            INFO,
-            "GPU tools",
-            nvidia_smi = nvidia,
-            rocm_smi = rocm
-        );
+        crate::test_log!(INFO, "GPU tools", nvidia_smi = nvidia, rocm_smi = rocm);
 
         // If tool check says available, snapshot should detect GPU
         let snap = collect_gpu_snapshot();

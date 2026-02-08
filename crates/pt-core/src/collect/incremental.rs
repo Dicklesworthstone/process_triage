@@ -94,8 +94,8 @@ pub struct IncrementalConfig {
 impl Default for IncrementalConfig {
     fn default() -> Self {
         Self {
-            cpu_change_threshold: 5.0,       // 5 percentage points
-            rss_change_fraction: 0.20,       // 20% change
+            cpu_change_threshold: 5.0,               // 5 percentage points
+            rss_change_fraction: 0.20,               // 20% change
             max_staleness: Duration::from_secs(600), // 10 minutes
             max_inventory_size: 100_000,
         }
@@ -147,8 +147,7 @@ impl IncrementalEngine {
         let mut deltas = Vec::with_capacity(processes.len());
 
         // Track which identity hashes we saw in this scan.
-        let mut seen_hashes: HashMap<String, ()> =
-            HashMap::with_capacity(processes.len());
+        let mut seen_hashes: HashMap<String, ()> = HashMap::with_capacity(processes.len());
 
         // Phase 1: classify each incoming process.
         for proc in processes {
@@ -305,8 +304,8 @@ impl IncrementalEngine {
 
         // RSS change beyond fraction.
         if prev.rss_bytes > 0 {
-            let rss_ratio = (current.rss_bytes as f64 - prev.rss_bytes as f64).abs()
-                / prev.rss_bytes as f64;
+            let rss_ratio =
+                (current.rss_bytes as f64 - prev.rss_bytes as f64).abs() / prev.rss_bytes as f64;
             if rss_ratio > self.config.rss_change_fraction {
                 return true;
             }
@@ -715,13 +714,22 @@ mod tests {
         let procs = vec![make_proc(1, "bash", "bash")];
 
         engine.update(&procs);
-        assert_eq!(engine.inventory.values().next().unwrap().consecutive_seen, 1);
+        assert_eq!(
+            engine.inventory.values().next().unwrap().consecutive_seen,
+            1
+        );
 
         engine.update(&procs);
-        assert_eq!(engine.inventory.values().next().unwrap().consecutive_seen, 2);
+        assert_eq!(
+            engine.inventory.values().next().unwrap().consecutive_seen,
+            2
+        );
 
         engine.update(&procs);
-        assert_eq!(engine.inventory.values().next().unwrap().consecutive_seen, 3);
+        assert_eq!(
+            engine.inventory.values().next().unwrap().consecutive_seen,
+            3
+        );
     }
 
     // ── Inventory size limit ────────────────────────────────────────────
@@ -859,7 +867,10 @@ mod tests {
             inventory_size = engine.inventory_size()
         );
 
-        assert_eq!(s1.appeared, s1.total, "All processes should be Appeared on first scan");
+        assert_eq!(
+            s1.appeared, s1.total,
+            "All processes should be Appeared on first scan"
+        );
         assert_eq!(engine.inventory_size(), scan1.processes.len());
 
         // Second scan: mostly unchanged (within milliseconds, little should change).
@@ -923,7 +934,12 @@ mod tests {
             assert_eq!(h1, h2, "Hash should be stable for pid={}", proc.pid.0);
 
             // 16 hex chars.
-            assert_eq!(h1.len(), 16, "Hash should be 16 hex chars for pid={}", proc.pid.0);
+            assert_eq!(
+                h1.len(),
+                16,
+                "Hash should be 16 hex chars for pid={}",
+                proc.pid.0
+            );
             assert!(
                 h1.chars().all(|c| c.is_ascii_hexdigit()),
                 "Hash should be hex for pid={}",

@@ -737,7 +737,8 @@ mod tests {
         assert!(result.config_path.exists());
         assert!(!result.changes.is_empty());
 
-        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
         assert!(content.get("allowedTools").is_some());
         assert!(content.get("mcpServers").is_some());
         let mcp = content["mcpServers"]["process_triage"].as_object().unwrap();
@@ -748,12 +749,17 @@ mod tests {
     fn configure_claude_code_existing_config_preserves_fields() {
         let dir = tempfile::TempDir::new().unwrap();
         let settings = dir.path().join("settings.json");
-        fs::write(&settings, r#"{"theme": "dark", "allowedTools": ["other_tool"]}"#).unwrap();
+        fs::write(
+            &settings,
+            r#"{"theme": "dark", "allowedTools": ["other_tool"]}"#,
+        )
+        .unwrap();
 
         let options = make_options(false, true);
         let result = configure_claude_code(dir.path(), &options).unwrap();
 
-        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
         assert_eq!(content["theme"], "dark");
         let tools = content["allowedTools"].as_array().unwrap();
         assert!(tools.iter().any(|t| t == "other_tool"));
@@ -768,9 +774,13 @@ mod tests {
         configure_claude_code(dir.path(), &options).unwrap();
         let result2 = configure_claude_code(dir.path(), &options).unwrap();
 
-        let content: Value = serde_json::from_str(&fs::read_to_string(&result2.config_path).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&result2.config_path).unwrap()).unwrap();
         let tools = content["allowedTools"].as_array().unwrap();
-        let pt_count = tools.iter().filter(|t| t.as_str() == Some("process_triage")).count();
+        let pt_count = tools
+            .iter()
+            .filter(|t| t.as_str() == Some("process_triage"))
+            .count();
         assert_eq!(pt_count, 1, "process_triage should appear exactly once");
     }
 
@@ -814,7 +824,10 @@ mod tests {
 
         let options = make_options(false, true);
         let result = configure_claude_code(dir.path(), &options).unwrap();
-        assert!(result.changes.iter().any(|c| c.contains("Replaced invalid mcpServers")));
+        assert!(result
+            .changes
+            .iter()
+            .any(|c| c.contains("Replaced invalid mcpServers")));
     }
 
     // ── configure_codex ─────────────────────────────────────────────
@@ -825,7 +838,8 @@ mod tests {
         let options = make_options(false, true);
 
         let result = configure_codex(dir.path(), &options).unwrap();
-        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
         let tools = content["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "process_triage");
@@ -839,7 +853,8 @@ mod tests {
 
         let options = make_options(false, true);
         let result = configure_codex(dir.path(), &options).unwrap();
-        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
         let tools = content["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
     }
@@ -852,9 +867,14 @@ mod tests {
         configure_codex(dir.path(), &options).unwrap();
         configure_codex(dir.path(), &options).unwrap();
 
-        let content: Value = serde_json::from_str(&fs::read_to_string(dir.path().join("config.json")).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("config.json")).unwrap())
+                .unwrap();
         let tools = content["tools"].as_array().unwrap();
-        let pt_count = tools.iter().filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("process_triage")).count();
+        let pt_count = tools
+            .iter()
+            .filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("process_triage"))
+            .count();
         assert_eq!(pt_count, 1);
     }
 
@@ -874,7 +894,10 @@ mod tests {
 
         let options = make_options(false, true);
         let result = configure_codex(dir.path(), &options).unwrap();
-        assert!(result.changes.iter().any(|c| c.contains("Replaced invalid tools")));
+        assert!(result
+            .changes
+            .iter()
+            .any(|c| c.contains("Replaced invalid tools")));
     }
 
     // ── configure_cursor ────────────────────────────────────────────
@@ -885,7 +908,8 @@ mod tests {
         let options = make_options(false, true);
 
         let result = configure_cursor(dir.path(), &options).unwrap();
-        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
         let ext = content["extensions"]["process_triage"].as_object().unwrap();
         assert_eq!(ext["enabled"], true);
         assert_eq!(ext["command"], "pt");
@@ -899,7 +923,8 @@ mod tests {
         configure_cursor(dir.path(), &options).unwrap();
         let result = configure_cursor(dir.path(), &options).unwrap();
 
-        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
         let exts = content["extensions"].as_object().unwrap();
         assert_eq!(exts.len(), 1);
     }
@@ -912,7 +937,10 @@ mod tests {
 
         let options = make_options(false, true);
         let result = configure_cursor(dir.path(), &options).unwrap();
-        assert!(result.changes.iter().any(|c| c.contains("Replaced invalid extensions")));
+        assert!(result
+            .changes
+            .iter()
+            .any(|c| c.contains("Replaced invalid extensions")));
     }
 
     // ── configure_copilot ───────────────────────────────────────────
@@ -946,7 +974,8 @@ mod tests {
         let options = make_options(false, true);
 
         let result = configure_windsurf(dir.path(), &options).unwrap();
-        let content: Value = serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&result.config_path).unwrap()).unwrap();
         assert!(content.get("extensions").is_some());
     }
 

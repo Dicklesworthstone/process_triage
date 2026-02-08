@@ -36,7 +36,6 @@ pub enum FieldPreset {
     Full,
 }
 
-
 impl FieldSelector {
     /// Create a new field selector with specific fields.
     pub fn new(fields: Vec<String>) -> Self {

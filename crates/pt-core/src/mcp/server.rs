@@ -75,7 +75,10 @@ impl McpServer {
             "resources/list" => self.handle_resources_list(),
             "resources/read" => self.handle_resources_read(&request.params),
             "ping" => Ok(serde_json::json!({})),
-            _ => Err((METHOD_NOT_FOUND, format!("Method not found: {}", request.method))),
+            _ => Err((
+                METHOD_NOT_FOUND,
+                format!("Method not found: {}", request.method),
+            )),
         };
 
         Some(match result {
@@ -159,10 +162,10 @@ impl McpServer {
         &self,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, (i32, String)> {
-        let uri = params
-            .get("uri")
-            .and_then(|v| v.as_str())
-            .ok_or((INVALID_PARAMS, "Missing 'uri' in resources/read".to_string()))?;
+        let uri = params.get("uri").and_then(|v| v.as_str()).ok_or((
+            INVALID_PARAMS,
+            "Missing 'uri' in resources/read".to_string(),
+        ))?;
 
         match resources::read_resource(uri) {
             Ok(contents) => Ok(serde_json::json!({ "contents": contents })),
@@ -208,9 +211,7 @@ mod tests {
     #[test]
     fn handle_notification_no_response() {
         let mut s = server();
-        let resp = s.handle_message(
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-        );
+        let resp = s.handle_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
         assert!(resp.is_none());
         assert!(s.initialized);
     }
