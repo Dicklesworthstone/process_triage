@@ -3300,6 +3300,19 @@ fn run_bundle_create(
         }
     }
 
+    // Include user signatures if available
+    if let Some(user_schema) = pt_core::signature_cli::load_user_signatures() {
+        if !user_schema.signatures.is_empty() {
+            if let Ok(json) = serde_json::to_string_pretty(&user_schema) {
+                writer.add_file(
+                    pt_core::signature_cli::BUNDLE_SIGNATURES_PATH,
+                    json.into_bytes(),
+                    Some(FileType::Json),
+                );
+            }
+        }
+    }
+
     // Determine output path
     let output_path = match output_arg {
         Some(p) => PathBuf::from(p),

@@ -120,6 +120,17 @@ pub enum SignatureCommands {
         /// Name of the signature to enable
         name: String,
     },
+    /// Import signatures from a file or .ptb bundle
+    Import {
+        /// Input file path (JSON or .ptb bundle)
+        input: String,
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+        /// Bundle passphrase (if encrypted .ptb)
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
     /// Show signature performance statistics
     Stats {
         /// Only show signatures with at least this many matches
@@ -257,6 +268,11 @@ pub fn run_signature(format: &OutputFormat, args: &SignatureArgs) -> ExitCode {
             run_signature_disable(format, name, reason.as_deref())
         }
         SignatureCommands::Enable { name } => run_signature_enable(format, name),
+        SignatureCommands::Import {
+            input,
+            dry_run,
+            passphrase,
+        } => run_signature_import(format, input, *dry_run, passphrase.as_deref()),
         SignatureCommands::Stats { min_matches, sort } => {
             run_signature_stats(format, *min_matches, sort)
         }
@@ -815,6 +831,190 @@ fn run_signature_export(format: &OutputFormat, output_path: &str, user_only: boo
     }
 
     ExitCode::Clean
+}
+
+fn run_signature_import(
+    format: &OutputFormat,
+    input_path: &str,
+    dry_run: bool,
+    passphrase: Option<&str>,
+) -> ExitCode {
+    let session_id = SessionId::new();
+
+    // Determine source: .ptb bundle or plain JSON file
+    let import_schema: SignatureSchema = if input_path.ends_with(".ptb") {
+        match load_signatures_from_bundle(input_path, passphrase) {
+            Ok(schema) => schema,
+            Err(msg) => {
+                let output = serde_json::json!({
+                    "schema_version": pt_common::SCHEMA_VERSION,
+                    "session_id": session_id.0,
+                    "generated_at": chrono::Utc::now().to_rfc3339(),
+                    "command": "signature import",
+                    "status": "error",
+                    "error": msg,
+                });
+                match format {
+                    OutputFormat::Json | OutputFormat::Toon => {
+                        println!("{}", format_signature_output(format, output));
+                    }
+                    _ => eprintln!("Error: {}", msg),
+                }
+                return ExitCode::ArgsError;
+            }
+        }
+    } else {
+        // Plain JSON file
+        let content = match std::fs::read_to_string(input_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to read '{}': {}", input_path, e);
+                return ExitCode::IoError;
+            }
+        };
+        match serde_json::from_str(&content) {
+            Ok(schema) => schema,
+            Err(e) => {
+                eprintln!("Failed to parse '{}': {}", input_path, e);
+                return ExitCode::ArgsError;
+            }
+        }
+    };
+
+    if import_schema.signatures.is_empty() {
+        let output = serde_json::json!({
+            "schema_version": pt_common::SCHEMA_VERSION,
+            "session_id": session_id.0,
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "command": "signature import",
+            "status": "empty",
+            "message": "No signatures found in source",
+        });
+        match format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                println!("{}", format_signature_output(format, output));
+            }
+            _ => println!("No signatures found in source."),
+        }
+        return ExitCode::Clean;
+    }
+
+    // Load existing user signatures for merge
+    let existing = load_user_signatures().unwrap_or_else(|| SignatureSchema {
+        schema_version: SIG_SCHEMA_VERSION,
+        signatures: Vec::new(),
+        metadata: None,
+    });
+
+    let existing_names: std::collections::HashSet<String> =
+        existing.signatures.iter().map(|s| s.name.clone()).collect();
+
+    let mut added = Vec::new();
+    let mut skipped = Vec::new();
+
+    for sig in &import_schema.signatures {
+        if existing_names.contains(&sig.name) {
+            skipped.push(sig.name.clone());
+        } else {
+            added.push(sig.name.clone());
+        }
+    }
+
+    if dry_run {
+        let output = serde_json::json!({
+            "schema_version": pt_common::SCHEMA_VERSION,
+            "session_id": session_id.0,
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "command": "signature import",
+            "status": "dry_run",
+            "source": input_path,
+            "total": import_schema.signatures.len(),
+            "would_add": added,
+            "would_skip": skipped,
+        });
+        match format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                println!("{}", format_signature_output(format, output));
+            }
+            _ => {
+                println!("Dry run — {} new, {} already exist:", added.len(), skipped.len());
+                for name in &added {
+                    println!("  + {}", name);
+                }
+                for name in &skipped {
+                    println!("  = {} (skipped, already exists)", name);
+                }
+            }
+        }
+        return ExitCode::Clean;
+    }
+
+    // Merge: add new signatures
+    let mut merged = existing;
+    for sig in import_schema.signatures {
+        if !existing_names.contains(&sig.name) {
+            merged.signatures.push(sig);
+        }
+    }
+
+    if let Err(e) = save_user_signatures(&merged) {
+        eprintln!("Failed to save: {}", e);
+        return ExitCode::IoError;
+    }
+
+    let output = serde_json::json!({
+        "schema_version": pt_common::SCHEMA_VERSION,
+        "session_id": session_id.0,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "signature import",
+        "status": "success",
+        "source": input_path,
+        "added": added,
+        "skipped": skipped,
+        "total_after_import": merged.signatures.len(),
+    });
+    match format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_signature_output(format, output));
+        }
+        _ => {
+            println!(
+                "Imported {} signatures ({} skipped). Total: {}",
+                added.len(),
+                skipped.len(),
+                merged.signatures.len()
+            );
+        }
+    }
+
+    ExitCode::Clean
+}
+
+/// Load a SignatureSchema from a .ptb bundle file.
+fn load_signatures_from_bundle(
+    path: &str,
+    passphrase: Option<&str>,
+) -> Result<SignatureSchema, String> {
+    let bundle_path = std::path::Path::new(path);
+
+    // open_with_passphrase handles both encrypted and unencrypted bundles
+    // and returns a uniform BundleReader<Cursor<Vec<u8>>> type.
+    let mut reader = pt_bundle::BundleReader::open_with_passphrase(bundle_path, passphrase)
+        .map_err(|e| format!("Failed to open bundle: {}", e))?;
+
+    if !reader.has_file(BUNDLE_SIGNATURES_PATH) {
+        return Err("Bundle does not contain signatures".to_string());
+    }
+
+    let content = reader
+        .read_verified(BUNDLE_SIGNATURES_PATH)
+        .map_err(|e| format!("No signatures in bundle: {}", e))?;
+
+    let text = String::from_utf8(content)
+        .map_err(|e| format!("Invalid UTF-8 in signatures: {}", e))?;
+
+    serde_json::from_str(&text)
+        .map_err(|e| format!("Failed to parse signatures: {}", e))
 }
 
 fn run_signature_disable(format: &OutputFormat, name: &str, reason: Option<&str>) -> ExitCode {
@@ -1411,5 +1611,160 @@ mod tests {
     #[test]
     fn exit_code_args_error_is_nonzero() {
         assert_ne!(ExitCode::ArgsError as i32, 0);
+    }
+
+    // ── import / bundle roundtrip ─────────────────────────────────
+
+    fn test_schema(names: &[&str]) -> SignatureSchema {
+        SignatureSchema {
+            schema_version: SIG_SCHEMA_VERSION,
+            signatures: names
+                .iter()
+                .map(|n| SupervisorSignature {
+                    name: n.to_string(),
+                    category: SupervisorCategory::Agent,
+                    patterns: SignaturePatterns::default(),
+                    priority: 100,
+                    confidence_weight: 0.8,
+                    notes: None,
+                    builtin: false,
+                    priors: Default::default(),
+                    expectations: Default::default(),
+                })
+                .collect(),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn load_signatures_from_bundle_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("test.ptb");
+
+        // Create a bundle with signatures
+        let schema = test_schema(&["bundle_sig_a", "bundle_sig_b"]);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+
+        let mut writer = pt_bundle::BundleWriter::new(
+            "test-session",
+            "test-host",
+            pt_redact::ExportProfile::Safe,
+        );
+        writer.add_file(
+            BUNDLE_SIGNATURES_PATH,
+            json.into_bytes(),
+            Some(pt_bundle::FileType::Json),
+        );
+        writer.write(&bundle_path).unwrap();
+
+        // Read back via our helper
+        let loaded = load_signatures_from_bundle(
+            bundle_path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.signatures.len(), 2);
+        assert_eq!(loaded.signatures[0].name, "bundle_sig_a");
+        assert_eq!(loaded.signatures[1].name, "bundle_sig_b");
+    }
+
+    #[test]
+    fn load_signatures_from_bundle_no_sigs_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("empty.ptb");
+
+        // Bundle without signatures entry
+        let mut writer = pt_bundle::BundleWriter::new(
+            "test-session",
+            "test-host",
+            pt_redact::ExportProfile::Safe,
+        );
+        writer.add_file("other.txt", b"hello".to_vec(), None);
+        writer.write(&bundle_path).unwrap();
+
+        let result = load_signatures_from_bundle(
+            bundle_path.to_str().unwrap(),
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not contain signatures"));
+    }
+
+    #[test]
+    fn import_merge_skips_duplicates() {
+        let existing = test_schema(&["alpha", "beta"]);
+        let incoming = test_schema(&["beta", "gamma"]);
+
+        let existing_names: std::collections::HashSet<String> =
+            existing.signatures.iter().map(|s| s.name.clone()).collect();
+
+        let mut added = Vec::new();
+        let mut skipped = Vec::new();
+        for sig in &incoming.signatures {
+            if existing_names.contains(&sig.name) {
+                skipped.push(sig.name.clone());
+            } else {
+                added.push(sig.name.clone());
+            }
+        }
+
+        assert_eq!(added, vec!["gamma"]);
+        assert_eq!(skipped, vec!["beta"]);
+    }
+
+    #[test]
+    fn import_merge_result_has_correct_count() {
+        let existing = test_schema(&["alpha", "beta"]);
+        let incoming = test_schema(&["beta", "gamma", "delta"]);
+
+        let existing_names: std::collections::HashSet<String> =
+            existing.signatures.iter().map(|s| s.name.clone()).collect();
+
+        let mut merged = existing;
+        for sig in incoming.signatures {
+            if !existing_names.contains(&sig.name) {
+                merged.signatures.push(sig);
+            }
+        }
+
+        assert_eq!(merged.signatures.len(), 4); // alpha, beta, gamma, delta
+    }
+
+    #[test]
+    fn load_signatures_from_bundle_encrypted_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("encrypted.ptb");
+
+        let schema = test_schema(&["enc_sig"]);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+
+        let mut writer = pt_bundle::BundleWriter::new(
+            "test-session",
+            "test-host",
+            pt_redact::ExportProfile::Safe,
+        );
+        writer.add_file(
+            BUNDLE_SIGNATURES_PATH,
+            json.into_bytes(),
+            Some(pt_bundle::FileType::Json),
+        );
+        writer.write_encrypted(&bundle_path, "test-pass").unwrap();
+
+        // Should fail without passphrase
+        let no_pw = load_signatures_from_bundle(
+            bundle_path.to_str().unwrap(),
+            None,
+        );
+        assert!(no_pw.is_err());
+
+        // Should succeed with correct passphrase
+        let loaded = load_signatures_from_bundle(
+            bundle_path.to_str().unwrap(),
+            Some("test-pass"),
+        )
+        .unwrap();
+        assert_eq!(loaded.signatures.len(), 1);
+        assert_eq!(loaded.signatures[0].name, "enc_sig");
     }
 }
