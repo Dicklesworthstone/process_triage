@@ -9,10 +9,12 @@
 
 mod backup;
 mod rollback;
+pub mod signature;
 mod verification;
 
 pub use backup::{Backup, BackupManager, BackupMetadata};
 pub use rollback::{RollbackManager, RollbackResult, UpdateResult};
+pub use signature::{SignatureError, SignatureVerifier};
 pub use verification::{verify_binary, VerificationResult};
 
 use std::path::PathBuf;
