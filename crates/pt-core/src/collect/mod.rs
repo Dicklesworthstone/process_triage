@@ -8,6 +8,7 @@
 //! - Cgroup and resource limit collection
 //! - Systemd unit detection
 //! - Container detection (Docker, K8s, etc.)
+//! - GPU process detection (NVIDIA CUDA, AMD ROCm)
 //! - Tool runner for safe external command execution
 //!
 //! The collection layer produces structured records that feed into the
@@ -29,6 +30,8 @@ pub mod container;
 pub mod cpu_capacity;
 #[cfg(target_os = "linux")]
 mod deep_scan;
+#[cfg(target_os = "linux")]
+pub mod gpu;
 #[cfg(target_os = "linux")]
 pub mod network;
 #[cfg(target_os = "linux")]
@@ -127,6 +130,14 @@ pub use user_intent::{
     collect_user_intent, collect_user_intent_batch, IntentEvidence, IntentMetadata,
     IntentSignalType, PrivacyMode, ScoringMethod, UserIntentConfig, UserIntentFeatures,
     UserIntentProvenance, USER_INTENT_SCHEMA_VERSION,
+};
+
+// Re-export GPU detection types
+#[cfg(target_os = "linux")]
+pub use gpu::{
+    collect_gpu_snapshot, gpu_usage_for_pid, is_nvidia_available, is_rocm_available,
+    total_vram_mib_for_pid, GpuDetectionSource, GpuDevice, GpuError, GpuProvenance,
+    GpuSnapshot, GpuType, ProcessGpuUsage,
 };
 
 // Re-export incremental scanning types
