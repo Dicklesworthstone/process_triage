@@ -4041,6 +4041,34 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
         }
     }
 
+    // Persist fleet session to disk
+    let persist_result = (|| -> Result<PathBuf, String> {
+        let store = SessionStore::from_env()
+            .map_err(|e| format!("session store error: {}", e))?;
+        let manifest = SessionManifest::new(
+            &fleet_session_id,
+            None,
+            SessionMode::RobotPlan,
+            args.label.clone(),
+        );
+        let handle = store
+            .create(&manifest)
+            .map_err(|e| format!("session create error: {}", e))?;
+        let fleet_json = serde_json::to_string_pretty(&fleet_session)
+            .map_err(|e| format!("serialization error: {}", e))?;
+        std::fs::write(handle.dir.join("fleet.json"), fleet_json)
+            .map_err(|e| format!("write error: {}", e))?;
+        Ok(handle.dir)
+    })();
+
+    let session_dir = match &persist_result {
+        Ok(dir) => Some(dir.display().to_string()),
+        Err(e) => {
+            warnings.push(format!("failed to persist fleet session: {}", e));
+            None
+        }
+    };
+
     let response = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "fleet_session_id": fleet_session_id.0,
@@ -4048,6 +4076,7 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
         "command": "agent fleet plan",
         "status": if scan_result.failed == 0 { "ok" } else { "partial" },
         "warnings": warnings,
+        "session_dir": session_dir,
         "scan_summary": {
             "total_hosts": scan_result.total_hosts,
             "successful": scan_result.successful,
@@ -4106,30 +4135,249 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
     ExitCode::Clean
 }
 
+fn load_fleet_session(
+    fleet_session_id: &str,
+) -> Result<(pt_core::session::fleet::FleetSession, PathBuf), String> {
+    let store =
+        SessionStore::from_env().map_err(|e| format!("session store error: {}", e))?;
+    let sid = SessionId(fleet_session_id.to_string());
+    let handle = store
+        .open(&sid)
+        .map_err(|e| format!("cannot open fleet session '{}': {}", fleet_session_id, e))?;
+    let fleet_path = handle.dir.join("fleet.json");
+    let content = std::fs::read_to_string(&fleet_path).map_err(|e| {
+        format!(
+            "cannot read fleet session '{}': {}",
+            fleet_path.display(),
+            e
+        )
+    })?;
+    let fleet: pt_core::session::fleet::FleetSession =
+        serde_json::from_str(&content).map_err(|e| format!("parse error: {}", e))?;
+    Ok((fleet, handle.dir))
+}
+
 fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> ExitCode {
-    let message = format!(
-        "Fleet apply not yet implemented (fleet_session={}, parallel={}, timeout={}, continue_on_error={})",
-        args.fleet_session, args.parallel, args.timeout, args.continue_on_error
-    );
-    output_stub(global, "agent fleet apply", &message);
+    let (fleet, session_dir) = match load_fleet_session(&args.fleet_session) {
+        Ok(f) => f,
+        Err(e) => return output_agent_error(global, "fleet apply", &e),
+    };
+
+    // Collect kill actions from the fleet session
+    let mut kill_actions: Vec<serde_json::Value> = Vec::new();
+    let mut review_actions: Vec<serde_json::Value> = Vec::new();
+
+    for host in &fleet.hosts {
+        for (action, count) in &host.summary.action_counts {
+            match action.as_str() {
+                "kill" => {
+                    kill_actions.push(serde_json::json!({
+                        "host": host.host_id,
+                        "action": "kill",
+                        "count": count,
+                    }));
+                }
+                "review" => {
+                    review_actions.push(serde_json::json!({
+                        "host": host.host_id,
+                        "action": "review",
+                        "count": count,
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let total_kills: u32 = kill_actions
+        .iter()
+        .filter_map(|a| a["count"].as_u64())
+        .map(|c| c as u32)
+        .sum();
+
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "fleet_session_id": fleet.fleet_session_id,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "agent fleet apply",
+        "status": "dry_run",
+        "note": "Fleet apply currently reports planned actions. Remote execution requires --confirm flag (not yet implemented).",
+        "session_dir": session_dir.display().to_string(),
+        "planned_actions": {
+            "total_kill_candidates": total_kills,
+            "approved_by_fdr": fleet.safety_budget.pooled_fdr.selected_kills,
+            "rejected_by_fdr": fleet.safety_budget.pooled_fdr.rejected_kills,
+            "kills": kill_actions,
+            "reviews": review_actions,
+        },
+        "safety_budget": fleet.safety_budget,
+    });
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# pt-core agent fleet apply");
+            println!();
+            println!("Fleet session: {}", fleet.fleet_session_id);
+            println!("Hosts: {}", fleet.hosts.len());
+            println!(
+                "Kill candidates: {} ({} approved by FDR, {} rejected)",
+                total_kills,
+                fleet.safety_budget.pooled_fdr.selected_kills,
+                fleet.safety_budget.pooled_fdr.rejected_kills,
+            );
+            println!();
+            println!("Note: Remote execution not yet implemented. Use --format json for full details.");
+        }
+    }
+
     ExitCode::Clean
 }
 
 fn run_agent_fleet_report(global: &GlobalOpts, args: &AgentFleetReportArgs) -> ExitCode {
-    let message = format!(
-        "Fleet report not yet implemented (fleet_session={}, out={:?}, profile={})",
-        args.fleet_session, args.out, args.profile
-    );
-    output_stub(global, "agent fleet report", &message);
+    let (fleet, session_dir) = match load_fleet_session(&args.fleet_session) {
+        Ok(f) => f,
+        Err(e) => return output_agent_error(global, "fleet report", &e),
+    };
+
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "fleet_session_id": fleet.fleet_session_id,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "agent fleet report",
+        "session_dir": session_dir.display().to_string(),
+        "report": {
+            "created_at": fleet.created_at,
+            "label": fleet.label,
+            "aggregate": fleet.aggregate,
+            "safety_budget": fleet.safety_budget,
+            "hosts": fleet.hosts.iter().map(|h| {
+                serde_json::json!({
+                    "host_id": h.host_id,
+                    "process_count": h.process_count,
+                    "candidate_count": h.candidate_count,
+                    "summary": h.summary,
+                })
+            }).collect::<Vec<_>>(),
+        },
+    });
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# Fleet Report: {}", fleet.fleet_session_id);
+            if let Some(label) = &fleet.label {
+                println!("Label: {}", label);
+            }
+            println!("Created: {}", fleet.created_at);
+            println!();
+            println!("## Aggregate");
+            println!("  Hosts:      {}", fleet.aggregate.total_hosts);
+            println!("  Processes:  {}", fleet.aggregate.total_processes);
+            println!("  Candidates: {}", fleet.aggregate.total_candidates);
+            println!(
+                "  Mean score: {:.3}",
+                fleet.aggregate.mean_candidate_score
+            );
+            println!(
+                "  Max score:  {:.3}",
+                fleet.aggregate.max_candidate_score
+            );
+            println!();
+            if !fleet.aggregate.recurring_patterns.is_empty() {
+                println!("## Recurring Patterns");
+                for p in &fleet.aggregate.recurring_patterns {
+                    println!(
+                        "  {} — {} hosts, {} instances (action: {})",
+                        p.signature, p.host_count, p.total_instances, p.dominant_action
+                    );
+                }
+                println!();
+            }
+            println!("## Per-Host Summary");
+            for h in &fleet.hosts {
+                println!(
+                    "  {} — {} processes, {} candidates",
+                    h.host_id, h.process_count, h.candidate_count
+                );
+            }
+        }
+    }
+
     ExitCode::Clean
 }
 
 fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> ExitCode {
-    let message = format!(
-        "Fleet status not yet implemented (fleet_session={})",
-        args.fleet_session
-    );
-    output_stub(global, "agent fleet status", &message);
+    let (fleet, session_dir) = match load_fleet_session(&args.fleet_session) {
+        Ok(f) => f,
+        Err(e) => return output_agent_error(global, "fleet status", &e),
+    };
+
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "fleet_session_id": fleet.fleet_session_id,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "agent fleet status",
+        "session_dir": session_dir.display().to_string(),
+        "created_at": fleet.created_at,
+        "label": fleet.label,
+        "hosts": fleet.hosts.len(),
+        "aggregate": {
+            "total_hosts": fleet.aggregate.total_hosts,
+            "total_processes": fleet.aggregate.total_processes,
+            "total_candidates": fleet.aggregate.total_candidates,
+            "mean_candidate_score": fleet.aggregate.mean_candidate_score,
+            "max_candidate_score": fleet.aggregate.max_candidate_score,
+            "class_counts": fleet.aggregate.class_counts,
+            "action_counts": fleet.aggregate.action_counts,
+            "recurring_patterns": fleet.aggregate.recurring_patterns.len(),
+        },
+        "safety_budget": {
+            "max_fdr": fleet.safety_budget.max_fdr,
+            "alpha_spent": fleet.safety_budget.alpha_spent,
+            "alpha_remaining": fleet.safety_budget.alpha_remaining,
+            "pooled_fdr_selected": fleet.safety_budget.pooled_fdr.selected_kills,
+            "pooled_fdr_rejected": fleet.safety_budget.pooled_fdr.rejected_kills,
+        },
+    });
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("# Fleet Status: {}", fleet.fleet_session_id);
+            if let Some(label) = &fleet.label {
+                println!("Label: {}", label);
+            }
+            println!("Created: {}", fleet.created_at);
+            println!("Session: {}", session_dir.display());
+            println!();
+            println!("Hosts:      {}", fleet.aggregate.total_hosts);
+            println!("Processes:  {}", fleet.aggregate.total_processes);
+            println!("Candidates: {}", fleet.aggregate.total_candidates);
+            println!();
+            println!(
+                "FDR budget: {:.1}% (spent {:.3}, remaining {:.3})",
+                fleet.safety_budget.max_fdr * 100.0,
+                fleet.safety_budget.alpha_spent,
+                fleet.safety_budget.alpha_remaining
+            );
+            println!(
+                "Kill decisions: {} approved, {} rejected by pooled FDR",
+                fleet.safety_budget.pooled_fdr.selected_kills,
+                fleet.safety_budget.pooled_fdr.rejected_kills
+            );
+        }
+    }
+
     ExitCode::Clean
 }
 
