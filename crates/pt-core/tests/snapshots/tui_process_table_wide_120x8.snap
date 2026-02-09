@@ -1,0 +1,8 @@
+┌ Processes [1] [view: score] [Space: toggle, a: rec, A: all, u: clear, x: invert, e: execute] ────────────────────────┐
+│[ ]│PID     │Score ▼│Class   │Runtime  │Memory  │Command                                                              │
+│☐  │4242    │91     │KILL    │3h 12m   │1.2 GB  │node dev server                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

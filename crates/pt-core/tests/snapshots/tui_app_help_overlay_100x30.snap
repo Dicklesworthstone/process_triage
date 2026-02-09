@@ -1,0 +1,30 @@
+┌ Search ──────────────────────────────────────────────────────────────────────────────────────────┐
+│Search processes...                                                                               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Processes [1] [view: score] [Space: toggle, a: rec, A: all, u:┐┌ Detail ─────────────────────────┐
+│[ ]│PID     │Score ▼│Class   │Runtime  │Memory  │Command       ││PID: 4242  Class: KILL           │
+│☐  │4242    │91     │KILL    │3h 12m   │1.2 GB  │node dev serve││Command: node dev server         │
+│                        ┌ Help ──────────────────────────────────────────┐ no                     │
+│                        │  Process Triage TUI Help             ││        │                        │
+│                        │                                      ││Score: 9│  Runtime: 3h 12m       │
+│                        │  Navigation:                         ││Memory: │.2 GB                   │
+│                        │    j / Down    Move down             ││        │                        │
+│                        │    k / Up      Move up               ││        │                        │
+│                        │    Home        Go to top             ││Evidence│                        │
+│                        │    End         Go to bottom          ││Old + id│e + orphaned            │
+│                        │    Ctrl+d      Page down             ││• PPID=1│                        │
+│                        │    Ctrl+u      Page up               ││• Idle>2│                        │
+│                        │    Tab         Cycle focus           ││        │                        │
+│                        │    n / N       Next/prev match       ││        │                        │
+│                        │                                      ││        │                        │
+│                        │  Actions:                            ││        │                        │
+│                        │    /           Start search          ││        │                        │
+│                        │    Space       Toggle selection      ││        │                        │
+│                        │    a           Select recommended    ││        │                        │
+│                        └────────────────────────────────────────────────┘                        │
+│                                                               ││                                 │
+│                                                               ││Action                           │
+│                                                               ││Plan: SIGTERM -> SIGKILL         │
+│                                                               ││                                 │
+└───────────────────────────────────────────────────────────────┘└─────────────────────────────────┘
+Ready │ [Help] │ ?: close  Esc: close                                                               

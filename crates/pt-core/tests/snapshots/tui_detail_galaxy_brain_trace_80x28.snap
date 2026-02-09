@@ -1,0 +1,28 @@
+┌ Detail ──────────────────────────────────────────────────────────────────────┐
+│PID: 4242  Class: KILL                                                        │
+│Command: node dev server                                                      │
+│Selected: no                                                                  │
+│                                                                              │
+│Score: 91  Runtime: 3h 12m                                                    │
+│Memory: 1.2 GB                                                                │
+│                                                                              │
+│                                                                              │
+│Galaxy Brain                                                                  │
+│[*] Galaxy-Brain Mode ==================================================      │
+│                                                                              │
+│> Prior Distribution                                                          │
+│  P(C)  ~ [0.2500, 0.2500, 0.2500, 0.2500]  (U, UB, A, Z)                     │
+│                                                                              │
+│> Posterior Distribution                                                      │
+│  P(C|x)  ~ [0.1200, 0.0800, 0.7200, 0.0800]  (U, UB, A, Z)                   │
+│                                                                              │
+│  Classification: Abandoned  |  Confidence: low                               │
+│                                                                              │
+│> Evidence (Bayes Factors)                                                    │
+│  age_days             BF=    9.03  ^A3.2 bits  [strong]                      │
+│  cpu_idle             BF=    3.32  ^A1.7 bits  [substantial]                 │
+│                                                                              │
+│Notes                                                                         │
+│• press g to toggle                                                           │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
