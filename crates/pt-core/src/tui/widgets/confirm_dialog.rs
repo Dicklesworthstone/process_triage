@@ -1,7 +1,17 @@
 //! Confirmation dialog widget.
 //!
 //! Modal dialog for confirming destructive actions like process termination.
+//! Uses ftui's Dialog as the primary rendering path, with ratatui legacy
+//! compat behind the `ui-legacy` feature gate.
 
+use ftui::widgets::modal::{
+    Dialog as FtuiDialog, DialogButton as FtuiDialogButton, DialogState as FtuiDialogState,
+};
+use ftui::widgets::StatefulWidget as FtuiStatefulWidget;
+use ftui::PackedRgba;
+use ftui::Style as FtuiStyle;
+
+#[cfg(feature = "ui-legacy")]
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -88,7 +98,69 @@ impl<'a> ConfirmDialog<'a> {
         self
     }
 
+    // ── ftui rendering ──────────────────────────────────────────────
+
+    /// Render the confirmation dialog using ftui Dialog.
+    pub fn render_ftui(
+        &self,
+        area: ftui::layout::Rect,
+        frame: &mut ftui::render::frame::Frame,
+        state: &mut ConfirmDialogState,
+    ) {
+        if !state.visible {
+            return;
+        }
+
+        // Build message (combine message + details)
+        let full_message = if let Some(details) = self.details {
+            format!("{}\n\n{}", self.message, details)
+        } else {
+            self.message.to_string()
+        };
+
+        // Build button styles from theme
+        let (button_style, focused_style) = if let Some(theme) = self.theme {
+            let sheet = theme.stylesheet();
+            (
+                sheet.get_or_default("border.normal"),
+                sheet.get_or_default("table.selected"),
+            )
+        } else {
+            (
+                FtuiStyle::default(),
+                FtuiStyle::new()
+                    .fg(PackedRgba::rgb(0, 0, 0))
+                    .bg(PackedRgba::rgb(0, 255, 255))
+                    .bold(),
+            )
+        };
+
+        // Build dialog with custom Yes/No buttons
+        let dialog = FtuiDialog::custom(
+            format!(" {} ", self.title),
+            full_message,
+        )
+        .button(FtuiDialogButton::new(self.yes_label, "yes"))
+        .button(FtuiDialogButton::new(self.no_label, "no"))
+        .build()
+        .button_style(button_style)
+        .focused_button_style(focused_style);
+
+        // Map our state to ftui DialogState for rendering
+        let mut ftui_state = FtuiDialogState::new();
+        ftui_state.open = true;
+        ftui_state.focused_button = match state.selected {
+            ConfirmChoice::Yes => Some(0),
+            ConfirmChoice::No => Some(1),
+        };
+
+        FtuiStatefulWidget::render(&dialog, area, frame, &mut ftui_state);
+    }
+
+    // ── Legacy ratatui helpers ──────────────────────────────────────
+
     /// Calculate dialog area centered in parent.
+    #[cfg(feature = "ui-legacy")]
     fn dialog_area(&self, parent: Rect) -> Rect {
         let width = 60.min(parent.width.saturating_sub(4));
         let height = if self.details.is_some() { 12 } else { 8 };
@@ -101,6 +173,11 @@ impl<'a> ConfirmDialog<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Legacy ratatui StatefulWidget (behind feature gate)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ui-legacy")]
 impl<'a> StatefulWidget for ConfirmDialog<'a> {
     type State = ConfirmDialogState;
 
@@ -222,6 +299,10 @@ impl<'a> StatefulWidget for ConfirmDialog<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ConfirmDialogState
+// ---------------------------------------------------------------------------
+
 /// State for the confirmation dialog.
 #[derive(Debug)]
 pub struct ConfirmDialogState {
@@ -298,9 +379,15 @@ impl ConfirmDialogState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── State tests (no feature gate needed) ────────────────────────
 
     #[test]
     fn test_dialog_state_defaults() {
@@ -357,5 +444,75 @@ mod tests {
         state.cancel();
         assert!(!state.was_confirmed());
         assert_eq!(state.result, Some(ConfirmChoice::No));
+    }
+
+    #[test]
+    fn test_select_left_right() {
+        let mut state = ConfirmDialogState::new();
+        state.show();
+
+        state.select_left();
+        assert_eq!(state.selected, ConfirmChoice::Yes);
+
+        state.select_right();
+        assert_eq!(state.selected, ConfirmChoice::No);
+    }
+
+    #[test]
+    fn test_confirm_no() {
+        let mut state = ConfirmDialogState::new();
+        state.show();
+        // Default is No
+        let choice = state.confirm();
+        assert_eq!(choice, ConfirmChoice::No);
+        assert!(!state.was_confirmed());
+        assert!(!state.visible);
+    }
+
+    #[test]
+    fn test_show_resets_state() {
+        let mut state = ConfirmDialogState::new();
+        state.show();
+        state.select_left();
+        state.confirm();
+
+        // Re-show should reset
+        state.show();
+        assert!(state.visible);
+        assert_eq!(state.selected, ConfirmChoice::No);
+        assert!(state.result.is_none());
+    }
+
+    // ── Builder tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_dialog_defaults() {
+        let d = ConfirmDialog::new();
+        assert_eq!(d.title, "Confirm");
+        assert_eq!(d.message, "Are you sure?");
+        assert!(d.details.is_none());
+        assert!(d.theme.is_none());
+        assert_eq!(d.yes_label, "Yes");
+        assert_eq!(d.no_label, "No");
+    }
+
+    #[test]
+    fn test_dialog_builder() {
+        let d = ConfirmDialog::new()
+            .title("Delete?")
+            .message("This is permanent")
+            .details("PID 1234: node server")
+            .labels("Confirm", "Cancel");
+
+        assert_eq!(d.title, "Delete?");
+        assert_eq!(d.message, "This is permanent");
+        assert_eq!(d.details, Some("PID 1234: node server"));
+        assert_eq!(d.yes_label, "Confirm");
+        assert_eq!(d.no_label, "Cancel");
+    }
+
+    #[test]
+    fn test_choice_default_is_no() {
+        assert_eq!(ConfirmChoice::default(), ConfirmChoice::No);
     }
 }

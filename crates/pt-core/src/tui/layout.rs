@@ -1,8 +1,8 @@
 //! Responsive constraint-based TUI layouts.
 //!
 //! This module provides responsive layouts that adapt to terminal size using
-//! ratatui's constraint system. Layouts automatically switch between breakpoints
-//! (small, medium, large) based on terminal dimensions.
+//! ftui's Flex constraint solver. Layouts automatically switch between breakpoints
+//! (minimal, compact, standard, wide) based on terminal dimensions.
 //!
 //! # Breakpoints
 //!
@@ -19,8 +19,30 @@
 //! // Use areas.search, areas.list, areas.detail, areas.status for rendering
 //! ```
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ftui::layout::{Constraint, Flex, Rect};
 use tracing::{debug, trace};
+
+// ---------------------------------------------------------------------------
+// Legacy ratatui interop
+// ---------------------------------------------------------------------------
+
+/// Convert ftui Rect to ratatui Rect.
+#[cfg(feature = "ui-legacy")]
+#[inline]
+pub fn to_ratatui_rect(r: Rect) -> ratatui::layout::Rect {
+    ratatui::layout::Rect::new(r.x, r.y, r.width, r.height)
+}
+
+/// Convert ratatui Rect to ftui Rect.
+#[cfg(feature = "ui-legacy")]
+#[inline]
+pub fn from_ratatui_rect(r: ratatui::layout::Rect) -> Rect {
+    Rect::new(r.x, r.y, r.width, r.height)
+}
+
+// ---------------------------------------------------------------------------
+// Breakpoints
+// ---------------------------------------------------------------------------
 
 /// Terminal size breakpoints for responsive layouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,6 +89,10 @@ impl Breakpoint {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Area structs
+// ---------------------------------------------------------------------------
+
 /// Layout areas for the main view.
 #[derive(Debug, Clone, Copy)]
 pub struct MainAreas {
@@ -84,6 +110,33 @@ pub struct MainAreas {
     pub status: Rect,
 }
 
+#[cfg(feature = "ui-legacy")]
+impl MainAreas {
+    /// Convert all areas to ratatui Rects for legacy rendering.
+    pub fn to_ratatui(&self) -> MainAreasLegacy {
+        MainAreasLegacy {
+            header: self.header.map(to_ratatui_rect),
+            search: to_ratatui_rect(self.search),
+            list: to_ratatui_rect(self.list),
+            detail: self.detail.map(to_ratatui_rect),
+            aux: self.aux.map(to_ratatui_rect),
+            status: to_ratatui_rect(self.status),
+        }
+    }
+}
+
+/// Legacy ratatui Rect version of [`MainAreas`].
+#[cfg(feature = "ui-legacy")]
+#[derive(Debug, Clone, Copy)]
+pub struct MainAreasLegacy {
+    pub header: Option<ratatui::layout::Rect>,
+    pub search: ratatui::layout::Rect,
+    pub list: ratatui::layout::Rect,
+    pub detail: Option<ratatui::layout::Rect>,
+    pub aux: Option<ratatui::layout::Rect>,
+    pub status: ratatui::layout::Rect,
+}
+
 /// Layout areas for the evidence detail view.
 #[derive(Debug, Clone, Copy)]
 pub struct DetailAreas {
@@ -95,6 +148,27 @@ pub struct DetailAreas {
     pub actions: Rect,
 }
 
+#[cfg(feature = "ui-legacy")]
+impl DetailAreas {
+    /// Convert all areas to ratatui Rects for legacy rendering.
+    pub fn to_ratatui(&self) -> DetailAreasLegacy {
+        DetailAreasLegacy {
+            header: to_ratatui_rect(self.header),
+            evidence: to_ratatui_rect(self.evidence),
+            actions: to_ratatui_rect(self.actions),
+        }
+    }
+}
+
+/// Legacy ratatui Rect version of [`DetailAreas`].
+#[cfg(feature = "ui-legacy")]
+#[derive(Debug, Clone, Copy)]
+pub struct DetailAreasLegacy {
+    pub header: ratatui::layout::Rect,
+    pub evidence: ratatui::layout::Rect,
+    pub actions: ratatui::layout::Rect,
+}
+
 /// Layout areas for galaxy brain (full math) view.
 #[derive(Debug, Clone, Copy)]
 pub struct GalaxyBrainAreas {
@@ -104,9 +178,33 @@ pub struct GalaxyBrainAreas {
     pub explanation: Rect,
 }
 
+#[cfg(feature = "ui-legacy")]
+impl GalaxyBrainAreas {
+    /// Convert all areas to ratatui Rects for legacy rendering.
+    pub fn to_ratatui(&self) -> GalaxyBrainAreasLegacy {
+        GalaxyBrainAreasLegacy {
+            math: to_ratatui_rect(self.math),
+            explanation: to_ratatui_rect(self.explanation),
+        }
+    }
+}
+
+/// Legacy ratatui Rect version of [`GalaxyBrainAreas`].
+#[cfg(feature = "ui-legacy")]
+#[derive(Debug, Clone, Copy)]
+pub struct GalaxyBrainAreasLegacy {
+    pub math: ratatui::layout::Rect,
+    pub explanation: ratatui::layout::Rect,
+}
+
+// ---------------------------------------------------------------------------
+// Responsive layout calculator
+// ---------------------------------------------------------------------------
+
 /// Responsive layout calculator.
 ///
 /// Computes layout areas based on terminal size and current breakpoint.
+/// Uses ftui's [`Flex`] solver internally for constraint-based layout.
 /// Automatically handles breakpoint transitions and provides smooth
 /// degradation for small terminals.
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +228,12 @@ impl ResponsiveLayout {
         );
 
         Self { area, breakpoint }
+    }
+
+    /// Create from a ratatui Rect (legacy interop).
+    #[cfg(feature = "ui-legacy")]
+    pub fn from_ratatui(area: ratatui::layout::Rect) -> Self {
+        Self::new(from_ratatui_rect(area))
     }
 
     /// Get the current breakpoint.
@@ -166,14 +270,13 @@ impl ResponsiveLayout {
     fn main_areas_wide(&self, header_height: u16) -> MainAreas {
         let mut constraints = Vec::new();
         if header_height > 0 {
-            constraints.push(Constraint::Length(header_height));
+            constraints.push(Constraint::Fixed(header_height));
         }
-        constraints.push(Constraint::Length(3)); // Search input
+        constraints.push(Constraint::Fixed(3)); // Search input
         constraints.push(Constraint::Min(10)); // Process table
-        constraints.push(Constraint::Length(1)); // Status bar
+        constraints.push(Constraint::Fixed(1)); // Status bar
 
-        let v_chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let v_chunks = Flex::vertical()
             .constraints(constraints)
             .split(self.area);
 
@@ -184,12 +287,11 @@ impl ResponsiveLayout {
         };
 
         // Horizontal split of content: list | detail | aux
-        let content_chunks = Layout::default()
-            .direction(Direction::Horizontal)
+        let content_chunks = Flex::horizontal()
             .constraints([
-                Constraint::Percentage(45), // List
-                Constraint::Percentage(35), // Detail
-                Constraint::Percentage(20), // Aux
+                Constraint::Percentage(45.0), // List
+                Constraint::Percentage(35.0), // Detail
+                Constraint::Percentage(20.0), // Aux
             ])
             .split(content);
 
@@ -207,14 +309,13 @@ impl ResponsiveLayout {
     fn main_areas_standard(&self, header_height: u16) -> MainAreas {
         let mut constraints = Vec::new();
         if header_height > 0 {
-            constraints.push(Constraint::Length(header_height));
+            constraints.push(Constraint::Fixed(header_height));
         }
-        constraints.push(Constraint::Length(3)); // Search input
+        constraints.push(Constraint::Fixed(3)); // Search input
         constraints.push(Constraint::Min(10)); // Process table
-        constraints.push(Constraint::Length(1)); // Status bar
+        constraints.push(Constraint::Fixed(1)); // Status bar
 
-        let v_chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let v_chunks = Flex::vertical()
             .constraints(constraints)
             .split(self.area);
 
@@ -225,11 +326,10 @@ impl ResponsiveLayout {
         };
 
         // Horizontal split of content: list | detail
-        let content_chunks = Layout::default()
-            .direction(Direction::Horizontal)
+        let content_chunks = Flex::horizontal()
             .constraints([
-                Constraint::Percentage(60), // List
-                Constraint::Percentage(40), // Detail
+                Constraint::Percentage(60.0), // List
+                Constraint::Percentage(40.0), // Detail
             ])
             .split(content);
 
@@ -247,14 +347,13 @@ impl ResponsiveLayout {
     fn main_areas_compact(&self, header_height: u16) -> MainAreas {
         let mut constraints = Vec::new();
         if header_height > 0 {
-            constraints.push(Constraint::Length(header_height));
+            constraints.push(Constraint::Fixed(header_height));
         }
-        constraints.push(Constraint::Length(3)); // Search input
+        constraints.push(Constraint::Fixed(3)); // Search input
         constraints.push(Constraint::Min(10)); // Process table
-        constraints.push(Constraint::Length(1)); // Status bar
+        constraints.push(Constraint::Fixed(1)); // Status bar
 
-        let v_chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let v_chunks = Flex::vertical()
             .constraints(constraints)
             .split(self.area);
 
@@ -264,11 +363,10 @@ impl ResponsiveLayout {
             (None, v_chunks[0], v_chunks[1], v_chunks[2])
         };
 
-        let content_chunks = Layout::default()
-            .direction(Direction::Horizontal)
+        let content_chunks = Flex::horizontal()
             .constraints([
-                Constraint::Percentage(65), // List
-                Constraint::Percentage(35), // Detail
+                Constraint::Percentage(65.0), // List
+                Constraint::Percentage(35.0), // Detail
             ])
             .split(content);
 
@@ -286,14 +384,13 @@ impl ResponsiveLayout {
     fn main_areas_minimal(&self, header_height: u16) -> MainAreas {
         let mut constraints = Vec::new();
         if header_height > 0 {
-            constraints.push(Constraint::Length(header_height));
+            constraints.push(Constraint::Fixed(header_height));
         }
-        constraints.push(Constraint::Length(1)); // Compact search
+        constraints.push(Constraint::Fixed(1)); // Compact search
         constraints.push(Constraint::Min(5)); // Process list
-        constraints.push(Constraint::Length(1)); // Status
+        constraints.push(Constraint::Fixed(1)); // Status
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let chunks = Flex::vertical()
             .constraints(constraints)
             .split(self.area);
 
@@ -325,12 +422,11 @@ impl ResponsiveLayout {
 
     /// Standard detail layout (large/medium).
     fn detail_areas_standard(&self) -> DetailAreas {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let chunks = Flex::vertical()
             .constraints([
-                Constraint::Percentage(30), // Process info header
-                Constraint::Percentage(50), // Evidence ledger
-                Constraint::Percentage(20), // Actions panel
+                Constraint::Percentage(30.0), // Process info header
+                Constraint::Percentage(50.0), // Evidence ledger
+                Constraint::Percentage(20.0), // Actions panel
             ])
             .split(self.area);
 
@@ -343,12 +439,11 @@ impl ResponsiveLayout {
 
     /// Compact detail layout (small).
     fn detail_areas_compact(&self) -> DetailAreas {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let chunks = Flex::vertical()
             .constraints([
-                Constraint::Length(4), // Compact header
-                Constraint::Min(5),    // Evidence (scrollable)
-                Constraint::Length(3), // Actions
+                Constraint::Fixed(4), // Compact header
+                Constraint::Min(5),   // Evidence (scrollable)
+                Constraint::Fixed(3), // Actions
             ])
             .split(self.area);
 
@@ -369,11 +464,10 @@ impl ResponsiveLayout {
 
     /// Large breakpoint: side-by-side math and explanation.
     fn galaxy_brain_large(&self) -> GalaxyBrainAreas {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
+        let chunks = Flex::horizontal()
             .constraints([
-                Constraint::Percentage(60), // Math display
-                Constraint::Percentage(40), // Explanation
+                Constraint::Percentage(60.0), // Math display
+                Constraint::Percentage(40.0), // Explanation
             ])
             .split(self.area);
 
@@ -385,11 +479,10 @@ impl ResponsiveLayout {
 
     /// Medium/small: stacked layout.
     fn galaxy_brain_stacked(&self) -> GalaxyBrainAreas {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let chunks = Flex::vertical()
             .constraints([
-                Constraint::Percentage(60), // Math display
-                Constraint::Percentage(40), // Explanation
+                Constraint::Percentage(60.0), // Math display
+                Constraint::Percentage(40.0), // Explanation
             ])
             .split(self.area);
 
@@ -417,6 +510,10 @@ impl ResponsiveLayout {
         Rect::new(self.area.x + x, self.area.y + y, width, height)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Layout state tracking
+// ---------------------------------------------------------------------------
 
 /// Tracks layout state changes for logging and animations.
 #[derive(Debug, Clone)]
@@ -495,6 +592,10 @@ impl LayoutState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,7 +611,6 @@ mod tests {
 
     #[test]
     fn test_breakpoint_boundaries() {
-        // Test exact boundaries
         assert_eq!(Breakpoint::from_size(79, 24), Breakpoint::Minimal);
         assert_eq!(Breakpoint::from_size(80, 24), Breakpoint::Compact);
         assert_eq!(Breakpoint::from_size(119, 24), Breakpoint::Compact);
@@ -530,9 +630,9 @@ mod tests {
         assert!(areas.detail.is_some());
         assert!(areas.aux.is_some());
 
-        // Aux should be ~20% of width
+        // Aux should be ~20% of 220 = 44
         let aux = areas.aux.unwrap();
-        assert_eq!(aux.width, 44); // 20% of 220
+        assert_eq!(aux.width, 44);
 
         // Status bar should be 1 row at bottom
         assert_eq!(areas.status.height, 1);
@@ -699,5 +799,55 @@ mod tests {
         let gb = medium.galaxy_brain_areas();
         // Medium: stacked (vertical)
         assert!(gb.math.height > gb.explanation.height);
+    }
+
+    #[test]
+    fn test_areas_cover_full_width() {
+        // Verify no gaps in horizontal splits
+        let area = Rect::new(0, 0, 220, 60);
+        let layout = ResponsiveLayout::new(area);
+        let areas = layout.main_areas();
+
+        let list_w = areas.list.width;
+        let detail_w = areas.detail.unwrap().width;
+        let aux_w = areas.aux.unwrap().width;
+        assert_eq!(
+            list_w + detail_w + aux_w,
+            area.width,
+            "panes should cover full width"
+        );
+    }
+
+    #[test]
+    fn test_areas_cover_full_height() {
+        // Verify no gaps in vertical splits
+        let area = Rect::new(0, 0, 140, 40);
+        let layout = ResponsiveLayout::new(area);
+        let areas = layout.main_areas();
+
+        let total_h = areas.search.height + areas.list.height + areas.status.height;
+        assert_eq!(total_h, area.height, "rows should cover full height");
+    }
+
+    #[cfg(feature = "ui-legacy")]
+    #[test]
+    fn test_ratatui_rect_roundtrip() {
+        let ftui_rect = Rect::new(10, 20, 100, 50);
+        let rat_rect = to_ratatui_rect(ftui_rect);
+        let back = from_ratatui_rect(rat_rect);
+        assert_eq!(ftui_rect, back);
+    }
+
+    #[cfg(feature = "ui-legacy")]
+    #[test]
+    fn test_main_areas_to_ratatui() {
+        let area = Rect::new(0, 0, 140, 40);
+        let layout = ResponsiveLayout::new(area);
+        let areas = layout.main_areas();
+        let legacy = areas.to_ratatui();
+
+        assert_eq!(legacy.search.width, areas.search.width);
+        assert_eq!(legacy.search.height, areas.search.height);
+        assert_eq!(legacy.list.x, areas.list.x);
     }
 }

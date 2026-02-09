@@ -1,7 +1,14 @@
 //! Search input widget for filtering processes.
 //!
-//! Simple text input widget for Process Triage-specific styling and behavior.
+//! Uses ftui's built-in TextInput as the primary rendering path, with
+//! ratatui legacy compat behind the `ui-legacy` feature gate.
 
+use ftui::widgets::block::Block as FtuiBlock;
+use ftui::widgets::input::TextInput as FtuiTextInput;
+use ftui::widgets::Widget as FtuiWidget;
+use ftui::Style as FtuiStyle;
+
+#[cfg(feature = "ui-legacy")]
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -12,30 +19,27 @@ use ratatui::{
 use crate::tui::theme::Theme;
 
 /// Search input widget for filtering the process list.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SearchInput<'a> {
-    /// Block wrapper for the input.
-    block: Option<Block<'a>>,
     /// Placeholder text when empty.
     placeholder: &'a str,
     /// Theme for styling.
     theme: Option<&'a Theme>,
 }
 
+impl<'a> Default for SearchInput<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> SearchInput<'a> {
     /// Create a new search input.
     pub fn new() -> Self {
         Self {
-            block: None,
             placeholder: "Search processes...",
             theme: None,
         }
-    }
-
-    /// Set the block wrapper.
-    pub fn block(mut self, block: Block<'a>) -> Self {
-        self.block = Some(block);
-        self
     }
 
     /// Set the placeholder text.
@@ -50,8 +54,86 @@ impl<'a> SearchInput<'a> {
         self
     }
 
-    /// Build the styled block based on focus state.
-    fn styled_block(&self, focused: bool) -> Block<'a> {
+    /// Render using ftui widgets.
+    pub fn render_ftui(
+        &self,
+        area: ftui::layout::Rect,
+        frame: &mut ftui::render::frame::Frame,
+        state: &mut SearchInputState,
+    ) {
+        let focused = state.focused;
+
+        let title = if focused {
+            " Search [Enter to filter] "
+        } else {
+            " Search "
+        };
+
+        let border_style = self
+            .theme
+            .map(|t| {
+                let class = if focused {
+                    "border.focused"
+                } else {
+                    "border.normal"
+                };
+                t.stylesheet().get_or_default(class)
+            })
+            .unwrap_or_default();
+
+        let block = FtuiBlock::bordered()
+            .title(title)
+            .border_style(border_style);
+
+        let inner = block.inner(area);
+        FtuiWidget::render(&block, area, frame);
+
+        // Configure the ftui TextInput for rendering
+        let input_style = self
+            .theme
+            .map(|t| {
+                if focused {
+                    t.stylesheet().get_or_default("table.header")
+                } else {
+                    FtuiStyle::default()
+                }
+            })
+            .unwrap_or_default();
+
+        let placeholder_style = self
+            .theme
+            .map(|t| t.class("status.warning"))
+            .unwrap_or_default();
+
+        let cursor_style = self
+            .theme
+            .map(|t| t.stylesheet().get_or_default("table.selected"))
+            .unwrap_or_else(|| FtuiStyle::new().reverse());
+
+        // Build a fresh TextInput widget configured for this render
+        let text_input = FtuiTextInput::new()
+            .with_value(state.value.clone())
+            .with_placeholder(self.placeholder)
+            .with_style(input_style)
+            .with_placeholder_style(placeholder_style)
+            .with_cursor_style(cursor_style)
+            .with_focused(focused);
+
+        FtuiWidget::render(&text_input, inner, frame);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy ratatui StatefulWidget (behind feature gate)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ui-legacy")]
+impl<'a> StatefulWidget for SearchInput<'a> {
+    type State = SearchInputState;
+
+    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let focused = state.focused;
+
         let title = if focused {
             " Search [Enter to filter] "
         } else {
@@ -72,22 +154,10 @@ impl<'a> SearchInput<'a> {
             })
         };
 
-        Block::default()
+        let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(border_style)
-    }
-}
-
-impl<'a> StatefulWidget for SearchInput<'a> {
-    type State = SearchInputState;
-
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let focused = state.focused;
-        let block = self
-            .block
-            .clone()
-            .unwrap_or_else(|| self.styled_block(focused));
+            .border_style(border_style);
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -102,9 +172,7 @@ impl<'a> StatefulWidget for SearchInput<'a> {
             Style::default()
         };
 
-        // Render the current value
         if state.value.is_empty() && !focused {
-            // Render placeholder
             let placeholder_style = if let Some(theme) = self.theme {
                 theme.style_muted()
             } else {
@@ -120,7 +188,6 @@ impl<'a> StatefulWidget for SearchInput<'a> {
                     .set_style(placeholder_style);
             }
         } else {
-            // Render value with cursor
             let display = if focused {
                 format!("{}_", state.value)
             } else {
@@ -138,6 +205,10 @@ impl<'a> StatefulWidget for SearchInput<'a> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// SearchInputState
+// ---------------------------------------------------------------------------
 
 /// State for the search input widget.
 #[derive(Debug, Clone)]
@@ -243,6 +314,10 @@ impl SearchInputState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +397,33 @@ mod tests {
 
         state.history_next();
         assert_eq!(state.value(), "");
+    }
+
+    #[test]
+    fn test_backspace_on_empty_is_noop() {
+        let mut state = SearchInputState::new();
+        assert_eq!(state.value(), "");
+        state.backspace();
+        assert_eq!(state.value(), "");
+    }
+
+    #[test]
+    fn test_history_max_size_evicts_oldest() {
+        let mut state = SearchInputState::new();
+
+        // Fill history beyond the 10-item limit
+        for i in 0..12 {
+            state.set_value(&format!("query_{}", i));
+            state.commit();
+        }
+
+        // History should be capped at 10
+        assert_eq!(state.history.len(), 10);
+        // Most recent should be first
+        assert_eq!(state.history[0], "query_11");
+        // Oldest entries should have been evicted
+        assert!(!state.history.contains(&"query_0".to_string()));
+        assert!(!state.history.contains(&"query_1".to_string()));
     }
 
     #[test]

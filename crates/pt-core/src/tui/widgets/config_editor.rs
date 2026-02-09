@@ -1,7 +1,17 @@
 //! Configuration editor widget.
 //!
 //! Form-based editor for modifying Process Triage configuration values.
+//! Uses ftui's Block and Paragraph for the primary rendering path, with
+//! ratatui legacy compat behind the `ui-legacy` feature gate.
 
+use ftui::text::{Line as FtuiLine, Span as FtuiSpan, Text as FtuiText};
+use ftui::widgets::block::{Alignment as FtuiAlignment, Block as FtuiBlock};
+use ftui::widgets::paragraph::Paragraph as FtuiParagraph;
+use ftui::widgets::Widget as FtuiWidget;
+use ftui::PackedRgba;
+use ftui::Style as FtuiStyle;
+
+#[cfg(feature = "ui-legacy")]
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -46,8 +56,6 @@ pub enum ConfigFieldType {
 /// Configuration editor widget.
 #[derive(Debug)]
 pub struct ConfigEditor<'a> {
-    /// Block wrapper.
-    block: Option<Block<'a>>,
     /// Theme for styling.
     theme: Option<&'a Theme>,
 }
@@ -61,16 +69,7 @@ impl<'a> Default for ConfigEditor<'a> {
 impl<'a> ConfigEditor<'a> {
     /// Create a new config editor.
     pub fn new() -> Self {
-        Self {
-            block: None,
-            theme: None,
-        }
-    }
-
-    /// Set the block wrapper.
-    pub fn block(mut self, block: Block<'a>) -> Self {
-        self.block = Some(block);
-        self
+        Self { theme: None }
     }
 
     /// Set the theme.
@@ -79,6 +78,160 @@ impl<'a> ConfigEditor<'a> {
         self
     }
 
+    // ── ftui style helpers ──────────────────────────────────────────
+
+    fn border_ftui_style(&self, focused: bool) -> FtuiStyle {
+        if let Some(theme) = self.theme {
+            let sheet = theme.stylesheet();
+            if focused {
+                sheet.get_or_default("border.focused")
+            } else {
+                sheet.get_or_default("border.normal")
+            }
+        } else if focused {
+            FtuiStyle::new().fg(PackedRgba::rgb(0, 255, 255))
+        } else {
+            FtuiStyle::new().fg(PackedRgba::rgb(128, 128, 128))
+        }
+    }
+
+    fn name_ftui_style(&self, is_cursor: bool) -> FtuiStyle {
+        if is_cursor {
+            if let Some(theme) = self.theme {
+                theme.stylesheet().get_or_default("table.header")
+            } else {
+                FtuiStyle::new().bold()
+            }
+        } else if let Some(theme) = self.theme {
+            theme.stylesheet().get_or_default("border.normal")
+        } else {
+            FtuiStyle::default()
+        }
+    }
+
+    fn value_ftui_style(&self, field: &ConfigField) -> FtuiStyle {
+        if field.error.is_some() {
+            if let Some(theme) = self.theme {
+                theme.stylesheet().get_or_default("status.error")
+            } else {
+                FtuiStyle::new().fg(PackedRgba::rgb(255, 0, 0))
+            }
+        } else if field.modified {
+            if let Some(theme) = self.theme {
+                theme.class("status.warning")
+            } else {
+                FtuiStyle::new().fg(PackedRgba::rgb(255, 255, 0))
+            }
+        } else if let Some(theme) = self.theme {
+            theme.stylesheet().get_or_default("border.normal")
+        } else {
+            FtuiStyle::default()
+        }
+    }
+
+    fn muted_ftui_style(&self) -> FtuiStyle {
+        if let Some(theme) = self.theme {
+            theme.class("status.warning")
+        } else {
+            FtuiStyle::new().fg(PackedRgba::rgb(128, 128, 128))
+        }
+    }
+
+    fn error_ftui_style(&self) -> FtuiStyle {
+        if let Some(theme) = self.theme {
+            theme.stylesheet().get_or_default("status.error")
+        } else {
+            FtuiStyle::new().fg(PackedRgba::rgb(255, 0, 0))
+        }
+    }
+
+    // ── ftui rendering ──────────────────────────────────────────────
+
+    /// Render the config editor using ftui widgets.
+    pub fn render_ftui(
+        &self,
+        area: ftui::layout::Rect,
+        frame: &mut ftui::render::frame::Frame,
+        state: &mut ConfigEditorState,
+    ) {
+        let focused = state.focused;
+        let any_modified = state.fields.iter().any(|f| f.modified);
+
+        let title = if any_modified {
+            " Configuration [modified] "
+        } else {
+            " Configuration "
+        };
+
+        let block = FtuiBlock::bordered()
+            .title(title)
+            .border_style(self.border_ftui_style(focused));
+
+        let inner = block.inner(area);
+        FtuiWidget::render(&block, area, frame);
+
+        if inner.width < 2 || inner.height == 0 {
+            return;
+        }
+
+        if state.fields.is_empty() {
+            let text: FtuiText = "No configuration fields".into();
+            let msg = FtuiParagraph::new(text)
+                .style(self.muted_ftui_style())
+                .alignment(FtuiAlignment::Center);
+            FtuiWidget::render(&msg, inner, frame);
+            return;
+        }
+
+        // Build field lines
+        let mut lines: Vec<FtuiLine> = Vec::new();
+        let max_visible = inner.height as usize;
+
+        for (i, field) in state.fields.iter().enumerate() {
+            if lines.len() >= max_visible.saturating_sub(1) {
+                break;
+            }
+
+            let is_cursor = i == state.cursor;
+            let name_style = self.name_ftui_style(is_cursor);
+            let val_style = self.value_ftui_style(field);
+
+            let value_display = if is_cursor && state.editing {
+                format!("{}_", field.value)
+            } else {
+                field.value.clone()
+            };
+
+            lines.push(FtuiLine::from_spans([
+                FtuiSpan::styled(field.name.clone(), name_style),
+                FtuiSpan::styled(": ", name_style),
+                FtuiSpan::styled(value_display, val_style),
+            ]));
+        }
+
+        // Add error line if present
+        if let Some(ref field) = state.fields.get(state.cursor) {
+            if let Some(ref error) = field.error {
+                if lines.len() < max_visible {
+                    lines.push(FtuiLine::from_spans([FtuiSpan::styled(
+                        error.clone(),
+                        self.error_ftui_style(),
+                    )]));
+                }
+            }
+        }
+
+        let text: FtuiText = lines.into_iter().collect();
+        FtuiWidget::render(
+            &FtuiParagraph::new(text).style(FtuiStyle::default()),
+            inner,
+            frame,
+        );
+    }
+
+    // ── Legacy ratatui helpers ──────────────────────────────────────
+
+    #[cfg(feature = "ui-legacy")]
     fn styled_block(&self, focused: bool, modified: bool) -> Block<'a> {
         let title = if modified {
             " Configuration [modified] "
@@ -107,16 +260,18 @@ impl<'a> ConfigEditor<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Legacy ratatui StatefulWidget (behind feature gate)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ui-legacy")]
 impl<'a> StatefulWidget for ConfigEditor<'a> {
     type State = ConfigEditorState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let focused = state.focused;
         let any_modified = state.fields.iter().any(|f| f.modified);
-        let block = self
-            .block
-            .clone()
-            .unwrap_or_else(|| self.styled_block(focused, any_modified));
+        let block = self.styled_block(focused, any_modified);
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -247,6 +402,10 @@ impl<'a> StatefulWidget for ConfigEditor<'a> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ConfigEditorState
+// ---------------------------------------------------------------------------
 
 /// State for the config editor widget.
 #[derive(Debug)]
@@ -394,6 +553,10 @@ impl ConfigEditorState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +581,8 @@ mod tests {
             },
         ]
     }
+
+    // ── State tests ─────────────────────────────────────────────────
 
     #[test]
     fn test_new_state() {
@@ -474,5 +639,129 @@ mod tests {
 
         assert!(state.fields[0].error.is_some());
         assert!(!state.is_valid());
+    }
+
+    // ── Additional state tests ──────────────────────────────────────
+
+    #[test]
+    fn test_is_modified() {
+        let mut state = ConfigEditorState::new();
+        state.set_fields(sample_fields());
+        assert!(!state.is_modified());
+
+        state.start_edit();
+        state.type_char('x');
+        assert!(state.is_modified());
+    }
+
+    #[test]
+    fn test_mark_saved() {
+        let mut state = ConfigEditorState::new();
+        state.set_fields(sample_fields());
+        state.start_edit();
+        state.type_char('x');
+        state.stop_edit();
+        assert!(state.is_modified());
+
+        state.mark_saved();
+        assert!(!state.is_modified());
+    }
+
+    #[test]
+    fn test_get_modified() {
+        let mut state = ConfigEditorState::new();
+        state.set_fields(sample_fields());
+        assert!(state.get_modified().is_empty());
+
+        state.start_edit();
+        state.type_char('x');
+        state.stop_edit();
+
+        let modified = state.get_modified();
+        assert_eq!(modified.len(), 1);
+        assert_eq!(modified[0].name, "min_score");
+    }
+
+    #[test]
+    fn test_boolean_validation() {
+        let mut state = ConfigEditorState::new();
+        state.set_fields(sample_fields());
+        state.cursor_down(); // Move to auto_kill (Boolean)
+
+        state.start_edit();
+        state.fields[1].value = "invalid".to_string();
+        state.stop_edit();
+
+        assert!(state.fields[1].error.is_some());
+        assert!(state.fields[1].error.as_ref().unwrap().contains("true/false"));
+    }
+
+    #[test]
+    fn test_float_validation() {
+        let mut state = ConfigEditorState::new();
+        let mut fields = sample_fields();
+        fields.push(ConfigField {
+            name: "threshold".to_string(),
+            value: "0.75".to_string(),
+            field_type: ConfigFieldType::Float,
+            description: "Score threshold".to_string(),
+            modified: false,
+            error: None,
+        });
+        state.set_fields(fields);
+        state.cursor_down();
+        state.cursor_down(); // Move to threshold (Float)
+
+        state.start_edit();
+        state.fields[2].value = "abc".to_string();
+        state.stop_edit();
+
+        assert!(state.fields[2].error.is_some());
+    }
+
+    #[test]
+    fn test_cursor_locked_while_editing() {
+        let mut state = ConfigEditorState::new();
+        state.set_fields(sample_fields());
+
+        state.start_edit();
+        state.cursor_down();
+        assert_eq!(state.cursor, 0); // Cursor doesn't move while editing
+    }
+
+    #[test]
+    fn test_start_edit_empty_fields() {
+        let mut state = ConfigEditorState::new();
+        state.start_edit();
+        assert!(!state.editing); // Can't edit with no fields
+    }
+
+    #[test]
+    fn test_cancel_edit() {
+        let mut state = ConfigEditorState::new();
+        state.set_fields(sample_fields());
+        state.start_edit();
+        state.cancel_edit();
+        assert!(!state.editing);
+    }
+
+    // ── Builder tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_editor_defaults() {
+        let e = ConfigEditor::new();
+        assert!(e.theme.is_none());
+    }
+
+    #[test]
+    fn test_default_impl() {
+        let e = ConfigEditor::default();
+        assert!(e.theme.is_none());
+    }
+
+    #[test]
+    fn test_field_type_eq() {
+        assert_eq!(ConfigFieldType::Integer, ConfigFieldType::Integer);
+        assert_ne!(ConfigFieldType::Integer, ConfigFieldType::Float);
     }
 }
