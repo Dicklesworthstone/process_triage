@@ -1,8 +1,8 @@
-//! Premium TUI for Process Triage using ratatui.
+//! Premium TUI for Process Triage using ftui (with ratatui legacy compat).
 //!
 //! This module provides an interactive terminal user interface for process
-//! triage operations. It is built on ratatui for rendering with custom
-//! widgets for the Process Triage workflow.
+//! triage operations. Layout and theme systems use ftui, with ratatui
+//! rendering support behind the `ui-legacy` feature gate.
 //!
 //! # Features
 //!
@@ -31,6 +31,11 @@ pub use events::{handle_event, AppAction, KeyBindings};
 pub use msg::{ExecutionOutcome, Msg};
 pub use layout::{
     Breakpoint, DetailAreas, GalaxyBrainAreas, LayoutState, MainAreas, ResponsiveLayout,
+};
+#[cfg(feature = "ui-legacy")]
+pub use layout::{
+    from_ratatui_rect, to_ratatui_rect, DetailAreasLegacy, GalaxyBrainAreasLegacy,
+    MainAreasLegacy,
 };
 pub use theme::{Theme, ThemeMode};
 

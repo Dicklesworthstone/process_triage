@@ -2,7 +2,7 @@
 //!
 //! Provides keyboard event handling with customizable key bindings.
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ftui::{Event, KeyCode, KeyEvent, Modifiers};
 
 /// Configurable key bindings for TUI navigation.
 #[derive(Debug, Clone)]
@@ -39,30 +39,30 @@ impl Default for KeyBindings {
     fn default() -> Self {
         Self {
             quit: vec![
-                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('q')),
+                KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL),
             ],
-            confirm: vec![KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)],
-            cancel: vec![KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)],
+            confirm: vec![KeyEvent::new(KeyCode::Enter)],
+            cancel: vec![KeyEvent::new(KeyCode::Escape)],
             help: vec![
-                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('?')),
+                KeyEvent::new(KeyCode::F(1)),
             ],
-            search: vec![KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)],
+            search: vec![KeyEvent::new(KeyCode::Char('/'))],
             next: vec![
-                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Down),
+                KeyEvent::new(KeyCode::Char('j')),
             ],
             prev: vec![
-                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Up),
+                KeyEvent::new(KeyCode::Char('k')),
             ],
-            toggle: vec![KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)],
-            select_all: vec![KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)],
-            deselect_all: vec![KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)],
-            execute: vec![KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)],
-            next_tab: vec![KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)],
-            prev_tab: vec![KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)],
+            toggle: vec![KeyEvent::new(KeyCode::Char(' '))],
+            select_all: vec![KeyEvent::new(KeyCode::Char('a')).with_modifiers(Modifiers::CTRL)],
+            deselect_all: vec![KeyEvent::new(KeyCode::Char('u')).with_modifiers(Modifiers::CTRL)],
+            execute: vec![KeyEvent::new(KeyCode::Char('x'))],
+            next_tab: vec![KeyEvent::new(KeyCode::Tab)],
+            prev_tab: vec![KeyEvent::new(KeyCode::BackTab)],
         }
     }
 }
@@ -112,6 +112,16 @@ impl KeyBindings {
     pub fn is_execute(&self, key: &KeyEvent) -> bool {
         self.execute.iter().any(|k| k == key)
     }
+
+    /// Check if a key event matches any next-tab binding.
+    pub fn is_next_tab(&self, key: &KeyEvent) -> bool {
+        self.next_tab.iter().any(|k| k == key)
+    }
+
+    /// Check if a key event matches any prev-tab binding.
+    pub fn is_prev_tab(&self, key: &KeyEvent) -> bool {
+        self.prev_tab.iter().any(|k| k == key)
+    }
 }
 
 /// Application-level action resulting from event handling.
@@ -133,7 +143,7 @@ pub enum AppAction {
     Redraw,
 }
 
-/// Handle a crossterm event and return the resulting action.
+/// Handle a terminal event and return the resulting action.
 pub fn handle_event(event: Event, bindings: &KeyBindings) -> AppAction {
     match event {
         Event::Key(key) => handle_key_event(&key, bindings),
@@ -141,7 +151,7 @@ pub fn handle_event(event: Event, bindings: &KeyBindings) -> AppAction {
             // Mouse events are handled by individual widgets
             AppAction::None
         }
-        Event::Resize(_, _) => AppAction::Redraw,
+        Event::Resize { .. } => AppAction::Redraw,
         _ => AppAction::None,
     }
 }
@@ -169,24 +179,24 @@ mod tests {
         let bindings = KeyBindings::default();
 
         // Test quit bindings
-        let q_key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let q_key = KeyEvent::new(KeyCode::Char('q'));
         assert!(bindings.is_quit(&q_key));
 
-        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL);
         assert!(bindings.is_quit(&ctrl_c));
 
         // Test navigation
-        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down);
         assert!(bindings.is_next(&down));
 
-        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        let j = KeyEvent::new(KeyCode::Char('j'));
         assert!(bindings.is_next(&j));
     }
 
     #[test]
     fn test_handle_quit_event() {
         let bindings = KeyBindings::default();
-        let quit_event = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        let quit_event = Event::Key(KeyEvent::new(KeyCode::Char('q')));
 
         let action = handle_event(quit_event, &bindings);
         assert_eq!(action, AppAction::Quit);
@@ -195,7 +205,10 @@ mod tests {
     #[test]
     fn test_resize_triggers_redraw() {
         let bindings = KeyBindings::default();
-        let resize_event = Event::Resize(80, 24);
+        let resize_event = Event::Resize {
+            width: 80,
+            height: 24,
+        };
 
         let action = handle_event(resize_event, &bindings);
         assert_eq!(action, AppAction::Redraw);

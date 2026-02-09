@@ -11,6 +11,12 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ftui::runtime::{Every, Subscription};
+use ftui::{
+    Cell as FtuiCell, Cmd as FtuiCmd, Frame as FtuiFrame, KeyCode as FtuiKeyCode,
+    KeyEvent as FtuiKeyEvent, KeyEventKind as FtuiKeyEventKind, Model as FtuiModel,
+    Modifiers as FtuiModifiers,
+};
 use ratatui::{
     backend::CrosstermBackend,
     layout::Rect,
@@ -19,7 +25,8 @@ use ratatui::{
 };
 
 use super::events::KeyBindings;
-use super::layout::{Breakpoint, LayoutState, ResponsiveLayout};
+use super::layout::{to_ratatui_rect, Breakpoint, LayoutState, ResponsiveLayout};
+use super::msg::Msg;
 use super::theme::Theme;
 use super::widgets::{
     ConfirmChoice, ConfirmDialog, ConfirmDialogState, DetailView, ProcessDetail, ProcessTable,
@@ -507,8 +514,8 @@ impl App {
         // Update layout state for current terminal size
         self.update_layout(size.width, size.height);
 
-        // Create responsive layout calculator
-        let layout = ResponsiveLayout::new(size);
+        // Create responsive layout calculator (ftui Flex-based)
+        let layout = ResponsiveLayout::from_ratatui(size);
 
         // Check if terminal is too small
         if layout.is_too_small() {
@@ -516,11 +523,11 @@ impl App {
             return;
         }
 
-        // Get layout areas based on current breakpoint
+        // Get layout areas based on current breakpoint, converted to ratatui Rects
         let areas = if self.goal_summary.as_ref().map_or(false, |v| !v.is_empty()) {
-            layout.main_areas_with_header(2)
+            layout.main_areas_with_header(2).to_ratatui()
         } else {
-            layout.main_areas()
+            layout.main_areas().to_ratatui()
         };
 
         // Render main content areas
@@ -558,12 +565,12 @@ impl App {
 
         // Render overlays using responsive popup areas
         if self.confirm_dialog.visible {
-            let popup_area = layout.popup_area(60, 50);
+            let popup_area = to_ratatui_rect(layout.popup_area(60, 50));
             self.render_confirm_dialog(frame, popup_area);
         }
 
         if self.state == AppState::Help {
-            let help_area = layout.popup_area(50, 60);
+            let help_area = to_ratatui_rect(layout.popup_area(50, 60));
             self.render_help_overlay(frame, help_area);
         }
     }
@@ -607,8 +614,8 @@ impl App {
             .map(|r| self.process_table.selected.contains(&r.pid))
             .unwrap_or(false);
         if self.detail_view == DetailView::GalaxyBrain {
-            let layout = ResponsiveLayout::new(area);
-            let gb = layout.galaxy_brain_areas();
+            let layout = ResponsiveLayout::from_ratatui(area);
+            let gb = layout.galaxy_brain_areas().to_ratatui();
 
             let math_text = row
                 .and_then(|r| r.galaxy_brain.as_deref())
@@ -791,6 +798,466 @@ Help: ?  Quit: q
     /// Check if the application should quit.
     pub fn should_quit(&self) -> bool {
         self.state == AppState::Quitting
+    }
+
+    /// Handle a message from the ftui runtime while preserving existing state
+    /// transitions from the legacy event handlers.
+    fn handle_msg(&mut self, msg: Msg) -> FtuiCmd<Msg> {
+        match msg {
+            Msg::KeyPressed(key) => self.handle_ftui_key_event(key),
+            Msg::Resized { width, height } => {
+                let from_breakpoint = self.layout_state.breakpoint();
+                self.update_layout(width, height);
+                tracing::debug!(
+                    target: "tui.state_transition",
+                    ?from_breakpoint,
+                    to_breakpoint = ?self.layout_state.breakpoint(),
+                    width,
+                    height,
+                    "Terminal resized"
+                );
+                FtuiCmd::none()
+            }
+            Msg::Tick => FtuiCmd::none(),
+            Msg::FocusChanged(gained) => {
+                self.set_status(if gained {
+                    "Terminal focus gained"
+                } else {
+                    "Terminal focus lost"
+                });
+                FtuiCmd::none()
+            }
+            Msg::PasteReceived { text, .. } => {
+                self.search.set_value(&text);
+                self.state = AppState::Searching;
+                self.focus = FocusTarget::Search;
+                self.update_focus();
+                FtuiCmd::none()
+            }
+            Msg::ClipboardReceived(content) => {
+                self.search.set_value(&content);
+                FtuiCmd::none()
+            }
+            Msg::Noop => FtuiCmd::none(),
+
+            Msg::CursorUp => {
+                self.process_table.cursor_up();
+                FtuiCmd::none()
+            }
+            Msg::CursorDown => {
+                self.process_table.cursor_down();
+                FtuiCmd::none()
+            }
+            Msg::CursorHome => {
+                self.process_table.cursor_home();
+                FtuiCmd::none()
+            }
+            Msg::CursorEnd => {
+                self.process_table.cursor_end();
+                FtuiCmd::none()
+            }
+            Msg::PageUp | Msg::HalfPageUp => {
+                self.process_table.page_up(10);
+                FtuiCmd::none()
+            }
+            Msg::PageDown | Msg::HalfPageDown => {
+                self.process_table.page_down(10);
+                FtuiCmd::none()
+            }
+
+            Msg::ToggleSelection => {
+                self.process_table.toggle_selection();
+                FtuiCmd::none()
+            }
+            Msg::SelectRecommended => {
+                self.process_table.select_recommended();
+                FtuiCmd::none()
+            }
+            Msg::SelectAll => {
+                self.process_table.select_all();
+                FtuiCmd::none()
+            }
+            Msg::DeselectAll => {
+                self.process_table.deselect_all();
+                FtuiCmd::none()
+            }
+            Msg::InvertSelection => {
+                self.process_table.invert_selection();
+                FtuiCmd::none()
+            }
+
+            Msg::EnterSearchMode => {
+                self.state = AppState::Searching;
+                self.focus = FocusTarget::Search;
+                self.update_focus();
+                FtuiCmd::none()
+            }
+            Msg::SearchInput(c) => {
+                self.search.type_char(c);
+                FtuiCmd::none()
+            }
+            Msg::SearchBackspace => {
+                self.search.backspace();
+                FtuiCmd::none()
+            }
+            Msg::SearchCommit => {
+                self.search.commit();
+                self.apply_search_filter();
+                self.state = AppState::Normal;
+                self.focus = FocusTarget::ProcessList;
+                self.update_focus();
+                FtuiCmd::none()
+            }
+            Msg::SearchCancel => {
+                self.state = AppState::Normal;
+                self.focus = FocusTarget::ProcessList;
+                self.update_focus();
+                FtuiCmd::none()
+            }
+            Msg::SearchHistoryUp => {
+                self.search.history_prev();
+                FtuiCmd::none()
+            }
+            Msg::SearchHistoryDown => {
+                self.search.history_next();
+                FtuiCmd::none()
+            }
+
+            Msg::ToggleDetail => {
+                self.toggle_detail_visibility();
+                FtuiCmd::none()
+            }
+            Msg::SetDetailView(view) => {
+                self.set_detail_view(view);
+                FtuiCmd::none()
+            }
+            Msg::ToggleGoalView => {
+                if self.process_table.has_goal_order() {
+                    self.process_table.toggle_view_mode();
+                    self.set_status(format!(
+                        "View mode: {}",
+                        self.process_table.view_mode_label()
+                    ));
+                } else {
+                    self.set_status("Goal view unavailable");
+                }
+                FtuiCmd::none()
+            }
+            Msg::ToggleHelp => {
+                self.state = if self.state == AppState::Help {
+                    AppState::Normal
+                } else {
+                    AppState::Help
+                };
+                FtuiCmd::none()
+            }
+
+            Msg::RequestExecute => {
+                let selected = self.process_table.selected_count();
+                tracing::info!(
+                    target: "tui.user_input",
+                    action = "execute_requested",
+                    selected_count = selected,
+                    "Execution requested"
+                );
+                self.set_status(format!(
+                    "Execution requested for {} process(es) (skeleton mode)",
+                    selected
+                ));
+                FtuiCmd::task_named("execute-selected", || {
+                    Msg::ExecutionComplete(Ok(Default::default()))
+                })
+            }
+            Msg::ConfirmExecute => {
+                self.handle_confirmation(ConfirmChoice::Yes);
+                FtuiCmd::none()
+            }
+            Msg::CancelExecute => {
+                self.handle_confirmation(ConfirmChoice::No);
+                FtuiCmd::none()
+            }
+            Msg::RequestRefresh => {
+                tracing::info!(target: "tui.user_input", action = "refresh_requested", "Refresh requested");
+                self.set_status("Refreshing process list (skeleton mode)...");
+                FtuiCmd::task_named("refresh-processes", || Msg::RefreshComplete(Vec::new()))
+            }
+            Msg::ExportEvidenceLedger => {
+                self.set_status("Evidence ledger export is not wired yet");
+                FtuiCmd::none()
+            }
+
+            Msg::ProcessesScanned(rows) | Msg::RefreshComplete(rows) => {
+                self.process_table.set_rows(rows);
+                self.set_status("Process list refreshed");
+                FtuiCmd::none()
+            }
+            Msg::ExecutionComplete(Ok(outcome)) => {
+                self.set_status(format!(
+                    "Execution complete: {} succeeded, {} failed ({} attempted)",
+                    outcome.succeeded, outcome.failed, outcome.attempted
+                ));
+                FtuiCmd::none()
+            }
+            Msg::ExecutionComplete(Err(error)) => {
+                tracing::error!(target: "tui.async_complete", error = %error, "Execution failed");
+                self.set_status(format!("Execution failed: {}", error));
+                FtuiCmd::none()
+            }
+            Msg::LedgerExported(Ok(path)) => {
+                self.set_status(format!("Evidence ledger exported to {}", path.display()));
+                FtuiCmd::none()
+            }
+            Msg::LedgerExported(Err(error)) => {
+                self.set_status(format!("Ledger export failed: {}", error));
+                FtuiCmd::none()
+            }
+
+            Msg::SwitchTheme(name) => {
+                self.theme = match name.to_lowercase().as_str() {
+                    "light" => Theme::light(),
+                    "high_contrast" | "high-contrast" | "hc" => Theme::high_contrast(),
+                    "no_color" | "no-color" => Theme::no_color(),
+                    _ => Theme::dark(),
+                };
+                FtuiCmd::none()
+            }
+
+            Msg::FocusNext | Msg::FocusPrev => {
+                self.cycle_focus();
+                FtuiCmd::none()
+            }
+
+            Msg::Quit => {
+                self.state = AppState::Quitting;
+                FtuiCmd::quit()
+            }
+        }
+    }
+
+    fn handle_ftui_key_event(&mut self, key: FtuiKeyEvent) -> FtuiCmd<Msg> {
+        if !matches!(key.kind, FtuiKeyEventKind::Press | FtuiKeyEventKind::Repeat) {
+            return FtuiCmd::none();
+        }
+
+        tracing::debug!(
+            target: "tui.user_input",
+            key_code = ?key.code,
+            modifiers = ?key.modifiers,
+            app_state = ?self.state,
+            focus = ?self.focus,
+            "Key event received"
+        );
+
+        match self.state {
+            AppState::Normal => self.handle_ftui_normal_key(key),
+            AppState::Searching => self.handle_ftui_search_key(key),
+            AppState::Confirming => self.handle_ftui_confirm_key(key),
+            AppState::Help => self.handle_ftui_help_key(key),
+            AppState::Quitting => FtuiCmd::quit(),
+        }
+    }
+
+    fn handle_ftui_normal_key(&mut self, key: FtuiKeyEvent) -> FtuiCmd<Msg> {
+        if self.key_bindings.is_quit(&key) {
+            tracing::info!(target: "tui.user_input", action = "quit", "Quit requested");
+            self.state = AppState::Quitting;
+            return FtuiCmd::quit();
+        }
+        if self.key_bindings.is_help(&key) {
+            tracing::debug!(target: "tui.user_input", action = "toggle_help", "Help requested");
+            self.state = AppState::Help;
+            return FtuiCmd::none();
+        }
+        if self.key_bindings.is_search(&key) {
+            tracing::debug!(target: "tui.user_input", action = "enter_search", "Search mode");
+            self.state = AppState::Searching;
+            self.focus = FocusTarget::Search;
+            self.update_focus();
+            return FtuiCmd::none();
+        }
+        if self.key_bindings.is_next(&key) {
+            tracing::trace!(target: "tui.user_input", action = "cursor_down");
+            self.process_table.cursor_down();
+            return FtuiCmd::none();
+        }
+        if self.key_bindings.is_prev(&key) {
+            tracing::trace!(target: "tui.user_input", action = "cursor_up");
+            self.process_table.cursor_up();
+            return FtuiCmd::none();
+        }
+        if self.key_bindings.is_toggle(&key) {
+            tracing::trace!(target: "tui.user_input", action = "toggle_selection");
+            self.process_table.toggle_selection();
+            return FtuiCmd::none();
+        }
+        if self.key_bindings.is_execute(&key) {
+            tracing::info!(target: "tui.user_input", action = "request_execute", selected = self.process_table.selected_count(), "Execute requested");
+            self.show_execute_confirmation();
+            return FtuiCmd::none();
+        }
+        if self.key_bindings.is_next_tab(&key) {
+            self.cycle_focus();
+            return FtuiCmd::none();
+        }
+
+        match key.code {
+            FtuiKeyCode::Home => self.process_table.cursor_home(),
+            FtuiKeyCode::End => self.process_table.cursor_end(),
+            FtuiKeyCode::PageDown => self.process_table.page_down(10),
+            FtuiKeyCode::PageUp => self.process_table.page_up(10),
+            FtuiKeyCode::Char('d') if key.modifiers.contains(FtuiModifiers::CTRL) => {
+                self.process_table.page_down(10)
+            }
+            FtuiKeyCode::Char('u') if key.modifiers.contains(FtuiModifiers::CTRL) => {
+                self.process_table.page_up(10)
+            }
+            FtuiKeyCode::Char('a') => self.process_table.select_recommended(),
+            FtuiKeyCode::Char('A') => self.process_table.select_all(),
+            FtuiKeyCode::Char('u') => self.process_table.deselect_all(),
+            FtuiKeyCode::Char('x') => self.process_table.invert_selection(),
+            FtuiKeyCode::Enter => self.toggle_detail_visibility(),
+            FtuiKeyCode::Char('r') => return FtuiCmd::msg(Msg::RequestRefresh),
+            FtuiKeyCode::Char('s') => self.set_detail_view(DetailView::Summary),
+            FtuiKeyCode::Char('t') => self.set_detail_view(DetailView::Genealogy),
+            FtuiKeyCode::Char('g') => {
+                if self.detail_view == DetailView::GalaxyBrain {
+                    self.set_detail_view(DetailView::Summary);
+                } else {
+                    self.set_detail_view(DetailView::GalaxyBrain);
+                }
+            }
+            FtuiKeyCode::Char('v') => {
+                if self.process_table.has_goal_order() {
+                    self.process_table.toggle_view_mode();
+                    self.set_status(format!(
+                        "View mode: {}",
+                        self.process_table.view_mode_label()
+                    ));
+                } else {
+                    self.set_status("Goal view unavailable");
+                }
+            }
+            _ => {}
+        }
+        FtuiCmd::none()
+    }
+
+    fn handle_ftui_search_key(&mut self, key: FtuiKeyEvent) -> FtuiCmd<Msg> {
+        match key.code {
+            FtuiKeyCode::Escape => {
+                self.state = AppState::Normal;
+                self.focus = FocusTarget::ProcessList;
+                self.update_focus();
+            }
+            FtuiKeyCode::Enter => {
+                self.search.commit();
+                self.apply_search_filter();
+                self.state = AppState::Normal;
+                self.focus = FocusTarget::ProcessList;
+                self.update_focus();
+            }
+            FtuiKeyCode::Up => self.search.history_prev(),
+            FtuiKeyCode::Down => self.search.history_next(),
+            FtuiKeyCode::Backspace => self.search.backspace(),
+            FtuiKeyCode::Char(c) => self.search.type_char(c),
+            _ => {}
+        }
+        FtuiCmd::none()
+    }
+
+    fn handle_ftui_confirm_key(&mut self, key: FtuiKeyEvent) -> FtuiCmd<Msg> {
+        match key.code {
+            FtuiKeyCode::Left | FtuiKeyCode::Char('h') => self.confirm_dialog.select_left(),
+            FtuiKeyCode::Right | FtuiKeyCode::Char('l') => self.confirm_dialog.select_right(),
+            FtuiKeyCode::Tab => self.confirm_dialog.toggle(),
+            FtuiKeyCode::Enter => {
+                let choice = self.confirm_dialog.confirm();
+                self.handle_confirmation(choice);
+                if self.take_execute() {
+                    return FtuiCmd::msg(Msg::RequestExecute);
+                }
+            }
+            FtuiKeyCode::Escape => {
+                self.confirm_dialog.cancel();
+                self.state = AppState::Normal;
+            }
+            _ => {}
+        }
+        FtuiCmd::none()
+    }
+
+    fn handle_ftui_help_key(&mut self, key: FtuiKeyEvent) -> FtuiCmd<Msg> {
+        if matches!(
+            key.code,
+            FtuiKeyCode::Escape | FtuiKeyCode::Char('q') | FtuiKeyCode::Char('?')
+        ) {
+            self.state = AppState::Normal;
+            tracing::debug!(
+                target: "tui.state_transition",
+                to_state = ?self.state,
+                "Leaving help mode"
+            );
+        }
+        FtuiCmd::none()
+    }
+}
+
+impl FtuiModel for App {
+    type Message = Msg;
+
+    fn init(&mut self) -> FtuiCmd<Self::Message> {
+        tracing::info!(
+            target: "tui.startup",
+            terminal_size = ?self.layout_state.size(),
+            theme = ?self.theme.mode,
+            "TUI model initialized"
+        );
+        FtuiCmd::none()
+    }
+
+    fn update(&mut self, msg: Self::Message) -> FtuiCmd<Self::Message> {
+        self.handle_msg(msg)
+    }
+
+    fn view(&self, frame: &mut FtuiFrame) {
+        frame.clear();
+        draw_ftui_text(
+            frame,
+            0,
+            0,
+            "Process Triage - ftui model skeleton (legacy ratatui rendering still active)",
+        );
+        draw_ftui_text(frame, 0, 1, &format!("State: {:?}", self.state));
+
+        let status = self
+            .status_message
+            .as_deref()
+            .unwrap_or("Ready | Press ? for help");
+        draw_ftui_text(frame, 0, 2, status);
+    }
+
+    fn subscriptions(&self) -> Vec<Box<dyn Subscription<Self::Message>>> {
+        vec![Box::new(Every::with_id(
+            0x5054_5449_434B,
+            Duration::from_secs(5),
+            || Msg::Tick,
+        ))]
+    }
+}
+
+fn draw_ftui_text(frame: &mut FtuiFrame, x: u16, y: u16, text: &str) {
+    if y >= frame.height() || x >= frame.width() {
+        return;
+    }
+
+    let mut col = x;
+    let max_col = frame.width();
+    for ch in text.chars() {
+        if col >= max_col {
+            break;
+        }
+        frame.buffer.set(col, y, FtuiCell::from_char(ch));
+        col = col.saturating_add(1);
     }
 }
 
@@ -1000,5 +1467,21 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(app.state, AppState::Normal);
+    }
+
+    #[test]
+    fn test_ftui_model_quit_message() {
+        let mut app = App::new();
+        let cmd = <App as FtuiModel>::update(&mut app, Msg::Quit);
+        assert!(matches!(cmd, FtuiCmd::Quit));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn test_ftui_model_tick_subscription_registered() {
+        let app = App::new();
+        let subs = <App as FtuiModel>::subscriptions(&app);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id(), 0x5054_5449_434B);
     }
 }
