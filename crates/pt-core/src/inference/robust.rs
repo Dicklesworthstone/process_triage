@@ -906,6 +906,9 @@ pub fn worst_case_expected_loss(
     if loss_row.len() != credal_sets.len() {
         return f64::INFINITY;
     }
+    if !is_feasible_credal_simplex(credal_sets) {
+        return f64::INFINITY;
+    }
 
     // 1. Start with minimum required probability for each class
     let mut probs: Vec<f64> = credal_sets.iter().map(|c| c.lower).collect();
@@ -939,6 +942,9 @@ pub fn worst_case_expected_loss(
 /// Compute best-case expected loss over a credal set.
 pub fn best_case_expected_loss(loss_row: &[f64], credal_sets: &[CredalSet]) -> f64 {
     if loss_row.len() != credal_sets.len() {
+        return f64::INFINITY;
+    }
+    if !is_feasible_credal_simplex(credal_sets) {
         return f64::INFINITY;
     }
 
@@ -990,7 +996,9 @@ pub fn select_eta_prequential(
         let mut alpha = prior_alpha;
         let mut beta = prior_beta;
 
-        for &(n, k) in observations {
+        for &(n, k_raw) in observations {
+            // Guard invalid summaries (k > n) to avoid usize underflow in (n - k).
+            let k = k_raw.min(n);
             // Predictive probability before seeing data
             let p_pred = alpha / (alpha + beta);
 
@@ -1012,6 +1020,15 @@ pub fn select_eta_prequential(
     }
 
     best_eta
+}
+
+fn is_feasible_credal_simplex(credal_sets: &[CredalSet]) -> bool {
+    // Feasibility for interval probabilities:
+    // Σ lower_i <= 1 <= Σ upper_i
+    let lower_sum: f64 = credal_sets.iter().map(|c| c.lower).sum();
+    let upper_sum: f64 = credal_sets.iter().map(|c| c.upper).sum();
+    let eps = 1e-10;
+    lower_sum <= 1.0 + eps && upper_sum + eps >= 1.0
 }
 
 /// Approximate standard normal quantile (probit function).
@@ -1260,6 +1277,27 @@ mod tests {
         let eta = select_eta_prequential(2.0, 2.0, &observations, &candidates);
         // Should return some valid eta
         assert!(eta > 0.0 && eta <= 1.0);
+    }
+
+    #[test]
+    fn test_select_eta_prequential_clamps_invalid_k_gt_n() {
+        let observations = vec![(5, 7), (0, 3), (10, 6)];
+        let candidates = vec![0.5, 1.0];
+        let eta = select_eta_prequential(2.0, 2.0, &observations, &candidates);
+        assert!(eta.is_finite());
+        assert!(candidates.contains(&eta));
+    }
+
+    #[test]
+    fn test_expected_loss_returns_infinity_for_infeasible_credal_simplex() {
+        let losses = [1.0, 0.0];
+        let infeasible = [CredalSet::interval(0.0, 0.4), CredalSet::interval(0.0, 0.4)];
+
+        let worst = worst_case_expected_loss(&losses, &infeasible);
+        let best = best_case_expected_loss(&losses, &infeasible);
+
+        assert!(worst.is_infinite());
+        assert!(best.is_infinite());
     }
 
     #[test]

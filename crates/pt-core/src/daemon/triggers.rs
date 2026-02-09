@@ -127,7 +127,7 @@ pub fn evaluate_triggers(
     metrics: &TickMetrics,
 ) -> Vec<FiredTrigger> {
     state.total_ticks += 1;
-    let alpha = config.ewma_alpha;
+    let alpha = sanitize_alpha(config.ewma_alpha);
     let mut fired = Vec::new();
 
     // --- Load trigger ---
@@ -233,6 +233,14 @@ fn ewma(prev: f64, value: f64, alpha: f64, tick: u64) -> f64 {
         value
     } else {
         alpha * value + (1.0 - alpha) * prev
+    }
+}
+
+fn sanitize_alpha(alpha: f64) -> f64 {
+    if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        TriggerConfig::default().ewma_alpha
     }
 }
 
@@ -399,5 +407,18 @@ mod tests {
         let restored: TriggerState = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.total_ticks, 1);
         assert!((restored.load_ewma - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_invalid_alpha_is_sanitized() {
+        let mut config = cfg(10, 0);
+        config.ewma_alpha = 2.0;
+        let mut state = TriggerState::new(&config);
+
+        evaluate_triggers(&config, &mut state, &metrics(1.0, 4096, 8192, 10));
+        evaluate_triggers(&config, &mut state, &metrics(0.0, 4096, 8192, 10));
+
+        assert!(state.load_ewma >= 0.0);
+        assert!(state.load_ewma <= 1.0);
     }
 }

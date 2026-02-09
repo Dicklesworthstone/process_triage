@@ -10050,7 +10050,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut signature_match_count = 0usize;
     let mut signature_fast_path_used_count = 0usize;
 
-    let feasibility = ActionFeasibility::allow_all();
+    let base_feasibility = ActionFeasibility::allow_all();
     let mut shadow_recorder = if global.shadow {
         match ShadowRecorder::new() {
             Ok(recorder) => Some(recorder),
@@ -10226,6 +10226,15 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 );
             }
         }
+
+        // Apply state-based feasibility constraints so decisioning does not
+        // recommend fundamentally invalid actions (e.g., kill for zombie/D-state).
+        let state_feasibility = ActionFeasibility::from_process_state(
+            proc.state.is_zombie(),
+            proc.state.is_disksleep(),
+            None,
+        );
+        let feasibility = base_feasibility.merge(&state_feasibility);
 
         // Compute decision (optimal action based on expected loss)
         let mut decision_outcome =
