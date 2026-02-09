@@ -2,13 +2,6 @@
 //!
 //! Provides consistent colors and styles across all widgets using ftui's
 //! Theme/StyleSheet system with WCAG accessibility validation.
-//!
-//! During the ratatui→ftui migration, this module exposes both:
-//! - Legacy `ratatui::style::Style` methods (for existing widgets)
-//! - ftui `Theme` + `StyleSheet` (for newly ported widgets)
-
-#[cfg(feature = "ui-legacy")]
-use ratatui::style::{Color, Modifier, Style};
 
 use ftui::style::{
     contrast_ratio, meets_wcag_aa, meets_wcag_aaa, ColorProfile, Rgb as FtuiRgb, StyleSheet,
@@ -43,41 +36,11 @@ struct ClassificationColors {
 
 /// Theme configuration for the TUI.
 ///
-/// Wraps ftui's `Theme` and `StyleSheet` for the new widget system, while
-/// preserving ratatui-compatible color fields and style methods for widgets
-/// that have not yet been ported.
+/// Wraps ftui's `Theme` and `StyleSheet` with WCAG-validated color schemes.
 #[derive(Debug, Clone)]
 pub struct Theme {
     /// Current theme mode.
     pub mode: ThemeMode,
-
-    // --- Legacy ratatui-compatible color fields ---
-    // These are kept for backward compatibility during the migration period.
-    // New widgets should use `stylesheet()` or `ftui_theme()` instead.
-    #[cfg(feature = "ui-legacy")]
-    pub bg: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub fg: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub highlight: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub muted: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub kill: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub review: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub spare: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub danger: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub warning: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub success: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub border: Color,
-    #[cfg(feature = "ui-legacy")]
-    pub border_focused: Color,
 
     // --- ftui theme system ---
     ftui_theme: FtuiTheme,
@@ -187,30 +150,6 @@ impl Theme {
 
         Self {
             mode: ThemeMode::Dark,
-            #[cfg(feature = "ui-legacy")]
-            bg: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            fg: Color::White,
-            #[cfg(feature = "ui-legacy")]
-            highlight: Color::Cyan,
-            #[cfg(feature = "ui-legacy")]
-            muted: Color::DarkGray,
-            #[cfg(feature = "ui-legacy")]
-            kill: Color::Red,
-            #[cfg(feature = "ui-legacy")]
-            review: Color::Yellow,
-            #[cfg(feature = "ui-legacy")]
-            spare: Color::Green,
-            #[cfg(feature = "ui-legacy")]
-            danger: Color::Red,
-            #[cfg(feature = "ui-legacy")]
-            warning: Color::Yellow,
-            #[cfg(feature = "ui-legacy")]
-            success: Color::Green,
-            #[cfg(feature = "ui-legacy")]
-            border: Color::DarkGray,
-            #[cfg(feature = "ui-legacy")]
-            border_focused: Color::Cyan,
             ftui_theme,
             stylesheet: sheet,
             classification,
@@ -267,30 +206,6 @@ impl Theme {
 
         Self {
             mode: ThemeMode::Light,
-            #[cfg(feature = "ui-legacy")]
-            bg: Color::White,
-            #[cfg(feature = "ui-legacy")]
-            fg: Color::Black,
-            #[cfg(feature = "ui-legacy")]
-            highlight: Color::Blue,
-            #[cfg(feature = "ui-legacy")]
-            muted: Color::Gray,
-            #[cfg(feature = "ui-legacy")]
-            kill: Color::Red,
-            #[cfg(feature = "ui-legacy")]
-            review: Color::Rgb(140, 100, 0),
-            #[cfg(feature = "ui-legacy")]
-            spare: Color::Rgb(0, 128, 0),
-            #[cfg(feature = "ui-legacy")]
-            danger: Color::Red,
-            #[cfg(feature = "ui-legacy")]
-            warning: Color::Rgb(140, 100, 0),
-            #[cfg(feature = "ui-legacy")]
-            success: Color::Rgb(0, 128, 0),
-            #[cfg(feature = "ui-legacy")]
-            border: Color::Gray,
-            #[cfg(feature = "ui-legacy")]
-            border_focused: Color::Blue,
             ftui_theme,
             stylesheet: sheet,
             classification,
@@ -331,30 +246,6 @@ impl Theme {
 
         Self {
             mode: ThemeMode::HighContrast,
-            #[cfg(feature = "ui-legacy")]
-            bg: Color::Black,
-            #[cfg(feature = "ui-legacy")]
-            fg: Color::White,
-            #[cfg(feature = "ui-legacy")]
-            highlight: Color::Yellow,
-            #[cfg(feature = "ui-legacy")]
-            muted: Color::White,
-            #[cfg(feature = "ui-legacy")]
-            kill: Color::LightRed,
-            #[cfg(feature = "ui-legacy")]
-            review: Color::LightYellow,
-            #[cfg(feature = "ui-legacy")]
-            spare: Color::LightGreen,
-            #[cfg(feature = "ui-legacy")]
-            danger: Color::LightRed,
-            #[cfg(feature = "ui-legacy")]
-            warning: Color::LightYellow,
-            #[cfg(feature = "ui-legacy")]
-            success: Color::LightGreen,
-            #[cfg(feature = "ui-legacy")]
-            border: Color::White,
-            #[cfg(feature = "ui-legacy")]
-            border_focused: Color::Yellow,
             ftui_theme,
             stylesheet: sheet,
             classification,
@@ -378,30 +269,6 @@ impl Theme {
 
         Self {
             mode: ThemeMode::NoColor,
-            #[cfg(feature = "ui-legacy")]
-            bg: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            fg: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            highlight: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            muted: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            kill: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            review: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            spare: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            danger: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            warning: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            success: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            border: Color::Reset,
-            #[cfg(feature = "ui-legacy")]
-            border_focused: Color::Reset,
             ftui_theme,
             stylesheet: sheet,
             classification,
@@ -428,78 +295,6 @@ impl Theme {
     /// Get the current color profile based on terminal capabilities.
     pub fn color_profile() -> ColorProfile {
         ColorProfile::detect()
-    }
-
-    // --- Legacy ratatui-compatible style methods ---
-
-    /// Get style for normal text.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_normal(&self) -> Style {
-        Style::default().fg(self.fg).bg(self.bg)
-    }
-
-    /// Get style for highlighted/selected items.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_highlight(&self) -> Style {
-        Style::default()
-            .fg(self.highlight)
-            .add_modifier(Modifier::BOLD)
-    }
-
-    /// Get style for muted/secondary text.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_muted(&self) -> Style {
-        Style::default().fg(self.muted)
-    }
-
-    /// Get style for KILL classification.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_kill(&self) -> Style {
-        Style::default().fg(self.kill).add_modifier(Modifier::BOLD)
-    }
-
-    /// Get style for REVIEW classification.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_review(&self) -> Style {
-        Style::default().fg(self.review)
-    }
-
-    /// Get style for SPARE classification.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_spare(&self) -> Style {
-        Style::default().fg(self.spare)
-    }
-
-    /// Get border style for unfocused widgets.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_border(&self) -> Style {
-        Style::default().fg(self.border)
-    }
-
-    /// Get border style for focused widgets.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_border_focused(&self) -> Style {
-        Style::default().fg(self.border_focused)
-    }
-
-    /// Get style for error messages.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_error(&self) -> Style {
-        Style::default()
-            .fg(self.danger)
-            .add_modifier(Modifier::BOLD)
-    }
-
-    /// Get style for success messages.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_success(&self) -> Style {
-        Style::default().fg(self.success)
-    }
-
-    /// Get style for warning messages.
-    #[cfg(feature = "ui-legacy")]
-    pub fn style_warning(&self) -> Style {
-        Style::default().fg(self.warning)
     }
 
     // --- WCAG validation ---
@@ -834,21 +629,4 @@ mod tests {
         assert_ne!(dark.classification.bg, hc.classification.bg);
     }
 
-    #[cfg(feature = "ui-legacy")]
-    #[test]
-    fn test_legacy_style_methods_work() {
-        let theme = Theme::dark();
-        // Verify all legacy methods return valid styles
-        let _s1 = theme.style_normal();
-        let _s2 = theme.style_highlight();
-        let _s3 = theme.style_muted();
-        let _s4 = theme.style_kill();
-        let _s5 = theme.style_review();
-        let _s6 = theme.style_spare();
-        let _s7 = theme.style_border();
-        let _s8 = theme.style_border_focused();
-        let _s9 = theme.style_error();
-        let _s10 = theme.style_success();
-        let _s11 = theme.style_warning();
-    }
 }

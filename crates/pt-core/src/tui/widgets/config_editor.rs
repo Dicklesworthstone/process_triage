@@ -1,8 +1,7 @@
 //! Configuration editor widget.
 //!
 //! Form-based editor for modifying Process Triage configuration values.
-//! Uses ftui's Block and Paragraph for the primary rendering path, with
-//! ratatui legacy compat behind the `ui-legacy` feature gate.
+//! Uses ftui's Block and Paragraph for rendering.
 
 use ftui::text::{Line as FtuiLine, Span as FtuiSpan, Text as FtuiText};
 use ftui::widgets::block::{Alignment as FtuiAlignment, Block as FtuiBlock};
@@ -10,14 +9,6 @@ use ftui::widgets::paragraph::Paragraph as FtuiParagraph;
 use ftui::widgets::Widget as FtuiWidget;
 use ftui::PackedRgba;
 use ftui::Style as FtuiStyle;
-
-#[cfg(feature = "ui-legacy")]
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    widgets::{Block, Borders, StatefulWidget, Widget},
-};
 
 use crate::tui::theme::Theme;
 
@@ -229,178 +220,6 @@ impl<'a> ConfigEditor<'a> {
         );
     }
 
-    // ── Legacy ratatui helpers ──────────────────────────────────────
-
-    #[cfg(feature = "ui-legacy")]
-    fn styled_block(&self, focused: bool, modified: bool) -> Block<'a> {
-        let title = if modified {
-            " Configuration [modified] "
-        } else {
-            " Configuration "
-        };
-
-        let border_style = if let Some(theme) = self.theme {
-            if focused {
-                theme.style_border_focused()
-            } else {
-                theme.style_border()
-            }
-        } else {
-            Style::default().fg(if focused {
-                Color::Cyan
-            } else {
-                Color::DarkGray
-            })
-        };
-
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(border_style)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy ratatui StatefulWidget (behind feature gate)
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "ui-legacy")]
-impl<'a> StatefulWidget for ConfigEditor<'a> {
-    type State = ConfigEditorState;
-
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let focused = state.focused;
-        let any_modified = state.fields.iter().any(|f| f.modified);
-        let block = self.styled_block(focused, any_modified);
-
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        if inner.width < 2 || inner.height == 0 {
-            return;
-        }
-
-        if state.fields.is_empty() {
-            let msg = "No configuration fields";
-            let style = if let Some(theme) = self.theme {
-                theme.style_muted()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            let x = inner.x + (inner.width.saturating_sub(msg.len() as u16)) / 2;
-            let y = inner.y + inner.height / 2;
-
-            if y < inner.bottom() {
-                for (i, ch) in msg.chars().enumerate() {
-                    if x + i as u16 >= inner.right() {
-                        break;
-                    }
-                    buf[(x + i as u16, y)].set_char(ch).set_style(style);
-                }
-            }
-            return;
-        }
-
-        // Render fields
-        let name_width = 20.min(inner.width / 3);
-        let value_start = inner.x + name_width + 2;
-
-        for (i, field) in state.fields.iter().enumerate() {
-            let y = inner.y + i as u16;
-            if y >= inner.bottom() {
-                break;
-            }
-
-            let is_cursor = i == state.cursor;
-
-            // Field name
-            let name_style = if is_cursor {
-                if let Some(theme) = self.theme {
-                    theme.style_highlight()
-                } else {
-                    Style::default().add_modifier(Modifier::BOLD)
-                }
-            } else if let Some(theme) = self.theme {
-                theme.style_normal()
-            } else {
-                Style::default()
-            };
-
-            for (j, ch) in field.name.chars().enumerate() {
-                if inner.x + j as u16 >= value_start.saturating_sub(1) {
-                    break;
-                }
-                buf[(inner.x + j as u16, y)]
-                    .set_char(ch)
-                    .set_style(name_style);
-            }
-
-            // Separator
-            let sep_x = value_start.saturating_sub(1);
-            if sep_x < inner.right() {
-                buf[(sep_x, y)].set_char(':').set_style(name_style);
-            }
-
-            // Field value
-            let value_style = if field.error.is_some() {
-                if let Some(theme) = self.theme {
-                    theme.style_error()
-                } else {
-                    Style::default().fg(Color::Red)
-                }
-            } else if field.modified {
-                if let Some(theme) = self.theme {
-                    theme.style_warning()
-                } else {
-                    Style::default().fg(Color::Yellow)
-                }
-            } else if let Some(theme) = self.theme {
-                theme.style_normal()
-            } else {
-                Style::default()
-            };
-
-            // Add cursor indicator if editing this field
-            let value_display = if is_cursor && state.editing {
-                format!("{}_", field.value)
-            } else {
-                field.value.clone()
-            };
-
-            for (j, ch) in value_display.chars().enumerate() {
-                if value_start + j as u16 >= inner.right() {
-                    break;
-                }
-                buf[(value_start + j as u16, y)]
-                    .set_char(ch)
-                    .set_style(value_style);
-            }
-        }
-
-        // Render error message if present
-        if let Some(ref field) = state.fields.get(state.cursor) {
-            if let Some(ref error) = field.error {
-                let error_y = inner.bottom().saturating_sub(1);
-                if error_y > inner.y {
-                    let error_style = if let Some(theme) = self.theme {
-                        theme.style_error()
-                    } else {
-                        Style::default().fg(Color::Red)
-                    };
-
-                    for (i, ch) in error.chars().enumerate() {
-                        if inner.x + i as u16 >= inner.right() {
-                            break;
-                        }
-                        buf[(inner.x + i as u16, error_y)]
-                            .set_char(ch)
-                            .set_style(error_style);
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

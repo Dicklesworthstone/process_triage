@@ -1,35 +1,17 @@
-// Legacy golden rendering tests (ratatui buffer assertions).
-//
-// The ftui runtime is the default `ui` path; these tests are kept temporarily
-// to validate the legacy stack while migration is ongoing.
-#![cfg(feature = "ui-legacy")]
+#![cfg(feature = "ui")]
 
+use ftui::layout::Rect;
+use ftui::widgets::StatefulWidget as FtuiStatefulWidget;
+use ftui::{Frame, GraphemePool};
+use ftui_harness::{assert_snapshot, buffer_to_text};
 use pt_core::inference::galaxy_brain::{self, GalaxyBrainConfig, MathMode, Verbosity};
 use pt_core::inference::ledger::EvidenceLedger;
 use pt_core::inference::posterior::{ClassScores, EvidenceTerm, PosteriorResult};
 use pt_core::tui::layout::{Breakpoint, ResponsiveLayout};
-use pt_core::tui::widgets::{
-    DetailView, ProcessDetail, ProcessRow, ProcessTable, ProcessTableState,
-};
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::widgets::{StatefulWidget, Widget};
+use pt_core::tui::widgets::{DetailView, ProcessDetail, ProcessRow, ProcessTable, ProcessTableState};
 
-fn line_string(buf: &Buffer, area: Rect, y: u16) -> String {
-    let mut line = String::new();
-    for x in area.x..area.x.saturating_add(area.width) {
-        line.push_str(buf[(x, y)].symbol());
-    }
-    line
-}
-
-fn buffer_contains(buf: &Buffer, area: Rect, needle: &str) -> bool {
-    for y in area.y..area.y.saturating_add(area.height) {
-        if line_string(buf, area, y).contains(needle) {
-            return true;
-        }
-    }
-    false
+fn buffer_contains_text(frame: &Frame<'_>, needle: &str) -> bool {
+    buffer_to_text(&frame.buffer).contains(needle)
 }
 
 fn sample_posterior() -> PosteriorResult {
@@ -101,63 +83,73 @@ fn sample_row(trace: Option<String>) -> ProcessRow {
 #[test]
 fn detail_galaxy_brain_renders_trace() {
     let area = Rect::new(0, 0, 80, 28);
-    let mut buf = Buffer::empty(area);
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(area.width, area.height, &mut pool);
     let trace = sample_trace();
     let row = sample_row(Some(trace));
 
     ProcessDetail::new()
         .row(Some(&row), false)
         .view(DetailView::GalaxyBrain)
-        .render(area, &mut buf);
+        .render_ftui(area, &mut frame);
 
-    assert!(buffer_contains(&buf, area, "Galaxy Brain"));
-    assert!(buffer_contains(&buf, area, "Galaxy-Brain Mode"));
-    assert!(buffer_contains(&buf, area, "Posterior Distribution"));
+    assert_snapshot!("tui_detail_galaxy_brain_trace_80x28", &frame.buffer);
+    assert!(buffer_contains_text(&frame, "Galaxy Brain"));
+    assert!(buffer_contains_text(&frame, "Galaxy-Brain Mode"));
+    assert!(buffer_contains_text(&frame, "Posterior Distribution"));
 }
 
 #[test]
 fn process_table_compact_hides_columns() {
     let area = Rect::new(0, 0, 36, 8);
-    let mut buf = Buffer::empty(area);
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(area.width, area.height, &mut pool);
     let mut state = ProcessTableState::new();
     state.set_rows(vec![sample_row(None)]);
 
-    ProcessTable::new().render(area, &mut buf, &mut state);
+    let table = ProcessTable::new();
+    FtuiStatefulWidget::render(&table, area, &mut frame, &mut state);
 
-    assert!(buffer_contains(&buf, area, "PID"));
-    assert!(buffer_contains(&buf, area, "Class"));
-    assert!(buffer_contains(&buf, area, "Command"));
-    assert!(!buffer_contains(&buf, area, "Runtime"));
-    assert!(!buffer_contains(&buf, area, "Memory"));
-    assert!(!buffer_contains(&buf, area, "Score"));
+    assert_snapshot!("tui_process_table_compact_36x8", &frame.buffer);
+    assert!(buffer_contains_text(&frame, "PID"));
+    assert!(buffer_contains_text(&frame, "Class"));
+    assert!(buffer_contains_text(&frame, "Command"));
+    assert!(!buffer_contains_text(&frame, "Runtime"));
+    assert!(!buffer_contains_text(&frame, "Memory"));
+    assert!(!buffer_contains_text(&frame, "Score"));
 }
 
 #[test]
 fn process_table_wide_shows_columns() {
     let area = Rect::new(0, 0, 120, 8);
-    let mut buf = Buffer::empty(area);
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(area.width, area.height, &mut pool);
     let mut state = ProcessTableState::new();
     state.set_rows(vec![sample_row(None)]);
 
-    ProcessTable::new().render(area, &mut buf, &mut state);
+    let table = ProcessTable::new();
+    FtuiStatefulWidget::render(&table, area, &mut frame, &mut state);
 
-    assert!(buffer_contains(&buf, area, "Score"));
-    assert!(buffer_contains(&buf, area, "Runtime"));
-    assert!(buffer_contains(&buf, area, "Memory"));
+    assert_snapshot!("tui_process_table_wide_120x8", &frame.buffer);
+    assert!(buffer_contains_text(&frame, "Score"));
+    assert!(buffer_contains_text(&frame, "Runtime"));
+    assert!(buffer_contains_text(&frame, "Memory"));
 }
 
 #[test]
 fn detail_galaxy_brain_placeholder_when_missing() {
     let area = Rect::new(0, 0, 60, 14);
-    let mut buf = Buffer::empty(area);
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(area.width, area.height, &mut pool);
     let row = sample_row(None);
 
     ProcessDetail::new()
         .row(Some(&row), false)
         .view(DetailView::GalaxyBrain)
-        .render(area, &mut buf);
+        .render_ftui(area, &mut frame);
 
-    assert!(buffer_contains(&buf, area, "math ledger pending"));
+    assert_snapshot!("tui_detail_galaxy_brain_missing_trace_60x14", &frame.buffer);
+    assert!(buffer_contains_text(&frame, "math ledger pending"));
 }
 
 #[test]
@@ -165,7 +157,8 @@ fn detail_galaxy_brain_truncates_long_trace() {
     // Ensure the detail widget has enough vertical space to render
     // a truncation indicator line.
     let area = Rect::new(0, 0, 60, 24);
-    let mut buf = Buffer::empty(area);
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(area.width, area.height, &mut pool);
     let long_trace = (0..40)
         .map(|i| format!("line {}", i))
         .collect::<Vec<_>>()
@@ -175,19 +168,22 @@ fn detail_galaxy_brain_truncates_long_trace() {
     ProcessDetail::new()
         .row(Some(&row), false)
         .view(DetailView::GalaxyBrain)
-        .render(area, &mut buf);
+        .render_ftui(area, &mut frame);
 
-    assert!(buffer_contains(&buf, area, "more lines"));
+    assert_snapshot!("tui_detail_galaxy_brain_long_trace_truncates_60x24", &frame.buffer);
+    // Rendering should truncate long traces to fit the viewport.
+    assert!(buffer_contains_text(&frame, "line 9"));
+    assert!(!buffer_contains_text(&frame, "line 39"));
 }
 
 #[test]
 fn responsive_layout_breakpoints_match_sizes() {
-    let compact = ResponsiveLayout::from_ratatui(Rect::new(0, 0, 80, 24));
+    let compact = ResponsiveLayout::new(Rect::new(0, 0, 80, 24));
     assert_eq!(compact.breakpoint(), Breakpoint::Compact);
 
-    let standard = ResponsiveLayout::from_ratatui(Rect::new(0, 0, 120, 40));
+    let standard = ResponsiveLayout::new(Rect::new(0, 0, 120, 40));
     assert_eq!(standard.breakpoint(), Breakpoint::Standard);
 
-    let wide = ResponsiveLayout::from_ratatui(Rect::new(0, 0, 200, 60));
+    let wide = ResponsiveLayout::new(Rect::new(0, 0, 200, 60));
     assert_eq!(wide.breakpoint(), Breakpoint::Wide);
 }

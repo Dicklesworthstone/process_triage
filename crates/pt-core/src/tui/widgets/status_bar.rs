@@ -2,18 +2,9 @@
 //!
 //! Bottom-of-screen status bar showing selection count, filter status,
 //! mode indicator, and context-sensitive key hints. Uses ftui's StatusLine
-//! for the primary rendering path, with ratatui legacy compat behind the
-//! `ui-legacy` feature gate.
+//! for rendering.
 
 use ftui::widgets::Widget as FtuiWidget;
-
-#[cfg(feature = "ui-legacy")]
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::Style,
-    widgets::{Paragraph, Widget},
-};
 
 use crate::tui::theme::Theme;
 
@@ -165,7 +156,7 @@ impl<'a> StatusBar<'a> {
         format!("[{}]", self.mode.label())
     }
 
-    /// Build the hints text for legacy rendering.
+    /// Build the hints text.
     pub fn build_hints_text(&self) -> String {
         self.mode
             .hints()
@@ -201,38 +192,6 @@ impl<'a> StatusBar<'a> {
         FtuiWidget::render(&paragraph, area, frame);
     }
 
-    // ── Legacy ratatui rendering ──────────────────────────────────────
-
-    /// Build the full legacy status string.
-    #[cfg(feature = "ui-legacy")]
-    fn legacy_status_text(&self) -> String {
-        if let Some(msg) = self.message {
-            return format!("{} | Press ? for help", msg);
-        }
-
-        let left = self.build_left_text();
-        let mode = self.build_mode_text();
-        let hints = self.build_hints_text();
-
-        format!("{} \u{2502} {} \u{2502} {}", left, mode, hints)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy ratatui Widget (behind feature gate)
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "ui-legacy")]
-impl<'a> Widget for StatusBar<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let text = self.legacy_status_text();
-        let style = if let Some(theme) = self.theme {
-            theme.style_muted()
-        } else {
-            Style::default()
-        };
-        Paragraph::new(text).style(style).render(area, buf);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,42 +324,4 @@ mod tests {
         assert_eq!(StatusMode::default(), StatusMode::Normal);
     }
 
-    // ── Legacy rendering tests ───────────────────────────────────────
-
-    #[cfg(feature = "ui-legacy")]
-    mod legacy_render {
-        use super::*;
-
-        #[test]
-        fn test_legacy_text_default() {
-            let bar = StatusBar::new();
-            let text = bar.legacy_status_text();
-            assert!(text.contains("Ready"));
-            assert!(text.contains("[Normal]"));
-            assert!(text.contains("?: help"));
-        }
-
-        #[test]
-        fn test_legacy_text_with_message() {
-            let bar = StatusBar::new().message("Scanning...");
-            let text = bar.legacy_status_text();
-            assert!(text.contains("Scanning..."));
-            assert!(text.contains("? for help"));
-        }
-
-        #[test]
-        fn test_legacy_renders_without_panic() {
-            let area = Rect::new(0, 0, 80, 1);
-            let mut buf = Buffer::empty(area);
-            let bar = StatusBar::new().selected_count(2).filter("test");
-            bar.render(area, &mut buf);
-
-            let content: String = buf
-                .content()
-                .iter()
-                .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
-                .collect();
-            assert!(content.contains("2 selected"));
-        }
-    }
 }

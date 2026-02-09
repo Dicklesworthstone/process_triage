@@ -60,8 +60,6 @@ use pt_core::supervision::{
     detect_supervision, is_human_supervised, AppActionType, AppSupervisionAnalyzer,
     AppSupervisorType, ContainerActionType, ContainerSupervisionAnalyzer,
 };
-#[cfg(all(feature = "ui", feature = "ui-legacy"))]
-use pt_core::tui::run_tui_with_handlers;
 #[cfg(feature = "ui")]
 use pt_core::tui::widgets::ProcessRow;
 #[cfg(feature = "ui")]
@@ -73,16 +71,14 @@ use pt_telemetry::writer::default_telemetry_dir;
 #[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(all(feature = "ui", feature = "ui-legacy"))]
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(all(feature = "ui", feature = "ui-legacy"))]
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "ui")]
+use std::sync::Mutex;
 
 /// Process Triage Core - Intelligent process classification and cleanup
 #[derive(Parser)]
@@ -1896,12 +1892,21 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     let priors = config.priors.clone();
     let policy = config.policy.clone();
 
-    let initial = build_tui_data_from_live_scan(global, args, &priors, &policy)?;
+    let TuiBuildOutput {
+        rows,
+        plan_candidates,
+        goal_summary,
+        goal_order,
+    } = build_tui_data_from_live_scan(global, args, &priors, &policy)?;
 
     let _ = handle.update_state(SessionState::Planned);
 
     let mut app = App::new();
-    app.process_table.set_rows(initial.rows);
+    app.process_table.set_rows(rows);
+    app.process_table.set_goal_order(goal_order);
+    if let Some(lines) = goal_summary {
+        app.set_goal_summary(lines);
+    }
     app.process_table.select_recommended();
     app.set_status(format!(
         "Session {} • {} candidates",
@@ -1909,153 +1914,11 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         app.process_table.rows.len()
     ));
 
-    // Choose runtime: ftui by default, legacy via PT_TUI_LEGACY=1
-    let use_legacy = std::env::var("PT_TUI_LEGACY").is_ok();
+    // ftui runtime path: terminal setup/teardown handled by Program RAII.
+    // Closures capture cloned, Send + 'static data for Cmd::task.
+    {
 
-    if use_legacy {
-        #[cfg(feature = "ui-legacy")]
-        {
-            let plan_cache = Rc::new(RefCell::new(initial.plan_candidates));
-            let plan_cache_refresh = Rc::clone(&plan_cache);
-            let plan_cache_execute = Rc::clone(&plan_cache);
-            let session_id_for_plan = session_id.clone();
-            let policy_for_plan = policy.clone();
-            let handle_for_plan = handle.clone();
-
-            run_tui_with_handlers(
-                &mut app,
-                |app| {
-                    match build_tui_data_from_live_scan(global, args, &priors, &policy) {
-                        Ok(output) => {
-                            let count = output.rows.len();
-                            app.process_table.set_rows(output.rows);
-                            app.process_table.select_recommended();
-                            *plan_cache_refresh.borrow_mut() = output.plan_candidates;
-                            app.set_status(format!("Refreshed • {} candidates", count));
-                        }
-                        Err(err) => {
-                            app.set_status(format!("Refresh failed: {}", err));
-                        }
-                    }
-                    Ok(())
-                },
-                |app| {
-                    let selected = app.process_table.get_selected();
-                    if selected.is_empty() {
-                        app.set_status("No processes selected");
-                        return Ok(());
-                    }
-                    match build_plan_from_selection(
-                        &session_id_for_plan,
-                        &policy_for_plan,
-                        &selected,
-                        &plan_cache_execute.borrow(),
-                    ) {
-                        Ok(plan) => {
-                            if plan.actions.is_empty() {
-                                app.set_status("No actions to apply for selected processes");
-                                return Ok(());
-                            }
-                            app.process_table.apply_plan_preview(&plan);
-                            app.request_redraw();
-                            match write_plan_to_session(&handle_for_plan, &plan) {
-                                Ok(path) => {
-                                    if global.dry_run || global.shadow {
-                                        let mode =
-                                            if global.dry_run { "dry_run" } else { "shadow" };
-                                        if let Err(err) =
-                                            write_outcomes_for_mode(&handle_for_plan, &plan, mode)
-                                        {
-                                            app.set_status(format!(
-                                                "Failed to write outcomes: {}",
-                                                err
-                                            ));
-                                            return Ok(());
-                                        }
-                                        app.set_status(format!(
-                                            "Plan saved ({} actions, {}): {}",
-                                            plan.actions.len(),
-                                            mode,
-                                            path.display()
-                                        ));
-                                        return Ok(());
-                                    }
-
-                                    let _ =
-                                        handle_for_plan.update_state(SessionState::Executing);
-                                    match execute_plan_actions(
-                                        &handle_for_plan,
-                                        &policy_for_plan,
-                                        &plan,
-                                    ) {
-                                        Ok(result) => {
-                                            if let Err(err) = write_outcomes_from_execution(
-                                                &handle_for_plan,
-                                                &plan,
-                                                &result,
-                                            ) {
-                                                app.set_status(format!(
-                                                "Execution complete but failed to write outcomes: {}",
-                                                err
-                                            ));
-                                                return Ok(());
-                                            }
-                                            let skipped = result
-                                                .outcomes
-                                                .iter()
-                                                .filter(|o| {
-                                                    matches!(
-                                                        o.status,
-                                                        pt_core::action::ActionStatus::Skipped
-                                                    )
-                                                })
-                                                .count();
-                                            let final_state =
-                                                if result.summary.actions_failed > 0 {
-                                                    SessionState::Failed
-                                                } else {
-                                                    SessionState::Completed
-                                                };
-                                            let _ = handle_for_plan.update_state(final_state);
-                                            app.set_status(format!(
-                                                "Executed {} actions: {} ok, {} failed, {} skipped",
-                                                result.summary.actions_attempted,
-                                                result.summary.actions_succeeded,
-                                                result.summary.actions_failed,
-                                                skipped
-                                            ));
-                                        }
-                                        Err(err) => {
-                                            let _ =
-                                                handle_for_plan.update_state(SessionState::Failed);
-                                            app.set_status(format!(
-                                                "Execution failed: {}",
-                                                err
-                                            ));
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    app.set_status(format!("Failed to save plan: {}", err));
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            app.set_status(format!("Plan build failed: {}", err));
-                        }
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|e| format!("tui error: {}", e))?;
-        }
-        #[cfg(not(feature = "ui-legacy"))]
-        return Err("PT_TUI_LEGACY=1 requires the ui-legacy feature".to_string());
-    } else {
-        // ftui runtime path: terminal setup/teardown handled by Program RAII.
-        // Closures capture cloned, Send + 'static data for Cmd::task.
-
-        let plan_candidates = Arc::new(Mutex::new(initial.plan_candidates));
+        let plan_candidates = Arc::new(Mutex::new(plan_candidates));
 
         // Build refresh closure
         let plan_cache_r = Arc::clone(&plan_candidates);

@@ -1,24 +1,14 @@
 #![cfg(feature = "ui")]
 //! E2E TUI workflow tests using ftui message-based testing.
 //!
-//! All interactions use ftui `Msg` types sent through `Model::update()`,
-//! replacing the legacy crossterm event-based approach. Rendering tests
-//! are gated behind `ui-legacy` as they require ratatui TestBackend.
+//! All interactions use ftui `Msg` types sent through `Model::update()`.
 
 use ftui::{
     KeyCode as FtuiKeyCode, KeyEvent as FtuiKeyEvent, Model as FtuiModel,
     Modifiers as FtuiModifiers,
 };
 use pt_core::tui::widgets::{DetailView, ProcessRow};
-use pt_core::tui::{App, AppState, Msg, Theme};
-#[cfg(feature = "ui-legacy")]
-use ratatui::backend::TestBackend;
-#[cfg(feature = "ui-legacy")]
-use ratatui::buffer::Buffer;
-#[cfg(feature = "ui-legacy")]
-use ratatui::layout::Rect;
-#[cfg(feature = "ui-legacy")]
-use ratatui::Terminal;
+use pt_core::tui::{App, AppState, Msg};
 
 // ===========================================================================
 // Helpers
@@ -49,33 +39,6 @@ fn ftui_char(c: char) -> Msg {
 /// Create a KeyPressed Msg with Ctrl modifier.
 fn ftui_key_ctrl(c: char) -> Msg {
     Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char(c)).with_modifiers(FtuiModifiers::CTRL))
-}
-
-#[cfg(feature = "ui-legacy")]
-fn line_string(buf: &Buffer, area: Rect, y: u16) -> String {
-    let mut line = String::new();
-    for x in area.x..area.x.saturating_add(area.width) {
-        line.push_str(buf[(x, y)].symbol());
-    }
-    line
-}
-
-#[cfg(feature = "ui-legacy")]
-fn buffer_contains(buf: &Buffer, area: Rect, needle: &str) -> bool {
-    for y in area.y..area.y.saturating_add(area.height) {
-        if line_string(buf, area, y).contains(needle) {
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(feature = "ui-legacy")]
-fn buffer_text(buf: &Buffer, area: Rect) -> String {
-    (area.y..area.y.saturating_add(area.height))
-        .map(|y| line_string(buf, area, y))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn make_row(
@@ -149,14 +112,6 @@ fn app_with_rows() -> App {
     let mut app = App::new();
     app.process_table.set_rows(sample_rows());
     app
-}
-
-#[cfg(feature = "ui-legacy")]
-fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| app.render(frame)).unwrap();
-    terminal
 }
 
 // ===========================================================================
@@ -501,94 +456,12 @@ fn detail_view_toggle_visibility() {
 }
 
 #[test]
-#[cfg(feature = "ui-legacy")]
-fn detail_view_switch_to_galaxy_brain() {
-    let mut app = app_with_rows();
-
-    // 'g' toggles galaxy brain view
-    send_msg(&mut app, ftui_char('g'));
-
-    let terminal = render(&mut app, 120, 40);
-    let buf = terminal.backend().buffer();
-    let area = Rect::new(0, 0, 120, 40);
-    assert!(
-        buffer_contains(buf, area, "Galaxy Brain")
-            || buffer_contains(buf, area, "Galaxy-Brain Mode")
-            || buffer_contains(buf, area, "Math Trace"),
-        "Galaxy brain view should be visible"
-    );
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn detail_view_switch_to_summary() {
-    let mut app = app_with_rows();
-
-    // Switch to galaxy brain then back to summary
-    send_msgs(&mut app, &[ftui_char('g'), ftui_char('s')]);
-
-    let terminal = render(&mut app, 120, 40);
-    let buf = terminal.backend().buffer();
-    let area = Rect::new(0, 0, 120, 40);
-    // Summary view should show process details
-    assert!(
-        buffer_contains(buf, area, "1001") || buffer_contains(buf, area, "node"),
-        "Summary view should show process info"
-    );
-}
-
-#[test]
 fn detail_view_switch_to_genealogy() {
     let mut app = app_with_rows();
 
     // 't' switches to genealogy view
     send_msg(&mut app, ftui_char('t'));
     assert_eq!(app.current_detail_view(), DetailView::Genealogy);
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn detail_view_follows_cursor() {
-    let mut app = app_with_rows();
-
-    // Render at first row
-    let terminal = render(&mut app, 120, 40);
-    let buf = terminal.backend().buffer();
-    let area = Rect::new(0, 0, 120, 40);
-    let text1 = buffer_text(buf, area);
-
-    // Move to row 2 and re-render
-    send_msgs(&mut app, &[ftui_char('j'), ftui_char('j')]);
-    let terminal = render(&mut app, 120, 40);
-    let buf = terminal.backend().buffer();
-    let text2 = buffer_text(buf, area);
-
-    // The detail pane content should change (different process focused)
-    assert_ne!(text1, text2, "Detail should update when cursor moves");
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn detail_view_via_semantic_msgs() {
-    let mut app = app_with_rows();
-
-    send_msg(&mut app, Msg::SetDetailView(DetailView::GalaxyBrain));
-    let terminal = render(&mut app, 120, 40);
-    let buf = terminal.backend().buffer();
-    let area = Rect::new(0, 0, 120, 40);
-    assert!(
-        buffer_contains(buf, area, "Galaxy Brain") || buffer_contains(buf, area, "Math Trace"),
-        "Galaxy brain should render via SetDetailView msg"
-    );
-
-    send_msg(&mut app, Msg::SetDetailView(DetailView::Summary));
-    let _terminal = render(&mut app, 120, 40);
-
-    send_msg(&mut app, Msg::SetDetailView(DetailView::Genealogy));
-    let _terminal = render(&mut app, 120, 40);
-
-    send_msg(&mut app, Msg::ToggleDetail);
-    let _terminal = render(&mut app, 120, 40);
 }
 
 // ===========================================================================
@@ -689,22 +562,6 @@ fn help_opens_and_closes() {
 
     send_msg(&mut app, ftui_key(FtuiKeyCode::Escape));
     assert_eq!(app.state, AppState::Normal);
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn help_renders_keybindings() {
-    let mut app = app_with_rows();
-
-    send_msg(&mut app, ftui_char('?'));
-    let terminal = render(&mut app, 100, 30);
-    let buf = terminal.backend().buffer();
-    let area = Rect::new(0, 0, 100, 30);
-
-    assert!(
-        buffer_contains(buf, area, "Help"),
-        "Help title should be visible"
-    );
 }
 
 #[test]
@@ -839,90 +696,8 @@ fn minimal_terminal_renders_without_crash() {
 }
 
 // ===========================================================================
-// 10. Theme Switching
+// 10. Full Workflow Sequences
 // ===========================================================================
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn dark_theme_renders() {
-    let mut app = app_with_rows().with_theme(Theme::dark());
-    let _terminal = render(&mut app, 120, 40);
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn light_theme_renders() {
-    let mut app = app_with_rows().with_theme(Theme::light());
-    let _terminal = render(&mut app, 120, 40);
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn high_contrast_theme_renders() {
-    let mut app = app_with_rows().with_theme(Theme::high_contrast());
-    let _terminal = render(&mut app, 120, 40);
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn theme_switch_via_msg() {
-    let mut app = app_with_rows();
-    send_msg(&mut app, Msg::SwitchTheme("light".to_string()));
-    let _terminal = render(&mut app, 120, 40);
-
-    send_msg(&mut app, Msg::SwitchTheme("high_contrast".to_string()));
-    let _terminal = render(&mut app, 120, 40);
-
-    send_msg(&mut app, Msg::SwitchTheme("dark".to_string()));
-    let _terminal = render(&mut app, 120, 40);
-}
-
-// ===========================================================================
-// 11. Full Workflow Sequences
-// ===========================================================================
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn workflow_triage_and_execute() {
-    let mut app = app_with_rows();
-
-    // 1. Browse processes (navigate down 2)
-    send_msgs(&mut app, &[ftui_char('j'), ftui_char('j')]);
-    assert_eq!(app.process_table.cursor, 2);
-
-    // 2. Open help
-    send_msg(&mut app, ftui_char('?'));
-    assert_eq!(app.state, AppState::Help);
-    send_msg(&mut app, ftui_key(FtuiKeyCode::Escape));
-    assert_eq!(app.state, AppState::Normal);
-
-    // 3. Select recommended
-    send_msg(&mut app, ftui_char('a'));
-    assert!(app.process_table.selected_count() > 0);
-
-    // 4. Switch to galaxy brain for the first KILL row
-    send_msgs(&mut app, &[ftui_key(FtuiKeyCode::Home), ftui_char('g')]);
-    let terminal = render(&mut app, 120, 40);
-    let buf = terminal.backend().buffer();
-    let area = Rect::new(0, 0, 120, 40);
-    assert!(
-        buffer_contains(buf, area, "Galaxy-Brain Mode")
-            || buffer_contains(buf, area, "Galaxy Brain")
-            || buffer_contains(buf, area, "Math Trace")
-    );
-
-    // 5. Execute (ftui binding: 'e')
-    send_msg(&mut app, ftui_char('e'));
-    assert!(app.confirm_dialog.visible);
-
-    // 6. Confirm
-    send_msg(&mut app, ftui_key(FtuiKeyCode::Enter));
-    assert!(!app.confirm_dialog.visible);
-
-    // 7. Quit
-    send_msg(&mut app, ftui_char('q'));
-    assert!(app.should_quit());
-}
 
 #[test]
 fn workflow_search_filter_select_abort() {
@@ -958,25 +733,6 @@ fn workflow_search_filter_select_abort() {
     // 5. Deselect all
     send_msg(&mut app, ftui_char('u'));
     assert_eq!(app.process_table.selected_count(), 0);
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn workflow_view_mode_switching() {
-    let mut app = app_with_rows();
-
-    // Switch through all detail views
-    send_msg(&mut app, ftui_char('s')); // Summary
-    let _terminal = render(&mut app, 120, 40);
-
-    send_msg(&mut app, ftui_char('g')); // Galaxy brain
-    let _terminal = render(&mut app, 120, 40);
-
-    send_msg(&mut app, ftui_char('t')); // Genealogy
-    let _terminal = render(&mut app, 120, 40);
-
-    send_msg(&mut app, ftui_char('s')); // Back to summary
-    let _terminal = render(&mut app, 120, 40);
 }
 
 // ===========================================================================
@@ -1062,14 +818,6 @@ fn execution_complete_err() {
 // ===========================================================================
 // 14. Empty State
 // ===========================================================================
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn empty_process_list_renders() {
-    let mut app = App::new();
-    // No rows set
-    let _terminal = render(&mut app, 120, 40);
-}
 
 #[test]
 fn empty_process_list_navigation_safe() {
@@ -1161,19 +909,6 @@ fn rapid_search_enter_exit_stress() {
 }
 
 #[test]
-#[cfg(feature = "ui-legacy")]
-fn interleaved_resize_and_keys() {
-    let mut app = app_with_rows();
-
-    // Mix resize messages with key events
-    for width in (60..200).step_by(20) {
-        send_msg(&mut app, Msg::Resized { width, height: 40 });
-        send_msgs(&mut app, &[ftui_char('j'), ftui_char(' ')]);
-        let _terminal = render(&mut app, width, 40);
-    }
-}
-
-#[test]
 fn rapid_semantic_msg_stress() {
     let mut app = app_with_rows();
 
@@ -1192,67 +927,7 @@ fn rapid_semantic_msg_stress() {
 }
 
 // ===========================================================================
-// 16. Rendering at Different Terminal Sizes (requires ratatui)
-// ===========================================================================
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn render_at_compact_80x24() {
-    let mut app = app_with_rows();
-    send_msg(
-        &mut app,
-        Msg::Resized {
-            width: 80,
-            height: 24,
-        },
-    );
-    let _terminal = render(&mut app, 80, 24);
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn render_at_standard_120x40() {
-    let mut app = app_with_rows();
-    send_msg(
-        &mut app,
-        Msg::Resized {
-            width: 120,
-            height: 40,
-        },
-    );
-    let _terminal = render(&mut app, 120, 40);
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn render_at_wide_200x60() {
-    let mut app = app_with_rows();
-    send_msg(
-        &mut app,
-        Msg::Resized {
-            width: 200,
-            height: 60,
-        },
-    );
-    let _terminal = render(&mut app, 200, 60);
-}
-
-#[test]
-#[cfg(feature = "ui-legacy")]
-fn render_at_minimal_40x10() {
-    let mut app = app_with_rows();
-    send_msg(
-        &mut app,
-        Msg::Resized {
-            width: 40,
-            height: 10,
-        },
-    );
-    let _terminal = render(&mut app, 40, 10);
-}
-
-// ===========================================================================
-// 17. Misc ftui-Specific Messages
+// 16. Misc ftui-Specific Messages
 // ===========================================================================
 
 #[test]

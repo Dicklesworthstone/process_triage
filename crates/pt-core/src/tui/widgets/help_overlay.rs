@@ -1,8 +1,7 @@
 //! Help overlay widget.
 //!
 //! Modal overlay showing keyboard shortcuts and navigation help.
-//! Uses ftui's Modal + Block + Paragraph for the primary rendering path,
-//! with ratatui legacy compat behind the `ui-legacy` feature gate.
+//! Uses ftui's Modal + Block + Paragraph for rendering.
 
 use ftui::text::{Line as FtuiLine, Span as FtuiSpan, Text as FtuiText};
 use ftui::widgets::block::Block as FtuiBlock;
@@ -11,14 +10,6 @@ use ftui::widgets::paragraph::Paragraph as FtuiParagraph;
 use ftui::widgets::Widget as FtuiWidget;
 use ftui::PackedRgba;
 use ftui::Style as FtuiStyle;
-
-#[cfg(feature = "ui-legacy")]
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Style},
-    widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
-};
 
 use crate::tui::layout::Breakpoint;
 use crate::tui::theme::Theme;
@@ -305,81 +296,6 @@ impl<'a> HelpOverlay<'a> {
         FtuiWidget::render(&modal, area, frame);
     }
 
-    // ── Legacy ratatui rendering ──────────────────────────────────────
-
-    /// Build compact help string for legacy rendering.
-    #[cfg(feature = "ui-legacy")]
-    fn compact_help_text() -> &'static str {
-        concat!(
-            "Navigation: j/k/Home/End\n",
-            "Search: /\n",
-            "Select: Space/a/A/u/x\n",
-            "Execute: e\n",
-            "Detail: Enter\n",
-            "Views: s/t/g  Mode: v\n",
-            "Help: ?  Quit: q",
-        )
-    }
-
-    /// Build full help string for legacy rendering.
-    #[cfg(feature = "ui-legacy")]
-    fn full_help_text() -> String {
-        let mut text = String::from("  Process Triage TUI Help\n\n");
-        for section in SECTIONS {
-            text.push_str(&format!("  {}:\n", section.title));
-            for binding in section.bindings {
-                text.push_str(&format!(
-                    "    {:width$}{}\n",
-                    binding.key,
-                    binding.desc,
-                    width = KEY_COL_WIDTH,
-                ));
-            }
-            text.push('\n');
-        }
-        text
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy ratatui Widget (behind feature gate)
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "ui-legacy")]
-impl<'a> Widget for HelpOverlay<'a> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let help_text = match self.breakpoint {
-            Breakpoint::Minimal => Self::compact_help_text().to_string(),
-            _ => Self::full_help_text(),
-        };
-
-        let border_style = if let Some(theme) = self.theme {
-            theme.style_border_focused()
-        } else {
-            Style::default().fg(Color::Cyan)
-        };
-
-        let text_style = if let Some(theme) = self.theme {
-            theme.style_normal()
-        } else {
-            Style::default()
-        };
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Help ")
-            .border_style(border_style);
-
-        // Clear background
-        Clear.render(area, buf);
-
-        let paragraph = Paragraph::new(help_text)
-            .block(block)
-            .style(text_style)
-            .wrap(Wrap { trim: false });
-
-        paragraph.render(area, buf);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,56 +409,4 @@ mod tests {
         assert!(full.len() > compact.len());
     }
 
-    // ── Legacy rendering tests ───────────────────────────────────────
-
-    #[cfg(feature = "ui-legacy")]
-    mod legacy_render {
-        use super::*;
-
-        #[test]
-        fn test_compact_text_has_categories() {
-            let text = HelpOverlay::compact_help_text();
-            assert!(text.contains("Navigation"));
-            assert!(text.contains("Quit"));
-        }
-
-        #[test]
-        fn test_full_text_has_sections() {
-            let text = HelpOverlay::full_help_text();
-            assert!(text.contains("Navigation:"));
-            assert!(text.contains("Actions:"));
-            assert!(text.contains("General:"));
-        }
-
-        #[test]
-        fn test_renders_without_panic() {
-            let area = Rect::new(0, 0, 60, 30);
-            let mut buf = Buffer::empty(area);
-            let overlay = HelpOverlay::new();
-            overlay.render(area, &mut buf);
-
-            // Should have rendered something in the buffer
-            let content: String = buf
-                .content()
-                .iter()
-                .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
-                .collect();
-            assert!(content.contains("Help"));
-        }
-
-        #[test]
-        fn test_compact_renders_without_panic() {
-            let area = Rect::new(0, 0, 40, 15);
-            let mut buf = Buffer::empty(area);
-            let overlay = HelpOverlay::new().breakpoint(Breakpoint::Minimal);
-            overlay.render(area, &mut buf);
-
-            let content: String = buf
-                .content()
-                .iter()
-                .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
-                .collect();
-            assert!(content.contains("Help"));
-        }
-    }
 }

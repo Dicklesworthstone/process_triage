@@ -1,20 +1,11 @@
 //! Search input widget for filtering processes.
 //!
-//! Uses ftui's built-in TextInput as the primary rendering path, with
-//! ratatui legacy compat behind the `ui-legacy` feature gate.
+//! Uses ftui's built-in TextInput for rendering.
 
 use ftui::widgets::block::Block as FtuiBlock;
 use ftui::widgets::input::TextInput as FtuiTextInput;
 use ftui::widgets::Widget as FtuiWidget;
 use ftui::Style as FtuiStyle;
-
-#[cfg(feature = "ui-legacy")]
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Style},
-    widgets::{Block, Borders, StatefulWidget, Widget},
-};
 
 use crate::tui::theme::Theme;
 
@@ -120,89 +111,6 @@ impl<'a> SearchInput<'a> {
             .with_focused(focused);
 
         FtuiWidget::render(&text_input, inner, frame);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy ratatui StatefulWidget (behind feature gate)
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "ui-legacy")]
-impl<'a> StatefulWidget for SearchInput<'a> {
-    type State = SearchInputState;
-
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let focused = state.focused;
-
-        let title = if focused {
-            " Search [Enter to filter] "
-        } else {
-            " Search "
-        };
-
-        let border_style = if let Some(theme) = self.theme {
-            if focused {
-                theme.style_border_focused()
-            } else {
-                theme.style_border()
-            }
-        } else {
-            Style::default().fg(if focused {
-                Color::Cyan
-            } else {
-                Color::DarkGray
-            })
-        };
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(border_style);
-
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        let input_style = if let Some(theme) = self.theme {
-            if focused {
-                theme.style_highlight()
-            } else {
-                theme.style_normal()
-            }
-        } else {
-            Style::default()
-        };
-
-        if state.value.is_empty() && !focused {
-            let placeholder_style = if let Some(theme) = self.theme {
-                theme.style_muted()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            for (i, ch) in self.placeholder.chars().enumerate() {
-                if inner.x + i as u16 >= inner.right() {
-                    break;
-                }
-                buf[(inner.x + i as u16, inner.y)]
-                    .set_char(ch)
-                    .set_style(placeholder_style);
-            }
-        } else {
-            let display = if focused {
-                format!("{}_", state.value)
-            } else {
-                state.value.clone()
-            };
-
-            for (i, ch) in display.chars().enumerate() {
-                if inner.x + i as u16 >= inner.right() {
-                    break;
-                }
-                buf[(inner.x + i as u16, inner.y)]
-                    .set_char(ch)
-                    .set_style(input_style);
-            }
-        }
     }
 }
 

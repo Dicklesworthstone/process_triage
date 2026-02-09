@@ -23,24 +23,6 @@ use ftui::layout::{Constraint, Flex, Rect};
 use tracing::{debug, trace};
 
 // ---------------------------------------------------------------------------
-// Legacy ratatui interop
-// ---------------------------------------------------------------------------
-
-/// Convert ftui Rect to ratatui Rect.
-#[cfg(feature = "ui-legacy")]
-#[inline]
-pub fn to_ratatui_rect(r: Rect) -> ratatui::layout::Rect {
-    ratatui::layout::Rect::new(r.x, r.y, r.width, r.height)
-}
-
-/// Convert ratatui Rect to ftui Rect.
-#[cfg(feature = "ui-legacy")]
-#[inline]
-pub fn from_ratatui_rect(r: ratatui::layout::Rect) -> Rect {
-    Rect::new(r.x, r.y, r.width, r.height)
-}
-
-// ---------------------------------------------------------------------------
 // Breakpoints
 // ---------------------------------------------------------------------------
 
@@ -110,33 +92,6 @@ pub struct MainAreas {
     pub status: Rect,
 }
 
-#[cfg(feature = "ui-legacy")]
-impl MainAreas {
-    /// Convert all areas to ratatui Rects for legacy rendering.
-    pub fn to_ratatui(&self) -> MainAreasLegacy {
-        MainAreasLegacy {
-            header: self.header.map(to_ratatui_rect),
-            search: to_ratatui_rect(self.search),
-            list: to_ratatui_rect(self.list),
-            detail: self.detail.map(to_ratatui_rect),
-            aux: self.aux.map(to_ratatui_rect),
-            status: to_ratatui_rect(self.status),
-        }
-    }
-}
-
-/// Legacy ratatui Rect version of [`MainAreas`].
-#[cfg(feature = "ui-legacy")]
-#[derive(Debug, Clone, Copy)]
-pub struct MainAreasLegacy {
-    pub header: Option<ratatui::layout::Rect>,
-    pub search: ratatui::layout::Rect,
-    pub list: ratatui::layout::Rect,
-    pub detail: Option<ratatui::layout::Rect>,
-    pub aux: Option<ratatui::layout::Rect>,
-    pub status: ratatui::layout::Rect,
-}
-
 /// Layout areas for the evidence detail view.
 #[derive(Debug, Clone, Copy)]
 pub struct DetailAreas {
@@ -148,27 +103,6 @@ pub struct DetailAreas {
     pub actions: Rect,
 }
 
-#[cfg(feature = "ui-legacy")]
-impl DetailAreas {
-    /// Convert all areas to ratatui Rects for legacy rendering.
-    pub fn to_ratatui(&self) -> DetailAreasLegacy {
-        DetailAreasLegacy {
-            header: to_ratatui_rect(self.header),
-            evidence: to_ratatui_rect(self.evidence),
-            actions: to_ratatui_rect(self.actions),
-        }
-    }
-}
-
-/// Legacy ratatui Rect version of [`DetailAreas`].
-#[cfg(feature = "ui-legacy")]
-#[derive(Debug, Clone, Copy)]
-pub struct DetailAreasLegacy {
-    pub header: ratatui::layout::Rect,
-    pub evidence: ratatui::layout::Rect,
-    pub actions: ratatui::layout::Rect,
-}
-
 /// Layout areas for galaxy brain (full math) view.
 #[derive(Debug, Clone, Copy)]
 pub struct GalaxyBrainAreas {
@@ -176,25 +110,6 @@ pub struct GalaxyBrainAreas {
     pub math: Rect,
     /// Explanation text area.
     pub explanation: Rect,
-}
-
-#[cfg(feature = "ui-legacy")]
-impl GalaxyBrainAreas {
-    /// Convert all areas to ratatui Rects for legacy rendering.
-    pub fn to_ratatui(&self) -> GalaxyBrainAreasLegacy {
-        GalaxyBrainAreasLegacy {
-            math: to_ratatui_rect(self.math),
-            explanation: to_ratatui_rect(self.explanation),
-        }
-    }
-}
-
-/// Legacy ratatui Rect version of [`GalaxyBrainAreas`].
-#[cfg(feature = "ui-legacy")]
-#[derive(Debug, Clone, Copy)]
-pub struct GalaxyBrainAreasLegacy {
-    pub math: ratatui::layout::Rect,
-    pub explanation: ratatui::layout::Rect,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,12 +143,6 @@ impl ResponsiveLayout {
         );
 
         Self { area, breakpoint }
-    }
-
-    /// Create from a ratatui Rect (legacy interop).
-    #[cfg(feature = "ui-legacy")]
-    pub fn from_ratatui(area: ratatui::layout::Rect) -> Self {
-        Self::new(from_ratatui_rect(area))
     }
 
     /// Get the current breakpoint.
@@ -821,25 +730,4 @@ mod tests {
         assert_eq!(total_h, area.height, "rows should cover full height");
     }
 
-    #[cfg(feature = "ui-legacy")]
-    #[test]
-    fn test_ratatui_rect_roundtrip() {
-        let ftui_rect = Rect::new(10, 20, 100, 50);
-        let rat_rect = to_ratatui_rect(ftui_rect);
-        let back = from_ratatui_rect(rat_rect);
-        assert_eq!(ftui_rect, back);
-    }
-
-    #[cfg(feature = "ui-legacy")]
-    #[test]
-    fn test_main_areas_to_ratatui() {
-        let area = Rect::new(0, 0, 140, 40);
-        let layout = ResponsiveLayout::new(area);
-        let areas = layout.main_areas();
-        let legacy = areas.to_ratatui();
-
-        assert_eq!(legacy.search.width, areas.search.width);
-        assert_eq!(legacy.search.height, areas.search.height);
-        assert_eq!(legacy.list.x, areas.list.x);
-    }
 }

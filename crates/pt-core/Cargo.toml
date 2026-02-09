@@ -46,11 +46,8 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 prometheus = { version = "0.13", optional = true }
 tiny_http = { version = "0.12", optional = true }
 
-# TUI dependencies (optional, behind "ui" or "ui-legacy" feature)
+# TUI dependencies (optional, behind "ui" feature)
 ftui = { path = "/dp/frankentui/crates/ftui", optional = true, features = ["crossterm"] }
-# Legacy stack retained during incremental migration to ftui.
-ratatui = { version = "0.30", optional = true, features = ["crossterm_0_28"] }
-crossterm = { version = "0.28", optional = true }
 
 # Internal crates
 pt-common = { path = "../pt-common" }
@@ -68,7 +65,6 @@ report = ["pt-report"]  # HTML report generator
 daemon = []         # Dormant monitoring mode
 metrics = ["prometheus", "tiny_http"]  # Prometheus /metrics endpoint for daemon
 ui = ["ftui"]              # Premium TUI experience (ftui, Elm-style)
-ui-legacy = ["ratatui", "crossterm"]  # Legacy ratatui TUI (opt-in during migration)
 test-utils = []     # Export test utilities for integration tests
 test-tempdir = []   # Enable tempdir helper in test utilities
 fleet-dns = []      # Enable DNS-based fleet discovery (scaffold)

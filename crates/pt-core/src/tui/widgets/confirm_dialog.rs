@@ -1,8 +1,7 @@
 //! Confirmation dialog widget.
 //!
 //! Modal dialog for confirming destructive actions like process termination.
-//! Uses ftui's Dialog as the primary rendering path, with ratatui legacy
-//! compat behind the `ui-legacy` feature gate.
+//! Uses ftui's Dialog for rendering.
 
 use ftui::widgets::modal::{
     Dialog as FtuiDialog, DialogButton as FtuiDialogButton, DialogState as FtuiDialogState,
@@ -10,14 +9,6 @@ use ftui::widgets::modal::{
 use ftui::widgets::StatefulWidget as FtuiStatefulWidget;
 use ftui::PackedRgba;
 use ftui::Style as FtuiStyle;
-
-#[cfg(feature = "ui-legacy")]
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Widget, Wrap},
-};
 
 use crate::tui::theme::Theme;
 
@@ -154,146 +145,6 @@ impl<'a> ConfirmDialog<'a> {
         FtuiStatefulWidget::render(&dialog, area, frame, &mut ftui_state);
     }
 
-    // ── Legacy ratatui helpers ──────────────────────────────────────
-
-    /// Calculate dialog area centered in parent.
-    #[cfg(feature = "ui-legacy")]
-    fn dialog_area(&self, parent: Rect) -> Rect {
-        let width = 60.min(parent.width.saturating_sub(4));
-        let height = if self.details.is_some() { 12 } else { 8 };
-        let height = height.min(parent.height.saturating_sub(4));
-
-        let x = parent.x + (parent.width.saturating_sub(width)) / 2;
-        let y = parent.y + (parent.height.saturating_sub(height)) / 2;
-
-        Rect::new(x, y, width, height)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy ratatui StatefulWidget (behind feature gate)
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "ui-legacy")]
-impl<'a> StatefulWidget for ConfirmDialog<'a> {
-    type State = ConfirmDialogState;
-
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let dialog_area = self.dialog_area(area);
-
-        // Clear background
-        Clear.render(dialog_area, buf);
-
-        // Draw border
-        let border_style = if let Some(theme) = self.theme {
-            Style::default().fg(theme.warning)
-        } else {
-            Style::default().fg(Color::Yellow)
-        };
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} ", self.title))
-            .border_style(border_style);
-
-        let inner = block.inner(dialog_area);
-        block.render(dialog_area, buf);
-
-        // Message
-        let message_style = if let Some(theme) = self.theme {
-            theme.style_normal()
-        } else {
-            Style::default()
-        };
-
-        let message = Paragraph::new(self.message)
-            .style(message_style)
-            .wrap(Wrap { trim: true });
-        message.render(Rect::new(inner.x, inner.y, inner.width, 2), buf);
-
-        // Details (if present)
-        let button_y = if let Some(details) = self.details {
-            let details_style = if let Some(theme) = self.theme {
-                theme.style_muted()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            let details_area = Rect::new(
-                inner.x,
-                inner.y + 3,
-                inner.width,
-                inner.height.saturating_sub(6),
-            );
-            let details_para = Paragraph::new(details)
-                .style(details_style)
-                .wrap(Wrap { trim: true });
-            details_para.render(details_area, buf);
-
-            inner.bottom().saturating_sub(2)
-        } else {
-            inner.bottom().saturating_sub(2)
-        };
-
-        // Buttons
-        let yes_style = if state.selected == ConfirmChoice::Yes {
-            if let Some(theme) = self.theme {
-                Style::default()
-                    .fg(theme.bg)
-                    .bg(theme.danger)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Red)
-                    .add_modifier(Modifier::BOLD)
-            }
-        } else if let Some(theme) = self.theme {
-            theme.style_normal()
-        } else {
-            Style::default()
-        };
-
-        let no_style = if state.selected == ConfirmChoice::No {
-            if let Some(theme) = self.theme {
-                Style::default()
-                    .fg(theme.bg)
-                    .bg(theme.highlight)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            }
-        } else if let Some(theme) = self.theme {
-            theme.style_normal()
-        } else {
-            Style::default()
-        };
-
-        let yes_text = format!(" {} ", self.yes_label);
-        let no_text = format!(" {} ", self.no_label);
-        let total_button_width = yes_text.len() + no_text.len() + 4;
-        let button_x = inner.x + (inner.width.saturating_sub(total_button_width as u16)) / 2;
-
-        // Render Yes button
-        for (i, ch) in yes_text.chars().enumerate() {
-            let x = button_x + (i as u16);
-            if x < inner.right() && button_y < inner.bottom() {
-                buf[(x, button_y)].set_char(ch).set_style(yes_style);
-            }
-        }
-
-        // Render No button
-        let no_x = button_x + yes_text.len() as u16 + 2;
-        for (i, ch) in no_text.chars().enumerate() {
-            let x = no_x + (i as u16);
-            if x < inner.right() && button_y < inner.bottom() {
-                buf[(x, button_y)].set_char(ch).set_style(no_style);
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
