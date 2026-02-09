@@ -107,8 +107,8 @@ fn test_format_toon_produces_valid_toon() {
     // TOON should contain key/value pairs
     assert!(!text.is_empty(), "TOON output should not be empty");
 
-    // TOON should be parseable back to a value via toon_rust
-    // (We can't use toon_rust directly in integration tests, but we
+    // TOON should be parseable back to a value via tru
+    // (We can't use tru directly in integration tests, but we
     // can verify the output is non-empty and structured)
     assert!(
         text.len() > 10,

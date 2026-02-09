@@ -4,7 +4,7 @@ use pt_core::output::{encode_toon_value, CompactConfig, FieldSelector, TokenEffi
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use toon_rust::try_decode;
+use tru::try_decode;
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

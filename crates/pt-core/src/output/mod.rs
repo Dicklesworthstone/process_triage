@@ -10,8 +10,8 @@ pub mod progressive;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
-use toon_rust::encode;
-use toon_rust::options::{EncodeOptions, KeyFoldingMode};
+use tru::encode;
+use tru::options::{EncodeOptions, KeyFoldingMode};
 
 /// Field selection specification for filtering output fields.
 #[derive(Debug, Clone, Default)]
@@ -542,7 +542,7 @@ pub fn encode_toon_value(value: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use toon_rust::try_decode;
+    use tru::try_decode;
 
     #[test]
     fn test_field_selector_presets() {
