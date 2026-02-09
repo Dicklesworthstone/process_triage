@@ -46,8 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 prometheus = { version = "0.13", optional = true }
 tiny_http = { version = "0.12", optional = true }
 
-# TUI dependencies (optional, behind "ui" feature)
-ratatui = { version = "0.29", optional = true }
+# TUI dependencies (optional, behind "ui" or "ui-legacy" feature)
+ftui = { path = "/dp/frankentui/crates/ftui", optional = true, features = ["crossterm"] }
+# Legacy stack retained during incremental migration to ftui.
+ratatui = { version = "0.30", optional = true, features = ["crossterm_0_28"] }
 crossterm = { version = "0.28", optional = true }
 
 # Internal crates
@@ -65,7 +67,8 @@ deep = []           # Enable expensive/privileged probes (lsof, ss, perf/eBPF)
 report = ["pt-report"]  # HTML report generator
 daemon = []         # Dormant monitoring mode
 metrics = ["prometheus", "tiny_http"]  # Prometheus /metrics endpoint for daemon
-ui = ["ratatui", "crossterm"]  # Premium TUI experience
+ui = ["ftui", "ui-legacy"]  # Premium TUI experience (ftui migration in progress)
+ui-legacy = ["ratatui", "crossterm"]  # Legacy ratatui TUI (migration period)
 test-utils = []     # Export test utilities for integration tests
 test-tempdir = []   # Enable tempdir helper in test utilities
 fleet-dns = []      # Enable DNS-based fleet discovery (scaffold)
@@ -78,6 +81,7 @@ tempfile = "3"
 regex = "1"
 proptest = "1"
 filetime = "0.2"
+ftui-harness = { path = "/dp/frankentui/crates/ftui-harness" }
 
 [[bench]]
 name = "collect_parsers"
