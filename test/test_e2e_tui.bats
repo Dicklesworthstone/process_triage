@@ -508,22 +508,26 @@ EOF
 # 8. FTUI-SPECIFIC TESTS (post-migration verification)
 # ==============================================================================
 
-@test "tui: no ratatui or crossterm in binary symbols" {
-    test_start "ftui no legacy" "verify legacy deps not linked"
+@test "tui: no direct ratatui or crossterm dependency in Cargo.toml" {
+    test_start "ftui no legacy" "verify no direct legacy deps"
 
-    if [[ ! -x "$PT_CORE" ]]; then
-        skip "pt-core not built"
+    # pt-core should not directly depend on ratatui or crossterm.
+    # (crossterm may appear as a transitive dep of ftui -- that's expected.)
+    local ratatui_direct crossterm_direct
+    ratatui_direct=$(grep -cE '^\s*ratatui\s*=' crates/pt-core/Cargo.toml || true)
+    crossterm_direct=$(grep -cE '^\s*crossterm\s*=' crates/pt-core/Cargo.toml || true)
+
+    assert_equals "0" "$ratatui_direct" "Cargo.toml should not list ratatui as direct dep"
+    assert_equals "0" "$crossterm_direct" "Cargo.toml should not list crossterm as direct dep"
+
+    # Also verify no ratatui symbols in binary (crossterm is OK as ftui transitive dep)
+    if [[ -x "$PT_CORE" ]]; then
+        local ratatui_syms
+        ratatui_syms=$(nm "$PT_CORE" 2>/dev/null | grep -ci 'ratatui' || true)
+        assert_equals "0" "$ratatui_syms" "binary should not contain ratatui symbols"
     fi
 
-    # Check that ratatui symbols are NOT in the binary
-    local ratatui_syms crossterm_syms
-    ratatui_syms=$(nm "$PT_CORE" 2>/dev/null | grep -ci 'ratatui' || true)
-    crossterm_syms=$(nm "$PT_CORE" 2>/dev/null | grep -ci 'crossterm' || true)
-
-    assert_equals "0" "$ratatui_syms" "binary should not contain ratatui symbols"
-    assert_equals "0" "$crossterm_syms" "binary should not contain crossterm symbols"
-
-    test_info "ratatui symbols: $ratatui_syms, crossterm symbols: $crossterm_syms"
+    test_info "direct deps clean"
     test_end "ftui no legacy" "pass"
 }
 
