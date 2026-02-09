@@ -729,5 +729,4 @@ mod tests {
         let total_h = areas.search.height + areas.list.height + areas.status.height;
         assert_eq!(total_h, area.height, "rows should cover full height");
     }
-
 }

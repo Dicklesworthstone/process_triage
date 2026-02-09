@@ -191,7 +191,6 @@ impl<'a> StatusBar<'a> {
         let paragraph = ftui::widgets::paragraph::Paragraph::new(text).style(style);
         FtuiWidget::render(&paragraph, area, frame);
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -323,5 +322,4 @@ mod tests {
     fn test_mode_default_is_normal() {
         assert_eq!(StatusMode::default(), StatusMode::Normal);
     }
-
 }

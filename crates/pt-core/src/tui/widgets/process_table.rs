@@ -307,8 +307,7 @@ impl<'a> ProcessTable<'a> {
         let visible = state.visible_rows();
         let rows: Vec<FtuiRow> = visible
             .iter()
-            .enumerate()
-            .map(|(_i, row)| {
+            .map(|row| {
                 let is_selected = state.selected.contains(&row.pid);
                 let class_style = self.classification_ftui_style(&row.classification);
 

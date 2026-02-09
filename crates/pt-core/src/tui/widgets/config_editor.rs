@@ -201,7 +201,7 @@ impl<'a> ConfigEditor<'a> {
         }
 
         // Add error line if present
-        if let Some(ref field) = state.fields.get(state.cursor) {
+        if let Some(field) = state.fields.get(state.cursor) {
             if let Some(ref error) = field.error {
                 if lines.len() < max_visible {
                     lines.push(FtuiLine::from_spans([FtuiSpan::styled(
@@ -219,7 +219,6 @@ impl<'a> ConfigEditor<'a> {
             frame,
         );
     }
-
 }
 
 // ---------------------------------------------------------------------------

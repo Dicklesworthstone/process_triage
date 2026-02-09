@@ -31,7 +31,9 @@ fn render_like_app_to_buffer(app: &mut App, width: u16, height: u16) -> ftui::Bu
     let areas = layout.main_areas();
 
     // Search input (stateful)
-    SearchInput::new().theme(&app.theme).render_ftui(areas.search, &mut frame, &mut app.search);
+    SearchInput::new()
+        .theme(&app.theme)
+        .render_ftui(areas.search, &mut frame, &mut app.search);
 
     // Process table (stateful)
     let table = ProcessTable::new().theme(&app.theme);
@@ -93,13 +95,17 @@ fn app_renders_galaxy_brain_split() {
     let mut app = App::new();
     app.process_table.set_rows(vec![sample_row()]);
 
-    let _cmd = <App as FtuiModel>::update(&mut app, Msg::KeyPressed(KeyEvent::new(KeyCode::Char('g'))));
+    let _cmd =
+        <App as FtuiModel>::update(&mut app, Msg::KeyPressed(KeyEvent::new(KeyCode::Char('g'))));
     assert_eq!(app.state, AppState::Normal);
     assert_eq!(app.current_detail_view(), DetailView::GalaxyBrain);
 
     let buf = render_like_app_to_buffer(&mut app, 120, 40);
     assert_snapshot!("tui_app_split_galaxy_brain_120x40", &buf);
-    assert!(buffer_to_text(&buf).contains("Galaxy Brain") || buffer_to_text(&buf).contains("Galaxy-Brain Mode"));
+    assert!(
+        buffer_to_text(&buf).contains("Galaxy Brain")
+            || buffer_to_text(&buf).contains("Galaxy-Brain Mode")
+    );
 }
 
 #[test]
@@ -107,7 +113,8 @@ fn app_help_overlay_renders() {
     let mut app = App::new();
     app.process_table.set_rows(vec![sample_row()]);
 
-    let _cmd = <App as FtuiModel>::update(&mut app, Msg::KeyPressed(KeyEvent::new(KeyCode::Char('?'))));
+    let _cmd =
+        <App as FtuiModel>::update(&mut app, Msg::KeyPressed(KeyEvent::new(KeyCode::Char('?'))));
     assert_eq!(app.state, AppState::Help);
 
     let buf = render_like_app_to_buffer(&mut app, 100, 30);

@@ -347,7 +347,10 @@ mod tests {
     #[test]
     fn test_mods_match_shift_tolerance() {
         assert!(mods_match(Modifiers::empty(), Modifiers::SHIFT));
-        assert!(mods_match(Modifiers::CTRL, Modifiers::CTRL | Modifiers::SHIFT));
+        assert!(mods_match(
+            Modifiers::CTRL,
+            Modifiers::CTRL | Modifiers::SHIFT
+        ));
     }
 
     #[test]

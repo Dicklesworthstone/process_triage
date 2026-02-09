@@ -144,7 +144,6 @@ impl<'a> ConfirmDialog<'a> {
 
         FtuiStatefulWidget::render(&dialog, area, frame, &mut ftui_state);
     }
-
 }
 
 // ---------------------------------------------------------------------------

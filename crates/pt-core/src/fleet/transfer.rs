@@ -83,21 +83,16 @@ pub struct BaselineStats {
 }
 
 /// Merge strategy for combining priors from two sources.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MergeStrategy {
     /// Weighted average of pseudo-observations (default).
+    #[default]
     Weighted,
     /// Replace local priors entirely with incoming.
     Replace,
     /// Keep local priors, ignore incoming.
     KeepLocal,
-}
-
-impl Default for MergeStrategy {
-    fn default() -> Self {
-        Self::Weighted
-    }
 }
 
 impl std::str::FromStr for MergeStrategy {

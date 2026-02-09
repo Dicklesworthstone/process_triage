@@ -1917,7 +1917,6 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     // ftui runtime path: terminal setup/teardown handled by Program RAII.
     // Closures capture cloned, Send + 'static data for Cmd::task.
     {
-
         let plan_candidates = Arc::new(Mutex::new(plan_candidates));
 
         // Build refresh closure
@@ -2048,7 +2047,9 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
 fn compute_inline_ui_height() -> u16 {
     // Prefer a fixed bottom-anchored UI region, leaving some scrollback space above.
     // We avoid adding a direct terminal-size dependency here; `LINES` is widely set by shells.
-    let lines = std::env::var("LINES").ok().and_then(|s| s.parse::<u16>().ok());
+    let lines = std::env::var("LINES")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok());
     match lines {
         Some(h) if h >= 12 => (h.saturating_sub(5)).clamp(10, 40),
         Some(h) if h >= 6 => (h.saturating_sub(2)).clamp(4, 20),
@@ -2513,7 +2514,7 @@ fn build_tui_rows(
             _ => "review",
         };
 
-        let memory_mb = (proc.rss_bytes / (1024 * 1024)) as u64;
+        let memory_mb = proc.rss_bytes / (1024 * 1024);
         goal_candidates.insert(
             proc.pid.0,
             serde_json::json!({
@@ -2526,7 +2527,7 @@ fn build_tui_rows(
         );
     }
 
-    rows.sort_by(|a, b| b.score.cmp(&a.score));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.score));
     rows.truncate(MAX_CANDIDATES);
 
     let mut goal_summary: Option<Vec<String>> = None;
@@ -2593,8 +2594,10 @@ fn build_tui_rows(
                                 }
                             }
                             for row in &rows {
-                                if !rank_map.contains_key(&row.pid) {
-                                    rank_map.insert(row.pid, rank);
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    rank_map.entry(row.pid)
+                                {
+                                    e.insert(rank);
                                     rank = rank.saturating_add(1);
                                 }
                             }

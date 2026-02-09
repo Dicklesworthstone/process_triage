@@ -351,18 +351,12 @@ impl Theme {
 // ---------------------------------------------------------------------------
 
 /// Build the standard stylesheet with classification-aware styles.
-fn build_stylesheet(colors: &ClassificationColors, bold_classifications: bool) -> StyleSheet {
+fn build_stylesheet(colors: &ClassificationColors, _bold_classifications: bool) -> StyleSheet {
     let sheet = StyleSheet::new();
 
-    let kill_style = if bold_classifications {
-        FtuiStyle::new()
-            .fg(PackedRgba::rgb(colors.kill.r, colors.kill.g, colors.kill.b))
-            .bold()
-    } else {
-        FtuiStyle::new()
-            .fg(PackedRgba::rgb(colors.kill.r, colors.kill.g, colors.kill.b))
-            .bold()
-    };
+    let kill_style = FtuiStyle::new()
+        .fg(PackedRgba::rgb(colors.kill.r, colors.kill.g, colors.kill.b))
+        .bold();
 
     let review_style = FtuiStyle::new().fg(PackedRgba::rgb(
         colors.review.r,
@@ -628,5 +622,4 @@ mod tests {
         assert_ne!(dark.classification.bg, light.classification.bg);
         assert_ne!(dark.classification.bg, hc.classification.bg);
     }
-
 }

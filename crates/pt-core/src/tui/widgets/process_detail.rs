@@ -362,9 +362,7 @@ impl<'a> ProcessDetail<'a> {
 
         (evidence, action)
     }
-
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -551,5 +549,4 @@ mod tests {
         assert_eq!(evidence.len(), 3);
         assert_eq!(action.len(), 2);
     }
-
 }

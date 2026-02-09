@@ -8,7 +8,9 @@ use pt_core::inference::galaxy_brain::{self, GalaxyBrainConfig, MathMode, Verbos
 use pt_core::inference::ledger::EvidenceLedger;
 use pt_core::inference::posterior::{ClassScores, EvidenceTerm, PosteriorResult};
 use pt_core::tui::layout::{Breakpoint, ResponsiveLayout};
-use pt_core::tui::widgets::{DetailView, ProcessDetail, ProcessRow, ProcessTable, ProcessTableState};
+use pt_core::tui::widgets::{
+    DetailView, ProcessDetail, ProcessRow, ProcessTable, ProcessTableState,
+};
 
 fn buffer_contains_text(frame: &Frame<'_>, needle: &str) -> bool {
     buffer_to_text(&frame.buffer).contains(needle)
@@ -170,7 +172,10 @@ fn detail_galaxy_brain_truncates_long_trace() {
         .view(DetailView::GalaxyBrain)
         .render_ftui(area, &mut frame);
 
-    assert_snapshot!("tui_detail_galaxy_brain_long_trace_truncates_60x24", &frame.buffer);
+    assert_snapshot!(
+        "tui_detail_galaxy_brain_long_trace_truncates_60x24",
+        &frame.buffer
+    );
     // Rendering should truncate long traces to fit the viewport.
     assert!(buffer_contains_text(&frame, "line 9"));
     assert!(!buffer_contains_text(&frame, "line 39"));

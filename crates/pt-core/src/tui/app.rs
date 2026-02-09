@@ -34,8 +34,7 @@ use super::layout::{Breakpoint, LayoutState};
 use super::msg::{ExecutionOutcome, Msg};
 use super::theme::Theme;
 use super::widgets::{
-    ConfirmChoice, ConfirmDialogState, DetailView, ProcessRow,
-    ProcessTableState, SearchInputState,
+    ConfirmChoice, ConfirmDialogState, DetailView, ProcessRow, ProcessTableState, SearchInputState,
 };
 use super::{TuiError, TuiResult};
 
@@ -63,6 +62,9 @@ pub enum AppState {
     /// Application is quitting.
     Quitting,
 }
+
+type RefreshOp = Arc<dyn Fn() -> Result<Vec<ProcessRow>, String> + Send + Sync>;
+type ExecuteOp = Arc<dyn Fn(Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync>;
 
 /// Main TUI application.
 pub struct App {
@@ -98,10 +100,10 @@ pub struct App {
     goal_summary: Option<Vec<String>>,
     /// Injected refresh operation for ftui Cmd::task (Send + 'static).
     /// Returns new process rows on success.
-    refresh_op: Option<Arc<dyn Fn() -> Result<Vec<ProcessRow>, String> + Send + Sync>>,
+    refresh_op: Option<RefreshOp>,
     /// Injected execute operation for ftui Cmd::task (Send + 'static).
     /// Takes selected PIDs, returns execution outcome.
-    execute_op: Option<Arc<dyn Fn(Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync>>,
+    execute_op: Option<ExecuteOp>,
 }
 
 impl Default for App {
@@ -188,18 +190,12 @@ impl App {
     }
 
     /// Set the async refresh operation for ftui Cmd::task.
-    pub fn set_refresh_op(
-        &mut self,
-        op: Arc<dyn Fn() -> Result<Vec<ProcessRow>, String> + Send + Sync>,
-    ) {
+    pub fn set_refresh_op(&mut self, op: RefreshOp) {
         self.refresh_op = Some(op);
     }
 
     /// Set the async execute operation for ftui Cmd::task.
-    pub fn set_execute_op(
-        &mut self,
-        op: Arc<dyn Fn(Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync>,
-    ) {
+    pub fn set_execute_op(&mut self, op: ExecuteOp) {
         self.execute_op = Some(op);
     }
 
@@ -531,10 +527,9 @@ impl App {
                     self.set_status("Refreshing process list...");
                     FtuiCmd::sequence(vec![
                         FtuiCmd::log("refresh: starting"),
-                        FtuiCmd::task_named(
-                            "refresh-processes",
-                            move || Msg::RefreshComplete(refresh()),
-                        ),
+                        FtuiCmd::task_named("refresh-processes", move || {
+                            Msg::RefreshComplete(refresh())
+                        }),
                     ])
                 } else {
                     self.set_status("Refreshing process list (skeleton mode)...");
@@ -814,12 +809,7 @@ impl FtuiModel for App {
 
     fn view(&self, frame: &mut FtuiFrame) {
         frame.clear();
-        draw_ftui_text(
-            frame,
-            0,
-            0,
-            "Process Triage - ftui model",
-        );
+        draw_ftui_text(frame, 0, 0, "Process Triage - ftui model");
         draw_ftui_text(frame, 0, 1, &format!("State: {:?}", self.state));
 
         let status = self
@@ -1004,7 +994,13 @@ mod tests {
     #[test]
     fn test_resize_updates_layout() {
         let mut app = App::new();
-        <App as FtuiModel>::update(&mut app, Msg::Resized { width: 200, height: 50 });
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::Resized {
+                width: 200,
+                height: 50,
+            },
+        );
         // Layout breakpoint should update (200 is wide enough for Wide)
         assert_eq!(app.breakpoint(), Breakpoint::Wide);
     }

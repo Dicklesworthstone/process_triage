@@ -295,7 +295,6 @@ impl<'a> HelpOverlay<'a> {
 
         FtuiWidget::render(&modal, area, frame);
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -408,5 +407,4 @@ mod tests {
         // Full should have significantly more lines than compact
         assert!(full.len() > compact.len());
     }
-
 }
