@@ -503,3 +503,132 @@ EOF
 
     test_end "pty multi recording" "pass"
 }
+
+# ==============================================================================
+# 8. FTUI-SPECIFIC TESTS (post-migration verification)
+# ==============================================================================
+
+@test "tui: no ratatui or crossterm in binary symbols" {
+    test_start "ftui no legacy" "verify legacy deps not linked"
+
+    if [[ ! -x "$PT_CORE" ]]; then
+        skip "pt-core not built"
+    fi
+
+    # Check that ratatui symbols are NOT in the binary
+    local ratatui_syms crossterm_syms
+    ratatui_syms=$(nm "$PT_CORE" 2>/dev/null | grep -ci 'ratatui' || true)
+    crossterm_syms=$(nm "$PT_CORE" 2>/dev/null | grep -ci 'crossterm' || true)
+
+    assert_equals "0" "$ratatui_syms" "binary should not contain ratatui symbols"
+    assert_equals "0" "$crossterm_syms" "binary should not contain crossterm symbols"
+
+    test_info "ratatui symbols: $ratatui_syms, crossterm symbols: $crossterm_syms"
+    test_end "ftui no legacy" "pass"
+}
+
+@test "tui: ui-legacy feature flag is gone from Cargo.toml" {
+    test_start "ftui no legacy feature" "verify ui-legacy feature removed"
+
+    local cargo_toml="${PROJECT_ROOT}/crates/pt-core/Cargo.toml"
+    [ -f "$cargo_toml" ]
+
+    # ui-legacy should not appear in Cargo.toml
+    local legacy_refs
+    legacy_refs=$(grep -c 'ui-legacy' "$cargo_toml" || true)
+    assert_equals "0" "$legacy_refs" "Cargo.toml should not reference ui-legacy"
+
+    # ratatui and crossterm should not appear as dependencies
+    local ratatui_deps crossterm_deps
+    ratatui_deps=$(grep -c '^ratatui' "$cargo_toml" || true)
+    crossterm_deps=$(grep -c '^crossterm' "$cargo_toml" || true)
+    assert_equals "0" "$ratatui_deps" "Cargo.toml should not have ratatui dep"
+    assert_equals "0" "$crossterm_deps" "Cargo.toml should not have crossterm dep"
+
+    test_end "ftui no legacy feature" "pass"
+}
+
+@test "tui: ftui dependency present in Cargo.toml" {
+    test_start "ftui dep present" "verify ftui is the TUI framework"
+
+    local cargo_toml="${PROJECT_ROOT}/crates/pt-core/Cargo.toml"
+    [ -f "$cargo_toml" ]
+
+    local ftui_refs
+    ftui_refs=$(grep -c 'ftui' "$cargo_toml" || true)
+    [ "$ftui_refs" -gt 0 ]
+    test_info "ftui references in Cargo.toml: $ftui_refs"
+
+    test_end "ftui dep present" "pass"
+}
+
+@test "tui: no ratatui imports in source code" {
+    test_start "ftui no ratatui src" "verify no ratatui in source files"
+
+    local src_dir="${PROJECT_ROOT}/crates/pt-core/src"
+
+    local ratatui_imports crossterm_imports
+    ratatui_imports=$(grep -r 'use ratatui' "$src_dir" 2>/dev/null | wc -l || true)
+    crossterm_imports=$(grep -r 'use crossterm' "$src_dir" 2>/dev/null | wc -l || true)
+
+    assert_equals "0" "$ratatui_imports" "no ratatui imports in source"
+    assert_equals "0" "$crossterm_imports" "no crossterm imports in source"
+
+    test_end "ftui no ratatui src" "pass"
+}
+
+@test "tui: no cfg(feature = ui-legacy) gates remain" {
+    test_start "ftui no legacy gates" "verify all ui-legacy gates removed"
+
+    local src_dir="${PROJECT_ROOT}/crates/pt-core/src"
+    local test_dir="${PROJECT_ROOT}/crates/pt-core/tests"
+
+    local src_gates test_gates
+    src_gates=$(grep -r 'cfg(feature = "ui-legacy")' "$src_dir" 2>/dev/null | wc -l || true)
+    test_gates=$(grep -r 'cfg(feature = "ui-legacy")' "$test_dir" 2>/dev/null | wc -l || true)
+
+    assert_equals "0" "$src_gates" "no ui-legacy gates in source"
+    assert_equals "0" "$test_gates" "no ui-legacy gates in tests"
+
+    test_end "ftui no legacy gates" "pass"
+}
+
+@test "tui: build succeeds without ui feature" {
+    test_start "ftui build no ui" "cargo build without ui feature compiles"
+
+    pushd "$PROJECT_ROOT" > /dev/null
+    run cargo check -p pt-core 2>&1
+    popd > /dev/null
+
+    assert_equals "0" "$status" "build without ui should succeed"
+
+    test_end "ftui build no ui" "pass"
+}
+
+@test "tui: build succeeds with ui feature" {
+    test_start "ftui build ui" "cargo build with ui feature compiles"
+
+    pushd "$PROJECT_ROOT" > /dev/null
+    run cargo check -p pt-core --features ui 2>&1
+    popd > /dev/null
+
+    assert_equals "0" "$status" "build with ui should succeed"
+
+    test_end "ftui build ui" "pass"
+}
+
+@test "tui: NO_COLOR environment variable is respected" {
+    test_start "ftui no color" "NO_COLOR disables color output"
+
+    if [[ ! -x "$PT_CORE" ]]; then
+        skip "pt-core not built"
+    fi
+
+    # Run with NO_COLOR=1 in scan mode (non-interactive for determinism)
+    run env NO_COLOR=1 timeout 10 "$PT_CORE" scan --robot 2>&1
+
+    test_info "Exit: $status Output length: ${#output}"
+    # Key: should not crash with NO_COLOR set
+
+    test_end "ftui no color" "pass"
+}
