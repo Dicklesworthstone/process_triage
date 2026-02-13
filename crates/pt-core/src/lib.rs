@@ -29,6 +29,7 @@ pub mod logging;
 pub mod mcp;
 pub mod output;
 pub mod plan;
+pub mod replay;
 pub mod schema;
 pub mod session;
 pub mod shadow;
