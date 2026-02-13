@@ -2,7 +2,14 @@
 
 use proptest::prelude::*;
 use pt_core::collect::{CriticalFile, CriticalFileCategory, DetectionStrength};
-use pt_core::config::policy::{DecisionTimeBound, Policy, RobotMode};
+use pt_core::config::policy::{DecisionTimeBound, LoadAwareDecision, Policy, RobotMode};
+use pt_core::config::priors::{
+    BetaParams, CausalInterventions, ClassParams, ClassPriors, GammaParams, InterventionPriors,
+    Priors,
+};
+use pt_core::decision::causal_interventions::{
+    expected_recovery, expected_recovery_by_action, update_beta,
+};
 use pt_core::decision::composite_test::{
     glr_bernoulli, mixture_sprt_bernoulli, mixture_sprt_beta_sequential, needs_composite_test,
     GlrConfig, MixtureSprtConfig, MixtureSprtState,
@@ -16,6 +23,14 @@ use pt_core::decision::dro::{
     is_de_escalation, DroTrigger,
 };
 use pt_core::decision::expected_loss::ActionFeasibility;
+use pt_core::decision::load_aware::{
+    apply_load_to_loss_matrix, compute_load_adjustment, LoadAdjustment, LoadSignals,
+};
+use pt_core::decision::martingale_gates::{
+    apply_martingale_gates, resolve_alpha, AlphaSource, MartingaleGateCandidate,
+    MartingaleGateConfig,
+};
+use pt_core::decision::fdr_selection::TargetIdentity;
 use pt_core::decision::myopic_policy::{compute_loss_table, decide_from_belief};
 use pt_core::decision::robot_constraints::{
     ConstraintChecker, ConstraintKind, RobotCandidate, RuntimeRobotConstraints,
@@ -26,10 +41,11 @@ use pt_core::decision::{
     compute_voi, decide_action, select_probe_by_information_gain, Action, ProbeCostModel, ProbeType,
 };
 use pt_core::inference::belief_state::BeliefState;
+use pt_core::inference::martingale::{MartingaleAnalyzer, MartingaleConfig};
 use pt_core::decision::alpha_investing::AlphaInvestingPolicy;
 use pt_core::decision::cvar::{compute_cvar, decide_with_cvar};
 use pt_core::decision::fdr_selection::{
-    by_correction_factor, select_fdr, FdrCandidate, FdrMethod, TargetIdentity,
+    by_correction_factor, select_fdr, FdrCandidate, FdrMethod,
 };
 use pt_core::decision::submodular::{
     coverage_utility, greedy_select_k, greedy_select_with_budget, FeatureKey, ProbeProfile,
@@ -2033,5 +2049,424 @@ proptest! {
         let config = CriticalFileInflation::default();
         let weight = config.category_weight(&category);
         prop_assert!(weight > 0.0, "category weight for {:?} should be positive, got {}", category, weight);
+    }
+}
+
+// ── Causal intervention property tests ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// expected_recovery should be in [0, 1] for valid Beta parameters.
+    #[test]
+    fn causal_expected_recovery_in_unit_interval(
+        alpha in 0.01f64..=100.0,
+        beta_val in 0.01f64..=100.0,
+    ) {
+        let beta = BetaParams::new(alpha, beta_val);
+        let p = expected_recovery(&beta);
+        prop_assert!(p >= -1e-12 && p <= 1.0 + 1e-12,
+            "expected_recovery {} out of [0,1] for α={}, β={}", p, alpha, beta_val);
+        prop_assert!(p.is_finite(), "expected_recovery not finite");
+    }
+
+    /// update_beta should increase alpha for successes and beta for failures.
+    #[test]
+    fn causal_update_beta_directional(
+        alpha in 0.1f64..=10.0,
+        beta_val in 0.1f64..=10.0,
+        successes in 0.0f64..=10.0,
+        trials in 0.0f64..=10.0,
+    ) {
+        let beta = BetaParams::new(alpha, beta_val);
+        let updated = update_beta(&beta, successes, trials, 1.0);
+        // alpha should increase (successes contribute)
+        prop_assert!(
+            updated.alpha >= alpha - 1e-9,
+            "alpha should not decrease: {} < {}", updated.alpha, alpha
+        );
+        // beta should increase (failures contribute)
+        prop_assert!(
+            updated.beta >= beta_val - 1e-9,
+            "beta should not decrease: {} < {}", updated.beta, beta_val
+        );
+        // total pseudo-count should increase
+        let original_total = alpha + beta_val;
+        let updated_total = updated.alpha + updated.beta;
+        prop_assert!(
+            updated_total >= original_total - 1e-9,
+            "total should not decrease: {} < {}", updated_total, original_total
+        );
+    }
+
+    /// update_beta with zero trials should not change parameters.
+    #[test]
+    fn causal_update_beta_zero_trials_no_change(
+        alpha in 0.1f64..=10.0,
+        beta_val in 0.1f64..=10.0,
+    ) {
+        let beta = BetaParams::new(alpha, beta_val);
+        let updated = update_beta(&beta, 0.0, 0.0, 1.0);
+        prop_assert!(
+            (updated.alpha - alpha).abs() < 1e-9,
+            "alpha changed with zero trials: {} -> {}", alpha, updated.alpha
+        );
+        prop_assert!(
+            (updated.beta - beta_val).abs() < 1e-9,
+            "beta changed with zero trials: {} -> {}", beta_val, updated.beta
+        );
+    }
+
+    /// update_beta should clamp successes to trials.
+    #[test]
+    fn causal_update_beta_clamps_successes(
+        alpha in 0.1f64..=10.0,
+        beta_val in 0.1f64..=10.0,
+        trials in 1.0f64..=10.0,
+    ) {
+        let beta = BetaParams::new(alpha, beta_val);
+        // Pass successes > trials
+        let updated = update_beta(&beta, trials + 5.0, trials, 1.0);
+        // Alpha should increase by at most `trials` (since successes clamped to trials)
+        prop_assert!(
+            (updated.alpha - (alpha + trials)).abs() < 1e-9,
+            "alpha {} != expected {} (successes should be clamped to trials)",
+            updated.alpha, alpha + trials
+        );
+        // Beta should not increase (all trials were successes after clamping)
+        prop_assert!(
+            (updated.beta - beta_val).abs() < 1e-9,
+            "beta should not change when all trials are successes: {} != {}",
+            updated.beta, beta_val
+        );
+    }
+
+    /// expected_recovery_by_action should return only configured actions.
+    #[test]
+    fn causal_recovery_by_action_valid_actions(posterior in posterior_strategy()) {
+        let priors = test_causal_priors();
+        let expectations = expected_recovery_by_action(&priors, &posterior);
+        let valid_actions = [Action::Pause, Action::Throttle, Action::Kill, Action::Restart];
+        for exp in &expectations {
+            prop_assert!(
+                valid_actions.contains(&exp.action),
+                "unexpected action {:?} in recovery expectations", exp.action
+            );
+            prop_assert!(
+                exp.probability >= -1e-12 && exp.probability <= 1.0 + 1e-12,
+                "recovery probability {} out of [0,1] for {:?}", exp.probability, exp.action
+            );
+        }
+    }
+}
+
+fn default_class_params() -> ClassParams {
+    ClassParams {
+        prior_prob: 0.25,
+        cpu_beta: BetaParams::new(1.0, 1.0),
+        runtime_gamma: Some(GammaParams { shape: 1.0, rate: 1.0, comment: None }),
+        orphan_beta: BetaParams::new(1.0, 1.0),
+        tty_beta: BetaParams::new(1.0, 1.0),
+        net_beta: BetaParams::new(1.0, 1.0),
+        io_active_beta: None,
+        hazard_gamma: None,
+        competing_hazards: None,
+    }
+}
+
+fn test_causal_priors() -> Priors {
+    Priors {
+        schema_version: "1.0.0".to_string(),
+        description: None,
+        created_at: None,
+        updated_at: None,
+        host_profile: None,
+        classes: ClassPriors {
+            useful: default_class_params(),
+            useful_bad: default_class_params(),
+            abandoned: default_class_params(),
+            zombie: default_class_params(),
+        },
+        hazard_regimes: vec![],
+        semi_markov: None,
+        change_point: None,
+        causal_interventions: Some(CausalInterventions {
+            pause: Some(InterventionPriors {
+                useful: Some(BetaParams::new(8.0, 2.0)),
+                useful_bad: Some(BetaParams::new(3.0, 7.0)),
+                abandoned: Some(BetaParams::new(2.0, 8.0)),
+                zombie: Some(BetaParams::new(1.0, 9.0)),
+            }),
+            throttle: Some(InterventionPriors {
+                useful: Some(BetaParams::new(7.0, 3.0)),
+                useful_bad: Some(BetaParams::new(4.0, 6.0)),
+                abandoned: Some(BetaParams::new(3.0, 7.0)),
+                zombie: Some(BetaParams::new(2.0, 8.0)),
+            }),
+            kill: Some(InterventionPriors {
+                useful: Some(BetaParams::new(1.0, 9.0)),
+                useful_bad: Some(BetaParams::new(5.0, 5.0)),
+                abandoned: Some(BetaParams::new(8.0, 2.0)),
+                zombie: Some(BetaParams::new(9.0, 1.0)),
+            }),
+            restart: Some(InterventionPriors {
+                useful: Some(BetaParams::new(6.0, 4.0)),
+                useful_bad: Some(BetaParams::new(5.0, 5.0)),
+                abandoned: Some(BetaParams::new(4.0, 6.0)),
+                zombie: Some(BetaParams::new(3.0, 7.0)),
+            }),
+        }),
+        command_categories: None,
+        state_flags: None,
+        hierarchical: None,
+        robust_bayes: None,
+        error_rate: None,
+        bocpd: None,
+    }
+}
+
+// ── Load-aware property tests ───────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// load_score should be in [0, 1].
+    #[test]
+    fn load_score_in_unit_interval(
+        queue in 0usize..=1000,
+        load1 in 0.0f64..=100.0,
+        cores in 1u32..=32,
+        mem_frac in 0.0f64..=1.0,
+        psi in 0.0f64..=100.0,
+    ) {
+        let config = LoadAwareDecision { enabled: true, ..LoadAwareDecision::default() };
+        let signals = LoadSignals {
+            queue_len: queue,
+            load1: Some(load1),
+            cores: Some(cores),
+            memory_used_fraction: Some(mem_frac),
+            psi_avg10: Some(psi),
+        };
+        if let Some(adj) = compute_load_adjustment(&config, &signals) {
+            prop_assert!(
+                adj.load_score >= -1e-9 && adj.load_score <= 1.0 + 1e-9,
+                "load_score {} out of [0,1]", adj.load_score
+            );
+        }
+    }
+
+    /// Disabled config should always return None.
+    #[test]
+    fn load_disabled_returns_none(
+        queue in 0usize..=100,
+    ) {
+        let config = LoadAwareDecision::default(); // enabled: false
+        let signals = LoadSignals {
+            queue_len: queue,
+            load1: Some(10.0),
+            cores: Some(4),
+            memory_used_fraction: Some(0.8),
+            psi_avg10: Some(50.0),
+        };
+        prop_assert!(compute_load_adjustment(&config, &signals).is_none(),
+            "disabled config should return None");
+    }
+
+    /// keep_multiplier >= 1.0 (keep loss increases under load).
+    #[test]
+    fn load_keep_multiplier_geq_one(
+        queue in 0usize..=500,
+        load1 in 0.0f64..=50.0,
+        cores in 1u32..=16,
+        mem_frac in 0.0f64..=1.0,
+    ) {
+        let config = LoadAwareDecision { enabled: true, ..LoadAwareDecision::default() };
+        let signals = LoadSignals {
+            queue_len: queue,
+            load1: Some(load1),
+            cores: Some(cores),
+            memory_used_fraction: Some(mem_frac),
+            psi_avg10: None,
+        };
+        if let Some(adj) = compute_load_adjustment(&config, &signals) {
+            prop_assert!(adj.keep_multiplier >= 1.0 - 1e-9,
+                "keep_multiplier {} < 1.0", adj.keep_multiplier);
+        }
+    }
+
+    /// reversible_multiplier <= 1.0 (reversible actions become cheaper under load).
+    #[test]
+    fn load_reversible_multiplier_leq_one(
+        queue in 0usize..=500,
+        load1 in 0.0f64..=50.0,
+        cores in 1u32..=16,
+        mem_frac in 0.0f64..=1.0,
+    ) {
+        let config = LoadAwareDecision { enabled: true, ..LoadAwareDecision::default() };
+        let signals = LoadSignals {
+            queue_len: queue,
+            load1: Some(load1),
+            cores: Some(cores),
+            memory_used_fraction: Some(mem_frac),
+            psi_avg10: None,
+        };
+        if let Some(adj) = compute_load_adjustment(&config, &signals) {
+            prop_assert!(adj.reversible_multiplier <= 1.0 + 1e-9,
+                "reversible_multiplier {} > 1.0", adj.reversible_multiplier);
+        }
+    }
+
+    /// risky_multiplier >= 1.0 (risky actions become more expensive under load).
+    #[test]
+    fn load_risky_multiplier_geq_one(
+        queue in 0usize..=500,
+        load1 in 0.0f64..=50.0,
+        cores in 1u32..=16,
+        mem_frac in 0.0f64..=1.0,
+    ) {
+        let config = LoadAwareDecision { enabled: true, ..LoadAwareDecision::default() };
+        let signals = LoadSignals {
+            queue_len: queue,
+            load1: Some(load1),
+            cores: Some(cores),
+            memory_used_fraction: Some(mem_frac),
+            psi_avg10: None,
+        };
+        if let Some(adj) = compute_load_adjustment(&config, &signals) {
+            prop_assert!(adj.risky_multiplier >= 1.0 - 1e-9,
+                "risky_multiplier {} < 1.0", adj.risky_multiplier);
+        }
+    }
+
+    /// apply_load_to_loss_matrix should preserve None entries.
+    #[test]
+    fn load_apply_preserves_none_entries(
+        keep_mult in 1.0f64..=2.0,
+        rev_mult in 0.5f64..=1.0,
+        risk_mult in 1.0f64..=2.0,
+    ) {
+        let policy = Policy::default();
+        let adj = LoadAdjustment {
+            load_score: 0.5,
+            keep_multiplier: keep_mult,
+            reversible_multiplier: rev_mult,
+            risky_multiplier: risk_mult,
+        };
+        let adjusted = apply_load_to_loss_matrix(&policy.loss_matrix, &adj);
+        // If original has a Some value, adjusted should too; if None, should remain None
+        prop_assert_eq!(
+            adjusted.useful.pause.is_some(),
+            policy.loss_matrix.useful.pause.is_some(),
+            "pause Some-ness changed"
+        );
+        prop_assert_eq!(
+            adjusted.useful.throttle.is_some(),
+            policy.loss_matrix.useful.throttle.is_some(),
+            "throttle Some-ness changed"
+        );
+    }
+}
+
+// ── Martingale gates property tests ─────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// resolve_alpha from default policy should return valid alpha.
+    #[test]
+    fn martingale_resolve_alpha_valid(_dummy in 0u32..1) {
+        let policy = Policy::default();
+        let (alpha, source) = resolve_alpha(&policy, None).unwrap();
+        prop_assert!(alpha > 0.0 && alpha <= 1.0, "alpha {} out of (0,1]", alpha);
+        prop_assert_eq!(source, AlphaSource::Policy);
+    }
+
+    /// apply_martingale_gates with empty candidates should return empty results.
+    #[test]
+    fn martingale_empty_candidates_empty_results(_dummy in 0u32..1) {
+        let policy = Policy::default();
+        let config = MartingaleGateConfig::default();
+        let summary = apply_martingale_gates(&[], &policy, &config, None).unwrap();
+        prop_assert!(summary.results.is_empty());
+    }
+
+    /// Results count should match candidates count.
+    #[test]
+    fn martingale_results_count_matches_candidates(n in 1usize..=20) {
+        let policy = Policy::default();
+        let config = MartingaleGateConfig::default();
+        let mut analyzer = MartingaleAnalyzer::new(MartingaleConfig::default());
+        for _ in 0..10 {
+            analyzer.update(0.5);
+        }
+        let result = analyzer.summary();
+        let candidates: Vec<MartingaleGateCandidate> = (0..n)
+            .map(|i| MartingaleGateCandidate {
+                target: TargetIdentity {
+                    pid: i as i32,
+                    start_id: format!("{i}-start"),
+                    uid: 1000,
+                },
+                result: result.clone(),
+            })
+            .collect();
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        prop_assert_eq!(
+            summary.results.len(), n,
+            "results count {} != candidates count {}", summary.results.len(), n
+        );
+    }
+
+    /// eligible implies: n >= min_observations AND (anomaly_detected OR !require_anomaly).
+    #[test]
+    fn martingale_eligibility_consistent(
+        n_observations in 1usize..=30,
+        update_value in 0.0f64..=1.0,
+    ) {
+        let policy = Policy::default();
+        let config = MartingaleGateConfig::default(); // min_obs=3, require_anomaly=true
+        let mut analyzer = MartingaleAnalyzer::new(MartingaleConfig::default());
+        for _ in 0..n_observations {
+            analyzer.update(update_value);
+        }
+        let result = analyzer.summary();
+        let candidates = vec![MartingaleGateCandidate {
+            target: TargetIdentity { pid: 1, start_id: "1-start".to_string(), uid: 1000 },
+            result,
+        }];
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        let r = &summary.results[0];
+        if r.eligible {
+            prop_assert!(r.n >= config.min_observations,
+                "eligible but n={} < min_obs={}", r.n, config.min_observations);
+            if config.require_anomaly {
+                prop_assert!(r.anomaly_detected,
+                    "eligible with require_anomaly=true but anomaly_detected=false");
+            }
+        }
+    }
+
+    /// gate_passed implies eligible.
+    #[test]
+    fn martingale_gate_passed_implies_eligible(
+        n_observations in 1usize..=30,
+        update_value in 0.0f64..=1.0,
+    ) {
+        let policy = Policy::default();
+        let config = MartingaleGateConfig::default();
+        let mut analyzer = MartingaleAnalyzer::new(MartingaleConfig::default());
+        for _ in 0..n_observations {
+            analyzer.update(update_value);
+        }
+        let result = analyzer.summary();
+        let candidates = vec![MartingaleGateCandidate {
+            target: TargetIdentity { pid: 1, start_id: "1-start".to_string(), uid: 1000 },
+            result,
+        }];
+        let summary = apply_martingale_gates(&candidates, &policy, &config, None).unwrap();
+        let r = &summary.results[0];
+        if r.gate_passed {
+            prop_assert!(r.eligible, "gate_passed but not eligible");
+        }
     }
 }
