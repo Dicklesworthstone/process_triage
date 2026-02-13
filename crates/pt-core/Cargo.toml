@@ -124,6 +124,10 @@ harness = false
 name = "fdr_alpha_investing"
 harness = false
 
+[[bench]]
+name = "sequential_robot"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
