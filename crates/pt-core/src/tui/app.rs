@@ -23,11 +23,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ftui::runtime::{Every, Subscription};
+use ftui::widgets::notification_queue::{NotificationQueue, QueueConfig};
+use ftui::widgets::toast::{Toast, ToastIcon, ToastPosition, ToastStyle};
+use ftui::widgets::notification_queue::NotificationStack;
+use ftui::widgets::Widget;
 use ftui::{
     Cell as FtuiCell, Cmd as FtuiCmd, Frame as FtuiFrame, KeyCode as FtuiKeyCode,
     KeyEvent as FtuiKeyEvent, KeyEventKind as FtuiKeyEventKind, Model as FtuiModel,
     Modifiers as FtuiModifiers, Program, ProgramConfig,
 };
+use ftui::core::geometry::Rect;
 
 use super::events::KeyBindings;
 use super::layout::{Breakpoint, LayoutState};
@@ -104,6 +109,8 @@ pub struct App {
     /// Injected execute operation for ftui Cmd::task (Send + 'static).
     /// Takes selected PIDs, returns execution outcome.
     execute_op: Option<ExecuteOp>,
+    /// Toast notification queue for async operation feedback.
+    notifications: NotificationQueue,
 }
 
 impl Default for App {
@@ -137,6 +144,14 @@ impl App {
             goal_summary: None,
             refresh_op: None,
             execute_op: None,
+            notifications: NotificationQueue::new(QueueConfig {
+                max_visible: 3,
+                max_queued: 10,
+                default_duration: Duration::from_secs(5),
+                position: ToastPosition::TopRight,
+                stagger_offset: 1,
+                dedup_window_ms: 1000,
+            }),
         }
     }
 
@@ -208,6 +223,16 @@ impl App {
     /// Clear the status message.
     pub fn clear_status(&mut self) {
         self.status_message = None;
+        self.needs_redraw = true;
+    }
+
+    /// Push a toast notification for transient user feedback.
+    fn push_toast(&mut self, message: impl Into<String>, icon: ToastIcon, style: ToastStyle) {
+        let toast = Toast::new(message)
+            .icon(icon)
+            .style_variant(style)
+            .duration(Duration::from_secs(4));
+        self.notifications.notify(toast);
         self.needs_redraw = true;
     }
 
@@ -335,7 +360,13 @@ impl App {
                 );
                 FtuiCmd::none()
             }
-            Msg::Tick => FtuiCmd::none(),
+            Msg::Tick => {
+                let actions = self.notifications.tick(Duration::from_secs(5));
+                if !actions.is_empty() {
+                    self.needs_redraw = true;
+                }
+                FtuiCmd::none()
+            }
             Msg::FocusChanged(gained) => {
                 self.set_status(if gained {
                     "Terminal focus gained"
@@ -556,11 +587,21 @@ impl App {
                 let count = rows.len();
                 self.process_table.set_rows(rows);
                 self.set_status(format!("Process list refreshed ({})", count));
+                self.push_toast(
+                    format!("Refreshed: {} processes", count),
+                    ToastIcon::Success,
+                    ToastStyle::Success,
+                );
                 FtuiCmd::log(format!("refresh: complete (rows={})", count))
             }
             Msg::RefreshComplete(Err(error)) => {
                 tracing::error!(target: "tui.async_complete", error = %error, "Refresh failed");
                 self.set_status(format!("Refresh failed: {}", error));
+                self.push_toast(
+                    format!("Refresh failed: {}", error),
+                    ToastIcon::Error,
+                    ToastStyle::Error,
+                );
                 FtuiCmd::log(format!("refresh: failed ({})", error))
             }
             Msg::ExecutionComplete(Ok(outcome)) => {
@@ -584,19 +625,40 @@ impl App {
                     )
                 };
                 self.set_status(status.clone());
+                let (icon, style) = if outcome.failed > 0 {
+                    (ToastIcon::Warning, ToastStyle::Warning)
+                } else {
+                    (ToastIcon::Success, ToastStyle::Success)
+                };
+                self.push_toast(status.clone(), icon, style);
                 FtuiCmd::log(format!("execute: {}", status))
             }
             Msg::ExecutionComplete(Err(error)) => {
                 tracing::error!(target: "tui.async_complete", error = %error, "Execution failed");
                 self.set_status(format!("Execution failed: {}", error));
+                self.push_toast(
+                    format!("Execution failed: {}", error),
+                    ToastIcon::Error,
+                    ToastStyle::Error,
+                );
                 FtuiCmd::log(format!("execute: failed ({})", error))
             }
             Msg::LedgerExported(Ok(path)) => {
                 self.set_status(format!("Evidence ledger exported to {}", path.display()));
+                self.push_toast(
+                    format!("Ledger exported to {}", path.display()),
+                    ToastIcon::Success,
+                    ToastStyle::Success,
+                );
                 FtuiCmd::none()
             }
             Msg::LedgerExported(Err(error)) => {
                 self.set_status(format!("Ledger export failed: {}", error));
+                self.push_toast(
+                    format!("Export failed: {}", error),
+                    ToastIcon::Error,
+                    ToastStyle::Error,
+                );
                 FtuiCmd::none()
             }
 
@@ -817,6 +879,12 @@ impl FtuiModel for App {
             .as_deref()
             .unwrap_or("Ready | Press ? for help");
         draw_ftui_text(frame, 0, 2, status);
+
+        // Render toast notifications as overlay
+        if !self.notifications.is_empty() {
+            let area = Rect::new(0, 0, frame.width(), frame.height());
+            NotificationStack::new(&self.notifications).render(area, frame);
+        }
     }
 
     fn subscriptions(&self) -> Vec<Box<dyn Subscription<Self::Message>>> {
