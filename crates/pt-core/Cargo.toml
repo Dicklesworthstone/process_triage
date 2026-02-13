@@ -104,6 +104,10 @@ harness = false
 name = "policy_enforcer"
 harness = false
 
+[[bench]]
+name = "myopic_policy"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"

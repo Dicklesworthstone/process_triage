@@ -293,6 +293,61 @@ fn daemon_signal_storm_remains_alive_during_storm() {
 }
 
 #[test]
+fn daemon_sigint_stops_and_cleans_pid_file() {
+    let data_dir = TempDir::new().expect("temp data dir");
+    let config_dir = TempDir::new().expect("temp config dir");
+
+    write_daemon_json_config(
+        config_dir.path(),
+        r#"{
+  "tick_interval_secs": 30,
+  "max_cpu_percent": 1000.0,
+  "max_rss_mb": 4096,
+  "triggers": {
+    "ewma_alpha": 0.3,
+    "load_threshold": 9999.0,
+    "memory_threshold": 9999.0,
+    "orphan_threshold": 9999999,
+    "sustained_ticks": 1,
+    "cooldown_ticks": 10
+  },
+  "escalation": {
+    "min_interval_secs": 0,
+    "allow_auto_mitigation": false,
+    "max_deep_scan_targets": 1
+  },
+  "notifications": {
+    "enabled": false,
+    "desktop": false,
+    "notify_cmd": null,
+    "notify_arg": []
+  }
+}"#,
+    );
+
+    let mut child = start_daemon_foreground(config_dir.path(), data_dir.path());
+
+    let pid_path = daemon_pid_path(data_dir.path());
+    wait_for(Duration::from_secs(10), || pid_path.exists());
+    assert!(
+        child.try_wait().expect("query child status").is_none(),
+        "daemon should be alive before SIGINT"
+    );
+
+    send_signal(&child, libc::SIGINT);
+    wait_for(Duration::from_secs(10), || {
+        child.try_wait().expect("query child status").is_some()
+    });
+
+    let status = child.wait().expect("wait for daemon exit status");
+    assert!(status.success(), "daemon should exit cleanly after SIGINT");
+    assert!(
+        !pid_path.exists(),
+        "daemon pid file should be removed after SIGINT shutdown"
+    );
+}
+
+#[test]
 fn daemon_overhead_budget_exceeded_is_persisted_and_skips_inbox_writes() {
     let data_dir = TempDir::new().expect("temp data dir");
     let config_dir = TempDir::new().expect("temp config dir");
