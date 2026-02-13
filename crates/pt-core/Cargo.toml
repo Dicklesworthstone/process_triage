@@ -144,6 +144,10 @@ harness = false
 name = "pressure_rate_respawn"
 harness = false
 
+[[bench]]
+name = "goal_plan_progress"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
