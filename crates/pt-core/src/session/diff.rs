@@ -122,18 +122,6 @@ impl Default for DiffConfig {
 // Core diff algorithm
 // ---------------------------------------------------------------------------
 
-/// Key for matching processes across snapshots.
-///
-/// Uses start_id for reliable cross-session identity (PID alone is not
-/// stable across reboots or long intervals).
-fn identity_key(proc: &PersistedProcess) -> String {
-    proc.start_id.clone()
-}
-
-fn inference_key(inf: &PersistedInference) -> String {
-    inf.start_id.clone()
-}
-
 /// Compute the diff between two session snapshots.
 ///
 /// `old_procs` / `old_inferences` are from the baseline session.
@@ -148,18 +136,18 @@ pub fn compute_diff(
     config: &DiffConfig,
 ) -> SessionDiff {
     // Build lookup maps by identity key.
-    let old_proc_map: HashMap<String, &PersistedProcess> =
-        old_procs.iter().map(|p| (identity_key(p), p)).collect();
-    let new_proc_map: HashMap<String, &PersistedProcess> =
-        new_procs.iter().map(|p| (identity_key(p), p)).collect();
+    let old_proc_map: HashMap<&str, &PersistedProcess> =
+        old_procs.iter().map(|p| (p.start_id.as_str(), p)).collect();
+    let new_proc_map: HashMap<&str, &PersistedProcess> =
+        new_procs.iter().map(|p| (p.start_id.as_str(), p)).collect();
 
-    let old_inf_map: HashMap<String, &PersistedInference> = old_inferences
+    let old_inf_map: HashMap<&str, &PersistedInference> = old_inferences
         .iter()
-        .map(|i| (inference_key(i), i))
+        .map(|i| (i.start_id.as_str(), i))
         .collect();
-    let new_inf_map: HashMap<String, &PersistedInference> = new_inferences
+    let new_inf_map: HashMap<&str, &PersistedInference> = new_inferences
         .iter()
-        .map(|i| (inference_key(i), i))
+        .map(|i| (i.start_id.as_str(), i))
         .collect();
 
     let mut deltas = Vec::new();
@@ -207,34 +195,42 @@ pub fn compute_diff(
         }
     }
 
-    // Sort by kind priority (New first, then Changed, Unchanged, Resolved).
-    deltas.sort_by_key(|d| match d.kind {
-        DeltaKind::New => 0,
-        DeltaKind::Changed => 1,
-        DeltaKind::Unchanged => 2,
-        DeltaKind::Resolved => 3,
+    // Sort deterministically:
+    // 1) kind priority (New, Changed, Unchanged, Resolved)
+    // 2) stable identity key (start_id)
+    // 3) pid as final tie-breaker.
+    deltas.sort_by(|a, b| {
+        delta_kind_rank(a.kind)
+            .cmp(&delta_kind_rank(b.kind))
+            .then_with(|| a.start_id.cmp(&b.start_id))
+            .then_with(|| a.pid.cmp(&b.pid))
     });
 
-    // Compute summary.
-    let summary = DiffSummary {
+    // Compute summary in a single pass.
+    let mut summary = DiffSummary {
         total_old: old_procs.len(),
         total_new: new_procs.len(),
-        new_count: deltas.iter().filter(|d| d.kind == DeltaKind::New).count(),
-        resolved_count: deltas
-            .iter()
-            .filter(|d| d.kind == DeltaKind::Resolved)
-            .count(),
-        changed_count: deltas
-            .iter()
-            .filter(|d| d.kind == DeltaKind::Changed)
-            .count(),
-        unchanged_count: deltas
-            .iter()
-            .filter(|d| d.kind == DeltaKind::Unchanged)
-            .count(),
-        worsened_count: deltas.iter().filter(|d| d.worsened).count(),
-        improved_count: deltas.iter().filter(|d| d.improved).count(),
+        new_count: 0,
+        resolved_count: 0,
+        changed_count: 0,
+        unchanged_count: 0,
+        worsened_count: 0,
+        improved_count: 0,
     };
+    for delta in &deltas {
+        match delta.kind {
+            DeltaKind::New => summary.new_count += 1,
+            DeltaKind::Resolved => summary.resolved_count += 1,
+            DeltaKind::Changed => summary.changed_count += 1,
+            DeltaKind::Unchanged => summary.unchanged_count += 1,
+        }
+        if delta.worsened {
+            summary.worsened_count += 1;
+        }
+        if delta.improved {
+            summary.improved_count += 1;
+        }
+    }
 
     SessionDiff {
         old_session_id: old_session_id.to_string(),
@@ -242,6 +238,16 @@ pub fn compute_diff(
         generated_at: chrono::Utc::now().to_rfc3339(),
         deltas,
         summary,
+    }
+}
+
+#[inline]
+fn delta_kind_rank(kind: DeltaKind) -> u8 {
+    match kind {
+        DeltaKind::New => 0,
+        DeltaKind::Changed => 1,
+        DeltaKind::Unchanged => 2,
+        DeltaKind::Resolved => 3,
     }
 }
 
@@ -497,6 +503,43 @@ mod tests {
         assert_eq!(diff.deltas[0].kind, DeltaKind::New);
         assert_eq!(diff.deltas[1].kind, DeltaKind::Changed);
         assert_eq!(diff.deltas[2].kind, DeltaKind::Resolved);
+    }
+
+    #[test]
+    fn test_deterministic_order_within_kind() {
+        let old_procs = vec![proc(1, "a:1:1"), proc(2, "a:2:2")];
+        let new_procs = vec![
+            proc(3, "a:3:3"), // New
+            proc(2, "a:2:2"), // Unchanged
+            proc(4, "a:0:0"), // New
+            proc(1, "a:1:1"), // Unchanged
+        ];
+
+        let diff = compute_diff(
+            "s1",
+            "s2",
+            &old_procs,
+            &[],
+            &new_procs,
+            &[],
+            &DiffConfig::default(),
+        );
+
+        let ordered: Vec<(DeltaKind, String)> = diff
+            .deltas
+            .iter()
+            .map(|d| (d.kind, d.start_id.clone()))
+            .collect();
+
+        assert_eq!(
+            ordered,
+            vec![
+                (DeltaKind::New, "a:0:0".to_string()),
+                (DeltaKind::New, "a:3:3".to_string()),
+                (DeltaKind::Unchanged, "a:1:1".to_string()),
+                (DeltaKind::Unchanged, "a:2:2".to_string()),
+            ]
+        );
     }
 
     #[test]

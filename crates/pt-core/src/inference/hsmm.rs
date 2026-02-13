@@ -631,11 +631,10 @@ impl HsmmAnalyzer {
     }
 
     /// Compute duration probability P(d | state).
-    fn duration_prob(&self, duration: usize, state: HsmmState) -> f64 {
+    fn duration_prob(&self, duration: f64, state: HsmmState) -> f64 {
         let s = state.index();
-        let d = duration as f64;
         self.duration_posteriors[s]
-            .survival(d)
+            .survival(duration)
             .max(self.config.min_probability)
     }
 
@@ -659,41 +658,39 @@ impl HsmmAnalyzer {
             emissions[s] = self.emission_prob(observation, HsmmState::from_index(s).unwrap());
         }
 
-        // Compute duration factors
-        let mut duration_factors = [0.0; 4];
-        #[allow(clippy::needless_range_loop)]
-        for s in 0..4 {
-            if s == self.current_state.index() {
-                // Probability of staying (survival)
-                duration_factors[s] = self.duration_prob(self.current_duration, self.current_state);
+        // Compute state-specific stay/leave factors.
+        let mut stay_factors = [0.0; 4];
+        let mut leave_mass = [0.0; 4];
+        let current_idx = self.current_state.index();
+        let current_duration = self.current_duration.max(1) as f64;
+        for (s, state) in HsmmState::ALL.into_iter().enumerate() {
+            // Exact dwell update for MAP state, asymptotic-rate surrogate for others.
+            let leave_hazard = if s == current_idx {
+                self.duration_posteriors[s]
+                    .hazard_rate(current_duration)
+                    .clamp(0.0, 1.0)
             } else {
-                // Probability of transitioning from current state
-                let trans_prob = self.config.transition_probs[self.current_state.index()][s];
-                // Duration hazard for leaving current state
-                let hazard = self.duration_posteriors[self.current_state.index()]
-                    .hazard_rate(self.current_duration as f64);
-                duration_factors[s] = trans_prob * hazard.min(1.0);
-            }
+                self.duration_posteriors[s].rate.clamp(0.0, 1.0)
+            };
+            stay_factors[s] = if s == current_idx {
+                self.duration_prob(current_duration, state)
+            } else {
+                (1.0 - leave_hazard).max(self.config.min_probability)
+            };
+            leave_mass[s] = self.state_probs[s] * leave_hazard;
         }
 
-        // Combine: new_prob[s] ∝ emission[s] * (stay_prob * old[s] + Σ_i trans_prob[i→s] * old[i])
+        // Combine:
+        // new_prob[s] ∝ emission[s] * (stay_mass[s] + Σ_{i≠s} leave_mass[i] * P(i→s))
         let mut new_probs = [0.0; 4];
         for s in 0..4 {
-            // Contribution from staying in state s
-            let stay_contrib = if s == self.current_state.index() {
-                self.state_probs[s] * duration_factors[s]
-            } else {
-                0.0
-            };
-
-            // Contribution from transitioning into state s
-            let trans_contrib = if s != self.current_state.index() {
-                self.state_probs[self.current_state.index()] * duration_factors[s]
-            } else {
-                0.0
-            };
-
-            new_probs[s] = emissions[s] * (stay_contrib + trans_contrib);
+            let mut inbound_mass = self.state_probs[s] * stay_factors[s];
+            for (i, row) in self.config.transition_probs.iter().enumerate() {
+                if i != s {
+                    inbound_mass += leave_mass[i] * row[s];
+                }
+            }
+            new_probs[s] = emissions[s] * inbound_mass;
         }
 
         // Normalize
@@ -1372,6 +1369,29 @@ mod tests {
 
         // Should detect at least one switch
         assert!(!result.switches.is_empty(), "Should detect state switches");
+    }
+
+    #[test]
+    fn test_transition_uses_full_posterior_mass() {
+        let mut config = HsmmConfig::default();
+        config.initial_probs = [0.51, 0.0, 0.49, 0.0];
+        config.emission_means = [[0.0; 4]; 4];
+        config.emission_vars = [[1.0; 4]; 4];
+        config.duration_priors[2] = GammaDuration::new(2.0, 1.0);
+        config.transition_probs = [
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ];
+
+        let mut analyzer = HsmmAnalyzer::new(config).unwrap();
+        let probs = analyzer.update(&[0.0, 0.0, 0.0, 0.0]).unwrap();
+
+        assert!(
+            probs[HsmmState::Zombie.index()] > 0.10,
+            "zombie posterior should receive mass from non-MAP abandoned posterior"
+        );
     }
 
     #[test]
