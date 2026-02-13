@@ -2,6 +2,10 @@
 
 use proptest::prelude::*;
 use pt_core::config::policy::Policy;
+use pt_core::decision::composite_test::{
+    glr_bernoulli, mixture_sprt_bernoulli, mixture_sprt_beta_sequential, needs_composite_test,
+    GlrConfig, MixtureSprtConfig, MixtureSprtState,
+};
 use pt_core::decision::expected_loss::ActionFeasibility;
 use pt_core::decision::myopic_policy::{compute_loss_table, decide_from_belief};
 use pt_core::decision::{
@@ -428,5 +432,194 @@ proptest! {
                 );
             }
         }
+    }
+}
+
+// ── Composite testing (SPRT/GLR) property tests ────────────────────
+
+/// Strategy for valid Bernoulli p0 parameter (0, 1).
+fn p0_strategy() -> impl Strategy<Value = f64> {
+    0.01f64..=0.99
+}
+
+/// Strategy for valid Beta prior parameters (positive).
+fn beta_params_strategy() -> impl Strategy<Value = (f64, f64)> {
+    (0.1f64..=10.0, 0.1f64..=10.0)
+}
+
+/// Strategy for Bernoulli observation sequences.
+fn bernoulli_obs_strategy(len: usize) -> impl Strategy<Value = Vec<bool>> {
+    prop::collection::vec(prop::bool::ANY, len..=len)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// mixture_sprt_bernoulli should never fail for valid inputs.
+    #[test]
+    fn sprt_bernoulli_never_errors(
+        p0 in p0_strategy(),
+        (alpha, beta) in beta_params_strategy(),
+        obs in prop::collection::vec(prop::bool::ANY, 1..50),
+    ) {
+        let config = MixtureSprtConfig::default();
+        let result = mixture_sprt_bernoulli(&obs, p0, alpha, beta, &config);
+        prop_assert!(result.is_ok(), "mixture_sprt_bernoulli failed: {:?}", result.err());
+    }
+
+    /// SPRT result fields should always be finite.
+    #[test]
+    fn sprt_bernoulli_outputs_finite(
+        p0 in p0_strategy(),
+        (alpha, beta) in beta_params_strategy(),
+        obs in prop::collection::vec(prop::bool::ANY, 1..50),
+    ) {
+        let config = MixtureSprtConfig::default();
+        if let Ok(result) = mixture_sprt_bernoulli(&obs, p0, alpha, beta, &config) {
+            prop_assert!(result.log_lambda.is_finite(),
+                "log_lambda is not finite: {}", result.log_lambda);
+            prop_assert!(result.e_value.is_finite(),
+                "e_value is not finite: {}", result.e_value);
+        }
+    }
+
+    /// SPRT e_value should be non-negative (it's exp of a log ratio).
+    #[test]
+    fn sprt_bernoulli_e_value_non_negative(
+        p0 in p0_strategy(),
+        (alpha, beta) in beta_params_strategy(),
+        obs in prop::collection::vec(prop::bool::ANY, 1..50),
+    ) {
+        let config = MixtureSprtConfig::default();
+        if let Ok(result) = mixture_sprt_bernoulli(&obs, p0, alpha, beta, &config) {
+            prop_assert!(
+                result.e_value >= -1e-12,
+                "e_value should be non-negative, got {}",
+                result.e_value
+            );
+        }
+    }
+
+    /// n_observations should match the input length.
+    #[test]
+    fn sprt_bernoulli_n_observations_matches_input(
+        p0 in p0_strategy(),
+        obs in prop::collection::vec(prop::bool::ANY, 1..100),
+    ) {
+        let config = MixtureSprtConfig::default();
+        if let Ok(result) = mixture_sprt_bernoulli(&obs, p0, 2.0, 2.0, &config) {
+            prop_assert_eq!(
+                result.n_observations, obs.len(),
+                "n_observations {} != input length {}",
+                result.n_observations, obs.len()
+            );
+        }
+    }
+
+    /// crossed_upper and crossed_lower should be mutually exclusive.
+    #[test]
+    fn sprt_boundaries_mutually_exclusive(
+        p0 in p0_strategy(),
+        (alpha, beta) in beta_params_strategy(),
+        obs in prop::collection::vec(prop::bool::ANY, 1..100),
+    ) {
+        let config = MixtureSprtConfig::default();
+        if let Ok(result) = mixture_sprt_bernoulli(&obs, p0, alpha, beta, &config) {
+            prop_assert!(
+                !(result.crossed_upper && result.crossed_lower),
+                "Both boundaries crossed: upper={}, lower={}, log_lambda={}",
+                result.crossed_upper, result.crossed_lower, result.log_lambda
+            );
+        }
+    }
+
+    /// Beta-sequential SPRT should also never error for valid inputs.
+    #[test]
+    fn sprt_beta_sequential_never_errors(
+        p0 in p0_strategy(),
+        (alpha, beta) in beta_params_strategy(),
+        obs in prop::collection::vec(prop::bool::ANY, 1..50),
+    ) {
+        let config = MixtureSprtConfig::default();
+        let result = mixture_sprt_beta_sequential(&obs, p0, alpha, beta, &config);
+        prop_assert!(result.is_ok(), "beta_sequential failed: {:?}", result.err());
+    }
+
+    /// GLR should succeed for valid inputs (n > 0, 0 < p0 < 1, successes <= n).
+    #[test]
+    fn glr_bernoulli_never_errors(
+        p0 in p0_strategy(),
+        n in 1usize..200,
+    ) {
+        let successes = n / 2; // Half success rate
+        let config = GlrConfig::default();
+        let result = glr_bernoulli(successes, n, p0, &config);
+        prop_assert!(result.is_ok(), "glr_bernoulli failed: {:?}", result.err());
+    }
+
+    /// GLR e_value should be non-negative.
+    #[test]
+    fn glr_e_value_non_negative(
+        p0 in p0_strategy(),
+        n in 1usize..200,
+    ) {
+        let successes = n / 2;
+        let config = GlrConfig::default();
+        if let Ok(result) = glr_bernoulli(successes, n, p0, &config) {
+            prop_assert!(
+                result.e_value >= -1e-12,
+                "GLR e_value should be non-negative, got {}",
+                result.e_value
+            );
+        }
+    }
+
+    /// GLR MLE should be in [0, 1] range.
+    #[test]
+    fn glr_mle_in_valid_range(
+        p0 in p0_strategy(),
+        n in 1usize..200,
+    ) {
+        let successes = n / 3;
+        let config = GlrConfig::default();
+        if let Ok(result) = glr_bernoulli(successes, n, p0, &config) {
+            if let Some(mle) = result.mle_h1 {
+                prop_assert!(
+                    mle >= -1e-12 && mle <= 1.0 + 1e-12,
+                    "GLR MLE should be in [0,1], got {}",
+                    mle
+                );
+            }
+        }
+    }
+
+    /// MixtureSprtState: reset should clear all accumulated state.
+    #[test]
+    fn sprt_state_reset_clears(
+        obs in prop::collection::vec(prop::bool::ANY, 1..50),
+    ) {
+        let config = MixtureSprtConfig { track_increments: true, ..MixtureSprtConfig::default() };
+        let mut state = MixtureSprtState::new(config);
+
+        for &o in &obs {
+            let ll1 = if o { -0.5 } else { -1.5 };
+            state.update(ll1, -1.0);
+        }
+
+        state.reset();
+        prop_assert_eq!(state.n_observations, 0, "n_observations should be 0 after reset");
+        prop_assert!((state.log_lambda).abs() < 1e-12, "log_lambda should be 0 after reset");
+    }
+
+    /// needs_composite_test should be a pure function of its inputs (deterministic).
+    #[test]
+    fn needs_composite_test_deterministic(
+        log_bf in -5.0f64..5.0,
+        entropy in 0.0f64..3.0,
+        uncertainty in 0.0f64..1.0,
+    ) {
+        let r1 = needs_composite_test(log_bf, entropy, uncertainty);
+        let r2 = needs_composite_test(log_bf, entropy, uncertainty);
+        prop_assert_eq!(r1, r2, "needs_composite_test should be deterministic");
     }
 }
