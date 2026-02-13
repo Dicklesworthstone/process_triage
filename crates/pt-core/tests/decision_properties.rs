@@ -69,10 +69,14 @@ use pt_core::decision::submodular::{
     coverage_utility, greedy_select_k, greedy_select_with_budget, FeatureKey, ProbeProfile,
 };
 use pt_core::decision::time_bound::{apply_time_bound, compute_t_max, TMaxInput};
+use pt_core::decision::wonham_gittins::{
+    compute_gittins_index, compute_gittins_schedule, GeneratorMatrix, GittinsCandidate,
+    WonhamConfig, WonhamFilter,
+};
 use pt_core::decision::{
     compute_voi, decide_action, select_probe_by_information_gain, Action, ProbeCostModel, ProbeType,
 };
-use pt_core::inference::belief_state::BeliefState;
+use pt_core::inference::belief_state::{BeliefState, ObservationLikelihood, TransitionModel};
 use pt_core::inference::martingale::{MartingaleAnalyzer, MartingaleConfig};
 use pt_core::inference::ClassScores;
 use std::collections::HashMap;
@@ -3666,5 +3670,331 @@ proptest! {
         coord.rebalance();
         let fdr = coord.compute_fleet_fdr();
         prop_assert!(fdr.is_finite(), "fdr not finite after rebalance: {}", fdr);
+    }
+}
+
+// ── Wonham filtering + Gittins index property tests ─────────────────────
+
+fn wonham_dt_strategy() -> impl Strategy<Value = f64> {
+    0.1f64..120.0
+}
+
+fn wonham_discount_strategy() -> impl Strategy<Value = f64> {
+    0.5f64..0.999
+}
+
+fn wonham_horizon_strategy() -> impl Strategy<Value = usize> {
+    1usize..8
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    // ── Wonham filter invariants ─────────────────────────────────────
+
+    /// Wonham predict conserves probability: output sums to 1.0.
+    #[test]
+    fn wonham_predict_conserves_probability(
+        belief in belief_strategy(),
+        dt in wonham_dt_strategy(),
+    ) {
+        let filter = WonhamFilter::new(WonhamConfig::default(), GeneratorMatrix::default());
+        let predicted = filter.predict(&belief, dt).unwrap();
+        let sum: f64 = predicted.probs.iter().sum();
+        prop_assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "predicted probs sum = {} (dt={})",
+            sum,
+            dt
+        );
+    }
+
+    /// Wonham predict produces non-negative probabilities.
+    #[test]
+    fn wonham_predict_non_negative(
+        belief in belief_strategy(),
+        dt in wonham_dt_strategy(),
+    ) {
+        let filter = WonhamFilter::new(WonhamConfig::default(), GeneratorMatrix::default());
+        let predicted = filter.predict(&belief, dt).unwrap();
+        for (i, &p) in predicted.probs.iter().enumerate() {
+            prop_assert!(
+                p >= -1e-12,
+                "negative probability at state {}: {} (dt={})",
+                i,
+                p,
+                dt
+            );
+        }
+    }
+
+    /// Wonham filter_step conserves probability after observation update.
+    #[test]
+    fn wonham_filter_step_conserves_probability(
+        belief in belief_strategy(),
+        dt in wonham_dt_strategy(),
+        obs in (0.01f64..1.0, 0.01f64..1.0, 0.01f64..1.0, 0.01f64..1.0),
+    ) {
+        let filter = WonhamFilter::new(WonhamConfig::default(), GeneratorMatrix::default());
+        let observation = ObservationLikelihood::from_likelihoods([obs.0, obs.1, obs.2, obs.3]).unwrap();
+        let updated = filter.filter_step(&belief, dt, &observation).unwrap();
+        let sum: f64 = updated.probs.iter().sum();
+        prop_assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "filtered probs sum = {} (dt={})",
+            sum,
+            dt
+        );
+    }
+
+    // ── GeneratorMatrix invariants ───────────────────────────────────
+
+    /// Generator matrix from any valid transition model has rows summing to ~0.
+    #[test]
+    fn generator_rows_sum_to_zero(
+        tau in 1.0f64..300.0,
+    ) {
+        let tm = TransitionModel::default_lifecycle();
+        let gen = GeneratorMatrix::from_transition(&tm, tau).unwrap();
+        for (i, row) in gen.rates.iter().enumerate() {
+            let sum: f64 = row.iter().sum();
+            prop_assert!(
+                sum.abs() < 1e-6,
+                "row {} sums to {} (tau={})",
+                i,
+                sum,
+                tau
+            );
+        }
+    }
+
+    /// Euler transition matrix has non-negative entries and rows summing to ~1.
+    #[test]
+    fn generator_euler_transition_valid(
+        dt in 0.01f64..10.0,
+    ) {
+        let gen = GeneratorMatrix::default();
+        let tm = gen.to_transition(dt).unwrap();
+        for (i, row) in tm.matrix.iter().enumerate() {
+            let sum: f64 = row.iter().sum();
+            prop_assert!(
+                (sum - 1.0).abs() < 1e-6,
+                "row {} sums to {} (dt={})",
+                i,
+                sum,
+                dt
+            );
+            for (j, &p) in row.iter().enumerate() {
+                prop_assert!(
+                    p >= -1e-12,
+                    "negative entry at [{i}][{j}]: {p} (dt={dt})"
+                );
+            }
+        }
+    }
+
+    /// Matrix-exp transition is valid for larger dt values.
+    #[test]
+    fn generator_exp_transition_valid(
+        dt in 0.1f64..300.0,
+    ) {
+        let gen = GeneratorMatrix::default();
+        let tm = gen.to_transition_exp(dt, 12).unwrap();
+        for (i, row) in tm.matrix.iter().enumerate() {
+            let sum: f64 = row.iter().sum();
+            prop_assert!(
+                (sum - 1.0).abs() < 1e-6,
+                "row {} sums to {} (dt={})",
+                i,
+                sum,
+                dt
+            );
+            for (j, &p) in row.iter().enumerate() {
+                prop_assert!(
+                    p >= -1e-12,
+                    "negative entry at [{i}][{j}]: {p} (dt={dt})"
+                );
+            }
+        }
+    }
+
+    // ── Gittins index invariants ─────────────────────────────────────
+
+    /// Gittins index computation never panics and produces finite values.
+    #[test]
+    fn gittins_index_no_panic_finite(
+        belief in belief_strategy(),
+        gamma in wonham_discount_strategy(),
+        horizon in wonham_horizon_strategy(),
+    ) {
+        let policy = Policy::default();
+        let transition = TransitionModel::default_lifecycle();
+        let config = WonhamConfig {
+            discount_factor: gamma,
+            horizon,
+            ..Default::default()
+        };
+        let idx = compute_gittins_index(
+            &belief,
+            &ActionFeasibility::allow_all(),
+            &transition,
+            &policy.loss_matrix,
+            &config,
+        )
+        .unwrap();
+
+        prop_assert!(idx.index_value.is_finite(), "index not finite: {}", idx.index_value);
+        prop_assert!(idx.stopping_value.is_finite(), "stopping not finite: {}", idx.stopping_value);
+        prop_assert!(idx.continuation_value.is_finite(), "continuation not finite: {}", idx.continuation_value);
+        prop_assert!(idx.belief_entropy >= 0.0, "negative entropy: {}", idx.belief_entropy);
+    }
+
+    /// State decomposition sums to the stopping value.
+    #[test]
+    fn gittins_decomposition_sums_to_stopping(
+        belief in belief_strategy(),
+        gamma in wonham_discount_strategy(),
+    ) {
+        let policy = Policy::default();
+        let transition = TransitionModel::default_lifecycle();
+        let config = WonhamConfig {
+            discount_factor: gamma,
+            horizon: 3,
+            ..Default::default()
+        };
+        let idx = compute_gittins_index(
+            &belief,
+            &ActionFeasibility::allow_all(),
+            &transition,
+            &policy.loss_matrix,
+            &config,
+        )
+        .unwrap();
+
+        let decomp_sum: f64 = idx.state_decomposition.iter().sum();
+        prop_assert!(
+            (decomp_sum - idx.stopping_value).abs() < 1e-6,
+            "decomposition {} != stopping {}",
+            decomp_sum,
+            idx.stopping_value
+        );
+    }
+
+    /// Gittins schedule is deterministic: same input → same output.
+    #[test]
+    fn gittins_schedule_deterministic(
+        b1 in belief_strategy(),
+        b2 in belief_strategy(),
+        gamma in wonham_discount_strategy(),
+    ) {
+        let policy = Policy::default();
+        let transition = TransitionModel::default_lifecycle();
+        let config = WonhamConfig {
+            discount_factor: gamma,
+            horizon: 3,
+            ..Default::default()
+        };
+
+        let candidates = vec![
+            GittinsCandidate {
+                id: "a".to_string(),
+                belief: b1.clone(),
+                feasibility: ActionFeasibility::allow_all(),
+                available_probes: vec![],
+            },
+            GittinsCandidate {
+                id: "b".to_string(),
+                belief: b2.clone(),
+                feasibility: ActionFeasibility::allow_all(),
+                available_probes: vec![],
+            },
+        ];
+
+        let s1 = compute_gittins_schedule(&candidates, &config, &transition, &policy.loss_matrix).unwrap();
+        let s2 = compute_gittins_schedule(&candidates, &config, &transition, &policy.loss_matrix).unwrap();
+
+        prop_assert_eq!(s1.allocations.len(), s2.allocations.len());
+        for (a, b) in s1.allocations.iter().zip(s2.allocations.iter()) {
+            prop_assert_eq!(&a.candidate_id, &b.candidate_id);
+            prop_assert!(
+                (a.index_value - b.index_value).abs() < 1e-12,
+                "non-deterministic: {} vs {}",
+                a.index_value,
+                b.index_value
+            );
+        }
+    }
+
+    /// Gittins schedule ordering: allocations are sorted by index value descending.
+    #[test]
+    fn gittins_schedule_ordering(
+        b1 in belief_strategy(),
+        b2 in belief_strategy(),
+        b3 in belief_strategy(),
+    ) {
+        let policy = Policy::default();
+        let transition = TransitionModel::default_lifecycle();
+        let config = WonhamConfig::default();
+
+        let candidates = vec![
+            GittinsCandidate {
+                id: "x".to_string(),
+                belief: b1,
+                feasibility: ActionFeasibility::allow_all(),
+                available_probes: vec![],
+            },
+            GittinsCandidate {
+                id: "y".to_string(),
+                belief: b2,
+                feasibility: ActionFeasibility::allow_all(),
+                available_probes: vec![],
+            },
+            GittinsCandidate {
+                id: "z".to_string(),
+                belief: b3,
+                feasibility: ActionFeasibility::allow_all(),
+                available_probes: vec![],
+            },
+        ];
+
+        let schedule = compute_gittins_schedule(&candidates, &config, &transition, &policy.loss_matrix).unwrap();
+
+        for window in schedule.allocations.windows(2) {
+            prop_assert!(
+                window[0].index_value >= window[1].index_value - 1e-12,
+                "not sorted: {} < {}",
+                window[0].index_value,
+                window[1].index_value
+            );
+        }
+    }
+
+    /// Continuation value is non-negative (discounted expected loss).
+    #[test]
+    fn gittins_continuation_non_negative(
+        belief in belief_strategy(),
+        gamma in wonham_discount_strategy(),
+    ) {
+        let policy = Policy::default();
+        let transition = TransitionModel::default_lifecycle();
+        let config = WonhamConfig {
+            discount_factor: gamma,
+            horizon: 5,
+            ..Default::default()
+        };
+        let idx = compute_gittins_index(
+            &belief,
+            &ActionFeasibility::allow_all(),
+            &transition,
+            &policy.loss_matrix,
+            &config,
+        )
+        .unwrap();
+
+        prop_assert!(
+            idx.continuation_value >= -1e-9,
+            "negative continuation: {}",
+            idx.continuation_value
+        );
     }
 }
