@@ -1,10 +1,19 @@
 //! Property-based tests for decision theory invariants.
 
 use proptest::prelude::*;
-use pt_core::config::policy::{Policy, RobotMode};
+use pt_core::collect::{CriticalFile, CriticalFileCategory, DetectionStrength};
+use pt_core::config::policy::{DecisionTimeBound, Policy, RobotMode};
 use pt_core::decision::composite_test::{
     glr_bernoulli, mixture_sprt_bernoulli, mixture_sprt_beta_sequential, needs_composite_test,
     GlrConfig, MixtureSprtConfig, MixtureSprtState,
+};
+use pt_core::decision::dependency_loss::{
+    compute_dependency_scaling, CriticalFileInflation, DependencyFactors, DependencyScaling,
+    scale_kill_loss, should_block_kill,
+};
+use pt_core::decision::dro::{
+    apply_dro_gate, compute_adaptive_epsilon, compute_wasserstein_dro, decide_with_dro,
+    is_de_escalation, DroTrigger,
 };
 use pt_core::decision::expected_loss::ActionFeasibility;
 use pt_core::decision::myopic_policy::{compute_loss_table, decide_from_belief};
@@ -12,6 +21,7 @@ use pt_core::decision::robot_constraints::{
     ConstraintChecker, ConstraintKind, RobotCandidate, RuntimeRobotConstraints,
 };
 use pt_core::decision::sequential::{decide_sequential, prioritize_by_esn, EsnCandidate};
+use pt_core::decision::time_bound::{apply_time_bound, compute_t_max, TMaxInput};
 use pt_core::decision::{
     compute_voi, decide_action, select_probe_by_information_gain, Action, ProbeCostModel, ProbeType,
 };
@@ -1498,5 +1508,530 @@ proptest! {
             "should pick min({}, {}) = {}",
             policy_kills, cli_kills, policy_kills.min(cli_kills)
         );
+    }
+}
+
+// ── Time-bound property tests ────────────────────────────────────────
+
+fn test_time_bound_config() -> DecisionTimeBound {
+    DecisionTimeBound {
+        enabled: true,
+        min_seconds: 60,
+        max_seconds: 600,
+        voi_decay_half_life_seconds: 120,
+        voi_floor: 0.01,
+        overhead_budget_seconds: 300,
+        fallback_action: "pause".to_string(),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// compute_t_max should never panic for any non-negative VOI.
+    #[test]
+    fn time_bound_t_max_never_panics(
+        voi_initial in 0.0f64..=1000.0,
+        budget in proptest::option::of(1u64..=3600),
+    ) {
+        let config = test_time_bound_config();
+        let input = TMaxInput { voi_initial, overhead_budget_seconds: budget };
+        let decision = compute_t_max(&config, &input);
+        prop_assert!(decision.t_max_seconds > 0 || voi_initial <= config.voi_floor,
+            "t_max={} for voi={}", decision.t_max_seconds, voi_initial);
+    }
+
+    /// T_max should never exceed the budget.
+    #[test]
+    fn time_bound_t_max_bounded_by_budget(
+        voi_initial in 0.0f64..=100.0,
+        budget in 1u64..=3600,
+    ) {
+        let config = test_time_bound_config();
+        let input = TMaxInput { voi_initial, overhead_budget_seconds: Some(budget) };
+        let decision = compute_t_max(&config, &input);
+        prop_assert!(
+            decision.t_max_seconds <= budget,
+            "t_max {} > budget {}", decision.t_max_seconds, budget
+        );
+    }
+
+    /// T_max should never exceed max_seconds from config.
+    #[test]
+    fn time_bound_t_max_bounded_by_max(
+        voi_initial in 0.0f64..=1000.0,
+    ) {
+        let config = test_time_bound_config();
+        let input = TMaxInput { voi_initial, overhead_budget_seconds: None };
+        let decision = compute_t_max(&config, &input);
+        prop_assert!(
+            decision.t_max_seconds <= config.max_seconds,
+            "t_max {} > max_seconds {}", decision.t_max_seconds, config.max_seconds
+        );
+    }
+
+    /// apply_time_bound: elapsed < t_max → don't stop probing.
+    #[test]
+    fn time_bound_early_does_not_stop(
+        elapsed in 0u64..100,
+        t_max in 101u64..=600,
+    ) {
+        let config = test_time_bound_config();
+        let outcome = apply_time_bound(&config, elapsed, t_max, true);
+        prop_assert!(
+            !outcome.stop_probing,
+            "should not stop: elapsed {} < t_max {}", elapsed, t_max
+        );
+        prop_assert!(outcome.fallback_action.is_none());
+    }
+
+    /// apply_time_bound: elapsed >= t_max → stop probing.
+    #[test]
+    fn time_bound_past_limit_stops(
+        t_max in 1u64..=300,
+        extra in 0u64..=300,
+        is_uncertain in prop::bool::ANY,
+    ) {
+        let config = test_time_bound_config();
+        let elapsed = t_max + extra;
+        let outcome = apply_time_bound(&config, elapsed, t_max, is_uncertain);
+        prop_assert!(
+            outcome.stop_probing,
+            "should stop: elapsed {} >= t_max {}", elapsed, t_max
+        );
+        // Fallback action present iff uncertain
+        prop_assert_eq!(
+            outcome.fallback_action.is_some(),
+            is_uncertain,
+            "fallback presence should match uncertainty"
+        );
+    }
+
+    /// apply_time_bound: disabled config → never stops.
+    #[test]
+    fn time_bound_disabled_never_stops(
+        elapsed in 0u64..=1000,
+        t_max in 1u64..=100,
+    ) {
+        let mut config = test_time_bound_config();
+        config.enabled = false;
+        let outcome = apply_time_bound(&config, elapsed, t_max, true);
+        prop_assert!(!outcome.stop_probing, "disabled config should never stop");
+    }
+}
+
+// ── DRO property tests ──────────────────────────────────────────────
+
+/// Strategy for actions with defined loss matrix entries.
+fn dro_action_strategy() -> impl Strategy<Value = Action> {
+    prop_oneof![
+        Just(Action::Keep),
+        Just(Action::Pause),
+        Just(Action::Throttle),
+        Just(Action::Renice),
+        Just(Action::Restart),
+        Just(Action::Kill),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// With ε=0, robust loss == nominal loss (no inflation).
+    #[test]
+    fn dro_zero_epsilon_no_inflation(
+        posterior in posterior_strategy(),
+        action in dro_action_strategy(),
+    ) {
+        let policy = Policy::default();
+        if let Ok(dro) = compute_wasserstein_dro(action, &posterior, &policy.loss_matrix, 0.0) {
+            prop_assert!(
+                (dro.robust_loss - dro.nominal_loss).abs() < 1e-9,
+                "ε=0: robust {} != nominal {}", dro.robust_loss, dro.nominal_loss
+            );
+            prop_assert!(dro.inflation.abs() < 1e-9, "ε=0: inflation {} != 0", dro.inflation);
+        }
+    }
+
+    /// With ε>0, robust loss >= nominal loss.
+    #[test]
+    fn dro_positive_epsilon_inflates(
+        posterior in posterior_strategy(),
+        action in dro_action_strategy(),
+        epsilon in 0.001f64..=1.0,
+    ) {
+        let policy = Policy::default();
+        if let Ok(dro) = compute_wasserstein_dro(action, &posterior, &policy.loss_matrix, epsilon) {
+            prop_assert!(
+                dro.robust_loss >= dro.nominal_loss - 1e-9,
+                "robust {} < nominal {}", dro.robust_loss, dro.nominal_loss
+            );
+        }
+    }
+
+    /// Inflation = ε × lipschitz (exact formula check).
+    #[test]
+    fn dro_inflation_equals_epsilon_times_lipschitz(
+        posterior in posterior_strategy(),
+        action in dro_action_strategy(),
+        epsilon in 0.0f64..=1.0,
+    ) {
+        let policy = Policy::default();
+        if let Ok(dro) = compute_wasserstein_dro(action, &posterior, &policy.loss_matrix, epsilon) {
+            let expected_inflation = epsilon * dro.lipschitz;
+            prop_assert!(
+                (dro.inflation - expected_inflation).abs() < 1e-9,
+                "inflation {} != ε×L = {}", dro.inflation, expected_inflation
+            );
+        }
+    }
+
+    /// Lipschitz constant should be non-negative.
+    #[test]
+    fn dro_lipschitz_non_negative(
+        posterior in posterior_strategy(),
+        action in dro_action_strategy(),
+    ) {
+        let policy = Policy::default();
+        if let Ok(dro) = compute_wasserstein_dro(action, &posterior, &policy.loss_matrix, 0.1) {
+            prop_assert!(dro.lipschitz >= -1e-12, "lipschitz {} < 0", dro.lipschitz);
+        }
+    }
+
+    /// All DRO outputs should be finite.
+    #[test]
+    fn dro_outputs_finite(
+        posterior in posterior_strategy(),
+        action in dro_action_strategy(),
+        epsilon in 0.0f64..=2.0,
+    ) {
+        let policy = Policy::default();
+        if let Ok(dro) = compute_wasserstein_dro(action, &posterior, &policy.loss_matrix, epsilon) {
+            prop_assert!(dro.robust_loss.is_finite(), "robust_loss not finite");
+            prop_assert!(dro.nominal_loss.is_finite(), "nominal_loss not finite");
+            prop_assert!(dro.inflation.is_finite(), "inflation not finite");
+            prop_assert!(dro.lipschitz.is_finite(), "lipschitz not finite");
+        }
+    }
+
+    /// decide_with_dro robust action should be in the feasible set.
+    #[test]
+    fn dro_decide_action_in_feasible_set(
+        posterior in posterior_strategy(),
+        epsilon in 0.0f64..=1.0,
+    ) {
+        let policy = Policy::default();
+        let feasible = vec![Action::Keep, Action::Renice, Action::Pause, Action::Kill];
+        if let Ok(outcome) = decide_with_dro(
+            &posterior, &policy, &feasible, epsilon, Action::Kill, "test",
+        ) {
+            prop_assert!(
+                feasible.contains(&outcome.robust_action),
+                "robust_action {:?} not in feasible set", outcome.robust_action
+            );
+        }
+    }
+
+    /// compute_adaptive_epsilon should never exceed max.
+    #[test]
+    fn dro_adaptive_epsilon_capped(
+        base in 0.01f64..=1.0,
+        max in 0.01f64..=2.0,
+        ppc in prop::bool::ANY,
+        drift in prop::bool::ANY,
+        eta in prop::bool::ANY,
+        low_conf in prop::bool::ANY,
+    ) {
+        let trigger = DroTrigger {
+            ppc_failure: ppc,
+            drift_detected: drift,
+            wasserstein_divergence: if drift { Some(0.5) } else { None },
+            eta_tempering_reduced: eta,
+            explicit_conservative: false,
+            low_model_confidence: low_conf,
+        };
+        let eps = compute_adaptive_epsilon(base, &trigger, max);
+        prop_assert!(
+            eps <= max + 1e-9,
+            "adaptive ε {} > max {}", eps, max
+        );
+    }
+
+    /// With no triggers, adaptive epsilon == base.
+    #[test]
+    fn dro_adaptive_epsilon_no_trigger_is_base(base in 0.01f64..=1.0) {
+        let trigger = DroTrigger::none();
+        let eps = compute_adaptive_epsilon(base, &trigger, 2.0);
+        prop_assert!(
+            (eps - base).abs() < 1e-9,
+            "no-trigger: ε {} != base {}", eps, base
+        );
+    }
+
+    /// apply_dro_gate with no trigger should not apply DRO.
+    #[test]
+    fn dro_gate_no_trigger_passthrough(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let trigger = DroTrigger::none();
+        let feasible = vec![Action::Keep, Action::Kill];
+        let outcome = apply_dro_gate(Action::Kill, &posterior, &policy, &trigger, 0.1, &feasible);
+        prop_assert!(!outcome.applied, "DRO should not be applied without trigger");
+        prop_assert_eq!(outcome.robust_action, Action::Kill);
+    }
+
+    /// is_de_escalation is asymmetric: if a→b is de-escalation, b→a is not.
+    #[test]
+    fn dro_de_escalation_asymmetric(
+        a_idx in 0usize..6,
+        b_idx in 0usize..6,
+    ) {
+        let actions = [Action::Keep, Action::Renice, Action::Pause, Action::Throttle, Action::Restart, Action::Kill];
+        let a = actions[a_idx];
+        let b = actions[b_idx];
+        if is_de_escalation(a, b) {
+            prop_assert!(
+                !is_de_escalation(b, a),
+                "de-escalation should be asymmetric: {:?}→{:?} and {:?}→{:?}", a, b, b, a
+            );
+        }
+    }
+}
+
+// ── Dependency-loss property tests ──────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// Impact score should be non-negative for any factors.
+    #[test]
+    fn dep_impact_score_non_negative(
+        children in 0usize..=200,
+        conns in 0usize..=500,
+        ports in 0usize..=100,
+        writes in 0usize..=1000,
+        shm in 0usize..=200,
+    ) {
+        let scaling = DependencyScaling::default();
+        let factors = DependencyFactors::new(children, conns, ports, writes, shm);
+        let impact = scaling.compute_impact_score(&factors);
+        prop_assert!(impact >= -1e-12, "impact {} < 0", impact);
+    }
+
+    /// Impact score should be capped at max_impact.
+    #[test]
+    fn dep_impact_score_capped(
+        children in 0usize..=500,
+        conns in 0usize..=500,
+        ports in 0usize..=100,
+        writes in 0usize..=1000,
+        shm in 0usize..=200,
+    ) {
+        let scaling = DependencyScaling::default();
+        let factors = DependencyFactors::new(children, conns, ports, writes, shm);
+        let impact = scaling.compute_impact_score(&factors);
+        prop_assert!(
+            impact <= scaling.max_impact + 1e-9,
+            "impact {} > max_impact {}", impact, scaling.max_impact
+        );
+    }
+
+    /// Zero factors → zero impact.
+    #[test]
+    fn dep_zero_factors_zero_impact(_dummy in 0u32..1) {
+        let scaling = DependencyScaling::default();
+        let factors = DependencyFactors::default();
+        let impact = scaling.compute_impact_score(&factors);
+        prop_assert!(impact.abs() < 1e-12, "zero factors should give zero impact, got {}", impact);
+    }
+
+    /// scale_factor = 1 + impact_score (structural invariant).
+    #[test]
+    fn dep_scale_factor_formula(
+        children in 0usize..=50,
+        conns in 0usize..=100,
+        ports in 0usize..=20,
+        writes in 0usize..=200,
+        shm in 0usize..=50,
+        base_loss in 1.0f64..=1000.0,
+    ) {
+        let factors = DependencyFactors::new(children, conns, ports, writes, shm);
+        let result = compute_dependency_scaling(base_loss, &factors, None);
+        prop_assert!(
+            (result.scale_factor - (1.0 + result.impact_score)).abs() < 1e-9,
+            "scale_factor {} != 1 + impact_score {}", result.scale_factor, result.impact_score
+        );
+        prop_assert!(
+            (result.scaled_kill_loss - base_loss * result.scale_factor).abs() < 1e-6,
+            "scaled_loss {} != base × scale_factor", result.scaled_kill_loss
+        );
+    }
+
+    /// scale_kill_loss convenience matches manual formula.
+    #[test]
+    fn dep_scale_kill_loss_matches_formula(
+        base_loss in 0.0f64..=1000.0,
+        impact in 0.0f64..=2.0,
+    ) {
+        let scaled = scale_kill_loss(base_loss, impact);
+        let expected = base_loss * (1.0 + impact);
+        prop_assert!(
+            (scaled - expected).abs() < 1e-9,
+            "scale_kill_loss {} != {} × (1 + {})", scaled, base_loss, impact
+        );
+    }
+
+    /// has_dependencies is true iff any factor > 0.
+    #[test]
+    fn dep_has_dependencies_iff_nonzero(
+        children in 0usize..=10,
+        conns in 0usize..=10,
+        ports in 0usize..=10,
+        writes in 0usize..=10,
+        shm in 0usize..=10,
+    ) {
+        let factors = DependencyFactors::new(children, conns, ports, writes, shm);
+        let any_nonzero = children > 0 || conns > 0 || ports > 0 || writes > 0 || shm > 0;
+        prop_assert_eq!(
+            factors.has_dependencies(), any_nonzero,
+            "has_dependencies mismatch for {:?}", factors
+        );
+    }
+}
+
+// ── Critical file inflation property tests ──────────────────────────
+
+fn make_test_critical_file(
+    category: CriticalFileCategory,
+    strength: DetectionStrength,
+) -> CriticalFile {
+    CriticalFile {
+        fd: 42,
+        path: "/test/path".to_string(),
+        category,
+        strength,
+        rule_id: "prop-test".to_string(),
+    }
+}
+
+/// Strategy for a CriticalFileCategory.
+fn category_strategy() -> impl Strategy<Value = CriticalFileCategory> {
+    prop_oneof![
+        Just(CriticalFileCategory::SqliteWal),
+        Just(CriticalFileCategory::GitLock),
+        Just(CriticalFileCategory::GitRebase),
+        Just(CriticalFileCategory::SystemPackageLock),
+        Just(CriticalFileCategory::NodePackageLock),
+        Just(CriticalFileCategory::CargoLock),
+        Just(CriticalFileCategory::DatabaseWrite),
+        Just(CriticalFileCategory::AppLock),
+        Just(CriticalFileCategory::OpenWrite),
+    ]
+}
+
+/// Strategy for DetectionStrength.
+fn strength_strategy() -> impl Strategy<Value = DetectionStrength> {
+    prop_oneof![
+        Just(DetectionStrength::Hard),
+        Just(DetectionStrength::Soft),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// compute_inflation with no files returns exactly 1.0.
+    #[test]
+    fn crit_file_empty_no_inflation(_dummy in 0u32..1) {
+        let config = CriticalFileInflation::default();
+        let inflation = config.compute_inflation(&[]);
+        prop_assert!((inflation - 1.0).abs() < 1e-12, "empty files: inflation {} != 1.0", inflation);
+    }
+
+    /// compute_inflation is always >= 1.0 for any non-empty file list.
+    #[test]
+    fn crit_file_inflation_geq_one(
+        category in category_strategy(),
+        strength in strength_strategy(),
+    ) {
+        let config = CriticalFileInflation::default();
+        let files = vec![make_test_critical_file(category, strength)];
+        let inflation = config.compute_inflation(&files);
+        prop_assert!(inflation >= 1.0 - 1e-12, "inflation {} < 1.0", inflation);
+    }
+
+    /// compute_inflation is capped at max_inflation.
+    #[test]
+    fn crit_file_inflation_capped(n in 1usize..=50) {
+        let config = CriticalFileInflation::default();
+        let files: Vec<CriticalFile> = (0..n)
+            .map(|_| make_test_critical_file(
+                CriticalFileCategory::SystemPackageLock,
+                DetectionStrength::Hard,
+            ))
+            .collect();
+        let inflation = config.compute_inflation(&files);
+        prop_assert!(
+            inflation <= config.max_inflation + 1e-9,
+            "inflation {} > max {}", inflation, config.max_inflation
+        );
+    }
+
+    /// Hard detections produce higher inflation than soft (same category).
+    #[test]
+    fn crit_file_hard_geq_soft(category in category_strategy()) {
+        let config = CriticalFileInflation::default();
+        let hard = config.compute_inflation(&[make_test_critical_file(category, DetectionStrength::Hard)]);
+        let soft = config.compute_inflation(&[make_test_critical_file(category, DetectionStrength::Soft)]);
+        prop_assert!(
+            hard >= soft - 1e-9,
+            "hard inflation {} < soft inflation {} for {:?}", hard, soft, category
+        );
+    }
+
+    /// should_block_kill is true iff any file has Hard strength.
+    #[test]
+    fn crit_file_block_kill_iff_hard(
+        n_hard in 0usize..=5,
+        n_soft in 0usize..=5,
+    ) {
+        let mut files = Vec::new();
+        for _ in 0..n_hard {
+            files.push(make_test_critical_file(CriticalFileCategory::GitLock, DetectionStrength::Hard));
+        }
+        for _ in 0..n_soft {
+            files.push(make_test_critical_file(CriticalFileCategory::OpenWrite, DetectionStrength::Soft));
+        }
+        prop_assert_eq!(
+            should_block_kill(&files),
+            n_hard > 0,
+            "should_block_kill: n_hard={}, n_soft={}", n_hard, n_soft
+        );
+    }
+
+    /// Adding more files should not decrease inflation (monotone non-decreasing).
+    #[test]
+    fn crit_file_inflation_monotone_in_count(
+        category in category_strategy(),
+        strength in strength_strategy(),
+        extra in 1usize..=10,
+    ) {
+        let config = CriticalFileInflation::default();
+        let base_file = make_test_critical_file(category, strength);
+        let one = config.compute_inflation(&[base_file.clone()]);
+        let many: Vec<_> = (0..=extra).map(|_| base_file.clone()).collect();
+        let more = config.compute_inflation(&many);
+        prop_assert!(
+            more >= one - 1e-9,
+            "adding files should not decrease inflation: {} (n=1) > {} (n={})",
+            one, more, extra + 1
+        );
+    }
+
+    /// category_weight should always be positive.
+    #[test]
+    fn crit_file_category_weight_positive(category in category_strategy()) {
+        let config = CriticalFileInflation::default();
+        let weight = config.category_weight(&category);
+        prop_assert!(weight > 0.0, "category weight for {:?} should be positive, got {}", category, weight);
     }
 }
