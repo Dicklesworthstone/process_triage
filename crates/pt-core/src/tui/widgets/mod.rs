@@ -10,6 +10,7 @@
 //! - `ConfirmDialog`: Confirmation dialog for actions
 //! - `ConfigEditor`: Form for editing configuration values
 
+mod aux_panel;
 mod config_editor;
 mod confirm_dialog;
 mod help_overlay;
@@ -18,6 +19,7 @@ mod process_table;
 mod search_input;
 mod status_bar;
 
+pub use aux_panel::AuxPanel;
 pub use config_editor::{ConfigEditor, ConfigEditorState, ConfigField, ConfigFieldType};
 pub use confirm_dialog::{ConfirmChoice, ConfirmDialog, ConfirmDialogState};
 pub use help_overlay::HelpOverlay;

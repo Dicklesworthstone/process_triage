@@ -38,9 +38,9 @@ use super::layout::{Breakpoint, LayoutState, ResponsiveLayout};
 use super::msg::{ExecutionOutcome, Msg};
 use super::theme::Theme;
 use super::widgets::{
-    ConfirmChoice, ConfirmDialog, ConfirmDialogState, DetailView, HelpOverlay, ProcessDetail,
-    ProcessRow, ProcessTable, ProcessTableState, SearchInput, SearchInputState, StatusBar,
-    StatusMode,
+    AuxPanel, ConfirmChoice, ConfirmDialog, ConfirmDialogState, DetailView, HelpOverlay,
+    ProcessDetail, ProcessRow, ProcessTable, ProcessTableState, SearchInput, SearchInputState,
+    StatusBar, StatusMode,
 };
 use super::{TuiError, TuiResult};
 
@@ -920,6 +920,17 @@ impl FtuiModel for App {
                     .view(self.detail_view)
                     .render_ftui(detail_area, frame);
             }
+        }
+
+        // ── Aux panel (Wide breakpoint only) ───────────────────────────
+        if let Some(aux_area) = areas.aux {
+            let current_row = self.process_table.current_row();
+            AuxPanel::new()
+                .theme(&self.theme)
+                .rows(&self.process_table.rows)
+                .selected_count(self.process_table.selected_count())
+                .current_row(current_row)
+                .render_ftui(aux_area, frame);
         }
 
         // ── Status bar ─────────────────────────────────────────────────
