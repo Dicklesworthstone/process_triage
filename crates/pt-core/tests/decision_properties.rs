@@ -12,7 +12,12 @@ use pt_core::decision::{
     compute_voi, decide_action, select_probe_by_information_gain, Action, ProbeCostModel, ProbeType,
 };
 use pt_core::inference::belief_state::BeliefState;
+use pt_core::decision::cvar::{compute_cvar, decide_with_cvar};
+use pt_core::decision::submodular::{
+    coverage_utility, greedy_select_k, greedy_select_with_budget, FeatureKey, ProbeProfile,
+};
 use pt_core::inference::ClassScores;
+use std::collections::HashMap;
 
 fn posterior_strategy() -> impl Strategy<Value = ClassScores> {
     (0.0f64..=1.0, 0.0f64..=1.0, 0.0f64..=1.0, 0.0f64..=1.0).prop_map(
@@ -621,5 +626,245 @@ proptest! {
         let r1 = needs_composite_test(log_bf, entropy, uncertainty);
         let r2 = needs_composite_test(log_bf, entropy, uncertainty);
         prop_assert_eq!(r1, r2, "needs_composite_test should be deterministic");
+    }
+}
+
+// ── CVaR property tests ─────────────────────────────────────────────
+
+/// Strategy for valid CVaR alpha parameter (0, 1).
+fn alpha_strategy() -> impl Strategy<Value = f64> {
+    0.01f64..=0.99
+}
+
+/// Strategy for actions that have defined loss entries in the default policy.
+fn cvar_action_strategy() -> impl Strategy<Value = Action> {
+    prop_oneof![
+        Just(Action::Keep),
+        Just(Action::Pause),
+        Just(Action::Throttle),
+        Just(Action::Renice),
+        Just(Action::Restart),
+        Just(Action::Kill),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// compute_cvar should never fail for valid posteriors and alpha.
+    #[test]
+    fn cvar_never_errors(
+        posterior in posterior_strategy(),
+        alpha in alpha_strategy(),
+        action in cvar_action_strategy(),
+    ) {
+        let policy = Policy::default();
+        let result = compute_cvar(action, &posterior, &policy.loss_matrix, alpha);
+        prop_assert!(result.is_ok(), "compute_cvar failed: {:?}", result.err());
+    }
+
+    /// CVaR >= E[L]: tail risk is at least as large as full expectation.
+    #[test]
+    fn cvar_geq_expected_loss(
+        posterior in posterior_strategy(),
+        alpha in alpha_strategy(),
+        action in cvar_action_strategy(),
+    ) {
+        let policy = Policy::default();
+        if let Ok(cl) = compute_cvar(action, &posterior, &policy.loss_matrix, alpha) {
+            prop_assert!(
+                cl.cvar >= cl.expected_loss - 1e-9,
+                "CVaR {} < E[L] {} for {:?} α={}",
+                cl.cvar, cl.expected_loss, action, alpha
+            );
+        }
+    }
+
+    /// All CVaR outputs should be finite.
+    #[test]
+    fn cvar_outputs_finite(
+        posterior in posterior_strategy(),
+        alpha in alpha_strategy(),
+        action in cvar_action_strategy(),
+    ) {
+        let policy = Policy::default();
+        if let Ok(cl) = compute_cvar(action, &posterior, &policy.loss_matrix, alpha) {
+            prop_assert!(cl.cvar.is_finite(), "CVaR not finite: {}", cl.cvar);
+            prop_assert!(cl.expected_loss.is_finite(), "E[L] not finite");
+            prop_assert!(cl.var.is_finite(), "VaR not finite: {}", cl.var);
+        }
+    }
+
+    /// CVaR is monotone non-decreasing in alpha (higher alpha → more conservative).
+    #[test]
+    fn cvar_monotone_in_alpha(
+        posterior in posterior_strategy(),
+        action in cvar_action_strategy(),
+    ) {
+        let policy = Policy::default();
+        let lo = compute_cvar(action, &posterior, &policy.loss_matrix, 0.5);
+        let hi = compute_cvar(action, &posterior, &policy.loss_matrix, 0.95);
+        if let (Ok(lo), Ok(hi)) = (lo, hi) {
+            prop_assert!(
+                hi.cvar >= lo.cvar - 1e-9,
+                "CVaR not monotone: α=0.5 CVaR={} > α=0.95 CVaR={} for {:?}",
+                lo.cvar, hi.cvar, action
+            );
+        }
+    }
+
+    /// Alpha should be preserved in the output.
+    #[test]
+    fn cvar_preserves_alpha(
+        posterior in posterior_strategy(),
+        alpha in alpha_strategy(),
+    ) {
+        let policy = Policy::default();
+        if let Ok(cl) = compute_cvar(Action::Keep, &posterior, &policy.loss_matrix, alpha) {
+            prop_assert!(
+                (cl.alpha - alpha).abs() < 1e-12,
+                "alpha not preserved: {} != {}", cl.alpha, alpha
+            );
+        }
+    }
+
+    /// decide_with_cvar should succeed for valid inputs.
+    #[test]
+    fn decide_with_cvar_never_errors(
+        posterior in posterior_strategy(),
+        alpha in alpha_strategy(),
+    ) {
+        let policy = Policy::default();
+        let feasible = vec![Action::Keep, Action::Pause, Action::Kill];
+        let result = decide_with_cvar(&posterior, &policy, &feasible, alpha, Action::Kill, "test");
+        prop_assert!(result.is_ok(), "decide_with_cvar failed: {:?}", result.err());
+    }
+
+    /// The risk-adjusted action should be one of the feasible actions.
+    #[test]
+    fn decide_cvar_action_in_feasible_set(
+        posterior in posterior_strategy(),
+        alpha in alpha_strategy(),
+    ) {
+        let policy = Policy::default();
+        let feasible = vec![Action::Keep, Action::Renice, Action::Pause, Action::Kill];
+        if let Ok(outcome) = decide_with_cvar(&posterior, &policy, &feasible, alpha, Action::Kill, "test") {
+            prop_assert!(
+                feasible.contains(&outcome.risk_adjusted_action),
+                "action {:?} not in feasible set", outcome.risk_adjusted_action
+            );
+        }
+    }
+}
+
+// ── Submodular selection property tests ─────────────────────────────
+
+/// Build test probe profiles and feature weights from random vectors.
+fn build_submodular_data(
+    feature_weights: Vec<f64>,
+    probe_costs: Vec<f64>,
+) -> (Vec<ProbeProfile>, HashMap<FeatureKey, f64>) {
+    let n_features = feature_weights.len().max(1);
+    let weights: HashMap<FeatureKey, f64> = feature_weights
+        .into_iter()
+        .enumerate()
+        .map(|(i, w)| (FeatureKey::new(format!("f_{i}")), w))
+        .collect();
+    let probe_types = ProbeType::ALL;
+    let profiles: Vec<ProbeProfile> = probe_costs
+        .into_iter()
+        .enumerate()
+        .map(|(i, cost)| {
+            let probe = probe_types[i % probe_types.len()];
+            let features: Vec<FeatureKey> = (0..2)
+                .map(|j| FeatureKey::new(format!("f_{}", (i + j) % n_features)))
+                .collect();
+            ProbeProfile::new(probe, cost, features)
+        })
+        .collect();
+    (profiles, weights)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// coverage_utility should be non-negative for non-negative weights.
+    #[test]
+    fn submodular_coverage_non_negative(
+        feature_weights in prop::collection::vec(0.0f64..=5.0, 1..=8),
+        probe_costs in prop::collection::vec(0.01f64..=2.0, 1..=10),
+    ) {
+        let (profiles, weights) = build_submodular_data(feature_weights, probe_costs);
+        let utility = coverage_utility(&profiles, &weights);
+        prop_assert!(utility >= -1e-12, "coverage_utility negative: {}", utility);
+    }
+
+    /// greedy_select_k should select at most k probes.
+    #[test]
+    fn submodular_select_k_respects_cardinality(
+        feature_weights in prop::collection::vec(0.1f64..=5.0, 1..=8),
+        probe_costs in prop::collection::vec(0.01f64..=2.0, 1..=10),
+        k in 0usize..=12,
+    ) {
+        let (profiles, weights) = build_submodular_data(feature_weights, probe_costs);
+        let result = greedy_select_k(&profiles, &weights, k);
+        prop_assert!(
+            result.selected.len() <= k,
+            "selected {} > k={}", result.selected.len(), k
+        );
+    }
+
+    /// greedy_select_with_budget should respect the budget constraint.
+    #[test]
+    fn submodular_budget_respects_constraint(
+        feature_weights in prop::collection::vec(0.1f64..=5.0, 1..=8),
+        probe_costs in prop::collection::vec(0.01f64..=2.0, 1..=10),
+        budget in 0.0f64..=5.0,
+    ) {
+        let (profiles, weights) = build_submodular_data(feature_weights, probe_costs);
+        let result = greedy_select_with_budget(&profiles, &weights, budget);
+        prop_assert!(
+            result.total_cost <= budget + 1e-9,
+            "total_cost {} > budget {}", result.total_cost, budget
+        );
+    }
+
+    /// Increasing k should not decrease total utility (monotonicity).
+    #[test]
+    fn submodular_select_k_monotone(
+        feature_weights in prop::collection::vec(0.1f64..=5.0, 2..=8),
+        probe_costs in prop::collection::vec(0.01f64..=2.0, 2..=10),
+    ) {
+        let (profiles, weights) = build_submodular_data(feature_weights, probe_costs);
+        let max_k = profiles.len();
+        let mut prev_utility = 0.0;
+        for k in 1..=max_k {
+            let result = greedy_select_k(&profiles, &weights, k);
+            prop_assert!(
+                result.total_utility >= prev_utility - 1e-9,
+                "utility decreased: k={} u={} < prev u={}",
+                k, result.total_utility, prev_utility
+            );
+            prev_utility = result.total_utility;
+        }
+    }
+
+    /// Selection utility values should be finite.
+    #[test]
+    fn submodular_values_finite(
+        feature_weights in prop::collection::vec(0.0f64..=5.0, 1..=8),
+        probe_costs in prop::collection::vec(0.01f64..=2.0, 1..=10),
+    ) {
+        let (profiles, weights) = build_submodular_data(feature_weights, probe_costs);
+        let u = coverage_utility(&profiles, &weights);
+        prop_assert!(u.is_finite(), "coverage_utility not finite: {}", u);
+
+        let sel = greedy_select_k(&profiles, &weights, 3);
+        prop_assert!(sel.total_utility.is_finite());
+        prop_assert!(sel.total_cost.is_finite());
+
+        let bud = greedy_select_with_budget(&profiles, &weights, 1.0);
+        prop_assert!(bud.total_utility.is_finite());
+        prop_assert!(bud.total_cost.is_finite());
     }
 }
