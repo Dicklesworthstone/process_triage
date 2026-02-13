@@ -472,6 +472,88 @@ fn daemon_sighup_reloads_config_without_exiting() {
 }
 
 #[test]
+fn daemon_restart_after_sigkill_recovers_cleanly() {
+    let data_dir = TempDir::new().expect("temp data dir");
+    let config_dir = TempDir::new().expect("temp config dir");
+
+    write_daemon_json_config(
+        config_dir.path(),
+        r#"{
+  "tick_interval_secs": 30,
+  "max_cpu_percent": 1000.0,
+  "max_rss_mb": 4096,
+  "triggers": {
+    "ewma_alpha": 0.3,
+    "load_threshold": 9999.0,
+    "memory_threshold": 9999.0,
+    "orphan_threshold": 9999999,
+    "sustained_ticks": 1,
+    "cooldown_ticks": 10
+  },
+  "escalation": {
+    "min_interval_secs": 0,
+    "allow_auto_mitigation": false,
+    "max_deep_scan_targets": 1
+  },
+  "notifications": {
+    "enabled": false,
+    "desktop": false,
+    "notify_cmd": null,
+    "notify_arg": []
+  }
+}"#,
+    );
+
+    let pid_path = daemon_pid_path(data_dir.path());
+
+    let mut first = start_daemon_foreground(config_dir.path(), data_dir.path());
+    wait_for(Duration::from_secs(10), || pid_path.exists());
+    let first_pid: u32 = fs::read_to_string(&pid_path)
+        .expect("read first daemon pid file")
+        .trim()
+        .parse()
+        .expect("parse first daemon pid");
+    assert!(
+        first.try_wait().expect("query first child status").is_none(),
+        "first daemon should be alive before SIGKILL"
+    );
+
+    send_signal(&first, libc::SIGKILL);
+    wait_for(Duration::from_secs(10), || {
+        first.try_wait().expect("query first child status").is_some()
+    });
+    let _ = first.wait().expect("wait for first daemon exit status");
+
+    let mut second = start_daemon_foreground(config_dir.path(), data_dir.path());
+    wait_for(Duration::from_secs(10), || {
+        if !pid_path.exists() {
+            return false;
+        }
+        let pid = fs::read_to_string(&pid_path)
+            .expect("read second daemon pid file")
+            .trim()
+            .parse::<u32>()
+            .expect("parse second daemon pid");
+        pid != first_pid
+    });
+    assert!(
+        second.try_wait().expect("query second child status").is_none(),
+        "second daemon should be alive after SIGKILL recovery restart"
+    );
+
+    send_sigterm(&second);
+    wait_for(Duration::from_secs(10), || {
+        second.try_wait().expect("query second child status").is_some()
+    });
+    let status = second.wait().expect("wait for second daemon exit status");
+    assert!(status.success(), "second daemon should exit cleanly after SIGTERM");
+    assert!(
+        !pid_path.exists(),
+        "daemon pid file should be removed after clean second shutdown"
+    );
+}
+
+#[test]
 fn daemon_overhead_budget_exceeded_is_persisted_and_skips_inbox_writes() {
     let data_dir = TempDir::new().expect("temp data dir");
     let config_dir = TempDir::new().expect("temp config dir");
