@@ -282,3 +282,25 @@ fn view_empty_table_renders_cleanly() {
     // Should render structure even with no processes
     assert!(text.contains("Search"), "search widget should still render");
 }
+
+#[test]
+fn view_shows_confirm_dialog() {
+    let mut app = App::new();
+    app.process_table.set_rows(vec![sample_row()]);
+    // Select the process and trigger confirmation
+    app.process_table.toggle_selection();
+    <App as FtuiModel>::update(
+        &mut app,
+        Msg::KeyPressed(KeyEvent::new(KeyCode::Char('e'))),
+    );
+    assert_eq!(app.state, AppState::Confirming);
+
+    let buf = render_app_view(&app, 120, 40);
+    let text = buffer_to_text(&buf);
+
+    assert_snapshot!("tui_view_confirm_dialog_120x40", &buf);
+    assert!(
+        text.contains("Confirm") || text.contains("Execute"),
+        "confirm dialog should render"
+    );
+}
