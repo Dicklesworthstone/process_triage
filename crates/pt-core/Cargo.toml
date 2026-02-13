@@ -164,6 +164,10 @@ harness = false
 name = "recovery_tree"
 harness = false
 
+[[bench]]
+name = "supervision_patterns"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
