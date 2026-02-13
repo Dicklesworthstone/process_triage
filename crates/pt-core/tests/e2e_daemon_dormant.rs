@@ -438,7 +438,9 @@ fn daemon_sighup_reloads_config_without_exiting() {
     let mut child = start_daemon_foreground(config_dir.path(), data_dir.path());
     let pid_path = daemon_pid_path(data_dir.path());
     let state_path = daemon_state_path(data_dir.path());
-    wait_for(Duration::from_secs(10), || pid_path.exists() && state_path.exists());
+    wait_for(Duration::from_secs(10), || {
+        pid_path.exists() && state_path.exists()
+    });
 
     send_signal(&child, libc::SIGHUP);
     wait_for(Duration::from_secs(10), || {
@@ -514,13 +516,19 @@ fn daemon_restart_after_sigkill_recovers_cleanly() {
         .parse()
         .expect("parse first daemon pid");
     assert!(
-        first.try_wait().expect("query first child status").is_none(),
+        first
+            .try_wait()
+            .expect("query first child status")
+            .is_none(),
         "first daemon should be alive before SIGKILL"
     );
 
     send_signal(&first, libc::SIGKILL);
     wait_for(Duration::from_secs(10), || {
-        first.try_wait().expect("query first child status").is_some()
+        first
+            .try_wait()
+            .expect("query first child status")
+            .is_some()
     });
     let _ = first.wait().expect("wait for first daemon exit status");
 
@@ -537,16 +545,25 @@ fn daemon_restart_after_sigkill_recovers_cleanly() {
         pid != first_pid
     });
     assert!(
-        second.try_wait().expect("query second child status").is_none(),
+        second
+            .try_wait()
+            .expect("query second child status")
+            .is_none(),
         "second daemon should be alive after SIGKILL recovery restart"
     );
 
     send_sigterm(&second);
     wait_for(Duration::from_secs(10), || {
-        second.try_wait().expect("query second child status").is_some()
+        second
+            .try_wait()
+            .expect("query second child status")
+            .is_some()
     });
     let status = second.wait().expect("wait for second daemon exit status");
-    assert!(status.success(), "second daemon should exit cleanly after SIGTERM");
+    assert!(
+        status.success(),
+        "second daemon should exit cleanly after SIGTERM"
+    );
     assert!(
         !pid_path.exists(),
         "daemon pid file should be removed after clean second shutdown"

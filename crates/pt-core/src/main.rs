@@ -389,6 +389,11 @@ struct RunArgs {
     /// Enable high-contrast mode (WCAG AAA). Shorthand for --theme=high-contrast.
     #[arg(long)]
     high_contrast: bool,
+
+    /// Disable animations and use static indicators (accessibility).
+    /// Also activatable via REDUCE_MOTION or PT_REDUCE_MOTION env vars.
+    #[arg(long)]
+    reduce_motion: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1733,6 +1738,7 @@ fn main() {
                     goal: None,
                     theme: None,
                     high_contrast: false,
+                    reduce_motion: false,
                 },
             )
         }
@@ -1931,6 +1937,11 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         } else if global.no_color {
             app.theme = TuiTheme::no_color();
         }
+    }
+
+    // --reduce-motion CLI flag overrides env var detection from App::new().
+    if args.reduce_motion {
+        app.reduce_motion = true;
     }
 
     app.process_table.set_rows(rows);

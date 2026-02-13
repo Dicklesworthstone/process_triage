@@ -112,6 +112,9 @@ pub struct App {
     execute_op: Option<ExecuteOp>,
     /// Toast notification queue for async operation feedback.
     notifications: NotificationQueue,
+    /// When true, disables animations and uses static indicators.
+    /// Activated by `--reduce-motion` CLI flag or `REDUCE_MOTION` env var.
+    pub reduce_motion: bool,
 }
 
 impl Default for App {
@@ -125,6 +128,9 @@ impl App {
     pub fn new() -> Self {
         let mut process_table = ProcessTableState::new();
         process_table.focused = true; // Start with process table focused
+
+        let reduce_motion =
+            std::env::var("REDUCE_MOTION").is_ok() || std::env::var("PT_REDUCE_MOTION").is_ok();
 
         Self {
             state: AppState::Normal,
@@ -148,11 +154,12 @@ impl App {
             notifications: NotificationQueue::new(QueueConfig {
                 max_visible: 3,
                 max_queued: 10,
-                default_duration: Duration::from_secs(5),
+                default_duration: Duration::from_secs(if reduce_motion { 8 } else { 5 }),
                 position: ToastPosition::TopRight,
-                stagger_offset: 1,
+                stagger_offset: if reduce_motion { 0 } else { 1 },
                 dedup_window_ms: 1000,
             }),
+            reduce_motion,
         }
     }
 
@@ -229,10 +236,11 @@ impl App {
 
     /// Push a toast notification for transient user feedback.
     fn push_toast(&mut self, message: impl Into<String>, icon: ToastIcon, style: ToastStyle) {
+        let dur = if self.reduce_motion { 8 } else { 4 };
         let toast = Toast::new(message)
             .icon(icon)
             .style_variant(style)
-            .duration(Duration::from_secs(4));
+            .duration(Duration::from_secs(dur));
         self.notifications.notify(toast);
         self.needs_redraw = true;
     }
@@ -983,11 +991,17 @@ impl FtuiModel for App {
     }
 
     fn subscriptions(&self) -> Vec<Box<dyn Subscription<Self::Message>>> {
-        vec![Box::new(Every::with_id(
-            0x5054_5449_434B,
-            Duration::from_secs(5),
-            || Msg::Tick,
-        ))]
+        if self.reduce_motion {
+            // Skip periodic tick when motion is reduced; toasts use longer
+            // static durations and no stagger animation.
+            vec![]
+        } else {
+            vec![Box::new(Every::with_id(
+                0x5054_5449_434B,
+                Duration::from_secs(5),
+                || Msg::Tick,
+            ))]
+        }
     }
 }
 

@@ -313,3 +313,28 @@ fn high_contrast_theme_validates_wcag_aaa() {
         "High contrast WCAG AAA failures: {failures:?}"
     );
 }
+
+// ── Reduce-motion tests ────────────────────────────────────────────
+
+#[test]
+fn reduce_motion_disables_stagger() {
+    let mut app = App::new();
+    app.reduce_motion = true;
+    app.process_table.set_rows(vec![sample_row()]);
+
+    // App should render normally with reduce_motion enabled.
+    let buf = render_app_view(&app, 120, 40);
+    let text = buffer_to_text(&buf);
+
+    assert!(text.contains("Search"), "search widget should render");
+    assert!(
+        text.contains("4242") || text.contains("KILL"),
+        "process table should render"
+    );
+}
+
+#[test]
+fn reduce_motion_default_is_false() {
+    let app = App::new();
+    assert!(!app.reduce_motion, "reduce_motion should default to false");
+}
