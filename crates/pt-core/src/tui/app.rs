@@ -20,17 +20,18 @@
 //! anchors the UI at the bottom of the terminal so logs/progress can scroll above it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ftui::layout::Rect;
 use ftui::runtime::{Every, Subscription};
+use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
 use ftui::widgets::notification_queue::{NotificationQueue, NotificationStack, QueueConfig};
 use ftui::widgets::toast::{Toast, ToastIcon, ToastPosition, ToastStyle};
 use ftui::widgets::Widget;
 use ftui::{
-    Cell as FtuiCell, Cmd as FtuiCmd, Frame as FtuiFrame, KeyCode as FtuiKeyCode,
-    KeyEvent as FtuiKeyEvent, KeyEventKind as FtuiKeyEventKind, Model as FtuiModel,
-    Modifiers as FtuiModifiers, Program, ProgramConfig,
+    Cell as FtuiCell, Cmd as FtuiCmd, Event as FtuiEvent, Frame as FtuiFrame,
+    KeyCode as FtuiKeyCode, KeyEvent as FtuiKeyEvent, KeyEventKind as FtuiKeyEventKind,
+    Model as FtuiModel, Modifiers as FtuiModifiers, Program, ProgramConfig,
 };
 
 use super::events::KeyBindings;
@@ -112,6 +113,10 @@ pub struct App {
     execute_op: Option<ExecuteOp>,
     /// Toast notification queue for async operation feedback.
     notifications: NotificationQueue,
+    /// Command palette for fuzzy action discovery and execution.
+    command_palette: CommandPalette,
+    /// Soft latency budget for palette key handling before warning.
+    command_palette_event_budget: Duration,
     /// When true, disables animations and uses static indicators.
     /// Activated by `--reduce-motion` CLI flag or `REDUCE_MOTION` env var.
     pub reduce_motion: bool,
@@ -137,6 +142,8 @@ impl App {
         let reduce_motion = accessible
             || std::env::var("REDUCE_MOTION").is_ok()
             || std::env::var("PT_REDUCE_MOTION").is_ok();
+        let mut command_palette = Self::build_command_palette();
+        command_palette.enable_evidence_tracking(true);
 
         Self {
             state: AppState::Normal,
@@ -165,9 +172,111 @@ impl App {
                 stagger_offset: if reduce_motion { 0 } else { 1 },
                 dedup_window_ms: 1000,
             }),
+            command_palette,
+            command_palette_event_budget: Duration::from_millis(8),
             reduce_motion,
             accessible,
         }
+    }
+
+    fn build_command_palette() -> CommandPalette {
+        let mut palette = CommandPalette::new().with_max_visible(12);
+        let mut actions = vec![
+            ActionItem::new("action.execute", "Execute selected  [e]")
+                .with_description("Open confirmation dialog for selected processes")
+                .with_tags(&["execute", "kill", "confirm"])
+                .with_category("Actions"),
+            ActionItem::new("action.refresh", "Refresh processes  [r]")
+                .with_description("Rescan processes and refresh recommendations")
+                .with_tags(&["refresh", "rescan"])
+                .with_category("Actions"),
+            ActionItem::new("navigation.first", "Go to first process  [Home]")
+                .with_description("Move cursor to the first process row")
+                .with_tags(&["navigate", "top", "home"])
+                .with_category("Navigation"),
+            ActionItem::new("navigation.last", "Go to last process  [End]")
+                .with_description("Move cursor to the last process row")
+                .with_tags(&["navigate", "bottom", "end"])
+                .with_category("Navigation"),
+            ActionItem::new("navigation.page_down", "Page down  [PgDn]")
+                .with_description("Move down one page in the process table")
+                .with_tags(&["navigate", "page", "down"])
+                .with_category("Navigation"),
+            ActionItem::new("navigation.page_up", "Page up  [PgUp]")
+                .with_description("Move up one page in the process table")
+                .with_tags(&["navigate", "page", "up"])
+                .with_category("Navigation"),
+            ActionItem::new("search.open", "Enter search mode  [/]")
+                .with_description("Focus the search input and start filtering")
+                .with_tags(&["search", "filter"])
+                .with_category("Navigation"),
+            ActionItem::new("selection.recommended", "Select recommended  [a]")
+                .with_description("Select rows classified as recommended")
+                .with_tags(&["select", "recommended"])
+                .with_category("Selection"),
+            ActionItem::new("selection.all", "Select all  [A]")
+                .with_description("Select all visible processes")
+                .with_tags(&["select", "all"])
+                .with_category("Selection"),
+            ActionItem::new("selection.none", "Deselect all  [u]")
+                .with_description("Clear current selection")
+                .with_tags(&["deselect", "clear"])
+                .with_category("Selection"),
+            ActionItem::new("selection.invert", "Invert selection  [x]")
+                .with_description("Invert selected and unselected rows")
+                .with_tags(&["invert", "selection"])
+                .with_category("Selection"),
+            ActionItem::new("view.toggle_detail", "Toggle detail pane  [Enter]")
+                .with_description("Show or hide the process detail pane")
+                .with_tags(&["detail", "pane"])
+                .with_category("Views"),
+            ActionItem::new("view.summary", "Show summary detail  [s]")
+                .with_description("Switch detail pane to summary mode")
+                .with_tags(&["detail", "summary"])
+                .with_category("Views"),
+            ActionItem::new("view.genealogy", "Show genealogy detail  [t]")
+                .with_description("Switch detail pane to genealogy mode")
+                .with_tags(&["detail", "genealogy"])
+                .with_category("Views"),
+            ActionItem::new("view.galaxy", "Toggle galaxy brain detail  [g]")
+                .with_description("Toggle detail pane between summary and galaxy-brain modes")
+                .with_tags(&["detail", "galaxy"])
+                .with_category("Views"),
+            ActionItem::new("view.goal", "Toggle goal view  [v]")
+                .with_description("Switch process table between score and goal ordering")
+                .with_tags(&["goal", "view", "sort"])
+                .with_category("Views"),
+            ActionItem::new("view.help", "Show keyboard shortcuts  [?]")
+                .with_description("Open the full help overlay")
+                .with_tags(&["help", "shortcuts"])
+                .with_category("Views"),
+            ActionItem::new("settings.theme.dark", "Switch theme: dark")
+                .with_description("Apply the dark theme")
+                .with_tags(&["theme", "dark"])
+                .with_category("Settings"),
+            ActionItem::new("settings.theme.light", "Switch theme: light")
+                .with_description("Apply the light theme")
+                .with_tags(&["theme", "light"])
+                .with_category("Settings"),
+            ActionItem::new(
+                "settings.theme.high_contrast",
+                "Switch theme: high contrast",
+            )
+            .with_description("Apply high-contrast theme for accessibility")
+            .with_tags(&["theme", "contrast", "accessible"])
+            .with_category("Settings"),
+            ActionItem::new("settings.theme.no_color", "Switch theme: no color")
+                .with_description("Disable colors for no-color terminals")
+                .with_tags(&["theme", "no-color"])
+                .with_category("Settings"),
+        ];
+
+        // Deterministic lexical fallback for ties when match scores are equal.
+        actions.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
+        for action in actions {
+            palette.register_action(action);
+        }
+        palette
     }
 
     /// Set goal summary lines for display.
@@ -317,6 +426,161 @@ impl App {
     fn set_detail_view(&mut self, view: DetailView) {
         self.detail_view = view;
         self.detail_visible = true;
+    }
+
+    fn announce_accessible(&mut self, message: impl Into<String>) {
+        if !self.accessible {
+            return;
+        }
+        let message = message.into();
+        tracing::info!(target: "a11y.announce", message = %message, "Accessibility announcement");
+        self.set_status(message);
+    }
+
+    fn palette_action_label(action_id: &str) -> &str {
+        match action_id {
+            "action.execute" => "Execute selected",
+            "action.refresh" => "Refresh processes",
+            "navigation.first" => "Go to first process",
+            "navigation.last" => "Go to last process",
+            "navigation.page_down" => "Page down",
+            "navigation.page_up" => "Page up",
+            "search.open" => "Enter search mode",
+            "selection.recommended" => "Select recommended",
+            "selection.all" => "Select all",
+            "selection.none" => "Deselect all",
+            "selection.invert" => "Invert selection",
+            "view.toggle_detail" => "Toggle detail pane",
+            "view.summary" => "Show summary detail",
+            "view.genealogy" => "Show genealogy detail",
+            "view.galaxy" => "Toggle galaxy brain detail",
+            "view.goal" => "Toggle goal view",
+            "view.help" => "Show keyboard shortcuts",
+            "settings.theme.dark" => "Switch theme dark",
+            "settings.theme.light" => "Switch theme light",
+            "settings.theme.high_contrast" => "Switch theme high contrast",
+            "settings.theme.no_color" => "Switch theme no color",
+            _ => "Unknown command",
+        }
+    }
+
+    fn execute_palette_action(&mut self, action_id: &str) -> FtuiCmd<Msg> {
+        self.announce_accessible(format!(
+            "Command executed: {}",
+            Self::palette_action_label(action_id)
+        ));
+        match action_id {
+            "action.execute" => self.show_execute_confirmation(),
+            "action.refresh" => return FtuiCmd::msg(Msg::RequestRefresh),
+
+            "navigation.first" => self.process_table.cursor_home(),
+            "navigation.last" => self.process_table.cursor_end(),
+            "navigation.page_down" => self.process_table.page_down(10),
+            "navigation.page_up" => self.process_table.page_up(10),
+            "search.open" => {
+                self.state = AppState::Searching;
+                self.focus = FocusTarget::Search;
+                self.update_focus();
+            }
+
+            "selection.recommended" => self.process_table.select_recommended(),
+            "selection.all" => self.process_table.select_all(),
+            "selection.none" => self.process_table.deselect_all(),
+            "selection.invert" => self.process_table.invert_selection(),
+
+            "view.toggle_detail" => self.toggle_detail_visibility(),
+            "view.summary" => self.set_detail_view(DetailView::Summary),
+            "view.genealogy" => self.set_detail_view(DetailView::Genealogy),
+            "view.galaxy" => {
+                if self.detail_view == DetailView::GalaxyBrain {
+                    self.set_detail_view(DetailView::Summary);
+                } else {
+                    self.set_detail_view(DetailView::GalaxyBrain);
+                }
+            }
+            "view.goal" => {
+                if self.process_table.has_goal_order() {
+                    self.process_table.toggle_view_mode();
+                    self.set_status(format!(
+                        "View mode: {}",
+                        self.process_table.view_mode_label()
+                    ));
+                } else {
+                    self.set_status("Goal view unavailable");
+                }
+            }
+            "view.help" => self.state = AppState::Help,
+
+            "settings.theme.dark" => self.theme = Theme::dark(),
+            "settings.theme.light" => self.theme = Theme::light(),
+            "settings.theme.high_contrast" => self.theme = Theme::high_contrast(),
+            "settings.theme.no_color" => self.theme = Theme::no_color(),
+
+            _ => {
+                tracing::warn!(
+                    target: "tui.command_palette",
+                    action_id,
+                    "Unknown command palette action"
+                );
+                self.set_status(format!("Unknown command: {}", action_id));
+            }
+        }
+        FtuiCmd::none()
+    }
+
+    fn handle_command_palette_key(&mut self, key: FtuiKeyEvent) -> Option<FtuiCmd<Msg>> {
+        let open_with_colon = self.state == AppState::Normal
+            && !self.command_palette.is_visible()
+            && key.code == FtuiKeyCode::Char(':')
+            && !key.modifiers.contains(FtuiModifiers::CTRL);
+        if open_with_colon {
+            self.command_palette.open();
+            self.announce_accessible(
+                "Command palette opened. Type to search, Enter to run, Escape to close.",
+            );
+            return Some(FtuiCmd::none());
+        }
+
+        let open_with_ctrl_p = self.state == AppState::Normal
+            && !self.command_palette.is_visible()
+            && key.code == FtuiKeyCode::Char('p')
+            && key.modifiers.contains(FtuiModifiers::CTRL);
+        let was_visible = self.command_palette.is_visible();
+        if !(was_visible || open_with_ctrl_p) {
+            return None;
+        }
+
+        let start = Instant::now();
+        let action = self.command_palette.handle_event(&FtuiEvent::Key(key));
+        let elapsed = start.elapsed();
+        if elapsed > self.command_palette_event_budget {
+            tracing::warn!(
+                target: "tui.command_palette",
+                latency_ms = elapsed.as_millis(),
+                budget_ms = self.command_palette_event_budget.as_millis(),
+                "Command palette key handling exceeded soft latency budget"
+            );
+        }
+
+        match action {
+            Some(PaletteAction::Execute(id)) => Some(self.execute_palette_action(&id)),
+            Some(PaletteAction::Dismiss) => {
+                self.announce_accessible("Command palette closed.");
+                Some(FtuiCmd::none())
+            }
+            None => {
+                if was_visible || self.command_palette.is_visible() {
+                    if !was_visible && self.command_palette.is_visible() {
+                        self.announce_accessible(
+                            "Command palette opened. Type to search, Enter to run, Escape to close.",
+                        );
+                    }
+                    Some(FtuiCmd::none())
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// Apply the current search filter to the process table.
@@ -705,6 +969,10 @@ impl App {
             return FtuiCmd::none();
         }
 
+        if let Some(cmd) = self.handle_command_palette_key(key) {
+            return cmd;
+        }
+
         tracing::debug!(
             target: "tui.user_input",
             key_code = ?key.code,
@@ -994,6 +1262,11 @@ impl FtuiModel for App {
         // Toast notifications (top-right overlay)
         if !self.notifications.is_empty() {
             NotificationStack::new(&self.notifications).render(full_area, frame);
+        }
+
+        // Command palette (top-most overlay)
+        if self.command_palette.is_visible() {
+            self.command_palette.render(full_area, frame);
         }
     }
 
@@ -1430,6 +1703,116 @@ mod tests {
             Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Escape)),
         );
         assert_eq!(app.state, AppState::Normal);
+    }
+
+    #[test]
+    fn test_command_palette_opens_with_ctrl_p() {
+        let mut app = App::new();
+        let key = FtuiKeyEvent::new(FtuiKeyCode::Char('p')).with_modifiers(FtuiModifiers::CTRL);
+        <App as FtuiModel>::update(&mut app, Msg::KeyPressed(key));
+        assert!(app.command_palette.is_visible());
+    }
+
+    #[test]
+    fn test_command_palette_opens_with_colon() {
+        let mut app = App::new();
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char(':'))),
+        );
+        assert!(app.command_palette.is_visible());
+    }
+
+    #[test]
+    fn test_command_palette_escape_dismisses() {
+        let mut app = App::new();
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(
+                FtuiKeyEvent::new(FtuiKeyCode::Char('p')).with_modifiers(FtuiModifiers::CTRL),
+            ),
+        );
+        assert!(app.command_palette.is_visible());
+
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Escape)),
+        );
+        assert!(!app.command_palette.is_visible());
+    }
+
+    #[test]
+    fn test_command_palette_executes_select_all_action() {
+        let mut app = App::new();
+        app.process_table
+            .set_rows(vec![make_row(11), make_row(22), make_row(33)]);
+
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(
+                FtuiKeyEvent::new(FtuiKeyCode::Char('p')).with_modifiers(FtuiModifiers::CTRL),
+            ),
+        );
+        app.command_palette.set_query("select all");
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Enter)),
+        );
+
+        assert_eq!(app.process_table.selected_count(), 3);
+        assert!(!app.command_palette.is_visible());
+    }
+
+    #[test]
+    fn test_command_palette_announces_open_and_close_in_accessible_mode() {
+        let mut app = App::new();
+        app.accessible = true;
+
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(
+                FtuiKeyEvent::new(FtuiKeyCode::Char('p')).with_modifiers(FtuiModifiers::CTRL),
+            ),
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Command palette opened. Type to search, Enter to run, Escape to close.")
+        );
+
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Escape)),
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Command palette closed.")
+        );
+    }
+
+    #[test]
+    fn test_command_palette_announces_executed_action_in_accessible_mode() {
+        let mut app = App::new();
+        app.accessible = true;
+        app.process_table
+            .set_rows(vec![make_row(11), make_row(22), make_row(33)]);
+
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(
+                FtuiKeyEvent::new(FtuiKeyCode::Char('p')).with_modifiers(FtuiModifiers::CTRL),
+            ),
+        );
+        app.command_palette.set_query("select all");
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Enter)),
+        );
+
+        assert_eq!(app.process_table.selected_count(), 3);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Command executed: Select all")
+        );
     }
 
     #[test]
