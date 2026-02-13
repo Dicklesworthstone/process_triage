@@ -96,6 +96,14 @@ harness = false
 name = "quick_scan_synthetic"
 harness = false
 
+[[bench]]
+name = "goal_optimizer"
+harness = false
+
+[[bench]]
+name = "policy_enforcer"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
