@@ -156,6 +156,10 @@ harness = false
 name = "escalation_fleet"
 harness = false
 
+[[bench]]
+name = "inference_advanced"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
