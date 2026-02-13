@@ -56,10 +56,86 @@ find_pt_core() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# UI mode selection
+# ══════════════════════════════════════════════════════════════════════════════
+
+detect_auto_ui_mode() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        printf 'shell\n'
+        return 0
+    fi
+
+    if [[ "${CI:-}" == "true" || "${CI:-}" == "1" ]]; then
+        printf 'shell\n'
+        return 0
+    fi
+
+    if [[ "${TERM:-}" == "dumb" ]]; then
+        printf 'shell\n'
+        return 0
+    fi
+
+    printf 'tui\n'
+}
+
+resolve_ui_mode() {
+    local cli_mode="${1:-}"
+    local env_mode="${PT_UI_MODE:-auto}"
+
+    if [[ "$cli_mode" == "shell" || "$cli_mode" == "tui" ]]; then
+        printf '%s\n' "$cli_mode"
+        return 0
+    fi
+
+    case "$env_mode" in
+        shell|tui)
+            printf '%s\n' "$env_mode"
+            return 0
+            ;;
+        auto|"")
+            ;;
+        *)
+            ;;
+    esac
+
+    detect_auto_ui_mode
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
 main() {
+    local cli_mode=""
+    local -a forwarded_args=()
+    local arg
+
+    for arg in "$@"; do
+        case "$arg" in
+            --shell)
+                if [[ "$cli_mode" == "tui" ]]; then
+                    echo "Error: --shell and --tui cannot be used together." >&2
+                    exit 2
+                fi
+                cli_mode="shell"
+                ;;
+            --tui)
+                if [[ "$cli_mode" == "shell" ]]; then
+                    echo "Error: --shell and --tui cannot be used together." >&2
+                    exit 2
+                fi
+                cli_mode="tui"
+                ;;
+            *)
+                forwarded_args+=("$arg")
+                ;;
+        esac
+    done
+
+    local selected_ui_mode
+    selected_ui_mode="$(resolve_ui_mode "$cli_mode")"
+    export PT_UI_MODE="$selected_ui_mode"
+
     local pt_core
     pt_core=$(find_pt_core) || {
         echo "Error: 'pt-core' binary not found." >&2
@@ -80,7 +156,7 @@ main() {
     fi
 
     # Special handling for 'update' (wrapper-level)
-    if [[ "${1:-}" == "update" ]]; then
+    if [[ "${forwarded_args[0]:-}" == "update" ]]; then
         echo "Updating Process Triage..."
         if [[ -z "$installer_cmd" ]]; then
             echo "Error: neither curl nor wget is available to run installer." >&2
@@ -90,14 +166,14 @@ main() {
         exit $?
     fi
 
-    if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+    if [[ "${forwarded_args[0]:-}" == "--version" || "${forwarded_args[0]:-}" == "-V" ]]; then
         printf 'pt %s\n' "$VERSION"
         exit 0
     fi
 
     # Forward to pt-core
     # We use 'exec' to replace the shell process
-    exec "$pt_core" "$@"
+    exec "$pt_core" "${forwarded_args[@]}"
 }
 
 main "$@"
