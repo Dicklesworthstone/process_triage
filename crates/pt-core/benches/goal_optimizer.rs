@@ -5,7 +5,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pt_core::decision::goal_optimizer::{
-    optimize_dp, optimize_greedy, local_search_improve, OptCandidate, ResourceGoal,
+    local_search_improve, optimize_dp, optimize_greedy, OptCandidate, ResourceGoal,
 };
 
 fn make_goals(n: usize) -> Vec<ResourceGoal> {
