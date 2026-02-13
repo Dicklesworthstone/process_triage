@@ -148,6 +148,14 @@ harness = false
 name = "goal_plan_progress"
 harness = false
 
+[[bench]]
+name = "daemon_triggers"
+harness = false
+
+[[bench]]
+name = "escalation_fleet"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
