@@ -1,13 +1,17 @@
 //! Property-based tests for decision theory invariants.
 
 use proptest::prelude::*;
-use pt_core::config::policy::Policy;
+use pt_core::config::policy::{Policy, RobotMode};
 use pt_core::decision::composite_test::{
     glr_bernoulli, mixture_sprt_bernoulli, mixture_sprt_beta_sequential, needs_composite_test,
     GlrConfig, MixtureSprtConfig, MixtureSprtState,
 };
 use pt_core::decision::expected_loss::ActionFeasibility;
 use pt_core::decision::myopic_policy::{compute_loss_table, decide_from_belief};
+use pt_core::decision::robot_constraints::{
+    ConstraintChecker, ConstraintKind, RobotCandidate, RuntimeRobotConstraints,
+};
+use pt_core::decision::sequential::{decide_sequential, prioritize_by_esn, EsnCandidate};
 use pt_core::decision::{
     compute_voi, decide_action, select_probe_by_information_gain, Action, ProbeCostModel, ProbeType,
 };
@@ -1089,6 +1093,410 @@ proptest! {
             next >= -1e-12,
             "next wealth {} < 0 (prev={}, spend={}, reward={})",
             next, wealth, spend, reward
+        );
+    }
+}
+
+// ── Sequential stopping property tests ──────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// decide_sequential should never fail for valid posteriors.
+    #[test]
+    fn sequential_never_errors(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        let result = decide_sequential(
+            &posterior, &policy, &feasibility, &cost_model, None,
+        );
+        prop_assert!(result.is_ok(), "decide_sequential failed: {:?}", result.err());
+    }
+
+    /// The ledger should always have entries (at least one probe type exists).
+    #[test]
+    fn sequential_ledger_non_empty(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        if let Ok((_, ledger)) = decide_sequential(
+            &posterior, &policy, &feasibility, &cost_model, None,
+        ) {
+            prop_assert!(
+                !ledger.is_empty(),
+                "ledger should have entries for available probes"
+            );
+        }
+    }
+
+    /// If should_probe is true, recommended_probe must be Some.
+    #[test]
+    fn sequential_probe_implies_recommendation(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        if let Ok((decision, _)) = decide_sequential(
+            &posterior, &policy, &feasibility, &cost_model, None,
+        ) {
+            if decision.should_probe {
+                prop_assert!(
+                    decision.recommended_probe.is_some(),
+                    "should_probe=true but recommended_probe is None"
+                );
+            }
+        }
+    }
+
+    /// All sequential outputs should be finite.
+    #[test]
+    fn sequential_outputs_finite(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        if let Ok((decision, ledger)) = decide_sequential(
+            &posterior, &policy, &feasibility, &cost_model, None,
+        ) {
+            if let Some(esn) = decision.esn_estimate {
+                prop_assert!(esn.is_finite(), "ESN estimate not finite: {}", esn);
+                prop_assert!(esn >= 1.0 - 1e-9, "ESN estimate < 1: {}", esn);
+            }
+            for entry in &ledger {
+                prop_assert!(entry.voi.is_finite(), "ledger VOI not finite");
+                prop_assert!(
+                    entry.expected_loss_after.is_finite(),
+                    "ledger expected_loss_after not finite"
+                );
+            }
+        }
+    }
+
+    /// Restricting to a single probe should yield ledger with only that probe.
+    #[test]
+    fn sequential_respects_probe_filter(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        if let Ok((decision, ledger)) = decide_sequential(
+            &posterior, &policy, &feasibility, &cost_model,
+            Some(&[ProbeType::QuickScan]),
+        ) {
+            for entry in &ledger {
+                prop_assert_eq!(
+                    entry.probe, ProbeType::QuickScan,
+                    "ledger contains {:?} but only QuickScan was available",
+                    entry.probe
+                );
+            }
+            if decision.should_probe {
+                prop_assert_eq!(
+                    decision.recommended_probe,
+                    Some(ProbeType::QuickScan),
+                    "recommended probe should be QuickScan"
+                );
+            }
+        }
+    }
+
+    /// prioritize_by_esn should produce exactly one entry per candidate.
+    #[test]
+    fn esn_priority_count_matches_input(
+        n in 1usize..=10,
+        posterior in posterior_strategy(),
+    ) {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        let candidates: Vec<EsnCandidate> = (0..n)
+            .map(|i| EsnCandidate::new(
+                format!("pid-{i}"),
+                posterior,
+                feasibility.clone(),
+                vec![ProbeType::QuickScan],
+            ))
+            .collect();
+
+        if let Ok(ranked) = prioritize_by_esn(&candidates, &policy, &cost_model) {
+            prop_assert_eq!(
+                ranked.len(), n,
+                "ranked count {} != input count {}",
+                ranked.len(), n
+            );
+        }
+    }
+
+    /// prioritize_by_esn should produce a stable sort (ESN ascending, ID tiebreak).
+    #[test]
+    fn esn_priority_deterministic(posterior in posterior_strategy()) {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        let candidates: Vec<EsnCandidate> = (0..5)
+            .map(|i| EsnCandidate::new(
+                format!("pid-{i}"),
+                posterior,
+                feasibility.clone(),
+                vec![ProbeType::QuickScan, ProbeType::DeepScan],
+            ))
+            .collect();
+
+        let r1 = prioritize_by_esn(&candidates, &policy, &cost_model);
+        let r2 = prioritize_by_esn(&candidates, &policy, &cost_model);
+        if let (Ok(r1), Ok(r2)) = (r1, r2) {
+            for (a, b) in r1.iter().zip(r2.iter()) {
+                prop_assert_eq!(
+                    &a.candidate_id, &b.candidate_id,
+                    "non-deterministic ordering"
+                );
+            }
+        }
+    }
+}
+
+// ── Robot constraint property tests ─────────────────────────────────
+
+fn test_robot_mode() -> RobotMode {
+    RobotMode {
+        enabled: true,
+        min_posterior: 0.95,
+        min_confidence: None,
+        max_blast_radius_mb: 1024.0,
+        max_kills: 10,
+        require_known_signature: false,
+        require_policy_snapshot: None,
+        allow_categories: Vec::new(),
+        exclude_categories: Vec::new(),
+        require_human_for_supervised: false,
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// check_candidate should never panic for any candidate configuration.
+    #[test]
+    fn robot_check_never_panics(
+        posterior in 0.0f64..=1.0,
+        memory_mb in 0.0f64..=10000.0,
+        has_sig in prop::bool::ANY,
+        is_kill in prop::bool::ANY,
+        has_snapshot in prop::bool::ANY,
+        is_supervised in prop::bool::ANY,
+    ) {
+        let constraints = RuntimeRobotConstraints::from_policy(&test_robot_mode());
+        let checker = ConstraintChecker::new(constraints);
+
+        let candidate = RobotCandidate::new()
+            .with_posterior(posterior)
+            .with_memory_mb(memory_mb)
+            .with_known_signature(has_sig)
+            .with_kill_action(is_kill)
+            .with_policy_snapshot(has_snapshot)
+            .with_supervised(is_supervised);
+
+        let result = checker.check_candidate(&candidate);
+        // Just verify it returns without panic and has consistent fields
+        prop_assert_eq!(
+            result.allowed,
+            result.violations.is_empty(),
+            "allowed={} but violations.len()={}",
+            result.allowed,
+            result.violations.len()
+        );
+    }
+
+    /// High posterior + small memory should always be allowed (when other constraints off).
+    #[test]
+    fn robot_high_confidence_small_blast_allowed(
+        posterior in 0.96f64..=1.0,
+        memory_mb in 0.0f64..=500.0,
+    ) {
+        let constraints = RuntimeRobotConstraints::from_policy(&test_robot_mode());
+        let checker = ConstraintChecker::new(constraints);
+
+        let candidate = RobotCandidate::new()
+            .with_posterior(posterior)
+            .with_memory_mb(memory_mb)
+            .with_known_signature(true)
+            .with_policy_snapshot(true)
+            .with_kill_action(true);
+
+        let result = checker.check_candidate(&candidate);
+        prop_assert!(
+            result.allowed,
+            "should be allowed: posterior={}, memory={}MB, violations={:?}",
+            posterior, memory_mb,
+            result.violations.iter().map(|v| format!("{:?}", v.constraint)).collect::<Vec<_>>()
+        );
+    }
+
+    /// Low posterior should always be blocked regardless of other fields.
+    #[test]
+    fn robot_low_posterior_always_blocked(
+        posterior in 0.0f64..0.90,
+        memory_mb in 0.0f64..=500.0,
+    ) {
+        let constraints = RuntimeRobotConstraints::from_policy(&test_robot_mode()); // min_posterior=0.95
+        let checker = ConstraintChecker::new(constraints);
+
+        let candidate = RobotCandidate::new()
+            .with_posterior(posterior)
+            .with_memory_mb(memory_mb)
+            .with_kill_action(false);
+
+        let result = checker.check_candidate(&candidate);
+        prop_assert!(
+            !result.allowed,
+            "low posterior {} should be blocked", posterior
+        );
+        prop_assert!(
+            result.violations.iter().any(|v| v.constraint == ConstraintKind::MinPosterior),
+            "should have MinPosterior violation"
+        );
+    }
+
+    /// Exceeding max_blast_radius should be blocked.
+    #[test]
+    fn robot_blast_radius_blocks(
+        memory_mb in 1025.0f64..=5000.0,
+    ) {
+        let constraints = RuntimeRobotConstraints::from_policy(&test_robot_mode()); // max=1024
+        let checker = ConstraintChecker::new(constraints);
+
+        let candidate = RobotCandidate::new()
+            .with_posterior(0.99)
+            .with_memory_mb(memory_mb)
+            .with_kill_action(false);
+
+        let result = checker.check_candidate(&candidate);
+        prop_assert!(
+            result.violations.iter().any(|v| v.constraint == ConstraintKind::MaxBlastRadius),
+            "memory {}MB should violate max_blast_radius (1024MB)", memory_mb
+        );
+    }
+
+    /// Kill count tracking: after max_kills are recorded, next kill should be blocked.
+    #[test]
+    fn robot_kill_count_enforced(
+        max_kills in 1u32..=20,
+    ) {
+        let mut robot_mode = test_robot_mode();
+        robot_mode.max_kills = max_kills;
+        let constraints = RuntimeRobotConstraints::from_policy(&robot_mode);
+        let checker = ConstraintChecker::new(constraints);
+
+        // Record max_kills kills
+        for _ in 0..max_kills {
+            checker.record_action(100 * 1024 * 1024, true);
+        }
+
+        let candidate = RobotCandidate::new()
+            .with_posterior(0.99)
+            .with_memory_mb(50.0)
+            .with_kill_action(true);
+
+        let result = checker.check_candidate(&candidate);
+        prop_assert!(
+            result.violations.iter().any(|v| v.constraint == ConstraintKind::MaxKills),
+            "after {} kills at limit {}, next should be blocked",
+            max_kills, max_kills
+        );
+    }
+
+    /// Disabled robot mode should always block.
+    #[test]
+    fn robot_disabled_always_blocks(
+        posterior in 0.0f64..=1.0,
+    ) {
+        let mut robot_mode = test_robot_mode();
+        robot_mode.enabled = false;
+        let constraints = RuntimeRobotConstraints::from_policy(&robot_mode);
+        let checker = ConstraintChecker::new(constraints);
+
+        let candidate = RobotCandidate::new()
+            .with_posterior(posterior)
+            .with_kill_action(false);
+
+        let result = checker.check_candidate(&candidate);
+        prop_assert!(
+            !result.allowed,
+            "disabled robot mode should block"
+        );
+        prop_assert!(
+            result.violations.iter().any(|v| v.constraint == ConstraintKind::RobotModeDisabled),
+            "should have RobotModeDisabled violation"
+        );
+    }
+
+    /// Metrics should be consistent: current_kills + remaining_kills == max_kills.
+    #[test]
+    fn robot_metrics_consistent(
+        kills_performed in 0u32..=10,
+    ) {
+        let constraints = RuntimeRobotConstraints::from_policy(&test_robot_mode()); // max_kills=10
+        let checker = ConstraintChecker::new(constraints);
+
+        for _ in 0..kills_performed {
+            checker.record_action(50 * 1024 * 1024, true);
+        }
+
+        let metrics = checker.current_metrics();
+        prop_assert_eq!(
+            metrics.current_kills, kills_performed,
+            "current_kills mismatch"
+        );
+        prop_assert_eq!(
+            metrics.current_kills + metrics.remaining_kills, 10,
+            "kills don't sum to max_kills"
+        );
+    }
+
+    /// Excluded category should always be blocked.
+    #[test]
+    fn robot_excluded_category_blocked(
+        posterior in 0.96f64..=1.0,
+    ) {
+        let mut robot_mode = test_robot_mode();
+        robot_mode.exclude_categories = vec!["daemon".to_string()];
+        let constraints = RuntimeRobotConstraints::from_policy(&robot_mode);
+        let checker = ConstraintChecker::new(constraints);
+
+        let candidate = RobotCandidate::new()
+            .with_posterior(posterior)
+            .with_memory_mb(50.0)
+            .with_category("daemon")
+            .with_kill_action(false);
+
+        let result = checker.check_candidate(&candidate);
+        prop_assert!(
+            result.violations.iter().any(|v| v.constraint == ConstraintKind::ExcludedCategory),
+            "excluded category 'daemon' should be blocked"
+        );
+    }
+
+    /// CLI override with_max_kills should use the more restrictive (smaller) value.
+    #[test]
+    fn robot_cli_override_safety(
+        policy_kills in 1u32..=20,
+        cli_kills in 1u32..=20,
+    ) {
+        let mut robot_mode = test_robot_mode();
+        robot_mode.max_kills = policy_kills;
+        let constraints = RuntimeRobotConstraints::from_policy(&robot_mode)
+            .with_max_kills(Some(cli_kills));
+
+        prop_assert_eq!(
+            constraints.max_kills,
+            policy_kills.min(cli_kills),
+            "should pick min({}, {}) = {}",
+            policy_kills, cli_kills, policy_kills.min(cli_kills)
         );
     }
 }
