@@ -3,7 +3,7 @@
 use ftui::{Frame, GraphemePool, KeyCode, KeyEvent, Model as FtuiModel};
 use ftui_harness::{assert_snapshot, buffer_to_text};
 use pt_core::tui::widgets::{DetailView, ProcessRow};
-use pt_core::tui::{App, AppState, Msg};
+use pt_core::tui::{App, AppState, Msg, Theme, ThemeMode};
 
 /// Render via the real Model::view() code path.
 fn render_app_view(app: &App, width: u16, height: u16) -> ftui::Buffer {
@@ -234,5 +234,82 @@ fn view_shows_confirm_dialog() {
     assert!(
         text.contains("Confirm") || text.contains("Execute"),
         "confirm dialog should render"
+    );
+}
+
+// ── Theme override tests ────────────────────────────────────────────
+
+#[test]
+fn theme_override_high_contrast() {
+    let mut app = App::new();
+    app.theme = Theme::high_contrast();
+    app.process_table.set_rows(vec![sample_row()]);
+
+    assert_eq!(app.theme.mode, ThemeMode::HighContrast);
+
+    let buf = render_app_view(&app, 120, 40);
+    let text = buffer_to_text(&buf);
+
+    assert_snapshot!("tui_view_high_contrast_120x40", &buf);
+    assert!(
+        text.contains("Search"),
+        "search widget should render in HC mode"
+    );
+    assert!(
+        text.contains("4242") || text.contains("KILL"),
+        "process table should render in HC mode"
+    );
+}
+
+#[test]
+fn theme_override_light() {
+    let mut app = App::new();
+    app.theme = Theme::light();
+    app.process_table.set_rows(vec![sample_row()]);
+
+    assert_eq!(app.theme.mode, ThemeMode::Light);
+
+    let buf = render_app_view(&app, 120, 40);
+    let text = buffer_to_text(&buf);
+
+    assert_snapshot!("tui_view_light_theme_120x40", &buf);
+    assert!(!text.is_empty(), "light theme should render");
+}
+
+#[test]
+fn theme_override_no_color() {
+    let mut app = App::new();
+    app.theme = Theme::no_color();
+    app.process_table.set_rows(vec![sample_row()]);
+
+    assert_eq!(app.theme.mode, ThemeMode::NoColor);
+
+    let buf = render_app_view(&app, 120, 40);
+    let text = buffer_to_text(&buf);
+
+    assert_snapshot!("tui_view_no_color_120x40", &buf);
+    assert!(!text.is_empty(), "no-color theme should render");
+}
+
+#[test]
+fn all_themes_validate_wcag_aa() {
+    let themes: Vec<Theme> = vec![Theme::dark(), Theme::light(), Theme::high_contrast()];
+    for theme in &themes {
+        let failures = theme.validate_wcag_aa();
+        assert!(
+            failures.is_empty(),
+            "Theme {:?} WCAG AA failures: {failures:?}",
+            theme.mode
+        );
+    }
+}
+
+#[test]
+fn high_contrast_theme_validates_wcag_aaa() {
+    let theme = Theme::high_contrast();
+    let failures = theme.validate_wcag_aaa();
+    assert!(
+        failures.is_empty(),
+        "High contrast WCAG AAA failures: {failures:?}"
     );
 }

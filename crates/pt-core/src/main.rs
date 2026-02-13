@@ -381,6 +381,14 @@ struct RunArgs {
     /// Resource recovery goal for goal-oriented optimization
     #[arg(long, help = "Resource recovery goal, e.g. 'free 4GB RAM'")]
     goal: Option<String>,
+
+    /// TUI color theme (overrides environment detection)
+    #[arg(long, value_parser = ["dark", "light", "high-contrast", "no-color"])]
+    theme: Option<String>,
+
+    /// Enable high-contrast mode (WCAG AAA). Shorthand for --theme=high-contrast.
+    #[arg(long)]
+    high_contrast: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1723,6 +1731,8 @@ fn main() {
                     community_signatures: false,
                     min_age: None,
                     goal: None,
+                    theme: None,
+                    high_contrast: false,
                 },
             )
         }
@@ -1902,6 +1912,27 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     let _ = handle.update_state(SessionState::Planned);
 
     let mut app = App::new();
+
+    // Apply theme from CLI flags (highest priority) or environment detection.
+    // Priority: --theme > --high-contrast > --no-color (global) > env vars > dark default.
+    // Apply theme from CLI flags (highest priority) or environment detection.
+    // Priority: --theme > --high-contrast > --no-color (global) > env vars > dark default.
+    {
+        use pt_core::tui::Theme as TuiTheme;
+        if let Some(ref theme_name) = args.theme {
+            app.theme = match theme_name.as_str() {
+                "light" => TuiTheme::light(),
+                "high-contrast" => TuiTheme::high_contrast(),
+                "no-color" => TuiTheme::no_color(),
+                _ => TuiTheme::dark(),
+            };
+        } else if args.high_contrast {
+            app.theme = TuiTheme::high_contrast();
+        } else if global.no_color {
+            app.theme = TuiTheme::no_color();
+        }
+    }
+
     app.process_table.set_rows(rows);
     app.process_table.set_goal_order(goal_order);
     if let Some(lines) = goal_summary {
