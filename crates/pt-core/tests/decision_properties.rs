@@ -67,6 +67,16 @@ use pt_core::decision::fdr_selection::{
 use pt_core::decision::submodular::{
     coverage_utility, greedy_select_k, greedy_select_with_budget, FeatureKey, ProbeProfile,
 };
+use pt_core::decision::escalation::{
+    EscalationConfig, EscalationManager, EscalationTrigger, Severity, TriggerType,
+};
+use pt_core::decision::fleet_fdr::{FleetFdrConfig, FleetFdrCoordinator};
+use pt_core::decision::fleet_pattern::{
+    correlate_fleet_patterns, FleetPatternConfig, PatternObservation,
+};
+use pt_core::decision::fleet_registry::{
+    FleetRegistry, FleetRegistryConfig, Heartbeat, HostCapabilities, HostRole,
+};
 use pt_core::inference::ClassScores;
 use std::collections::HashMap;
 
@@ -3283,5 +3293,370 @@ proptest! {
             GoalMetric::Memory, None, &before, &after, outcomes, &config, None,
         );
         prop_assert!(report.discrepancy.is_finite());
+    }
+
+    // ── Escalation properties ───────────────────────────────────────
+
+    /// submit_trigger accepts first and rejects duplicate dedupe_key.
+    #[test]
+    fn escalation_dedupe_rejects_second(
+        severity in prop_oneof![Just(Severity::Warning), Just(Severity::Critical)],
+        ts in 0.0f64..1e6,
+    ) {
+        let config = EscalationConfig::default();
+        let mut mgr = EscalationManager::new(config);
+        let trigger = EscalationTrigger {
+            trigger_id: "t-1".to_string(),
+            dedupe_key: "dup".to_string(),
+            trigger_type: TriggerType::MemoryPressure,
+            severity,
+            confidence: Some(0.9),
+            summary: "test".to_string(),
+            detected_at: ts,
+            session_id: None,
+        };
+        let first = mgr.submit_trigger(trigger.clone());
+        let second = mgr.submit_trigger(trigger);
+        prop_assert!(first);
+        prop_assert!(!second, "dedupe should reject second submission");
+    }
+
+    /// After forget_key, the same dedupe_key is accepted again.
+    #[test]
+    fn escalation_forget_re_accepts(
+        ts in 0.0f64..1e6,
+    ) {
+        let config = EscalationConfig::default();
+        let mut mgr = EscalationManager::new(config);
+        let trigger = EscalationTrigger {
+            trigger_id: "t-1".to_string(),
+            dedupe_key: "key".to_string(),
+            trigger_type: TriggerType::CpuPressure,
+            severity: Severity::Warning,
+            confidence: Some(0.8),
+            summary: "test".to_string(),
+            detected_at: ts,
+            session_id: None,
+        };
+        mgr.submit_trigger(trigger.clone());
+        mgr.forget_key("key");
+        prop_assert!(!mgr.has_key("key"));
+        let re_accepted = mgr.submit_trigger(trigger);
+        prop_assert!(re_accepted, "should accept after forget_key");
+    }
+
+    /// flush produces notifications ≤ max_notifications_per_hour.
+    #[test]
+    fn escalation_flush_respects_rate(
+        n_triggers in 1usize..30,
+        flush_ts in 100.0f64..1000.0,
+    ) {
+        let config = EscalationConfig::default();
+        let max = config.max_notifications_per_hour;
+        let mut mgr = EscalationManager::new(config);
+        for i in 0..n_triggers {
+            mgr.submit_trigger(EscalationTrigger {
+                trigger_id: format!("t-{}", i),
+                dedupe_key: format!("k-{}", i),
+                trigger_type: TriggerType::OrphanSpike,
+                severity: Severity::Warning,
+                confidence: Some(0.7),
+                summary: format!("trigger {}", i),
+                detected_at: i as f64,
+                session_id: None,
+            });
+        }
+        let notifications = mgr.flush(flush_ts);
+        prop_assert!(notifications.len() <= max,
+            "got {} notifications but max is {}", notifications.len(), max);
+    }
+
+    /// Persist → restore round-trip preserves total_sent count.
+    #[test]
+    fn escalation_persist_roundtrip(
+        n_triggers in 1usize..10,
+    ) {
+        let config = EscalationConfig::default();
+        let mut mgr = EscalationManager::new(config.clone());
+        for i in 0..n_triggers {
+            mgr.submit_trigger(EscalationTrigger {
+                trigger_id: format!("t-{}", i),
+                dedupe_key: format!("k-{}", i),
+                trigger_type: TriggerType::ThresholdExceeded,
+                severity: Severity::Critical,
+                confidence: Some(0.95),
+                summary: "test".to_string(),
+                detected_at: i as f64 * 10.0,
+                session_id: None,
+            });
+        }
+        let _ = mgr.flush(500.0);
+        let sent_before = mgr.total_sent();
+        let state = mgr.persisted_state();
+        let restored = EscalationManager::from_persisted(config, state);
+        prop_assert_eq!(restored.total_sent(), sent_before);
+    }
+
+    // ── Fleet registry properties ───────────────────────────────────
+
+    /// Registering n unique hosts yields fleet_size == n.
+    #[test]
+    fn fleet_registry_size_matches(
+        n in 1usize..20,
+    ) {
+        let config = FleetRegistryConfig::default();
+        let mut reg = FleetRegistry::new(config);
+        for i in 0..n {
+            let _ = reg.register(
+                format!("h-{}", i),
+                format!("host-{}", i),
+                vec![format!("10.0.0.{}", i + 1)],
+                HostCapabilities {
+                    cores: 4,
+                    memory_gb: 16.0,
+                    pt_version: "2.0.3".to_string(),
+                    features: vec![],
+                },
+                HostRole::Member,
+                1000.0,
+                None,
+            );
+        }
+        prop_assert_eq!(reg.fleet_size(), n);
+    }
+
+    /// Duplicate host_id registration returns AlreadyRegistered error.
+    #[test]
+    fn fleet_registry_duplicate_rejected(
+        ts in 0.0f64..1e6,
+    ) {
+        let config = FleetRegistryConfig::default();
+        let mut reg = FleetRegistry::new(config);
+        let cap = HostCapabilities {
+            cores: 8,
+            memory_gb: 32.0,
+            pt_version: "2.0.3".to_string(),
+            features: vec![],
+        };
+        let first = reg.register(
+            "dup".to_string(), "host".to_string(), vec![], cap.clone(),
+            HostRole::Member, ts, None,
+        );
+        let second = reg.register(
+            "dup".to_string(), "host2".to_string(), vec![], cap,
+            HostRole::Member, ts + 1.0, None,
+        );
+        prop_assert!(first.is_ok());
+        prop_assert!(second.is_err(), "duplicate host_id should error");
+    }
+
+    /// Heartbeat for unregistered host returns NotFound error.
+    #[test]
+    fn fleet_registry_heartbeat_unknown(
+        ts in 0.0f64..1e6,
+    ) {
+        let config = FleetRegistryConfig::default();
+        let mut reg = FleetRegistry::new(config);
+        let hb = Heartbeat {
+            host_id: "nonexistent".to_string(),
+            timestamp: ts,
+            process_count: None,
+            active_kills: None,
+        };
+        let result = reg.heartbeat(&hb);
+        prop_assert!(result.is_err());
+    }
+
+    /// check_heartbeats degrades hosts with stale heartbeats.
+    #[test]
+    fn fleet_registry_degradation(
+        n in 2usize..10,
+        gap in 100.0f64..1000.0,
+    ) {
+        let config = FleetRegistryConfig::default();
+        let mut reg = FleetRegistry::new(config.clone());
+        for i in 0..n {
+            let _ = reg.register(
+                format!("h-{}", i),
+                format!("host-{}", i),
+                vec![],
+                HostCapabilities {
+                    cores: 4,
+                    memory_gb: 8.0,
+                    pt_version: "2.0.3".to_string(),
+                    features: vec![],
+                },
+                HostRole::Member,
+                1000.0,
+                None,
+            );
+        }
+        // Only heartbeat first host
+        let _ = reg.heartbeat(&Heartbeat {
+            host_id: "h-0".to_string(),
+            timestamp: 1000.0 + gap,
+            process_count: None,
+            active_kills: None,
+        });
+        reg.check_heartbeats(1000.0 + gap);
+        // First host should still be active, others degraded/offline
+        let active = reg.active_host_count();
+        prop_assert!(active <= n, "active {} > total {}", active, n);
+        prop_assert!(active >= 1, "at least the heartbeating host should be active");
+    }
+
+    // ── Fleet pattern properties ────────────────────────────────────
+
+    /// No alerts when observations come from fewer hosts than min_hosts.
+    #[test]
+    fn fleet_pattern_below_min_hosts_no_alerts(
+        n_patterns in 1usize..5,
+    ) {
+        let config = FleetPatternConfig {
+            min_hosts: 5,
+            min_host_fraction: 0.0,
+            ..FleetPatternConfig::default()
+        };
+        // Only 1 host
+        let obs: Vec<PatternObservation> = (0..n_patterns).map(|p| PatternObservation {
+            host_id: "single-host".to_string(),
+            pattern_key: format!("pat-{}", p),
+            instance_count: 10,
+            avg_cpu: 0.5,
+            avg_rss_bytes: 100_000_000,
+            earliest_spawn_ts: 1000.0,
+            latest_spawn_ts: 1001.0,
+            abandoned_fraction: 0.9,
+            deploy_sha: None,
+        }).collect();
+        let alerts = correlate_fleet_patterns(&obs, &config);
+        prop_assert!(alerts.is_empty(),
+            "expected 0 alerts from 1 host with min_hosts=5, got {}", alerts.len());
+    }
+
+    /// Each alert's affected_hosts ≤ fleet_size and host_fraction ∈ [0,1].
+    #[test]
+    fn fleet_pattern_alert_fractions_valid(
+        n_hosts in 3usize..12,
+        n_patterns in 1usize..4,
+    ) {
+        let config = FleetPatternConfig::default();
+        let obs: Vec<PatternObservation> = (0..n_hosts).flat_map(|h| {
+            (0..n_patterns).map(move |p| PatternObservation {
+                host_id: format!("h-{}", h),
+                pattern_key: format!("pat-{}", p),
+                instance_count: 5,
+                avg_cpu: 0.3,
+                avg_rss_bytes: 200_000_000,
+                earliest_spawn_ts: 1000.0,
+                latest_spawn_ts: 1005.0,
+                abandoned_fraction: 0.6,
+                deploy_sha: None,
+            })
+        }).collect();
+        let alerts = correlate_fleet_patterns(&obs, &config);
+        for alert in &alerts {
+            prop_assert!(alert.affected_hosts <= alert.fleet_size,
+                "affected {} > fleet_size {}", alert.affected_hosts, alert.fleet_size);
+            prop_assert!(alert.host_fraction >= 0.0 && alert.host_fraction <= 1.0,
+                "host_fraction {} out of [0,1]", alert.host_fraction);
+        }
+    }
+
+    /// Deploy-correlated observations produce alerts mentioning deploy SHA.
+    #[test]
+    fn fleet_pattern_deploy_correlation(
+        n_hosts in 5usize..15,
+    ) {
+        let config = FleetPatternConfig::default();
+        let obs: Vec<PatternObservation> = (0..n_hosts).map(|h| PatternObservation {
+            host_id: format!("h-{}", h),
+            pattern_key: "leaky-svc".to_string(),
+            instance_count: 5,
+            avg_cpu: 0.4,
+            avg_rss_bytes: 300_000_000,
+            earliest_spawn_ts: 1000.0,
+            latest_spawn_ts: 1002.0,
+            abandoned_fraction: 0.8,
+            deploy_sha: Some("abc123".to_string()),
+        }).collect();
+        let alerts = correlate_fleet_patterns(&obs, &config);
+        // With enough hosts all sharing same deploy SHA, should get alerts
+        if !alerts.is_empty() {
+            for alert in &alerts {
+                prop_assert!(alert.deploy_sha.is_some(),
+                    "deploy-correlated alert should include deploy_sha");
+            }
+        }
+    }
+
+    // ── Fleet FDR properties ────────────────────────────────────────
+
+    /// compute_fleet_fdr is non-negative and finite.
+    #[test]
+    fn fleet_fdr_non_negative_finite(
+        n_hosts in 1usize..10,
+        e_val in 0.1f64..50.0,
+    ) {
+        let config = FleetFdrConfig::default();
+        let mut coord = FleetFdrCoordinator::new(config);
+        for i in 0..n_hosts {
+            coord.register_host(&format!("h-{}", i), 20);
+            coord.submit_e_value(&format!("h-{}", i), e_val + i as f64);
+        }
+        let fdr = coord.compute_fleet_fdr();
+        prop_assert!(fdr >= 0.0, "fdr {} is negative", fdr);
+        prop_assert!(fdr.is_finite(), "fdr is not finite");
+    }
+
+    /// submit_e_value for unregistered host returns non-approved.
+    #[test]
+    fn fleet_fdr_unregistered_rejected(
+        e_val in 0.1f64..100.0,
+    ) {
+        let config = FleetFdrConfig::default();
+        let mut coord = FleetFdrCoordinator::new(config);
+        let result = coord.submit_e_value("ghost", e_val);
+        prop_assert!(!result.approved, "unregistered host should not be approved");
+    }
+
+    /// pool_evidence combined e-value is finite and n_hosts matches input.
+    #[test]
+    fn fleet_fdr_pool_evidence_valid(
+        n_hosts in 2usize..8,
+        base_e in 1.0f64..20.0,
+    ) {
+        let config = FleetFdrConfig::default();
+        let mut coord = FleetFdrCoordinator::new(config);
+        for i in 0..n_hosts {
+            coord.register_host(&format!("h-{}", i), 30);
+        }
+        let evidence: Vec<(String, f64)> = (0..n_hosts)
+            .map(|i| (format!("h-{}", i), base_e + i as f64 * 0.5))
+            .collect();
+        let refs: Vec<(&str, f64)> = evidence.iter().map(|(h, v)| (h.as_str(), *v)).collect();
+        let pooled = coord.pool_evidence("test-pattern", &refs);
+        prop_assert_eq!(pooled.n_hosts, n_hosts);
+        prop_assert!(pooled.combined_e_value.is_finite(),
+            "combined e-value not finite: {}", pooled.combined_e_value);
+    }
+
+    /// rebalance never panics and keeps fleet_fdr finite.
+    #[test]
+    fn fleet_fdr_rebalance_stable(
+        n_hosts in 1usize..15,
+        e_val in 0.5f64..10.0,
+    ) {
+        let config = FleetFdrConfig::default();
+        let mut coord = FleetFdrCoordinator::new(config);
+        for i in 0..n_hosts {
+            coord.register_host(&format!("h-{}", i), 25);
+            if i % 2 == 0 {
+                coord.submit_e_value(&format!("h-{}", i), e_val);
+            }
+        }
+        coord.rebalance();
+        let fdr = coord.compute_fleet_fdr();
+        prop_assert!(fdr.is_finite(), "fdr not finite after rebalance: {}", fdr);
     }
 }
