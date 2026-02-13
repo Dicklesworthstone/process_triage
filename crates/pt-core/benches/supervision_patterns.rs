@@ -6,10 +6,10 @@
 //! (record_match/acceptance_rate/lifecycle) — supervision-engine hotpaths.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use pt_core::supervision::pattern_learning::CommandNormalizer;
 use pt_core::supervision::pattern_persistence::{
     AllPatternStats, DisabledPatterns, PatternLifecycle, PatternStats,
 };
-use pt_core::supervision::pattern_learning::CommandNormalizer;
 use pt_core::supervision::signature::ProcessMatchContext;
 use pt_core::supervision::SignatureDatabase;
 use std::collections::HashMap;
@@ -62,21 +62,22 @@ fn bench_match_process(c: &mut Criterion) {
         ("python3", "/usr/bin/python3 -m pytest tests/", None),
         ("nginx", "nginx: master process /usr/sbin/nginx", None),
         ("java", "/usr/bin/java -jar app.jar", None),
-        ("containerd-shim", "containerd-shim -namespace moby", Some("containerd")),
+        (
+            "containerd-shim",
+            "containerd-shim -namespace moby",
+            Some("containerd"),
+        ),
         ("unknown_proc", "/custom/binary --flag", None),
     ];
 
     for (comm, cmdline, parent) in &processes {
         let ctx = make_match_context(comm, cmdline, *parent, None);
-        group.bench_function(
-            BenchmarkId::new("process", *comm),
-            |b| {
-                b.iter(|| {
-                    let matches = db.match_process(black_box(&ctx));
-                    black_box(matches.len());
-                })
-            },
-        );
+        group.bench_function(BenchmarkId::new("process", *comm), |b| {
+            b.iter(|| {
+                let matches = db.match_process(black_box(&ctx));
+                black_box(matches.len());
+            })
+        });
     }
 
     group.finish();
@@ -137,10 +138,18 @@ fn bench_match_with_env(c: &mut Criterion) {
 
     // Process with environment variables (Docker-like)
     let env: HashMap<String, String> = [
-        ("DOCKER_HOST".to_string(), "unix:///var/run/docker.sock".to_string()),
+        (
+            "DOCKER_HOST".to_string(),
+            "unix:///var/run/docker.sock".to_string(),
+        ),
         ("HOME".to_string(), "/root".to_string()),
-        ("PATH".to_string(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_string()),
-    ].into_iter().collect();
+        (
+            "PATH".to_string(),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_string(),
+        ),
+    ]
+    .into_iter()
+    .collect();
 
     let ctx = ProcessMatchContext::with_comm("containerd")
         .cmdline("/usr/bin/containerd")
@@ -154,8 +163,7 @@ fn bench_match_with_env(c: &mut Criterion) {
     });
 
     // Process without env (faster path)
-    let ctx_no_env = ProcessMatchContext::with_comm("containerd")
-        .cmdline("/usr/bin/containerd");
+    let ctx_no_env = ProcessMatchContext::with_comm("containerd").cmdline("/usr/bin/containerd");
 
     group.bench_function("no_env", |b| {
         b.iter(|| {
@@ -199,20 +207,30 @@ fn bench_generate_candidates(c: &mut Criterion) {
     let normalizer = CommandNormalizer::new();
 
     let commands = [
-        ("node", "/usr/bin/node /home/user/project/server.js --port 3000"),
-        ("python3", "/usr/bin/python3 -m pytest tests/ -v --timeout=30"),
-        ("java", "/usr/bin/java -Xmx4g -jar /opt/app/application.jar --spring.profiles.active=prod"),
-        ("nginx", "nginx: master process /usr/sbin/nginx -c /etc/nginx/nginx.conf"),
+        (
+            "node",
+            "/usr/bin/node /home/user/project/server.js --port 3000",
+        ),
+        (
+            "python3",
+            "/usr/bin/python3 -m pytest tests/ -v --timeout=30",
+        ),
+        (
+            "java",
+            "/usr/bin/java -Xmx4g -jar /opt/app/application.jar --spring.profiles.active=prod",
+        ),
+        (
+            "nginx",
+            "nginx: master process /usr/sbin/nginx -c /etc/nginx/nginx.conf",
+        ),
         ("bash", "/bin/bash -c 'while true; do sleep 1; done'"),
     ];
 
     for (name, cmdline) in &commands {
         group.bench_function(BenchmarkId::new("command", *name), |b| {
             b.iter(|| {
-                let candidates = normalizer.generate_candidates(
-                    black_box(name),
-                    black_box(cmdline),
-                );
+                let candidates =
+                    normalizer.generate_candidates(black_box(name), black_box(cmdline));
                 black_box(candidates.len());
             })
         });
@@ -221,14 +239,15 @@ fn bench_generate_candidates(c: &mut Criterion) {
     // Long command line
     let long_cmdline = format!(
         "/usr/bin/java {} -jar app.jar",
-        (0..50).map(|i| format!("-Dprop{}=value{}", i, i)).collect::<Vec<_>>().join(" ")
+        (0..50)
+            .map(|i| format!("-Dprop{}=value{}", i, i))
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     group.bench_function("long_cmdline", |b| {
         b.iter(|| {
-            let candidates = normalizer.generate_candidates(
-                black_box("java"),
-                black_box(&long_cmdline),
-            );
+            let candidates =
+                normalizer.generate_candidates(black_box("java"), black_box(&long_cmdline));
             black_box(candidates.len());
         })
     });
@@ -347,13 +366,14 @@ fn bench_pattern_lifecycle(c: &mut Criterion) {
 
     for (confidence, matches) in [(0.3, 5u32), (0.7, 20), (0.95, 100)] {
         group.bench_function(
-            BenchmarkId::new("from_stats", format!("c{}_m{}", (confidence * 100.0) as u32, matches)),
+            BenchmarkId::new(
+                "from_stats",
+                format!("c{}_m{}", (confidence * 100.0) as u32, matches),
+            ),
             |b| {
                 b.iter(|| {
-                    let lc = PatternLifecycle::from_stats(
-                        black_box(confidence),
-                        black_box(matches),
-                    );
+                    let lc =
+                        PatternLifecycle::from_stats(black_box(confidence), black_box(matches));
                     black_box(lc.is_active());
                 })
             },

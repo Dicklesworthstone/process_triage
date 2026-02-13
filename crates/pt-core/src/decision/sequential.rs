@@ -125,13 +125,28 @@ pub fn prioritize_by_esn(
     let mut priorities = Vec::new();
 
     for candidate in candidates {
-        let (decision, _) = decide_sequential(
+        let decision = match decide_sequential(
             &candidate.posterior,
             policy,
             &candidate.feasibility,
             cost_model,
             Some(candidate.available_probes.as_slice()),
-        )?;
+        ) {
+            Ok((decision, _)) => decision,
+            Err(SequentialError::Voi(VoiError::NoProbesAvailable)) => {
+                let action_now =
+                    decide_action(&candidate.posterior, policy, &candidate.feasibility)?
+                        .optimal_action;
+                SequentialDecision {
+                    action_now,
+                    should_probe: false,
+                    recommended_probe: None,
+                    esn_estimate: None,
+                    rationale: "Act now: no probes available".to_string(),
+                }
+            }
+            Err(err) => return Err(err),
+        };
 
         priorities.push(EsnPriority {
             candidate_id: candidate.candidate_id.clone(),
@@ -459,6 +474,39 @@ mod tests {
         // Should be deterministic
         assert_eq!(r1[0].candidate_id, r2[0].candidate_id);
         assert_eq!(r1[1].candidate_id, r2[1].candidate_id);
+    }
+
+    #[test]
+    fn prioritize_handles_candidates_without_probes() {
+        let policy = Policy::default();
+        let cost_model = ProbeCostModel::default();
+        let feasibility = ActionFeasibility::allow_all();
+
+        let candidates = vec![
+            EsnCandidate::new(
+                "no-probes",
+                uncertain_posterior(),
+                feasibility.clone(),
+                vec![],
+            ),
+            EsnCandidate::new(
+                "with-probe",
+                uncertain_posterior(),
+                feasibility,
+                vec![ProbeType::QuickScan],
+            ),
+        ];
+
+        let ranked = prioritize_by_esn(&candidates, &policy, &cost_model).unwrap();
+        assert_eq!(ranked.len(), 2);
+
+        let without = ranked
+            .iter()
+            .find(|candidate| candidate.candidate_id == "no-probes")
+            .unwrap();
+        assert!(!without.should_probe);
+        assert!(without.recommended_probe.is_none());
+        assert!(without.esn_estimate.is_none());
     }
 
     // ── Zombie posterior ──────────────────────────────────────────────

@@ -25,6 +25,14 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace};
 
+fn recent_io_probe_window(window: Duration) -> Duration {
+    if window.is_zero() {
+        Duration::from_millis(10)
+    } else {
+        window
+    }
+}
+
 /// Errors during pre-check validation.
 #[derive(Debug, Error)]
 pub enum PreCheckError {
@@ -405,8 +413,7 @@ impl LivePreCheckProvider {
             return false;
         };
 
-        let probe_ms = window.as_millis().clamp(10u128, 200u128) as u64;
-        std::thread::sleep(Duration::from_millis(probe_ms));
+        std::thread::sleep(recent_io_probe_window(window));
 
         let after = parse_io(pid);
         let Some(after) = after else {
@@ -988,12 +995,15 @@ mod tests {
             check: PreCheck::CheckDataLossGate,
             reason: "open write fds".to_string(),
         };
-        if let PreCheckResult::Blocked { check, reason } = blocked {
-            assert!(matches!(check, PreCheck::CheckDataLossGate));
-            assert_eq!(reason, "open write fds");
-        } else {
-            panic!("expected Blocked");
-        }
+        let (check, reason) = match blocked {
+            PreCheckResult::Blocked { check, reason } => (check, reason),
+            _ => {
+                assert!(false, "expected Blocked");
+                return;
+            }
+        };
+        assert!(matches!(check, PreCheck::CheckDataLossGate));
+        assert_eq!(reason, "open write fds");
     }
 
     // ── NoopPreCheckProvider ────────────────────────────────────────
@@ -1347,6 +1357,26 @@ mod tests {
         assert!(config.protect_ssh_chains);
         assert!(config.protect_multiplexers);
         assert!(config.protect_parent_shells);
+    }
+
+    #[test]
+    fn recent_io_probe_window_respects_nonzero_input() {
+        assert_eq!(
+            recent_io_probe_window(Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            recent_io_probe_window(Duration::from_millis(250)),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn recent_io_probe_window_fallback_for_zero() {
+        assert_eq!(
+            recent_io_probe_window(Duration::ZERO),
+            Duration::from_millis(10)
+        );
     }
 
     #[test]

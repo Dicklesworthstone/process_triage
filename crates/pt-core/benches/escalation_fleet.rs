@@ -266,25 +266,21 @@ fn bench_registry_heartbeat(c: &mut Criterion) {
             );
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("hosts", n_hosts),
-            &reg,
-            |b, registry| {
-                b.iter(|| {
-                    let mut reg = registry.clone();
-                    for i in 0..n_hosts {
-                        let hb = Heartbeat {
-                            host_id: format!("host-{}", i),
-                            timestamp: 1010.0,
-                            process_count: Some(50 + i),
-                            active_kills: Some(i % 3),
-                        };
-                        let _ = reg.heartbeat(black_box(&hb));
-                    }
-                    black_box(reg.active_host_count());
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("hosts", n_hosts), &reg, |b, registry| {
+            b.iter(|| {
+                let mut reg = registry.clone();
+                for i in 0..n_hosts {
+                    let hb = Heartbeat {
+                        host_id: format!("host-{}", i),
+                        timestamp: 1010.0,
+                        process_count: Some(50 + i),
+                        active_kills: Some(i % 3),
+                    };
+                    let _ = reg.heartbeat(black_box(&hb));
+                }
+                black_box(reg.active_host_count());
+            })
+        });
     }
 
     group.finish();
@@ -316,17 +312,13 @@ fn bench_registry_check_heartbeats(c: &mut Criterion) {
             let _ = reg.heartbeat(&hb);
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("hosts", n_hosts),
-            &reg,
-            |b, registry| {
-                b.iter(|| {
-                    let mut reg = registry.clone();
-                    reg.check_heartbeats(black_box(2000.0));
-                    black_box(reg.active_host_count());
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("hosts", n_hosts), &reg, |b, registry| {
+            b.iter(|| {
+                let mut reg = registry.clone();
+                reg.check_heartbeats(black_box(2000.0));
+                black_box(reg.active_host_count());
+            })
+        });
     }
 
     group.finish();
@@ -343,10 +335,7 @@ fn bench_correlate_fleet_patterns(c: &mut Criterion) {
         let obs = make_observations(n_hosts, n_patterns);
 
         group.bench_with_input(
-            BenchmarkId::new(
-                "grid",
-                format!("{}h_{}p", n_hosts, n_patterns),
-            ),
+            BenchmarkId::new("grid", format!("{}h_{}p", n_hosts, n_patterns)),
             &obs,
             |b, observations| {
                 b.iter(|| {
@@ -429,10 +418,7 @@ fn bench_fdr_submit(c: &mut Criterion) {
                 }
                 for i in 0..n_hosts {
                     let e_val = 1.5 + (i as f64 * 0.3);
-                    coord.submit_e_value(
-                        black_box(&format!("host-{}", i)),
-                        black_box(e_val),
-                    );
+                    coord.submit_e_value(black_box(&format!("host-{}", i)), black_box(e_val));
                 }
                 black_box(coord.compute_fleet_fdr());
             })
@@ -492,8 +478,7 @@ fn bench_fdr_pool_evidence(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("hosts", n_hosts), |b| {
             b.iter(|| {
-                let pooled =
-                    coord.pool_evidence(black_box("pattern-leak"), black_box(&refs));
+                let pooled = coord.pool_evidence(black_box("pattern-leak"), black_box(&refs));
                 black_box(pooled.combined_e_value);
             })
         });

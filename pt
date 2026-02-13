@@ -14,7 +14,9 @@ readonly VERSION="2.0.3"
 # ══════════════════════════════════════════════════════════════════════════════
 
 readonly PT_CORE_BIN="pt-core"
-readonly INSTALL_URL="https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh"
+readonly INSTALL_BASE_URL="https://raw.githubusercontent.com/Dicklesworthstone/process_triage"
+readonly INSTALL_URL="${INSTALL_BASE_URL}/master/install.sh"
+readonly PINNED_INSTALL_URL="${INSTALL_BASE_URL}/v${VERSION}/install.sh"
 
 # Locations to search for pt-core
 readonly SEARCH_PATHS=(
@@ -146,23 +148,22 @@ main() {
         exit 1
     }
 
-    local installer_cmd
-    if command -v curl &>/dev/null; then
-        installer_cmd="curl -fsSL $INSTALL_URL | bash"
-    elif command -v wget &>/dev/null; then
-        installer_cmd="wget -qO- $INSTALL_URL | bash"
-    else
-        installer_cmd=""
-    fi
-
     # Special handling for 'update' (wrapper-level)
     if [[ "${forwarded_args[0]:-}" == "update" ]]; then
         echo "Updating Process Triage..."
-        if [[ -z "$installer_cmd" ]]; then
+        local update_installer_cmd
+        if command -v curl &>/dev/null; then
+            update_installer_cmd="curl -fsSL $PINNED_INSTALL_URL | bash"
+        elif command -v wget &>/dev/null; then
+            update_installer_cmd="wget -qO- $PINNED_INSTALL_URL | bash"
+        else
+            update_installer_cmd=""
+        fi
+        if [[ -z "$update_installer_cmd" ]]; then
             echo "Error: neither curl nor wget is available to run installer." >&2
             exit 1
         fi
-        bash -c "set -euo pipefail; $installer_cmd"
+        bash -c "set -euo pipefail; $update_installer_cmd"
         exit $?
     fi
 

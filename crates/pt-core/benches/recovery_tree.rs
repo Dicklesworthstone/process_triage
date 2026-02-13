@@ -173,15 +173,12 @@ fn bench_requirement_context(c: &mut Criterion) {
 
     // Single requirement check
     for req in &all_reqs {
-        group.bench_function(
-            BenchmarkId::new("is_met", format!("{:?}", req)),
-            |b| {
-                b.iter(|| {
-                    let met = ctx_full.is_met(black_box(req));
-                    black_box(met);
-                })
-            },
-        );
+        group.bench_function(BenchmarkId::new("is_met", format!("{:?}", req)), |b| {
+            b.iter(|| {
+                let met = ctx_full.is_met(black_box(req));
+                black_box(met);
+            })
+        });
     }
 
     // all_met with varying requirement counts
@@ -275,10 +272,7 @@ fn bench_executor_find_alternatives(c: &mut Criterion) {
         ] {
             let session = RecoverySession::new(1234, None, 10);
             group.bench_function(
-                BenchmarkId::new(
-                    "fresh",
-                    format!("{:?}_{:?}", action, category),
-                ),
+                BenchmarkId::new("fresh", format!("{:?}_{:?}", action, category)),
                 |b| {
                     b.iter(|| {
                         let alts = executor.find_alternatives(
@@ -297,20 +291,17 @@ fn bench_executor_find_alternatives(c: &mut Criterion) {
     // With prior attempts (budget partially consumed)
     for n_prior in [3, 8] {
         let session = make_session_with_attempts(n_prior);
-        group.bench_function(
-            BenchmarkId::new("with_attempts", n_prior),
-            |b| {
-                b.iter(|| {
-                    let alts = executor.find_alternatives(
-                        black_box(Action::Kill),
-                        black_box(FailureCategory::PermissionDenied),
-                        black_box(1234),
-                        black_box(&session),
-                    );
-                    black_box(alts.len());
-                })
-            },
-        );
+        group.bench_function(BenchmarkId::new("with_attempts", n_prior), |b| {
+            b.iter(|| {
+                let alts = executor.find_alternatives(
+                    black_box(Action::Kill),
+                    black_box(FailureCategory::PermissionDenied),
+                    black_box(1234),
+                    black_box(&session),
+                );
+                black_box(alts.len());
+            })
+        });
     }
 
     group.finish();
@@ -332,19 +323,16 @@ fn bench_executor_classify_failure(c: &mut Criterion) {
     ];
 
     for (kind, respawned, label) in &error_kinds {
-        group.bench_function(
-            BenchmarkId::new("error", *label),
-            |b| {
-                b.iter(|| {
-                    let cat = executor.classify_failure(
-                        black_box(kind),
-                        black_box(1234),
-                        black_box(*respawned),
-                    );
-                    black_box(cat);
-                })
-            },
-        );
+        group.bench_function(BenchmarkId::new("error", *label), |b| {
+            b.iter(|| {
+                let cat = executor.classify_failure(
+                    black_box(kind),
+                    black_box(1234),
+                    black_box(*respawned),
+                );
+                black_box(cat);
+            })
+        });
     }
 
     group.finish();
@@ -358,20 +346,17 @@ fn bench_executor_generate_hint(c: &mut Criterion) {
 
     for action in [Action::Kill, Action::Pause, Action::Throttle] {
         let session = RecoverySession::new(9999, None, 10);
-        group.bench_function(
-            BenchmarkId::new("action", format!("{:?}", action)),
-            |b| {
-                b.iter(|| {
-                    let hint = executor.generate_hint(
-                        black_box(action),
-                        black_box(FailureCategory::PermissionDenied),
-                        black_box(9999),
-                        black_box(&session),
-                    );
-                    black_box(hint.is_some());
-                })
-            },
-        );
+        group.bench_function(BenchmarkId::new("action", format!("{:?}", action)), |b| {
+            b.iter(|| {
+                let hint = executor.generate_hint(
+                    black_box(action),
+                    black_box(FailureCategory::PermissionDenied),
+                    black_box(9999),
+                    black_box(&session),
+                );
+                black_box(hint.is_some());
+            })
+        });
     }
 
     group.finish();

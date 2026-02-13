@@ -11,7 +11,9 @@ use pt_core::config::Policy;
 use pt_core::decision::dependency_loss::{
     compute_dependency_scaling, CriticalFileInflation, DependencyFactors, DependencyScaling,
 };
-use pt_core::decision::dro::{compute_adaptive_epsilon, compute_wasserstein_dro, decide_with_dro, DroTrigger};
+use pt_core::decision::dro::{
+    compute_adaptive_epsilon, compute_wasserstein_dro, decide_with_dro, DroTrigger,
+};
 use pt_core::decision::expected_loss::Action;
 use pt_core::decision::time_bound::{apply_time_bound, compute_t_max, TMaxInput};
 use pt_core::inference::ClassScores;
@@ -238,22 +240,10 @@ fn bench_dependency_impact_score(c: &mut Criterion) {
     let scaling = DependencyScaling::default();
 
     let scenarios = [
-        (
-            "isolated",
-            DependencyFactors::new(0, 0, 0, 0, 0),
-        ),
-        (
-            "moderate",
-            DependencyFactors::new(3, 5, 1, 10, 2),
-        ),
-        (
-            "heavy",
-            DependencyFactors::new(20, 50, 10, 100, 20),
-        ),
-        (
-            "overflow",
-            DependencyFactors::new(200, 500, 100, 1000, 200),
-        ),
+        ("isolated", DependencyFactors::new(0, 0, 0, 0, 0)),
+        ("moderate", DependencyFactors::new(3, 5, 1, 10, 2)),
+        ("heavy", DependencyFactors::new(20, 50, 10, 100, 20)),
+        ("overflow", DependencyFactors::new(200, 500, 100, 1000, 200)),
     ];
 
     for (name, factors) in &scenarios {
@@ -278,7 +268,8 @@ fn bench_dependency_scaling(c: &mut Criterion) {
             &base_loss,
             |b, &loss| {
                 b.iter(|| {
-                    let result = compute_dependency_scaling(black_box(loss), black_box(&factors), None);
+                    let result =
+                        compute_dependency_scaling(black_box(loss), black_box(&factors), None);
                     black_box(result.scaled_kill_loss);
                 })
             },
@@ -305,11 +296,17 @@ fn bench_critical_file_inflation(c: &mut Criterion) {
         ("empty", vec![]),
         (
             "single_hard",
-            vec![make_file(CriticalFileCategory::SqliteWal, DetectionStrength::Hard)],
+            vec![make_file(
+                CriticalFileCategory::SqliteWal,
+                DetectionStrength::Hard,
+            )],
         ),
         (
             "single_soft",
-            vec![make_file(CriticalFileCategory::OpenWrite, DetectionStrength::Soft)],
+            vec![make_file(
+                CriticalFileCategory::OpenWrite,
+                DetectionStrength::Soft,
+            )],
         ),
         (
             "mixed_5",
@@ -324,7 +321,12 @@ fn bench_critical_file_inflation(c: &mut Criterion) {
         (
             "many_hard_20",
             (0..20)
-                .map(|_| make_file(CriticalFileCategory::SystemPackageLock, DetectionStrength::Hard))
+                .map(|_| {
+                    make_file(
+                        CriticalFileCategory::SystemPackageLock,
+                        DetectionStrength::Hard,
+                    )
+                })
                 .collect(),
         ),
     ];

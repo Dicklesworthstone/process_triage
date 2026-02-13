@@ -60,18 +60,11 @@ fn bench_select_fdr(c: &mut Criterion) {
                     FdrMethod::None => "none",
                 };
                 group.bench_with_input(
-                    BenchmarkId::new(
-                        format!("{}_{}", name, method_str),
-                        n,
-                    ),
+                    BenchmarkId::new(format!("{}_{}", name, method_str), n),
                     candidates,
                     |b, cands| {
                         b.iter(|| {
-                            let result = select_fdr(
-                                black_box(cands),
-                                black_box(0.05),
-                                method,
-                            );
+                            let result = select_fdr(black_box(cands), black_box(0.05), method);
                             black_box(result.unwrap().selected_k);
                         })
                     },
@@ -112,15 +105,11 @@ fn bench_alpha_spend_for_wealth(c: &mut Criterion) {
         ("normal", 0.05),
         ("high", 1.0),
     ] {
-        group.bench_with_input(
-            BenchmarkId::new("compute", name),
-            &wealth,
-            |b, &w| {
-                b.iter(|| {
-                    black_box(policy.alpha_spend_for_wealth(black_box(w)));
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("compute", name), &wealth, |b, &w| {
+            b.iter(|| {
+                black_box(policy.alpha_spend_for_wealth(black_box(w)));
+            })
+        });
     }
 
     group.finish();
@@ -137,11 +126,7 @@ fn bench_fdr_alpha_sweep(c: &mut Criterion) {
             &alpha,
             |b, &a| {
                 b.iter(|| {
-                    let result = select_fdr(
-                        black_box(&candidates),
-                        black_box(a),
-                        FdrMethod::EBy,
-                    );
+                    let result = select_fdr(black_box(&candidates), black_box(a), FdrMethod::EBy);
                     black_box(result.unwrap().selected_k);
                 })
             },

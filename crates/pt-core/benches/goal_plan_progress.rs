@@ -41,7 +41,7 @@ fn make_outcomes(n: usize, expected_each: f64) -> Vec<ActionOutcome> {
         .map(|i| ActionOutcome {
             pid: i as u32 + 1,
             label: format!("proc-{}", i),
-            success: i % 5 != 0, // 80% success
+            success: i % 5 != 0,          // 80% success
             respawn_detected: i % 4 == 0, // 25% respawn
             expected_contribution: expected_each,
         })
@@ -227,24 +227,20 @@ fn bench_measure_progress(c: &mut Criterion) {
         };
         let outcomes = make_outcomes(n, 1_000_000_000.0 / n as f64);
 
-        group.bench_with_input(
-            BenchmarkId::new("outcomes", n),
-            &outcomes,
-            |b, outs| {
-                b.iter(|| {
-                    let report = measure_progress(
-                        GoalMetric::Memory,
-                        None,
-                        black_box(&before),
-                        black_box(&after),
-                        black_box(outs.clone()),
-                        black_box(&config),
-                        None,
-                    );
-                    black_box(report.classification);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("outcomes", n), &outcomes, |b, outs| {
+            b.iter(|| {
+                let report = measure_progress(
+                    GoalMetric::Memory,
+                    None,
+                    black_box(&before),
+                    black_box(&after),
+                    black_box(outs.clone()),
+                    black_box(&config),
+                    None,
+                );
+                black_box(report.classification);
+            })
+        });
     }
 
     // Discrepancy scenarios
@@ -258,11 +254,7 @@ fn bench_measure_progress(c: &mut Criterion) {
     };
 
     for (name, after, outcomes) in [
-        (
-            "no_effect",
-            no_change,
-            make_outcomes(3, 1_000_000_000.0),
-        ),
+        ("no_effect", no_change, make_outcomes(3, 1_000_000_000.0)),
         (
             "overperformance",
             overperform,

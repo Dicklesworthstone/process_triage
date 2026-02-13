@@ -124,6 +124,7 @@ pub enum DaemonEventType {
     EscalationStarted,
     EscalationCompleted,
     EscalationDeferred,
+    EscalationFailed,
     LockContention,
     OverheadBudgetExceeded,
     ConfigReloaded,
@@ -248,7 +249,12 @@ where
                 });
             }
             escalation::EscalationStatus::Failed => {
-                state.record_event(DaemonEventType::EscalationDeferred, &outcome.reason);
+                state.record_event(DaemonEventType::EscalationFailed, &outcome.reason);
+                events.push(DaemonEvent {
+                    timestamp: metrics.timestamp.clone(),
+                    event_type: DaemonEventType::EscalationFailed,
+                    detail: outcome.reason.clone(),
+                });
             }
         }
 
@@ -366,6 +372,36 @@ mod tests {
         assert!(outcome.escalation.is_some());
         assert_eq!(state.deferred_count, 1);
         assert_eq!(state.escalation_count, 0);
+    }
+
+    #[test]
+    fn test_tick_failed_escalation_emits_failed_event() {
+        let mut config = DaemonConfig::default();
+        config.triggers.load_threshold = 2.0;
+        config.triggers.sustained_ticks = 1;
+        let mut state = DaemonState::new();
+        let mut trig_state = triggers::TriggerState::new(&config.triggers);
+
+        let metrics = test_metrics(10.0, 2000, 5);
+        let outcome = process_tick(
+            &config,
+            &mut state,
+            &mut trig_state,
+            &metrics,
+            &mut |_, _| escalation::EscalationOutcome {
+                status: escalation::EscalationStatus::Failed,
+                reason: "escalation failed".to_string(),
+                session_id: None,
+            },
+        );
+
+        assert!(outcome.escalation.is_some());
+        assert_eq!(state.deferred_count, 0);
+        assert_eq!(state.escalation_count, 0);
+        assert!(outcome
+            .events
+            .iter()
+            .any(|event| event.event_type == DaemonEventType::EscalationFailed));
     }
 
     #[test]

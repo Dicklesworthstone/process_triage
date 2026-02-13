@@ -467,9 +467,12 @@ install_binary() {
 
         # Create backup of existing binary for rollback
         local backup_file="${dest_file}.bak"
-        if cp "$dest_file" "$backup_file" 2>/dev/null; then
-            log_info "Backed up existing ${binary_name} to ${backup_file}"
+        if ! cp "$dest_file" "$backup_file" 2>/dev/null; then
+            log_error "Failed to back up existing ${binary_name} to ${backup_file}"
+            log_error "Aborting install to preserve rollback safety"
+            return 1
         fi
+        log_info "Backed up existing ${binary_name} to ${backup_file}"
     fi
 
     # Make source executable before moving

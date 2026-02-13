@@ -14,7 +14,7 @@ use pt_core::config::priors::{
 use pt_core::decision::cvar::CvarTrigger;
 use pt_core::decision::dro::DroTrigger;
 use pt_core::decision::expected_loss::{
-    decide_action, decide_action_with_recovery, apply_dro_control, apply_risk_sensitive_control,
+    apply_dro_control, apply_risk_sensitive_control, decide_action, decide_action_with_recovery,
     ActionFeasibility,
 };
 use pt_core::decision::goal_contribution::{
@@ -172,12 +172,9 @@ fn bench_decide_action(c: &mut Criterion) {
             &posterior,
             |b, post| {
                 b.iter(|| {
-                    let outcome = decide_action(
-                        black_box(post),
-                        black_box(&policy),
-                        black_box(&feasibility),
-                    )
-                    .unwrap();
+                    let outcome =
+                        decide_action(black_box(post), black_box(&policy), black_box(&feasibility))
+                            .unwrap();
                     black_box(outcome.optimal_action);
                 })
             },
@@ -310,25 +307,20 @@ fn bench_risk_sensitive_control(c: &mut Criterion) {
 
     for (name, trigger) in &triggers {
         let posterior = ambiguous_posterior();
-        let outcome =
-            decide_action(&posterior, &policy, &feasibility).unwrap();
+        let outcome = decide_action(&posterior, &policy, &feasibility).unwrap();
 
-        group.bench_with_input(
-            BenchmarkId::new("apply", *name),
-            trigger,
-            |b, trig| {
-                b.iter(|| {
-                    let result = apply_risk_sensitive_control(
-                        black_box(outcome.clone()),
-                        black_box(&posterior),
-                        black_box(&policy),
-                        black_box(trig),
-                        black_box(0.95),
-                    );
-                    black_box(result.optimal_action);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("apply", *name), trigger, |b, trig| {
+            b.iter(|| {
+                let result = apply_risk_sensitive_control(
+                    black_box(outcome.clone()),
+                    black_box(&posterior),
+                    black_box(&policy),
+                    black_box(trig),
+                    black_box(0.95),
+                );
+                black_box(result.optimal_action);
+            })
+        });
     }
 
     group.finish();
@@ -372,25 +364,20 @@ fn bench_dro_control(c: &mut Criterion) {
 
     for (name, trigger) in &triggers {
         let posterior = ambiguous_posterior();
-        let outcome =
-            decide_action(&posterior, &policy, &feasibility).unwrap();
+        let outcome = decide_action(&posterior, &policy, &feasibility).unwrap();
 
-        group.bench_with_input(
-            BenchmarkId::new("apply", *name),
-            trigger,
-            |b, trig| {
-                b.iter(|| {
-                    let result = apply_dro_control(
-                        black_box(outcome.clone()),
-                        black_box(&posterior),
-                        black_box(&policy),
-                        black_box(trig),
-                        black_box(0.15),
-                    );
-                    black_box(result.optimal_action);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("apply", *name), trigger, |b, trig| {
+            b.iter(|| {
+                let result = apply_dro_control(
+                    black_box(outcome.clone()),
+                    black_box(&posterior),
+                    black_box(&policy),
+                    black_box(trig),
+                    black_box(0.15),
+                );
+                black_box(result.optimal_action);
+            })
+        });
     }
 
     group.finish();
@@ -422,16 +409,12 @@ fn bench_estimate_memory(c: &mut Criterion) {
     ];
 
     for (name, candidate) in &candidates {
-        group.bench_with_input(
-            BenchmarkId::new("estimate", *name),
-            candidate,
-            |b, cand| {
-                b.iter(|| {
-                    let contrib = estimate_memory_contribution(black_box(cand));
-                    black_box(contrib.expected);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("estimate", *name), candidate, |b, cand| {
+            b.iter(|| {
+                let contrib = estimate_memory_contribution(black_box(cand));
+                black_box(contrib.expected);
+            })
+        });
     }
 
     group.finish();
@@ -452,16 +435,12 @@ fn bench_estimate_cpu(c: &mut Criterion) {
             },
         ),
     ] {
-        group.bench_with_input(
-            BenchmarkId::new("estimate", name),
-            &candidate,
-            |b, cand| {
-                b.iter(|| {
-                    let contrib = estimate_cpu_contribution(black_box(cand));
-                    black_box(contrib.expected);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("estimate", name), &candidate, |b, cand| {
+            b.iter(|| {
+                let contrib = estimate_cpu_contribution(black_box(cand));
+                black_box(contrib.expected);
+            })
+        });
     }
 
     group.finish();
@@ -514,16 +493,12 @@ fn bench_estimate_fd(c: &mut Criterion) {
             },
         ),
     ] {
-        group.bench_with_input(
-            BenchmarkId::new("estimate", name),
-            &candidate,
-            |b, cand| {
-                b.iter(|| {
-                    let contrib = estimate_fd_contribution(black_box(cand));
-                    black_box(contrib.expected);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("estimate", name), &candidate, |b, cand| {
+            b.iter(|| {
+                let contrib = estimate_fd_contribution(black_box(cand));
+                black_box(contrib.expected);
+            })
+        });
     }
 
     group.finish();
@@ -575,10 +550,7 @@ fn bench_goal_canonical(c: &mut Criterion) {
             "and_3",
             parse_goal("free 4GB RAM AND release port 8080 AND free 100 FDs").unwrap(),
         ),
-        (
-            "or_2",
-            parse_goal("free 2GB RAM OR free 20% CPU").unwrap(),
-        ),
+        ("or_2", parse_goal("free 2GB RAM OR free 20% CPU").unwrap()),
     ];
 
     for (name, goal) in &goals {

@@ -6,9 +6,7 @@ use pt_core::inference::compound_poisson::{
     BurstEvent, CompoundPoissonAnalyzer, CompoundPoissonConfig,
 };
 use pt_core::inference::hsmm::{HsmmAnalyzer, HsmmConfig, HsmmState};
-use pt_core::inference::robust::{
-    CredalSet, MinimaxConfig, MinimaxGate, RobustConfig, RobustGate,
-};
+use pt_core::inference::robust::{CredalSet, MinimaxConfig, MinimaxGate, RobustConfig, RobustGate};
 use pt_core::inference::{compute_posterior, CpuEvidence, Evidence};
 
 fn cpu_evidence_strategy() -> impl Strategy<Value = CpuEvidence> {

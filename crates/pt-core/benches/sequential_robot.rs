@@ -135,21 +135,14 @@ fn bench_prioritize_by_esn(c: &mut Criterion) {
             })
             .collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("mixed", n),
-            &candidates,
-            |b, cands| {
-                b.iter(|| {
-                    let ranked = prioritize_by_esn(
-                        black_box(cands),
-                        black_box(&policy),
-                        black_box(&cost_model),
-                    )
-                    .unwrap();
-                    black_box(ranked.len());
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("mixed", n), &candidates, |b, cands| {
+            b.iter(|| {
+                let ranked =
+                    prioritize_by_esn(black_box(cands), black_box(&policy), black_box(&cost_model))
+                        .unwrap();
+                black_box(ranked.len());
+            })
+        });
     }
 
     group.finish();
@@ -263,29 +256,25 @@ fn bench_check_candidate_batch(c: &mut Criterion) {
             })
             .collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("batch", n),
-            &candidates,
-            |b, cands| {
-                b.iter(|| {
-                    let checker = ConstraintChecker::new(constraints.clone());
-                    let mut allowed = 0u32;
-                    for cand in black_box(cands) {
-                        let result = checker.check_candidate(cand);
-                        if result.allowed {
-                            allowed += 1;
-                            if cand.is_kill_action {
-                                checker.record_action(
-                                    (cand.memory_mb.unwrap_or(0.0) * 1024.0 * 1024.0) as u64,
-                                    true,
-                                );
-                            }
+        group.bench_with_input(BenchmarkId::new("batch", n), &candidates, |b, cands| {
+            b.iter(|| {
+                let checker = ConstraintChecker::new(constraints.clone());
+                let mut allowed = 0u32;
+                for cand in black_box(cands) {
+                    let result = checker.check_candidate(cand);
+                    if result.allowed {
+                        allowed += 1;
+                        if cand.is_kill_action {
+                            checker.record_action(
+                                (cand.memory_mb.unwrap_or(0.0) * 1024.0 * 1024.0) as u64,
+                                true,
+                            );
                         }
                     }
-                    black_box(allowed);
-                })
-            },
-        );
+                }
+                black_box(allowed);
+            })
+        });
     }
 
     group.finish();

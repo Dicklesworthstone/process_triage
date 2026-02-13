@@ -6,13 +6,9 @@
 //! — runtime safety-gating hotpaths.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use pt_core::decision::mem_pressure::{
-    MemPressureConfig, MemPressureMonitor, MemorySignals,
-};
+use pt_core::decision::mem_pressure::{MemPressureConfig, MemPressureMonitor, MemorySignals};
 use pt_core::decision::rate_limit::{RateLimitConfig, SlidingWindowRateLimiter};
-use pt_core::decision::respawn_loop::{
-    discount_kill_utility, RespawnLoopConfig, RespawnTracker,
-};
+use pt_core::decision::respawn_loop::{discount_kill_utility, RespawnLoopConfig, RespawnTracker};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -139,10 +135,7 @@ fn bench_rate_limit_check(c: &mut Criterion) {
     let mut group = c.benchmark_group("rate_limit/check");
 
     let configs = [
-        (
-            "default",
-            RateLimitConfig::default_conservative(),
-        ),
+        ("default", RateLimitConfig::default_conservative()),
         (
             "tight",
             RateLimitConfig {
@@ -164,32 +157,23 @@ fn bench_rate_limit_check(c: &mut Criterion) {
     ];
 
     for (name, config) in &configs {
-        let limiter =
-            SlidingWindowRateLimiter::new(config.clone(), None::<&str>).unwrap();
+        let limiter = SlidingWindowRateLimiter::new(config.clone(), None::<&str>).unwrap();
 
         // Fresh check (no kills recorded)
-        group.bench_with_input(
-            BenchmarkId::new("fresh", *name),
-            &limiter,
-            |b, lim| {
-                b.iter(|| {
-                    let result = lim.check(black_box(false)).unwrap();
-                    black_box(result.allowed);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("fresh", *name), &limiter, |b, lim| {
+            b.iter(|| {
+                let result = lim.check(black_box(false)).unwrap();
+                black_box(result.allowed);
+            })
+        });
 
         // Force mode
-        group.bench_with_input(
-            BenchmarkId::new("force", *name),
-            &limiter,
-            |b, lim| {
-                b.iter(|| {
-                    let result = lim.check(black_box(true)).unwrap();
-                    black_box(result.allowed);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("force", *name), &limiter, |b, lim| {
+            b.iter(|| {
+                let result = lim.check(black_box(true)).unwrap();
+                black_box(result.allowed);
+            })
+        });
     }
 
     group.finish();
@@ -198,11 +182,9 @@ fn bench_rate_limit_check(c: &mut Criterion) {
 fn bench_rate_limit_check_with_override(c: &mut Criterion) {
     let mut group = c.benchmark_group("rate_limit/check_override");
 
-    let limiter = SlidingWindowRateLimiter::new(
-        RateLimitConfig::default_conservative(),
-        None::<&str>,
-    )
-    .unwrap();
+    let limiter =
+        SlidingWindowRateLimiter::new(RateLimitConfig::default_conservative(), None::<&str>)
+            .unwrap();
 
     for override_val in [None, Some(5), Some(50)] {
         let label = match override_val {
@@ -211,10 +193,9 @@ fn bench_rate_limit_check_with_override(c: &mut Criterion) {
         };
         group.bench_function(BenchmarkId::new("check", &label), |b| {
             b.iter(|| {
-                let result = limiter.check_with_override(
-                    black_box(false),
-                    black_box(override_val),
-                ).unwrap();
+                let result = limiter
+                    .check_with_override(black_box(false), black_box(override_val))
+                    .unwrap();
                 black_box(result.allowed);
             })
         });
@@ -281,8 +262,8 @@ fn bench_detect_loop(c: &mut Criterion) {
                     "nginx-1234".to_string(),
                     Some("nginx.service".to_string()),
                     None,
-                    (i * 10) as f64,      // kill_ts
-                    (i * 10 + 2) as f64,  // respawn_ts (2s delay)
+                    (i * 10) as f64,     // kill_ts
+                    (i * 10 + 2) as f64, // respawn_ts (2s delay)
                     None,
                 );
             }
@@ -373,10 +354,8 @@ fn bench_discount_kill_utility(c: &mut Criterion) {
                 detection,
                 |b, det| {
                     b.iter(|| {
-                        let discounted = discount_kill_utility(
-                            black_box(base_utility),
-                            black_box(det),
-                        );
+                        let discounted =
+                            discount_kill_utility(black_box(base_utility), black_box(det));
                         black_box(discounted);
                     })
                 },

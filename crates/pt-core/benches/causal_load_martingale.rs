@@ -14,13 +14,13 @@ use pt_core::decision::causal_interventions::{
     apply_outcome, expected_recovery, expected_recovery_by_action, InterventionOutcome,
     ProcessClass,
 };
+use pt_core::decision::fdr_selection::TargetIdentity;
 use pt_core::decision::load_aware::{
     apply_load_to_loss_matrix, compute_load_adjustment, LoadAdjustment, LoadSignals,
 };
 use pt_core::decision::martingale_gates::{
     apply_martingale_gates, resolve_alpha, MartingaleGateCandidate, MartingaleGateConfig,
 };
-use pt_core::decision::fdr_selection::TargetIdentity;
 use pt_core::inference::martingale::{MartingaleAnalyzer, MartingaleConfig};
 use pt_core::inference::ClassScores;
 
@@ -199,10 +199,30 @@ fn bench_apply_outcome(c: &mut Criterion) {
     let interventions = priors.causal_interventions.as_ref().unwrap();
 
     for (name, action, class, recovered) in [
-        ("pause_useful_success", pt_core::decision::Action::Pause, ProcessClass::Useful, true),
-        ("pause_zombie_failure", pt_core::decision::Action::Pause, ProcessClass::Zombie, false),
-        ("kill_abandoned_success", pt_core::decision::Action::Kill, ProcessClass::Abandoned, true),
-        ("restart_useful_bad_failure", pt_core::decision::Action::Restart, ProcessClass::UsefulBad, false),
+        (
+            "pause_useful_success",
+            pt_core::decision::Action::Pause,
+            ProcessClass::Useful,
+            true,
+        ),
+        (
+            "pause_zombie_failure",
+            pt_core::decision::Action::Pause,
+            ProcessClass::Zombie,
+            false,
+        ),
+        (
+            "kill_abandoned_success",
+            pt_core::decision::Action::Kill,
+            ProcessClass::Abandoned,
+            true,
+        ),
+        (
+            "restart_useful_bad_failure",
+            pt_core::decision::Action::Restart,
+            ProcessClass::UsefulBad,
+            false,
+        ),
     ] {
         let outcome = InterventionOutcome {
             action,
@@ -338,8 +358,10 @@ fn bench_apply_load_to_loss_matrix(c: &mut Criterion) {
     for (name, adj) in &adjustments {
         group.bench_with_input(BenchmarkId::new("apply", *name), adj, |b, adjustment| {
             b.iter(|| {
-                let adjusted =
-                    apply_load_to_loss_matrix(black_box(&policy.loss_matrix), black_box(adjustment));
+                let adjusted = apply_load_to_loss_matrix(
+                    black_box(&policy.loss_matrix),
+                    black_box(adjustment),
+                );
                 black_box(adjusted.useful.kill);
             })
         });
@@ -393,22 +415,18 @@ fn bench_apply_martingale_gates(c: &mut Criterion) {
 
     for n in [1, 5, 10, 25] {
         let candidates = make_candidates(n);
-        group.bench_with_input(
-            BenchmarkId::new("mixed", n),
-            &candidates,
-            |b, cands| {
-                b.iter(|| {
-                    let summary = apply_martingale_gates(
-                        black_box(cands),
-                        black_box(&policy),
-                        black_box(&config),
-                        None,
-                    )
-                    .unwrap();
-                    black_box(summary.results.len());
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("mixed", n), &candidates, |b, cands| {
+            b.iter(|| {
+                let summary = apply_martingale_gates(
+                    black_box(cands),
+                    black_box(&policy),
+                    black_box(&config),
+                    None,
+                )
+                .unwrap();
+                black_box(summary.results.len());
+            })
+        });
     }
 
     // All high-e-value candidates
@@ -424,22 +442,18 @@ fn bench_apply_martingale_gates(c: &mut Criterion) {
             })
             .collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("all_high", n),
-            &candidates,
-            |b, cands| {
-                b.iter(|| {
-                    let summary = apply_martingale_gates(
-                        black_box(cands),
-                        black_box(&policy),
-                        black_box(&config),
-                        None,
-                    )
-                    .unwrap();
-                    black_box(summary.results.len());
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("all_high", n), &candidates, |b, cands| {
+            b.iter(|| {
+                let summary = apply_martingale_gates(
+                    black_box(cands),
+                    black_box(&policy),
+                    black_box(&config),
+                    None,
+                )
+                .unwrap();
+                black_box(summary.results.len());
+            })
+        });
     }
 
     group.finish();

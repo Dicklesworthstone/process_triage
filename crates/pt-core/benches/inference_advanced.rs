@@ -12,9 +12,7 @@ use pt_core::inference::compound_poisson::{
     BurstEvent, CompoundPoissonAnalyzer, CompoundPoissonConfig,
 };
 use pt_core::inference::hsmm::{HsmmAnalyzer, HsmmConfig};
-use pt_core::inference::robust::{
-    CredalSet, MinimaxConfig, MinimaxGate, RobustConfig, RobustGate,
-};
+use pt_core::inference::robust::{CredalSet, MinimaxConfig, MinimaxGate, RobustConfig, RobustGate};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -30,13 +28,7 @@ fn make_observations(n: usize, features: usize) -> Vec<Vec<f64>> {
 
 fn make_burst_events(n: usize) -> Vec<BurstEvent> {
     (0..n)
-        .map(|i| {
-            BurstEvent::new(
-                i as f64 * 5.0,
-                10.0 + (i as f64 * 3.7) % 50.0,
-                None,
-            )
-        })
+        .map(|i| BurstEvent::new(i as f64 * 5.0, 10.0 + (i as f64 * 3.7) % 50.0, None))
         .collect()
 }
 
@@ -258,9 +250,7 @@ fn bench_minimax_gate(c: &mut Criterion) {
 
     // Varying number of classes
     for n_classes in [2, 4, 8] {
-        let loss_row: Vec<f64> = (0..n_classes)
-            .map(|i| 1.0 + i as f64 * 2.0)
-            .collect();
+        let loss_row: Vec<f64> = (0..n_classes).map(|i| 1.0 + i as f64 * 2.0).collect();
         let credal_sets = make_credal_sets(n_classes);
 
         group.bench_function(BenchmarkId::new("is_safe", n_classes), |b| {
@@ -274,9 +264,7 @@ fn bench_minimax_gate(c: &mut Criterion) {
 
     // LFP computation
     for n_classes in [2, 4] {
-        let loss_row: Vec<f64> = (0..n_classes)
-            .map(|i| 1.0 + i as f64 * 3.0)
-            .collect();
+        let loss_row: Vec<f64> = (0..n_classes).map(|i| 1.0 + i as f64 * 3.0).collect();
         let credal_sets = make_credal_sets(n_classes);
         let class_names: Vec<&str> = (0..n_classes)
             .map(|i| match i {
@@ -339,17 +327,13 @@ fn bench_cp_observe(c: &mut Criterion) {
     // Batch observation
     for n in [10, 50, 100, 500] {
         let events = make_burst_events(n);
-        group.bench_with_input(
-            BenchmarkId::new("batch", n),
-            &events,
-            |b, evts| {
-                b.iter(|| {
-                    let mut analyzer = CompoundPoissonAnalyzer::new(config.clone());
-                    analyzer.observe_batch(black_box(evts));
-                    black_box(analyzer.event_count());
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("batch", n), &events, |b, evts| {
+            b.iter(|| {
+                let mut analyzer = CompoundPoissonAnalyzer::new(config.clone());
+                analyzer.observe_batch(black_box(evts));
+                black_box(analyzer.event_count());
+            })
+        });
     }
 
     group.finish();

@@ -2759,6 +2759,54 @@ fn session_progress_emitter(
     )))
 }
 
+struct SessionLifecycle {
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+    finished: bool,
+}
+
+impl SessionLifecycle {
+    fn start(
+        global: &GlobalOpts,
+        handle: &pt_core::session::SessionHandle,
+        session_id: &SessionId,
+    ) -> Self {
+        let emitter = session_progress_emitter(global, handle, session_id);
+        if let Some(ref emitter_ref) = emitter {
+            emitter_ref.emit(ProgressEvent::new(
+                pt_core::events::event_names::SESSION_STARTED,
+                Phase::Session,
+            ));
+        }
+        Self {
+            emitter,
+            finished: false,
+        }
+    }
+
+    fn emitter(&self) -> Option<Arc<dyn ProgressEmitter>> {
+        self.emitter.clone()
+    }
+
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(ref emitter_ref) = self.emitter {
+            emitter_ref.emit(ProgressEvent::new(
+                pt_core::events::event_names::SESSION_ENDED,
+                Phase::Session,
+            ));
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for SessionLifecycle {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
     let ctx = LogContext::new(
         pt_core::logging::generate_run_id(),
@@ -10061,14 +10109,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         None
     };
 
-    // Progress emitter for streaming updates + session log
-    let emitter = session_progress_emitter(global, &handle, &session_id);
-    if let Some(ref e) = emitter {
-        e.emit(ProgressEvent::new(
-            pt_core::events::event_names::SESSION_STARTED,
-            Phase::Session,
-        ));
-    }
+    // Progress emitter for streaming updates + session log.
+    // Emits SESSION_STARTED immediately and guarantees SESSION_ENDED on all exits.
+    let session_lifecycle = SessionLifecycle::start(global, &handle, &session_id);
+    let emitter = session_lifecycle.emitter();
 
     // Perform quick scan to enumerate processes (with timing)
     let scan_start = std::time::Instant::now();
@@ -10968,12 +11012,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             expected_memory_freed_gb,
         );
         println!("{}", narrative);
-        if let Some(ref e) = emitter {
-            e.emit(ProgressEvent::new(
-                pt_core::events::event_names::SESSION_ENDED,
-                Phase::Session,
-            ));
-        }
         return if candidates.is_empty() {
             ExitCode::Clean
         } else {
@@ -11130,13 +11168,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 println!("- PID {}: {} ({}) → {}", pid, cmd, class, action);
             }
         }
-    }
-
-    if let Some(ref e) = emitter {
-        e.emit(ProgressEvent::new(
-            pt_core::events::event_names::SESSION_ENDED,
-            Phase::Session,
-        ));
     }
 
     // Return appropriate exit code
@@ -11806,13 +11837,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }
     };
 
-    let emitter = session_progress_emitter(global, &handle, &sid);
-    if let Some(ref e) = emitter {
-        e.emit(ProgressEvent::new(
-            pt_core::events::event_names::SESSION_STARTED,
-            Phase::Session,
-        ));
-    }
+    let session_lifecycle = SessionLifecycle::start(global, &handle, &sid);
+    let emitter = session_lifecycle.emitter();
 
     // Load the plan from decision/plan.json
     let plan_path = handle.dir.join("decision").join("plan.json");
@@ -11908,12 +11934,6 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     if target_pids.is_empty() {
-        if let Some(ref e) = emitter {
-            e.emit(ProgressEvent::new(
-                pt_core::events::event_names::SESSION_ENDED,
-                Phase::Session,
-            ));
-        }
         output_apply_nothing(global, &sid);
         return ExitCode::Clean;
     }
@@ -11926,12 +11946,6 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .filter(|a| !completed_action_ids.contains(&a.action_id))
         .collect();
     if actions_to_apply.is_empty() {
-        if let Some(ref e) = emitter {
-            e.emit(ProgressEvent::new(
-                pt_core::events::event_names::SESSION_ENDED,
-                Phase::Session,
-            ));
-        }
         output_apply_nothing(global, &sid);
         return ExitCode::Clean;
     }
@@ -12688,28 +12702,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     if (blocked_by_constraints + blocked_by_prechecks) > 0 && succeeded == 0 && failed == 0 {
-        if let Some(ref e) = emitter {
-            e.emit(ProgressEvent::new(
-                pt_core::events::event_names::SESSION_ENDED,
-                Phase::Session,
-            ));
-        }
         ExitCode::PolicyBlocked
     } else if failed > 0 {
-        if let Some(ref e) = emitter {
-            e.emit(ProgressEvent::new(
-                pt_core::events::event_names::SESSION_ENDED,
-                Phase::Session,
-            ));
-        }
         ExitCode::PartialFail
     } else {
-        if let Some(ref e) = emitter {
-            e.emit(ProgressEvent::new(
-                pt_core::events::event_names::SESSION_ENDED,
-                Phase::Session,
-            ));
-        }
         ExitCode::ActionsOk
     }
 }

@@ -7,6 +7,7 @@ use pt_core::config::priors::{
     BetaParams, CausalInterventions, ClassParams, ClassPriors, GammaParams, InterventionPriors,
     Priors,
 };
+use pt_core::decision::alpha_investing::AlphaInvestingPolicy;
 use pt_core::decision::causal_interventions::{
     expected_recovery, expected_recovery_by_action, update_beta,
 };
@@ -14,17 +15,29 @@ use pt_core::decision::composite_test::{
     glr_bernoulli, mixture_sprt_bernoulli, mixture_sprt_beta_sequential, needs_composite_test,
     GlrConfig, MixtureSprtConfig, MixtureSprtState,
 };
+use pt_core::decision::cvar::{compute_cvar, decide_with_cvar, CvarTrigger};
 use pt_core::decision::dependency_loss::{
-    compute_dependency_scaling, CriticalFileInflation, DependencyFactors, DependencyScaling,
-    scale_kill_loss, should_block_kill,
+    compute_dependency_scaling, scale_kill_loss, should_block_kill, CriticalFileInflation,
+    DependencyFactors, DependencyScaling,
 };
 use pt_core::decision::dro::{
     apply_dro_gate, compute_adaptive_epsilon, compute_wasserstein_dro, decide_with_dro,
     is_de_escalation, DroTrigger,
 };
+use pt_core::decision::escalation::{
+    EscalationConfig, EscalationManager, EscalationTrigger, Severity, TriggerType,
+};
 use pt_core::decision::expected_loss::{
-    apply_dro_control, apply_risk_sensitive_control, decide_action_with_recovery,
-    ActionFeasibility,
+    apply_dro_control, apply_risk_sensitive_control, decide_action_with_recovery, ActionFeasibility,
+};
+use pt_core::decision::fdr_selection::TargetIdentity;
+use pt_core::decision::fdr_selection::{by_correction_factor, select_fdr, FdrCandidate, FdrMethod};
+use pt_core::decision::fleet_fdr::{FleetFdrConfig, FleetFdrCoordinator};
+use pt_core::decision::fleet_pattern::{
+    correlate_fleet_patterns, FleetPatternConfig, PatternObservation,
+};
+use pt_core::decision::fleet_registry::{
+    FleetRegistry, FleetRegistryConfig, Heartbeat, HostCapabilities, HostRole,
 };
 use pt_core::decision::goal_contribution::{
     estimate_cpu_contribution, estimate_fd_contribution, estimate_memory_contribution,
@@ -35,11 +48,6 @@ use pt_core::decision::goal_plan::{optimize_goal_plan, PlanCandidate, PlanConstr
 use pt_core::decision::goal_progress::{
     measure_progress, ActionOutcome, GoalMetric, MetricSnapshot, ProgressConfig,
 };
-use pt_core::decision::mem_pressure::{MemPressureConfig, MemPressureMonitor, MemorySignals};
-use pt_core::decision::rate_limit::{RateLimitConfig, SlidingWindowRateLimiter};
-use pt_core::decision::respawn_loop::{
-    discount_kill_utility, RespawnLoopConfig, RespawnLoopDetection, RespawnTracker,
-};
 use pt_core::decision::load_aware::{
     apply_load_to_loss_matrix, compute_load_adjustment, LoadAdjustment, LoadSignals,
 };
@@ -47,36 +55,25 @@ use pt_core::decision::martingale_gates::{
     apply_martingale_gates, resolve_alpha, AlphaSource, MartingaleGateCandidate,
     MartingaleGateConfig,
 };
-use pt_core::decision::fdr_selection::TargetIdentity;
+use pt_core::decision::mem_pressure::{MemPressureConfig, MemPressureMonitor, MemorySignals};
 use pt_core::decision::myopic_policy::{compute_loss_table, decide_from_belief};
+use pt_core::decision::rate_limit::{RateLimitConfig, SlidingWindowRateLimiter};
+use pt_core::decision::respawn_loop::{
+    discount_kill_utility, RespawnLoopConfig, RespawnLoopDetection, RespawnTracker,
+};
 use pt_core::decision::robot_constraints::{
     ConstraintChecker, ConstraintKind, RobotCandidate, RuntimeRobotConstraints,
 };
 use pt_core::decision::sequential::{decide_sequential, prioritize_by_esn, EsnCandidate};
+use pt_core::decision::submodular::{
+    coverage_utility, greedy_select_k, greedy_select_with_budget, FeatureKey, ProbeProfile,
+};
 use pt_core::decision::time_bound::{apply_time_bound, compute_t_max, TMaxInput};
 use pt_core::decision::{
     compute_voi, decide_action, select_probe_by_information_gain, Action, ProbeCostModel, ProbeType,
 };
 use pt_core::inference::belief_state::BeliefState;
 use pt_core::inference::martingale::{MartingaleAnalyzer, MartingaleConfig};
-use pt_core::decision::alpha_investing::AlphaInvestingPolicy;
-use pt_core::decision::cvar::{compute_cvar, decide_with_cvar, CvarTrigger};
-use pt_core::decision::fdr_selection::{
-    by_correction_factor, select_fdr, FdrCandidate, FdrMethod,
-};
-use pt_core::decision::submodular::{
-    coverage_utility, greedy_select_k, greedy_select_with_budget, FeatureKey, ProbeProfile,
-};
-use pt_core::decision::escalation::{
-    EscalationConfig, EscalationManager, EscalationTrigger, Severity, TriggerType,
-};
-use pt_core::decision::fleet_fdr::{FleetFdrConfig, FleetFdrCoordinator};
-use pt_core::decision::fleet_pattern::{
-    correlate_fleet_patterns, FleetPatternConfig, PatternObservation,
-};
-use pt_core::decision::fleet_registry::{
-    FleetRegistry, FleetRegistryConfig, Heartbeat, HostCapabilities, HostRole,
-};
 use pt_core::inference::ClassScores;
 use std::collections::HashMap;
 
@@ -1973,10 +1970,7 @@ fn category_strategy() -> impl Strategy<Value = CriticalFileCategory> {
 
 /// Strategy for DetectionStrength.
 fn strength_strategy() -> impl Strategy<Value = DetectionStrength> {
-    prop_oneof![
-        Just(DetectionStrength::Hard),
-        Just(DetectionStrength::Soft),
-    ]
+    prop_oneof![Just(DetectionStrength::Hard), Just(DetectionStrength::Soft),]
 }
 
 proptest! {
@@ -2191,7 +2185,11 @@ fn default_class_params() -> ClassParams {
     ClassParams {
         prior_prob: 0.25,
         cpu_beta: BetaParams::new(1.0, 1.0),
-        runtime_gamma: Some(GammaParams { shape: 1.0, rate: 1.0, comment: None }),
+        runtime_gamma: Some(GammaParams {
+            shape: 1.0,
+            rate: 1.0,
+            comment: None,
+        }),
         orphan_beta: BetaParams::new(1.0, 1.0),
         tty_beta: BetaParams::new(1.0, 1.0),
         net_beta: BetaParams::new(1.0, 1.0),
@@ -2604,19 +2602,28 @@ proptest! {
 
 fn contribution_candidate_strategy() -> impl Strategy<Value = ContributionCandidate> {
     (
-        1u32..65535,                  // pid
-        1u64..10_000_000_000,         // rss_bytes
-        proptest::option::of(1u64..10_000_000_000), // uss_bytes
-        0.0f64..2.0,                  // cpu_frac
-        0u32..10000,                  // fd_count
+        1u32..65535,                                      // pid
+        1u64..10_000_000_000,                             // rss_bytes
+        proptest::option::of(1u64..10_000_000_000),       // uss_bytes
+        0.0f64..2.0,                                      // cpu_frac
+        0u32..10000,                                      // fd_count
         proptest::collection::vec(1u16..=65535u16, 0..5), // bound_ports
-        0.0f64..1.0,                  // respawn_probability
-        proptest::bool::ANY,          // has_shared_memory
-        0usize..50,                   // child_count
+        0.0f64..1.0,                                      // respawn_probability
+        proptest::bool::ANY,                              // has_shared_memory
+        0usize..50,                                       // child_count
     )
         .prop_map(
-            |(pid, rss_bytes, uss_bytes, cpu_frac, fd_count, bound_ports,
-              respawn_probability, has_shared_memory, child_count)| {
+            |(
+                pid,
+                rss_bytes,
+                uss_bytes,
+                cpu_frac,
+                fd_count,
+                bound_ports,
+                respawn_probability,
+                has_shared_memory,
+                child_count,
+            )| {
                 ContributionCandidate {
                     pid,
                     rss_bytes,
@@ -2763,12 +2770,12 @@ proptest! {
 
 fn memory_signals_strategy() -> impl Strategy<Value = MemorySignals> {
     (
-        1u64..100_000_000_000,       // total_bytes (1B to 100GB)
-        0.0f64..1.0,                 // used_fraction
-        0u64..50_000_000_000,        // swap_total
-        0.0f64..1.0,                 // swap_fraction
+        1u64..100_000_000_000,               // total_bytes (1B to 100GB)
+        0.0f64..1.0,                         // used_fraction
+        0u64..50_000_000_000,                // swap_total
+        0.0f64..1.0,                         // swap_fraction
         proptest::option::of(0.0f64..100.0), // psi_some10
-        0.0f64..10000.0,             // timestamp
+        0.0f64..10000.0,                     // timestamp
     )
         .prop_map(|(total, used_frac, swap_total, swap_frac, psi, ts)| {
             let used = (total as f64 * used_frac) as u64;
@@ -3033,15 +3040,15 @@ proptest! {
 
 fn plan_candidate_strategy() -> impl Strategy<Value = PlanCandidate> {
     (
-        1u32..10000,                    // pid
-        0.1f64..1000.0,                 // expected_contribution
-        0.1f64..1.0,                    // confidence
-        0.01f64..5.0,                   // risk
-        proptest::bool::ANY,            // is_protected
-        1000u32..2000,                  // uid
+        1u32..10000,         // pid
+        0.1f64..1000.0,      // expected_contribution
+        0.1f64..1.0,         // confidence
+        0.01f64..5.0,        // risk
+        proptest::bool::ANY, // is_protected
+        1000u32..2000,       // uid
     )
-        .prop_map(|(pid, expected_contribution, confidence, risk, is_protected, uid)| {
-            PlanCandidate {
+        .prop_map(
+            |(pid, expected_contribution, confidence, risk, is_protected, uid)| PlanCandidate {
                 pid,
                 expected_contribution,
                 confidence,
@@ -3049,8 +3056,8 @@ fn plan_candidate_strategy() -> impl Strategy<Value = PlanCandidate> {
                 is_protected,
                 uid,
                 label: format!("proc-{}", pid),
-            }
-        })
+            },
+        )
 }
 
 proptest! {
