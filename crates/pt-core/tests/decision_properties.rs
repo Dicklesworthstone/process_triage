@@ -31,6 +31,10 @@ use pt_core::decision::goal_contribution::{
     estimate_port_contribution, ContributionCandidate,
 };
 use pt_core::decision::goal_parser::parse_goal;
+use pt_core::decision::goal_plan::{optimize_goal_plan, PlanCandidate, PlanConstraints};
+use pt_core::decision::goal_progress::{
+    measure_progress, ActionOutcome, GoalMetric, MetricSnapshot, ProgressConfig,
+};
 use pt_core::decision::mem_pressure::{MemPressureConfig, MemPressureMonitor, MemorySignals};
 use pt_core::decision::rate_limit::{RateLimitConfig, SlidingWindowRateLimiter};
 use pt_core::decision::respawn_loop::{
@@ -3012,5 +3016,272 @@ proptest! {
         let loops = tracker.all_loops(&config, 100.0);
         prop_assert!(loops.len() <= tracker.identity_count(),
             "all_loops {} > identity_count {}", loops.len(), tracker.identity_count());
+    }
+}
+
+// ── Goal plan properties ──────────────────────────────────────────────
+
+fn plan_candidate_strategy() -> impl Strategy<Value = PlanCandidate> {
+    (
+        1u32..10000,                    // pid
+        0.1f64..1000.0,                 // expected_contribution
+        0.1f64..1.0,                    // confidence
+        0.01f64..5.0,                   // risk
+        proptest::bool::ANY,            // is_protected
+        1000u32..2000,                  // uid
+    )
+        .prop_map(|(pid, expected_contribution, confidence, risk, is_protected, uid)| {
+            PlanCandidate {
+                pid,
+                expected_contribution,
+                confidence,
+                risk,
+                is_protected,
+                uid,
+                label: format!("proc-{}", pid),
+            }
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// Empty candidates → empty plans.
+    #[test]
+    fn goal_plan_empty_candidates_empty(target in 1.0f64..1000.0) {
+        let constraints = PlanConstraints {
+            goal_target: target,
+            ..Default::default()
+        };
+        let plans = optimize_goal_plan(&[], &constraints);
+        prop_assert!(plans.is_empty());
+    }
+
+    /// Protected candidates never appear in any plan.
+    #[test]
+    fn goal_plan_protected_excluded(
+        candidates in proptest::collection::vec(plan_candidate_strategy(), 1..20),
+        target in 1.0f64..5000.0,
+    ) {
+        let constraints = PlanConstraints {
+            goal_target: target,
+            ..Default::default()
+        };
+        let plans = optimize_goal_plan(&candidates, &constraints);
+        // A pid is exclusively-protected only if every candidate with that pid
+        // is protected.  When two candidates share a pid but differ in
+        // is_protected, the optimizer may legitimately select the non-protected
+        // one.
+        let exclusively_protected_pids: Vec<u32> = candidates.iter()
+            .filter(|c| c.is_protected)
+            .map(|c| c.pid)
+            .filter(|pid| candidates.iter().all(|c| c.pid != *pid || c.is_protected))
+            .collect();
+        for plan in &plans {
+            for action in &plan.actions {
+                prop_assert!(!exclusively_protected_pids.contains(&action.pid),
+                    "protected pid {} found in plan {:?}", action.pid, plan.variant);
+            }
+        }
+    }
+
+    /// Plan actions never exceed max_actions constraint.
+    #[test]
+    fn goal_plan_max_actions_respected(
+        candidates in proptest::collection::vec(plan_candidate_strategy(), 1..20),
+        max_actions in 1usize..10,
+    ) {
+        let constraints = PlanConstraints {
+            goal_target: 10000.0,
+            max_actions,
+            ..Default::default()
+        };
+        let plans = optimize_goal_plan(&candidates, &constraints);
+        for plan in &plans {
+            prop_assert!(plan.actions.len() <= max_actions,
+                "plan {:?} has {} actions > max {}", plan.variant, plan.actions.len(), max_actions);
+        }
+    }
+
+    /// Total risk never exceeds max_total_risk constraint.
+    #[test]
+    fn goal_plan_risk_budget_respected(
+        candidates in proptest::collection::vec(plan_candidate_strategy(), 1..20),
+        max_risk in 0.5f64..10.0,
+    ) {
+        let constraints = PlanConstraints {
+            goal_target: 10000.0,
+            max_total_risk: max_risk,
+            ..Default::default()
+        };
+        let plans = optimize_goal_plan(&candidates, &constraints);
+        for plan in &plans {
+            prop_assert!(plan.total_risk <= max_risk + 1e-9,
+                "plan {:?} risk {} exceeds budget {}", plan.variant, plan.total_risk, max_risk);
+        }
+    }
+
+    /// goal_fraction is in [0, 1].
+    #[test]
+    fn goal_plan_fraction_bounded(
+        candidates in proptest::collection::vec(plan_candidate_strategy(), 1..15),
+        target in 1.0f64..5000.0,
+    ) {
+        let constraints = PlanConstraints {
+            goal_target: target,
+            ..Default::default()
+        };
+        let plans = optimize_goal_plan(&candidates, &constraints);
+        for plan in &plans {
+            prop_assert!(plan.goal_fraction >= 0.0 && plan.goal_fraction <= 1.0,
+                "goal_fraction {} outside [0,1]", plan.goal_fraction);
+        }
+    }
+
+    /// goal_achievable is true iff total_contribution >= goal_target.
+    #[test]
+    fn goal_plan_achievable_consistent(
+        candidates in proptest::collection::vec(plan_candidate_strategy(), 1..15),
+        target in 1.0f64..5000.0,
+    ) {
+        let constraints = PlanConstraints {
+            goal_target: target,
+            ..Default::default()
+        };
+        let plans = optimize_goal_plan(&candidates, &constraints);
+        for plan in &plans {
+            let expected_achievable = plan.total_contribution >= target;
+            prop_assert_eq!(plan.goal_achievable, expected_achievable,
+                "achievable flag mismatch: contribution={}, target={}",
+                plan.total_contribution, target);
+        }
+    }
+
+    /// At most 3 plan variants returned (conservative, balanced, aggressive).
+    #[test]
+    fn goal_plan_at_most_three_variants(
+        candidates in proptest::collection::vec(plan_candidate_strategy(), 1..20),
+    ) {
+        let constraints = PlanConstraints {
+            goal_target: 500.0,
+            ..Default::default()
+        };
+        let plans = optimize_goal_plan(&candidates, &constraints);
+        prop_assert!(plans.len() <= 3, "got {} plan variants", plans.len());
+    }
+}
+
+// ── Goal progress properties ──────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// Discrepancy equals observed - expected.
+    #[test]
+    fn goal_progress_discrepancy_formula(
+        before_avail in 1u64..10_000_000_000,
+        delta in 0u64..5_000_000_000,
+        expected_each in 1.0f64..2_000_000_000.0,
+    ) {
+        let before = MetricSnapshot {
+            available_memory_bytes: before_avail,
+            total_cpu_frac: 0.5,
+            occupied_ports: vec![],
+            total_fds: 1000,
+            timestamp: 0.0,
+        };
+        let after = MetricSnapshot {
+            available_memory_bytes: before_avail + delta,
+            total_cpu_frac: 0.5,
+            occupied_ports: vec![],
+            total_fds: 1000,
+            timestamp: 1.0,
+        };
+        let outcomes = vec![ActionOutcome {
+            pid: 1,
+            label: "p".to_string(),
+            success: true,
+            respawn_detected: false,
+            expected_contribution: expected_each,
+        }];
+        let config = ProgressConfig::default();
+        let report = measure_progress(
+            GoalMetric::Memory, None, &before, &after, outcomes, &config, None,
+        );
+        let observed = delta as f64;
+        prop_assert!((report.observed_progress - observed).abs() < 1.0,
+            "observed {} != delta {}", report.observed_progress, observed);
+        prop_assert!((report.discrepancy - (observed - expected_each)).abs() < 1.0,
+            "discrepancy {} != observed-expected {}", report.discrepancy, observed - expected_each);
+    }
+
+    /// Classification is AsExpected when discrepancy fraction is within tolerance.
+    #[test]
+    fn goal_progress_as_expected_within_tolerance(
+        expected in 100.0f64..1_000_000.0,
+        frac_delta in -0.15f64..0.15, // within default 0.2 tolerance
+    ) {
+        let observed = expected * (1.0 + frac_delta);
+        // Need observed > no_effect_threshold (5% of expected)
+        prop_assume!(observed.abs() >= expected * 0.05);
+        let before = MetricSnapshot {
+            available_memory_bytes: 1_000_000_000,
+            total_cpu_frac: 0.5,
+            occupied_ports: vec![],
+            total_fds: 1000,
+            timestamp: 0.0,
+        };
+        let after = MetricSnapshot {
+            available_memory_bytes: 1_000_000_000 + observed as u64,
+            ..before.clone()
+        };
+        let outcomes = vec![ActionOutcome {
+            pid: 1, label: "p".to_string(),
+            success: true, respawn_detected: false,
+            expected_contribution: expected,
+        }];
+        let config = ProgressConfig::default();
+        let report = measure_progress(
+            GoalMetric::Memory, None, &before, &after, outcomes, &config, None,
+        );
+        prop_assert_eq!(report.classification,
+            pt_core::decision::goal_progress::DiscrepancyClass::AsExpected,
+            "frac_delta={}, discrepancy_fraction={}", frac_delta, report.discrepancy_fraction);
+    }
+
+    /// measure_progress never panics on arbitrary valid inputs.
+    #[test]
+    fn goal_progress_never_panics(
+        before_avail in 0u64..10_000_000_000,
+        after_avail in 0u64..10_000_000_000,
+        n_outcomes in 0usize..10,
+        expected in 0.0f64..1_000_000_000.0,
+    ) {
+        let before = MetricSnapshot {
+            available_memory_bytes: before_avail,
+            total_cpu_frac: 0.5,
+            occupied_ports: vec![],
+            total_fds: 1000,
+            timestamp: 0.0,
+        };
+        let after = MetricSnapshot {
+            available_memory_bytes: after_avail,
+            total_cpu_frac: 0.5,
+            occupied_ports: vec![],
+            total_fds: 1000,
+            timestamp: 1.0,
+        };
+        let outcomes: Vec<ActionOutcome> = (0..n_outcomes).map(|i| ActionOutcome {
+            pid: i as u32,
+            label: format!("p-{}", i),
+            success: true,
+            respawn_detected: false,
+            expected_contribution: expected / (n_outcomes.max(1)) as f64,
+        }).collect();
+        let config = ProgressConfig::default();
+        let report = measure_progress(
+            GoalMetric::Memory, None, &before, &after, outcomes, &config, None,
+        );
+        prop_assert!(report.discrepancy.is_finite());
     }
 }

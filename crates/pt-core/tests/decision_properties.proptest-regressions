@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 7fe28ab74804c60a6c75011c4cbb849ba601cae22d8c25f12cbf97b2c5abdaf8 # shrinks to posterior = ClassScores { useful: 0.25, useful_bad: 0.25, abandoned: 0.25, zombie: 0.25 }
 cc f2792939f21c8d653f8037bbf43887c439a00e4e5be7d4dd5e36238b45fe29cf # shrinks to posterior = ClassScores { useful: 0.03114304201866514, useful_bad: 0.0, abandoned: 0.9688569579813349, zombie: 0.0 }
+cc 55a311465ce7059848fbffee50bb28a16cf23ee245ef6dd4448c2f7f073f080b # shrinks to candidates = [PlanCandidate { pid: 5389, expected_contribution: 0.1, confidence: 0.1, risk: 0.01, is_protected: false, uid: 1000, label: "proc-5389" }, PlanCandidate { pid: 5389, expected_contribution: 0.1, confidence: 0.1, risk: 0.01, is_protected: true, uid: 1000, label: "proc-5389" }], target = 1.0
