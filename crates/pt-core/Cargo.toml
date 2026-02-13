@@ -160,6 +160,10 @@ harness = false
 name = "inference_advanced"
 harness = false
 
+[[bench]]
+name = "recovery_tree"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
