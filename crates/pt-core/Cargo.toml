@@ -168,6 +168,10 @@ harness = false
 name = "supervision_patterns"
 harness = false
 
+[[bench]]
+name = "wonham_gittins"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
