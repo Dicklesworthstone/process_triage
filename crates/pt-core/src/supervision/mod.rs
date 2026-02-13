@@ -45,6 +45,7 @@
 mod ancestry;
 mod app_supervision;
 pub mod blast_radius;
+#[cfg(target_os = "linux")]
 mod container_supervision;
 mod environ;
 mod ipc;
@@ -67,6 +68,7 @@ pub use app_supervision::{
     detect_app_supervision, AlternativeAction, AppActionType, AppSupervisionAnalyzer,
     AppSupervisionError, AppSupervisionResult, AppSupervisorAction, AppSupervisorType,
 };
+#[cfg(target_os = "linux")]
 pub use container_supervision::{
     detect_container_supervision, detect_container_supervision_with_actions, ContainerAction,
     ContainerActionType, ContainerSupervisionAnalyzer, ContainerSupervisionError,

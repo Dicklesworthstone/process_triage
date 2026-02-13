@@ -25,7 +25,9 @@
 //! - forever (forever stop)
 
 use crate::action::prechecks::{SupervisorAction, SupervisorInfo};
-use crate::supervision::{AppSupervisionResult, AppSupervisorType, ContainerSupervisionResult};
+use crate::supervision::{AppSupervisionResult, AppSupervisorType};
+#[cfg(target_os = "linux")]
+use crate::supervision::ContainerSupervisionResult;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::process::{Command, Output};
@@ -975,6 +977,7 @@ pub fn plan_action_from_app_supervision(
 }
 
 /// Convert container supervision result to a supervisor plan action.
+#[cfg(target_os = "linux")]
 pub fn plan_action_from_container_supervision(
     action_id: &str,
     result: &ContainerSupervisionResult,
