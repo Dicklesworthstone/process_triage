@@ -78,7 +78,15 @@ fn bench_single_tick(c: &mut Criterion) {
     let metrics = tick(2.1, 5_500, 16_000, 10);
 
     let mut group = c.benchmark_group("daemon_triggers/single_tick");
-    group.bench_function("evaluate_triggers", |b| {
+    group.bench_function("evaluate_triggers_fresh_state", |b| {
+        b.iter(|| {
+            let mut state = TriggerState::new(&config);
+            let fired = evaluate_triggers(black_box(&config), &mut state, black_box(&metrics));
+            black_box(fired.len());
+        });
+    });
+
+    group.bench_function("evaluate_triggers_hot_state", |b| {
         let mut state = TriggerState::new(&config);
         b.iter(|| {
             let fired = evaluate_triggers(black_box(&config), &mut state, black_box(&metrics));
