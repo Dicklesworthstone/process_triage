@@ -120,6 +120,10 @@ harness = false
 name = "submodular_cvar"
 harness = false
 
+[[bench]]
+name = "fdr_alpha_investing"
+harness = false
+
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
