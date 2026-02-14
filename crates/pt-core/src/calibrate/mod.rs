@@ -36,6 +36,7 @@ pub mod hierarchical;
 pub mod kalman;
 pub mod mem_growth;
 pub mod metrics;
+pub mod monitor;
 pub mod pac_bayes;
 pub mod ppc;
 pub mod queries;
@@ -53,6 +54,11 @@ pub use pac_bayes::*;
 pub use queries::*;
 pub use report::*;
 pub use validation::*;
+
+pub use monitor::{
+    CalibrationHealth, CalibrationMonitor, CalibrationMonitorConfig, CalibrationObservation,
+    WindowHealth,
+};
 
 use serde::{Deserialize, Serialize};
 

@@ -8,6 +8,7 @@
 //! - Configuration presets for common deployment scenarios
 
 pub mod policy;
+pub mod policy_bundle;
 pub mod preset;
 pub mod priors;
 pub mod resolve;
@@ -15,6 +16,7 @@ pub mod snapshot;
 pub mod validate;
 
 pub use policy::Policy;
+pub use policy_bundle::{PolicyBundle, PolicyBundleError, PolicyMode};
 pub use preset::{get_preset, list_presets, PresetError, PresetInfo, PresetName};
 pub use priors::Priors;
 pub use resolve::{resolve_config, ConfigPaths};

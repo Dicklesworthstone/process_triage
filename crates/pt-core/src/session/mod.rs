@@ -20,6 +20,7 @@ pub mod resume;
 #[cfg(test)]
 mod resume_tests;
 pub mod snapshot_persist;
+pub mod typestate;
 pub mod verify;
 
 use chrono::{DateTime, Duration, Utc};

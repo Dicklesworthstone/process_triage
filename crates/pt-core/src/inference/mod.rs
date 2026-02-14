@@ -10,6 +10,7 @@ pub mod confidence_viz;
 pub mod conformal;
 pub mod copula;
 pub mod ctw;
+pub mod drift_membrane;
 pub mod evt;
 pub mod explain;
 pub mod explain_api;
@@ -22,6 +23,7 @@ pub mod hsmm;
 pub mod imm;
 #[cfg(target_os = "linux")]
 pub mod impact;
+pub mod incremental;
 pub mod kalman;
 pub mod kl_surprisal;
 pub mod ledger;
@@ -70,6 +72,10 @@ pub use ctw::{
     CtwBatchResult, CtwConfig, CtwError, CtwEvidence, CtwFeatures, CtwPredictor, CtwProvenance,
     CtwUpdateResult, DiscretizationMode, Discretizer, DiscretizerConfig,
 };
+pub use drift_membrane::{
+    CompositeDriftMembrane, MembraneConfig, MembraneError, MembraneEvidence, MembraneObservation,
+    MembraneRegime, MembraneTick,
+};
 pub use evt::{
     BatchEvtAnalyzer, EstimationMethod, EvtError, EvtEvidence, GpdConfig, GpdFitter, GpdResult,
     TailType, ThresholdMethod,
@@ -100,6 +106,7 @@ pub use impact::{
     ImpactConfig, ImpactError, ImpactEvidence, ImpactResult, ImpactScorer, ImpactSeverity,
     MissingDataSource, SupervisorLevel,
 };
+pub use incremental::{CacheStats, CachedPosterior, IncrementalConfig};
 pub use kalman::{
     FilterState, KalmanConfig, KalmanEvidence, KalmanFilter, KalmanResult, KalmanSummary,
 };

@@ -4,6 +4,7 @@ pub mod active_sensing;
 pub mod alpha_investing;
 pub mod causal_interventions;
 pub mod composite_test;
+pub mod contextual_bandits;
 pub mod cvar;
 pub mod dependency_loss;
 pub mod dro;
@@ -23,6 +24,7 @@ pub mod load_aware;
 pub mod martingale_gates;
 pub mod mem_pressure;
 pub mod myopic_policy;
+pub mod ope;
 pub mod rate_limit;
 pub mod respawn_loop;
 pub mod robot_constraints;
@@ -48,6 +50,9 @@ pub use composite_test::{
     glr_bernoulli, mixture_sprt_bernoulli, mixture_sprt_beta_sequential, mixture_sprt_multiclass,
     needs_composite_test, CompositeEvidenceAggregator, CompositeTestError, CompositeTestOutcome,
     GlrConfig, GlrResult, MixtureSprtConfig, MixtureSprtResult, MixtureSprtState,
+};
+pub use contextual_bandits::{
+    BanditConfig, BanditError, BanditSelection, ContextualBandit, RegretStats,
 };
 pub use cvar::{
     compute_cvar, decide_with_cvar, CvarError, CvarLoss, CvarTrigger, RiskSensitiveOutcome,
@@ -88,6 +93,9 @@ pub use myopic_policy::{
     decide_from_belief_with_config, ActionLossBreakdown, AlphaInvestingSummary, BeliefStateDisplay,
     BlastRadiusSummary, ConstraintSummary, FdrGateSummary, MyopicDecision, MyopicPolicyConfig,
     MyopicPolicyError, PolicyCheckSummary, RobotConstraintSummary, StateContributions,
+};
+pub use ope::{
+    DoublyRobustEstimator, IpsEstimator, LoggedDecision, OpeError, OpeRecommendation, OpeResult,
 };
 pub use robot_constraints::{
     ConstraintCheckResult, ConstraintChecker, ConstraintKind, ConstraintMetrics, ConstraintSource,
