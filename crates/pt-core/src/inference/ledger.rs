@@ -347,6 +347,10 @@ fn evidence_to_json(evidence: &crate::inference::Evidence) -> serde_json::Value 
         "runtime_seconds": evidence.runtime_seconds,
         "orphan": evidence.orphan,
         "tty": evidence.tty,
+        "net": evidence.net,
+        "io_active": evidence.io_active,
+        "state_flag": evidence.state_flag,
+        "command_category": evidence.command_category,
     })
 }
 
