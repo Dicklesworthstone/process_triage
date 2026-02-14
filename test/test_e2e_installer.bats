@@ -638,6 +638,25 @@ MOCK_CURL
     test_end "checksum valid" "pass"
 }
 
+@test "installer: VERIFY=1 fails on release key fingerprint mismatch" {
+    test_start "fingerprint mismatch" "verify key pin mismatch fails closed"
+
+    setup_installer_test_env "1.0.0" "Linux" "x86_64"
+
+    export DEST="$INSTALL_DEST"
+    export PT_NO_PATH=1
+    export PT_REFRESHED=1
+    export VERIFY=1
+    export PT_RELEASE_PUBLIC_KEY_FINGERPRINT="0000000000000000000000000000000000000000000000000000000000000000"
+
+    run bash "$INSTALLER_PATH"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Release public key fingerprint mismatch"* ]]
+
+    test_end "fingerprint mismatch" "pass"
+}
+
 @test "installer: VERIFY=1 fails with corrupted download" {
     test_start "checksum invalid" "verify VERIFY=1 fails on mismatch"
 

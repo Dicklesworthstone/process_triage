@@ -65,7 +65,11 @@ PT_SYSTEM=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/proce
 # Verify signatures + checksums (fail-closed on missing/invalid metadata)
 VERIFY=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
 
-# Optional: pin a local trusted release key instead of downloading it
+# Optional: pin expected release-key fingerprint (from release-signing-public.pem.sha256)
+PT_RELEASE_PUBLIC_KEY_FINGERPRINT=<64-hex-sha256> VERIFY=1 \
+  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
+
+# Optional: pin a local trusted release key file instead of downloading it
 PT_RELEASE_PUBLIC_KEY_FILE=/path/to/release-signing-public.pem VERIFY=1 \
   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
 ```

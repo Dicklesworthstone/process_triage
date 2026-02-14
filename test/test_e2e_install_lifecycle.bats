@@ -482,6 +482,21 @@ EOF
     test_end "tampered missing signature" "pass"
 }
 
+@test "tampered: release key fingerprint mismatch with VERIFY=1 fails closed" {
+    test_start "tampered fingerprint" "wrong key fingerprint causes failure"
+
+    setup_lifecycle_env "1.0.0" "2.0.0"
+
+    export VERIFY=1
+    export PT_RELEASE_PUBLIC_KEY_FINGERPRINT="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    run_installer
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Release public key fingerprint mismatch"* ]]
+
+    test_end "tampered fingerprint" "pass"
+}
+
 @test "tampered: empty tarball does not crash installer" {
     test_start "tampered empty tarball" "empty tarball handled gracefully"
 

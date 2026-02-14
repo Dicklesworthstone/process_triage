@@ -16,7 +16,8 @@ readonly VERSION="2.0.3"
 readonly PT_CORE_BIN="pt-core"
 readonly INSTALL_BASE_URL="https://raw.githubusercontent.com/Dicklesworthstone/process_triage"
 readonly INSTALL_URL="${INSTALL_BASE_URL}/master/install.sh"
-readonly PINNED_INSTALL_URL="${INSTALL_BASE_URL}/v${VERSION}/install.sh"
+# Populated in release artifacts to pin expected installer signing key.
+readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=""
 
 # Locations to search for pt-core
 readonly SEARCH_PATHS=(
@@ -55,6 +56,26 @@ find_pt_core() {
     fi
 
     return 1
+}
+
+fetch_latest_release_version() {
+    local version_url="${INSTALL_BASE_URL}/master/VERSION"
+    local version=""
+
+    if command -v curl &>/dev/null; then
+        version="$(curl -fsSL "$version_url" 2>/dev/null | tr -d '[:space:]')" || return 1
+    elif command -v wget &>/dev/null; then
+        version="$(wget -qO- "$version_url" 2>/dev/null | tr -d '[:space:]')" || return 1
+    else
+        return 1
+    fi
+
+    # Accept semver-like release tags only (e.g., 2.0.3, 2.0.3-rc1, 2.0.3+build).
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*(\+[0-9A-Za-z.-]+)?$ ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$version"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -150,20 +171,32 @@ main() {
 
     # Special handling for 'update' (wrapper-level)
     if [[ "${forwarded_args[0]:-}" == "update" ]]; then
-        echo "Updating Process Triage..."
-        local update_installer_cmd
-        if command -v curl &>/dev/null; then
-            update_installer_cmd="curl -fsSL $PINNED_INSTALL_URL | bash"
-        elif command -v wget &>/dev/null; then
-            update_installer_cmd="wget -qO- $PINNED_INSTALL_URL | bash"
+        local target_version
+        if target_version="$(fetch_latest_release_version)"; then
+            :
         else
-            update_installer_cmd=""
+            target_version="$VERSION"
+            echo "Warning: could not resolve latest VERSION; falling back to v${VERSION} installer." >&2
         fi
-        if [[ -z "$update_installer_cmd" ]]; then
+        local target_install_url="${INSTALL_BASE_URL}/v${target_version}/install.sh"
+
+        echo "Updating Process Triage to v${target_version}..."
+        if command -v curl &>/dev/null; then
+            if [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
+                curl -fsSL "$target_install_url" | env VERIFY=1 PT_RELEASE_PUBLIC_KEY_FINGERPRINT="${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}" bash
+            else
+                curl -fsSL "$target_install_url" | env VERIFY=1 bash
+            fi
+        elif command -v wget &>/dev/null; then
+            if [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
+                wget -qO- "$target_install_url" | env VERIFY=1 PT_RELEASE_PUBLIC_KEY_FINGERPRINT="${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}" bash
+            else
+                wget -qO- "$target_install_url" | env VERIFY=1 bash
+            fi
+        else
             echo "Error: neither curl nor wget is available to run installer." >&2
             exit 1
         fi
-        bash -c "set -euo pipefail; export VERIFY=1; $update_installer_cmd"
         exit $?
     fi
 

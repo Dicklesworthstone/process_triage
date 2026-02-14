@@ -132,5 +132,98 @@ EOF
         "$PT_SCRIPT" update
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Updating Process Triage..."* ]]
+    [[ "$output" == *"Updating Process Triage to v"* ]]
+}
+
+@test "wrapper: update resolves latest version and fetches matching installer" {
+    local curl_log="${TEST_DIR}/curl.log"
+
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PT_CURL_LOG:?PT_CURL_LOG must be set}"
+url="${@: -1}"
+printf '%s\n' "$url" >> "$PT_CURL_LOG"
+
+if [[ "$url" == *"/master/VERSION" ]]; then
+  echo "9.9.9"
+  exit 0
+fi
+
+if [[ "$url" == *"/v9.9.9/install.sh" ]]; then
+  cat <<'INSTALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${VERIFY:-}" != "1" ]]; then
+  echo "VERIFY missing" >&2
+  exit 44
+fi
+exit 0
+INSTALLER
+  exit 0
+fi
+
+echo "unexpected url: $url" >&2
+exit 31
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_CURL_LOG="$curl_log" \
+        PATH="${MOCK_BIN_DIR}:$PATH" \
+        "$PT_SCRIPT" update
+
+    [ "$status" -eq 0 ]
+    grep -q '/master/VERSION' "$curl_log"
+    grep -q '/v9.9.9/install.sh' "$curl_log"
+}
+
+@test "wrapper: update rejects unsafe version metadata and falls back safely" {
+    local curl_log="${TEST_DIR}/curl.log"
+
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PT_CURL_LOG:?PT_CURL_LOG must be set}"
+url="${@: -1}"
+printf '%s\n' "$url" >> "$PT_CURL_LOG"
+
+if [[ "$url" == *"/master/VERSION" ]]; then
+  echo "9.9.9;injected"
+  exit 0
+fi
+
+if [[ "$url" == *"/v2.0.3/install.sh" ]]; then
+  cat <<'INSTALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${VERIFY:-}" != "1" ]]; then
+  echo "VERIFY missing" >&2
+  exit 44
+fi
+exit 0
+INSTALLER
+  exit 0
+fi
+
+echo "unexpected url: $url" >&2
+exit 31
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_CURL_LOG="$curl_log" \
+        PATH="${MOCK_BIN_DIR}:$PATH" \
+        "$PT_SCRIPT" update
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Warning: could not resolve latest VERSION; falling back to v2.0.3 installer."* ]]
+    [[ "$output" == *"Updating Process Triage to v2.0.3..."* ]]
+    grep -q '/master/VERSION' "$curl_log"
+    grep -q '/v2.0.3/install.sh' "$curl_log"
+    ! grep -q '/v9.9.9;injected/install.sh' "$curl_log"
 }

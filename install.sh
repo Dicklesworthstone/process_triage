@@ -13,6 +13,8 @@
 #   VERIFY      - Set to 1 to enforce signature + checksum verification
 #   PT_RELEASE_PUBLIC_KEY_FILE - Optional PEM public key file for signature verification
 #   PT_RELEASE_PUBLIC_KEY_PEM  - Optional PEM public key content for signature verification
+#   PT_RELEASE_PUBLIC_KEY_FINGERPRINT - Optional expected SHA-256 fingerprint (hex) for the public key
+#   PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE - Optional file containing expected key fingerprint
 #   PT_CORE_VERSION - Install specific pt-core version (default: same as PT_VERSION)
 #
 set -euo pipefail
@@ -20,6 +22,8 @@ set -euo pipefail
 readonly GITHUB_REPO="Dicklesworthstone/process_triage"
 readonly RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/master"
 readonly RELEASES_URL="https://github.com/${GITHUB_REPO}/releases"
+# Populated in release artifacts to pin the expected release-signing key.
+readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=""
 
 # Minimal downloader for early bootstrapping (stdout).
 fetch_stdout() {
@@ -194,6 +198,18 @@ sha256_file() {
         openssl dgst -sha256 "$file" | awk '{print $NF}'
     else
         log_warn "No SHA256 tool available"
+        return 1
+    fi
+}
+
+sha256_stdin() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 | cut -d' ' -f1
+    elif command -v openssl &>/dev/null; then
+        openssl dgst -sha256 | awk '{print $NF}'
+    else
         return 1
     fi
 }
@@ -446,6 +462,42 @@ ensure_openssl_for_signatures() {
     fi
 }
 
+normalize_fingerprint() {
+    local value="$1"
+    value="${value//[[:space:]]/}"
+    value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+    if [[ ! "$value" =~ ^[a-f0-9]{64}$ ]]; then
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+resolve_expected_key_fingerprint() {
+    local expected=""
+
+    if [[ -n "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
+        expected="${PT_RELEASE_PUBLIC_KEY_FINGERPRINT}"
+    elif [[ -n "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE:-}" ]]; then
+        if [[ ! -f "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}" ]]; then
+            log_error "PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE does not exist: ${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}"
+            return 1
+        fi
+        expected="$(head -n1 "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}" | awk '{print $1}')"
+    elif [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
+        expected="${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}"
+    fi
+
+    if [[ -z "$expected" ]]; then
+        printf '\n'
+        return 0
+    fi
+
+    normalize_fingerprint "$expected" || {
+        log_error "Invalid release public key fingerprint (expected 64 hex chars)."
+        return 1
+    }
+}
+
 resolve_release_public_key() {
     local version="$1"
     local output="$2"
@@ -475,6 +527,34 @@ resolve_release_public_key() {
         log_error "Invalid public key PEM for release signature verification"
         return 1
     fi
+
+    local expected_fingerprint
+    expected_fingerprint="$(resolve_expected_key_fingerprint)" || return 1
+
+    if [[ -z "$expected_fingerprint" ]]; then
+        log_warn "No release key fingerprint pin configured; proceeding with provided key source."
+        return 0
+    fi
+
+    local actual_fingerprint
+    actual_fingerprint="$(openssl pkey -pubin -in "$output" -outform der 2>/dev/null | sha256_stdin)" || {
+        log_error "Could not compute release public key fingerprint"
+        return 1
+    }
+
+    actual_fingerprint="$(normalize_fingerprint "$actual_fingerprint")" || {
+        log_error "Computed release public key fingerprint was invalid"
+        return 1
+    }
+
+    if [[ "$actual_fingerprint" != "$expected_fingerprint" ]]; then
+        log_error "Release public key fingerprint mismatch"
+        log_error "Expected: $expected_fingerprint"
+        log_error "Actual:   $actual_fingerprint"
+        return 1
+    fi
+
+    log_success "Release public key fingerprint verified: ${actual_fingerprint:0:16}..."
 }
 
 download_signature() {

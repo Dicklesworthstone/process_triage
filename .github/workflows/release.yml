@@ -246,6 +246,35 @@ jobs:
           echo "Release contents:"
           ls -la release/
 
+      - name: Inject release key fingerprint pins
+        run: |
+          cd release
+
+          if [[ -z "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" ]]; then
+            echo "::error::Missing RELEASE_SIGNING_KEY_PEM secret"
+            exit 1
+          fi
+
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" > "$key_file"
+          chmod 600 "$key_file"
+
+          # Export trusted public key and compute canonical DER fingerprint.
+          openssl pkey -in "$key_file" -pubout -out release-signing-public.pem
+          key_fp="$(
+            openssl pkey -pubin -in release-signing-public.pem -outform der \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          printf '%s\n' "$key_fp" > release-signing-public.pem.sha256
+
+          # Pin release artifacts to this fingerprint.
+          sed -i "s|^readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=.*$|readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=\"$key_fp\"|" install.sh
+          sed -i "s|^readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=.*$|readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=\"$key_fp\"|" pt
+
+          echo "Release key fingerprint: $key_fp"
+
       - name: Generate checksums
         run: |
           cd release
@@ -268,8 +297,18 @@ jobs:
           printf '%s\n' "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" > "$key_file"
           chmod 600 "$key_file"
 
-          # Export trusted public key used by installer verification.
-          openssl pkey -in "$key_file" -pubout -out release-signing-public.pem
+          actual_fp="$(
+            openssl pkey -pubin -in release-signing-public.pem -outform der \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          expected_fp="$(tr -d '[:space:]' < release-signing-public.pem.sha256)"
+          if [[ "$actual_fp" != "$expected_fp" ]]; then
+            echo "::error::release-signing-public.pem fingerprint mismatch"
+            echo "expected: $expected_fp"
+            echo "actual:   $actual_fp"
+            exit 1
+          fi
 
           # Detached signatures for every distributable artifact.
           for asset in *; do
@@ -283,7 +322,7 @@ jobs:
 
           echo ""
           echo "Signed assets:"
-          ls -la *.sig release-signing-public.pem
+          ls -la *.sig release-signing-public.pem release-signing-public.pem.sha256
 
       - name: Generate release notes
         run: |
@@ -307,7 +346,10 @@ jobs:
           3. Move to PATH: `mv pt-core ~/.local/bin/`
           4. Download `pt` wrapper and `install.sh`
           5. Verify checksums: `sha256sum -c checksums.sha256`
-          6. Verify signatures:
+          6. Verify release key fingerprint:
+             `openssl pkey -pubin -in release-signing-public.pem -outform der | sha256sum`
+             Compare against `release-signing-public.pem.sha256`
+          7. Verify signatures:
              `openssl dgst -sha256 -verify release-signing-public.pem -signature <artifact>.sig <artifact>`
 
           ## Checksums
@@ -320,6 +362,7 @@ jobs:
           - `checksums.sha256` - SHA-256 checksums for verification
           - `*.sig` - Detached ECDSA signatures for each artifact
           - `release-signing-public.pem` - Trusted public key for signature verification
+          - `release-signing-public.pem.sha256` - Pinned SHA-256 fingerprint for the public key
 
           ## Supported Platforms
           - Linux x86_64 (Intel/AMD 64-bit)
