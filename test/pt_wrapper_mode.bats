@@ -12,6 +12,8 @@ setup() {
     mkdir -p "$TEST_DIR"
 
     export MOCK_LOG="${TEST_DIR}/mock.log"
+    export MOCK_BIN_DIR="${TEST_DIR}/mock-bin"
+    mkdir -p "$MOCK_BIN_DIR"
     export MOCK_PT_CORE="${TEST_DIR}/pt-core-mock"
     cat > "$MOCK_PT_CORE" << 'EOF'
 #!/usr/bin/env bash
@@ -104,4 +106,31 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"pt 2.0.3"* ]]
     [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: update enforces VERIFY=1 for installer invocation" {
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Return an installer script to stdout. The script fails unless VERIFY=1.
+cat <<'INSTALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${VERIFY:-}" != "1" ]]; then
+  echo "VERIFY missing" >&2
+  exit 44
+fi
+exit 0
+INSTALLER
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PATH="${MOCK_BIN_DIR}:$PATH" \
+        "$PT_SCRIPT" update
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Updating Process Triage..."* ]]
 }

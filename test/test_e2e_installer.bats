@@ -98,6 +98,22 @@ create_checksums_file() {
     test_info "Created checksums file with $(wc -l < "$checksums_file") entries"
 }
 
+create_release_signatures() {
+    local assets_dir="$1"
+    local private_key="$2"
+
+    for file in "$assets_dir"/*; do
+        [[ -f "$file" ]] || continue
+        case "$file" in
+            *.sig) continue ;;
+            */release-signing-public.pem) continue ;;
+        esac
+        openssl dgst -sha256 -sign "$private_key" -out "${file}.sig" "$file"
+    done
+
+    openssl pkey -in "$private_key" -pubout -out "$assets_dir/release-signing-public.pem"
+}
+
 # Create mock curl that serves files from a directory
 create_serving_mock_curl() {
     local serve_dir="$1"
@@ -176,6 +192,22 @@ case "$url" in
         if [[ -f "$SERVE_DIR/checksums.sha256" ]]; then
             serve_file "$SERVE_DIR/checksums.sha256"
         else
+            exit 1
+        fi
+        ;;
+    *"/release-signing-public.pem"*)
+        if [[ -f "$SERVE_DIR/release-signing-public.pem" ]]; then
+            serve_file "$SERVE_DIR/release-signing-public.pem"
+        else
+            exit 1
+        fi
+        ;;
+    *".sig")
+        filename="${url##*/}"
+        if [[ -f "$SERVE_DIR/$filename" ]]; then
+            serve_file "$SERVE_DIR/$filename"
+        else
+            echo "ERROR: Signature not found: $filename in $SERVE_DIR" >&2
             exit 1
         fi
         ;;
@@ -272,9 +304,18 @@ setup_installer_test_env() {
 
     # Create fake pt-core tarball
     create_fake_pt_core_tarball "$version" "$os_normalized" "$arch" "$ASSETS_DIR"
+    if [[ "$os_normalized" == "linux" ]]; then
+        create_fake_pt_core_tarball "$version" "$os_normalized" "${arch}-musl" "$ASSETS_DIR"
+    fi
 
     # Create checksums
     create_checksums_file "$version" "$ASSETS_DIR" "$ASSETS_DIR/checksums.sha256"
+
+    # Create signing key pair and detached signatures
+    export RELEASE_SIGNING_PRIVATE_KEY="${TEST_DIR}/release-signing-private.pem"
+    openssl ecparam -name prime256v1 -genkey -noout -out "$RELEASE_SIGNING_PRIVATE_KEY"
+    create_release_signatures "$ASSETS_DIR" "$RELEASE_SIGNING_PRIVATE_KEY"
+    export PT_RELEASE_PUBLIC_KEY_FILE="$ASSETS_DIR/release-signing-public.pem"
 
     # Setup mocks
     create_mock_uname "$os" "$arch"
@@ -614,13 +655,8 @@ MOCK_CURL
 
     test_info "Output: $output"
 
-    # Should fail or warn (depending on implementation)
-    # Key assertion: if it fails, nothing is installed
-    if [[ "$status" -ne 0 ]]; then
-        # If installer fails, ensure no partial install
-        [ ! -f "$INSTALL_DEST/pt" ] || \
-        [ ! -x "$INSTALL_DEST/pt" ]
-    fi
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Signature verification failed"* ]] || [[ "$output" == *"verification failed"* ]]
 
     test_end "checksum invalid" "pass"
 }
@@ -642,10 +678,48 @@ MOCK_CURL
 
     test_info "Output: $output"
 
-    # Check for informative error message
-    # (Implementation may vary - just verify it handles the case)
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Checksum mismatch"* ]]
 
     test_end "checksum error message" "pass"
+}
+
+@test "installer: VERIFY=1 fails when pt signature is missing" {
+    test_start "missing pt signature" "verify missing pt.sig aborts install"
+
+    setup_installer_test_env "1.0.0" "Linux" "x86_64"
+    rm -f "$ASSETS_DIR/pt.sig"
+
+    export DEST="$INSTALL_DEST"
+    export PT_NO_PATH=1
+    export PT_REFRESHED=1
+    export VERIFY=1
+
+    run bash "$INSTALLER_PATH"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Could not download signature for pt"* ]]
+
+    test_end "missing pt signature" "pass"
+}
+
+@test "installer: VERIFY=1 fails when pt-core signature is missing" {
+    test_start "missing pt-core signature" "verify missing pt-core archive .sig aborts install"
+
+    setup_installer_test_env "1.0.0" "Linux" "x86_64"
+    rm -f "$ASSETS_DIR"/pt-core-*.tar.gz.sig
+
+    export DEST="$INSTALL_DEST"
+    export PT_NO_PATH=1
+    export PT_REFRESHED=1
+    export VERIFY=1
+
+    run bash "$INSTALLER_PATH"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Could not download signature for pt-core"* ]]
+
+    test_end "missing pt-core signature" "pass"
 }
 
 # ==============================================================================

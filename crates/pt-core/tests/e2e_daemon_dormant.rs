@@ -117,6 +117,27 @@ fn read_jsonl_items(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn state_has_event(state_path: &Path, event_type: &str) -> bool {
+    let Ok(content) = fs::read_to_string(state_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    let events = json
+        .get("daemon")
+        .and_then(|d| d.get("recent_events"))
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+    events.iter().any(|ev| {
+        ev.get("event_type")
+            .and_then(|t| t.as_str())
+            .map(|t| t == event_type)
+            .unwrap_or(false)
+    })
+}
+
 #[test]
 fn daemon_starts_with_defaults_when_daemon_json_is_missing() {
     let data_dir = TempDir::new().expect("temp data dir");
@@ -544,20 +565,7 @@ fn daemon_sighup_reloads_config_without_exiting() {
 
     send_signal(&child, libc::SIGHUP);
     wait_for(Duration::from_secs(10), || {
-        let content = fs::read_to_string(&state_path).expect("read state.json");
-        let json: Value = serde_json::from_str(&content).expect("valid state json");
-        let events = json
-            .get("daemon")
-            .and_then(|d| d.get("recent_events"))
-            .and_then(|e| e.as_array())
-            .cloned()
-            .unwrap_or_default();
-        events.iter().any(|ev| {
-            ev.get("event_type")
-                .and_then(|t| t.as_str())
-                .map(|t| t == "config_reloaded")
-                .unwrap_or(false)
-        })
+        state_has_event(&state_path, "config_reloaded")
     });
 
     assert!(
@@ -571,6 +579,126 @@ fn daemon_sighup_reloads_config_without_exiting() {
     });
     let status = child.wait().expect("wait for daemon exit status");
     assert!(status.success(), "daemon should exit cleanly after SIGTERM");
+}
+
+#[test]
+fn daemon_sighup_with_deleted_config_keeps_running() {
+    let data_dir = TempDir::new().expect("temp data dir");
+    let config_dir = TempDir::new().expect("temp config dir");
+
+    write_daemon_json_config(
+        config_dir.path(),
+        r#"{
+  "tick_interval_secs": 1,
+  "max_cpu_percent": 1000.0,
+  "max_rss_mb": 4096,
+  "triggers": {
+    "ewma_alpha": 0.3,
+    "load_threshold": 9999.0,
+    "memory_threshold": 9999.0,
+    "orphan_threshold": 9999999,
+    "sustained_ticks": 1,
+    "cooldown_ticks": 10
+  },
+  "escalation": {
+    "min_interval_secs": 0,
+    "allow_auto_mitigation": false,
+    "max_deep_scan_targets": 1
+  },
+  "notifications": {
+    "enabled": false,
+    "desktop": false,
+    "notify_cmd": null,
+    "notify_arg": []
+  }
+}"#,
+    );
+
+    let daemon_config_path = config_dir.path().join("daemon.json");
+    let mut child = start_daemon_foreground(config_dir.path(), data_dir.path());
+    let pid_path = daemon_pid_path(data_dir.path());
+    let state_path = daemon_state_path(data_dir.path());
+    wait_for(Duration::from_secs(10), || {
+        pid_path.exists() && state_path.exists()
+    });
+
+    fs::remove_file(&daemon_config_path).expect("remove daemon.json");
+    send_signal(&child, libc::SIGHUP);
+
+    wait_for(Duration::from_secs(10), || {
+        child.try_wait().expect("query child status").is_none()
+            && state_has_event(&state_path, "config_reloaded")
+    });
+
+    send_sigterm(&child);
+    wait_for(Duration::from_secs(10), || {
+        child.try_wait().expect("query child status").is_some()
+    });
+    let status = child.wait().expect("wait for daemon exit status");
+    assert!(
+        status.success(),
+        "daemon should remain healthy when config is deleted before SIGHUP reload"
+    );
+}
+
+#[test]
+fn daemon_sighup_with_invalid_config_keeps_running() {
+    let data_dir = TempDir::new().expect("temp data dir");
+    let config_dir = TempDir::new().expect("temp config dir");
+
+    write_daemon_json_config(
+        config_dir.path(),
+        r#"{
+  "tick_interval_secs": 1,
+  "max_cpu_percent": 1000.0,
+  "max_rss_mb": 4096,
+  "triggers": {
+    "ewma_alpha": 0.3,
+    "load_threshold": 9999.0,
+    "memory_threshold": 9999.0,
+    "orphan_threshold": 9999999,
+    "sustained_ticks": 1,
+    "cooldown_ticks": 10
+  },
+  "escalation": {
+    "min_interval_secs": 0,
+    "allow_auto_mitigation": false,
+    "max_deep_scan_targets": 1
+  },
+  "notifications": {
+    "enabled": false,
+    "desktop": false,
+    "notify_cmd": null,
+    "notify_arg": []
+  }
+}"#,
+    );
+
+    let daemon_config_path = config_dir.path().join("daemon.json");
+    let mut child = start_daemon_foreground(config_dir.path(), data_dir.path());
+    let pid_path = daemon_pid_path(data_dir.path());
+    let state_path = daemon_state_path(data_dir.path());
+    wait_for(Duration::from_secs(10), || {
+        pid_path.exists() && state_path.exists()
+    });
+
+    fs::write(&daemon_config_path, "{ invalid json").expect("write invalid daemon.json");
+    send_signal(&child, libc::SIGHUP);
+
+    wait_for(Duration::from_secs(10), || {
+        child.try_wait().expect("query child status").is_none()
+            && state_has_event(&state_path, "config_reloaded")
+    });
+
+    send_sigterm(&child);
+    wait_for(Duration::from_secs(10), || {
+        child.try_wait().expect("query child status").is_some()
+    });
+    let status = child.wait().expect("wait for daemon exit status");
+    assert!(
+        status.success(),
+        "daemon should remain healthy when config is invalid during SIGHUP reload"
+    );
 }
 
 #[test]

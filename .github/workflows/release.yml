@@ -254,6 +254,37 @@ jobs:
           echo "Checksums:"
           cat checksums.sha256
 
+      - name: Sign release assets
+        run: |
+          cd release
+
+          if [[ -z "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" ]]; then
+            echo "::error::Missing RELEASE_SIGNING_KEY_PEM secret"
+            exit 1
+          fi
+
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" > "$key_file"
+          chmod 600 "$key_file"
+
+          # Export trusted public key used by installer verification.
+          openssl pkey -in "$key_file" -pubout -out release-signing-public.pem
+
+          # Detached signatures for every distributable artifact.
+          for asset in *; do
+            case "$asset" in
+              *.sig|release-signing-public.pem)
+                continue
+                ;;
+            esac
+            openssl dgst -sha256 -sign "$key_file" -out "${asset}.sig" "$asset"
+          done
+
+          echo ""
+          echo "Signed assets:"
+          ls -la *.sig release-signing-public.pem
+
       - name: Generate release notes
         run: |
           version="${{ needs.validate-version.outputs.version }}"
@@ -276,6 +307,8 @@ jobs:
           3. Move to PATH: `mv pt-core ~/.local/bin/`
           4. Download `pt` wrapper and `install.sh`
           5. Verify checksums: `sha256sum -c checksums.sha256`
+          6. Verify signatures:
+             `openssl dgst -sha256 -verify release-signing-public.pem -signature <artifact>.sig <artifact>`
 
           ## Checksums
           All release artifacts include SHA-256 checksums in `checksums.sha256`.
@@ -285,6 +318,8 @@ jobs:
           - `install.sh` - Self-updating installer script
           - `pt-core-*` - Platform-specific Rust binaries
           - `checksums.sha256` - SHA-256 checksums for verification
+          - `*.sig` - Detached ECDSA signatures for each artifact
+          - `release-signing-public.pem` - Trusted public key for signature verification
 
           ## Supported Platforms
           - Linux x86_64 (Intel/AMD 64-bit)

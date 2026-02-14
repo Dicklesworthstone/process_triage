@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
 use super::backup::{Backup, BackupManager};
+use super::signature::{SignatureError, SignatureVerifier};
 use super::verification::{verify_binary, VerificationResult};
 
 /// Result of a rollback operation
@@ -47,6 +48,7 @@ impl RollbackResult {
 pub struct RollbackManager {
     backup_manager: BackupManager,
     target_path: PathBuf,
+    verifier: Option<SignatureVerifier>,
 }
 
 impl RollbackManager {
@@ -55,6 +57,7 @@ impl RollbackManager {
         Self {
             backup_manager: BackupManager::new(binary_name),
             target_path,
+            verifier: None,
         }
     }
 
@@ -63,7 +66,23 @@ impl RollbackManager {
         Self {
             backup_manager: BackupManager::with_config(backup_dir, binary_name, 3),
             target_path,
+            verifier: None,
         }
+    }
+
+    /// Attach a signature verifier for enforced artifact authenticity.
+    ///
+    /// When set, [`Self::atomic_update`] will reject any new binary whose
+    /// detached `.sig` sidecar is missing or fails ECDSA P-256 verification
+    /// (fail-closed policy).
+    pub fn with_verifier(mut self, verifier: SignatureVerifier) -> Self {
+        self.verifier = Some(verifier);
+        self
+    }
+
+    /// Returns a reference to the configured signature verifier, if any.
+    pub fn verifier(&self) -> Option<&SignatureVerifier> {
+        self.verifier.as_ref()
     }
 
     /// Get the backup manager
@@ -112,13 +131,15 @@ impl RollbackManager {
         Ok(backup)
     }
 
-    /// Perform atomic update with verification and automatic rollback
+    /// Perform atomic update with verification and automatic rollback.
     ///
     /// Steps:
-    /// 1. Create backup of current binary
-    /// 2. Download/copy new binary to temp location
+    /// 1. **Signature check** — If a [`SignatureVerifier`] is configured,
+    ///    verify the detached `.sig` sidecar of `new_binary_path`.
+    ///    Rejects the update on missing or invalid signatures (fail-closed).
+    /// 2. Create backup of current binary
     /// 3. Atomically replace current with new
-    /// 4. Verify new binary works
+    /// 4. Verify new binary works (`--version` + `health`)
     /// 5. If verification fails, automatically rollback
     pub fn atomic_update(
         &self,
@@ -133,6 +154,38 @@ impl RollbackManager {
             new_binary = ?new_binary_path,
             "Starting atomic update"
         );
+
+        // Step 0: Signature verification (fail-closed when verifier is set)
+        if let Some(verifier) = &self.verifier {
+            info!(
+                target: "update.signature_check",
+                binary = ?new_binary_path,
+                trusted_keys = verifier.key_count(),
+                "Verifying artifact signature before update"
+            );
+            match verifier.verify_file(new_binary_path) {
+                Ok(result) => {
+                    info!(
+                        target: "update.signature_pass",
+                        key_fingerprint = %result.key_fingerprint,
+                        sig_path = %result.sig_path,
+                        "Signature verification passed"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        target: "update.signature_fail",
+                        reason = %e,
+                        binary = ?new_binary_path,
+                        "Signature verification failed — update rejected"
+                    );
+                    return Ok(UpdateResult::SignatureRejected {
+                        error: e,
+                        binary_path: new_binary_path.to_path_buf(),
+                    });
+                }
+            }
+        }
 
         // Step 1: Create backup
         let backup = self.backup_current(current_version)?;
@@ -331,6 +384,13 @@ pub enum UpdateResult {
         rollback: RollbackResult,
         backup: Backup,
     },
+    /// Update rejected because signature verification failed (fail-closed).
+    ///
+    /// No backup was created and the current binary is untouched.
+    SignatureRejected {
+        error: SignatureError,
+        binary_path: PathBuf,
+    },
 }
 
 impl UpdateResult {
@@ -339,11 +399,24 @@ impl UpdateResult {
         matches!(self, UpdateResult::Success { .. })
     }
 
-    /// Get the verification result
-    pub fn verification(&self) -> &VerificationResult {
+    /// Get the verification result, if available.
+    ///
+    /// Returns `None` for [`UpdateResult::SignatureRejected`] because
+    /// the binary was never installed.
+    pub fn verification(&self) -> Option<&VerificationResult> {
         match self {
-            UpdateResult::Success { verification, .. } => verification,
-            UpdateResult::VerificationFailed { verification, .. } => verification,
+            UpdateResult::Success { verification, .. } => Some(verification),
+            UpdateResult::VerificationFailed { verification, .. } => Some(verification),
+            UpdateResult::SignatureRejected { .. } => None,
+        }
+    }
+
+    /// Returns the signature error if the update was rejected due to
+    /// a failed signature check.
+    pub fn signature_error(&self) -> Option<&SignatureError> {
+        match self {
+            UpdateResult::SignatureRejected { error, .. } => Some(error),
+            _ => None,
         }
     }
 }
@@ -587,6 +660,7 @@ esac
             backup,
         };
         let _v = ur.verification();
+        assert!(_v.is_some(), "Success variant should have verification");
         // Just verify it doesn't panic and returns a reference
     }
 
@@ -694,5 +768,34 @@ esac
         assert_eq!(manager.target_path(), Path::new("/tmp/pt-core"));
         // backup_manager should have been created with default dir
         let _bm = manager.backup_manager();
+    }
+
+    // --- Verifier accessor tests (bd-oyk3) ---
+
+    #[test]
+    fn rollback_manager_no_verifier_by_default() {
+        let manager = RollbackManager::new(PathBuf::from("/tmp/pt-core"), "pt-core");
+        assert!(manager.verifier().is_none());
+    }
+
+    #[test]
+    fn rollback_manager_with_verifier() {
+        let verifier = SignatureVerifier::new();
+        let manager = RollbackManager::new(PathBuf::from("/tmp/pt-core"), "pt-core")
+            .with_verifier(verifier);
+        assert!(manager.verifier().is_some());
+        assert_eq!(manager.verifier().unwrap().key_count(), 0);
+    }
+
+    #[test]
+    fn signature_rejected_result_accessors() {
+        let err = SignatureError::NoKeys;
+        let result = UpdateResult::SignatureRejected {
+            error: err,
+            binary_path: PathBuf::from("/tmp/bad-binary"),
+        };
+        assert!(!result.is_success());
+        assert!(result.verification().is_none());
+        assert!(result.signature_error().is_some());
     }
 }

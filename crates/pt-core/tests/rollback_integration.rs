@@ -161,6 +161,9 @@ mod rollback_tests {
             UpdateResult::VerificationFailed { .. } => {
                 // Expected if version check doesn't match exactly
             }
+            UpdateResult::SignatureRejected { .. } => {
+                panic!("Unexpected signature rejection (no verifier configured)");
+            }
         }
     }
 
@@ -194,6 +197,9 @@ mod rollback_tests {
             }
             UpdateResult::Success { .. } => {
                 panic!("Expected verification failure, got success");
+            }
+            UpdateResult::SignatureRejected { .. } => {
+                panic!("Unexpected signature rejection (no verifier configured)");
             }
         }
     }
@@ -354,6 +360,9 @@ mod atomic_replace_tests {
             UpdateResult::Success { .. } | UpdateResult::VerificationFailed { .. } => {
                 // Both are acceptable - the atomic replace worked
             }
+            UpdateResult::SignatureRejected { .. } => {
+                panic!("Unexpected signature rejection (no verifier configured)");
+            }
         }
     }
 }
@@ -394,5 +403,274 @@ mod cli_integration {
                 || combined.contains("error")
                 || !output.status.success()
         );
+    }
+}
+
+// ── Signature verification integration tests (bd-oyk3) ──────────────────
+
+mod signature_verification_tests {
+    use super::*;
+    use pt_core::install::signature::{sign_bytes, SignatureVerifier};
+    use pt_core::install::{RollbackManager, SignatureError, UpdateResult};
+
+    /// Helper: generate a fresh ECDSA P-256 key pair.
+    fn test_keypair() -> (p256::ecdsa::SigningKey, p256::ecdsa::VerifyingKey) {
+        let sk = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let vk = *sk.verifying_key();
+        (sk, vk)
+    }
+
+    /// Helper: create a binary and sign it with a valid .sig sidecar.
+    fn create_signed_binary(
+        dir: &std::path::Path,
+        name: &str,
+        version: &str,
+        sk: &p256::ecdsa::SigningKey,
+    ) -> PathBuf {
+        let binary_path = create_mock_binary(dir, name, version);
+        let contents = fs::read(&binary_path).unwrap();
+        let sig_der = sign_bytes(&contents, sk);
+        let sig_path = dir.join(format!("{}.sig", name));
+        fs::write(&sig_path, &sig_der).unwrap();
+        binary_path
+    }
+
+    // ── Fail-closed: missing .sig file ──────────────────────────────────
+
+    #[test]
+    fn test_update_rejected_when_sig_file_missing() {
+        let temp = TempDir::new().unwrap();
+        let binary_path = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("rollback");
+
+        // New binary WITHOUT a .sig sidecar
+        let new_binary = create_mock_binary(temp.path(), "pt-core-new", "2.0.0");
+
+        let (_sk, vk) = test_keypair();
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_key(vk);
+
+        let manager =
+            RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
+                .with_verifier(verifier);
+
+        let result = manager
+            .atomic_update(&new_binary, "1.0.0", Some("2.0.0"))
+            .unwrap();
+
+        match result {
+            UpdateResult::SignatureRejected { error, binary_path } => {
+                assert!(
+                    matches!(error, SignatureError::SignatureFileNotFound(_)),
+                    "Expected SignatureFileNotFound, got: {:?}",
+                    error
+                );
+                assert!(binary_path.ends_with("pt-core-new"));
+            }
+            other => panic!("Expected SignatureRejected, got: {:?}", other),
+        }
+
+        // Original binary must be untouched
+        let original_content = fs::read_to_string(&binary_path).unwrap();
+        assert!(
+            original_content.contains("1.0.0"),
+            "Original binary should be untouched after signature rejection"
+        );
+    }
+
+    // ── Fail-closed: signature mismatch (wrong key) ─────────────────────
+
+    #[test]
+    fn test_update_rejected_when_signature_invalid() {
+        let temp = TempDir::new().unwrap();
+        let binary_path = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("rollback");
+
+        // Sign the new binary with key A
+        let (sk_a, _vk_a) = test_keypair();
+        let new_binary =
+            create_signed_binary(temp.path(), "pt-core-new", "2.0.0", &sk_a);
+
+        // Configure verifier with key B (different from the signing key)
+        let (_sk_b, vk_b) = test_keypair();
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_key(vk_b);
+
+        let manager =
+            RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
+                .with_verifier(verifier);
+
+        let result = manager
+            .atomic_update(&new_binary, "1.0.0", Some("2.0.0"))
+            .unwrap();
+
+        match result {
+            UpdateResult::SignatureRejected { error, .. } => {
+                assert!(
+                    matches!(error, SignatureError::VerificationFailed { tried: 1 }),
+                    "Expected VerificationFailed, got: {:?}",
+                    error
+                );
+            }
+            other => panic!("Expected SignatureRejected, got: {:?}", other),
+        }
+
+        // Original binary untouched
+        let original_content = fs::read_to_string(&binary_path).unwrap();
+        assert!(original_content.contains("1.0.0"));
+    }
+
+    // ── Fail-closed: corrupted .sig file ────────────────────────────────
+
+    #[test]
+    fn test_update_rejected_when_sig_corrupted() {
+        let temp = TempDir::new().unwrap();
+        let binary_path = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("rollback");
+
+        // Create a new binary with a garbage .sig file
+        let new_binary = create_mock_binary(temp.path(), "pt-core-new", "2.0.0");
+        let sig_path = temp.path().join("pt-core-new.sig");
+        fs::write(&sig_path, b"this is not a valid DER signature").unwrap();
+
+        let (_sk, vk) = test_keypair();
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_key(vk);
+
+        let manager =
+            RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
+                .with_verifier(verifier);
+
+        let result = manager
+            .atomic_update(&new_binary, "1.0.0", Some("2.0.0"))
+            .unwrap();
+
+        match result {
+            UpdateResult::SignatureRejected { error, .. } => {
+                assert!(
+                    matches!(error, SignatureError::InvalidSignature(_)),
+                    "Expected InvalidSignature, got: {:?}",
+                    error
+                );
+            }
+            other => panic!("Expected SignatureRejected, got: {:?}", other),
+        }
+    }
+
+    // ── Happy path: valid signature allows update ───────────────────────
+
+    #[test]
+    fn test_update_proceeds_with_valid_signature() {
+        let temp = TempDir::new().unwrap();
+        let binary_path = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("rollback");
+
+        let (sk, vk) = test_keypair();
+        let new_binary =
+            create_signed_binary(temp.path(), "pt-core-new", "2.0.0", &sk);
+
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_key(vk);
+
+        let manager =
+            RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
+                .with_verifier(verifier);
+
+        let result = manager
+            .atomic_update(&new_binary, "1.0.0", None)
+            .unwrap();
+
+        // Should NOT be SignatureRejected
+        assert!(
+            !matches!(result, UpdateResult::SignatureRejected { .. }),
+            "Valid signature should not be rejected"
+        );
+    }
+
+    // ── No verifier = no enforcement ────────────────────────────────────
+
+    #[test]
+    fn test_update_without_verifier_skips_signature_check() {
+        let temp = TempDir::new().unwrap();
+        let binary_path = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("rollback");
+
+        // No .sig file, no verifier configured
+        let new_binary = create_mock_binary(temp.path(), "pt-core-new", "2.0.0");
+
+        let manager =
+            RollbackManager::with_backup_dir(binary_path, "pt-core", backup_dir);
+        // NOTE: no .with_verifier()
+
+        let result = manager
+            .atomic_update(&new_binary, "1.0.0", None)
+            .unwrap();
+
+        // Should not be rejected — no verifier means no enforcement
+        assert!(
+            !matches!(result, UpdateResult::SignatureRejected { .. }),
+            "Without verifier, missing .sig should not cause rejection"
+        );
+    }
+
+    // ── Key rotation: old key still validates ───────────────────────────
+
+    #[test]
+    fn test_update_key_rotation_old_key_accepted() {
+        let temp = TempDir::new().unwrap();
+        let binary_path = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("rollback");
+
+        // Sign with old key
+        let (old_sk, old_vk) = test_keypair();
+        let new_binary =
+            create_signed_binary(temp.path(), "pt-core-new", "2.0.0", &old_sk);
+
+        // Verifier trusts both new and old keys
+        let (_new_sk, new_vk) = test_keypair();
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_key(new_vk);
+        verifier.add_key(old_vk);
+
+        let manager =
+            RollbackManager::with_backup_dir(binary_path, "pt-core", backup_dir)
+                .with_verifier(verifier);
+
+        let result = manager
+            .atomic_update(&new_binary, "1.0.0", None)
+            .unwrap();
+
+        assert!(
+            !matches!(result, UpdateResult::SignatureRejected { .. }),
+            "Old key should still be accepted during rotation"
+        );
+    }
+
+    // ── UpdateResult helpers ────────────────────────────────────────────
+
+    #[test]
+    fn test_update_result_signature_error_accessor() {
+        let temp = TempDir::new().unwrap();
+        let binary_path = create_mock_binary(temp.path(), "pt-core", "1.0.0");
+        let backup_dir = temp.path().join("rollback");
+
+        let new_binary = create_mock_binary(temp.path(), "pt-core-new", "2.0.0");
+        // No .sig sidecar
+
+        let (_sk, vk) = test_keypair();
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_key(vk);
+
+        let manager =
+            RollbackManager::with_backup_dir(binary_path, "pt-core", backup_dir)
+                .with_verifier(verifier);
+
+        let result = manager
+            .atomic_update(&new_binary, "1.0.0", None)
+            .unwrap();
+
+        assert!(!result.is_success());
+        assert!(result.signature_error().is_some());
+        assert!(result.verification().is_none());
     }
 }

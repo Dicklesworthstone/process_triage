@@ -62,8 +62,12 @@ ln -s "$(pwd)/process_triage/pt" ~/.local/bin/pt
 # Or install to system-wide location
 PT_SYSTEM=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
 
-# Verify checksums
+# Verify signatures + checksums (fail-closed on missing/invalid metadata)
 VERIFY=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
+
+# Optional: pin a local trusted release key instead of downloading it
+PT_RELEASE_PUBLIC_KEY_FILE=/path/to/release-signing-public.pem VERIFY=1 \
+  curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
 ```
 
 **Platforms supported:**

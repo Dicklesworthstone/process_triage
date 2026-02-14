@@ -10,7 +10,9 @@
 #   PT_SYSTEM   - Set to 1 for system-wide install (/usr/local/bin)
 #   PT_VERSION  - Install specific version (default: latest)
 #   PT_NO_PATH  - Set to 1 to skip PATH modification
-#   VERIFY      - Set to 1 to enable checksum verification
+#   VERIFY      - Set to 1 to enforce signature + checksum verification
+#   PT_RELEASE_PUBLIC_KEY_FILE - Optional PEM public key file for signature verification
+#   PT_RELEASE_PUBLIC_KEY_PEM  - Optional PEM public key content for signature verification
 #   PT_CORE_VERSION - Install specific pt-core version (default: same as PT_VERSION)
 #
 set -euo pipefail
@@ -328,8 +330,8 @@ download_checksums() {
     local checksum_url="${RELEASES_URL}/download/v${version}/checksums.sha256"
 
     download "$checksum_url" "$output" 2>/dev/null || {
-        log_warn "Could not download checksums file"
-        log_warn "URL: $checksum_url"
+        log_error "Could not download checksums file"
+        log_error "URL: $checksum_url"
         return 1
     }
 }
@@ -362,23 +364,23 @@ verify_download() {
     local expected
 
     expected=$(fetch_stdout "$checksum_url" 2>/dev/null) || {
-        log_warn "Could not download checksum file"
-        log_warn "URL: $checksum_url"
-        log_warn ""
-        log_warn "Checksums may not be available for this version."
-        log_warn "Proceeding without verification."
-        return 0
+        log_error "Could not download checksum file"
+        log_error "URL: $checksum_url"
+        return 1
     }
 
     # Extract hash (format: "hash  filename" or just "hash")
     expected="${expected%% *}"
+    if [[ -z "$expected" ]]; then
+        log_error "Checksum file was empty or malformed: $checksum_url"
+        return 1
+    fi
 
     # Compute actual
     local actual
     actual=$(sha256_file "$file") || {
-        log_warn "Could not compute checksum (no SHA256 tool)"
-        log_warn "Skipping verification"
-        return 0
+        log_error "Could not compute checksum (no SHA256 tool available)"
+        return 1
     }
 
     # Compare
@@ -410,20 +412,19 @@ verify_file_checksum() {
 
     local expected
     expected=$(lookup_checksum "$checksums_file" "$filename") || {
-        log_warn "No checksum found for ${filename}"
-        log_warn "Proceeding without verification"
-        return 0
+        log_error "No checksum found for ${filename} in ${checksums_file}"
+        return 1
     }
 
     if [[ -z "$expected" ]]; then
-        log_warn "Checksum not found for ${filename}"
-        return 0
+        log_error "Checksum not found for ${filename} in ${checksums_file}"
+        return 1
     fi
 
     local actual
     actual=$(sha256_file "$file") || {
-        log_warn "Could not compute checksum (no SHA256 tool)"
-        return 0
+        log_error "Could not compute checksum (no SHA256 tool available)"
+        return 1
     }
 
     if [[ "$expected" == "$actual" ]]; then
@@ -435,6 +436,77 @@ verify_file_checksum() {
         log_error "Actual:   $actual"
         return 1
     fi
+}
+
+ensure_openssl_for_signatures() {
+    if ! command -v openssl &>/dev/null; then
+        log_error "OpenSSL is required for signature verification (VERIFY=1)."
+        log_error "Install OpenSSL and retry."
+        return 1
+    fi
+}
+
+resolve_release_public_key() {
+    local version="$1"
+    local output="$2"
+
+    if [[ -n "${PT_RELEASE_PUBLIC_KEY_FILE:-}" ]]; then
+        if [[ ! -f "${PT_RELEASE_PUBLIC_KEY_FILE}" ]]; then
+            log_error "PT_RELEASE_PUBLIC_KEY_FILE does not exist: ${PT_RELEASE_PUBLIC_KEY_FILE}"
+            return 1
+        fi
+        cp "${PT_RELEASE_PUBLIC_KEY_FILE}" "$output" || {
+            log_error "Failed to copy public key from PT_RELEASE_PUBLIC_KEY_FILE"
+            return 1
+        }
+    elif [[ -n "${PT_RELEASE_PUBLIC_KEY_PEM:-}" ]]; then
+        printf '%s\n' "${PT_RELEASE_PUBLIC_KEY_PEM}" > "$output"
+    else
+        local key_url="${RELEASES_URL}/download/v${version}/release-signing-public.pem"
+        download "$key_url" "$output" || {
+            log_error "Could not download trusted public key for v${version}"
+            log_error "URL: ${key_url}"
+            log_error "Set PT_RELEASE_PUBLIC_KEY_FILE or PT_RELEASE_PUBLIC_KEY_PEM to provide a trusted key."
+            return 1
+        }
+    fi
+
+    if ! openssl pkey -pubin -in "$output" -noout >/dev/null 2>&1; then
+        log_error "Invalid public key PEM for release signature verification"
+        return 1
+    fi
+}
+
+download_signature() {
+    local version="$1"
+    local artifact_name="$2"
+    local output="$3"
+
+    local sig_url="${RELEASES_URL}/download/v${version}/${artifact_name}.sig"
+    download "$sig_url" "$output" || {
+        log_error "Could not download signature for ${artifact_name}"
+        log_error "URL: ${sig_url}"
+        return 1
+    }
+}
+
+verify_file_signature() {
+    local file_path="$1"
+    local artifact_name="$2"
+    local version="$3"
+    local pubkey_file="$4"
+    local sig_output="$5"
+
+    log_step "Verifying ${artifact_name} signature..."
+    download_signature "$version" "$artifact_name" "$sig_output" || return 1
+
+    if openssl dgst -sha256 -verify "$pubkey_file" -signature "$sig_output" "$file_path" >/dev/null 2>&1; then
+        log_success "${artifact_name} signature verified"
+        return 0
+    fi
+
+    log_error "Signature verification failed for ${artifact_name}"
+    return 1
 }
 
 # ==============================================================================
@@ -643,23 +715,41 @@ main() {
     # Download consolidated checksums file (for verification)
     local wrapper_checksums_file="$temp_dir/checksums-wrapper.sha256"
     local core_checksums_file="$temp_dir/checksums-core.sha256"
-    local have_wrapper_checksums=false
-    local have_core_checksums=false
+    local wrapper_pubkey_file="$temp_dir/release-signing-wrapper.pem"
+    local core_pubkey_file="$temp_dir/release-signing-core.pem"
     if [[ "${VERIFY:-}" == "1" ]]; then
-        log_step "Downloading checksums..."
-        if download_checksums "$version" "$wrapper_checksums_file"; then
-            have_wrapper_checksums=true
-            log_success "Downloaded wrapper checksums.sha256"
+        ensure_openssl_for_signatures || exit 1
+
+        log_step "Resolving trusted public key..."
+        if ! resolve_release_public_key "$version" "$wrapper_pubkey_file"; then
+            log_error "Installation aborted: could not load trusted key for wrapper version v${version}"
+            exit 1
         fi
 
         if [[ "$core_version" == "$version" ]]; then
-            core_checksums_file="$wrapper_checksums_file"
-            have_core_checksums="$have_wrapper_checksums"
+            cp "$wrapper_pubkey_file" "$core_pubkey_file"
         else
-            if download_checksums "$core_version" "$core_checksums_file"; then
-                have_core_checksums=true
-                log_success "Downloaded pt-core checksums.sha256"
+            if ! resolve_release_public_key "$core_version" "$core_pubkey_file"; then
+                log_error "Installation aborted: could not load trusted key for pt-core version v${core_version}"
+                exit 1
             fi
+        fi
+
+        log_step "Downloading checksums..."
+        if ! download_checksums "$version" "$wrapper_checksums_file"; then
+            log_error "Installation aborted: wrapper checksums are required when VERIFY=1"
+            exit 1
+        fi
+        log_success "Downloaded wrapper checksums.sha256"
+
+        if [[ "$core_version" == "$version" ]]; then
+            core_checksums_file="$wrapper_checksums_file"
+        else
+            if ! download_checksums "$core_version" "$core_checksums_file"; then
+                log_error "Installation aborted: pt-core checksums are required when VERIFY=1"
+                exit 1
+            fi
+            log_success "Downloaded pt-core checksums.sha256"
         fi
     fi
 
@@ -683,8 +773,9 @@ main() {
 
     if [[ "$downloaded_wrapper" != "true" ]]; then
         if [[ "${VERIFY:-}" == "1" ]]; then
-            log_warn "Failed to download pt wrapper from release or tag."
-            log_warn "Falling back to master; verification may be unavailable."
+            log_error "Failed to download pt wrapper from release or tag with VERIFY=1."
+            log_error "Refusing insecure fallback to master while verification is enabled."
+            exit 1
         else
             log_warn "Falling back to master pt wrapper (unverified)."
         fi
@@ -697,17 +788,19 @@ main() {
 
     # Verify pt wrapper if requested
     if [[ "${VERIFY:-}" == "1" ]]; then
-        if [[ "$have_wrapper_checksums" == "true" ]]; then
-            if ! verify_file_checksum "$temp_dir/pt" "pt" "$wrapper_checksums_file"; then
-                log_error "Installation aborted: pt wrapper verification failed"
-                exit 1
-            fi
-        else
-            # Fallback to individual checksum file
-            if ! verify_download "$temp_dir/pt" "$version"; then
-                log_error "Installation aborted: pt wrapper verification failed"
-                exit 1
-            fi
+        if ! verify_file_signature \
+            "$temp_dir/pt" \
+            "pt" \
+            "$version" \
+            "$wrapper_pubkey_file" \
+            "$temp_dir/pt.sig"; then
+            log_error "Installation aborted: pt wrapper signature verification failed"
+            exit 1
+        fi
+
+        if ! verify_file_checksum "$temp_dir/pt" "pt" "$wrapper_checksums_file"; then
+            log_error "Installation aborted: pt wrapper checksum verification failed"
+            exit 1
         fi
     fi
 
@@ -740,13 +833,19 @@ main() {
         if [[ "$download_success" == "true" ]]; then
             # Verify pt-core archive if requested
             if [[ "${VERIFY:-}" == "1" ]]; then
-                if [[ "$have_core_checksums" == "true" ]]; then
-                    if ! verify_file_checksum "$temp_dir/$archive_name" "$archive_name" "$core_checksums_file"; then
-                        log_error "Installation aborted: pt-core verification failed"
-                        exit 1
-                    fi
-                else
-                    log_warn "Checksums not available; skipping pt-core verification"
+                if ! verify_file_signature \
+                    "$temp_dir/$archive_name" \
+                    "$archive_name" \
+                    "$core_version" \
+                    "$core_pubkey_file" \
+                    "$temp_dir/${archive_name}.sig"; then
+                    log_error "Installation aborted: pt-core signature verification failed"
+                    exit 1
+                fi
+
+                if ! verify_file_checksum "$temp_dir/$archive_name" "$archive_name" "$core_checksums_file"; then
+                    log_error "Installation aborted: pt-core checksum verification failed"
+                    exit 1
                 fi
             fi
 

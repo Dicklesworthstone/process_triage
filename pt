@@ -163,7 +163,7 @@ main() {
             echo "Error: neither curl nor wget is available to run installer." >&2
             exit 1
         fi
-        bash -c "set -euo pipefail; $update_installer_cmd"
+        bash -c "set -euo pipefail; export VERIFY=1; $update_installer_cmd"
         exit $?
     fi
 

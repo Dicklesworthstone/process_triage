@@ -57,18 +57,41 @@ EOF
     # tarball
     local tarball="pt-core-${os}-${arch}-${version}.tar.gz"
     tar -czf "${dest_dir}/${tarball}" -C "$temp_dir" pt-core
+
+    # Linux musl fallback tarball (installer may prefer/require this target)
+    local musl_tarball=""
+    if [[ "$os" == "linux" ]]; then
+        musl_tarball="pt-core-${os}-${arch}-musl-${version}.tar.gz"
+        tar -czf "${dest_dir}/${musl_tarball}" -C "$temp_dir" pt-core
+    fi
     rm -rf "$temp_dir"
 
     # checksums
     (
         cd "$dest_dir" || exit 1
         > checksums.sha256
-        for f in pt "$tarball"; do
+        for f in pt "$tarball" ${musl_tarball:+$musl_tarball}; do
             if [[ -f "$f" ]]; then
                 sha256sum "$f" >> checksums.sha256
             fi
         done
     )
+}
+
+sign_assets_with_key() {
+    local assets_dir="$1"
+    local private_key="$2"
+
+    for file in "$assets_dir"/*; do
+        [[ -f "$file" ]] || continue
+        case "$file" in
+            *.sig) continue ;;
+            */release-signing-public.pem) continue ;;
+        esac
+        openssl dgst -sha256 -sign "$private_key" -out "${file}.sig" "$file"
+    done
+
+    openssl pkey -in "$private_key" -pubout -out "$assets_dir/release-signing-public.pem"
 }
 
 # Create a mock curl that serves from versioned asset directories
@@ -136,6 +159,15 @@ case "$url" in
         serve_file "$SERVE_DIR/pt" ;;
     *"/checksums.sha256"*)
         serve_file "$SERVE_DIR/checksums.sha256" ;;
+    *"/release-signing-public.pem"*)
+        serve_file "$SERVE_DIR/release-signing-public.pem" ;;
+    *.sig)
+        filename="${url##*/}"; filename="${filename%%\?*}"
+        if [[ -f "$SERVE_DIR/$filename" ]]; then
+            serve_file "$SERVE_DIR/$filename"
+        else
+            echo "ERROR: $filename not found in $SERVE_DIR" >&2; exit 1
+        fi ;;
     *.tar.gz*)
         filename="${url##*/}"; filename="${filename%%\?*}"
         if [[ -f "$SERVE_DIR/$filename" ]]; then
@@ -195,6 +227,12 @@ setup_lifecycle_env() {
 
     create_version_assets "$v1" "$os_norm" "$arch" "$ASSETS_V1"
     create_version_assets "$v2" "$os_norm" "$arch" "$ASSETS_V2"
+
+    export RELEASE_SIGNING_PRIVATE_KEY="${TEST_DIR}/release-signing-private.pem"
+    openssl ecparam -name prime256v1 -genkey -noout -out "$RELEASE_SIGNING_PRIVATE_KEY"
+    sign_assets_with_key "$ASSETS_V1" "$RELEASE_SIGNING_PRIVATE_KEY"
+    sign_assets_with_key "$ASSETS_V2" "$RELEASE_SIGNING_PRIVATE_KEY"
+    export PT_RELEASE_PUBLIC_KEY_FILE="$ASSETS_V1/release-signing-public.pem"
 
     create_mock_uname "$os" "$arch"
     create_versioned_mock_curl "$ASSETS_V1" "$v1" "$ASSETS_V2" "$v2"
@@ -395,20 +433,17 @@ EOF
 
     setup_lifecycle_env "1.0.0" "2.0.0"
 
-    # Corrupt the v1 tarball after checksums were generated
-    echo "CORRUPTED_DATA" >> "$ASSETS_V1"/*.tar.gz
+    # Corrupt v1 tarballs after checksums were generated
+    for f in "$ASSETS_V1"/*.tar.gz; do
+        echo "CORRUPTED_DATA" >> "$f"
+    done
 
     export VERIFY=1
     run_installer
 
     test_info "Exit: $status Output: $output"
-    # Installer should fail or at least not install a broken binary
-    if [[ "$status" -eq 0 ]]; then
-        # If it "succeeds", pt wrapper may install but pt-core should be skipped/missing
-        test_info "Installer exited 0 — checking if pt-core was installed anyway"
-    else
-        test_info "Installer correctly rejected corrupted tarball"
-    fi
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Signature verification failed"* ]] || [[ "$output" == *"verification failed"* ]]
 
     test_end "tampered tarball" "pass"
 }
@@ -426,12 +461,25 @@ EOF
     run_installer
 
     test_info "Exit: $status Output: $output"
-    # Should fail or warn about checksum mismatch
-    if [[ "$status" -ne 0 ]]; then
-        test_info "Installer rejected bad checksums (exit=$status)"
-    fi
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Checksum mismatch"* ]]
 
     test_end "tampered checksums" "pass"
+}
+
+@test "tampered: missing signature file with VERIFY=1 fails closed" {
+    test_start "tampered missing signature" "missing detached signature causes failure"
+
+    setup_lifecycle_env "1.0.0" "2.0.0"
+    rm -f "$ASSETS_V1/pt.sig"
+
+    export VERIFY=1
+    run_installer
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Could not download signature for pt"* ]]
+
+    test_end "tampered missing signature" "pass"
 }
 
 @test "tampered: empty tarball does not crash installer" {
