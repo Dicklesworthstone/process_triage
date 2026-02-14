@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-02-14T00:00:00Z",
+  "hosts": [
+    {
+      "hostname": "127.0.0.1",
+      "tags": {
+        "role": "coordinator",
+        "env": "local"
+      },
+      "access_method": "ssh",
+      "status": "active"
+    },
+    {
+      "hostname": "build-agent-01.internal",
+      "tags": {
+        "role": "worker",
+        "env": "staging"
+      },
+      "access_method": "ssh",
+      "status": "active"
+    }
+  ]
+}

@@ -1,0 +1,141 @@
+{
+  "schema_version": "1.0.0",
+  "policy_id": "preset:developer",
+  "description": "Developer preset: aggressive detection for dev environments",
+  "created_at": null,
+  "updated_at": null,
+  "inherits": [],
+  "loss_matrix": {
+    "useful": {
+      "keep": 0.0,
+      "pause": 0.3,
+      "throttle": 0.5,
+      "kill": 50.0,
+      "restart": 5.0,
+      "renice": 0.1
+    },
+    "useful_bad": {
+      "keep": 0.0,
+      "pause": 0.2,
+      "throttle": 0.3,
+      "kill": 20.0,
+      "restart": 3.0,
+      "renice": 0.05
+    },
+    "abandoned": {
+      "keep": 10.0,
+      "pause": 0.1,
+      "throttle": 0.2,
+      "kill": 0.05,
+      "restart": 0.5,
+      "renice": 0.05
+    },
+    "zombie": {
+      "keep": 5.0,
+      "pause": 0.05,
+      "throttle": 0.05,
+      "kill": 0.01,
+      "restart": 0.05,
+      "renice": 0.01
+    }
+  },
+  "guardrails": {
+    "protected_patterns": [
+      {
+        "pattern": "^systemd$",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "Init system"
+      },
+      {
+        "pattern": "^sshd$",
+        "kind": "regex",
+        "case_insensitive": true,
+        "notes": "SSH daemon"
+      }
+    ],
+    "force_review_patterns": [],
+    "protected_users": [
+      "root"
+    ],
+    "protected_groups": [],
+    "protected_categories": [
+      "database"
+    ],
+    "never_kill_ppid": [
+      1
+    ],
+    "never_kill_pid": [],
+    "max_kills_per_run": 20,
+    "max_kills_per_minute": 10,
+    "max_kills_per_hour": 50,
+    "max_kills_per_day": 200,
+    "min_process_age_seconds": 1800,
+    "require_confirmation": true
+  },
+  "robot_mode": {
+    "enabled": false,
+    "min_posterior": 0.9,
+    "min_confidence": "medium",
+    "max_blast_radius_mb": 8192.0,
+    "max_kills": 15,
+    "require_known_signature": false,
+    "require_policy_snapshot": null,
+    "allow_categories": [
+      "test_runner",
+      "dev_server",
+      "build_tool"
+    ],
+    "exclude_categories": [],
+    "require_human_for_supervised": false
+  },
+  "signature_fast_path": {
+    "enabled": true,
+    "min_confidence_threshold": 0.9,
+    "require_explicit_priors": true
+  },
+  "fdr_control": {
+    "enabled": true,
+    "method": "bh",
+    "alpha": 0.1,
+    "min_candidates": null,
+    "lfdr_null": [],
+    "alpha_investing": null
+  },
+  "data_loss_gates": {
+    "block_if_open_write_fds": true,
+    "max_open_write_fds": 5,
+    "block_if_locked_files": true,
+    "block_if_deleted_cwd": null,
+    "block_if_active_tty": false,
+    "block_if_recent_io_seconds": 30
+  },
+  "load_aware": {
+    "enabled": false,
+    "queue_high": 50,
+    "load_per_core_high": 1.0,
+    "memory_used_fraction_high": 0.85,
+    "psi_avg10_high": 20.0,
+    "weights": {
+      "queue": 0.25,
+      "load": 0.35,
+      "memory": 0.25,
+      "psi": 0.15
+    },
+    "multipliers": {
+      "keep_max": 1.4,
+      "reversible_min": 0.6,
+      "risky_max": 1.8
+    }
+  },
+  "decision_time_bound": {
+    "enabled": true,
+    "min_seconds": 60,
+    "max_seconds": 600,
+    "voi_decay_half_life_seconds": 120,
+    "voi_floor": 0.01,
+    "overhead_budget_seconds": 300,
+    "fallback_action": "pause"
+  },
+  "notes": "Optimized for catching stuck test runners, dev servers, and build tools"
+}

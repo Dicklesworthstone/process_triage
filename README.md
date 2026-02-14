@@ -133,6 +133,7 @@ Runs additional probes: I/O activity, CPU progress over time, TTY state, network
 ```bash
 pt history     # View past kill/spare decisions
 pt clear       # Clear learned decisions (fresh start)
+pt learn       # Interactive tutorial progress + guided exercises
 pt diff --last # Compare the latest two sessions
 pt --version   # Show version
 pt --help      # Full command reference
@@ -341,10 +342,45 @@ See [docs/PRIORS_SCHEMA.md](docs/PRIORS_SCHEMA.md) for the full specification.
   "robot_mode": {
     "enabled": false,
     "min_posterior": 0.99,
-    "max_kills_per_session": 5,
-    "max_blast_radius_mb": 2048
+    "max_blast_radius_mb": 2048,
+    "max_kills": 5
   }
 }
+```
+
+---
+
+## Interactive Tutorials and Docs
+
+Use the built-in tutorial workflow to learn the safest operational patterns:
+
+```bash
+pt learn
+pt learn list
+pt learn show 01
+pt learn verify --all --mark-complete
+```
+
+- Tutorial docs: [docs/tutorials/README.md](docs/tutorials/README.md)
+- Architecture overview + flow diagram: [docs/architecture/README.md](docs/architecture/README.md)
+- ADR index: [docs/adr/](docs/adr/)
+- Demo scripts and recording references: [docs/demos/README.md](docs/demos/README.md)
+
+## Scenario Configurations
+
+Ready-to-use scenario examples live in [examples/configs/](examples/configs/):
+
+- `developer.json`: aggressive dev-machine cleanup profile
+- `server.json`: conservative production profile
+- `ci.json`: automation/CI-friendly profile
+- `fleet.json`: multi-host discovery config (with static inventory)
+
+Validate them quickly:
+
+```bash
+pt-core config validate examples/configs/developer.json --format summary
+pt-core config validate examples/configs/server.json --format summary
+pt-core config validate examples/configs/ci.json --format summary
 ```
 
 ---

@@ -1,0 +1,11 @@
+flowchart LR
+    A[pt wrapper] --> B[pt-core CLI]
+    B --> C[Config Loader]
+    B --> D[Process Sampler]
+    D --> E[Evidence Extractors]
+    E --> F[Bayesian Inference]
+    F --> G[Risk and Policy Gates]
+    G --> H[Plan Output]
+    H --> I[Review UX or Agent JSON]
+    I --> J[Apply Engine]
+    J --> K[Audit and Telemetry]

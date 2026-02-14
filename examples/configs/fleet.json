@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-02-14T00:00:00Z",
+  "cache_ttl_secs": 120,
+  "refresh_interval_secs": 300,
+  "stale_while_revalidate_secs": 900,
+  "providers": [
+    {
+      "type": "static",
+      "path": "examples/configs/fleet.inventory.json"
+    }
+  ]
+}

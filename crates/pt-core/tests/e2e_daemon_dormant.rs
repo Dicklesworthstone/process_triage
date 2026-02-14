@@ -118,6 +118,106 @@ fn read_jsonl_items(path: &Path) -> Vec<Value> {
 }
 
 #[test]
+fn daemon_starts_with_defaults_when_daemon_json_is_missing() {
+    let data_dir = TempDir::new().expect("temp data dir");
+    let config_dir = TempDir::new().expect("temp config dir");
+
+    let mut child = start_daemon_foreground(config_dir.path(), data_dir.path());
+    let pid_path = daemon_pid_path(data_dir.path());
+    let state_path = daemon_state_path(data_dir.path());
+
+    wait_for(Duration::from_secs(10), || {
+        pid_path.exists() && state_path.exists()
+    });
+
+    assert!(
+        child.try_wait().expect("query child status").is_none(),
+        "daemon should stay alive when daemon.json is missing (default config path)"
+    );
+
+    send_sigterm(&child);
+    wait_for(Duration::from_secs(10), || {
+        child.try_wait().expect("query child status").is_some()
+    });
+
+    let status = child.wait().expect("wait for daemon exit status");
+    assert!(status.success(), "daemon should exit cleanly after SIGTERM");
+    assert!(
+        !pid_path.exists(),
+        "daemon pid file should be removed after clean shutdown"
+    );
+}
+
+#[test]
+fn daemon_recovers_from_corrupt_state_file() {
+    let data_dir = TempDir::new().expect("temp data dir");
+    let config_dir = TempDir::new().expect("temp config dir");
+
+    write_daemon_json_config(
+        config_dir.path(),
+        r#"{
+  "tick_interval_secs": 30,
+  "max_cpu_percent": 1000.0,
+  "max_rss_mb": 4096,
+  "triggers": {
+    "ewma_alpha": 0.3,
+    "load_threshold": 9999.0,
+    "memory_threshold": 9999.0,
+    "orphan_threshold": 9999999,
+    "sustained_ticks": 1,
+    "cooldown_ticks": 10
+  },
+  "escalation": {
+    "min_interval_secs": 0,
+    "allow_auto_mitigation": false,
+    "max_deep_scan_targets": 1
+  },
+  "notifications": {
+    "enabled": false,
+    "desktop": false,
+    "notify_cmd": null,
+    "notify_arg": []
+  }
+}"#,
+    );
+
+    let state_path = daemon_state_path(data_dir.path());
+    fs::create_dir_all(
+        state_path
+            .parent()
+            .expect("state path should have daemon parent dir"),
+    )
+    .expect("create daemon state dir");
+    fs::write(&state_path, "{ this is not valid json }").expect("write corrupt state");
+
+    let mut child = start_daemon_foreground(config_dir.path(), data_dir.path());
+    let pid_path = daemon_pid_path(data_dir.path());
+
+    wait_for(Duration::from_secs(10), || pid_path.exists());
+    wait_for(Duration::from_secs(10), || {
+        let Ok(content) = fs::read_to_string(&state_path) else {
+            return false;
+        };
+        serde_json::from_str::<Value>(&content).is_ok()
+    });
+
+    assert!(
+        child.try_wait().expect("query child status").is_none(),
+        "daemon should remain alive after recovering from corrupt state file"
+    );
+
+    send_sigterm(&child);
+    wait_for(Duration::from_secs(10), || {
+        child.try_wait().expect("query child status").is_some()
+    });
+    let status = child.wait().expect("wait for daemon exit status");
+    assert!(
+        status.success(),
+        "daemon should exit cleanly after corrupt-state recovery test"
+    );
+}
+
+#[test]
 fn daemon_lock_contention_writes_inbox_item_and_cleans_pid() {
     let data_dir = TempDir::new().expect("temp data dir");
     let config_dir = TempDir::new().expect("temp config dir");
