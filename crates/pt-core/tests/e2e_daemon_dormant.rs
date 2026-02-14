@@ -55,6 +55,27 @@ fn acquire_global_lock(data_dir: &Path) -> std::fs::File {
     file
 }
 
+fn acquire_daemon_pid_lock(data_dir: &Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+
+    let path = data_dir.join("daemon").join("daemon.pid.lock");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create daemon pid lock dir");
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .expect("open daemon pid lock file");
+
+    let fd = file.as_raw_fd();
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "expected to acquire daemon pid lock at {:?}", path);
+    file
+}
+
 fn start_daemon_foreground(config_dir: &Path, data_dir: &Path) -> Child {
     let exe = assert_cmd::cargo::cargo_bin!("pt-core");
     let mut cmd = Command::new(exe);
@@ -136,6 +157,58 @@ fn state_has_event(state_path: &Path, event_type: &str) -> bool {
             .map(|t| t == event_type)
             .unwrap_or(false)
     })
+}
+
+#[test]
+fn daemon_start_fails_when_pid_lock_is_held() {
+    let data_dir = TempDir::new().expect("temp data dir");
+    let config_dir = TempDir::new().expect("temp config dir");
+
+    write_daemon_json_config(
+        config_dir.path(),
+        r#"{
+  "tick_interval_secs": 30,
+  "max_cpu_percent": 1000.0,
+  "max_rss_mb": 4096,
+  "triggers": {
+    "ewma_alpha": 0.3,
+    "load_threshold": 9999.0,
+    "memory_threshold": 9999.0,
+    "orphan_threshold": 9999999,
+    "sustained_ticks": 1,
+    "cooldown_ticks": 10
+  },
+  "escalation": {
+    "min_interval_secs": 0,
+    "allow_auto_mitigation": false,
+    "max_deep_scan_targets": 1
+  },
+  "notifications": {
+    "enabled": false,
+    "desktop": false,
+    "notify_cmd": null,
+    "notify_arg": []
+  }
+}"#,
+    );
+
+    let _pid_lock = acquire_daemon_pid_lock(data_dir.path());
+    let mut child = start_daemon_foreground(config_dir.path(), data_dir.path());
+
+    wait_for(Duration::from_secs(10), || {
+        child.try_wait().expect("query child status").is_some()
+    });
+    let status = child.wait().expect("wait for daemon exit status");
+    // ExitCode::LockError == 14.
+    assert_eq!(
+        status.code(),
+        Some(14),
+        "daemon should exit with lock contention when daemon pid lock is held"
+    );
+    assert!(
+        !daemon_pid_path(data_dir.path()).exists(),
+        "daemon pid file should not be written when pid lock acquisition fails"
+    );
 }
 
 #[test]

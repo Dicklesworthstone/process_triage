@@ -450,9 +450,8 @@ mod signature_verification_tests {
         let mut verifier = SignatureVerifier::new();
         verifier.add_key(vk);
 
-        let manager =
-            RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
-                .with_verifier(verifier);
+        let manager = RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
+            .with_verifier(verifier);
 
         let result = manager
             .atomic_update(&new_binary, "1.0.0", Some("2.0.0"))
@@ -488,17 +487,15 @@ mod signature_verification_tests {
 
         // Sign the new binary with key A
         let (sk_a, _vk_a) = test_keypair();
-        let new_binary =
-            create_signed_binary(temp.path(), "pt-core-new", "2.0.0", &sk_a);
+        let new_binary = create_signed_binary(temp.path(), "pt-core-new", "2.0.0", &sk_a);
 
         // Configure verifier with key B (different from the signing key)
         let (_sk_b, vk_b) = test_keypair();
         let mut verifier = SignatureVerifier::new();
         verifier.add_key(vk_b);
 
-        let manager =
-            RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
-                .with_verifier(verifier);
+        let manager = RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
+            .with_verifier(verifier);
 
         let result = manager
             .atomic_update(&new_binary, "1.0.0", Some("2.0.0"))
@@ -537,9 +534,8 @@ mod signature_verification_tests {
         let mut verifier = SignatureVerifier::new();
         verifier.add_key(vk);
 
-        let manager =
-            RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
-                .with_verifier(verifier);
+        let manager = RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
+            .with_verifier(verifier);
 
         let result = manager
             .atomic_update(&new_binary, "1.0.0", Some("2.0.0"))
@@ -566,19 +562,15 @@ mod signature_verification_tests {
         let backup_dir = temp.path().join("rollback");
 
         let (sk, vk) = test_keypair();
-        let new_binary =
-            create_signed_binary(temp.path(), "pt-core-new", "2.0.0", &sk);
+        let new_binary = create_signed_binary(temp.path(), "pt-core-new", "2.0.0", &sk);
 
         let mut verifier = SignatureVerifier::new();
         verifier.add_key(vk);
 
-        let manager =
-            RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
-                .with_verifier(verifier);
+        let manager = RollbackManager::with_backup_dir(binary_path.clone(), "pt-core", backup_dir)
+            .with_verifier(verifier);
 
-        let result = manager
-            .atomic_update(&new_binary, "1.0.0", None)
-            .unwrap();
+        let result = manager.atomic_update(&new_binary, "1.0.0", None).unwrap();
 
         // Should NOT be SignatureRejected
         assert!(
@@ -598,13 +590,10 @@ mod signature_verification_tests {
         // No .sig file, no verifier configured
         let new_binary = create_mock_binary(temp.path(), "pt-core-new", "2.0.0");
 
-        let manager =
-            RollbackManager::with_backup_dir(binary_path, "pt-core", backup_dir);
+        let manager = RollbackManager::with_backup_dir(binary_path, "pt-core", backup_dir);
         // NOTE: no .with_verifier()
 
-        let result = manager
-            .atomic_update(&new_binary, "1.0.0", None)
-            .unwrap();
+        let result = manager.atomic_update(&new_binary, "1.0.0", None).unwrap();
 
         // Should not be rejected — no verifier means no enforcement
         assert!(
@@ -623,8 +612,7 @@ mod signature_verification_tests {
 
         // Sign with old key
         let (old_sk, old_vk) = test_keypair();
-        let new_binary =
-            create_signed_binary(temp.path(), "pt-core-new", "2.0.0", &old_sk);
+        let new_binary = create_signed_binary(temp.path(), "pt-core-new", "2.0.0", &old_sk);
 
         // Verifier trusts both new and old keys
         let (_new_sk, new_vk) = test_keypair();
@@ -632,13 +620,10 @@ mod signature_verification_tests {
         verifier.add_key(new_vk);
         verifier.add_key(old_vk);
 
-        let manager =
-            RollbackManager::with_backup_dir(binary_path, "pt-core", backup_dir)
-                .with_verifier(verifier);
+        let manager = RollbackManager::with_backup_dir(binary_path, "pt-core", backup_dir)
+            .with_verifier(verifier);
 
-        let result = manager
-            .atomic_update(&new_binary, "1.0.0", None)
-            .unwrap();
+        let result = manager.atomic_update(&new_binary, "1.0.0", None).unwrap();
 
         assert!(
             !matches!(result, UpdateResult::SignatureRejected { .. }),
@@ -661,13 +646,10 @@ mod signature_verification_tests {
         let mut verifier = SignatureVerifier::new();
         verifier.add_key(vk);
 
-        let manager =
-            RollbackManager::with_backup_dir(binary_path, "pt-core", backup_dir)
-                .with_verifier(verifier);
+        let manager = RollbackManager::with_backup_dir(binary_path, "pt-core", backup_dir)
+            .with_verifier(verifier);
 
-        let result = manager
-            .atomic_update(&new_binary, "1.0.0", None)
-            .unwrap();
+        let result = manager.atomic_update(&new_binary, "1.0.0", None).unwrap();
 
         assert!(!result.is_success());
         assert!(result.signature_error().is_some());

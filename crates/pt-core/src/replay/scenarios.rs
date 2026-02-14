@@ -196,7 +196,7 @@ pub fn stuck_tests() -> ReplaySnapshot {
             .state(ProcessState::Sleeping)
             .cpu(0.0)
             .rss(16 * 1024 * 1024)
-            .elapsed_secs(1 * 3600)
+            .elapsed_secs(3600)
             .tty(Some("pts/0"))
             .build(),
     ];

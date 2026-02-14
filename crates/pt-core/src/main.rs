@@ -6774,14 +6774,6 @@ fn run_daemon_start(global: &GlobalOpts, foreground: bool) -> ExitCode {
 
 #[cfg(feature = "daemon")]
 fn run_daemon_background(global: &GlobalOpts) -> ExitCode {
-    if let Ok(Some(pid)) = read_daemon_pid() {
-        if is_process_running(pid) {
-            eprintln!("daemon start: existing daemon running (pid {})", pid);
-            return ExitCode::LockError;
-        }
-        let _ = remove_daemon_pid();
-    }
-
     let exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(err) => {
@@ -6797,7 +6789,7 @@ fn run_daemon_background(global: &GlobalOpts) -> ExitCode {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             eprintln!("daemon start: failed to spawn background worker: {}", err);
@@ -6805,9 +6797,31 @@ fn run_daemon_background(global: &GlobalOpts) -> ExitCode {
         }
     };
 
-    if let Err(err) = write_daemon_pid(child.id()) {
-        eprintln!("daemon start: failed to write pid file: {}", err);
-        return ExitCode::IoError;
+    let startup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().ok().flatten() {
+            if status.code() == Some(ExitCode::LockError.as_i32()) {
+                eprintln!("daemon start: existing daemon running");
+                return ExitCode::LockError;
+            }
+            eprintln!(
+                "daemon start: background worker exited early with status {}",
+                status
+            );
+            return ExitCode::IoError;
+        }
+
+        if let Ok(Some(pid)) = read_daemon_pid() {
+            if pid == child.id() {
+                break;
+            }
+        }
+
+        if std::time::Instant::now() >= startup_deadline {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     let response = serde_json::json!({
@@ -6834,6 +6848,19 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
 
     install_daemon_signal_handlers();
     apply_daemon_nice();
+
+    let _pid_lock = match try_acquire_daemon_pid_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!("daemon start: existing daemon running");
+            return ExitCode::LockError;
+        }
+        Err(err) => {
+            eprintln!("daemon start: failed to acquire daemon pid lock: {}", err);
+            return ExitCode::IoError;
+        }
+    };
+
     let own_pid = std::process::id();
     let mut last_cpu_sample: Option<(f64, std::time::Instant)> = None;
 
@@ -8485,11 +8512,26 @@ fn install_daemon_signal_handlers() {
     }
 
     unsafe {
-        let handler_ptr = handler as *const () as libc::sighandler_t;
-        libc::signal(libc::SIGTERM, handler_ptr);
-        libc::signal(libc::SIGINT, handler_ptr);
-        libc::signal(libc::SIGHUP, handler_ptr);
-        libc::signal(libc::SIGUSR1, handler_ptr);
+        #[cfg(target_os = "linux")]
+        {
+            // Use sigaction for persistent handler semantics across repeated signals.
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGUSR1] {
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let handler_ptr = handler as *const () as libc::sighandler_t;
+            libc::signal(libc::SIGTERM, handler_ptr);
+            libc::signal(libc::SIGINT, handler_ptr);
+            libc::signal(libc::SIGHUP, handler_ptr);
+            libc::signal(libc::SIGUSR1, handler_ptr);
+        }
     }
 }
 
@@ -8534,6 +8576,16 @@ fn daemon_base_dir() -> PathBuf {
 #[cfg(feature = "daemon")]
 fn daemon_pid_path() -> PathBuf {
     daemon_base_dir().join("daemon.pid")
+}
+
+#[cfg(feature = "daemon")]
+fn daemon_pid_lock_path() -> PathBuf {
+    daemon_base_dir().join("daemon.pid.lock")
+}
+
+#[cfg(feature = "daemon")]
+fn try_acquire_daemon_pid_lock() -> std::io::Result<Option<GlobalLock>> {
+    GlobalLock::try_acquire(&daemon_pid_lock_path())
 }
 
 #[cfg(feature = "daemon")]

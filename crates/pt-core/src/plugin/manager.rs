@@ -198,7 +198,7 @@ impl PluginManager {
 
     /// Check if a specific plugin is disabled.
     pub fn is_disabled(&self, name: &str) -> bool {
-        self.plugins.get(name).map_or(true, |s| s.disabled)
+        self.plugins.get(name).is_none_or(|s| s.disabled)
     }
 
     /// Manually disable a plugin.

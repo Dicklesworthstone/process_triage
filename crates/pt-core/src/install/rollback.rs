@@ -781,8 +781,8 @@ esac
     #[test]
     fn rollback_manager_with_verifier() {
         let verifier = SignatureVerifier::new();
-        let manager = RollbackManager::new(PathBuf::from("/tmp/pt-core"), "pt-core")
-            .with_verifier(verifier);
+        let manager =
+            RollbackManager::new(PathBuf::from("/tmp/pt-core"), "pt-core").with_verifier(verifier);
         assert!(manager.verifier().is_some());
         assert_eq!(manager.verifier().unwrap().key_count(), 0);
     }
