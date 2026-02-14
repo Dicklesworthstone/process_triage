@@ -69,7 +69,7 @@ pub struct CpuCapacityProvenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AffinitySource {
-    /// From /proc/[pid]/status Cpus_allowed_list.
+    /// From /proc/\[pid\]/status Cpus_allowed_list.
     ProcStatus,
     /// Not available (assume unconstrained).
     #[default]
@@ -196,7 +196,7 @@ fn collect_affinity(pid: u32, provenance: &mut CpuCapacityProvenance) -> Option<
     Some(affinity)
 }
 
-/// Parse Cpus_allowed_list from /proc/[pid]/status content.
+/// Parse Cpus_allowed_list from /proc/\[pid\]/status content.
 ///
 /// Format: "Cpus_allowed_list:\t0-3" or "Cpus_allowed_list:\t0,2,4-7"
 pub fn parse_cpus_allowed_list(content: &str) -> Option<u32> {

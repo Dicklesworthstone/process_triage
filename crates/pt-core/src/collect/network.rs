@@ -341,7 +341,7 @@ impl UnixSocketState {
 
 /// Collect network information for a specific process.
 ///
-/// This function reads /proc/[pid]/fd to find socket inodes, then
+/// This function reads /proc/\[pid\]/fd to find socket inodes, then
 /// looks them up in /proc/net/tcp, /proc/net/udp, /proc/net/unix.
 ///
 /// Note: For bulk collection, use `NetworkSnapshot::collect()` and `get_process_info`

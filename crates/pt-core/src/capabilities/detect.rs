@@ -116,7 +116,7 @@ pub struct DataSourceCapabilities {
     /// eBPF available.
     pub ebpf: bool,
 
-    /// schedstat available in /proc/[pid]/schedstat.
+    /// schedstat available in /proc/\[pid\]/schedstat.
     pub schedstat: bool,
 
     /// cgroup v1 available.

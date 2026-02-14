@@ -136,7 +136,7 @@ pub enum CalibrationError {
     NoData,
     /// Insufficient labeled data for reliable metrics.
     InsufficientData { count: usize, min_required: usize },
-    /// Invalid probability value (outside [0,1]).
+    /// Invalid probability value (outside \[0,1\]).
     InvalidProbability(f64),
     /// IO error (for report generation).
     IoError(String),

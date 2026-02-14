@@ -1,6 +1,6 @@
 //! Parsers for /proc filesystem files.
 //!
-//! This module provides parsers for various /proc/[pid]/* files
+//! This module provides parsers for various /proc/\[pid\]/* files
 //! that provide detailed process information on Linux systems.
 //!
 //! # Files Parsed
@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-/// I/O statistics from /proc/[pid]/io.
+/// I/O statistics from /proc/\[pid\]/io.
 ///
 /// Fields are cumulative since process start.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -39,7 +39,7 @@ pub struct IoStats {
     pub cancelled_write_bytes: u64,
 }
 
-/// Scheduler statistics from /proc/[pid]/schedstat.
+/// Scheduler statistics from /proc/\[pid\]/schedstat.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SchedStats {
     /// Time spent on CPU (nanoseconds).
@@ -50,7 +50,7 @@ pub struct SchedStats {
     pub timeslices: u64,
 }
 
-/// Scheduler info from /proc/[pid]/sched.
+/// Scheduler info from /proc/\[pid\]/sched.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SchedInfo {
     /// Number of voluntary context switches.
@@ -63,7 +63,7 @@ pub struct SchedInfo {
     pub nice: Option<i32>,
 }
 
-/// Memory statistics from /proc/[pid]/statm.
+/// Memory statistics from /proc/\[pid\]/statm.
 ///
 /// All values are in pages (typically 4KB on x86_64).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -262,7 +262,7 @@ pub struct CgroupInfo {
     pub in_container: bool,
 }
 
-/// Process statistics from /proc/[pid]/stat.
+/// Process statistics from /proc/\[pid\]/stat.
 ///
 /// Contains key fields parsed from the stat file.
 /// See proc(5) man page for full field documentation.
@@ -300,7 +300,7 @@ pub struct ProcessStat {
     pub num_threads: i32,
 }
 
-/// Parse /proc/[pid]/stat file.
+/// Parse /proc/\[pid\]/stat file.
 ///
 /// Returns None if the file cannot be read or parsed.
 pub fn parse_proc_stat(pid: u32) -> Option<ProcessStat> {
@@ -358,7 +358,7 @@ pub fn parse_proc_stat_content(content: &str) -> Option<ProcessStat> {
     })
 }
 
-/// Parse /proc/[pid]/io file.
+/// Parse /proc/\[pid\]/io file.
 ///
 /// # Errors
 /// Returns None if the file cannot be read (permission denied, process exited).
@@ -401,7 +401,7 @@ pub fn parse_io_content(content: &str) -> Option<IoStats> {
     Some(stats)
 }
 
-/// Parse /proc/[pid]/schedstat file.
+/// Parse /proc/\[pid\]/schedstat file.
 ///
 /// Format: "cpu_time wait_time timeslices"
 pub fn parse_schedstat(pid: u32) -> Option<SchedStats> {
@@ -424,7 +424,7 @@ pub fn parse_schedstat_content(content: &str) -> Option<SchedStats> {
     })
 }
 
-/// Parse /proc/[pid]/sched file.
+/// Parse /proc/\[pid\]/sched file.
 ///
 /// Extracts voluntary/involuntary switches, priority, and nice value.
 pub fn parse_sched(pid: u32) -> Option<SchedInfo> {
@@ -467,7 +467,7 @@ pub fn parse_sched_content(content: &str) -> Option<SchedInfo> {
     Some(info)
 }
 
-/// Parse /proc/[pid]/statm file.
+/// Parse /proc/\[pid\]/statm file.
 ///
 /// Format: "size resident shared text lib data dt"
 pub fn parse_statm(pid: u32) -> Option<MemStats> {
@@ -494,7 +494,7 @@ pub fn parse_statm_content(content: &str) -> Option<MemStats> {
     })
 }
 
-/// Parse /proc/[pid]/fd/ directory.
+/// Parse /proc/\[pid\]/fd/ directory.
 ///
 /// Counts and categorizes open file descriptors.
 pub fn parse_fd(pid: u32) -> Option<FdInfo> {
@@ -796,7 +796,7 @@ fn categorize_fd(target: &str) -> String {
     }
 }
 
-/// Parse /proc/[pid]/wchan file.
+/// Parse /proc/\[pid\]/wchan file.
 ///
 /// Returns the kernel function where the process is sleeping.
 pub fn parse_wchan(pid: u32) -> Option<String> {
@@ -812,7 +812,7 @@ pub fn parse_wchan(pid: u32) -> Option<String> {
     }
 }
 
-/// Parse /proc/[pid]/cgroup file.
+/// Parse /proc/\[pid\]/cgroup file.
 ///
 /// Determines cgroup membership and container detection.
 pub fn parse_cgroup(pid: u32) -> Option<CgroupInfo> {
@@ -861,7 +861,7 @@ pub fn parse_cgroup_content(content: &str) -> Option<CgroupInfo> {
     Some(info)
 }
 
-/// Parse /proc/[pid]/environ file.
+/// Parse /proc/\[pid\]/environ file.
 ///
 /// Returns environment variables as key-value pairs.
 /// Note: Only accessible for processes owned by the same user or root.

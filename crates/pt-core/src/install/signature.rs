@@ -119,7 +119,7 @@ pub struct SignatureVerifier {
 }
 
 impl SignatureVerifier {
-    /// Create a verifier with no keys. Keys must be added via [`add_key`].
+    /// Create a verifier with no keys. Keys must be added via [`Self::add_key`].
     pub fn new() -> Self {
         Self { keys: Vec::new() }
     }

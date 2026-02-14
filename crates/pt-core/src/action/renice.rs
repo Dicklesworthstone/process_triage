@@ -2,7 +2,7 @@
 //!
 //! Implements process priority adjustment using setpriority(2) with:
 //! - TOCTOU safety via identity revalidation
-//! - Verification via /proc/[pid]/stat
+//! - Verification via /proc/\[pid\]/stat
 //! - Graceful handling of permission denied
 //! - Reversal metadata capture for undo operations
 

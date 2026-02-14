@@ -23,7 +23,7 @@
 //! ```
 //! where G is a prior/mixture distribution over the alternative parameters.
 //!
-//! This produces valid e-values: E[Λ_n] ≤ 1 under H0, enabling optional stopping.
+//! This produces valid e-values: E\[Λ_n\] ≤ 1 under H0, enabling optional stopping.
 
 use pt_math::bayes_factor::{e_value_from_log_bf, EvidenceStrength, EvidenceSummary};
 use serde::Serialize;

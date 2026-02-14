@@ -91,7 +91,7 @@ impl NohupResult {
     }
 }
 
-/// Signal mask information from /proc/<pid>/status.
+/// Signal mask information from /proc/\[pid\]/status.
 #[derive(Debug, Clone, Default)]
 pub struct SignalMask {
     /// Signals being blocked (SigBlk).
@@ -116,7 +116,7 @@ impl SignalMask {
     }
 }
 
-/// Read signal mask from /proc/<pid>/status.
+/// Read signal mask from /proc/\[pid\]/status.
 #[cfg(target_os = "linux")]
 pub fn read_signal_mask(pid: u32) -> Result<SignalMask, NohupError> {
     let path = format!("/proc/{}/status", pid);

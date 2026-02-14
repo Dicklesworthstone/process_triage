@@ -106,11 +106,11 @@ impl Default for WonhamConfig {
 
 /// Continuous-time generator (rate) matrix Q.
 ///
-/// Each row sums to 0: Q[i][j] for j≠i is the transition rate from i to j,
-/// and Q[i][i] = −Σ_{j≠i} Q[i][j].
+/// Each row sums to 0: Q\[i\]\[j\] for j!=i is the transition rate from i to j,
+/// and Q\[i\]\[i\] = -Σ_{j!=i} Q\[i\]\[j\].
 #[derive(Debug, Clone, Serialize)]
 pub struct GeneratorMatrix {
-    /// Rate matrix Q[from][to]. Rows sum to 0.
+    /// Rate matrix Q\[from\]\[to\]. Rows sum to 0.
     pub rates: [[f64; NUM_STATES]; NUM_STATES],
 }
 

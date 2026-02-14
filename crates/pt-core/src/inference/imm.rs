@@ -134,7 +134,7 @@ pub struct ImmConfig {
     /// Number of modes/regimes
     pub num_modes: usize,
     /// Mode transition probability matrix (row-stochastic)
-    /// Entry [i][j] = P(mode_j at t | mode_i at t-1)
+    /// Entry \[i\]\[j\] = P(mode_j at t | mode_i at t-1)
     pub transition_matrix: Vec<Vec<f64>>,
     /// Initial mode probabilities
     pub initial_mode_probs: Vec<f64>,

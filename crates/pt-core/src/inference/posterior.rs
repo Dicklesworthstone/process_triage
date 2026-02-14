@@ -12,7 +12,7 @@ use thiserror::Error;
 /// Evidence for CPU activity.
 #[derive(Debug, Clone)]
 pub enum CpuEvidence {
-    /// Use a fraction in [0,1] and a Beta likelihood.
+    /// Use a fraction in \[0,1\] and a Beta likelihood.
     Fraction { occupancy: f64 },
     /// Use a Beta-Binomial marginal likelihood for k successes out of n.
     Binomial { k: f64, n: f64, eta: Option<f64> },

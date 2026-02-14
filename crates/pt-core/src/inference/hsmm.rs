@@ -133,12 +133,12 @@ impl GammaDuration {
         Self { shape, rate }
     }
 
-    /// Mean of the duration distribution: E[D] = α/β.
+    /// Mean of the duration distribution: E\[D\] = α/β.
     pub fn mean(&self) -> f64 {
         self.shape / self.rate
     }
 
-    /// Variance of the duration: Var[D] = α/β².
+    /// Variance of the duration: Var\[D\] = α/β².
     pub fn variance(&self) -> f64 {
         self.shape / (self.rate * self.rate)
     }
@@ -254,7 +254,7 @@ pub struct HsmmConfig {
     pub duration_priors: [GammaDuration; 4],
 
     /// Transition probabilities when leaving state i.
-    /// Entry [i][j] = P(next state = j | leaving state i).
+    /// Entry \[i\]\[j\] = P(next state = j | leaving state i).
     /// Diagonal entries should be 0 (no self-transitions in HSMM).
     pub transition_probs: [[f64; 4]; 4],
 
@@ -461,7 +461,7 @@ pub struct DurationStats {
 pub struct HsmmResult {
     /// Most likely state at each time step (Viterbi path).
     pub state_sequence: Vec<HsmmState>,
-    /// State posteriors at each time step [time][state].
+    /// State posteriors at each time step \[time\]\[state\].
     pub state_posteriors: Vec<[f64; 4]>,
     /// Current (final) most likely state.
     pub current_state: HsmmState,

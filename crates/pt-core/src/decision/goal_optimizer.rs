@@ -149,7 +149,7 @@ pub struct ReoptimizationDecision {
 /// User preference model (risk tolerance) learned from plan choices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreferenceModel {
-    /// Risk tolerance in [0,1]. 0 = conservative, 1 = aggressive.
+    /// Risk tolerance in \[0,1\]. 0 = conservative, 1 = aggressive.
     pub risk_tolerance: f64,
     /// Learning rate for preference updates.
     pub learning_rate: f64,

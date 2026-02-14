@@ -178,7 +178,7 @@ pub struct CompoundPoissonParams {
     pub kappa: f64,
 
     /// Burst size rate β (inverse of mean burst size).
-    /// E[X] = 1/β for X ~ Exp(β).
+    /// E\[X\] = 1/β for X ~ Exp(β).
     pub beta: f64,
 }
 
@@ -461,7 +461,7 @@ pub struct CompoundPoissonResult {
     pub magnitude_variance: f64,
 
     /// Burstiness score (Fano factor for arrivals).
-    /// = Var(N) / E[N] for count N in windows.
+    /// = Var(N) / E\[N\] for count N in windows.
     /// = 1 for Poisson; > 1 indicates overdispersion/clustering.
     pub burstiness_score: f64,
 

@@ -344,7 +344,7 @@ impl EnvironDatabase {
     }
 }
 
-/// Read environment variables from /proc/<pid>/environ.
+/// Read environment variables from /proc/\[pid\]/environ.
 #[cfg(target_os = "linux")]
 pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
     let path = format!("/proc/{}/environ", pid);

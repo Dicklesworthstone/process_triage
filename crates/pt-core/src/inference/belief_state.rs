@@ -258,7 +258,7 @@ impl Default for BeliefState {
 /// from state i to state j.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransitionModel {
-    /// Transition probability matrix [from][to].
+    /// Transition probability matrix \[from\]\[to\].
     pub matrix: [[f64; NUM_STATES]; NUM_STATES],
     /// Optional description of this model.
     #[serde(skip_serializing_if = "Option::is_none")]

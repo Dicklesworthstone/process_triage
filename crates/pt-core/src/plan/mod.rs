@@ -48,7 +48,7 @@ pub struct DecisionCandidate {
 /// Diagnostics for D-state (uninterruptible sleep) processes.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DStateDiagnostics {
-    /// Kernel function where process is blocked (from /proc/[pid]/wchan).
+    /// Kernel function where process is blocked (from /proc/\[pid\]/wchan).
     pub wchan: Option<String>,
     /// I/O read bytes at time of detection.
     pub io_read_bytes: Option<u64>,

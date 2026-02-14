@@ -19,7 +19,7 @@
 //! # Integration
 //!
 //! Designed to work with streaming sketch inputs:
-//! - [`TDigest`](super::sketches::TDigest) for quantile estimation
+//! - [`TDigest`] for quantile estimation
 //! - [`SpaceSaving`](super::sketches::SpaceSaving) for heavy-hitter marks
 //! - Reservoir samples for exact statistics on bounded subsets
 //!

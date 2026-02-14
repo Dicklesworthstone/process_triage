@@ -257,7 +257,7 @@ impl TemperedPosterior {
         Self::beta_binomial(prior_alpha, prior_beta, n, k, 1.0)
     }
 
-    /// Posterior mean E[θ] = α / (α + β).
+    /// Posterior mean E\[θ\] = α / (α + β).
     pub fn mean(&self) -> f64 {
         self.alpha / (self.alpha + self.beta)
     }

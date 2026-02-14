@@ -139,7 +139,7 @@ pub enum MemoryLimitSource {
 /// Provenance tracking for cgroup data.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CgroupProvenance {
-    /// Path to /proc/[pid]/cgroup.
+    /// Path to /proc/\[pid\]/cgroup.
     pub cgroup_file: String,
 
     /// Paths attempted for resource limits.

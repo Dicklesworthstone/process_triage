@@ -226,7 +226,7 @@ pub struct DeepScanMetadata {
 /// Perform a deep scan of running processes.
 ///
 /// Reads detailed information from /proc filesystem for each process.
-/// Requires appropriate permissions to read /proc/[pid]/* files.
+/// Requires appropriate permissions to read /proc/\[pid\]/* files.
 ///
 /// # Arguments
 /// * `options` - Scan configuration options

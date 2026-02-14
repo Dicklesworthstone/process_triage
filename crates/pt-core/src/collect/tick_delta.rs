@@ -3,7 +3,7 @@
 //! This module computes canonical CPU occupancy features from Plan §3.2:
 //! - `k_ticks`: CPU time consumed (utime + stime delta)
 //! - `n_ticks`: Tick budget for the sample window
-//! - `u`: CPU occupancy ratio (k_ticks / n_ticks), clamped to [0,1]
+//! - `u`: CPU occupancy ratio (k_ticks / n_ticks), clamped to \[0,1\]
 //! - `u_cores`: CPU cores worth of utilization
 //! - `n_eff`: Effective sample size (correlation-corrected)
 //!
@@ -103,7 +103,7 @@ fn build_identity(pid: u32, starttime: u64) -> ProcessIdentity {
     identity
 }
 
-/// Raw tick data from /proc/[pid]/stat.
+/// Raw tick data from /proc/\[pid\]/stat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TickSnapshot {
     /// Process ID.
@@ -270,7 +270,7 @@ pub fn collect_tick_snapshot(pid: u32) -> Option<TickSnapshot> {
     Some(snapshot)
 }
 
-/// Parse tick snapshot from /proc/[pid]/stat content.
+/// Parse tick snapshot from /proc/\[pid\]/stat content.
 pub fn parse_tick_snapshot(
     content: &str,
     pid: u32,

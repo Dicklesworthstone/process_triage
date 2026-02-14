@@ -96,12 +96,12 @@ impl GammaParams {
         Self { alpha, beta }
     }
 
-    /// Mean of the Gamma distribution: E[λ] = α/β.
+    /// Mean of the Gamma distribution: E\[λ\] = α/β.
     pub fn mean(&self) -> f64 {
         self.alpha / self.beta
     }
 
-    /// Variance of the Gamma distribution: Var[λ] = α/β².
+    /// Variance of the Gamma distribution: Var\[λ\] = α/β².
     pub fn variance(&self) -> f64 {
         self.alpha / (self.beta * self.beta)
     }
