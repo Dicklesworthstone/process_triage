@@ -170,12 +170,24 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ded5f9a03ac8f24d1b8a25101ee812cd32cdc8c50a4c50237de2c4915850e73"
+checksum = "f9f3647c145568cec02c42054e07bdf9a5a698e15b466fb2341bfc393cd24aa5"
 dependencies = [
  "rustversion",
 ]
+
+[[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
+name = "arrayvec"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "arrow"
@@ -548,6 +560,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2468ef7d57b3fb7e16b576e8377cdbde2320c60e1491e961d11da40fc4f02a2d"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -884,6 +910,12 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
@@ -1510,9 +1542,9 @@ dependencies = [
 
 [[package]]
 name = "ftui"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0e797adc957e0548e465d76046b1214d7127fae5f3e2b20a6ac9fe880d403cf"
+checksum = "c067649514af6d1cc308f78826fd8e7655b05bb001f44824e04d296fdb7d43c3"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -1525,37 +1557,50 @@ dependencies = [
 ]
 
 [[package]]
-name = "ftui-core"
-version = "0.1.1"
+name = "ftui-backend"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83cc0116641860c7ba9ab003c66eb357f97de7c8f81eabdd748d6b5ffa2ea00b"
+checksum = "5d2a7626014a38b2676f18362d744d7fefefbd2d531860d72e9fd2ff8137ef83"
 dependencies = [
+ "ftui-core",
+ "ftui-render",
+]
+
+[[package]]
+name = "ftui-core"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07f72a180b002371a31ad286c396801adc47a095df6a4f5f5d3e4f91ee0a3c06"
+dependencies = [
+ "ahash 0.8.12",
+ "arc-swap",
  "bitflags 2.10.0",
  "crossterm",
  "signal-hook 0.4.3",
  "unicode-display-width",
  "unicode-segmentation",
  "unicode-width",
+ "web-time",
 ]
 
 [[package]]
 name = "ftui-extras"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fc5fa8ecd7e4cd4255688fff8cc3b6cbbd6f1f3b2c7d4faa913082fca170625"
+checksum = "1bae79f17f6392916417005d2f3c128e1d7b7cad08acef4e8e62ac3b87b5615b"
 dependencies = [
  "ftui-render",
- "ftui-runtime",
  "ftui-style",
+ "web-time",
 ]
 
 [[package]]
 name = "ftui-harness"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b27fb1d5cc23db04f47eea33e36f61bb5a139373c79a2e91b388af02aab4936"
+checksum = "6dcea018357828e60079a4c63c72c33697391333c327e5f77a58593386a20eb7"
 dependencies = [
- "crossterm",
+ "blake3",
  "ftui-core",
  "ftui-extras",
  "ftui-layout",
@@ -1565,45 +1610,49 @@ dependencies = [
  "ftui-text",
  "ftui-widgets",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
 name = "ftui-i18n"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd509411d8314ff3e0d63fa422b267d52a0e560f9046c30c1347f88b1a12276d"
+checksum = "5f4ce37b0ad45d37e083d4db5ccee5540ea18725f87045673f41adda86a92ea2"
 
 [[package]]
 name = "ftui-layout"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ea21724327201dcfcf869c03a4142b62d0dcc8bc548c4417352411c76187b98"
+checksum = "6cebeada8b3b542471ed2e43b3e9fae43d8fc7f275f340861fdcab6794b4ce4e"
 dependencies = [
  "ftui-core",
+ "rustc-hash 2.1.1",
+ "serde",
 ]
 
 [[package]]
 name = "ftui-render"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "693d4800f2a3699eced76e9480109a7a707cc253c06435b4a11ae2828049c3bc"
+checksum = "66559719b7cf30a9824fcb368b82e36eacee7178ef85c8bc2ec4c588dc3dfdf9"
 dependencies = [
+ "ahash 0.8.12",
  "bitflags 2.10.0",
+ "bumpalo",
  "ftui-core",
  "memchr",
  "smallvec",
- "unicode-display-width",
  "unicode-segmentation",
- "unicode-width",
+ "web-time",
 ]
 
 [[package]]
 name = "ftui-runtime"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a3a58ae1fda1e517f18a2b67a824e471d7e1eb95967b52813cce609d481dcd8"
+checksum = "441fd2910cef058c40241e4a6ec48a0165cf2cfb787c493f13063ca311a462c8"
 dependencies = [
- "crossterm",
+ "ftui-backend",
  "ftui-core",
  "ftui-i18n",
  "ftui-layout",
@@ -1613,23 +1662,26 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
+ "web-time",
 ]
 
 [[package]]
 name = "ftui-style"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dad76916d9567978b6f84586bfb398258463adf3e3c5e100990b190ccb54554"
+checksum = "e9d0f4c1a06ca3ec677dd52d7418ee7dc38fe5df983b62a4f91938cf52185906"
 dependencies = [
+ "ahash 0.8.12",
+ "arc-swap",
  "ftui-render",
  "tracing",
 ]
 
 [[package]]
 name = "ftui-text"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "026e14a0b9411e3693a2557f12a716a7dcf4be6c2fbd34aaa1d92e87e1f57263"
+checksum = "4936f5a4d61e9c99e96e23240fc6084d70eef5b0ecd4a726609a6bedbae77c44"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -1641,14 +1693,16 @@ dependencies = [
  "smallvec",
  "tracing",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
 name = "ftui-widgets"
-version = "0.1.1"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f8977421e7e9b2260a22b4f8a44e2ad3399e9172048a202db67161fb8686988"
+checksum = "d5cd953320541aafc80ca0546ff26a9478e161baf421d9e0372c2f503b1e881b"
 dependencies = [
+ "ahash 0.8.12",
  "bitflags 2.10.0",
  "ftui-core",
  "ftui-layout",
@@ -1657,6 +1711,7 @@ dependencies = [
  "ftui-text",
  "unicode-segmentation",
  "unicode-width",
+ "web-time",
 ]
 
 [[package]]
@@ -5423,6 +5478,16 @@ name = "web-sys"
 version = "0.3.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "312e32e551d92129218ea9a2452120f4aabc03529ef03e4d0d82fb2780608598"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
