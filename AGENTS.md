@@ -622,6 +622,15 @@ rch exec -- cargo test
 rch exec -- cargo clippy
 ```
 
+For this repo, prefer an explicit remote target dir to avoid worker-side `target` path issues:
+```bash
+rch exec -- cargo check --target-dir /tmp/rch-target-process-triage --workspace --all-targets
+rch exec -- cargo clippy --target-dir /tmp/rch-target-process-triage --workspace --all-targets -- -D warnings
+rch exec -- cargo check --target-dir /tmp/rch-target-process-triage -p pt-core --features ui
+```
+
+If offload ever fails, do **not** proceed with local fail-open for heavy cargo jobs. Fix remote offload first (for example, ensure unreadable files like `perf_hsmm.data*` are excluded in `~/.config/rch/config.toml`) and then rerun with `rch exec`.
+
 Quick commands:
 ```bash
 rch doctor                    # Health check
@@ -632,7 +641,7 @@ rch queue                     # See active/waiting builds
 
 If rch or its workers are unavailable, it fails open — builds run locally as normal.
 
-**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, so you must manually offload compute-intensive compilation commands with `rch exec -- <command>` (and in this repo, include `--target-dir /tmp/rch-target-process-triage` for cargo compile/test/clippy commands).
 
 ---
 
