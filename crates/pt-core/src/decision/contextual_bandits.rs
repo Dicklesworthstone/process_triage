@@ -560,7 +560,7 @@ mod tests {
             b.update(1, &context, 0.1).unwrap();
         }
 
-        let selection = b.select_arm(&context).unwrap();
+        let _selection = b.select_arm(&context).unwrap();
         // Arm 0 should generally be preferred (higher reward)
         assert_eq!(b.rounds(), 20);
     }

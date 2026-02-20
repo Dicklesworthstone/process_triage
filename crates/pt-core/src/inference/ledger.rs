@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(map.get("cpu"), Some(&'\u{1F4BB}'));
         assert_eq!(map.get("runtime"), Some(&'\u{23F1}'));
         assert_eq!(map.get("orphan"), Some(&'\u{1F47B}'));
-        assert!(map.get("unknown").is_none());
+        assert!(!map.contains_key("unknown"));
     }
 
     // ── EvidenceLedger::from_posterior_result ─────────────────────────
