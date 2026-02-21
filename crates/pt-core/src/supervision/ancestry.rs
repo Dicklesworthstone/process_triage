@@ -188,7 +188,10 @@ pub(crate) fn parse_stat(content: &str, pid: u32) -> Result<(u32, String), Ances
     let comm = content[open_paren + 1..close_paren].to_string();
 
     // Rest of the fields after the closing paren
-    let rest = &content[close_paren + 2..]; // Skip ") "
+    let rest = content.get(close_paren + 2..).ok_or_else(|| AncestryError::ParseError {
+        pid,
+        message: "content truncated after comm".to_string(),
+    })?; // Skip ") "
     let fields: Vec<&str> = rest.split_whitespace().collect();
 
     // Field 0 after comm is state, field 1 is ppid
