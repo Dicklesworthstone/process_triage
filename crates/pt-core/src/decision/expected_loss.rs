@@ -559,10 +559,19 @@ pub(crate) fn expected_loss_for_action(
     let abandoned = loss_for_action(&loss_matrix.abandoned, action, "abandoned")?;
     let zombie = loss_for_action(&loss_matrix.zombie, action, "zombie")?;
 
-    Ok(posterior.useful * useful
+    let loss = posterior.useful * useful
         + posterior.useful_bad * useful_bad
         + posterior.abandoned * abandoned
-        + posterior.zombie * zombie)
+        + posterior.zombie * zombie;
+
+    // Guard against NaN/Inf propagation from invalid posteriors
+    if loss.is_nan() || loss.is_infinite() {
+        return Err(DecisionError::InvalidPosterior {
+            message: "expected loss computation produced NaN/Inf".to_string(),
+        });
+    }
+
+    Ok(loss)
 }
 
 fn loss_for_action(

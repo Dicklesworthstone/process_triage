@@ -554,10 +554,9 @@ impl LeastFavorablePrior {
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // 3. Greedily assign remaining probability to highest-loss classes
-        let mut loss = 0.0;
         let mut high_loss_classes = Vec::new();
 
-        for (idx, class_loss) in &indexed {
+        for (idx, _class_loss) in &indexed {
             let credal = &credal_sets[*idx];
             let capacity = credal.upper - credal.lower;
             let assign = capacity.min(remaining_prob);
@@ -574,7 +573,7 @@ impl LeastFavorablePrior {
         }
 
         // Compute expected loss from the final probabilities
-        loss = loss_row.iter().zip(probs.iter()).map(|(l, p)| l * p).sum();
+        let loss: f64 = loss_row.iter().zip(probs.iter()).map(|(l, p)| l * p).sum();
 
         let description = if high_loss_classes.is_empty() {
             "No high-loss classes identified".to_string()

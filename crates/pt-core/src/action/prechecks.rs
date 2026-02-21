@@ -510,7 +510,9 @@ impl LivePreCheckProvider {
                                 let uid_str_target = uid.to_string();
                                 for pwd_line in passwd.lines() {
                                     let mut fields = pwd_line.split(':');
-                                    if let (Some(name), _, Some(id)) = (fields.next(), fields.next(), fields.next()) {
+                                    if let (Some(name), _, Some(id)) =
+                                        (fields.next(), fields.next(), fields.next())
+                                    {
                                         if id == uid_str_target {
                                             return Some(name.to_string());
                                         }

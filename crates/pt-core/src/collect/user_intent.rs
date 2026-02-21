@@ -579,15 +579,14 @@ fn detect_recent_tty_activity(pid: u32, config: &UserIntentConfig) -> Option<Int
                             min_age_secs = min_age_secs.min(age.as_secs());
                         }
                     }
-                    
+
                     if min_age_secs < config.recent_tty_secs {
                         return Some(IntentEvidence {
                             signal_type: IntentSignalType::RecentTtyActivity,
                             weight: config.weight_for(IntentSignalType::RecentTtyActivity),
                             description: format!(
                                 "Recent TTY activity on fd {} ({} secs ago)",
-                                fd,
-                                min_age_secs
+                                fd, min_age_secs
                             ),
                             metadata: Some(IntentMetadata::Tty {
                                 device: target_str.to_string(),

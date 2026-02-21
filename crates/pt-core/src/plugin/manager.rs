@@ -463,11 +463,13 @@ fn invoke_subprocess(
         .spawn()
         .map_err(|e| format!("failed to spawn: {e}"))?;
 
-    // Write stdin
+    // Write stdin (BrokenPipe is acceptable if the plugin exits without reading input)
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(stdin_data)
-            .map_err(|e| format!("failed to write stdin: {e}"))?;
+        match stdin.write_all(stdin_data) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(format!("failed to write stdin: {e}")),
+        }
         // stdin is dropped here, closing the pipe
     }
 

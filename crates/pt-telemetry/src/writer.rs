@@ -248,12 +248,14 @@ impl Drop for BatchedWriter {
         if !self.buffer.is_empty() {
             let _ = self.flush();
         }
-        
+
         if let Some(writer) = self.writer.take() {
             let _ = writer.close();
         }
-        
-        if let (Some(temp_path), Some(output_path)) = (self.temp_path.take(), self.output_path.take()) {
+
+        if let (Some(temp_path), Some(output_path)) =
+            (self.temp_path.take(), self.output_path.take())
+        {
             let _ = atomic_rename(&temp_path, &output_path);
         }
     }

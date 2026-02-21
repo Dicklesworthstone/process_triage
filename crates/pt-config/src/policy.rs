@@ -604,20 +604,24 @@ impl Policy {
                 }
                 PatternKind::Regex => {
                     // Basic regex check fallback (full implementation uses regex crate in pt-core)
-                    let p = p.pattern.replace("\\b", "").replace("^", "").replace("$", "");
+                    let stripped = p
+                        .pattern
+                        .replace("\\b", "")
+                        .replace("^", "")
+                        .replace("$", "");
                     if p.case_insensitive {
-                        command.to_lowercase().contains(&p.to_lowercase())
+                        command.to_lowercase().contains(&stripped.to_lowercase())
                     } else {
-                        command.contains(&p)
+                        command.contains(&stripped)
                     }
                 }
                 PatternKind::Glob => {
                     // Simplified glob matching fallback
-                    let p = p.pattern.replace("*", "");
+                    let stripped = p.pattern.replace("*", "");
                     if p.case_insensitive {
-                        command.to_lowercase().contains(&p.to_lowercase())
+                        command.to_lowercase().contains(&stripped.to_lowercase())
                     } else {
-                        command.contains(&p)
+                        command.contains(&stripped)
                     }
                 }
             }
