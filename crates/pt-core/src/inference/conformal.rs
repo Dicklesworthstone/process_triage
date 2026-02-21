@@ -574,7 +574,7 @@ impl AdaptiveConformalRegressor {
     pub fn calibrate_with_feedback(&mut self, prediction: f64, actual: f64) {
         // Check if previous prediction would have covered
         if self.inner.n_samples() >= self.inner.config.min_samples {
-            let interval = self.inner.predict(prediction);
+            let interval = self.predict(prediction);
             let covered = actual >= interval.lower && actual <= interval.upper;
 
             self.recent_errors.push_back(!covered);

@@ -543,22 +543,25 @@ impl LeastFavorablePrior {
             };
         }
 
-        // Sort classes by loss (highest first)
+        // 1. Start with minimum required probability for each class
+        let mut probs: Vec<f64> = credal_sets.iter().map(|c| c.lower).collect();
+        let current_sum: f64 = probs.iter().sum();
+        let mut remaining_prob = (1.0 - current_sum).max(0.0);
+
+        // 2. Sort classes by loss (highest first)
         let mut indexed: Vec<(usize, f64)> =
             loss_row.iter().enumerate().map(|(i, &l)| (i, l)).collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Greedily assign maximum probability to highest-loss classes
-        let mut probs = vec![0.0; loss_row.len()];
-        let mut remaining_prob = 1.0;
+        // 3. Greedily assign remaining probability to highest-loss classes
         let mut loss = 0.0;
         let mut high_loss_classes = Vec::new();
 
         for (idx, class_loss) in &indexed {
             let credal = &credal_sets[*idx];
-            let assign = credal.upper.min(remaining_prob);
-            probs[*idx] = assign;
-            loss += assign * class_loss;
+            let capacity = credal.upper - credal.lower;
+            let assign = capacity.min(remaining_prob);
+            probs[*idx] += assign;
             remaining_prob -= assign;
 
             if assign > 0.0 {
@@ -570,21 +573,8 @@ impl LeastFavorablePrior {
             }
         }
 
-        // If we still have remaining probability, assign to lowest-loss class at minimum
-        if remaining_prob > 1e-10 {
-            for (idx, class_loss) in indexed.iter().rev() {
-                let credal = &credal_sets[*idx];
-                let needed = remaining_prob.min(credal.lower);
-                if needed > 0.0 {
-                    probs[*idx] += needed;
-                    loss += needed * class_loss;
-                    remaining_prob -= needed;
-                }
-                if remaining_prob <= 1e-10 {
-                    break;
-                }
-            }
-        }
+        // Compute expected loss from the final probabilities
+        loss = loss_row.iter().zip(probs.iter()).map(|(l, p)| l * p).sum();
 
         let description = if high_loss_classes.is_empty() {
             "No high-loss classes identified".to_string()

@@ -729,16 +729,16 @@ impl HsmmAnalyzer {
                 from_state: prev_state,
                 to_state: new_state,
                 confidence: self.state_probs[new_state.index()],
-                previous_duration: self.current_duration,
+                previous_duration: self.current_duration - 1,
             });
 
             // Update duration posterior for the state we're leaving
             let prev_idx = prev_state.index();
             self.duration_posteriors[prev_idx] = self.duration_posteriors[prev_idx]
-                .update_with_duration(self.current_duration as f64);
+                .update_with_duration((self.current_duration - 1) as f64);
 
             // Reset duration counter
-            self.current_duration = 0;
+            self.current_duration = 1;
             self.state_entries[new_state.index()] += 1;
         }
 

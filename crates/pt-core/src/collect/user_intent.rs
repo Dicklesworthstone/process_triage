@@ -566,25 +566,33 @@ fn detect_recent_tty_activity(pid: u32, config: &UserIntentConfig) -> Option<Int
             let target_str = target.to_string_lossy();
             // Check if it's a tty/pts device
             if target_str.contains("/dev/pts/") || target_str.contains("/dev/tty") {
-                // Check modification time of the target file (not the symlink)
+                // Check modification and access time of the target file (not the symlink)
                 if let Ok(metadata) = fs::metadata(&link_path) {
+                    let mut min_age_secs = u64::MAX;
                     if let Ok(accessed) = metadata.accessed() {
                         if let Ok(age) = SystemTime::now().duration_since(accessed) {
-                            if age.as_secs() < config.recent_tty_secs {
-                                return Some(IntentEvidence {
-                                    signal_type: IntentSignalType::RecentTtyActivity,
-                                    weight: config.weight_for(IntentSignalType::RecentTtyActivity),
-                                    description: format!(
-                                        "Recent TTY activity on fd {} ({} secs ago)",
-                                        fd,
-                                        age.as_secs()
-                                    ),
-                                    metadata: Some(IntentMetadata::Tty {
-                                        device: target_str.to_string(),
-                                    }),
-                                });
-                            }
+                            min_age_secs = min_age_secs.min(age.as_secs());
                         }
+                    }
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(age) = SystemTime::now().duration_since(modified) {
+                            min_age_secs = min_age_secs.min(age.as_secs());
+                        }
+                    }
+                    
+                    if min_age_secs < config.recent_tty_secs {
+                        return Some(IntentEvidence {
+                            signal_type: IntentSignalType::RecentTtyActivity,
+                            weight: config.weight_for(IntentSignalType::RecentTtyActivity),
+                            description: format!(
+                                "Recent TTY activity on fd {} ({} secs ago)",
+                                fd,
+                                min_age_secs
+                            ),
+                            metadata: Some(IntentMetadata::Tty {
+                                device: target_str.to_string(),
+                            }),
+                        });
                     }
                 }
             }
@@ -679,26 +687,31 @@ fn detect_shell_activity_signals(
         // Check if this is a shell
         let comm_lower = proc_stat.comm.to_lowercase();
         if SHELL_NAMES.iter().any(|&s| comm_lower == s) {
-            // Check if shell has recent activity
-            let stat_path = format!("/proc/{}/stat", current_pid);
-            if let Ok(metadata) = fs::metadata(&stat_path) {
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(age) = SystemTime::now().duration_since(modified) {
-                        if age.as_secs() < config.recent_shell_secs {
-                            return Some(vec![IntentEvidence {
-                                signal_type: IntentSignalType::RecentShellActivity,
-                                weight: config.weight_for(IntentSignalType::RecentShellActivity),
-                                description: format!(
-                                    "Parent shell {} (PID {}) has recent activity ({} secs ago)",
-                                    proc_stat.comm,
-                                    current_pid,
-                                    age.as_secs()
-                                ),
-                                metadata: Some(IntentMetadata::Shell {
-                                    shell_type: proc_stat.comm.clone(),
-                                    shell_pid: current_pid,
-                                }),
-                            }]);
+            // Check if shell has recent activity by checking its stdin TTY
+            let fd0_path = format!("/proc/{}/fd/0", current_pid);
+            if let Ok(target) = fs::read_link(&fd0_path) {
+                let target_str = target.to_string_lossy();
+                if target_str.contains("/dev/pts/") || target_str.contains("/dev/tty") {
+                    if let Ok(metadata) = fs::metadata(&fd0_path) {
+                        if let Ok(accessed) = metadata.accessed() {
+                            if let Ok(age) = SystemTime::now().duration_since(accessed) {
+                                if age.as_secs() < config.recent_shell_secs {
+                                    return Some(vec![IntentEvidence {
+                                        signal_type: IntentSignalType::RecentShellActivity,
+                                        weight: config.weight_for(IntentSignalType::RecentShellActivity),
+                                        description: format!(
+                                            "Parent shell {} (PID {}) has recent activity ({} secs ago)",
+                                            proc_stat.comm,
+                                            current_pid,
+                                            age.as_secs()
+                                        ),
+                                        metadata: Some(IntentMetadata::Shell {
+                                            shell_type: proc_stat.comm.clone(),
+                                            shell_pid: current_pid,
+                                        }),
+                                    }]);
+                                }
+                            }
                         }
                     }
                 }
