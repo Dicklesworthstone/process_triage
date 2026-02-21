@@ -600,17 +600,7 @@ impl PolicyEnforcer {
             // SlidingWindowRateLimiter::check(false) does a check without recording.
             // SlidingWindowRateLimiter::check_with_override(false, limit) does a check.
 
-            if let Err(e) = self.rate_limiter.check_with_override(false, limit) {
-                // If it returns error (e.g. lock poisoned), we fail safe/open? Fail safe (block).
-                return PolicyCheckResult::blocked(PolicyViolation {
-                    kind: ViolationKind::RateLimitExceeded,
-                    message: format!("rate limit check failed: {}", e),
-                    rule: "guardrails.rate_limit_error".to_string(),
-                    context: None,
-                });
-            }
-
-            // We need to unwrap the result from check_with_override to see if allowed
+            // Check rate limit once and use the result (avoids double-check race window)
             match self.rate_limiter.check_with_override(false, limit) {
                 Ok(result) => {
                     if !result.allowed {
@@ -631,6 +621,7 @@ impl PolicyEnforcer {
                     }
                 }
                 Err(e) => {
+                    // Fail safe (block) on rate limiter errors (e.g. lock poisoned)
                     return PolicyCheckResult::blocked(PolicyViolation {
                         kind: ViolationKind::RateLimitExceeded,
                         message: format!("rate limit check failed: {}", e),

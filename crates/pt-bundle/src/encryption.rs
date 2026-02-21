@@ -15,6 +15,8 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 const KDF_ITERS: u32 = 100_000;
+/// Maximum iterations accepted during decryption to prevent DoS via crafted bundles.
+const MAX_KDF_ITERS: u32 = 10_000_000;
 const HEADER_LEN: usize = 8 + 4 + SALT_LEN + NONCE_LEN;
 
 fn derive_key(passphrase: &str, salt: &[u8], iterations: u32) -> [u8; KEY_LEN] {
@@ -45,7 +47,7 @@ fn parse_header(bytes: &[u8]) -> Result<(u32, [u8; SALT_LEN], [u8; NONCE_LEN])> 
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&bytes[offset..offset + NONCE_LEN]);
 
-    if iterations == 0 {
+    if iterations == 0 || iterations > MAX_KDF_ITERS {
         return Err(BundleError::InvalidEncryptionHeader);
     }
 

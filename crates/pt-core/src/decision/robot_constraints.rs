@@ -695,8 +695,12 @@ impl ConstraintChecker {
         if is_kill {
             self.kill_count.fetch_add(1, Ordering::Release);
         }
+        // Use saturating add to prevent u64 wrapping that could bypass blast radius checks
         self.accumulated_blast_bytes
-            .fetch_add(memory_bytes, Ordering::Release);
+            .fetch_update(Ordering::Release, Ordering::Acquire, |current| {
+                Some(current.saturating_add(memory_bytes))
+            })
+            .unwrap(); // safe: closure always returns Some
     }
 
     /// Get current metrics.
