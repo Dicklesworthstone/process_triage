@@ -1141,12 +1141,9 @@ nice                                         :                    0
         // statm should always be readable for our own processes
         let stats = result.expect("statm should be readable");
 
-        // Real process must have non-zero memory stats
+        // Real process must have non-zero virtual size; resident may be 0 for
+        // freshly spawned lightweight processes whose pages haven't been faulted in yet.
         assert!(stats.size > 0, "process should have non-zero size");
-        assert!(
-            stats.resident > 0,
-            "process should have non-zero resident pages"
-        );
 
         crate::test_log!(
             DEBUG,
