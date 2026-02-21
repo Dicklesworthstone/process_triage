@@ -430,8 +430,6 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 
 Beads provides a lightweight, dependency-aware issue database and CLI (`br` - beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
 
-**Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
-
 ### Conventions
 
 - **Single source of truth:** Beads for task status/priority/dependencies; Agent Mail for conversation and audit
@@ -442,7 +440,7 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 1. **Pick ready work (Beads):**
    ```bash
-   br ready --json  # Choose highest priority, no blockers
+   bd ready --json  # Choose highest priority, no blockers
    ```
 
 2. **Reserve edit surface (Mail):**
@@ -459,8 +457,8 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 5. **Complete and release:**
    ```bash
-   br close 123 --reason "Completed"
-   br sync --flush-only  # Export to JSONL (no git operations)
+   bd close 123 --reason "Completed"
+   bd sync  # Export to JSONL (no git operations)
    ```
    ```
    release_file_reservations(project_key, agent_name, paths=["pt"])
@@ -788,72 +786,6 @@ Returns in <50ms:
 | 3 | Index/DB missing | Yes—run `cass index --full` |
 
 Treat cass as a way to avoid re-solving problems other agents already handled.
-
-<!-- bv-agent-instructions-v1 -->
-
----
-
-## Beads Workflow Integration
-
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
-
-**Important:** `br` is non-invasive—it NEVER executes git commands. After `br sync --flush-only`, you must manually run `git add .beads/ && git commit`.
-
-### Essential Commands
-
-```bash
-# View issues (launches TUI - avoid in automated sessions)
-bv
-
-# CLI commands for agents (use these instead)
-br ready              # Show issues ready to work (no blockers)
-br list --status=open # All open issues
-br show <id>          # Full issue details with dependencies
-br create --title="..." --type=task --priority=2
-br update <id> --status=in_progress
-br close <id> --reason "Completed"
-br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Export to JSONL (NO git operations)
-```
-
-### Workflow Pattern
-
-1. **Start**: Run `br ready` to find actionable work
-2. **Claim**: Use `br update <id> --status=in_progress`
-3. **Work**: Implement the task
-4. **Complete**: Use `br close <id>`
-5. **Sync**: Run `br sync --flush-only` then manually commit
-
-### Key Concepts
-
-- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
-- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
-- **Types**: task, bug, feature, epic, question, docs
-- **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
-
-### Session Protocol
-
-**Before ending any session, run this checklist:**
-
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync --flush-only    # Export beads to JSONL
-git add .beads/         # Stage beads changes
-git commit -m "..."     # Commit everything together
-git push                # Push to remote
-```
-
-### Best Practices
-
-- Check `br ready` at session start to find available work
-- Update status as you work (in_progress -> closed)
-- Create new issues with `br create` when you discover tasks
-- Use descriptive titles and set appropriate priority/type
-- Always `br sync --flush-only && git add .beads/` before ending session
-
-<!-- end-bv-agent-instructions -->
-
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, you MUST complete ALL steps below.
@@ -863,7 +795,7 @@ git push                # Push to remote
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
-4. **Sync beads** - `br sync --flush-only` to export to JSONL
+4. **Sync beads** - `bd sync` to export to JSONL
 5. **Hand off** - Provide context for next session
 
 
