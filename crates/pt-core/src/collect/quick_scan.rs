@@ -368,10 +368,15 @@ fn parse_ps_line(
     // Split line into fields, preserving command at the end
     let fields: Vec<&str> = line.split_whitespace().collect();
 
+    // Minimum fields: pid ppid uid user pgid sid state %cpu rss vsz tty (11)
+    //                 + lstart (5 tokens: DOW Mon Day HH:MM:SS Year)
+    //                 + etimes/etime (1) + comm (1) = 18
+    // On macOS, processes with short command names may have as few as 18-19 fields.
+    // On Linux, processes typically have more due to longer args.
     let comm_idx = 17;
-    if fields.len() < 22 {
+    if fields.len() < 18 {
         return Err(format!(
-            "Insufficient fields: expected at least 22, got {}",
+            "Insufficient fields: expected at least 18, got {}",
             fields.len()
         ));
     }
@@ -455,10 +460,11 @@ fn parse_ps_line_synthetic(
 ) -> Result<ProcessRecord, String> {
     let fields: Vec<&str> = line.split_whitespace().collect();
 
+    // Minimum fields: 11 (pid..tty) + 5 (lstart) + 1 (etimes/etime) + 1 (comm) = 18
     let comm_idx = 17;
-    if fields.len() < 22 {
+    if fields.len() < 18 {
         return Err(format!(
-            "Insufficient fields: expected at least 22, got {}",
+            "Insufficient fields: expected at least 18, got {}",
             fields.len()
         ));
     }
@@ -846,6 +852,41 @@ mod tests {
         assert_eq!(record.comm, "bash");
         assert!(record.cmd.contains("/bin/bash"));
         assert_eq!(record.elapsed.as_secs(), 3600);
+    }
+
+    #[test]
+    fn test_parse_ps_line_macos_short() {
+        // macOS ps output typically has fewer fields than Linux (no long args).
+        // Previously this was rejected with "expected at least 22, got 19".
+        // Format: pid ppid uid user pgid sid state %cpu rss vsz tty + lstart(5) + etime + comm + args
+        let line = "  501   1  501 alice  501  501 S  0.0  8192 40960 ??  Mon Feb 24 09:00:00 2026 1:23:45 sleep sleep";
+        let boot_id: Option<String> = None;
+
+        let result = parse_ps_line(line, "macos", &boot_id);
+        assert!(result.is_ok(), "macOS short line parse failed: {:?}", result);
+
+        let record = result.unwrap();
+        assert_eq!(record.pid.0, 501);
+        assert_eq!(record.ppid.0, 1);
+        assert_eq!(record.uid, 501);
+        assert_eq!(record.user, "alice");
+        assert_eq!(record.comm, "sleep");
+    }
+
+    #[test]
+    fn test_parse_ps_line_minimal_fields() {
+        // 18 fields is the absolute minimum: 11 (pid..tty) + 5 (lstart) + 1 (etime) + 1 (comm)
+        let line = "1 0 0 root 1 1 S 0.0 0 0 ? Thu Feb 20 00:00:00 2026 3600 init";
+        let boot_id = Some("test".to_string());
+
+        let result = parse_ps_line(line, "linux", &boot_id);
+        assert!(result.is_ok(), "Minimal field parse failed: {:?}", result);
+
+        let record = result.unwrap();
+        assert_eq!(record.pid.0, 1);
+        assert_eq!(record.comm, "init");
+        // When args == comm, cmd should equal comm
+        assert_eq!(record.cmd, "init");
     }
 
     // =====================================================
