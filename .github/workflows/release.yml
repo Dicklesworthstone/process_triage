@@ -162,11 +162,12 @@ jobs:
         run: |
           echo "Checking if binary is statically linked..."
           file "$CARGO_TARGET_DIR/${{ matrix.target }}/release/pt-core"
-          if ldd "$CARGO_TARGET_DIR/${{ matrix.target }}/release/pt-core" 2>&1 | grep -q "not a dynamic executable"; then
+          ldd_output=$(ldd "$CARGO_TARGET_DIR/${{ matrix.target }}/release/pt-core" 2>&1 || true)
+          if echo "$ldd_output" | grep -qE "not a dynamic executable|statically linked"; then
             echo "✓ Binary is statically linked"
           else
             echo "::error::Binary is not statically linked!"
-            ldd "$CARGO_TARGET_DIR/${{ matrix.target }}/release/pt-core"
+            echo "$ldd_output"
             exit 1
           fi
 
