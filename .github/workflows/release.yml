@@ -252,9 +252,12 @@ jobs:
           cd release
 
           if [[ -z "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" ]]; then
-            echo "::error::Missing RELEASE_SIGNING_KEY_PEM secret"
-            exit 1
+            echo "::warning::RELEASE_SIGNING_KEY_PEM secret not configured — skipping signing"
+            echo "SIGNING_AVAILABLE=false" >> "$GITHUB_ENV"
+            exit 0
           fi
+
+          echo "SIGNING_AVAILABLE=true" >> "$GITHUB_ENV"
 
           key_file="$(mktemp)"
           trap 'rm -f "$key_file"' EXIT
@@ -285,12 +288,13 @@ jobs:
           cat checksums.sha256
 
       - name: Sign release assets
+        if: env.SIGNING_AVAILABLE == 'true'
         run: |
           cd release
 
           if [[ -z "${{ secrets.RELEASE_SIGNING_KEY_PEM }}" ]]; then
-            echo "::error::Missing RELEASE_SIGNING_KEY_PEM secret"
-            exit 1
+            echo "::warning::Skipping signing — no key available"
+            exit 0
           fi
 
           key_file="$(mktemp)"
