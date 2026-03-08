@@ -368,12 +368,12 @@ fn parse_ps_line(
     // Split line into fields, preserving command at the end
     let fields: Vec<&str> = line.split_whitespace().collect();
 
-    // Need at least: pid ppid uid user pgid sid state %cpu rss vsz + lstart(5 fields) + etime + comm
-    // Total minimum: 17 fields (tty may be absent on macOS depending on ps version)
+    // Need at least: pid ppid uid user pgid sid state %cpu rss vsz tty + lstart(5 fields) + etime + comm
+    // Total minimum: 18 fields (indices 0-17)
     let comm_idx = 17;
-    if fields.len() < 17 {
+    if fields.len() < 18 {
         return Err(format!(
-            "Insufficient fields: expected at least 17, got {}",
+            "Insufficient fields: expected at least 18, got {}",
             fields.len()
         ));
     }
@@ -457,12 +457,12 @@ fn parse_ps_line_synthetic(
 ) -> Result<ProcessRecord, String> {
     let fields: Vec<&str> = line.split_whitespace().collect();
 
-    // Need at least: pid ppid uid user pgid sid state %cpu rss vsz + lstart(5 fields) + etime + comm
-    // Total minimum: 17 fields
+    // Need at least: pid ppid uid user pgid sid state %cpu rss vsz tty + lstart(5 fields) + etime + comm
+    // Total minimum: 18 fields (indices 0-17)
     let comm_idx = 17;
-    if fields.len() < 17 {
+    if fields.len() < 18 {
         return Err(format!(
-            "Insufficient fields: expected at least 17, got {}",
+            "Insufficient fields: expected at least 18, got {}",
             fields.len()
         ));
     }
