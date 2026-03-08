@@ -1,6 +1,6 @@
 [package]
 name = "pt-core"
-version = "2.0.3"
+version = "2.0.4"
 edition = "2021"
 description = "Process Triage core inference and decision engine"
 license = "MIT"
