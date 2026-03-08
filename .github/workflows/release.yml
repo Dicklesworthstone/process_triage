@@ -110,11 +110,11 @@ jobs:
             artifact_name: pt-core-linux-aarch64-musl
             is_musl: true
           # macOS builds
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact_name: pt-core-macos-x86_64
             is_musl: false
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: pt-core-macos-aarch64
             is_musl: false
