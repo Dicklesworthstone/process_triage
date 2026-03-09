@@ -332,17 +332,18 @@ jobs:
       - name: Generate release notes
         run: |
           version="${{ needs.validate-version.outputs.version }}"
-          cat > release-notes.md << 'EOF'
+
+          cat > release-notes.md << 'NOTES'
           ## Installation
 
           ### Quick Install (recommended)
           ```bash
-          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
+          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
           ```
 
           ### Verify Installation
           ```bash
-          VERIFY=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/master/install.sh | bash
+          VERIFY=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
           ```
 
           ### Manual Installation
@@ -351,11 +352,6 @@ jobs:
           3. Move to PATH: `mv pt-core ~/.local/bin/`
           4. Download `pt` wrapper and `install.sh`
           5. Verify checksums: `sha256sum -c checksums.sha256`
-          6. Verify release key fingerprint:
-             `openssl pkey -pubin -in release-signing-public.pem -outform der | sha256sum`
-             Compare against `release-signing-public.pem.sha256`
-          7. Verify signatures:
-             `openssl dgst -sha256 -verify release-signing-public.pem -signature <artifact>.sig <artifact>`
 
           ## Checksums
           All release artifacts include SHA-256 checksums in `checksums.sha256`.
@@ -365,9 +361,24 @@ jobs:
           - `install.sh` - Self-updating installer script
           - `pt-core-*` - Platform-specific Rust binaries
           - `checksums.sha256` - SHA-256 checksums for verification
+          NOTES
+
+          if [[ "${SIGNING_AVAILABLE:-false}" == "true" ]]; then
+            cat >> release-notes.md << 'SIGNED'
           - `*.sig` - Detached ECDSA signatures for each artifact
           - `release-signing-public.pem` - Trusted public key for signature verification
           - `release-signing-public.pem.sha256` - Pinned SHA-256 fingerprint for the public key
+
+          ### Signature Verification
+          ```bash
+          openssl pkey -pubin -in release-signing-public.pem -outform der | sha256sum
+          # Compare against release-signing-public.pem.sha256
+          openssl dgst -sha256 -verify release-signing-public.pem -signature <artifact>.sig <artifact>
+          ```
+          SIGNED
+          fi
+
+          cat >> release-notes.md << 'PLATFORMS'
 
           ## Supported Platforms
           - Linux x86_64 (Intel/AMD 64-bit)
@@ -378,12 +389,11 @@ jobs:
           - macOS aarch64 (Apple Silicon)
 
           ### Static/musl Binaries
-          The \`-musl\` variants are statically linked and work on any Linux distro,
+          The `-musl` variants are statically linked and work on any Linux distro,
           including Alpine, older glibc systems, and minimal containers. Use these
           for maximum portability.
-          EOF
+          PLATFORMS
 
-          echo ""
           echo "Release notes generated"
 
       - name: Create GitHub Release
