@@ -6,7 +6,7 @@
 
 <div align="center">
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![CI](https://github.com/Dicklesworthstone/process_triage/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/process_triage/actions/workflows/ci.yml)
 
 </div>
@@ -640,7 +640,7 @@ Created by **Jeffrey Emanuel** after a session where 23 stuck `bun test` workers
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT License (with OpenAI/Anthropic Rider) — see [LICENSE](LICENSE) for details.
 
 ---
 
