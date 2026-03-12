@@ -158,11 +158,13 @@ teardown() {
     BATS_TEST_COMPLETED=pass
 }
 
-@test "Command: pt version is alias for --version" {
+@test "Command: pt version forwards to pt-core version schema" {
     test_info "Running: pt version"
     run "$PT_SCRIPT" version
 
     assert_equals "0" "$status" "version subcommand should succeed"
+    assert_contains "$output" "\"pt_core_version\"" "version subcommand should return pt-core schema"
+    assert_contains "$output" "\"schema_version\"" "version subcommand should include schema version"
 
     BATS_TEST_COMPLETED=pass
 }

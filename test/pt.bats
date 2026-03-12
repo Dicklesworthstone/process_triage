@@ -33,9 +33,11 @@ teardown() {
 }
 
 @test "pt --version shows version" {
+    local expected_version
+    expected_version="$(<"$BATS_TEST_DIRNAME/../VERSION")"
     run pt --version
     [ "$status" -eq 0 ]
-    [[ "$output" == *"2.0.0"* ]]
+    [[ "$output" == *"$expected_version"* ]]
 }
 
 @test "pt unknown command fails" {

@@ -15,6 +15,12 @@ setup() {
     export MOCK_BIN_DIR="${TEST_DIR}/mock-bin"
     mkdir -p "$MOCK_BIN_DIR"
     export MOCK_PT_CORE="${TEST_DIR}/pt-core-mock"
+    export PT_WRAPPER_VERSION
+    PT_WRAPPER_VERSION="$(sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' "$PT_SCRIPT" | head -n1)"
+    if [[ -z "$PT_WRAPPER_VERSION" ]]; then
+        echo "failed to parse wrapper version from $PT_SCRIPT" >&2
+        exit 1
+    fi
     cat > "$MOCK_PT_CORE" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -196,7 +202,7 @@ EOF
         "$PT_SCRIPT" --shell --version
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"pt 2.0.3"* ]]
+    [[ "$output" == *"pt ${PT_WRAPPER_VERSION}"* ]]
     [ ! -f "$MOCK_LOG" ]
 }
 
@@ -288,7 +294,7 @@ if [[ "$url" == *"/main/VERSION" ]]; then
   exit 0
 fi
 
-if [[ "$url" == *"/v2.0.3/install.sh" ]]; then
+if [[ "$url" == *"/v${PT_WRAPPER_VERSION}/install.sh" ]]; then
   cat <<'INSTALLER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -308,15 +314,16 @@ EOF
 
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_VERSION="$PT_WRAPPER_VERSION" \
         PT_CURL_LOG="$curl_log" \
         PATH="${MOCK_BIN_DIR}:$PATH" \
         "$PT_SCRIPT" update
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Warning: could not resolve latest VERSION; falling back to v2.0.3 installer."* ]]
-    [[ "$output" == *"Updating Process Triage to v2.0.3..."* ]]
+    [[ "$output" == *"Warning: could not resolve latest VERSION; falling back to v${PT_WRAPPER_VERSION} installer."* ]]
+    [[ "$output" == *"Updating Process Triage to v${PT_WRAPPER_VERSION}..."* ]]
     grep -q '/main/VERSION' "$curl_log"
-    grep -q '/v2.0.3/install.sh' "$curl_log"
+    grep -q "/v${PT_WRAPPER_VERSION}/install.sh" "$curl_log"
     if grep -q '/v9.9.9;injected/install.sh' "$curl_log"; then
         fail "unexpected injected installer URL should never be requested"
     fi
