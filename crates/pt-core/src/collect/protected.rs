@@ -119,7 +119,19 @@ impl CompiledProtectedPattern {
                     }
                 })?)
             }
-            PatternKind::Literal => None, // Use string matching
+            PatternKind::Literal => {
+                if case_insensitive {
+                    let re_pattern = format!("(?i){}", regex::escape(pattern));
+                    Some(Regex::new(&re_pattern).map_err(|e| {
+                        ProtectedFilterError::InvalidPattern {
+                            path: path.to_string(),
+                            message: e.to_string(),
+                        }
+                    })?)
+                } else {
+                    None // Use standard string matching
+                }
+            }
         };
 
         Ok(Self {
@@ -141,7 +153,10 @@ impl CompiledProtectedPattern {
                 .unwrap_or(false),
             PatternKind::Literal => {
                 if self.case_insensitive {
-                    text.to_lowercase().contains(&self.original.to_lowercase())
+                    self.regex.as_ref().map(|r| r.is_match(text)).unwrap_or_else(|| {
+                        // Fallback just in case regex failed to compile (though it shouldn't)
+                        text.to_lowercase().contains(&self.original.to_lowercase())
+                    })
                 } else {
                     text.contains(&self.original)
                 }

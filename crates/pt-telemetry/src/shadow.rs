@@ -745,10 +745,15 @@ impl ShadowStorage {
     /// Load storage stats from disk.
     fn load_stats(&mut self) -> Result<(), ShadowStorageError> {
         let stats_path = self.config.base_dir.join("stats.json");
-        if stats_path.exists() {
-            let file = File::open(&stats_path)?;
-            let reader = BufReader::new(file);
-            self.stats = serde_json::from_reader(reader)?;
+        match File::open(&stats_path) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                self.stats = serde_json::from_reader(reader)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist yet, which is fine
+            }
+            Err(e) => return Err(e.into()),
         }
         Ok(())
     }
@@ -810,11 +815,17 @@ impl ShadowStorage {
                     let modified_dt = DateTime::<Utc>::from(modified);
                     if modified_dt < cutoff {
                         if entry.path().is_file() {
-                            fs::remove_file(entry.path())?;
-                            cleaned += 1;
+                            match fs::remove_file(entry.path()) {
+                                Ok(_) => cleaned += 1,
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => return Err(e.into()),
+                            }
                         } else if entry.path().is_dir() {
-                            fs::remove_dir_all(entry.path())?;
-                            cleaned += 1;
+                            match fs::remove_dir_all(entry.path()) {
+                                Ok(_) => cleaned += 1,
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => return Err(e.into()),
+                            }
                         }
                     }
                 }

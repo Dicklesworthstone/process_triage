@@ -664,16 +664,18 @@ impl RetentionEnforcer {
                 );
 
                 // Actually delete the file
-                if full_path.exists() {
-                    match fs::remove_file(&full_path) {
-                        Ok(_) => {
-                            debug!("Deleted: {}", full_path.display());
-                        }
-                        Err(e) => {
-                            warn!("Failed to delete {}: {}", full_path.display(), e);
-                            // Continue with other files, but mark event as failed
-                            // (In a real impl, you might want a separate status field)
-                        }
+                match fs::remove_file(&full_path) {
+                    Ok(_) => {
+                        debug!("Deleted: {}", full_path.display());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Already deleted, that's fine
+                        debug!("File already deleted: {}", full_path.display());
+                    }
+                    Err(e) => {
+                        warn!("Failed to delete {}: {}", full_path.display(), e);
+                        // Continue with other files, but mark event as failed
+                        // (In a real impl, you might want a separate status field)
                     }
                 }
             }

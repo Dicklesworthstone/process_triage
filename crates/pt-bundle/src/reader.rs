@@ -91,7 +91,7 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
 
     /// Read and parse the manifest from the archive.
     fn read_manifest(archive: &mut ZipArchive<R>) -> Result<BundleManifest> {
-        let mut manifest_file = archive
+        let manifest_file = archive
             .by_name("manifest.json")
             .map_err(|_| BundleError::MissingFile("manifest.json".to_string()))?;
 
@@ -102,7 +102,13 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
         }
 
         let mut json = String::new();
-        manifest_file.read_to_string(&mut json)?;
+        manifest_file.take(MAX_FILE_SIZE + 1).read_to_string(&mut json)?;
+
+        if json.len() > MAX_FILE_SIZE as usize {
+            return Err(BundleError::Io(std::io::Error::other(
+                "manifest.json exceeds maximum allowed size",
+            )));
+        }
 
         let manifest = BundleManifest::from_json(&json)?;
 
@@ -147,7 +153,7 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
     ///
     /// Use `read_verified` for integrity-checked reads.
     pub fn read_raw(&mut self, path: &str) -> Result<Vec<u8>> {
-        let mut file = self
+        let file = self
             .archive
             .by_name(path)
             .map_err(|_| BundleError::FileNotFound(path.to_string()))?;
@@ -160,8 +166,16 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
             ))));
         }
 
-        let mut data = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut data)?;
+        let mut data = Vec::with_capacity(file.size().min(MAX_FILE_SIZE) as usize);
+        file.take(MAX_FILE_SIZE + 1).read_to_end(&mut data)?;
+
+        if data.len() > MAX_FILE_SIZE as usize {
+            return Err(BundleError::Io(std::io::Error::other(format!(
+                "file {} exceeds maximum allowed size ({} bytes)",
+                path,
+                MAX_FILE_SIZE
+            ))));
+        }
 
         debug!(
             path,

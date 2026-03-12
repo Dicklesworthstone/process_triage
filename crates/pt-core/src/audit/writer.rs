@@ -96,12 +96,7 @@ impl AuditLog {
         let path = audit_dir.join(AUDIT_LOG_FILENAME);
 
         // Determine initial state
-        let (last_hash, entry_count) = if path.exists() {
-            // Read the last entry to get its hash
-            Self::read_last_entry_hash(&path)?
-        } else {
-            (GENESIS_HASH.to_string(), 0)
-        };
+        let (last_hash, entry_count) = Self::read_last_entry_hash(&path)?;
 
         config.audit_dir = Some(audit_dir);
 
@@ -414,14 +409,14 @@ impl AuditLog {
 
     /// Check if rotation is needed based on file size.
     fn should_rotate(&self) -> Result<bool, AuditError> {
-        if !self.path.exists() {
-            return Ok(false);
-        }
-
-        let metadata = std::fs::metadata(&self.path).map_err(|e| AuditError::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
+        let metadata = match std::fs::metadata(&self.path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(AuditError::Io {
+                path: self.path.clone(),
+                source: e,
+            }),
+        };
 
         Ok(metadata.len() >= self.config.max_size_bytes)
     }
@@ -447,10 +442,14 @@ impl AuditLog {
 
     /// Read the last entry hash from an existing log file.
     fn read_last_entry_hash(path: &Path) -> Result<(String, u64), AuditError> {
-        let file = File::open(path).map_err(|e| AuditError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((GENESIS_HASH.to_string(), 0)),
+            Err(e) => return Err(AuditError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }),
+        };
 
         let reader = BufReader::new(file);
         let mut last_hash = GENESIS_HASH.to_string();
@@ -482,14 +481,14 @@ impl AuditLog {
 
     /// Compute the state hash (hash of all entry hashes concatenated).
     fn compute_state_hash(&self) -> Result<String, AuditError> {
-        if !self.path.exists() {
-            return Ok("empty".to_string());
-        }
-
-        let file = File::open(&self.path).map_err(|e| AuditError::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
+        let file = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("empty".to_string()),
+            Err(e) => return Err(AuditError::Io {
+                path: self.path.clone(),
+                source: e,
+            }),
+        };
 
         let reader = BufReader::new(file);
         let mut combined = String::new();

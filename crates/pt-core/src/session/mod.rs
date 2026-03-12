@@ -542,11 +542,19 @@ impl SessionStore {
             }
 
             // Remove the session directory
-            if let Err(e) = std::fs::remove_dir_all(&session.path) {
-                result.errors.push(format!("{}: {}", session.session_id, e));
-            } else {
-                result.removed_count += 1;
-                result.removed_sessions.push(session.session_id);
+            match std::fs::remove_dir_all(&session.path) {
+                Ok(_) => {
+                    result.removed_count += 1;
+                    result.removed_sessions.push(session.session_id);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already removed, treat as success
+                    result.removed_count += 1;
+                    result.removed_sessions.push(session.session_id);
+                }
+                Err(e) => {
+                    result.errors.push(format!("{}: {}", session.session_id, e));
+                }
             }
         }
 
