@@ -206,7 +206,11 @@ fn tools_list_returns_all_tools() {
     let resp = send_rpc(&mut s, 1, "tools/list", serde_json::json!({}));
     let result = assert_success(&resp);
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6, "expected 6 tools (scan, explain, plan, history, signatures, capabilities)");
+    assert_eq!(
+        tools.len(),
+        6,
+        "expected 6 tools (scan, explain, plan, history, signatures, capabilities)"
+    );
 }
 
 #[test]
