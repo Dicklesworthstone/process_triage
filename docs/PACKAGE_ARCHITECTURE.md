@@ -174,7 +174,8 @@ The `pt` script exposes friendly commands that delegate to `pt-core`:
 | `pt scan` | `pt-core scan` |
 | `pt deep` | `pt-core deep-scan` |
 | `pt agent ...` | `pt-core agent ...` |
-| `pt help` | `pt-core help` |
+| `pt help` | Wrapper-aware top-level help |
+| `pt help <subcommand>` | `pt-core help <subcommand>` |
 
 ---
 
