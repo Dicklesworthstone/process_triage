@@ -117,6 +117,41 @@ EOF
     grep -q '^ARGS=deep-scan --format json$' "$MOCK_LOG"
 }
 
+@test "wrapper: history reads decision memory without forwarding to pt-core" {
+    local config_dir="${TEST_DIR}/config"
+    mkdir -p "$config_dir"
+    cat > "${config_dir}/decisions.json" << 'EOF'
+{"bun test --watch":"kill","vim":"spare"}
+EOF
+
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        PROCESS_TRIAGE_CONFIG="$config_dir" \
+        "$PT_SCRIPT" history
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Decision history (2 total)"* ]]
+    [[ "$output" == *"kill: 1"* ]]
+    [[ "$output" == *$'kill\tbun test --watch'* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: clear empties decision memory without forwarding to pt-core" {
+    local config_dir="${TEST_DIR}/config"
+    mkdir -p "$config_dir"
+    cat > "${config_dir}/decisions.json" << 'EOF'
+{"pattern1":"kill","pattern2":"spare"}
+EOF
+
+    run bash -lc "printf 'y\n' | env PT_CORE_PATH='$MOCK_PT_CORE' PT_WRAPPER_TEST_LOG='$MOCK_LOG' PROCESS_TRIAGE_CONFIG='$config_dir' '$PT_SCRIPT' clear"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Cleared 2 decisions."* ]]
+    grep -q '^{}$' "${config_dir}/decisions.json"
+    [ ! -f "$MOCK_LOG" ]
+}
+
 @test "wrapper: version check still works with wrapper mode flags" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \

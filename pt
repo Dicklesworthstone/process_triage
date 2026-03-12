@@ -124,6 +124,109 @@ resolve_ui_mode() {
     detect_auto_ui_mode
 }
 
+resolve_config_dir() {
+    if [[ -n "${PT_CONFIG_DIR:-}" ]]; then
+        printf '%s\n' "$PT_CONFIG_DIR"
+        return 0
+    fi
+
+    if [[ -n "${PROCESS_TRIAGE_CONFIG:-}" ]]; then
+        printf '%s\n' "$PROCESS_TRIAGE_CONFIG"
+        return 0
+    fi
+
+    if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+        printf '%s\n' "${XDG_CONFIG_HOME}/process_triage"
+        return 0
+    fi
+
+    printf '%s\n' "${HOME}/.config/process_triage"
+}
+
+ensure_decisions_file() {
+    local config_dir="$1"
+    local decisions_file="${config_dir}/decisions.json"
+
+    mkdir -p "$config_dir"
+
+    if [[ ! -e "$decisions_file" || ! -s "$decisions_file" ]]; then
+        printf '{}\n' > "$decisions_file"
+    fi
+
+    printf '%s\n' "$decisions_file"
+}
+
+show_history() {
+    local config_dir decisions_file
+    config_dir="$(resolve_config_dir)"
+    decisions_file="$(ensure_decisions_file "$config_dir")"
+
+    if ! command -v jq &>/dev/null; then
+        echo "Error: jq is required for 'pt history'." >&2
+        exit 1
+    fi
+
+    if ! jq -e 'type == "object"' "$decisions_file" >/dev/null 2>&1; then
+        echo "Error: decision history is not valid JSON object: $decisions_file" >&2
+        exit 1
+    fi
+
+    local total
+    total="$(jq 'length' "$decisions_file")"
+    if [[ "$total" == "0" ]]; then
+        printf 'No decision history.\n'
+        return 0
+    fi
+
+    local kill_count spare_count
+    kill_count="$(jq '[.[] | select(. == "kill")] | length' "$decisions_file")"
+    spare_count="$(jq '[.[] | select(. == "spare")] | length' "$decisions_file")"
+
+    printf 'Decision history (%s total)\n' "$total"
+    printf 'kill: %s\n' "$kill_count"
+    printf 'spare: %s\n' "$spare_count"
+    jq -r 'to_entries[] | "\(.value)\t\(.key)"' "$decisions_file"
+}
+
+clear_history() {
+    local config_dir decisions_file
+    config_dir="$(resolve_config_dir)"
+    decisions_file="$(ensure_decisions_file "$config_dir")"
+
+    if ! command -v jq &>/dev/null; then
+        echo "Error: jq is required for 'pt clear'." >&2
+        exit 1
+    fi
+
+    if ! jq -e 'type == "object"' "$decisions_file" >/dev/null 2>&1; then
+        echo "Error: decision history is not valid JSON object: $decisions_file" >&2
+        exit 1
+    fi
+
+    local total
+    total="$(jq 'length' "$decisions_file")"
+    if [[ "$total" == "0" ]]; then
+        printf 'Decision history already empty.\n'
+        return 0
+    fi
+
+    local reply=""
+    if [[ -t 0 && -z "${CI:-}" && -z "${TEST_MODE:-}" ]]; then
+        printf 'Clear all decision history? [y/N] ' >&2
+        read -r reply || true
+    else
+        read -r reply || true
+    fi
+
+    if [[ ! "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+        printf 'Aborted.\n' >&2
+        exit 1
+    fi
+
+    printf '{}\n' > "$decisions_file"
+    printf 'Cleared %s decision%s.\n' "$total" "$([[ "$total" == "1" ]] && printf '' || printf 's')"
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
@@ -202,6 +305,16 @@ main() {
 
     if [[ "${forwarded_args[0]:-}" == "--version" || "${forwarded_args[0]:-}" == "-V" ]]; then
         printf 'pt %s\n' "$VERSION"
+        exit 0
+    fi
+
+    if [[ "${forwarded_args[0]:-}" == "history" ]]; then
+        show_history
+        exit 0
+    fi
+
+    if [[ "${forwarded_args[0]:-}" == "clear" ]]; then
+        clear_history
         exit 0
     fi
 

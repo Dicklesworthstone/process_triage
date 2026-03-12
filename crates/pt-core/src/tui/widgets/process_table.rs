@@ -397,6 +397,8 @@ impl<'a> FtuiStatefulWidget for ProcessTable<'a> {
         let border_style = self.border_ftui_style(state.focused);
         let visible = state.visible_rows();
 
+        state.last_visible_height = area.height.saturating_sub(3) as usize; // Borders + header
+
         if visible.is_empty() {
             let msg = if state.filter.is_some() {
                 "No matching processes"
@@ -530,6 +532,8 @@ pub struct ProcessTableState {
     pub view_mode: ViewMode,
     /// Optional goal-based ordering (pid -> rank).
     goal_rank: Option<HashMap<u32, usize>>,
+    /// Last known visible height of the table area.
+    pub last_visible_height: usize,
 }
 
 impl Default for ProcessTableState {
@@ -552,6 +556,7 @@ impl ProcessTableState {
             filter: None,
             view_mode: ViewMode::SuspicionFirst,
             goal_rank: None,
+            last_visible_height: 20,
         }
     }
 
@@ -696,7 +701,7 @@ impl ProcessTableState {
 
     /// Ensure cursor is visible within scroll view.
     fn ensure_cursor_visible(&mut self) {
-        let visible = 20; // Assume typical visible rows
+        let visible = self.last_visible_height.max(1);
         if self.cursor < self.scroll_offset {
             self.scroll_offset = self.cursor;
         } else if self.cursor >= self.scroll_offset + visible {

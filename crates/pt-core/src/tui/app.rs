@@ -475,8 +475,8 @@ impl App {
 
             "navigation.first" => self.process_table.cursor_home(),
             "navigation.last" => self.process_table.cursor_end(),
-            "navigation.page_down" => self.process_table.page_down(10),
-            "navigation.page_up" => self.process_table.page_up(10),
+            "navigation.page_down" => self.process_table.page_down(self.process_table.last_visible_height),
+            "navigation.page_up" => self.process_table.page_up(self.process_table.last_visible_height),
             "search.open" => {
                 self.state = AppState::Searching;
                 self.focus = FocusTarget::Search;
@@ -685,11 +685,11 @@ impl App {
                 FtuiCmd::none()
             }
             Msg::PageUp | Msg::HalfPageUp => {
-                self.process_table.page_up(10);
+                self.process_table.page_up(self.process_table.last_visible_height);
                 FtuiCmd::none()
             }
             Msg::PageDown | Msg::HalfPageDown => {
-                self.process_table.page_down(10);
+                self.process_table.page_down(self.process_table.last_visible_height);
                 FtuiCmd::none()
             }
 
@@ -1037,13 +1037,13 @@ impl App {
         match key.code {
             FtuiKeyCode::Home => self.process_table.cursor_home(),
             FtuiKeyCode::End => self.process_table.cursor_end(),
-            FtuiKeyCode::PageDown => self.process_table.page_down(10),
-            FtuiKeyCode::PageUp => self.process_table.page_up(10),
+            FtuiKeyCode::PageDown => self.process_table.page_down(self.process_table.last_visible_height),
+            FtuiKeyCode::PageUp => self.process_table.page_up(self.process_table.last_visible_height),
             FtuiKeyCode::Char('d') if key.modifiers.contains(FtuiModifiers::CTRL) => {
-                self.process_table.page_down(10)
+                self.process_table.page_down(self.process_table.last_visible_height)
             }
             FtuiKeyCode::Char('u') if key.modifiers.contains(FtuiModifiers::CTRL) => {
-                self.process_table.page_up(10)
+                self.process_table.page_up(self.process_table.last_visible_height)
             }
             FtuiKeyCode::Char('a') => self.process_table.select_recommended(),
             FtuiKeyCode::Char('A') => self.process_table.select_all(),
