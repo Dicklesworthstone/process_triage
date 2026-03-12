@@ -225,7 +225,9 @@ impl IpcDatabase {
             .iter()
             .filter(|p| {
                 if p.is_abstract {
-                    socket_path.strip_prefix('@').is_some_and(|rest| rest.starts_with(&p.path_prefix))
+                    socket_path
+                        .strip_prefix('@')
+                        .is_some_and(|rest| rest.starts_with(&p.path_prefix))
                 } else {
                     socket_path.starts_with(&p.path_prefix)
                         && self.path_contains_supervisor_name(socket_path, &p.supervisor_name)

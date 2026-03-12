@@ -760,7 +760,11 @@ impl SupervisorActionRunner {
     fn is_protected_unit(&self, unit: &str) -> bool {
         for re in &self.compiled_patterns {
             if re.is_match(unit) {
-                debug!(unit, pattern = re.as_str(), "unit matches protected pattern");
+                debug!(
+                    unit,
+                    pattern = re.as_str(),
+                    "unit matches protected pattern"
+                );
                 return true;
             }
         }

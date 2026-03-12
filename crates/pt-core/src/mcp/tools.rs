@@ -2,13 +2,15 @@
 //!
 //! Each tool maps to a pt operation: scan, explain, history, signatures, capabilities.
 
-use crate::mcp::protocol::{ToolContent, ToolDefinition};
-use crate::collect::{QuickScanOptions, quick_scan, ProcessRecord, ProcessState, ScanResult, ScanMetadata};
 #[cfg(target_os = "linux")]
 use crate::collect::{deep_scan, DeepScanOptions};
-use crate::supervision::SignatureDatabase;
-use crate::supervision::signature::ProcessMatchContext;
+use crate::collect::{
+    quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanMetadata, ScanResult,
+};
+use crate::mcp::protocol::{ToolContent, ToolDefinition};
 use crate::signature_cli::load_user_signatures;
+use crate::supervision::signature::ProcessMatchContext;
+use crate::supervision::SignatureDatabase;
 
 fn collect_scan_result(deep: bool) -> Result<ScanResult, String> {
     if deep {
@@ -199,8 +201,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "pt_plan".to_string(),
-            description: "Generate a triage plan with recommended actions for suspicious processes."
-                .to_string(),
+            description:
+                "Generate a triage plan with recommended actions for suspicious processes."
+                    .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -267,7 +270,10 @@ pub fn call_tool(name: &str, params: &serde_json::Value) -> Result<Vec<ToolConte
 }
 
 fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
-    let deep = params.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+    let deep = params
+        .get("deep")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let min_score = params
         .get("min_score")
         .and_then(|v| v.as_f64())
@@ -418,7 +424,10 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 }
 
 fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
-    let deep = params.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+    let deep = params
+        .get("deep")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let min_score = params
         .get("min_score")
         .and_then(|v| v.as_f64())

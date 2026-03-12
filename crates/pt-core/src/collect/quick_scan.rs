@@ -861,7 +861,11 @@ mod tests {
         let boot_id: Option<String> = None;
 
         let result = parse_ps_line(line, "macos", &boot_id);
-        assert!(result.is_ok(), "macOS short line parse failed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "macOS short line parse failed: {:?}",
+            result
+        );
 
         let record = result.unwrap();
         assert_eq!(record.pid.0, 501);

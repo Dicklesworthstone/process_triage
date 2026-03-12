@@ -66,8 +66,8 @@
 //! }
 //! ```
 
-use serde::Serialize;
 use pt_math::log_add_exp;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 

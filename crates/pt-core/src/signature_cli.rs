@@ -43,9 +43,9 @@ pub enum SignatureCommands {
         /// Only show built-in signatures
         #[arg(long)]
         builtin_only: bool,
-        /// Filter by category (agent, ide, ci, orchestrator, terminal, other)
-        #[arg(long)]
-        category: Option<String>,
+        /// Filter by category
+        #[arg(long, value_enum)]
+        category: Option<SupervisorCategory>,
     },
     /// Show details of a specific signature
     Show {
@@ -56,9 +56,9 @@ pub enum SignatureCommands {
     Add {
         /// Name for the new signature
         name: String,
-        /// Category (agent, ide, ci, orchestrator, terminal, other)
-        #[arg(long)]
-        category: String,
+        /// Category
+        #[arg(long, value_enum)]
+        category: SupervisorCategory,
         /// Process name patterns (regex)
         #[arg(long = "pattern", value_name = "REGEX")]
         patterns: Vec<String>,
@@ -155,10 +155,10 @@ pub fn load_user_signatures() -> Option<SignatureSchema> {
     let path = user_signatures_path();
     if path.exists() {
         match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str(&content) {
+            Ok(content) => match SignatureSchema::from_json(&content) {
                 Ok(schema) => Some(schema),
                 Err(e) => {
-                    eprintln!("Warning: Failed to parse user signatures: {}", e);
+                    eprintln!("Warning: Failed to load user signatures: {}", e);
                     None
                 }
             },
@@ -232,7 +232,7 @@ pub fn run_signature(format: &OutputFormat, args: &SignatureArgs) -> ExitCode {
             user_only,
             builtin_only,
             category,
-        } => run_signature_list(format, *user_only, *builtin_only, category.as_deref()),
+        } => run_signature_list(format, *user_only, *builtin_only, *category),
         SignatureCommands::Show { name } => run_signature_show(format, name),
         SignatureCommands::Add {
             name,
@@ -246,7 +246,7 @@ pub fn run_signature(format: &OutputFormat, args: &SignatureArgs) -> ExitCode {
         } => run_signature_add(
             format,
             name,
-            category,
+            *category,
             patterns,
             arg_patterns,
             env_vars,
@@ -273,9 +273,7 @@ pub fn run_signature(format: &OutputFormat, args: &SignatureArgs) -> ExitCode {
             dry_run,
             passphrase,
         } => run_signature_import(format, input, *dry_run, passphrase.as_deref()),
-        SignatureCommands::Stats { min_matches, sort } => {
-            run_signature_stats(format, *min_matches, sort)
-        }
+        SignatureCommands::Stats { min_matches, sort } => run_signature_stats(format, *min_matches, sort),
     }
 }
 
@@ -283,7 +281,7 @@ fn run_signature_list(
     format: &OutputFormat,
     user_only: bool,
     builtin_only: bool,
-    category_filter: Option<&str>,
+    category_filter: Option<SupervisorCategory>,
 ) -> ExitCode {
     let session_id = SessionId::new();
     let mut all_sigs: Vec<serde_json::Value> = Vec::new();
@@ -294,10 +292,8 @@ fn run_signature_list(
         db.add_default_signatures();
         for sig in db.signatures() {
             if let Some(cat) = category_filter {
-                if let Some(parsed) = parse_category(cat) {
-                    if sig.category != parsed {
-                        continue;
-                    }
+                if sig.category != cat {
+                    continue;
                 }
             }
             all_sigs.push(serde_json::json!({
@@ -315,10 +311,8 @@ fn run_signature_list(
         if let Some(user_schema) = load_user_signatures() {
             for sig in &user_schema.signatures {
                 if let Some(cat) = category_filter {
-                    if let Some(parsed) = parse_category(cat) {
-                        if sig.category != parsed {
-                            continue;
-                        }
+                    if sig.category != cat {
+                        continue;
                     }
                 }
                 all_sigs.push(serde_json::json!({
@@ -462,7 +456,7 @@ fn run_signature_show(format: &OutputFormat, name: &str) -> ExitCode {
 fn run_signature_add(
     format: &OutputFormat,
     name: &str,
-    category: &str,
+    category: SupervisorCategory,
     patterns: &[String],
     arg_patterns: &[String],
     env_vars: &[String],
@@ -471,18 +465,6 @@ fn run_signature_add(
     priority: u32,
 ) -> ExitCode {
     let session_id = SessionId::new();
-
-    // Parse category
-    let cat = match parse_category(category) {
-        Some(c) => c,
-        None => {
-            eprintln!(
-                "Invalid category '{}'. Valid: agent, ide, ci, orchestrator, terminal, other",
-                category
-            );
-            return ExitCode::ArgsError;
-        }
-    };
 
     // Parse environment variables (NAME=REGEX format)
     let mut env_map: HashMap<String, String> = HashMap::new();
@@ -506,7 +488,7 @@ fn run_signature_add(
     // Create new signature
     let new_sig = SupervisorSignature {
         name: name.to_string(),
-        category: cat,
+        category,
         patterns: sig_patterns,
         priority,
         confidence_weight: confidence,

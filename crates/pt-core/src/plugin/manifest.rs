@@ -228,23 +228,17 @@ pub fn load_manifest(plugin_dir: &Path) -> Result<ResolvedPlugin, ManifestError>
             (plugin_dir.canonicalize(), resolved.canonicalize())
         {
             if !canonical_cmd.starts_with(&canonical_dir) {
-                return Err(ManifestError::CommandNotFound {
-                    path: resolved,
-                });
+                return Err(ManifestError::CommandNotFound { path: resolved });
             }
         }
         resolved
     };
 
     if !command_path.exists() {
-        return Err(ManifestError::CommandNotFound {
-            path: command_path,
-        });
+        return Err(ManifestError::CommandNotFound { path: command_path });
     }
     if !command_path.is_file() {
-        return Err(ManifestError::CommandNotFound {
-            path: command_path,
-        });
+        return Err(ManifestError::CommandNotFound { path: command_path });
     }
 
     // Validate weight is in [0, 1]

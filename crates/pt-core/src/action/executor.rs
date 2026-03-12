@@ -81,7 +81,11 @@ pub trait ActionRunner {
     fn verify(&self, action: &PlanAction) -> Result<(), ActionError>;
 
     /// Revalidate the identity of the target process before taking action.
-    fn revalidate(&self, _action: &PlanAction, _provider: &dyn IdentityProvider) -> Result<bool, ActionError> {
+    fn revalidate(
+        &self,
+        _action: &PlanAction,
+        _provider: &dyn IdentityProvider,
+    ) -> Result<bool, ActionError> {
         Ok(true)
     }
 }

@@ -190,10 +190,12 @@ pub fn read_ppid(pid: u32) -> Result<u32, NohupError> {
         message: "missing ')' in stat".to_string(),
     })?;
 
-    let rest = content.get(close_paren + 2..).ok_or_else(|| NohupError::ParseError {
-        pid,
-        message: "content truncated after comm".to_string(),
-    })?; // Skip ") "
+    let rest = content
+        .get(close_paren + 2..)
+        .ok_or_else(|| NohupError::ParseError {
+            pid,
+            message: "content truncated after comm".to_string(),
+        })?; // Skip ") "
     let fields: Vec<&str> = rest.split_whitespace().collect();
 
     if fields.len() < 2 {

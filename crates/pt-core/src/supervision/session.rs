@@ -232,7 +232,7 @@ impl SshConnectionInfo {
 }
 
 /// Detect SSH connection from environment variables.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detect_ssh_connection(pid: u32) -> Option<SshConnectionInfo> {
     let env = read_environ(pid).ok()?;
 
@@ -255,7 +255,7 @@ pub fn detect_ssh_connection(pid: u32) -> Option<SshConnectionInfo> {
     None
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn detect_ssh_connection(_pid: u32) -> Option<SshConnectionInfo> {
     None
 }
@@ -292,14 +292,14 @@ impl TmuxInfo {
 }
 
 /// Detect tmux session from environment.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detect_tmux_session(pid: u32) -> Option<TmuxInfo> {
     let env = read_environ(pid).ok()?;
     env.get("TMUX")
-        .and_then(|v| TmuxInfo::from_tmux_env(v.as_str()))
+        .and_then(|v| TmuxInfo::from_tmux_env(v))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn detect_tmux_session(_pid: u32) -> Option<TmuxInfo> {
     None
 }
@@ -338,14 +338,14 @@ impl ScreenInfo {
 }
 
 /// Detect screen session from environment.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detect_screen_session(pid: u32) -> Option<ScreenInfo> {
     let env = read_environ(pid).ok()?;
     env.get("STY")
-        .and_then(|v| ScreenInfo::from_sty_env(v.as_str()))
+        .and_then(|v| ScreenInfo::from_sty_env(v))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn detect_screen_session(_pid: u32) -> Option<ScreenInfo> {
     None
 }

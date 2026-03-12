@@ -219,7 +219,6 @@ impl DependencyFactors {
             || self.open_write_handles > 0
             || self.shared_memory_segments > 0
     }
-
 }
 
 /// Result of dependency scaling computation.

@@ -412,10 +412,12 @@ impl AuditLog {
         let metadata = match std::fs::metadata(&self.path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(AuditError::Io {
-                path: self.path.clone(),
-                source: e,
-            }),
+            Err(e) => {
+                return Err(AuditError::Io {
+                    path: self.path.clone(),
+                    source: e,
+                })
+            }
         };
 
         Ok(metadata.len() >= self.config.max_size_bytes)
@@ -444,11 +446,15 @@ impl AuditLog {
     fn read_last_entry_hash(path: &Path) -> Result<(String, u64), AuditError> {
         let file = match File::open(path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((GENESIS_HASH.to_string(), 0)),
-            Err(e) => return Err(AuditError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((GENESIS_HASH.to_string(), 0))
+            }
+            Err(e) => {
+                return Err(AuditError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })
+            }
         };
 
         let reader = BufReader::new(file);
@@ -484,10 +490,12 @@ impl AuditLog {
         let file = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("empty".to_string()),
-            Err(e) => return Err(AuditError::Io {
-                path: self.path.clone(),
-                source: e,
-            }),
+            Err(e) => {
+                return Err(AuditError::Io {
+                    path: self.path.clone(),
+                    source: e,
+                })
+            }
         };
 
         let reader = BufReader::new(file);

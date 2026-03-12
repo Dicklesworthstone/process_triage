@@ -344,7 +344,7 @@ impl EnvironDatabase {
     }
 }
 
-/// Read environment variables from /proc/\[pid\]/environ.
+/// Read environment variables from /proc/\[pid\]/environ (Linux) or via ps (macOS).
 #[cfg(target_os = "linux")]
 pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
     let path = format!("/proc/{}/environ", pid);
@@ -359,7 +359,13 @@ pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
     Ok(parse_environ_content(&content).unwrap_or_default())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
+    crate::collect::macos::collect_environ(pid)
+        .ok_or(EnvironError::ProcessNotFound(pid))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn read_environ(_pid: u32) -> Result<HashMap<String, String>, EnvironError> {
     Ok(HashMap::new())
 }

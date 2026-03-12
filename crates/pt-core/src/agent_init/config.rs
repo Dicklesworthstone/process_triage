@@ -222,7 +222,9 @@ fn configure_claude_code(
             config
                 .get_mut("mcpServers")
                 .and_then(|v| v.as_object_mut())
-                .ok_or_else(|| ConfigError::InternalState("mcpServers not an object after init".into()))?
+                .ok_or_else(|| {
+                    ConfigError::InternalState("mcpServers not an object after init".into())
+                })?
         }
     };
 
@@ -427,7 +429,9 @@ fn configure_cursor(config_dir: &Path, options: &InitOptions) -> Result<ConfigRe
             config
                 .get_mut("extensions")
                 .and_then(|v| v.as_object_mut())
-                .ok_or_else(|| ConfigError::InternalState("extensions not an object after init".into()))?
+                .ok_or_else(|| {
+                    ConfigError::InternalState("extensions not an object after init".into())
+                })?
         }
     };
 

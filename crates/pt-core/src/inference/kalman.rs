@@ -262,9 +262,7 @@ impl KalmanFilter {
         for state in &filter_states {
             let s = c * c * state.predicted_variance + r;
             log_likelihood += -0.5
-                * (state.innovation * state.innovation / s
-                    + s.ln()
-                    + std::f64::consts::TAU.ln());
+                * (state.innovation * state.innovation / s + s.ln() + std::f64::consts::TAU.ln());
             sum_sq_innovation += state.innovation * state.innovation;
         }
         let mean_squared_innovation = sum_sq_innovation / n as f64;

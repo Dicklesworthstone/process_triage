@@ -60,7 +60,8 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use thiserror::Error;
 
-static VERSIONED_INTERPRETER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(python|ruby|perl|node)(\d+(?:\.\d+)*)$").unwrap());
+static VERSIONED_INTERPRETER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(python|ruby|perl|node)(\d+(?:\.\d+)*)$").unwrap());
 static BROAD_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^\s]+/[^\s]+").unwrap());
 static BROAD_NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+\b").unwrap());
 static BROAD_WILDCARD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\.\*)+").unwrap());
@@ -126,13 +127,20 @@ impl PatternCandidate {
     }
 }
 
-static PATH_STRIPPER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^|\s)/(?:[^/\s]+/)+").unwrap());
+static PATH_STRIPPER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^|\s)/(?:[^/\s]+/)+").unwrap());
 static NUMBER_REPLACER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{4,}\b").unwrap());
-static PORT_FLAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(--?(?:port|p)\s*[=:]?\s*)\d+").unwrap());
+static PORT_FLAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(--?(?:port|p)\s*[=:]?\s*)\d+").unwrap());
 static PORT_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":\d{2,5}\b").unwrap());
-static TEMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/(?:tmp|var/tmp|var/folders)/[^\s]+").unwrap());
-static HOME_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/(?:home|Users)/[^/\s]+/[^\s]*").unwrap());
-static UUID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b").unwrap());
+static TEMP_PATH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/(?:tmp|var/tmp|var/folders)/[^\s]+").unwrap());
+static HOME_PATH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/(?:home|Users)/[^/\s]+/[^\s]*").unwrap());
+static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+        .unwrap()
+});
 static HASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{8,}\b").unwrap());
 
 /// Command normalizer for converting raw commands to patterns.
@@ -155,8 +163,7 @@ impl CommandNormalizer {
         };
 
         // Handle versioned interpreters (python3.11 -> python.*)
-        if let Some(captures) = VERSIONED_INTERPRETER_RE.captures(base)
-        {
+        if let Some(captures) = VERSIONED_INTERPRETER_RE.captures(base) {
             if let Some(lang) = captures.get(1) {
                 return format!("{}.*", lang.as_str());
             }
@@ -171,9 +178,7 @@ impl CommandNormalizer {
         let uuid_placeholder = "__UUID__";
 
         // Replace UUIDs with pattern
-        result = UUID_RE
-            .replace_all(&result, uuid_placeholder)
-            .to_string();
+        result = UUID_RE.replace_all(&result, uuid_placeholder).to_string();
 
         // Escape regex metacharacters but keep the replacements
         result = regex::escape(&result);
@@ -187,42 +192,26 @@ impl CommandNormalizer {
         let mut result = arg.to_string();
 
         // Strip absolute paths, keep final component
-        result = PATH_STRIPPER_RE
-            .replace_all(&result, "${1}.*")
-            .to_string();
+        result = PATH_STRIPPER_RE.replace_all(&result, "${1}.*").to_string();
 
         // Replace home paths
-        result = HOME_PATH_RE
-            .replace_all(&result, ".*")
-            .to_string();
+        result = HOME_PATH_RE.replace_all(&result, ".*").to_string();
 
         // Replace temp paths
-        result = TEMP_PATH_RE
-            .replace_all(&result, ".*")
-            .to_string();
+        result = TEMP_PATH_RE.replace_all(&result, ".*").to_string();
 
         // Replace port numbers, preserving original form when possible
-        result = PORT_FLAG_RE
-            .replace_all(&result, r"${1}\d+")
-            .to_string();
-        result = PORT_SUFFIX_RE
-            .replace_all(&result, r":\d+")
-            .to_string();
+        result = PORT_FLAG_RE.replace_all(&result, r"${1}\d+").to_string();
+        result = PORT_SUFFIX_RE.replace_all(&result, r":\d+").to_string();
 
         // Replace long numbers (PIDs, etc.)
-        result = NUMBER_REPLACER_RE
-            .replace_all(&result, r"\d+")
-            .to_string();
+        result = NUMBER_REPLACER_RE.replace_all(&result, r"\d+").to_string();
 
         // Replace UUIDs
-        result = UUID_RE
-            .replace_all(&result, "[0-9a-f-]+")
-            .to_string();
+        result = UUID_RE.replace_all(&result, "[0-9a-f-]+").to_string();
 
         // Replace hash-like strings
-        result = HASH_RE
-            .replace_all(&result, "[0-9a-fA-F]+")
-            .to_string();
+        result = HASH_RE.replace_all(&result, "[0-9a-fA-F]+").to_string();
 
         result
     }
@@ -236,19 +225,13 @@ impl CommandNormalizer {
         result = PATH_STRIPPER_RE.replace_all(&result, "${1}").to_string();
 
         // Replace all paths (including relative)
-        result = BROAD_PATH_RE
-            .replace_all(&result, ".*")
-            .to_string();
+        result = BROAD_PATH_RE.replace_all(&result, ".*").to_string();
 
         // Replace all numbers
-        result = BROAD_NUMBER_RE
-            .replace_all(&result, r"\d+")
-            .to_string();
+        result = BROAD_NUMBER_RE.replace_all(&result, r"\d+").to_string();
 
         // Collapse multiple wildcards
-        result = BROAD_WILDCARD_RE
-            .replace_all(&result, ".*")
-            .to_string();
+        result = BROAD_WILDCARD_RE.replace_all(&result, ".*").to_string();
 
         result.trim().to_string()
     }

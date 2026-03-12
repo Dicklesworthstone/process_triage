@@ -51,7 +51,7 @@
 //! }
 //! ```
 
-use pt_math::{beta_cdf, beta_inv_cdf, beta_pdf, gamma_cdf, gamma_inv_cdf, normal_quantile};
+use pt_math::{beta_inv_cdf, gamma_inv_cdf, normal_quantile};
 use serde::Serialize;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -1101,8 +1101,6 @@ mod tests {
 
     #[test]
     fn test_normal_quantile() {
-        let checker = PpcChecker::default();
-
         // Standard normal quantiles
         assert!((normal_quantile(0.5) - 0.0).abs() < 0.01);
         assert!((normal_quantile(0.975) - 1.96).abs() < 0.05);

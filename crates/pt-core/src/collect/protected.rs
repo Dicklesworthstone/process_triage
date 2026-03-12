@@ -153,10 +153,13 @@ impl CompiledProtectedPattern {
                 .unwrap_or(false),
             PatternKind::Literal => {
                 if self.case_insensitive {
-                    self.regex.as_ref().map(|r| r.is_match(text)).unwrap_or_else(|| {
-                        // Fallback just in case regex failed to compile (though it shouldn't)
-                        text.to_lowercase().contains(&self.original.to_lowercase())
-                    })
+                    self.regex
+                        .as_ref()
+                        .map(|r| r.is_match(text))
+                        .unwrap_or_else(|| {
+                            // Fallback just in case regex failed to compile (though it shouldn't)
+                            text.to_lowercase().contains(&self.original.to_lowercase())
+                        })
                 } else {
                     text.contains(&self.original)
                 }

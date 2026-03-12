@@ -65,7 +65,10 @@ impl SignalActionRunner {
     #[cfg(unix)]
     fn send_signal(&self, target_id: u32, signal: i32, use_group: bool) -> Result<(), ActionError> {
         if target_id > i32::MAX as u32 {
-            return Err(ActionError::Failed(format!("PID {} exceeds i32 range", target_id)));
+            return Err(ActionError::Failed(format!(
+                "PID {} exceeds i32 range",
+                target_id
+            )));
         }
 
         let target_pid = if use_group {
@@ -276,7 +279,11 @@ impl SignalActionRunner {
 
 #[cfg(unix)]
 impl ActionRunner for SignalActionRunner {
-    fn revalidate(&self, action: &PlanAction, provider: &dyn super::executor::IdentityProvider) -> Result<bool, ActionError> {
+    fn revalidate(
+        &self,
+        action: &PlanAction,
+        provider: &dyn super::executor::IdentityProvider,
+    ) -> Result<bool, ActionError> {
         provider.revalidate(&action.target)
     }
 

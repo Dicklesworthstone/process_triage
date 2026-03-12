@@ -7,7 +7,7 @@ use pt_common::ProcessId;
 use serde::{Deserialize, Serialize};
 
 /// Category of supervisor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum SupervisorCategory {
     /// AI coding agents (Claude, Codex, Aider, Cursor).
