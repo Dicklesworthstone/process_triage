@@ -152,7 +152,7 @@ fn run_full_pipeline(
             "timestamp": Utc::now().to_rfc3339(),
             "phase": "report",
             "case_id": case_id,
-            "command": "pt report generate",
+            "command": "pt agent report",
             "exit_code": 0,
             "duration_ms": 15,
             "artifacts": [

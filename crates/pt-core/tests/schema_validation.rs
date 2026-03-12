@@ -515,11 +515,15 @@ mod start_id_format {
         assert!(StartId::parse(valid).is_some());
     }
 
-    /// Start ID requires UUID boot_id.
+    /// Start ID requires non-empty boot_id.
     #[test]
-    fn start_id_requires_uuid_boot_id() {
-        let invalid_boot_id = "not-a-uuid:123456789:4242";
+    fn start_id_requires_non_empty_boot_id() {
+        let invalid_boot_id = ":123456789:4242";
         assert!(StartId::parse(invalid_boot_id).is_none());
+
+        // "synthetic" should be allowed now
+        let synthetic = "synthetic:123456789:4242";
+        assert!(StartId::parse(synthetic).is_some());
     }
 
     /// Start ID requires numeric start_time.

@@ -8,6 +8,12 @@ use pt_core::supervision::pattern_persistence::{
 };
 use pt_core::supervision::signature::ProcessMatchContext;
 use pt_core::supervision::SignatureDatabase;
+use std::sync::OnceLock;
+
+static DB: OnceLock<SignatureDatabase> = OnceLock::new();
+fn get_db() -> &'static SignatureDatabase {
+    DB.get_or_init(SignatureDatabase::with_defaults)
+}
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2000))]
@@ -17,7 +23,7 @@ proptest! {
     /// Default database is non-empty (has built-in signatures).
     #[test]
     fn database_default_non_empty(_dummy in 0u8..1) {
-        let db = SignatureDatabase::with_defaults();
+        let db = get_db();
         prop_assert!(!db.is_empty(), "default database should have built-in signatures");
     }
 
@@ -27,7 +33,7 @@ proptest! {
         comm in "[a-zA-Z0-9_.-]{1,30}",
         cmdline in "[a-zA-Z0-9 /._-]{0,100}",
     ) {
-        let db = SignatureDatabase::with_defaults();
+        let db = get_db();
         let ctx = ProcessMatchContext::with_comm(&comm).cmdline(&cmdline);
         let _matches = db.match_process(&ctx);
     }
@@ -43,7 +49,7 @@ proptest! {
             Just("unknown"),
         ],
     ) {
-        let db = SignatureDatabase::with_defaults();
+        let db = get_db();
         let ctx = ProcessMatchContext::with_comm(comm);
         let all = db.match_process(&ctx);
         let best = db.best_match(&ctx);
@@ -60,7 +66,7 @@ proptest! {
     fn database_find_by_name_no_panic(
         name in "[a-zA-Z0-9_.-]{1,30}",
     ) {
-        let db = SignatureDatabase::with_defaults();
+        let db = get_db();
         let _results = db.find_by_process_name(&name);
     }
 
@@ -69,7 +75,7 @@ proptest! {
     fn database_find_by_parent_no_panic(
         name in "[a-zA-Z0-9_.-]{1,30}",
     ) {
-        let db = SignatureDatabase::with_defaults();
+        let db = get_db();
         let _results = db.find_by_parent_name(&name);
     }
 

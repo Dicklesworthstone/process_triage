@@ -186,5 +186,12 @@ impl LiveHarness {
 impl Drop for LiveHarness {
     fn drop(&mut self) {
         self.terminate_child();
+        for stream in &self.tcp_streams {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        #[cfg(unix)]
+        for stream in &self.unix_streams {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
