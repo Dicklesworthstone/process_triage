@@ -211,6 +211,12 @@ main() {
         forwarded_args[0]="deep-scan"
     fi
 
+    # Preserve the older wrapper-level `pt scan deep` shortcut by routing it
+    # to the explicit deep-scan subcommand exposed by pt-core.
+    if [[ "${forwarded_args[0]:-}" == "scan" && "${forwarded_args[1]:-}" == "deep" ]]; then
+        forwarded_args=("deep-scan" "${forwarded_args[@]:2}")
+    fi
+
     # Forward to pt-core
     # We use 'exec' to replace the shell process
     exec "$pt_core" "${forwarded_args[@]}"

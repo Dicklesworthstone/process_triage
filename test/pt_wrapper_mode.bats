@@ -107,6 +107,16 @@ EOF
     grep -q '^ARGS=deep-scan --format json$' "$MOCK_LOG"
 }
 
+@test "wrapper: scan deep rewrites to deep-scan before forwarding" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" scan deep --format json
+
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=deep-scan --format json$' "$MOCK_LOG"
+}
+
 @test "wrapper: version check still works with wrapper mode flags" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \
