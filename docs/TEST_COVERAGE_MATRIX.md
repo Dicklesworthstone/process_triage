@@ -1,6 +1,6 @@
 # Test Coverage Matrix (No-Mock & E2E Logging)
 
-Last updated: 2026-01-15
+Last updated: 2026-03-12
 
 ## Executive Summary
 
@@ -35,7 +35,7 @@ Legend:
 | pt-config (policy/priors/resolve) | ✓ | ✗ | ✗ | ✗ | ~ | Unit tests with fixtures. |
 | pt-math | ✓ | ✗ | ✗ | ✓ | ~ | Property tests exist, but not end-to-end. |
 | pt-redact | ✓ | ~ | ✗ | ✗ | ~ | Integration tests exist; no E2E harness. |
-| pt-telemetry | ✓ | ✗ | ✗ | ✗ | ~ | Unit tests exist; no retention/E2E. |
+| pt-telemetry | ✓ | ✓ | ✓ | ✗ | ✓ | No-mock logging/retention tests, shadow retention pipeline coverage, and telemetry status/prune E2E workflows exist. |
 | bash pt (BATS) | ✓ | ~ | ~ | ✗ | ~ | BATS covers wrapper paths; no full E2E w/ logs. |
 
 ## Gaps and Bead Mapping
@@ -79,4 +79,3 @@ no-mock policy, tests must:
 2. Wire evidence collection + action tests to use it (`process_triage-aii.7.3`, `aii.7.4`).
 3. Add the E2E runner harness and log/artefact layout (`process_triage-aii.7.7`).
 4. Expand CLI/agent E2E coverage with logs (`aii.7.8`, `aii.7.9`).
-

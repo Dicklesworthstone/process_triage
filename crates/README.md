@@ -1,95 +1,112 @@
 # Process Triage Rust Crates
 
-This directory contains the Rust workspace for `pt-core`, the Process Triage inference and decision engine.
+This directory contains the Rust workspace that powers Process Triage. `pt-core`
+is the user-facing binary, while the other crates provide shared types,
+configuration, math, redaction, bundling, telemetry, and report generation.
 
 ## Workspace Structure
 
-```
+```text
 crates/
-├── pt-core/      # Binary crate: CLI entrypoint and orchestration
-├── pt-common/    # Library crate: shared types, IDs, errors, schemas
-└── pt-math/      # Library crate: numerical stability primitives
+├── pt-bundle/     # Session bundle writer/reader and encryption helpers
+├── pt-common/     # Shared types, schemas, IDs, and output contracts
+├── pt-config/     # Configuration loading, presets, and validation
+├── pt-core/       # Main CLI, orchestration, inference, planning, and actions
+├── pt-math/       # Numerical helpers for Bayesian and statistical routines
+├── pt-report/     # HTML report generation
+├── pt-redact/     # Redaction, normalization, and hashing for persisted data
+└── pt-telemetry/  # Telemetry schemas, retention, and Parquet/shadow storage
 ```
 
 ## Crate Responsibilities
 
-### pt-core (binary)
+### pt-core
 
-The main entry point. Responsibilities:
-- CLI subcommand routing (`run`, `scan`, `agent`, etc.)
-- Session lifecycle management
-- Coordination between inference, decision, and action modules
-- Output formatting and exit codes
+The main binary crate. Responsibilities include:
+- CLI subcommand routing (`run`, `scan`, `agent`, `robot`, `shadow`, `bundle`)
+- Session lifecycle management and artifact persistence
+- Process collection, inference, decisioning, planning, and action execution
+- Structured output, TUI integration, MCP support, and capability detection
 
-### pt-common (library)
+### pt-common
 
-Shared foundational types. Responsibilities:
-- Process identity types (`ProcessId`, `StartId`, `SessionId`)
-- Schema versioning constants
-- Unified error types with error codes
-- Output format specifications
+Shared foundational types and contracts:
+- Process/session identity types and schema constants
+- Output format types used across CLI, agent, and robot flows
+- Shared configuration schema pieces and capability metadata
 
-### pt-math (library)
+### pt-config
 
-Numerical stability primitives for log-domain Bayesian inference:
-- `log_sum_exp` - numerically stable log-sum-exp
-- `log_add_exp` / `log_sub_exp` - pairwise operations
-- `log_gamma` - log-gamma function (lgamma)
-- `log_beta` / `log_factorial` / `log_binomial` - combinatorial functions
+Configuration handling:
+- Loading and resolving config directories and files
+- Preset definitions and validation
+- Shared policy and priors parsing used by `pt-core`
 
-## Future Crates (planned)
+### pt-math
 
-These will be added as implementation progresses:
+Numerical and statistical primitives:
+- Stable Bayesian/log-domain helpers
+- Probability utilities used by inference and calibration code
+- Benchmark coverage for core math routines
 
-- `pt-collect` - Process collection abstractions + platform-specific implementations
-- `pt-features` - Deterministic derived features + provenance tracking
-- `pt-infer` - Posterior computation, Bayes factors, evidence ledger
-- `pt-decide` - Expected-loss, stopping rules, VOI, FDR gates
-- `pt-action` - Action planning + staged execution
-- `pt-telemetry` - Parquet writer, redaction, event schemas
-- `pt-report` - HTML report generation
-- `pt-bundle` - `.ptb` pack/unpack + manifest/checksums
+### pt-redact
+
+Privacy and persistence safety:
+- Command/path normalization
+- Field classification and redaction policies
+- Hashing and redaction engines for persisted artifacts
+
+### pt-bundle
+
+Session bundle packaging:
+- Bundle manifests and checksums
+- ZIP-based bundle read/write paths
+- Optional encryption helpers for shareable session artifacts
+
+### pt-telemetry
+
+Observability and retention:
+- Arrow/Parquet schema definitions and writers
+- Shadow-mode storage helpers
+- Retention and pruning logic for telemetry/session data
+
+### pt-report
+
+Reporting output:
+- Askama-based HTML report generation
+- Evidence, action, and overview report sections
+- Report-specific configuration and rendering tests
 
 ## Building
 
 ```bash
-# Build all crates
-cargo build
+# Check the full workspace
+cargo check --workspace --all-targets
 
-# Build release
-cargo build --release
-
-# Run tests
+# Run tests across the workspace
 cargo test --workspace
 
-# Run pt-core
+# Run the main binary from source
 cargo run -p pt-core -- --help
 ```
 
 ## Feature Flags
 
-`pt-core` supports these compile-time features:
+`pt-core` exposes optional features for higher-cost probes and extra output
+surfaces:
 
-- `deep` - Enable expensive/privileged probes (lsof, ss, perf/eBPF)
-- `report` - HTML report generator dependencies
-- `daemon` - Dormant monitoring mode
-- `ui` - Premium TUI experience
+- `deep` - Enable expensive or privileged probes such as `lsof` and `ss`
+- `report` - Enable HTML report generation through `pt-report`
+- `daemon` - Enable dormant monitoring mode
+- `metrics` - Enable Prometheus/tiny_http metrics endpoints
+- `ui` - Enable the ftui-based TUI
 
-Feature flags never change inference math semantics—they only control available evidence sources and output surfaces.
-
-## Adding New Evidence Sources
-
-When adding a new evidence source, follow this path:
-
-1. **Collection** (`pt-collect`): Add platform-specific collection code
-2. **Features** (`pt-features`): Add deterministic feature derivation with provenance
-3. **Inference** (`pt-infer`): Add likelihood term to posterior computation
-4. **Ledger** (`pt-infer`): Include in math ledger for galaxy-brain mode
-5. **Tests**: Add unit tests at each layer
+Feature flags add capabilities and output surfaces; they do not change the core
+policy guarantees around confirmation and safe action application.
 
 ## Cross-Platform Notes
 
-- Use `cfg(target_os = "linux")` and `cfg(target_os = "macos")` for platform-specific code
-- Linux collectors use `/proc`, cgroups, etc.
-- macOS collectors use `ps`, `proc_pidinfo`, `lsof` equivalents
-- Always tag features with platform provenance
+- Use `cfg(target_os = "linux")` and `cfg(target_os = "macos")` for OS-specific code
+- Linux collection relies on `/proc`, cgroups, and related kernel interfaces
+- macOS collection uses platform tools and APIs such as `ps`, `lsof`, and launchd detection
+- Platform provenance should remain explicit in collected evidence and capability reporting

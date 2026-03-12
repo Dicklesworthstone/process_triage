@@ -139,8 +139,6 @@ Runs additional probes: I/O activity, CPU progress over time, TTY state, network
 ### Other Commands
 
 ```bash
-pt history     # View past kill/spare decisions
-pt clear       # Clear learned decisions (fresh start)
 pt learn       # Interactive tutorial progress + guided exercises
 pt diff --last # Compare the latest two sessions
 pt --version   # Show version
@@ -471,24 +469,37 @@ Threat model and limitations:
 - Does not protect data after decryption; keep decrypted outputs local and access-controlled.
 - Security depends on passphrase strength (use a strong, unique passphrase).
 
-### HTML Reports — Planned
+### HTML Reports
 
-Generate a human-readable report:
+HTML report generation is implemented in the agent/report pipeline when
+`pt-core` is built with the `report` feature.
+
+Generate a human-readable report from a recorded session:
 
 ```bash
-# Planned feature
-pt report --session pt-20260115-143022-a7xq --output report.html
+cargo run -p pt-core --features report -- \
+  agent report --session pt-20260115-143022-a7xq --out report.html
 ```
 
-Reports will include:
+You can also generate directly from a bundle:
+
+```bash
+cargo run -p pt-core --features report -- \
+  agent report --bundle session.ptb --out report.html
+```
+
+Available output/report options include:
 - Executive summary
 - Candidate details with evidence
 - Actions taken and outcomes
 - System resource impact
 
-Two modes planned:
+Two supported asset modes:
 - **CDN mode** (default): Smaller file, requires internet for styling
 - **Offline mode** (`--embed-assets`): Self-contained, works without network
+
+Note: the top-level `pt report` convenience command is still planned. The
+implemented path today is `agent report`.
 
 ---
 
@@ -559,6 +570,7 @@ pt agent plan --format json      # Generate actionable plan
 pt agent plan --format toon      # Token-optimized plan output
 pt agent apply --session <id>    # Execute plan
 pt agent verify --session <id>   # Confirm outcomes
+pt agent report --session <id>   # Generate HTML report (build with `report` feature)
 pt agent watch --format jsonl    # Stream watch events (JSONL)
 ```
 

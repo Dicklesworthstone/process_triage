@@ -671,12 +671,12 @@ pt-core shadow <command> [OPTIONS]
 
 ---
 
-### `pt-core bundle`
+### `pt-core bundle create`
 
 Create `.ptb` session bundle.
 
 ```
-pt-core bundle --session <id> --out <path> [OPTIONS]
+pt-core bundle create --session <id> --output <path> [OPTIONS]
 ```
 
 | Option | Description |
@@ -690,7 +690,7 @@ pt-core bundle --session <id> --out <path> [OPTIONS]
 Generate standalone HTML report.
 
 ```
-pt-core report --session <id> --out <path> [OPTIONS]
+pt-core report --session <id> --output <path> [OPTIONS]
 ```
 
 | Option | Description |
@@ -718,45 +718,6 @@ pt-core daemon [start|stop|status] [OPTIONS]
 Notes:
 - `pt-core daemon` (no subcommand) runs in the foreground.
 - `pt-core daemon start` backgrounds by default; use `--foreground` to keep it attached.
-
----
-
-### `pt-core inbox`
-
-List daemon-created sessions (alias for `agent inbox`).
-
-```
-pt-core inbox [OPTIONS]
-```
-
----
-
-### `pt-core history`
-
-Show decision history.
-
-```
-pt-core history [OPTIONS]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--limit <N>` | Limit results |
-| `--format json\|md` | Output format |
-
----
-
-### `pt-core clear`
-
-Clear decision memory.
-
-```
-pt-core clear [OPTIONS]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--confirm` | Required confirmation flag |
 
 ---
 

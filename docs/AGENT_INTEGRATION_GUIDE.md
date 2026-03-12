@@ -17,9 +17,9 @@ This documentation describes both **currently available features** and **planned
 | Safety gates (`--min-posterior`, `--max-kills`) | ✅ Implemented | Enforced at apply time; policy defaults still apply |
 | Pattern filtering (`--patterns`) | 🚧 Planned | Filter by process name patterns |
 | `pt export` | ✅ Implemented | Use `pt bundle create` or `pt agent export` |
-| `pt report` | ⚠️ Partial | `pt report` is a stub; `pt agent report` requires build with `report` feature |
+| `pt report` | ✅ Implemented | Top-level report delegates to the report backend when built with the `report` feature; `pt agent report` remains available for the fuller agent-oriented surface |
 
-**For immediate use**: Focus on the "Currently Implemented" workflows in the [Quickstart](#quickstart-workflows) section. Sections marked with 🚧 describe planned features.
+**For immediate use**: Focus on the "Currently Implemented" workflows in the [Quickstart](#quickstart-workflows) section. Commands that require optional features call that out explicitly; sections marked with 🚧 describe planned features.
 
 ---
 
