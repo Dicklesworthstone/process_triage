@@ -600,20 +600,20 @@ pt-core daemon stop
 
 ```bash
 # List pending daemon sessions
-pt inbox
-pt-core inbox
+pt agent inbox
+pt-core agent inbox
 
-# Show specific session
-pt inbox show <session_id>
+# Show only unread items
+pt agent inbox --unread
 
-# Apply session plan
-pt inbox apply <session_id>
+# Acknowledge or dismiss an item
+pt agent inbox --ack <item_id>
 
-# Dismiss session
-pt inbox dismiss <session_id>
+# Clear acknowledged items
+pt agent inbox --clear
 
-# Clear all inbox
-pt inbox clear --older-than 24h
+# Clear all items, including unacknowledged
+pt agent inbox --clear-all
 ```
 
 ---

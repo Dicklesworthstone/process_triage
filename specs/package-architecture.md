@@ -68,7 +68,7 @@ The Rust binary owns **all functional logic**. It is the "alien artifact."
 | `pt-core bundle` | Create shareable .ptb bundles |
 | `pt-core report` | Generate single-file HTML report |
 | `pt-core daemon` | Dormant monitoring mode |
-| `pt-core inbox` | List daemon-created sessions |
+| `pt-core agent inbox` | List daemon-created sessions |
 
 #### Responsibilities
 

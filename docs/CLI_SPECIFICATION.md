@@ -476,8 +476,11 @@ pt-core agent inbox [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Limit results |
-| `--format json\|md` | Output format |
+| `--ack <ID>` | Acknowledge or dismiss a specific inbox item |
+| `--clear` | Remove all acknowledged items |
+| `--clear-all` | Remove all items, including unread ones |
+| `--unread` | Show only unread items |
+| `--format <FORMAT>` | Output format (`json`, `toon`, `md`, `jsonl`, `summary`, `metrics`, `slack`, `exitcode`, `prose`) |
 
 ---
 

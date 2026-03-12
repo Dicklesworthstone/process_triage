@@ -235,18 +235,20 @@ pt-core daemon [OPTIONS]
 | `--notify-exec` | string | Command to execute on escalation |
 | `--oneshot` | flag | Run once and exit (for cron) |
 
-### 3.12 `pt-core inbox`
+### 3.12 `pt-core agent inbox`
 
 List daemon-created sessions pending review.
 
 ```
-pt-core inbox [OPTIONS]
+pt-core agent inbox [OPTIONS]
 ```
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `--limit` | int | Maximum entries to show |
-| `--filter` | enum | Filter: `pending`, `reviewed`, `all` |
+| `--ack <ID>` | string | Acknowledge or dismiss a specific inbox item |
+| `--clear` | flag | Remove all acknowledged items |
+| `--clear-all` | flag | Remove all items, including unread ones |
+| `--unread` | flag | Show only unread items |
 
 ---
 
@@ -418,7 +420,10 @@ pt-core agent inbox [OPTIONS]
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `--limit` | int | Maximum entries |
+| `--ack <ID>` | string | Acknowledge or dismiss a specific inbox item |
+| `--clear` | flag | Remove all acknowledged items |
+| `--clear-all` | flag | Remove all items, including unread ones |
+| `--unread` | flag | Show only unread items |
 | `--format` | enum | Output format |
 
 ### 4.11 `agent export`
