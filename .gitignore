@@ -19,6 +19,9 @@
 # Temporary files
 *.tmp
 
+# UBS scan output
+ubs_output.txt
+
 # bv (beads viewer) local config and caches
 .bv/
 
