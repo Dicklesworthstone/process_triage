@@ -172,7 +172,7 @@ The `pt` script exposes friendly commands that delegate to `pt-core`:
 |--------------|--------------|
 | `pt` (default) | `pt-core run` |
 | `pt scan` | `pt-core scan` |
-| `pt deep` | `pt-core run --deep` |
+| `pt deep` | `pt-core deep-scan` |
 | `pt agent ...` | `pt-core agent ...` |
 | `pt help` | `pt-core help` |
 

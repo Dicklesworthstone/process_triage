@@ -15,7 +15,7 @@ CLI onboarding helper:
 - `pt learn` shows your progress and the next tutorial.
 - `pt learn list` lists all tutorials with completion state.
 - `pt learn show <id-or-slug>` displays a specific tutorial and hints.
-- `pt learn verify --topic <id-or-slug>` runs budgeted command checks.
+- `pt learn verify <id-or-slug>` runs budgeted command checks.
 - `pt learn verify --all --mark-complete` verifies all tutorials and records progress.
 - `pt learn reset` clears tutorial progress.
 

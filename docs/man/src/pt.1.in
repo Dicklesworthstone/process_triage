@@ -21,8 +21,17 @@ Quick scan only (no actions).
 .B pt deep
 Deep scan (more evidence, slower).
 .TP
+.B pt diff
+Compare saved sessions and show changes.
+.TP
+.B pt learn
+Interactive tutorials and onboarding guidance.
+.TP
 .B pt robot <subcommand>
 Agent/robot interface (plan, explain, apply).
+.TP
+.B pt shadow <subcommand>
+Shadow mode observation management.
 .TP
 .B pt bundle <subcommand>
 Bundle management (create, inspect, extract).

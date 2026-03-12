@@ -471,17 +471,22 @@ Threat model and limitations:
 
 ### HTML Reports
 
-HTML report generation is implemented in the agent/report pipeline when
-`pt-core` is built with the `report` feature.
+HTML report generation is available through the top-level `pt report` command
+when `pt-core` is built with the `report` feature.
 
 Generate a human-readable report from a recorded session:
 
 ```bash
-cargo run -p pt-core --features report -- \
-  agent report --session pt-20260115-143022-a7xq --out report.html
+pt report --session pt-20260115-143022-a7xq --output report.html
 ```
 
-You can also generate directly from a bundle:
+You can also include the detailed ledger in the top-level report flow:
+
+```bash
+pt report --session pt-20260115-143022-a7xq --output report.html --include-ledger
+```
+
+For bundle-based report generation, use the agent-oriented path:
 
 ```bash
 cargo run -p pt-core --features report -- \
@@ -497,9 +502,6 @@ Available output/report options include:
 Two supported asset modes:
 - **CDN mode** (default): Smaller file, requires internet for styling
 - **Offline mode** (`--embed-assets`): Self-contained, works without network
-
-Note: the top-level `pt report` convenience command is still planned. The
-implemented path today is `agent report`.
 
 ---
 
