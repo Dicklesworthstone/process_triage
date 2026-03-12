@@ -79,6 +79,11 @@ pub struct ExecutionResult {
 pub trait ActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError>;
     fn verify(&self, action: &PlanAction) -> Result<(), ActionError>;
+
+    /// Revalidate the identity of the target process before taking action.
+    fn revalidate(&self, _action: &PlanAction, _provider: &dyn IdentityProvider) -> Result<bool, ActionError> {
+        Ok(true)
+    }
 }
 
 /// No-op action runner (used for tests and scaffolding).
@@ -197,6 +202,13 @@ impl<'a> ActionExecutor<'a> {
                 Ok(false) => return ActionStatus::IdentityMismatch,
                 Err(_) => return ActionStatus::IdentityMismatch,
             }
+        }
+
+        // Just-in-time revalidation by the runner itself
+        match self.runner.revalidate(action, self.identity_provider) {
+            Ok(true) => {}
+            Ok(false) => return ActionStatus::IdentityMismatch,
+            Err(e) => return status_from_error(e),
         }
 
         // Run other pre-checks (protected, data-loss, supervisor, session safety)

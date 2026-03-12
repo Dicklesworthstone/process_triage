@@ -3,6 +3,12 @@
 //! Each tool maps to a pt operation: scan, explain, history, signatures, capabilities.
 
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
+use crate::collect::{QuickScanOptions, quick_scan, ProcessRecord, ProcessState, ScanResult, ScanMetadata};
+#[cfg(target_os = "linux")]
+use crate::collect::{deep_scan, DeepScanOptions};
+use crate::supervision::SignatureDatabase;
+use crate::supervision::signature::ProcessMatchContext;
+use crate::signature_cli::load_user_signatures;
 
 /// Build the list of available MCP tool definitions.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
@@ -69,6 +75,28 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "pt_plan".to_string(),
+            description: "Generate a triage plan with recommended actions for suspicious processes."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "deep": {
+                        "type": "boolean",
+                        "description": "Enable deep probes",
+                        "default": false
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Minimum score to include",
+                        "default": 0.5
+                    }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
             name: "pt_signatures".to_string(),
             description: "List available process signatures (built-in and user-defined)."
                 .to_string(),
@@ -107,6 +135,7 @@ pub fn call_tool(name: &str, params: &serde_json::Value) -> Result<Vec<ToolConte
     match name {
         "pt_scan" => tool_scan(params),
         "pt_explain" => tool_explain(params),
+        "pt_plan" => tool_plan(params),
         "pt_history" => tool_history(params),
         "pt_signatures" => tool_signatures(params),
         "pt_capabilities" => tool_capabilities(params),
@@ -115,33 +144,102 @@ pub fn call_tool(name: &str, params: &serde_json::Value) -> Result<Vec<ToolConte
 }
 
 fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    let deep = params.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
     let min_score = params
         .get("min_score")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
 
-    let options = crate::collect::QuickScanOptions::default();
-    let scan_result =
-        crate::collect::quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?;
-
-    // Filter by score if requested, using state as a basic score proxy
-    let candidates: Vec<&crate::collect::ProcessRecord> = scan_result
-        .processes
-        .iter()
-        .filter(|p| {
-            if min_score > 0.0 {
-                let score = match p.state {
-                    crate::collect::ProcessState::Zombie => 0.95,
-                    crate::collect::ProcessState::Stopped => 0.6,
-                    crate::collect::ProcessState::DiskSleep => 0.4,
-                    _ => 0.1,
-                };
-                score >= min_score
-            } else {
-                true
+    let scan_result: ScanResult = if deep {
+        #[cfg(target_os = "linux")]
+        {
+            let options = DeepScanOptions::default();
+            let deep_result = deep_scan(&options).map_err(|e| format!("Deep scan failed: {}", e))?;
+            ScanResult {
+                processes: deep_result.processes.into_iter().map(|p| {
+                    ProcessRecord {
+                        pid: p.pid,
+                        ppid: p.ppid,
+                        uid: p.uid,
+                        user: p.user,
+                        pgid: p.pgid,
+                        sid: p.sid,
+                        start_id: p.start_id,
+                        comm: p.comm,
+                        cmd: p.cmdline,
+                        state: ProcessState::from_char(p.state),
+                        cpu_percent: 0.0, // Not collected in deep_scan currently
+                        rss_bytes: p.mem.as_ref().map(|m| m.resident * 4096).unwrap_or(0),
+                        vsz_bytes: p.mem.as_ref().map(|m| m.size * 4096).unwrap_or(0),
+                        tty: None,
+                        start_time_unix: 0,
+                        elapsed: std::time::Duration::from_secs(0),
+                        source: "deep_scan".to_string(),
+                        container_info: None,
+                    }
+                }).collect(),
+                metadata: ScanMetadata {
+                    scan_type: "deep".to_string(),
+                    platform: "linux".to_string(),
+                    boot_id: None,
+                    started_at: deep_result.metadata.started_at,
+                    duration_ms: deep_result.metadata.duration_ms,
+                    process_count: deep_result.metadata.process_count,
+                    warnings: deep_result.metadata.warnings,
+                },
             }
-        })
-        .collect();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let options = QuickScanOptions::default();
+            quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?
+        }
+    } else {
+        let options = QuickScanOptions::default();
+        quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?
+    };
+
+    // Load signature database for scoring
+    let mut db = SignatureDatabase::new();
+    db.add_default_signatures();
+    if let Some(user_schema) = load_user_signatures() {
+        for sig in user_schema.signatures {
+            let _ = db.add(sig);
+        }
+    }
+
+    // Process and filter candidates
+    let mut candidates = Vec::new();
+    for p in &scan_result.processes {
+        let ctx = ProcessMatchContext {
+            comm: &p.comm,
+            cmdline: Some(p.cmd.as_str()),
+            cwd: None,
+            env_vars: None,
+            socket_paths: None,
+            parent_comm: None,
+        };
+
+        let matches = db.match_process(&ctx);
+        let sig_score = matches.iter().map(|m| m.score).fold(0.0, f64::max);
+
+        // Basic heuristic score if no signature matches
+        let state_score = match p.state {
+            ProcessState::Zombie => 0.9,
+            ProcessState::Stopped => 0.5,
+            ProcessState::DiskSleep => 0.3,
+            _ => 0.05,
+        };
+
+        let final_score = (sig_score + state_score).min(1.0);
+
+        if final_score >= min_score {
+            candidates.push((p, final_score, matches));
+        }
+    }
+
+    // Sort by score descending
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let result = serde_json::json!({
         "scanned_at": scan_result.metadata.started_at,
@@ -149,7 +247,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         "platform": scan_result.metadata.platform,
         "total_processes": scan_result.processes.len(),
         "returned": candidates.len(),
-        "processes": candidates.iter().take(200).map(|p| {
+        "processes": candidates.iter().take(200).map(|(p, score, matches)| {
             serde_json::json!({
                 "pid": p.pid.0,
                 "ppid": p.ppid.0,
@@ -162,6 +260,8 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
                 "rss_bytes": p.rss_bytes,
                 "vsz_bytes": p.vsz_bytes,
                 "elapsed_sec": p.elapsed.as_secs(),
+                "score": score,
+                "top_signature": matches.first().map(|m| m.signature.name.clone()),
             })
         }).collect::<Vec<_>>(),
     });
@@ -182,8 +282,8 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
     }
 
     // Run a quick scan to find the process
-    let options = crate::collect::QuickScanOptions::default();
-    let scan = crate::collect::quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?;
+    let options = QuickScanOptions::default();
+    let scan = quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?;
 
     let process = scan.processes.iter().find(|p| {
         if let Some(target_pid) = pid {
@@ -198,7 +298,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
     match process {
         Some(p) => {
             // Build signature match context
-            let ctx = crate::supervision::signature::ProcessMatchContext {
+            let ctx = ProcessMatchContext {
                 comm: &p.comm,
                 cmdline: Some(p.cmd.as_str()),
                 cwd: None,
@@ -207,9 +307,9 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 parent_comm: None,
             };
 
-            let mut db = crate::supervision::SignatureDatabase::new();
+            let mut db = SignatureDatabase::new();
             db.add_default_signatures();
-            if let Some(user_schema) = crate::signature_cli::load_user_signatures() {
+            if let Some(user_schema) = load_user_signatures() {
                 for sig in user_schema.signatures {
                     let _ = db.add(sig);
                 }
@@ -218,9 +318,9 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
             let matches = db.match_process(&ctx);
 
             let state_risk = match p.state {
-                crate::collect::ProcessState::Zombie => "high",
-                crate::collect::ProcessState::Stopped => "medium",
-                crate::collect::ProcessState::DiskSleep => "elevated",
+                ProcessState::Zombie => "high",
+                ProcessState::Stopped => "medium",
+                ProcessState::DiskSleep => "elevated",
                 _ => "low",
             };
 
@@ -268,6 +368,125 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
             }])
         }
     }
+}
+
+fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    let deep = params.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+    let min_score = params
+        .get("min_score")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.5);
+
+    let scan_result: ScanResult = if deep {
+        #[cfg(target_os = "linux")]
+        {
+            let options = DeepScanOptions::default();
+            let deep_result = deep_scan(&options).map_err(|e| format!("Deep scan failed: {}", e))?;
+            ScanResult {
+                processes: deep_result.processes.into_iter().map(|p| {
+                    ProcessRecord {
+                        pid: p.pid,
+                        ppid: p.ppid,
+                        uid: p.uid,
+                        user: p.user,
+                        pgid: p.pgid,
+                        sid: p.sid,
+                        start_id: p.start_id,
+                        comm: p.comm,
+                        cmd: p.cmdline,
+                        state: ProcessState::from_char(p.state),
+                        cpu_percent: 0.0, // Not collected in deep_scan currently
+                        rss_bytes: p.mem.as_ref().map(|m| m.resident * 4096).unwrap_or(0),
+                        vsz_bytes: p.mem.as_ref().map(|m| m.size * 4096).unwrap_or(0),
+                        tty: None,
+                        start_time_unix: 0,
+                        elapsed: std::time::Duration::from_secs(0),
+                        source: "deep_scan".to_string(),
+                        container_info: None,
+                    }
+                }).collect(),
+                metadata: ScanMetadata {
+                    scan_type: "deep".to_string(),
+                    platform: "linux".to_string(),
+                    boot_id: None,
+                    started_at: deep_result.metadata.started_at,
+                    duration_ms: deep_result.metadata.duration_ms,
+                    process_count: deep_result.metadata.process_count,
+                    warnings: deep_result.metadata.warnings,
+                },
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let options = QuickScanOptions::default();
+            quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?
+        }
+    } else {
+        let options = QuickScanOptions::default();
+        quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?
+    };
+
+    // Load signature database
+    let mut db = SignatureDatabase::new();
+    db.add_default_signatures();
+    if let Some(user_schema) = load_user_signatures() {
+        for sig in user_schema.signatures {
+            let _ = db.add(sig);
+        }
+    }
+
+    let mut plan_items = Vec::new();
+    for p in &scan_result.processes {
+        let ctx = ProcessMatchContext {
+            comm: &p.comm,
+            cmdline: Some(p.cmd.as_str()),
+            cwd: None,
+            env_vars: None,
+            socket_paths: None,
+            parent_comm: None,
+        };
+
+        let matches = db.match_process(&ctx);
+        let sig_score = matches.iter().map(|m| m.score).fold(0.0, f64::max);
+
+        let state_score = match p.state {
+            ProcessState::Zombie => 0.9,
+            ProcessState::Stopped => 0.5,
+            ProcessState::DiskSleep => 0.3,
+            _ => 0.05,
+        };
+
+        let final_score = (sig_score + state_score).min(1.0);
+
+        if final_score >= min_score {
+            let recommendation = if final_score > 0.8 {
+                "kill"
+            } else if final_score > 0.4 {
+                "pause"
+            } else {
+                "keep"
+            };
+
+            plan_items.push(serde_json::json!({
+                "pid": p.pid.0,
+                "comm": p.comm,
+                "score": final_score,
+                "recommended_action": recommendation,
+                "reason": matches.first().map(|m| m.signature.name.clone()).unwrap_or_else(|| "suspicious process state".to_string()),
+            }));
+        }
+    }
+
+    let result = serde_json::json!({
+        "plan_id": format!("mcp-{}", chrono::Utc::now().timestamp()),
+        "candidates": plan_items,
+    });
+
+    Ok(vec![ToolContent {
+        content_type: "text".to_string(),
+        text: serde_json::to_string_pretty(&result)
+            .map_err(|e| format!("Serialization error: {}", e))?,
+    }])
 }
 
 fn tool_history(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
@@ -327,7 +546,7 @@ fn tool_signatures(params: &serde_json::Value) -> Result<Vec<ToolContent>, Strin
     let mut all_sigs = Vec::new();
 
     if !user_only {
-        let mut db = crate::supervision::SignatureDatabase::new();
+        let mut db = SignatureDatabase::new();
         db.add_default_signatures();
         for sig in db.signatures() {
             if let Some(cat) = category_filter {
@@ -347,7 +566,7 @@ fn tool_signatures(params: &serde_json::Value) -> Result<Vec<ToolContent>, Strin
         }
     }
 
-    if let Some(user_schema) = crate::signature_cli::load_user_signatures() {
+    if let Some(user_schema) = load_user_signatures() {
         for sig in &user_schema.signatures {
             if let Some(cat) = category_filter {
                 if let Some(parsed) = crate::signature_cli::parse_category(cat) {
@@ -457,9 +676,17 @@ mod tests {
     }
 
     #[test]
+    fn tool_plan_succeeds() {
+        let result = call_tool("pt_plan", &serde_json::json!({})).unwrap();
+        assert!(!result.is_empty());
+        let parsed: serde_json::Value = serde_json::from_str(&result[0].text).unwrap();
+        assert!(parsed.get("candidates").is_some());
+    }
+
+    #[test]
     fn tool_definitions_count() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 6);
     }
 
     #[test]

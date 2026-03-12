@@ -276,6 +276,10 @@ impl SignalActionRunner {
 
 #[cfg(unix)]
 impl ActionRunner for SignalActionRunner {
+    fn revalidate(&self, action: &PlanAction, provider: &dyn super::executor::IdentityProvider) -> Result<bool, ActionError> {
+        provider.revalidate(&action.target)
+    }
+
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
         match action.action {
             Action::Pause => self.execute_pause(action),
