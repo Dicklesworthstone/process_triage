@@ -51,6 +51,7 @@
 //! }
 //! ```
 
+use pt_math::{beta_cdf, beta_inv_cdf, beta_pdf, gamma_cdf, gamma_inv_cdf, normal_quantile};
 use serde::Serialize;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -655,7 +656,7 @@ impl PpcChecker {
             let mut sample = Vec::with_capacity(n_obs);
             for j in 0..n_obs {
                 let u = self.quasi_random(i * n_obs + j, n_samples * n_obs);
-                let z = self.normal_quantile(u);
+                let z = normal_quantile(u);
                 sample.push(mean + std_dev * z);
             }
             samples.push(sample);
@@ -683,106 +684,12 @@ impl PpcChecker {
 
     /// Approximate Beta quantile function using Newton-Raphson.
     fn beta_quantile(&self, p: f64, alpha: f64, beta: f64) -> f64 {
-        // Initial guess using normal approximation
-        let mean = alpha / (alpha + beta);
-        let var = (alpha * beta) / ((alpha + beta).powi(2) * (alpha + beta + 1.0));
-        let std = var.sqrt();
-
-        let z = self.normal_quantile(p);
-        let mut x = (mean + std * z).clamp(0.001, 0.999);
-
-        // Newton-Raphson iterations
-        for _ in 0..10 {
-            let cdf = self.beta_cdf_approx(x, alpha, beta);
-            let pdf = self.beta_pdf(x, alpha, beta);
-
-            if pdf < 1e-10 {
-                break;
-            }
-
-            let delta = (cdf - p) / pdf;
-            x = (x - delta).clamp(0.001, 0.999);
-
-            if delta.abs() < 1e-8 {
-                break;
-            }
-        }
-
-        x
+        beta_inv_cdf(p, alpha, beta).clamp(0.001, 0.999)
     }
 
     /// Approximate Gamma quantile function.
     fn gamma_quantile(&self, p: f64, shape: f64, rate: f64) -> f64 {
-        // Use Wilson-Hilferty transformation for initial guess
-        let mean = shape / rate;
-
-        if shape >= 1.0 {
-            // Normal approximation
-            let std = (shape / rate / rate).sqrt();
-            let z = self.normal_quantile(p);
-            (mean + std * z).max(0.001)
-        } else {
-            // For small shape, use exponential approximation
-            let exp_quantile = -mean * p.ln();
-            exp_quantile.max(0.001)
-        }
-    }
-
-    /// Standard normal quantile (probit) function.
-    fn normal_quantile(&self, p: f64) -> f64 {
-        // Rational approximation (Abramowitz & Stegun)
-        let p = p.clamp(1e-10, 1.0 - 1e-10);
-
-        let sign = if p < 0.5 { -1.0 } else { 1.0 };
-        let p = if p < 0.5 { p } else { 1.0 - p };
-
-        let t = (-2.0 * p.ln()).sqrt();
-
-        let c0 = 2.515517;
-        let c1 = 0.802853;
-        let c2 = 0.010328;
-        let d1 = 1.432788;
-        let d2 = 0.189269;
-        let d3 = 0.001308;
-
-        let z = t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t);
-
-        sign * z
-    }
-
-    /// Beta PDF.
-    fn beta_pdf(&self, x: f64, alpha: f64, beta: f64) -> f64 {
-        if x <= 0.0 || x >= 1.0 {
-            return 0.0;
-        }
-
-        let log_b = pt_math::log_beta(alpha, beta);
-        let log_pdf = (alpha - 1.0) * x.ln() + (beta - 1.0) * (1.0 - x).ln() - log_b;
-        log_pdf.exp()
-    }
-
-    /// Approximate Beta CDF using continued fraction.
-    fn beta_cdf_approx(&self, x: f64, alpha: f64, beta: f64) -> f64 {
-        if x <= 0.0 {
-            return 0.0;
-        }
-        if x >= 1.0 {
-            return 1.0;
-        }
-
-        // Simple numerical integration (trapezoidal)
-        let n_steps = 100;
-        let dx = x / n_steps as f64;
-        let mut integral = 0.0;
-
-        for i in 0..=n_steps {
-            let xi = i as f64 * dx;
-            let yi = self.beta_pdf(xi, alpha, beta);
-            let weight = if i == 0 || i == n_steps { 0.5 } else { 1.0 };
-            integral += weight * yi;
-        }
-
-        (integral * dx).clamp(0.0, 1.0)
+        gamma_inv_cdf(p, shape, rate).max(0.001)
     }
 }
 
@@ -1197,9 +1104,9 @@ mod tests {
         let checker = PpcChecker::default();
 
         // Standard normal quantiles
-        assert!((checker.normal_quantile(0.5) - 0.0).abs() < 0.01);
-        assert!((checker.normal_quantile(0.975) - 1.96).abs() < 0.05);
-        assert!((checker.normal_quantile(0.025) - (-1.96)).abs() < 0.05);
+        assert!((normal_quantile(0.5) - 0.0).abs() < 0.01);
+        assert!((normal_quantile(0.975) - 1.96).abs() < 0.05);
+        assert!((normal_quantile(0.025) - (-1.96)).abs() < 0.05);
     }
 
     #[test]

@@ -52,7 +52,7 @@ impl MemorySignals {
         if self.total_bytes == 0 {
             return 0.0;
         }
-        1.0 - (self.available_bytes as f64 / self.total_bytes as f64)
+        (1.0 - (self.available_bytes as f64 / self.total_bytes as f64)).clamp(0.0, 1.0)
     }
 
     /// Swap utilization as a fraction.
@@ -60,7 +60,7 @@ impl MemorySignals {
         if self.swap_total_bytes == 0 {
             return 0.0;
         }
-        self.swap_used_bytes as f64 / self.swap_total_bytes as f64
+        (self.swap_used_bytes as f64 / self.swap_total_bytes as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -446,5 +446,35 @@ mod tests {
 
         // Only 1 consecutive warning, not 2 → stays normal.
         assert_eq!(mon.mode(), PressureMode::Normal);
+    }
+
+    #[test]
+    fn test_utilization_clamps_when_available_exceeds_total() {
+        let signals = MemorySignals {
+            total_bytes: 100,
+            used_bytes: 0,
+            available_bytes: 150,
+            swap_used_bytes: 0,
+            swap_total_bytes: 100,
+            psi_some10: None,
+            timestamp: 0.0,
+        };
+
+        assert_eq!(signals.utilization(), 0.0);
+    }
+
+    #[test]
+    fn test_swap_utilization_clamps_above_one() {
+        let signals = MemorySignals {
+            total_bytes: 100,
+            used_bytes: 100,
+            available_bytes: 0,
+            swap_used_bytes: 250,
+            swap_total_bytes: 100,
+            psi_some10: None,
+            timestamp: 0.0,
+        };
+
+        assert_eq!(signals.swap_utilization(), 1.0);
     }
 }

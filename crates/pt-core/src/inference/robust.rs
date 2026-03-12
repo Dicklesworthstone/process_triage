@@ -32,6 +32,7 @@
 //! let robust = gate.is_action_robust(&credal, 0.7);
 //! ```
 
+use pt_math::normal_quantile;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -1018,41 +1019,6 @@ fn is_feasible_credal_simplex(credal_sets: &[CredalSet]) -> bool {
     let upper_sum: f64 = credal_sets.iter().map(|c| c.upper).sum();
     let eps = 1e-10;
     lower_sum <= 1.0 + eps && upper_sum + eps >= 1.0
-}
-
-/// Approximate standard normal quantile (probit function).
-fn normal_quantile(p: f64) -> f64 {
-    if p <= 0.0 {
-        return f64::NEG_INFINITY;
-    }
-    if p >= 1.0 {
-        return f64::INFINITY;
-    }
-    if (p - 0.5).abs() < 1e-10 {
-        return 0.0;
-    }
-
-    // Abramowitz and Stegun approximation 26.2.23
-    let t = if p < 0.5 {
-        (-2.0 * p.ln()).sqrt()
-    } else {
-        (-2.0 * (1.0 - p).ln()).sqrt()
-    };
-
-    let c0 = 2.515517;
-    let c1 = 0.802853;
-    let c2 = 0.010328;
-    let d1 = 1.432788;
-    let d2 = 0.189269;
-    let d3 = 0.001308;
-
-    let approx = t - (c0 + c1 * t + c2 * t * t) / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t);
-
-    if p < 0.5 {
-        -approx
-    } else {
-        approx
-    }
 }
 
 #[cfg(test)]

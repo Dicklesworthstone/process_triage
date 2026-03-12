@@ -169,6 +169,7 @@ fn run_with_timeout(binary: &Path, args: &[&str], timeout: Duration) -> io::Resu
             None => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!("Command timed out after {:?}", timeout),
@@ -262,5 +263,19 @@ mod tests {
         let result = verify_binary(&script_path, Some("1.2.3")).unwrap();
         assert!(!result.passed);
         assert!(result.error.unwrap_or_default().contains("unparseable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_run_with_timeout_times_out() {
+        let temp = TempDir::new().unwrap();
+        let script_path = temp.path().join("pt-core-timeout");
+        fs::write(&script_path, "#!/bin/sh\nsleep 2\n").unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+
+        let err = run_with_timeout(&script_path, &[], Duration::from_millis(100)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }
