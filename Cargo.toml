@@ -5,6 +5,7 @@ members = [
     "crates/pt-config",
     "crates/pt-core",
     "crates/pt-math",
+    "crates/pt-report",
     "crates/pt-redact",
     "crates/pt-telemetry",
 ]

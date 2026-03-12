@@ -1,5 +1,5 @@
 {
-    "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
+    "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/main/schema.json",
     "version": "{{VERSION}}",
     "description": "Bayesian-inspired zombie/abandoned process detection and cleanup (WSL2)",
     "homepage": "https://github.com/Dicklesworthstone/process_triage",
