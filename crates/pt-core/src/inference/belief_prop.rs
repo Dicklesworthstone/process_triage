@@ -67,6 +67,7 @@
 //! ```
 
 use serde::Serialize;
+use pt_math::log_add_exp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
@@ -655,7 +656,7 @@ impl BeliefPropagator {
                 }
 
                 let log_term = log_local + log_psi + log_neighbor_product;
-                log_sum = log_sum_exp(log_sum, log_term);
+                log_sum = log_add_exp(log_sum, log_term);
             }
 
             msg.log_probs[state_v.index()] = log_sum;
@@ -712,7 +713,7 @@ impl BeliefPropagator {
             let log_sum = log_marginal
                 .iter()
                 .cloned()
-                .fold(f64::NEG_INFINITY, log_sum_exp);
+                .fold(f64::NEG_INFINITY, log_add_exp);
             let mut state_probs = HashMap::new();
 
             for state in State::all() {
@@ -772,19 +773,6 @@ impl Default for BeliefPropagator {
     fn default() -> Self {
         Self::new(BeliefPropConfig::default())
     }
-}
-
-/// Log-sum-exp for numerical stability.
-fn log_sum_exp(a: f64, b: f64) -> f64 {
-    if a == f64::NEG_INFINITY {
-        return b;
-    }
-    if b == f64::NEG_INFINITY {
-        return a;
-    }
-
-    let max = a.max(b);
-    max + ((a - max).exp() + (b - max).exp()).ln()
 }
 
 /// Compute total variation distance between two belief distributions.
@@ -1024,16 +1012,16 @@ mod tests {
     }
 
     #[test]
-    fn test_log_sum_exp() {
+    fn test_log_add_exp() {
         // Basic cases
-        assert!((log_sum_exp(0.0, 0.0) - 2.0_f64.ln()).abs() < 1e-10);
+        assert!((log_add_exp(0.0, 0.0) - 2.0_f64.ln()).abs() < 1e-10);
 
         // Edge cases
-        assert_eq!(log_sum_exp(f64::NEG_INFINITY, 0.0), 0.0);
-        assert_eq!(log_sum_exp(0.0, f64::NEG_INFINITY), 0.0);
+        assert_eq!(log_add_exp(f64::NEG_INFINITY, 0.0), 0.0);
+        assert_eq!(log_add_exp(0.0, f64::NEG_INFINITY), 0.0);
 
         // Large difference (should handle without overflow)
-        let result = log_sum_exp(100.0, 0.0);
+        let result = log_add_exp(100.0, 0.0);
         assert!((result - 100.0).abs() < 1e-10);
     }
 

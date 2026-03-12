@@ -346,7 +346,9 @@ impl MetricsServer {
     pub fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         // Send a dummy request to unblock the accept loop
-        let _ = std::net::TcpStream::connect(self.addr);
+        if let Ok(stream) = std::net::TcpStream::connect(self.addr) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -357,7 +359,9 @@ impl MetricsServer {
 impl Drop for MetricsServer {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let _ = std::net::TcpStream::connect(self.addr);
+        if let Ok(stream) = std::net::TcpStream::connect(self.addr) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

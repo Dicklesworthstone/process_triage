@@ -85,8 +85,7 @@ pub fn log_sub_exp(a: f64, b: f64) -> f64 {
     if a == f64::INFINITY {
         return f64::INFINITY;
     }
-    let exp_x = (b - a).exp();
-    a + (-exp_x).ln_1p()
+    a + (-(b - a).exp_m1()).ln()
 }
 
 /// Natural log of the Gamma function (log |Gamma(z)|).

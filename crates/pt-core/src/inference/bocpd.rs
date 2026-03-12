@@ -49,6 +49,7 @@
 //! }
 //! ```
 
+use pt_math::{log_gamma, log_sum_exp};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use thiserror::Error;
@@ -343,8 +344,8 @@ impl SufficientStats {
 
                 // Log PDF of Student-t
                 let z = (x - mu) / scale;
-                let log_gamma_half_nu_plus_half = ln_gamma((nu + 1.0) / 2.0);
-                let log_gamma_half_nu = ln_gamma(nu / 2.0);
+                let log_gamma_half_nu_plus_half = log_gamma((nu + 1.0) / 2.0);
+                let log_gamma_half_nu = log_gamma(nu / 2.0);
 
                 if !log_gamma_half_nu_plus_half.is_finite() || !log_gamma_half_nu.is_finite() {
                     return f64::NEG_INFINITY;
@@ -369,9 +370,9 @@ impl SufficientStats {
 
                 // Log PMF of negative binomial
                 // P(x) = C(x+r-1, x) * p^r * (1-p)^x
-                let term1 = ln_gamma(x + r);
-                let term2 = ln_gamma(x + 1.0);
-                let term3 = ln_gamma(r);
+                let term1 = log_gamma(x + r);
+                let term2 = log_gamma(x + 1.0);
+                let term3 = log_gamma(r);
 
                 if !term1.is_finite() || !term2.is_finite() || !term3.is_finite() {
                     return f64::NEG_INFINITY;
@@ -772,68 +773,6 @@ impl BocpdEvidence {
 
 // Helper functions
 
-/// Compute log(sum(exp(xs))) in a numerically stable way.
-fn log_sum_exp(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
-        return f64::NEG_INFINITY;
-    }
-
-    let max_x = xs
-        .iter()
-        .copied()
-        .filter(|x| x.is_finite())
-        .fold(f64::NEG_INFINITY, f64::max);
-
-    if !max_x.is_finite() {
-        return f64::NEG_INFINITY;
-    }
-
-    let sum_exp: f64 = xs
-        .iter()
-        .map(|x| (x - max_x).exp())
-        .filter(|x| x.is_finite())
-        .sum();
-
-    max_x + sum_exp.ln()
-}
-
-/// Log gamma function using Stirling approximation.
-fn ln_gamma(x: f64) -> f64 {
-    if x <= 0.0 {
-        return f64::NAN;
-    }
-    if x < 0.5 {
-        // Reflection formula
-        let pi = std::f64::consts::PI;
-        return (pi / (pi * x).sin()).ln() - ln_gamma(1.0 - x);
-    }
-
-    // Stirling's approximation with Lanczos coefficients
-    let g = 7.0;
-    let c = [
-        0.999_999_999_999_81,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-
-    let z = x - 1.0;
-    let mut sum = c[0];
-    for (i, &coef) in c.iter().enumerate().skip(1) {
-        sum += coef / (z + i as f64);
-    }
-
-    let t = z + g + 0.5;
-    let pi2 = 2.0 * std::f64::consts::PI;
-
-    0.5 * pi2.ln() + (z + 0.5) * t.ln() - t + sum.ln()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,12 +956,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ln_gamma() {
+    fn test_log_gamma() {
         // Known values
-        assert!(approx_eq(ln_gamma(1.0), 0.0, 1e-6));
-        assert!(approx_eq(ln_gamma(2.0), 0.0, 1e-6)); // 1! = 1
-        assert!(approx_eq(ln_gamma(3.0), 2.0_f64.ln(), 1e-6)); // 2! = 2
-        assert!(approx_eq(ln_gamma(4.0), 6.0_f64.ln(), 1e-6)); // 3! = 6
+        assert!(approx_eq(log_gamma(1.0), 0.0, 1e-6));
+        assert!(approx_eq(log_gamma(2.0), 0.0, 1e-6)); // 1! = 1
+        assert!(approx_eq(log_gamma(3.0), 2.0_f64.ln(), 1e-6)); // 2! = 2
+        assert!(approx_eq(log_gamma(4.0), 6.0_f64.ln(), 1e-6)); // 3! = 6
     }
 
     #[test]
@@ -1378,28 +1317,28 @@ mod tests {
         );
     }
 
-    // ── ln_gamma edge cases ────────────────────────────────────────
+    // ── log_gamma edge cases ────────────────────────────────────────
 
     #[test]
-    fn ln_gamma_negative_is_nan() {
-        assert!(ln_gamma(-1.0).is_nan());
+    fn log_gamma_negative_is_nan() {
+        assert!(log_gamma(-1.0).is_nan());
     }
 
     #[test]
-    fn ln_gamma_zero_is_nan() {
-        assert!(ln_gamma(0.0).is_nan());
+    fn log_gamma_zero_is_nan() {
+        assert!(log_gamma(0.0).is_nan());
     }
 
     #[test]
-    fn ln_gamma_half() {
+    fn log_gamma_half() {
         // Gamma(0.5) = sqrt(pi) ≈ 1.7724538509
         let expected = std::f64::consts::PI.sqrt().ln();
-        assert!(approx_eq(ln_gamma(0.5), expected, 1e-4));
+        assert!(approx_eq(log_gamma(0.5), expected, 1e-4));
     }
 
     #[test]
-    fn ln_gamma_five() {
+    fn log_gamma_five() {
         // Gamma(5) = 4! = 24
-        assert!(approx_eq(ln_gamma(5.0), 24.0_f64.ln(), 1e-6));
+        assert!(approx_eq(log_gamma(5.0), 24.0_f64.ln(), 1e-6));
     }
 }

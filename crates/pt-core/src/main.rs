@@ -3349,9 +3349,119 @@ fn resolve_bundle_passphrase(passphrase_arg: &Option<String>) -> Option<String> 
         .or_else(|| std::env::var("PT_BUNDLE_PASSPHRASE").ok())
 }
 
-fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
-    output_stub(global, "deep-scan", "Deep scan mode not yet implemented");
-    ExitCode::Clean
+fn run_deep_scan(global: &GlobalOpts, args: &DeepScanArgs) -> ExitCode {
+    #[cfg(target_os = "linux")]
+    {
+        use pt_core::collect::{deep_scan, DeepScanOptions};
+
+        let progress = progress_emitter(global);
+        let options = DeepScanOptions {
+            pids: args.pids.clone(),
+            skip_inaccessible: true,
+            include_environ: false,
+            progress,
+        };
+
+        match deep_scan(&options) {
+            Ok(mut result) => {
+                if let Some(budget) = args.budget {
+                    result.metadata.warnings.push(format!(
+                        "budget={}s is currently advisory and not enforced by the collector",
+                        budget
+                    ));
+                }
+
+                match global.format {
+                    OutputFormat::Json | OutputFormat::Toon => {
+                        let session_id = SessionId::new();
+                        let output = serde_json::json!({
+                            "schema_version": SCHEMA_VERSION,
+                            "session_id": session_id.0,
+                            "generated_at": chrono::Utc::now().to_rfc3339(),
+                            "deep_scan": result
+                        });
+                        println!("{}", format_structured_output(global, output));
+                    }
+                    OutputFormat::Summary => {
+                        println!(
+                            "Deep-scanned {} processes in {}ms",
+                            result.metadata.process_count, result.metadata.duration_ms
+                        );
+                        if result.metadata.skipped_count > 0 {
+                            println!("Skipped: {}", result.metadata.skipped_count);
+                        }
+                        for warning in &result.metadata.warnings {
+                            println!("Warning: {}", warning);
+                        }
+                    }
+                    OutputFormat::Exitcode => {}
+                    _ => {
+                        println!("# Deep Scan Results");
+                        println!(
+                            "Scanned {} processes in {}ms",
+                            result.metadata.process_count, result.metadata.duration_ms
+                        );
+                        if result.metadata.skipped_count > 0 {
+                            println!("Skipped: {}", result.metadata.skipped_count);
+                        }
+                        if !result.metadata.warnings.is_empty() {
+                            println!();
+                            println!("## Warnings");
+                            for warning in &result.metadata.warnings {
+                                println!("- {}", warning);
+                            }
+                        }
+                        println!();
+                        println!(
+                            "{:<8} {:<8} {:<10} {:<6} {:<8} {:<8} {:<15}",
+                            "PID", "PPID", "USER", "STATE", "FDS", "IO", "COMM"
+                        );
+
+                        for p in result.processes.iter().take(20) {
+                            let fd_count =
+                                p.fd.as_ref()
+                                    .map(|fd| fd.count.to_string())
+                                    .unwrap_or_else(|| "-".to_string());
+                            let io_summary =
+                                p.io.as_ref()
+                                    .map(|io| format!("{}R/{}W", io.read_bytes, io.write_bytes))
+                                    .unwrap_or_else(|| "-".to_string());
+
+                            println!(
+                                "{:<8} {:<8} {:<10} {:<6} {:<8} {:<8} {}",
+                                p.pid.0,
+                                p.ppid.0,
+                                p.user.chars().take(10).collect::<String>(),
+                                p.state,
+                                fd_count,
+                                io_summary,
+                                p.comm
+                            );
+                        }
+                        if result.processes.len() > 20 {
+                            println!("... and {} more", result.processes.len() - 20);
+                        }
+                    }
+                }
+
+                ExitCode::Clean
+            }
+            Err(e) => {
+                eprintln!("Deep scan failed: {}", e);
+                ExitCode::InternalError
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        output_stub(
+            global,
+            "deep-scan",
+            "Deep scan is currently supported on Linux only",
+        );
+        ExitCode::Clean
+    }
 }
 
 fn run_query(global: &GlobalOpts, args: &QueryArgs) -> ExitCode {
@@ -4123,8 +4233,58 @@ fn run_bundle_extract(
     }
 }
 
+#[cfg(feature = "report")]
+fn run_report(global: &GlobalOpts, args: &ReportArgs) -> ExitCode {
+    let session = if let Some(ref session) = args.session {
+        Some(session.clone())
+    } else {
+        let store = match SessionStore::from_env() {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("report: session store error: {}", e);
+                return ExitCode::InternalError;
+            }
+        };
+        let options = ListSessionsOptions {
+            limit: Some(1),
+            ..Default::default()
+        };
+        match store.list_sessions(&options) {
+            Ok(sessions) if !sessions.is_empty() => Some(sessions[0].session_id.clone()),
+            Ok(_) => {
+                eprintln!("report: no sessions found");
+                return ExitCode::ArgsError;
+            }
+            Err(e) => {
+                eprintln!("report: failed to list sessions: {}", e);
+                return ExitCode::InternalError;
+            }
+        }
+    };
+
+    let agent_args = AgentReportArgs {
+        session,
+        bundle: None,
+        out: args.output.clone(),
+        profile: "safe".to_string(),
+        galaxy_brain: args.include_ledger,
+        embed_assets: false,
+        report_format: "html".to_string(),
+        prose_style: "conversational".to_string(),
+        title: None,
+        theme: "auto".to_string(),
+    };
+
+    run_agent_report(global, &agent_args)
+}
+
+#[cfg(not(feature = "report"))]
 fn run_report(global: &GlobalOpts, _args: &ReportArgs) -> ExitCode {
-    output_stub(global, "report", "Report generation not yet implemented");
+    output_stub(
+        global,
+        "report",
+        "Report generation requires building with the `report` feature",
+    );
     ExitCode::Clean
 }
 

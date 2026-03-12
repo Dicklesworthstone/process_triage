@@ -57,7 +57,13 @@ use super::signature::{SignaturePatterns, SupervisorSignature};
 use super::types::SupervisorCategory;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use thiserror::Error;
+
+static VERSIONED_INTERPRETER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(python|ruby|perl|node)(\d+(?:\.\d+)*)$").unwrap());
+static BROAD_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^\s]+/[^\s]+").unwrap());
+static BROAD_NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+\b").unwrap());
+static BROAD_WILDCARD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\.\*)+").unwrap());
 
 /// Errors from pattern learning operations.
 #[derive(Debug, Error)]
@@ -183,9 +189,7 @@ impl CommandNormalizer {
         };
 
         // Handle versioned interpreters (python3.11 -> python.*)
-        if let Some(captures) = Regex::new(r"^(python|ruby|perl|node)(\d+(?:\.\d+)*)$")
-            .ok()
-            .and_then(|re| re.captures(base))
+        if let Some(captures) = VERSIONED_INTERPRETER_RE.captures(base)
         {
             if let Some(lang) = captures.get(1) {
                 return format!("{}.*", lang.as_str());
@@ -275,20 +279,17 @@ impl CommandNormalizer {
         result = self.path_stripper.replace_all(&result, "${1}").to_string();
 
         // Replace all paths (including relative)
-        result = Regex::new(r"[^\s]+/[^\s]+")
-            .unwrap()
+        result = BROAD_PATH_RE
             .replace_all(&result, ".*")
             .to_string();
 
         // Replace all numbers
-        result = Regex::new(r"\b\d+\b")
-            .unwrap()
+        result = BROAD_NUMBER_RE
             .replace_all(&result, r"\d+")
             .to_string();
 
         // Collapse multiple wildcards
-        result = Regex::new(r"(\.\*)+")
-            .unwrap()
+        result = BROAD_WILDCARD_RE
             .replace_all(&result, ".*")
             .to_string();
 

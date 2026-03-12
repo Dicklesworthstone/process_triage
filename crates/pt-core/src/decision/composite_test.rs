@@ -26,6 +26,7 @@
 //! This produces valid e-values: E\[Λ_n\] ≤ 1 under H0, enabling optional stopping.
 
 use pt_math::bayes_factor::{e_value_from_log_bf, EvidenceStrength, EvidenceSummary};
+use pt_math::log_sum_exp;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -514,21 +515,6 @@ pub fn mixture_sprt_multiclass(
     let log_bf = log_lik_bad + prior_bad.ln() - log_lik_good - prior_good.ln();
 
     Ok(log_bf)
-}
-
-/// Numerically stable log-sum-exp.
-fn log_sum_exp(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return f64::NEG_INFINITY;
-    }
-
-    let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if max_val.is_infinite() && max_val < 0.0 {
-        return f64::NEG_INFINITY;
-    }
-
-    let sum: f64 = values.iter().map(|&v| (v - max_val).exp()).sum();
-    max_val + sum.ln()
 }
 
 /// Evidence aggregator for composite testing across multiple features.

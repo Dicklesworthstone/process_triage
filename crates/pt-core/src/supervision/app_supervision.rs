@@ -757,7 +757,7 @@ mod tests {
             .generate_supervisord_action(&Some("worker".to_string()), &Some("celery".to_string()));
 
         assert_eq!(action.action_type, AppActionType::Stop);
-        assert_eq!(action.command, "supervisorctl stop celery:worker");
+        assert_eq!(action.command, "supervisorctl stop 'celery:worker'");
     }
 
     #[test]

@@ -296,19 +296,26 @@ pub struct SupervisorActionResult {
 /// Executor for supervisor-aware actions.
 pub struct SupervisorActionRunner {
     config: SupervisorActionConfig,
+    compiled_patterns: Vec<regex::Regex>,
 }
 
 impl SupervisorActionRunner {
     /// Create a new supervisor action runner with default config.
     pub fn new() -> Self {
-        Self {
-            config: SupervisorActionConfig::default(),
-        }
+        Self::with_config(SupervisorActionConfig::default())
     }
 
     /// Create a runner with custom config.
     pub fn with_config(config: SupervisorActionConfig) -> Self {
-        Self { config }
+        let compiled_patterns = config
+            .protected_patterns
+            .iter()
+            .filter_map(|p| regex::Regex::new(p).ok())
+            .collect();
+        Self {
+            config,
+            compiled_patterns,
+        }
     }
 
     /// Execute a supervisor action.
@@ -751,12 +758,10 @@ impl SupervisorActionRunner {
 
     /// Check if a unit identifier matches any protected pattern.
     fn is_protected_unit(&self, unit: &str) -> bool {
-        for pattern in &self.config.protected_patterns {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                if re.is_match(unit) {
-                    debug!(unit, pattern, "unit matches protected pattern");
-                    return true;
-                }
+        for re in &self.compiled_patterns {
+            if re.is_match(unit) {
+                debug!(unit, pattern = re.as_str(), "unit matches protected pattern");
+                return true;
             }
         }
         false

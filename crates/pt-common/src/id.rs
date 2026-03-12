@@ -54,7 +54,9 @@ impl StartId {
         if parts.next().is_some() {
             return None;
         }
-        if uuid::Uuid::parse_str(boot_id).is_err() {
+        // boot_id can be a UUID (Linux) or "synthetic"/"unknown" (macOS/fallback)
+        // We validate that it's not empty rather than requiring strict UUID format.
+        if boot_id.is_empty() {
             return None;
         }
         if start_time.parse::<u64>().is_err() {
