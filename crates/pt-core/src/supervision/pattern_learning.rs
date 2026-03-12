@@ -126,57 +126,23 @@ impl PatternCandidate {
     }
 }
 
-/// Command normalizer for converting raw commands to patterns.
-pub struct CommandNormalizer {
-    /// Patterns for path stripping.
-    path_stripper: Regex,
-    /// Patterns for PID/number replacement.
-    number_replacer: Regex,
-    /// Patterns for port flags (e.g. --port 8080, -p8080).
-    port_flag_pattern: Regex,
-    /// Patterns for port suffixes (e.g. :8080).
-    port_suffix_pattern: Regex,
-    /// Patterns for temp path detection.
-    temp_path_pattern: Regex,
-    /// Patterns for home directory detection.
-    home_path_pattern: Regex,
-    /// Patterns for UUID detection.
-    uuid_pattern: Regex,
-    /// Patterns for hash-like strings.
-    hash_pattern: Regex,
-}
+static PATH_STRIPPER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^|\s)/(?:[^/\s]+/)+").unwrap());
+static NUMBER_REPLACER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{4,}\b").unwrap());
+static PORT_FLAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(--?(?:port|p)\s*[=:]?\s*)\d+").unwrap());
+static PORT_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":\d{2,5}\b").unwrap());
+static TEMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/(?:tmp|var/tmp|var/folders)/[^\s]+").unwrap());
+static HOME_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/(?:home|Users)/[^/\s]+/[^\s]*").unwrap());
+static UUID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b").unwrap());
+static HASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{8,}\b").unwrap());
 
-impl Default for CommandNormalizer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Command normalizer for converting raw commands to patterns.
+#[derive(Default)]
+pub struct CommandNormalizer;
 
 impl CommandNormalizer {
-    /// Create a new normalizer with default patterns.
+    /// Create a new normalizer.
     pub fn new() -> Self {
-        Self {
-            // Match absolute paths like /usr/bin/node, /home/user/...
-            // Use capturing group to preserve boundary (start or whitespace)
-            path_stripper: Regex::new(r"(^|\s)/(?:[^/\s]+/)+").unwrap(),
-            // Match standalone numbers (PIDs, process IDs)
-            number_replacer: Regex::new(r"\b\d{4,}\b").unwrap(),
-            // Match port flags in common formats (capture flag prefix)
-            port_flag_pattern: Regex::new(r"(--?(?:port|p)\s*[=:]?\s*)\d+").unwrap(),
-            // Match port suffixes like :8080
-            port_suffix_pattern: Regex::new(r":\d{2,5}\b").unwrap(),
-            // Match temp paths
-            temp_path_pattern: Regex::new(r"/(?:tmp|var/tmp|var/folders)/[^\s]+").unwrap(),
-            // Match home directory paths
-            home_path_pattern: Regex::new(r"/(?:home|Users)/[^/\s]+/[^\s]*").unwrap(),
-            // Match UUIDs
-            uuid_pattern: Regex::new(
-                r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
-            )
-            .unwrap(),
-            // Match hash-like strings (8+ hex chars)
-            hash_pattern: Regex::new(r"\b[0-9a-fA-F]{8,}\b").unwrap(),
-        }
+        Self
     }
 
     /// Normalize a process name.
@@ -205,8 +171,7 @@ impl CommandNormalizer {
         let uuid_placeholder = "__UUID__";
 
         // Replace UUIDs with pattern
-        result = self
-            .uuid_pattern
+        result = UUID_RE
             .replace_all(&result, uuid_placeholder)
             .to_string();
 
@@ -222,48 +187,40 @@ impl CommandNormalizer {
         let mut result = arg.to_string();
 
         // Strip absolute paths, keep final component
-        result = self
-            .path_stripper
+        result = PATH_STRIPPER_RE
             .replace_all(&result, "${1}.*")
             .to_string();
 
         // Replace home paths
-        result = self
-            .home_path_pattern
+        result = HOME_PATH_RE
             .replace_all(&result, ".*")
             .to_string();
 
         // Replace temp paths
-        result = self
-            .temp_path_pattern
+        result = TEMP_PATH_RE
             .replace_all(&result, ".*")
             .to_string();
 
         // Replace port numbers, preserving original form when possible
-        result = self
-            .port_flag_pattern
+        result = PORT_FLAG_RE
             .replace_all(&result, r"${1}\d+")
             .to_string();
-        result = self
-            .port_suffix_pattern
+        result = PORT_SUFFIX_RE
             .replace_all(&result, r":\d+")
             .to_string();
 
         // Replace long numbers (PIDs, etc.)
-        result = self
-            .number_replacer
+        result = NUMBER_REPLACER_RE
             .replace_all(&result, r"\d+")
             .to_string();
 
         // Replace UUIDs
-        result = self
-            .uuid_pattern
+        result = UUID_RE
             .replace_all(&result, "[0-9a-f-]+")
             .to_string();
 
         // Replace hash-like strings
-        result = self
-            .hash_pattern
+        result = HASH_RE
             .replace_all(&result, "[0-9a-fA-F]+")
             .to_string();
 
@@ -276,7 +233,7 @@ impl CommandNormalizer {
         let mut result = arg.to_string();
 
         // Strip all paths
-        result = self.path_stripper.replace_all(&result, "${1}").to_string();
+        result = PATH_STRIPPER_RE.replace_all(&result, "${1}").to_string();
 
         // Replace all paths (including relative)
         result = BROAD_PATH_RE

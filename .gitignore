@@ -85,5 +85,6 @@ storage.sqlite3-wal.corrupt-*
 .beads/*.pre_repair_*
 .beads/*.repair_candidate_*
 .beads/*.bak-corrupt
+.beads/recovery_*/
 target-*/
 crates/*/target*/

@@ -653,9 +653,8 @@ impl HsmmAnalyzer {
 
         // Compute emission likelihoods
         let mut emissions = [0.0; 4];
-        #[allow(clippy::needless_range_loop)]
-        for s in 0..4 {
-            emissions[s] = self.emission_prob(observation, HsmmState::from_index(s).unwrap());
+        for (s, state) in HsmmState::ALL.into_iter().enumerate() {
+            emissions[s] = self.emission_prob(observation, state);
         }
 
         // Compute state-specific stay/leave factors.

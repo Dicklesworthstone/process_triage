@@ -407,7 +407,7 @@ fn serve_loop(
                     let response = tiny_http::Response::from_string(body).with_header(
                         "Content-Type: text/plain; version=0.0.4; charset=utf-8"
                             .parse::<tiny_http::Header>()
-                            .unwrap(),
+                            .expect("literal header is valid"),
                     );
                     if let Err(e) = request.respond(response) {
                         warn!(error = %e, "failed to send metrics response");
