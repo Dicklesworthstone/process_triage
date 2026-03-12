@@ -360,7 +360,6 @@ pt decide            # Generate plan from inference
 pt ui                # Launch TUI for session
 pt agent plan        # Agent-optimized interface
 pt daemon            # Background monitoring
-pt history           # View past sessions
 ```
 
 ---

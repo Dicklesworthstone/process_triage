@@ -173,9 +173,6 @@ The `pt` script exposes friendly commands that delegate to `pt-core`:
 | `pt` (default) | `pt-core run` |
 | `pt scan` | `pt-core scan` |
 | `pt deep` | `pt-core run --deep` |
-| `pt history` | `pt-core history` |
-| `pt clear` | `pt-core clear` |
-| `pt inbox` | `pt-core inbox` |
 | `pt agent ...` | `pt-core agent ...` |
 | `pt help` | `pt-core help` |
 
