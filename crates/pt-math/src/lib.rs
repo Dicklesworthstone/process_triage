@@ -8,5 +8,6 @@ pub use math::beta::*;
 pub use math::binomial;
 pub use math::dirichlet;
 pub use math::gamma::*;
+pub use math::normal::*;
 pub use math::posterior::*;
 pub use math::stable::*;

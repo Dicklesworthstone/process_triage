@@ -6,5 +6,6 @@ pub mod beta;
 pub mod binomial;
 pub mod dirichlet;
 pub mod gamma;
+pub mod normal;
 pub mod posterior;
 pub mod stable;

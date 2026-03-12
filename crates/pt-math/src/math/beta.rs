@@ -78,6 +78,58 @@ pub fn beta_pdf(x: f64, alpha: f64, beta: f64) -> f64 {
 
 /// Regularized incomplete beta function I_x(a,b).
 pub fn beta_cdf(x: f64, alpha: f64, beta: f64) -> f64 {
+    let log_cdf = beta_log_cdf(x, alpha, beta);
+    if log_cdf.is_nan() {
+        return f64::NAN;
+    }
+    if log_cdf == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    log_cdf.exp().min(1.0)
+}
+
+/// Log of the regularized incomplete beta function I_x(a,b).
+pub fn beta_log_cdf(x: f64, alpha: f64, beta: f64) -> f64 {
+    if x.is_nan() || alpha.is_nan() || beta.is_nan() {
+        return f64::NAN;
+    }
+    if alpha <= 0.0 || beta <= 0.0 {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if x >= 1.0 {
+        return 0.0;
+    }
+
+    let ln_beta = log_beta(alpha, beta);
+    let bt_log = alpha * x.ln() + beta * (1.0 - x).ln() - ln_beta;
+    let threshold = (alpha + 1.0) / (alpha + beta + 2.0);
+
+    if x < threshold {
+        bt_log + (betacf(alpha, beta, x) / alpha).ln()
+    } else {
+        // Log(1 - I_{1-x}(b, a))
+        let complementary = (bt_log.exp() * betacf(beta, alpha, 1.0 - x) / beta).min(1.0);
+        (1.0 - complementary).ln()
+    }
+}
+
+/// Survival function of the Beta distribution (1 - CDF).
+pub fn beta_survival(x: f64, alpha: f64, beta: f64) -> f64 {
+    let log_surv = beta_log_survival(x, alpha, beta);
+    if log_surv.is_nan() {
+        return f64::NAN;
+    }
+    if log_surv == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    log_surv.exp().min(1.0)
+}
+
+/// Log of the survival function of the Beta distribution.
+pub fn beta_log_survival(x: f64, alpha: f64, beta: f64) -> f64 {
     if x.is_nan() || alpha.is_nan() || beta.is_nan() {
         return f64::NAN;
     }
@@ -88,16 +140,11 @@ pub fn beta_cdf(x: f64, alpha: f64, beta: f64) -> f64 {
         return 0.0;
     }
     if x >= 1.0 {
-        return 1.0;
+        return f64::NEG_INFINITY;
     }
-    let ln_beta = log_beta(alpha, beta);
-    let bt = (alpha * x.ln() + beta * (1.0 - x).ln() - ln_beta).exp();
-    let threshold = (alpha + 1.0) / (alpha + beta + 2.0);
-    if x < threshold {
-        bt * betacf(alpha, beta, x) / alpha
-    } else {
-        1.0 - bt * betacf(beta, alpha, 1.0 - x) / beta
-    }
+
+    // Survival(x, a, b) = CDF(1-x, b, a)
+    beta_log_cdf(1.0 - x, beta, alpha)
 }
 
 /// Inverse CDF (quantile) for Beta(alpha, beta).
@@ -293,6 +340,34 @@ mod tests {
         let x = beta_inv_cdf(p, a, b);
         let cdf = beta_cdf(x, a, b);
         assert!(approx_eq(cdf, p, 1e-6));
+    }
+
+    #[test]
+    fn log_cdf_matches_cdf() {
+        let x = 0.3;
+        let a = 2.0;
+        let b = 5.0;
+        let cdf = beta_cdf(x, a, b);
+        let log_cdf = beta_log_cdf(x, a, b);
+        assert!(approx_eq(cdf.ln(), log_cdf, 1e-10));
+    }
+
+    #[test]
+    fn log_survival_matches_survival() {
+        let x = 0.7;
+        let a = 2.0;
+        let b = 5.0;
+        let surv = beta_survival(x, a, b);
+        let log_surv = beta_log_survival(x, a, b);
+        assert!(approx_eq(surv.ln(), log_surv, 1e-10));
+    }
+
+    #[test]
+    fn cdf_boundary_at_one() {
+        let a = 2.0;
+        let b = 5.0;
+        assert!(approx_eq(beta_cdf(1.0, a, b), 1.0, 1e-12));
+        assert!(approx_eq(beta_log_cdf(1.0, a, b), 0.0, 1e-12));
     }
 
     #[test]

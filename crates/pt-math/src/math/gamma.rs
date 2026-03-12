@@ -90,29 +90,41 @@ pub fn gamma_pdf(t: f64, alpha: f64, beta: f64) -> f64 {
 ///
 /// This is the CDF of Gamma(a, 1) evaluated at x.
 pub fn gamma_p(a: f64, x: f64) -> f64 {
+    let log_p = gamma_log_p(a, x);
+    if log_p.is_nan() {
+        return f64::NAN;
+    }
+    if log_p == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    log_p.exp().min(1.0)
+}
+
+/// Log of the regularized lower incomplete gamma function P(a, x).
+pub fn gamma_log_p(a: f64, x: f64) -> f64 {
     if a.is_nan() || x.is_nan() {
         return f64::NAN;
     }
-    if a <= 0.0 {
-        return f64::NAN;
-    }
-    if x < 0.0 {
+    if a <= 0.0 || x < 0.0 {
         return f64::NAN;
     }
     if x == 0.0 {
-        return 0.0;
+        return f64::NEG_INFINITY;
     }
     if x.is_infinite() {
-        return 1.0;
+        return 0.0;
     }
 
     // Choose algorithm based on x vs a+1
     if x < a + 1.0 {
-        // Series representation is more efficient
-        gammainc_series(a, x)
+        gammainc_series_log(a, x)
     } else {
-        // Continued fraction for Q(a,x) is more efficient
-        1.0 - gammainc_cf(a, x)
+        // Log(1 - Q(a,x))
+        let q = gamma_q(a, x);
+        if q >= 1.0 {
+            return f64::NEG_INFINITY;
+        }
+        (1.0 - q).ln()
     }
 }
 
@@ -122,44 +134,55 @@ pub fn gamma_p(a: f64, x: f64) -> f64 {
 ///
 /// This is the survival function of Gamma(a, 1) evaluated at x.
 pub fn gamma_q(a: f64, x: f64) -> f64 {
+    let log_q = gamma_log_q(a, x);
+    if log_q.is_nan() {
+        return f64::NAN;
+    }
+    if log_q == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    log_q.exp().min(1.0)
+}
+
+/// Log of the regularized upper incomplete gamma function Q(a, x).
+pub fn gamma_log_q(a: f64, x: f64) -> f64 {
     if a.is_nan() || x.is_nan() {
         return f64::NAN;
     }
-    if a <= 0.0 {
-        return f64::NAN;
-    }
-    if x < 0.0 {
+    if a <= 0.0 || x < 0.0 {
         return f64::NAN;
     }
     if x == 0.0 {
-        return 1.0;
+        return 0.0;
     }
     if x.is_infinite() {
-        return 0.0;
+        return f64::NEG_INFINITY;
     }
 
     // Choose algorithm based on x vs a+1
     if x < a + 1.0 {
-        1.0 - gammainc_series(a, x)
+        // Log(1 - P(a,x))
+        let p = gamma_p(a, x);
+        if p >= 1.0 {
+            return f64::NEG_INFINITY;
+        }
+        (1.0 - p).ln()
     } else {
-        gammainc_cf(a, x)
+        gammainc_cf_log(a, x)
     }
 }
 
-/// Series expansion for P(a, x) when x < a+1.
-///
-/// P(a, x) = e^(-x) * x^a * Σ_{n=0}^∞ x^n / Γ(a+n+1)
-fn gammainc_series(a: f64, x: f64) -> f64 {
+/// Series expansion for Log P(a, x) when x < a+1.
+fn gammainc_series_log(a: f64, x: f64) -> f64 {
     if x == 0.0 {
-        return 0.0;
+        return f64::NEG_INFINITY;
     }
 
-    // Compute in log domain for stability
+    // Compute prefactor in log domain
     let log_gam_a = log_gamma(a);
     let log_prefactor = a * x.ln() - x - log_gam_a;
 
-    // Series: Σ_{n=0}^∞ x^n * Γ(a) / Γ(a+n+1)
-    // = Σ_{n=0}^∞ x^n / (a * (a+1) * ... * (a+n))
+    // Series: Σ_{n=0}^∞ x^n / (a * (a+1) * ... * (a+n))
     let mut term = 1.0 / a;
     let mut sum = term;
 
@@ -171,24 +194,14 @@ fn gammainc_series(a: f64, x: f64) -> f64 {
         }
     }
 
-    let result = log_prefactor.exp() * sum;
-
-    // Clamp to [0, 1]
-    result.clamp(0.0, 1.0)
+    log_prefactor + sum.ln()
 }
 
-/// Continued fraction for Q(a, x) when x >= a+1.
-///
-/// Uses modified Lentz's algorithm (Numerical Recipes).
-fn gammainc_cf(a: f64, x: f64) -> f64 {
-    // Compute log(x^a * e^(-x) / Γ(a))
+/// Continued fraction for Log Q(a, x) when x >= a+1.
+fn gammainc_cf_log(a: f64, x: f64) -> f64 {
+    // Compute log prefactor
     let log_gam_a = log_gamma(a);
     let log_prefactor = a * x.ln() - x - log_gam_a;
-
-    // Continued fraction representation
-    // Q(a,x) = (x^a * e^(-x) / Γ(a)) * CF
-    // where CF = 1 / (x - a + 1 + K₁/(x - a + 3 + K₂/(x - a + 5 + ...)))
-    // with Kₙ = n * (a - n)
 
     let mut b = x - a + 1.0;
     let mut c = 1.0 / GAMMAINC_FPMIN;
@@ -214,31 +227,21 @@ fn gammainc_cf(a: f64, x: f64) -> f64 {
         }
     }
 
-    let result = log_prefactor.exp() * h;
-
-    // Clamp to [0, 1]
-    result.clamp(0.0, 1.0)
+    log_prefactor + h.ln()
 }
 
 /// CDF of the Gamma distribution.
 ///
 /// P(T <= t) where T ~ Gamma(α, β)
 pub fn gamma_cdf(t: f64, alpha: f64, beta: f64) -> f64 {
-    if t.is_nan() || alpha.is_nan() || beta.is_nan() {
+    let log_cdf = gamma_log_cdf(t, alpha, beta);
+    if log_cdf.is_nan() {
         return f64::NAN;
     }
-    if alpha <= 0.0 || beta <= 0.0 {
-        return f64::NAN;
-    }
-    if t <= 0.0 {
+    if log_cdf == f64::NEG_INFINITY {
         return 0.0;
     }
-    if t.is_infinite() {
-        return 1.0;
-    }
-
-    // CDF = P(α, β*t) where P is regularized lower incomplete gamma
-    gamma_p(alpha, beta * t)
+    log_cdf.exp().min(1.0)
 }
 
 /// Log of the Gamma CDF.
@@ -246,23 +249,6 @@ pub fn gamma_cdf(t: f64, alpha: f64, beta: f64) -> f64 {
 /// Returns log(P(T <= t)) where T ~ Gamma(α, β).
 /// More stable than log(gamma_cdf(...)) for small probabilities.
 pub fn gamma_log_cdf(t: f64, alpha: f64, beta: f64) -> f64 {
-    let cdf = gamma_cdf(t, alpha, beta);
-    if cdf.is_nan() {
-        return f64::NAN;
-    }
-    if cdf == 0.0 {
-        return f64::NEG_INFINITY;
-    }
-    if cdf == 1.0 {
-        return 0.0;
-    }
-    cdf.ln()
-}
-
-/// Survival function of the Gamma distribution.
-///
-/// S(t) = P(T > t) = 1 - CDF(t)
-pub fn gamma_survival(t: f64, alpha: f64, beta: f64) -> f64 {
     if t.is_nan() || alpha.is_nan() || beta.is_nan() {
         return f64::NAN;
     }
@@ -270,14 +256,28 @@ pub fn gamma_survival(t: f64, alpha: f64, beta: f64) -> f64 {
         return f64::NAN;
     }
     if t <= 0.0 {
-        return 1.0;
+        return f64::NEG_INFINITY;
     }
     if t.is_infinite() {
         return 0.0;
     }
 
-    // Survival = Q(α, β*t) where Q is regularized upper incomplete gamma
-    gamma_q(alpha, beta * t)
+    // log CDF = Log P(α, β*t)
+    gamma_log_p(alpha, beta * t)
+}
+
+/// Survival function of the Gamma distribution.
+///
+/// S(t) = P(T > t) = 1 - CDF(t)
+pub fn gamma_survival(t: f64, alpha: f64, beta: f64) -> f64 {
+    let log_surv = gamma_log_survival(t, alpha, beta);
+    if log_surv.is_nan() {
+        return f64::NAN;
+    }
+    if log_surv == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    log_surv.exp().min(1.0)
 }
 
 /// Log of the survival function.
@@ -285,17 +285,21 @@ pub fn gamma_survival(t: f64, alpha: f64, beta: f64) -> f64 {
 /// Returns log(P(T > t)) where T ~ Gamma(α, β).
 /// Essential for stable hazard computations.
 pub fn gamma_log_survival(t: f64, alpha: f64, beta: f64) -> f64 {
-    let surv = gamma_survival(t, alpha, beta);
-    if surv.is_nan() {
+    if t.is_nan() || alpha.is_nan() || beta.is_nan() {
         return f64::NAN;
     }
-    if surv == 0.0 {
-        return f64::NEG_INFINITY;
+    if alpha <= 0.0 || beta <= 0.0 {
+        return f64::NAN;
     }
-    if surv == 1.0 {
+    if t <= 0.0 {
         return 0.0;
     }
-    surv.ln()
+    if t.is_infinite() {
+        return f64::NEG_INFINITY;
+    }
+
+    // log Survival = Log Q(α, β*t)
+    gamma_log_q(alpha, beta * t)
 }
 
 /// Hazard rate (failure rate) of the Gamma distribution.
@@ -362,6 +366,82 @@ pub fn gamma_cum_hazard(t: f64, alpha: f64, beta: f64) -> f64 {
     -log_surv
 }
 
+/// Inverse CDF (quantile) for Gamma(α, β).
+///
+/// Returns t such that P(T <= t) = p.
+/// Uses Newton-Raphson with bisection fallback.
+pub fn gamma_inv_cdf(p: f64, alpha: f64, beta: f64) -> f64 {
+    if p.is_nan() || alpha.is_nan() || beta.is_nan() {
+        return f64::NAN;
+    }
+    if alpha <= 0.0 || beta <= 0.0 {
+        return f64::NAN;
+    }
+    if p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+
+    // Initial guess using Wilson-Hilferty or mean
+    let mut t = if alpha >= 1.0 {
+        // Wilson-Hilferty transformation
+        let z = super::normal::normal_quantile(p);
+        let factor = 1.0 - 1.0 / (9.0 * alpha) + z / (3.0 * alpha.sqrt());
+        (alpha / beta) * factor.powi(3)
+    } else {
+        // For small shape, use exponential approximation
+        -(alpha / beta) * (1.0 - p).ln()
+    };
+    
+    t = t.max(1e-10);
+    let tol = 1e-10;
+
+    // Newton-Raphson method
+    for _ in 0..50 {
+        let cdf = gamma_cdf(t, alpha, beta);
+        if cdf.is_nan() {
+            break;
+        }
+        let delta = cdf - p;
+        if delta.abs() < tol {
+            return t;
+        }
+        let pdf = gamma_pdf(t, alpha, beta);
+        if pdf <= 0.0 || pdf.is_nan() {
+            break;
+        }
+        let next_t = t - delta / pdf;
+        t = next_t.max(1e-14);
+    }
+
+    // Fallback to bisection
+    let mut low = 0.0;
+    let mut high = (alpha / beta).max(1.0);
+    while gamma_cdf(high, alpha, beta) < p && high < 1e10 {
+        high *= 2.0;
+    }
+
+    for _ in 0..100 {
+        let mid = 0.5 * (low + high);
+        let cdf = gamma_cdf(mid, alpha, beta);
+        if cdf.is_nan() {
+            return mid;
+        }
+        let delta = cdf - p;
+        if delta.abs() < tol {
+            return mid;
+        }
+        if delta < 0.0 {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    (low + high) * 0.5
+}
+
 /// Mean of Gamma(α, β).
 ///
 /// E[T] = α / β
@@ -409,6 +489,26 @@ mod tests {
             return diff == 0.0;
         }
         diff / max_ab <= rel_tol
+    }
+
+    #[test]
+    fn rel_eq_matches_itself() {
+        assert!(rel_eq(1.0, 1.0, 1e-10));
+    }
+
+    #[test]
+    fn test_gamma_inv_cdf() {
+        let alpha = 2.0;
+        let beta = 1.0;
+        let p = 0.5;
+        let t = gamma_inv_cdf(p, alpha, beta);
+        let p2 = gamma_cdf(t, alpha, beta);
+        assert!(approx_eq(p, p2, 1e-6));
+
+        let alpha2 = 0.5;
+        let t2 = gamma_inv_cdf(p, alpha2, beta);
+        let p2_2 = gamma_cdf(t2, alpha2, beta);
+        assert!(approx_eq(p, p2_2, 1e-6));
     }
 
     // ==================== Exponential special case tests ====================
@@ -679,6 +779,19 @@ mod tests {
             "log_survival at t=100 should be very negative, got {}",
             log_surv
         );
+    }
+
+    #[test]
+    fn hazard_stability_at_large_t() {
+        let alpha = 2.0;
+        let beta = 1.0;
+        // Previously t=800 caused overflow to infinity
+        let t = 800.0;
+        let h = gamma_hazard(t, alpha, beta);
+        
+        // Hazard should be finite and close to beta (1.0)
+        assert!(h.is_finite(), "Hazard at t=800 should be finite");
+        assert!(rel_eq(h, beta, 1e-2), "Hazard at t=800 should be close to beta={}, got {}", beta, h);
     }
 
     #[test]
