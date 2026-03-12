@@ -1286,7 +1286,7 @@ mod tests {
 
     #[test]
     fn test_normalizer_default_trait() {
-        let n = CommandNormalizer::default();
+        let n = CommandNormalizer;
         // Should work identically to new()
         assert_eq!(n.normalize_process_name("node"), "node");
     }

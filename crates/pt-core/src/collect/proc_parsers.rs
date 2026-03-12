@@ -616,18 +616,25 @@ pub fn parse_fdinfo_content(content: &str) -> Option<OpenMode> {
 }
 
 /// Detect if a file path is a critical file for safety gates.
-fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
-    let path_lower = path.to_lowercase();
+fn has_ascii_suffix(path: &str, suffix: &str) -> bool {
+    let path_bytes = path.as_bytes();
+    let suffix_bytes = suffix.as_bytes();
+    path_bytes.len() >= suffix_bytes.len()
+        && path_bytes[path_bytes.len() - suffix_bytes.len()..].eq_ignore_ascii_case(suffix_bytes)
+}
 
+/// Detect if a file path is a critical file for safety gates.
+fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
     // SQLite WAL and journal files - HARD block (active transaction in progress)
-    if path_lower.ends_with("-wal")
-        || path_lower.ends_with("-journal")
-        || path_lower.ends_with("-shm")
-        || path_lower.ends_with(".sqlite-wal")
-        || path_lower.ends_with(".sqlite-journal")
-        || path_lower.ends_with(".db-wal")
-        || path_lower.ends_with(".db-journal")
-    {
+    let is_sqlite_wal = has_ascii_suffix(path, "-wal")
+        || has_ascii_suffix(path, "-shm")
+        || has_ascii_suffix(path, "-journal")
+        || has_ascii_suffix(path, ".sqlite-wal")
+        || has_ascii_suffix(path, ".sqlite-journal")
+        || has_ascii_suffix(path, ".db-wal")
+        || has_ascii_suffix(path, ".db-journal");
+
+    if is_sqlite_wal {
         return Some(CriticalFile {
             fd,
             path: path.to_string(),
@@ -680,7 +687,7 @@ fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
         }
 
         // Git objects being written - SOFT (could be read-only pack access)
-        if path.contains("/objects/") && path_lower.ends_with(".lock") {
+        if path.contains("/objects/") && has_ascii_suffix(path, ".lock") {
             return Some(CriticalFile {
                 fd,
                 path: path.to_string(),
@@ -755,7 +762,7 @@ fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
     // Database files open for write - SOFT (may be read-only access despite FD flags)
     let db_extensions = [".db", ".sqlite", ".sqlite3", ".ldb", ".mdb"];
     for ext in &db_extensions {
-        if path_lower.ends_with(ext) {
+        if has_ascii_suffix(path, ext) {
             return Some(CriticalFile {
                 fd,
                 path: path.to_string(),
@@ -767,7 +774,8 @@ fn detect_critical_file(fd: u32, path: &str) -> Option<CriticalFile> {
     }
 
     // Generic lock files - SOFT (may be stale)
-    if path_lower.ends_with(".lock") || path_lower.ends_with(".lck") || path.contains("/lock/") {
+    if has_ascii_suffix(path, ".lock") || has_ascii_suffix(path, ".lck") || path.contains("/lock/")
+    {
         return Some(CriticalFile {
             fd,
             path: path.to_string(),
@@ -1589,6 +1597,19 @@ nice                                         :                    0
     fn test_detect_critical_file_case_insensitive() {
         // SQLite WAL patterns should be case-insensitive
         let cf = detect_critical_file(22, "/home/user/DATA.DB-WAL").unwrap();
+        assert_eq!(cf.category, CriticalFileCategory::SqliteWal);
+        assert_eq!(cf.strength, DetectionStrength::Hard);
+    }
+
+    #[test]
+    fn test_detect_critical_file_short_path_does_not_panic() {
+        let result = detect_critical_file(23, "db");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_critical_file_unicode_prefix_and_uppercase_suffix() {
+        let cf = detect_critical_file(24, "/home/user/naive-\u{03c0}.SQLITE-JOURNAL").unwrap();
         assert_eq!(cf.category, CriticalFileCategory::SqliteWal);
         assert_eq!(cf.strength, DetectionStrength::Hard);
     }
