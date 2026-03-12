@@ -394,7 +394,7 @@ pub fn gamma_inv_cdf(p: f64, alpha: f64, beta: f64) -> f64 {
         // For small shape, use exponential approximation
         -(alpha / beta) * (1.0 - p).ln()
     };
-    
+
     t = t.max(1e-10);
     let tol = 1e-10;
 
@@ -788,10 +788,15 @@ mod tests {
         // Previously t=800 caused overflow to infinity
         let t = 800.0;
         let h = gamma_hazard(t, alpha, beta);
-        
+
         // Hazard should be finite and close to beta (1.0)
         assert!(h.is_finite(), "Hazard at t=800 should be finite");
-        assert!(rel_eq(h, beta, 1e-2), "Hazard at t=800 should be close to beta={}, got {}", beta, h);
+        assert!(
+            rel_eq(h, beta, 1e-2),
+            "Hazard at t=800 should be close to beta={}, got {}",
+            beta,
+            h
+        );
     }
 
     #[test]

@@ -81,8 +81,7 @@ fn erf(x: f64) -> f64 {
     let p = 0.3275911;
 
     let t = 1.0 / (1.0 + p * x);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
-    y
+    1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp()
 }
 
 #[cfg(test)]

@@ -165,35 +165,35 @@ pub fn beta_inv_cdf(p: f64, alpha: f64, beta: f64) -> f64 {
     // Initial guess using mean
     let mut x = alpha / (alpha + beta);
     let tol = 1e-10;
-    
+
     // Newton-Raphson method
     for _ in 0..50 {
         let cdf = beta_cdf(x, alpha, beta);
         if cdf.is_nan() {
             return f64::NAN;
         }
-        
+
         let delta = cdf - p;
         if delta.abs() < tol {
             return x;
         }
-        
+
         let pdf = beta_pdf(x, alpha, beta);
         if pdf <= 0.0 || pdf.is_nan() {
             // Fallback to bisection if derivative is useless
             break;
         }
-        
+
         let next_x = x - delta / pdf;
         // Clamp to valid range (0, 1) to prevent divergence
         x = next_x.clamp(1e-14, 1.0 - 1e-14);
     }
-    
+
     // Fallback to bisection if Newton-Raphson fails to converge
     let mut low = 0.0;
     let mut high = 1.0;
     let mut mid = x;
-    
+
     for _ in 0..100 {
         mid = 0.5 * (low + high);
         let cdf = beta_cdf(mid, alpha, beta);
