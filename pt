@@ -227,6 +227,52 @@ clear_history() {
     printf 'Cleared %s decision%s.\n' "$total" "$([[ "$total" == "1" ]] && printf '' || printf 's')"
 }
 
+show_wrapper_help() {
+    cat <<EOF
+Process Triage wrapper for pt-core
+
+Usage: pt [WRAPPER-OPTIONS] [COMMAND]
+
+Wrapper options:
+      --shell     Force shell/non-TUI mode
+      --tui       Force TUI mode when interactive
+  -h, --help      Show this wrapper-aware help
+  -V, --version   Show wrapper version
+
+Wrapper commands:
+  help            Show wrapper-aware top-level help
+  update          Run the signed installer update flow
+  history         Show learned decision memory from decisions.json
+  clear           Clear learned decision memory after confirmation
+  deep            Alias for \`deep-scan\`
+
+Core commands:
+  run             Interactive golden path
+  scan            Quick scan only
+  deep-scan       Full deep scan with all available probes
+  diff            Compare two sessions
+  query           Query telemetry and history
+  bundle          Create or inspect diagnostic bundles
+  report          Generate HTML reports
+  check           Validate configuration and environment
+  learn           Interactive tutorials and onboarding
+  agent           Agent/robot subcommands
+  config          Configuration management
+  telemetry       Telemetry management
+  shadow          Shadow mode observation management
+  signature       Signature management
+  schema          Generate JSON schemas
+  update          Update management
+  mcp             MCP server
+  completions     Generate shell completion scripts
+  version         Print version information
+
+Notes:
+  - \`pt scan deep\` is accepted as a wrapper alias for \`pt deep-scan\`.
+  - Use \`pt help <subcommand>\` or \`pt <subcommand> --help\` for pt-core help.
+EOF
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
@@ -305,6 +351,16 @@ main() {
 
     if [[ "${forwarded_args[0]:-}" == "--version" || "${forwarded_args[0]:-}" == "-V" ]]; then
         printf 'pt %s\n' "$VERSION"
+        exit 0
+    fi
+
+    if [[ "${forwarded_args[0]:-}" == "--help" || "${forwarded_args[0]:-}" == "-h" ]]; then
+        show_wrapper_help
+        exit 0
+    fi
+
+    if [[ "${forwarded_args[0]:-}" == "help" && ${#forwarded_args[@]} -eq 1 ]]; then
+        show_wrapper_help
         exit 0
     fi
 

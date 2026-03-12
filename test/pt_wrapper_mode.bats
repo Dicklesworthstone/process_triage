@@ -152,6 +152,43 @@ EOF
     [ ! -f "$MOCK_LOG" ]
 }
 
+@test "wrapper: top-level help shows wrapper-only commands and flags" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" help
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Process Triage wrapper for pt-core"* ]]
+    [[ "$output" == *"history"* ]]
+    [[ "$output" == *"clear"* ]]
+    [[ "$output" == *"--shell"* ]]
+    [[ "$output" == *"--tui"* ]]
+    [[ "$output" == *"pt help <subcommand>"* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: --help uses wrapper-aware top-level help" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" --help
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Process Triage wrapper for pt-core"* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: help with subcommand still forwards to pt-core" {
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" help query
+
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=help query$' "$MOCK_LOG"
+}
+
 @test "wrapper: version check still works with wrapper mode flags" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \
