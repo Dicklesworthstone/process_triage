@@ -205,6 +205,12 @@ main() {
         exit 0
     fi
 
+    # Preserve the documented `pt deep` surface even though pt-core exposes
+    # the clap-generated `deep-scan` subcommand name.
+    if [[ "${forwarded_args[0]:-}" == "deep" ]]; then
+        forwarded_args[0]="deep-scan"
+    fi
+
     # Forward to pt-core
     # We use 'exec' to replace the shell process
     exec "$pt_core" "${forwarded_args[@]}"
