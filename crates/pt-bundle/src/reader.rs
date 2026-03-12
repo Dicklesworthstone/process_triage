@@ -102,7 +102,9 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
         }
 
         let mut json = String::new();
-        manifest_file.take(MAX_FILE_SIZE + 1).read_to_string(&mut json)?;
+        manifest_file
+            .take(MAX_FILE_SIZE + 1)
+            .read_to_string(&mut json)?;
 
         if json.len() > MAX_FILE_SIZE as usize {
             return Err(BundleError::Io(std::io::Error::other(
@@ -172,8 +174,7 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
         if data.len() > MAX_FILE_SIZE as usize {
             return Err(BundleError::Io(std::io::Error::other(format!(
                 "file {} exceeds maximum allowed size ({} bytes)",
-                path,
-                MAX_FILE_SIZE
+                path, MAX_FILE_SIZE
             ))));
         }
 
