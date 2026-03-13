@@ -8,8 +8,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pt_core::action::{
-    ActionAttempt, AttemptResult, FailureCategory, NoopRequirementChecker, RecoveryExecutor,
-    RecoverySession, RecoveryTreeDatabase, Requirement, RequirementContext,
+    ActionAttempt, ActionStatus, AttemptResult, FailureCategory, NoopRequirementChecker,
+    RecoveryExecutor, RecoverySession, RecoveryTreeDatabase, Requirement, RequirementContext,
 };
 use pt_core::decision::Action;
 
@@ -313,20 +313,19 @@ fn bench_executor_classify_failure(c: &mut Criterion) {
     let checker = NoopRequirementChecker::default();
     let executor = RecoveryExecutor::new(&db, &checker);
 
-    let error_kinds: Vec<(&str, bool, &str)> = vec![
-        ("EPERM", false, "EPERM"),
-        ("ESRCH", false, "ESRCH"),
-        ("timeout", false, "timeout"),
-        ("supervisor", false, "supervisor"),
-        ("unknown_error", false, "unknown"),
-        ("ESRCH", true, "ESRCH_respawn"),
+    let error_kinds: Vec<(ActionStatus, bool, &str)> = vec![
+        (ActionStatus::PermissionDenied, false, "permission_denied"),
+        (ActionStatus::ProcessNotFound, false, "not_found"),
+        (ActionStatus::Timeout, false, "timeout"),
+        (ActionStatus::Failed, false, "failed"),
+        (ActionStatus::Failed, true, "respawn"),
     ];
 
-    for (kind, respawned, label) in &error_kinds {
+    for (status, respawned, label) in &error_kinds {
         group.bench_function(BenchmarkId::new("error", *label), |b| {
             b.iter(|| {
                 let cat = executor.classify_failure(
-                    black_box(kind),
+                    black_box(status),
                     black_box(1234),
                     black_box(*respawned),
                 );

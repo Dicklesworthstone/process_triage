@@ -2,8 +2,8 @@
 
 use proptest::prelude::*;
 use pt_core::action::{
-    ActionAttempt, AttemptResult, FailureCategory, NoopRequirementChecker, RecoveryExecutor,
-    RecoverySession, RecoveryTreeDatabase, Requirement, RequirementContext,
+    ActionAttempt, ActionStatus, AttemptResult, FailureCategory, NoopRequirementChecker,
+    RecoveryExecutor, RecoverySession, RecoveryTreeDatabase, Requirement, RequirementContext,
 };
 use pt_core::decision::Action;
 
@@ -238,20 +238,19 @@ proptest! {
     /// classify_failure always returns a valid FailureCategory.
     #[test]
     fn executor_classify_valid(
-        error_kind in prop_oneof![
-            Just("EPERM"),
-            Just("ESRCH"),
-            Just("timeout"),
-            Just("supervisor"),
-            Just("resource_busy"),
-            Just("some_random_error"),
+        status in prop_oneof![
+            Just(ActionStatus::PermissionDenied),
+            Just(ActionStatus::ProcessNotFound),
+            Just(ActionStatus::Timeout),
+            Just(ActionStatus::Failed),
+            Just(ActionStatus::IdentityMismatch),
         ],
         respawned in any::<bool>(),
     ) {
         let db = RecoveryTreeDatabase::new();
         let checker = NoopRequirementChecker::default();
         let executor = RecoveryExecutor::new(&db, &checker);
-        let _cat = executor.classify_failure(error_kind, 1234, respawned);
+        let _cat = executor.classify_failure(&status, 1234, respawned);
         // Just verifying it returns without panic
     }
 
