@@ -6,6 +6,7 @@
 use super::types::{
     AncestryEntry, EvidenceType, SupervisionEvidence, SupervisionResult, SupervisorDatabase,
 };
+use crate::collect::proc_parsers::{parse_proc_cmdline, parse_proc_stat};
 use pt_common::ProcessId;
 use std::collections::HashMap;
 use std::fs;
@@ -150,16 +151,8 @@ impl ProcessTreeCache {
 /// Read PPID and comm from /proc/<pid>/stat.
 #[cfg(target_os = "linux")]
 fn read_stat(pid: u32) -> Result<(u32, String), AncestryError> {
-    let stat_path = format!("/proc/{}/stat", pid);
-    let content = fs::read_to_string(&stat_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            AncestryError::ProcessNotFound(pid)
-        } else {
-            AncestryError::IoError { pid, source: e }
-        }
-    })?;
-
-    parse_stat(&content, pid)
+    let stat = parse_proc_stat(pid).ok_or(AncestryError::ProcessNotFound(pid))?;
+    Ok((stat.ppid, stat.comm))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -167,62 +160,10 @@ fn read_stat(pid: u32) -> Result<(u32, String), AncestryError> {
     Err(AncestryError::ProcessNotFound(pid))
 }
 
-/// Parse /proc/<pid>/stat content to extract PPID and comm.
-#[doc(hidden)]
-pub(crate) fn parse_stat(content: &str, pid: u32) -> Result<(u32, String), AncestryError> {
-    // Format: pid (comm) state ppid ...
-    // The comm can contain spaces and parentheses, so find the last ')' first
-
-    let open_paren = content.find('(').ok_or_else(|| AncestryError::ParseError {
-        pid,
-        message: "missing '(' in stat".to_string(),
-    })?;
-
-    let close_paren = content
-        .rfind(')')
-        .ok_or_else(|| AncestryError::ParseError {
-            pid,
-            message: "missing ')' in stat".to_string(),
-        })?;
-
-    let comm = content[open_paren + 1..close_paren].to_string();
-
-    // Rest of the fields after the closing paren
-    let rest = content
-        .get(close_paren + 2..)
-        .ok_or_else(|| AncestryError::ParseError {
-            pid,
-            message: "content truncated after comm".to_string(),
-        })?; // Skip ") "
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-
-    // Field 0 after comm is state, field 1 is ppid
-    if fields.len() < 2 {
-        return Err(AncestryError::ParseError {
-            pid,
-            message: "too few fields after comm".to_string(),
-        });
-    }
-
-    let ppid = fields[1]
-        .parse::<u32>()
-        .map_err(|_| AncestryError::ParseError {
-            pid,
-            message: format!("invalid ppid: {}", fields[1]),
-        })?;
-
-    Ok((ppid, comm))
-}
-
 /// Read cmdline from /proc/<pid>/cmdline.
 #[cfg(target_os = "linux")]
 fn read_cmdline(pid: u32) -> Result<String, AncestryError> {
-    let path = format!("/proc/{}/cmdline", pid);
-    let content =
-        fs::read_to_string(&path).map_err(|e| AncestryError::IoError { pid, source: e })?;
-
-    // cmdline uses NUL as separator
-    Ok(content.replace('\0', " ").trim().to_string())
+    parse_proc_cmdline(pid).ok_or(AncestryError::ProcessNotFound(pid))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -399,32 +340,33 @@ pub fn analyze_supervision_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::proc_parsers::parse_proc_stat_content;
 
     #[test]
     fn test_parse_stat_simple() {
         // Format: pid (comm) state ppid pgrp session ...
         let content = "1234 (bash) S 1000 1234 1234 0 -1";
-        let (ppid, comm) = parse_stat(content, 1234).unwrap();
-        assert_eq!(ppid, 1000); // ppid is field 3 (index 1 after comm)
-        assert_eq!(comm, "bash");
+        let stat = parse_proc_stat_content(content).unwrap();
+        assert_eq!(stat.ppid, 1000); // ppid is field 3 (index 1 after comm)
+        assert_eq!(stat.comm, "bash");
     }
 
     #[test]
     fn test_parse_stat_with_parens_in_comm() {
         // Format: pid (comm) state ppid pgrp session ...
         let content = "5678 (my (weird) process) S 1234 5678 5678 0 -1";
-        let (ppid, comm) = parse_stat(content, 5678).unwrap();
-        assert_eq!(ppid, 1234); // ppid is 1234
-        assert_eq!(comm, "my (weird) process");
+        let stat = parse_proc_stat_content(content).unwrap();
+        assert_eq!(stat.ppid, 1234); // ppid is 1234
+        assert_eq!(stat.comm, "my (weird) process");
     }
 
     #[test]
     fn test_parse_stat_with_spaces() {
         // Format: pid (comm) state ppid pgrp session ...
         let content = "9999 (Web Content) S 1000 9999 9999 0 -1";
-        let (ppid, comm) = parse_stat(content, 9999).unwrap();
-        assert_eq!(ppid, 1000); // ppid is 1000
-        assert_eq!(comm, "Web Content");
+        let stat = parse_proc_stat_content(content).unwrap();
+        assert_eq!(stat.ppid, 1000); // ppid is 1000
+        assert_eq!(stat.comm, "Web Content");
     }
 
     #[test]

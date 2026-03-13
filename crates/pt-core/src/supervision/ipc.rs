@@ -3,6 +3,7 @@
 //! Detects supervision through socket connections to known supervisor IPC paths.
 
 use super::types::{EvidenceType, SupervisionEvidence, SupervisorCategory};
+use crate::collect::network::parse_proc_net_unix;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -332,21 +333,15 @@ fn read_unix_sockets(pid: u32) -> Result<Vec<String>, std::io::Error> {
         return Ok(vec![]);
     }
 
-    // Parse /proc/net/unix
-    let content = fs::read_to_string("/proc/net/unix")?;
+    // Reuse the robust parser from network module
+    let all_unix_sockets = parse_proc_net_unix("/proc/net/unix").unwrap_or_default();
     let mut paths = Vec::new();
 
-    for line in content.lines().skip(1) {
-        // Skip header
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 7 {
-            // Format: Num RefCount Protocol Flags Type St Inode Path
-            if let Ok(inode) = fields[6].parse::<u64>() {
-                if socket_inodes.contains(&inode) {
-                    // Path is optional, fields[7] if present
-                    if fields.len() > 7 {
-                        paths.push(fields[7].to_string());
-                    }
+    for socket in all_unix_sockets {
+        if socket_inodes.contains(&socket.inode) {
+            if let Some(path) = socket.path {
+                if !path.is_empty() {
+                    paths.push(path);
                 }
             }
         }

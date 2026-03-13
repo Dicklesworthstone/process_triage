@@ -915,43 +915,54 @@ impl SignatureDatabase {
     pub fn add(&mut self, signature: SupervisorSignature) -> Result<(), SignatureError> {
         signature.validate()?;
 
-        // Compile process name regexes
-        let mut proc_res = Vec::new();
+        // Pre-compile all regexes to ensure success before updating state
+        let mut proc_res = Vec::with_capacity(signature.patterns.process_names.len());
         for pattern in &signature.patterns.process_names {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                proc_res.push(re);
-            }
+            proc_res.push(regex::Regex::new(pattern).map_err(|e| {
+                SignatureError::InvalidRegex {
+                    pattern: pattern.clone(),
+                    error: e.to_string(),
+                }
+            })?);
         }
-        self.process_regexes.push(proc_res);
 
-        // Compile argument regexes
-        let mut arg_res = Vec::new();
+        let mut arg_res = Vec::with_capacity(signature.patterns.arg_patterns.len());
         for pattern in &signature.patterns.arg_patterns {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                arg_res.push(re);
-            }
+            arg_res.push(
+                regex::Regex::new(pattern).map_err(|e| SignatureError::InvalidRegex {
+                    pattern: pattern.clone(),
+                    error: e.to_string(),
+                })?,
+            );
         }
-        self.arg_regexes.push(arg_res);
 
-        // Compile working directory regexes
-        let mut wd_res = Vec::new();
+        let mut wd_res = Vec::with_capacity(signature.patterns.working_dir_patterns.len());
         for pattern in &signature.patterns.working_dir_patterns {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                wd_res.push(re);
-            }
+            wd_res.push(
+                regex::Regex::new(pattern).map_err(|e| SignatureError::InvalidRegex {
+                    pattern: pattern.clone(),
+                    error: e.to_string(),
+                })?,
+            );
         }
-        self.working_dir_regexes.push(wd_res);
 
-        // Compile parent pattern regexes
-        let mut parent_res = Vec::new();
+        let mut parent_res = Vec::with_capacity(signature.patterns.parent_patterns.len());
         for pattern in &signature.patterns.parent_patterns {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                parent_res.push(re);
-            }
+            parent_res.push(regex::Regex::new(pattern).map_err(|e| {
+                SignatureError::InvalidRegex {
+                    pattern: pattern.clone(),
+                    error: e.to_string(),
+                }
+            })?);
         }
-        self.parent_regexes.push(parent_res);
 
+        // All compiled successfully, update state
+        self.process_regexes.push(proc_res);
+        self.arg_regexes.push(arg_res);
+        self.working_dir_regexes.push(wd_res);
+        self.parent_regexes.push(parent_res);
         self.signatures.push(signature);
+
         Ok(())
     }
 

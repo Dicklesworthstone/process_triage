@@ -612,7 +612,7 @@ impl SessionHandle {
     }
 
     pub fn write_snapshot(&self, snapshot: &SessionSnapshot) -> Result<(), SessionError> {
-        write_json_pretty_atomic(&self.snapshot_path(), snapshot)
+        write_json_pretty(&self.snapshot_path(), snapshot)
     }
 
     pub fn update_state(&self, new_state: SessionState) -> Result<SessionManifest, SessionError> {
@@ -687,24 +687,7 @@ fn resolve_sessions_root() -> Result<PathBuf, SessionError> {
     Err(SessionError::DataDirUnavailable)
 }
 
-fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), SessionError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| SessionError::Io {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-    }
-    let content = serde_json::to_string_pretty(value).map_err(|e| SessionError::Json {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    std::fs::write(path, content).map_err(|e| SessionError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })
-}
-
-fn write_json_pretty_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), SessionError> {
+pub fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SessionError::Io {
             path: parent.to_path_buf(),
@@ -718,7 +701,7 @@ fn write_json_pretty_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), 
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("snapshot.json");
+        .unwrap_or("file.json");
     let tmp_path = path.with_file_name(format!("{}.tmp.{}", file_name, std::process::id()));
     {
         use std::io::Write;
@@ -1320,7 +1303,7 @@ mod tests {
         assert_eq!(count_actions(tmp.path()), Some(2));
     }
 
-    // ── write_json_pretty / write_json_pretty_atomic ────────────────
+    // ── write_json_pretty ────────────────
 
     #[test]
     fn write_json_pretty_creates_file() {
@@ -1343,22 +1326,10 @@ mod tests {
     }
 
     #[test]
-    fn write_json_pretty_atomic_creates_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("atomic.json");
-        let value = serde_json::json!({"atomic": true});
-        write_json_pretty_atomic(&path, &value).unwrap();
-        assert!(path.exists());
-        let content = std::fs::read_to_string(&path).unwrap();
-        let back: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(back["atomic"], true);
-    }
-
-    #[test]
-    fn write_json_pretty_atomic_no_temp_file_left() {
+    fn write_json_pretty_no_temp_file_left() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("clean.json");
-        write_json_pretty_atomic(&path, &serde_json::json!({})).unwrap();
+        write_json_pretty(&path, &serde_json::json!({})).unwrap();
         // No .tmp files should remain
         let entries: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
         assert_eq!(entries.len(), 1);

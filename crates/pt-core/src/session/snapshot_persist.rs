@@ -222,7 +222,7 @@ fn persist_artifact<T: serde::de::DeserializeOwned + Serialize>(
 ) -> Result<PathBuf, SessionError> {
     let path = handle.dir.join(rel_path);
     envelope.integrity_sha256 = payload_sha256(&envelope.payload, &path)?;
-    super::write_json_pretty_atomic(&path, &envelope)?;
+    super::write_json_pretty(&path, &envelope)?;
     Ok(path)
 }
 

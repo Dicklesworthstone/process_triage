@@ -295,8 +295,7 @@ impl TmuxInfo {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detect_tmux_session(pid: u32) -> Option<TmuxInfo> {
     let env = read_environ(pid).ok()?;
-    env.get("TMUX")
-        .and_then(|v| TmuxInfo::from_tmux_env(v))
+    env.get("TMUX").and_then(|v| TmuxInfo::from_tmux_env(v))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -341,8 +340,7 @@ impl ScreenInfo {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detect_screen_session(pid: u32) -> Option<ScreenInfo> {
     let env = read_environ(pid).ok()?;
-    env.get("STY")
-        .and_then(|v| ScreenInfo::from_sty_env(v))
+    env.get("STY").and_then(|v| ScreenInfo::from_sty_env(v))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

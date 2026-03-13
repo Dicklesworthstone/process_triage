@@ -361,8 +361,7 @@ pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
 
 #[cfg(target_os = "macos")]
 pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
-    crate::collect::macos::collect_environ(pid)
-        .ok_or(EnvironError::ProcessNotFound(pid))
+    crate::collect::macos::collect_environ(pid).ok_or(EnvironError::ProcessNotFound(pid))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

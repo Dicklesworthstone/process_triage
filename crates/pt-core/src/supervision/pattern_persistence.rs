@@ -441,7 +441,13 @@ impl PersistedSchema {
     /// Save to file.
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), PersistenceError> {
         let json = self.to_json()?;
-        fs::write(path, json)?;
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, json)?;
+        fs::rename(&tmp_path, path)?;
         Ok(())
     }
 
@@ -517,7 +523,13 @@ impl DisabledPatterns {
     /// Save to file.
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), PersistenceError> {
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)?;
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, json)?;
+        fs::rename(&tmp_path, path)?;
         Ok(())
     }
 }
@@ -571,7 +583,13 @@ impl AllPatternStats {
     /// Save to file.
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), PersistenceError> {
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)?;
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, json)?;
+        fs::rename(&tmp_path, path)?;
         Ok(())
     }
 }

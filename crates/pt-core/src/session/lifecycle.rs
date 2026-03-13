@@ -390,11 +390,7 @@ fn seconds_to_duration(seconds: u64, path: &std::path::Path) -> Result<Duration,
 
 fn write_lifecycle(handle: &SessionHandle, info: &LifecycleInfo) -> Result<(), SessionError> {
     let path = lifecycle_path(handle);
-    let content = serde_json::to_string_pretty(info).map_err(|e| SessionError::Json {
-        path: path.clone(),
-        source: e,
-    })?;
-    std::fs::write(&path, content).map_err(|e| SessionError::Io { path, source: e })
+    crate::session::write_json_pretty(&path, info)
 }
 
 fn read_lifecycle(handle: &SessionHandle) -> Result<LifecycleInfo, SessionError> {

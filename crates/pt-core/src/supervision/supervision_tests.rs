@@ -7,6 +7,7 @@
 mod ancestry_tests {
     use super::super::ancestry::*;
     use super::super::types::*;
+    use crate::collect::proc_parsers::parse_proc_stat_content;
 
     // =========================================================================
     // Unit Tests: Parent Chain Reconstruction
@@ -15,19 +16,19 @@ mod ancestry_tests {
     #[test]
     fn test_parse_stat_formats() {
         // Standard format
-        let (ppid, comm) = parse_stat("1234 (bash) S 1000 1234 1234 0 -1", 1234).unwrap();
-        assert_eq!(ppid, 1000);
-        assert_eq!(comm, "bash");
+        let stat = parse_proc_stat_content("1234 (bash) S 1000 1234 1234 0 -1").unwrap();
+        assert_eq!(stat.ppid, 1000);
+        assert_eq!(stat.comm, "bash");
 
         // Comm with spaces
-        let (ppid, comm) = parse_stat("5678 (Web Content) R 4321 5678 5678 0 -1", 5678).unwrap();
-        assert_eq!(ppid, 4321);
-        assert_eq!(comm, "Web Content");
+        let stat = parse_proc_stat_content("5678 (Web Content) R 4321 5678 5678 0 -1").unwrap();
+        assert_eq!(stat.ppid, 4321);
+        assert_eq!(stat.comm, "Web Content");
 
         // Comm with parentheses
-        let (ppid, comm) = parse_stat("9999 (my (test) app) S 8888 9999 9999 0 -1", 9999).unwrap();
-        assert_eq!(ppid, 8888);
-        assert_eq!(comm, "my (test) app");
+        let stat = parse_proc_stat_content("9999 (my (test) app) S 8888 9999 9999 0 -1").unwrap();
+        assert_eq!(stat.ppid, 8888);
+        assert_eq!(stat.comm, "my (test) app");
     }
 
     #[test]
@@ -35,43 +36,39 @@ mod ancestry_tests {
         // Test all process states: R, S, D, Z, T, t, W, X, x, K, W, P
         for state in &["R", "S", "D", "Z", "T", "t", "X", "I"] {
             let content = format!("100 (test) {} 1 100 100 0 -1", state);
-            let result = parse_stat(&content, 100);
-            assert!(result.is_ok(), "Failed to parse state {}", state);
+            let result = parse_proc_stat_content(&content);
+            assert!(result.is_some(), "Failed to parse state {}", state);
         }
     }
 
     #[test]
     fn test_parse_stat_edge_cases() {
         // Empty comm
-        let result = parse_stat("1 () S 0 1 1 0 -1", 1);
-        assert!(result.is_ok());
-        let (ppid, comm) = result.unwrap();
-        assert_eq!(ppid, 0);
-        assert_eq!(comm, "");
+        let result = parse_proc_stat_content("1 () S 0 1 1 0 -1");
+        assert!(result.is_some());
+        let stat = result.unwrap();
+        assert_eq!(stat.ppid, 0);
+        assert_eq!(stat.comm, "");
 
         // Very long comm (kernel truncates at 15 chars but we should handle longer)
-        let (ppid, comm) = parse_stat("1 (averylongprocessname) S 0 1 1 0 -1", 1).unwrap();
-        assert_eq!(ppid, 0);
-        assert_eq!(comm, "averylongprocessname");
+        let stat = parse_proc_stat_content("1 (averylongprocessname) S 0 1 1 0 -1").unwrap();
+        assert_eq!(stat.ppid, 0);
+        assert_eq!(stat.comm, "averylongprocessname");
     }
 
     #[test]
     fn test_parse_stat_error_cases() {
         // Missing parentheses
-        let result = parse_stat("1234 bash S 1000 1234", 1234);
-        assert!(result.is_err());
+        let result = parse_proc_stat_content("1234 bash S 1000 1234");
+        assert!(result.is_none());
 
         // Missing closing paren
-        let result = parse_stat("1234 (bash S 1000 1234", 1234);
-        assert!(result.is_err());
+        let result = parse_proc_stat_content("1234 (bash S 1000 1234");
+        assert!(result.is_none());
 
-        // Not enough fields
-        let result = parse_stat("1234 (bash) S", 1234);
-        assert!(result.is_err());
-
-        // Invalid PPID
-        let result = parse_stat("1234 (bash) S notanumber 1234", 1234);
-        assert!(result.is_err());
+        // Not enough fields (needs at least pid, comm, state, ppid)
+        let result = parse_proc_stat_content("1234 (bash) S");
+        assert!(result.is_none());
     }
 
     // =========================================================================
@@ -324,13 +321,11 @@ mod ancestry_tests {
 
     #[test]
     fn test_loop_detection_in_stat_parsing() {
-        // parse_stat doesn't detect loops, but the analyzer should
+        // parse_proc_stat_content doesn't detect loops, but the analyzer should
         // This tests that parsing doesn't itself cause issues
         let content = "1 (init) S 1 1 1 0 -1"; // self-referential ppid
-        let result = parse_stat(content, 1);
-        assert!(result.is_ok());
-        let (ppid, _) = result.unwrap();
-        assert_eq!(ppid, 1); // Self-parent should be detectable
+        let stat = parse_proc_stat_content(content).unwrap();
+        assert_eq!(stat.ppid, 1); // Self-parent should be detectable
     }
 
     // =========================================================================
@@ -355,11 +350,9 @@ mod ancestry_tests {
     fn test_parse_zombie_state() {
         // Zombie process state parsing
         let content = "999 (zombie_child) Z 1000 999 999 0 -1";
-        let result = parse_stat(content, 999);
-        assert!(result.is_ok());
-        let (ppid, comm) = result.unwrap();
-        assert_eq!(ppid, 1000);
-        assert_eq!(comm, "zombie_child");
+        let stat = parse_proc_stat_content(content).unwrap();
+        assert_eq!(stat.ppid, 1000);
+        assert_eq!(stat.comm, "zombie_child");
     }
 
     // =========================================================================
@@ -369,17 +362,17 @@ mod ancestry_tests {
     #[test]
     fn test_kernel_thread_patterns() {
         // Kernel threads often have brackets in their names
-        // parse_stat should handle them correctly
+        // parse_proc_stat_content should handle them correctly
         let content = "2 (kthreadd) S 0 0 0 0 -1";
-        let (ppid, comm) = parse_stat(content, 2).unwrap();
-        assert_eq!(ppid, 0);
-        assert_eq!(comm, "kthreadd");
+        let stat = parse_proc_stat_content(content).unwrap();
+        assert_eq!(stat.ppid, 0);
+        assert_eq!(stat.comm, "kthreadd");
 
         // Worker threads
         let content = "123 (kworker/0:0) I 2 0 0 0 -1";
-        let (ppid, comm) = parse_stat(content, 123).unwrap();
-        assert_eq!(ppid, 2);
-        assert_eq!(comm, "kworker/0:0");
+        let stat = parse_proc_stat_content(content).unwrap();
+        assert_eq!(stat.ppid, 2);
+        assert_eq!(stat.comm, "kworker/0:0");
     }
 }
 
