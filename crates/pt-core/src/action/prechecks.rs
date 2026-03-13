@@ -302,8 +302,8 @@ impl From<&DataLossGates> for LivePreCheckConfig {
     }
 }
 
-/// Live pre-check provider that reads from /proc.
-#[cfg(target_os = "linux")]
+/// Live pre-check provider that reads from /proc (Linux) or sysctl/lsof (macOS).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct LivePreCheckProvider {
     protected_filter: Option<ProtectedFilter>,
     config: LivePreCheckConfig,
@@ -311,7 +311,7 @@ pub struct LivePreCheckProvider {
     known_supervisors: HashSet<String>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl LivePreCheckProvider {
     /// Create a new provider with the given guardrails and config.
     pub fn new(
@@ -332,6 +332,7 @@ impl LivePreCheckProvider {
             "runsv",
             "containerd-shim",
             "docker-containerd",
+            "launchd",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -342,6 +343,113 @@ impl LivePreCheckProvider {
             config,
             known_supervisors,
         })
+    }
+
+    /// Read process comm (basename) from the OS.
+    fn read_comm(&self, pid: u32) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let comm_path = format!("/proc/{pid}/comm");
+            std::fs::read_to_string(&comm_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.get_macos_proc_info(pid).map(|info| {
+                let comm = unsafe {
+                    std::ffi::CStr::from_ptr(info.kp_proc.p_comm.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                comm
+            })
+        }
+    }
+
+    /// Read process cmdline from the OS.
+    fn read_cmdline(&self, pid: u32) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let cmdline_path = format!("/proc/{pid}/cmdline");
+            std::fs::read_to_string(&cmdline_path)
+                .ok()
+                .map(|s| s.replace('\0', " ").trim().to_string())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS, getting the full cmdline requires a more complex sysctl call
+            // (KERN_PROCARGS2). For now, fallback to comm if unavailable.
+            self.read_comm(pid)
+        }
+    }
+
+    /// Read process owner username.
+    fn read_user(&self, pid: u32) -> Option<String> {
+        let uid = self.read_uid(pid)?;
+        // Try to resolve UID to username safely
+        #[cfg(unix)]
+        {
+            if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
+                let uid_str_target = uid.to_string();
+                for pwd_line in passwd.lines() {
+                    let mut fields = pwd_line.split(':');
+                    let username = fields.next();
+                    let _passwd = fields.next();
+                    let uid_field = fields.next();
+                    if let (Some(u), Some(f)) = (username, uid_field) {
+                        if f == uid_str_target {
+                            return Some(u.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Some(uid.to_string())
+    }
+
+    /// Read process UID.
+    fn read_uid(&self, pid: u32) -> Option<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            let status_path = format!("/proc/{pid}/status");
+            let content = std::fs::read_to_string(&status_path).ok()?;
+            for line in content.lines() {
+                if line.starts_with("Uid:") {
+                    return line.split_whitespace().nth(1)?.parse().ok();
+                }
+            }
+            None
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.get_macos_proc_info(pid)
+                .map(|info| info.kp_eproc.e_ucred.cr_uid)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn get_macos_proc_info(&self, pid: u32) -> Option<libc::kinfo_proc> {
+        let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as i32];
+        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::kinfo_proc>();
+
+        let result = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                name.len() as u32,
+                &mut info as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+
+        if result == 0 && size > 0 {
+            Some(info)
+        } else {
+            None
+        }
     }
 
     /// Create with default config.
@@ -370,221 +478,327 @@ impl LivePreCheckProvider {
 
     /// Check if process has open write file descriptors.
     fn has_open_write_fds(&self, pid: u32) -> (bool, u32) {
-        let fd_dir = format!("/proc/{pid}/fd");
-        let fdinfo_dir = format!("/proc/{pid}/fdinfo");
+        #[cfg(target_os = "linux")]
+        {
+            let fd_dir = format!("/proc/{pid}/fd");
+            let fdinfo_dir = format!("/proc/{pid}/fdinfo");
 
-        let Ok(entries) = std::fs::read_dir(&fd_dir) else {
-            return (false, 0);
-        };
+            let Ok(entries) = std::fs::read_dir(&fd_dir) else {
+                return (false, 0);
+            };
 
-        let mut write_count = 0;
+            let mut write_count = 0;
 
-        for entry in entries.flatten() {
-            let fd_name = entry.file_name();
-            let fdinfo_path = format!("{fdinfo_dir}/{}", fd_name.to_string_lossy());
+            for entry in entries.flatten() {
+                let fd_name = entry.file_name();
+                let fdinfo_path = format!("{fdinfo_dir}/{}", fd_name.to_string_lossy());
 
-            if let Ok(content) = std::fs::read_to_string(&fdinfo_path) {
-                // Check flags field for write mode
-                for line in content.lines() {
-                    if line.starts_with("flags:") {
-                        if let Some(flags_str) = line.split_whitespace().nth(1) {
-                            if let Ok(flags) = u32::from_str_radix(flags_str, 8) {
-                                // O_WRONLY = 1, O_RDWR = 2
-                                let access_mode = flags & 0o3;
-                                if access_mode == 1 || access_mode == 2 {
-                                    write_count += 1;
+                if let Ok(content) = std::fs::read_to_string(&fdinfo_path) {
+                    // Check flags field for write mode
+                    for line in content.lines() {
+                        if line.starts_with("flags:") {
+                            if let Some(flags_str) = line.split_whitespace().nth(1) {
+                                if let Ok(flags) = u32::from_str_radix(flags_str, 8) {
+                                    // O_WRONLY = 1, O_RDWR = 2
+                                    let access_mode = flags & 0o3;
+                                    if access_mode == 1 || access_mode == 2 {
+                                        write_count += 1;
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
 
-        (write_count > self.config.max_open_write_fds, write_count)
+            (
+                write_count > self.config.max_open_write_fds,
+                write_count,
+            )
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Use lsof to find open write descriptors
+            if let Ok((files, _)) =
+                crate::collect::macos::collect_lsof_info(pid, Duration::from_secs(2))
+            {
+                let write_count = files
+                    .iter()
+                    .filter(|f| {
+                        if let Some(ref mode) = f.mode {
+                            mode.contains('w') || mode.contains('u')
+                        } else {
+                            false
+                        }
+                    })
+                    .count() as u32;
+
+                (
+                    write_count > self.config.max_open_write_fds as u32,
+                    write_count,
+                )
+            } else {
+                (false, 0)
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            (false, 0)
+        }
     }
 
     /// Best-effort check for recent I/O activity (write-heavy).
     ///
     /// Uses a short probe window to detect increases in /proc/<pid>/io counters.
     fn has_recent_io(&self, pid: u32, window: Duration) -> bool {
-        let before = parse_io(pid);
-        let Some(before) = before else {
-            return false;
-        };
+        #[cfg(target_os = "linux")]
+        {
+            let before = parse_io(pid);
+            let Some(before) = before else {
+                return false;
+            };
 
-        std::thread::sleep(recent_io_probe_window(window));
+            std::thread::sleep(recent_io_probe_window(window));
 
-        let after = parse_io(pid);
-        let Some(after) = after else {
-            return false;
-        };
+            let after = parse_io(pid);
+            let Some(after) = after else {
+                return false;
+            };
 
-        let write_bytes_delta = after.write_bytes.saturating_sub(before.write_bytes);
-        let wchar_delta = after.wchar.saturating_sub(before.wchar);
+            let write_bytes_delta = after.write_bytes.saturating_sub(before.write_bytes);
+            let wchar_delta = after.wchar.saturating_sub(before.wchar);
 
-        write_bytes_delta > 0 || wchar_delta > 0
+            write_bytes_delta > 0 || wchar_delta > 0
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // No easy /proc/pid/io on macOS. Best effort via lsof is too expensive
+            // for a frequent pre-check. Fallback to false.
+            let _ = pid;
+            let _ = window;
+            false
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            let _ = window;
+            false
+        }
     }
 
     /// Check if process has any locked files.
     fn has_locked_files(&self, pid: u32) -> bool {
-        let locks_path = "/proc/locks";
-        let Ok(content) = std::fs::read_to_string(locks_path) else {
-            return false;
-        };
+        #[cfg(target_os = "linux")]
+        {
+            let locks_path = "/proc/locks";
+            let Ok(content) = std::fs::read_to_string(locks_path) else {
+                return false;
+            };
 
-        let pid_str = pid.to_string();
-        for line in content.lines() {
-            // Format: 1: POSIX  ADVISORY  WRITE 12345 ...
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 4 && parts[4] == pid_str {
-                return true;
+            let pid_str = pid.to_string();
+            for line in content.lines() {
+                // Format: 1: POSIX  ADVISORY  WRITE 12345 ...
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 4 && parts[4] == pid_str {
+                    return true;
+                }
             }
-        }
 
-        false
+            false
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Use lsof - look for lock status
+            let output = std::process::Command::new("lsof")
+                .args(["-p", &pid.to_string(), "-F", "l"])
+                .output();
+
+            if let Ok(out) = output {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                for line in stdout.lines() {
+                    if line.starts_with('l') && line.len() > 1 {
+                        let lock_char = line.chars().nth(1).unwrap_or(' ');
+                        // 'R' = read lock, 'W' = write lock, 'U' = unknown lock
+                        if lock_char == 'R' || lock_char == 'W' || lock_char == 'U' {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            false
+        }
     }
 
     /// Check if process has active TTY.
     fn has_active_tty(&self, pid: u32) -> bool {
-        let stat_path = format!("/proc/{pid}/stat");
-        let Ok(content) = std::fs::read_to_string(&stat_path) else {
-            return false;
-        };
+        #[cfg(target_os = "linux")]
+        {
+            let stat_path = format!("/proc/{pid}/stat");
+            let Ok(content) = std::fs::read_to_string(&stat_path) else {
+                return false;
+            };
 
-        // Parse tty_nr from stat (field 7 after comm)
-        if let Some(comm_end) = content.rfind(')') {
-            if let Some(after_comm) = content.get(comm_end + 2..) {
-                let fields: Vec<&str> = after_comm.split_whitespace().collect();
-                if let Some(tty_nr_str) = fields.get(4) {
-                    if let Ok(tty_nr) = tty_nr_str.parse::<i32>() {
-                        return tty_nr != 0;
+            // Parse tty_nr from stat (field 7 after comm)
+            if let Some(comm_end) = content.rfind(')') {
+                if let Some(after_comm) = content.get(comm_end + 2..) {
+                    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+                    if let Some(tty_nr_str) = fields.get(4) {
+                        if let Ok(tty_nr) = tty_nr_str.parse::<i32>() {
+                            return tty_nr != 0;
+                        }
                     }
                 }
             }
-        }
 
-        false
+            false
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Check if controlling terminal is set in sysctl info
+            if let Some(info) = self.get_macos_proc_info(pid) {
+                // p_tdev is the controlling terminal device number
+                // -1 (or usually 0xffffffff in unsigned) means no TTY
+                let tdev = info.kp_eproc.e_tdev;
+                return tdev != -1 && tdev != 0;
+            }
+            false
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            false
+        }
     }
 
     /// Check if process CWD is deleted.
     fn has_deleted_cwd(&self, pid: u32) -> bool {
-        let cwd_link = format!("/proc/{pid}/cwd");
-        if let Ok(target) = std::fs::read_link(&cwd_link) {
-            let target_str = target.to_string_lossy();
-            return target_str.ends_with(" (deleted)");
+        #[cfg(target_os = "linux")]
+        {
+            let cwd_link = format!("/proc/{pid}/cwd");
+            if let Ok(target) = std::fs::read_link(&cwd_link) {
+                let target_str = target.to_string_lossy();
+                return target_str.ends_with(" (deleted)");
+            }
+            false
         }
-        false
+        #[cfg(target_os = "macos")]
+        {
+            // macOS doesn't easily expose this info via sysctl/proc
+            let _ = pid;
+            false
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            false
+        }
     }
 
-    /// Read process comm (basename) from /proc.
-    fn read_comm(&self, pid: u32) -> Option<String> {
-        let comm_path = format!("/proc/{pid}/comm");
-        std::fs::read_to_string(&comm_path)
-            .ok()
-            .map(|s| s.trim().to_string())
-    }
+    /// Read process state.
+    fn read_process_state(&self, pid: u32) -> Option<ProcessState> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat_path = format!("/proc/{pid}/stat");
+            let content = std::fs::read_to_string(&stat_path).ok()?;
 
-    /// Read process cmdline from /proc.
-    fn read_cmdline(&self, pid: u32) -> Option<String> {
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-        std::fs::read_to_string(&cmdline_path)
-            .ok()
-            .map(|s| s.replace('\0', " ").trim().to_string())
-    }
+            // Parse state from stat: pid (comm) state ...
+            // State is the first character after the closing paren
+            let comm_end = content.rfind(')')?;
+            let after_comm = content.get(comm_end + 2..)?;
+            let state_char = after_comm.chars().next()?;
 
-    /// Read process owner username from /proc.
-    fn read_user(&self, pid: u32) -> Option<String> {
-        let status_path = format!("/proc/{pid}/status");
-        let content = std::fs::read_to_string(&status_path).ok()?;
-
-        // Find Uid line: "Uid:\t1000\t1000\t1000\t1000"
-        for line in content.lines() {
-            if line.starts_with("Uid:") {
-                if let Some(uid_str) = line.split_whitespace().nth(1) {
-                    if let Ok(uid) = uid_str.parse::<u32>() {
-                        // Try to resolve UID to username safely without thread-unsafe libc calls
-                        #[cfg(unix)]
-                        {
-                            if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
-                                let uid_str_target = uid.to_string();
-                                for pwd_line in passwd.lines() {
-                                    let mut fields = pwd_line.split(':');
-                                    if let (Some(name), _, Some(id)) =
-                                        (fields.next(), fields.next(), fields.next())
-                                    {
-                                        if id == uid_str_target {
-                                            return Some(name.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Fallback to UID string
-                        return Some(uid.to_string());
-                    }
+            Some(ProcessState::from_char(state_char))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.get_macos_proc_info(pid).map(|info| {
+                // macOS state mapping from sysctl:
+                // SIDL=1, SRUN=2, SSLEEP=3, SSTOP=4, SZOMB=5
+                match info.kp_proc.p_stat {
+                    1 => ProcessState::Sleeping, // SIDL
+                    2 => ProcessState::Running,  // SRUN
+                    3 => ProcessState::Sleeping, // SSLEEP
+                    4 => ProcessState::Stopped,  // SSTOP
+                    5 => ProcessState::Zombie,   // SZOMB
+                    _ => ProcessState::Unknown,
                 }
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
+    /// Read kernel wait channel.
+    fn read_wchan(&self, pid: u32) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let wchan_path = format!("/proc/{pid}/wchan");
+            let wchan = std::fs::read_to_string(&wchan_path)
+                .ok()?
+                .trim()
+                .to_string();
+
+            // "0" means not blocked, return None in that case
+            if wchan == "0" || wchan.is_empty() {
+                None
+            } else {
+                Some(wchan)
             }
         }
-
-        None
-    }
-
-    /// Read process state from /proc/[pid]/stat.
-    ///
-    /// Parses the state field (field 3 in stat) and returns the ProcessState.
-    fn read_process_state(&self, pid: u32) -> Option<ProcessState> {
-        let stat_path = format!("/proc/{pid}/stat");
-        let content = std::fs::read_to_string(&stat_path).ok()?;
-
-        // Parse state from stat: pid (comm) state ...
-        // State is the first character after the closing paren
-        let comm_end = content.rfind(')')?;
-        let after_comm = content.get(comm_end + 2..)?;
-        let state_char = after_comm.chars().next()?;
-
-        Some(ProcessState::from_char(state_char))
-    }
-
-    /// Read kernel wait channel from /proc/[pid]/wchan.
-    ///
-    /// Returns the kernel function name where the process is blocked (if in sleep state).
-    fn read_wchan(&self, pid: u32) -> Option<String> {
-        let wchan_path = format!("/proc/{pid}/wchan");
-        let wchan = std::fs::read_to_string(&wchan_path)
-            .ok()?
-            .trim()
-            .to_string();
-
-        // "0" means not blocked, return None in that case
-        if wchan == "0" || wchan.is_empty() {
+        #[cfg(target_os = "macos")]
+        {
+            // macOS doesn't expose wchan via sysctl in a simple string way
+            let _ = pid;
             None
-        } else {
-            Some(wchan)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            None
         }
     }
 
     /// Get parent process comm name.
     fn get_ppid_comm(&self, pid: u32) -> Option<String> {
-        let stat_path = format!("/proc/{pid}/stat");
-        let content = std::fs::read_to_string(&stat_path).ok()?;
+        #[cfg(target_os = "linux")]
+        {
+            let stat_path = format!("/proc/{pid}/stat");
+            let content = std::fs::read_to_string(&stat_path).ok()?;
 
-        // Get PPID (field 4 after comm)
-        let comm_end = content.rfind(')')?;
-        let after_comm = content.get(comm_end + 2..)?;
-        let fields: Vec<&str> = after_comm.split_whitespace().collect();
-        let ppid: u32 = fields.first()?.parse().ok()?;
+            // Get PPID (field 4 after comm)
+            let comm_end = content.rfind(')')?;
+            let after_comm = content.get(comm_end + 2..)?;
+            let fields: Vec<&str> = after_comm.split_whitespace().collect();
+            let ppid: u32 = fields.first()?.parse().ok()?;
 
-        // Get parent's comm
-        let parent_comm_path = format!("/proc/{ppid}/comm");
-        std::fs::read_to_string(&parent_comm_path)
-            .ok()
-            .map(|s| s.trim().to_string())
+            // Get parent's comm
+            let parent_comm_path = format!("/proc/{ppid}/comm");
+            std::fs::read_to_string(&parent_comm_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.get_macos_proc_info(pid).and_then(|info| {
+                let ppid = info.kp_eproc.e_ppid as u32;
+                self.read_comm(ppid)
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            None
+        }
     }
 
     /// Check if process is managed by a known supervisor.
-    ///
-    /// Returns detailed supervisor info including unit metadata and recommended actions.
     fn is_supervisor_managed(&self, pid: u32) -> Option<SupervisorInfo> {
         // First check for non-systemd supervisors via parent comm
         if let Some(ppid_comm) = self.get_ppid_comm(pid) {
@@ -593,30 +807,50 @@ impl LivePreCheckProvider {
             }
         }
 
-        // Try to get systemd unit info with full metadata
-        let cgroup_unit = self.extract_cgroup_unit(pid);
-        if let Some(unit) = collect_systemd_unit(pid, cgroup_unit.as_deref()) {
-            // Filter out slice-only units (e.g., user.slice) - these aren't real supervision
-            if unit.unit_type == SystemdUnitType::Slice {
-                trace!(pid, unit_name = %unit.name, "ignoring slice-only unit");
-                return None;
+        // Try to get systemd unit info with full metadata (Linux only)
+        #[cfg(target_os = "linux")]
+        {
+            let cgroup_unit = self.extract_cgroup_unit(pid);
+            if let Some(unit) = collect_systemd_unit(pid, cgroup_unit.as_deref()) {
+                // Filter out slice-only units (e.g., user.slice) - these aren't real supervision
+                if unit.unit_type == SystemdUnitType::Slice {
+                    trace!(pid, unit_name = %unit.name, "ignoring slice-only unit");
+                    return None;
+                }
+
+                debug!(
+                    pid,
+                    unit_name = %unit.name,
+                    unit_type = ?unit.unit_type,
+                    is_main = unit.is_main_process,
+                    "detected systemd unit"
+                );
+
+                return Some(SupervisorInfo::from_systemd_unit(unit, pid));
             }
+        }
 
-            debug!(
-                pid,
-                unit_name = %unit.name,
-                unit_type = ?unit.unit_type,
-                is_main = unit.is_main_process,
-                "detected systemd unit"
-            );
-
-            return Some(SupervisorInfo::from_systemd_unit(unit, pid));
+        // Check for launchd (macOS only)
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(launchd_service) = crate::collect::macos::detect_launchd_service(pid) {
+                return Some(SupervisorInfo {
+                    supervisor: "launchd".to_string(),
+                    unit_name: Some(launchd_service.label),
+                    unit_type: None,
+                    is_main_process: true, // If detect_launchd_service returns it, it's the main process
+                    recommended_action: SupervisorAction::StopUnit {
+                        command: "launchctl stop".to_string(),
+                    },
+                });
+            }
         }
 
         None
     }
 
-    /// Extract the cgroup unit name from /proc/PID/cgroup.
+    /// Extract the cgroup unit name (Linux only).
+    #[cfg(target_os = "linux")]
     fn extract_cgroup_unit(&self, pid: u32) -> Option<String> {
         let cgroup_path = format!("/proc/{pid}/cgroup");
         let content = std::fs::read_to_string(&cgroup_path).ok()?;
@@ -636,9 +870,32 @@ impl LivePreCheckProvider {
 
         None
     }
+
+    #[cfg(target_os = "macos")]
+    fn get_macos_proc_info(&self, pid: u32) -> Option<libc::kinfo_proc> {
+        let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as i32];
+        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::kinfo_proc>();
+
+        let result = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                name.len() as u32,
+                &mut info as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+
+        if result == 0 && size > 0 {
+            Some(info)
+        } else {
+            None
+        }
+    }
 }
 
-#[cfg(target_os = "linux")]
 impl PreCheckProvider for LivePreCheckProvider {
     fn check_not_protected(&self, pid: u32) -> PreCheckResult {
         trace!(pid, "checking protection status");
@@ -901,7 +1158,7 @@ impl PreCheckProvider for LivePreCheckProvider {
     fn check_process_state(&self, pid: u32) -> PreCheckResult {
         trace!(pid, "checking process state for kill viability");
 
-        // Read current process state from /proc
+        // Read current process state
         let state = match self.read_process_state(pid) {
             Some(s) => s,
             None => {
@@ -923,6 +1180,7 @@ impl PreCheckProvider for LivePreCheckProvider {
         }
 
         // Check for D-state (uninterruptible sleep) - kill may not work
+        #[cfg(target_os = "linux")]
         if state.is_disksleep() {
             let wchan = self.read_wchan(pid);
             let wchan_info = wchan
@@ -968,6 +1226,10 @@ impl PreCheckProvider for NoopPreCheckProvider {
     }
 
     fn check_session_safety(&self, _pid: u32, _sid: Option<u32>) -> PreCheckResult {
+        PreCheckResult::Passed
+    }
+
+    fn check_process_state(&self, _pid: u32) -> PreCheckResult {
         PreCheckResult::Passed
     }
 }

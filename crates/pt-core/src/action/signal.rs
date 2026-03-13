@@ -84,7 +84,7 @@ impl SignalActionRunner {
 
         let err = std::io::Error::last_os_error();
         match err.raw_os_error() {
-            Some(libc::ESRCH) => Err(ActionError::Failed("process not found".to_string())),
+            Some(libc::ESRCH) => Err(ActionError::ProcessNotFound),
             Some(libc::EPERM) => Err(ActionError::PermissionDenied),
             Some(libc::EINVAL) => Err(ActionError::Failed("invalid signal".to_string())),
             _ => Err(ActionError::Failed(err.to_string())),
@@ -103,7 +103,7 @@ impl SignalActionRunner {
         err.raw_os_error() == Some(libc::EPERM)
     }
 
-    /// Get process state from /proc/[pid]/stat.
+    /// Get process state.
     #[cfg(target_os = "linux")]
     fn get_process_state(&self, pid: u32) -> Option<char> {
         let stat_path = format!("/proc/{pid}/stat");
@@ -114,12 +114,27 @@ impl SignalActionRunner {
         after_comm.chars().next()
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn get_process_state(&self, pid: u32) -> Option<char> {
+        self.get_macos_proc_info(pid).map(|info| {
+            // macOS state mapping from sysctl:
+            // SIDL=1, SRUN=2, SSLEEP=3, SSTOP=4, SZOMB=5
+            match info.kp_proc.p_stat {
+                4 => 'T', // Stopped
+                5 => 'Z', // Zombie
+                2 => 'R', // Running
+                3 => 'S', // Sleeping
+                _ => '?',
+            }
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn get_process_state(&self, _pid: u32) -> Option<char> {
         None
     }
 
-    /// Read the starttime field from /proc/[pid]/stat for PID-reuse detection.
+    /// Read the starttime field for PID-reuse detection.
     #[cfg(target_os = "linux")]
     fn read_starttime(&self, pid: u32) -> Option<u64> {
         let stat_path = format!("/proc/{pid}/stat");
@@ -129,6 +144,36 @@ impl SignalActionRunner {
         let fields: Vec<&str> = after_comm.split_whitespace().collect();
         // Field 19 (0-indexed from after comm) is starttime
         fields.get(19)?.parse::<u64>().ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_starttime(&self, pid: u32) -> Option<u64> {
+        self.get_macos_proc_info(pid)
+            .map(|info| info.kp_proc.p_starttime.tv_sec as u64)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn get_macos_proc_info(&self, pid: u32) -> Option<libc::kinfo_proc> {
+        let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as i32];
+        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::kinfo_proc>();
+
+        let result = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                name.len() as u32,
+                &mut info as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+
+        if result == 0 && size > 0 {
+            Some(info)
+        } else {
+            None
+        }
     }
 
     /// Wait for a process to reach a target state or exit.
@@ -204,14 +249,12 @@ impl SignalActionRunner {
         // TOCTOU window: the process may have exited and its PID may have been
         // reused between the grace-period timeout and the SIGKILL below.
         // Re-validate the starttime to guard against killing a replacement process.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self.process_exists(pid) {
             if let Some(current_starttime) = self.read_starttime(pid) {
                 let start_id = &action.target.start_id.0;
                 if !ids_match_starttime(start_id, current_starttime) {
-                    return Err(ActionError::Failed(
-                        "PID reuse detected before SIGKILL; aborting".to_string(),
-                    ));
+                    return Err(ActionError::IdentityMismatch);
                 }
             }
             // If we can't read starttime, the process is likely gone — SIGKILL
@@ -486,8 +529,8 @@ fn ids_match(expected: &str, current: &str) -> bool {
 /// Check whether a start_id string matches a raw starttime value (u64).
 ///
 /// Used for lightweight revalidation where we have the numeric starttime
-/// from /proc but the original identity stores a composite start_id string.
-#[cfg(target_os = "linux")]
+/// from the OS but the original identity stores a composite start_id string.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ids_match_starttime(start_id: &str, current_starttime: u64) -> bool {
     fn extract_starttime(id: &str) -> Option<u64> {
         let parts: Vec<&str> = id.split(':').collect();
@@ -500,7 +543,20 @@ fn ids_match_starttime(start_id: &str, current_starttime: u64) -> bool {
     }
 
     if let Some(expected) = extract_starttime(start_id) {
-        expected.abs_diff(current_starttime) <= 150
+        #[cfg(target_os = "linux")]
+        {
+            // Linux ticks (usually 100Hz) - allow 1.5s jitter
+            expected.abs_diff(current_starttime) <= 150
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS starttime is in seconds - allow 2s jitter
+            expected.abs_diff(current_starttime) <= 2
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            expected == current_starttime
+        }
     } else {
         false
     }

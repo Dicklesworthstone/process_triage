@@ -564,9 +564,11 @@ impl ToolRunner {
             let mut did_read = false;
 
             // Try to read stdout
+            let mut stdout_eof = false;
             if let Some(ref mut out) = stdout {
-                if let Ok(n) = try_read_nonblocking(out, &mut chunk) {
-                    if n > 0 {
+                match try_read_nonblocking(out, &mut chunk) {
+                    Ok(0) => stdout_eof = true,
+                    Ok(n) => {
                         did_read = true;
                         let space = max_output.saturating_sub(stdout_buf.len());
                         if space > 0 {
@@ -579,13 +581,20 @@ impl ToolRunner {
                             truncated = true;
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => stdout_eof = true, // Treat other errors as EOF
                 }
+            }
+            if stdout_eof {
+                stdout = None;
             }
 
             // Try to read stderr
+            let mut stderr_eof = false;
             if let Some(ref mut err) = stderr {
-                if let Ok(n) = try_read_nonblocking(err, &mut chunk) {
-                    if n > 0 {
+                match try_read_nonblocking(err, &mut chunk) {
+                    Ok(0) => stderr_eof = true,
+                    Ok(n) => {
                         did_read = true;
                         let space = max_output.saturating_sub(stderr_buf.len());
                         if space > 0 {
@@ -598,7 +607,12 @@ impl ToolRunner {
                             truncated = true;
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => stderr_eof = true, // Treat other errors as EOF
                 }
+            }
+            if stderr_eof {
+                stderr = None;
             }
 
             // Check if process has exited
@@ -786,12 +800,7 @@ fn try_read_nonblocking<R: Read + std::os::unix::io::AsRawFd>(
         }
     }
 
-    // Convert EAGAIN/EWOULDBLOCK to Ok(0)
-    match result {
-        Ok(n) => Ok(n),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
-        Err(e) => Err(e),
-    }
+    result
 }
 
 /// Non-blocking read fallback for non-Unix platforms.

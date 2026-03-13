@@ -587,16 +587,33 @@ pub fn collect_environ(pid: u32) -> Option<HashMap<String, String>> {
     // Parse environment variables from command line
     // macOS ps -E appends environment to command
     let mut environ = HashMap::new();
+    let mut current_key = None;
+    let mut current_value = String::new();
 
     for part in stdout.split_whitespace() {
         if let Some(eq_pos) = part.find('=') {
-            let key = &part[..eq_pos];
-            let value = &part[eq_pos + 1..];
+            let key_candidate = &part[..eq_pos];
             // Filter to likely environment variables
-            if key.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
-                environ.insert(key.to_string(), value.to_string());
+            if !key_candidate.is_empty()
+                && key_candidate.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+            {
+                if let Some(k) = current_key.take() {
+                    environ.insert(k, current_value.trim().to_string());
+                }
+                current_key = Some(key_candidate.to_string());
+                current_value = part[eq_pos + 1..].to_string();
+                continue;
             }
         }
+
+        if current_key.is_some() {
+            current_value.push(' ');
+            current_value.push_str(part);
+        }
+    }
+
+    if let Some(k) = current_key {
+        environ.insert(k, current_value.trim().to_string());
     }
 
     if environ.is_empty() {

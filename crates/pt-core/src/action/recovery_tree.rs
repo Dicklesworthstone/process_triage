@@ -1213,27 +1213,44 @@ impl<'a> RecoveryExecutor<'a> {
         RecoverySession::new(pid, start_id, self.max_total_attempts)
     }
 
-    /// Classify a failure from ActionError-like inputs.
-    pub fn classify_failure(&self, error_kind: &str, pid: u32, respawned: bool) -> FailureCategory {
+    /// Classify a failure from ActionStatus.
+    pub fn classify_failure(
+        &self,
+        status: &crate::action::executor::ActionStatus,
+        pid: u32,
+        respawned: bool,
+    ) -> FailureCategory {
         if respawned {
             return FailureCategory::SupervisorConflict;
         }
 
-        match error_kind {
-            "permission_denied" | "PermissionDenied" => FailureCategory::PermissionDenied,
-            "not_found" | "ProcessNotFound" | "NotFound" => FailureCategory::ProcessNotFound,
-            "protected" | "ProcessProtected" => FailureCategory::ProcessProtected,
-            "timeout" | "Timeout" => FailureCategory::Timeout,
-            "identity_mismatch" | "IdentityMismatch" => FailureCategory::IdentityMismatch,
-            "pre_check_blocked" | "PreCheckBlocked" => FailureCategory::PreCheckBlocked,
-            "resource_conflict" | "ResourceConflict" => FailureCategory::ResourceConflict,
-            _ => {
-                // Check if process is in D-state for timeout-like failures
-                if self.checker.check_in_d_state(pid) {
+        match status {
+            crate::action::executor::ActionStatus::PermissionDenied => {
+                FailureCategory::PermissionDenied
+            }
+            crate::action::executor::ActionStatus::ProcessNotFound => {
+                FailureCategory::ProcessNotFound
+            }
+            crate::action::executor::ActionStatus::IdentityMismatch => {
+                FailureCategory::IdentityMismatch
+            }
+            crate::action::executor::ActionStatus::Timeout
+            | crate::action::executor::ActionStatus::Failed => {
+                // Check if process is in D-state for timeout or generic failures
+                if self.checker.check_in_d_state(pid)
+                    || matches!(status, crate::action::executor::ActionStatus::Timeout)
+                {
                     FailureCategory::Timeout
                 } else {
                     FailureCategory::UnexpectedError
                 }
+            }
+            crate::action::executor::ActionStatus::PreCheckBlocked { .. } => {
+                FailureCategory::PreCheckBlocked
+            }
+            crate::action::executor::ActionStatus::Success
+            | crate::action::executor::ActionStatus::Skipped => {
+                FailureCategory::UnexpectedError // Should not be called for success/skip
             }
         }
     }
@@ -1581,19 +1598,19 @@ mod tests {
         let executor = RecoveryExecutor::new(&db, &checker);
 
         assert_eq!(
-            executor.classify_failure("permission_denied", 1234, false),
+            executor.classify_failure(&crate::action::executor::ActionStatus::PermissionDenied, 1234, false),
             FailureCategory::PermissionDenied
         );
         assert_eq!(
-            executor.classify_failure("timeout", 1234, false),
+            executor.classify_failure(&crate::action::executor::ActionStatus::Timeout, 1234, false),
             FailureCategory::Timeout
         );
         assert_eq!(
-            executor.classify_failure("any_error", 1234, true),
+            executor.classify_failure(&crate::action::executor::ActionStatus::Failed, 1234, true),
             FailureCategory::SupervisorConflict
         );
         assert_eq!(
-            executor.classify_failure("unknown", 1234, false),
+            executor.classify_failure(&crate::action::executor::ActionStatus::Failed, 1234, false),
             FailureCategory::UnexpectedError
         );
     }
@@ -1930,26 +1947,34 @@ mod tests {
     }
 
     #[test]
-    fn recovery_executor_classify_process_not_found() {
+    fn test_recovery_executor_classify_process_not_found() {
         let db = RecoveryTreeDatabase::new();
         let checker = NoopRequirementChecker::default();
         let executor = RecoveryExecutor::new(&db, &checker);
         assert_eq!(
-            executor.classify_failure("not_found", 1, false),
+            executor.classify_failure(&crate::action::executor::ActionStatus::ProcessNotFound, 1, false),
             FailureCategory::ProcessNotFound
         );
     }
 
     #[test]
-    fn recovery_executor_classify_protected() {
+    fn test_recovery_executor_classify_protected() {
         let db = RecoveryTreeDatabase::new();
         let checker = NoopRequirementChecker::default();
         let executor = RecoveryExecutor::new(&db, &checker);
         assert_eq!(
-            executor.classify_failure("protected", 1, false),
-            FailureCategory::ProcessProtected
+            executor.classify_failure(
+                &crate::action::executor::ActionStatus::PreCheckBlocked {
+                    check: crate::plan::PreCheck::CheckNotProtected,
+                    reason: "protected".to_string()
+                },
+                1,
+                false
+            ),
+            FailureCategory::PreCheckBlocked
         );
     }
+
 
     // ── RecoveryHint serde ────────────────────────────────────────────
 

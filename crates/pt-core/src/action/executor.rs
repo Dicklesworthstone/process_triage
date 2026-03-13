@@ -25,6 +25,8 @@ pub enum ExecutionError {
 pub enum ActionError {
     #[error("identity mismatch")]
     IdentityMismatch,
+    #[error("process not found")]
+    ProcessNotFound,
     #[error("permission denied")]
     PermissionDenied,
     #[error("timeout")]
@@ -39,6 +41,7 @@ pub enum ActionError {
 pub enum ActionStatus {
     Success,
     IdentityMismatch,
+    ProcessNotFound,
     PermissionDenied,
     Timeout,
     Failed,
@@ -245,6 +248,7 @@ impl<'a> ActionExecutor<'a> {
 fn status_from_error(err: ActionError) -> ActionStatus {
     match err {
         ActionError::IdentityMismatch => ActionStatus::IdentityMismatch,
+        ActionError::ProcessNotFound => ActionStatus::ProcessNotFound,
         ActionError::PermissionDenied => ActionStatus::PermissionDenied,
         ActionError::Timeout => ActionStatus::Timeout,
         ActionError::Failed(_) => ActionStatus::Failed,

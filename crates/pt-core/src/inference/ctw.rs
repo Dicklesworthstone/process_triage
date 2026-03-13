@@ -559,7 +559,12 @@ impl CtwPredictor {
     }
 
     /// Update with a new symbol and return result.
-    pub fn update(&mut self, symbol: usize) -> CtwUpdateResult {
+    pub fn update(&mut self, mut symbol: usize) -> CtwUpdateResult {
+        // Prevent out-of-bounds panics if caller provides an invalid symbol
+        if symbol >= self.config.alphabet_size {
+            symbol = self.config.alphabet_size.saturating_sub(1);
+        }
+
         // Compute predictive probability before update
         let log_prob = self.log_weighted_prob(symbol);
         let log_loss = -log_prob;
