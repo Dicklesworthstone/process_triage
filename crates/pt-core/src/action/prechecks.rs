@@ -16,8 +16,7 @@ use crate::collect::ProcessState;
 use crate::config::policy::{DataLossGates, Guardrails};
 use crate::plan::PreCheck;
 use crate::supervision::session::{SessionAnalyzer, SessionConfig, SessionProtectionType};
-#[cfg(target_os = "linux")]
-use crate::supervision::{detect_supervision, is_human_supervised};
+use crate::supervision::{detect_supervision, is_human_supervised, SupervisorCategory};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
@@ -356,14 +355,7 @@ impl LivePreCheckProvider {
         }
         #[cfg(target_os = "macos")]
         {
-            self.get_macos_proc_info(pid).map(|info| {
-                let comm = unsafe {
-                    std::ffi::CStr::from_ptr(info.kp_proc.p_comm.as_ptr())
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                comm
-            })
+            crate::collect::read_process_snapshot(pid).map(|info| info.comm)
         }
     }
 
@@ -423,32 +415,7 @@ impl LivePreCheckProvider {
         }
         #[cfg(target_os = "macos")]
         {
-            self.get_macos_proc_info(pid)
-                .map(|info| info.kp_eproc.e_ucred.cr_uid)
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_macos_proc_info(&self, pid: u32) -> Option<libc::kinfo_proc> {
-        let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as i32];
-        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::kinfo_proc>();
-
-        let result = unsafe {
-            libc::sysctl(
-                name.as_mut_ptr(),
-                name.len() as u32,
-                &mut info as *mut _ as *mut libc::c_void,
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-
-        if result == 0 && size > 0 {
-            Some(info)
-        } else {
-            None
+            crate::collect::read_process_snapshot(pid).map(|info| info.uid)
         }
     }
 
@@ -511,10 +478,7 @@ impl LivePreCheckProvider {
                 }
             }
 
-            (
-                write_count > self.config.max_open_write_fds,
-                write_count,
-            )
+            (write_count > self.config.max_open_write_fds, write_count)
         }
         #[cfg(target_os = "macos")]
         {
@@ -609,12 +573,15 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "macos")]
         {
             // Use lsof - look for lock status
-            let output = std::process::Command::new("lsof")
-                .args(["-p", &pid.to_string(), "-F", "l"])
-                .output();
+            let output = crate::collect::tool_runner::run_tool(
+                "lsof",
+                &["-p", &pid.to_string(), "-F", "l"],
+                Some(std::time::Duration::from_secs(5)),
+                None,
+            );
 
             if let Ok(out) = output {
-                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stdout = out.stdout_str();
                 for line in stdout.lines() {
                     if line.starts_with('l') && line.len() > 1 {
                         let lock_char = line.chars().nth(1).unwrap_or(' ');
@@ -658,14 +625,9 @@ impl LivePreCheckProvider {
         }
         #[cfg(target_os = "macos")]
         {
-            // Check if controlling terminal is set in sysctl info
-            if let Some(info) = self.get_macos_proc_info(pid) {
-                // p_tdev is the controlling terminal device number
-                // -1 (or usually 0xffffffff in unsigned) means no TTY
-                let tdev = info.kp_eproc.e_tdev;
-                return tdev != -1 && tdev != 0;
-            }
-            false
+            crate::collect::read_process_snapshot(pid)
+                .and_then(|info| info.tty)
+                .is_some()
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -715,18 +677,8 @@ impl LivePreCheckProvider {
         }
         #[cfg(target_os = "macos")]
         {
-            self.get_macos_proc_info(pid).map(|info| {
-                // macOS state mapping from sysctl:
-                // SIDL=1, SRUN=2, SSLEEP=3, SSTOP=4, SZOMB=5
-                match info.kp_proc.p_stat {
-                    1 => ProcessState::Sleeping, // SIDL
-                    2 => ProcessState::Running,  // SRUN
-                    3 => ProcessState::Sleeping, // SSLEEP
-                    4 => ProcessState::Stopped,  // SSTOP
-                    5 => ProcessState::Zombie,   // SZOMB
-                    _ => ProcessState::Unknown,
-                }
-            })
+            crate::collect::read_process_snapshot(pid)
+                .map(|info| ProcessState::from_char(info.state))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -786,10 +738,7 @@ impl LivePreCheckProvider {
         }
         #[cfg(target_os = "macos")]
         {
-            self.get_macos_proc_info(pid).and_then(|info| {
-                let ppid = info.kp_eproc.e_ppid as u32;
-                self.read_comm(ppid)
-            })
+            crate::collect::read_process_snapshot(pid).and_then(|info| self.read_comm(info.ppid))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -834,14 +783,16 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "macos")]
         {
             if let Some(launchd_service) = crate::collect::macos::detect_launchd_service(pid) {
+                let label = launchd_service.label;
                 return Some(SupervisorInfo {
                     supervisor: "launchd".to_string(),
-                    unit_name: Some(launchd_service.label),
+                    unit_name: Some(label.clone()),
                     unit_type: None,
                     is_main_process: true, // If detect_launchd_service returns it, it's the main process
                     recommended_action: SupervisorAction::StopUnit {
-                        command: "launchctl stop".to_string(),
+                        command: format!("launchctl stop {}", label),
                     },
+                    systemd_unit: None,
                 });
             }
         }
@@ -869,30 +820,6 @@ impl LivePreCheckProvider {
         }
 
         None
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_macos_proc_info(&self, pid: u32) -> Option<libc::kinfo_proc> {
-        let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as i32];
-        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::kinfo_proc>();
-
-        let result = unsafe {
-            libc::sysctl(
-                name.as_mut_ptr(),
-                name.len() as u32,
-                &mut info as *mut _ as *mut libc::c_void,
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-
-        if result == 0 && size > 0 {
-            Some(info)
-        } else {
-            None
-        }
     }
 }
 
@@ -1039,7 +966,7 @@ impl PreCheckProvider for LivePreCheckProvider {
                         .unwrap_or_else(|| "unknown supervisor".to_string());
                     let category = result
                         .supervisor_type
-                        .map(|t| t.to_string())
+                        .map(|t: SupervisorCategory| t.to_string())
                         .unwrap_or_else(|| "unknown".to_string());
 
                     debug!(
@@ -1539,6 +1466,24 @@ mod tests {
         let reason = info.to_block_reason();
         assert!(reason.contains("systemctl stop"));
         assert!(reason.contains("session-1.scope"));
+    }
+
+    #[test]
+    fn supervisor_info_block_reason_launchd_stop_includes_label() {
+        let info = SupervisorInfo {
+            supervisor: "launchd".to_string(),
+            unit_name: Some("com.example.agent".to_string()),
+            unit_type: None,
+            is_main_process: true,
+            recommended_action: SupervisorAction::StopUnit {
+                command: "launchctl stop com.example.agent".to_string(),
+            },
+            systemd_unit: None,
+        };
+
+        let reason = info.to_block_reason();
+        assert!(reason.contains("launchctl stop com.example.agent"));
+        assert!(reason.contains("com.example.agent"));
     }
 
     #[test]

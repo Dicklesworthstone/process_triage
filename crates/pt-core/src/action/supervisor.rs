@@ -809,10 +809,15 @@ impl SupervisorActionRunner {
             .unwrap_or(&action.unit_identifier);
 
         // Check if unit is active via systemctl
-        let output = Command::new("systemctl").args(["is-active", unit]).output();
+        let output = crate::collect::tool_runner::run_tool(
+            "systemctl",
+            &["is-active", unit],
+            Some(Duration::from_secs(5)),
+            None,
+        );
 
         if let Ok(output) = output {
-            let status = String::from_utf8_lossy(&output.stdout);
+            let status = output.stdout_str();
             status.trim() == "active"
         } else {
             false
@@ -834,14 +839,19 @@ impl SupervisorActionRunner {
         // launchctl list <label> returns info about a specific service
         // Output is a property list dictionary.
         // If the service is running, it will contain a "PID" key.
-        let output = Command::new("launchctl").args(["list", label]).output();
+        let output = crate::collect::tool_runner::run_tool(
+            "launchctl",
+            &["list", label],
+            Some(Duration::from_secs(5)),
+            None,
+        );
 
         if let Ok(output) = output {
-            if !output.status.success() {
+            if !output.success() {
                 // Service not found or not loaded
                 return false;
             }
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = output.stdout_str();
             // Search for "PID" = <number>;
             for line in stdout.lines() {
                 let trimmed = line.trim();
@@ -863,10 +873,15 @@ impl SupervisorActionRunner {
             .unwrap_or(&action.unit_identifier);
 
         // Check pm2 status
-        let output = Command::new("pm2").args(["show", name]).output();
+        let output = crate::collect::tool_runner::run_tool(
+            "pm2",
+            &["show", name],
+            Some(Duration::from_secs(5)),
+            None,
+        );
 
         if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = output.stdout_str();
             stdout.contains("status") && stdout.contains("online")
         } else {
             false
@@ -886,12 +901,15 @@ impl SupervisorActionRunner {
             _ => "docker",
         };
 
-        let output = Command::new(tool)
-            .args(["inspect", "-f", "{{.State.Running}}", container_id])
-            .output();
+        let output = crate::collect::tool_runner::run_tool(
+            tool,
+            &["inspect", "-f", "{{.State.Running}}", container_id],
+            Some(Duration::from_secs(5)),
+            None,
+        );
 
         if let Ok(output) = output {
-            let status = String::from_utf8_lossy(&output.stdout);
+            let status = output.stdout_str();
             status.trim() == "true"
         } else {
             false
@@ -906,12 +924,15 @@ impl SupervisorActionRunner {
             .unwrap_or(&action.unit_identifier);
 
         // Check supervisorctl status
-        let output = Command::new("supervisorctl")
-            .args(["status", program])
-            .output();
+        let output = crate::collect::tool_runner::run_tool(
+            "supervisorctl",
+            &["status", program],
+            Some(Duration::from_secs(5)),
+            None,
+        );
 
         if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = output.stdout_str();
             stdout.contains("RUNNING")
         } else {
             false

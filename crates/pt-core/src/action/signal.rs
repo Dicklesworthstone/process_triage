@@ -116,17 +116,7 @@ impl SignalActionRunner {
 
     #[cfg(target_os = "macos")]
     fn get_process_state(&self, pid: u32) -> Option<char> {
-        self.get_macos_proc_info(pid).map(|info| {
-            // macOS state mapping from sysctl:
-            // SIDL=1, SRUN=2, SSLEEP=3, SSTOP=4, SZOMB=5
-            match info.kp_proc.p_stat {
-                4 => 'T', // Stopped
-                5 => 'Z', // Zombie
-                2 => 'R', // Running
-                3 => 'S', // Sleeping
-                _ => '?',
-            }
-        })
+        crate::collect::read_process_snapshot(pid).map(|info| info.state)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -148,32 +138,7 @@ impl SignalActionRunner {
 
     #[cfg(target_os = "macos")]
     fn read_starttime(&self, pid: u32) -> Option<u64> {
-        self.get_macos_proc_info(pid)
-            .map(|info| info.kp_proc.p_starttime.tv_sec as u64)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn get_macos_proc_info(&self, pid: u32) -> Option<libc::kinfo_proc> {
-        let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as i32];
-        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::kinfo_proc>();
-
-        let result = unsafe {
-            libc::sysctl(
-                name.as_mut_ptr(),
-                name.len() as u32,
-                &mut info as *mut _ as *mut libc::c_void,
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-
-        if result == 0 && size > 0 {
-            Some(info)
-        } else {
-            None
-        }
+        crate::collect::read_process_snapshot(pid).map(|info| info.start_time_unix)
     }
 
     /// Wait for a process to reach a target state or exit.

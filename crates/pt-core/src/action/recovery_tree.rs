@@ -1598,7 +1598,11 @@ mod tests {
         let executor = RecoveryExecutor::new(&db, &checker);
 
         assert_eq!(
-            executor.classify_failure(&crate::action::executor::ActionStatus::PermissionDenied, 1234, false),
+            executor.classify_failure(
+                &crate::action::executor::ActionStatus::PermissionDenied,
+                1234,
+                false
+            ),
             FailureCategory::PermissionDenied
         );
         assert_eq!(
@@ -1952,7 +1956,11 @@ mod tests {
         let checker = NoopRequirementChecker::default();
         let executor = RecoveryExecutor::new(&db, &checker);
         assert_eq!(
-            executor.classify_failure(&crate::action::executor::ActionStatus::ProcessNotFound, 1, false),
+            executor.classify_failure(
+                &crate::action::executor::ActionStatus::ProcessNotFound,
+                1,
+                false
+            ),
             FailureCategory::ProcessNotFound
         );
     }
@@ -1974,7 +1982,6 @@ mod tests {
             FailureCategory::PreCheckBlocked
         );
     }
-
 
     // ── RecoveryHint serde ────────────────────────────────────────────
 
