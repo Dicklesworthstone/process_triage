@@ -325,7 +325,9 @@ fn persist_pending(
     let mut records: Vec<&PendingObservation> = pending.values().collect();
     records.sort_by(|a, b| a.identity_hash.cmp(&b.identity_hash));
     let content = serde_json::to_string_pretty(&records)?;
-    fs::write(path, content)?;
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, content)?;
+    fs::rename(&tmp_path, path)?;
     Ok(())
 }
 

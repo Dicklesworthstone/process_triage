@@ -398,10 +398,7 @@ fn log_lik_runtime(runtime: f64, priors: &ClassParams) -> Result<f64, PosteriorE
             ),
         });
     }
-    let log_pdf = gamma.shape * gamma.rate.ln() + (gamma.shape - 1.0) * runtime.ln()
-        - gamma.rate * runtime
-        - log_gamma(gamma.shape);
-    Ok(log_pdf)
+    Ok(pt_math::gamma_log_pdf(runtime, gamma.shape, gamma.rate))
 }
 
 fn log_lik_beta_bernoulli(

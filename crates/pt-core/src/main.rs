@@ -5042,9 +5042,7 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
         let handle = store
             .create(&manifest)
             .map_err(|e| format!("session create error: {}", e))?;
-        let fleet_json = serde_json::to_string_pretty(&fleet_session)
-            .map_err(|e| format!("serialization error: {}", e))?;
-        std::fs::write(handle.dir.join("fleet.json"), fleet_json)
+        pt_core::session::write_json_pretty(&handle.dir.join("fleet.json"), &fleet_session)
             .map_err(|e| format!("write error: {}", e))?;
         Ok(handle.dir)
     })();
@@ -5617,9 +5615,17 @@ fn write_report_output_file(path: &str, rendered: &str) -> Result<(), String> {
             )
         })?;
     }
-    std::fs::write(&out_path, rendered).map_err(|e| {
+    let temp_path = out_path.with_extension("tmp");
+    std::fs::write(&temp_path, rendered).map_err(|e| {
         format!(
             "failed to write report output {}: {}",
+            temp_path.display(),
+            e
+        )
+    })?;
+    std::fs::rename(&temp_path, &out_path).map_err(|e| {
+        format!(
+            "failed to rename temp file to {}: {}",
             out_path.display(),
             e
         )
@@ -8394,7 +8400,7 @@ fn run_shadow_report(global: &GlobalOpts, args: &ShadowReportArgs) -> ExitCode {
         };
 
         let wrote_file = if let Some(ref path) = args.output {
-            if let Err(err) = std::fs::write(path, &report_output) {
+            if let Err(err) = write_report_output_file(path, &report_output) {
                 eprintln!("shadow report: failed to write {}: {}", path, err);
                 return ExitCode::IoError;
             }
@@ -8450,7 +8456,7 @@ fn run_shadow_report(global: &GlobalOpts, args: &ShadowReportArgs) -> ExitCode {
     let ascii_report = report.ascii_report(60, 14);
 
     let wrote_file = if let Some(ref path) = args.output {
-        if let Err(err) = std::fs::write(path, &ascii_report) {
+        if let Err(err) = write_report_output_file(path, &ascii_report) {
             eprintln!("shadow report: failed to write {}: {}", path, err);
             return ExitCode::IoError;
         }
@@ -13645,7 +13651,7 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         return ExitCode::IoError;
     }
     let verify_path = verify_dir.join("verifications.json");
-    if let Err(e) = std::fs::write(&verify_path, serde_json::to_string_pretty(&report).unwrap()) {
+    if let Err(e) = pt_core::session::write_json_pretty(&verify_path, &report) {
         eprintln!(
             "agent verify: failed to write {}: {}",
             verify_path.display(),

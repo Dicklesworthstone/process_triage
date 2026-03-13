@@ -227,7 +227,14 @@ impl BundleWriter {
     pub fn write_encrypted(self, path: &Path, passphrase: &str) -> Result<BundleManifest> {
         let (bytes, manifest) = self.write_to_vec()?;
         let encrypted = encryption::encrypt_bytes(&bytes, passphrase)?;
-        std::fs::write(path, encrypted)?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("ptb.tmp");
+        std::fs::write(&tmp_path, encrypted)?;
+        std::fs::rename(&tmp_path, path)?;
+
         Ok(manifest)
     }
 

@@ -6,7 +6,6 @@
 use crate::collect::{ProcessRecord, ScanResult};
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -147,20 +146,31 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
     let start = std::time::Instant::now();
 
     let args = build_ssh_args(host, config);
+    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let timeout = Duration::from_secs(config.command_timeout);
 
-    let child = match Command::new("ssh").args(&args).output() {
+    let output = match crate::collect::tool_runner::run_tool("ssh", &args_ref, Some(timeout), None)
+    {
         Ok(output) => output,
+        Err(crate::collect::tool_runner::ToolError::CommandNotFound(_)) => {
+            return HostScanResult {
+                host: host.to_string(),
+                success: false,
+                scan: None,
+                error: Some("ssh binary not found".to_string()),
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+        Err(crate::collect::tool_runner::ToolError::Timeout(_)) => {
+            return HostScanResult {
+                host: host.to_string(),
+                success: false,
+                scan: None,
+                error: Some(format!("timed out after {}s", config.command_timeout)),
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
         Err(e) => {
-            if e.kind() == io::ErrorKind::NotFound {
-                return HostScanResult {
-                    host: host.to_string(),
-                    success: false,
-                    scan: None,
-                    error: Some(format!("ssh binary not found: {}", e)),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                };
-            }
             return HostScanResult {
                 host: host.to_string(),
                 success: false,
@@ -173,20 +183,9 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    // Check for timeout (approximate — Command::output blocks)
-    if duration_ms > timeout.as_millis() as u64 {
-        return HostScanResult {
-            host: host.to_string(),
-            success: false,
-            scan: None,
-            error: Some(format!("timed out after {}s", config.command_timeout)),
-            duration_ms,
-        };
-    }
-
-    if !child.status.success() {
-        let stderr = String::from_utf8_lossy(&child.stderr);
-        let code = child.status.code().unwrap_or(-1);
+    if !output.success() {
+        let stderr = output.stderr_str();
+        let code = output.exit_code.unwrap_or(-1);
         return HostScanResult {
             host: host.to_string(),
             success: false,
@@ -196,7 +195,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
         };
     }
 
-    let stdout = String::from_utf8_lossy(&child.stdout);
+    let stdout = output.stdout_str();
 
     // Parse the JSON output
     match serde_json::from_str::<RemoteScanOutput>(&stdout) {

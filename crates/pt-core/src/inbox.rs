@@ -344,7 +344,12 @@ impl InboxStore {
             content.push('\n');
         }
 
-        fs::write(&self.inbox_path, content).map_err(|e| InboxError::Io {
+        let tmp_path = self.inbox_path.with_extension("tmp");
+        fs::write(&tmp_path, content).map_err(|e| InboxError::Io {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+        fs::rename(&tmp_path, &self.inbox_path).map_err(|e| InboxError::Io {
             path: self.inbox_path.clone(),
             source: e,
         })?;

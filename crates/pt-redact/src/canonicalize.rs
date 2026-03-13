@@ -323,6 +323,9 @@ mod tests {
         let canon = Canonicalizer::new();
         let result = canon.canonicalize("test_1234");
         assert_eq!(result, "test_[N]");
+
+        let result = canon.canonicalize("v1.2.3 and python3.11");
+        assert_eq!(result, "v1.[N].[N] and python3.[N]");
     }
 
     #[test]

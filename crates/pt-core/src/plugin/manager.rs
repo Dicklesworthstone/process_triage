@@ -505,15 +505,35 @@ fn invoke_subprocess(
         .spawn()
         .map_err(|e| format!("failed to spawn: {e}"))?;
 
-    // Write stdin (BrokenPipe is acceptable if the plugin exits without reading input)
-    if let Some(mut stdin) = child.stdin.take() {
-        match stdin.write_all(stdin_data) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => return Err(format!("failed to write stdin: {e}")),
+    // Use threads to prevent deadlocks caused by full pipe buffers
+    let mut stdin_pipe = child.stdin.take();
+    let stdin_data_owned = stdin_data.to_vec();
+    let stdin_thread = std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin_pipe.take() {
+            let _ = stdin.write_all(&stdin_data_owned);
+            // stdin is dropped here, closing the pipe
         }
-        // stdin is dropped here, closing the pipe
-    }
+    });
+
+    let mut stdout_pipe = child.stdout.take();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stdout) = stdout_pipe.take() {
+            use std::io::Read;
+            let _ = stdout.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let mut stderr_pipe = child.stderr.take();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut stderr) = stderr_pipe.take() {
+            use std::io::Read;
+            let _ = stderr.read_to_end(&mut buf);
+        }
+        buf
+    });
 
     // Poll for completion with timeout
     let timeout = Duration::from_millis(timeout_ms);
@@ -524,9 +544,10 @@ fn invoke_subprocess(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Threads might leak if grandchildren hold pipes open, but this is a fatal timeout anyway
                     return Err(format!("timed out after {}ms", timeout_ms));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => return Err(format!("wait failed: {e}")),
         }
@@ -534,24 +555,18 @@ fn invoke_subprocess(
 
     let duration = start.elapsed();
 
+    // Wait for threads to finish
+    let _ = stdin_thread.join();
+    let mut stdout = stdout_thread.join().unwrap_or_default();
+    let stderr_buf = stderr_thread.join().unwrap_or_default();
+
     if !status.success() {
-        let mut stderr_buf = Vec::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            use std::io::Read;
-            let _ = stderr.read_to_end(&mut stderr_buf);
-        }
         let stderr = String::from_utf8_lossy(&stderr_buf);
         let code = status.code().unwrap_or(-1);
         return Err(format!(
             "exited with code {code}: {}",
             stderr.chars().take(500).collect::<String>()
         ));
-    }
-
-    let mut stdout = Vec::new();
-    if let Some(mut stdout_pipe) = child.stdout.take() {
-        use std::io::Read;
-        let _ = stdout_pipe.read_to_end(&mut stdout);
     }
 
     let original_len = stdout.len();

@@ -8,7 +8,6 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -246,13 +245,16 @@ fn is_executable(path: &Path) -> bool {
 
 /// Check for GitHub Copilot CLI extension.
 fn check_copilot_extension() -> Option<(bool, String)> {
-    let output = Command::new("gh")
-        .args(["extension", "list"])
-        .output()
-        .ok()?;
+    let output = crate::collect::tool_runner::run_tool(
+        "gh",
+        &["extension", "list"],
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    )
+    .ok()?;
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.success() {
+        let stdout = output.stdout_str();
         if stdout.contains("copilot") {
             Some((true, "Copilot extension installed".to_string()))
         } else {
@@ -276,13 +278,11 @@ fn get_agent_version(agent_type: &AgentType) -> Option<String> {
         AgentType::Windsurf => ("windsurf", &["--version"]),
     };
 
-    Command::new(cmd)
-        .args(args)
-        .output()
+    crate::collect::tool_runner::run_tool(cmd, args, Some(std::time::Duration::from_secs(2)), None)
         .ok()
         .and_then(|output| {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
+            if output.success() {
+                let stdout = output.stdout_str();
                 // Take first line, trim whitespace
                 stdout.lines().next().map(|l| l.trim().to_string())
             } else {

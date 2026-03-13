@@ -380,7 +380,9 @@ alias pt-verify 'pt agent verify'
         return Err(ConfigError::DryRun);
     }
 
-    fs::write(&suggestion_path, content)?;
+    let tmp_path = suggestion_path.with_extension("tmp");
+    fs::write(&tmp_path, content)?;
+    fs::rename(&tmp_path, &suggestion_path)?;
     changes.push("Created Copilot integration guide".to_string());
 
     Ok(ConfigResult {

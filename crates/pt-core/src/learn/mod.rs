@@ -236,8 +236,13 @@ pub fn save_progress(config_dir: &Path, progress: &LearnProgress) -> Result<Path
         source,
     })?;
     let path = progress_path(config_dir);
+    let tmp_path = path.with_extension("tmp");
     let serialized = serde_json::to_string_pretty(progress).expect("progress serialization");
-    std::fs::write(&path, serialized).map_err(|source| LearnError::Io {
+    std::fs::write(&tmp_path, serialized).map_err(|source| LearnError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp_path, &path).map_err(|source| LearnError::Io {
         path: path.clone(),
         source,
     })?;

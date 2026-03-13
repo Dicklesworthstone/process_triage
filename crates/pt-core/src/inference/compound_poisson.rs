@@ -875,15 +875,24 @@ impl CompoundPoissonAnalyzer {
             counts[idx] += 1.0;
         }
 
-        // Compute mean and variance
-        let mean: f64 = counts.iter().sum::<f64>() / num_windows as f64;
+        // Compute mean and variance using Welford's algorithm for stability
+        let mut count = 0.0;
+        let mut mean = 0.0;
+        let mut m2 = 0.0;
+
+        for &x in &counts {
+            count += 1.0;
+            let delta = x - mean;
+            mean += delta / count;
+            let delta2 = x - mean;
+            m2 += delta * delta2;
+        }
+
         if mean <= 0.0 {
             return 1.0;
         }
 
-        let variance: f64 =
-            counts.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / num_windows as f64;
-
+        let variance = m2 / num_windows as f64;
         variance / mean
     }
 

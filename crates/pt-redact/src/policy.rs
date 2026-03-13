@@ -194,7 +194,13 @@ impl RedactionPolicy {
     /// Save policy to a file.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> crate::Result<()> {
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, content)?;
+        std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
 

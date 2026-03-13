@@ -273,7 +273,9 @@ pub fn run_signature(format: &OutputFormat, args: &SignatureArgs) -> ExitCode {
             dry_run,
             passphrase,
         } => run_signature_import(format, input, *dry_run, passphrase.as_deref()),
-        SignatureCommands::Stats { min_matches, sort } => run_signature_stats(format, *min_matches, sort),
+        SignatureCommands::Stats { min_matches, sort } => {
+            run_signature_stats(format, *min_matches, sort)
+        }
     }
 }
 
