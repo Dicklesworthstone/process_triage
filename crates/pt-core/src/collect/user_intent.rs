@@ -353,10 +353,12 @@ impl Default for UserIntentConfig {
 impl UserIntentConfig {
     /// Get the weight for a signal type (custom or default).
     pub fn weight_for(&self, signal: IntentSignalType) -> f64 {
-        self.custom_weights
-            .get(&signal)
-            .copied()
-            .unwrap_or_else(|| signal.default_weight())
+        normalize_intent_weight(
+            self.custom_weights
+                .get(&signal)
+                .copied()
+                .unwrap_or_else(|| signal.default_weight()),
+        )
     }
 }
 
@@ -818,21 +820,28 @@ fn compute_intent_score(evidence: &[IntentEvidence], config: &UserIntentConfig) 
         return 0.0;
     }
 
+    let normalized_weights = evidence.iter().map(|e| normalize_intent_weight(e.weight));
+
     match config.scoring_method {
-        ScoringMethod::MaxWeight => evidence
-            .iter()
-            .map(|e| e.weight)
-            .fold(0.0f64, |a, b| a.max(b)),
+        ScoringMethod::MaxWeight => normalized_weights.fold(0.0f64, |a, b| a.max(b)),
         ScoringMethod::WeightedAverage => {
-            let sum: f64 = evidence.iter().map(|e| e.weight).sum();
-            sum / evidence.len() as f64
+            let sum: f64 = normalized_weights.sum();
+            (sum / evidence.len() as f64).clamp(0.0, 1.0)
         }
         ScoringMethod::Probabilistic => {
             // P(at least one intent) = 1 - P(no intent)
             // P(no intent) = product of (1 - weight) for each signal
-            let no_intent_prob: f64 = evidence.iter().map(|e| 1.0 - e.weight).product();
-            1.0 - no_intent_prob
+            let no_intent_prob: f64 = normalized_weights.map(|weight| 1.0 - weight).product();
+            (1.0 - no_intent_prob).clamp(0.0, 1.0)
         }
+    }
+}
+
+fn normalize_intent_weight(weight: f64) -> f64 {
+    if weight.is_finite() {
+        weight.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -920,6 +929,55 @@ mod tests {
         let evidence: Vec<IntentEvidence> = vec![];
         let config = UserIntentConfig::default();
         assert_eq!(compute_intent_score(&evidence, &config), 0.0);
+    }
+
+    #[test]
+    fn test_custom_weight_is_clamped() {
+        let mut config = UserIntentConfig::default();
+        config
+            .custom_weights
+            .insert(IntentSignalType::ActiveTty, 1.5);
+        config
+            .custom_weights
+            .insert(IntentSignalType::TmuxSession, -0.25);
+        config
+            .custom_weights
+            .insert(IntentSignalType::SshSession, f64::NAN);
+
+        assert_eq!(config.weight_for(IntentSignalType::ActiveTty), 1.0);
+        assert_eq!(config.weight_for(IntentSignalType::TmuxSession), 0.0);
+        assert_eq!(config.weight_for(IntentSignalType::SshSession), 0.0);
+    }
+
+    #[test]
+    fn test_probabilistic_score_is_clamped_for_invalid_evidence_weights() {
+        let evidence = vec![
+            IntentEvidence {
+                signal_type: IntentSignalType::ActiveTty,
+                weight: 1.5,
+                description: "too high".to_string(),
+                metadata: None,
+            },
+            IntentEvidence {
+                signal_type: IntentSignalType::TmuxSession,
+                weight: -0.25,
+                description: "too low".to_string(),
+                metadata: None,
+            },
+            IntentEvidence {
+                signal_type: IntentSignalType::SshSession,
+                weight: f64::NAN,
+                description: "not a number".to_string(),
+                metadata: None,
+            },
+        ];
+
+        let config = UserIntentConfig {
+            scoring_method: ScoringMethod::Probabilistic,
+            ..Default::default()
+        };
+
+        assert_eq!(compute_intent_score(&evidence, &config), 1.0);
     }
 
     #[test]

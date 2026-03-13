@@ -20,6 +20,7 @@
 //! # Platform Support
 //! This module only compiles on macOS (target_os = "macos").
 
+use super::tool_runner::run_tool;
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
 use pt_common::{IdentityQuality, ProcessId, StartId};
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{debug, trace, warn};
+use tracing::debug;
+
+/// Minimal per-process snapshot from `ps` for action-time checks on macOS.
+#[derive(Debug, Clone)]
+pub struct MacOsPsSnapshot {
+    pub uid: u32,
+    pub ppid: u32,
+    pub state: char,
+    pub tty: Option<String>,
+    pub elapsed: Duration,
+    pub start_time_unix: u64,
+    pub comm: String,
+}
 
 // ============================================================================
 // SIP Detection
@@ -62,9 +75,9 @@ impl Default for SipStatus {
 /// - `SipStatus::CustomConfiguration` if SIP is partially enabled
 /// - `SipStatus::Unknown` if detection fails
 pub fn detect_sip_status() -> SipStatus {
-    match Command::new("csrutil").arg("status").output() {
+    match crate::collect::tool_runner::run_tool("csrutil", &["status"], Some(std::time::Duration::from_secs(2)), None) {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = output.stdout_str();
             parse_csrutil_output(&stdout)
         }
         Err(e) => {
@@ -120,32 +133,23 @@ impl MacOsCapabilities {
     /// Detect available capabilities on this system.
     pub fn detect() -> Self {
         let sip_status = detect_sip_status();
-        let lsof_available = Command::new("lsof")
-            .arg("-v")
-            .output()
-            .map(|o| o.status.success() || !o.stderr.is_empty())
+        let lsof_available = crate::collect::tool_runner::run_tool("lsof", &["-v"], Some(std::time::Duration::from_secs(2)), None)
+            .map(|o| o.success() || !o.stderr.is_empty())
             .unwrap_or(false);
 
-        let netstat_available = Command::new("netstat")
-            .arg("-h")
-            .output()
+        let netstat_available = crate::collect::tool_runner::run_tool("netstat", &["-h"], Some(std::time::Duration::from_secs(2)), None)
             .map(|_| true)
             .unwrap_or(false);
 
-        let launchctl_available = Command::new("launchctl")
-            .arg("list")
-            .output()
-            .map(|o| o.status.success())
+        let launchctl_available = crate::collect::tool_runner::run_tool("launchctl", &["list"], Some(std::time::Duration::from_secs(2)), None)
+            .map(|o| o.success())
             .unwrap_or(false);
 
         let elevated_privileges = unsafe { libc::geteuid() } == 0;
 
-        let macos_version = Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
+        let macos_version = crate::collect::tool_runner::run_tool("sw_vers", &["-productVersion"], Some(std::time::Duration::from_secs(2)), None)
             .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string());
+            .map(|o| o.stdout_str().trim().to_string());
 
         Self {
             sip_status,
@@ -506,17 +510,24 @@ pub fn collect_lsof_info(
     pid: u32,
     timeout: Duration,
 ) -> Result<(Vec<OpenFile>, Vec<MacOsNetworkConnection>), MacOsScanError> {
-    let output = Command::new("lsof")
-        .args(["-p", &pid.to_string(), "-F", "ftna"])
-        .output()
-        .map_err(|e| MacOsScanError::ToolFailed {
-            tool: "lsof".to_string(),
-            message: e.to_string(),
-        })?;
+    let output = match run_tool(
+        "lsof",
+        &["-p", &pid.to_string(), "-F", "ftna"],
+        Some(timeout),
+        None,
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(MacOsScanError::ToolFailed {
+                tool: "lsof".to_string(),
+                message: e.to_string(),
+            });
+        }
+    };
 
-    if !output.status.success() {
+    if !output.success() {
         // lsof returns non-zero for various reasons (process exited, permission denied)
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = output.stderr_str();
         if stderr.contains("Permission denied") {
             return Err(MacOsScanError::PermissionDenied(pid));
         }
@@ -524,8 +535,7 @@ pub fn collect_lsof_info(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_lsof_output(&stdout))
+    Ok(parse_lsof_output(&output.stdout_str()))
 }
 
 // ============================================================================
@@ -535,13 +545,13 @@ pub fn collect_lsof_info(
 /// Check if a PID is managed by launchd and get service info.
 pub fn detect_launchd_service(pid: u32) -> Option<LaunchdService> {
     // Run `launchctl list` and find the service with matching PID
-    let output = Command::new("launchctl").arg("list").output().ok()?;
+    let output = crate::collect::tool_runner::run_tool("launchctl", &["list"], Some(std::time::Duration::from_secs(5)), None).ok()?;
 
-    if !output.status.success() {
+    if !output.success() {
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_str();
 
     for line in stdout.lines().skip(1) {
         // Skip header
@@ -573,16 +583,19 @@ pub fn detect_launchd_service(pid: u32) -> Option<LaunchdService> {
 ///
 /// Uses `ps -p <pid> -E` on macOS.
 pub fn collect_environ(pid: u32) -> Option<HashMap<String, String>> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-E", "-o", "command="])
-        .output()
-        .ok()?;
+    let output = crate::collect::tool_runner::run_tool(
+        "ps",
+        &["-p", &pid.to_string(), "-E", "-o", "command="],
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    )
+    .ok()?;
 
-    if !output.status.success() {
+    if !output.success() {
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_str();
 
     // Parse environment variables from command line
     // macOS ps -E appends environment to command
@@ -595,7 +608,9 @@ pub fn collect_environ(pid: u32) -> Option<HashMap<String, String>> {
             let key_candidate = &part[..eq_pos];
             // Filter to likely environment variables
             if !key_candidate.is_empty()
-                && key_candidate.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                && key_candidate
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_')
             {
                 if let Some(k) = current_key.take() {
                     environ.insert(k, current_value.trim().to_string());
@@ -621,6 +636,62 @@ pub fn collect_environ(pid: u32) -> Option<HashMap<String, String>> {
     } else {
         Some(environ)
     }
+}
+
+/// Read a minimal process snapshot using `ps`.
+///
+/// This avoids relying on unstable/private Darwin libc process structs while
+/// still giving the action layer enough metadata for safety checks.
+pub fn read_process_snapshot(pid: u32) -> Option<MacOsPsSnapshot> {
+    let output = crate::collect::tool_runner::run_tool(
+        "ps",
+        &[
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "uid=,ppid=,state=,tty=,etime=,comm=",
+        ],
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    )
+    .ok()?;
+
+    if !output.success() {
+        return None;
+    }
+
+    let stdout = output.stdout_str();
+    let line = stdout.lines().find(|line| !line.trim().is_empty())?;
+    parse_process_snapshot_line(line, chrono::Utc::now().timestamp())
+}
+
+fn parse_process_snapshot_line(line: &str, now_unix: i64) -> Option<MacOsPsSnapshot> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 6 {
+        return None;
+    }
+
+    let uid: u32 = fields[0].parse().ok()?;
+    let ppid: u32 = fields[1].parse().ok()?;
+    let state = fields[2].chars().next().unwrap_or('?');
+    let tty = match fields[3] {
+        "?" | "??" | "-" => None,
+        tty => Some(tty.to_string()),
+    };
+    let elapsed_secs = parse_etime_macos(fields[4])?;
+    let elapsed = Duration::from_secs(elapsed_secs);
+    let start_time_unix = now_unix.saturating_sub(elapsed_secs as i64).max(0) as u64;
+    let comm = fields[5..].join(" ");
+
+    Some(MacOsPsSnapshot {
+        uid,
+        ppid,
+        state,
+        tty,
+        elapsed,
+        start_time_unix,
+        comm,
+    })
 }
 
 // ============================================================================
@@ -671,7 +742,7 @@ pub fn macos_scan(options: &MacOsScanOptions) -> Result<MacOsScanResult, MacOsSc
     let scanned = AtomicUsize::new(0);
     const PROGRESS_STEP: usize = 50;
 
-    for (i, pid) in pids.iter().enumerate() {
+    for pid in &pids {
         let Some(base) = base_info.get(pid) else {
             // Process may have exited
             skipped_count += 1;
@@ -801,19 +872,20 @@ struct BaseProcessInfo {
 
 /// List all PIDs on macOS using ps.
 fn list_all_pids_macos() -> Result<Vec<u32>, MacOsScanError> {
-    let output = Command::new("ps")
-        .args(["-eo", "pid"])
-        .output()
-        .map_err(|e| MacOsScanError::IoError(e))?;
+    let output = crate::collect::tool_runner::run_tool("ps", &["-eo", "pid"], Some(std::time::Duration::from_secs(10)), None)
+        .map_err(|e| MacOsScanError::ToolFailed {
+            tool: "ps".to_string(),
+            message: e.to_string(),
+        })?;
 
-    if !output.status.success() {
+    if !output.success() {
         return Err(MacOsScanError::ToolFailed {
             tool: "ps".to_string(),
             message: "Failed to list processes".to_string(),
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_str();
     let mut pids = Vec::new();
 
     for line in stdout.lines().skip(1) {
@@ -831,22 +903,40 @@ fn collect_base_process_info(
     pids: &[u32],
 ) -> Result<HashMap<u32, BaseProcessInfo>, MacOsScanError> {
     // Use ps with BSD format to get all needed fields
-    let output = Command::new("ps")
-        .args([
-            "-eo",
-            "pid,ppid,uid,user,pgid,sess,state,%cpu,rss,vsz,lstart,etime,comm,args",
-        ])
-        .output()
-        .map_err(|e| MacOsScanError::IoError(e))?;
+    let mut args = vec![
+        "-eo".to_string(),
+        "pid,ppid,uid,user,pgid,sess,state,%cpu,rss,vsz,lstart,etime,comm,args".to_string(),
+    ];
 
-    if !output.status.success() {
+    if !pids.is_empty() {
+        let pid_list = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        args.push("-p".to_string());
+        args.push(pid_list);
+    }
+
+    let output = crate::collect::tool_runner::run_tool(
+        "ps",
+        &args.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
+        Some(std::time::Duration::from_secs(10)),
+        None,
+    )
+    .map_err(|e| MacOsScanError::ToolFailed {
+        tool: "ps".to_string(),
+        message: e.to_string(),
+    })?;
+
+    if !output.success() {
         return Err(MacOsScanError::ToolFailed {
             tool: "ps".to_string(),
             message: "Failed to get process info".to_string(),
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_str();
     let mut info = HashMap::new();
 
     for line in stdout.lines().skip(1) {
@@ -1017,6 +1107,34 @@ mod tests {
             parse_etime_macos("2-12:30:15"),
             Some(2 * 86400 + 12 * 3600 + 30 * 60 + 15)
         );
+    }
+
+    #[test]
+    fn test_parse_process_snapshot_line() {
+        let line = "501 1 Ss ttys001 01:02 bash";
+        let snapshot = parse_process_snapshot_line(line, 1_700_000_000).expect("snapshot");
+
+        assert_eq!(snapshot.uid, 501);
+        assert_eq!(snapshot.ppid, 1);
+        assert_eq!(snapshot.state, 'S');
+        assert_eq!(snapshot.tty.as_deref(), Some("ttys001"));
+        assert_eq!(snapshot.elapsed, Duration::from_secs(62));
+        assert_eq!(snapshot.start_time_unix, 1_699_999_938);
+        assert_eq!(snapshot.comm, "bash");
+    }
+
+    #[test]
+    fn test_parse_process_snapshot_line_without_tty() {
+        let line = "0 1 I ?? 30 launchd";
+        let snapshot = parse_process_snapshot_line(line, 1_700_000_000).expect("snapshot");
+
+        assert_eq!(snapshot.uid, 0);
+        assert_eq!(snapshot.ppid, 1);
+        assert_eq!(snapshot.state, 'I');
+        assert_eq!(snapshot.tty, None);
+        assert_eq!(snapshot.elapsed, Duration::from_secs(30));
+        assert_eq!(snapshot.start_time_unix, 1_699_999_970);
+        assert_eq!(snapshot.comm, "launchd");
     }
 
     #[test]

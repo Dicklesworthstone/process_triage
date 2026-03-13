@@ -148,6 +148,7 @@ pub use incremental::{
 #[cfg(target_os = "macos")]
 pub use macos::{
     collect_environ, collect_lsof_info, detect_launchd_service, detect_sip_status, macos_scan,
-    LaunchdService, MacOsCapabilities, MacOsNetworkConnection, MacOsScanError, MacOsScanMetadata,
-    MacOsScanOptions, MacOsScanRecord, MacOsScanResult, OpenFile, SipStatus,
+    read_process_snapshot, LaunchdService, MacOsCapabilities, MacOsNetworkConnection,
+    MacOsPsSnapshot, MacOsScanError, MacOsScanMetadata, MacOsScanOptions, MacOsScanRecord,
+    MacOsScanResult, OpenFile, SipStatus,
 };

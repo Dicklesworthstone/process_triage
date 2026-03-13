@@ -17,8 +17,9 @@
 
 use super::network::{NetworkInfo, NetworkSnapshot};
 use super::proc_parsers::{
-    parse_cgroup, parse_environ, parse_fd, parse_io, parse_sched, parse_schedstat, parse_statm,
-    parse_wchan, CgroupInfo, FdInfo, IoStats, MemStats, SchedInfo, SchedStats,
+    parse_cgroup, parse_environ, parse_fd, parse_io, parse_proc_cmdline, parse_proc_exe,
+    parse_proc_stat, parse_proc_status, parse_sched, parse_schedstat, parse_statm, parse_wchan,
+    CgroupInfo, FdInfo, IoStats, MemStats, SchedInfo, SchedStats,
 };
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
 use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
@@ -434,45 +435,20 @@ fn scan_process(
     boot_id: &Option<String>,
     network_snapshot: &NetworkSnapshot,
 ) -> Result<DeepScanRecord, DeepScanError> {
-    let proc_path = format!("/proc/{}", pid);
-
     // Parse /proc/[pid]/stat for core info
-    // We read this first; if it fails, the process likely doesn't exist or is inaccessible.
-    let stat_content = match fs::read_to_string(format!("{}/stat", proc_path)) {
-        Ok(c) => c,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                return Err(DeepScanError::ProcessVanished(pid));
-            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                return Err(DeepScanError::PermissionDenied(pid));
-            } else {
-                return Err(DeepScanError::IoError(e));
-            }
-        }
-    };
-
-    let stat_info = parse_stat(&stat_content, pid)?;
+    let stat_info = parse_proc_stat(pid).ok_or(DeepScanError::ProcessVanished(pid))?;
 
     // Parse /proc/[pid]/status for UID and username
-    let status_content = fs::read_to_string(format!("{}/status", proc_path)).ok();
-    let (uid, user, uid_known) = match status_content
-        .as_ref()
-        .and_then(|c| parse_uid_from_status(c, user_cache))
-    {
-        Some((uid, user)) => (uid, user, true),
+    let (uid, user, uid_known) = match parse_proc_status(pid) {
+        Some(status) => (status.euid, user_cache.resolve(status.euid), true),
         None => (0, "unknown".to_string(), false),
     };
 
     // Read cmdline
-    let cmdline = fs::read_to_string(format!("{}/cmdline", proc_path))
-        .ok()
-        .map(|s| s.replace('\0', " ").trim().to_string())
-        .unwrap_or_default();
+    let cmdline = parse_proc_cmdline(pid).unwrap_or_default();
 
     // Read exe symlink
-    let exe = fs::read_link(format!("{}/exe", proc_path))
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
+    let exe = parse_proc_exe(pid);
 
     // Compute identity quality based on available data
     let identity_quality = match (boot_id, stat_info.starttime, uid_known) {
@@ -506,8 +482,8 @@ fn scan_process(
         ppid: ProcessId(stat_info.ppid),
         uid,
         user,
-        pgid: Some(stat_info.pgrp),
-        sid: Some(stat_info.session),
+        pgid: Some(stat_info.pgrp as u32),
+        sid: Some(stat_info.session as u32),
         start_id,
         comm: stat_info.comm,
         cmdline,
@@ -528,88 +504,6 @@ fn scan_process(
     })
 }
 
-/// Parsed info from /proc/[pid]/stat.
-struct StatInfo {
-    comm: String,
-    state: char,
-    ppid: u32,
-    pgrp: u32,
-    session: u32,
-    starttime: u64,
-}
-
-/// Parse /proc/[pid]/stat file.
-///
-/// Format: pid (comm) state ppid pgrp session tty_nr tpgid flags
-///         minflt cminflt majflt cmajflt utime stime cutime cstime
-///         priority nice num_threads itrealvalue starttime ...
-fn parse_stat(content: &str, pid: u32) -> Result<StatInfo, DeepScanError> {
-    // Find comm field (surrounded by parentheses, may contain spaces)
-    let comm_start = content.find('(').ok_or_else(|| DeepScanError::ParseError {
-        pid,
-        message: "Missing comm start".to_string(),
-    })?;
-    let comm_end = content
-        .rfind(')')
-        .ok_or_else(|| DeepScanError::ParseError {
-            pid,
-            message: "Missing comm end".to_string(),
-        })?;
-
-    let comm = content[comm_start + 1..comm_end].to_string();
-
-    // Safely skip ") " after comm - use get() to avoid panic on truncated content
-    let after_comm = content
-        .get(comm_end + 2..)
-        .ok_or_else(|| DeepScanError::ParseError {
-            pid,
-            message: "Stat content truncated after comm".to_string(),
-        })?;
-
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    if fields.len() < 20 {
-        return Err(DeepScanError::ParseError {
-            pid,
-            message: format!("Insufficient stat fields: {}", fields.len()),
-        });
-    }
-
-    let state = fields[0].chars().next().unwrap_or('?');
-    let ppid: u32 = fields[1].parse().unwrap_or(0);
-    let pgrp: u32 = fields[2].parse().unwrap_or(0);
-    let session: u32 = fields[3].parse().unwrap_or(0);
-    let starttime: u64 = fields[19].parse().unwrap_or(0);
-
-    Ok(StatInfo {
-        comm,
-        state,
-        ppid,
-        pgrp,
-        session,
-        starttime,
-    })
-}
-
-/// Parse UID and username from /proc/[pid]/status.
-fn parse_uid_from_status(content: &str, user_cache: &UserCache) -> Option<(u32, String)> {
-    let mut uid = None;
-
-    for line in content.lines() {
-        if line.starts_with("Uid:") {
-            // Format: "Uid:\t1000\t1000\t1000\t1000"
-            // First value is real UID
-            if let Some(uid_str) = line.split_whitespace().nth(1) {
-                if let Ok(val) = uid_str.parse::<u32>() {
-                    uid = Some(val);
-                }
-            }
-            break;
-        }
-    }
-
-    uid.map(|u| (u, user_cache.resolve(u)))
-}
-
 /// Compute start_id from available information.
 fn compute_start_id(boot_id: &Option<String>, starttime: u64, pid: u32) -> StartId {
     let boot = boot_id.as_deref().unwrap_or("unknown");
@@ -619,80 +513,6 @@ fn compute_start_id(boot_id: &Option<String>, starttime: u64, pid: u32) -> Start
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_stat_simple() {
-        let content = "1234 (bash) S 1 1234 1234 0 -1 4194304 1000 0 0 0 10 5 0 0 20 0 1 0 12345 1000000 100 18446744073709551615 0 0 0 0 0 0 0 0 65536 0 0 0 17 0 0 0 0 0 0";
-        let info = parse_stat(content, 1234).unwrap();
-
-        assert_eq!(info.comm, "bash");
-        assert_eq!(info.state, 'S');
-        assert_eq!(info.ppid, 1);
-        assert_eq!(info.pgrp, 1234);
-        assert_eq!(info.session, 1234);
-        assert_eq!(info.starttime, 12345);
-    }
-
-    #[test]
-    fn test_parse_stat_with_spaces_in_comm() {
-        // Some processes have spaces in their command name
-        let content = "5678 (Web Content) S 1234 5678 5678 0 -1 4194304 1000 0 0 0 10 5 0 0 20 0 1 0 54321 2000000 200 18446744073709551615 0 0 0 0 0 0 0 0 65536 0 0 0 17 0 0 0 0 0 0";
-        let info = parse_stat(content, 5678).unwrap();
-
-        assert_eq!(info.comm, "Web Content");
-        assert_eq!(info.state, 'S');
-        assert_eq!(info.ppid, 1234);
-    }
-
-    #[test]
-    fn test_parse_stat_with_parens_in_comm() {
-        // Edge case: command name contains parentheses
-        let content = "9999 (test (v2)) S 1 9999 9999 0 -1 4194304 1000 0 0 0 10 5 0 0 20 0 1 0 99999 3000000 300 18446744073709551615 0 0 0 0 0 0 0 0 65536 0 0 0 17 0 0 0 0 0 0";
-        let info = parse_stat(content, 9999).unwrap();
-
-        assert_eq!(info.comm, "test (v2)");
-    }
-
-    #[test]
-    fn test_parse_stat_truncated() {
-        // Edge case: content ends right after closing paren - should error, not panic
-        let content = "1234 (test)";
-        let result = parse_stat(content, 1234);
-        assert!(result.is_err());
-
-        // Also test with just paren and no space after
-        let content2 = "1234 (test) ";
-        let result2 = parse_stat(content2, 1234);
-        // Should error due to insufficient fields
-        assert!(result2.is_err());
-    }
-
-    #[test]
-    fn test_parse_uid_from_status() {
-        let content = r#"Name:	bash
-Umask:	0022
-State:	S (sleeping)
-Tgid:	1234
-Ngid:	0
-Pid:	1234
-PPid:	1
-TracerPid:	0
-Uid:	1000	1000	1000	1000
-Gid:	1000	1000	1000	1000
-"#;
-
-        // Mock cache for testing
-        let mut user_cache = UserCache {
-            uid_map: std::collections::HashMap::new(),
-        };
-        user_cache.uid_map.insert(1000, "testuser".to_string());
-
-        let result = parse_uid_from_status(content, &user_cache);
-        assert!(result.is_some());
-        let (uid, user) = result.unwrap();
-        assert_eq!(uid, 1000);
-        assert_eq!(user, "testuser");
-    }
 
     #[test]
     fn test_resolve_username_root() {

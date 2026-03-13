@@ -115,6 +115,17 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     let timed_out = Arc::new(AtomicBool::new(false));
     let timed_out_clone = timed_out.clone();
 
+    // Guard to ensure `finished` is always set to true on exit.
+    // This prevents the watchdog thread from waking up later and killing
+    // whatever process recycled this PID if we return early (e.g. via `?`).
+    struct FinishGuard(Arc<AtomicBool>);
+    impl Drop for FinishGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let _guard = FinishGuard(finished.clone());
+
     // Spawn watchdog thread
     thread::spawn(move || {
         thread::sleep(timeout);
@@ -193,8 +204,8 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         }
     }
 
-    // Mark as finished before waiting, so we don't race with PID reuse
-    finished.store(true, Ordering::Relaxed);
+    // Drop the guard to mark as finished before waiting, so we don't race with PID reuse
+    drop(_guard);
 
     // Wait for child process to avoid leaving zombies
     let _ = child.wait();

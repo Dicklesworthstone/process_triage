@@ -216,16 +216,31 @@ pub fn detect_container_from_markers() -> Option<ContainerInfo> {
         });
     }
 
-    // Check for container indication in /proc/1/cgroup
+    // Check for Podman/generic marker
+    if fs::metadata("/.containerenv").is_ok() {
+        return Some(ContainerInfo {
+            in_container: true,
+            runtime: ContainerRuntime::Podman,
+            provenance: ContainerProvenance {
+                source: ContainerDetectionSource::MarkerFile,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+
+    // Check for container indication in /proc/1/cgroup (init process cgroup)
     if let Ok(content) = fs::read_to_string("/proc/1/cgroup") {
         for line in content.lines() {
-            let mut parts = line.splitn(3, ':');
-            let _ = parts.next();
-            let _ = parts.next();
-            if let Some(path) = parts.next() {
-                let info = detect_container_from_cgroup(path);
-                if info.in_container {
-                    return Some(info);
+            // Format: hierarchy-ID:controller-list:cgroup-path
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3 {
+                let path = parts[2];
+                if path != "/" && !path.is_empty() {
+                    let info = detect_container_from_cgroup(path);
+                    if info.in_container {
+                        return Some(info);
+                    }
                 }
             }
         }

@@ -145,10 +145,8 @@ pub struct GpuSnapshot {
 
 /// Check whether a GPU tool binary is available on the system.
 fn tool_available(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .output()
-        .map(|o| o.status.success())
+    crate::collect::tool_runner::run_tool("which", &[name], Some(std::time::Duration::from_secs(1)), None)
+        .map(|o| o.success())
         .unwrap_or(false)
 }
 
@@ -168,23 +166,26 @@ pub fn is_rocm_available() -> bool {
 
 /// Run nvidia-smi and collect GPU device information.
 fn query_nvidia_devices() -> Result<Vec<GpuDevice>, GpuError> {
-    let output = Command::new("nvidia-smi")
-        .args([
+    let output = crate::collect::tool_runner::run_tool(
+        "nvidia-smi",
+        &[
             "--query-gpu=index,name,uuid,memory.total,memory.used,utilization.gpu,temperature.gpu,driver_version",
             "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .map_err(|e| GpuError::ExecutionFailed(format!("nvidia-smi device query: {e}")))?;
+        ],
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    )
+    .map_err(|e| GpuError::ExecutionFailed(format!("nvidia-smi device query: {e}")))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.success() {
+        let stderr = output.stderr_str();
         return Err(GpuError::ExecutionFailed(format!(
             "nvidia-smi exited {}: {}",
-            output.status, stderr
+            output.exit_code.unwrap_or(-1), stderr
         )));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_str();
     parse_nvidia_device_csv(&stdout)
 }
 
@@ -237,23 +238,26 @@ fn parse_nvidia_device_fields(fields: &[&str]) -> Result<GpuDevice, GpuError> {
 
 /// Query per-process GPU usage from nvidia-smi.
 fn query_nvidia_processes() -> Result<Vec<ProcessGpuUsage>, GpuError> {
-    let output = Command::new("nvidia-smi")
-        .args([
+    let output = crate::collect::tool_runner::run_tool(
+        "nvidia-smi",
+        &[
             "--query-compute-apps=pid,gpu_uuid,used_memory",
             "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .map_err(|e| GpuError::ExecutionFailed(format!("nvidia-smi process query: {e}")))?;
+        ],
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    )
+    .map_err(|e| GpuError::ExecutionFailed(format!("nvidia-smi process query: {e}")))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.success() {
+        let stderr = output.stderr_str();
         return Err(GpuError::ExecutionFailed(format!(
             "nvidia-smi process query exited {}: {}",
-            output.status, stderr
+            output.exit_code.unwrap_or(-1), stderr
         )));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_str();
     parse_nvidia_process_csv(&stdout, &[])
 }
 
@@ -309,34 +313,41 @@ pub fn parse_nvidia_process_csv(
 
 /// Run rocm-smi and collect GPU device information.
 fn query_rocm_devices() -> Result<Vec<GpuDevice>, GpuError> {
-    let output = Command::new("rocm-smi")
-        .args([
+    let output = crate::collect::tool_runner::run_tool(
+        "rocm-smi",
+        &[
             "--showid",
             "--showtemp",
             "--showuse",
             "--showmeminfo",
             "vram",
             "--json",
-        ])
-        .output()
-        .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi: {e}")))?;
+        ],
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    )
+    .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi: {e}")))?;
 
-    if !output.status.success() {
+    if !output.success() {
         // rocm-smi without --json for older versions
         return query_rocm_devices_text();
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_str();
     parse_rocm_json(&stdout)
 }
 
 /// Fallback: parse rocm-smi text output for older versions.
 fn query_rocm_devices_text() -> Result<Vec<GpuDevice>, GpuError> {
-    let output = Command::new("rocm-smi")
-        .output()
-        .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi text fallback: {e}")))?;
+    let output = crate::collect::tool_runner::run_tool(
+        "rocm-smi",
+        &[],
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    )
+    .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi text fallback: {e}")))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_str();
     parse_rocm_text(&stdout)
 }
 
@@ -448,17 +459,20 @@ pub fn parse_rocm_text(output: &str) -> Result<Vec<GpuDevice>, GpuError> {
 
 /// Query per-process GPU usage from rocm-smi.
 fn query_rocm_processes() -> Result<Vec<ProcessGpuUsage>, GpuError> {
-    let output = Command::new("rocm-smi")
-        .args(["--showpidgpumem", "--json"])
-        .output()
-        .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi process query: {e}")))?;
+    let output = crate::collect::tool_runner::run_tool(
+        "rocm-smi",
+        &["--showpidgpumem", "--json"],
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    )
+    .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi process query: {e}")))?;
 
-    if !output.status.success() {
+    if !output.success() {
         // Older rocm-smi may not support this
         return Ok(Vec::new());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = output.stdout_str();
     parse_rocm_process_json(&stdout)
 }
 

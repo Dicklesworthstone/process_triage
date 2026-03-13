@@ -63,7 +63,7 @@ pub struct SchedInfo {
     pub nice: Option<i32>,
 }
 
-/// Memory statistics from /proc/\[pid\]/statm.
+/// Memory statistics from /proc/[pid]/statm.
 ///
 /// All values are in pages (typically 4KB on x86_64).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -82,6 +82,83 @@ pub struct MemStats {
     pub data: u64,
     /// Dirty pages (unused since Linux 2.6).
     pub dt: u64,
+}
+
+/// Process status information from /proc/[pid]/status.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProcessStatus {
+    /// Real user ID.
+    pub ruid: u32,
+    /// Effective user ID.
+    pub euid: u32,
+    /// Saved set user ID.
+    pub suid: u32,
+    /// File system user ID.
+    pub fsuid: u32,
+    /// Real group ID.
+    pub rgid: u32,
+    /// Effective group ID.
+    pub egid: u32,
+}
+
+/// Parse /proc/[pid]/cmdline file.
+///
+/// Returns the full command line string, with NUL bytes replaced by spaces.
+pub fn parse_proc_cmdline(pid: u32) -> Option<String> {
+    let path = format!("/proc/{}/cmdline", pid);
+    fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.replace('\0', " ").trim().to_string())
+}
+
+/// Parse /proc/[pid]/status file.
+///
+/// Extracts UID and GID information.
+pub fn parse_proc_status(pid: u32) -> Option<ProcessStatus> {
+    let path = format!("/proc/{}/status", pid);
+    let content = fs::read_to_string(&path).ok()?;
+    parse_proc_status_content(&content)
+}
+
+/// Parse status file content (for testing).
+pub fn parse_proc_status_content(content: &str) -> Option<ProcessStatus> {
+    let mut status = ProcessStatus::default();
+    let mut found_uid = false;
+    let mut found_gid = false;
+
+    for line in content.lines() {
+        if line.starts_with("Uid:") {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 5 {
+                status.ruid = fields[1].parse().ok()?;
+                status.euid = fields[2].parse().ok()?;
+                status.suid = fields[3].parse().ok()?;
+                status.fsuid = fields[4].parse().ok()?;
+                found_uid = true;
+            }
+        } else if line.starts_with("Gid:") {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 5 {
+                status.rgid = fields[1].parse().ok()?;
+                status.egid = fields[2].parse().ok()?;
+                found_gid = true;
+            }
+        }
+    }
+
+    if found_uid || found_gid {
+        Some(status)
+    } else {
+        None
+    }
+}
+
+/// Read the target of /proc/[pid]/exe symlink.
+pub fn parse_proc_exe(pid: u32) -> Option<String> {
+    let path = format!("/proc/{}/exe", pid);
+    fs::read_link(path)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 /// File descriptor information.
@@ -332,8 +409,8 @@ pub fn parse_proc_stat_content(content: &str) -> Option<ProcessStat> {
     let rest = content.get(close_paren + 1..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
 
-    // Need at least 22 fields after comm for the fields we want (we access up to index 21)
-    if fields.len() < 22 {
+    // Need at least 2 fields after comm for basic info (state, ppid)
+    if fields.len() < 2 {
         return None;
     }
 
@@ -342,20 +419,20 @@ pub fn parse_proc_stat_content(content: &str) -> Option<ProcessStat> {
         comm,
         state: fields[0].chars().next().unwrap_or('?'),
         ppid: fields[1].parse().unwrap_or(0),
-        pgrp: fields[2].parse().unwrap_or(0),
-        session: fields[3].parse().unwrap_or(0),
-        tty_nr: fields[4].parse().unwrap_or(0),
-        tpgid: fields[5].parse().unwrap_or(0),
+        pgrp: fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
+        session: fields.get(3).and_then(|s| s.parse().ok()).unwrap_or(0),
+        tty_nr: fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(0),
+        tpgid: fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(0),
         // Skip flags (6), minflt (7), cminflt (8), majflt (9), cmajflt (10)
-        utime: fields[11].parse().unwrap_or(0),
-        stime: fields[12].parse().unwrap_or(0),
+        utime: fields.get(11).and_then(|s| s.parse().ok()).unwrap_or(0),
+        stime: fields.get(12).and_then(|s| s.parse().ok()).unwrap_or(0),
         // Skip cutime (13), cstime (14), priority (15)
-        nice: fields[16].parse().unwrap_or(0),
-        num_threads: fields[17].parse().unwrap_or(1),
+        nice: fields.get(16).and_then(|s| s.parse().ok()).unwrap_or(0),
+        num_threads: fields.get(17).and_then(|s| s.parse().ok()).unwrap_or(1),
         // Skip itrealvalue (18)
-        starttime: fields[19].parse().unwrap_or(0),
-        vsize: fields[20].parse().unwrap_or(0),
-        rss: fields[21].parse().unwrap_or(0),
+        starttime: fields.get(19).and_then(|s| s.parse().ok()).unwrap_or(0),
+        vsize: fields.get(20).and_then(|s| s.parse().ok()).unwrap_or(0),
+        rss: fields.get(21).and_then(|s| s.parse().ok()).unwrap_or(0),
     })
 }
 

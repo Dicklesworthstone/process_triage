@@ -9,9 +9,10 @@
 //! - `systemctl show --property=... <pid>` - structured unit info
 //! - Cgroup path parsing (fallback when systemctl unavailable)
 
+use crate::collect::tool_runner::run_tool;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Command;
+use std::time::Duration;
 
 /// Systemd unit information for a process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -208,16 +209,19 @@ fn query_systemctl(unit_name: &str, pid: u32) -> Option<SystemdUnit> {
     ];
 
     let property_arg = properties.join(",");
-    let output = Command::new("systemctl")
-        .args(["show", "--property", &property_arg, unit_name])
-        .output()
-        .ok()?;
+    let output = run_tool(
+        "systemctl",
+        &["show", "--property", &property_arg, unit_name],
+        Some(Duration::from_secs(5)),
+        None,
+    )
+    .ok()?;
 
-    if !output.status.success() {
+    if !output.success() {
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stdout = output.stdout_str();
     parse_systemctl_output(&stdout, pid)
 }
 
@@ -322,20 +326,27 @@ fn unit_from_cgroup_path(unit_name: &str, _pid: u32) -> SystemdUnit {
 /// Check if systemd is available on the system.
 pub fn is_systemd_available() -> bool {
     // Check if systemctl exists and is functional
-    Command::new("systemctl")
-        .args(["--version"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    run_tool(
+        "systemctl",
+        &["--version"],
+        Some(Duration::from_secs(2)),
+        None,
+    )
+    .map(|o| o.success())
+    .unwrap_or(false)
 }
 
 /// Check if a process is managed by systemd.
 pub fn is_systemd_managed(pid: u32) -> bool {
-    Command::new("systemctl")
-        .args(["status", &pid.to_string()])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let pid_str = pid.to_string();
+    run_tool(
+        "systemctl",
+        &["status", &pid_str],
+        Some(Duration::from_secs(2)),
+        None,
+    )
+    .map(|o| o.success())
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
