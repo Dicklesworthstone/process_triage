@@ -4,15 +4,17 @@
 
 This guide helps AI agents integrate with the `pt agent` CLI interface. It covers the mental model, common workflows, output parsing, safety guarantees, and best practices.
 
+`pt agent` is the canonical spelling used throughout this guide. `pt robot` remains a supported alias for the same subcommand surface, so older examples and scripts that use `pt robot ...` still map to the same commands.
+
 ## ⚠️ Implementation Status
 
 This documentation describes both **currently available features** and **planned features** from the agent CLI contract specification. The following table summarizes what's implemented:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `pt robot plan` | ✅ Implemented | `--deep`, `--min-age`, `--format`, `--only`, `--max-candidates`, token-efficient globals (`--fields`, `--compact`, `--max-tokens`, `--estimate-tokens`) |
-| `pt robot apply` | ✅ Implemented | `--recommended`, `--pids`, `--targets`, `--yes`, `--resume`, safety gates (`--min-posterior`, `--max-kills`, `--max-blast-radius`, `--max-total-blast-radius`, `--require-known-signature`) |
-| `pt robot explain` | ✅ Implemented | `--session` plus `--pids` or `--target` |
+| `pt agent plan` | ✅ Implemented | `pt robot plan` is an alias; supports `--deep`, `--min-age`, `--format`, `--only`, `--max-candidates`, and token-efficient globals (`--fields`, `--compact`, `--max-tokens`, `--estimate-tokens`) |
+| `pt agent apply` | ✅ Implemented | `pt robot apply` is an alias; supports `--recommended`, `--pids`, `--targets`, `--yes`, `--resume`, and safety gates (`--min-posterior`, `--max-kills`, `--max-blast-radius`, `--max-total-blast-radius`, `--require-known-signature`) |
+| `pt agent explain` | ✅ Implemented | `pt robot explain` is an alias; supports `--session` plus `--pids` or `--target` |
 | Session management (`--session`) | ✅ Implemented | `pt agent snapshot`, `pt agent sessions`, `pt agent plan --session`, `pt agent apply --session`, `pt agent verify --session`, `pt agent diff` |
 | Safety gates (`--min-posterior`, `--max-kills`) | ✅ Implemented | Enforced at apply time; policy defaults still apply |
 | Pattern filtering (`--patterns`) | 🚧 Planned | Filter by process name patterns |
@@ -101,28 +103,28 @@ These workflows work with the current implementation:
 
 ```bash
 # Scan and report in JSON, no actions taken
-pt robot plan --format json --max-candidates 10
+pt agent plan --format json --max-candidates 10
 
 # With deep inspection (more evidence, slower)
-pt robot plan --deep --format json
+pt agent plan --deep --format json
 ```
 
 #### One-Shot Cleanup
 
 ```bash
 # Apply all KILL recommendations (requires explicit --yes)
-pt robot apply --recommended --yes --format json
+pt agent apply --recommended --yes --format json
 
 # Kill specific PIDs
-pt robot apply --pids 1234,5678 --yes --format json
+pt agent apply --pids 1234,5678 --yes --format json
 ```
 
 #### Explain a Process
 
 ```bash
 # Get detailed analysis of a single process
-SESSION=$(pt robot plan --format json | jq -r .session_id)
-pt robot explain --session "$SESSION" --pids 1234 --format json
+SESSION=$(pt agent plan --format json | jq -r .session_id)
+pt agent explain --session "$SESSION" --pids 1234 --format json
 ```
 
 #### Tail Progress Events (JSONL)

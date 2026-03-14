@@ -208,9 +208,9 @@ For full transparency, use the deep scan with JSON output:
 ```bash
 pt deep
 # Or for agent/scripted use with detailed output:
-pt robot plan --deep --format json
+pt agent plan --deep --format json
 # Token-optimized structured output:
-pt robot plan --deep --format toon
+pt agent plan --deep --format toon
 ```
 
 The JSON output includes the evidence behind each decision:
@@ -533,10 +533,10 @@ This is often expected! If your system is clean, `pt` won't invent problems. Com
 - **No matching patterns**: Your processes don't match known suspicious patterns
 - **Clean system**: Congratulations!
 
-To lower thresholds for testing, use the robot/agent interface:
+To lower thresholds for testing, use the agent interface (`pt robot` is an alias):
 
 ```bash
-pt robot plan --min-age 60  # 1 minute instead of 1 hour
+pt agent plan --min-age 60  # 1 minute instead of 1 hour
 ```
 
 ### Permission errors
@@ -565,7 +565,7 @@ ls -la ~/.local/bin/pt-core
 
 ## For AI Agents
 
-`pt` includes a dedicated agent interface for programmatic integration:
+`pt` includes a dedicated agent interface for programmatic integration. `pt robot` remains a supported alias for the same subcommands:
 
 ```bash
 pt agent plan --format json      # Generate actionable plan
