@@ -376,86 +376,7 @@ fn parse_ps_line(
     platform: &str,
     boot_id: &Option<String>,
 ) -> Result<ProcessRecord, String> {
-    // Split line into fields, preserving command at the end
-    let fields: Vec<&str> = line.split_whitespace().collect();
-
-    // Need at least: pid ppid uid user pgid sid state %cpu rss vsz tty + lstart(5 fields) + etime + comm
-    // Total minimum: 18 fields (indices 0-17)
-    let comm_idx = 17;
-    if fields.len() < 18 {
-        return Err(format!(
-            "Insufficient fields: expected at least 18, got {}",
-            fields.len()
-        ));
-    }
-
-    // Parse fixed-position fields
-    let pid: u32 = fields[0].parse().map_err(|_| "Invalid PID")?;
-    let ppid: u32 = fields[1].parse().map_err(|_| "Invalid PPID")?;
-    let uid: u32 = fields[2].parse().map_err(|_| "Invalid UID")?;
-    let user = fields[3].to_string();
-    let pgid: u32 = fields[4].parse().map_err(|_| "Invalid PGID")?;
-    let sid: u32 = fields[5].parse().map_err(|_| "Invalid SID")?;
-
-    // State is single character (may have modifiers like S+, Ss, etc.)
-    let state_char = fields[6].chars().next().unwrap_or('?');
-    let state = ProcessState::from_char(state_char);
-
-    let cpu_percent: f64 = fields[7].parse().unwrap_or(0.0);
-
-    // RSS is in KB, convert to bytes
-    let rss_kb: u64 = fields[8].parse().unwrap_or(0);
-    let rss_bytes = rss_kb.saturating_mul(1024);
-
-    // VSZ is in KB, convert to bytes
-    let vsz_kb: u64 = fields[9].parse().unwrap_or(0);
-    let vsz_bytes = vsz_kb.saturating_mul(1024);
-
-    // TTY (? or - means no TTY)
-    let tty_raw = fields[10];
-    let tty = if tty_raw == "?" || tty_raw == "-" {
-        None
-    } else {
-        Some(tty_raw.to_string())
-    };
-
-    // Parse lstart (platform-specific format)
-    // Linux: "Tue Jan 14 10:30:00 2026"
-    // macOS: "Tue Jan 14 10:30:00 2026"
-    let (start_time_unix, elapsed) = parse_timing_fields(platform, &fields)?;
-
-    let comm = fields.get(comm_idx).unwrap_or(&"").to_string();
-
-    // Args/cmd is everything after comm (field 14+)
-    let cmd = if fields.len() > comm_idx + 1 {
-        fields[comm_idx + 1..].join(" ")
-    } else {
-        comm.clone()
-    };
-
-    // Compute start_id
-    let start_id = compute_start_id(platform, boot_id, start_time_unix, elapsed, pid);
-
-    Ok(ProcessRecord {
-        pid: ProcessId(pid),
-        ppid: ProcessId(ppid),
-        uid,
-        user,
-        pgid: Some(pgid),
-        sid: Some(sid),
-        start_id,
-        comm,
-        cmd,
-        state,
-        cpu_percent,
-        rss_bytes,
-        vsz_bytes,
-        tty,
-        start_time_unix,
-        elapsed,
-        source: "quick_scan".to_string(),
-        container_info: None, // Container detection done as post-processing step
-    })
+    parse_ps_line_with_timing(line, platform, boot_id, None)
 }
 
 /// Parse a single line of ps output like `parse_ps_line`, but with deterministic
@@ -466,68 +387,46 @@ fn parse_ps_line_synthetic(
     boot_id: &Option<String>,
     now_unix: i64,
 ) -> Result<ProcessRecord, String> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
+    parse_ps_line_with_timing(line, platform, boot_id, Some(now_unix))
+}
 
-    // Need at least: pid ppid uid user pgid sid state %cpu rss vsz tty + lstart(5 fields) + etime + comm
-    // Total minimum: 18 fields (indices 0-17)
-    let comm_idx = 17;
-    if fields.len() < 18 {
-        return Err(format!(
-            "Insufficient fields: expected at least 18, got {}",
-            fields.len()
-        ));
-    }
+fn parse_ps_line_with_timing(
+    line: &str,
+    platform: &str,
+    boot_id: &Option<String>,
+    synthetic_now_unix: Option<i64>,
+) -> Result<ProcessRecord, String> {
+    let parsed = parse_ps_fields(line)?;
+    let (start_time_unix, elapsed) = match synthetic_now_unix {
+        Some(now_unix) => parse_timing_field_at(platform, parsed.etimes_str, now_unix)?,
+        None => parse_timing_field(platform, parsed.etimes_str)?,
+    };
 
-    let pid: u32 = fields[0].parse().map_err(|_| "Invalid PID")?;
-    let ppid: u32 = fields[1].parse().map_err(|_| "Invalid PPID")?;
-    let uid: u32 = fields[2].parse().map_err(|_| "Invalid UID")?;
-    let user = fields[3].to_string();
-    let pgid: u32 = fields[4].parse().map_err(|_| "Invalid PGID")?;
-    let sid: u32 = fields[5].parse().map_err(|_| "Invalid SID")?;
+    let start_id = match synthetic_now_unix {
+        Some(_) => compute_start_id_synthetic(platform, boot_id, start_time_unix, parsed.pid),
+        None => compute_start_id(platform, boot_id, start_time_unix, elapsed, parsed.pid),
+    };
 
-    let state_char = fields[6].chars().next().unwrap_or('?');
-    let state = ProcessState::from_char(state_char);
-
-    let cpu_percent: f64 = fields[7].parse().unwrap_or(0.0);
-
-    let rss_kb: u64 = fields[8].parse().unwrap_or(0);
-    let rss_bytes = rss_kb.saturating_mul(1024);
-
-    let vsz_kb: u64 = fields[9].parse().unwrap_or(0);
-    let vsz_bytes = vsz_kb.saturating_mul(1024);
-
-    let tty_raw = fields[10];
-    let tty = if tty_raw == "?" || tty_raw == "-" {
+    let tty = if parsed.tty_raw == "?" || parsed.tty_raw == "-" {
         None
     } else {
-        Some(tty_raw.to_string())
+        Some(parsed.tty_raw.to_string())
     };
-
-    let (start_time_unix, elapsed) = parse_timing_fields_at(platform, &fields, now_unix)?;
-
-    let comm = fields.get(comm_idx).unwrap_or(&"").to_string();
-    let cmd = if fields.len() > comm_idx + 1 {
-        fields[comm_idx + 1..].join(" ")
-    } else {
-        comm.clone()
-    };
-
-    let start_id = compute_start_id_synthetic(platform, boot_id, start_time_unix, pid);
 
     Ok(ProcessRecord {
-        pid: ProcessId(pid),
-        ppid: ProcessId(ppid),
-        uid,
-        user,
-        pgid: Some(pgid),
-        sid: Some(sid),
+        pid: ProcessId(parsed.pid),
+        ppid: ProcessId(parsed.ppid),
+        uid: parsed.uid,
+        user: parsed.user.to_string(),
+        pgid: Some(parsed.pgid),
+        sid: Some(parsed.sid),
         start_id,
-        comm,
-        cmd,
-        state,
-        cpu_percent,
-        rss_bytes,
-        vsz_bytes,
+        comm: parsed.comm.to_string(),
+        cmd: parsed.cmd,
+        state: ProcessState::from_char(parsed.state_char),
+        cpu_percent: parsed.cpu_percent,
+        rss_bytes: parsed.rss_bytes,
+        vsz_bytes: parsed.vsz_bytes,
         tty,
         start_time_unix,
         elapsed,
@@ -536,21 +435,113 @@ fn parse_ps_line_synthetic(
     })
 }
 
+struct ParsedPsFields<'a> {
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    user: &'a str,
+    pgid: u32,
+    sid: u32,
+    state_char: char,
+    cpu_percent: f64,
+    rss_bytes: u64,
+    vsz_bytes: u64,
+    tty_raw: &'a str,
+    etimes_str: &'a str,
+    comm: &'a str,
+    cmd: String,
+}
+
+fn parse_ps_fields(line: &str) -> Result<ParsedPsFields<'_>, String> {
+    let mut fields = line.split_whitespace();
+    let mut seen = 0usize;
+
+    let pid: u32 = next_ps_field(&mut fields, &mut seen)?
+        .parse()
+        .map_err(|_| "Invalid PID")?;
+    let ppid: u32 = next_ps_field(&mut fields, &mut seen)?
+        .parse()
+        .map_err(|_| "Invalid PPID")?;
+    let uid: u32 = next_ps_field(&mut fields, &mut seen)?
+        .parse()
+        .map_err(|_| "Invalid UID")?;
+    let user = next_ps_field(&mut fields, &mut seen)?;
+    let pgid: u32 = next_ps_field(&mut fields, &mut seen)?
+        .parse()
+        .map_err(|_| "Invalid PGID")?;
+    let sid: u32 = next_ps_field(&mut fields, &mut seen)?
+        .parse()
+        .map_err(|_| "Invalid SID")?;
+    let state_char = next_ps_field(&mut fields, &mut seen)?
+        .chars()
+        .next()
+        .unwrap_or('?');
+    let cpu_percent: f64 = next_ps_field(&mut fields, &mut seen)?
+        .parse()
+        .unwrap_or(0.0);
+    let rss_bytes = next_ps_field(&mut fields, &mut seen)?
+        .parse::<u64>()
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let vsz_bytes = next_ps_field(&mut fields, &mut seen)?
+        .parse::<u64>()
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let tty_raw = next_ps_field(&mut fields, &mut seen)?;
+
+    // Skip lstart's five whitespace-delimited fields; elapsed time comes from etimes/etime.
+    for _ in 0..5 {
+        let _ = next_ps_field(&mut fields, &mut seen)?;
+    }
+
+    let etimes_str = next_ps_field(&mut fields, &mut seen)?;
+    let comm = next_ps_field(&mut fields, &mut seen)?;
+    let cmd = command_from_tail(&mut fields, comm);
+
+    Ok(ParsedPsFields {
+        pid,
+        ppid,
+        uid,
+        user,
+        pgid,
+        sid,
+        state_char,
+        cpu_percent,
+        rss_bytes,
+        vsz_bytes,
+        tty_raw,
+        etimes_str,
+        comm,
+        cmd,
+    })
+}
+
+fn next_ps_field<'a>(
+    fields: &mut std::str::SplitWhitespace<'a>,
+    seen: &mut usize,
+) -> Result<&'a str, String> {
+    let field = fields
+        .next()
+        .ok_or_else(|| format!("Insufficient fields: expected at least 18, got {}", *seen))?;
+    *seen += 1;
+    Ok(field)
+}
+
+fn command_from_tail<'a>(fields: &mut std::str::SplitWhitespace<'a>, comm: &'a str) -> String {
+    let Some(first) = fields.next() else {
+        return comm.to_string();
+    };
+
+    let mut cmd = String::from(first);
+    for field in fields {
+        cmd.push(' ');
+        cmd.push_str(field);
+    }
+    cmd
+}
+
 /// Parse timing fields from ps output.
-fn parse_timing_fields(platform: &str, fields: &[&str]) -> Result<(i64, Duration), String> {
-    // lstart is fields 11-15 (day month date time year) for Linux
-    // etimes is field after that (seconds since start)
-
-    // For simplicity, use etimes to compute elapsed time
-    // and estimate start_time from current time - etimes
-
-    let lstart_idx = 11;
-    let etimes_idx = lstart_idx + 5;
-    let etimes_str = fields
-        .get(etimes_idx)
-        .ok_or_else(|| format!("Missing etimes field for platform {platform}"))?;
-
-    // Parse elapsed time
+fn parse_timing_field(_platform: &str, etimes_str: &str) -> Result<(i64, Duration), String> {
     let elapsed_secs: u64 = if etimes_str.contains(':') {
         // Format: [[dd-]hh:]mm:ss
         parse_etime_format(etimes_str).unwrap_or(0)
@@ -567,17 +558,11 @@ fn parse_timing_fields(platform: &str, fields: &[&str]) -> Result<(i64, Duration
     Ok((start_time_unix, elapsed))
 }
 
-fn parse_timing_fields_at(
-    platform: &str,
-    fields: &[&str],
+fn parse_timing_field_at(
+    _platform: &str,
+    etimes_str: &str,
     now_unix: i64,
 ) -> Result<(i64, Duration), String> {
-    let lstart_idx = 11;
-    let etimes_idx = lstart_idx + 5;
-    let etimes_str = fields
-        .get(etimes_idx)
-        .ok_or_else(|| format!("Missing etimes field for platform {platform}"))?;
-
     let elapsed_secs: u64 = if etimes_str.contains(':') {
         parse_etime_format(etimes_str).unwrap_or(0)
     } else {
@@ -606,44 +591,27 @@ fn compute_start_id_synthetic(
 
 /// Parse etime format: [[dd-]hh:]mm:ss
 fn parse_etime_format(s: &str) -> Option<u64> {
-    let mut total_secs = 0u64;
-
-    // Check for days
-    let (days_part, time_part) = if s.contains('-') {
-        let mut parts = s.splitn(2, '-');
-        let days: u64 = parts.next()?.parse().ok()?;
-        (days, parts.next()?)
+    let (days_part, time_part) = if let Some((days, time)) = s.split_once('-') {
+        (days.parse::<u64>().ok()?, time)
     } else {
         (0, s)
     };
 
-    total_secs += days_part * 86400;
-
-    // Parse time components
-    let time_parts: Vec<&str> = time_part.split(':').collect();
-    match time_parts.len() {
-        3 => {
-            // hh:mm:ss
-            let hours: u64 = time_parts[0].parse().ok()?;
-            let mins: u64 = time_parts[1].parse().ok()?;
-            let secs: u64 = time_parts[2].parse().ok()?;
-            total_secs += hours * 3600 + mins * 60 + secs;
-        }
-        2 => {
-            // mm:ss
-            let mins: u64 = time_parts[0].parse().ok()?;
-            let secs: u64 = time_parts[1].parse().ok()?;
-            total_secs += mins * 60 + secs;
-        }
-        1 => {
-            // ss
-            let secs: u64 = time_parts[0].parse().ok()?;
-            total_secs += secs;
-        }
-        _ => return None,
+    let mut parts = time_part.rsplit(':');
+    let secs = parts.next()?.parse::<u64>().ok()?;
+    let mins = match parts.next() {
+        Some(value) => value.parse::<u64>().ok()?,
+        None => 0,
+    };
+    let hours = match parts.next() {
+        Some(value) => value.parse::<u64>().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
     }
 
-    Some(total_secs)
+    Some(days_part * 86400 + hours * 3600 + mins * 60 + secs)
 }
 
 /// Compute start_id from available information.

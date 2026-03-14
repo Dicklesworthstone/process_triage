@@ -3669,7 +3669,7 @@ fn run_bundle_create(
             OutputFormat::Md => eprintln!(
                 "Error: Encryption requested but no passphrase provided (use --passphrase or PT_BUNDLE_PASSPHRASE)"
             ),
-            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())),
             _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
         return ExitCode::ArgsError;
@@ -3693,7 +3693,7 @@ fn run_bundle_create(
                     profile_str
                 ),
                 OutputFormat::Jsonl => {
-                    println!("{}", serde_json::to_string(&error_output).unwrap())
+                    println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
@@ -3867,7 +3867,7 @@ fn run_bundle_create(
                         "Error: Encryption requested but no passphrase provided (use --passphrase or PT_BUNDLE_PASSPHRASE)"
                     ),
                     OutputFormat::Jsonl => {
-                        println!("{}", serde_json::to_string(&error_output).unwrap())
+                        println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
                     }
                     _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
                 }
@@ -3921,7 +3921,7 @@ fn run_bundle_create(
             match global.format {
                 OutputFormat::Md => eprintln!("Error creating bundle: {}", e),
                 OutputFormat::Jsonl => {
-                    println!("{}", serde_json::to_string(&error_output).unwrap())
+                    println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
@@ -3952,7 +3952,7 @@ fn run_bundle_inspect(
         });
         match global.format {
             OutputFormat::Md => eprintln!("Error: Bundle not found: {}", path),
-            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())),
             _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
         return ExitCode::ArgsError;
@@ -3973,7 +3973,7 @@ fn run_bundle_inspect(
             match global.format {
                 OutputFormat::Md => eprintln!("Error: Failed to open bundle: {}", e),
                 OutputFormat::Jsonl => {
-                    println!("{}", serde_json::to_string(&error_output).unwrap())
+                    println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
@@ -4093,7 +4093,7 @@ fn run_bundle_extract(
         });
         match global.format {
             OutputFormat::Md => eprintln!("Error: Bundle not found: {}", path),
-            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap()),
+            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())),
             _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
         return ExitCode::ArgsError;
@@ -4114,7 +4114,7 @@ fn run_bundle_extract(
             match global.format {
                 OutputFormat::Md => eprintln!("Error: Failed to open bundle: {}", e),
                 OutputFormat::Jsonl => {
-                    println!("{}", serde_json::to_string(&error_output).unwrap())
+                    println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
@@ -4153,7 +4153,7 @@ fn run_bundle_extract(
         match global.format {
             OutputFormat::Md => eprintln!("Error: Failed to create output directory: {}", e),
             OutputFormat::Jsonl => {
-                println!("{}", serde_json::to_string(&error_output).unwrap())
+                println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
             }
             _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
@@ -4984,10 +4984,11 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
         };
 
     // Perform SSH scanning of remote hosts
+    let parallel = args.parallel.max(1) as usize;
     let ssh_config = SshScanConfig {
         connect_timeout: args.timeout.min(30),
         command_timeout: args.timeout,
-        parallel: args.parallel as usize,
+        parallel,
         continue_on_error: args.continue_on_error,
         ..SshScanConfig::default()
     };
@@ -16700,9 +16701,14 @@ fn run_agent_session_status(
                     println!("## Action Outcomes");
                     for (i, o) in outcomes.iter().take(5).enumerate() {
                         let pid = o.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let success = o.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let status = if success { "✓" } else { "✗" };
-                        println!("    {}. PID {} {}", i + 1, pid, status);
+                        let outcome_status =
+                            o.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let marker = match outcome_status {
+                            "success" | "dry_run" | "shadow" | "skipped" => "✓",
+                            "precheck_blocked" => "!",
+                            _ => "✗",
+                        };
+                        println!("    {}. PID {} {} {}", i + 1, pid, marker, outcome_status);
                     }
                     if outcomes.len() > 5 {
                         println!("    ... and {} more", outcomes.len() - 5);

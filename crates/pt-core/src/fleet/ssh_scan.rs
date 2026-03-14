@@ -236,13 +236,14 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
     let start = std::time::Instant::now();
     let results: Arc<Mutex<Vec<(usize, HostScanResult)>>> = Arc::new(Mutex::new(Vec::new()));
     let aborted = Arc::new(Mutex::new(false));
+    let parallel = config.parallel.max(1);
 
     // Process hosts in batches of `parallel`
     let chunks: Vec<Vec<(usize, &String)>> = hosts
         .iter()
         .enumerate()
         .collect::<Vec<_>>()
-        .chunks(config.parallel)
+        .chunks(parallel)
         .map(|chunk| chunk.to_vec())
         .collect();
 
@@ -584,6 +585,19 @@ mod tests {
     #[test]
     fn ssh_scan_fleet_empty_hosts() {
         let config = SshScanConfig::default();
+        let result = ssh_scan_fleet(&[], &config);
+        assert_eq!(result.total_hosts, 0);
+        assert_eq!(result.successful, 0);
+        assert_eq!(result.failed, 0);
+        assert!(result.results.is_empty());
+    }
+
+    #[test]
+    fn ssh_scan_fleet_zero_parallel_does_not_panic() {
+        let config = SshScanConfig {
+            parallel: 0,
+            ..SshScanConfig::default()
+        };
         let result = ssh_scan_fleet(&[], &config);
         assert_eq!(result.total_hosts, 0);
         assert_eq!(result.successful, 0);
