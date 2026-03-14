@@ -411,12 +411,11 @@ impl SupervisorActionRunner {
             action.command,
             SupervisorCommand::Stop | SupervisorCommand::Kill
         ) && success
+            && self.detect_respawn(action)
         {
-            if self.detect_respawn(action) {
-                result.respawned = true;
-                result.success = false;
-                return Err(SupervisorActionError::ProcessRespawned);
-            }
+            result.respawned = true;
+            result.success = false;
+            return Err(SupervisorActionError::ProcessRespawned);
         }
 
         Ok(result)

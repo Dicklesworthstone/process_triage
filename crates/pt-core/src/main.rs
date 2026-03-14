@@ -2553,12 +2553,15 @@ fn build_tui_rows(
             Ok(r) => r,
             Err(_) => continue,
         };
-        let decision_outcome =
+        let mut decision_outcome =
             match decide_action(&posterior_result.posterior, &decision_policy, &feasibility) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
 
+        // Populate rationale fields available in current context
+        decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
+        
         let ledger =
             EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
         let max_posterior = posterior_result
@@ -11200,6 +11203,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 Err(_) => continue, // Skip processes that fail decision
             };
         decision_outcome.rationale.has_known_signature = Some(signature_match.is_some());
+        decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
+        decision_outcome.rationale.category = signature_category.clone();
 
         // Determine max posterior class for filtering
         let posterior = &posterior_result.posterior;
@@ -12906,7 +12911,18 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     // Check --yes requirement
     if !args.yes && !global.dry_run && !global.shadow {
         let err = serde_json::json!({"session_id": sid.0, "error": "confirmation_required", "message": "--yes flag required for execution"});
-        println!("{}", serde_json::to_string_pretty(&err).unwrap());
+        println!("{}", format_structured_output(global, err));
+        return ExitCode::PolicyBlocked;
+    }
+
+    // Check if robot mode is enabled in policy (required for agent apply)
+    if !config.policy.robot_mode.enabled && !global.dry_run && !global.shadow {
+        let err = serde_json::json!({
+            "session_id": sid.0,
+            "error": "robot_mode_disabled",
+            "message": "Robot mode is disabled in policy. Use 'pt config' to enable it."
+        });
+        println!("{}", format_structured_output(global, err));
         return ExitCode::PolicyBlocked;
     }
 
@@ -13005,10 +13021,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
 
             let candidate = RobotCandidate {
-                posterior: action.rationale.posterior_odds_abandoned_vs_useful,
-                memory_mb: None,
-                has_known_signature: false,
-                category: None,
+                posterior: action.rationale.posterior.as_ref().map(|p| 1.0 - p.useful),
+                memory_mb: action.rationale.memory_mb,
+                has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
+                category: action.rationale.category.clone(),
                 is_kill_action: action.action == Action::Kill,
                 has_policy_snapshot: true,
                 is_supervised: is_supervised_for_robot(action.target.pid.0),
@@ -13120,10 +13136,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
                 let start = std::time::Instant::now();
                 let candidate = RobotCandidate {
-                    posterior: action.rationale.posterior_odds_abandoned_vs_useful,
-                    memory_mb: None,
-                    has_known_signature: false,
-                    category: None,
+                    posterior: action.rationale.posterior.as_ref().map(|p| 1.0 - p.useful),
+                    memory_mb: action.rationale.memory_mb,
+                    has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
+                    category: action.rationale.category.clone(),
                     is_kill_action: action.action == Action::Kill,
                     has_policy_snapshot: true,
                     is_supervised: is_supervised_for_robot(action.target.pid.0),

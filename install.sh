@@ -2,462 +2,586 @@
 #
 # install.sh - Process Triage (pt) Installer
 #
-# One-liner installation:
+# One-line install (with cache buster):
+#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh?$(date +%s)" | bash
+#
+# One-line install (stable URL):
 #   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
 #
-# Environment variables:
-#   DEST        - Custom install directory (default: ~/.local/bin)
-#   PT_SYSTEM   - Set to 1 for system-wide install (/usr/local/bin)
-#   PT_VERSION  - Install specific version (default: latest)
-#   PT_NO_PATH  - Set to 1 to skip PATH modification
-#   VERIFY      - Set to 1 to enforce signature + checksum verification
-#   PT_RELEASE_PUBLIC_KEY_FILE - Optional PEM public key file for signature verification
-#   PT_RELEASE_PUBLIC_KEY_PEM  - Optional PEM public key content for signature verification
-#   PT_RELEASE_PUBLIC_KEY_FINGERPRINT - Optional expected SHA-256 fingerprint (hex) for the public key
-#   PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE - Optional file containing expected key fingerprint
-#   PT_CORE_VERSION - Install specific pt-core version (default: same as PT_VERSION)
+# Common options:
+#   --version 2.0.5        Install a specific release
+#   --dest ~/.local/bin    Install into a custom directory
+#   --system               Install into /usr/local/bin
+#   --easy-mode            Update shell PATH files automatically
+#   --verify               Enforce checksum + signature verification
+#   --from-source          Build pt-core from source
+#   --offline FILE         Install from a local pt-core tarball
+#   --quiet                Suppress non-error output
+#   --no-gum               Disable gum formatting
+#   --force                Reinstall even if target version is already present
+#   --no-configure         Skip agent auto-configuration and skill install
 #
 set -euo pipefail
+umask 022
+shopt -s lastpipe 2>/dev/null || true
 
-readonly GITHUB_REPO="Dicklesworthstone/process_triage"
-readonly RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main"
-readonly RELEASES_URL="https://github.com/${GITHUB_REPO}/releases"
-# Populated in release artifacts to pin the expected release-signing key.
-readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=""
+OWNER="${OWNER:-Dicklesworthstone}"
+REPO="${REPO:-process_triage}"
+GITHUB_REPO="${OWNER}/${REPO}"
+RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main"
+RELEASES_URL="https://github.com/${GITHUB_REPO}/releases"
+API_URL="https://api.github.com/repos/${GITHUB_REPO}"
 
-# Minimal downloader for early bootstrapping (stdout).
+DEST_DEFAULT="$HOME/.local/bin"
+DEST="${DEST:-$DEST_DEFAULT}"
+VERSION="${PT_VERSION:-}"
+CORE_VERSION="${PT_CORE_VERSION:-}"
+SYSTEM=0
+EASY_MODE=0
+QUIET=0
+NO_GUM=0
+FORCE_INSTALL=0
+FROM_SOURCE=0
+VERIFY=0
+NO_CONFIGURE=0
+NO_VERIFY=0
+VERIFY_SELF=0
+OFFLINE_BUNDLE=""
+LOCK_ROOT="/tmp/pt-install.lock.d"
+LOCK_HELD=0
+TEMP_DIR=""
+HAS_GUM=0
+WSL=0
+OS=""
+ARCH=""
+TARGET=""
+PLATFORM=""
+PROXY_ARGS=()
+DOWNLOADED_ARTIFACT=""
+INSTALLED_WRAPPER_VERSION=""
+INSTALLED_CORE_VERSION=""
+SUMMARY_LINES=()
+AGENT_LINES=()
+BACKUP_LINES=()
+
+CLAUDE_STATUS="skipped"
+CODEX_STATUS="skipped"
+COPILOT_STATUS="skipped"
+CURSOR_STATUS="skipped"
+WINDSURF_STATUS="skipped"
+GEMINI_STATUS="skipped"
+CLAUDE_SKILL_STATUS="skipped"
+CODEX_SKILL_STATUS="skipped"
+
+DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=""
+
+strip_ansi() {
+    sed $'s/\033\\[[0-9;]*m//g'
+}
+
+detect_gum() {
+    if command -v gum >/dev/null 2>&1 && [[ -t 1 ]] && [[ "$NO_GUM" -eq 0 ]]; then
+        HAS_GUM=1
+    fi
+}
+
+info() {
+    [[ "$QUIET" -eq 1 ]] && return 0
+    if [[ "$HAS_GUM" -eq 1 ]]; then
+        gum style --foreground 39 "→ $*"
+    else
+        printf '\033[0;34m→\033[0m %s\n' "$*"
+    fi
+}
+
+ok() {
+    [[ "$QUIET" -eq 1 ]] && return 0
+    if [[ "$HAS_GUM" -eq 1 ]]; then
+        gum style --foreground 42 "✓ $*"
+    else
+        printf '\033[0;32m✓\033[0m %s\n' "$*"
+    fi
+}
+
+warn() {
+    [[ "$QUIET" -eq 1 ]] && return 0
+    if [[ "$HAS_GUM" -eq 1 ]]; then
+        gum style --foreground 214 "⚠ $*"
+    else
+        printf '\033[1;33m⚠\033[0m %s\n' "$*"
+    fi
+}
+
+err() {
+    if [[ "$HAS_GUM" -eq 1 ]]; then
+        gum style --foreground 196 "✗ $*" >&2
+    else
+        printf '\033[0;31m✗\033[0m %s\n' "$*" >&2
+    fi
+}
+
+run_with_spinner() {
+    local title="$1"
+    shift
+    if [[ "$HAS_GUM" -eq 1 && "$QUIET" -eq 0 ]]; then
+        gum spin --spinner dot --title "$title" -- "$@"
+    else
+        info "$title"
+        "$@"
+    fi
+}
+
+draw_box() {
+    local color="$1"
+    shift
+    local lines=("$@")
+    local max_width=0
+    local line stripped len pad
+
+    for line in "${lines[@]}"; do
+        stripped=$(printf '%b' "$line" | strip_ansi)
+        len=${#stripped}
+        [[ "$len" -gt "$max_width" ]] && max_width="$len"
+    done
+
+    local border=""
+    local inner_width=$((max_width + 4))
+    local i
+    for ((i = 0; i < inner_width; i++)); do
+        border+="═"
+    done
+
+    printf "\033[%sm╔%s╗\033[0m\n" "$color" "$border"
+    for line in "${lines[@]}"; do
+        stripped=$(printf '%b' "$line" | strip_ansi)
+        len=${#stripped}
+        pad=$((max_width - len))
+        printf "\033[%sm║\033[0m  %b%*s  \033[%sm║\033[0m\n" "$color" "$line" "$pad" "" "$color"
+    done
+    printf "\033[%sm╚%s╝\033[0m\n" "$color" "$border"
+}
+
+show_header() {
+    [[ "$QUIET" -eq 1 ]] && return 0
+    if [[ "$HAS_GUM" -eq 1 ]]; then
+        gum style \
+            --border normal \
+            --border-foreground 39 \
+            --padding "0 1" \
+            --margin "1 0" \
+            "$(gum style --foreground 42 --bold 'pt installer')" \
+            "$(gum style --foreground 245 'Safety-first process triage with signed releases and agent integration')"
+    else
+        echo ""
+        draw_box "0;36" \
+            "\033[1;32mpt installer\033[0m" \
+            "Safety-first process triage with signed releases and agent integration"
+        echo ""
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+Process Triage installer
+
+Usage:
+  bash install.sh [options]
+
+Options:
+  --version <ver>      Install a specific version
+  --dest <dir>         Install directory (default: ~/.local/bin)
+  --system             Install to /usr/local/bin
+  --easy-mode          Update shell PATH files automatically
+  --verify             Require checksum + signature verification
+  --verify-self        Run post-install diagnostics
+  --from-source        Build pt-core from source
+  --offline <file>     Install pt-core from a local tarball
+  --force              Reinstall even if already at target version
+  --quiet              Suppress non-error output
+  --no-gum             Disable gum formatting
+  --no-configure       Skip agent init + skill install
+  --no-verify          Disable checksum/signature verification
+  -h, --help           Show help
+
+Environment:
+  PT_VERSION                              Version override
+  PT_CORE_VERSION                         pt-core version override
+  PT_SYSTEM=1                             System install shortcut
+  PT_NO_PATH=1                            Skip PATH updates
+  VERIFY=1                                Require verification
+  PT_RELEASE_PUBLIC_KEY_FILE              PEM file for release verification
+  PT_RELEASE_PUBLIC_KEY_PEM               PEM contents for release verification
+  PT_RELEASE_PUBLIC_KEY_FINGERPRINT       Expected SHA-256 fingerprint
+  PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE  File containing expected fingerprint
+  HTTP_PROXY / HTTPS_PROXY / NO_PROXY     Proxy support
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version)
+                VERSION="${2:-}"
+                shift 2
+                ;;
+            --dest)
+                DEST="${2:-}"
+                shift 2
+                ;;
+            --system)
+                SYSTEM=1
+                shift
+                ;;
+            --easy-mode)
+                EASY_MODE=1
+                shift
+                ;;
+            --verify)
+                VERIFY=1
+                shift
+                ;;
+            --verify-self)
+                VERIFY_SELF=1
+                shift
+                ;;
+            --from-source)
+                FROM_SOURCE=1
+                shift
+                ;;
+            --offline)
+                OFFLINE_BUNDLE="${2:-}"
+                shift 2
+                ;;
+            --force)
+                FORCE_INSTALL=1
+                shift
+                ;;
+            --quiet)
+                QUIET=1
+                shift
+                ;;
+            --no-gum)
+                NO_GUM=1
+                shift
+                ;;
+            --no-configure)
+                NO_CONFIGURE=1
+                shift
+                ;;
+            --no-verify)
+                NO_VERIFY=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                err "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ "${PT_SYSTEM:-0}" == "1" ]]; then
+        SYSTEM=1
+    fi
+    if [[ "${VERIFY:-0}" == "1" ]]; then
+        VERIFY=1
+    fi
+    if [[ "$NO_VERIFY" -eq 1 ]]; then
+        VERIFY=0
+    fi
+}
+
+setup_proxy() {
+    PROXY_ARGS=()
+    if [[ -n "${HTTPS_PROXY:-}" ]]; then
+        PROXY_ARGS=(--proxy "$HTTPS_PROXY")
+    elif [[ -n "${HTTP_PROXY:-}" ]]; then
+        PROXY_ARGS=(--proxy "$HTTP_PROXY")
+    fi
+}
+
 fetch_stdout() {
     local url="$1"
-
-    if command -v curl &>/dev/null; then
-        curl -fsSL --connect-timeout 10 --max-time 120 "$url"
-    elif command -v wget &>/dev/null; then
-        wget -q --timeout=10 -O - "$url"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 120 "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O - "$url"
     else
-        printf 'Neither curl nor wget available\n' >&2
+        err "Neither curl nor wget is available"
         return 1
     fi
 }
 
-# ==============================================================================
-# Self-Refresh: Re-download when piped to avoid CDN cache issues
-# ==============================================================================
-
-maybe_self_refresh() {
-    # Only refresh if being piped AND not already refreshed
-    if [[ -p /dev/stdin ]] && [[ -z "${PT_REFRESHED:-}" ]]; then
-        export PT_REFRESHED=1
-        # Re-execute with cache-busted URL
-        exec bash <(fetch_stdout "${RAW_URL}/install.sh?cb=$(date +%s)")
-    fi
-}
-
-maybe_self_refresh
-
-# ==============================================================================
-# Logging
-# ==============================================================================
-
-log_info() {
-    printf '\033[0;34mi\033[0m %s\n' "$*" >&2
-}
-
-log_success() {
-    printf '\033[0;32m✓\033[0m %s\n' "$*" >&2
-}
-
-log_error() {
-    printf '\033[0;31m✗\033[0m %s\n' "$*" >&2
-}
-
-log_step() {
-    printf '\033[0;36m→\033[0m %s\n' "$*" >&2
-}
-
-log_warn() {
-    printf '\033[0;33m⚠\033[0m %s\n' "$*" >&2
-}
-
-# ==============================================================================
-# Platform Detection
-# ==============================================================================
-
-detect_os() {
-    local os
-    os=$(uname -s | tr '[:upper:]' '[:lower:]')
-
-    case "$os" in
-        linux)
-            echo "linux"
-            ;;
-        darwin)
-            echo "macos"
-            ;;
-        *)
-            log_error "Unsupported operating system: $os"
-            log_error "pt-core supports Linux and macOS only"
-            return 1
-            ;;
-    esac
-}
-
-detect_arch() {
-    local arch
-    arch=$(uname -m)
-
-    case "$arch" in
-        x86_64|amd64)
-            echo "x86_64"
-            ;;
-        aarch64|arm64)
-            echo "aarch64"
-            ;;
-        *)
-            log_error "Unsupported architecture: $arch"
-            log_error "pt-core supports x86_64 and aarch64 only"
-            return 1
-            ;;
-    esac
-}
-
-# Build artifact name for pt-core binary
-# Format: pt-core-{os}-{arch}-{version}.tar.gz
-get_pt_core_artifact_name() {
-    local version="$1"
-    local os arch
-
-    os=$(detect_os) || return 1
-    arch=$(detect_arch) || return 1
-
-    echo "pt-core-${os}-${arch}-${version}.tar.gz"
-}
-
-# ==============================================================================
-# Utilities
-# ==============================================================================
-
-# Cross-platform mktemp (Linux GNU vs macOS BSD)
-mktemp_dir() {
-    local dir
-
-    # Try GNU style first (Linux)
-    dir=$(mktemp -d 2>/dev/null) && { echo "$dir"; return 0; }
-
-    # BSD style with -t (macOS)
-    dir=$(mktemp -d -t pt 2>/dev/null) && { echo "$dir"; return 0; }
-
-    # BSD style with explicit template
-    dir=$(mktemp -d -t pt.XXXXXXXXXX 2>/dev/null) && { echo "$dir"; return 0; }
-
-    # Manual fallback
-    dir="/tmp/pt.$$.$(date +%s)"
-    mkdir -p "$dir" && { echo "$dir"; return 0; }
-
-    log_error "Failed to create temporary directory"
-    return 1
-}
-
-# Append cache-buster to URL to bypass CDN caching
-append_cache_buster() {
-    local url="$1"
-    local timestamp
-    timestamp=$(date +%s)
-
-    if [[ "$url" == *"?"* ]]; then
-        echo "${url}&cb=${timestamp}"
-    else
-        echo "${url}?cb=${timestamp}"
-    fi
-}
-
-# Download file using curl or wget
 download() {
     local url="$1"
     local output="$2"
-
-    if command -v curl &>/dev/null; then
-        curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$output"
-    elif command -v wget &>/dev/null; then
-        wget -q --timeout=10 -O "$output" "$url"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 120 "$url" -o "$output"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$output" "$url"
     else
-        log_error "Neither curl nor wget available"
-        log_error "Install curl: apt install curl (or brew install curl)"
+        err "Neither curl nor wget is available"
         return 1
     fi
 }
 
-# Cross-platform SHA256
+append_cache_buster() {
+    local url="$1"
+    local ts
+    ts=$(date +%s)
+    if [[ "$url" == *"?"* ]]; then
+        printf '%s&cb=%s\n' "$url" "$ts"
+    else
+        printf '%s?cb=%s\n' "$url" "$ts"
+    fi
+}
+
+cleanup() {
+    [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR"
+    if [[ "$LOCK_HELD" -eq 1 && -d "$LOCK_ROOT" ]]; then
+        rm -rf "$LOCK_ROOT"
+    fi
+}
+
+create_temp_dir() {
+    TEMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t pt.XXXXXXXX 2>/dev/null)"
+    if [[ -z "$TEMP_DIR" || ! -d "$TEMP_DIR" ]]; then
+        err "Failed to create temporary directory"
+        exit 1
+    fi
+    trap cleanup EXIT
+}
+
+maybe_self_refresh() {
+    if [[ -p /dev/stdin && -z "${PT_REFRESHED:-}" && -z "$OFFLINE_BUNDLE" ]]; then
+        export PT_REFRESHED=1
+        exec bash <(fetch_stdout "$(append_cache_buster "${RAW_URL}/install.sh")") "$@"
+    fi
+}
+
+detect_platform() {
+    OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    ARCH="$(uname -m)"
+
+    case "$ARCH" in
+        x86_64|amd64) ARCH="x86_64" ;;
+        arm64|aarch64) ARCH="aarch64" ;;
+        *)
+            err "Unsupported architecture: $ARCH"
+            exit 1
+            ;;
+    esac
+
+    if [[ "$OS" == "linux" && -f /proc/version ]] && grep -qi microsoft /proc/version 2>/dev/null; then
+        WSL=1
+        warn "WSL detected; continuing with Linux install"
+    fi
+
+    case "$OS" in
+        linux)
+            if [[ -f /etc/alpine-release ]] || (command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl); then
+                PLATFORM="linux-${ARCH}-musl"
+            else
+                PLATFORM="linux-${ARCH}"
+            fi
+            ;;
+        darwin)
+            PLATFORM="macos-${ARCH}"
+            ;;
+        *)
+            err "Unsupported operating system: $OS"
+            exit 1
+            ;;
+    esac
+
+    case "$PLATFORM" in
+        linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+        linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+        linux-x86_64-musl) TARGET="x86_64-unknown-linux-musl" ;;
+        linux-aarch64-musl) TARGET="aarch64-unknown-linux-musl" ;;
+        macos-x86_64) TARGET="x86_64-apple-darwin" ;;
+        macos-aarch64) TARGET="aarch64-apple-darwin" ;;
+        *)
+            warn "No prebuilt for ${PLATFORM}; will fall back to source"
+            FROM_SOURCE=1
+            ;;
+    esac
+}
+
+resolve_version() {
+    if [[ -n "$VERSION" ]]; then
+        return 0
+    fi
+
+    local latest=""
+    latest="$(fetch_stdout "${API_URL}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    latest="${latest#v}"
+    if [[ -z "$latest" ]]; then
+        latest="$(fetch_stdout "$(append_cache_buster "${RAW_URL}/VERSION")" 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    if [[ -z "$latest" ]]; then
+        err "Could not resolve latest version"
+        exit 1
+    fi
+    VERSION="$latest"
+}
+
+resolve_core_version() {
+    if [[ -z "$CORE_VERSION" ]]; then
+        CORE_VERSION="$VERSION"
+    fi
+}
+
+artifact_name_for_platform() {
+    local version="$1"
+    local platform="$2"
+    printf 'pt-core-%s-%s.tar.gz\n' "$platform" "$version"
+}
+
+wrapper_urls() {
+    printf '%s\n' \
+        "${RELEASES_URL}/download/v${VERSION}/pt" \
+        "https://raw.githubusercontent.com/${GITHUB_REPO}/v${VERSION}/pt" \
+        "${RAW_URL}/pt"
+}
+
+core_urls() {
+    local artifact
+    artifact="$(artifact_name_for_platform "$CORE_VERSION" "$PLATFORM")"
+    printf '%s\n' \
+        "${RELEASES_URL}/download/v${CORE_VERSION}/${artifact}"
+    if [[ "$PLATFORM" == linux-x86_64 ]]; then
+        printf '%s\n' "${RELEASES_URL}/download/v${CORE_VERSION}/pt-core-linux-x86_64-musl-${CORE_VERSION}.tar.gz"
+    elif [[ "$PLATFORM" == linux-aarch64 ]]; then
+        printf '%s\n' "${RELEASES_URL}/download/v${CORE_VERSION}/pt-core-linux-aarch64-musl-${CORE_VERSION}.tar.gz"
+    fi
+}
+
+download_first_available() {
+    local output="$1"
+    shift
+    local url
+    for url in "$@"; do
+        [[ -z "$url" ]] && continue
+        if download "$url" "$output" 2>/dev/null; then
+            DOWNLOADED_ARTIFACT="$(basename "$url")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+check_disk_space() {
+    local install_parent
+    install_parent="$(dirname "$DEST")"
+    mkdir -p "$install_parent"
+    local available
+    available=$(df -Pk "$install_parent" | awk 'NR==2 {print $4}')
+    if [[ -n "$available" && "$available" -lt 10240 ]]; then
+        err "At least 10MB of free space is required in $install_parent"
+        exit 1
+    fi
+}
+
+check_write_permissions() {
+    local install_parent
+    install_parent="$(dirname "$DEST")"
+    mkdir -p "$install_parent"
+    if [[ ! -w "$install_parent" ]] && [[ "$SYSTEM" -eq 0 ]]; then
+        err "Install directory is not writable: $install_parent"
+        exit 1
+    fi
+}
+
+check_network() {
+    if [[ -n "$OFFLINE_BUNDLE" || "$FROM_SOURCE" -eq 1 ]]; then
+        info "Skipping network preflight"
+        return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "curl not found; skipping network preflight"
+        return 0
+    fi
+    local url
+    url="${RELEASES_URL}/download/v${VERSION}/pt"
+    if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 3 --max-time 5 -o /dev/null "$url"; then
+        warn "Network preflight failed for $url"
+    fi
+}
+
+get_installed_version() {
+    local bin="$1"
+    [[ -x "$bin" ]] || return 0
+    "$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+}
+
+check_existing_install() {
+    INSTALLED_WRAPPER_VERSION="$(get_installed_version "$DEST/pt")"
+    INSTALLED_CORE_VERSION="$(get_installed_version "$DEST/pt-core")"
+    if [[ -n "$INSTALLED_WRAPPER_VERSION" ]]; then
+        info "Existing pt version: ${INSTALLED_WRAPPER_VERSION}"
+    fi
+    if [[ -n "$INSTALLED_CORE_VERSION" ]]; then
+        info "Existing pt-core version: ${INSTALLED_CORE_VERSION}"
+    fi
+}
+
+preflight_checks() {
+    info "Running preflight checks"
+    check_disk_space
+    check_write_permissions
+    check_existing_install
+    check_network
+}
+
+acquire_lock() {
+    if mkdir "$LOCK_ROOT" 2>/dev/null; then
+        LOCK_HELD=1
+        printf '%s\n' "$$" > "${LOCK_ROOT}/pid"
+        return 0
+    fi
+
+    if [[ -f "${LOCK_ROOT}/pid" ]]; then
+        local existing_pid
+        existing_pid="$(cat "${LOCK_ROOT}/pid" 2>/dev/null || true)"
+        if [[ -n "$existing_pid" ]] && ! kill -0 "$existing_pid" 2>/dev/null; then
+            rm -rf "$LOCK_ROOT"
+            mkdir "$LOCK_ROOT"
+            LOCK_HELD=1
+            printf '%s\n' "$$" > "${LOCK_ROOT}/pid"
+            return 0
+        fi
+    fi
+
+    err "Another pt installer appears to be running (${LOCK_ROOT})"
+    exit 1
+}
+
 sha256_file() {
     local file="$1"
-
-    if command -v sha256sum &>/dev/null; then
+    if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$file" | cut -d' ' -f1
-    elif command -v shasum &>/dev/null; then
+    elif command -v shasum >/dev/null 2>&1; then
         shasum -a 256 "$file" | cut -d' ' -f1
-    elif command -v openssl &>/dev/null; then
+    elif command -v openssl >/dev/null 2>&1; then
         openssl dgst -sha256 "$file" | awk '{print $NF}'
     else
-        log_warn "No SHA256 tool available"
         return 1
     fi
 }
 
 sha256_stdin() {
-    if command -v sha256sum &>/dev/null; then
+    if command -v sha256sum >/dev/null 2>&1; then
         sha256sum | cut -d' ' -f1
-    elif command -v shasum &>/dev/null; then
+    elif command -v shasum >/dev/null 2>&1; then
         shasum -a 256 | cut -d' ' -f1
-    elif command -v openssl &>/dev/null; then
+    elif command -v openssl >/dev/null 2>&1; then
         openssl dgst -sha256 | awk '{print $NF}'
     else
-        return 1
-    fi
-}
-
-# ==============================================================================
-# Version Detection
-# ==============================================================================
-
-get_latest_version() {
-    local version_url
-    version_url=$(append_cache_buster "${RAW_URL}/VERSION")
-
-    local version
-    version=$(fetch_stdout "$version_url" 2>/dev/null | tr -d '[:space:]') || {
-        log_error "Could not fetch VERSION file"
-        log_error "URL: ${RAW_URL}/VERSION"
-        return 1
-    }
-
-    # Validate version format (semver-like)
-    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
-        log_error "Invalid version format: $version"
-        return 1
-    fi
-
-    echo "$version"
-}
-
-get_installed_version() {
-    local install_path="$1"
-
-    if [[ ! -x "$install_path" ]]; then
-        echo ""
-        return 0
-    fi
-
-    # Extract version from installed script
-    local version
-    version=$("$install_path" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
-    echo "${version:-unknown}"
-}
-
-# Detect if system uses musl libc (Alpine, etc.)
-# Returns: 0 if musl, 1 if glibc or unknown
-detect_musl() {
-    # Check for Alpine Linux
-    if [[ -f /etc/alpine-release ]]; then
-        return 0
-    fi
-
-    # Check ldd output for musl
-    if command -v ldd &>/dev/null; then
-        if ldd --version 2>&1 | grep -qi musl; then
-            return 0
-        fi
-    fi
-
-    # Check /lib for musl-libc
-    if [[ -f /lib/ld-musl-x86_64.so.1 ]] || [[ -f /lib/ld-musl-aarch64.so.1 ]]; then
-        return 0
-    fi
-
-    return 1
-}
-
-# Detect platform (OS + architecture + libc) for artifact naming
-# Returns: linux-x86_64, linux-x86_64-musl, linux-aarch64, macos-x86_64, etc.
-detect_platform() {
-    local arch; arch=$(uname -m)
-    local os; os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    local suffix=""
-
-    case "$arch" in
-        x86_64) arch="x86_64" ;;
-        aarch64|arm64) arch="aarch64" ;;
-        *)
-            log_error "Unsupported architecture: $arch"
-            return 1
-            ;;
-    esac
-
-    case "$os" in
-        linux)
-            # Check for musl-based system
-            if detect_musl; then
-                suffix="-musl"
-                log_info "Detected musl-based system (using static binary)"
-            fi
-            ;;
-        darwin) os="macos" ;;
-        *)
-            log_error "Unsupported OS: $os"
-            return 1
-            ;;
-    esac
-
-    echo "${os}-${arch}${suffix}"
-}
-
-# Get artifact name with optional musl fallback
-# On glibc systems, first try glibc build, then musl as fallback
-get_artifact_with_fallback() {
-    local version="$1"
-    local platform="$2"
-
-    # Primary artifact name
-    echo "pt-core-${platform}-${version}.tar.gz"
-}
-
-# Try to get musl fallback artifact name (for glibc version mismatch)
-get_musl_fallback() {
-    local version="$1"
-    local platform="$2"
-
-    # Only applicable for Linux glibc builds
-    if [[ "$platform" == linux-x86_64 ]]; then
-        echo "pt-core-linux-x86_64-musl-${version}.tar.gz"
-    elif [[ "$platform" == linux-aarch64 ]]; then
-        echo "pt-core-linux-aarch64-musl-${version}.tar.gz"
-    else
-        echo ""
-    fi
-}
-
-# ==============================================================================
-# Verification (optional)
-# ==============================================================================
-
-# Download the consolidated checksums file from release
-download_checksums() {
-    local version="$1"
-    local output="$2"
-
-    local checksum_url="${RELEASES_URL}/download/v${version}/checksums.sha256"
-
-    download "$checksum_url" "$output" 2>/dev/null || {
-        log_error "Could not download checksums file"
-        log_error "URL: $checksum_url"
-        return 1
-    }
-}
-
-# Look up expected checksum for a file from checksums.sha256
-lookup_checksum() {
-    local checksums_file="$1"
-    local filename="$2"
-
-    if [[ ! -f "$checksums_file" ]]; then
-        return 1
-    fi
-
-    # Format: "hash  filename" (two spaces)
-    grep -E "^[a-f0-9]{64}  ${filename}$" "$checksums_file" | cut -d' ' -f1
-}
-
-verify_download() {
-    local file="$1"
-    local version="$2"
-
-    if [[ "${VERIFY:-}" != "1" ]]; then
-        return 0  # Verification not requested
-    fi
-
-    log_step "Verifying checksum..."
-
-    # Download expected checksum
-    local checksum_url="${RELEASES_URL}/download/v${version}/pt.sha256"
-    local expected
-
-    expected=$(fetch_stdout "$checksum_url" 2>/dev/null) || {
-        log_error "Could not download checksum file"
-        log_error "URL: $checksum_url"
-        return 1
-    }
-
-    # Extract hash (format: "hash  filename" or just "hash")
-    expected="${expected%% *}"
-    if [[ -z "$expected" ]]; then
-        log_error "Checksum file was empty or malformed: $checksum_url"
-        return 1
-    fi
-
-    # Compute actual
-    local actual
-    actual=$(sha256_file "$file") || {
-        log_error "Could not compute checksum (no SHA256 tool available)"
-        return 1
-    }
-
-    # Compare
-    if [[ "$expected" == "$actual" ]]; then
-        log_success "Checksum verified: ${actual:0:16}..."
-        return 0
-    else
-        log_error "Checksum mismatch!"
-        log_error "Expected: $expected"
-        log_error "Actual:   $actual"
-        log_error ""
-        log_error "The downloaded file may be corrupted or tampered with."
-        log_error "Please report this issue if it persists."
-        return 1
-    fi
-}
-
-# Verify a file against checksums.sha256 file
-verify_file_checksum() {
-    local file="$1"
-    local filename="$2"
-    local checksums_file="$3"
-
-    if [[ "${VERIFY:-}" != "1" ]]; then
-        return 0  # Verification not requested
-    fi
-
-    log_step "Verifying ${filename} checksum..."
-
-    local expected
-    expected=$(lookup_checksum "$checksums_file" "$filename") || {
-        log_error "No checksum found for ${filename} in ${checksums_file}"
-        return 1
-    }
-
-    if [[ -z "$expected" ]]; then
-        log_error "Checksum not found for ${filename} in ${checksums_file}"
-        return 1
-    fi
-
-    local actual
-    actual=$(sha256_file "$file") || {
-        log_error "Could not compute checksum (no SHA256 tool available)"
-        return 1
-    }
-
-    if [[ "$expected" == "$actual" ]]; then
-        log_success "${filename} checksum verified: ${actual:0:16}..."
-        return 0
-    else
-        log_error "Checksum mismatch for ${filename}!"
-        log_error "Expected: $expected"
-        log_error "Actual:   $actual"
-        return 1
-    fi
-}
-
-ensure_openssl_for_signatures() {
-    if ! command -v openssl &>/dev/null; then
-        log_error "OpenSSL is required for signature verification (VERIFY=1)."
-        log_error "Install OpenSSL and retry."
         return 1
     fi
 }
@@ -466,36 +590,22 @@ normalize_fingerprint() {
     local value="$1"
     value="${value//[[:space:]]/}"
     value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
-    if [[ ! "$value" =~ ^[a-f0-9]{64}$ ]]; then
-        return 1
-    fi
+    [[ "$value" =~ ^[a-f0-9]{64}$ ]] || return 1
     printf '%s\n' "$value"
 }
 
 resolve_expected_key_fingerprint() {
     local expected=""
-
     if [[ -n "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
-        expected="${PT_RELEASE_PUBLIC_KEY_FINGERPRINT}"
-    elif [[ -n "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE:-}" ]]; then
-        if [[ ! -f "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}" ]]; then
-            log_error "PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE does not exist: ${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}"
-            return 1
-        fi
+        expected="$PT_RELEASE_PUBLIC_KEY_FINGERPRINT"
+    elif [[ -n "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE:-}" && -f "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}" ]]; then
         expected="$(head -n1 "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}" | awk '{print $1}')"
-    elif [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
-        expected="${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}"
+    elif [[ -n "$DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT" ]]; then
+        expected="$DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT"
     fi
 
-    if [[ -z "$expected" ]]; then
-        printf '\n'
-        return 0
-    fi
-
-    normalize_fingerprint "$expected" || {
-        log_error "Invalid release public key fingerprint (expected 64 hex chars)."
-        return 1
-    }
+    [[ -z "$expected" ]] && return 0
+    normalize_fingerprint "$expected"
 }
 
 resolve_release_public_key() {
@@ -503,71 +613,67 @@ resolve_release_public_key() {
     local output="$2"
 
     if [[ -n "${PT_RELEASE_PUBLIC_KEY_FILE:-}" ]]; then
-        if [[ ! -f "${PT_RELEASE_PUBLIC_KEY_FILE}" ]]; then
-            log_error "PT_RELEASE_PUBLIC_KEY_FILE does not exist: ${PT_RELEASE_PUBLIC_KEY_FILE}"
-            return 1
-        fi
-        cp "${PT_RELEASE_PUBLIC_KEY_FILE}" "$output" || {
-            log_error "Failed to copy public key from PT_RELEASE_PUBLIC_KEY_FILE"
-            return 1
-        }
+        cp "${PT_RELEASE_PUBLIC_KEY_FILE}" "$output"
     elif [[ -n "${PT_RELEASE_PUBLIC_KEY_PEM:-}" ]]; then
         printf '%s\n' "${PT_RELEASE_PUBLIC_KEY_PEM}" > "$output"
     else
-        local key_url="${RELEASES_URL}/download/v${version}/release-signing-public.pem"
-        download "$key_url" "$output" || {
-            log_error "Could not download trusted public key for v${version}"
-            log_error "URL: ${key_url}"
-            log_error "Set PT_RELEASE_PUBLIC_KEY_FILE or PT_RELEASE_PUBLIC_KEY_PEM to provide a trusted key."
+        download "${RELEASES_URL}/download/v${version}/release-signing-public.pem" "$output"
+    fi
+
+    openssl pkey -pubin -in "$output" -noout >/dev/null 2>&1 || {
+        err "Invalid release public key PEM"
+        return 1
+    }
+
+    local expected actual
+    expected="$(resolve_expected_key_fingerprint || true)"
+    if [[ -n "$expected" ]]; then
+        actual="$(openssl pkey -pubin -in "$output" -outform der 2>/dev/null | sha256_stdin)"
+        actual="$(normalize_fingerprint "$actual")"
+        if [[ "$actual" != "$expected" ]]; then
+            err "Release public key fingerprint mismatch"
             return 1
-        }
+        fi
+        ok "Release public key fingerprint verified: ${actual:0:16}..."
+    else
+        warn "No release public key fingerprint pin configured"
     fi
-
-    if ! openssl pkey -pubin -in "$output" -noout >/dev/null 2>&1; then
-        log_error "Invalid public key PEM for release signature verification"
-        return 1
-    fi
-
-    local expected_fingerprint
-    expected_fingerprint="$(resolve_expected_key_fingerprint)" || return 1
-
-    if [[ -z "$expected_fingerprint" ]]; then
-        log_warn "No release key fingerprint pin configured; proceeding with provided key source."
-        return 0
-    fi
-
-    local actual_fingerprint
-    actual_fingerprint="$(openssl pkey -pubin -in "$output" -outform der 2>/dev/null | sha256_stdin)" || {
-        log_error "Could not compute release public key fingerprint"
-        return 1
-    }
-
-    actual_fingerprint="$(normalize_fingerprint "$actual_fingerprint")" || {
-        log_error "Computed release public key fingerprint was invalid"
-        return 1
-    }
-
-    if [[ "$actual_fingerprint" != "$expected_fingerprint" ]]; then
-        log_error "Release public key fingerprint mismatch"
-        log_error "Expected: $expected_fingerprint"
-        log_error "Actual:   $actual_fingerprint"
-        return 1
-    fi
-
-    log_success "Release public key fingerprint verified: ${actual_fingerprint:0:16}..."
 }
 
-download_signature() {
+download_checksums() {
     local version="$1"
-    local artifact_name="$2"
-    local output="$3"
+    local output="$2"
+    download "${RELEASES_URL}/download/v${version}/checksums.sha256" "$output"
+}
 
-    local sig_url="${RELEASES_URL}/download/v${version}/${artifact_name}.sig"
-    download "$sig_url" "$output" || {
-        log_error "Could not download signature for ${artifact_name}"
-        log_error "URL: ${sig_url}"
+lookup_checksum() {
+    local checksums_file="$1"
+    local filename="$2"
+    grep -E "^[a-f0-9]{64}  ${filename}$" "$checksums_file" | awk '{print $1}'
+}
+
+verify_file_checksum() {
+    local file="$1"
+    local filename="$2"
+    local checksums_file="$3"
+    local expected actual
+
+    expected="$(lookup_checksum "$checksums_file" "$filename" || true)"
+    [[ -n "$expected" ]] || {
+        err "No checksum found for ${filename}"
         return 1
     }
+    actual="$(sha256_file "$file")" || {
+        err "Could not compute checksum"
+        return 1
+    }
+    if [[ "$actual" != "$expected" ]]; then
+        err "Checksum mismatch for ${filename}"
+        err "Expected: $expected"
+        err "Actual:   $actual"
+        return 1
+    fi
+    ok "${filename} checksum verified: ${actual:0:16}..."
 }
 
 verify_file_signature() {
@@ -577,404 +683,451 @@ verify_file_signature() {
     local pubkey_file="$4"
     local sig_output="$5"
 
-    log_step "Verifying ${artifact_name} signature..."
-    download_signature "$version" "$artifact_name" "$sig_output" || return 1
-
+    download "${RELEASES_URL}/download/v${version}/${artifact_name}.sig" "$sig_output"
     if openssl dgst -sha256 -verify "$pubkey_file" -signature "$sig_output" "$file_path" >/dev/null 2>&1; then
-        log_success "${artifact_name} signature verified"
+        ok "${artifact_name} signature verified"
         return 0
     fi
-
-    log_error "Signature verification failed for ${artifact_name}"
+    err "Signature verification failed for ${artifact_name}"
     return 1
 }
 
-# ==============================================================================
-# Installation
-# ==============================================================================
+best_effort_sigstore_verify() {
+    local file_path="$1"
+    local artifact_name="$2"
+    if ! command -v cosign >/dev/null 2>&1; then
+        warn "cosign not found; skipping Sigstore verification for ${artifact_name}"
+        return 0
+    fi
+    warn "No Sigstore bundle published for ${artifact_name}; skipping cosign verification"
+}
 
-# Atomically install a binary with optional backup of existing version
-# Uses rename (mv) for atomicity - either the install completes or it doesn't
 install_binary() {
     local source_file="$1"
     local dest_dir="$2"
     local binary_name="$3"
+    local backup_file=""
     local dest_file="${dest_dir}/${binary_name}"
-
-    # Create destination directory if needed
-    if [[ ! -d "$dest_dir" ]]; then
-        log_step "Creating directory: $dest_dir"
-        mkdir -p "$dest_dir"
-    fi
-
-    # Check for existing installation and create backup
-    local current_version=""
-    if [[ -f "$dest_file" ]]; then
-        if [[ "$binary_name" == "pt" ]]; then
-            current_version=$(get_installed_version "$dest_file")
-            if [[ -n "$current_version" && "$current_version" != "unknown" ]]; then
-                log_info "Current $binary_name version: $current_version"
-            fi
-        fi
-
-        # Create backup of existing binary for rollback
-        local backup_file="${dest_file}.bak"
-        if ! cp "$dest_file" "$backup_file" 2>/dev/null; then
-            log_error "Failed to back up existing ${binary_name} to ${backup_file}"
-            log_error "Aborting install to preserve rollback safety"
-            return 1
-        fi
-        log_info "Backed up existing ${binary_name} to ${backup_file}"
-    fi
-
-    # Make source executable before moving
-    chmod +x "$source_file"
-
-    # Atomic install using rename (mv)
-    # On the same filesystem, mv is atomic; we ensure this by copying to dest_dir first
     local temp_dest="${dest_file}.new"
-    cp "$source_file" "$temp_dest" || {
-        log_error "Failed to copy ${binary_name} to destination"
-        return 1
-    }
-    chmod +x "$temp_dest"
 
-    # Atomic rename
-    mv "$temp_dest" "$dest_file" || {
-        log_error "Failed to install ${binary_name} (atomic rename failed)"
-        rm -f "$temp_dest" 2>/dev/null
-        return 1
-    }
+    mkdir -p "$dest_dir"
+    if [[ -f "$dest_file" ]]; then
+        backup_file="${dest_file}.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$dest_file" "$backup_file"
+        BACKUP_LINES+=("${binary_name} backup: ${backup_file}")
+    fi
 
-    log_success "Installed: $dest_file"
+    install -m 0755 "$source_file" "$temp_dest"
+    mv "$temp_dest" "$dest_file"
+    ok "Installed ${dest_file}"
 }
 
-# ==============================================================================
-# PATH Management
-# ==============================================================================
-
-detect_shell() {
-    local shell_name
-
-    # Check $SHELL environment variable
-    shell_name="${SHELL##*/}"
-
-    # Validate it's a known shell
-    case "$shell_name" in
-        bash|zsh|fish|sh)
-            echo "$shell_name"
-            ;;
-        *)
-            # Fallback: check what's running
-            if [[ -n "${BASH_VERSION:-}" ]]; then
-                echo "bash"
-            elif [[ -n "${ZSH_VERSION:-}" ]]; then
-                echo "zsh"
-            else
-                echo "bash"  # Default assumption
-            fi
-            ;;
-    esac
+extract_core_archive() {
+    local archive="$1"
+    local extract_dir="$2"
+    mkdir -p "$extract_dir"
+    tar -xzf "$archive" -C "$extract_dir" pt-core 2>/dev/null || tar -xzf "$archive" -C "$extract_dir"
 }
 
-get_shell_config() {
-    local shell_name="$1"
-
+path_line_for_shell() {
+    local install_dir="$1"
+    local shell_name="$2"
     case "$shell_name" in
-        bash)
-            # Prefer .bashrc for interactive, .bash_profile for login
-            if [[ -f "$HOME/.bashrc" ]]; then
-                echo "$HOME/.bashrc"
-            elif [[ -f "$HOME/.bash_profile" ]]; then
-                echo "$HOME/.bash_profile"
-            else
-                echo "$HOME/.bashrc"  # Create it
-            fi
-            ;;
-        zsh)
-            echo "$HOME/.zshrc"
-            ;;
         fish)
-            echo "$HOME/.config/fish/config.fish"
+            printf 'if not contains "%s" $PATH\n    set -gx PATH "%s" $PATH\nend\n' "$install_dir" "$install_dir"
             ;;
         *)
-            echo "$HOME/.profile"
+            printf 'case ":$PATH:" in\n  *:"%s":*) ;;\n  *) export PATH="%s:$PATH" ;;\nesac\n' "$install_dir" "$install_dir"
             ;;
     esac
 }
 
-add_to_path() {
+append_path_snippet() {
+    local file="$1"
+    local shell_name="$2"
+    local install_dir="$3"
+    local marker="# process_triage installer PATH"
+
+    [[ -f "$file" ]] || : > "$file"
+    if grep -Fq "$marker" "$file" 2>/dev/null; then
+        return 0
+    fi
+
+    {
+        printf '\n%s\n' "$marker"
+        path_line_for_shell "$install_dir" "$shell_name"
+    } >> "$file"
+}
+
+maybe_add_path() {
     local install_dir="$1"
 
-    # Check if already in PATH
-    if [[ ":$PATH:" == *":$install_dir:"* ]]; then
-        log_info "$install_dir already in PATH"
+    if [[ "${PT_NO_PATH:-0}" == "1" ]]; then
+        info "Skipping PATH changes (PT_NO_PATH=1)"
         return 0
     fi
 
-    # Detect shell and config file
-    local shell_name config_file
-    shell_name=$(detect_shell)
-    config_file=$(get_shell_config "$shell_name")
-
-    log_step "Adding $install_dir to PATH in $config_file"
-
-    # Create directory for fish config if needed
-    if [[ "$shell_name" == "fish" ]]; then
-        mkdir -p "${config_file%/*}"
-    fi
-
-    # Prepare PATH export line
-    local path_line
-    case "$shell_name" in
-        fish)
-            path_line="set -gx PATH \"$install_dir\" \$PATH"
-            ;;
-        *)
-            path_line="export PATH=\"$install_dir:\$PATH\""
-            ;;
-    esac
-
-    # Check if already added (avoid duplicates)
-    if [[ -f "$config_file" ]] && grep -qF "$install_dir" "$config_file" 2>/dev/null; then
-        log_info "PATH already configured in $config_file"
+    if [[ ":$PATH:" == *":${install_dir}:"* ]]; then
+        info "${install_dir} already in PATH"
         return 0
     fi
 
-    # Add to config
-    {
-        echo ""
-        echo "# Added by pt installer"
-        echo "$path_line"
-    } >> "$config_file"
-
-    log_success "Added to $config_file"
-    log_info "Run 'source $config_file' or start a new terminal to use pt."
+    if [[ "$EASY_MODE" -eq 1 ]]; then
+        append_path_snippet "$HOME/.zshenv" "zsh" "$install_dir"
+        append_path_snippet "$HOME/.profile" "sh" "$install_dir"
+        append_path_snippet "$HOME/.bashrc" "bash" "$install_dir"
+        ok "Added ${install_dir} to shell PATH config"
+    else
+        warn "Add ${install_dir} to PATH to use pt"
+        warn "Hint: run with --easy-mode to update your shell rc files"
+    fi
 }
 
-# ==============================================================================
-# Main
-# ==============================================================================
+install_completions_for_shell() {
+    local shell_name="$1"
+    local target=""
+    case "$shell_name" in
+        bash)
+            target="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/pt"
+            ;;
+        zsh)
+            target="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_pt"
+            ;;
+        fish)
+            target="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/pt.fish"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+    mkdir -p "$(dirname "$target")"
+    "$DEST/pt" completions "$shell_name" > "$target"
+    ok "Installed ${shell_name} completions"
+}
 
-main() {
-    log_step "Installing pt (Process Triage)..."
+maybe_install_completions() {
+    [[ -x "$DEST/pt" ]] || return 0
+    install_completions_for_shell "bash" || true
+    install_completions_for_shell "zsh" || true
+    install_completions_for_shell "fish" || true
+}
 
-    # Determine version to install
-    local version="${PT_VERSION:-}"
-    if [[ -z "$version" ]]; then
-        log_step "Detecting latest version..."
-        version=$(get_latest_version) || exit 1
+agent_present() {
+    local agent="$1"
+    case "$agent" in
+        claude)
+            [[ -d "$HOME/.claude" ]] || command -v claude >/dev/null 2>&1
+            ;;
+        codex)
+            [[ -d "$HOME/.codex" ]] || command -v codex >/dev/null 2>&1
+            ;;
+        copilot)
+            command -v copilot >/dev/null 2>&1
+            ;;
+        cursor)
+            [[ -d "$HOME/.cursor" ]] || [[ -d "$HOME/.config/Cursor" ]] || [[ -d "$HOME/Library/Application Support/Cursor" ]]
+            ;;
+        windsurf)
+            [[ -d "$HOME/.codeium/windsurf" ]] || [[ -d "$HOME/.config/Windsurf" ]]
+            ;;
+        gemini)
+            [[ -d "$HOME/.gemini" ]] || command -v gemini >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+run_agent_init_for() {
+    local agent="$1"
+    local status_var="$2"
+    if ! agent_present "$agent"; then
+        printf -v "$status_var" '%s' "skipped"
+        return 0
     fi
-    log_info "Version: $version"
-
-    # Determine pt-core version (may differ from pt wrapper version)
-    local core_version="${PT_CORE_VERSION:-$version}"
-    if [[ "$core_version" != "$version" ]]; then
-        log_info "pt-core version: $core_version (decoupled from wrapper)"
-    fi
-
-    # Determine install location
-    local dest="${DEST:-$HOME/.local/bin}"
-    if [[ "${PT_SYSTEM:-}" == "1" ]]; then
-        dest="/usr/local/bin"
-        # Check for root/sudo for system install
-        if [[ ! -w "$dest" ]] && [[ "$(id -u)" != "0" ]]; then
-            log_error "System-wide install requires root privileges"
-            log_error "Run with: sudo PT_SYSTEM=1 bash <(curl -fsSL ...)"
-            exit 1
-        fi
-    fi
-
-    log_info "Install directory: $dest"
-
-    # Create temp directory
-    local temp_dir
-    temp_dir=$(mktemp_dir)
-    trap 'rm -rf "${temp_dir:-}"' EXIT
-
-    # Download consolidated checksums file (for verification)
-    local wrapper_checksums_file="$temp_dir/checksums-wrapper.sha256"
-    local core_checksums_file="$temp_dir/checksums-core.sha256"
-    local wrapper_pubkey_file="$temp_dir/release-signing-wrapper.pem"
-    local core_pubkey_file="$temp_dir/release-signing-core.pem"
-    if [[ "${VERIFY:-}" == "1" ]]; then
-        ensure_openssl_for_signatures || exit 1
-
-        log_step "Resolving trusted public key..."
-        if ! resolve_release_public_key "$version" "$wrapper_pubkey_file"; then
-            log_error "Installation aborted: could not load trusted key for wrapper version v${version}"
-            exit 1
-        fi
-
-        if [[ "$core_version" == "$version" ]]; then
-            cp "$wrapper_pubkey_file" "$core_pubkey_file"
-        else
-            if ! resolve_release_public_key "$core_version" "$core_pubkey_file"; then
-                log_error "Installation aborted: could not load trusted key for pt-core version v${core_version}"
-                exit 1
-            fi
-        fi
-
-        log_step "Downloading checksums..."
-        if ! download_checksums "$version" "$wrapper_checksums_file"; then
-            log_error "Installation aborted: wrapper checksums are required when VERIFY=1"
-            exit 1
-        fi
-        log_success "Downloaded wrapper checksums.sha256"
-
-        if [[ "$core_version" == "$version" ]]; then
-            core_checksums_file="$wrapper_checksums_file"
-        else
-            if ! download_checksums "$core_version" "$core_checksums_file"; then
-                log_error "Installation aborted: pt-core checksums are required when VERIFY=1"
-                exit 1
-            fi
-            log_success "Downloaded pt-core checksums.sha256"
-        fi
-    fi
-
-    # Download pt wrapper script
-    log_step "Downloading pt wrapper..."
-    local download_url
-    local downloaded_wrapper=false
-    local release_url="${RELEASES_URL}/download/v${version}/pt"
-    local tag_url="https://raw.githubusercontent.com/${GITHUB_REPO}/v${version}/pt"
-    local main_url="${RAW_URL}/pt"
-
-    download_url=$(append_cache_buster "$release_url")
-    if download "$download_url" "$temp_dir/pt"; then
-        downloaded_wrapper=true
+    if "$DEST/pt-core" agent init --yes --agent "$agent" --format summary >/dev/null 2>&1; then
+        printf -v "$status_var" '%s' "configured"
     else
-        download_url=$(append_cache_buster "$tag_url")
-        if download "$download_url" "$temp_dir/pt"; then
-            downloaded_wrapper=true
-        fi
+        printf -v "$status_var" '%s' "failed"
+    fi
+}
+
+skill_payload() {
+    cat <<'EOF'
+# process-triage
+
+Use `pt` as the user-facing command and `pt help` for wrapper-aware help.
+
+Core workflows:
+- `pt scan --format json`
+- `pt deep-scan --format json`
+- `pt agent plan`
+- `pt agent explain`
+- `pt agent apply`
+
+Safety:
+- Never kill automatically without explicit user approval
+- Prefer `pt agent` over legacy `pt robot`
+- Use structured output for agent automation
+EOF
+}
+
+install_skill_dir() {
+    local base_dir="$1"
+    local status_var="$2"
+    local skill_dir="${base_dir}/process-triage"
+
+    mkdir -p "$skill_dir"
+    if download "${RELEASES_URL}/download/v${VERSION}/process-triage-skill.tar.gz" "${TEMP_DIR}/process-triage-skill.tar.gz" 2>/dev/null; then
+        tar -xzf "${TEMP_DIR}/process-triage-skill.tar.gz" -C "$base_dir"
+        printf -v "$status_var" '%s' "downloaded"
+        return 0
     fi
 
-    if [[ "$downloaded_wrapper" != "true" ]]; then
-        if [[ "${VERIFY:-}" == "1" ]]; then
-            log_error "Failed to download pt wrapper from release or tag with VERIFY=1."
-            log_error "Refusing insecure fallback to main while verification is enabled."
-            exit 1
-        else
-            log_warn "Falling back to main pt wrapper (unverified)."
-        fi
-        download_url=$(append_cache_buster "$main_url")
-        download "$download_url" "$temp_dir/pt" || {
-            log_error "Failed to download pt wrapper"
-            exit 1
-        }
+    skill_payload > "${skill_dir}/SKILL.md"
+    printf -v "$status_var" '%s' "inline"
+}
+
+maybe_configure_agents() {
+    if [[ "$NO_CONFIGURE" -eq 1 || ! -x "$DEST/pt-core" ]]; then
+        return 0
     fi
 
-    # Verify pt wrapper if requested
-    if [[ "${VERIFY:-}" == "1" ]]; then
-        if ! verify_file_signature \
-            "$temp_dir/pt" \
-            "pt" \
-            "$version" \
-            "$wrapper_pubkey_file" \
-            "$temp_dir/pt.sig"; then
-            log_error "Installation aborted: pt wrapper signature verification failed"
-            exit 1
-        fi
-
-        if ! verify_file_checksum "$temp_dir/pt" "pt" "$wrapper_checksums_file"; then
-            log_error "Installation aborted: pt wrapper checksum verification failed"
-            exit 1
-        fi
+    run_agent_init_for "claude" CLAUDE_STATUS
+    run_agent_init_for "codex" CODEX_STATUS
+    run_agent_init_for "copilot" COPILOT_STATUS
+    run_agent_init_for "cursor" CURSOR_STATUS
+    run_agent_init_for "windsurf" WINDSURF_STATUS
+    if agent_present "gemini"; then
+        GEMINI_STATUS="unsupported"
     fi
 
-    # Download and verify pt-core
-    local target
-    local core_installed=false
-    if target=$(detect_platform); then
-        log_step "Downloading pt-core (${target})..."
-        local archive_name="pt-core-${target}-${core_version}.tar.gz"
-        local core_url="${RELEASES_URL}/download/v${core_version}/${archive_name}"
-        local download_success=false
-
-        if download "$core_url" "$temp_dir/$archive_name"; then
-            download_success=true
-        else
-            # Try musl fallback for Linux glibc systems
-            local musl_fallback
-            musl_fallback=$(get_musl_fallback "$core_version" "$target")
-            if [[ -n "$musl_fallback" ]]; then
-                log_info "Trying musl static binary as fallback..."
-                local musl_url="${RELEASES_URL}/download/v${core_version}/${musl_fallback}"
-                if download "$musl_url" "$temp_dir/$musl_fallback"; then
-                    archive_name="$musl_fallback"
-                    download_success=true
-                    log_success "Using musl static binary (works on any Linux)"
-                fi
-            fi
-        fi
-
-        if [[ "$download_success" == "true" ]]; then
-            # Verify pt-core archive if requested
-            if [[ "${VERIFY:-}" == "1" ]]; then
-                if ! verify_file_signature \
-                    "$temp_dir/$archive_name" \
-                    "$archive_name" \
-                    "$core_version" \
-                    "$core_pubkey_file" \
-                    "$temp_dir/${archive_name}.sig"; then
-                    log_error "Installation aborted: pt-core signature verification failed"
-                    exit 1
-                fi
-
-                if ! verify_file_checksum "$temp_dir/$archive_name" "$archive_name" "$core_checksums_file"; then
-                    log_error "Installation aborted: pt-core checksum verification failed"
-                    exit 1
-                fi
-            fi
-
-            # Extract pt-core binary from archive
-            if tar -xzf "$temp_dir/$archive_name" -C "$temp_dir" pt-core 2>/dev/null || \
-               tar -xzf "$temp_dir/$archive_name" -C "$temp_dir" 2>/dev/null; then
-                if [[ -f "$temp_dir/pt-core" ]]; then
-                    if install_binary "$temp_dir/pt-core" "$dest" "pt-core"; then
-                        core_installed=true
-                    fi
-                else
-                    log_warn "pt-core binary not found in archive"
-                fi
-            else
-                log_warn "Failed to extract pt-core from archive"
-            fi
-        else
-            log_warn "Failed to download pt-core binary for $target"
-            log_warn "You may need to build from source: cargo install --path crates/pt-core"
-        fi
-    else
-        log_warn "Skipping pt-core (unsupported architecture)"
+    if [[ -d "$HOME/.claude" || "$CLAUDE_STATUS" == "configured" ]]; then
+        install_skill_dir "$HOME/.claude/skills" CLAUDE_SKILL_STATUS
     fi
+    if [[ -d "$HOME/.codex" || "$CODEX_STATUS" == "configured" ]]; then
+        install_skill_dir "$HOME/.codex/skills" CODEX_SKILL_STATUS
+    fi
+}
 
-    # Install pt wrapper
-    if ! install_binary "$temp_dir/pt" "$dest" "pt"; then
-        log_error "Failed to install pt wrapper"
+maybe_build_from_source() {
+    local source_dir="${TEMP_DIR}/src"
+    local git_ref="v${VERSION}"
+    local wrapper_path="${TEMP_DIR}/pt"
+    local core_path="${TEMP_DIR}/pt-core"
+
+    command -v git >/dev/null 2>&1 || {
+        err "git is required for --from-source"
         exit 1
-    fi
+    }
+    command -v cargo >/dev/null 2>&1 || {
+        err "cargo is required for --from-source"
+        exit 1
+    }
 
-    # Add to PATH if needed and not disabled
-    if [[ "${PT_NO_PATH:-}" != "1" ]]; then
-        add_to_path "$dest"
-    else
-        log_info "Skipping PATH modification (PT_NO_PATH=1)"
-        if [[ ":$PATH:" != *":$dest:"* ]]; then
-            log_info "Add manually: export PATH=\"$dest:\$PATH\""
-        fi
+    run_with_spinner "Cloning source" git clone --depth 1 --branch "$git_ref" "https://github.com/${GITHUB_REPO}.git" "$source_dir"
+    run_with_spinner "Building pt-core from source" bash -lc "cd '$source_dir' && cargo build --release -p pt-core"
+
+    cp "${source_dir}/pt" "$wrapper_path"
+    cp "${source_dir}/target/release/pt-core" "$core_path"
+}
+
+verify_existing_install_short_circuit() {
+    if [[ "$FORCE_INSTALL" -eq 1 ]]; then
+        return 1
     fi
+    if [[ "${INSTALLED_WRAPPER_VERSION:-}" == "$VERSION" && "${INSTALLED_CORE_VERSION:-}" == "$CORE_VERSION" ]]; then
+        ok "pt ${VERSION} is already installed"
+        maybe_add_path "$DEST"
+        maybe_install_completions
+        maybe_configure_agents
+        if [[ "$VERIFY_SELF" -eq 1 ]]; then
+            "$DEST/pt" --version >/dev/null
+            "$DEST/pt" scan --format json >/dev/null 2>/dev/null || true
+        fi
+        show_final_summary
+        exit 0
+    fi
+}
+
+prepare_release_verification() {
+    local version="$1"
+    local pubkey_file="$2"
+    local checksums_file="$3"
+
+    resolve_release_public_key "$version" "$pubkey_file"
+    download_checksums "$version" "$checksums_file"
+}
+
+download_wrapper() {
+    local output="$1"
+    local urls=()
+    mapfile -t urls < <(wrapper_urls)
+    download_first_available "$output" "${urls[@]}" || {
+        err "Failed to download pt wrapper"
+        exit 1
+    }
+}
+
+download_core_archive() {
+    local output="$1"
+    local urls=()
+    mapfile -t urls < <(core_urls)
+    download_first_available "$output" "${urls[@]}" || return 1
+    return 0
+}
+
+show_agent_scan_notice() {
+    [[ "$NO_CONFIGURE" -eq 1 || "$QUIET" -eq 1 ]] && return 0
+    if [[ "$HAS_GUM" -eq 1 ]]; then
+        gum style \
+            --border normal \
+            --border-foreground 244 \
+            --padding "0 1" \
+            "$(gum style --foreground 212 --bold 'Agent scan')" \
+            "$(gum style --foreground 247 'Looking for installed coding agents and optional skills')"
+    else
+        draw_box "0;36" \
+            "Agent scan" \
+            "Looking for installed coding agents and optional skills"
+    fi
+}
+
+show_final_summary() {
+    local lines=(
+        "Installed pt ${VERSION} to ${DEST}"
+        "Installed pt-core ${CORE_VERSION} to ${DEST}"
+    )
+
+    [[ "$CLAUDE_STATUS" != "skipped" ]] && AGENT_LINES+=("Claude Code: ${CLAUDE_STATUS}")
+    [[ "$CODEX_STATUS" != "skipped" ]] && AGENT_LINES+=("Codex CLI: ${CODEX_STATUS}")
+    [[ "$COPILOT_STATUS" != "skipped" ]] && AGENT_LINES+=("GitHub Copilot CLI: ${COPILOT_STATUS}")
+    [[ "$CURSOR_STATUS" != "skipped" ]] && AGENT_LINES+=("Cursor: ${CURSOR_STATUS}")
+    [[ "$WINDSURF_STATUS" != "skipped" ]] && AGENT_LINES+=("Windsurf: ${WINDSURF_STATUS}")
+    [[ "$GEMINI_STATUS" != "skipped" ]] && AGENT_LINES+=("Gemini CLI: ${GEMINI_STATUS}")
+    [[ "$CLAUDE_SKILL_STATUS" != "skipped" ]] && AGENT_LINES+=("Claude skill: ${CLAUDE_SKILL_STATUS}")
+    [[ "$CODEX_SKILL_STATUS" != "skipped" ]] && AGENT_LINES+=("Codex skill: ${CODEX_SKILL_STATUS}")
+
+    lines+=("${AGENT_LINES[@]}")
+    lines+=("${BACKUP_LINES[@]}")
+    lines+=("Run: pt --help")
+    lines+=("Uninstall: rm -f ${DEST}/pt ${DEST}/pt-core")
+    lines+=("If you enabled PATH updates, remove the '# process_triage installer PATH' block from your shell files to revert them.")
 
     echo ""
-    log_success "pt v${version} installed successfully!"
-    if [[ "$core_installed" == "true" ]]; then
-        log_success "pt-core v${core_version} installed successfully!"
+    if [[ "$HAS_GUM" -eq 1 && "$QUIET" -eq 0 ]]; then
+        gum style --border double --border-foreground 42 --padding "1 2" "${lines[@]}"
     else
-        log_warn "pt-core was not installed. Some features may be unavailable."
-        log_warn "To build from source: cargo install --path crates/pt-core"
+        draw_box "0;32" "${lines[@]}"
     fi
-    log_info "Run 'pt --help' to get started."
+}
+
+main() {
+    parse_args "$@"
+    setup_proxy
+    detect_gum
+    maybe_self_refresh "$@"
+    show_header
+
+    if [[ "$SYSTEM" -eq 1 ]]; then
+        DEST="/usr/local/bin"
+    fi
+
+    detect_platform
+    resolve_version
+    resolve_core_version
+    create_temp_dir
+    preflight_checks
+    if verify_existing_install_short_circuit; then
+        return 0
+    fi
+    acquire_lock
+
+    local wrapper_file="${TEMP_DIR}/pt"
+    local core_archive="${TEMP_DIR}/pt-core.tar.gz"
+    local core_extract_dir="${TEMP_DIR}/core"
+    local core_binary="${TEMP_DIR}/core/pt-core"
+    local wrapper_checksums="${TEMP_DIR}/wrapper-checksums.sha256"
+    local core_checksums="${TEMP_DIR}/core-checksums.sha256"
+    local wrapper_pubkey="${TEMP_DIR}/wrapper-release.pem"
+    local core_pubkey="${TEMP_DIR}/core-release.pem"
+
+    if [[ "$VERIFY" -eq 1 ]]; then
+        prepare_release_verification "$VERSION" "$wrapper_pubkey" "$wrapper_checksums"
+        if [[ "$CORE_VERSION" == "$VERSION" ]]; then
+            cp "$wrapper_pubkey" "$core_pubkey"
+            cp "$wrapper_checksums" "$core_checksums"
+        else
+            prepare_release_verification "$CORE_VERSION" "$core_pubkey" "$core_checksums"
+        fi
+    fi
+
+    if [[ -n "$OFFLINE_BUNDLE" ]]; then
+        if [[ ! -f "$OFFLINE_BUNDLE" ]]; then
+            err "Offline bundle not found: $OFFLINE_BUNDLE"
+            exit 1
+        fi
+        cp "$OFFLINE_BUNDLE" "$core_archive"
+        if [[ -f "./pt" ]]; then
+            cp ./pt "$wrapper_file"
+        elif [[ -f "$(dirname "$0")/pt" ]]; then
+            cp "$(dirname "$0")/pt" "$wrapper_file"
+        else
+            err "Offline mode requires a local pt wrapper beside install.sh or in the current directory"
+            exit 1
+        fi
+    elif [[ "$FROM_SOURCE" -eq 1 ]]; then
+        maybe_build_from_source
+    else
+        run_with_spinner "Downloading pt wrapper" download_wrapper "$wrapper_file"
+        if ! run_with_spinner "Downloading pt-core archive" download_core_archive "$core_archive"; then
+            warn "Prebuilt pt-core download failed; falling back to source build"
+            FROM_SOURCE=1
+            maybe_build_from_source
+        fi
+    fi
+
+    if [[ "$FROM_SOURCE" -ne 1 && "$VERIFY" -eq 1 ]]; then
+        verify_file_signature "$wrapper_file" "pt" "$VERSION" "$wrapper_pubkey" "${TEMP_DIR}/pt.sig"
+        verify_file_checksum "$wrapper_file" "pt" "$wrapper_checksums"
+        best_effort_sigstore_verify "$wrapper_file" "pt"
+
+        verify_file_signature "$core_archive" "$DOWNLOADED_ARTIFACT" "$CORE_VERSION" "$core_pubkey" "${TEMP_DIR}/${DOWNLOADED_ARTIFACT}.sig"
+        verify_file_checksum "$core_archive" "$DOWNLOADED_ARTIFACT" "$core_checksums"
+        best_effort_sigstore_verify "$core_archive" "$DOWNLOADED_ARTIFACT"
+    fi
+
+    if [[ "$FROM_SOURCE" -ne 1 ]]; then
+        extract_core_archive "$core_archive" "$core_extract_dir"
+    fi
+
+    if [[ "$FROM_SOURCE" -eq 1 ]]; then
+        core_binary="${TEMP_DIR}/pt-core"
+    fi
+
+    [[ -f "$wrapper_file" ]] || {
+        err "Wrapper file missing after acquisition"
+        exit 1
+    }
+    [[ -f "$core_binary" ]] || {
+        err "pt-core binary missing after acquisition"
+        exit 1
+    }
+
+    install_binary "$wrapper_file" "$DEST" "pt"
+    install_binary "$core_binary" "$DEST" "pt-core"
+
+    maybe_add_path "$DEST"
+    maybe_install_completions
+    show_agent_scan_notice
+    maybe_configure_agents
+
+    if [[ "$VERIFY_SELF" -eq 1 ]]; then
+        run_with_spinner "Running post-install verification" bash -lc "'$DEST/pt' --version >/dev/null && '$DEST/pt-core' --version >/dev/null && '$DEST/pt' scan --format json >/dev/null 2>/dev/null"
+    fi
+
+    show_final_summary
 }
 
 main "$@"

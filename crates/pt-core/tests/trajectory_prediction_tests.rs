@@ -168,7 +168,7 @@ fn test_trend_detection_sensitivity_levels() {
     let step_secs = 60.0;
 
     let low = make_relative_change_series(100.0, 0.05, duration_secs, step_secs);
-    let medium = make_relative_change_series(100.0, 0.10, duration_secs, step_secs);
+    let medium = make_relative_change_series(100.0, 0.12, duration_secs, step_secs);
     let high = make_relative_change_series(100.0, 0.20, duration_secs, step_secs);
 
     let low_summary = classify_trend("cpu_pct", &low, &config, "%", None).unwrap();

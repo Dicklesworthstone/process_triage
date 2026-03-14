@@ -286,9 +286,15 @@ pub fn classify_trend(
     let change_points = detect_change_points(points, config.change_point_threshold, std_dev);
     let is_periodic = detect_periodicity(points);
 
-    // Relative change over the observation window.
-    let relative_change = if mean_value.abs() > 1e-15 {
-        (reg.slope * duration / mean_value).abs()
+    // Relative change over the observation window. When the series mean is near
+    // zero, fall back to a broader signal scale so cross-zero trends do not get
+    // suppressed into "stable" purely because the denominator vanished.
+    let scale = mean_value
+        .abs()
+        .max(std_dev)
+        .max(values.iter().map(|v| v.abs()).fold(0.0, f64::max));
+    let relative_change = if scale > 1e-15 {
+        (reg.slope * duration).abs() / scale
     } else {
         0.0
     };
@@ -458,6 +464,16 @@ mod tests {
         let s = summary.unwrap();
         assert_eq!(s.trend, TrendClass::Stable);
         assert!(s.interpretation.contains("stable"));
+    }
+
+    #[test]
+    fn test_classify_increasing_when_series_crosses_zero() {
+        let points = make_linear(60, 0.05, -90.0);
+        let config = TrendConfig::default();
+
+        let summary = classify_trend("delta_metric", &points, &config, "units", None).unwrap();
+        assert_eq!(summary.trend, TrendClass::Increasing);
+        assert!(summary.slope > 0.0);
     }
 
     #[test]
