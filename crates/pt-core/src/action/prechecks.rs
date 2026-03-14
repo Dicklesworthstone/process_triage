@@ -784,13 +784,14 @@ impl LivePreCheckProvider {
         {
             if let Some(launchd_service) = crate::collect::macos::detect_launchd_service(pid) {
                 let label = launchd_service.label;
+                let service_target = format!("system/{}", label);
                 return Some(SupervisorInfo {
                     supervisor: "launchd".to_string(),
                     unit_name: Some(label.clone()),
                     unit_type: None,
                     is_main_process: true, // If detect_launchd_service returns it, it's the main process
                     recommended_action: SupervisorAction::StopUnit {
-                        command: format!("launchctl stop {}", label),
+                        command: format!("launchctl bootout {}", service_target),
                     },
                     systemd_unit: None,
                 });
@@ -1469,20 +1470,20 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_info_block_reason_launchd_stop_includes_label() {
+    fn supervisor_info_block_reason_launchd_stop_includes_service_target() {
         let info = SupervisorInfo {
             supervisor: "launchd".to_string(),
             unit_name: Some("com.example.agent".to_string()),
             unit_type: None,
             is_main_process: true,
             recommended_action: SupervisorAction::StopUnit {
-                command: "launchctl stop com.example.agent".to_string(),
+                command: "launchctl bootout system/com.example.agent".to_string(),
             },
             systemd_unit: None,
         };
 
         let reason = info.to_block_reason();
-        assert!(reason.contains("launchctl stop com.example.agent"));
+        assert!(reason.contains("launchctl bootout system/com.example.agent"));
         assert!(reason.contains("com.example.agent"));
     }
 

@@ -77,7 +77,7 @@ use pt_telemetry::writer::default_telemetry_dir;
 #[cfg(feature = "daemon")]
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -3349,10 +3349,11 @@ fn resolve_bundle_passphrase(passphrase_arg: &Option<String>) -> Option<String> 
         .or_else(|| std::env::var("PT_BUNDLE_PASSPHRASE").ok())
 }
 
-fn run_deep_scan(global: &GlobalOpts, args: &DeepScanArgs) -> ExitCode {
+fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
         use pt_core::collect::{deep_scan, DeepScanOptions};
+        let args = _args;
 
         let progress = progress_emitter(global);
         let options = DeepScanOptions {
@@ -12511,7 +12512,7 @@ fn read_mem_available_bytes_for_goal_progress() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn collect_occupied_ports_for_goal_progress() -> Vec<u16> {
-    let mut ports = BTreeSet::new();
+    let mut ports = std::collections::BTreeSet::new();
 
     if let Some(entries) = parse_proc_net_tcp("/proc/net/tcp", false) {
         for entry in entries.into_iter().filter(|e| e.state.is_listen()) {

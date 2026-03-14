@@ -13,7 +13,6 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::LazyLock;
 use thiserror::Error;
 use tracing::{debug, trace, warn};

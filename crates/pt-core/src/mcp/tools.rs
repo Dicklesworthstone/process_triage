@@ -4,9 +4,9 @@
 
 #[cfg(target_os = "linux")]
 use crate::collect::{deep_scan, DeepScanOptions};
-use crate::collect::{
-    quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanMetadata, ScanResult,
-};
+#[cfg(target_os = "linux")]
+use crate::collect::ScanMetadata;
+use crate::collect::{quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
 use crate::signature_cli::load_user_signatures;
 use crate::supervision::signature::ProcessMatchContext;

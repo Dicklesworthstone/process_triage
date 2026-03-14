@@ -79,36 +79,31 @@ pub fn compute_flip_conditions(ledger: &EvidenceLedger, config: &FlipConfig) -> 
         .filter(|bf| is_supporting(bf, ledger.classification))
         .collect();
 
-    // Total supporting log-odds.
-    let total_support_log_bf: f64 = supporting.iter().map(|bf| bf.log_bf.abs()).sum();
+    let logit = |p: f64| {
+        let p = p.clamp(1e-9, 1.0 - 1e-9);
+        (p / (1.0 - p)).ln()
+    };
+    let current_log_odds = logit(current_posterior);
+    let threshold_log_odds = logit(config.threshold);
+    let required_delta_log_bf = (current_log_odds - threshold_log_odds).abs();
+    let required_delta_bits = required_delta_log_bf / std::f64::consts::LN_2;
 
     let mut scenarios: Vec<FlipScenario> =
         supporting
             .iter()
             .map(|bf| {
                 let abs_bits = bf.delta_bits.abs();
-                let fraction = if total_support_log_bf > 0.0 {
-                    bf.log_bf.abs() / total_support_log_bf
-                } else {
-                    0.0
-                };
-                // Approximate delta_p if this feature were entirely removed.
-                let delta_p = fraction * margin.max(0.0);
-
-                // How much would log_bf need to change to eliminate margin?
-                // Rough linear approximation: required_delta ≈ margin / fraction_per_unit.
-                let required_delta_log_bf = if fraction > 0.0 {
-                    margin / fraction
-                } else {
-                    f64::INFINITY
-                };
-                let required_delta_bits = required_delta_log_bf / std::f64::consts::LN_2;
+                
+                // Exactly calculate new probability if feature removed
+                let removed_log_odds = current_log_odds - bf.log_bf.abs();
+                let p_if_removed = 1.0 / (1.0 + (-removed_log_odds).exp());
+                let delta_p = (current_posterior - p_if_removed).max(0.0);
 
                 let explanation =
                     format!(
                 "If '{}' evidence were removed ({:.1} bits), posterior would drop ~{:.1}pp. \
-                 To flip, this feature would need to shift by {:.1} bits.",
-                bf.feature, abs_bits, delta_p * 100.0, required_delta_bits.abs(),
+                 To flip, total evidence must shift by {:.1} bits against it.",
+                bf.feature, abs_bits, delta_p * 100.0, required_delta_bits,
             );
 
                 FlipScenario {
@@ -123,11 +118,10 @@ pub fn compute_flip_conditions(ledger: &EvidenceLedger, config: &FlipConfig) -> 
             })
             .collect();
 
-    // Sort by required_delta_bits ascending (easiest flip first).
+    // Sort by delta_p_if_removed descending (largest impact first).
     scenarios.sort_by(|a, b| {
-        a.required_delta_bits
-            .abs()
-            .partial_cmp(&b.required_delta_bits.abs())
+        b.delta_p_if_removed
+            .partial_cmp(&a.delta_p_if_removed)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
@@ -259,9 +253,9 @@ mod tests {
         ]);
         let analysis = compute_flip_conditions(&ledger, &FlipConfig::default());
 
-        // Largest contributor (cpu) should need least relative change.
+        // Largest contributor should have the biggest impact when removed.
         for w in analysis.scenarios.windows(2) {
-            assert!(w[0].required_delta_bits.abs() <= w[1].required_delta_bits.abs());
+            assert!(w[0].delta_p_if_removed >= w[1].delta_p_if_removed);
         }
     }
 

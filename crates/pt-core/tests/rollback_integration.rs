@@ -35,6 +35,8 @@ esac
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
+        // Brief delay to prevent "Text file busy" (ETXTBSY) when executed immediately
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     path
@@ -329,7 +331,11 @@ mod verification_tests {
         // Expect version 2.0.0 but binary reports 1.0.0
         let result = verify_binary(&binary_path, Some("2.0.0")).unwrap();
         assert!(!result.passed);
-        assert!(result.error.as_ref().unwrap().contains("Version mismatch"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Version mismatch"),
+            "Unexpected error message: {:?}",
+            result.error
+        );
     }
 }
 
