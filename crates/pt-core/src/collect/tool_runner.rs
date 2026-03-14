@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -308,6 +308,8 @@ impl ToolRunner {
             args: args.iter().map(|s| s.to_string()).collect(),
             timeout,
             max_output: None,
+            stdin: None,
+            working_dir: None,
         };
         self.run(&spec)
     }
