@@ -330,14 +330,11 @@ impl GpdFitter {
         }
     }
 
-    /// Compute empirical quantile.
-    fn quantile(&self, data: &[f64], q: f64) -> f64 {
-        if data.is_empty() {
+    /// Compute empirical quantile from already sorted data.
+    fn quantile_sorted(&self, sorted: &[f64], q: f64) -> f64 {
+        if sorted.is_empty() {
             return 0.0;
         }
-
-        let mut sorted: Vec<f64> = data.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let n = sorted.len() as f64;
         let idx = q * (n - 1.0);
@@ -352,17 +349,28 @@ impl GpdFitter {
         sorted[lo] * (1.0 - frac) + sorted[hi] * frac
     }
 
+    /// Compute empirical quantile.
+    fn quantile(&self, data: &[f64], q: f64) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
+
+        let mut sorted: Vec<f64> = data.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.quantile_sorted(&sorted, q)
+    }
+
     /// Mean residual life threshold selection.
     fn mrl_threshold(&self, observations: &[f64]) -> Result<f64, EvtError> {
         let mut sorted: Vec<f64> = observations.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // Try thresholds at various quantiles
-        let mut best_threshold = self.quantile(observations, 0.90);
+        let mut best_threshold = self.quantile_sorted(&sorted, 0.90);
         let mut min_variance = f64::INFINITY;
 
         for q in [0.80, 0.85, 0.90, 0.95] {
-            let threshold = self.quantile(observations, q);
+            let threshold = self.quantile_sorted(&sorted, q);
             let exceedances: Vec<f64> = sorted
                 .iter()
                 .filter(|&&x| x > threshold)

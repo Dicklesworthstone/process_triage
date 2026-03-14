@@ -10607,9 +10607,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                                 })
                                 .filter(|k| !k.is_empty())
                                 .collect();
-                            obj.as_object_mut()
-                                .unwrap()
-                                .insert("env_keys".to_string(), serde_json::json!(keys));
+                            if let Some(obj_mut) = obj.as_object_mut() {
+                                obj_mut.insert("env_keys".to_string(), serde_json::json!(keys));
+                            }
                         }
                     }
 
@@ -10632,9 +10632,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                                     .count()
                             })
                             .unwrap_or(0);
-                        obj.as_object_mut()
-                            .unwrap()
-                            .insert("socket_count".to_string(), serde_json::json!(socket_count));
+                        if let Some(obj_mut) = obj.as_object_mut() {
+                            obj_mut.insert("socket_count".to_string(), serde_json::json!(socket_count));
+                        }
                     }
 
                     obj
@@ -10687,10 +10687,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "capabilities": capabilities_summary,
             });
             if let Some(procs) = &process_snapshot {
-                output
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("process_snapshot".to_string(), procs.clone());
+                if let Some(out_mut) = output.as_object_mut() {
+                    out_mut.insert("process_snapshot".to_string(), procs.clone());
+                }
             }
             println!("{}", format_structured_output(global, output));
         }
@@ -16618,16 +16617,14 @@ fn run_agent_session_status(
             // Add detail if requested
             if include_detail {
                 if let Some(plan) = &plan_detail {
-                    output
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("plan".to_string(), plan.clone());
+                    if let Some(out_mut) = output.as_object_mut() {
+                        out_mut.insert("plan".to_string(), plan.clone());
+                    }
                 }
                 if let Some(outcomes) = &outcomes_detail {
-                    output
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("outcomes".to_string(), serde_json::json!(outcomes));
+                    if let Some(out_mut) = output.as_object_mut() {
+                        out_mut.insert("outcomes".to_string(), serde_json::json!(outcomes));
+                    }
                 }
             }
             println!("{}", format_structured_output(global, output));

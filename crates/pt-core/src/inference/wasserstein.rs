@@ -708,8 +708,8 @@ pub fn wasserstein_2_squared(p: &[f64], q: &[f64]) -> f64 {
 
         for i in 0..n {
             let u = (i as f64 + 0.5) / n as f64;
-            let p_q = quantile(p, u);
-            let q_q = quantile(q, u);
+            let p_q = quantile(&p_sorted, u);
+            let q_q = quantile(&q_sorted, u);
             total += (p_q - q_q).powi(2);
         }
 
@@ -717,26 +717,23 @@ pub fn wasserstein_2_squared(p: &[f64], q: &[f64]) -> f64 {
     }
 }
 
-/// Linear quantile interpolation.
+/// Linear quantile interpolation. Assumes `sorted` is already sorted.
 fn quantile(sorted: &[f64], u: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
 
-    let mut data = sorted.to_vec();
-    data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let n = data.len() as f64;
+    let n = sorted.len() as f64;
     let idx = u * (n - 1.0);
     let lo = idx.floor() as usize;
     let hi = idx.ceil() as usize;
 
-    if lo == hi || hi >= data.len() {
-        return data[lo.min(data.len() - 1)];
+    if lo == hi || hi >= sorted.len() {
+        return sorted[lo.min(sorted.len() - 1)];
     }
 
     let frac = idx - lo as f64;
-    data[lo] * (1.0 - frac) + data[hi] * frac
+    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
 }
 
 #[cfg(test)]

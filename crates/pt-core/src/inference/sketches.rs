@@ -664,7 +664,7 @@ impl TDigest {
         }
 
         // Find which centroid contains the target
-        let mut idx = 0;
+        let mut idx = n.saturating_sub(1); // Default to last in case of precision issues
         for i in 0..n {
             let lower = cum_weight[i];
             let upper = cum_weight[i + 1];

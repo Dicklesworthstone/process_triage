@@ -183,12 +183,9 @@ impl ContainerSupervisionAnalyzer {
             collect_cgroup_details(pid).ok_or(ContainerSupervisionError::ProcessNotFound(pid))?;
 
         // Get cgroup path to analyze
-        let cgroup_path = self.get_cgroup_path(&cgroup_details);
-
-        if cgroup_path.is_none() {
+        let Some(cgroup_path) = self.get_cgroup_path(&cgroup_details) else {
             return Ok(ContainerSupervisionResult::not_in_container(pid));
-        }
-        let cgroup_path = cgroup_path.unwrap();
+        };
 
         // Detect container from cgroup path
         let container_info = detect_container_from_cgroup(&cgroup_path);
