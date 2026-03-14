@@ -16,6 +16,7 @@
 #   --verify               Enforce checksum + signature verification
 #   --from-source          Build pt-core from source
 #   --offline FILE         Install from a local pt-core tarball
+#                          Version inferred from bundle name or local VERSION file
 #   --quiet                Suppress non-error output
 #   --no-gum               Disable gum formatting
 #   --force                Reinstall even if target version is already present
@@ -196,6 +197,7 @@ Options:
   --verify-self        Run post-install diagnostics
   --from-source        Build pt-core from source
   --offline <file>     Install pt-core from a local tarball
+                       Version inferred from bundle name or local VERSION file
   --force              Reinstall even if already at target version
   --quiet              Suppress non-error output
   --no-gum             Disable gum formatting
@@ -340,6 +342,123 @@ append_cache_buster() {
     fi
 }
 
+infer_version_from_text() {
+    local text="$1"
+    if [[ "$text" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+infer_version_from_offline_bundle() {
+    local bundle_path="$1"
+    infer_version_from_text "$(basename "$bundle_path")"
+}
+
+resolve_local_version_file() {
+    local candidate=""
+
+    if [[ -f "./VERSION" ]]; then
+        candidate="$(tr -d '[:space:]' < ./VERSION)"
+        infer_version_from_text "$candidate" && return 0
+    fi
+
+    if [[ -f "$(dirname "$0")/VERSION" ]]; then
+        candidate="$(tr -d '[:space:]' < "$(dirname "$0")/VERSION")"
+        infer_version_from_text "$candidate" && return 0
+    fi
+
+    return 1
+}
+
+copy_local_verification_file() {
+    local output="$1"
+    shift
+    local candidate
+    for candidate in "$@"; do
+        [[ -n "$candidate" && -f "$candidate" ]] || continue
+        cp "$candidate" "$output"
+        return 0
+    done
+    return 1
+}
+
+prepare_offline_release_public_key() {
+    local output="$1"
+    local script_dir
+    script_dir="$(dirname "$0")"
+
+    if [[ -n "${PT_RELEASE_PUBLIC_KEY_FILE:-}" ]]; then
+        cp "${PT_RELEASE_PUBLIC_KEY_FILE}" "$output"
+    elif [[ -n "${PT_RELEASE_PUBLIC_KEY_PEM:-}" ]]; then
+        printf '%s\n' "${PT_RELEASE_PUBLIC_KEY_PEM}" > "$output"
+    elif ! copy_local_verification_file \
+        "$output" \
+        "./release-signing-public.pem" \
+        "${script_dir}/release-signing-public.pem" \
+        "$(dirname "$OFFLINE_BUNDLE")/release-signing-public.pem"; then
+        err "Offline verification requires a local release-signing-public.pem"
+        err "Provide PT_RELEASE_PUBLIC_KEY_FILE/PT_RELEASE_PUBLIC_KEY_PEM or place the PEM beside install.sh, the current directory, or the offline bundle"
+        return 1
+    fi
+
+    openssl pkey -pubin -in "$output" -noout >/dev/null 2>&1 || {
+        err "Invalid release public key PEM"
+        return 1
+    }
+
+    local expected actual
+    expected="$(resolve_expected_key_fingerprint || true)"
+    if [[ -n "$expected" ]]; then
+        actual="$(openssl pkey -pubin -in "$output" -outform der 2>/dev/null | sha256_stdin)"
+        actual="$(normalize_fingerprint "$actual")"
+        if [[ "$actual" != "$expected" ]]; then
+            err "Release public key fingerprint mismatch"
+            return 1
+        fi
+        ok "Release public key fingerprint verified: ${actual:0:16}..."
+    else
+        warn "No release public key fingerprint pin configured"
+    fi
+}
+
+prepare_offline_checksums() {
+    local output="$1"
+    local script_dir
+    script_dir="$(dirname "$0")"
+
+    if ! copy_local_verification_file \
+        "$output" \
+        "./checksums.sha256" \
+        "${script_dir}/checksums.sha256" \
+        "$(dirname "$OFFLINE_BUNDLE")/checksums.sha256"; then
+        err "Offline verification requires a local checksums.sha256"
+        err "Place checksums.sha256 beside install.sh, the current directory, or the offline bundle"
+        return 1
+    fi
+}
+
+verify_file_signature_offline() {
+    local file_path="$1"
+    local artifact_name="$2"
+    local pubkey_file="$3"
+    local sig_output="$4"
+    shift 4
+
+    copy_local_verification_file "$sig_output" "$@" || {
+        err "Offline verification requires a local signature for ${artifact_name}"
+        return 1
+    }
+
+    if openssl dgst -sha256 -verify "$pubkey_file" -signature "$sig_output" "$file_path" >/dev/null 2>&1; then
+        ok "${artifact_name} signature verified"
+        return 0
+    fi
+    err "Signature verification failed for ${artifact_name}"
+    return 1
+}
+
 cleanup() {
     [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR"
     if [[ "$LOCK_HELD" -eq 1 && -d "$LOCK_ROOT" ]]; then
@@ -417,9 +536,30 @@ resolve_version() {
         return 0
     fi
 
+    if [[ -n "$OFFLINE_BUNDLE" ]]; then
+        VERSION="$(infer_version_from_offline_bundle "$OFFLINE_BUNDLE" || true)"
+        if [[ -z "$VERSION" ]]; then
+            VERSION="$(resolve_local_version_file || true)"
+        fi
+        if [[ -z "$VERSION" ]]; then
+            err "Offline mode requires --version or a versioned bundle filename"
+            err "Example: pt-core-linux-x86_64-2.0.5.tar.gz"
+            exit 1
+        fi
+        return 0
+    fi
+
     local latest=""
     latest="$(fetch_stdout "${API_URL}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)"
     latest="${latest#v}"
+    if [[ -z "$latest" ]]; then
+        latest="$(
+            curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -o /dev/null -w '%{url_effective}' \
+                "${RELEASES_URL}/latest" 2>/dev/null \
+                | sed -E 's|.*/tag/v?([0-9]+\.[0-9]+\.[0-9]+)$|\1|' \
+                || true
+        )"
+    fi
     if [[ -z "$latest" ]]; then
         latest="$(fetch_stdout "$(append_cache_buster "${RAW_URL}/VERSION")" 2>/dev/null | tr -d '[:space:]' || true)"
     fi
@@ -949,6 +1089,7 @@ verify_existing_install_short_circuit() {
         show_final_summary
         exit 0
     fi
+    return 1
 }
 
 prepare_release_verification() {
@@ -958,6 +1099,41 @@ prepare_release_verification() {
 
     resolve_release_public_key "$version" "$pubkey_file"
     download_checksums "$version" "$checksums_file"
+}
+
+prepare_offline_verification() {
+    local wrapper_source="$1"
+    local core_bundle="$2"
+    local wrapper_sig_output="$3"
+    local core_sig_output="$4"
+    local wrapper_name
+    local core_name
+    local script_dir
+    script_dir="$(dirname "$0")"
+    wrapper_name="$(basename "$wrapper_source")"
+    core_name="$(basename "$core_bundle")"
+
+    prepare_offline_release_public_key "$wrapper_pubkey"
+    cp "$wrapper_pubkey" "$core_pubkey"
+    prepare_offline_checksums "$wrapper_checksums"
+    cp "$wrapper_checksums" "$core_checksums"
+
+    verify_file_signature_offline \
+        "$wrapper_source" \
+        "$wrapper_name" \
+        "$wrapper_pubkey" \
+        "$wrapper_sig_output" \
+        "./${wrapper_name}.sig" \
+        "${script_dir}/${wrapper_name}.sig" \
+        "$(dirname "$wrapper_source")/${wrapper_name}.sig"
+
+    verify_file_signature_offline \
+        "$core_bundle" \
+        "$core_name" \
+        "$core_pubkey" \
+        "$core_sig_output" \
+        "${core_bundle}.sig" \
+        "$(dirname "$core_bundle")/${core_name}.sig"
 }
 
 download_wrapper() {
@@ -1052,8 +1228,9 @@ main() {
     local core_checksums="${TEMP_DIR}/core-checksums.sha256"
     local wrapper_pubkey="${TEMP_DIR}/wrapper-release.pem"
     local core_pubkey="${TEMP_DIR}/core-release.pem"
+    local wrapper_source=""
 
-    if [[ "$VERIFY" -eq 1 ]]; then
+    if [[ "$VERIFY" -eq 1 && -z "$OFFLINE_BUNDLE" ]]; then
         prepare_release_verification "$VERSION" "$wrapper_pubkey" "$wrapper_checksums"
         if [[ "$CORE_VERSION" == "$VERSION" ]]; then
             cp "$wrapper_pubkey" "$core_pubkey"
@@ -1070,8 +1247,10 @@ main() {
         fi
         cp "$OFFLINE_BUNDLE" "$core_archive"
         if [[ -f "./pt" ]]; then
+            wrapper_source="./pt"
             cp ./pt "$wrapper_file"
         elif [[ -f "$(dirname "$0")/pt" ]]; then
+            wrapper_source="$(dirname "$0")/pt"
             cp "$(dirname "$0")/pt" "$wrapper_file"
         else
             err "Offline mode requires a local pt wrapper beside install.sh or in the current directory"
@@ -1089,13 +1268,19 @@ main() {
     fi
 
     if [[ "$FROM_SOURCE" -ne 1 && "$VERIFY" -eq 1 ]]; then
-        verify_file_signature "$wrapper_file" "pt" "$VERSION" "$wrapper_pubkey" "${TEMP_DIR}/pt.sig"
-        verify_file_checksum "$wrapper_file" "pt" "$wrapper_checksums"
-        best_effort_sigstore_verify "$wrapper_file" "pt"
+        if [[ -n "$OFFLINE_BUNDLE" ]]; then
+            prepare_offline_verification "$wrapper_source" "$OFFLINE_BUNDLE" "${TEMP_DIR}/pt.sig" "${TEMP_DIR}/$(basename "$OFFLINE_BUNDLE").sig"
+            verify_file_checksum "$wrapper_file" "pt" "$wrapper_checksums"
+            verify_file_checksum "$core_archive" "$(basename "$OFFLINE_BUNDLE")" "$core_checksums"
+        else
+            verify_file_signature "$wrapper_file" "pt" "$VERSION" "$wrapper_pubkey" "${TEMP_DIR}/pt.sig"
+            verify_file_checksum "$wrapper_file" "pt" "$wrapper_checksums"
+            best_effort_sigstore_verify "$wrapper_file" "pt"
 
-        verify_file_signature "$core_archive" "$DOWNLOADED_ARTIFACT" "$CORE_VERSION" "$core_pubkey" "${TEMP_DIR}/${DOWNLOADED_ARTIFACT}.sig"
-        verify_file_checksum "$core_archive" "$DOWNLOADED_ARTIFACT" "$core_checksums"
-        best_effort_sigstore_verify "$core_archive" "$DOWNLOADED_ARTIFACT"
+            verify_file_signature "$core_archive" "$DOWNLOADED_ARTIFACT" "$CORE_VERSION" "$core_pubkey" "${TEMP_DIR}/${DOWNLOADED_ARTIFACT}.sig"
+            verify_file_checksum "$core_archive" "$DOWNLOADED_ARTIFACT" "$core_checksums"
+            best_effort_sigstore_verify "$core_archive" "$DOWNLOADED_ARTIFACT"
+        fi
     fi
 
     if [[ "$FROM_SOURCE" -ne 1 ]]; then
