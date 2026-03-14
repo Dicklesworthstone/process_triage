@@ -230,7 +230,8 @@ pub fn detect_container_from_markers() -> Option<ContainerInfo> {
     }
 
     // Check for container indication in /proc/1/cgroup (init process cgroup)
-    if let Ok(content) = fs::read_to_string("/proc/1/cgroup") {
+    if let Ok(cgroup_bytes) = fs::read("/proc/1/cgroup") {
+        let content = String::from_utf8_lossy(&cgroup_bytes);
         for line in content.lines() {
             // Format: hierarchy-ID:controller-list:cgroup-path
             let parts: Vec<&str> = line.split(':').collect();
@@ -691,7 +692,7 @@ mod tests {
             return;
         }
 
-        let content = match std::fs::read_to_string("/proc/self/cgroup") {
+        let content_bytes = match std::fs::read("/proc/self/cgroup") {
             Ok(c) => c,
             Err(e) => {
                 crate::test_log!(
@@ -702,6 +703,7 @@ mod tests {
                 return;
             }
         };
+        let content = String::from_utf8_lossy(&content_bytes);
 
         crate::test_log!(INFO, "container detection from real cgroup test");
 

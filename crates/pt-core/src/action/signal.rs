@@ -107,7 +107,8 @@ impl SignalActionRunner {
     #[cfg(target_os = "linux")]
     fn get_process_state(&self, pid: u32) -> Option<char> {
         let stat_path = format!("/proc/{pid}/stat");
-        let content = std::fs::read_to_string(stat_path).ok()?;
+        let content_bytes = std::fs::read(stat_path).ok()?;
+        let content = String::from_utf8_lossy(&content_bytes);
         // Format: pid (comm) state ...
         let comm_end = content.rfind(')')?;
         let after_comm = content.get(comm_end + 2..)?;
@@ -128,7 +129,8 @@ impl SignalActionRunner {
     #[cfg(target_os = "linux")]
     fn read_starttime(&self, pid: u32) -> Option<u64> {
         let stat_path = format!("/proc/{pid}/stat");
-        let content = std::fs::read_to_string(stat_path).ok()?;
+        let content_bytes = std::fs::read(stat_path).ok()?;
+        let content = String::from_utf8_lossy(&content_bytes);
         let comm_end = content.rfind(')')?;
         let after_comm = content.get(comm_end + 2..)?;
         let fields: Vec<&str> = after_comm.split_whitespace().collect();
@@ -389,7 +391,8 @@ impl LiveIdentityProvider {
     /// Read start_id from /proc/[pid]/stat.
     fn read_start_id(&self, pid: u32) -> Option<String> {
         let stat_path = format!("/proc/{pid}/stat");
-        let content = std::fs::read_to_string(&stat_path).ok()?;
+        let content_bytes = std::fs::read(&stat_path).ok()?;
+        let content = String::from_utf8_lossy(&content_bytes);
         let comm_end = content.rfind(')')?;
         let after_comm = content.get(comm_end + 2..)?;
         let fields: Vec<&str> = after_comm.split_whitespace().collect();
@@ -402,7 +405,8 @@ impl LiveIdentityProvider {
     /// Read uid from /proc/[pid]/status.
     fn read_uid(&self, pid: u32) -> Option<u32> {
         let status_path = format!("/proc/{pid}/status");
-        let content = std::fs::read_to_string(&status_path).ok()?;
+        let content_bytes = std::fs::read(&status_path).ok()?;
+        let content = String::from_utf8_lossy(&content_bytes);
         for line in content.lines() {
             if line.starts_with("Uid:") {
                 let parts: Vec<&str> = line.split_whitespace().collect();

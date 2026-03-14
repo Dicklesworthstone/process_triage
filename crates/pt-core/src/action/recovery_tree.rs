@@ -922,7 +922,8 @@ impl LiveRequirementChecker {
     fn read_proc_stat(&self, pid: u32) -> Option<char> {
         use std::fs;
         let path = format!("/proc/{}/stat", pid);
-        let content = fs::read_to_string(&path).ok()?;
+        let content_bytes = fs::read(&path).ok()?;
+        let content = String::from_utf8_lossy(&content_bytes);
         // Parse state from stat file: pid (comm) state ...
         // Find the last ')' to handle commands with parentheses
         let after_comm = content.rfind(')')? + 1;
@@ -933,10 +934,11 @@ impl LiveRequirementChecker {
     /// Check if a process is supervised by systemd by inspecting its cgroup.
     fn check_systemd_supervised(&self, pid: u32) -> bool {
         let cgroup_path = format!("/proc/{}/cgroup", pid);
-        let content = match std::fs::read_to_string(&cgroup_path) {
+        let content_bytes = match std::fs::read(&cgroup_path) {
             Ok(c) => c,
             Err(_) => return false,
         };
+        let content = String::from_utf8_lossy(&content_bytes);
         // Look for .service or .scope units (not .slice which isn't real supervision)
         content
             .lines()
@@ -946,20 +948,22 @@ impl LiveRequirementChecker {
     /// Check if a process is supervised by Docker by inspecting its cgroup.
     fn check_docker_supervised(&self, pid: u32) -> bool {
         let cgroup_path = format!("/proc/{}/cgroup", pid);
-        let content = match std::fs::read_to_string(&cgroup_path) {
+        let content_bytes = match std::fs::read(&cgroup_path) {
             Ok(c) => c,
             Err(_) => return false,
         };
+        let content = String::from_utf8_lossy(&content_bytes);
         content.lines().any(|line| line.contains("/docker/"))
     }
 
     /// Check if a process is supervised by pm2 by inspecting its parent comm.
     fn check_pm2_supervised(&self, pid: u32) -> bool {
         let stat_path = format!("/proc/{}/stat", pid);
-        let content = match std::fs::read_to_string(&stat_path) {
+        let content_bytes = match std::fs::read(&stat_path) {
             Ok(c) => c,
             Err(_) => return false,
         };
+        let content = String::from_utf8_lossy(&content_bytes);
         // Get PPID (field 4 after comm)
         let comm_end = match content.rfind(')') {
             Some(i) => i,
@@ -978,12 +982,14 @@ impl LiveRequirementChecker {
         };
         // Read parent's comm and check for pm2
         let parent_comm_path = format!("/proc/{}/comm", ppid);
-        std::fs::read_to_string(&parent_comm_path)
-            .map(|c| {
-                let trimmed = c.trim();
+        match std::fs::read(&parent_comm_path) {
+            Ok(c) => {
+                let s = String::from_utf8_lossy(&c);
+                let trimmed = s.trim();
                 trimmed == "pm2" || trimmed.starts_with("PM2")
-            })
-            .unwrap_or(false)
+            }
+            Err(_) => false,
+        }
     }
 }
 

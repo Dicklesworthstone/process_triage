@@ -120,7 +120,8 @@ impl ReniceActionRunner {
     #[cfg(target_os = "linux")]
     fn get_nice_value(&self, pid: u32) -> Option<i32> {
         let stat_path = format!("/proc/{pid}/stat");
-        let content = std::fs::read_to_string(stat_path).ok()?;
+        let content_bytes = std::fs::read(stat_path).ok()?;
+        let content = String::from_utf8_lossy(&content_bytes);
 
         // Format: pid (comm) state ...
         // Field 19 (0-indexed from start, or field 17 after comm+state) is nice

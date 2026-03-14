@@ -349,9 +349,8 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "linux")]
         {
             let comm_path = format!("/proc/{pid}/comm");
-            std::fs::read_to_string(&comm_path)
-                .ok()
-                .map(|s| s.trim().to_string())
+            let comm_bytes = std::fs::read(&comm_path).ok()?;
+            Some(String::from_utf8_lossy(&comm_bytes).trim().to_string())
         }
         #[cfg(target_os = "macos")]
         {
@@ -364,9 +363,9 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "linux")]
         {
             let cmdline_path = format!("/proc/{pid}/cmdline");
-            std::fs::read_to_string(&cmdline_path)
-                .ok()
-                .map(|s| s.replace('\0', " ").trim().to_string())
+            let cmdline_bytes = std::fs::read(&cmdline_path).ok()?;
+            let s = String::from_utf8_lossy(&cmdline_bytes);
+            Some(s.replace('\0', " ").trim().to_string())
         }
         #[cfg(target_os = "macos")]
         {
@@ -405,7 +404,8 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "linux")]
         {
             let status_path = format!("/proc/{pid}/status");
-            let content = std::fs::read_to_string(&status_path).ok()?;
+            let content_bytes = std::fs::read(&status_path).ok()?;
+            let content = String::from_utf8_lossy(&content_bytes);
             for line in content.lines() {
                 if line.starts_with("Uid:") {
                     return line.split_whitespace().nth(1)?.parse().ok();
@@ -460,7 +460,8 @@ impl LivePreCheckProvider {
                 let fd_name = entry.file_name();
                 let fdinfo_path = format!("{fdinfo_dir}/{}", fd_name.to_string_lossy());
 
-                if let Ok(content) = std::fs::read_to_string(&fdinfo_path) {
+                if let Ok(content_bytes) = std::fs::read(&fdinfo_path) {
+                    let content = String::from_utf8_lossy(&content_bytes);
                     // Check flags field for write mode
                     for line in content.lines() {
                         if line.starts_with("flags:") {
@@ -605,9 +606,10 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "linux")]
         {
             let stat_path = format!("/proc/{pid}/stat");
-            let Ok(content) = std::fs::read_to_string(&stat_path) else {
+            let Ok(content_bytes) = std::fs::read(&stat_path) else {
                 return false;
             };
+            let content = String::from_utf8_lossy(&content_bytes);
 
             // Parse tty_nr from stat (field 7 after comm)
             if let Some(comm_end) = content.rfind(')') {
@@ -665,7 +667,8 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "linux")]
         {
             let stat_path = format!("/proc/{pid}/stat");
-            let content = std::fs::read_to_string(&stat_path).ok()?;
+            let content_bytes = std::fs::read(&stat_path).ok()?;
+            let content = String::from_utf8_lossy(&content_bytes);
 
             // Parse state from stat: pid (comm) state ...
             // State is the first character after the closing paren
@@ -692,8 +695,8 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "linux")]
         {
             let wchan_path = format!("/proc/{pid}/wchan");
-            let wchan = std::fs::read_to_string(&wchan_path)
-                .ok()?
+            let wchan_bytes = std::fs::read(&wchan_path).ok()?;
+            let wchan = String::from_utf8_lossy(&wchan_bytes)
                 .trim()
                 .to_string();
 
@@ -722,7 +725,8 @@ impl LivePreCheckProvider {
         #[cfg(target_os = "linux")]
         {
             let stat_path = format!("/proc/{pid}/stat");
-            let content = std::fs::read_to_string(&stat_path).ok()?;
+            let content_bytes = std::fs::read(&stat_path).ok()?;
+            let content = String::from_utf8_lossy(&content_bytes);
 
             // Get PPID (field 4 after comm)
             let comm_end = content.rfind(')')?;
@@ -732,9 +736,8 @@ impl LivePreCheckProvider {
 
             // Get parent's comm
             let parent_comm_path = format!("/proc/{ppid}/comm");
-            std::fs::read_to_string(&parent_comm_path)
-                .ok()
-                .map(|s| s.trim().to_string())
+            let comm_bytes = std::fs::read(&parent_comm_path).ok()?;
+            Some(String::from_utf8_lossy(&comm_bytes).trim().to_string())
         }
         #[cfg(target_os = "macos")]
         {
@@ -805,7 +808,8 @@ impl LivePreCheckProvider {
     #[cfg(target_os = "linux")]
     fn extract_cgroup_unit(&self, pid: u32) -> Option<String> {
         let cgroup_path = format!("/proc/{pid}/cgroup");
-        let content = std::fs::read_to_string(&cgroup_path).ok()?;
+        let content_bytes = std::fs::read(&cgroup_path).ok()?;
+        let content = String::from_utf8_lossy(&content_bytes);
 
         for line in content.lines() {
             // Look for lines with .service or .scope (not .slice - those aren't real supervision)

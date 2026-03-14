@@ -168,7 +168,8 @@ pub fn detect_container() -> bool {
     }
 
     // 2. Check cgroup for container patterns
-    if let Ok(cgroup) = fs::read_to_string("/proc/1/cgroup") {
+    if let Ok(cgroup_bytes) = fs::read("/proc/1/cgroup") {
+        let cgroup = String::from_utf8_lossy(&cgroup_bytes);
         if cgroup.contains("/docker/")
             || cgroup.contains("/kubepods/")
             || cgroup.contains("/lxc/")
@@ -187,8 +188,9 @@ pub fn detect_container() -> bool {
     }
 
     // 4. Check if PID 1 is not init/systemd
-    if let Ok(comm) = fs::read_to_string("/proc/1/comm") {
-        let comm = comm.trim();
+    if let Ok(comm_bytes) = fs::read("/proc/1/comm") {
+        let comm_str = String::from_utf8_lossy(&comm_bytes);
+        let comm = comm_str.trim();
         // If PID 1 is not a typical init system, we're likely in a container
         if ![
             "init",

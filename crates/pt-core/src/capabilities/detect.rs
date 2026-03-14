@@ -500,7 +500,8 @@ fn detect_container() -> (bool, Option<String>) {
     }
 
     // Check cgroup for container indicators
-    if let Ok(cgroup) = fs::read_to_string("/proc/1/cgroup") {
+    if let Ok(cgroup_bytes) = fs::read("/proc/1/cgroup") {
+        let cgroup = String::from_utf8_lossy(&cgroup_bytes);
         if cgroup.contains("/docker/") || cgroup.contains("/docker-") {
             return (true, Some("docker".to_string()));
         }
@@ -516,7 +517,7 @@ fn detect_container() -> (bool, Option<String>) {
     }
 
     // Check /proc/1/environ for container env vars
-    if let Ok(environ) = fs::read_to_string("/proc/1/environ") {
+    if let Ok(environ) = fs::read("/proc/1/environ").map(|b| String::from_utf8_lossy(&b).into_owned()) {
         if environ.contains("container=") {
             return (true, None);
         }
@@ -775,7 +776,8 @@ fn detect_linux_capabilities() -> Vec<String> {
         let mut caps = Vec::new();
 
         // Read /proc/self/status for CapEff (effective capabilities)
-        if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        if let Ok(status_bytes) = fs::read("/proc/self/status") {
+            let status = String::from_utf8_lossy(&status_bytes);
             for line in status.lines() {
                 if let Some(hex) = line.strip_prefix("CapEff:\t") {
                     if let Ok(bits) = u64::from_str_radix(hex.trim(), 16) {
@@ -859,7 +861,7 @@ fn check_read_others_procs(uid: u32) -> bool {
     }
 
     // Try to read /proc/1/cmdline (init, owned by root)
-    fs::read_to_string("/proc/1/cmdline").is_ok()
+    fs::read("/proc/1/cmdline").is_ok()
 }
 
 /// Detect available supervisor systems.
@@ -904,7 +906,8 @@ fn check_systemd_running() -> bool {
     #[cfg(target_os = "linux")]
     {
         // Check if PID 1 is systemd
-        if let Ok(cmdline) = fs::read_to_string("/proc/1/cmdline") {
+        if let Ok(cmdline_bytes) = fs::read("/proc/1/cmdline") {
+            let cmdline = String::from_utf8_lossy(&cmdline_bytes);
             return cmdline.contains("systemd");
         }
         false
@@ -984,7 +987,8 @@ fn detect_actions(
 /// Check if we have write access to cgroup v2 hierarchy.
 fn check_cgroup_write_access() -> bool {
     // Check if we can write to our own cgroup
-    if let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup") {
+    if let Ok(cgroup_bytes) = fs::read("/proc/self/cgroup") {
+        let cgroup = String::from_utf8_lossy(&cgroup_bytes);
         for line in cgroup.lines() {
             // cgroup v2 format: "0::<path>"
             if let Some(path) = line.strip_prefix("0::") {

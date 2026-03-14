@@ -116,7 +116,8 @@ pub fn parse_proc_cmdline(pid: u32) -> Option<String> {
 /// Extracts UID and GID information.
 pub fn parse_proc_status(pid: u32) -> Option<ProcessStatus> {
     let path = format!("/proc/{}/status", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     parse_proc_status_content(&content)
 }
 
@@ -382,7 +383,8 @@ pub struct ProcessStat {
 /// Returns None if the file cannot be read or parsed.
 pub fn parse_proc_stat(pid: u32) -> Option<ProcessStat> {
     let path = format!("/proc/{}/stat", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     parse_proc_stat_content(&content)
 }
 
@@ -442,7 +444,8 @@ pub fn parse_proc_stat_content(content: &str) -> Option<ProcessStat> {
 /// Returns None if the file cannot be read (permission denied, process exited).
 pub fn parse_io(pid: u32) -> Option<IoStats> {
     let path = format!("/proc/{}/io", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     parse_io_content(&content)
 }
 
@@ -484,7 +487,8 @@ pub fn parse_io_content(content: &str) -> Option<IoStats> {
 /// Format: "cpu_time wait_time timeslices"
 pub fn parse_schedstat(pid: u32) -> Option<SchedStats> {
     let path = format!("/proc/{}/schedstat", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     parse_schedstat_content(&content)
 }
 
@@ -507,7 +511,8 @@ pub fn parse_schedstat_content(content: &str) -> Option<SchedStats> {
 /// Extracts voluntary/involuntary switches, priority, and nice value.
 pub fn parse_sched(pid: u32) -> Option<SchedInfo> {
     let path = format!("/proc/{}/sched", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     parse_sched_content(&content)
 }
 
@@ -550,7 +555,8 @@ pub fn parse_sched_content(content: &str) -> Option<SchedInfo> {
 /// Format: "size resident shared text lib data dt"
 pub fn parse_statm(pid: u32) -> Option<MemStats> {
     let path = format!("/proc/{}/statm", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     parse_statm_content(&content)
 }
 
@@ -668,7 +674,8 @@ fn parse_fd_type(type_str: &str) -> FdType {
 
 /// Parse fdinfo file to extract open mode flags.
 fn parse_fdinfo_flags(path: &Path) -> Option<OpenMode> {
-    let content = fs::read_to_string(path).ok()?;
+    let bytes = fs::read(path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     parse_fdinfo_content(&content)
 }
 
@@ -891,7 +898,8 @@ fn categorize_fd(target: &str) -> String {
 /// Returns the kernel function where the process is sleeping.
 pub fn parse_wchan(pid: u32) -> Option<String> {
     let path = format!("/proc/{}/wchan", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     let wchan = content.trim();
 
     // "0" means not waiting
@@ -907,7 +915,8 @@ pub fn parse_wchan(pid: u32) -> Option<String> {
 /// Determines cgroup membership and container detection.
 pub fn parse_cgroup(pid: u32) -> Option<CgroupInfo> {
     let path = format!("/proc/{}/cgroup", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     parse_cgroup_content(&content)
 }
 
