@@ -237,7 +237,7 @@ fn load_priors_from_file(path: &PathBuf) -> Result<(Priors, String), ConfigError
     if priors.schema_version != CONFIG_SCHEMA_VERSION {
         return Err(ConfigError::VersionMismatch {
             expected: CONFIG_SCHEMA_VERSION.to_string(),
-            actual: priors.schema_version.clone(),
+            actual: priors.schema_version,
         });
     }
 
@@ -262,7 +262,7 @@ fn load_policy_from_file(path: &PathBuf) -> Result<(Policy, String), ConfigError
     if policy.schema_version != CONFIG_SCHEMA_VERSION {
         return Err(ConfigError::VersionMismatch {
             expected: CONFIG_SCHEMA_VERSION.to_string(),
-            actual: policy.schema_version.clone(),
+            actual: policy.schema_version,
         });
     }
 

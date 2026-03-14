@@ -417,7 +417,7 @@ fn plan_zombie_actions(candidate: &DecisionCandidate, blocked: bool) -> Option<V
                     PreCheck::CheckSupervisor,
                     PreCheck::CheckAgentSupervision,
                 ],
-                rationale: base_rationale.clone(),
+                rationale: base_rationale,
                 on_success: vec![ActionHook {
                     action: "zombie_reaped".to_string(),
                     details: Some(format!(

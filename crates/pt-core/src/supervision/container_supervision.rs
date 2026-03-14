@@ -202,7 +202,7 @@ impl ContainerSupervisionAnalyzer {
             if let Some(k8s_info) = detect_kubernetes_from_env(&env) {
                 // Merge K8s info
                 if result.kubernetes.is_none() {
-                    result.kubernetes = Some(k8s_info.clone());
+                    result.kubernetes = Some(k8s_info);
                 } else if let Some(ref mut existing) = result.kubernetes {
                     // Enrich existing info
                     if existing.pod_name.is_none() {

@@ -283,7 +283,7 @@ fn parse_memory_amount(s: &str) -> Result<f64, GoalParseError> {
         .unwrap_or(s.len());
 
     if num_end == 0 {
-        return Err(GoalParseError::InvalidNumber(s.to_string()));
+        return Err(GoalParseError::InvalidNumber(s));
     }
 
     let num_str = &s[..num_end];

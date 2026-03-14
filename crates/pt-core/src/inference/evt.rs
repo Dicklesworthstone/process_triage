@@ -656,7 +656,7 @@ impl BatchEvtAnalyzer {
             .fitters
             .get(metric)
             .or_else(|| self.fitters.get("default"))
-            .unwrap();
+            .expect("default fitter is always present");
         fitter.fit(observations)
     }
 

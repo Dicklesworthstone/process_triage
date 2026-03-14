@@ -604,7 +604,7 @@ impl KlSurprisalAnalyzer {
             observed_rate,
             reference_rate,
             n_eff,
-            description: description.clone(),
+            description: description,
         };
 
         Ok(KlSurprisalResult {

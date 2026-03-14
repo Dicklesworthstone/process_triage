@@ -195,7 +195,7 @@ pub fn load_manifest(plugin_dir: &Path) -> Result<ResolvedPlugin, ManifestError>
     if manifest.api_version != PLUGIN_API_VERSION {
         return Err(ManifestError::ApiVersionMismatch {
             expected: PLUGIN_API_VERSION.to_string(),
-            actual: manifest.api_version.clone(),
+            actual: manifest.api_version,
         });
     }
 

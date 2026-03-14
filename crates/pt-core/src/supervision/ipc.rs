@@ -393,7 +393,12 @@ impl IpcAnalyzer {
                 });
                 matched_sockets.push(socket.clone());
 
-                if best_match.is_none() || pattern.confidence > best_match.unwrap().0.confidence {
+                let is_better = match &best_match {
+                    Some((best_pattern, _)) => pattern.confidence > best_pattern.confidence,
+                    None => true,
+                };
+                
+                if is_better {
                     best_match = Some((pattern, socket));
                 }
             }

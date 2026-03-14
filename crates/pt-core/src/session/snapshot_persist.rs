@@ -245,7 +245,7 @@ fn load_artifact<T: serde::de::DeserializeOwned + Serialize>(
     // Validate schema version compatibility.
     if !pt_common::schema::is_compatible(&envelope.schema_version) {
         return Err(SessionError::Json {
-            path: path.clone(),
+            path: path,
             source: serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -293,7 +293,7 @@ fn load_artifact_unchecked<T: serde::de::DeserializeOwned + Serialize>(
     // Validate schema version compatibility.
     if !pt_common::schema::is_compatible(&envelope.schema_version) {
         return Err(SessionError::Json {
-            path: path.clone(),
+            path: path,
             source: serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(

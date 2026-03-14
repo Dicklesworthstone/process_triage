@@ -206,7 +206,7 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
         if actual_checksum != entry.sha256 {
             return Err(BundleError::ChecksumMismatch {
                 path: path.to_string(),
-                expected: entry.sha256.clone(),
+                expected: entry.sha256,
                 actual: actual_checksum,
             });
         }

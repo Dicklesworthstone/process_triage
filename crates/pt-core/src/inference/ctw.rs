@@ -383,7 +383,7 @@ impl CtwNode {
         if self.children[symbol].is_none() {
             self.children[symbol] = Some(Box::new(CtwNode::new(alphabet_size)));
         }
-        self.children[symbol].as_mut().unwrap()
+        self.children[symbol].as_mut().expect("child was just created")
     }
 
     /// Get child reference.

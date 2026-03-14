@@ -202,8 +202,8 @@ impl BeliefState {
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap();
-        ProcessState::from_index(idx).unwrap()
+            .expect("probs array is non-empty");
+        ProcessState::from_index(idx).expect("idx is within bounds")
     }
 
     /// Get the probability of the most likely state.

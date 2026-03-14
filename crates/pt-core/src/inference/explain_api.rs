@@ -161,7 +161,7 @@ pub fn build_explanation(
             config.max_evidence_factors,
         ));
         response.contributing_factors = Some(nl.contributing_factors.clone());
-        response.countervailing = Some(nl.countervailing.clone());
+        response.countervailing = Some(nl.countervailing);
 
         let flip = compute_flip_conditions(
             ledger,

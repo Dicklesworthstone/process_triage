@@ -124,7 +124,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
             self.0.store(true, Ordering::Relaxed);
         }
     }
-    let _guard = FinishGuard(finished.clone());
+    let _guard = FinishGuard(finished);
 
     // Spawn watchdog thread
     thread::spawn(move || {

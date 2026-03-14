@@ -248,7 +248,7 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
 
     for chunk in chunks {
         // Check if aborted
-        if !config.continue_on_error && *aborted.lock().unwrap() {
+        if !config.continue_on_error && *aborted.lock().expect("lock poisoned") {
             break;
         }
 
@@ -261,17 +261,17 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
                 let aborted = Arc::clone(&aborted);
 
                 std::thread::spawn(move || {
-                    if !config.continue_on_error && *aborted.lock().unwrap() {
+                    if !config.continue_on_error && *aborted.lock().expect("lock poisoned") {
                         return;
                     }
 
                     let result = ssh_scan_host(&host, &config);
 
                     if !result.success && !config.continue_on_error {
-                        *aborted.lock().unwrap() = true;
+                        *aborted.lock().expect("lock poisoned") = true;
                     }
 
-                    results.lock().unwrap().push((idx, result));
+                    results.lock().expect("lock poisoned").push((idx, result));
                 })
             })
             .collect();
@@ -282,7 +282,10 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
     }
 
     // Sort by original index to maintain order
-    let mut collected = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+    let mut collected = Arc::try_unwrap(results)
+        .expect("Arc has multiple owners")
+        .into_inner()
+        .expect("lock poisoned");
     collected.sort_by_key(|(idx, _)| *idx);
     let results: Vec<HostScanResult> = collected.into_iter().map(|(_, r)| r).collect();
 

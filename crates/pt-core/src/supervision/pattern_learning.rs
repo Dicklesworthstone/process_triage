@@ -61,10 +61,10 @@ use std::sync::LazyLock;
 use thiserror::Error;
 
 static VERSIONED_INTERPRETER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(python|ruby|perl|node)(\d+(?:\.\d+)*)$").unwrap());
-static BROAD_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^\s]+/[^\s]+").unwrap());
-static BROAD_NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+\b").unwrap());
-static BROAD_WILDCARD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\.\*)+").unwrap());
+    LazyLock::new(|| Regex::new(r"^(python|ruby|perl|node)(\d+(?:\.\d+)*)$").expect("valid regex"));
+static BROAD_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^\s]+/[^\s]+").expect("valid regex"));
+static BROAD_NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+\b").expect("valid regex"));
+static BROAD_WILDCARD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\.\*)+").expect("valid regex"));
 
 /// Errors from pattern learning operations.
 #[derive(Debug, Error)]
@@ -128,20 +128,20 @@ impl PatternCandidate {
 }
 
 static PATH_STRIPPER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(^|\s)/(?:[^/\s]+/)+").unwrap());
-static NUMBER_REPLACER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{4,}\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(^|\s)/(?:[^/\s]+/)+").expect("valid regex"));
+static NUMBER_REPLACER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{4,}\b").expect("valid regex"));
 static PORT_FLAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(--?(?:port|p)\s*[=:]?\s*)\d+").unwrap());
-static PORT_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":\d{2,5}\b").unwrap());
+    LazyLock::new(|| Regex::new(r"(--?(?:port|p)\s*[=:]?\s*)\d+").expect("valid regex"));
+static PORT_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":\d{2,5}\b").expect("valid regex"));
 static TEMP_PATH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"/(?:tmp|var/tmp|var/folders)/[^\s]+").unwrap());
+    LazyLock::new(|| Regex::new(r"/(?:tmp|var/tmp|var/folders)/[^\s]+").expect("valid regex"));
 static HOME_PATH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"/(?:home|Users)/[^/\s]+/[^\s]*").unwrap());
+    LazyLock::new(|| Regex::new(r"/(?:home|Users)/[^/\s]+/[^\s]*").expect("valid regex"));
 static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
-        .unwrap()
+        .expect("valid regex")
 });
-static HASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{8,}\b").unwrap());
+static HASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{8,}\b").expect("valid regex"));
 
 /// Command normalizer for converting raw commands to patterns.
 #[derive(Default)]
@@ -269,7 +269,7 @@ impl CommandNormalizer {
             candidates.push(PatternCandidate {
                 level: SpecificityLevel::Exact,
                 process_pattern: format!("^{}$", regex::escape(&normalized_name)),
-                arg_patterns: exact_args.clone(),
+                arg_patterns: exact_args,
                 description: format!("Exact match for {} with specific args", normalized_name),
             });
         }

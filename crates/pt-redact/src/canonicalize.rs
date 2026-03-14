@@ -21,45 +21,45 @@ pub struct Canonicalizer {
 // Pre-compiled regex patterns for canonicalization
 static RE_UUID: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-        .unwrap()
+        .expect("valid regex")
 });
 
 static RE_TIMESTAMP_ISO: Lazy<Regex> = Lazy::new(|| {
     // Case-insensitive because we lowercase before matching
-    Regex::new(r"(?i)\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?").unwrap()
+    Regex::new(r"(?i)\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?").expect("valid regex")
 });
 
 static RE_TIMESTAMP_UNIX: Lazy<Regex> = Lazy::new(|| {
     // Unix timestamps (10-13 digits, reasonable range 2000-2100)
-    Regex::new(r"\b(9[0-9]{8}|1[0-9]{9,12})\b").unwrap()
+    Regex::new(r"\b(9[0-9]{8}|1[0-9]{9,12})\b").expect("valid regex")
 });
 
-static RE_PID_ARG: Lazy<Regex> = Lazy::new(|| Regex::new(r"--pid[=\s]+\d+").unwrap());
+static RE_PID_ARG: Lazy<Regex> = Lazy::new(|| Regex::new(r"--pid[=\s]+\d+").expect("valid regex"));
 
-static RE_PORT_ARG: Lazy<Regex> = Lazy::new(|| Regex::new(r"--port[=\s]+\d+").unwrap());
+static RE_PORT_ARG: Lazy<Regex> = Lazy::new(|| Regex::new(r"--port[=\s]+\d+").expect("valid regex"));
 
 static RE_TMP_SESSION: Lazy<Regex> = Lazy::new(|| {
     // Matches /tmp/pytest-123, /tmp/tmp.abc123, /var/tmp/session-456
     // Captures the full session directory including trailing slash if present
-    Regex::new(r"(/tmp|/var/tmp)/[a-zA-Z_][a-zA-Z0-9_.-]*").unwrap()
+    Regex::new(r"(/tmp|/var/tmp)/[a-zA-Z_][a-zA-Z0-9_.-]*").expect("valid regex")
 });
 
 static RE_NUMERIC_SUFFIX: Lazy<Regex> = Lazy::new(|| {
     // Matches _123, -456, .789 at end of words
-    Regex::new(r"([_.-])\d+\b").unwrap()
+    Regex::new(r"([_.-])\d+\b").expect("valid regex")
 });
 
 static RE_URL_CRED: Lazy<Regex> = Lazy::new(|| {
     // user:pass@ in URLs
-    Regex::new(r"://[^:/@]+:[^@]+@").unwrap()
+    Regex::new(r"://[^:/@]+:[^@]+@").expect("valid regex")
 });
 
 static RE_URL_PORT: Lazy<Regex> = Lazy::new(|| {
     // Port numbers in URLs (2-5 digits followed by / or end)
-    Regex::new(r":(\d{2,5})(/|$)").unwrap()
+    Regex::new(r":(\d{2,5})(/|$)").expect("valid regex")
 });
 
-static RE_MULTIPLE_SPACES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+static RE_MULTIPLE_SPACES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").expect("valid regex"));
 
 impl Canonicalizer {
     /// Create a new canonicalizer.

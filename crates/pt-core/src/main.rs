@@ -2406,6 +2406,7 @@ fn action_status_label(status: &pt_core::action::ActionStatus) -> &'static str {
     match status {
         ActionStatus::Success => "success",
         ActionStatus::IdentityMismatch => "identity_mismatch",
+        ActionStatus::ProcessNotFound => "process_not_found",
         ActionStatus::PermissionDenied => "permission_denied",
         ActionStatus::Timeout => "timeout",
         ActionStatus::Failed => "failed",
@@ -5667,10 +5668,10 @@ fn run_agent_fleet_report(global: &GlobalOpts, args: &AgentFleetReportArgs) -> E
                 "action_counts": ordered_u32_map(&fleet.aggregate.action_counts),
                 "mean_candidate_score": fleet.aggregate.mean_candidate_score,
                 "max_candidate_score": fleet.aggregate.max_candidate_score,
-                "recurring_patterns": top_offenders.clone(),
+                "recurring_patterns": top_offenders,
             },
             "safety_budget": safety_budget,
-            "hosts": host_comparison.clone(),
+            "hosts": host_comparison,
             "top_offenders": top_offenders,
             "host_comparison": host_comparison,
             "cross_host_anomalies": cross_host_anomalies,
@@ -5679,7 +5680,7 @@ fn run_agent_fleet_report(global: &GlobalOpts, args: &AgentFleetReportArgs) -> E
 
     let rendered_for_file = match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
-            let rendered = format_structured_output(global, response.clone());
+            let rendered = format_structured_output(global, response);
             println!("{}", rendered);
             Some(rendered)
         }
@@ -7804,7 +7805,7 @@ fn run_telemetry_status(global: &GlobalOpts, args: &TelemetryArgs) -> ExitCode {
         }
     };
 
-    let enforcer = RetentionEnforcer::new(telemetry_dir.clone(), config);
+    let enforcer = RetentionEnforcer::new(telemetry_dir, config);
     let status = match enforcer.status() {
         Ok(status) => status,
         Err(err) => {
@@ -7897,7 +7898,7 @@ fn run_telemetry_prune(
         return ExitCode::ArgsError;
     }
 
-    let mut enforcer = RetentionEnforcer::new(telemetry_dir.clone(), config);
+    let mut enforcer = RetentionEnforcer::new(telemetry_dir, config);
     let events = if dry_run {
         match enforcer.dry_run() {
             Ok(events) => events,
@@ -10437,7 +10438,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         };
         if let Ok(config) = load_config(&config_options) {
             let priors = config.priors.clone();
-            let policy = config.policy.clone();
+            let policy = config.policy;
 
             if let Ok(protected_filter) = ProtectedFilter::from_guardrails(&policy.guardrails) {
                 let filter_result = protected_filter.filter_scan_result(scan_result);
@@ -10879,7 +10880,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     };
     let priors = config.priors.clone();
-    let policy = config.policy.clone();
+    let policy = config.policy;
     let fast_path_config = FastPathConfig {
         enabled: policy.signature_fast_path.enabled,
         min_confidence_threshold: policy.signature_fast_path.min_confidence_threshold,
@@ -10987,7 +10988,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         adjusted.loss_matrix = apply_load_to_loss_matrix(&policy.loss_matrix, adjustment);
         adjusted
     } else {
-        policy.clone()
+        policy
     };
 
     // Process each candidate: compute posterior, make decision, build candidate output.
@@ -11522,7 +11523,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 ) {
                     Ok(goal_output) => {
                         let goal_json = goal_summary_json(goal_str, &goal, &goal_output);
-                        let selected = goal_output.selected_pids.clone();
+                        let selected = goal_output.selected_pids;
                         let selected_set: HashSet<u32> = selected.iter().copied().collect();
                         let mut selected_rank: HashMap<u32, usize> = HashMap::new();
                         for (idx, pid) in selected.iter().enumerate() {
@@ -12423,7 +12424,7 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
             if is_human_supervised(&result) {
                 detected = true;
                 supervisor_type = result.supervisor_type.map(|t| t.to_string());
-                unit = result.supervisor_name.clone();
+                unit = result.supervisor_name;
                 recommended_action = "review".to_string();
             }
         }
@@ -13403,10 +13404,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "before": before_snapshot,
         "after": after_snapshot,
         "metrics": {
-            "memory": memory_report.clone(),
-            "cpu": cpu_report.clone(),
-            "ports": port_report.clone(),
-            "file_descriptors": fd_report.clone()
+            "memory": memory_report,
+            "cpu": cpu_report,
+            "ports": port_report,
+            "file_descriptors": fd_report
         }
     });
     let goal_progress_discrepancy = serde_json::json!({
@@ -14206,15 +14207,15 @@ fn run_diff(global: &GlobalOpts, args: &DiffArgs) -> ExitCode {
         &compare_inference.payload.candidates,
     );
 
-    let base_ts = base_inference.generated_at.clone();
-    let compare_ts = compare_inference.generated_at.clone();
+    let base_ts = base_inference.generated_at;
+    let compare_ts = compare_inference.generated_at;
 
     let output = serde_json::json!({
         "comparison": {
             "base_session": base_id.0,
             "compare_session": compare_id.0,
-            "base_timestamp": base_ts.clone(),
-            "compare_timestamp": compare_ts.clone(),
+            "base_timestamp": base_ts,
+            "compare_timestamp": compare_ts,
             "base_label": base_label,
             "compare_label": compare_label,
         },
@@ -14610,7 +14611,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
 
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
-            println!("{}", format_structured_output(global, output.clone()));
+            println!("{}", format_structured_output(global, output));
         }
         OutputFormat::Summary => {
             let focus_note = if focus != FocusMode::All {
@@ -15052,7 +15053,7 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
         // Merge mode: weighted combination
         // For now, we do a simple replacement of class priors that exist in the import
         // A more sophisticated merge could weight by observation counts
-        let mut merged = config.priors.clone();
+        let mut merged = config.priors;
 
         // Merge class priors
         merged.classes.useful = imported_priors.classes.useful.clone();
@@ -15068,7 +15069,7 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
             merged.hierarchical = imported_priors.hierarchical.clone();
         }
         if imported_priors.robust_bayes.is_some() {
-            merged.robust_bayes = imported_priors.robust_bayes.clone();
+            merged.robust_bayes = imported_priors.robust_bayes;
         }
 
         merged
@@ -16554,7 +16555,7 @@ fn run_agent_session_status(
 
     // Load plan details if --detail flag is set
     let plan_detail = if include_detail {
-        plan_value.clone()
+        plan_value
     } else {
         None
     };
@@ -16927,7 +16928,7 @@ fn run_update(global: &GlobalOpts, args: &UpdateArgs) -> ExitCode {
         }
     };
 
-    let manager = RollbackManager::new(binary_path.clone(), "pt-core");
+    let manager = RollbackManager::new(binary_path, "pt-core");
 
     match &args.command {
         UpdateCommands::ListBackups => {

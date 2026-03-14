@@ -393,11 +393,11 @@ impl<'a> FtuiStatefulWidget for ProcessTable<'a> {
         frame: &mut ftui::render::frame::Frame,
         state: &mut Self::State,
     ) {
+        state.last_visible_height = area.height.saturating_sub(3) as usize; // Borders + header
+
         let title = self.title_string(state);
         let border_style = self.border_ftui_style(state.focused);
         let visible = state.visible_rows();
-
-        state.last_visible_height = area.height.saturating_sub(3) as usize; // Borders + header
 
         if visible.is_empty() {
             let msg = if state.filter.is_some() {

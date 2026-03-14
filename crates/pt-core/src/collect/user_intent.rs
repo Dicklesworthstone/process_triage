@@ -707,7 +707,7 @@ fn detect_shell_activity_signals(
                                             age.as_secs()
                                         ),
                                         metadata: Some(IntentMetadata::Shell {
-                                            shell_type: proc_stat.comm.clone(),
+                                            shell_type: proc_stat.comm,
                                             shell_pid: current_pid,
                                         }),
                                     }]);

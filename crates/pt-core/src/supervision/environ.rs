@@ -409,7 +409,7 @@ impl EnvironAnalyzer {
                     .partial_cmp(&b.0.confidence)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .unwrap();
+            .expect("matches is not empty");
 
         let evidence: Vec<SupervisionEvidence> = matches
             .iter()
