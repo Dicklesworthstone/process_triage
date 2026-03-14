@@ -279,9 +279,10 @@ impl GpdFitter {
             .map(|&x| x - threshold)
             .collect();
 
-        if exceedances.len() < self.config.min_exceedances {
+        let min_exceedances = self.config.min_exceedances.max(1);
+        if exceedances.len() < min_exceedances {
             return Err(EvtError::InsufficientExceedances {
-                needed: self.config.min_exceedances,
+                needed: min_exceedances,
                 have: exceedances.len(),
             });
         }
@@ -293,7 +294,11 @@ impl GpdFitter {
         };
 
         // Compute diagnostics
-        let mean_excess = exceedances.iter().sum::<f64>() / exceedances.len() as f64;
+        let mean_excess = if exceedances.is_empty() {
+            0.0
+        } else {
+            exceedances.iter().sum::<f64>() / exceedances.len() as f64
+        };
         let ad_stat = self.anderson_darling(&exceedances, xi, sigma);
         let fit_reliable = ad_stat < 2.5 && sigma > 0.0;
 
@@ -377,7 +382,8 @@ impl GpdFitter {
                 .map(|&x| x - threshold)
                 .collect();
 
-            if exceedances.len() >= self.config.min_exceedances {
+            let min_exceedances = self.config.min_exceedances.max(1);
+            if exceedances.len() >= min_exceedances {
                 // Compute mean residual life variance
                 let mean = exceedances.iter().sum::<f64>() / exceedances.len() as f64;
                 let var = exceedances.iter().map(|x| (x - mean).powi(2)).sum::<f64>()

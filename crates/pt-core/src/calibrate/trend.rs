@@ -174,14 +174,27 @@ fn detect_change_points(points: &[TimePoint], threshold: f64, std_dev: f64) -> V
         return Vec::new();
     }
 
+    let n = points.len();
     let min_half = 3;
+
+    // Precompute prefix sums for O(1) range sum queries
+    let mut prefix_sum = Vec::with_capacity(n + 1);
+    prefix_sum.push(0.0);
+    let mut current_sum = 0.0;
+    for p in points {
+        current_sum += p.value;
+        prefix_sum.push(current_sum);
+    }
+
     let mut best_score = 0.0f64;
     let mut best_idx = 0;
 
-    for split in min_half..(points.len() - min_half) {
-        let left_mean: f64 = points[..split].iter().map(|p| p.value).sum::<f64>() / split as f64;
-        let right_mean: f64 =
-            points[split..].iter().map(|p| p.value).sum::<f64>() / (points.len() - split) as f64;
+    for split in min_half..(n - min_half) {
+        let left_sum = prefix_sum[split];
+        let right_sum = prefix_sum[n] - prefix_sum[split];
+
+        let left_mean = left_sum / split as f64;
+        let right_mean = right_sum / (n - split) as f64;
         let diff = (right_mean - left_mean).abs();
 
         if diff > best_score {
@@ -192,10 +205,8 @@ fn detect_change_points(points: &[TimePoint], threshold: f64, std_dev: f64) -> V
 
     let normalized = best_score / std_dev;
     if normalized >= threshold {
-        let left_mean: f64 =
-            points[..best_idx].iter().map(|p| p.value).sum::<f64>() / best_idx as f64;
-        let right_mean: f64 = points[best_idx..].iter().map(|p| p.value).sum::<f64>()
-            / (points.len() - best_idx) as f64;
+        let left_mean = prefix_sum[best_idx] / best_idx as f64;
+        let right_mean = (prefix_sum[n] - prefix_sum[best_idx]) / (n - best_idx) as f64;
         let direction = if right_mean > left_mean {
             "increase"
         } else {

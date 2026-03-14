@@ -259,10 +259,11 @@ mod tests {
         let mut perms = fs::metadata(&script_path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         let result = verify_binary(&script_path, Some("1.2.3")).unwrap();
-        assert!(!result.passed);
-        assert!(result.error.unwrap_or_default().contains("unparseable"));
+        assert!(!result.passed, "Expected failure but got success");
+        assert!(result.error.unwrap_or_default().contains("unparseable"), "Expected 'unparseable' error");
     }
 
     #[cfg(unix)]
@@ -274,6 +275,7 @@ mod tests {
         let mut perms = fs::metadata(&script_path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         let err = run_with_timeout(&script_path, &[], Duration::from_millis(100)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);

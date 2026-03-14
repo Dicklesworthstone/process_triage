@@ -118,6 +118,9 @@ fn filter_finite(samples: &[f64]) -> Vec<f64> {
 }
 
 fn median(samples: &[f64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
     let mut values = samples.to_vec();
     values.sort_by(|a, b| a.total_cmp(b));
     let mid = values.len() / 2;
@@ -129,6 +132,9 @@ fn median(samples: &[f64]) -> f64 {
 }
 
 fn mad(samples: &[f64], center: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
     let mut deviations: Vec<f64> = samples.iter().map(|v| (v - center).abs()).collect();
     deviations.sort_by(|a, b| a.total_cmp(b));
     let mid = deviations.len() / 2;

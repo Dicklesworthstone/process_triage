@@ -2561,7 +2561,6 @@ fn build_tui_rows(
 
         // Populate rationale fields available in current context
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
-        
         let ledger =
             EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
         let max_posterior = posterior_result
@@ -12885,6 +12884,14 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
     let total_actions = actions_to_apply.len() as u64;
     let mut action_index = 0u64;
+
+    let candidate_posterior = |scores: &pt_core::inference::ClassScores| {
+        scores
+            .useful
+            .max(scores.useful_bad)
+            .max(scores.abandoned)
+            .max(scores.zombie)
+    };
     let emit_action_event = |event_name: &str,
                              index: u64,
                              elapsed_ms: Option<u64>,
@@ -13021,7 +13028,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
 
             let candidate = RobotCandidate {
-                posterior: action.rationale.posterior.as_ref().map(|p| 1.0 - p.useful),
+                posterior: action.rationale.posterior.as_ref().map(candidate_posterior),
                 memory_mb: action.rationale.memory_mb,
                 has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
                 category: action.rationale.category.clone(),
@@ -13136,7 +13143,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
                 let start = std::time::Instant::now();
                 let candidate = RobotCandidate {
-                    posterior: action.rationale.posterior.as_ref().map(|p| 1.0 - p.useful),
+                    posterior: action.rationale.posterior.as_ref().map(candidate_posterior),
                     memory_mb: action.rationale.memory_mb,
                     has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
                     category: action.rationale.category.clone(),
