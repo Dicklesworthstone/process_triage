@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
+use crate::collect::tool_runner::{ToolRunner, ToolSpec};
 use crate::plugin::action::{ActionPluginError, ActionPluginInput, ActionPluginOutput};
 use crate::plugin::evidence::{EvidencePluginError, EvidencePluginInput, EvidencePluginOutput};
 use crate::plugin::manifest::{load_manifest, ManifestError, PluginType, ResolvedPlugin};

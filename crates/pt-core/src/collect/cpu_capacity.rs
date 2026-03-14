@@ -189,7 +189,8 @@ fn collect_affinity(pid: u32, provenance: &mut CpuCapacityProvenance) -> Option<
     let path = format!("/proc/{}/status", pid);
     provenance.paths_tried.push(path.clone());
 
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     let affinity = parse_cpus_allowed_list(&content)?;
 
     provenance.affinity_source = AffinitySource::ProcStatus;
@@ -281,7 +282,8 @@ fn collect_cpuset(
     let cpuset_path = format!("/proc/{}/cpuset", pid);
     provenance.paths_tried.push(cpuset_path.clone());
 
-    if let Ok(content) = fs::read_to_string(&cpuset_path) {
+    if let Ok(bytes) = fs::read(&cpuset_path) {
+        let content = String::from_utf8_lossy(&bytes);
         let cgroup_path = content.trim();
         if !cgroup_path.is_empty() && cgroup_path != "/" {
             // Try both v2 and v1 locations
@@ -307,7 +309,8 @@ fn collect_cpuset(
 
 /// Read and parse a cpuset.cpus file.
 fn read_cpuset_file(path: &str) -> Option<u32> {
-    let content = fs::read_to_string(path).ok()?;
+    let bytes = fs::read(path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     let trimmed = content.trim();
 
     if trimmed.is_empty() {
@@ -320,7 +323,8 @@ fn read_cpuset_file(path: &str) -> Option<u32> {
 /// Get the number of logical CPUs on the system.
 pub fn num_logical_cpus() -> u32 {
     // Try /proc/cpuinfo first
-    if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
+    if let Ok(bytes) = fs::read("/proc/cpuinfo") {
+        let content = String::from_utf8_lossy(&bytes);
         let count = content
             .lines()
             .filter(|l| l.starts_with("processor"))

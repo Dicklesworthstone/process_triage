@@ -29,8 +29,6 @@ use crate::action::prechecks::{SupervisorAction, SupervisorInfo};
 use crate::supervision::ContainerSupervisionResult;
 use crate::supervision::{AppSupervisionResult, AppSupervisorType};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
-use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -364,13 +362,19 @@ impl SupervisorActionRunner {
         }
 
         let timeout = std::cmp::min(action.timeout, self.config.max_timeout);
-        let output = self.run_command_with_timeout(&program, &args, timeout)?;
+        
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let output = crate::collect::tool_runner::run_tool(&program, &args_refs, Some(timeout), None)
+            .map_err(|e| match e {
+                crate::collect::tool_runner::ToolError::Timeout(d) => SupervisorActionError::Timeout(d),
+                other => SupervisorActionError::CommandFailed(other.to_string()),
+            })?;
 
-        let exit_code = output.status.code();
+        let exit_code = output.exit_code;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        let success = output.status.success();
+        let success = exit_code == Some(0);
 
         if !success {
             // Check for common error patterns
@@ -384,7 +388,7 @@ impl SupervisorActionRunner {
             }
         }
 
-        Ok(SupervisorActionResult {
+        let mut result = SupervisorActionResult {
             success,
             duration: start.elapsed(),
             stdout: if stdout.is_empty() {
@@ -400,7 +404,22 @@ impl SupervisorActionRunner {
             exit_code,
             respawned: false,
             warnings: vec![],
-        })
+        };
+
+        // If action was Stop or Kill, check for respawn
+        if matches!(
+            action.command,
+            SupervisorCommand::Stop | SupervisorCommand::Kill
+        ) && success
+        {
+            if self.detect_respawn(action) {
+                result.respawned = true;
+                result.success = false;
+                return Err(SupervisorActionError::ProcessRespawned);
+            }
+        }
+
+        Ok(result)
     }
 
     /// Verify the process stopped and check for respawns.
@@ -705,56 +724,6 @@ impl SupervisorActionRunner {
         Ok(("forever".to_string(), vec![subcmd.to_string(), uid.clone()]))
     }
 
-    /// Run a command with timeout.
-    fn run_command_with_timeout(
-        &self,
-        program: &str,
-        args: &[String],
-        timeout: Duration,
-    ) -> Result<Output, SupervisorActionError> {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| SupervisorActionError::CommandFailed(e.to_string()))?;
-
-        let start = Instant::now();
-
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // Process finished; collect any remaining output without double-waiting.
-                    let mut stdout = Vec::new();
-                    let mut stderr = Vec::new();
-                    if let Some(mut out) = child.stdout.take() {
-                        let _ = out.read_to_end(&mut stdout);
-                    }
-                    if let Some(mut err) = child.stderr.take() {
-                        let _ = err.read_to_end(&mut stderr);
-                    }
-                    return Ok(Output {
-                        status,
-                        stdout,
-                        stderr,
-                    });
-                }
-                Ok(None) => {
-                    // Still running
-                    if start.elapsed() > timeout {
-                        // Kill the hung command
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(SupervisorActionError::Timeout(timeout));
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(e) => {
-                    return Err(SupervisorActionError::CommandFailed(e.to_string()));
-                }
-            }
-        }
-    }
 
     /// Check if a unit identifier matches any protected pattern.
     fn is_protected_unit(&self, unit: &str) -> bool {

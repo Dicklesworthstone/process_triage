@@ -3,14 +3,14 @@
 //! Each tool maps to a pt operation: scan, explain, history, signatures, capabilities.
 
 #[cfg(target_os = "linux")]
-use crate::collect::{deep_scan, DeepScanOptions};
-#[cfg(target_os = "linux")]
 use crate::collect::ScanMetadata;
+#[cfg(target_os = "linux")]
+use crate::collect::{deep_scan, DeepScanOptions};
 use crate::collect::{quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
 use crate::signature_cli::load_user_signatures;
 use crate::supervision::signature::ProcessMatchContext;
-use crate::supervision::SignatureDatabase;
+use crate::supervision::{SignatureDatabase, SupervisorCategory};
 
 fn collect_scan_result(deep: bool) -> Result<ScanResult, String> {
     if deep {
@@ -236,7 +236,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "category": {
                         "type": "string",
-                        "description": "Filter by category: agent, ide, ci, orchestrator, terminal, other"
+                        "description": "Filter by category: agent, ide, ci, orchestrator, terminal, other",
+                        "enum": ["agent", "ide", "ci", "orchestrator", "terminal", "other"]
                     }
                 },
                 "required": [],
@@ -459,7 +460,10 @@ fn tool_history(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 
     if sessions_root.exists() {
         if let Ok(dir) = std::fs::read_dir(sessions_root) {
-            let mut session_dirs: Vec<_> = dir.filter_map(|e| e.ok()).collect();
+            let mut session_dirs: Vec<_> = dir
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .collect();
             session_dirs.sort_by(|a, b| {
                 let ta = a.metadata().and_then(|m| m.modified()).ok();
                 let tb = b.metadata().and_then(|m| m.modified()).ok();
@@ -500,7 +504,7 @@ fn tool_signatures(params: &serde_json::Value) -> Result<Vec<ToolContent>, Strin
         .get("user_only")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let category_filter = params.get("category").and_then(|v| v.as_str());
+    let category_filter = parse_signature_category_filter(params)?;
 
     let mut all_sigs = Vec::new();
 
@@ -508,11 +512,9 @@ fn tool_signatures(params: &serde_json::Value) -> Result<Vec<ToolContent>, Strin
         let mut db = SignatureDatabase::new();
         db.add_default_signatures();
         for sig in db.signatures() {
-            if let Some(cat) = category_filter {
-                if let Some(parsed) = crate::signature_cli::parse_category(cat) {
-                    if sig.category != parsed {
-                        continue;
-                    }
+            if let Some(parsed) = category_filter {
+                if sig.category != parsed {
+                    continue;
                 }
             }
             all_sigs.push(serde_json::json!({
@@ -527,11 +529,9 @@ fn tool_signatures(params: &serde_json::Value) -> Result<Vec<ToolContent>, Strin
 
     if let Some(user_schema) = load_user_signatures() {
         for sig in &user_schema.signatures {
-            if let Some(cat) = category_filter {
-                if let Some(parsed) = crate::signature_cli::parse_category(cat) {
-                    if sig.category != parsed {
-                        continue;
-                    }
+            if let Some(parsed) = category_filter {
+                if sig.category != parsed {
+                    continue;
                 }
             }
             all_sigs.push(serde_json::json!({
@@ -554,6 +554,23 @@ fn tool_signatures(params: &serde_json::Value) -> Result<Vec<ToolContent>, Strin
         text: serde_json::to_string_pretty(&result)
             .map_err(|e| format!("Serialization error: {}", e))?,
     }])
+}
+
+fn parse_signature_category_filter(
+    params: &serde_json::Value,
+) -> Result<Option<SupervisorCategory>, String> {
+    let Some(category) = params.get("category").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+
+    crate::signature_cli::parse_category(category)
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "Invalid category '{}'. Valid categories: agent, ide, ci, orchestrator, terminal, other",
+                category
+            )
+        })
 }
 
 fn tool_capabilities(_params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
@@ -627,6 +644,13 @@ mod tests {
     }
 
     #[test]
+    fn tool_signatures_rejects_invalid_category() {
+        let result = call_tool("pt_signatures", &serde_json::json!({"category": "bogus"}));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid category"));
+    }
+
+    #[test]
     fn tool_history_succeeds() {
         let result = call_tool("pt_history", &serde_json::json!({})).unwrap();
         assert!(!result.is_empty());
@@ -675,5 +699,21 @@ mod tests {
         let defs = tool_definitions();
         let scan = defs.iter().find(|d| d.name == "pt_scan").unwrap();
         assert!(scan.input_schema["properties"].get("min_score").is_some());
+    }
+
+    #[test]
+    fn tool_signatures_definition_has_category_enum() {
+        let defs = tool_definitions();
+        let signatures = defs.iter().find(|d| d.name == "pt_signatures").unwrap();
+        let category = &signatures.input_schema["properties"]["category"]["enum"];
+        assert!(category.is_array());
+        assert!(category
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("agent")));
+        assert!(category
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("other")));
     }
 }

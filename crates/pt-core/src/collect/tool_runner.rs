@@ -67,7 +67,11 @@ pub enum ToolError {
     BudgetExhausted { used_ms: u64, budget_ms: u64 },
 
     #[error("command exited with non-zero status: {code}")]
-    NonZeroExit { code: i32 },
+    NonZeroExit {
+        code: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
 
     #[error("command killed by signal: {signal}")]
     KilledBySignal { signal: i32 },
@@ -188,6 +192,12 @@ pub struct ToolSpec {
     /// Arguments to pass.
     pub args: Vec<String>,
 
+    /// Optional data to write to stdin.
+    pub stdin: Option<Vec<u8>>,
+
+    /// Optional working directory.
+    pub working_dir: Option<std::path::PathBuf>,
+
     /// Override timeout (None = use default).
     pub timeout: Option<Duration>,
 
@@ -201,9 +211,23 @@ impl ToolSpec {
         Self {
             command: command.into(),
             args,
+            stdin: None,
+            working_dir: None,
             timeout: None,
             max_output: None,
         }
+    }
+
+    /// Set stdin data.
+    pub fn with_stdin(mut self, stdin: Vec<u8>) -> Self {
+        self.stdin = Some(stdin);
+        self
+    }
+
+    /// Set working directory.
+    pub fn with_working_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.working_dir = Some(dir);
+        self
     }
 
     /// Set custom timeout.
@@ -343,7 +367,17 @@ impl ToolRunner {
 
         // Build command
         let mut command = match self.build_command(&spec.command, &spec.args) {
-            Ok(cmd) => cmd,
+            Ok(mut cmd) => {
+                if let Some(ref dir) = spec.working_dir {
+                    cmd.current_dir(dir);
+                }
+                if spec.stdin.is_some() {
+                    cmd.stdin(Stdio::piped());
+                } else {
+                    cmd.stdin(Stdio::null());
+                }
+                cmd
+            }
             Err(e) => {
                 // Refund budget if build fails
                 self.used_ms.fetch_sub(allocated_ms, Ordering::SeqCst);
@@ -353,7 +387,6 @@ impl ToolRunner {
 
         // Spawn process
         let mut child = match command
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -366,6 +399,29 @@ impl ToolRunner {
                 return Err(ToolError::SpawnFailed(e.to_string()));
             }
         };
+
+        // Handle stdin if provided
+        if let Some(stdin_data) = spec.stdin.clone() {
+            if let Some(mut stdin) = child.stdin.take() {
+                // We must write to stdin in a separate thread to avoid deadlocks
+                // if the child starts writing to stdout before we finish writing to stdin.
+                std::thread::spawn(move || {
+                    let _ = stdin.write_all(&stdin_data);
+                });
+            }
+        }
+
+        // Set non-blocking mode on stdout/stderr once
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Some(ref out) = child.stdout {
+                let _ = set_nonblocking(out.as_raw_fd());
+            }
+            if let Some(ref err) = child.stderr {
+                let _ = set_nonblocking(err.as_raw_fd());
+            }
+        }
 
         // Execute with timeout and output capture
         let result = self.execute_with_timeout(&mut child, timeout, max_output);
@@ -658,7 +714,7 @@ impl ToolRunner {
     /// Uses non-blocking reads to avoid hanging on grandchild processes
     /// that may still hold the pipe open after the direct child exits.
     #[cfg(unix)]
-    fn drain_to_limit<R: Read + std::os::unix::io::AsRawFd>(
+    fn drain_to_limit<R: Read>(
         stream: &mut R,
         buf: &mut Vec<u8>,
         max: usize,
@@ -763,44 +819,27 @@ impl ToolRunner {
     }
 }
 
-/// Try to read from a stream without blocking.
-///
-/// On Unix, this uses fcntl to set O_NONBLOCK on the file descriptor,
-/// performs a read, then restores the original flags.
-/// Returns Ok(0) if no data is available (EAGAIN/EWOULDBLOCK).
+/// Set non-blocking mode on a file descriptor.
 #[cfg(unix)]
-fn try_read_nonblocking<R: Read + std::os::unix::io::AsRawFd>(
-    stream: &mut R,
-    buf: &mut [u8],
-) -> std::io::Result<usize> {
-    let fd = stream.as_raw_fd();
-
-    // Get current flags
+fn set_nonblocking(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(std::io::Error::last_os_error());
     }
-
-    // Set non-blocking if not already set
-    let was_nonblocking = (flags & libc::O_NONBLOCK) != 0;
-    if !was_nonblocking {
-        let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
+}
 
-    // Attempt read
-    let result = stream.read(buf);
-
-    // Restore blocking mode if we changed it
-    if !was_nonblocking {
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFL, flags);
-        }
-    }
-
-    result
+/// Try to read from a stream without blocking.
+///
+/// On Unix, this assumes O_NONBLOCK is already set on the file descriptor.
+/// Returns Ok(0) if no data is available (EAGAIN/EWOULDBLOCK).
+#[cfg(unix)]
+fn try_read_nonblocking<R: Read>(stream: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    stream.read(buf)
 }
 
 /// Non-blocking read fallback for non-Unix platforms.

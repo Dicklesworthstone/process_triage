@@ -405,7 +405,8 @@ impl UserCache {
     fn new() -> Self {
         let mut uid_map = std::collections::HashMap::new();
         // Best effort read of /etc/passwd
-        if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+        if let Ok(bytes) = fs::read("/etc/passwd") {
+            let passwd = String::from_utf8_lossy(&bytes);
             for line in passwd.lines() {
                 let fields: Vec<&str> = line.split(':').collect();
                 if fields.len() >= 3 {

@@ -60,7 +60,8 @@ fn read_boot_id() -> Option<String> {
 #[cfg(target_os = "linux")]
 fn read_uid(pid: u32) -> Option<u32> {
     let path = format!("/proc/{}/status", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("Uid:") {
             let mut parts = rest.split_whitespace();
@@ -261,7 +262,8 @@ impl Default for TickDeltaConfig {
 /// * `Option<TickSnapshot>` - Snapshot or None if process not accessible
 pub fn collect_tick_snapshot(pid: u32) -> Option<TickSnapshot> {
     let path = format!("/proc/{}/stat", pid);
-    let content = fs::read_to_string(&path).ok()?;
+    let bytes = fs::read(&path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     let timestamp = std::time::SystemTime::now();
     let monotonic = std::time::Instant::now();
 

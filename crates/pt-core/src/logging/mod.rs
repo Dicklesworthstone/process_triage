@@ -144,8 +144,9 @@ pub fn generate_run_id() -> String {
 /// Uses machine-id on Linux or generates a stable ID from hostname.
 pub fn get_host_id() -> String {
     // Try to read machine-id
-    if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
-        let id = id.trim();
+    if let Ok(bytes) = std::fs::read("/etc/machine-id") {
+        let id_str = String::from_utf8_lossy(&bytes);
+        let id = id_str.trim();
         if id.len() >= 8 {
             return format!("host-{}", &id[..8]);
         }

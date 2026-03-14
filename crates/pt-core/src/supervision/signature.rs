@@ -875,6 +875,9 @@ pub struct SignatureDatabase {
     working_dir_regexes: Vec<Vec<regex::Regex>>,
     /// Compiled regex patterns for parent processes (cached).
     parent_regexes: Vec<Vec<regex::Regex>>,
+    /// Compiled regex patterns for environment variables (cached).
+    /// Maps variable name to compiled regex.
+    env_regexes: Vec<HashMap<String, regex::Regex>>,
 }
 
 impl SignatureDatabase {
@@ -886,6 +889,7 @@ impl SignatureDatabase {
             arg_regexes: vec![],
             working_dir_regexes: vec![],
             parent_regexes: vec![],
+            env_regexes: vec![],
         }
     }
 
@@ -956,11 +960,25 @@ impl SignatureDatabase {
             })?);
         }
 
+        let mut env_res = HashMap::with_capacity(signature.patterns.environment_vars.len());
+        for (var_name, pattern) in &signature.patterns.environment_vars {
+            if !pattern.is_empty() && pattern != ".*" {
+                env_res.insert(
+                    var_name.clone(),
+                    regex::Regex::new(pattern).map_err(|e| SignatureError::InvalidRegex {
+                        pattern: pattern.clone(),
+                        error: e.to_string(),
+                    })?,
+                );
+            }
+        }
+
         // All compiled successfully, update state
         self.process_regexes.push(proc_res);
         self.arg_regexes.push(arg_res);
         self.working_dir_regexes.push(wd_res);
         self.parent_regexes.push(parent_res);
+        self.env_regexes.push(env_res);
         self.signatures.push(signature);
 
         Ok(())
@@ -1044,21 +1062,19 @@ impl SignatureDatabase {
 
     /// Find signatures matching an environment variable.
     pub fn find_by_env_var(&self, var_name: &str, var_value: &str) -> Vec<&SupervisorSignature> {
-        self.signatures
-            .iter()
-            .filter(|sig| {
-                if let Some(pattern) = sig.patterns.environment_vars.get(var_name) {
-                    if pattern.is_empty() || pattern == ".*" {
-                        return true;
+        let mut matches = Vec::new();
+        for (idx, sig) in self.signatures.iter().enumerate() {
+            if let Some(pattern) = sig.patterns.environment_vars.get(var_name) {
+                if pattern.is_empty() || pattern == ".*" {
+                    matches.push(sig);
+                } else if let Some(re) = self.env_regexes[idx].get(var_name) {
+                    if re.is_match(var_value) {
+                        matches.push(sig);
                     }
-                    regex::Regex::new(pattern)
-                        .map(|re| re.is_match(var_value))
-                        .unwrap_or(false)
-                } else {
-                    false
                 }
-            })
-            .collect()
+            }
+        }
+        matches
     }
 
     /// Find signatures matching a socket path.
@@ -1161,10 +1177,10 @@ impl SignatureDatabase {
                             if let Some(var_value) = env.get(var_name) {
                                 if pattern.is_empty() || pattern == ".*" {
                                     true
+                                } else if let Some(re) = self.env_regexes[sig_idx].get(var_name) {
+                                    re.is_match(var_value)
                                 } else {
-                                    regex::Regex::new(pattern)
-                                        .map(|re| re.is_match(var_value))
-                                        .unwrap_or(false)
+                                    false
                                 }
                             } else {
                                 false

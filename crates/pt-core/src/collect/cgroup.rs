@@ -160,7 +160,8 @@ pub struct CgroupProvenance {
 /// * `Option<CgroupDetails>` - Cgroup details or None if unavailable
 pub fn collect_cgroup_details(pid: u32) -> Option<CgroupDetails> {
     let cgroup_path = format!("/proc/{}/cgroup", pid);
-    let content = fs::read_to_string(&cgroup_path).ok()?;
+    let bytes = fs::read(&cgroup_path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
 
     collect_cgroup_from_content(&content, &cgroup_path, Some(pid))
 }
@@ -292,7 +293,8 @@ fn collect_cpu_limits(details: &mut CgroupDetails, _pid: u32) {
         // Also try cpu.weight
         let weight_path = format!("{}{}/cpu.weight", cgroup_root, unified_path);
         provenance.limit_paths_tried.push(weight_path.clone());
-        if let Ok(content) = fs::read_to_string(&weight_path) {
+        if let Ok(bytes) = fs::read(&weight_path) {
+            let content = String::from_utf8_lossy(&bytes);
             if let Ok(weight) = content.trim().parse::<u64>() {
                 limits.weight = Some(weight);
             }
@@ -410,7 +412,8 @@ fn collect_memory_limits(details: &mut CgroupDetails, _pid: u32) {
 
 /// Read cpu.max file (v2 format: "quota period" or "max period").
 fn read_cpu_max(path: &str) -> Option<(Option<i64>, u64)> {
-    let content = fs::read_to_string(path).ok()?;
+    let bytes = fs::read(path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     let parts: Vec<&str> = content.split_whitespace().collect();
     if parts.len() < 2 {
         return None;
@@ -429,7 +432,8 @@ fn read_cpu_max(path: &str) -> Option<(Option<i64>, u64)> {
 
 /// Read memory limit file (v2 format: number or "max").
 fn read_memory_limit(path: &str) -> Option<Option<u64>> {
-    let content = fs::read_to_string(path).ok()?;
+    let bytes = fs::read(path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     let trimmed = content.trim();
 
     if trimmed == "max" {
@@ -441,7 +445,8 @@ fn read_memory_limit(path: &str) -> Option<Option<u64>> {
 
 /// Read v1 memory limit (large values like PAGE_COUNTER_MAX mean unlimited).
 fn read_v1_memory_limit(path: &str) -> Option<Option<u64>> {
-    let content = fs::read_to_string(path).ok()?;
+    let bytes = fs::read(path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     let value = content.trim().parse::<u64>().ok()?;
 
     // v1 uses very large values to indicate unlimited
@@ -457,13 +462,15 @@ fn read_v1_memory_limit(path: &str) -> Option<Option<u64>> {
 
 /// Helper to read a u64 from a file.
 fn read_u64_file(path: &str) -> Option<u64> {
-    let content = fs::read_to_string(path).ok()?;
+    let bytes = fs::read(path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     content.trim().parse::<u64>().ok()
 }
 
 /// Helper to read an i64 from a file.
 fn read_i64_file(path: &str) -> Option<i64> {
-    let content = fs::read_to_string(path).ok()?;
+    let bytes = fs::read(path).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     content.trim().parse::<i64>().ok()
 }
 

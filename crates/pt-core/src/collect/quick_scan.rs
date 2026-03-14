@@ -681,14 +681,16 @@ fn linux_start_ticks_from_btime(_start_time_unix: i64) -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn read_uptime_seconds() -> Option<f64> {
-    let content = std::fs::read_to_string("/proc/uptime").ok()?;
+    let bytes = std::fs::read("/proc/uptime").ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     let first = content.split_whitespace().next()?;
     first.parse::<f64>().ok()
 }
 
 #[cfg(target_os = "linux")]
 fn read_boot_time_unix() -> Option<i64> {
-    let content = std::fs::read_to_string("/proc/stat").ok()?;
+    let bytes = std::fs::read("/proc/stat").ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("btime") {
             let value = rest.trim();

@@ -9072,10 +9072,11 @@ fn collect_daemon_metrics() -> pt_core::daemon::TickMetrics {
 
 #[cfg(feature = "daemon")]
 fn collect_swap_used_mb() -> u64 {
-    let content = match std::fs::read_to_string("/proc/meminfo") {
+    let content_bytes = match std::fs::read("/proc/meminfo") {
         Ok(c) => c,
         Err(_) => return 0,
     };
+    let content = String::from_utf8_lossy(&content_bytes);
     let mut total = 0u64;
     let mut free = 0u64;
     for line in content.lines() {
@@ -9927,9 +9928,10 @@ fn collect_system_state() -> serde_json::Value {
 
 /// Read /proc/loadavg and return [1min, 5min, 15min].
 fn collect_load_averages() -> Vec<f64> {
-    std::fs::read_to_string("/proc/loadavg")
+    std::fs::read("/proc/loadavg")
         .ok()
-        .and_then(|content| {
+        .and_then(|bytes| {
+            let content = String::from_utf8_lossy(&bytes);
             let parts: Vec<&str> = content.split_whitespace().collect();
             if parts.len() >= 3 {
                 let load1 = parts[0].parse::<f64>().ok()?;
@@ -9946,7 +9948,8 @@ fn collect_load_averages() -> Vec<f64> {
 /// Get CPU count from /proc/cpuinfo or nproc.
 fn collect_cpu_count() -> u32 {
     // Try reading from /proc/cpuinfo
-    if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
+    if let Ok(bytes) = std::fs::read("/proc/cpuinfo") {
+        let content = String::from_utf8_lossy(&bytes);
         let count = content
             .lines()
             .filter(|line| line.starts_with("processor"))
@@ -9965,9 +9968,10 @@ fn collect_cpu_count() -> u32 {
 
 /// Read /proc/meminfo and return memory stats in GB.
 fn collect_memory_info() -> serde_json::Value {
-    let (total_kb, available_kb) = std::fs::read_to_string("/proc/meminfo")
+    let (total_kb, available_kb) = std::fs::read("/proc/meminfo")
         .ok()
-        .map(|content| {
+        .map(|bytes| {
+            let content = String::from_utf8_lossy(&bytes);
             let mut total: u64 = 0;
             let mut available: u64 = 0;
             for line in content.lines() {
@@ -12493,9 +12497,10 @@ fn precheck_label_for_apply(check: &pt_core::plan::PreCheck) -> &'static str {
 
 #[cfg(target_os = "linux")]
 fn read_mem_available_bytes_for_goal_progress() -> u64 {
-    std::fs::read_to_string("/proc/meminfo")
+    std::fs::read("/proc/meminfo")
         .ok()
-        .and_then(|content| {
+        .and_then(|bytes| {
+            let content = String::from_utf8_lossy(&bytes);
             content.lines().find_map(|line| {
                 line.strip_prefix("MemAvailable:")
                     .and_then(|rest| rest.split_whitespace().next())
