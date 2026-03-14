@@ -106,9 +106,9 @@ pub struct ProcessStatus {
 /// Returns the full command line string, with NUL bytes replaced by spaces.
 pub fn parse_proc_cmdline(pid: u32) -> Option<String> {
     let path = format!("/proc/{}/cmdline", pid);
-    fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.replace('\0', " ").trim().to_string())
+    let bytes = fs::read(&path).ok()?;
+    let s = String::from_utf8_lossy(&bytes).into_owned();
+    Some(s.replace('\0', " ").trim().to_string())
 }
 
 /// Parse /proc/[pid]/status file.
