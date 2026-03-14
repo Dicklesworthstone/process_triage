@@ -486,6 +486,45 @@ fn sessions_detail_shows_session_info() {
 }
 
 #[test]
+fn sessions_detail_marks_successful_outcomes_in_human_output() {
+    with_temp_data_dir(|dir| {
+        let session_id = create_session_with_plan(dir, test_identity(222_223), false);
+        let store = SessionStore::from_env().expect("session store from env");
+        let handle = store.open(&session_id).expect("open session");
+
+        fs::create_dir_all(handle.dir.join("action")).expect("create action dir");
+        fs::write(
+            handle.dir.join("action").join("outcomes.jsonl"),
+            r#"{"action_id":"action-1","pid":222223,"status":"success","time_ms":12}"#,
+        )
+        .expect("write outcomes");
+
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "--format",
+                "md",
+                "agent",
+                "sessions",
+                "--session",
+                &session_id.0,
+                "--detail",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let text = String::from_utf8(output).expect("utf8 output");
+        assert!(
+            text.contains("PID 222223 ✓ success"),
+            "expected successful outcome marker, got:\n{text}"
+        );
+    });
+}
+
+#[test]
 fn sessions_detail_invalid_session_returns_error() {
     with_temp_data_dir(|dir| {
         pt_core_fast()
