@@ -7,33 +7,31 @@ Goal: Run pt in a structured, automation-friendly way without taking unsafe acti
 Plan-only:
 
 ```bash
-pt robot plan --format json > /tmp/pt-plan.json
+pt agent plan --format json > /tmp/pt-plan.json
 ```
 
 Explain a candidate:
 
 ```bash
-pt robot explain --pid <pid> --format json > /tmp/pt-explain.json
+pt agent explain --pid <pid> --format json > /tmp/pt-explain.json
 ```
 
 Apply (manual decision):
 
 ```bash
 # Example only. Review evidence before applying.
-pt robot apply --pids <pid> --yes --format json
+pt agent apply --pids <pid> --yes --format json
 ```
 
-## Planned session-based workflow
+## Session-based workflow
 
-Session lifecycle is described in the agent contract and will enable resumable workflows:
+Session lifecycle is already available for resumable workflows:
 
 ```bash
-# Planned interface (may not be implemented yet)
+# Session-aware interface
 SESSION=$(pt agent plan --format json | jq -r .session_id)
 pt agent explain --session "$SESSION" --pid <pid>
 pt agent apply --session "$SESSION" --recommended --yes
 pt agent verify --session "$SESSION"
 pt agent diff --session "$SESSION" --vs <prior-session>
 ```
-
-If the session-based commands are not available, keep using plan/explain/apply without sessions.

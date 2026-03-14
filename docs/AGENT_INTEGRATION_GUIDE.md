@@ -490,17 +490,17 @@ Process Triage uses **False Discovery Rate** control:
 
 ```bash
 # Good: Review plan before applying
-pt robot plan --format json | jq '.candidates[] | {pid, cmd_short, recommendation}'
+pt agent plan --format json | jq '.candidates[] | {pid, cmd_short, recommendation}'
 # Then apply based on what you saw
-pt robot apply --recommended --yes --format json
+pt agent apply --recommended --yes --format json
 ```
 
-### 🚧 1b. Use Sessions (Planned)
+### 1b. Use Sessions
 
-When sessions are implemented, always use explicit session management:
+Use explicit session management when you want plan/apply to stay pinned to the same snapshot:
 
 ```bash
-# Good: Explicit session management (planned)
+# Good: Explicit session management
 SESSION=$(pt agent plan --format json | jq -r .session_id)
 pt agent apply --session "$SESSION" --recommended --yes
 
@@ -521,7 +521,7 @@ def parse_plan(output):
 ### 3. Handle All Exit Codes
 
 ```bash
-pt robot apply --recommended --yes --format json
+pt agent apply --recommended --yes --format json
 case $? in
     0) echo "Clean system, nothing to do" ;;
     1) echo "Plan ready, no actions taken" ;;
@@ -533,12 +533,12 @@ case $? in
 esac
 ```
 
-### 🚧 4. Set Confidence Thresholds (Planned)
+### 4. Set Confidence Thresholds
 
-When safety gates are implemented, autonomous operation should require high confidence:
+For autonomous operation, require high confidence and tight blast-radius limits:
 
 ```bash
-# Planned: Fine-grained safety controls
+# Conservative autonomous apply
 pt agent apply --session "$SESSION" \
   --recommended --yes \
   --min-posterior 0.99 \
@@ -546,7 +546,7 @@ pt agent apply --session "$SESSION" \
   --max-blast-radius 1GB
 ```
 
-Currently, the default policy provides safety through protected process lists and posterior thresholds built into the recommendation logic.
+The default policy already provides safety through protected process lists and posterior thresholds built into the recommendation logic, but explicit gates make automation easier to audit.
 
 ### 5. Use Field Projection for Large Systems
 
@@ -578,26 +578,20 @@ for candidate in plan["candidates"]:
         # e.g., "systemctl --user stop my-app.service"
 ```
 
-### 🚧 8. Respect Resumability (Planned)
+### 8. Respect Resumability
 
-When sessions are implemented, interrupted workflows can be resumed:
+Interrupted workflows can be resumed when the session is still valid:
 
 ```bash
-# Planned: Check if resumable
-STATUS=$(pt agent status --session "$SESSION")
-if echo "$STATUS" | jq -e '.resumable' > /dev/null; then
-    pt agent apply --session "$SESSION" --resume
-else
-    # Start fresh
-    SESSION=$(pt agent plan --format json | jq -r .session_id)
-fi
+# Resume the prior apply attempt
+pt agent apply --session "$SESSION" --resume
 ```
 
 ---
 
 ## 🚧 Real Workflow Examples (Planned Features)
 
-These examples demonstrate the **target workflow patterns** using planned features like sessions, pattern filtering, and safety gates. They show the intended design but use features not yet implemented.
+These examples demonstrate **target workflow patterns**. They intentionally include some not-yet-implemented filters such as `--patterns`, `--exclude-patterns`, and `--min-idle-minutes`, even though sessions and safety gates shown elsewhere in this guide are already implemented.
 
 ### Example 1: Development Machine Cleanup Agent
 

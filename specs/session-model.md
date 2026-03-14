@@ -484,8 +484,8 @@ A global lock prevents concurrent pt invocations from conflicting:
 |-----------|-----------|-------------------|
 | `pt scan` | Shared | Multiple scans OK |
 | `pt deep` | Exclusive | Single instance |
-| `pt robot plan` | Shared | Multiple plans OK |
-| `pt robot apply` | Exclusive | Single instance |
+| `pt agent plan` | Shared | Multiple plans OK |
+| `pt agent apply` | Exclusive | Single instance |
 | `pt daemon` | Exclusive | Single daemon |
 | `pt sessions list` | None | Always allowed |
 | `pt bundle` | Session-specific | Isolated to session |

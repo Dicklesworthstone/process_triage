@@ -38,12 +38,12 @@ Interactive mode will always ask before taking any action.
 ## 5) Generate a plan for automation review (plan-only)
 
 ```bash
-pt robot plan --format json
+pt agent plan --format json
 ```
 
 This generates a machine-readable plan with evidence and recommendations. No actions are taken.
 
 ## Next steps
 
-- If you see a candidate you recognize, run `pt robot explain --pid <pid>` to view evidence.
+- If you see a candidate you recognize, run `pt agent explain --pid <pid>` to view evidence.
 - If nothing looks suspicious, you are done. pt does not invent problems.

@@ -159,7 +159,7 @@ pt scan --signatures /path/to/signatures.json
 4) Check that candidates show `matched_signature` in JSON output:
 
 ```bash
-pt robot plan --format json --signatures /path/to/signatures.json | jq '.candidates[] | {pid, cmd_short, matched_signature}'
+pt agent plan --format json --signatures /path/to/signatures.json | jq '.candidates[] | {pid, cmd_short, matched_signature}'
 ```
 
 If your signature matches unexpectedly, tighten patterns or increase `min_matches`.
@@ -196,4 +196,3 @@ Use this checklist before sharing:
 - Expectations are consistent and validated.
 - Signature passes `pt signature validate` and `pt signature test`.
 - No protected/system process matches are possible.
-

@@ -28,7 +28,7 @@ Run plan-only scans over SSH:
 ```bash
 while read -r host; do
   echo "==> $host"
-  ssh "$host" "pt robot plan --format json" > "/tmp/pt-plan-$host.json"
+  ssh "$host" "pt agent plan --format json" > "/tmp/pt-plan-$host.json"
 done < fleet-hosts.txt
 ```
 

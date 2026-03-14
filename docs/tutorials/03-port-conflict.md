@@ -13,13 +13,13 @@ If you see a PID, you can use it in the steps below.
 ## 2) Generate a plan (safe)
 
 ```bash
-pt robot plan --format json --min-age 3600
+pt agent plan --format json --min-age 3600
 ```
 
 ## 3) Filter for dev servers
 
 ```bash
-pt robot plan --format json --min-age 3600 \
+pt agent plan --format json --min-age 3600 \
   | jq '.candidates[] | select(.cmd_short | test("next dev|vite|webpack|node .*dev"; "i")) \
   | {pid, cmd_short, runtime_seconds, recommendation, posterior_abandoned}'
 ```
@@ -27,7 +27,7 @@ pt robot plan --format json --min-age 3600 \
 ## 4) Explain a candidate
 
 ```bash
-pt robot explain --pid <pid> --format json
+pt agent explain --pid <pid> --format json
 ```
 
 Verify it is yours (same UID) and not protected. If it is supervised by a tool
@@ -37,7 +37,7 @@ Verify it is yours (same UID) and not protected. If it is supervised by a tool
 
 ```bash
 # Example only. Review evidence before applying.
-pt robot apply --pids <pid> --yes --format json
+pt agent apply --pids <pid> --yes --format json
 ```
 
 If you see a supervisor recommendation in the plan, follow that instead of killing directly.

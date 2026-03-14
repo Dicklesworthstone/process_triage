@@ -3,4 +3,4 @@ set -euo pipefail
 
 pt --version
 pt scan
-pt robot plan --format summary
+pt agent plan --format summary
