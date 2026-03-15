@@ -6,10 +6,12 @@
   "source": {
     "origin": "manual-copy",
     "command": [
-      "cp crates/pt-core/tests/fixtures/*.json test/fixtures/pt-core/"
+      "cp crates/pt-core/tests/fixtures/*.json test/fixtures/pt-core/",
+      "add provenance fixture pack and debug trace fixtures"
     ],
     "paths": [
-      "crates/pt-core/tests/fixtures"
+      "crates/pt-core/tests/fixtures",
+      "test/fixtures/pt-core"
     ]
   },
   "tool_versions": {
@@ -48,6 +50,13 @@
       "redaction_profile": "safe"
     },
     {
+      "path": "logs/provenance_debug_trace.jsonl",
+      "kind": "log",
+      "sha256": "e381d561cafb4ac70e8322b31e03d3c03e54c2a92a2ef2b284cf16398d91428d",
+      "bytes": 1250,
+      "redaction_profile": "safe"
+    },
+    {
       "path": "malformed.json",
       "kind": "config",
       "sha256": "9519f39e393c5a95b0c103706ccae1f902a7c7efc88509828a60008fed4d6115",
@@ -62,6 +71,13 @@
       "redaction_profile": "safe"
     },
     {
+      "path": "provenance_privacy_snapshot.json",
+      "kind": "snapshot",
+      "sha256": "b2f47920901e538e4b97414c6abc1692e5a02d364aec4386e1247f71130d403a",
+      "bytes": 5799,
+      "redaction_profile": "safe"
+    },
+    {
       "path": "priors.json",
       "kind": "priors",
       "sha256": "2e255cef355e078f14f40835eed862c5ee59b1c6a774852b1a2d9f649f8020f1",
@@ -69,6 +85,6 @@
       "redaction_profile": "safe"
     }
   ],
-  "description": "pt-core policy/priors + inference fixtures",
-  "manifest_sha256": "ca0a1e2951c55a956c8b158db7dc5d77f9d72e204f7e6b98067fa87e8144983e"
+  "description": "pt-core policy/priors + inference + provenance fixtures",
+  "manifest_sha256": "71010c849efb13a706548195057e88d961ae9788ad59cd7d58eb597e2973b7a5"
 }

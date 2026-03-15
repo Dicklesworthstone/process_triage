@@ -56,3 +56,17 @@ setup() {
     run bash -lc "cd '$REPO_ROOT' && rg -n 'basic-scan.sh|plan-review-apply.sh|robot-mode.sh' docs/demos/README.md"
     [ "$status" -eq 0 ]
 }
+
+@test "provenance testing docs define fixture pack and debug vocabulary" {
+    [[ -f "${REPO_ROOT}/docs/PROVENANCE_TESTING_AND_LOGGING.md" ]]
+
+    run bash -lc "cd '$REPO_ROOT' && rg -n 'provenance_privacy_snapshot.json|provenance_debug_trace.jsonl|provenance_confidence_downgraded|provenance_evidence_redacted' docs/PROVENANCE_TESTING_AND_LOGGING.md docs/FIXTURES.md"
+    [ "$status" -eq 0 ]
+}
+
+@test "provenance controls docs define rollout surfaces and defaults" {
+    [[ -f "${REPO_ROOT}/docs/PROVENANCE_CONTROLS_AND_ROLLOUT.md" ]]
+
+    run bash -lc "cd '$REPO_ROOT' && rg -n 'PT_PROVENANCE_POSTURE|--provenance-posture|provenance\\.posture|daemon|fleet|report' docs/PROVENANCE_CONTROLS_AND_ROLLOUT.md README.md"
+    [ "$status" -eq 0 ]
+}

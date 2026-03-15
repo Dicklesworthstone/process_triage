@@ -65,3 +65,13 @@ The capture tool normalizes common sensitive values in metadata:
 
 Fixtures themselves must already be redacted; the manifest validator enforces redaction for
 metadata fields (`source.command`, `source.paths`).
+
+## Provenance Fixtures
+
+Canonical provenance fixtures now live in the `pt-core` fixture domain:
+
+- `test/fixtures/pt-core/provenance_privacy_snapshot.json`
+- `test/fixtures/pt-core/logs/provenance_debug_trace.jsonl`
+
+The shared Rust-side loader for these fixtures is documented in
+`docs/PROVENANCE_TESTING_AND_LOGGING.md`.

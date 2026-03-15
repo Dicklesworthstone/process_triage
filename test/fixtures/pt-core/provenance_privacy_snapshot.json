@@ -1,0 +1,222 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-03-15T20:00:00Z",
+  "session_id": "pt-20260315-200000-prov",
+  "host_id": "host-redacted",
+  "privacy": {
+    "version": "1.0.0",
+    "local_persistence_days": 30,
+    "field_policies": [
+      {
+        "selector": {
+          "scope": "node_label",
+          "kind": "workspace"
+        },
+        "sensitivity": "local_path",
+        "collect": "allow",
+        "persist": "hash",
+        "export": "hash",
+        "display": "summarize",
+        "log": "hash",
+        "retention": "short_term",
+        "consent": "explicit_operator",
+        "consequence": {
+          "missing_confidence": "low",
+          "redacted_confidence": "low",
+          "explanation_effect": "note_withheld",
+          "user_note": "workspace labels are withheld on shared surfaces"
+        }
+      },
+      {
+        "selector": {
+          "scope": "evidence_attribute",
+          "kind": "env",
+          "key": "value"
+        },
+        "sensitivity": "secret_adjacent",
+        "collect": "omit",
+        "persist": "omit",
+        "export": "omit",
+        "display": "omit",
+        "log": "omit",
+        "retention": "ephemeral",
+        "consent": "support_escalation",
+        "consequence": {
+          "missing_confidence": "unknown",
+          "redacted_confidence": "unknown",
+          "explanation_effect": "note_withheld",
+          "user_note": "env values are never retained in provenance"
+        }
+      },
+      {
+        "selector": {
+          "scope": "snapshot_host_id"
+        },
+        "sensitivity": "infrastructure_identity",
+        "collect": "allow",
+        "persist": "hash",
+        "export": "hash",
+        "display": "summarize",
+        "log": "hash",
+        "retention": "short_term",
+        "consent": "explicit_operator",
+        "consequence": {
+          "missing_confidence": "medium",
+          "redacted_confidence": "medium",
+          "explanation_effect": "note_withheld",
+          "user_note": "host identifiers are summarized outside the local machine"
+        }
+      }
+    ]
+  },
+  "summary": {
+    "node_count": 3,
+    "edge_count": 2,
+    "evidence_count": 3,
+    "redacted_evidence_count": 1,
+    "missing_or_conflicted_evidence_count": 2
+  },
+  "nodes": [
+    {
+      "id": "pn_process_74b53e57d6bbf4f6",
+      "kind": "process",
+      "label": "pytest",
+      "confidence": "high",
+      "redaction": "none",
+      "evidence_ids": [
+        "pv_procfs_1a603ecf40793644"
+      ],
+      "attributes": {
+        "pid": 41,
+        "cmd": "pytest -k provenance"
+      }
+    },
+    {
+      "id": "pn_workspace_53b6a161ab1d514e",
+      "kind": "workspace",
+      "label": "<workspace:redacted>",
+      "confidence": "low",
+      "redaction": "full",
+      "evidence_ids": [
+        "pv_git_e187a34b9f3c8f0d"
+      ],
+      "attributes": {
+        "repo_root": "<repo:redacted>"
+      }
+    },
+    {
+      "id": "pn_host_4e63f37a0ca5ae75",
+      "kind": "host",
+      "label": "<host:redacted>",
+      "confidence": "medium",
+      "redaction": "full",
+      "evidence_ids": [
+        "pv_derived_03b76dbe9f5cb0e4"
+      ],
+      "attributes": {
+        "scope": "fleet"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "pe_attached_to_workspace_39646f6d0a5f0df4",
+      "kind": "attached_to_workspace",
+      "from": "pn_process_74b53e57d6bbf4f6",
+      "to": "pn_workspace_53b6a161ab1d514e",
+      "confidence": "low",
+      "redaction": "partial",
+      "evidence_ids": [
+        "pv_git_e187a34b9f3c8f0d"
+      ],
+      "derived_from_edge_ids": [],
+      "attributes": {
+        "reason": "cwd_under_workspace"
+      }
+    },
+    {
+      "id": "pe_observed_on_host_f07a7428f4b0b4b8",
+      "kind": "observed_on_host",
+      "from": "pn_process_74b53e57d6bbf4f6",
+      "to": "pn_host_4e63f37a0ca5ae75",
+      "confidence": "medium",
+      "redaction": "partial",
+      "evidence_ids": [
+        "pv_derived_03b76dbe9f5cb0e4"
+      ],
+      "derived_from_edge_ids": [],
+      "attributes": {
+        "reason": "fleet_summary_only"
+      }
+    }
+  ],
+  "evidence": [
+    {
+      "id": "pv_procfs_1a603ecf40793644",
+      "kind": "procfs",
+      "source": "/proc/41/stat",
+      "observed_at": "2026-03-15T20:00:00Z",
+      "status": "observed",
+      "confidence": "high",
+      "redaction": "none",
+      "process": {
+        "pid": 41,
+        "start_id": "boot-1:123:41"
+      },
+      "attributes": {
+        "collector": "procfs"
+      }
+    },
+    {
+      "id": "pv_git_e187a34b9f3c8f0d",
+      "kind": "git",
+      "source": "<git:redacted>",
+      "observed_at": "2026-03-15T20:00:01Z",
+      "status": "missing",
+      "confidence": "low",
+      "redaction": "full",
+      "process": {
+        "pid": 41,
+        "start_id": "boot-1:123:41"
+      },
+      "attributes": {
+        "reason": "policy_withheld_workspace_path"
+      }
+    },
+    {
+      "id": "pv_derived_03b76dbe9f5cb0e4",
+      "kind": "derived",
+      "source": "provenance_reasoner",
+      "observed_at": "2026-03-15T20:00:02Z",
+      "status": "conflicted",
+      "confidence": "low",
+      "redaction": "partial",
+      "process": {
+        "pid": 41,
+        "start_id": "boot-1:123:41"
+      },
+      "attributes": {
+        "reason": "host_only_without_workspace"
+      }
+    }
+  ],
+  "warnings": [
+    {
+      "code": "workspace_withheld_by_policy",
+      "message": "workspace provenance was withheld by privacy policy",
+      "confidence": "low",
+      "evidence_ids": [
+        "pv_git_e187a34b9f3c8f0d"
+      ]
+    },
+    {
+      "code": "confidence_downgraded_due_to_missing_workspace",
+      "message": "workspace linkage confidence was downgraded after redaction",
+      "confidence": "low",
+      "evidence_ids": [
+        "pv_git_e187a34b9f3c8f0d",
+        "pv_derived_03b76dbe9f5cb0e4"
+      ]
+    }
+  ]
+}
