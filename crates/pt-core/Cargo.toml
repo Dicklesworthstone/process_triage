@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror.workspace = true
 dirs = "5"
 libc = "0.2"
+io-uring = "0.7"
 regex = "1"
 sha2 = "0.10"
 hex = "0.4"
@@ -80,6 +81,10 @@ regex = "1"
 proptest = "1"
 filetime = "0.2"
 ftui-harness = "0.2.0"
+
+[[bench]]
+name = "wait_free_prober"
+harness = false
 
 [[bench]]
 name = "collect_parsers"

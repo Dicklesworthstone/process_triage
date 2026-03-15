@@ -16,15 +16,19 @@
 //! - Graceful degradation for permission-denied paths
 
 use super::network::{NetworkInfo, NetworkSnapshot};
+use super::prober::{Prober, ProberConfig, ProbeResult};
 use super::proc_parsers::{
-    parse_cgroup, parse_environ, parse_fd, parse_io, parse_proc_cmdline, parse_proc_exe,
-    parse_proc_stat, parse_proc_status, parse_sched, parse_schedstat, parse_statm, parse_wchan,
-    CgroupInfo, FdInfo, IoStats, MemStats, SchedInfo, SchedStats,
+    parse_cgroup, parse_cgroup_content, parse_environ, parse_environ_content, parse_fd, parse_io,
+    parse_io_content, parse_proc_cmdline, parse_proc_exe, parse_proc_stat, parse_proc_stat_content,
+    parse_proc_status, parse_proc_status_content, parse_sched, parse_sched_content, parse_schedstat,
+    parse_schedstat_content, parse_statm, parse_statm_content, parse_wchan, CgroupInfo, FdInfo,
+    IoStats, MemStats, SchedInfo, SchedStats,
 };
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
 use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -32,9 +36,10 @@ use std::sync::{
 use std::thread;
 use std::time::Instant;
 use thiserror::Error;
+use tracing::warn;
 
 /// Options for deep scan operation.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DeepScanOptions {
     /// Only scan specific PIDs (empty = all processes).
     pub pids: Vec<u32>,
@@ -45,8 +50,23 @@ pub struct DeepScanOptions {
     /// Include environment variables (may be sensitive).
     pub include_environ: bool,
 
+    /// Use wait-free io_uring prober if available (Linux-only).
+    pub use_wait_free: bool,
+
     /// Optional progress event emitter.
     pub progress: Option<Arc<dyn ProgressEmitter>>,
+}
+
+impl Default for DeepScanOptions {
+    fn default() -> Self {
+        Self {
+            pids: Vec::new(),
+            skip_inaccessible: false,
+            include_environ: false,
+            use_wait_free: true,
+            progress: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for DeepScanOptions {
@@ -55,6 +75,7 @@ impl std::fmt::Debug for DeepScanOptions {
             .field("pids", &self.pids)
             .field("skip_inaccessible", &self.skip_inaccessible)
             .field("include_environ", &self.include_environ)
+            .field("use_wait_free", &self.use_wait_free)
             .field("progress", &self.progress.as_ref().map(|_| "..."))
             .finish()
     }
@@ -265,10 +286,75 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
             ProgressEvent::new(event_names::DEEP_SCAN_STARTED, Phase::DeepScan)
                 .with_progress(0, Some(total_pids))
                 .with_detail("include_environ", options.include_environ)
-                .with_detail("skip_inaccessible", options.skip_inaccessible),
+                .with_detail("skip_inaccessible", options.skip_inaccessible)
+                .with_detail("wait_free", options.use_wait_free),
         );
     }
 
+    let mut processes = Vec::new();
+    let mut warnings = Vec::new();
+    let mut total_skipped = 0;
+
+    // Try to use wait-free prober if requested
+    if options.use_wait_free {
+        if let Ok(mut prober) = Prober::new(ProberConfig::default()) {
+            // Process in chunks to keep ring buffer usage sane
+            for chunk in pids.chunks(100) {
+                let mut paths = Vec::new();
+                for &pid in chunk {
+                    paths.push(PathBuf::from(format!("/proc/{}/stat", pid)));
+                    paths.push(PathBuf::from(format!("/proc/{}/status", pid)));
+                    paths.push(PathBuf::from(format!("/proc/{}/io", pid)));
+                    paths.push(PathBuf::from(format!("/proc/{}/schedstat", pid)));
+                    paths.push(PathBuf::from(format!("/proc/{}/sched", pid)));
+                    paths.push(PathBuf::from(format!("/proc/{}/statm", pid)));
+                    paths.push(PathBuf::from(format!("/proc/{}/cgroup", pid)));
+                    if options.include_environ {
+                        paths.push(PathBuf::from(format!("/proc/{}/environ", pid)));
+                    }
+                }
+
+                let probe_results = prober.probe_batch(&paths);
+                // Map results back to PIDs
+                let mut pid_results: std::collections::HashMap<u32, std::collections::HashMap<String, ProbeResult>> = std::collections::HashMap::new();
+                for res in probe_results {
+                    if let Some(pid_str) = res.path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            let file_name = res.path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+                            pid_results.entry(pid).or_default().insert(file_name, res);
+                        }
+                    }
+                }
+
+                for &pid in chunk {
+                    let results = pid_results.remove(&pid).unwrap_or_default();
+                    match parse_probed_process(
+                        pid,
+                        &results,
+                        &user_cache,
+                        &boot_id,
+                        &network_snapshot,
+                    ) {
+                        Ok(record) => processes.push(record),
+                        Err(DeepScanError::ProcessVanished(_)) => total_skipped += 1,
+                        Err(e) => {
+                            if options.skip_inaccessible {
+                                total_skipped += 1;
+                            } else {
+                                warnings.push(format!("PID {}: {}", pid, e));
+                            }
+                        }
+                    }
+                }
+            }
+            
+            return finish_scan(start, started_at, processes, warnings, total_skipped, options.progress.as_ref());
+        } else {
+            warn!("Failed to initialize io_uring prober, falling back to standard threaded mode");
+        }
+    }
+
+    // Standard threaded mode (fallback)
     const PROGRESS_STEP: usize = 50;
     let scanned_counter = AtomicUsize::new(0);
 
@@ -280,7 +366,7 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
     let chunk_size = (pids.len() + num_threads - 1) / num_threads.max(1);
     let chunks: Vec<_> = pids.chunks(chunk_size).collect();
 
-    let (processes, warnings, skipped_count) = thread::scope(|s| {
+    let (procs, warns, skipped) = thread::scope(|s| {
         let mut handles = Vec::new();
 
         for chunk in chunks {
@@ -326,7 +412,7 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
                                     Phase::DeepScan,
                                 )
                                 .with_progress(current as u64, Some(total_pids))
-                                .with_detail("skipped", local_skipped), // Local skipped isn't global, but roughly indicative
+                                .with_detail("skipped", local_skipped),
                             );
                         }
                     }
@@ -350,14 +436,23 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
         (all_processes, all_warnings, total_skipped)
     });
 
+    finish_scan(start, started_at, procs, warns, skipped, options.progress.as_ref())
+}
+
+fn finish_scan(
+    start: Instant,
+    started_at: String,
+    processes: Vec<DeepScanRecord>,
+    warnings: Vec<String>,
+    skipped_count: usize,
+    progress: Option<&Arc<dyn ProgressEmitter>>,
+) -> Result<DeepScanResult, DeepScanError> {
     let duration = start.elapsed();
     let process_count = processes.len();
-    let scanned_total = scanned_counter.load(Ordering::Relaxed);
 
-    if let Some(emitter) = options.progress.as_ref() {
+    if let Some(emitter) = progress {
         emitter.emit(
             ProgressEvent::new(event_names::DEEP_SCAN_COMPLETE, Phase::DeepScan)
-                .with_progress(scanned_total as u64, Some(total_pids))
                 .with_elapsed_ms(duration.as_millis() as u64)
                 .with_detail("process_count", process_count)
                 .with_detail("skipped", skipped_count)
@@ -374,6 +469,86 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
             skipped_count,
             warnings,
         },
+    })
+}
+
+/// Helper to parse results from wait-free prober.
+fn parse_probed_process(
+    pid: u32,
+    results: &std::collections::HashMap<String, ProbeResult>,
+    user_cache: &UserCache,
+    boot_id: &Option<String>,
+    network_snapshot: &NetworkSnapshot,
+) -> Result<DeepScanRecord, DeepScanError> {
+    let stat_res = results.get("stat").ok_or(DeepScanError::ProcessVanished(pid))?;
+    if stat_res.timed_out {
+        return Err(DeepScanError::ParseError { pid, message: "Probe timed out for /proc/[pid]/stat".to_string() });
+    }
+    let stat_content = String::from_utf8_lossy(&stat_res.data);
+    let stat_info = parse_proc_stat_content(&stat_content).ok_or(DeepScanError::ProcessVanished(pid))?;
+
+    let (uid, user, uid_known) = if let Some(status_res) = results.get("status") {
+        if !status_res.timed_out && status_res.error.is_none() {
+            let content = String::from_utf8_lossy(&status_res.data);
+            match parse_proc_status_content(&content) {
+                Some(status) => (status.euid, user_cache.resolve(status.euid), true),
+                None => (0, "unknown".to_string(), false),
+            }
+        } else {
+            (0, "unknown".to_string(), false)
+        }
+    } else {
+        (0, "unknown".to_string(), false)
+    };
+
+    let cmdline = parse_proc_cmdline(pid).unwrap_or_default();
+    let exe = parse_proc_exe(pid);
+
+    let identity_quality = match (boot_id, stat_info.starttime, uid_known) {
+        (_, _, false) => IdentityQuality::PidOnly,
+        (Some(_), starttime, true) if starttime > 0 => IdentityQuality::Full,
+        (None, starttime, true) if starttime > 0 => IdentityQuality::NoBootId,
+        _ => IdentityQuality::PidOnly,
+    };
+
+    let start_id = compute_start_id(boot_id, stat_info.starttime, pid);
+
+    // Parse other optional fields
+    let io = results.get("io").and_then(|r| if !r.timed_out { parse_io_content(&String::from_utf8_lossy(&r.data)) } else { None });
+    let schedstat = results.get("schedstat").and_then(|r| if !r.timed_out { parse_schedstat_content(&String::from_utf8_lossy(&r.data)) } else { None });
+    let sched = results.get("sched").and_then(|r| if !r.timed_out { parse_sched_content(&String::from_utf8_lossy(&r.data)) } else { None });
+    let mem = results.get("statm").and_then(|r| if !r.timed_out { parse_statm_content(&String::from_utf8_lossy(&r.data)) } else { None });
+    let cgroup = results.get("cgroup").and_then(|r| if !r.timed_out { parse_cgroup_content(&String::from_utf8_lossy(&r.data)) } else { None });
+    let environ = results.get("environ").and_then(|r| if !r.timed_out { parse_environ_content(&r.data) } else { None });
+
+    let fd = parse_fd(pid); // fd is a directory, still sync for now
+    let wchan = parse_wchan(pid); // wchan might be better probed but keep sync for now
+    let network = network_snapshot.get_process_info(pid);
+
+    Ok(DeepScanRecord {
+        pid: ProcessId(pid),
+        ppid: ProcessId(stat_info.ppid),
+        uid,
+        user,
+        pgid: Some(stat_info.pgrp as u32),
+        sid: Some(stat_info.session as u32),
+        start_id,
+        comm: stat_info.comm,
+        cmdline,
+        exe,
+        state: stat_info.state,
+        io,
+        schedstat,
+        sched,
+        mem,
+        fd,
+        cgroup,
+        wchan,
+        network,
+        environ,
+        starttime: stat_info.starttime,
+        source: "deep_scan".to_string(),
+        identity_quality,
     })
 }
 
@@ -544,6 +719,7 @@ mod tests {
             pids: vec![1], // Just scan init/systemd
             skip_inaccessible: true,
             include_environ: false,
+            use_wait_free: true,
             progress: None,
         };
 
@@ -602,6 +778,7 @@ mod tests {
             pids: vec![proc.pid()],
             skip_inaccessible: false,
             include_environ: false,
+            use_wait_free: true,
             progress: None,
         };
 
@@ -732,6 +909,7 @@ mod tests {
             pids: vec![proc.pid()],
             skip_inaccessible: false,
             include_environ: false,
+            use_wait_free: true,
             progress: None,
         };
 

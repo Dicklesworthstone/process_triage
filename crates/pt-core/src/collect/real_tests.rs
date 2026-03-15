@@ -50,6 +50,7 @@ fn test_deep_scan_real_pid() {
         pids: vec![proc.pid()],
         skip_inaccessible: true,
         include_environ: false,
+        use_wait_free: true,
         progress: None,
     };
     let result = deep_scan(&options).expect("deep_scan");

@@ -2447,6 +2447,7 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
             pids,
             skip_inaccessible: true,
             include_environ: false,
+            use_wait_free: true,
             progress: None,
         };
         let result = match deep_scan(&options) {
@@ -3363,6 +3364,7 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
             pids: args.pids.clone(),
             skip_inaccessible: true,
             include_environ: false,
+            use_wait_free: true,
             progress,
         };
 

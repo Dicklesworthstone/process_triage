@@ -33,6 +33,7 @@ pub mod gpu;
 pub mod incremental;
 #[cfg(target_os = "linux")]
 pub mod network;
+pub mod prober;
 pub mod proc_parsers;
 pub mod protected;
 mod quick_scan;
@@ -50,6 +51,8 @@ pub mod macos;
 #[cfg(test)]
 mod real_tests;
 
+#[cfg(target_os = "linux")]
+pub use prober::{ProbeResult, Prober, ProberConfig};
 #[cfg(target_os = "linux")]
 pub use deep_scan::{
     deep_scan, DeepScanError, DeepScanMetadata, DeepScanOptions, DeepScanRecord, DeepScanResult,
