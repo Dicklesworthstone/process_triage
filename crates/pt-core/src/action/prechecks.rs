@@ -696,9 +696,7 @@ impl LivePreCheckProvider {
         {
             let wchan_path = format!("/proc/{pid}/wchan");
             let wchan_bytes = std::fs::read(&wchan_path).ok()?;
-            let wchan = String::from_utf8_lossy(&wchan_bytes)
-                .trim()
-                .to_string();
+            let wchan = String::from_utf8_lossy(&wchan_bytes).trim().to_string();
 
             // "0" means not blocked, return None in that case
             if wchan == "0" || wchan.is_empty() {

@@ -362,13 +362,16 @@ impl SupervisorActionRunner {
         }
 
         let timeout = std::cmp::min(action.timeout, self.config.max_timeout);
-        
+
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = crate::collect::tool_runner::run_tool(&program, &args_refs, Some(timeout), None)
-            .map_err(|e| match e {
-                crate::collect::tool_runner::ToolError::Timeout(d) => SupervisorActionError::Timeout(d),
-                other => SupervisorActionError::CommandFailed(other.to_string()),
-            })?;
+        let output =
+            crate::collect::tool_runner::run_tool(&program, &args_refs, Some(timeout), None)
+                .map_err(|e| match e {
+                    crate::collect::tool_runner::ToolError::Timeout(d) => {
+                        SupervisorActionError::Timeout(d)
+                    }
+                    other => SupervisorActionError::CommandFailed(other.to_string()),
+                })?;
 
         let exit_code = output.exit_code;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -722,7 +725,6 @@ impl SupervisorActionRunner {
 
         Ok(("forever".to_string(), vec![subcmd.to_string(), uid.clone()]))
     }
-
 
     /// Check if a unit identifier matches any protected pattern.
     fn is_protected_unit(&self, unit: &str) -> bool {

@@ -397,7 +397,7 @@ impl IpcAnalyzer {
                     Some((best_pattern, _)) => pattern.confidence > best_pattern.confidence,
                     None => true,
                 };
-                
+
                 if is_better {
                     best_match = Some((pattern, socket));
                 }

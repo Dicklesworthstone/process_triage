@@ -861,6 +861,7 @@ mod tests {
         assert!(path.exists());
 
         let loaded = load_provenance(&handle).unwrap();
+        assert_eq!(loaded.schema_version, SNAPSHOT_SCHEMA_VERSION);
         assert_eq!(loaded.payload.schema_version, PROVENANCE_SCHEMA_VERSION);
         assert_eq!(loaded.payload.summary.node_count, 2);
         assert_eq!(loaded.payload.summary.edge_count, 1);

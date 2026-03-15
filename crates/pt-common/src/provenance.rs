@@ -496,4 +496,160 @@ mod tests {
         assert_eq!(parsed.schema_version, PROVENANCE_SCHEMA_VERSION);
         assert_eq!(parsed, graph);
     }
+
+    #[test]
+    fn graph_summary_counts_partial_missing_and_conflicted_evidence() {
+        let observed_id =
+            ProvenanceEvidenceId::new(ProvenanceEvidenceKind::Procfs, "procfs:pid=11:start=a");
+        let partial_id = ProvenanceEvidenceId::new(ProvenanceEvidenceKind::Ps, "ps:pid=11:start=a");
+        let missing_id = ProvenanceEvidenceId::new(ProvenanceEvidenceKind::Git, "git:cwd=/repo");
+        let conflicted_id =
+            ProvenanceEvidenceId::new(ProvenanceEvidenceKind::Derived, "derived:workspace");
+
+        let graph = ProvenanceGraphSnapshot::new(
+            "2026-03-15T02:00:00Z".to_string(),
+            Some("pt-20260315-020000-wxyz".to_string()),
+            Some("host-b".to_string()),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                ProvenanceEvidence {
+                    id: observed_id,
+                    kind: ProvenanceEvidenceKind::Procfs,
+                    source: "/proc/11/stat".to_string(),
+                    observed_at: "2026-03-15T02:00:00Z".to_string(),
+                    status: ProvenanceObservationStatus::Observed,
+                    confidence: ProvenanceConfidence::High,
+                    redaction: ProvenanceRedactionState::None,
+                    process: None,
+                    attributes: BTreeMap::new(),
+                },
+                ProvenanceEvidence {
+                    id: partial_id,
+                    kind: ProvenanceEvidenceKind::Ps,
+                    source: "ps".to_string(),
+                    observed_at: "2026-03-15T02:00:00Z".to_string(),
+                    status: ProvenanceObservationStatus::Partial,
+                    confidence: ProvenanceConfidence::Medium,
+                    redaction: ProvenanceRedactionState::Partial,
+                    process: None,
+                    attributes: BTreeMap::new(),
+                },
+                ProvenanceEvidence {
+                    id: missing_id,
+                    kind: ProvenanceEvidenceKind::Git,
+                    source: "/repo/.git".to_string(),
+                    observed_at: "2026-03-15T02:00:00Z".to_string(),
+                    status: ProvenanceObservationStatus::Missing,
+                    confidence: ProvenanceConfidence::Low,
+                    redaction: ProvenanceRedactionState::None,
+                    process: None,
+                    attributes: BTreeMap::new(),
+                },
+                ProvenanceEvidence {
+                    id: conflicted_id,
+                    kind: ProvenanceEvidenceKind::Derived,
+                    source: "graph_reasoner".to_string(),
+                    observed_at: "2026-03-15T02:00:00Z".to_string(),
+                    status: ProvenanceObservationStatus::Conflicted,
+                    confidence: ProvenanceConfidence::Low,
+                    redaction: ProvenanceRedactionState::Full,
+                    process: None,
+                    attributes: BTreeMap::new(),
+                },
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(graph.summary.evidence_count, 4);
+        assert_eq!(graph.summary.redacted_evidence_count, 2);
+        assert_eq!(graph.summary.missing_or_conflicted_evidence_count, 3);
+    }
+
+    #[test]
+    fn representative_graph_json_shape_is_stable() {
+        let graph = sample_graph();
+        let json = serde_json::to_value(&graph).expect("serialize graph to value");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "schema_version": "1.0.0",
+                "generated_at": "2026-03-15T01:00:00Z",
+                "session_id": "pt-20260315-010000-abcd",
+                "host_id": "host-a",
+                "summary": {
+                    "node_count": 2,
+                    "edge_count": 1,
+                    "evidence_count": 1,
+                    "redacted_evidence_count": 0,
+                    "missing_or_conflicted_evidence_count": 0
+                },
+                "nodes": [
+                    {
+                        "id": graph.nodes[0].id.0,
+                        "kind": "process",
+                        "label": "pytest",
+                        "confidence": "high",
+                        "redaction": "none",
+                        "evidence_ids": [graph.nodes[0].evidence_ids[0].0.clone()],
+                        "attributes": {
+                            "cmd": "pytest -k foo",
+                            "pid": 123
+                        }
+                    },
+                    {
+                        "id": graph.nodes[1].id.0,
+                        "kind": "workspace",
+                        "label": "/repo/worktree",
+                        "confidence": "medium",
+                        "redaction": "partial",
+                        "evidence_ids": [graph.nodes[1].evidence_ids[0].0.clone()],
+                        "attributes": {
+                            "repo_root": "/repo"
+                        }
+                    }
+                ],
+                "edges": [
+                    {
+                        "id": graph.edges[0].id.0,
+                        "kind": "attached_to_workspace",
+                        "from": graph.edges[0].from.0,
+                        "to": graph.edges[0].to.0,
+                        "confidence": "medium",
+                        "redaction": "partial",
+                        "evidence_ids": [graph.edges[0].evidence_ids[0].0.clone()],
+                        "attributes": {
+                            "reason": "cwd_under_workspace"
+                        }
+                    }
+                ],
+                "evidence": [
+                    {
+                        "id": graph.evidence[0].id.0,
+                        "kind": "procfs",
+                        "source": "/proc/123/stat",
+                        "observed_at": "2026-03-15T01:00:00Z",
+                        "status": "observed",
+                        "confidence": "high",
+                        "redaction": "none",
+                        "process": {
+                            "pid": 123,
+                            "start_id": "boot-1:99:123"
+                        },
+                        "attributes": {
+                            "collector": "procfs"
+                        }
+                    }
+                ],
+                "warnings": [
+                    {
+                        "code": "workspace_partially_redacted",
+                        "message": "workspace label was partially redacted",
+                        "confidence": "low"
+                    }
+                ]
+            })
+        );
+    }
 }

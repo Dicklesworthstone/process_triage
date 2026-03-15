@@ -77,7 +77,8 @@ impl SecretType {
 }
 
 // Pre-compiled detection patterns as individual Lazy statics
-static RE_AWS_ACCESS_KEY: Lazy<Regex> = Lazy::new(|| Regex::new(r"AKIA[0-9A-Z]{16}").expect("valid regex"));
+static RE_AWS_ACCESS_KEY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"AKIA[0-9A-Z]{16}").expect("valid regex"));
 
 static RE_GITHUB_TOKEN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"gh[pousr]_[A-Za-z0-9_]{36,}").expect("valid regex"));
@@ -88,8 +89,9 @@ static RE_GITLAB_TOKEN: Lazy<Regex> =
 static RE_SLACK_TOKEN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"xox[baprs]-[A-Za-z0-9\-]+").expect("valid regex"));
 
-static RE_JWT: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").expect("valid regex"));
+static RE_JWT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").expect("valid regex")
+});
 
 static RE_PRIVATE_KEY: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"-----BEGIN[A-Z ]*PRIVATE KEY-----").expect("valid regex"));
@@ -97,15 +99,18 @@ static RE_PRIVATE_KEY: Lazy<Regex> =
 static RE_AI_API_KEY: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"sk-(?:ant-)?[A-Za-z0-9_-]{20,}").expect("valid regex"));
 
-static RE_PASSWORD_ARG: Lazy<Regex> = Lazy::new(|| Regex::new(r"--password[=\s]+[^\s]+").expect("valid regex"));
+static RE_PASSWORD_ARG: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"--password[=\s]+[^\s]+").expect("valid regex"));
 
-static RE_TOKEN_ARG: Lazy<Regex> = Lazy::new(|| Regex::new(r"--token[=\s]+[^\s]+").expect("valid regex"));
+static RE_TOKEN_ARG: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"--token[=\s]+[^\s]+").expect("valid regex"));
 
 static RE_API_KEY_ARG: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"--api[-_]?key[=\s]+[^\s]+").expect("valid regex"));
 
-static RE_CONNECTION_STRING: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)(postgres|mysql|mongodb|redis|amqp)://[^@]+@").expect("valid regex"));
+static RE_CONNECTION_STRING: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(postgres|mysql|mongodb|redis|amqp)://[^@]+@").expect("valid regex")
+});
 
 /// Secret detector for automatic sensitivity detection.
 #[derive(Clone)]

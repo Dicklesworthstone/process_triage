@@ -705,7 +705,11 @@ impl SessionAnalyzer {
         };
 
         let mut result = if is_protected {
-            SessionResult::protected(protection_types, reason.expect("is_protected is true"), evidence)
+            SessionResult::protected(
+                protection_types,
+                reason.expect("is_protected is true"),
+                evidence,
+            )
         } else {
             SessionResult::not_protected()
         };

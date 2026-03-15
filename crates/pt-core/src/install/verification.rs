@@ -263,7 +263,10 @@ mod tests {
 
         let result = verify_binary(&script_path, Some("1.2.3")).unwrap();
         assert!(!result.passed, "Expected failure but got success");
-        assert!(result.error.unwrap_or_default().contains("unparseable"), "Expected 'unparseable' error");
+        assert!(
+            result.error.unwrap_or_default().contains("unparseable"),
+            "Expected 'unparseable' error"
+        );
     }
 
     #[cfg(unix)]

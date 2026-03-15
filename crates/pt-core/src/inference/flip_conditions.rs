@@ -93,7 +93,7 @@ pub fn compute_flip_conditions(ledger: &EvidenceLedger, config: &FlipConfig) -> 
             .iter()
             .map(|bf| {
                 let abs_bits = bf.delta_bits.abs();
-                
+
                 // Exactly calculate new probability if feature removed
                 let removed_log_odds = current_log_odds - bf.log_bf.abs();
                 let p_if_removed = 1.0 / (1.0 + (-removed_log_odds).exp());

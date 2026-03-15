@@ -517,7 +517,9 @@ fn detect_container() -> (bool, Option<String>) {
     }
 
     // Check /proc/1/environ for container env vars
-    if let Ok(environ) = fs::read("/proc/1/environ").map(|b| String::from_utf8_lossy(&b).into_owned()) {
+    if let Ok(environ) =
+        fs::read("/proc/1/environ").map(|b| String::from_utf8_lossy(&b).into_owned())
+    {
         if environ.contains("container=") {
             return (true, None);
         }

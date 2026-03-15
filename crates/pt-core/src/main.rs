@@ -3695,7 +3695,10 @@ fn run_bundle_create(
                     profile_str
                 ),
                 OutputFormat::Jsonl => {
-                    println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
+                    println!(
+                        "{}",
+                        serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())
+                    )
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
@@ -3923,7 +3926,10 @@ fn run_bundle_create(
             match global.format {
                 OutputFormat::Md => eprintln!("Error creating bundle: {}", e),
                 OutputFormat::Jsonl => {
-                    println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
+                    println!(
+                        "{}",
+                        serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())
+                    )
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
@@ -3954,7 +3960,10 @@ fn run_bundle_inspect(
         });
         match global.format {
             OutputFormat::Md => eprintln!("Error: Bundle not found: {}", path),
-            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())),
+            OutputFormat::Jsonl => println!(
+                "{}",
+                serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())
+            ),
             _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
         return ExitCode::ArgsError;
@@ -3975,7 +3984,10 @@ fn run_bundle_inspect(
             match global.format {
                 OutputFormat::Md => eprintln!("Error: Failed to open bundle: {}", e),
                 OutputFormat::Jsonl => {
-                    println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
+                    println!(
+                        "{}",
+                        serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())
+                    )
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
@@ -4095,7 +4107,10 @@ fn run_bundle_extract(
         });
         match global.format {
             OutputFormat::Md => eprintln!("Error: Bundle not found: {}", path),
-            OutputFormat::Jsonl => println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())),
+            OutputFormat::Jsonl => println!(
+                "{}",
+                serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())
+            ),
             _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
         return ExitCode::ArgsError;
@@ -4116,7 +4131,10 @@ fn run_bundle_extract(
             match global.format {
                 OutputFormat::Md => eprintln!("Error: Failed to open bundle: {}", e),
                 OutputFormat::Jsonl => {
-                    println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
+                    println!(
+                        "{}",
+                        serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())
+                    )
                 }
                 _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
             }
@@ -4155,7 +4173,10 @@ fn run_bundle_extract(
         match global.format {
             OutputFormat::Md => eprintln!("Error: Failed to create output directory: {}", e),
             OutputFormat::Jsonl => {
-                println!("{}", serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string()))
+                println!(
+                    "{}",
+                    serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())
+                )
             }
             _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
         }
@@ -10641,7 +10662,10 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                             })
                             .unwrap_or(0);
                         if let Some(obj_mut) = obj.as_object_mut() {
-                            obj_mut.insert("socket_count".to_string(), serde_json::json!(socket_count));
+                            obj_mut.insert(
+                                "socket_count".to_string(),
+                                serde_json::json!(socket_count),
+                            );
                         }
                     }
 
@@ -16583,11 +16607,7 @@ fn run_agent_session_status(
     let pending_actions = total_actions.saturating_sub(completed_actions);
 
     // Load plan details if --detail flag is set
-    let plan_detail = if include_detail {
-        plan_value
-    } else {
-        None
-    };
+    let plan_detail = if include_detail { plan_value } else { None };
 
     // Load action outcomes if --detail flag is set
     let outcomes_detail = if include_detail {
@@ -16729,8 +16749,10 @@ fn run_agent_session_status(
                     println!("## Action Outcomes");
                     for (i, o) in outcomes.iter().take(5).enumerate() {
                         let pid = o.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let outcome_status =
-                            o.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let outcome_status = o
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
                         let marker = match outcome_status {
                             "success" | "dry_run" | "shadow" | "skipped" => "✓",
                             "precheck_blocked" => "!",

@@ -26,7 +26,8 @@ static RE_UUID: Lazy<Regex> = Lazy::new(|| {
 
 static RE_TIMESTAMP_ISO: Lazy<Regex> = Lazy::new(|| {
     // Case-insensitive because we lowercase before matching
-    Regex::new(r"(?i)\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?").expect("valid regex")
+    Regex::new(r"(?i)\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?")
+        .expect("valid regex")
 });
 
 static RE_TIMESTAMP_UNIX: Lazy<Regex> = Lazy::new(|| {
@@ -36,7 +37,8 @@ static RE_TIMESTAMP_UNIX: Lazy<Regex> = Lazy::new(|| {
 
 static RE_PID_ARG: Lazy<Regex> = Lazy::new(|| Regex::new(r"--pid[=\s]+\d+").expect("valid regex"));
 
-static RE_PORT_ARG: Lazy<Regex> = Lazy::new(|| Regex::new(r"--port[=\s]+\d+").expect("valid regex"));
+static RE_PORT_ARG: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"--port[=\s]+\d+").expect("valid regex"));
 
 static RE_TMP_SESSION: Lazy<Regex> = Lazy::new(|| {
     // Matches /tmp/pytest-123, /tmp/tmp.abc123, /var/tmp/session-456

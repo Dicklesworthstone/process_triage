@@ -144,9 +144,14 @@ pub struct GpuSnapshot {
 
 /// Check whether a GPU tool binary is available on the system.
 fn tool_available(name: &str) -> bool {
-    crate::collect::tool_runner::run_tool("which", &[name], Some(std::time::Duration::from_secs(1)), None)
-        .map(|o| o.success())
-        .unwrap_or(false)
+    crate::collect::tool_runner::run_tool(
+        "which",
+        &[name],
+        Some(std::time::Duration::from_secs(1)),
+        None,
+    )
+    .map(|o| o.success())
+    .unwrap_or(false)
 }
 
 /// Check if nvidia-smi is available.
@@ -180,7 +185,8 @@ fn query_nvidia_devices() -> Result<Vec<GpuDevice>, GpuError> {
         let stderr = output.stderr_str();
         return Err(GpuError::ExecutionFailed(format!(
             "nvidia-smi exited {}: {}",
-            output.exit_code.unwrap_or(-1), stderr
+            output.exit_code.unwrap_or(-1),
+            stderr
         )));
     }
 
@@ -252,7 +258,8 @@ fn query_nvidia_processes() -> Result<Vec<ProcessGpuUsage>, GpuError> {
         let stderr = output.stderr_str();
         return Err(GpuError::ExecutionFailed(format!(
             "nvidia-smi process query exited {}: {}",
-            output.exit_code.unwrap_or(-1), stderr
+            output.exit_code.unwrap_or(-1),
+            stderr
         )));
     }
 

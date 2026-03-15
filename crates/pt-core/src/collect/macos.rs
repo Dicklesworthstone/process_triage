@@ -74,7 +74,12 @@ impl Default for SipStatus {
 /// - `SipStatus::CustomConfiguration` if SIP is partially enabled
 /// - `SipStatus::Unknown` if detection fails
 pub fn detect_sip_status() -> SipStatus {
-    match crate::collect::tool_runner::run_tool("csrutil", &["status"], Some(std::time::Duration::from_secs(2)), None) {
+    match crate::collect::tool_runner::run_tool(
+        "csrutil",
+        &["status"],
+        Some(std::time::Duration::from_secs(2)),
+        None,
+    ) {
         Ok(output) => {
             let stdout = output.stdout_str();
             parse_csrutil_output(&stdout)
@@ -132,23 +137,43 @@ impl MacOsCapabilities {
     /// Detect available capabilities on this system.
     pub fn detect() -> Self {
         let sip_status = detect_sip_status();
-        let lsof_available = crate::collect::tool_runner::run_tool("lsof", &["-v"], Some(std::time::Duration::from_secs(2)), None)
-            .map(|o| o.success() || !o.stderr.is_empty())
-            .unwrap_or(false);
+        let lsof_available = crate::collect::tool_runner::run_tool(
+            "lsof",
+            &["-v"],
+            Some(std::time::Duration::from_secs(2)),
+            None,
+        )
+        .map(|o| o.success() || !o.stderr.is_empty())
+        .unwrap_or(false);
 
-        let netstat_available = crate::collect::tool_runner::run_tool("netstat", &["-h"], Some(std::time::Duration::from_secs(2)), None)
-            .map(|_| true)
-            .unwrap_or(false);
+        let netstat_available = crate::collect::tool_runner::run_tool(
+            "netstat",
+            &["-h"],
+            Some(std::time::Duration::from_secs(2)),
+            None,
+        )
+        .map(|_| true)
+        .unwrap_or(false);
 
-        let launchctl_available = crate::collect::tool_runner::run_tool("launchctl", &["list"], Some(std::time::Duration::from_secs(2)), None)
-            .map(|o| o.success())
-            .unwrap_or(false);
+        let launchctl_available = crate::collect::tool_runner::run_tool(
+            "launchctl",
+            &["list"],
+            Some(std::time::Duration::from_secs(2)),
+            None,
+        )
+        .map(|o| o.success())
+        .unwrap_or(false);
 
         let elevated_privileges = unsafe { libc::geteuid() } == 0;
 
-        let macos_version = crate::collect::tool_runner::run_tool("sw_vers", &["-productVersion"], Some(std::time::Duration::from_secs(2)), None)
-            .ok()
-            .map(|o| o.stdout_str().trim().to_string());
+        let macos_version = crate::collect::tool_runner::run_tool(
+            "sw_vers",
+            &["-productVersion"],
+            Some(std::time::Duration::from_secs(2)),
+            None,
+        )
+        .ok()
+        .map(|o| o.stdout_str().trim().to_string());
 
         Self {
             sip_status,
@@ -544,7 +569,13 @@ pub fn collect_lsof_info(
 /// Check if a PID is managed by launchd and get service info.
 pub fn detect_launchd_service(pid: u32) -> Option<LaunchdService> {
     // Run `launchctl list` and find the service with matching PID
-    let output = crate::collect::tool_runner::run_tool("launchctl", &["list"], Some(std::time::Duration::from_secs(5)), None).ok()?;
+    let output = crate::collect::tool_runner::run_tool(
+        "launchctl",
+        &["list"],
+        Some(std::time::Duration::from_secs(5)),
+        None,
+    )
+    .ok()?;
 
     if !output.success() {
         return None;
@@ -871,11 +902,16 @@ struct BaseProcessInfo {
 
 /// List all PIDs on macOS using ps.
 fn list_all_pids_macos() -> Result<Vec<u32>, MacOsScanError> {
-    let output = crate::collect::tool_runner::run_tool("ps", &["-eo", "pid"], Some(std::time::Duration::from_secs(10)), None)
-        .map_err(|e| MacOsScanError::ToolFailed {
-            tool: "ps".to_string(),
-            message: e.to_string(),
-        })?;
+    let output = crate::collect::tool_runner::run_tool(
+        "ps",
+        &["-eo", "pid"],
+        Some(std::time::Duration::from_secs(10)),
+        None,
+    )
+    .map_err(|e| MacOsScanError::ToolFailed {
+        tool: "ps".to_string(),
+        message: e.to_string(),
+    })?;
 
     if !output.success() {
         return Err(MacOsScanError::ToolFailed {
