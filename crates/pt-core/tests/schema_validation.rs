@@ -55,6 +55,108 @@ mod schema_version {
         assert!(!pt_common::schema::is_compatible("2.0.0"));
         assert!(!pt_common::schema::is_compatible("3.5.1"));
     }
+
+    #[test]
+    fn provenance_schema_version_is_valid_semver() {
+        let version = pt_common::PROVENANCE_SCHEMA_VERSION;
+        let parts: Vec<&str> = version.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "provenance schema version should have 3 parts"
+        );
+        for part in &parts {
+            assert!(
+                part.parse::<u32>().is_ok(),
+                "Each provenance version part should be numeric: {}",
+                part
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_graph_snapshot_round_trips() {
+        use pt_common::{
+            ProcessId, ProvenanceConfidence, ProvenanceEdge, ProvenanceEdgeId, ProvenanceEdgeKind,
+            ProvenanceEvidence, ProvenanceEvidenceId, ProvenanceEvidenceKind,
+            ProvenanceGraphSnapshot, ProvenanceNode, ProvenanceNodeId, ProvenanceNodeKind,
+            ProvenanceObservationStatus, ProvenanceProcessRef, ProvenanceRedactionState, StartId,
+        };
+        use std::collections::BTreeMap;
+
+        let evidence_id =
+            ProvenanceEvidenceId::new(ProvenanceEvidenceKind::Procfs, "procfs:pid=41:start=b:1:41");
+        let process_id = ProvenanceNodeId::new(ProvenanceNodeKind::Process, "process:41:b:1:41");
+        let session_id = ProvenanceNodeId::new(
+            ProvenanceNodeKind::Session,
+            "session:pt-20260315-010000-abcd",
+        );
+
+        let snapshot = ProvenanceGraphSnapshot::new(
+            "2026-03-15T01:00:00Z".to_string(),
+            Some("pt-20260315-010000-abcd".to_string()),
+            Some("host-a".to_string()),
+            vec![
+                ProvenanceNode {
+                    id: process_id.clone(),
+                    kind: ProvenanceNodeKind::Process,
+                    label: "pytest".to_string(),
+                    confidence: ProvenanceConfidence::High,
+                    redaction: ProvenanceRedactionState::None,
+                    evidence_ids: vec![evidence_id.clone()],
+                    attributes: BTreeMap::from([("pid".to_string(), serde_json::json!(41))]),
+                },
+                ProvenanceNode {
+                    id: session_id.clone(),
+                    kind: ProvenanceNodeKind::Session,
+                    label: "pt-20260315-010000-abcd".to_string(),
+                    confidence: ProvenanceConfidence::High,
+                    redaction: ProvenanceRedactionState::None,
+                    evidence_ids: Vec::new(),
+                    attributes: BTreeMap::new(),
+                },
+            ],
+            vec![ProvenanceEdge {
+                id: ProvenanceEdgeId::new(
+                    ProvenanceEdgeKind::PartOfSession,
+                    &process_id,
+                    &session_id,
+                ),
+                kind: ProvenanceEdgeKind::PartOfSession,
+                from: process_id,
+                to: session_id,
+                confidence: ProvenanceConfidence::High,
+                redaction: ProvenanceRedactionState::None,
+                evidence_ids: vec![evidence_id.clone()],
+                derived_from_edge_ids: Vec::new(),
+                attributes: BTreeMap::new(),
+            }],
+            vec![ProvenanceEvidence {
+                id: evidence_id,
+                kind: ProvenanceEvidenceKind::Procfs,
+                source: "/proc/41/stat".to_string(),
+                observed_at: "2026-03-15T01:00:00Z".to_string(),
+                status: ProvenanceObservationStatus::Observed,
+                confidence: ProvenanceConfidence::High,
+                redaction: ProvenanceRedactionState::None,
+                process: Some(ProvenanceProcessRef {
+                    pid: ProcessId(41),
+                    start_id: StartId("b:1:41".to_string()),
+                }),
+                attributes: BTreeMap::new(),
+            }],
+            Vec::new(),
+        );
+
+        let json = serde_json::to_string(&snapshot).expect("serialize provenance snapshot");
+        let parsed: ProvenanceGraphSnapshot =
+            serde_json::from_str(&json).expect("deserialize provenance snapshot");
+
+        assert_eq!(parsed.schema_version, pt_common::PROVENANCE_SCHEMA_VERSION);
+        assert_eq!(parsed.summary.node_count, 2);
+        assert_eq!(parsed.summary.edge_count, 1);
+        assert_eq!(parsed.summary.evidence_count, 1);
+    }
 }
 
 // ============================================================================

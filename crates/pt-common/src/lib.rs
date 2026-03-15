@@ -17,6 +17,7 @@ pub mod error;
 pub mod galaxy_brain;
 pub mod id;
 pub mod output;
+pub mod provenance;
 pub mod schema;
 
 pub use capabilities::{
@@ -41,4 +42,11 @@ pub use galaxy_brain::{
 };
 pub use id::{IdentityQuality, ProcessId, ProcessIdentity, SessionId, StartId};
 pub use output::OutputFormat;
+pub use provenance::{
+    ProvenanceConfidence, ProvenanceEdge, ProvenanceEdgeId, ProvenanceEdgeKind, ProvenanceEvidence,
+    ProvenanceEvidenceId, ProvenanceEvidenceKind, ProvenanceGraphSnapshot, ProvenanceGraphSummary,
+    ProvenanceGraphWarning, ProvenanceNode, ProvenanceNodeId, ProvenanceNodeKind,
+    ProvenanceObservationStatus, ProvenanceProcessRef, ProvenanceRedactionState,
+    PROVENANCE_SCHEMA_VERSION,
+};
 pub use schema::SCHEMA_VERSION;

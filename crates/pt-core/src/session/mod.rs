@@ -179,6 +179,15 @@ pub struct SnapshotPlanRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotProvenanceRef {
+    pub path: String,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub evidence_count: usize,
+    pub redacted_evidence_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSnapshot {
     pub schema_version: String,
     pub session_id: String,
@@ -191,6 +200,8 @@ pub struct SessionSnapshot {
     pub inventory: SnapshotInventory,
     pub inference: SnapshotInferenceSummary,
     pub plan: SnapshotPlanRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<SnapshotProvenanceRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1011,10 +1022,10 @@ mod tests {
         let sid = SessionId("pt-nonexistent".to_string());
         let result = store.open(&sid);
         assert!(result.is_err());
-        match result.unwrap_err() {
-            SessionError::NotFound { session_id } => assert_eq!(session_id, "pt-nonexistent"),
-            other => panic!("expected NotFound, got {:?}", other),
-        }
+        assert!(matches!(
+            result,
+            Err(SessionError::NotFound { ref session_id }) if session_id == "pt-nonexistent"
+        ));
     }
 
     #[test]
@@ -1364,6 +1375,22 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: SnapshotScanSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.total_processes, 500);
+    }
+
+    #[test]
+    fn snapshot_provenance_ref_serde() {
+        let provenance = SnapshotProvenanceRef {
+            path: "scan/provenance.json".to_string(),
+            node_count: 2,
+            edge_count: 1,
+            evidence_count: 3,
+            redacted_evidence_count: 1,
+        };
+        let json = serde_json::to_string(&provenance).unwrap();
+        let back: SnapshotProvenanceRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.path, "scan/provenance.json");
+        assert_eq!(back.node_count, 2);
+        assert_eq!(back.redacted_evidence_count, 1);
     }
 
     // ── SessionSummary ──────────────────────────────────────────────

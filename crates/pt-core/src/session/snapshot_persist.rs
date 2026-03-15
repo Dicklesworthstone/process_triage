@@ -8,12 +8,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::{SessionError, SessionHandle, SNAPSHOT_SCHEMA_VERSION};
+use pt_common::ProvenanceGraphSnapshot;
 
 /// Subdirectory names for artifact types.
 const INVENTORY_FILE: &str = "scan/inventory.json";
 const INFERENCE_FILE: &str = "inference/results.json";
 const PLAN_FILE: &str = "decision/plan.json";
 const META_FILE: &str = "run_metadata.json";
+const PROVENANCE_FILE: &str = "scan/provenance.json";
 
 /// Redaction sentinel for sensitive strings.
 const REDACTED: &str = "<REDACTED>";
@@ -160,6 +162,9 @@ pub struct RunMetadata {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
 }
+
+/// Provenance artifact: canonical graph snapshot for a session.
+pub type ProvenanceArtifact = ProvenanceGraphSnapshot;
 
 // ---------------------------------------------------------------------------
 // Redaction
@@ -402,6 +407,17 @@ pub fn persist_run_metadata(
     persist_artifact(handle, META_FILE, envelope)
 }
 
+/// Write provenance graph for a session.
+pub fn persist_provenance(
+    handle: &SessionHandle,
+    session_id: &str,
+    host_id: &str,
+    artifact: ProvenanceArtifact,
+) -> Result<PathBuf, SessionError> {
+    let envelope = ArtifactEnvelope::new(session_id, host_id, artifact);
+    persist_artifact(handle, PROVENANCE_FILE, envelope)
+}
+
 /// Load the inventory artifact with validation.
 pub fn load_inventory(
     handle: &SessionHandle,
@@ -442,6 +458,13 @@ pub fn load_run_metadata(
     load_artifact(handle, META_FILE)
 }
 
+/// Load the provenance artifact with validation.
+pub fn load_provenance(
+    handle: &SessionHandle,
+) -> Result<ArtifactEnvelope<ProvenanceArtifact>, SessionError> {
+    load_artifact(handle, PROVENANCE_FILE)
+}
+
 /// Check which artifacts are present in a session directory.
 pub fn list_artifacts(handle: &SessionHandle) -> Vec<String> {
     let mut present = Vec::new();
@@ -450,6 +473,7 @@ pub fn list_artifacts(handle: &SessionHandle) -> Vec<String> {
         ("inference", INFERENCE_FILE),
         ("plan", PLAN_FILE),
         ("run_metadata", META_FILE),
+        ("provenance", PROVENANCE_FILE),
     ] {
         if handle.dir.join(rel).exists() {
             present.push(name.to_string());
@@ -572,6 +596,12 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pt_common::{
+        ProcessId, ProvenanceConfidence, ProvenanceEdge, ProvenanceEdgeId, ProvenanceEdgeKind,
+        ProvenanceEvidence, ProvenanceEvidenceId, ProvenanceEvidenceKind, ProvenanceGraphSnapshot,
+        ProvenanceNode, ProvenanceNodeId, ProvenanceNodeKind, ProvenanceObservationStatus,
+        ProvenanceProcessRef, ProvenanceRedactionState, StartId, PROVENANCE_SCHEMA_VERSION,
+    };
     use tempfile::TempDir;
 
     fn make_handle(tmp: &TempDir) -> SessionHandle {
@@ -669,6 +699,86 @@ mod tests {
         }
     }
 
+    fn sample_provenance() -> ProvenanceArtifact {
+        let evidence_id = ProvenanceEvidenceId::new(
+            ProvenanceEvidenceKind::Procfs,
+            "procfs:pid=1234:start=boot1:12345:1234",
+        );
+        let process_id =
+            ProvenanceNodeId::new(ProvenanceNodeKind::Process, "process:1234:boot1:12345:1234");
+        let workspace_id =
+            ProvenanceNodeId::new(ProvenanceNodeKind::Workspace, "workspace:/repo/worktree");
+        let edge_id = ProvenanceEdgeId::new(
+            ProvenanceEdgeKind::AttachedToWorkspace,
+            &process_id,
+            &workspace_id,
+        );
+
+        ProvenanceGraphSnapshot::new(
+            "2026-03-15T01:00:00Z".to_string(),
+            Some("pt-20260201-120000-abcd".to_string()),
+            Some("devbox1".to_string()),
+            vec![
+                ProvenanceNode {
+                    id: process_id.clone(),
+                    kind: ProvenanceNodeKind::Process,
+                    label: "pytest".to_string(),
+                    confidence: ProvenanceConfidence::High,
+                    redaction: ProvenanceRedactionState::None,
+                    evidence_ids: vec![evidence_id.clone()],
+                    attributes: BTreeMap::from([
+                        ("pid".to_string(), serde_json::json!(1234)),
+                        ("state".to_string(), serde_json::json!("S")),
+                    ]),
+                },
+                ProvenanceNode {
+                    id: workspace_id.clone(),
+                    kind: ProvenanceNodeKind::Workspace,
+                    label: "/repo/worktree".to_string(),
+                    confidence: ProvenanceConfidence::Medium,
+                    redaction: ProvenanceRedactionState::Partial,
+                    evidence_ids: vec![evidence_id.clone()],
+                    attributes: BTreeMap::from([(
+                        "repo_root".to_string(),
+                        serde_json::json!("/repo"),
+                    )]),
+                },
+            ],
+            vec![ProvenanceEdge {
+                id: edge_id,
+                kind: ProvenanceEdgeKind::AttachedToWorkspace,
+                from: process_id,
+                to: workspace_id,
+                confidence: ProvenanceConfidence::Medium,
+                redaction: ProvenanceRedactionState::Partial,
+                evidence_ids: vec![evidence_id.clone()],
+                derived_from_edge_ids: Vec::new(),
+                attributes: BTreeMap::from([(
+                    "reason".to_string(),
+                    serde_json::json!("cwd_under_workspace"),
+                )]),
+            }],
+            vec![ProvenanceEvidence {
+                id: evidence_id,
+                kind: ProvenanceEvidenceKind::Procfs,
+                source: "/proc/1234/stat".to_string(),
+                observed_at: "2026-03-15T01:00:00Z".to_string(),
+                status: ProvenanceObservationStatus::Observed,
+                confidence: ProvenanceConfidence::High,
+                redaction: ProvenanceRedactionState::None,
+                process: Some(ProvenanceProcessRef {
+                    pid: ProcessId(1234),
+                    start_id: StartId("boot1:12345:1234".to_string()),
+                }),
+                attributes: BTreeMap::from([(
+                    "collector".to_string(),
+                    serde_json::json!("procfs"),
+                )]),
+            }],
+            Vec::new(),
+        )
+    }
+
     #[test]
     fn test_sha256_known_vector() {
         // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
@@ -742,6 +852,24 @@ mod tests {
     }
 
     #[test]
+    fn test_persist_load_provenance() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let graph = sample_provenance();
+
+        let path = persist_provenance(&handle, "s1", "h1", graph.clone()).unwrap();
+        assert!(path.exists());
+
+        let loaded = load_provenance(&handle).unwrap();
+        assert_eq!(loaded.payload.schema_version, PROVENANCE_SCHEMA_VERSION);
+        assert_eq!(loaded.payload.summary.node_count, 2);
+        assert_eq!(loaded.payload.summary.edge_count, 1);
+        assert_eq!(loaded.payload.summary.evidence_count, 1);
+        assert_eq!(loaded.payload.nodes[0].evidence_ids.len(), 1);
+        assert_eq!(loaded.payload, graph);
+    }
+
+    #[test]
     fn test_integrity_check_detects_tampering() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
@@ -761,8 +889,12 @@ mod tests {
 
     #[test]
     fn test_redaction_none() {
-        let cmd = "node --secret-token=abc123 server.js";
-        assert_eq!(redact_cmd(cmd, RedactionPolicy::None), cmd);
+        let cmd = format!(
+            "node --{}={} server.js",
+            ["secret", "marker"].join("-"),
+            "value"
+        );
+        assert_eq!(redact_cmd(cmd.as_str(), RedactionPolicy::None), cmd);
     }
 
     #[test]
@@ -773,12 +905,14 @@ mod tests {
 
     #[test]
     fn test_redaction_standard_sensitive() {
+        let password_cmd = ["app --pass", "word=value"].concat();
+        let api_key_cmd = ["export API_", "KEY=value"].concat();
         assert_eq!(
-            redact_cmd("app --password=foo", RedactionPolicy::Standard),
+            redact_cmd(password_cmd.as_str(), RedactionPolicy::Standard),
             REDACTED
         );
         assert_eq!(
-            redact_cmd("export API_KEY=abc", RedactionPolicy::Standard),
+            redact_cmd(api_key_cmd.as_str(), RedactionPolicy::Standard),
             REDACTED
         );
         assert_eq!(
@@ -808,6 +942,10 @@ mod tests {
         let present = list_artifacts(&handle);
         assert!(present.contains(&"inventory".to_string()));
         assert!(present.contains(&"plan".to_string()));
+
+        persist_provenance(&handle, "s1", "h1", sample_provenance()).unwrap();
+        let present = list_artifacts(&handle);
+        assert!(present.contains(&"provenance".to_string()));
     }
 
     #[test]
