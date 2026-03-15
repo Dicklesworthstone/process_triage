@@ -756,8 +756,10 @@ resolve_release_public_key() {
         cp "${PT_RELEASE_PUBLIC_KEY_FILE}" "$output"
     elif [[ -n "${PT_RELEASE_PUBLIC_KEY_PEM:-}" ]]; then
         printf '%s\n' "${PT_RELEASE_PUBLIC_KEY_PEM}" > "$output"
-    else
-        download "${RELEASES_URL}/download/v${version}/release-signing-public.pem" "$output"
+    elif ! download "${RELEASES_URL}/download/v${version}/release-signing-public.pem" "$output" 2>/dev/null; then
+        err "Release v${version} does not publish release-signing-public.pem"
+        err "Use PT_RELEASE_PUBLIC_KEY_FILE/PT_RELEASE_PUBLIC_KEY_PEM or install without --verify"
+        return 1
     fi
 
     openssl pkey -pubin -in "$output" -noout >/dev/null 2>&1 || {
@@ -783,7 +785,11 @@ resolve_release_public_key() {
 download_checksums() {
     local version="$1"
     local output="$2"
-    download "${RELEASES_URL}/download/v${version}/checksums.sha256" "$output"
+    if ! download "${RELEASES_URL}/download/v${version}/checksums.sha256" "$output" 2>/dev/null; then
+        err "Release v${version} does not publish checksums.sha256"
+        err "Install without --verify or provide local verification materials in offline mode"
+        return 1
+    fi
 }
 
 lookup_checksum() {
@@ -823,7 +829,11 @@ verify_file_signature() {
     local pubkey_file="$4"
     local sig_output="$5"
 
-    download "${RELEASES_URL}/download/v${version}/${artifact_name}.sig" "$sig_output"
+    if ! download "${RELEASES_URL}/download/v${version}/${artifact_name}.sig" "$sig_output" 2>/dev/null; then
+        err "Release v${version} does not publish ${artifact_name}.sig"
+        err "Install without --verify or publish the matching signature sidecar"
+        return 1
+    fi
     if openssl dgst -sha256 -verify "$pubkey_file" -signature "$sig_output" "$file_path" >/dev/null 2>&1; then
         ok "${artifact_name} signature verified"
         return 0
