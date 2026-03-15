@@ -140,6 +140,8 @@ Override: `$PROCESS_TRIAGE_DATA/sessions/`
 | `scan/quick.jsonl` | Process samples from quick scan | JSONL | During quick scan |
 | `scan/deep.jsonl` | Deep scan evidence | JSONL | During deep scan |
 | `scan/features.parquet` | Feature matrix (columnar) | Parquet | After feature extraction |
+| `scan/provenance.json` | Persisted provenance graph snapshot for replay | JSON | After provenance capture |
+| `scan/provenance_audit.json` | Audit sidecar describing persisted/redacted/omitted provenance sections | JSON | When provenance is persisted |
 | `scan/probes/` | Raw output from diagnostic tools | Various | During collection |
 | `inference/posteriors.parquet` | Posterior probabilities | Parquet | After inference |
 | `inference/ledger.jsonl` | Evidence chain for each process | JSONL | During inference |

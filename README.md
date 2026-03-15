@@ -425,6 +425,9 @@ Redaction profiles control the level of detail preserved:
 For provenance-specific collection, disclosure, and confidence-downgrade rules, see
 [docs/PROVENANCE_PRIVACY_MODEL.md](docs/PROVENANCE_PRIVACY_MODEL.md).
 
+For the provenance rollout contract, context defaults, and intended config/env/CLI
+surfaces, see [docs/PROVENANCE_CONTROLS_AND_ROLLOUT.md](docs/PROVENANCE_CONTROLS_AND_ROLLOUT.md).
+
 ### Opting Out
 
 To minimize data collection:

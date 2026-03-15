@@ -361,18 +361,18 @@ impl EffectiveProvenanceControls {
         context: ProvenanceExecutionContext,
         allow_degraded_fallbacks: bool,
     ) {
-        let mut cap = |label: &str,
-                       current_depth: &mut ProvenanceCollectionDepth,
-                       max_depth: ProvenanceCollectionDepth,
-                       current_persistence: &mut ProvenancePersistenceMode,
-                       max_persistence: ProvenancePersistenceMode,
-                       current_export: &mut ProvenanceExportMode,
-                       max_export: ProvenanceExportMode,
-                       current_redaction: &mut ProvenanceRedactionLevel,
-                       max_redaction: ProvenanceRedactionLevel,
-                       current_verbosity: &mut ProvenanceExplanationVerbosity,
-                       max_verbosity: ProvenanceExplanationVerbosity,
-                       downgrades: &mut Vec<String>| {
+        let cap = |label: &str,
+                   current_depth: &mut ProvenanceCollectionDepth,
+                   max_depth: ProvenanceCollectionDepth,
+                   current_persistence: &mut ProvenancePersistenceMode,
+                   max_persistence: ProvenancePersistenceMode,
+                   current_export: &mut ProvenanceExportMode,
+                   max_export: ProvenanceExportMode,
+                   current_redaction: &mut ProvenanceRedactionLevel,
+                   max_redaction: ProvenanceRedactionLevel,
+                   current_verbosity: &mut ProvenanceExplanationVerbosity,
+                   max_verbosity: ProvenanceExplanationVerbosity,
+                   downgrades: &mut Vec<String>| {
             if *current_depth > max_depth {
                 *current_depth = max_depth;
                 downgrades.push(format!("{label}: collection depth downgraded for context"));
@@ -391,7 +391,9 @@ impl EffectiveProvenanceControls {
             }
             if *current_verbosity > max_verbosity {
                 *current_verbosity = max_verbosity;
-                downgrades.push(format!("{label}: explanation verbosity downgraded for context"));
+                downgrades.push(format!(
+                    "{label}: explanation verbosity downgraded for context"
+                ));
             }
         };
 
@@ -490,8 +492,14 @@ mod tests {
         let controls = ProvenanceControls::default();
         let effective = controls.resolve_for_context(ProvenanceExecutionContext::Scan);
 
-        assert_eq!(effective.collection_depth, ProvenanceCollectionDepth::Minimal);
-        assert_eq!(effective.persistence, ProvenancePersistenceMode::SessionOnly);
+        assert_eq!(
+            effective.collection_depth,
+            ProvenanceCollectionDepth::Minimal
+        );
+        assert_eq!(
+            effective.persistence,
+            ProvenancePersistenceMode::SessionOnly
+        );
         assert_eq!(effective.export, ProvenanceExportMode::None);
         assert_eq!(effective.redaction_level, ProvenanceRedactionLevel::Strict);
         assert_eq!(
@@ -509,15 +517,16 @@ mod tests {
         };
         let effective = controls.resolve_for_context(ProvenanceExecutionContext::Daemon);
 
-        assert_eq!(effective.collection_depth, ProvenanceCollectionDepth::Minimal);
+        assert_eq!(
+            effective.collection_depth,
+            ProvenanceCollectionDepth::Minimal
+        );
         assert_eq!(effective.export, ProvenanceExportMode::None);
         assert_eq!(effective.redaction_level, ProvenanceRedactionLevel::Strict);
-        assert!(
-            effective
-                .forced_downgrades
-                .iter()
-                .any(|item| item.contains("daemon"))
-        );
+        assert!(effective
+            .forced_downgrades
+            .iter()
+            .any(|item| item.contains("daemon")));
     }
 
     #[test]
@@ -534,16 +543,14 @@ mod tests {
             effective.consent_requirement,
             ProvenanceConsentRequirement::None
         );
-        assert!(
-            effective
-                .forced_downgrades
-                .iter()
-                .any(|item| item.contains("consent prompts"))
-        );
+        assert!(effective
+            .forced_downgrades
+            .iter()
+            .any(|item| item.contains("consent prompts")));
     }
 
     #[test]
-    fn report_context_is_output_only() {
+    fn report_context_only_disables_new_collection() {
         let controls = ProvenanceControls {
             posture: ProvenanceRolloutPosture::Standard,
             ..ProvenanceControls::default()
@@ -551,26 +558,24 @@ mod tests {
         let effective = controls.resolve_for_context(ProvenanceExecutionContext::Report);
 
         assert_eq!(effective.collection_depth, ProvenanceCollectionDepth::None);
-        assert_eq!(effective.explanation_verbosity, ProvenanceExplanationVerbosity::Off);
+        assert_eq!(effective.export, ProvenanceExportMode::Redacted);
+        assert_eq!(
+            effective.explanation_verbosity,
+            ProvenanceExplanationVerbosity::Standard
+        );
     }
 
     #[test]
     fn documented_surfaces_expose_config_env_and_cli_layers() {
         let surfaces = ProvenanceControls::documented_surfaces();
-        assert!(
-            surfaces
-                .iter()
-                .any(|surface| surface.name == "provenance.posture")
-        );
-        assert!(
-            surfaces
-                .iter()
-                .any(|surface| surface.name == "PT_PROVENANCE_POSTURE")
-        );
-        assert!(
-            surfaces
-                .iter()
-                .any(|surface| surface.name == "--provenance-posture")
-        );
+        assert!(surfaces
+            .iter()
+            .any(|surface| surface.name == "provenance.posture"));
+        assert!(surfaces
+            .iter()
+            .any(|surface| surface.name == "PT_PROVENANCE_POSTURE"));
+        assert!(surfaces
+            .iter()
+            .any(|surface| surface.name == "--provenance-posture"));
     }
 }

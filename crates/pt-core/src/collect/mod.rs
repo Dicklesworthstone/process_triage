@@ -44,6 +44,7 @@ pub mod tool_runner;
 mod types;
 #[cfg(target_os = "linux")]
 pub mod user_intent;
+pub mod workspace_resolver;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -140,6 +141,11 @@ pub use gpu::{
     total_vram_mib_for_pid, GpuDetectionSource, GpuDevice, GpuError, GpuProvenance, GpuSnapshot,
     GpuType, ProcessGpuUsage,
 };
+
+// Re-export workspace resolver types
+pub use workspace_resolver::{find_repo_root, read_head_state};
+#[cfg(target_os = "linux")]
+pub use workspace_resolver::resolve_workspace_for_pid;
 
 // Re-export incremental scanning types
 pub use incremental::{
