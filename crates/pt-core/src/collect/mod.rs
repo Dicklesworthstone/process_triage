@@ -52,8 +52,6 @@ pub mod macos;
 mod real_tests;
 
 #[cfg(target_os = "linux")]
-pub use prober::{ProbeResult, Prober, ProberConfig};
-#[cfg(target_os = "linux")]
 pub use deep_scan::{
     deep_scan, DeepScanError, DeepScanMetadata, DeepScanOptions, DeepScanRecord, DeepScanResult,
 };
@@ -63,6 +61,8 @@ pub use network::{
     NetworkInfo, NetworkSnapshot, SocketCounts, TcpConnection, TcpState, UdpSocket, UnixSocket,
     UnixSocketState, UnixSocketType,
 };
+#[cfg(target_os = "linux")]
+pub use prober::{ProbeResult, Prober, ProberConfig};
 #[cfg(target_os = "linux")]
 pub use proc_parsers::{
     parse_cgroup, parse_environ, parse_environ_content, parse_fd, parse_fd_dir, parse_io,

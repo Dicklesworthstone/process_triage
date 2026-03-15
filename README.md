@@ -422,6 +422,9 @@ Redaction profiles control the level of detail preserved:
 | `debug` | Troubleshooting | Full detail (local only) |
 | `share` | Sending to others | Redacted + anonymized |
 
+For provenance-specific collection, disclosure, and confidence-downgrade rules, see
+[docs/PROVENANCE_PRIVACY_MODEL.md](docs/PROVENANCE_PRIVACY_MODEL.md).
+
 ### Opting Out
 
 To minimize data collection:

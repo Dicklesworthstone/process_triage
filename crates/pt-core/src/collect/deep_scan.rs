@@ -16,13 +16,13 @@
 //! - Graceful degradation for permission-denied paths
 
 use super::network::{NetworkInfo, NetworkSnapshot};
-use super::prober::{Prober, ProberConfig, ProbeResult};
+use super::prober::{ProbeResult, Prober, ProberConfig};
 use super::proc_parsers::{
     parse_cgroup, parse_cgroup_content, parse_environ, parse_environ_content, parse_fd, parse_io,
     parse_io_content, parse_proc_cmdline, parse_proc_exe, parse_proc_stat, parse_proc_stat_content,
-    parse_proc_status, parse_proc_status_content, parse_sched, parse_sched_content, parse_schedstat,
-    parse_schedstat_content, parse_statm, parse_statm_content, parse_wchan, CgroupInfo, FdInfo,
-    IoStats, MemStats, SchedInfo, SchedStats,
+    parse_proc_status, parse_proc_status_content, parse_sched, parse_sched_content,
+    parse_schedstat, parse_schedstat_content, parse_statm, parse_statm_content, parse_wchan,
+    CgroupInfo, FdInfo, IoStats, MemStats, SchedInfo, SchedStats,
 };
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
 use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
@@ -316,11 +316,24 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
 
                 let probe_results = prober.probe_batch(&paths);
                 // Map results back to PIDs
-                let mut pid_results: std::collections::HashMap<u32, std::collections::HashMap<String, ProbeResult>> = std::collections::HashMap::new();
+                let mut pid_results: std::collections::HashMap<
+                    u32,
+                    std::collections::HashMap<String, ProbeResult>,
+                > = std::collections::HashMap::new();
                 for res in probe_results {
-                    if let Some(pid_str) = res.path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+                    if let Some(pid_str) = res
+                        .path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|s| s.to_str())
+                    {
                         if let Ok(pid) = pid_str.parse::<u32>() {
-                            let file_name = res.path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+                            let file_name = res
+                                .path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_default()
+                                .to_string();
                             pid_results.entry(pid).or_default().insert(file_name, res);
                         }
                     }
@@ -347,8 +360,15 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
                     }
                 }
             }
-            
-            return finish_scan(start, started_at, processes, warnings, total_skipped, options.progress.as_ref());
+
+            return finish_scan(
+                start,
+                started_at,
+                processes,
+                warnings,
+                total_skipped,
+                options.progress.as_ref(),
+            );
         } else {
             warn!("Failed to initialize io_uring prober, falling back to standard threaded mode");
         }
@@ -436,7 +456,14 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
         (all_processes, all_warnings, total_skipped)
     });
 
-    finish_scan(start, started_at, procs, warns, skipped, options.progress.as_ref())
+    finish_scan(
+        start,
+        started_at,
+        procs,
+        warns,
+        skipped,
+        options.progress.as_ref(),
+    )
 }
 
 fn finish_scan(
@@ -480,12 +507,18 @@ fn parse_probed_process(
     boot_id: &Option<String>,
     network_snapshot: &NetworkSnapshot,
 ) -> Result<DeepScanRecord, DeepScanError> {
-    let stat_res = results.get("stat").ok_or(DeepScanError::ProcessVanished(pid))?;
+    let stat_res = results
+        .get("stat")
+        .ok_or(DeepScanError::ProcessVanished(pid))?;
     if stat_res.timed_out {
-        return Err(DeepScanError::ParseError { pid, message: "Probe timed out for /proc/[pid]/stat".to_string() });
+        return Err(DeepScanError::ParseError {
+            pid,
+            message: "Probe timed out for /proc/[pid]/stat".to_string(),
+        });
     }
     let stat_content = String::from_utf8_lossy(&stat_res.data);
-    let stat_info = parse_proc_stat_content(&stat_content).ok_or(DeepScanError::ProcessVanished(pid))?;
+    let stat_info =
+        parse_proc_stat_content(&stat_content).ok_or(DeepScanError::ProcessVanished(pid))?;
 
     let (uid, user, uid_known) = if let Some(status_res) = results.get("status") {
         if !status_res.timed_out && status_res.error.is_none() {
@@ -514,12 +547,48 @@ fn parse_probed_process(
     let start_id = compute_start_id(boot_id, stat_info.starttime, pid);
 
     // Parse other optional fields
-    let io = results.get("io").and_then(|r| if !r.timed_out { parse_io_content(&String::from_utf8_lossy(&r.data)) } else { None });
-    let schedstat = results.get("schedstat").and_then(|r| if !r.timed_out { parse_schedstat_content(&String::from_utf8_lossy(&r.data)) } else { None });
-    let sched = results.get("sched").and_then(|r| if !r.timed_out { parse_sched_content(&String::from_utf8_lossy(&r.data)) } else { None });
-    let mem = results.get("statm").and_then(|r| if !r.timed_out { parse_statm_content(&String::from_utf8_lossy(&r.data)) } else { None });
-    let cgroup = results.get("cgroup").and_then(|r| if !r.timed_out { parse_cgroup_content(&String::from_utf8_lossy(&r.data)) } else { None });
-    let environ = results.get("environ").and_then(|r| if !r.timed_out { parse_environ_content(&r.data) } else { None });
+    let io = results.get("io").and_then(|r| {
+        if !r.timed_out {
+            parse_io_content(&String::from_utf8_lossy(&r.data))
+        } else {
+            None
+        }
+    });
+    let schedstat = results.get("schedstat").and_then(|r| {
+        if !r.timed_out {
+            parse_schedstat_content(&String::from_utf8_lossy(&r.data))
+        } else {
+            None
+        }
+    });
+    let sched = results.get("sched").and_then(|r| {
+        if !r.timed_out {
+            parse_sched_content(&String::from_utf8_lossy(&r.data))
+        } else {
+            None
+        }
+    });
+    let mem = results.get("statm").and_then(|r| {
+        if !r.timed_out {
+            parse_statm_content(&String::from_utf8_lossy(&r.data))
+        } else {
+            None
+        }
+    });
+    let cgroup = results.get("cgroup").and_then(|r| {
+        if !r.timed_out {
+            parse_cgroup_content(&String::from_utf8_lossy(&r.data))
+        } else {
+            None
+        }
+    });
+    let environ = results.get("environ").and_then(|r| {
+        if !r.timed_out {
+            parse_environ_content(&r.data)
+        } else {
+            None
+        }
+    });
 
     let fd = parse_fd(pid); // fd is a directory, still sync for now
     let wchan = parse_wchan(pid); // wchan might be better probed but keep sync for now

@@ -16,6 +16,8 @@ use crate::{ProcessId, StartId};
 
 /// Schema version for persisted provenance graphs.
 pub const PROVENANCE_SCHEMA_VERSION: &str = "1.0.0";
+/// Schema version for the provenance privacy/redaction policy contract.
+pub const PROVENANCE_PRIVACY_POLICY_VERSION: &str = "1.0.0";
 
 /// Canonical identifier for a graph node.
 #[derive(
@@ -230,6 +232,390 @@ pub enum ProvenanceRedactionState {
     Full,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceSensitivity {
+    PublicOperational,
+    OperatorContext,
+    LocalPath,
+    InfrastructureIdentity,
+    SecretAdjacent,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceHandling {
+    Allow,
+    Summarize,
+    Hash,
+    Redact,
+    Omit,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceRetentionClass {
+    Ephemeral,
+    Session,
+    ShortTerm,
+    LongTerm,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceConsentRequirement {
+    None,
+    ExplicitOperator,
+    SupportEscalation,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceExplanationEffect {
+    None,
+    NoteRedacted,
+    NoteWithheld,
+    SuppressSpecifics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "scope")]
+pub enum ProvenanceFieldSelector {
+    NodeLabel {
+        kind: ProvenanceNodeKind,
+    },
+    NodeAttribute {
+        kind: ProvenanceNodeKind,
+        key: String,
+    },
+    EdgeAttribute {
+        kind: ProvenanceEdgeKind,
+        key: String,
+    },
+    EvidenceSource {
+        kind: ProvenanceEvidenceKind,
+    },
+    EvidenceAttribute {
+        kind: ProvenanceEvidenceKind,
+        key: String,
+    },
+    SnapshotHostId,
+    SnapshotSessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProvenancePolicyConsequence {
+    pub missing_confidence: ProvenanceConfidence,
+    pub redacted_confidence: ProvenanceConfidence,
+    pub explanation_effect: ProvenanceExplanationEffect,
+    pub user_note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProvenanceFieldPolicy {
+    pub selector: ProvenanceFieldSelector,
+    pub sensitivity: ProvenanceSensitivity,
+    pub collect: ProvenanceHandling,
+    pub persist: ProvenanceHandling,
+    pub export: ProvenanceHandling,
+    pub display: ProvenanceHandling,
+    pub log: ProvenanceHandling,
+    pub retention: ProvenanceRetentionClass,
+    pub consent: ProvenanceConsentRequirement,
+    pub consequence: ProvenancePolicyConsequence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProvenancePrivacyPolicy {
+    pub version: String,
+    pub local_persistence_days: u32,
+    pub field_policies: Vec<ProvenanceFieldPolicy>,
+}
+
+impl ProvenancePrivacyPolicy {
+    pub fn for_selector(
+        &self,
+        selector: &ProvenanceFieldSelector,
+    ) -> Option<&ProvenanceFieldPolicy> {
+        self.field_policies
+            .iter()
+            .find(|policy| &policy.selector == selector)
+    }
+
+    pub fn consent_required_count(&self) -> usize {
+        self.field_policies
+            .iter()
+            .filter(|policy| policy.consent != ProvenanceConsentRequirement::None)
+            .count()
+    }
+}
+
+impl Default for ProvenancePrivacyPolicy {
+    fn default() -> Self {
+        let rules = vec![
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::NodeLabel {
+                    kind: ProvenanceNodeKind::Process,
+                },
+                sensitivity: ProvenanceSensitivity::PublicOperational,
+                collect: ProvenanceHandling::Allow,
+                persist: ProvenanceHandling::Allow,
+                export: ProvenanceHandling::Summarize,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Summarize,
+                retention: ProvenanceRetentionClass::Session,
+                consent: ProvenanceConsentRequirement::None,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Medium,
+                    redacted_confidence: ProvenanceConfidence::Medium,
+                    explanation_effect: ProvenanceExplanationEffect::SuppressSpecifics,
+                    user_note: "process labels may be summarized when provenance is exported or logged".to_string(),
+                },
+                notes: Some("Process labels stay readable locally but should avoid leaking full raw commands across shareable surfaces.".to_string()),
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::NodeAttribute {
+                    kind: ProvenanceNodeKind::Process,
+                    key: "cmd".to_string(),
+                },
+                sensitivity: ProvenanceSensitivity::SecretAdjacent,
+                collect: ProvenanceHandling::Summarize,
+                persist: ProvenanceHandling::Redact,
+                export: ProvenanceHandling::Omit,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Omit,
+                retention: ProvenanceRetentionClass::Ephemeral,
+                consent: ProvenanceConsentRequirement::SupportEscalation,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Medium,
+                    redacted_confidence: ProvenanceConfidence::Medium,
+                    explanation_effect: ProvenanceExplanationEffect::NoteRedacted,
+                    user_note: "raw command lines can contain secrets, so user-facing output must prefer normalized explanations over verbatim argv".to_string(),
+                },
+                notes: Some("Do not persist or export raw argv in provenance artifacts without an explicit support-grade escalation.".to_string()),
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::NodeLabel {
+                    kind: ProvenanceNodeKind::Workspace,
+                },
+                sensitivity: ProvenanceSensitivity::LocalPath,
+                collect: ProvenanceHandling::Allow,
+                persist: ProvenanceHandling::Hash,
+                export: ProvenanceHandling::Hash,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Hash,
+                retention: ProvenanceRetentionClass::ShortTerm,
+                consent: ProvenanceConsentRequirement::ExplicitOperator,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Low,
+                    redacted_confidence: ProvenanceConfidence::Low,
+                    explanation_effect: ProvenanceExplanationEffect::NoteWithheld,
+                    user_note: "workspace and repo paths are useful but identifying, so redaction lowers confidence and should be disclosed in explanations".to_string(),
+                },
+                notes: Some("Workspace labels should preserve relationship semantics without revealing the exact on-disk path.".to_string()),
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::NodeAttribute {
+                    kind: ProvenanceNodeKind::Workspace,
+                    key: "repo_root".to_string(),
+                },
+                sensitivity: ProvenanceSensitivity::LocalPath,
+                collect: ProvenanceHandling::Allow,
+                persist: ProvenanceHandling::Hash,
+                export: ProvenanceHandling::Hash,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Hash,
+                retention: ProvenanceRetentionClass::ShortTerm,
+                consent: ProvenanceConsentRequirement::ExplicitOperator,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Low,
+                    redacted_confidence: ProvenanceConfidence::Low,
+                    explanation_effect: ProvenanceExplanationEffect::NoteWithheld,
+                    user_note: "repo roots should be represented by stable redacted identifiers on shared surfaces".to_string(),
+                },
+                notes: None,
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::NodeLabel {
+                    kind: ProvenanceNodeKind::Host,
+                },
+                sensitivity: ProvenanceSensitivity::InfrastructureIdentity,
+                collect: ProvenanceHandling::Allow,
+                persist: ProvenanceHandling::Hash,
+                export: ProvenanceHandling::Hash,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Hash,
+                retention: ProvenanceRetentionClass::ShortTerm,
+                consent: ProvenanceConsentRequirement::ExplicitOperator,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Medium,
+                    redacted_confidence: ProvenanceConfidence::Medium,
+                    explanation_effect: ProvenanceExplanationEffect::NoteWithheld,
+                    user_note: "host identities are useful for fleet provenance but should not be exposed verbatim in shared artifacts".to_string(),
+                },
+                notes: None,
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::EvidenceSource {
+                    kind: ProvenanceEvidenceKind::Procfs,
+                },
+                sensitivity: ProvenanceSensitivity::PublicOperational,
+                collect: ProvenanceHandling::Allow,
+                persist: ProvenanceHandling::Allow,
+                export: ProvenanceHandling::Allow,
+                display: ProvenanceHandling::Allow,
+                log: ProvenanceHandling::Allow,
+                retention: ProvenanceRetentionClass::ShortTerm,
+                consent: ProvenanceConsentRequirement::None,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Medium,
+                    redacted_confidence: ProvenanceConfidence::Medium,
+                    explanation_effect: ProvenanceExplanationEffect::None,
+                    user_note: "collector source names are safe to show when they do not embed sensitive paths or arguments".to_string(),
+                },
+                notes: None,
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::EvidenceSource {
+                    kind: ProvenanceEvidenceKind::Git,
+                },
+                sensitivity: ProvenanceSensitivity::OperatorContext,
+                collect: ProvenanceHandling::Allow,
+                persist: ProvenanceHandling::Hash,
+                export: ProvenanceHandling::Hash,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Hash,
+                retention: ProvenanceRetentionClass::ShortTerm,
+                consent: ProvenanceConsentRequirement::ExplicitOperator,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Low,
+                    redacted_confidence: ProvenanceConfidence::Low,
+                    explanation_effect: ProvenanceExplanationEffect::NoteWithheld,
+                    user_note: "git-derived provenance may identify repos, branches, or worktrees and must disclose when policy withholds it".to_string(),
+                },
+                notes: None,
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::EvidenceAttribute {
+                    kind: ProvenanceEvidenceKind::Filesystem,
+                    key: "path".to_string(),
+                },
+                sensitivity: ProvenanceSensitivity::LocalPath,
+                collect: ProvenanceHandling::Allow,
+                persist: ProvenanceHandling::Hash,
+                export: ProvenanceHandling::Hash,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Hash,
+                retention: ProvenanceRetentionClass::ShortTerm,
+                consent: ProvenanceConsentRequirement::ExplicitOperator,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Low,
+                    redacted_confidence: ProvenanceConfidence::Low,
+                    explanation_effect: ProvenanceExplanationEffect::NoteWithheld,
+                    user_note: "lockfile or pidfile paths should be transformed into stable redacted handles on shared surfaces".to_string(),
+                },
+                notes: None,
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::EvidenceAttribute {
+                    kind: ProvenanceEvidenceKind::CommandLine,
+                    key: "raw".to_string(),
+                },
+                sensitivity: ProvenanceSensitivity::SecretAdjacent,
+                collect: ProvenanceHandling::Summarize,
+                persist: ProvenanceHandling::Redact,
+                export: ProvenanceHandling::Omit,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Omit,
+                retention: ProvenanceRetentionClass::Ephemeral,
+                consent: ProvenanceConsentRequirement::SupportEscalation,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Medium,
+                    redacted_confidence: ProvenanceConfidence::Medium,
+                    explanation_effect: ProvenanceExplanationEffect::NoteRedacted,
+                    user_note: "command-line evidence should survive only as normalized explanations unless an operator explicitly opts into a support workflow".to_string(),
+                },
+                notes: None,
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::EvidenceAttribute {
+                    kind: ProvenanceEvidenceKind::Env,
+                    key: "value".to_string(),
+                },
+                sensitivity: ProvenanceSensitivity::SecretAdjacent,
+                collect: ProvenanceHandling::Omit,
+                persist: ProvenanceHandling::Omit,
+                export: ProvenanceHandling::Omit,
+                display: ProvenanceHandling::Omit,
+                log: ProvenanceHandling::Omit,
+                retention: ProvenanceRetentionClass::Ephemeral,
+                consent: ProvenanceConsentRequirement::SupportEscalation,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Unknown,
+                    redacted_confidence: ProvenanceConfidence::Unknown,
+                    explanation_effect: ProvenanceExplanationEffect::NoteWithheld,
+                    user_note: "env values are treated as too sensitive for provenance; consumers must explain that the signal was intentionally unavailable".to_string(),
+                },
+                notes: Some("Environment values should influence provenance only through coarse derived facts, never via raw persistence.".to_string()),
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::SnapshotHostId,
+                sensitivity: ProvenanceSensitivity::InfrastructureIdentity,
+                collect: ProvenanceHandling::Allow,
+                persist: ProvenanceHandling::Hash,
+                export: ProvenanceHandling::Hash,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Hash,
+                retention: ProvenanceRetentionClass::ShortTerm,
+                consent: ProvenanceConsentRequirement::ExplicitOperator,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::Medium,
+                    redacted_confidence: ProvenanceConfidence::Medium,
+                    explanation_effect: ProvenanceExplanationEffect::NoteWithheld,
+                    user_note: "host identifiers should be stable enough for grouping while avoiding direct disclosure outside the local machine".to_string(),
+                },
+                notes: None,
+            },
+            ProvenanceFieldPolicy {
+                selector: ProvenanceFieldSelector::SnapshotSessionId,
+                sensitivity: ProvenanceSensitivity::OperatorContext,
+                collect: ProvenanceHandling::Allow,
+                persist: ProvenanceHandling::Allow,
+                export: ProvenanceHandling::Summarize,
+                display: ProvenanceHandling::Summarize,
+                log: ProvenanceHandling::Summarize,
+                retention: ProvenanceRetentionClass::ShortTerm,
+                consent: ProvenanceConsentRequirement::None,
+                consequence: ProvenancePolicyConsequence {
+                    missing_confidence: ProvenanceConfidence::High,
+                    redacted_confidence: ProvenanceConfidence::High,
+                    explanation_effect: ProvenanceExplanationEffect::SuppressSpecifics,
+                    user_note: "session identifiers support replay and debugging but should be summarized on shared surfaces".to_string(),
+                },
+                notes: None,
+            },
+        ];
+
+        Self {
+            version: PROVENANCE_PRIVACY_POLICY_VERSION.to_string(),
+            local_persistence_days: 30,
+            field_policies: rules,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProvenanceProcessRef {
     pub pid: ProcessId,
@@ -306,6 +692,7 @@ pub struct ProvenanceGraphSnapshot {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_id: Option<String>,
+    pub privacy: ProvenancePrivacyPolicy,
     pub summary: ProvenanceGraphSummary,
     pub nodes: Vec<ProvenanceNode>,
     pub edges: Vec<ProvenanceEdge>,
@@ -345,6 +732,7 @@ impl ProvenanceGraphSnapshot {
             generated_at,
             session_id,
             host_id,
+            privacy: ProvenancePrivacyPolicy::default(),
             summary: ProvenanceGraphSummary {
                 node_count: nodes.len(),
                 edge_count: edges.len(),
@@ -484,6 +872,10 @@ mod tests {
         assert_eq!(graph.summary.evidence_count, 1);
         assert_eq!(graph.summary.redacted_evidence_count, 0);
         assert_eq!(graph.summary.missing_or_conflicted_evidence_count, 0);
+        assert_eq!(
+            graph.privacy.version,
+            PROVENANCE_PRIVACY_POLICY_VERSION.to_string()
+        );
     }
 
     #[test]
@@ -571,85 +963,95 @@ mod tests {
         let graph = sample_graph();
         let json = serde_json::to_value(&graph).expect("serialize graph to value");
 
+        assert_eq!(json["schema_version"], serde_json::json!("1.0.0"));
         assert_eq!(
-            json,
+            json["generated_at"],
+            serde_json::json!("2026-03-15T01:00:00Z")
+        );
+        assert_eq!(
+            json["session_id"],
+            serde_json::json!("pt-20260315-010000-abcd")
+        );
+        assert_eq!(json["host_id"], serde_json::json!("host-a"));
+        assert_eq!(
+            json["summary"],
             serde_json::json!({
-                "schema_version": "1.0.0",
-                "generated_at": "2026-03-15T01:00:00Z",
-                "session_id": "pt-20260315-010000-abcd",
-                "host_id": "host-a",
-                "summary": {
-                    "node_count": 2,
-                    "edge_count": 1,
-                    "evidence_count": 1,
-                    "redacted_evidence_count": 0,
-                    "missing_or_conflicted_evidence_count": 0
-                },
-                "nodes": [
-                    {
-                        "id": graph.nodes[0].id.0,
-                        "kind": "process",
-                        "label": "pytest",
-                        "confidence": "high",
-                        "redaction": "none",
-                        "evidence_ids": [graph.nodes[0].evidence_ids[0].0.clone()],
-                        "attributes": {
-                            "cmd": "pytest -k foo",
-                            "pid": 123
-                        }
-                    },
-                    {
-                        "id": graph.nodes[1].id.0,
-                        "kind": "workspace",
-                        "label": "/repo/worktree",
-                        "confidence": "medium",
-                        "redaction": "partial",
-                        "evidence_ids": [graph.nodes[1].evidence_ids[0].0.clone()],
-                        "attributes": {
-                            "repo_root": "/repo"
-                        }
-                    }
-                ],
-                "edges": [
-                    {
-                        "id": graph.edges[0].id.0,
-                        "kind": "attached_to_workspace",
-                        "from": graph.edges[0].from.0,
-                        "to": graph.edges[0].to.0,
-                        "confidence": "medium",
-                        "redaction": "partial",
-                        "evidence_ids": [graph.edges[0].evidence_ids[0].0.clone()],
-                        "attributes": {
-                            "reason": "cwd_under_workspace"
-                        }
-                    }
-                ],
-                "evidence": [
-                    {
-                        "id": graph.evidence[0].id.0,
-                        "kind": "procfs",
-                        "source": "/proc/123/stat",
-                        "observed_at": "2026-03-15T01:00:00Z",
-                        "status": "observed",
-                        "confidence": "high",
-                        "redaction": "none",
-                        "process": {
-                            "pid": 123,
-                            "start_id": "boot-1:99:123"
-                        },
-                        "attributes": {
-                            "collector": "procfs"
-                        }
-                    }
-                ],
-                "warnings": [
-                    {
-                        "code": "workspace_partially_redacted",
-                        "message": "workspace label was partially redacted",
-                        "confidence": "low"
-                    }
-                ]
+                "node_count": 2,
+                "edge_count": 1,
+                "evidence_count": 1,
+                "redacted_evidence_count": 0,
+                "missing_or_conflicted_evidence_count": 0
             })
         );
+        assert_eq!(
+            json["privacy"]["version"],
+            serde_json::json!(PROVENANCE_PRIVACY_POLICY_VERSION)
+        );
+        assert_eq!(
+            json["privacy"]["local_persistence_days"],
+            serde_json::json!(30)
+        );
+        assert_eq!(
+            json["privacy"]["field_policies"]
+                .as_array()
+                .expect("privacy field policies array")
+                .len(),
+            12
+        );
+        assert_eq!(json["nodes"][0]["label"], serde_json::json!("pytest"));
+        assert_eq!(json["nodes"][1]["redaction"], serde_json::json!("partial"));
+        assert_eq!(
+            json["edges"][0]["attributes"]["reason"],
+            serde_json::json!("cwd_under_workspace")
+        );
+        assert_eq!(
+            json["evidence"][0]["source"],
+            serde_json::json!("/proc/123/stat")
+        );
+        assert_eq!(
+            json["warnings"][0]["code"],
+            serde_json::json!("workspace_partially_redacted")
+        );
+    }
+
+    #[test]
+    fn privacy_policy_marks_sensitive_fields_with_explicit_handling() {
+        let policy = ProvenancePrivacyPolicy::default();
+        let workspace_label = policy
+            .for_selector(&ProvenanceFieldSelector::NodeLabel {
+                kind: ProvenanceNodeKind::Workspace,
+            })
+            .expect("workspace label policy");
+
+        assert_eq!(
+            workspace_label.sensitivity,
+            ProvenanceSensitivity::LocalPath
+        );
+        assert_eq!(workspace_label.persist, ProvenanceHandling::Hash);
+        assert_eq!(workspace_label.export, ProvenanceHandling::Hash);
+        assert_eq!(
+            workspace_label.consent,
+            ProvenanceConsentRequirement::ExplicitOperator
+        );
+
+        let env_value = policy
+            .for_selector(&ProvenanceFieldSelector::EvidenceAttribute {
+                kind: ProvenanceEvidenceKind::Env,
+                key: "value".to_string(),
+            })
+            .expect("env value policy");
+
+        assert_eq!(env_value.collect, ProvenanceHandling::Omit);
+        assert_eq!(env_value.export, ProvenanceHandling::Omit);
+        assert_eq!(
+            env_value.consequence.explanation_effect,
+            ProvenanceExplanationEffect::NoteWithheld
+        );
+    }
+
+    #[test]
+    fn privacy_policy_counts_rules_that_require_operator_consent() {
+        let policy = ProvenancePrivacyPolicy::default();
+        assert_eq!(policy.consent_required_count(), 9);
     }
 }

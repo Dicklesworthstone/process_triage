@@ -43,10 +43,13 @@ pub use galaxy_brain::{
 pub use id::{IdentityQuality, ProcessId, ProcessIdentity, SessionId, StartId};
 pub use output::OutputFormat;
 pub use provenance::{
-    ProvenanceConfidence, ProvenanceEdge, ProvenanceEdgeId, ProvenanceEdgeKind, ProvenanceEvidence,
-    ProvenanceEvidenceId, ProvenanceEvidenceKind, ProvenanceGraphSnapshot, ProvenanceGraphSummary,
-    ProvenanceGraphWarning, ProvenanceNode, ProvenanceNodeId, ProvenanceNodeKind,
-    ProvenanceObservationStatus, ProvenanceProcessRef, ProvenanceRedactionState,
-    PROVENANCE_SCHEMA_VERSION,
+    ProvenanceConfidence, ProvenanceConsentRequirement, ProvenanceEdge, ProvenanceEdgeId,
+    ProvenanceEdgeKind, ProvenanceEvidence, ProvenanceEvidenceId, ProvenanceEvidenceKind,
+    ProvenanceExplanationEffect, ProvenanceFieldPolicy, ProvenanceFieldSelector,
+    ProvenanceGraphSnapshot, ProvenanceGraphSummary, ProvenanceGraphWarning, ProvenanceHandling,
+    ProvenanceNode, ProvenanceNodeId, ProvenanceNodeKind, ProvenanceObservationStatus,
+    ProvenancePolicyConsequence, ProvenancePrivacyPolicy, ProvenanceProcessRef,
+    ProvenanceRedactionState, ProvenanceRetentionClass, ProvenanceSensitivity,
+    PROVENANCE_PRIVACY_POLICY_VERSION, PROVENANCE_SCHEMA_VERSION,
 };
 pub use schema::SCHEMA_VERSION;
