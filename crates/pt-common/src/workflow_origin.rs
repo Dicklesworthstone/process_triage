@@ -285,6 +285,11 @@ fn apply_workspace_signals(
 }
 
 /// Strip known wrapper launchers from the beginning of a command line.
+///
+/// Handles chained wrappers like "sudo nohup pytest" → "pytest".
+/// Does NOT attempt to strip wrapper flags (e.g., "nice -n 10 pytest"
+/// strips "nice" but "-n 10 pytest" remains as-is, since flag parsing
+/// across arbitrary wrappers is inherently fragile).
 pub fn strip_wrapper_launchers(cmdline: &str) -> &str {
     let mut remaining = cmdline.trim();
 
@@ -295,18 +300,6 @@ pub fn strip_wrapper_launchers(cmdline: &str) -> &str {
                 .strip_prefix(wrapper)
                 .and_then(|r| r.strip_prefix(|c: char| c.is_whitespace()))
             {
-                // Skip any flags that start with -
-                let mut inner = rest.trim();
-                while inner.starts_with('-') {
-                    if let Some(after_flag) = inner.split_whitespace().nth(1) {
-                        inner = &rest[rest.len() - after_flag.len() - rest[rest.len() - after_flag.len()..].len()..];
-                        // Simple: skip to next non-flag token
-                        break;
-                    } else {
-                        // Only flags left, nothing to classify
-                        return remaining;
-                    }
-                }
                 remaining = rest.trim();
                 stripped = true;
                 break;

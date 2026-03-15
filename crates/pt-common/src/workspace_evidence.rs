@@ -358,19 +358,27 @@ pub fn normalize_workspace(evidence: &RawWorkspaceEvidence) -> WorkspaceNormaliz
         }
     }
 
-    let workspace = NormalizedWorkspace {
-        workspace_id,
-        canonical_root,
-        worktree_id,
-        canonical_worktree,
-        head_state: evidence.head_state.clone(),
-        confidence,
-        downgrade_reasons: downgrade_reasons.clone(),
-    };
-
     if downgrade_reasons.is_empty() {
+        let workspace = NormalizedWorkspace {
+            workspace_id,
+            canonical_root,
+            worktree_id,
+            canonical_worktree,
+            head_state: evidence.head_state.clone(),
+            confidence,
+            downgrade_reasons: Vec::new(),
+        };
         WorkspaceNormalizationResult::Resolved { workspace }
     } else {
+        let workspace = NormalizedWorkspace {
+            workspace_id,
+            canonical_root,
+            worktree_id,
+            canonical_worktree,
+            head_state: evidence.head_state.clone(),
+            confidence,
+            downgrade_reasons: downgrade_reasons.clone(),
+        };
         WorkspaceNormalizationResult::Degraded {
             partial: workspace,
             warnings: downgrade_reasons,
