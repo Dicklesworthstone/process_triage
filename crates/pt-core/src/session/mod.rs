@@ -181,10 +181,16 @@ pub struct SnapshotPlanRef {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotProvenanceRef {
     pub path: String,
+    pub schema_version: String,
+    pub privacy_version: String,
+    pub integrity_sha256: String,
     pub node_count: usize,
     pub edge_count: usize,
     pub evidence_count: usize,
     pub redacted_evidence_count: usize,
+    pub missing_or_conflicted_evidence_count: usize,
+    pub warning_count: usize,
+    pub audit_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1381,16 +1387,26 @@ mod tests {
     fn snapshot_provenance_ref_serde() {
         let provenance = SnapshotProvenanceRef {
             path: "scan/provenance.json".to_string(),
+            schema_version: "1.0.0".to_string(),
+            privacy_version: "1.0.0".to_string(),
+            integrity_sha256: "abcd".repeat(16),
             node_count: 2,
             edge_count: 1,
             evidence_count: 3,
             redacted_evidence_count: 1,
+            missing_or_conflicted_evidence_count: 2,
+            warning_count: 1,
+            audit_path: "scan/provenance_audit.json".to_string(),
         };
         let json = serde_json::to_string(&provenance).unwrap();
         let back: SnapshotProvenanceRef = serde_json::from_str(&json).unwrap();
         assert_eq!(back.path, "scan/provenance.json");
+        assert_eq!(back.schema_version, "1.0.0");
         assert_eq!(back.node_count, 2);
         assert_eq!(back.redacted_evidence_count, 1);
+        assert_eq!(back.missing_or_conflicted_evidence_count, 2);
+        assert_eq!(back.warning_count, 1);
+        assert_eq!(back.audit_path, "scan/provenance_audit.json");
     }
 
     // ── SessionSummary ──────────────────────────────────────────────

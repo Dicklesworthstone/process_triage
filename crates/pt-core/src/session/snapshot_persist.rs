@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::{SessionError, SessionHandle, SNAPSHOT_SCHEMA_VERSION};
+use super::{SessionError, SessionHandle, SnapshotProvenanceRef, SNAPSHOT_SCHEMA_VERSION};
 use pt_common::ProvenanceGraphSnapshot;
 
 /// Subdirectory names for artifact types.
@@ -16,6 +16,7 @@ const INFERENCE_FILE: &str = "inference/results.json";
 const PLAN_FILE: &str = "decision/plan.json";
 const META_FILE: &str = "run_metadata.json";
 const PROVENANCE_FILE: &str = "scan/provenance.json";
+const PROVENANCE_AUDIT_FILE: &str = "scan/provenance_audit.json";
 
 /// Redaction sentinel for sensitive strings.
 const REDACTED: &str = "<REDACTED>";
@@ -166,6 +167,109 @@ pub struct RunMetadata {
 /// Provenance artifact: canonical graph snapshot for a session.
 pub type ProvenanceArtifact = ProvenanceGraphSnapshot;
 
+/// Audit sidecar describing how provenance was persisted for local replay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvenancePersistenceAudit {
+    pub schema_version: String,
+    pub artifact_path: String,
+    pub generated_at: String,
+    pub provenance_schema_version: String,
+    pub privacy_version: String,
+    pub integrity_sha256: String,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub evidence_count: usize,
+    pub redacted_evidence_count: usize,
+    pub missing_or_conflicted_evidence_count: usize,
+    pub warning_count: usize,
+    pub consent_required_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persisted_sections: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted_sections: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted_sections: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migration_notes: Vec<String>,
+}
+
+impl ProvenancePersistenceAudit {
+    fn from_envelope(envelope: &ArtifactEnvelope<ProvenanceArtifact>) -> Self {
+        let payload = &envelope.payload;
+        let mut redacted_sections = Vec::new();
+        let mut omitted_sections = Vec::new();
+
+        if payload
+            .nodes
+            .iter()
+            .any(|node| node.redaction != pt_common::ProvenanceRedactionState::None)
+        {
+            redacted_sections.push("graph.nodes".to_string());
+        }
+        if payload
+            .edges
+            .iter()
+            .any(|edge| edge.redaction != pt_common::ProvenanceRedactionState::None)
+        {
+            redacted_sections.push("graph.edges".to_string());
+        }
+        if payload.summary.redacted_evidence_count > 0 {
+            redacted_sections.push("graph.evidence".to_string());
+        }
+        if payload.summary.missing_or_conflicted_evidence_count > 0 {
+            omitted_sections.push("graph.evidence.missing_or_conflicted".to_string());
+        }
+        if payload.privacy.consent_required_count() > 0 {
+            omitted_sections.push("privacy.consent_guarded_fields".to_string());
+        }
+
+        Self {
+            schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
+            artifact_path: PROVENANCE_FILE.to_string(),
+            generated_at: envelope.generated_at.clone(),
+            provenance_schema_version: payload.schema_version.clone(),
+            privacy_version: payload.privacy.version.clone(),
+            integrity_sha256: envelope.integrity_sha256.clone(),
+            node_count: payload.summary.node_count,
+            edge_count: payload.summary.edge_count,
+            evidence_count: payload.summary.evidence_count,
+            redacted_evidence_count: payload.summary.redacted_evidence_count,
+            missing_or_conflicted_evidence_count: payload
+                .summary
+                .missing_or_conflicted_evidence_count,
+            warning_count: payload.warnings.len(),
+            consent_required_count: payload.privacy.consent_required_count(),
+            persisted_sections: vec![
+                "graph.nodes".to_string(),
+                "graph.edges".to_string(),
+                "graph.evidence".to_string(),
+                "graph.summary".to_string(),
+                "graph.warnings".to_string(),
+                "privacy.policy".to_string(),
+            ],
+            redacted_sections,
+            omitted_sections,
+            migration_notes: Vec::new(),
+        }
+    }
+
+    pub fn snapshot_ref(&self) -> SnapshotProvenanceRef {
+        SnapshotProvenanceRef {
+            path: self.artifact_path.clone(),
+            schema_version: self.provenance_schema_version.clone(),
+            privacy_version: self.privacy_version.clone(),
+            integrity_sha256: self.integrity_sha256.clone(),
+            node_count: self.node_count,
+            edge_count: self.edge_count,
+            evidence_count: self.evidence_count,
+            redacted_evidence_count: self.redacted_evidence_count,
+            missing_or_conflicted_evidence_count: self.missing_or_conflicted_evidence_count,
+            warning_count: self.warning_count,
+            audit_path: PROVENANCE_AUDIT_FILE.to_string(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Redaction
 // ---------------------------------------------------------------------------
@@ -228,6 +332,16 @@ fn persist_artifact<T: serde::de::DeserializeOwned + Serialize>(
     let path = handle.dir.join(rel_path);
     envelope.integrity_sha256 = payload_sha256(&envelope.payload, &path)?;
     super::write_json_pretty(&path, &envelope)?;
+    Ok(path)
+}
+
+fn persist_audit<T: Serialize>(
+    handle: &SessionHandle,
+    rel_path: &str,
+    payload: &T,
+) -> Result<PathBuf, SessionError> {
+    let path = handle.dir.join(rel_path);
+    super::write_json_pretty(&path, payload)?;
     Ok(path)
 }
 
@@ -310,6 +424,18 @@ fn load_artifact_unchecked<T: serde::de::DeserializeOwned + Serialize>(
     }
 
     Ok(envelope)
+}
+
+fn load_audit<T: serde::de::DeserializeOwned>(
+    handle: &SessionHandle,
+    rel_path: &str,
+) -> Result<T, SessionError> {
+    let path = handle.dir.join(rel_path);
+    let content = std::fs::read_to_string(&path).map_err(|e| SessionError::Io {
+        path: path.clone(),
+        source: e,
+    })?;
+    serde_json::from_str(&content).map_err(|e| SessionError::Json { path, source: e })
 }
 
 fn payload_sha256<T: serde::de::DeserializeOwned + Serialize>(
@@ -415,7 +541,11 @@ pub fn persist_provenance(
     artifact: ProvenanceArtifact,
 ) -> Result<PathBuf, SessionError> {
     let envelope = ArtifactEnvelope::new(session_id, host_id, artifact);
-    persist_artifact(handle, PROVENANCE_FILE, envelope)
+    let path = persist_artifact(handle, PROVENANCE_FILE, envelope)?;
+    let persisted = load_artifact_unchecked::<ProvenanceArtifact>(handle, PROVENANCE_FILE)?;
+    let audit = ProvenancePersistenceAudit::from_envelope(&persisted);
+    persist_audit(handle, PROVENANCE_AUDIT_FILE, &audit)?;
+    Ok(path)
 }
 
 /// Load the inventory artifact with validation.
@@ -465,6 +595,20 @@ pub fn load_provenance(
     load_artifact(handle, PROVENANCE_FILE)
 }
 
+/// Load the provenance artifact but skip integrity validation.
+pub fn load_provenance_unchecked(
+    handle: &SessionHandle,
+) -> Result<ArtifactEnvelope<ProvenanceArtifact>, SessionError> {
+    load_artifact_unchecked(handle, PROVENANCE_FILE)
+}
+
+/// Load the provenance persistence audit sidecar.
+pub fn load_provenance_audit(
+    handle: &SessionHandle,
+) -> Result<ProvenancePersistenceAudit, SessionError> {
+    load_audit(handle, PROVENANCE_AUDIT_FILE)
+}
+
 /// Check which artifacts are present in a session directory.
 pub fn list_artifacts(handle: &SessionHandle) -> Vec<String> {
     let mut present = Vec::new();
@@ -474,6 +618,7 @@ pub fn list_artifacts(handle: &SessionHandle) -> Vec<String> {
         ("plan", PLAN_FILE),
         ("run_metadata", META_FILE),
         ("provenance", PROVENANCE_FILE),
+        ("provenance_audit", PROVENANCE_AUDIT_FILE),
     ] {
         if handle.dir.join(rel).exists() {
             present.push(name.to_string());
@@ -868,6 +1013,39 @@ mod tests {
         assert_eq!(loaded.payload.summary.evidence_count, 1);
         assert_eq!(loaded.payload.nodes[0].evidence_ids.len(), 1);
         assert_eq!(loaded.payload, graph);
+
+        let audit = load_provenance_audit(&handle).unwrap();
+        assert_eq!(audit.provenance_schema_version, PROVENANCE_SCHEMA_VERSION);
+        assert_eq!(audit.node_count, 2);
+        assert_eq!(audit.warning_count, 0);
+        assert_eq!(audit.integrity_sha256, loaded.integrity_sha256);
+        assert!(audit
+            .persisted_sections
+            .contains(&"graph.nodes".to_string()));
+        assert!(audit.redacted_sections.contains(&"graph.nodes".to_string()));
+        assert!(audit.redacted_sections.contains(&"graph.edges".to_string()));
+        assert!(audit
+            .omitted_sections
+            .contains(&"privacy.consent_guarded_fields".to_string()));
+    }
+
+    #[test]
+    fn test_provenance_snapshot_ref_tracks_replay_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        persist_provenance(&handle, "s1", "h1", sample_provenance()).unwrap();
+        let audit = load_provenance_audit(&handle).unwrap();
+        let reference = audit.snapshot_ref();
+
+        assert_eq!(reference.path, PROVENANCE_FILE);
+        assert_eq!(reference.audit_path, PROVENANCE_AUDIT_FILE);
+        assert_eq!(reference.schema_version, PROVENANCE_SCHEMA_VERSION);
+        assert_eq!(reference.privacy_version, "1.0.0");
+        assert_eq!(reference.node_count, 2);
+        assert_eq!(reference.warning_count, 0);
+        assert_eq!(reference.missing_or_conflicted_evidence_count, 0);
+        assert_eq!(reference.integrity_sha256.len(), SHA256_HEX_LEN);
     }
 
     #[test]
@@ -947,6 +1125,7 @@ mod tests {
         persist_provenance(&handle, "s1", "h1", sample_provenance()).unwrap();
         let present = list_artifacts(&handle);
         assert!(present.contains(&"provenance".to_string()));
+        assert!(present.contains(&"provenance_audit".to_string()));
     }
 
     #[test]

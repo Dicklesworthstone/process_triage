@@ -19,6 +19,12 @@ use pt_config::validate::{validate_policy, validate_priors};
 
 // Re-export preset types
 pub use pt_config::preset::{get_preset, list_presets, PresetError, PresetInfo, PresetName};
+pub use pt_config::provenance::{
+    EffectiveProvenanceControls, ProvenanceCollectionDepth, ProvenanceControlSurface,
+    ProvenanceControlSurfaceKind, ProvenanceControls, ProvenanceExecutionContext,
+    ProvenanceExplanationVerbosity, ProvenanceExportMode, ProvenancePersistenceMode,
+    ProvenanceRedactionLevel, ProvenanceRolloutPosture, PROVENANCE_CONTROL_MODEL_VERSION,
+};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
