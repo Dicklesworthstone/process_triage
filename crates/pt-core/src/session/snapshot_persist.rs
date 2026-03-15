@@ -219,10 +219,6 @@ impl ProvenancePersistenceAudit {
         if payload.summary.missing_or_conflicted_evidence_count > 0 {
             omitted_sections.push("graph.evidence.missing_or_conflicted".to_string());
         }
-        if payload.privacy.consent_required_count() > 0 {
-            omitted_sections.push("privacy.consent_guarded_fields".to_string());
-        }
-
         Self {
             schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
             artifact_path: PROVENANCE_FILE.to_string(),
@@ -256,7 +252,7 @@ impl ProvenancePersistenceAudit {
     pub fn snapshot_ref(&self) -> SnapshotProvenanceRef {
         SnapshotProvenanceRef {
             path: self.artifact_path.clone(),
-            schema_version: self.provenance_schema_version.clone(),
+            provenance_schema_version: self.provenance_schema_version.clone(),
             privacy_version: self.privacy_version.clone(),
             integrity_sha256: self.integrity_sha256.clone(),
             node_count: self.node_count,
@@ -1019,6 +1015,7 @@ mod tests {
         assert_eq!(audit.node_count, 2);
         assert_eq!(audit.warning_count, 0);
         assert_eq!(audit.integrity_sha256, loaded.integrity_sha256);
+        assert!(audit.omitted_sections.is_empty());
         assert!(audit
             .persisted_sections
             .contains(&"graph.nodes".to_string()));
@@ -1040,7 +1037,10 @@ mod tests {
 
         assert_eq!(reference.path, PROVENANCE_FILE);
         assert_eq!(reference.audit_path, PROVENANCE_AUDIT_FILE);
-        assert_eq!(reference.schema_version, PROVENANCE_SCHEMA_VERSION);
+        assert_eq!(
+            reference.provenance_schema_version,
+            PROVENANCE_SCHEMA_VERSION
+        );
         assert_eq!(reference.privacy_version, "1.0.0");
         assert_eq!(reference.node_count, 2);
         assert_eq!(reference.warning_count, 0);

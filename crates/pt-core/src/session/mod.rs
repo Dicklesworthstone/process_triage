@@ -181,7 +181,7 @@ pub struct SnapshotPlanRef {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotProvenanceRef {
     pub path: String,
-    pub schema_version: String,
+    pub provenance_schema_version: String,
     pub privacy_version: String,
     pub integrity_sha256: String,
     pub node_count: usize,
@@ -1387,7 +1387,7 @@ mod tests {
     fn snapshot_provenance_ref_serde() {
         let provenance = SnapshotProvenanceRef {
             path: "scan/provenance.json".to_string(),
-            schema_version: "1.0.0".to_string(),
+            provenance_schema_version: "1.0.0".to_string(),
             privacy_version: "1.0.0".to_string(),
             integrity_sha256: "abcd".repeat(16),
             node_count: 2,
@@ -1401,7 +1401,7 @@ mod tests {
         let json = serde_json::to_string(&provenance).unwrap();
         let back: SnapshotProvenanceRef = serde_json::from_str(&json).unwrap();
         assert_eq!(back.path, "scan/provenance.json");
-        assert_eq!(back.schema_version, "1.0.0");
+        assert_eq!(back.provenance_schema_version, "1.0.0");
         assert_eq!(back.node_count, 2);
         assert_eq!(back.redacted_evidence_count, 1);
         assert_eq!(back.missing_or_conflicted_evidence_count, 2);
