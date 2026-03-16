@@ -49,7 +49,7 @@ pub mod writer;
 
 pub use encryption::{decrypt_bytes, encrypt_bytes, is_encrypted};
 pub use error::{BundleError, Result};
-pub use manifest::{BundleManifest, FileEntry, BUNDLE_SCHEMA_VERSION};
+pub use manifest::{BundleManifest, BundleProvenanceSummary, FileEntry, BUNDLE_SCHEMA_VERSION};
 pub use pt_redact::ExportProfile;
 pub use reader::BundleReader;
 pub use writer::{BundleWriter, FileType};

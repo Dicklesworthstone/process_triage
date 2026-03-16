@@ -64,7 +64,9 @@ pub fn collect_listener_resources(pid: u32) -> Vec<RawResourceEvidence> {
 ///
 /// Returns a list of resource evidence entries marked as `Conflicted` for
 /// ports where more than one process appears to be listening.
-pub fn detect_listener_conflicts(all_resources: &[RawResourceEvidence]) -> Vec<RawResourceEvidence> {
+pub fn detect_listener_conflicts(
+    all_resources: &[RawResourceEvidence],
+) -> Vec<RawResourceEvidence> {
     use std::collections::HashMap;
 
     let mut port_owners: HashMap<String, Vec<u32>> = HashMap::new();
@@ -253,7 +255,9 @@ mod tests {
 
         let conflicts = detect_listener_conflicts(&resources);
         assert_eq!(conflicts.len(), 2);
-        assert!(conflicts.iter().all(|c| c.state == ResourceState::Conflicted));
+        assert!(conflicts
+            .iter()
+            .all(|c| c.state == ResourceState::Conflicted));
     }
 
     #[test]

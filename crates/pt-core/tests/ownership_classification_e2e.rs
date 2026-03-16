@@ -7,9 +7,8 @@
 mod support;
 
 use pt_common::{
-    normalize_lineage, AncestorEntry, LineageCollectionMethod, NormalizedLineage,
-    OwnershipState, ProvenanceConfidence, RawLineageEvidence, SupervisorEvidence,
-    SupervisorKind, TtyEvidence,
+    normalize_lineage, AncestorEntry, LineageCollectionMethod, NormalizedLineage, OwnershipState,
+    ProvenanceConfidence, RawLineageEvidence, SupervisorEvidence, SupervisorKind, TtyEvidence,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,10 +31,26 @@ fn shell_owned_fixture() -> RawLineageEvidence {
         }),
         supervisor: None,
         ancestors: vec![
-            AncestorEntry { pid: 1000, comm: "zsh".to_string(), uid: 1000 },
-            AncestorEntry { pid: 999, comm: "tmux: server".to_string(), uid: 1000 },
-            AncestorEntry { pid: 500, comm: "sshd".to_string(), uid: 0 },
-            AncestorEntry { pid: 1, comm: "systemd".to_string(), uid: 0 },
+            AncestorEntry {
+                pid: 1000,
+                comm: "zsh".to_string(),
+                uid: 1000,
+            },
+            AncestorEntry {
+                pid: 999,
+                comm: "tmux: server".to_string(),
+                uid: 1000,
+            },
+            AncestorEntry {
+                pid: 500,
+                comm: "sshd".to_string(),
+                uid: 0,
+            },
+            AncestorEntry {
+                pid: 1,
+                comm: "systemd".to_string(),
+                uid: 0,
+            },
         ],
         collection_method: LineageCollectionMethod::Synthetic,
         observed_at: "2026-03-16T00:00:00Z".to_string(),
@@ -58,10 +73,26 @@ fn agent_owned_fixture() -> RawLineageEvidence {
         }),
         supervisor: None,
         ancestors: vec![
-            AncestorEntry { pid: 20000, comm: "claude".to_string(), uid: 1000 },
-            AncestorEntry { pid: 15000, comm: "bash".to_string(), uid: 1000 },
-            AncestorEntry { pid: 14000, comm: "tmux: server".to_string(), uid: 1000 },
-            AncestorEntry { pid: 1, comm: "systemd".to_string(), uid: 0 },
+            AncestorEntry {
+                pid: 20000,
+                comm: "claude".to_string(),
+                uid: 1000,
+            },
+            AncestorEntry {
+                pid: 15000,
+                comm: "bash".to_string(),
+                uid: 1000,
+            },
+            AncestorEntry {
+                pid: 14000,
+                comm: "tmux: server".to_string(),
+                uid: 1000,
+            },
+            AncestorEntry {
+                pid: 1,
+                comm: "systemd".to_string(),
+                uid: 0,
+            },
         ],
         collection_method: LineageCollectionMethod::Synthetic,
         observed_at: "2026-03-16T00:00:00Z".to_string(),
@@ -83,9 +114,11 @@ fn systemd_service_fixture() -> RawLineageEvidence {
             auto_restart: Some(true),
             confidence: ProvenanceConfidence::High,
         }),
-        ancestors: vec![
-            AncestorEntry { pid: 1, comm: "systemd".to_string(), uid: 0 },
-        ],
+        ancestors: vec![AncestorEntry {
+            pid: 1,
+            comm: "systemd".to_string(),
+            uid: 0,
+        }],
         collection_method: LineageCollectionMethod::Procfs,
         observed_at: "2026-03-16T00:00:00Z".to_string(),
     }
@@ -118,8 +151,16 @@ fn detached_no_tty_fixture() -> RawLineageEvidence {
         tty: None,
         supervisor: None,
         ancestors: vec![
-            AncestorEntry { pid: 800, comm: "bash".to_string(), uid: 1000 },
-            AncestorEntry { pid: 1, comm: "systemd".to_string(), uid: 0 },
+            AncestorEntry {
+                pid: 800,
+                comm: "bash".to_string(),
+                uid: 1000,
+            },
+            AncestorEntry {
+                pid: 1,
+                comm: "systemd".to_string(),
+                uid: 0,
+            },
         ],
         collection_method: LineageCollectionMethod::Procfs,
         observed_at: "2026-03-16T00:00:00Z".to_string(),
@@ -137,7 +178,10 @@ fn shell_owned_process_has_tty_and_known_shell_ancestor() {
 
     // zsh is the closest ancestor (index 0), so ShellOwned wins
     match &result.ownership {
-        OwnershipState::ShellOwned { shell_pid, shell_comm } => {
+        OwnershipState::ShellOwned {
+            shell_pid,
+            shell_comm,
+        } => {
             assert_eq!(*shell_pid, 1000);
             assert_eq!(shell_comm, "zsh");
         }
@@ -159,7 +203,10 @@ fn agent_owned_process_finds_claude_ancestor() {
     let result = normalize_lineage(&evidence);
 
     match &result.ownership {
-        OwnershipState::AgentOwned { agent_pid, agent_comm } => {
+        OwnershipState::AgentOwned {
+            agent_pid,
+            agent_comm,
+        } => {
             assert_eq!(*agent_pid, 20000);
             assert_eq!(agent_comm, "claude");
         }
@@ -221,7 +268,10 @@ fn detached_process_without_tty_still_finds_shell_ancestor() {
     let result = normalize_lineage(&evidence);
 
     match &result.ownership {
-        OwnershipState::ShellOwned { shell_pid, shell_comm } => {
+        OwnershipState::ShellOwned {
+            shell_pid,
+            shell_comm,
+        } => {
             assert_eq!(*shell_pid, 800);
             assert_eq!(shell_comm, "bash");
         }

@@ -3,7 +3,7 @@
 //! Creates ZIP archives with manifest and checksums.
 
 use crate::encryption;
-use crate::{BundleError, BundleManifest, FileEntry, Result};
+use crate::{BundleError, BundleManifest, BundleProvenanceSummary, FileEntry, Result};
 use pt_redact::ExportProfile;
 use std::fs::File;
 use std::io::{Cursor, Write};
@@ -92,6 +92,12 @@ impl BundleWriter {
         self
     }
 
+    /// Set bundle-level provenance metadata.
+    pub fn with_provenance(mut self, provenance: BundleProvenanceSummary) -> Self {
+        self.manifest = self.manifest.with_provenance(provenance);
+        self
+    }
+
     /// Add a file to the bundle with automatic checksum.
     pub fn add_file(
         &mut self,
@@ -133,6 +139,16 @@ impl BundleWriter {
     /// Add the agent plan.
     pub fn add_plan<T: serde::Serialize>(&mut self, plan: &T) -> Result<()> {
         self.add_json("plan.json", plan)
+    }
+
+    /// Add the canonical provenance snapshot.
+    pub fn add_provenance_snapshot<T: serde::Serialize>(&mut self, snapshot: &T) -> Result<()> {
+        self.add_json("scan/provenance.json", snapshot)
+    }
+
+    /// Add the provenance audit sidecar.
+    pub fn add_provenance_audit<T: serde::Serialize>(&mut self, audit: &T) -> Result<()> {
+        self.add_json("scan/provenance_audit.json", audit)
     }
 
     /// Add raw bytes with a specific file type.
@@ -333,6 +349,27 @@ mod tests {
     }
 
     #[test]
+    fn test_bundle_writer_add_provenance_files() {
+        let mut writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Safe);
+
+        writer
+            .add_provenance_snapshot(&serde_json::json!({"schema_version": "1.0.0"}))
+            .unwrap();
+        writer
+            .add_provenance_audit(&serde_json::json!({"artifact_path": "scan/provenance.json"}))
+            .unwrap();
+
+        assert!(writer
+            .manifest()
+            .find_file("scan/provenance.json")
+            .is_some());
+        assert!(writer
+            .manifest()
+            .find_file("scan/provenance_audit.json")
+            .is_some());
+    }
+
+    #[test]
     fn test_bundle_writer_add_telemetry() {
         let mut writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Safe);
 
@@ -458,5 +495,29 @@ mod tests {
         assert_eq!(manifest.redaction_policy_hash, "abc123");
         assert_eq!(manifest.pt_version, Some("0.1.0".to_string()));
         assert_eq!(manifest.description, Some("Test bundle".to_string()));
+    }
+
+    #[test]
+    fn test_bundle_writer_with_provenance_metadata() {
+        let writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Forensic)
+            .with_provenance(BundleProvenanceSummary {
+                snapshot_path: "scan/provenance.json".to_string(),
+                audit_path: Some("scan/provenance_audit.json".to_string()),
+                provenance_schema_version: Some("1.0.0".to_string()),
+                privacy_version: Some("1.0.0".to_string()),
+                integrity_sha256: Some("a".repeat(64)),
+                node_count: Some(10),
+                edge_count: Some(9),
+                evidence_count: Some(11),
+                redacted_evidence_count: Some(2),
+                missing_or_conflicted_evidence_count: Some(1),
+                warning_count: Some(0),
+                persisted_sections: vec!["graph.nodes".to_string()],
+                redacted_sections: vec!["graph.evidence".to_string()],
+                omitted_sections: vec![],
+                compatibility_notes: vec!["redacted export".to_string()],
+            });
+
+        assert!(writer.manifest().provenance.is_some());
     }
 }

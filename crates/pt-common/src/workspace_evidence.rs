@@ -307,13 +307,14 @@ pub fn normalize_workspace(evidence: &RawWorkspaceEvidence) -> WorkspaceNormaliz
             repo_root
                 .resolution_error
                 .as_ref()
-                .map_or("unknown", |e| match e {
+                .map(|e| match e {
                     PathResolutionError::BrokenSymlink => "broken symlink",
                     PathResolutionError::PermissionDenied => "permission denied",
                     PathResolutionError::NotFound => "not found",
                     PathResolutionError::IoError { .. } => "I/O error",
                     PathResolutionError::InvalidPath => "invalid path",
                 })
+                .unwrap_or("unknown")
         ));
     }
 
@@ -348,7 +349,7 @@ pub fn normalize_workspace(evidence: &RawWorkspaceEvidence) -> WorkspaceNormaliz
         let under_root = is_path_under(&canonical_root, cwd_effective);
         let under_worktree = canonical_worktree
             .as_deref()
-            .map_or(false, |wt| is_path_under(wt, cwd_effective));
+            .is_some_and(|wt| is_path_under(wt, cwd_effective));
         if !under_root && !under_worktree {
             confidence = downgrade_confidence(confidence);
             downgrade_reasons.push(format!(
@@ -480,9 +481,15 @@ mod tests {
 
     #[test]
     fn is_path_under_basic_cases() {
-        assert!(is_path_under("/home/user/project", "/home/user/project/src/main.rs"));
+        assert!(is_path_under(
+            "/home/user/project",
+            "/home/user/project/src/main.rs"
+        ));
         assert!(is_path_under("/home/user/project", "/home/user/project"));
-        assert!(!is_path_under("/home/user/project", "/home/user/project2/file"));
+        assert!(!is_path_under(
+            "/home/user/project",
+            "/home/user/project2/file"
+        ));
         assert!(!is_path_under("/home/user/project", "/other/path"));
     }
 
@@ -813,11 +820,11 @@ mod tests {
     fn json_round_trip_raw_evidence() {
         let evidence = RawWorkspaceEvidence {
             pid: 99,
-            cwd: Some(RawPathEvidence::resolved("/home/user/src", "/home/user/src")),
-            repo_root: Some(RawPathEvidence::resolved(
-                "/home/user",
-                "/home/user",
+            cwd: Some(RawPathEvidence::resolved(
+                "/home/user/src",
+                "/home/user/src",
             )),
+            repo_root: Some(RawPathEvidence::resolved("/home/user", "/home/user")),
             worktree: None,
             head_state: Some(HeadState::Branch {
                 name: "main".to_string(),
@@ -835,10 +842,7 @@ mod tests {
     fn json_round_trip_normalization_result() {
         let evidence = RawWorkspaceEvidence {
             pid: 100,
-            cwd: Some(RawPathEvidence::resolved(
-                "/project/src",
-                "/project/src",
-            )),
+            cwd: Some(RawPathEvidence::resolved("/project/src", "/project/src")),
             repo_root: Some(RawPathEvidence::resolved("/project", "/project")),
             worktree: None,
             head_state: Some(HeadState::Detached {
@@ -858,8 +862,14 @@ mod tests {
 
     #[test]
     fn path_resolution_error_display() {
-        assert_eq!(PathResolutionError::BrokenSymlink.to_string(), "broken symlink");
-        assert_eq!(PathResolutionError::PermissionDenied.to_string(), "permission denied");
+        assert_eq!(
+            PathResolutionError::BrokenSymlink.to_string(),
+            "broken symlink"
+        );
+        assert_eq!(
+            PathResolutionError::PermissionDenied.to_string(),
+            "permission denied"
+        );
         assert_eq!(PathResolutionError::NotFound.to_string(), "not found");
         assert_eq!(
             PathResolutionError::IoError {

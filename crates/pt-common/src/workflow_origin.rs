@@ -141,9 +141,26 @@ pub struct WorkflowOriginClassification {
 
 /// Known launcher wrappers that should be stripped before classification.
 const WRAPPER_LAUNCHERS: &[&str] = &[
-    "nohup", "screen", "tmux", "nice", "ionice", "timeout", "env", "sudo", "su",
-    "strace", "ltrace", "perf", "valgrind", "time", "taskset", "numactl", "chrt",
-    "setsid", "daemonize", "start-stop-daemon",
+    "nohup",
+    "screen",
+    "tmux",
+    "nice",
+    "ionice",
+    "timeout",
+    "env",
+    "sudo",
+    "su",
+    "strace",
+    "ltrace",
+    "perf",
+    "valgrind",
+    "time",
+    "taskset",
+    "numactl",
+    "chrt",
+    "setsid",
+    "daemonize",
+    "start-stop-daemon",
 ];
 
 /// Classify a process's workflow origin from its command and workspace evidence.
@@ -209,10 +226,7 @@ pub fn classify_workflow_origin(
             // Project-local families without workspace context → contradiction
             if family.is_project_local() && cmd_category != CommandCategory::Unknown {
                 signals.push(ClassificationSignal::Contradiction {
-                    description: format!(
-                        "{:?} process running outside any workspace",
-                        family
-                    ),
+                    description: format!("{:?} process running outside any workspace", family),
                 });
                 confidence = downgrade(confidence);
             }
@@ -342,10 +356,10 @@ pub const WORKFLOW_ORIGIN_CLASSIFIED: &str = "provenance_workflow_origin_classif
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace_evidence::normalize_workspace;
     use crate::workspace_evidence::{
         RawPathEvidence, RawWorkspaceEvidence, WorkspaceCollectionMethod,
     };
-    use crate::workspace_evidence::normalize_workspace;
 
     fn make_workspace(root: &str, branch: &str) -> WorkspaceNormalizationResult {
         let evidence = RawWorkspaceEvidence {
@@ -383,12 +397,15 @@ mod tests {
         assert!(result.project_local);
         assert!(result.signals.iter().any(|s| matches!(
             s,
-            ClassificationSignal::CommandPattern { category: CommandCategory::Test, .. }
+            ClassificationSignal::CommandPattern {
+                category: CommandCategory::Test,
+                ..
+            }
         )));
-        assert!(result.signals.iter().any(|s| matches!(
-            s,
-            ClassificationSignal::InWorkspace { .. }
-        )));
+        assert!(result
+            .signals
+            .iter()
+            .any(|s| matches!(s, ClassificationSignal::InWorkspace { .. })));
     }
 
     #[test]
@@ -419,28 +436,23 @@ mod tests {
         assert_eq!(result.family, WorkflowFamily::TestRunner);
         assert_eq!(result.confidence, ProvenanceConfidence::Medium); // downgraded
         assert!(!result.project_local);
-        assert!(result.signals.iter().any(|s| matches!(
-            s,
-            ClassificationSignal::Contradiction { .. }
-        )));
+        assert!(result
+            .signals
+            .iter()
+            .any(|s| matches!(s, ClassificationSignal::Contradiction { .. })));
     }
 
     #[test]
     fn system_daemon_in_workspace_is_contradiction() {
         let ws = make_workspace("/home/user/project", "main");
-        let result = classify_workflow_origin(
-            CommandCategory::Daemon,
-            "systemd",
-            None,
-            Some(&ws),
-        );
+        let result = classify_workflow_origin(CommandCategory::Daemon, "systemd", None, Some(&ws));
 
         assert_eq!(result.family, WorkflowFamily::SystemDaemon);
         assert!(result.confidence <= ProvenanceConfidence::Medium);
-        assert!(result.signals.iter().any(|s| matches!(
-            s,
-            ClassificationSignal::Contradiction { .. }
-        )));
+        assert!(result
+            .signals
+            .iter()
+            .any(|s| matches!(s, ClassificationSignal::Contradiction { .. })));
     }
 
     #[test]
@@ -487,19 +499,15 @@ mod tests {
         };
         let ws = normalize_workspace(&evidence);
 
-        let result = classify_workflow_origin(
-            CommandCategory::Unknown,
-            "myprocess",
-            None,
-            Some(&ws),
-        );
+        let result =
+            classify_workflow_origin(CommandCategory::Unknown, "myprocess", None, Some(&ws));
 
         // Detached HEAD with unknown command → guesses BuildTool (CI)
         assert_eq!(result.family, WorkflowFamily::BuildTool);
-        assert!(result.signals.iter().any(|s| matches!(
-            s,
-            ClassificationSignal::DetachedHead { .. }
-        )));
+        assert!(result
+            .signals
+            .iter()
+            .any(|s| matches!(s, ClassificationSignal::DetachedHead { .. })));
     }
 
     #[test]
@@ -535,7 +543,10 @@ mod tests {
     #[test]
     fn strip_wrapper_nohup() {
         let stripped = strip_wrapper_launchers("nohup pytest -k test_foo");
-        assert!(stripped.contains("pytest"), "should contain pytest: {stripped}");
+        assert!(
+            stripped.contains("pytest"),
+            "should contain pytest: {stripped}"
+        );
     }
 
     #[test]
@@ -554,12 +565,7 @@ mod tests {
     #[test]
     fn branch_context_recorded() {
         let ws = make_workspace("/home/user/project", "feature-auth");
-        let result = classify_workflow_origin(
-            CommandCategory::DevServer,
-            "next",
-            None,
-            Some(&ws),
-        );
+        let result = classify_workflow_origin(CommandCategory::DevServer, "next", None, Some(&ws));
 
         assert!(result.signals.iter().any(|s| matches!(
             s,
@@ -570,12 +576,7 @@ mod tests {
     #[test]
     fn json_round_trip() {
         let ws = make_workspace("/project", "main");
-        let result = classify_workflow_origin(
-            CommandCategory::Test,
-            "pytest",
-            None,
-            Some(&ws),
-        );
+        let result = classify_workflow_origin(CommandCategory::Test, "pytest", None, Some(&ws));
 
         let json = serde_json::to_string(&result).expect("serialize");
         let parsed: WorkflowOriginClassification =

@@ -22,21 +22,21 @@ pub mod output;
 pub mod provenance;
 pub mod resource_evidence;
 pub mod schema;
-pub mod workspace_evidence;
 pub mod workflow_origin;
+pub mod workspace_evidence;
 
+pub use blast_radius::{
+    compute_risk_level, summarize_blast_radius, AffectedResource, AffectedService,
+    BlastRadiusAssessment, BlastRadiusConfidence, ConfidenceTier, DependencyKind, DependentProcess,
+    DirectImpact, EvidenceCitation, EvidenceCoverage, IndirectImpact, ResourceImpactKind,
+    RiskLevel, Unknown, UnknownReason, BLAST_RADIUS_COMPUTED, BLAST_RADIUS_EVIDENCE_GAP,
+    BLAST_RADIUS_SCHEMA_VERSION,
+};
 pub use capabilities::{
     Capabilities, CapabilitiesError, CgroupInfo, CgroupVersion, ContainerInfo, CpuArch,
     LaunchdInfo, OsFamily, OsInfo, PathsInfo, PrivilegesInfo, ProcField, ProcFsInfo, PsiInfo,
     SudoInfo, SystemInfo, SystemdInfo, ToolInfo, ToolPermissions, UserInfo,
     CAPABILITIES_SCHEMA_VERSION, DEFAULT_CACHE_TTL_SECS,
-};
-pub use blast_radius::{
-    compute_risk_level, summarize_blast_radius, AffectedResource, AffectedService,
-    BlastRadiusAssessment, BlastRadiusConfidence, ConfidenceTier, DependencyKind,
-    DependentProcess, DirectImpact, EvidenceCitation, EvidenceCoverage, IndirectImpact,
-    ResourceImpactKind, RiskLevel, Unknown, UnknownReason, BLAST_RADIUS_COMPUTED,
-    BLAST_RADIUS_EVIDENCE_GAP, BLAST_RADIUS_SCHEMA_VERSION,
 };
 pub use categories::{
     CategorizationOutput, CategoryMatcher, CategoryTaxonomy, CommandCategory, CommandCategoryDef,
@@ -54,10 +54,9 @@ pub use galaxy_brain::{
 };
 pub use id::{IdentityQuality, ProcessId, ProcessIdentity, SessionId, StartId};
 pub use lineage_evidence::{
-    normalize_lineage, AncestorEntry, LineageCollectionMethod, NormalizedLineage,
-    OwnershipState, RawLineageEvidence, SessionContext, SupervisorEvidence, SupervisorKind,
-    TtyEvidence, LINEAGE_EVIDENCE_NORMALIZED, LINEAGE_EVIDENCE_MISSING,
-    LINEAGE_EVIDENCE_VERSION,
+    normalize_lineage, AncestorEntry, LineageCollectionMethod, NormalizedLineage, OwnershipState,
+    RawLineageEvidence, SessionContext, SupervisorEvidence, SupervisorKind, TtyEvidence,
+    LINEAGE_EVIDENCE_MISSING, LINEAGE_EVIDENCE_NORMALIZED, LINEAGE_EVIDENCE_VERSION,
 };
 pub use output::OutputFormat;
 pub use provenance::{
@@ -71,21 +70,19 @@ pub use provenance::{
     PROVENANCE_PRIVACY_POLICY_VERSION, PROVENANCE_SCHEMA_VERSION,
 };
 pub use resource_evidence::{
-    normalize_resource, stable_resource_id, LockMechanism, NormalizedResource,
-    RawResourceEvidence, ResourceCollectionMethod, ResourceDetails, ResourceKind,
-    ResourceState, RESOURCE_EVIDENCE_CONFLICT, RESOURCE_EVIDENCE_NORMALIZED,
-    RESOURCE_EVIDENCE_VERSION,
+    normalize_resource, stable_resource_id, LockMechanism, NormalizedResource, RawResourceEvidence,
+    ResourceCollectionMethod, ResourceDetails, ResourceKind, ResourceState,
+    RESOURCE_EVIDENCE_CONFLICT, RESOURCE_EVIDENCE_NORMALIZED, RESOURCE_EVIDENCE_VERSION,
 };
 pub use schema::SCHEMA_VERSION;
 pub use workflow_origin::{
-    classify_workflow_origin, strip_wrapper_launchers, ClassificationSignal,
-    WorkflowFamily, WorkflowOriginClassification, WORKFLOW_ORIGIN_CLASSIFIED,
-    WORKFLOW_ORIGIN_VERSION,
+    classify_workflow_origin, strip_wrapper_launchers, ClassificationSignal, WorkflowFamily,
+    WorkflowOriginClassification, WORKFLOW_ORIGIN_CLASSIFIED, WORKFLOW_ORIGIN_VERSION,
 };
 pub use workspace_evidence::{
-    normalize_workspace, paths_are_same_location, stable_path_id, HeadState,
-    NormalizedWorkspace, PathResolutionError, RawPathEvidence, RawWorkspaceEvidence,
-    WorkspaceCollectionMethod, WorkspaceNormalizationResult, WORKSPACE_EVIDENCE_NORMALIZED,
-    WORKSPACE_EVIDENCE_MISSING, WORKSPACE_EVIDENCE_VERSION, WORKSPACE_PATH_ALIAS_RESOLVED,
-    is_path_under, normalize_path_for_hashing,
+    is_path_under, normalize_path_for_hashing, normalize_workspace, paths_are_same_location,
+    stable_path_id, HeadState, NormalizedWorkspace, PathResolutionError, RawPathEvidence,
+    RawWorkspaceEvidence, WorkspaceCollectionMethod, WorkspaceNormalizationResult,
+    WORKSPACE_EVIDENCE_MISSING, WORKSPACE_EVIDENCE_NORMALIZED, WORKSPACE_EVIDENCE_VERSION,
+    WORKSPACE_PATH_ALIAS_RESOLVED,
 };

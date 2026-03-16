@@ -141,10 +141,7 @@ pub enum ResourceDetails {
         bind_address: String,
     },
     /// Unix domain socket.
-    UnixSocket {
-        path: String,
-        socket_type: String,
-    },
+    UnixSocket { path: String, socket_type: String },
     /// File-based lock.
     Lockfile {
         path: String,
@@ -158,9 +155,7 @@ pub enum ResourceDetails {
         recorded_pid: Option<u32>,
     },
     /// Generic resource (shm, fifo, dbus, gpu).
-    Generic {
-        description: String,
-    },
+    Generic { description: String },
 }
 
 /// How a lockfile implements its lock.
@@ -252,7 +247,8 @@ pub fn normalize_resource(evidence: &RawResourceEvidence) -> NormalizedResource 
     // Downgrade if collection method is inference-based
     if evidence.collection_method == ResourceCollectionMethod::Inferred {
         confidence = downgrade(confidence);
-        downgrade_reasons.push("resource detected via inference, not direct observation".to_string());
+        downgrade_reasons
+            .push("resource detected via inference, not direct observation".to_string());
     }
 
     // Determine redaction based on sensitivity
@@ -303,7 +299,9 @@ fn canonicalize_resource_key(kind: ResourceKind, key: &str) -> String {
 fn make_resource_label(evidence: &RawResourceEvidence) -> String {
     match &evidence.details {
         ResourceDetails::Listener {
-            protocol, port, bind_address,
+            protocol,
+            port,
+            bind_address,
         } => format!("{protocol}:{bind_address}:{port}"),
         ResourceDetails::UnixSocket { path, .. } => {
             // Shorten long socket paths
@@ -603,7 +601,8 @@ mod tests {
 
     #[test]
     fn unix_socket_label_truncation() {
-        let long_path = "/very/long/path/to/a/deeply/nested/application/socket/that/exceeds/the/threshold.sock";
+        let long_path =
+            "/very/long/path/to/a/deeply/nested/application/socket/that/exceeds/the/threshold.sock";
         let evidence = RawResourceEvidence {
             kind: ResourceKind::UnixSocket,
             key: long_path.to_string(),

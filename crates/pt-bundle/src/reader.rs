@@ -3,7 +3,9 @@
 //! Reads ZIP archives with integrity verification.
 
 use crate::encryption;
-use crate::{BundleError, BundleManifest, FileEntry, Result, BUNDLE_SCHEMA_VERSION};
+use crate::{
+    BundleError, BundleManifest, BundleProvenanceSummary, FileEntry, Result, BUNDLE_SCHEMA_VERSION,
+};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -141,6 +143,11 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
         &self.manifest.session_id
     }
 
+    /// Get bundle-level provenance metadata if present.
+    pub fn provenance(&self) -> Option<&BundleProvenanceSummary> {
+        self.manifest.provenance.as_ref()
+    }
+
     /// List all files in the bundle.
     pub fn files(&self) -> &[FileEntry] {
         &self.manifest.files
@@ -270,6 +277,24 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
         }
     }
 
+    /// Read the provenance snapshot file (if present).
+    pub fn read_provenance<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>> {
+        if self.has_file("scan/provenance.json") {
+            Ok(Some(self.read_json("scan/provenance.json")?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Read the provenance audit sidecar (if present).
+    pub fn read_provenance_audit<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>> {
+        if self.has_file("scan/provenance_audit.json") {
+            Ok(Some(self.read_json("scan/provenance_audit.json")?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Read the report HTML (if present).
     pub fn read_report(&mut self) -> Result<Option<Vec<u8>>> {
         if self.has_file("report.html") {
@@ -307,6 +332,11 @@ impl<R: Read + std::io::Seek> BundleReader<R> {
     pub fn read_log(&mut self, name: &str) -> Result<Vec<u8>> {
         let path = format!("logs/{}.jsonl", name);
         self.read_verified(&path)
+    }
+
+    /// Check if the bundle contains provenance data.
+    pub fn has_provenance(&self) -> bool {
+        self.has_file("scan/provenance.json")
     }
 }
 
@@ -453,6 +483,49 @@ mod tests {
         let plan: Option<serde_json::Value> = reader.read_plan().unwrap();
         assert!(plan.is_some());
         assert_eq!(plan.unwrap()["action"], "kill");
+    }
+
+    #[test]
+    fn test_bundle_reader_read_provenance_present() {
+        let mut writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Safe)
+            .with_provenance(BundleProvenanceSummary {
+                snapshot_path: "scan/provenance.json".to_string(),
+                audit_path: Some("scan/provenance_audit.json".to_string()),
+                provenance_schema_version: Some("1.0.0".to_string()),
+                privacy_version: Some("1.0.0".to_string()),
+                integrity_sha256: Some("a".repeat(64)),
+                node_count: Some(2),
+                edge_count: Some(1),
+                evidence_count: Some(3),
+                redacted_evidence_count: Some(1),
+                missing_or_conflicted_evidence_count: Some(0),
+                warning_count: Some(1),
+                persisted_sections: vec!["graph.nodes".to_string()],
+                redacted_sections: vec!["graph.evidence".to_string()],
+                omitted_sections: vec!["graph.secret_fields".to_string()],
+                compatibility_notes: vec!["shared export".to_string()],
+            });
+        writer
+            .add_summary(&serde_json::json!({"total": 42}))
+            .unwrap();
+        writer
+            .add_provenance_snapshot(&serde_json::json!({"schema_version": "1.0.0"}))
+            .unwrap();
+        writer
+            .add_provenance_audit(&serde_json::json!({"artifact_path": "scan/provenance.json"}))
+            .unwrap();
+
+        let (bytes, _) = writer.write_to_vec().unwrap();
+        let mut reader = BundleReader::from_bytes(bytes).unwrap();
+
+        assert!(reader.provenance().is_some());
+        let snapshot: Option<serde_json::Value> = reader.read_provenance().unwrap();
+        let audit: Option<serde_json::Value> = reader.read_provenance_audit().unwrap();
+        assert_eq!(snapshot.unwrap()["schema_version"].as_str(), Some("1.0.0"));
+        assert_eq!(
+            audit.unwrap()["artifact_path"].as_str(),
+            Some("scan/provenance.json")
+        );
     }
 
     #[test]

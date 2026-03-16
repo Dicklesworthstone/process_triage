@@ -9,10 +9,9 @@
 mod support;
 
 use pt_common::{
-    classify_workflow_origin, normalize_workspace, CommandCategory, HeadState,
-    PathResolutionError, ProvenanceConfidence, RawPathEvidence,
-    RawWorkspaceEvidence, WorkflowFamily,
-    WorkspaceNormalizationResult, WorkspaceCollectionMethod,
+    classify_workflow_origin, normalize_workspace, CommandCategory, HeadState, PathResolutionError,
+    ProvenanceConfidence, RawPathEvidence, RawWorkspaceEvidence, WorkflowFamily,
+    WorkspaceCollectionMethod, WorkspaceNormalizationResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -106,7 +105,11 @@ fn stale_test_runner_in_workspace_produces_high_confidence_classification() {
 
 #[test]
 fn dev_server_on_feature_branch_records_branch_context() {
-    let raw = workspace_in_repo("/home/dev/webapp", "/home/dev/webapp", "feature/auth-redesign");
+    let raw = workspace_in_repo(
+        "/home/dev/webapp",
+        "/home/dev/webapp",
+        "feature/auth-redesign",
+    );
     let ws = normalize_workspace(&raw);
 
     let classification = classify_workflow_origin(
@@ -158,7 +161,10 @@ fn system_process_outside_repo_has_no_workspace() {
     let raw = workspace_non_repo("/usr/sbin");
     let ws = normalize_workspace(&raw);
 
-    assert!(matches!(ws, WorkspaceNormalizationResult::NoWorkspace { .. }));
+    assert!(matches!(
+        ws,
+        WorkspaceNormalizationResult::NoWorkspace { .. }
+    ));
 
     let classification = classify_workflow_origin(
         CommandCategory::Daemon,
@@ -268,9 +274,10 @@ fn test_runner_outside_workspace_flags_contradiction() {
     assert_eq!(classification.family, WorkflowFamily::TestRunner);
     assert!(!classification.project_local);
 
-    let has_contradiction = classification.signals.iter().any(|s| {
-        matches!(s, pt_common::ClassificationSignal::Contradiction { .. })
-    });
+    let has_contradiction = classification
+        .signals
+        .iter()
+        .any(|s| matches!(s, pt_common::ClassificationSignal::Contradiction { .. }));
     assert!(has_contradiction, "should flag contradiction");
     assert!(classification.confidence > ProvenanceConfidence::High);
 }

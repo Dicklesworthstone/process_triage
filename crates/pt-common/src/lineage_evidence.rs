@@ -168,19 +168,11 @@ impl NormalizedLineage {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum OwnershipState {
     /// Owned by an interactive shell (user started it).
-    ShellOwned {
-        shell_pid: u32,
-        shell_comm: String,
-    },
+    ShellOwned { shell_pid: u32, shell_comm: String },
     /// Managed by a service supervisor.
-    Supervised {
-        supervisor: SupervisorEvidence,
-    },
+    Supervised { supervisor: SupervisorEvidence },
     /// Running inside an agent session.
-    AgentOwned {
-        agent_pid: u32,
-        agent_comm: String,
-    },
+    AgentOwned { agent_pid: u32, agent_comm: String },
     /// Orphaned — PPID is 1 with no supervisor.
     Orphaned,
     /// Owned by init/systemd directly (expected for system services).
@@ -241,20 +233,14 @@ pub fn normalize_lineage(evidence: &RawLineageEvidence) -> NormalizedLineage {
     let crossed_user_boundary = evidence
         .ancestors
         .first()
-        .map_or(false, |parent| parent.uid != evidence.uid);
+        .is_some_and(|parent| parent.uid != evidence.uid);
 
     // Build session context
     let session = SessionContext {
         sid: evidence.sid,
-        has_tty: evidence
-            .tty
-            .as_ref()
-            .map_or(false, |t| t.has_controlling_tty),
+        has_tty: evidence.tty.as_ref().is_some_and(|t| t.has_controlling_tty),
         tty_device: evidence.tty.as_ref().map(|t| t.device.clone()),
-        is_session_leader: evidence
-            .tty
-            .as_ref()
-            .map_or(false, |t| t.is_session_leader),
+        is_session_leader: evidence.tty.as_ref().is_some_and(|t| t.is_session_leader),
     };
 
     // Classify ownership
@@ -294,9 +280,10 @@ fn classify_ownership(
         // Check ancestors for context
         if evidence.ancestors.is_empty() {
             *confidence = downgrade(*confidence);
-            downgrade_reasons
-                .push("PPID=1 with no ancestor chain; cannot distinguish init child from orphan"
-                    .to_string());
+            downgrade_reasons.push(
+                "PPID=1 with no ancestor chain; cannot distinguish init child from orphan"
+                    .to_string(),
+            );
             return OwnershipState::Orphaned;
         }
         return OwnershipState::InitChild;
@@ -338,8 +325,7 @@ fn classify_ownership(
     // No recognizable owner found
     if evidence.ancestors.is_empty() {
         *confidence = downgrade(*confidence);
-        downgrade_reasons
-            .push("no ancestors available; ownership is unknown".to_string());
+        downgrade_reasons.push("no ancestors available; ownership is unknown".to_string());
     }
 
     OwnershipState::Unknown
@@ -463,10 +449,7 @@ mod tests {
         match &result.ownership {
             OwnershipState::Supervised { supervisor } => {
                 assert_eq!(supervisor.kind, SupervisorKind::Systemd);
-                assert_eq!(
-                    supervisor.unit_name.as_deref(),
-                    Some("nginx.service")
-                );
+                assert_eq!(supervisor.unit_name.as_deref(), Some("nginx.service"));
             }
             other => panic!("expected Supervised, got {other:?}"),
         }

@@ -54,6 +54,73 @@ pub struct BundleManifest {
     /// pt version that created this bundle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pt_version: Option<String>,
+
+    /// Optional provenance export metadata for explicit compatibility handling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<BundleProvenanceSummary>,
+}
+
+/// Provenance payload metadata carried at the bundle level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleProvenanceSummary {
+    /// Path to the canonical provenance snapshot inside the bundle.
+    pub snapshot_path: String,
+
+    /// Optional audit sidecar path describing redaction and omission semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_path: Option<String>,
+
+    /// Schema version for the provenance graph payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_schema_version: Option<String>,
+
+    /// Privacy/redaction policy version applied to the exported provenance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub privacy_version: Option<String>,
+
+    /// Integrity hash of the exported provenance payload when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity_sha256: Option<String>,
+
+    /// Node count carried by the exported provenance graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_count: Option<usize>,
+
+    /// Edge count carried by the exported provenance graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_count: Option<usize>,
+
+    /// Evidence count carried by the exported provenance graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_count: Option<usize>,
+
+    /// Count of redacted evidence items in the exported graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redacted_evidence_count: Option<usize>,
+
+    /// Count of missing or conflicted evidence items in the exported graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_or_conflicted_evidence_count: Option<usize>,
+
+    /// Count of warnings emitted during provenance persistence/export.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning_count: Option<usize>,
+
+    /// Sections explicitly persisted into the bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persisted_sections: Vec<String>,
+
+    /// Sections exported in redacted form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted_sections: Vec<String>,
+
+    /// Sections intentionally omitted from the bundle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted_sections: Vec<String>,
+
+    /// Compatibility or migration notes for bundle consumers/importers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatibility_notes: Vec<String>,
 }
 
 impl BundleManifest {
@@ -75,6 +142,7 @@ impl BundleManifest {
             files: Vec::new(),
             description: None,
             pt_version: None,
+            provenance: None,
         }
     }
 
@@ -98,6 +166,12 @@ impl BundleManifest {
     /// Set the description.
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Set bundle-level provenance metadata.
+    pub fn with_provenance(mut self, provenance: BundleProvenanceSummary) -> Self {
+        self.provenance = Some(provenance);
         self
     }
 
@@ -133,6 +207,7 @@ impl BundleManifest {
             "export_profile": self.export_profile.to_string(),
             "redaction_policy_version": self.redaction_policy_version,
             "redaction_policy_hash": self.redaction_policy_hash,
+            "provenance": self.provenance,
         });
 
         let json = serde_json::to_string(&canonical).unwrap_or_default();
@@ -160,6 +235,42 @@ impl BundleManifest {
             return Err(crate::BundleError::CorruptedManifest(
                 "host_id is empty".to_string(),
             ));
+        }
+
+        if let Some(provenance) = &self.provenance {
+            if provenance.snapshot_path.is_empty() {
+                return Err(crate::BundleError::CorruptedManifest(
+                    "provenance snapshot_path is empty".to_string(),
+                ));
+            }
+
+            if !self
+                .files
+                .iter()
+                .any(|file| file.path == provenance.snapshot_path)
+            {
+                return Err(crate::BundleError::CorruptedManifest(format!(
+                    "provenance snapshot '{}' missing from file listing",
+                    provenance.snapshot_path
+                )));
+            }
+
+            if let Some(audit_path) = &provenance.audit_path {
+                if !self.files.iter().any(|file| file.path == *audit_path) {
+                    return Err(crate::BundleError::CorruptedManifest(format!(
+                        "provenance audit '{}' missing from file listing",
+                        audit_path
+                    )));
+                }
+            }
+
+            if let Some(integrity) = &provenance.integrity_sha256 {
+                if integrity.len() != 64 {
+                    return Err(crate::BundleError::CorruptedManifest(
+                        "provenance integrity hash has invalid length".to_string(),
+                    ));
+                }
+            }
         }
 
         // Validate file entries
@@ -282,6 +393,37 @@ mod tests {
 
         assert_eq!(manifest.pt_version, Some("0.1.0".to_string()));
         assert_eq!(manifest.description, Some("Test bundle".to_string()));
+    }
+
+    #[test]
+    fn test_manifest_with_provenance() {
+        let mut manifest = BundleManifest::new("session-123", "host-abc", ExportProfile::Safe);
+        manifest.add_file(FileEntry::new("scan/provenance.json", "a".repeat(64), 100));
+        manifest.add_file(FileEntry::new(
+            "scan/provenance_audit.json",
+            "b".repeat(64),
+            120,
+        ));
+        manifest = manifest.with_provenance(BundleProvenanceSummary {
+            snapshot_path: "scan/provenance.json".to_string(),
+            audit_path: Some("scan/provenance_audit.json".to_string()),
+            provenance_schema_version: Some("1.0.0".to_string()),
+            privacy_version: Some("1.0.0".to_string()),
+            integrity_sha256: Some("c".repeat(64)),
+            node_count: Some(3),
+            edge_count: Some(2),
+            evidence_count: Some(4),
+            redacted_evidence_count: Some(1),
+            missing_or_conflicted_evidence_count: Some(1),
+            warning_count: Some(0),
+            persisted_sections: vec!["graph.nodes".to_string()],
+            redacted_sections: vec!["graph.evidence".to_string()],
+            omitted_sections: vec![],
+            compatibility_notes: vec![],
+        });
+
+        assert!(manifest.validate().is_ok());
+        assert!(manifest.provenance.is_some());
     }
 
     #[test]

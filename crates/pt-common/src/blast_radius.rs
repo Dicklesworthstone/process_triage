@@ -358,7 +358,11 @@ pub fn summarize_blast_radius(assessment: &BlastRadiusAssessment) -> String {
         parts.push(format!(
             "terminates {} child{}",
             assessment.direct.child_count,
-            if assessment.direct.child_count == 1 { "" } else { "ren" }
+            if assessment.direct.child_count == 1 {
+                ""
+            } else {
+                "ren"
+            }
         ));
     }
 
@@ -366,7 +370,11 @@ pub fn summarize_blast_radius(assessment: &BlastRadiusAssessment) -> String {
         parts.push(format!(
             "stops {} listener{}",
             assessment.direct.listener_count,
-            if assessment.direct.listener_count == 1 { "" } else { "s" }
+            if assessment.direct.listener_count == 1 {
+                ""
+            } else {
+                "s"
+            }
         ));
     }
 
@@ -374,14 +382,25 @@ pub fn summarize_blast_radius(assessment: &BlastRadiusAssessment) -> String {
         parts.push(format!(
             "affects {} dependent process{}",
             assessment.indirect.dependent_processes.len(),
-            if assessment.indirect.dependent_processes.len() == 1 { "" } else { "es" }
+            if assessment.indirect.dependent_processes.len() == 1 {
+                ""
+            } else {
+                "es"
+            }
         ));
     }
 
     if !assessment.unknowns.is_empty() {
-        let risky = assessment.unknowns.iter().filter(|u| u.could_affect_risk).count();
+        let risky = assessment
+            .unknowns
+            .iter()
+            .filter(|u| u.could_affect_risk)
+            .count();
         if risky > 0 {
-            parts.push(format!("{risky} unknown risk factor{}", if risky == 1 { "" } else { "s" }));
+            parts.push(format!(
+                "{risky} unknown risk factor{}",
+                if risky == 1 { "" } else { "s" }
+            ));
         }
     }
 
@@ -486,11 +505,7 @@ mod tests {
             downgrade_reasons: vec!["no deep scan".to_string()],
         };
 
-        let risk = compute_risk_level(
-            &DirectImpact::none(),
-            &IndirectImpact::none(),
-            &confidence,
-        );
+        let risk = compute_risk_level(&DirectImpact::none(), &IndirectImpact::none(), &confidence);
         assert_eq!(risk, RiskLevel::High);
     }
 
