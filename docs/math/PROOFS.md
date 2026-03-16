@@ -166,8 +166,10 @@ P(N > L) = sum_{k=L+1}^{inf} (1-rho) rho^k
          = rho^{L+1}
 ```
 
-The implementation uses `rho^threshold` as an approximation (threshold in bytes,
-not queue length units), which preserves the monotonicity in rho.
+The implementation uses `rho^L` where `L` is a configurable abstract queue-length
+parameter (`probability_queue_length`, default 8), distinct from the byte-level
+`saturation_threshold`.  This preserves the monotonicity in rho while keeping the
+probability in a meaningful range.
 
 ### 3.3 EWMA Estimation
 
