@@ -34,6 +34,8 @@ pub mod incremental;
 pub mod lineage_collector;
 #[cfg(target_os = "linux")]
 pub mod network;
+#[cfg(target_os = "linux")]
+pub mod network_resource_collector;
 pub mod prober;
 pub mod proc_parsers;
 pub mod protected;
@@ -148,6 +150,12 @@ pub use gpu::{
 // Re-export lineage collector types
 #[cfg(target_os = "linux")]
 pub use lineage_collector::collect_lineage_for_pid;
+
+// Re-export network resource collector types
+#[cfg(target_os = "linux")]
+pub use network_resource_collector::{
+    collect_fd_ipc_resources, collect_listener_resources, detect_listener_conflicts,
+};
 
 // Re-export workspace resolver types
 #[cfg(target_os = "linux")]
