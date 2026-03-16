@@ -41,6 +41,10 @@ pub struct QueueStallConfig {
     /// Rho threshold above which a queue is declared stalled.
     /// Default: 0.9
     pub rho_threshold: f64,
+    /// Queue length parameter L for the M/M/1 probability P(N > L) = rho^L.
+    /// This is an abstract queue-length unit (not bytes). Kept small so the
+    /// probability remains informative. Default: 8
+    pub probability_queue_length: u32,
 }
 
 impl Default for QueueStallConfig {
@@ -50,6 +54,7 @@ impl Default for QueueStallConfig {
             saturation_threshold: 4096,
             min_samples: 2,
             rho_threshold: 0.9,
+            probability_queue_length: 8,
         }
     }
 }
@@ -174,16 +179,22 @@ impl QueueStallDetector {
             self.config.saturation_threshold as f64,
         );
 
-        let is_saturated = total_rx > u64::from(self.config.saturation_threshold)
-            || total_tx > u64::from(self.config.saturation_threshold);
+        let threshold = u64::from(self.config.saturation_threshold);
+        let is_saturated = total_rx > threshold || total_tx > threshold;
 
+        // Use max of the two smoothed depths (not sum) for stall check,
+        // matching is_saturated semantics: either queue individually deep.
+        let max_smoothed = self.rx_ewma.value().max(self.tx_ewma.value());
         let is_stalled = sample_count >= self.config.min_samples
             && rho >= self.config.rho_threshold
-            && smoothed_depth > self.config.saturation_threshold as f64;
+            && max_smoothed > self.config.saturation_threshold as f64;
 
         // M/M/1 steady-state: P(Queue > L) = rho^L.
-        let stall_probability = if rho < 1.0 && self.config.saturation_threshold > 0 {
-            rho.powi(self.config.saturation_threshold as i32)
+        // L is an abstract queue-length parameter (not bytes) kept small
+        // so the probability remains informative.
+        let l = self.config.probability_queue_length.min(1024);
+        let stall_probability = if rho < 1.0 && l > 0 {
+            rho.powi(l as i32)
         } else if rho >= 1.0 {
             1.0
         } else {
@@ -364,6 +375,7 @@ mod tests {
             saturation_threshold: 1000,
             min_samples: 2,
             rho_threshold: 0.8,
+            ..Default::default()
         });
         // Simulate queue growing over several observations.
         det.observe(500, 500);
@@ -380,6 +392,7 @@ mod tests {
             saturation_threshold: 4096,
             min_samples: 2,
             rho_threshold: 0.9,
+            ..Default::default()
         });
         // Queue starts high but drains.
         det.observe(10000, 0);
@@ -403,6 +416,7 @@ mod tests {
                 saturation_threshold: 100,
                 min_samples: 1,
                 rho_threshold: 0.5,
+                ..Default::default()
             });
             d.observe(50000, 50000);
             d.observe(100000, 100000);
