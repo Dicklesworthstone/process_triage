@@ -2066,18 +2066,22 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                 };
                 let scan_result =
                     quick_scan(&scan_options).map_err(|e| format!("scan failed: {}", e))?;
-                let deep_signals = if deep_r {
-                    collect_deep_signals(&scan_result.processes)
-                } else {
-                    None
-                };
                 let protected_filter = ProtectedFilter::from_guardrails(&policy_scan_r.guardrails)
                     .map_err(|e| format!("filter error: {}", e))?;
                 let filter_result = protected_filter.filter_scan_result(&scan_result);
+                let probe_advice =
+                    compute_probe_advice(&filter_result.passed, &priors_r, &policy_r);
+                let deep_signals = if deep_r {
+                    collect_deep_signals(&filter_result.passed)
+                } else {
+                    let targeted = deep_scan_target_pids(&filter_result.passed, &probe_advice);
+                    collect_deep_signals_for_pids(&targeted)
+                };
                 let output = build_tui_rows(
                     &filter_result.passed,
                     min_age_r,
                     deep_signals.as_ref(),
+                    Some(&probe_advice),
                     &priors_r,
                     &policy_r,
                     goal_r.as_deref(),
@@ -2216,20 +2220,22 @@ fn build_tui_data_from_live_scan(
     };
     let scan_result = quick_scan(&scan_options).map_err(|e| format!("scan failed: {}", e))?;
 
-    let deep_signals = if args.deep {
-        collect_deep_signals(&scan_result.processes)
-    } else {
-        None
-    };
-
     let protected_filter = ProtectedFilter::from_guardrails(&policy.guardrails)
         .map_err(|e| format!("protected filter error: {}", e))?;
     let filter_result = protected_filter.filter_scan_result(&scan_result);
+    let probe_advice = compute_probe_advice(&filter_result.passed, priors, policy);
+    let deep_signals = if args.deep {
+        collect_deep_signals(&filter_result.passed)
+    } else {
+        let targeted = deep_scan_target_pids(&filter_result.passed, &probe_advice);
+        collect_deep_signals_for_pids(&targeted)
+    };
 
     Ok(build_tui_rows(
         &filter_result.passed,
         args.min_age,
         deep_signals.as_ref(),
+        Some(&probe_advice),
         priors,
         policy,
         args.goal.as_deref(),
@@ -2442,14 +2448,96 @@ struct DeepSignals {
 }
 
 #[cfg(feature = "ui")]
-fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, DeepSignals>> {
+#[derive(Debug, Clone)]
+struct ProbeAdvice {
+    should_probe: bool,
+    recommended_probe: Option<pt_core::decision::ProbeType>,
+    rationale: String,
+}
+
+#[cfg(feature = "ui")]
+fn compute_probe_advice(
+    processes: &[ProcessRecord],
+    priors: &Priors,
+    policy: &pt_core::config::Policy,
+) -> HashMap<u32, ProbeAdvice> {
+    let mut advice = HashMap::new();
+    let cost_model = pt_core::decision::ProbeCostModel::default();
+    let available_probes = [pt_core::decision::ProbeType::DeepScan];
+
+    for proc in processes {
+        let evidence = Evidence {
+            cpu: Some(CpuEvidence::Fraction {
+                occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
+            }),
+            runtime_seconds: Some(proc.elapsed.as_secs_f64()),
+            orphan: Some(proc.is_orphan()),
+            tty: Some(proc.has_tty()),
+            net: None,
+            io_active: None,
+            queue_saturated: None,
+            state_flag: state_to_flag(proc.state),
+            command_category: None,
+        };
+
+        let Ok(posterior) = compute_posterior(priors, &evidence) else {
+            continue;
+        };
+        let Ok((decision, _)) = pt_core::decision::decide_sequential(
+            &posterior.posterior,
+            policy,
+            &ActionFeasibility::allow_all(),
+            &cost_model,
+            Some(&available_probes),
+        ) else {
+            continue;
+        };
+
+        advice.insert(
+            proc.pid.0,
+            ProbeAdvice {
+                should_probe: decision.should_probe,
+                recommended_probe: decision.recommended_probe,
+                rationale: decision.rationale,
+            },
+        );
+    }
+
+    advice
+}
+
+#[cfg(feature = "ui")]
+fn deep_scan_target_pids(
+    processes: &[ProcessRecord],
+    probe_advice: &HashMap<u32, ProbeAdvice>,
+) -> Vec<u32> {
+    processes
+        .iter()
+        .filter_map(|proc| {
+            let advice = probe_advice.get(&proc.pid.0)?;
+            if advice.should_probe
+                && advice.recommended_probe == Some(pt_core::decision::ProbeType::DeepScan)
+            {
+                Some(proc.pid.0)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "ui")]
+fn collect_deep_signals_for_pids(pids: &[u32]) -> Option<HashMap<u32, DeepSignals>> {
     #[cfg(target_os = "linux")]
     {
         use pt_core::collect::{deep_scan, DeepScanOptions};
 
-        let pids = processes.iter().map(|p| p.pid.0).collect::<Vec<_>>();
+        if pids.is_empty() {
+            return None;
+        }
+
         let options = DeepScanOptions {
-            pids,
+            pids: pids.to_vec(),
             skip_inaccessible: true,
             include_environ: false,
             use_wait_free: true,
@@ -2504,6 +2592,12 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
         eprintln!("run: deep scan not supported on this platform; using quick scan");
         None
     }
+}
+
+#[cfg(feature = "ui")]
+fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, DeepSignals>> {
+    let pids = processes.iter().map(|p| p.pid.0).collect::<Vec<_>>();
+    collect_deep_signals_for_pids(&pids)
 }
 
 #[cfg(feature = "ui")]
@@ -2573,6 +2667,7 @@ fn build_tui_rows(
     processes: &[ProcessRecord],
     min_age: Option<u64>,
     deep_signals: Option<&HashMap<u32, DeepSignals>>,
+    probe_advice: Option<&HashMap<u32, ProbeAdvice>>,
     priors: &Priors,
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
@@ -2613,6 +2708,7 @@ fn build_tui_rows(
         }
 
         let deep = deep_signals.and_then(|m| m.get(&proc.pid.0).copied());
+        let probe = probe_advice.and_then(|m| m.get(&proc.pid.0));
         let evidence = Evidence {
             cpu: Some(CpuEvidence::Fraction {
                 occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
@@ -2641,6 +2737,16 @@ fn build_tui_rows(
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
         let mut ledger =
             EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
+        if let Some(probe) = probe {
+            if probe.should_probe
+                && probe.recommended_probe == Some(pt_core::decision::ProbeType::DeepScan)
+            {
+                ledger
+                    .top_evidence
+                    .insert(0, "VOI recommends deep scan before acting".to_string());
+                ledger.why_summary = format!("{} {}", ledger.why_summary, probe.rationale);
+            }
+        }
         if let Some(queue) = deep {
             if let (Some(lambda), Some(mu), Some(stall_probability), Some(backlog_sockets)) = (
                 queue.queue_lambda,
