@@ -61,6 +61,7 @@ fn scenario_1_bun_test_high_cpu_18min_is_not_abandoned() {
         net: Some(false),
         state_flag: None,
         command_category: None, // Would be "test" if categories were configured
+        queue_saturated: None,
     };
 
     let result =
@@ -106,6 +107,7 @@ fn scenario_1b_bun_test_stalled_shifts_toward_abandoned() {
         net: Some(false),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     };
 
     let result =
@@ -124,6 +126,7 @@ fn scenario_1b_bun_test_stalled_shifts_toward_abandoned() {
         net: Some(false),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     };
     let baseline = compute_posterior(&priors, &baseline_evidence)
         .expect("baseline computation should succeed")
@@ -157,6 +160,7 @@ fn scenario_2_gemini_agent_moderate_runtime_not_abandoned() {
         net: Some(true), // Likely has network activity
         state_flag: None,
         command_category: None, // Would be "agent" if configured
+        queue_saturated: None,
     };
 
     let result =
@@ -198,6 +202,7 @@ fn scenario_2b_gemini_agent_long_orphaned_shifts_toward_abandoned() {
         net: Some(false),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     };
 
     let result =
@@ -233,6 +238,7 @@ fn scenario_3_gunicorn_server_is_useful() {
         net: Some(true), // Serving web requests
         state_flag: None,
         command_category: None, // Would be "server" if configured
+        queue_saturated: None,
     };
 
     let result =
@@ -282,6 +288,7 @@ fn scenario_4_claude_agent_high_cpu_is_useful() {
         net: Some(true), // Making API calls
         state_flag: None,
         command_category: None, // Would be "agent" if configured
+        queue_saturated: None,
     };
 
     let result =
@@ -320,6 +327,7 @@ fn scenario_4b_claude_orphaned_no_tty_shifts_toward_abandoned() {
         net: Some(false),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     };
 
     let result =
@@ -337,6 +345,7 @@ fn scenario_4b_claude_orphaned_no_tty_shifts_toward_abandoned() {
         net: Some(true),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     };
     let baseline = compute_posterior(&priors, &baseline_evidence)
         .expect("baseline should succeed")
@@ -368,6 +377,7 @@ fn orphan_alone_is_weak_signal() {
         net: Some(true),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     };
 
     // Same process but not orphaned
@@ -415,6 +425,7 @@ fn high_cpu_alone_is_not_abandoned() {
         net: Some(false),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     };
 
     let result =

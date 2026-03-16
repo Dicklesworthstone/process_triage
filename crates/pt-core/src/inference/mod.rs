@@ -32,6 +32,7 @@ pub mod martingale;
 pub mod mpp;
 pub mod posterior;
 pub mod ppc;
+pub mod queueing;
 pub mod prior_override;
 pub mod robust;
 pub mod robust_stats;
@@ -131,6 +132,9 @@ pub use mpp::{
 pub use posterior::{
     compute_posterior, ClassScores, CpuEvidence, Evidence, EvidenceTerm, PosteriorError,
     PosteriorResult,
+};
+pub use queueing::{
+    is_queue_saturated, EwmaEstimator, QueueStallConfig, QueueStallDetector, QueueStallResult,
 };
 pub use ppc::{
     AggregatedPpcEvidence, BatchPpcChecker, FallbackAction, PpcChecker, PpcConfig, PpcError,

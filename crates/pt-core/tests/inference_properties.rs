@@ -41,6 +41,7 @@ fn evidence_strategy() -> impl Strategy<Value = Evidence> {
             io_active,
             state_flag: None,
             command_category: None,
+            queue_saturated: None,
         },
     )
 }

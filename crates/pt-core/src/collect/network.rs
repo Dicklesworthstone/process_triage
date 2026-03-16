@@ -36,6 +36,34 @@ pub struct NetworkInfo {
     pub unix_sockets: Vec<UnixSocket>,
 }
 
+impl NetworkInfo {
+    /// Total receive queue depth across all TCP connections (bytes).
+    ///
+    /// A large aggregate rx_queue signals that the process is not draining
+    /// incoming data — a hallmark of stalled / useful-bad behaviour.
+    pub fn total_rx_queue(&self) -> u64 {
+        self.tcp_connections
+            .iter()
+            .map(|c| u64::from(c.rx_queue))
+            .sum()
+    }
+
+    /// Total transmit queue depth across all TCP connections (bytes).
+    pub fn total_tx_queue(&self) -> u64 {
+        self.tcp_connections
+            .iter()
+            .map(|c| u64::from(c.tx_queue))
+            .sum()
+    }
+
+    /// Whether any socket has a saturated queue (rx_queue > threshold bytes).
+    pub fn has_saturated_queue(&self, threshold: u32) -> bool {
+        self.tcp_connections
+            .iter()
+            .any(|c| c.rx_queue > threshold || c.tx_queue > threshold)
+    }
+}
+
 /// A snapshot of global network state for O(1) process lookup.
 ///
 /// This structure reads /proc/net/* files once and indexes them by inode,
@@ -195,6 +223,12 @@ pub struct TcpConnection {
     pub inode: u64,
     /// IPv6 connection.
     pub is_ipv6: bool,
+    /// Transmit queue size (bytes pending in kernel send buffer).
+    #[serde(default)]
+    pub tx_queue: u32,
+    /// Receive queue size (bytes pending in kernel receive buffer).
+    #[serde(default)]
+    pub rx_queue: u32,
 }
 
 /// TCP connection state.
@@ -289,6 +323,9 @@ pub struct UnixSocket {
     pub state: UnixSocketState,
     /// Socket inode number.
     pub inode: u64,
+    /// Kernel reference count reported by `/proc/net/unix`.
+    #[serde(default)]
+    pub ref_count: u32,
 }
 
 /// Unix socket type.
@@ -403,6 +440,7 @@ pub fn parse_proc_net_tcp_reader<R: BufRead>(reader: R, is_ipv6: bool) -> Vec<Tc
         let local = parts[1];
         let remote = parts[2];
         let state_hex = parts[3];
+        let queue_str = parts[4]; // tx_queue:rx_queue
         let inode_str = parts[9];
 
         let (local_addr, local_port) = parse_addr_port(local, is_ipv6);
@@ -412,6 +450,8 @@ pub fn parse_proc_net_tcp_reader<R: BufRead>(reader: R, is_ipv6: bool) -> Vec<Tc
             .unwrap_or(TcpState::Unknown);
         let inode = inode_str.parse().unwrap_or(0);
 
+        let (tx_queue, rx_queue) = parse_queue_sizes(queue_str);
+
         connections.push(TcpConnection {
             local_addr,
             local_port,
@@ -420,6 +460,8 @@ pub fn parse_proc_net_tcp_reader<R: BufRead>(reader: R, is_ipv6: bool) -> Vec<Tc
             state,
             inode,
             is_ipv6,
+            tx_queue,
+            rx_queue,
         });
     }
 
@@ -494,6 +536,7 @@ pub fn parse_proc_net_unix_reader<R: BufRead>(reader: R) -> Vec<UnixSocket> {
         }
 
         // Format: Num RefCount Protocol Flags Type St Inode Path
+        let ref_count = u32::from_str_radix(parts[1], 16).unwrap_or(0);
         let socket_type = parts[4]
             .parse()
             .ok()
@@ -516,6 +559,7 @@ pub fn parse_proc_net_unix_reader<R: BufRead>(reader: R) -> Vec<UnixSocket> {
             socket_type,
             state,
             inode,
+            ref_count,
         });
     }
 
@@ -526,6 +570,17 @@ pub fn parse_proc_net_unix_reader<R: BufRead>(reader: R) -> Vec<UnixSocket> {
 #[cfg(test)]
 pub fn parse_proc_net_unix_content(content: &str) -> Vec<UnixSocket> {
     parse_proc_net_unix_reader(content.as_bytes())
+}
+
+/// Parse tx_queue:rx_queue field from /proc/net/tcp format (hex encoded).
+fn parse_queue_sizes(queue_field: &str) -> (u32, u32) {
+    let parts: Vec<&str> = queue_field.split(':').collect();
+    if parts.len() != 2 {
+        return (0, 0);
+    }
+    let tx = u32::from_str_radix(parts[0], 16).unwrap_or(0);
+    let rx = u32::from_str_radix(parts[1], 16).unwrap_or(0);
+    (tx, rx)
 }
 
 /// Parse address:port from /proc/net format (hex encoded).
@@ -664,12 +719,28 @@ mod tests {
         assert_eq!(connections[0].local_port, 53);
         assert_eq!(connections[0].state, TcpState::Listen);
         assert_eq!(connections[0].inode, 12345);
+        assert_eq!(connections[0].tx_queue, 0);
+        assert_eq!(connections[0].rx_queue, 0);
 
         // Second entry: established connection
         assert_eq!(connections[1].local_addr, "127.0.0.1");
         assert_eq!(connections[1].local_port, 3306);
         assert_eq!(connections[1].state, TcpState::Established);
         assert_eq!(connections[1].inode, 67890);
+        assert_eq!(connections[1].tx_queue, 0);
+        assert_eq!(connections[1].rx_queue, 0);
+    }
+
+    #[test]
+    fn test_parse_proc_net_tcp_content_preserves_queue_depth() {
+        let content = r#"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F90 0200007F:1770 01 00000010:00000020 00:00000000 00000000  1000        0 99999 1 0000000000000000 20 0 0 10 -1
+"#;
+
+        let connections = parse_proc_net_tcp_content(content, false);
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].tx_queue, 16);
+        assert_eq!(connections[0].rx_queue, 32);
     }
 
     #[test]
@@ -697,6 +768,7 @@ mod tests {
 
         assert_eq!(sockets[0].socket_type, UnixSocketType::Stream);
         assert_eq!(sockets[0].inode, 22222);
+        assert_eq!(sockets[0].ref_count, 2);
         assert_eq!(
             sockets[0].path,
             Some("/var/run/dbus/system_bus_socket".to_string())
@@ -704,6 +776,7 @@ mod tests {
 
         assert_eq!(sockets[1].socket_type, UnixSocketType::Dgram);
         assert_eq!(sockets[1].inode, 33333);
+        assert_eq!(sockets[1].ref_count, 2);
         assert_eq!(sockets[1].path, None);
     }
 

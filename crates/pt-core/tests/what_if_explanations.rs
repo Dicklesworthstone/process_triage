@@ -26,6 +26,7 @@ fn uniform_priors() -> Priors {
         tty_beta: BetaParams::new(1.0, 1.0),
         net_beta: BetaParams::new(1.0, 1.0),
         io_active_beta: Some(BetaParams::new(1.0, 1.0)),
+        queue_saturation_beta: None,
         hazard_gamma: None,
         competing_hazards: None,
     };
@@ -151,6 +152,7 @@ mod evidence_contribution {
             io_active: Some(false),
             state_flag: None,
             command_category: None,
+            queue_saturated: None,
         };
 
         let result = compute_posterior(&priors, &evidence).expect("posterior");
@@ -965,6 +967,7 @@ mod integration {
             io_active: Some(false),
             state_flag: None,
             command_category: None,
+            queue_saturated: None,
         };
 
         let result = compute_posterior(&priors, &evidence).expect("posterior");

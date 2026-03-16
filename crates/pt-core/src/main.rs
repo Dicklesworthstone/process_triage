@@ -2434,6 +2434,11 @@ fn precheck_label(check: &pt_core::plan::PreCheck) -> &'static str {
 struct DeepSignals {
     net_active: Option<bool>,
     io_active: Option<bool>,
+    queue_saturated: Option<bool>,
+    queue_lambda: Option<f64>,
+    queue_mu: Option<f64>,
+    queue_stall_probability: Option<f64>,
+    queue_backlog_sockets: Option<usize>,
 }
 
 #[cfg(feature = "ui")]
@@ -2460,6 +2465,10 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
 
         let mut map = HashMap::new();
         for record in result.processes {
+            let io_active = record
+                .io
+                .as_ref()
+                .map(|io| io.read_bytes > 0 || io.write_bytes > 0);
             let net_active = record.network.as_ref().map(|info| {
                 let counts = &info.socket_counts;
                 let total =
@@ -2470,16 +2479,21 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
                     || !info.udp_sockets.is_empty()
                     || !info.unix_sockets.is_empty()
             });
-            let io_active = record
-                .io
+            let queue_metrics = record
+                .network
                 .as_ref()
-                .map(|io| io.read_bytes > 0 || io.write_bytes > 0);
+                .map(|info| estimate_queue_metrics(info, io_active.unwrap_or(false)));
 
             map.insert(
                 record.pid.0,
                 DeepSignals {
                     net_active,
                     io_active,
+                    queue_saturated: queue_metrics.map(|metrics| metrics.saturated),
+                    queue_lambda: queue_metrics.map(|metrics| metrics.lambda),
+                    queue_mu: queue_metrics.map(|metrics| metrics.mu),
+                    queue_stall_probability: queue_metrics.map(|metrics| metrics.stall_probability),
+                    queue_backlog_sockets: queue_metrics.map(|metrics| metrics.backlog_sockets),
                 },
             );
         }
@@ -2489,6 +2503,68 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
     {
         eprintln!("run: deep scan not supported on this platform; using quick scan");
         None
+    }
+}
+
+#[cfg(feature = "ui")]
+#[derive(Debug, Clone, Copy)]
+struct QueueMetrics {
+    saturated: bool,
+    lambda: f64,
+    mu: f64,
+    stall_probability: f64,
+    backlog_sockets: usize,
+}
+
+#[cfg(feature = "ui")]
+fn estimate_queue_metrics(info: &pt_core::collect::NetworkInfo, io_active: bool) -> QueueMetrics {
+    const QUEUE_SATURATION_THRESHOLD: u32 = 4096;
+
+    let total_rx = info.total_rx_queue();
+    let total_tx = info.total_tx_queue();
+    let tcp_backlog = info
+        .tcp_connections
+        .iter()
+        .filter(|conn| conn.rx_queue > 0 || conn.tx_queue > 0)
+        .count();
+    let unix_pressure = info
+        .unix_sockets
+        .iter()
+        .filter(|sock| {
+            sock.state == pt_core::collect::UnixSocketState::Connected && sock.ref_count > 1
+        })
+        .count();
+    let backlog_sockets = tcp_backlog + unix_pressure;
+
+    let lambda = total_rx as f64 + unix_pressure as f64;
+    let mu = if io_active {
+        total_tx.max(1) as f64 + 1.0
+    } else {
+        total_tx as f64 * 0.25
+    };
+    let rho = if mu <= f64::EPSILON {
+        f64::INFINITY
+    } else {
+        lambda / mu
+    };
+    let stall_probability = if backlog_sockets == 0 {
+        0.0
+    } else if !rho.is_finite() || rho >= 1.0 {
+        1.0
+    } else {
+        rho.powf(backlog_sockets.max(1) as f64).clamp(0.0, 1.0)
+    };
+    let saturated = backlog_sockets > 0
+        && (stall_probability >= 0.5
+            || info.has_saturated_queue(QUEUE_SATURATION_THRESHOLD)
+            || !io_active);
+
+    QueueMetrics {
+        saturated,
+        lambda,
+        mu,
+        stall_probability,
+        backlog_sockets,
     }
 }
 
@@ -2546,6 +2622,7 @@ fn build_tui_rows(
             tty: Some(proc.has_tty()),
             net: deep.and_then(|d| d.net_active),
             io_active: deep.and_then(|d| d.io_active),
+            queue_saturated: deep.and_then(|d| d.queue_saturated),
             state_flag: state_to_flag(proc.state),
             command_category: None,
         };
@@ -2562,8 +2639,29 @@ fn build_tui_rows(
 
         // Populate rationale fields available in current context
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
-        let ledger =
+        let mut ledger =
             EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
+        if let Some(queue) = deep {
+            if let (Some(lambda), Some(mu), Some(stall_probability), Some(backlog_sockets)) = (
+                queue.queue_lambda,
+                queue.queue_mu,
+                queue.queue_stall_probability,
+                queue.queue_backlog_sockets,
+            ) {
+                if backlog_sockets > 0 {
+                    ledger.top_evidence.insert(
+                        0,
+                        format!(
+                            "queue stall λ≈{lambda:.1}, μ≈{mu:.1}, P(queue>L)≈{stall_probability:.2} across {backlog_sockets} socket(s)"
+                        ),
+                    );
+                    ledger.why_summary = format!(
+                        "{} Queueing view: λ≈{lambda:.1}, μ≈{mu:.1}, stall≈{stall_probability:.2}.",
+                        ledger.why_summary
+                    );
+                }
+            }
+        }
         let max_posterior = posterior_result
             .posterior
             .useful
@@ -3653,7 +3751,7 @@ fn run_bundle_create(
     encrypt: bool,
     passphrase_arg: &Option<String>,
 ) -> ExitCode {
-    use pt_bundle::{BundleWriter, FileType};
+    use pt_bundle::{BundleProvenanceSummary, BundleWriter, FileType};
     use pt_redact::ExportProfile;
 
     let session_id = SessionId::new();
@@ -3801,6 +3899,78 @@ fn run_bundle_create(
         if let Ok(content) = std::fs::read(&audit_path) {
             writer.add_file("logs/outcomes.jsonl", content, Some(FileType::Log));
         }
+    }
+
+    // Add provenance snapshot + audit sidecar if present and describe the export explicitly.
+    let provenance_snapshot_path = handle.dir.join("scan/provenance.json");
+    let provenance_audit_path = handle.dir.join("scan/provenance_audit.json");
+    if provenance_snapshot_path.exists() {
+        if let Ok(content) = std::fs::read(&provenance_snapshot_path) {
+            writer.add_file("scan/provenance.json", content, Some(FileType::Json));
+        }
+
+        let mut provenance_summary = BundleProvenanceSummary {
+            snapshot_path: "scan/provenance.json".to_string(),
+            audit_path: None,
+            provenance_schema_version: None,
+            privacy_version: None,
+            integrity_sha256: None,
+            node_count: None,
+            edge_count: None,
+            evidence_count: None,
+            redacted_evidence_count: None,
+            missing_or_conflicted_evidence_count: None,
+            warning_count: None,
+            persisted_sections: vec!["graph.snapshot".to_string()],
+            redacted_sections: Vec::new(),
+            omitted_sections: Vec::new(),
+            compatibility_notes: Vec::new(),
+        };
+
+        if provenance_audit_path.exists() {
+            match std::fs::read_to_string(&provenance_audit_path).ok().and_then(|raw| {
+                serde_json::from_str::<
+                    pt_core::session::snapshot_persist::ProvenancePersistenceAudit,
+                >(&raw)
+                .ok()
+            }) {
+                Some(audit) => {
+                    if let Ok(content) = std::fs::read(&provenance_audit_path) {
+                        writer.add_file(
+                            "scan/provenance_audit.json",
+                            content,
+                            Some(FileType::Json),
+                        );
+                    }
+                    provenance_summary.audit_path = Some("scan/provenance_audit.json".to_string());
+                    provenance_summary.provenance_schema_version =
+                        Some(audit.provenance_schema_version);
+                    provenance_summary.privacy_version = Some(audit.privacy_version);
+                    provenance_summary.integrity_sha256 = Some(audit.integrity_sha256);
+                    provenance_summary.node_count = Some(audit.node_count);
+                    provenance_summary.edge_count = Some(audit.edge_count);
+                    provenance_summary.evidence_count = Some(audit.evidence_count);
+                    provenance_summary.redacted_evidence_count =
+                        Some(audit.redacted_evidence_count);
+                    provenance_summary.missing_or_conflicted_evidence_count =
+                        Some(audit.missing_or_conflicted_evidence_count);
+                    provenance_summary.warning_count = Some(audit.warning_count);
+                    provenance_summary.persisted_sections = audit.persisted_sections;
+                    provenance_summary.redacted_sections = audit.redacted_sections;
+                    provenance_summary.omitted_sections = audit.omitted_sections;
+                    provenance_summary.compatibility_notes = audit.migration_notes;
+                }
+                None => provenance_summary.compatibility_notes.push(
+                    "provenance audit sidecar was present but unreadable; bundle consumers should treat provenance compatibility details as partial".to_string(),
+                ),
+            }
+        } else {
+            provenance_summary.compatibility_notes.push(
+                "bundle includes provenance snapshot without provenance audit sidecar; omission/redaction semantics may be incomplete".to_string(),
+            );
+        }
+
+        writer = writer.with_provenance(provenance_summary);
     }
 
     // Optionally include telemetry data
@@ -4016,6 +4186,26 @@ fn run_bundle_inspect(
     let description = reader.manifest().description.clone();
     let file_count = reader.manifest().file_count();
     let total_bytes = reader.manifest().total_bytes();
+    let provenance = reader.provenance().map(|p| {
+        serde_json::json!({
+            "snapshot_path": p.snapshot_path,
+            "audit_path": p.audit_path,
+            "provenance_schema_version": p.provenance_schema_version,
+            "privacy_version": p.privacy_version,
+            "integrity_sha256": p.integrity_sha256,
+            "node_count": p.node_count,
+            "edge_count": p.edge_count,
+            "evidence_count": p.evidence_count,
+            "redacted_evidence_count": p.redacted_evidence_count,
+            "missing_or_conflicted_evidence_count": p.missing_or_conflicted_evidence_count,
+            "warning_count": p.warning_count,
+            "persisted_sections": p.persisted_sections,
+            "redacted_sections": p.redacted_sections,
+            "omitted_sections": p.omitted_sections,
+            "compatibility_notes": p.compatibility_notes,
+        })
+    });
+    let provenance_for_output = provenance.clone();
     let files: Vec<_> = reader
         .manifest()
         .files
@@ -4058,6 +4248,7 @@ fn run_bundle_inspect(
             "description": description,
             "file_count": file_count,
             "total_bytes": total_bytes,
+            "provenance": provenance_for_output,
         },
         "files": files,
         "verification": verification,
@@ -4070,6 +4261,16 @@ fn run_bundle_inspect(
             println!("  Created: {}", created_at);
             println!("  Profile: {}", export_profile);
             println!("  Files: {} ({} bytes)", file_count, total_bytes);
+            if let Some(provenance) = provenance.as_ref() {
+                println!(
+                    "  Provenance: {}{}",
+                    provenance["snapshot_path"].as_str().unwrap_or("present"),
+                    provenance["audit_path"]
+                        .as_str()
+                        .map(|path| format!(" (audit: {})", path))
+                        .unwrap_or_default()
+                );
+            }
             if let Some(ref v) = verification {
                 if v["verified"].as_bool() == Some(true) {
                     println!("  Verification: PASSED");
@@ -10491,6 +10692,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                         io_active: None,
                         state_flag: state_to_flag(proc.state),
                         command_category: None,
+                        queue_saturated: None,
                     };
 
                     let posterior_result = match compute_posterior(&priors, &evidence) {
@@ -11114,6 +11316,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             io_active: None,
             state_flag: state_to_flag(proc.state),
             command_category: None,
+            queue_saturated: None,
         };
 
         let mut match_ctx = ProcessMatchContext::with_comm(&proc.comm);
@@ -12264,6 +12467,7 @@ fn build_process_explanation(
         io_active: None, // Would need /proc inspection
         state_flag: state_to_flag(proc.state),
         command_category: None, // Would need category classifier
+        queue_saturated: None,
     };
 
     // Compute posterior
@@ -16038,6 +16242,7 @@ fn evaluate_watch_candidate(
         io_active: None,
         state_flag: state_to_flag(proc.state),
         command_category: None,
+        queue_saturated: None,
     };
 
     let posterior_result = compute_posterior(priors, &evidence).ok()?;
@@ -16317,6 +16522,73 @@ mod watch_tests {
             event.get("event").and_then(|v| v.as_str()),
             Some("baseline_anomaly")
         );
+    }
+}
+
+#[cfg(all(test, feature = "ui"))]
+mod queue_metrics_tests {
+    use super::*;
+    use pt_core::collect::{
+        NetworkInfo, SocketCounts, TcpConnection, TcpState, UnixSocket, UnixSocketState,
+        UnixSocketType,
+    };
+
+    #[test]
+    fn estimate_queue_metrics_marks_idle_backlog_as_saturated() {
+        let info = NetworkInfo {
+            socket_counts: SocketCounts {
+                tcp: 1,
+                ..SocketCounts::default()
+            },
+            tcp_connections: vec![TcpConnection {
+                local_addr: "127.0.0.1".to_string(),
+                local_port: 8080,
+                remote_addr: "127.0.0.1".to_string(),
+                remote_port: 54000,
+                state: TcpState::Established,
+                inode: 42,
+                is_ipv6: false,
+                tx_queue: 16,
+                rx_queue: 8192,
+            }],
+            udp_sockets: Vec::new(),
+            listen_ports: Vec::new(),
+            unix_sockets: Vec::new(),
+        };
+
+        let metrics = estimate_queue_metrics(&info, false);
+        assert!(metrics.saturated);
+        assert_eq!(metrics.backlog_sockets, 1);
+        assert_eq!(metrics.lambda, 8192.0);
+        assert_eq!(metrics.mu, 4.0);
+        assert_eq!(metrics.stall_probability, 1.0);
+    }
+
+    #[test]
+    fn estimate_queue_metrics_counts_connected_unix_pressure() {
+        let info = NetworkInfo {
+            socket_counts: SocketCounts {
+                unix: 1,
+                ..SocketCounts::default()
+            },
+            tcp_connections: Vec::new(),
+            udp_sockets: Vec::new(),
+            listen_ports: Vec::new(),
+            unix_sockets: vec![UnixSocket {
+                socket_type: UnixSocketType::Stream,
+                path: Some("/tmp/agent.sock".to_string()),
+                state: UnixSocketState::Connected,
+                inode: 7,
+                ref_count: 2,
+            }],
+        };
+
+        let metrics = estimate_queue_metrics(&info, true);
+        assert_eq!(metrics.backlog_sockets, 1);
+        assert_eq!(metrics.lambda, 1.0);
+        assert_eq!(metrics.mu, 2.0);
+        assert_eq!(metrics.stall_probability, 0.5);
+        assert!(metrics.saturated);
     }
 }
 

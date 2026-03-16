@@ -356,6 +356,7 @@ fn build_evidence(proc: &ProcessRecord, deep: Option<&DeepSignalRecord>) -> Evid
         io_active: deep.and_then(|d| d.io_active),
         state_flag,
         command_category: None,
+        queue_saturated: None,
     }
 }
 

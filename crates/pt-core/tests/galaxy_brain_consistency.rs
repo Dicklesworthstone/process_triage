@@ -59,6 +59,7 @@ fn create_test_evidence_abandoned() -> Evidence {
         io_active: Some(false),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     }
 }
 
@@ -72,6 +73,7 @@ fn create_test_evidence_useful() -> Evidence {
         io_active: Some(true),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     }
 }
 
@@ -1246,6 +1248,7 @@ fn test_galaxy_brain_multiple_scenarios_consistency() {
                 io_active: Some(false),
                 state_flag: None,
                 command_category: None,
+            queue_saturated: None,
             },
         ),
         (
@@ -1259,6 +1262,7 @@ fn test_galaxy_brain_multiple_scenarios_consistency() {
                 io_active: Some(true),
                 state_flag: None,
                 command_category: None,
+            queue_saturated: None,
             },
         ),
         (
@@ -1272,6 +1276,7 @@ fn test_galaxy_brain_multiple_scenarios_consistency() {
                 io_active: Some(false),
                 state_flag: None,
                 command_category: None,
+            queue_saturated: None,
             },
         ),
     ];

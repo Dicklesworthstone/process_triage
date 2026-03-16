@@ -2199,6 +2199,7 @@ fn default_class_params() -> ClassParams {
         tty_beta: BetaParams::new(1.0, 1.0),
         net_beta: BetaParams::new(1.0, 1.0),
         io_active_beta: None,
+        queue_saturation_beta: None,
         hazard_gamma: None,
         competing_hazards: None,
     }

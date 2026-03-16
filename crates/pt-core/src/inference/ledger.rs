@@ -209,6 +209,7 @@ pub fn get_glyph(feature: &str) -> char {
         "tty" => '\u{1F5A5}',              // desktop computer - terminal
         "net" => '\u{1F310}',              // globe - network activity
         "io_active" => '\u{1F4BE}',        // floppy - I/O activity
+        "queue_saturated" => '\u{1F6A6}',  // traffic light - queue backpressure
         "state_flag" => '\u{1F6A9}',       // flag - process state
         "command_category" => '\u{1F3F7}', // label - command type
         "signature_match" => '\u{1F50D}',  // magnifying glass
@@ -226,6 +227,7 @@ pub fn default_glyph_map() -> std::collections::HashMap<String, char> {
         "tty",
         "net",
         "io_active",
+        "queue_saturated",
         "state_flag",
         "command_category",
         "signature_match",
@@ -260,6 +262,7 @@ pub fn build_process_explanation(proc: &ProcessRecord, priors: &Priors) -> serde
         io_active: None,
         state_flag,
         command_category: None, // Needs category mapping
+        queue_saturated: None,
     };
 
     // 2. Compute posterior
@@ -574,6 +577,7 @@ mod tests {
         assert_eq!(get_glyph("runtime"), '\u{23F1}');
         assert_eq!(get_glyph("orphan"), '\u{1F47B}');
         assert_eq!(get_glyph("prior"), '\u{1F3B2}');
+        assert_eq!(get_glyph("queue_saturated"), '\u{1F6A6}');
         // Unknown features still return '?'
         assert_eq!(get_glyph(""), '?');
         assert_eq!(get_glyph("unknown_feature"), '?');
@@ -586,6 +590,7 @@ mod tests {
         assert_eq!(map.get("cpu"), Some(&'\u{1F4BB}'));
         assert_eq!(map.get("runtime"), Some(&'\u{23F1}'));
         assert_eq!(map.get("orphan"), Some(&'\u{1F47B}'));
+        assert_eq!(map.get("queue_saturated"), Some(&'\u{1F6A6}'));
         assert!(!map.contains_key("unknown"));
     }
 

@@ -131,6 +131,7 @@ fn to_evidence(fix: &EvidenceFixture) -> Evidence {
         io_active: fix.io_active,
         state_flag: fix.state_flag,
         command_category: fix.command_category,
+            queue_saturated: None,
     }
 }
 
@@ -322,6 +323,7 @@ fn test_monotonic_runtime_increases_abandoned() {
         io_active: Some(false),
         state_flag: None,
         command_category: None,
+            queue_saturated: None,
     };
 
     let long = Evidence {

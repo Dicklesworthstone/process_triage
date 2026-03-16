@@ -272,6 +272,7 @@ mod tests {
             io_active: Some(true),
             state_flag: None,
             command_category: None,
+            queue_saturated: None,
         }
     }
 

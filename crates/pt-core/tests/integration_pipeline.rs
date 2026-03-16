@@ -165,6 +165,7 @@ fn candidates_sorted_by_posterior_not_pid_order() {
             io_active: Some(false),
             state_flag: state_flag(proc.state),
             command_category: None,
+            queue_saturated: None,
         };
         let posterior = compute_posterior(&priors, &evidence)
             .expect("posterior computation failed")

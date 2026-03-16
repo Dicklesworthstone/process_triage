@@ -29,6 +29,10 @@ pub struct Evidence {
     pub io_active: Option<bool>,
     pub state_flag: Option<usize>,
     pub command_category: Option<usize>,
+    /// Queue saturation signal from queueing-theoretic stall detection.
+    /// `true` when at least one socket has a deep rx/tx queue, indicating
+    /// the process may be stalled or deadlocked (useful-bad evidence).
+    pub queue_saturated: Option<bool>,
 }
 
 /// Per-class scores for the 4-state model.
@@ -209,6 +213,36 @@ pub fn compute_posterior(
         log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "io_active".to_string(),
+            log_likelihood: term,
+        });
+    }
+
+    if let Some(queue_sat) = evidence.queue_saturated {
+        let term = ClassScores {
+            useful: log_lik_optional_beta_bernoulli(
+                queue_sat,
+                priors.classes.useful.queue_saturation_beta.as_ref(),
+                "queue_saturated",
+            )?,
+            useful_bad: log_lik_optional_beta_bernoulli(
+                queue_sat,
+                priors.classes.useful_bad.queue_saturation_beta.as_ref(),
+                "queue_saturated",
+            )?,
+            abandoned: log_lik_optional_beta_bernoulli(
+                queue_sat,
+                priors.classes.abandoned.queue_saturation_beta.as_ref(),
+                "queue_saturated",
+            )?,
+            zombie: log_lik_optional_beta_bernoulli(
+                queue_sat,
+                priors.classes.zombie.queue_saturation_beta.as_ref(),
+                "queue_saturated",
+            )?,
+        };
+        log_unnormalized = add_scores(log_unnormalized, term);
+        evidence_terms.push(EvidenceTerm {
+            feature: "queue_saturated".to_string(),
             log_likelihood: term,
         });
     }
@@ -539,6 +573,7 @@ mod tests {
             tty_beta: BetaParams::new(1.0, 1.0),
             net_beta: BetaParams::new(1.0, 1.0),
             io_active_beta: Some(BetaParams::new(1.0, 1.0)),
+            queue_saturation_beta: None,
             hazard_gamma: None,
             competing_hazards: None,
         };
@@ -961,6 +996,7 @@ mod tests {
             tty_beta: BetaParams::new(1.0, 1.0),
             net_beta: BetaParams::new(1.0, 1.0),
             io_active_beta: None,
+            queue_saturation_beta: None,
             hazard_gamma: None,
             competing_hazards: None,
         };
@@ -1163,6 +1199,7 @@ mod tests {
             io_active: Some(false),
             state_flag: None,
             command_category: None,
+            queue_saturated: None,
         };
         let result = compute_posterior(&priors, &evidence).expect("posterior");
         // 7 evidence terms: prior + cpu + runtime + orphan + tty + net + io_active
@@ -1172,6 +1209,28 @@ mod tests {
             + result.posterior.abandoned
             + result.posterior.zombie;
         assert!(approx_eq(sum, 1.0, 1e-10));
+    }
+
+    #[test]
+    fn queue_saturated_evidence_boosts_useful_bad_when_configured() {
+        let mut priors = base_priors();
+        priors.classes.useful.queue_saturation_beta = Some(BetaParams::new(1.0, 6.0));
+        priors.classes.useful_bad.queue_saturation_beta = Some(BetaParams::new(6.0, 1.0));
+        priors.classes.abandoned.queue_saturation_beta = Some(BetaParams::new(2.0, 3.0));
+        priors.classes.zombie.queue_saturation_beta = Some(BetaParams::new(1.0, 4.0));
+
+        let evidence = Evidence {
+            queue_saturated: Some(true),
+            ..Evidence::default()
+        };
+
+        let result = compute_posterior(&priors, &evidence).expect("posterior");
+        assert!(result.posterior.useful_bad > result.posterior.useful);
+        assert!(result.posterior.useful_bad > result.posterior.abandoned);
+        assert!(result
+            .evidence_terms
+            .iter()
+            .any(|term| term.feature == "queue_saturated"));
     }
 
     #[test]

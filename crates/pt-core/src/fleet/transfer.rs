@@ -324,6 +324,15 @@ fn merge_class_params(
                     (None, Some(i)) => Some(i.clone()),
                     (None, None) => None,
                 },
+                queue_saturation_beta: match (
+                    &local.queue_saturation_beta,
+                    &incoming.queue_saturation_beta,
+                ) {
+                    (Some(l), Some(i)) => Some(merge_beta_params(l, i, wl, wi)?),
+                    (Some(l), None) => Some(l.clone()),
+                    (None, Some(i)) => Some(i.clone()),
+                    (None, None) => None,
+                },
                 hazard_gamma: local.hazard_gamma.clone(),
                 competing_hazards: local.competing_hazards.clone(),
             })

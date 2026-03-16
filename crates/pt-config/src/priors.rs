@@ -79,6 +79,12 @@ pub struct ClassParams {
     #[serde(default)]
     pub io_active_beta: Option<BetaParams>,
 
+    /// Beta prior for queue saturation (queueing-theoretic stall detection).
+    /// When present, a Beta-Bernoulli likelihood is computed from the boolean
+    /// `queue_saturated` evidence (true = at least one socket has a deep queue).
+    #[serde(default)]
+    pub queue_saturation_beta: Option<BetaParams>,
+
     #[serde(default)]
     pub hazard_gamma: Option<GammaParams>,
 

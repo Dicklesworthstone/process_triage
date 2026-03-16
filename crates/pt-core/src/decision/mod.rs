@@ -3,6 +3,7 @@
 pub mod active_sensing;
 pub mod alpha_investing;
 pub mod causal_interventions;
+pub mod causal_snapshot;
 pub mod composite_test;
 pub mod contextual_bandits;
 pub mod cvar;
@@ -40,6 +41,11 @@ pub use active_sensing::{
 };
 pub use alpha_investing::{
     AlphaInvestingPolicy, AlphaInvestingStore, AlphaUpdate, AlphaWealthState,
+};
+pub use causal_snapshot::{
+    check_causal_safety, CausalCheckResult, CausalViolation, ConsistentCut, CutValidity,
+    DependencyType, HostSnapshot, Marker, RemoteDependency, SnapshotConfig, SnapshotCoordinator,
+    SnapshotState,
 };
 pub use causal_interventions::{
     apply_outcome, apply_outcomes, expected_recovery, expected_recovery_by_action,

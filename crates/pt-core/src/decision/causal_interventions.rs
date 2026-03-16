@@ -644,6 +644,7 @@ mod tests {
                 comment: None,
             },
             io_active_beta: None,
+            queue_saturation_beta: None,
             hazard_gamma: None,
             competing_hazards: None,
         }
