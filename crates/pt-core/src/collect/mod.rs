@@ -31,12 +31,14 @@ mod deep_scan;
 #[cfg(target_os = "linux")]
 pub mod gpu;
 pub mod incremental;
+pub mod lineage_collector;
 #[cfg(target_os = "linux")]
 pub mod network;
 pub mod prober;
 pub mod proc_parsers;
 pub mod protected;
 mod quick_scan;
+pub mod resource_collector;
 pub mod systemd;
 #[cfg(target_os = "linux")]
 pub mod tick_delta;
@@ -78,6 +80,7 @@ pub use proc_parsers::{
 pub use quick_scan::{
     parse_ps_output_synthetic_linux, quick_scan, QuickScanError, QuickScanOptions,
 };
+pub use resource_collector::collect_local_resource_evidence;
 pub use tool_runner::{
     run_tool, run_tools_parallel, ToolConfig, ToolError, ToolOutput, ToolRunner, ToolRunnerBuilder,
     ToolSpec, DEFAULT_BUDGET_MS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_PARALLEL,
@@ -142,10 +145,14 @@ pub use gpu::{
     GpuType, ProcessGpuUsage,
 };
 
+// Re-export lineage collector types
+#[cfg(target_os = "linux")]
+pub use lineage_collector::collect_lineage_for_pid;
+
 // Re-export workspace resolver types
-pub use workspace_resolver::{find_repo_root, read_head_state};
 #[cfg(target_os = "linux")]
 pub use workspace_resolver::resolve_workspace_for_pid;
+pub use workspace_resolver::{find_repo_root, read_head_state};
 
 // Re-export incremental scanning types
 pub use incremental::{

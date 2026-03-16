@@ -232,7 +232,10 @@ pub fn read_head_state(repo_root: &Path) -> Option<HeadState> {
                 })
             } else {
                 Some(HeadState::Unreadable {
-                    reason: format!("unexpected HEAD content: {}", &trimmed[..40.min(trimmed.len())]),
+                    reason: format!(
+                        "unexpected HEAD content: {}",
+                        &trimmed[..40.min(trimmed.len())]
+                    ),
                 })
             }
         }
@@ -362,16 +365,11 @@ mod tests {
         ));
         assert_eq!(perm, PathResolutionError::PermissionDenied);
 
-        let nf = io_error_to_resolution(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "gone",
-        ));
+        let nf = io_error_to_resolution(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
         assert_eq!(nf, PathResolutionError::NotFound);
 
-        let other = io_error_to_resolution(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "something",
-        ));
+        let other =
+            io_error_to_resolution(std::io::Error::new(std::io::ErrorKind::Other, "something"));
         match other {
             PathResolutionError::IoError { message } => assert!(message.contains("something")),
             _ => panic!("expected IoError variant"),

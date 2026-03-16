@@ -24,7 +24,9 @@ use super::proc_parsers::{
     parse_schedstat, parse_schedstat_content, parse_statm, parse_statm_content, parse_wchan,
     CgroupInfo, FdInfo, IoStats, MemStats, SchedInfo, SchedStats,
 };
+use super::resource_collector::collect_local_resource_evidence;
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
+use pt_common::RawResourceEvidence;
 use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -162,6 +164,10 @@ pub struct DeepScanRecord {
     /// File descriptor information.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fd: Option<FdInfo>,
+
+    /// File-backed shared-resource evidence derived from open descriptors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_resource_evidence: Vec<RawResourceEvidence>,
 
     /// Cgroup information.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -591,6 +597,7 @@ fn parse_probed_process(
     });
 
     let fd = parse_fd(pid); // fd is a directory, still sync for now
+    let local_resource_evidence = collect_local_resource_evidence(pid, fd.as_ref());
     let wchan = parse_wchan(pid); // wchan might be better probed but keep sync for now
     let network = network_snapshot.get_process_info(pid);
 
@@ -611,6 +618,7 @@ fn parse_probed_process(
         sched,
         mem,
         fd,
+        local_resource_evidence,
         cgroup,
         wchan,
         network,
@@ -711,6 +719,7 @@ fn scan_process(
     let sched = parse_sched(pid);
     let mem = parse_statm(pid);
     let fd = parse_fd(pid);
+    let local_resource_evidence = collect_local_resource_evidence(pid, fd.as_ref());
     let cgroup = parse_cgroup(pid);
     let wchan = parse_wchan(pid);
     let network = network_snapshot.get_process_info(pid);
@@ -739,6 +748,7 @@ fn scan_process(
         sched,
         mem,
         fd,
+        local_resource_evidence,
         cgroup,
         wchan,
         network,
