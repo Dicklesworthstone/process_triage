@@ -152,18 +152,18 @@ Each process's network I/O is modeled as an M/M/1 queue:
 For a stable M/M/1 queue in steady state:
 
 ```
-P(Queue > L) = rho^L
+P(N >= L) = rho^L
 ```
 
-When `rho >= 1`, the queue is unstable: `P(Queue > L) = 1` for all `L >= 0`.
+When `rho >= 1`, the queue is unstable: `P(N >= L) = 1` for all `L >= 0`.
 
 **Proof:** In steady state, the M/M/1 queue has geometric distribution
 `P(N = k) = (1 - rho) * rho^k` for `k = 0, 1, 2, ...`.  Therefore:
 
 ```
-P(N > L) = sum_{k=L+1}^{inf} (1-rho) rho^k
-         = (1-rho) rho^{L+1} / (1-rho)
-         = rho^{L+1}
+P(N >= L) = sum_{k=L}^{inf} (1-rho) rho^k
+          = (1-rho) rho^L / (1-rho)
+          = rho^L
 ```
 
 The implementation uses `rho^L` where `L` is a configurable abstract queue-length

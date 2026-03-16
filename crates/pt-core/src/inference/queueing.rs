@@ -21,7 +21,7 @@
 //!
 //! # Stall Probability
 //!
-//! For an M/M/1 queue in steady state: `P(Queue > L) = rho^L`.
+//! For an M/M/1 queue in steady state: `P(N >= L) = rho^L`.
 //! When mu → 0, this probability approaches 1.
 
 use serde::{Deserialize, Serialize};
@@ -189,7 +189,7 @@ impl QueueStallDetector {
             && rho >= self.config.rho_threshold
             && max_smoothed > self.config.saturation_threshold as f64;
 
-        // M/M/1 steady-state: P(Queue > L) = rho^L.
+        // M/M/1 steady-state: P(N >= L) = rho^L.
         // L is an abstract queue-length parameter (not bytes) kept small
         // so the probability remains informative.
         let l = self.config.probability_queue_length.min(1024);
@@ -235,7 +235,7 @@ pub struct QueueStallResult {
     pub is_saturated: bool,
     /// Whether the detector declares a stall (high rho + deep queue + enough samples).
     pub is_stalled: bool,
-    /// M/M/1 steady-state probability P(Queue > L).
+    /// M/M/1 steady-state probability P(N >= L).
     pub stall_probability: f64,
     /// Number of observations processed.
     pub sample_count: usize,
