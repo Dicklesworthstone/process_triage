@@ -8,6 +8,7 @@ pub mod bocpd;
 pub mod compound_poisson;
 pub mod confidence_viz;
 pub mod conformal;
+pub mod conformal_robot;
 pub mod copula;
 pub mod ctw;
 pub mod drift_membrane;
@@ -67,6 +68,11 @@ pub use conformal::{
     AdaptiveConformalRegressor, BlockedConformalRegressor, ConformalClassifier, ConformalConfig,
     ConformalError, ConformalEvidence, ConformalInterval, ConformalPredictionSet,
     ConformalRegressor,
+};
+pub use conformal_robot::{
+    CalibrationHealth, CalibrationSample, CalibrationStore, ClassPosteriors, ConfidenceCertificate,
+    ConformalRobotConfig, ConformalRobotGate, DriftCheck, HealthLevel, PredictionSetSnapshot,
+    RobotGateResult,
 };
 pub use copula::{summarize_copula_dependence, CopulaConfig, CopulaSummary};
 pub use ctw::{
