@@ -40,6 +40,7 @@ pub mod prober;
 pub mod proc_parsers;
 pub mod protected;
 mod quick_scan;
+pub mod provenance_continuity;
 pub mod resource_collector;
 pub mod shared_resource_graph;
 pub mod systemd;
@@ -82,6 +83,10 @@ pub use proc_parsers::{
 };
 pub use quick_scan::{
     parse_ps_output_synthetic_linux, quick_scan, QuickScanError, QuickScanOptions,
+};
+pub use provenance_continuity::{
+    compute_provenance_delta, pid_continuity, summarize_delta, BlastRadiusDelta, PidContinuity,
+    ProvenanceDelta, ResourceChange,
 };
 pub use resource_collector::collect_local_resource_evidence;
 pub use shared_resource_graph::{BlastRadius, SharedResource, SharedResourceGraph};
