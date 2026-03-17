@@ -10539,6 +10539,12 @@ fn generate_single_line_rationale(candidate: &serde_json::Value) -> String {
         .get("cpu_percent")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
+    let voi_hint = candidate
+        .get("voi")
+        .and_then(|v| v.get("recommended_probe"))
+        .and_then(|v| v.as_str())
+        .map(|probe| format!(", probe={probe}"))
+        .unwrap_or_default();
 
     // Extract top evidence factor if available
     let top_factor = candidate
@@ -10552,18 +10558,18 @@ fn generate_single_line_rationale(candidate: &serde_json::Value) -> String {
     // Build concise rationale
     if cpu_pct < 0.1 && memory_mb > 100 {
         format!(
-            "{} for {} ({}% conf), idle+{}MB, {}",
-            classification, age_human, score, memory_mb, top_factor
+            "{} for {} ({}% conf), idle+{}MB, {}{}",
+            classification, age_human, score, memory_mb, top_factor, voi_hint
         )
     } else if cpu_pct < 0.1 {
         format!(
-            "{} for {} ({}% conf), idle, {}",
-            classification, age_human, score, top_factor
+            "{} for {} ({}% conf), idle, {}{}",
+            classification, age_human, score, top_factor, voi_hint
         )
     } else {
         format!(
-            "{} for {} ({}% conf), {:.1}% CPU, {}",
-            classification, age_human, score, cpu_pct, top_factor
+            "{} for {} ({}% conf), {:.1}% CPU, {}{}",
+            classification, age_human, score, cpu_pct, top_factor, voi_hint
         )
     }
 }
@@ -11380,6 +11386,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     };
 
     let _current_cpu_pct: f64 = processes_to_infer.iter().map(|p| p.cpu_percent).sum();
+    let probe_cost_model = pt_core::decision::ProbeCostModel::default();
+    let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
 
     let candidates_evaluated = processes_to_infer.len();
     let total_processes = candidates_evaluated as u64;
@@ -11536,6 +11544,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 Ok(d) => d,
                 Err(_) => continue, // Skip processes that fail decision
             };
+        let sequential_probe = pt_core::decision::decide_sequential(
+            &posterior_result.posterior,
+            &decision_policy,
+            &feasibility,
+            &probe_cost_model,
+            Some(&deep_scan_probe),
+        )
+        .ok();
         decision_outcome.rationale.has_known_signature = Some(signature_match.is_some());
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
         decision_outcome.rationale.category = signature_category.clone();
@@ -11675,6 +11691,19 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         // Calculate a composite score (0-100) based on max posterior
         let score = (max_posterior * 100.0).round() as u32;
+        let voi_summary = sequential_probe.as_ref().map(|(decision, ledger)| {
+            serde_json::json!({
+                "should_probe": decision.should_probe,
+                "recommended_probe": decision.recommended_probe.map(|probe| probe.name().to_string()),
+                "esn_estimate": decision.esn_estimate,
+                "rationale": decision.rationale,
+                "ledger": ledger.iter().map(|entry| serde_json::json!({
+                    "probe": entry.probe.name(),
+                    "voi": entry.voi,
+                    "expected_loss_after": entry.expected_loss_after,
+                })).collect::<Vec<_>>(),
+            })
+        });
 
         let predictions = if args.include_predictions {
             let mut predictions = build_stub_predictions(proc);
@@ -11753,6 +11782,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "recommendation": recommended_action.to_uppercase(),
             "recommended_action": recommended_action,
             "action_rationale": action_rationale,
+            "voi": voi_summary,
             "expected_loss": decision_outcome.expected_loss.iter()
                 .map(|el| serde_json::json!({
                     "action": format!("{:?}", el.action),
