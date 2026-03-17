@@ -365,10 +365,7 @@ impl ConformalRobotGate {
 
     /// Check for calibration drift (exchangeability violation).
     pub fn check_drift(&self) -> DriftCheck {
-        let window = self
-            .config
-            .drift_window
-            .min(self.recent_outcomes.len());
+        let window = self.config.drift_window.min(self.recent_outcomes.len());
         if window == 0 {
             return DriftCheck {
                 drift_detected: false,
@@ -484,7 +481,12 @@ fn apply_small_sample_correction(
 mod tests {
     use super::*;
 
-    fn sample_posteriors(useful: f64, useful_bad: f64, abandoned: f64, zombie: f64) -> ClassPosteriors {
+    fn sample_posteriors(
+        useful: f64,
+        useful_bad: f64,
+        abandoned: f64,
+        zombie: f64,
+    ) -> ClassPosteriors {
         ClassPosteriors {
             useful,
             useful_bad,

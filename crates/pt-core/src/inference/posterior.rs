@@ -75,6 +75,52 @@ pub struct PosteriorResult {
     pub evidence_terms: Vec<EvidenceTerm>,
 }
 
+/// Apply additional derived log-likelihood terms to an existing posterior.
+///
+/// This keeps higher-level features in the same evidence ledger instead of
+/// forcing downstream callers to bolt on opaque score tweaks.
+pub fn apply_evidence_terms(
+    base: &PosteriorResult,
+    extra_terms: impl IntoIterator<Item = EvidenceTerm>,
+) -> Result<PosteriorResult, PosteriorError> {
+    let extra_terms: Vec<EvidenceTerm> = extra_terms.into_iter().collect();
+    if extra_terms.is_empty() {
+        return Ok(base.clone());
+    }
+
+    let mut log_unnormalized = base.log_posterior;
+    for term in &extra_terms {
+        log_unnormalized = add_scores(log_unnormalized, term.log_likelihood);
+    }
+
+    let log_vec = log_unnormalized.as_vec();
+    let log_post_vec = normalize_log_probs(&log_vec);
+    if log_post_vec.iter().any(|v| v.is_nan()) {
+        return Err(PosteriorError::InvalidEvidence {
+            field: "posterior",
+            message: "normalization with derived evidence produced NaN".to_string(),
+        });
+    }
+
+    let log_posterior = ClassScores::from_vec(&log_post_vec);
+    let posterior = ClassScores::from_vec(&[
+        log_post_vec[0].exp(),
+        log_post_vec[1].exp(),
+        log_post_vec[2].exp(),
+        log_post_vec[3].exp(),
+    ]);
+
+    let mut evidence_terms = base.evidence_terms.clone();
+    evidence_terms.extend(extra_terms);
+
+    Ok(PosteriorResult {
+        posterior,
+        log_posterior,
+        log_odds_abandoned_useful: log_posterior.abandoned - log_posterior.useful,
+        evidence_terms,
+    })
+}
+
 /// Errors raised during posterior computation.
 #[derive(Debug, Error)]
 pub enum PosteriorError {
@@ -749,6 +795,41 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let deser: PosteriorResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, deser);
+    }
+
+    #[test]
+    fn apply_evidence_terms_shifts_posterior() {
+        let priors = base_priors();
+        let base = compute_posterior(&priors, &Evidence::default()).expect("base posterior");
+        let adjusted = apply_evidence_terms(
+            &base,
+            [EvidenceTerm {
+                feature: "derived_provenance".to_string(),
+                log_likelihood: ClassScores {
+                    useful: -0.8,
+                    useful_bad: -0.2,
+                    abandoned: 0.9,
+                    zombie: 0.1,
+                },
+            }],
+        )
+        .expect("adjusted posterior");
+
+        assert!(adjusted.posterior.abandoned > base.posterior.abandoned);
+        assert!(adjusted.posterior.useful < base.posterior.useful);
+        assert_eq!(adjusted.evidence_terms.len(), base.evidence_terms.len() + 1);
+        assert_eq!(
+            adjusted.evidence_terms.last().map(|t| t.feature.as_str()),
+            Some("derived_provenance")
+        );
+    }
+
+    #[test]
+    fn apply_evidence_terms_empty_is_identity() {
+        let priors = base_priors();
+        let base = compute_posterior(&priors, &Evidence::default()).expect("base posterior");
+        let adjusted = apply_evidence_terms(&base, std::iter::empty()).expect("identity");
+        assert_eq!(adjusted, base);
     }
 
     // ── PosteriorError ──────────────────────────────────────────────

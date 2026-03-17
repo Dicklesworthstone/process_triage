@@ -275,7 +275,7 @@ fn supervision_impact(lineage: Option<&RawLineageEvidence>) -> (bool, f64, Optio
         ProvenanceConfidence::Unknown => 0.35,
     };
 
-    let score: f64 = (base * confidence_multiplier).clamp(0.0, 1.0);
+    let score: f64 = (base * confidence_multiplier).clamp(0.0_f64, 1.0_f64);
     let reason = Some(format!(
         "{} supervision ({:?} confidence)",
         supervisor.kind.slug(),

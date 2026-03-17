@@ -10,9 +10,12 @@
 use clap::parser::ValueSource;
 use clap::FromArgMatches;
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use pt_common::{
+    normalize_lineage, OutputFormat, OwnershipState, ProvenanceConfidence, RawLineageEvidence,
+    SessionId, SCHEMA_VERSION,
+};
 #[cfg(feature = "ui")]
 use pt_common::{IdentityQuality, ProcessIdentity};
-use pt_common::{OutputFormat, SessionId, SCHEMA_VERSION};
 use pt_core::calibrate::{validation::ValidationEngine, CalibrationError};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::collect::protected::ProtectedFilter;
@@ -2971,21 +2974,306 @@ fn build_tui_rows(
 }
 
 #[cfg(target_os = "linux")]
-use pt_core::collect::{parse_fd, parse_proc_net_tcp, parse_proc_net_udp, NetworkSnapshot};
+use pt_core::collect::{
+    collect_fd_ipc_resources, collect_lineage_for_pid, collect_listener_resources,
+    collect_local_resource_evidence, detect_listener_conflicts, parse_fd, parse_proc_net_tcp,
+    parse_proc_net_udp, NetworkSnapshot, SharedResourceGraph,
+};
 use pt_core::collect::{quick_scan, ProcessRecord, QuickScanOptions, ScanResult};
 use pt_core::decision::goal_progress::{
     self, ActionOutcome as GoalActionOutcome, GoalMetric, GoalProgressReport, MetricSnapshot,
     ProgressConfig,
 };
 use pt_core::decision::{
-    apply_load_to_loss_matrix, compute_load_adjustment, decide_action, Action, ActionFeasibility,
-    LoadSignals,
+    apply_load_to_loss_matrix, compute_load_adjustment, decide_action, estimate_blast_radius,
+    Action, ActionFeasibility, BlastRadiusEstimate, BlastRadiusEstimatorConfig, LoadSignals,
+    RiskLevel,
 };
 use pt_core::inference::{
-    compute_posterior, compute_posterior_with_overrides, try_signature_fast_path, CpuEvidence,
-    Evidence, EvidenceLedger, FastPathConfig, FastPathSkipReason, PriorContext,
+    apply_evidence_terms, compute_posterior, compute_posterior_with_overrides,
+    try_signature_fast_path, ClassScores, Confidence, CpuEvidence, Evidence, EvidenceLedger,
+    EvidenceTerm, FastPathConfig, FastPathSkipReason, PriorContext,
 };
 use pt_core::supervision::signature::{MatchLevel, ProcessMatchContext, SignatureDatabase};
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct ProvenanceInferenceBundle {
+    resource_graph: SharedResourceGraph,
+    lineages: HashMap<u32, RawLineageEvidence>,
+    children: HashMap<u32, Vec<u32>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct ProvenanceScoreAdjustment {
+    evidence_terms: Vec<EvidenceTerm>,
+    evidence_completeness: f64,
+    confidence_penalty_steps: usize,
+    confidence_notes: Vec<String>,
+    blast_radius: BlastRadiusEstimate,
+}
+
+#[cfg(target_os = "linux")]
+fn build_provenance_inference_bundle(processes: &[&ProcessRecord]) -> ProvenanceInferenceBundle {
+    let mut lineages = HashMap::new();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut per_process_resources: Vec<(u32, Vec<pt_common::RawResourceEvidence>)> = Vec::new();
+    let mut all_resources = Vec::new();
+
+    for proc in processes {
+        let pid = proc.pid.0;
+        children.entry(proc.ppid.0).or_default().push(pid);
+        lineages.insert(pid, collect_lineage_for_pid(pid));
+
+        let fd_info = parse_fd(pid);
+        let mut resources = collect_local_resource_evidence(pid, fd_info.as_ref());
+        resources.extend(collect_listener_resources(pid));
+        resources.extend(collect_fd_ipc_resources(pid));
+        all_resources.extend(resources.iter().cloned());
+        per_process_resources.push((pid, resources));
+    }
+
+    for conflict in detect_listener_conflicts(&all_resources) {
+        if let Some((_, resources)) = per_process_resources
+            .iter_mut()
+            .find(|(pid, _)| *pid == conflict.owner_pid)
+        {
+            if let Some(existing) = resources
+                .iter_mut()
+                .find(|resource| resource.key == conflict.key && resource.kind == conflict.kind)
+            {
+                existing.state = conflict.state;
+                existing.observed_at = conflict.observed_at.clone();
+            } else {
+                resources.push(conflict);
+            }
+        }
+    }
+
+    let resource_graph = SharedResourceGraph::from_evidence(&per_process_resources);
+
+    ProvenanceInferenceBundle {
+        resource_graph,
+        lineages,
+        children,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn provenance_confidence_score(confidence: ProvenanceConfidence) -> f64 {
+    match confidence {
+        ProvenanceConfidence::High => 1.0,
+        ProvenanceConfidence::Medium => 0.75,
+        ProvenanceConfidence::Low => 0.45,
+        ProvenanceConfidence::Unknown => 0.2,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn downgrade_confidence(confidence: Confidence, steps: usize) -> Confidence {
+    let mut downgraded = confidence;
+    for _ in 0..steps {
+        downgraded = match downgraded {
+            Confidence::VeryHigh => Confidence::High,
+            Confidence::High => Confidence::Medium,
+            Confidence::Medium | Confidence::Low => Confidence::Low,
+        };
+    }
+    downgraded
+}
+
+#[cfg(target_os = "linux")]
+fn provenance_term(
+    feature: &str,
+    useful: f64,
+    useful_bad: f64,
+    abandoned: f64,
+    zombie: f64,
+) -> EvidenceTerm {
+    EvidenceTerm {
+        feature: feature.to_string(),
+        log_likelihood: ClassScores {
+            useful,
+            useful_bad,
+            abandoned,
+            zombie,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn derive_provenance_adjustment(
+    pid: u32,
+    bundle: &ProvenanceInferenceBundle,
+) -> ProvenanceScoreAdjustment {
+    let lineage = bundle.lineages.get(&pid);
+    let normalized_lineage = lineage.map(normalize_lineage);
+    let child_pids = bundle
+        .children
+        .get(&pid)
+        .map(|children| children.as_slice())
+        .unwrap_or(&[]);
+
+    let mut resolved_resources = 0usize;
+    let mut unresolved_resources = 0usize;
+    let mut conflict_resources = 0usize;
+
+    if let Some(keys) = bundle.resource_graph.process_resources.get(&pid) {
+        for key in keys {
+            let Some(resource) = bundle.resource_graph.resources.get(key) else {
+                continue;
+            };
+            let Some(holder_state) = resource.holder_states.iter().find(|state| state.pid == pid)
+            else {
+                continue;
+            };
+            match holder_state.state {
+                pt_common::ResourceState::Active | pt_common::ResourceState::Stale => {
+                    resolved_resources += 1;
+                }
+                pt_common::ResourceState::Partial | pt_common::ResourceState::Missing => {
+                    unresolved_resources += 1;
+                }
+                pt_common::ResourceState::Conflicted => {
+                    unresolved_resources += 1;
+                    conflict_resources += 1;
+                }
+            }
+        }
+    }
+
+    let lineage_confidence = normalized_lineage
+        .as_ref()
+        .map(|lineage| lineage.confidence)
+        .unwrap_or(ProvenanceConfidence::Unknown);
+    let lineage_score = provenance_confidence_score(lineage_confidence);
+    let resource_score = if resolved_resources + unresolved_resources == 0 {
+        0.7
+    } else {
+        resolved_resources as f64 / (resolved_resources + unresolved_resources) as f64
+    };
+    let mut evidence_completeness = ((lineage_score + resource_score) / 2.0).clamp(0.0, 1.0);
+
+    let mut confidence_notes = Vec::new();
+    let mut confidence_penalty_steps = 0usize;
+
+    if lineage.is_none() {
+        confidence_notes.push("missing lineage provenance".to_string());
+        confidence_penalty_steps += 1;
+    }
+    if unresolved_resources > 0 {
+        confidence_notes.push(format!(
+            "resource provenance has {unresolved_resources} unresolved edge(s)"
+        ));
+        confidence_penalty_steps += 1;
+    }
+    if let Some(normalized_lineage) = normalized_lineage.as_ref() {
+        if !normalized_lineage.downgrade_reasons.is_empty() {
+            confidence_notes.extend(normalized_lineage.downgrade_reasons.iter().cloned());
+            confidence_penalty_steps += 1;
+        }
+    }
+    if conflict_resources > 0 {
+        confidence_notes.push(format!(
+            "resource provenance has {conflict_resources} conflicting edge(s)"
+        ));
+    }
+
+    if !confidence_notes.is_empty() {
+        evidence_completeness = (evidence_completeness - 0.1).clamp(0.0, 1.0);
+    }
+
+    let blast_radius = estimate_blast_radius(
+        pid,
+        &bundle.resource_graph,
+        lineage,
+        child_pids,
+        evidence_completeness,
+        &BlastRadiusEstimatorConfig::default(),
+    );
+
+    if blast_radius.confidence < 0.5 {
+        confidence_notes.push("blast-radius estimate is low-confidence".to_string());
+        confidence_penalty_steps += 1;
+    }
+
+    let mut evidence_terms = Vec::new();
+    if let Some(normalized_lineage) = normalized_lineage.as_ref() {
+        match &normalized_lineage.ownership {
+            OwnershipState::Orphaned => {
+                evidence_terms.push(provenance_term(
+                    "provenance_ownership_orphaned",
+                    -0.55,
+                    -0.10,
+                    0.70,
+                    0.20,
+                ));
+            }
+            OwnershipState::Supervised { .. }
+            | OwnershipState::InitChild
+            | OwnershipState::AgentOwned { .. } => {
+                evidence_terms.push(provenance_term(
+                    "provenance_ownership_supervised",
+                    0.60,
+                    0.20,
+                    -0.70,
+                    -0.20,
+                ));
+            }
+            OwnershipState::ShellOwned { .. } => {
+                evidence_terms.push(provenance_term(
+                    "provenance_ownership_shell",
+                    0.35,
+                    0.15,
+                    -0.35,
+                    -0.10,
+                ));
+            }
+            OwnershipState::Unknown => {}
+        }
+    }
+
+    if blast_radius.direct.components.listener_count > 0 {
+        evidence_terms.push(provenance_term(
+            "provenance_active_listener",
+            0.55,
+            0.20,
+            -0.60,
+            -0.15,
+        ));
+    }
+
+    match blast_radius.risk_level {
+        RiskLevel::High | RiskLevel::Critical => {
+            evidence_terms.push(provenance_term(
+                "provenance_blast_radius_high",
+                0.65,
+                0.30,
+                -0.75,
+                -0.20,
+            ));
+        }
+        RiskLevel::Low if blast_radius.total_affected == 0 => {
+            evidence_terms.push(provenance_term(
+                "provenance_blast_radius_low",
+                -0.25,
+                -0.05,
+                0.35,
+                0.10,
+            ));
+        }
+        RiskLevel::Medium | RiskLevel::Low => {}
+    }
+
+    ProvenanceScoreAdjustment {
+        evidence_terms,
+        evidence_completeness,
+        confidence_penalty_steps: confidence_penalty_steps.min(3),
+        confidence_notes,
+        blast_radius,
+    }
+}
 
 fn progress_emitter(global: &GlobalOpts) -> Option<Arc<dyn ProgressEmitter>> {
     match global.format {
@@ -11389,6 +11677,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let _current_cpu_pct: f64 = processes_to_infer.iter().map(|p| p.cpu_percent).sum();
     let probe_cost_model = pt_core::decision::ProbeCostModel::default();
     let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
+    #[cfg(target_os = "linux")]
+    let provenance_bundle = build_provenance_inference_bundle(&processes_to_infer);
 
     let candidates_evaluated = processes_to_infer.len();
     let total_processes = candidates_evaluated as u64;
@@ -11453,7 +11743,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             user_overrides: None,
         };
 
-        let (posterior_result, mut ledger) = if let Some(sig_match) = signature_match.as_ref() {
+        let (mut posterior_result, mut ledger) = if let Some(sig_match) = signature_match.as_ref() {
             match try_signature_fast_path(&fast_path_config, Some(sig_match), proc.pid.0) {
                 Ok(Some(fast_path)) => {
                     fast_path_used = true;
@@ -11497,6 +11787,75 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 }
                 Err(_) => continue,
             }
+        };
+
+        #[cfg(target_os = "linux")]
+        let provenance_adjustment = {
+            let adjustment = derive_provenance_adjustment(proc.pid.0, &provenance_bundle);
+            if !adjustment.evidence_terms.is_empty() {
+                match apply_evidence_terms(&posterior_result, adjustment.evidence_terms.clone()) {
+                    Ok(adjusted) => {
+                        posterior_result = adjusted;
+                        ledger = EvidenceLedger::from_posterior_result(
+                            &posterior_result,
+                            Some(proc.pid.0),
+                            None,
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            pid = proc.pid.0,
+                            error = %err,
+                            "Failed to apply provenance-derived evidence terms"
+                        );
+                    }
+                }
+            }
+
+            if adjustment.confidence_penalty_steps > 0 {
+                let downgraded =
+                    downgrade_confidence(ledger.confidence, adjustment.confidence_penalty_steps);
+                if downgraded != ledger.confidence {
+                    ledger.confidence = downgraded;
+                }
+                if !adjustment.confidence_notes.is_empty() {
+                    let joined = adjustment.confidence_notes.join("; ");
+                    ledger
+                        .top_evidence
+                        .push(format!("Provenance confidence downgrade: {joined}"));
+                    ledger.why_summary =
+                        format!("{} Provenance caveats: {}.", ledger.why_summary, joined);
+                }
+            }
+
+            for term in &adjustment.evidence_terms {
+                let glyph = if term.feature.contains("blast_radius") {
+                    "🛡"
+                } else {
+                    "🔗"
+                };
+                ledger
+                    .evidence_glyphs
+                    .insert(term.feature.clone(), glyph.to_string());
+            }
+
+            tracing::debug!(
+                pid = proc.pid.0,
+                evidence_completeness = adjustment.evidence_completeness,
+                blast_radius_risk = adjustment.blast_radius.risk_score,
+                blast_radius_confidence = adjustment.blast_radius.confidence,
+                blast_radius_level = ?adjustment.blast_radius.risk_level,
+                confidence_penalty_steps = adjustment.confidence_penalty_steps,
+                score_terms = ?adjustment
+                    .evidence_terms
+                    .iter()
+                    .map(|term| term.feature.clone())
+                    .collect::<Vec<_>>(),
+                notes = ?adjustment.confidence_notes,
+                "Applied provenance-derived scoring adjustments"
+            );
+
+            adjustment
         };
 
         let signature_name = signature_match.as_ref().map(|m| m.signature.name.clone());
@@ -11705,6 +12064,25 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 })).collect::<Vec<_>>(),
             })
         });
+        #[cfg(target_os = "linux")]
+        let provenance_summary = serde_json::json!({
+            "enabled": true,
+            "evidence_completeness": provenance_adjustment.evidence_completeness,
+            "confidence_penalty_steps": provenance_adjustment.confidence_penalty_steps,
+            "confidence_notes": provenance_adjustment.confidence_notes,
+            "score_terms": provenance_adjustment
+                .evidence_terms
+                .iter()
+                .map(|term| term.feature.clone())
+                .collect::<Vec<_>>(),
+            "blast_radius": {
+                "risk_score": provenance_adjustment.blast_radius.risk_score,
+                "risk_level": format!("{:?}", provenance_adjustment.blast_radius.risk_level).to_lowercase(),
+                "confidence": provenance_adjustment.blast_radius.confidence,
+                "summary": provenance_adjustment.blast_radius.summary,
+                "total_affected": provenance_adjustment.blast_radius.total_affected,
+            }
+        });
 
         let predictions = if args.include_predictions {
             let mut predictions = build_stub_predictions(proc);
@@ -11763,6 +12141,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             },
             "confidence": ledger.confidence.label(),
             "evidence": evidence_contributions,
+            "provenance_inference": {
+                "enabled": false,
+            },
             "blast_radius": {
                 "memory_mb": proc.rss_bytes / (1024 * 1024),
                 "cpu_pct": proc.cpu_percent,
@@ -11801,6 +12182,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                     serde_json::to_value(predictions).unwrap_or_else(|_| serde_json::json!({})),
                 );
             }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(obj) = candidate.as_object_mut() {
+            obj.insert("provenance_inference".to_string(), provenance_summary);
         }
 
         let persisted_proc = PersistedProcess {
@@ -16682,6 +17067,150 @@ mod watch_tests {
             event.get("event").and_then(|v| v.as_str()),
             Some("baseline_anomaly")
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod provenance_scoring_tests {
+    use super::*;
+    use pt_common::{
+        AncestorEntry, LineageCollectionMethod, LockMechanism, RawResourceEvidence,
+        ResourceCollectionMethod, ResourceDetails, ResourceKind, ResourceState, SupervisorEvidence,
+        SupervisorKind,
+    };
+
+    fn lock_ev(pid: u32, path: &str, state: ResourceState) -> RawResourceEvidence {
+        RawResourceEvidence {
+            kind: ResourceKind::Lockfile,
+            key: path.to_string(),
+            owner_pid: pid,
+            collection_method: ResourceCollectionMethod::ProcFd,
+            state,
+            details: ResourceDetails::Lockfile {
+                path: path.to_string(),
+                mechanism: LockMechanism::Existence,
+            },
+            observed_at: "2026-03-17T00:00:00Z".to_string(),
+        }
+    }
+
+    fn listener_ev(pid: u32, port: u16) -> RawResourceEvidence {
+        RawResourceEvidence {
+            kind: ResourceKind::Listener,
+            key: format!("tcp:0.0.0.0:{port}"),
+            owner_pid: pid,
+            collection_method: ResourceCollectionMethod::ProcNet,
+            state: ResourceState::Active,
+            details: ResourceDetails::Listener {
+                protocol: "tcp".to_string(),
+                port,
+                bind_address: "0.0.0.0".to_string(),
+            },
+            observed_at: "2026-03-17T00:00:00Z".to_string(),
+        }
+    }
+
+    fn lineage(pid: u32, ppid: u32, supervisor: Option<SupervisorEvidence>) -> RawLineageEvidence {
+        RawLineageEvidence {
+            pid,
+            ppid,
+            pgid: pid,
+            sid: pid,
+            uid: 1000,
+            user: Some("ubuntu".to_string()),
+            tty: None,
+            supervisor,
+            ancestors: if ppid > 1 {
+                vec![AncestorEntry {
+                    pid: ppid,
+                    comm: "bash".to_string(),
+                    uid: 1000,
+                }]
+            } else {
+                Vec::new()
+            },
+            collection_method: LineageCollectionMethod::Synthetic,
+            observed_at: "2026-03-17T00:00:00Z".to_string(),
+        }
+    }
+
+    fn feature_names(adjustment: &ProvenanceScoreAdjustment) -> Vec<&str> {
+        adjustment
+            .evidence_terms
+            .iter()
+            .map(|term| term.feature.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn orphaned_low_blast_radius_elevates_abandonment_features() {
+        let bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[]),
+            lineages: HashMap::from([(100, lineage(100, 1, None))]),
+            children: HashMap::new(),
+        };
+
+        let adjustment = derive_provenance_adjustment(100, &bundle);
+        let features = feature_names(&adjustment);
+
+        assert!(features.contains(&"provenance_ownership_orphaned"));
+        assert!(features.contains(&"provenance_blast_radius_low"));
+        assert_eq!(adjustment.confidence_penalty_steps, 0);
+    }
+
+    #[test]
+    fn supervised_listener_suppresses_false_positive_path() {
+        let bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[(
+                200,
+                vec![listener_ev(200, 8080)],
+            )]),
+            lineages: HashMap::from([(
+                200,
+                lineage(
+                    200,
+                    2,
+                    Some(SupervisorEvidence {
+                        kind: SupervisorKind::Systemd,
+                        unit_name: Some("api.service".to_string()),
+                        auto_restart: Some(true),
+                        confidence: ProvenanceConfidence::High,
+                    }),
+                ),
+            )]),
+            children: HashMap::new(),
+        };
+
+        let adjustment = derive_provenance_adjustment(200, &bundle);
+        let features = feature_names(&adjustment);
+
+        assert!(features.contains(&"provenance_ownership_supervised"));
+        assert!(features.contains(&"provenance_active_listener"));
+        assert!(adjustment.evidence_completeness >= 0.8);
+    }
+
+    #[test]
+    fn missing_and_conflicted_provenance_downgrades_confidence() {
+        let bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[(
+                300,
+                vec![lock_ev(300, "/tmp/shared.lock", ResourceState::Conflicted)],
+            )]),
+            lineages: HashMap::new(),
+            children: HashMap::new(),
+        };
+
+        let adjustment = derive_provenance_adjustment(300, &bundle);
+
+        assert!(adjustment.confidence_penalty_steps >= 2);
+        assert!(adjustment
+            .confidence_notes
+            .iter()
+            .any(|note| note.contains("missing lineage provenance")));
+        assert!(adjustment
+            .confidence_notes
+            .iter()
+            .any(|note| note.contains("unresolved edge")));
     }
 }
 
