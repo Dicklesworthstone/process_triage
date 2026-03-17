@@ -41,6 +41,7 @@ pub mod proc_parsers;
 pub mod protected;
 mod quick_scan;
 pub mod resource_collector;
+pub mod shared_resource_graph;
 pub mod systemd;
 #[cfg(target_os = "linux")]
 pub mod tick_delta;
@@ -83,6 +84,7 @@ pub use quick_scan::{
     parse_ps_output_synthetic_linux, quick_scan, QuickScanError, QuickScanOptions,
 };
 pub use resource_collector::collect_local_resource_evidence;
+pub use shared_resource_graph::{BlastRadius, SharedResource, SharedResourceGraph};
 pub use tool_runner::{
     run_tool, run_tools_parallel, ToolConfig, ToolError, ToolOutput, ToolRunner, ToolRunnerBuilder,
     ToolSpec, DEFAULT_BUDGET_MS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_PARALLEL,
