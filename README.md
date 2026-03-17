@@ -603,6 +603,255 @@ Fleet mode uses **Chandy-Lamport consistent snapshots** to prevent triage cascad
 
 ---
 
+## GPU and Container Awareness
+
+### GPU Process Detection
+
+`pt` detects GPU-bound processes via `nvidia-smi` (CUDA) and `rocm-smi` (AMD ROCm):
+
+```bash
+$ pt deep   # Automatically detects GPU processes
+```
+
+| Field Collected | NVIDIA | AMD |
+|----------------|:------:|:---:|
+| Device name, UUID, index | Yes | Yes |
+| Total/used VRAM (MiB) | Yes | Yes |
+| GPU utilization % | Yes | Yes |
+| Temperature | Yes | Yes |
+| Per-process GPU memory | Yes | Yes |
+| Driver version | Yes | Yes |
+
+A process consuming 8GB of VRAM on a 12GB GPU gets a higher blast-radius score than one using 200MB. If neither `nvidia-smi` nor `rocm-smi` is available, GPU detection silently degrades with a provenance warning.
+
+### Container and Kubernetes Detection
+
+`pt` automatically detects containerized processes through three mechanisms (in priority order):
+
+1. **Cgroup path patterns**: Parses `/proc/[pid]/cgroup` for Docker (`/docker/<64hex>`), Podman (`libpod-<id>`), containerd, LXC, and CRI-O patterns
+2. **Marker files**: Checks for `/.dockerenv` (Docker) and `/.containerenv` (Podman)
+3. **Environment variables**: Reads `KUBERNETES_SERVICE_HOST`, `POD_NAME`, `POD_NAMESPACE`, `POD_UID` for Kubernetes metadata
+
+For Kubernetes pods, `pt` extracts the QoS class (Guaranteed / Burstable / BestEffort), pod name, namespace, and container name. Container-managed processes get special treatment in the decision engine — killing a process inside a container that will be restarted by its orchestrator may be pointless.
+
+---
+
+## Daemon Mode (Background Monitoring)
+
+`pt` can run as a persistent background monitor that watches system health and triggers triage when conditions deteriorate:
+
+```bash
+pt-core daemon start              # Start background monitor
+pt-core daemon status             # Check daemon state
+pt-core daemon stop               # Stop monitor
+```
+
+### How It Works
+
+The daemon runs a tick-based event loop (default: every 60 seconds) that evaluates trigger conditions:
+
+| Trigger | Default Threshold | What It Detects |
+|---------|------------------|-----------------|
+| Load average | > 2.0 sustained | CPU overload |
+| Orphan count | > 10 | Process leak |
+| Memory pressure | > 85% used | Memory exhaustion |
+
+When a trigger fires for multiple consecutive ticks (sustained window), the daemon escalates: it runs a quick scan, infers posteriors, generates a plan, and optionally executes low-risk actions or sends notifications.
+
+### Self-Limiting
+
+The daemon enforces overhead budgets on itself:
+
+- **CPU cap**: 2.0% by default (configurable)
+- **RSS cap**: 64MB by default (configurable)
+- **Event audit ring**: Circular buffer of 100 recent events for debugging
+
+If the daemon itself exceeds its budget, it backs off automatically.
+
+---
+
+## Process Signature Database
+
+`pt` ships with a built-in database of known process signatures — command patterns that indicate specific process types (test runners, dev servers, build tools, agents):
+
+```bash
+pt-core signature list              # Show all signatures
+pt-core signature add \
+  --name "stuck-jest" \
+  --pattern "jest" \
+  --arg-pattern "--runInBand" \
+  --category test_runner             # Add custom signature
+
+pt-core signature export > sigs.json # Export for sharing
+pt-core signature import sigs.json   # Import from file
+```
+
+Signatures are matched against a `ProcessMatchContext` that includes the process name, command-line arguments, environment variables, container info, and network state. Matched signatures adjust the Bayesian prior: a `test_runner` signature shifts the prior toward "likely to be stuck if old."
+
+---
+
+## The Evidence Ledger
+
+The evidence ledger is the core explainability tool. Every triage candidate gets a detailed breakdown showing exactly how each piece of evidence shifted the posterior:
+
+```
+PID 84721 (bun test) — Score: 87 — Classification: Abandoned
+
+  Evidence Ledger:
+  🎲 prior         Bayes factor: 1.00   (baseline)
+  💻 cpu           Bayes factor: 8.42   decisive → supports abandoned
+  ⏱  runtime       Bayes factor: 5.23   strong   → supports abandoned
+  👻 orphan        Bayes factor: 3.71   strong   → supports abandoned
+  🖥  tty           Bayes factor: 0.89   weak     → supports useful
+  🌐 net           Bayes factor: 1.12   weak     → supports abandoned
+  💾 io_active     Bayes factor: 4.55   strong   → supports abandoned
+  🚦 queue_sat     Bayes factor: 1.00   neutral
+  🚩 state_flag    Bayes factor: 1.34   weak     → supports abandoned
+
+  Posterior: P(abandoned)=0.87  P(useful)=0.06  P(useful_bad)=0.04  P(zombie)=0.03
+  Log-odds (abandoned vs useful): 2.67 bits
+```
+
+Each evidence term has a glyph, a Bayes factor (ratio of likelihoods), a strength label (decisive/strong/substantial/weak), and a direction (which class it supports). The strength thresholds follow standard Bayesian interpretation: decisive = |delta_bits| > 3.3 (>10:1 odds), strong = > 2.0 (>4:1), substantial = > 1.0 (>2:1).
+
+Access this via `pt deep` (interactive) or `pt agent plan --deep --format json` (structured).
+
+---
+
+## Plan Format and Example Output
+
+When you run `pt agent plan --format json`, the output is a deterministic, resumable plan:
+
+```json
+{
+  "plan_id": "plan-a7c92e3f1b2d4e5f",
+  "session_id": "pt-20260317-150000-a7xq",
+  "generated_at": "2026-03-17T15:00:00Z",
+  "actions": [
+    {
+      "action_id": "act-1234567890abcdef",
+      "target": {
+        "pid": 84721,
+        "start_id": "boot-abc123:1234567890:84721"
+      },
+      "action": "kill",
+      "order": 0,
+      "stage": 0,
+      "timeouts": {
+        "preflight_ms": 2000,
+        "execute_ms": 10000,
+        "verify_ms": 5000
+      },
+      "pre_checks": [
+        "verify_identity",
+        "check_not_protected",
+        "check_data_loss_gate"
+      ],
+      "rationale": {
+        "expected_loss": 0.05,
+        "expected_recovery": 0.95,
+        "posterior": {
+          "abandoned": 0.87,
+          "useful": 0.06,
+          "useful_bad": 0.04,
+          "zombie": 0.03
+        },
+        "memory_mb": 1024.5,
+        "category": "test_runner"
+      },
+      "routing": "direct",
+      "confidence": "normal"
+    }
+  ],
+  "gates_summary": {
+    "total_candidates": 47,
+    "blocked_candidates": 8,
+    "pre_toggled_actions": 1
+  }
+}
+```
+
+**Key design choices:**
+- **IDs are deterministic** (FNV-1a 64-bit hashes, not UUIDs) — the same inputs always produce the same plan
+- **Zombie routing**: Z-state processes are routed to their parent for `restart` (forcing reap), not killed directly
+- **D-state handling**: Processes in uninterruptible sleep get `confidence: "low"` with diagnostic fields (wchan, I/O counters, D-state duration)
+- **Pre-checks**: Every action has a list of safety checks that must pass before execution (identity verification, protection check, data-loss gate, supervisor check)
+
+---
+
+## Session Lifecycle (Type-State Machine)
+
+Sessions enforce valid state transitions at **compile time** using Rust's type system:
+
+```
+Created ──→ Scanning ──→ Planned ──→ Executing ──→ Completed
+   │          │            │          │
+   └─→ Failed ←┴────────────┴──────────┘
+   └─→ Cancelled
+```
+
+Each state is a zero-sized marker type. The method `TypedSession<Scanning>::finish_scan()` returns a `TypedSession<Planned>` — you literally cannot call `start_execution()` on a session that hasn't been planned yet, because the method doesn't exist on that type. Invalid transitions are caught by the compiler, not by runtime checks.
+
+---
+
+## The Bash Wrapper
+
+The `pt` script is a thin Bash wrapper that locates and execs `pt-core`:
+
+**Binary discovery** (checked in order):
+1. `$PT_CORE_PATH` (explicit override)
+2. `./pt-core` (same directory)
+3. `./target/release/pt-core` (cargo build artifact)
+4. `~/.local/bin/pt-core`
+5. `/usr/local/bin/pt-core`
+6. PATH lookup via `which`
+
+**UI mode selection**: Checks for TTY, CI environment, and `$TERM` to decide between TUI and shell mode. Override with `--shell`, `--tui`, or `$PT_UI_MODE`.
+
+**Built-in commands**:
+- `pt update` — Fetches latest version, runs signed installer
+- `pt history` — Shows past kill/spare decisions (requires `jq`)
+- `pt clear` — Resets decision memory with confirmation
+- `pt deep` — Alias for `deep-scan`
+
+The wrapper is deliberately simple (~200 lines of shellcheck-clean Bash) so the Rust engine can be updated independently.
+
+---
+
+## Shell Completions
+
+Tab completion is available for Bash, Fish, and Zsh:
+
+```bash
+# Bash
+source completions/pt-core.bash
+
+# Fish
+cp completions/pt-core.fish ~/.config/fish/completions/
+
+# Zsh
+cp completions/_pt-core ~/.zfunc/
+```
+
+Completions cover all subcommands, options, and argument values — including `--format` choices (json, toon, md, jsonl, summary, metrics, prose), `--theme` options (dark, light, high-contrast, no-color), and session IDs.
+
+---
+
+## Numerical Stability
+
+All Bayesian computation happens in **log-domain** to prevent the floating-point catastrophes that plague naive probability implementations:
+
+**The problem**: Multiplying many small probabilities (e.g., `0.001 * 0.002 * 0.0003 * ...`) underflows to zero in IEEE 754 double precision. Dividing by the sum of such products for normalization produces 0/0 = NaN.
+
+**The solution**: Work with log-probabilities throughout:
+- Multiplication becomes addition: `log(a * b) = log(a) + log(b)`
+- Normalization uses log-sum-exp: `log(sum(exp(x_i))) = max(x) + log(sum(exp(x_i - max(x))))`
+- The max-subtraction trick ensures the largest exponent is `exp(0) = 1`, preventing overflow
+
+The `pt-math` crate provides `log_sum_exp`, `log_beta_pdf`, `log_gamma`, `gamma_log_pdf`, and `normalize_log_probs` — all numerically stable. The implementation has been validated with 21 stress tests covering 1000+ parameter combinations with zero panics.
+
+---
+
 ## Mathematical Foundations
 
 The inference engine is backed by formal mathematical guarantees documented in [docs/math/PROOFS.md](docs/math/PROOFS.md):
