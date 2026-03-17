@@ -18,6 +18,7 @@ pub mod fleet_fdr;
 pub mod fleet_pattern;
 pub mod fleet_registry;
 pub mod goal_contribution;
+pub mod indirect_impact;
 pub mod goal_optimizer;
 pub mod goal_parser;
 pub mod goal_plan;
@@ -67,6 +68,9 @@ pub use cvar::{
 pub use direct_impact::{
     compute_direct_impact, compute_direct_impact_batch, DirectImpactComponents, DirectImpactConfig,
     DirectImpactResult,
+};
+pub use indirect_impact::{
+    compute_indirect_impact, HopBreakdown, IndirectImpactConfig, IndirectImpactResult,
 };
 pub use dependency_loss::{
     compute_critical_file_inflation, compute_dependency_scaling, scale_kill_loss,
