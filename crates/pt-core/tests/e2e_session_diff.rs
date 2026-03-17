@@ -18,6 +18,12 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use predicates::prelude::*;
+use pt_common::SessionId;
+use pt_core::session::snapshot_persist::{
+    persist_inference, persist_inventory, InferenceArtifact, InventoryArtifact, PersistedInference,
+    PersistedProcess,
+};
+use pt_core::session::{SessionManifest, SessionMode, SessionState, SessionStore};
 use serde_json::Value;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -133,6 +139,91 @@ fn create_labeled_plan_session(data_dir: &str, label: &str) -> String {
         "session id should be 23 chars (output too short)"
     );
     text[idx..end].to_string()
+}
+
+fn create_custom_session(
+    data_dir: &str,
+    session_id: &str,
+    processes: Vec<PersistedProcess>,
+    inferences: Vec<PersistedInference>,
+) -> String {
+    std::env::set_var("PROCESS_TRIAGE_DATA", data_dir);
+    let store = SessionStore::from_env().expect("session store");
+    let sid = SessionId(session_id.to_string());
+    let manifest = SessionManifest::new(&sid, None, SessionMode::RobotPlan, None);
+    let handle = store.create(&manifest).expect("create session");
+    let _ = handle
+        .update_state(SessionState::Planned)
+        .expect("update session state");
+
+    persist_inventory(
+        &handle,
+        session_id,
+        "host-test",
+        InventoryArtifact {
+            total_system_processes: processes.len() as u64,
+            protected_filtered: 0,
+            record_count: processes.len(),
+            records: processes,
+        },
+    )
+    .expect("persist inventory");
+    persist_inference(
+        &handle,
+        session_id,
+        "host-test",
+        InferenceArtifact {
+            candidate_count: inferences.len(),
+            candidates: inferences,
+        },
+    )
+    .expect("persist inference");
+
+    session_id.to_string()
+}
+
+fn proc(
+    pid: u32,
+    ppid: u32,
+    uid: u32,
+    start_id: &str,
+    state: &str,
+    elapsed_secs: u64,
+) -> PersistedProcess {
+    PersistedProcess {
+        pid,
+        ppid,
+        uid,
+        start_id: start_id.to_string(),
+        comm: "worker".to_string(),
+        cmd: "worker --serve".to_string(),
+        state: state.to_string(),
+        start_time_unix: 1_700_000_000,
+        elapsed_secs,
+        identity_quality: "Full".to_string(),
+    }
+}
+
+fn inf(
+    pid: u32,
+    start_id: &str,
+    class: &str,
+    score: u32,
+    action: &str,
+    abandoned: f64,
+) -> PersistedInference {
+    PersistedInference {
+        pid,
+        start_id: start_id.to_string(),
+        classification: class.to_string(),
+        posterior_useful: 1.0 - abandoned - 0.05,
+        posterior_useful_bad: 0.03,
+        posterior_abandoned: abandoned,
+        posterior_zombie: 0.02,
+        confidence: "high".to_string(),
+        recommended_action: action.to_string(),
+        score,
+    }
 }
 
 // ============================================================================
@@ -523,6 +614,87 @@ fn test_diff_category_filter() {
         json["filters"]["category"], "new",
         "filters should reflect category"
     );
+}
+
+#[test]
+fn test_diff_json_includes_lifecycle_metadata() {
+    let dir = tempdir().expect("tempdir");
+    let data_dir = dir.path().to_str().unwrap();
+
+    let sid1 = create_custom_session(
+        data_dir,
+        "pt-20260317-000001-aaab",
+        vec![proc(100, 42, 1000, "b1:100:100", "S", 3600)],
+        vec![inf(100, "b1:100:100", "useful_bad", 40, "review", 0.3)],
+    );
+    let sid2 = create_custom_session(
+        data_dir,
+        "pt-20260317-000002-aaac",
+        vec![proc(100, 1, 0, "b1:100:100", "R", 5400)],
+        vec![inf(100, "b1:100:100", "abandoned", 81, "kill", 0.9)],
+    );
+
+    let output = pt_core_with_data(data_dir)
+        .args(["--format", "json", "diff", &sid1, &sid2])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("parse JSON");
+    let delta = json["delta"]
+        .as_array()
+        .expect("delta should be an array")
+        .iter()
+        .find(|entry| entry["start_id"] == "b1:100:100")
+        .expect("expected lifecycle delta");
+
+    assert_eq!(delta["kind"], "changed");
+    assert_eq!(delta["lifecycle"]["transition"], "multiple");
+    assert_eq!(delta["lifecycle"]["signals"][0], "newly_orphaned");
+    assert!(
+        delta["lifecycle"]["continuity_confidence"]
+            .as_f64()
+            .unwrap_or_default()
+            > 0.5
+    );
+    assert!(delta["lifecycle"]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("matched by start_id continuity"));
+}
+
+#[test]
+fn test_diff_plain_output_shows_lifecycle_column() {
+    let dir = tempdir().expect("tempdir");
+    let data_dir = dir.path().to_str().unwrap();
+
+    let sid1 = create_custom_session(
+        data_dir,
+        "pt-20260317-000003-aaad",
+        vec![proc(100, 42, 1000, "b1:100:100", "S", 3600)],
+        vec![inf(100, "b1:100:100", "useful_bad", 40, "review", 0.3)],
+    );
+    let sid2 = create_custom_session(
+        data_dir,
+        "pt-20260317-000004-aaae",
+        vec![proc(100, 1, 1000, "b1:100:100", "S", 5400)],
+        vec![inf(100, "b1:100:100", "abandoned", 81, "kill", 0.9)],
+    );
+
+    let stdout = String::from_utf8_lossy(
+        &pt_core_with_data(data_dir)
+            .args(["diff", &sid1, &sid2])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .to_string();
+
+    assert!(stdout.contains("LIFECYCLE"));
+    assert!(stdout.contains("newly_orphaned"));
 }
 
 // ============================================================================
