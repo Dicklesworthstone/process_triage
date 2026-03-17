@@ -2,6 +2,7 @@
 
 pub mod active_sensing;
 pub mod alpha_investing;
+pub mod blast_radius_estimator;
 pub mod causal_interventions;
 pub mod causal_snapshot;
 pub mod composite_test;
@@ -43,6 +44,10 @@ pub use active_sensing::{
 };
 pub use alpha_investing::{
     AlphaInvestingPolicy, AlphaInvestingStore, AlphaUpdate, AlphaWealthState,
+};
+pub use blast_radius_estimator::{
+    estimate_blast_radius, estimate_blast_radius_batch, BlastRadiusEstimate,
+    BlastRadiusEstimatorConfig, RiskLevel, RiskThresholds,
 };
 pub use causal_snapshot::{
     check_causal_safety, CausalCheckResult, CausalViolation, ConsistentCut, CutValidity,

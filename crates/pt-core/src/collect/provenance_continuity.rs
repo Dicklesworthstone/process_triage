@@ -8,9 +8,9 @@
 //! single-point observations: a process whose blast radius is growing
 //! is more concerning than one that's stable.
 
-use crate::collect::shared_resource_graph::{BlastRadius, SharedResourceGraph};
+use crate::collect::shared_resource_graph::SharedResourceGraph;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Lifecycle delta between two scan snapshots.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
