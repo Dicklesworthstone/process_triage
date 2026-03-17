@@ -225,9 +225,17 @@ fn build_summary(
         )
     };
 
+    // Extract the detail portion after " — " from the direct summary.
+    // If there's no " — " separator (isolated process), omit the detail
+    // to avoid duplicating the PID prefix.
+    let detail = direct
+        .summary
+        .split_once(" — ")
+        .map(|(_, detail)| format!(". {detail}"))
+        .unwrap_or_default();
+
     format!(
-        "PID {pid}: {level_str} risk (score={score:.2}, {confidence_str}) — {affected}. {}",
-        direct.summary.split(" — ").last().unwrap_or("")
+        "PID {pid}: {level_str} risk (score={score:.2}, {confidence_str}) — {affected}{detail}"
     )
 }
 
