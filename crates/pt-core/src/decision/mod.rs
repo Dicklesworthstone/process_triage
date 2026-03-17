@@ -29,6 +29,7 @@ pub mod martingale_gates;
 pub mod mem_pressure;
 pub mod myopic_policy;
 pub mod ope;
+pub mod provenance_scoring;
 pub mod rate_limit;
 pub mod respawn_loop;
 pub mod robot_constraints;
@@ -113,6 +114,10 @@ pub use myopic_policy::{
     decide_from_belief_with_config, ActionLossBreakdown, AlphaInvestingSummary, BeliefStateDisplay,
     BlastRadiusSummary, ConstraintSummary, FdrGateSummary, MyopicDecision, MyopicPolicyConfig,
     MyopicPolicyError, PolicyCheckSummary, RobotConstraintSummary, StateContributions,
+};
+pub use provenance_scoring::{
+    compute_provenance_adjusted_score, compute_provenance_adjusted_scores,
+    ActionRecommendation, ProvenanceAdjustedScore, ProvenanceScoringConfig,
 };
 pub use ope::{
     DoublyRobustEstimator, IpsEstimator, LoggedDecision, OpeError, OpeRecommendation, OpeResult,
