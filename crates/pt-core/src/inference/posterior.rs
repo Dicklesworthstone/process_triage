@@ -4,7 +4,7 @@
 //! returns normalized posteriors plus log-odds.
 
 use crate::config::priors::{ClassParams, CommandCategories, DirichletParams, Priors, StateFlags};
-use pt_math::{log_beta, log_beta_pdf, log_gamma, normalize_log_probs};
+use pt_math::{log_beta, log_beta_pdf, log_gamma, normalize_log_probs_array};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -93,21 +93,21 @@ pub fn apply_evidence_terms(
         log_unnormalized = add_scores(log_unnormalized, term.log_likelihood);
     }
 
-    let log_vec = log_unnormalized.as_vec();
-    let log_post_vec = normalize_log_probs(&log_vec);
-    if log_post_vec.iter().any(|v| v.is_nan()) {
+    let log_arr = log_unnormalized.as_vec();
+    let log_post_arr = normalize_log_probs_array(&log_arr);
+    if log_post_arr.iter().any(|v| v.is_nan()) {
         return Err(PosteriorError::InvalidEvidence {
             field: "posterior",
             message: "normalization with derived evidence produced NaN".to_string(),
         });
     }
 
-    let log_posterior = ClassScores::from_vec(&log_post_vec);
+    let log_posterior = ClassScores::from_vec(&log_post_arr);
     let posterior = ClassScores::from_vec(&[
-        log_post_vec[0].exp(),
-        log_post_vec[1].exp(),
-        log_post_vec[2].exp(),
-        log_post_vec[3].exp(),
+        log_post_arr[0].exp(),
+        log_post_arr[1].exp(),
+        log_post_arr[2].exp(),
+        log_post_arr[3].exp(),
     ]);
 
     let mut evidence_terms = base.evidence_terms.clone();
@@ -361,20 +361,20 @@ pub fn compute_posterior(
         });
     }
 
-    let log_vec = log_unnormalized.as_vec();
-    let log_post_vec = normalize_log_probs(&log_vec);
-    if log_post_vec.iter().any(|v| v.is_nan()) {
+    let log_arr = log_unnormalized.as_vec();
+    let log_post_arr = normalize_log_probs_array(&log_arr);
+    if log_post_arr.iter().any(|v| v.is_nan()) {
         return Err(PosteriorError::InvalidEvidence {
             field: "posterior",
             message: "normalization produced NaN".to_string(),
         });
     }
-    let log_posterior = ClassScores::from_vec(&log_post_vec);
+    let log_posterior = ClassScores::from_vec(&log_post_arr);
     let posterior = ClassScores::from_vec(&[
-        log_post_vec[0].exp(),
-        log_post_vec[1].exp(),
-        log_post_vec[2].exp(),
-        log_post_vec[3].exp(),
+        log_post_arr[0].exp(),
+        log_post_arr[1].exp(),
+        log_post_arr[2].exp(),
+        log_post_arr[3].exp(),
     ]);
 
     Ok(PosteriorResult {

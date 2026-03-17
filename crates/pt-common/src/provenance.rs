@@ -223,10 +223,12 @@ pub enum ProvenanceObservationStatus {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceRedactionState {
+    #[default]
     None,
     Partial,
     Full,
@@ -748,6 +750,390 @@ impl ProvenanceGraphSnapshot {
     }
 }
 
+// ── Per-candidate provenance output contract ────────────────────────
+//
+// This is the stable machine-readable payload that JSON, TOON, agent,
+// and API consumers receive per process candidate.  It replaces inline
+// serde_json::json!() construction with typed structs so consumers
+// can depend on a schema instead of reverse-engineering ad-hoc JSON.
+
+/// Provenance output for a single candidate process.
+///
+/// Included in the `provenance_inference` field of each candidate in
+/// `pt agent plan` JSON/TOON output.  Every field has a defined
+/// semantic so consumers can rely on the schema without inspecting
+/// renderer code.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CandidateProvenanceOutput {
+    /// Whether provenance inference was active for this candidate.
+    pub enabled: bool,
+
+    /// Evidence completeness score [0, 1].
+    ///
+    /// 1.0 = all expected lineage and resource evidence was collected.
+    /// <1.0 = some evidence was missing, partial, redacted, or conflicted.
+    /// Consumers should treat low completeness as reduced confidence in
+    /// both the score and the blast-radius estimate.
+    pub evidence_completeness: f64,
+
+    /// How many confidence-downgrade steps were applied.
+    ///
+    /// Each step reduces the displayed confidence level by one tier
+    /// (VeryHigh→High→Medium→Low).  Caused by missing lineage,
+    /// unresolved resource edges, or low-confidence blast-radius.
+    pub confidence_penalty_steps: usize,
+
+    /// Human-readable notes explaining each confidence downgrade.
+    ///
+    /// Examples: "missing lineage provenance", "resource provenance has
+    /// 2 unresolved edge(s)", "blast-radius estimate is low-confidence".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confidence_notes: Vec<String>,
+
+    /// Named provenance features that contributed to the posterior.
+    ///
+    /// Each entry is a feature name like "provenance_ownership_orphaned"
+    /// or "provenance_blast_radius_high".  The score terms themselves
+    /// (log-likelihood contributions per class) are in the evidence
+    /// ledger; this field provides the index for auditability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub score_terms: Vec<String>,
+
+    /// Blast-radius summary for this candidate.
+    pub blast_radius: CandidateBlastRadiusOutput,
+
+    /// Redaction state of the provenance evidence for this candidate.
+    ///
+    /// `none` = all evidence available.
+    /// `partial` = some evidence was redacted per privacy policy.
+    /// `full` = all provenance evidence was redacted.
+    #[serde(default)]
+    pub redaction_state: ProvenanceRedactionState,
+
+    /// Score-impact breakdown: how much provenance moved the posterior.
+    ///
+    /// Absent when provenance had no score impact (no evidence terms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_impact: Option<ProvenanceScoreImpact>,
+}
+
+/// Blast-radius output for a single candidate.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CandidateBlastRadiusOutput {
+    /// Risk score [0, 1].  Higher = more dangerous to kill.
+    pub risk_score: f64,
+
+    /// Classified risk level.
+    pub risk_level: String,
+
+    /// Confidence in the blast-radius estimate [0, 1].
+    pub confidence: f64,
+
+    /// Human-readable summary of the blast radius.
+    pub summary: String,
+
+    /// Total number of other processes/resources affected by killing
+    /// this candidate (direct + indirect transitive impact).
+    pub total_affected: usize,
+}
+
+/// How provenance features affected the candidate's posterior score.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProvenanceScoreImpact {
+    /// Net shift in log-odds(abandoned/useful) from provenance terms.
+    ///
+    /// Positive = provenance pushed toward abandonment classification.
+    /// Negative = provenance pushed toward useful classification.
+    pub log_odds_shift: f64,
+
+    /// Per-feature breakdown of score contributions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feature_contributions: Vec<ProvenanceFeatureContribution>,
+}
+
+/// A single provenance feature's contribution to the score.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProvenanceFeatureContribution {
+    /// Feature name (e.g. "provenance_ownership_orphaned").
+    pub feature: String,
+
+    /// Log-likelihood contribution toward abandoned classification.
+    pub abandoned_ll: f64,
+
+    /// Log-likelihood contribution toward useful classification.
+    pub useful_ll: f64,
+
+    /// Net direction: "toward_abandon", "toward_useful", or "neutral".
+    pub direction: String,
+}
+
+impl CandidateProvenanceOutput {
+    /// Construct a disabled/absent provenance output.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            evidence_completeness: 0.0,
+            confidence_penalty_steps: 0,
+            confidence_notes: Vec::new(),
+            score_terms: Vec::new(),
+            blast_radius: CandidateBlastRadiusOutput {
+                risk_score: 0.0,
+                risk_level: "unknown".to_string(),
+                confidence: 0.0,
+                summary: "provenance not available".to_string(),
+                total_affected: 0,
+            },
+            redaction_state: ProvenanceRedactionState::None,
+            score_impact: None,
+        }
+    }
+}
+
+// ── Human-readable narrative formatter ───────────────────────────────
+//
+// Translates `CandidateProvenanceOutput` into structured human-readable
+// narratives for CLI, TUI, and report surfaces.  The narrative answers
+// four operator questions in order:
+//
+// 1. **Origin**: Why does this process exist?
+// 2. **Suspicion**: Why is it flagged?
+// 3. **Blast radius**: What could break if it's killed?
+// 4. **Uncertainty**: What don't we know?
+//
+// Each section uses consistent terminology so human and machine outputs
+// never tell different stories.
+
+/// Narrative verbosity level for different display surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NarrativeVerbosity {
+    /// One-line summary for compact CLI output (≤80 chars).
+    Compact,
+    /// Multi-line summary for standard CLI output (3-5 lines).
+    Standard,
+    /// Full narrative for reports and verbose/debug modes.
+    Full,
+}
+
+/// Structured narrative produced from provenance evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceNarrative {
+    /// One-line summary suitable for any surface.
+    pub headline: String,
+    /// Ordered narrative sections.
+    pub sections: Vec<NarrativeSection>,
+    /// Caveats that must be visible to the user (never truncated).
+    pub caveats: Vec<String>,
+}
+
+/// A single section of the provenance narrative.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NarrativeSection {
+    /// Section heading (e.g., "Blast Radius", "Uncertainty").
+    pub heading: String,
+    /// Section body text.
+    pub body: String,
+    /// Glyph for TUI/CLI display.
+    pub glyph: String,
+}
+
+/// Risk level labels for human display.
+fn risk_level_label(level: &str) -> &'static str {
+    match level {
+        "low" => "low",
+        "medium" => "moderate",
+        "high" => "high",
+        "critical" => "critical",
+        _ => "unknown",
+    }
+}
+
+/// Confidence label for humans.
+fn completeness_label(completeness: f64) -> &'static str {
+    if completeness >= 0.9 {
+        "strong"
+    } else if completeness >= 0.7 {
+        "moderate"
+    } else if completeness >= 0.5 {
+        "partial"
+    } else {
+        "weak"
+    }
+}
+
+impl ProvenanceNarrative {
+    /// Build a narrative from a provenance output.
+    pub fn from_output(output: &CandidateProvenanceOutput) -> Self {
+        if !output.enabled {
+            return Self {
+                headline: "Provenance: not available".to_string(),
+                sections: Vec::new(),
+                caveats: Vec::new(),
+            };
+        }
+
+        let mut sections = Vec::new();
+        let mut caveats = Vec::new();
+
+        // ── Section 1: Suspicion (score terms) ──────────────────────
+        if !output.score_terms.is_empty() {
+            let term_descriptions: Vec<&str> = output
+                .score_terms
+                .iter()
+                .map(|t| match t.as_str() {
+                    "provenance_ownership_orphaned" => "orphaned (no parent)",
+                    "provenance_ownership_supervised" => "supervised by init system",
+                    "provenance_ownership_shell" => "shell-owned",
+                    "provenance_active_listener" => "actively listening on network",
+                    "provenance_blast_radius_high" => "high blast radius",
+                    "provenance_blast_radius_low" => "low blast radius",
+                    other => other,
+                })
+                .collect();
+
+            sections.push(NarrativeSection {
+                heading: "Provenance Signals".to_string(),
+                body: term_descriptions.join("; "),
+                glyph: "🔗".to_string(),
+            });
+        }
+
+        // ── Section 2: Blast radius ─────────────────────────────────
+        let br = &output.blast_radius;
+        let risk_label = risk_level_label(&br.risk_level);
+        let br_body = if br.total_affected == 0 {
+            format!(
+                "{} risk (score {:.0}%). {}",
+                capitalize(risk_label),
+                br.risk_score * 100.0,
+                br.summary
+            )
+        } else {
+            format!(
+                "{} risk (score {:.0}%), {} affected. {}",
+                capitalize(risk_label),
+                br.risk_score * 100.0,
+                br.total_affected,
+                br.summary
+            )
+        };
+
+        sections.push(NarrativeSection {
+            heading: "Blast Radius".to_string(),
+            body: br_body,
+            glyph: "🛡".to_string(),
+        });
+
+        // ── Section 3: Uncertainty ──────────────────────────────────
+        let completeness = completeness_label(output.evidence_completeness);
+        if output.evidence_completeness < 0.9 || output.confidence_penalty_steps > 0 {
+            let mut uncertainty_parts = vec![format!(
+                "Evidence completeness: {} ({:.0}%)",
+                completeness,
+                output.evidence_completeness * 100.0
+            )];
+
+            if output.confidence_penalty_steps > 0 {
+                uncertainty_parts.push(format!(
+                    "Confidence reduced by {} step(s)",
+                    output.confidence_penalty_steps
+                ));
+            }
+
+            sections.push(NarrativeSection {
+                heading: "Uncertainty".to_string(),
+                body: uncertainty_parts.join(". "),
+                glyph: "⚠".to_string(),
+            });
+        }
+
+        // ── Caveats (never truncated) ───────────────────────────────
+        for note in &output.confidence_notes {
+            caveats.push(note.clone());
+        }
+
+        if output.redaction_state != ProvenanceRedactionState::None {
+            caveats.push(format!(
+                "Some provenance evidence was {} per privacy policy",
+                match output.redaction_state {
+                    ProvenanceRedactionState::Partial => "partially redacted",
+                    ProvenanceRedactionState::Full => "fully redacted",
+                    ProvenanceRedactionState::None => unreachable!(),
+                }
+            ));
+        }
+
+        // ── Headline ────────────────────────────────────────────────
+        let headline = Self::build_headline(output, risk_label, completeness);
+
+        Self {
+            headline,
+            sections,
+            caveats,
+        }
+    }
+
+    fn build_headline(
+        output: &CandidateProvenanceOutput,
+        risk_label: &str,
+        completeness: &str,
+    ) -> String {
+        let risk_part = format!("{} blast radius", risk_label);
+        let evidence_part = format!("{} evidence", completeness);
+
+        if output.confidence_penalty_steps > 0 {
+            format!(
+                "Provenance: {}; {} (confidence reduced)",
+                risk_part, evidence_part
+            )
+        } else {
+            format!("Provenance: {}; {}", risk_part, evidence_part)
+        }
+    }
+
+    /// Render the narrative at a given verbosity level.
+    pub fn render(&self, verbosity: NarrativeVerbosity) -> String {
+        match verbosity {
+            NarrativeVerbosity::Compact => self.headline.clone(),
+            NarrativeVerbosity::Standard => {
+                let mut lines = vec![self.headline.clone()];
+                for section in &self.sections {
+                    lines.push(format!("  {} {}: {}", section.glyph, section.heading, section.body));
+                }
+                if !self.caveats.is_empty() {
+                    lines.push(format!(
+                        "  ⚠ Caveats: {}",
+                        self.caveats.join("; ")
+                    ));
+                }
+                lines.join("\n")
+            }
+            NarrativeVerbosity::Full => {
+                let mut lines = vec![self.headline.clone(), String::new()];
+                for section in &self.sections {
+                    lines.push(format!("{} {}", section.glyph, section.heading));
+                    lines.push(format!("  {}", section.body));
+                    lines.push(String::new());
+                }
+                if !self.caveats.is_empty() {
+                    lines.push("⚠ Caveats".to_string());
+                    for caveat in &self.caveats {
+                        lines.push(format!("  • {}", caveat));
+                    }
+                }
+                lines.join("\n")
+            }
+        }
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
 fn short_hash(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
@@ -1053,5 +1439,291 @@ mod tests {
     fn privacy_policy_counts_rules_that_require_operator_consent() {
         let policy = ProvenancePrivacyPolicy::default();
         assert_eq!(policy.consent_required_count(), 9);
+    }
+
+    // ── Narrative formatter tests ───────────────────────────────────
+
+    fn sample_full_provenance() -> CandidateProvenanceOutput {
+        CandidateProvenanceOutput {
+            enabled: true,
+            evidence_completeness: 0.72,
+            confidence_penalty_steps: 2,
+            confidence_notes: vec![
+                "missing lineage provenance".to_string(),
+                "resource provenance has 2 unresolved edge(s)".to_string(),
+            ],
+            score_terms: vec![
+                "provenance_ownership_orphaned".to_string(),
+                "provenance_blast_radius_low".to_string(),
+            ],
+            blast_radius: CandidateBlastRadiusOutput {
+                risk_score: 0.15,
+                risk_level: "low".to_string(),
+                confidence: 0.60,
+                summary: "Isolated process, no shared resources".to_string(),
+                total_affected: 0,
+            },
+            redaction_state: ProvenanceRedactionState::None,
+            score_impact: None,
+        }
+    }
+
+    #[test]
+    fn narrative_disabled_is_short() {
+        let output = CandidateProvenanceOutput::disabled();
+        let narrative = ProvenanceNarrative::from_output(&output);
+        assert_eq!(narrative.headline, "Provenance: not available");
+        assert!(narrative.sections.is_empty());
+        assert!(narrative.caveats.is_empty());
+    }
+
+    #[test]
+    fn narrative_has_expected_sections() {
+        let output = sample_full_provenance();
+        let narrative = ProvenanceNarrative::from_output(&output);
+
+        let headings: Vec<&str> = narrative.sections.iter().map(|s| s.heading.as_str()).collect();
+        assert!(headings.contains(&"Provenance Signals"));
+        assert!(headings.contains(&"Blast Radius"));
+        assert!(headings.contains(&"Uncertainty"));
+    }
+
+    #[test]
+    fn narrative_caveats_include_confidence_notes() {
+        let output = sample_full_provenance();
+        let narrative = ProvenanceNarrative::from_output(&output);
+
+        assert!(narrative.caveats.iter().any(|c| c.contains("missing lineage")));
+        assert!(narrative.caveats.iter().any(|c| c.contains("unresolved edge")));
+    }
+
+    #[test]
+    fn narrative_redaction_caveat_added() {
+        let mut output = sample_full_provenance();
+        output.redaction_state = ProvenanceRedactionState::Partial;
+        let narrative = ProvenanceNarrative::from_output(&output);
+
+        assert!(narrative
+            .caveats
+            .iter()
+            .any(|c| c.contains("partially redacted")));
+    }
+
+    #[test]
+    fn narrative_compact_is_one_line() {
+        let output = sample_full_provenance();
+        let narrative = ProvenanceNarrative::from_output(&output);
+        let rendered = narrative.render(NarrativeVerbosity::Compact);
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.len() <= 120); // Reasonable compact length
+    }
+
+    #[test]
+    fn narrative_standard_has_sections() {
+        let output = sample_full_provenance();
+        let narrative = ProvenanceNarrative::from_output(&output);
+        let rendered = narrative.render(NarrativeVerbosity::Standard);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(lines.len() >= 3); // headline + sections
+        assert!(rendered.contains("🔗")); // Score terms glyph
+        assert!(rendered.contains("🛡")); // Blast radius glyph
+    }
+
+    #[test]
+    fn narrative_full_has_all_details() {
+        let output = sample_full_provenance();
+        let narrative = ProvenanceNarrative::from_output(&output);
+        let rendered = narrative.render(NarrativeVerbosity::Full);
+        assert!(rendered.contains("Provenance Signals"));
+        assert!(rendered.contains("Blast Radius"));
+        assert!(rendered.contains("Uncertainty"));
+        assert!(rendered.contains("Caveats"));
+        assert!(rendered.contains("missing lineage"));
+    }
+
+    #[test]
+    fn narrative_headline_mentions_confidence_reduction() {
+        let output = sample_full_provenance();
+        let narrative = ProvenanceNarrative::from_output(&output);
+        assert!(narrative.headline.contains("confidence reduced"));
+    }
+
+    #[test]
+    fn narrative_no_uncertainty_section_when_evidence_strong() {
+        let mut output = sample_full_provenance();
+        output.evidence_completeness = 0.95;
+        output.confidence_penalty_steps = 0;
+        output.confidence_notes.clear();
+        let narrative = ProvenanceNarrative::from_output(&output);
+
+        let headings: Vec<&str> = narrative.sections.iter().map(|s| s.heading.as_str()).collect();
+        assert!(!headings.contains(&"Uncertainty"));
+    }
+
+    #[test]
+    fn narrative_score_terms_use_human_labels() {
+        let output = sample_full_provenance();
+        let narrative = ProvenanceNarrative::from_output(&output);
+        let signals = narrative
+            .sections
+            .iter()
+            .find(|s| s.heading == "Provenance Signals")
+            .unwrap();
+        assert!(signals.body.contains("orphaned"));
+        assert!(signals.body.contains("low blast radius"));
+    }
+
+    // ── CandidateProvenanceOutput contract tests ────────────────────
+
+    #[test]
+    fn candidate_provenance_output_disabled_serializes_stably() {
+        let output = CandidateProvenanceOutput::disabled();
+        let json = serde_json::to_value(&output).expect("serialize disabled output");
+
+        assert_eq!(json["enabled"], serde_json::json!(false));
+        assert_eq!(json["evidence_completeness"], serde_json::json!(0.0));
+        assert_eq!(json["confidence_penalty_steps"], serde_json::json!(0));
+        assert_eq!(json["blast_radius"]["risk_score"], serde_json::json!(0.0));
+        assert_eq!(
+            json["blast_radius"]["risk_level"],
+            serde_json::json!("unknown")
+        );
+        // Empty vecs should be absent (skip_serializing_if)
+        assert!(json.get("confidence_notes").is_none());
+        assert!(json.get("score_terms").is_none());
+        assert!(json.get("score_impact").is_none());
+    }
+
+    #[test]
+    fn candidate_provenance_output_full_serializes_stably() {
+        let output = CandidateProvenanceOutput {
+            enabled: true,
+            evidence_completeness: 0.85,
+            confidence_penalty_steps: 1,
+            confidence_notes: vec![
+                "resource provenance has 2 unresolved edge(s)".to_string(),
+            ],
+            score_terms: vec![
+                "provenance_ownership_orphaned".to_string(),
+                "provenance_blast_radius_low".to_string(),
+            ],
+            blast_radius: CandidateBlastRadiusOutput {
+                risk_score: 0.12,
+                risk_level: "low".to_string(),
+                confidence: 0.90,
+                summary: "Isolated process with no shared resources".to_string(),
+                total_affected: 0,
+            },
+            redaction_state: ProvenanceRedactionState::None,
+            score_impact: Some(ProvenanceScoreImpact {
+                log_odds_shift: 0.35,
+                feature_contributions: vec![
+                    ProvenanceFeatureContribution {
+                        feature: "provenance_ownership_orphaned".to_string(),
+                        abandoned_ll: 0.70,
+                        useful_ll: -0.55,
+                        direction: "toward_abandon".to_string(),
+                    },
+                    ProvenanceFeatureContribution {
+                        feature: "provenance_blast_radius_low".to_string(),
+                        abandoned_ll: 0.35,
+                        useful_ll: -0.25,
+                        direction: "toward_abandon".to_string(),
+                    },
+                ],
+            }),
+        };
+
+        let json = serde_json::to_value(&output).expect("serialize full output");
+
+        // Top-level fields
+        assert_eq!(json["enabled"], serde_json::json!(true));
+        assert_eq!(json["evidence_completeness"], serde_json::json!(0.85));
+        assert_eq!(json["confidence_penalty_steps"], serde_json::json!(1));
+        assert_eq!(json["redaction_state"], serde_json::json!("none"));
+
+        // Confidence notes
+        let notes = json["confidence_notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+
+        // Score terms
+        let terms = json["score_terms"].as_array().unwrap();
+        assert_eq!(terms.len(), 2);
+        assert_eq!(terms[0], serde_json::json!("provenance_ownership_orphaned"));
+
+        // Blast radius
+        assert_eq!(json["blast_radius"]["risk_score"], serde_json::json!(0.12));
+        assert_eq!(json["blast_radius"]["risk_level"], serde_json::json!("low"));
+        assert_eq!(json["blast_radius"]["total_affected"], serde_json::json!(0));
+
+        // Score impact
+        let impact = &json["score_impact"];
+        assert_eq!(impact["log_odds_shift"], serde_json::json!(0.35));
+        let contributions = impact["feature_contributions"].as_array().unwrap();
+        assert_eq!(contributions.len(), 2);
+        assert_eq!(
+            contributions[0]["direction"],
+            serde_json::json!("toward_abandon")
+        );
+    }
+
+    #[test]
+    fn candidate_provenance_output_roundtrips() {
+        let output = CandidateProvenanceOutput {
+            enabled: true,
+            evidence_completeness: 0.72,
+            confidence_penalty_steps: 2,
+            confidence_notes: vec![
+                "missing lineage provenance".to_string(),
+                "blast-radius estimate is low-confidence".to_string(),
+            ],
+            score_terms: vec!["provenance_blast_radius_high".to_string()],
+            blast_radius: CandidateBlastRadiusOutput {
+                risk_score: 0.78,
+                risk_level: "high".to_string(),
+                confidence: 0.45,
+                summary: "Process shares 3 lockfiles with 5 peers".to_string(),
+                total_affected: 5,
+            },
+            redaction_state: ProvenanceRedactionState::Partial,
+            score_impact: None,
+        };
+
+        let json_str = serde_json::to_string(&output).expect("serialize");
+        let deser: CandidateProvenanceOutput =
+            serde_json::from_str(&json_str).expect("deserialize");
+
+        assert_eq!(deser.enabled, output.enabled);
+        assert_eq!(deser.evidence_completeness, output.evidence_completeness);
+        assert_eq!(
+            deser.confidence_penalty_steps,
+            output.confidence_penalty_steps
+        );
+        assert_eq!(deser.confidence_notes, output.confidence_notes);
+        assert_eq!(deser.score_terms, output.score_terms);
+        assert_eq!(
+            deser.blast_radius.risk_score,
+            output.blast_radius.risk_score
+        );
+        assert_eq!(deser.blast_radius.risk_level, output.blast_radius.risk_level);
+        assert_eq!(
+            deser.blast_radius.total_affected,
+            output.blast_radius.total_affected
+        );
+        assert_eq!(deser.redaction_state, output.redaction_state);
+        assert!(deser.score_impact.is_none());
+    }
+
+    #[test]
+    fn candidate_provenance_json_schema_is_valid() {
+        let schema = schemars::schema_for!(CandidateProvenanceOutput);
+        let json = serde_json::to_value(&schema).expect("serialize schema");
+        assert!(json.get("$schema").is_some() || json.get("title").is_some());
+        // Verify key properties exist in schema
+        let props = json["properties"].as_object().unwrap();
+        assert!(props.contains_key("enabled"));
+        assert!(props.contains_key("evidence_completeness"));
+        assert!(props.contains_key("blast_radius"));
+        assert!(props.contains_key("score_impact"));
     }
 }
