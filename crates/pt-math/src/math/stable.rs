@@ -41,6 +41,34 @@ pub fn log_sum_exp(values: &[f64]) -> f64 {
     max + sum.ln()
 }
 
+/// Zero-allocation log-sum-exp for fixed-size arrays.
+///
+/// Semantically identical to [`log_sum_exp`] but avoids slice overhead
+/// and enables the compiler to unroll the loops for small N (e.g., N=4).
+#[inline]
+pub fn log_sum_exp_array<const N: usize>(values: &[f64; N]) -> f64 {
+    let mut max = f64::NEG_INFINITY;
+    for v in values {
+        if v.is_nan() {
+            return f64::NAN;
+        }
+        if *v > max {
+            max = *v;
+        }
+    }
+    if max == f64::NEG_INFINITY {
+        return f64::NEG_INFINITY;
+    }
+    if max == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    let mut sum = 0.0;
+    for v in values {
+        sum += (*v - max).exp();
+    }
+    max + sum.ln()
+}
+
 /// Stable log(exp(a) + exp(b)).
 pub fn log_add_exp(a: f64, b: f64) -> f64 {
     if a.is_nan() || b.is_nan() {
@@ -256,5 +284,43 @@ mod tests {
     fn log_gamma_negative_integer_is_nan() {
         let out = log_gamma(-2.0);
         assert!(out.is_nan());
+    }
+
+    // ── log_sum_exp_array tests ─────────────────────────────────────
+
+    #[test]
+    fn log_sum_exp_array_matches_slice_version() {
+        let vals = [-0.356, -1.609, -2.302, -3.912];
+        let slice_result = log_sum_exp(&vals);
+        let array_result = log_sum_exp_array(&vals);
+        assert!(approx_eq(slice_result, array_result, 1e-14));
+    }
+
+    #[test]
+    fn log_sum_exp_array_basic() {
+        let vals = [0.0, 0.0];
+        let out = log_sum_exp_array(&vals);
+        assert!(approx_eq(out, 2.0f64.ln(), 1e-12));
+    }
+
+    #[test]
+    fn log_sum_exp_array_dominance() {
+        let vals = [-1000.0, 0.0, -2000.0, -3000.0];
+        let out = log_sum_exp_array(&vals);
+        assert!(approx_eq(out, 0.0, 1e-12));
+    }
+
+    #[test]
+    fn log_sum_exp_array_nan_propagates() {
+        let vals = [0.0, f64::NAN, -1.0, -2.0];
+        let out = log_sum_exp_array(&vals);
+        assert!(out.is_nan());
+    }
+
+    #[test]
+    fn log_sum_exp_array_all_neg_inf() {
+        let vals = [f64::NEG_INFINITY; 4];
+        let out = log_sum_exp_array(&vals);
+        assert!(out == f64::NEG_INFINITY);
     }
 }

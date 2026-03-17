@@ -17155,7 +17155,11 @@ mod provenance_scoring_tests {
 
         assert!(features.contains(&"provenance_ownership_orphaned"));
         assert!(features.contains(&"provenance_blast_radius_low"));
-        assert_eq!(adjustment.confidence_penalty_steps, 0);
+        assert!(adjustment.confidence_penalty_steps >= 1);
+        assert!(adjustment
+            .confidence_notes
+            .iter()
+            .any(|note| note.contains("PPID=1") || note.contains("ancestor chain")));
     }
 
     #[test]

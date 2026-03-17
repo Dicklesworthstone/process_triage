@@ -8,4 +8,5 @@ pub mod dirichlet;
 pub mod gamma;
 pub mod normal;
 pub mod posterior;
+pub mod precomputed;
 pub mod stable;
