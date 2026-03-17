@@ -126,8 +126,8 @@ fn stall_detector_produces_consistent_signals() {
     let r1 = detector.observe(500, 0);
     assert!(!r1.is_stalled);
 
-    let r2 = detector.observe(2000, 0);
-    let r3 = detector.observe(5000, 0);
+    let _r2 = detector.observe(2000, 0);
+    let _r3 = detector.observe(5000, 0);
     let r4 = detector.observe(10000, 0);
 
     // Rho should be monotonically increasing.
