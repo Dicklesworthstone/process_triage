@@ -49,7 +49,8 @@ use pt_core::output::{encode_toon_value, CompactConfig, FieldSelector, TokenEffi
 use pt_core::plan::{generate_plan, DecisionBundle, DecisionCandidate};
 use pt_core::session::compare::generate_comparison_report;
 use pt_core::session::diff::{
-    compute_diff, DeltaKind, DiffConfig, InferenceSummary, ProcessDelta, SessionDiff,
+    compute_diff, DeltaKind, DiffConfig, InferenceSummary, LifecycleTransition, ProcessDelta,
+    SessionDiff,
 };
 use pt_core::session::fleet::{create_fleet_session, HostInput};
 use pt_core::session::snapshot_persist::{
@@ -14425,6 +14426,28 @@ fn format_inference_summary(inf: Option<&InferenceSummary>) -> String {
     }
 }
 
+fn format_lifecycle_summary(delta: &ProcessDelta) -> String {
+    let transition = match delta.lifecycle.transition {
+        LifecycleTransition::Appeared => "appeared",
+        LifecycleTransition::Resolved => "resolved",
+        LifecycleTransition::Stable => "stable",
+        LifecycleTransition::NewlyOrphaned => "newly_orphaned",
+        LifecycleTransition::LongOrphaned => "long_orphaned",
+        LifecycleTransition::Reparented => "reparented",
+        LifecycleTransition::OwnershipChanged => "ownership_changed",
+        LifecycleTransition::StateChanged => "state_changed",
+        LifecycleTransition::Multiple => "multiple",
+    };
+
+    let confidence = format!("{:.2}", delta.lifecycle.continuity_confidence);
+    if matches!(delta.lifecycle.transition, LifecycleTransition::Stable) {
+        format!("{transition}@{confidence}")
+    } else {
+        let reason = truncate_ascii(&delta.lifecycle.reason, 32);
+        format!("{transition}@{confidence} {reason}")
+    }
+}
+
 fn format_diff_plain(
     base_id: &SessionId,
     compare_id: &SessionId,
@@ -14471,12 +14494,12 @@ fn format_diff_plain(
     ));
 
     output.push_str(&format!(
-        "{:>6} {:<9} {:<40} | {:<22} | {:<22} | {:>6}\n",
-        "PID", "KIND", "CMD", "OLD", "NEW", "DELTA"
+        "{:>6} {:<9} {:<40} | {:<22} | {:<22} | {:>6} | {:<32}\n",
+        "PID", "KIND", "CMD", "OLD", "NEW", "DELTA", "LIFECYCLE"
     ));
     output.push_str(&format!(
-        "{:-<6} {:-<9} {:-<40}-+-{:-<22}-+-{:-<22}-+-{:-<6}\n",
-        "", "", "", "", "", ""
+        "{:-<6} {:-<9} {:-<40}-+-{:-<22}-+-{:-<22}-+-{:-<6}-+-{:-<32}\n",
+        "", "", "", "", "", "", ""
     ));
 
     for delta in deltas {
@@ -14493,6 +14516,7 @@ fn format_diff_plain(
             .score_drift
             .map(|d| format!("{:+}", d))
             .unwrap_or_else(|| "-".to_string());
+        let lifecycle = format_lifecycle_summary(delta);
 
         let kind = match delta.kind {
             DeltaKind::New => "NEW",
@@ -14502,8 +14526,8 @@ fn format_diff_plain(
         };
 
         output.push_str(&format!(
-            "{:>6} {:<9} {:<40} | {:<22} | {:<22} | {:>6}\n",
-            delta.pid, kind, cmd, old_desc, new_desc, delta_str
+            "{:>6} {:<9} {:<40} | {:<22} | {:<22} | {:>6} | {:<32}\n",
+            delta.pid, kind, cmd, old_desc, new_desc, delta_str, lifecycle
         ));
     }
 

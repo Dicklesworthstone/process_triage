@@ -187,6 +187,71 @@ mod tests {
         assert_eq!(diff.summary.changed_count, 0);
     }
 
+    // -- Scenario: continuity captures newly orphaned and ownership transition --
+
+    #[test]
+    fn scenario_continuity_lifecycle_delta() {
+        let old_procs = vec![PersistedProcess {
+            pid: 100,
+            ppid: 42,
+            uid: 1000,
+            start_id: "b1:100:100".to_string(),
+            comm: "worker".to_string(),
+            cmd: "worker --serve".to_string(),
+            state: "S".to_string(),
+            start_time_unix: 1700000000,
+            elapsed_secs: 3600,
+            identity_quality: "Full".to_string(),
+        }];
+        let new_procs = vec![PersistedProcess {
+            pid: 100,
+            ppid: 1,
+            uid: 0,
+            start_id: "b1:100:100".to_string(),
+            comm: "worker".to_string(),
+            cmd: "worker --serve".to_string(),
+            state: "R".to_string(),
+            start_time_unix: 1700000000,
+            elapsed_secs: 5400,
+            identity_quality: "Full".to_string(),
+        }];
+        let old_infs = vec![inf(100, "b1:100:100", "useful_bad", 40, "review", 0.3)];
+        let new_infs = vec![inf(100, "b1:100:100", "abandoned", 81, "kill", 0.9)];
+
+        let diff = compute_diff(
+            "s1",
+            "s2",
+            &old_procs,
+            &old_infs,
+            &new_procs,
+            &new_infs,
+            &DiffConfig::default(),
+        );
+
+        let delta = diff
+            .deltas
+            .iter()
+            .find(|d| d.start_id == "b1:100:100")
+            .unwrap();
+        assert_eq!(delta.kind, DeltaKind::Changed);
+        assert_eq!(delta.lifecycle.transition, LifecycleTransition::Multiple);
+        assert!(delta
+            .lifecycle
+            .signals
+            .iter()
+            .any(|signal| signal == "newly_orphaned"));
+        assert!(delta
+            .lifecycle
+            .signals
+            .iter()
+            .any(|signal| signal == "ownership_transition"));
+        assert!(delta
+            .lifecycle
+            .reason
+            .contains("matched by start_id continuity"));
+        assert!(delta.worsened);
+    }
+
     // -- Scenario: Worsening over time --
 
     #[test]

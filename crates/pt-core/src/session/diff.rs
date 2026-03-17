@@ -32,6 +32,8 @@ pub struct ProcessDelta {
     pub pid: u32,
     pub start_id: String,
     pub kind: DeltaKind,
+    /// Temporal continuity/lifecycle metadata for this identity match.
+    pub lifecycle: LifecycleDelta,
     /// Previous inference (if present in old snapshot).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_inference: Option<InferenceSummary>,
@@ -47,6 +49,31 @@ pub struct ProcessDelta {
     pub worsened: bool,
     /// Improved (score decreased = less suspicious).
     pub improved: bool,
+}
+
+/// High-level lifecycle transition inferred across snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleTransition {
+    Appeared,
+    Resolved,
+    Stable,
+    NewlyOrphaned,
+    LongOrphaned,
+    Reparented,
+    OwnershipChanged,
+    StateChanged,
+    Multiple,
+}
+
+/// Continuity metadata attached to a process delta.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleDelta {
+    pub transition: LifecycleTransition,
+    pub continuity_confidence: f64,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<String>,
 }
 
 /// Compact inference summary for delta display.
@@ -159,7 +186,14 @@ pub fn compute_diff(
 
         if old_proc_map.contains_key(key) {
             // Present in both snapshots.
-            let delta = classify_change(new_proc, old_inf.copied(), new_inf.copied(), config);
+            let old_proc = old_proc_map[key];
+            let delta = classify_change(
+                old_proc,
+                new_proc,
+                old_inf.copied(),
+                new_inf.copied(),
+                config,
+            );
             deltas.push(delta);
         } else {
             // New process.
@@ -167,6 +201,12 @@ pub fn compute_diff(
                 pid: new_proc.pid,
                 start_id: new_proc.start_id.clone(),
                 kind: DeltaKind::New,
+                lifecycle: LifecycleDelta {
+                    transition: LifecycleTransition::Appeared,
+                    continuity_confidence: 1.0,
+                    reason: "present only in newer snapshot".to_string(),
+                    signals: vec!["new_process".to_string()],
+                },
                 old_inference: None,
                 new_inference: new_inf.map(|i| InferenceSummary::from(*i)),
                 score_drift: None,
@@ -185,6 +225,12 @@ pub fn compute_diff(
                 pid: old_proc.pid,
                 start_id: old_proc.start_id.clone(),
                 kind: DeltaKind::Resolved,
+                lifecycle: LifecycleDelta {
+                    transition: LifecycleTransition::Resolved,
+                    continuity_confidence: 1.0,
+                    reason: "present only in older snapshot".to_string(),
+                    signals: vec!["resolved_process".to_string()],
+                },
                 old_inference: old_inf.map(|i| InferenceSummary::from(*i)),
                 new_inference: None,
                 score_drift: None,
@@ -252,7 +298,8 @@ fn delta_kind_rank(kind: DeltaKind) -> u8 {
 }
 
 fn classify_change(
-    proc: &PersistedProcess,
+    old_proc: &PersistedProcess,
+    new_proc: &PersistedProcess,
     old_inf: Option<&PersistedInference>,
     new_inf: Option<&PersistedInference>,
     config: &DiffConfig,
@@ -275,13 +322,14 @@ fn classify_change(
     let improved = score_drift.map(|d| d < 0).unwrap_or(false) && is_changed;
 
     ProcessDelta {
-        pid: proc.pid,
-        start_id: proc.start_id.clone(),
+        pid: new_proc.pid,
+        start_id: new_proc.start_id.clone(),
         kind: if is_changed {
             DeltaKind::Changed
         } else {
             DeltaKind::Unchanged
         },
+        lifecycle: classify_lifecycle(old_proc, new_proc),
         old_inference: old_inf.map(InferenceSummary::from),
         new_inference: new_inf.map(InferenceSummary::from),
         score_drift,
@@ -289,6 +337,120 @@ fn classify_change(
         worsened,
         improved,
     }
+}
+
+fn classify_lifecycle(old_proc: &PersistedProcess, new_proc: &PersistedProcess) -> LifecycleDelta {
+    let mut signals = Vec::new();
+
+    if old_proc.ppid != 1 && new_proc.ppid == 1 {
+        signals.push("newly_orphaned".to_string());
+    } else if old_proc.ppid == 1 && new_proc.ppid == 1 {
+        signals.push("long_orphaned".to_string());
+    } else if old_proc.ppid != new_proc.ppid {
+        signals.push("parent_transition".to_string());
+    }
+
+    if old_proc.uid != new_proc.uid {
+        signals.push("ownership_transition".to_string());
+    }
+
+    if old_proc.state != new_proc.state {
+        signals.push("state_transition".to_string());
+    }
+
+    if old_proc.identity_quality != new_proc.identity_quality {
+        signals.push("identity_quality_transition".to_string());
+    }
+
+    let transition = if signals.is_empty() {
+        LifecycleTransition::Stable
+    } else if signals.len() > 1 {
+        LifecycleTransition::Multiple
+    } else {
+        match signals[0].as_str() {
+            "newly_orphaned" => LifecycleTransition::NewlyOrphaned,
+            "long_orphaned" => LifecycleTransition::LongOrphaned,
+            "parent_transition" => LifecycleTransition::Reparented,
+            "ownership_transition" => LifecycleTransition::OwnershipChanged,
+            "state_transition" => LifecycleTransition::StateChanged,
+            _ => LifecycleTransition::Stable,
+        }
+    };
+
+    LifecycleDelta {
+        transition,
+        continuity_confidence: estimate_continuity_confidence(old_proc, new_proc),
+        reason: build_lifecycle_reason(old_proc, new_proc, &signals),
+        signals,
+    }
+}
+
+fn estimate_continuity_confidence(old_proc: &PersistedProcess, new_proc: &PersistedProcess) -> f64 {
+    let mut confidence: f64 = 0.75;
+
+    if old_proc.pid == new_proc.pid {
+        confidence += 0.15;
+    } else {
+        confidence -= 0.2;
+    }
+
+    if old_proc.uid == new_proc.uid {
+        confidence += 0.05;
+    } else {
+        confidence -= 0.1;
+    }
+
+    if old_proc.comm == new_proc.comm {
+        confidence += 0.03;
+    } else {
+        confidence -= 0.05;
+    }
+
+    if old_proc.identity_quality == new_proc.identity_quality {
+        confidence += 0.02;
+    }
+
+    confidence.clamp(0.0, 1.0)
+}
+
+fn build_lifecycle_reason(
+    old_proc: &PersistedProcess,
+    new_proc: &PersistedProcess,
+    signals: &[String],
+) -> String {
+    if signals.is_empty() {
+        return format!(
+            "stable continuity via start_id match; pid {} unchanged and no lifecycle transition detected",
+            new_proc.pid
+        );
+    }
+
+    let mut fragments = Vec::new();
+    for signal in signals {
+        match signal.as_str() {
+            "newly_orphaned" => fragments.push(format!(
+                "PPID {} -> {} (newly orphaned)",
+                old_proc.ppid, new_proc.ppid
+            )),
+            "long_orphaned" => fragments.push("PPID remained 1 across both snapshots".to_string()),
+            "parent_transition" => {
+                fragments.push(format!("PPID {} -> {}", old_proc.ppid, new_proc.ppid))
+            }
+            "ownership_transition" => {
+                fragments.push(format!("UID {} -> {}", old_proc.uid, new_proc.uid))
+            }
+            "state_transition" => {
+                fragments.push(format!("state {} -> {}", old_proc.state, new_proc.state))
+            }
+            "identity_quality_transition" => fragments.push(format!(
+                "identity quality {} -> {}",
+                old_proc.identity_quality, new_proc.identity_quality
+            )),
+            _ => {}
+        }
+    }
+
+    format!("matched by start_id continuity; {}", fragments.join(", "))
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +542,10 @@ mod tests {
             .find(|d| d.kind == DeltaKind::New)
             .unwrap();
         assert_eq!(new_delta.pid, 2);
+        assert_eq!(
+            new_delta.lifecycle.transition,
+            LifecycleTransition::Appeared
+        );
     }
 
     #[test]
@@ -402,6 +568,7 @@ mod tests {
             .find(|d| d.kind == DeltaKind::Resolved)
             .unwrap();
         assert_eq!(resolved.pid, 2);
+        assert_eq!(resolved.lifecycle.transition, LifecycleTransition::Resolved);
     }
 
     #[test]
@@ -588,5 +755,120 @@ mod tests {
         );
         assert_eq!(diff.summary.new_count, 1);
         assert_eq!(diff.summary.resolved_count, 1);
+    }
+
+    #[test]
+    fn test_newly_orphaned_transition() {
+        let old_proc = PersistedProcess {
+            ppid: 42,
+            ..proc(7, "a:7:7")
+        };
+        let new_proc = PersistedProcess {
+            ppid: 1,
+            ..proc(7, "a:7:7")
+        };
+        let diff = compute_diff(
+            "s1",
+            "s2",
+            &[old_proc],
+            &[],
+            &[new_proc],
+            &[],
+            &DiffConfig::default(),
+        );
+        let delta = &diff.deltas[0];
+        assert_eq!(
+            delta.lifecycle.transition,
+            LifecycleTransition::NewlyOrphaned
+        );
+        assert!(delta.lifecycle.reason.contains("newly orphaned"));
+        assert!(delta.lifecycle.continuity_confidence >= 0.9);
+    }
+
+    #[test]
+    fn test_long_orphaned_transition() {
+        let old_proc = proc(7, "a:7:7");
+        let new_proc = proc(7, "a:7:7");
+        let diff = compute_diff(
+            "s1",
+            "s2",
+            &[old_proc],
+            &[],
+            &[new_proc],
+            &[],
+            &DiffConfig::default(),
+        );
+        let delta = &diff.deltas[0];
+        assert_eq!(
+            delta.lifecycle.transition,
+            LifecycleTransition::LongOrphaned
+        );
+        assert!(delta.lifecycle.signals.iter().any(|s| s == "long_orphaned"));
+    }
+
+    #[test]
+    fn test_parent_transition() {
+        let old_proc = PersistedProcess {
+            ppid: 42,
+            ..proc(7, "a:7:7")
+        };
+        let new_proc = PersistedProcess {
+            ppid: 99,
+            ..proc(7, "a:7:7")
+        };
+        let diff = compute_diff(
+            "s1",
+            "s2",
+            &[old_proc],
+            &[],
+            &[new_proc],
+            &[],
+            &DiffConfig::default(),
+        );
+        let delta = &diff.deltas[0];
+        assert_eq!(delta.lifecycle.transition, LifecycleTransition::Reparented);
+        assert!(delta.lifecycle.reason.contains("PPID 42 -> 99"));
+    }
+
+    #[test]
+    fn test_multiple_lifecycle_signals() {
+        let old_proc = PersistedProcess {
+            ppid: 42,
+            uid: 1000,
+            state: "S".to_string(),
+            ..proc(7, "a:7:7")
+        };
+        let new_proc = PersistedProcess {
+            ppid: 1,
+            uid: 0,
+            state: "R".to_string(),
+            ..proc(7, "a:7:7")
+        };
+        let diff = compute_diff(
+            "s1",
+            "s2",
+            &[old_proc],
+            &[],
+            &[new_proc],
+            &[],
+            &DiffConfig::default(),
+        );
+        let delta = &diff.deltas[0];
+        assert_eq!(delta.lifecycle.transition, LifecycleTransition::Multiple);
+        assert!(delta
+            .lifecycle
+            .signals
+            .iter()
+            .any(|s| s == "newly_orphaned"));
+        assert!(delta
+            .lifecycle
+            .signals
+            .iter()
+            .any(|s| s == "ownership_transition"));
+        assert!(delta
+            .lifecycle
+            .signals
+            .iter()
+            .any(|s| s == "state_transition"));
     }
 }
