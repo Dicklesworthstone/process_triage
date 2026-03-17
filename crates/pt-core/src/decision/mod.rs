@@ -8,6 +8,7 @@ pub mod composite_test;
 pub mod contextual_bandits;
 pub mod cvar;
 pub mod dependency_loss;
+pub mod direct_impact;
 pub mod dro;
 pub mod enforcer;
 pub mod escalation;
@@ -62,6 +63,10 @@ pub use contextual_bandits::{
 };
 pub use cvar::{
     compute_cvar, decide_with_cvar, CvarError, CvarLoss, CvarTrigger, RiskSensitiveOutcome,
+};
+pub use direct_impact::{
+    compute_direct_impact, compute_direct_impact_batch, DirectImpactComponents, DirectImpactConfig,
+    DirectImpactResult,
 };
 pub use dependency_loss::{
     compute_critical_file_inflation, compute_dependency_scaling, scale_kill_loss,
