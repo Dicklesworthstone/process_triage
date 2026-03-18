@@ -6,10 +6,15 @@ It exists to satisfy `bd-ppcl.16`: later provenance beads should be able to add 
 
 ## Canonical Fixture Pack
 
-The current provenance fixture pack lives in:
+The provenance fixture pack lives in `test/fixtures/pt-core/`:
 
-- `test/fixtures/pt-core/provenance_privacy_snapshot.json`
-- `test/fixtures/pt-core/logs/provenance_debug_trace.jsonl`
+| Fixture | Purpose |
+|---------|---------|
+| `provenance_privacy_snapshot.json` | Graph snapshot with redacted/missing/conflicted evidence |
+| `provenance_output_disabled.json` | Golden snapshot: `CandidateProvenanceOutput::disabled()` |
+| `provenance_output_full.json` | Golden snapshot: full output with score_impact breakdown |
+| `provenance_output_redacted_high_blast.json` | Golden snapshot: partial redaction + high blast radius |
+| `logs/provenance_debug_trace.jsonl` | Canonical debug trace event vocabulary |
 
 Those fixtures intentionally cover:
 
@@ -18,6 +23,8 @@ Those fixtures intentionally cover:
 - conflicted/derived evidence
 - confidence downgrade warnings
 - explicit privacy-policy metadata
+- structured output contract serialization stability (disabled, full, redacted+high-blast variants)
+- score-impact feature contributions
 
 ## Shared Helper API
 
@@ -61,6 +68,8 @@ Use these canonical event names in structured logs:
 - `provenance_confidence_downgraded`
 - `provenance_graph_warning_emitted`
 - `provenance_blast_radius_reasoned`
+- `provenance_evidence_selected` (per-feature log-likelihood trace)
+- `provenance_blast_radius_computed` (risk score, level, affected count)
 
 Required fields by event family:
 
