@@ -133,6 +133,8 @@ pub enum ViolationKind {
     ForceReview,
     /// Process state prevents action (zombie/D-state).
     ProcessStateInvalid,
+    /// Provenance evidence blocks automated action.
+    ProvenanceGate,
 }
 
 /// Information about a process candidate for policy checking.
@@ -174,6 +176,18 @@ pub struct ProcessCandidate {
     pub wchan: Option<String>,
     /// Critical files detected (for data-loss safety gate).
     pub critical_files: Vec<CriticalFile>,
+
+    // ── Provenance fields (bd-ppcl.11) ────────────────────────────
+    /// Blast-radius risk level from provenance graph analysis.
+    /// Values: "low", "medium", "high", "critical", or None if unavailable.
+    pub blast_radius_risk_level: Option<String>,
+    /// Total processes/resources affected if this process is killed.
+    pub blast_radius_total_affected: Option<usize>,
+    /// Provenance evidence completeness [0, 1].
+    /// 1.0 = all expected evidence collected; <1.0 = gaps exist.
+    pub provenance_evidence_completeness: Option<f64>,
+    /// Number of confidence downgrade steps applied from provenance.
+    pub provenance_confidence_penalty: Option<usize>,
 }
 
 /// Compiled pattern for efficient matching.
@@ -670,7 +684,7 @@ impl PolicyEnforcer {
             }
         }
 
-        // Check blast radius
+        // Check blast radius (memory)
         if let Some(memory_mb) = candidate.memory_mb {
             if memory_mb > self.robot_mode.max_blast_radius_mb {
                 return Some(PolicyViolation {
@@ -682,6 +696,74 @@ impl PolicyEnforcer {
                     rule: "robot_mode.max_blast_radius_mb".to_string(),
                     context: None,
                 });
+            }
+        }
+
+        // ── Provenance gates (bd-ppcl.11) ────────────────────────────
+        // Block automated kills for high/critical blast-radius risk.
+        if let Some(ref risk_level) = candidate.blast_radius_risk_level {
+            match risk_level.as_str() {
+                "critical" => {
+                    let affected = candidate.blast_radius_total_affected.unwrap_or(0);
+                    return Some(PolicyViolation {
+                        kind: ViolationKind::ProvenanceGate,
+                        message: format!(
+                            "provenance blast radius is critical ({} affected); \
+                             automated action blocked",
+                            affected
+                        ),
+                        rule: "provenance.blast_radius_critical".to_string(),
+                        context: Some(
+                            "Process has critical blast radius from provenance graph. \
+                             Manual review required."
+                                .to_string(),
+                        ),
+                    });
+                }
+                "high" => {
+                    let affected = candidate.blast_radius_total_affected.unwrap_or(0);
+                    return Some(PolicyViolation {
+                        kind: ViolationKind::ProvenanceGate,
+                        message: format!(
+                            "provenance blast radius is high ({} affected); \
+                             automated action blocked — confirm manually",
+                            affected
+                        ),
+                        rule: "provenance.blast_radius_high".to_string(),
+                        context: Some(
+                            "Process has high blast radius from provenance graph. \
+                             Killing may affect dependent processes or shared resources."
+                                .to_string(),
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Block automated kills when provenance evidence is too incomplete.
+        // If we can't assess blast radius reliably, err on the safe side.
+        if let Some(completeness) = candidate.provenance_evidence_completeness {
+            if completeness < 0.3 {
+                if let Some(penalty) = candidate.provenance_confidence_penalty {
+                    if penalty >= 2 {
+                        return Some(PolicyViolation {
+                            kind: ViolationKind::ProvenanceGate,
+                            message: format!(
+                                "provenance evidence completeness is {:.0}% with {} confidence \
+                                 downgrade(s); insufficient evidence for automated action",
+                                completeness * 100.0,
+                                penalty
+                            ),
+                            rule: "provenance.evidence_completeness".to_string(),
+                            context: Some(
+                                "Provenance data is too sparse to reliably assess blast radius. \
+                                 Manual review recommended."
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                }
             }
         }
 
@@ -1063,6 +1145,10 @@ mod tests {
             process_state: None, // Normal processes have no special state
             wchan: None,
             critical_files: Vec::new(),
+            blast_radius_risk_level: None,
+            blast_radius_total_affected: None,
+            provenance_evidence_completeness: None,
+            provenance_confidence_penalty: None,
         }
     }
 
@@ -2336,5 +2422,168 @@ mod tests {
         // Using a zero-length duration should trigger reload immediately
         std::thread::sleep(std::time::Duration::from_millis(1));
         assert!(enforcer.should_reload(Duration::from_nanos(1)));
+    }
+
+    // ── Provenance gates (bd-ppcl.11) ────────────────────────────────
+
+    #[test]
+    fn provenance_critical_blast_radius_blocks_robot_kill() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.min_posterior = 0.50;
+
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.posterior = Some(0.99);
+        candidate.blast_radius_risk_level = Some("critical".to_string());
+        candidate.blast_radius_total_affected = Some(12);
+
+        let result = enforcer.check_action(&candidate, Action::Kill, true);
+        assert!(!result.allowed);
+        assert_eq!(
+            result.violation.as_ref().unwrap().kind,
+            ViolationKind::ProvenanceGate
+        );
+        assert!(result
+            .violation
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("critical"));
+        assert!(result
+            .violation
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("12 affected"));
+    }
+
+    #[test]
+    fn provenance_high_blast_radius_blocks_robot_kill() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.min_posterior = 0.50;
+
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.posterior = Some(0.99);
+        candidate.blast_radius_risk_level = Some("high".to_string());
+        candidate.blast_radius_total_affected = Some(5);
+
+        let result = enforcer.check_action(&candidate, Action::Kill, true);
+        assert!(!result.allowed);
+        assert_eq!(
+            result.violation.as_ref().unwrap().kind,
+            ViolationKind::ProvenanceGate
+        );
+        assert!(result
+            .violation
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("high"));
+    }
+
+    #[test]
+    fn provenance_low_blast_radius_allows_robot_kill() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.min_posterior = 0.50;
+
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.posterior = Some(0.99);
+        candidate.blast_radius_risk_level = Some("low".to_string());
+        candidate.blast_radius_total_affected = Some(0);
+
+        let result = enforcer.check_action(&candidate, Action::Kill, true);
+        assert!(result.allowed);
+    }
+
+    #[test]
+    fn provenance_medium_blast_radius_allows_robot_kill() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.min_posterior = 0.50;
+
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.posterior = Some(0.99);
+        candidate.blast_radius_risk_level = Some("medium".to_string());
+        candidate.blast_radius_total_affected = Some(2);
+
+        let result = enforcer.check_action(&candidate, Action::Kill, true);
+        assert!(result.allowed);
+    }
+
+    #[test]
+    fn provenance_low_evidence_with_high_penalty_blocks_robot_kill() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.min_posterior = 0.50;
+
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.posterior = Some(0.99);
+        candidate.provenance_evidence_completeness = Some(0.20);
+        candidate.provenance_confidence_penalty = Some(3);
+
+        let result = enforcer.check_action(&candidate, Action::Kill, true);
+        assert!(!result.allowed);
+        assert_eq!(
+            result.violation.as_ref().unwrap().kind,
+            ViolationKind::ProvenanceGate
+        );
+        assert!(result
+            .violation
+            .as_ref()
+            .unwrap()
+            .rule
+            .contains("evidence_completeness"));
+    }
+
+    #[test]
+    fn provenance_low_evidence_with_single_penalty_allows_robot_kill() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.min_posterior = 0.50;
+
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.posterior = Some(0.99);
+        candidate.provenance_evidence_completeness = Some(0.25);
+        candidate.provenance_confidence_penalty = Some(1); // Only 1, threshold is >= 2
+
+        let result = enforcer.check_action(&candidate, Action::Kill, true);
+        assert!(result.allowed);
+    }
+
+    #[test]
+    fn provenance_absent_does_not_block() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.min_posterior = 0.50;
+
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.posterior = Some(0.99);
+        // All provenance fields are None (default)
+
+        let result = enforcer.check_action(&candidate, Action::Kill, true);
+        assert!(result.allowed);
+    }
+
+    #[test]
+    fn provenance_gates_only_apply_in_robot_mode() {
+        let policy = test_policy(); // robot_mode.enabled = false
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.blast_radius_risk_level = Some("critical".to_string());
+        candidate.blast_radius_total_affected = Some(20);
+
+        // Not in robot mode — provenance gates are inside check_robot_mode_gates
+        // which is only called when robot_mode = true
+        let result = enforcer.check_action(&candidate, Action::Kill, false);
+        assert!(result.allowed);
     }
 }

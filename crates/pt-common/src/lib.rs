@@ -60,6 +60,11 @@ pub use lineage_evidence::{
 };
 pub use output::OutputFormat;
 pub use provenance::{
+    CandidateBlastRadiusOutput, CandidateProvenanceOutput, NarrativeSection, NarrativeVerbosity,
+    ProvenanceFeatureContribution, ProvenanceFeatureInput, ProvenanceNarrative,
+    ProvenanceScoreImpact,
+};
+pub use provenance::{
     ProvenanceConfidence, ProvenanceConsentRequirement, ProvenanceEdge, ProvenanceEdgeId,
     ProvenanceEdgeKind, ProvenanceEvidence, ProvenanceEvidenceId, ProvenanceEvidenceKind,
     ProvenanceExplanationEffect, ProvenanceFieldPolicy, ProvenanceFieldSelector,

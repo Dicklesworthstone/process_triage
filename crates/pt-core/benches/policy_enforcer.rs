@@ -27,6 +27,10 @@ fn simple_candidate(pid: i32) -> ProcessCandidate {
         process_state: None,
         wchan: None,
         critical_files: vec![],
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
     }
 }
 

@@ -488,6 +488,11 @@ mod tests {
             confidence: "high".to_string(),
             recommended_action: action.to_string(),
             score,
+            blast_radius_risk_level: None,
+            blast_radius_total_affected: None,
+            provenance_evidence_completeness: None,
+            provenance_score_terms: Vec::new(),
+            provenance_log_odds_shift: None,
         }
     }
 

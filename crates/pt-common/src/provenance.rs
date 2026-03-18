@@ -223,7 +223,17 @@ pub enum ProvenanceObservationStatus {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Serialize,
+    Deserialize,
     JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
@@ -867,6 +877,20 @@ pub struct ProvenanceFeatureContribution {
     pub direction: String,
 }
 
+/// Per-feature log-likelihood pair used to build `ProvenanceScoreImpact`.
+///
+/// This is a minimal input struct so callers don't need to depend on
+/// `pt-core`'s `EvidenceTerm` / `ClassScores` types.
+#[derive(Debug, Clone)]
+pub struct ProvenanceFeatureInput {
+    /// Feature name (e.g. "provenance_ownership_orphaned").
+    pub feature: String,
+    /// Log-likelihood contribution toward the abandoned class.
+    pub abandoned_ll: f64,
+    /// Log-likelihood contribution toward the useful class.
+    pub useful_ll: f64,
+}
+
 impl CandidateProvenanceOutput {
     /// Construct a disabled/absent provenance output.
     pub fn disabled() -> Self {
@@ -885,6 +909,75 @@ impl CandidateProvenanceOutput {
             },
             redaction_state: ProvenanceRedactionState::None,
             score_impact: None,
+        }
+    }
+
+    /// Build from provenance adjustment components.
+    ///
+    /// This is the canonical constructor that main.rs should use instead of
+    /// assembling ad-hoc JSON.  It populates `score_impact` from the feature
+    /// inputs and computes the net log-odds shift.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        evidence_completeness: f64,
+        confidence_penalty_steps: usize,
+        confidence_notes: Vec<String>,
+        features: &[ProvenanceFeatureInput],
+        blast_radius_risk_score: f64,
+        blast_radius_risk_level: &str,
+        blast_radius_confidence: f64,
+        blast_radius_summary: &str,
+        blast_radius_total_affected: usize,
+        redaction_state: ProvenanceRedactionState,
+    ) -> Self {
+        let score_terms: Vec<String> = features.iter().map(|f| f.feature.clone()).collect();
+
+        let score_impact = if features.is_empty() {
+            None
+        } else {
+            let mut log_odds_shift = 0.0_f64;
+            let contributions: Vec<ProvenanceFeatureContribution> = features
+                .iter()
+                .map(|f| {
+                    let shift = f.abandoned_ll - f.useful_ll;
+                    log_odds_shift += shift;
+                    let direction = if shift > 0.1 {
+                        "toward_abandon"
+                    } else if shift < -0.1 {
+                        "toward_useful"
+                    } else {
+                        "neutral"
+                    };
+                    ProvenanceFeatureContribution {
+                        feature: f.feature.clone(),
+                        abandoned_ll: f.abandoned_ll,
+                        useful_ll: f.useful_ll,
+                        direction: direction.to_string(),
+                    }
+                })
+                .collect();
+
+            Some(ProvenanceScoreImpact {
+                log_odds_shift,
+                feature_contributions: contributions,
+            })
+        };
+
+        Self {
+            enabled: true,
+            evidence_completeness,
+            confidence_penalty_steps,
+            confidence_notes,
+            score_terms,
+            blast_radius: CandidateBlastRadiusOutput {
+                risk_score: blast_radius_risk_score,
+                risk_level: blast_radius_risk_level.to_string(),
+                confidence: blast_radius_confidence,
+                summary: blast_radius_summary.to_string(),
+                total_affected: blast_radius_total_affected,
+            },
+            redaction_state,
+            score_impact,
         }
     }
 }
@@ -936,6 +1029,44 @@ pub struct NarrativeSection {
     pub glyph: String,
 }
 
+/// Map a provenance score term to a human-readable label.
+///
+/// These labels appear in the "Provenance Signals" narrative section.
+/// When adding new provenance features to the inference engine, add a
+/// corresponding label here so human and machine outputs stay aligned.
+fn score_term_label(term: &str) -> &str {
+    match term {
+        // Ownership / lineage
+        "provenance_ownership_orphaned" => "orphaned (no parent process)",
+        "provenance_ownership_supervised" => "supervised by init system",
+        "provenance_ownership_shell" => "shell-owned (interactive session)",
+        "provenance_ownership_agent" => "owned by AI agent session",
+        "provenance_ownership_init_child" => "direct child of init/PID 1",
+        "provenance_ownership_unknown" => "unknown ownership (no lineage)",
+        // Resource / blast radius
+        "provenance_active_listener" => "actively listening on network port(s)",
+        "provenance_blast_radius_high" => "high blast radius (many dependents)",
+        "provenance_blast_radius_low" => "low blast radius (isolated)",
+        "provenance_blast_radius_critical" => "critical blast radius (blocks automation)",
+        "provenance_shared_lockfiles" => "holds shared lockfile(s)",
+        "provenance_shared_memory" => "uses shared memory segments",
+        // Workspace / workflow
+        "provenance_in_workspace" => "attached to known workspace",
+        "provenance_no_workspace" => "no workspace association",
+        "provenance_stale_branch" => "on stale/merged branch",
+        "provenance_detached_head" => "running from detached HEAD",
+        // Workflow family
+        "provenance_test_runner" => "test runner process",
+        "provenance_dev_server" => "development server",
+        "provenance_build_tool" => "build tool process",
+        "provenance_system_daemon" => "system daemon",
+        // Cross-user / boundary
+        "provenance_crossed_user_boundary" => "crossed user boundary (owned by different user)",
+        // Catch-all: return the raw term name (stripped of prefix if possible)
+        other => other,
+    }
+}
+
 /// Risk level labels for human display.
 fn risk_level_label(level: &str) -> &'static str {
     match level {
@@ -979,21 +1110,37 @@ impl ProvenanceNarrative {
             let term_descriptions: Vec<&str> = output
                 .score_terms
                 .iter()
-                .map(|t| match t.as_str() {
-                    "provenance_ownership_orphaned" => "orphaned (no parent)",
-                    "provenance_ownership_supervised" => "supervised by init system",
-                    "provenance_ownership_shell" => "shell-owned",
-                    "provenance_active_listener" => "actively listening on network",
-                    "provenance_blast_radius_high" => "high blast radius",
-                    "provenance_blast_radius_low" => "low blast radius",
-                    other => other,
-                })
+                .map(|t| score_term_label(t))
                 .collect();
 
             sections.push(NarrativeSection {
                 heading: "Provenance Signals".to_string(),
                 body: term_descriptions.join("; "),
                 glyph: "🔗".to_string(),
+            });
+        }
+
+        // ── Section 1b: Score impact (when present) ─────────────────
+        if let Some(ref impact) = output.score_impact {
+            let direction_label = if impact.log_odds_shift > 0.5 {
+                "strongly toward abandonment"
+            } else if impact.log_odds_shift > 0.1 {
+                "toward abandonment"
+            } else if impact.log_odds_shift < -0.5 {
+                "strongly toward useful"
+            } else if impact.log_odds_shift < -0.1 {
+                "toward useful"
+            } else {
+                "neutral (no strong signal)"
+            };
+
+            sections.push(NarrativeSection {
+                heading: "Score Impact".to_string(),
+                body: format!(
+                    "Provenance pushes classification {} (log-odds shift: {:+.2})",
+                    direction_label, impact.log_odds_shift
+                ),
+                glyph: "📊".to_string(),
             });
         }
 
@@ -1097,13 +1244,13 @@ impl ProvenanceNarrative {
             NarrativeVerbosity::Standard => {
                 let mut lines = vec![self.headline.clone()];
                 for section in &self.sections {
-                    lines.push(format!("  {} {}: {}", section.glyph, section.heading, section.body));
+                    lines.push(format!(
+                        "  {} {}: {}",
+                        section.glyph, section.heading, section.body
+                    ));
                 }
                 if !self.caveats.is_empty() {
-                    lines.push(format!(
-                        "  ⚠ Caveats: {}",
-                        self.caveats.join("; ")
-                    ));
+                    lines.push(format!("  ⚠ Caveats: {}", self.caveats.join("; ")));
                 }
                 lines.join("\n")
             }
@@ -1482,7 +1629,11 @@ mod tests {
         let output = sample_full_provenance();
         let narrative = ProvenanceNarrative::from_output(&output);
 
-        let headings: Vec<&str> = narrative.sections.iter().map(|s| s.heading.as_str()).collect();
+        let headings: Vec<&str> = narrative
+            .sections
+            .iter()
+            .map(|s| s.heading.as_str())
+            .collect();
         assert!(headings.contains(&"Provenance Signals"));
         assert!(headings.contains(&"Blast Radius"));
         assert!(headings.contains(&"Uncertainty"));
@@ -1493,8 +1644,14 @@ mod tests {
         let output = sample_full_provenance();
         let narrative = ProvenanceNarrative::from_output(&output);
 
-        assert!(narrative.caveats.iter().any(|c| c.contains("missing lineage")));
-        assert!(narrative.caveats.iter().any(|c| c.contains("unresolved edge")));
+        assert!(narrative
+            .caveats
+            .iter()
+            .any(|c| c.contains("missing lineage")));
+        assert!(narrative
+            .caveats
+            .iter()
+            .any(|c| c.contains("unresolved edge")));
     }
 
     #[test]
@@ -1561,7 +1718,11 @@ mod tests {
         output.confidence_notes.clear();
         let narrative = ProvenanceNarrative::from_output(&output);
 
-        let headings: Vec<&str> = narrative.sections.iter().map(|s| s.heading.as_str()).collect();
+        let headings: Vec<&str> = narrative
+            .sections
+            .iter()
+            .map(|s| s.heading.as_str())
+            .collect();
         assert!(!headings.contains(&"Uncertainty"));
     }
 
@@ -1576,6 +1737,71 @@ mod tests {
             .unwrap();
         assert!(signals.body.contains("orphaned"));
         assert!(signals.body.contains("low blast radius"));
+    }
+
+    #[test]
+    fn narrative_includes_score_impact_when_present() {
+        let mut output = sample_full_provenance();
+        output.score_impact = Some(ProvenanceScoreImpact {
+            log_odds_shift: 1.25,
+            feature_contributions: vec![ProvenanceFeatureContribution {
+                feature: "provenance_ownership_orphaned".to_string(),
+                abandoned_ll: 0.70,
+                useful_ll: -0.55,
+                direction: "toward_abandon".to_string(),
+            }],
+        });
+
+        let narrative = ProvenanceNarrative::from_output(&output);
+        let impact_section = narrative
+            .sections
+            .iter()
+            .find(|s| s.heading == "Score Impact")
+            .expect("should have Score Impact section");
+        assert!(impact_section.body.contains("strongly toward abandonment"));
+        assert!(impact_section.body.contains("+1.25"));
+    }
+
+    #[test]
+    fn narrative_omits_score_impact_when_absent() {
+        let output = sample_full_provenance(); // score_impact is None
+        let narrative = ProvenanceNarrative::from_output(&output);
+        assert!(
+            !narrative
+                .sections
+                .iter()
+                .any(|s| s.heading == "Score Impact"),
+            "Score Impact section should be absent when score_impact is None"
+        );
+    }
+
+    #[test]
+    fn narrative_score_term_labels_cover_all_known_features() {
+        // Verify each known feature maps to a human label, not itself
+        let known_terms = [
+            "provenance_ownership_orphaned",
+            "provenance_ownership_supervised",
+            "provenance_ownership_shell",
+            "provenance_active_listener",
+            "provenance_blast_radius_high",
+            "provenance_blast_radius_low",
+            "provenance_blast_radius_critical",
+            "provenance_shared_lockfiles",
+            "provenance_in_workspace",
+            "provenance_no_workspace",
+            "provenance_test_runner",
+            "provenance_dev_server",
+            "provenance_build_tool",
+            "provenance_crossed_user_boundary",
+        ];
+
+        for term in known_terms {
+            let label = score_term_label(term);
+            assert_ne!(
+                label, term,
+                "term {term} should have a human-readable label, not return itself"
+            );
+        }
     }
 
     // ── CandidateProvenanceOutput contract tests ────────────────────
@@ -1605,9 +1831,7 @@ mod tests {
             enabled: true,
             evidence_completeness: 0.85,
             confidence_penalty_steps: 1,
-            confidence_notes: vec![
-                "resource provenance has 2 unresolved edge(s)".to_string(),
-            ],
+            confidence_notes: vec!["resource provenance has 2 unresolved edge(s)".to_string()],
             score_terms: vec![
                 "provenance_ownership_orphaned".to_string(),
                 "provenance_blast_radius_low".to_string(),
@@ -1710,7 +1934,10 @@ mod tests {
             deser.blast_radius.risk_score,
             output.blast_radius.risk_score
         );
-        assert_eq!(deser.blast_radius.risk_level, output.blast_radius.risk_level);
+        assert_eq!(
+            deser.blast_radius.risk_level,
+            output.blast_radius.risk_level
+        );
         assert_eq!(
             deser.blast_radius.total_affected,
             output.blast_radius.total_affected
@@ -1730,5 +1957,163 @@ mod tests {
         assert!(props.contains_key("evidence_completeness"));
         assert!(props.contains_key("blast_radius"));
         assert!(props.contains_key("score_impact"));
+    }
+
+    // ── from_parts contract tests ────────────────────────────────────
+
+    #[test]
+    fn from_parts_populates_score_impact_from_features() {
+        let features = vec![
+            ProvenanceFeatureInput {
+                feature: "provenance_ownership_orphaned".to_string(),
+                abandoned_ll: 0.70,
+                useful_ll: -0.55,
+            },
+            ProvenanceFeatureInput {
+                feature: "provenance_blast_radius_low".to_string(),
+                abandoned_ll: 0.35,
+                useful_ll: -0.25,
+            },
+        ];
+
+        let output = CandidateProvenanceOutput::from_parts(
+            0.85,
+            1,
+            vec!["resource provenance has 2 unresolved edge(s)".to_string()],
+            &features,
+            0.12,
+            "low",
+            0.90,
+            "Isolated process with no shared resources",
+            0,
+            ProvenanceRedactionState::None,
+        );
+
+        assert!(output.enabled);
+        assert_eq!(output.evidence_completeness, 0.85);
+        assert_eq!(output.confidence_penalty_steps, 1);
+        assert_eq!(output.score_terms.len(), 2);
+        assert_eq!(output.score_terms[0], "provenance_ownership_orphaned");
+        assert_eq!(output.blast_radius.risk_level, "low");
+
+        let impact = output
+            .score_impact
+            .as_ref()
+            .expect("score_impact should be Some");
+        // Net shift = (0.70 - (-0.55)) + (0.35 - (-0.25)) = 1.25 + 0.60 = 1.85
+        assert!((impact.log_odds_shift - 1.85).abs() < 1e-10);
+        assert_eq!(impact.feature_contributions.len(), 2);
+        assert_eq!(impact.feature_contributions[0].direction, "toward_abandon");
+        assert_eq!(impact.feature_contributions[1].direction, "toward_abandon");
+    }
+
+    #[test]
+    fn from_parts_no_features_means_no_score_impact() {
+        let output = CandidateProvenanceOutput::from_parts(
+            0.70,
+            0,
+            Vec::new(),
+            &[],
+            0.05,
+            "low",
+            0.80,
+            "No impact",
+            0,
+            ProvenanceRedactionState::None,
+        );
+
+        assert!(output.enabled);
+        assert!(output.score_impact.is_none());
+        assert!(output.score_terms.is_empty());
+    }
+
+    #[test]
+    fn from_parts_neutral_direction_for_balanced_features() {
+        let features = vec![ProvenanceFeatureInput {
+            feature: "provenance_ownership_shell".to_string(),
+            abandoned_ll: 0.10,
+            useful_ll: 0.08,
+        }];
+
+        let output = CandidateProvenanceOutput::from_parts(
+            0.90,
+            0,
+            Vec::new(),
+            &features,
+            0.05,
+            "low",
+            0.95,
+            "No impact",
+            0,
+            ProvenanceRedactionState::None,
+        );
+
+        let impact = output.score_impact.unwrap();
+        assert_eq!(impact.feature_contributions[0].direction, "neutral");
+    }
+
+    #[test]
+    fn from_parts_toward_useful_direction() {
+        let features = vec![ProvenanceFeatureInput {
+            feature: "provenance_ownership_supervised".to_string(),
+            abandoned_ll: -0.70,
+            useful_ll: 0.60,
+        }];
+
+        let output = CandidateProvenanceOutput::from_parts(
+            0.95,
+            0,
+            Vec::new(),
+            &features,
+            0.05,
+            "low",
+            0.99,
+            "Supervised process",
+            0,
+            ProvenanceRedactionState::None,
+        );
+
+        let impact = output.score_impact.unwrap();
+        assert_eq!(impact.feature_contributions[0].direction, "toward_useful");
+        assert!(impact.log_odds_shift < 0.0);
+    }
+
+    #[test]
+    fn from_parts_serializes_same_as_manual_construction() {
+        let features = vec![ProvenanceFeatureInput {
+            feature: "provenance_ownership_orphaned".to_string(),
+            abandoned_ll: 0.70,
+            useful_ll: -0.55,
+        }];
+
+        let from_parts = CandidateProvenanceOutput::from_parts(
+            0.85,
+            1,
+            vec!["missing lineage provenance".to_string()],
+            &features,
+            0.12,
+            "low",
+            0.90,
+            "Isolated process",
+            0,
+            ProvenanceRedactionState::Partial,
+        );
+
+        let json = serde_json::to_value(&from_parts).expect("serialize");
+
+        // Verify all contract fields present
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["evidence_completeness"], 0.85);
+        assert_eq!(json["confidence_penalty_steps"], 1);
+        assert_eq!(json["redaction_state"], "partial");
+        assert!(json["confidence_notes"].as_array().unwrap().len() == 1);
+        assert!(json["score_terms"].as_array().unwrap().len() == 1);
+        assert!(json["score_impact"]["log_odds_shift"].as_f64().is_some());
+        assert_eq!(json["blast_radius"]["risk_level"], "low");
+
+        // Round-trip
+        let deser: CandidateProvenanceOutput = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(deser.enabled, from_parts.enabled);
+        assert_eq!(deser.redaction_state, from_parts.redaction_state);
     }
 }

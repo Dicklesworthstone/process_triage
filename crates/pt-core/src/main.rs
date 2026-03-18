@@ -11,7 +11,8 @@ use clap::parser::ValueSource;
 use clap::FromArgMatches;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use pt_common::{
-    normalize_lineage, OutputFormat, OwnershipState, ProvenanceConfidence, RawLineageEvidence,
+    normalize_lineage, CandidateProvenanceOutput, OutputFormat, OwnershipState,
+    ProvenanceConfidence, ProvenanceFeatureInput, ProvenanceRedactionState, RawLineageEvidence,
     SessionId, SCHEMA_VERSION,
 };
 #[cfg(feature = "ui")]
@@ -3012,6 +3013,39 @@ struct ProvenanceScoreAdjustment {
     confidence_penalty_steps: usize,
     confidence_notes: Vec<String>,
     blast_radius: BlastRadiusEstimate,
+}
+
+#[cfg(target_os = "linux")]
+impl ProvenanceScoreAdjustment {
+    /// Convert to the stable output contract type for JSON/TOON/agent consumers.
+    ///
+    /// Delegates to `CandidateProvenanceOutput::from_parts` so the contract
+    /// logic (direction thresholds, score-impact construction) lives in one
+    /// place in pt-common rather than being duplicated here.
+    fn to_candidate_output(&self) -> CandidateProvenanceOutput {
+        let feature_inputs: Vec<ProvenanceFeatureInput> = self
+            .evidence_terms
+            .iter()
+            .map(|term| ProvenanceFeatureInput {
+                feature: term.feature.clone(),
+                abandoned_ll: term.log_likelihood.abandoned,
+                useful_ll: term.log_likelihood.useful,
+            })
+            .collect();
+
+        CandidateProvenanceOutput::from_parts(
+            self.evidence_completeness,
+            self.confidence_penalty_steps,
+            self.confidence_notes.clone(),
+            &feature_inputs,
+            self.blast_radius.risk_score,
+            &format!("{:?}", self.blast_radius.risk_level).to_lowercase(),
+            self.blast_radius.confidence,
+            &self.blast_radius.summary,
+            self.blast_radius.total_affected,
+            ProvenanceRedactionState::None,
+        )
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -7874,6 +7908,7 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                                 status: pt_core::daemon::escalation::EscalationStatus::Failed,
                                 reason: format!("lock error: {}", err),
                                 session_id: None,
+                                provenance_summary: None,
                             };
                         }
                     };
@@ -10974,6 +11009,22 @@ fn generate_narrative_summary(
                 output.push_str(&format!("   Key factors: {}\n", top_factors.join(", ")));
             }
         }
+
+        // Provenance narrative (when available)
+        if let Some(prov) = candidate.get("provenance_inference") {
+            if prov.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if let Ok(prov_output) =
+                    serde_json::from_value::<CandidateProvenanceOutput>(prov.clone())
+                {
+                    let narrative = pt_common::ProvenanceNarrative::from_output(&prov_output);
+                    let rendered =
+                        narrative.render(pt_common::NarrativeVerbosity::Standard);
+                    for line in rendered.lines() {
+                        output.push_str(&format!("   {}\n", line));
+                    }
+                }
+            }
+        }
     }
 
     output.push('\n');
@@ -11159,6 +11210,11 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                         confidence: ledger.confidence.label().to_string(),
                         recommended_action: recommended_action.to_string(),
                         score,
+                        blast_radius_risk_level: None,
+                        blast_radius_total_affected: None,
+                        provenance_evidence_completeness: None,
+                        provenance_score_terms: Vec::new(),
+                        provenance_log_odds_shift: None,
                     });
                 }
 
@@ -11855,6 +11911,50 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 "Applied provenance-derived scoring adjustments"
             );
 
+            // Explanation-trace diagnostics: emit per-feature evidence selection
+            // events so provenance decisions can be diagnosed from the trace log.
+            for term in &adjustment.evidence_terms {
+                let net_shift = term.log_likelihood.abandoned - term.log_likelihood.useful;
+                let direction = if net_shift > 0.1 {
+                    "toward_abandon"
+                } else if net_shift < -0.1 {
+                    "toward_useful"
+                } else {
+                    "neutral"
+                };
+                tracing::trace!(
+                    pid = proc.pid.0,
+                    feature = %term.feature,
+                    abandoned_ll = term.log_likelihood.abandoned,
+                    useful_ll = term.log_likelihood.useful,
+                    net_shift = net_shift,
+                    direction = direction,
+                    "provenance_evidence_selected"
+                );
+            }
+
+            if adjustment.confidence_penalty_steps > 0 {
+                tracing::trace!(
+                    pid = proc.pid.0,
+                    steps = adjustment.confidence_penalty_steps,
+                    reasons = ?adjustment.confidence_notes,
+                    evidence_completeness = adjustment.evidence_completeness,
+                    "provenance_confidence_downgraded"
+                );
+            }
+
+            if adjustment.blast_radius.total_affected > 0 {
+                tracing::trace!(
+                    pid = proc.pid.0,
+                    risk_score = adjustment.blast_radius.risk_score,
+                    risk_level = ?adjustment.blast_radius.risk_level,
+                    total_affected = adjustment.blast_radius.total_affected,
+                    confidence = adjustment.blast_radius.confidence,
+                    summary = %adjustment.blast_radius.summary,
+                    "provenance_blast_radius_computed"
+                );
+            }
+
             adjustment
         };
 
@@ -12000,6 +12100,28 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             process_state: Some(proc.state),
             wchan: None,
             critical_files: Vec::new(),
+            #[cfg(target_os = "linux")]
+            blast_radius_risk_level: Some(
+                format!("{:?}", provenance_adjustment.blast_radius.risk_level).to_lowercase(),
+            ),
+            #[cfg(not(target_os = "linux"))]
+            blast_radius_risk_level: None,
+            #[cfg(target_os = "linux")]
+            blast_radius_total_affected: Some(provenance_adjustment.blast_radius.total_affected),
+            #[cfg(not(target_os = "linux"))]
+            blast_radius_total_affected: None,
+            #[cfg(target_os = "linux")]
+            provenance_evidence_completeness: Some(
+                provenance_adjustment.evidence_completeness,
+            ),
+            #[cfg(not(target_os = "linux"))]
+            provenance_evidence_completeness: None,
+            #[cfg(target_os = "linux")]
+            provenance_confidence_penalty: Some(
+                provenance_adjustment.confidence_penalty_steps,
+            ),
+            #[cfg(not(target_os = "linux"))]
+            provenance_confidence_penalty: None,
         };
         let policy_result = enforcer.check_action(
             &process_candidate,
@@ -12065,24 +12187,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             })
         });
         #[cfg(target_os = "linux")]
-        let provenance_summary = serde_json::json!({
-            "enabled": true,
-            "evidence_completeness": provenance_adjustment.evidence_completeness,
-            "confidence_penalty_steps": provenance_adjustment.confidence_penalty_steps,
-            "confidence_notes": provenance_adjustment.confidence_notes,
-            "score_terms": provenance_adjustment
-                .evidence_terms
-                .iter()
-                .map(|term| term.feature.clone())
-                .collect::<Vec<_>>(),
-            "blast_radius": {
-                "risk_score": provenance_adjustment.blast_radius.risk_score,
-                "risk_level": format!("{:?}", provenance_adjustment.blast_radius.risk_level).to_lowercase(),
-                "confidence": provenance_adjustment.blast_radius.confidence,
-                "summary": provenance_adjustment.blast_radius.summary,
-                "total_affected": provenance_adjustment.blast_radius.total_affected,
-            }
-        });
+        let provenance_summary = serde_json::to_value(provenance_adjustment.to_candidate_output())
+            .unwrap_or_else(|_| serde_json::json!({"enabled": false}));
 
         let predictions = if args.include_predictions {
             let mut predictions = build_stub_predictions(proc);
@@ -12141,9 +12247,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             },
             "confidence": ledger.confidence.label(),
             "evidence": evidence_contributions,
-            "provenance_inference": {
-                "enabled": false,
-            },
+            "provenance_inference": serde_json::to_value(CandidateProvenanceOutput::disabled())
+                .unwrap_or_else(|_| serde_json::json!({"enabled": false})),
             "blast_radius": {
                 "memory_mb": proc.rss_bytes / (1024 * 1024),
                 "cpu_pct": proc.cpu_percent,
@@ -12213,6 +12318,39 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             confidence: ledger.confidence.label().to_string(),
             recommended_action: recommended_action.to_string(),
             score,
+            #[cfg(target_os = "linux")]
+            blast_radius_risk_level: Some(
+                format!("{:?}", provenance_adjustment.blast_radius.risk_level).to_lowercase(),
+            ),
+            #[cfg(not(target_os = "linux"))]
+            blast_radius_risk_level: None,
+            #[cfg(target_os = "linux")]
+            blast_radius_total_affected: Some(provenance_adjustment.blast_radius.total_affected),
+            #[cfg(not(target_os = "linux"))]
+            blast_radius_total_affected: None,
+            #[cfg(target_os = "linux")]
+            provenance_evidence_completeness: Some(provenance_adjustment.evidence_completeness),
+            #[cfg(not(target_os = "linux"))]
+            provenance_evidence_completeness: None,
+            #[cfg(target_os = "linux")]
+            provenance_score_terms: provenance_adjustment
+                .evidence_terms
+                .iter()
+                .map(|t| t.feature.clone())
+                .collect(),
+            #[cfg(not(target_os = "linux"))]
+            provenance_score_terms: Vec::new(),
+            #[cfg(target_os = "linux")]
+            provenance_log_odds_shift: {
+                let shift: f64 = provenance_adjustment
+                    .evidence_terms
+                    .iter()
+                    .map(|t| t.log_likelihood.abandoned - t.log_likelihood.useful)
+                    .sum();
+                if shift.abs() > f64::EPSILON { Some(shift) } else { None }
+            },
+            #[cfg(not(target_os = "linux"))]
+            provenance_log_odds_shift: None,
         };
 
         // Store candidate with max_posterior for sorting (no early break!)

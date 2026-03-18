@@ -780,6 +780,10 @@ fn test_enforcer_with_real_policy_fixture() {
         process_state: None,
         wchan: None,
         critical_files: Vec::new(),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
     };
 
     let _result = enforcer.check_action(&candidate, Action::Kill, false);
@@ -846,6 +850,10 @@ fn test_enforcer_protected_patterns() {
             process_state: None,
             wchan: None,
             critical_files: Vec::new(),
+            blast_radius_risk_level: None,
+            blast_radius_total_affected: None,
+            provenance_evidence_completeness: None,
+            provenance_confidence_penalty: None,
         };
 
         let result = enforcer.check_action(&candidate, Action::Kill, false);
@@ -911,6 +919,10 @@ fn test_enforcer_rate_limiting() {
         process_state: None,
         wchan: None,
         critical_files: Vec::new(),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
     };
 
     // First 3 kills should be allowed
@@ -972,6 +984,10 @@ fn test_enforcer_robot_mode_gates() {
         process_state: None,
         wchan: None,
         critical_files: Vec::new(),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
     };
 
     let result = enforcer.check_action(&low_posterior_candidate, Action::Kill, true);
@@ -1004,6 +1020,10 @@ fn test_enforcer_robot_mode_gates() {
         process_state: None,
         wchan: None,
         critical_files: Vec::new(),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
     };
 
     let result = enforcer.check_action(&high_memory_candidate, Action::Kill, true);
@@ -1046,6 +1066,10 @@ fn test_enforcer_data_loss_gates() {
         process_state: None,
         wchan: None,
         critical_files: Vec::new(),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
     };
 
     let result = enforcer.check_action(&candidate_with_fds, Action::Kill, false);
@@ -1078,6 +1102,10 @@ fn test_enforcer_data_loss_gates() {
         process_state: None,
         wchan: None,
         critical_files: Vec::new(),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
     };
 
     let result = enforcer.check_action(&candidate_locked, Action::Kill, false);
@@ -1116,6 +1144,10 @@ fn test_enforcer_min_age_gate() {
         process_state: None,
         wchan: None,
         critical_files: Vec::new(),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
     };
 
     let result = enforcer.check_action(&young_candidate, Action::Kill, false);
@@ -1178,6 +1210,10 @@ fn test_enforcer_warnings() {
         process_state: None,
         wchan: None,
         critical_files: Vec::new(),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
     };
 
     // In interactive mode, should be allowed with warning

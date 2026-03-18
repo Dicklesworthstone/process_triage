@@ -107,6 +107,23 @@ pub struct PersistedInference {
     pub confidence: String,
     pub recommended_action: String,
     pub score: u32,
+
+    // ── Provenance context (bd-c4d1) ─────────────────────────────
+    /// Blast-radius risk level from provenance graph (low/medium/high/critical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blast_radius_risk_level: Option<String>,
+    /// Total processes/resources affected if killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blast_radius_total_affected: Option<usize>,
+    /// Provenance evidence completeness [0, 1].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_evidence_completeness: Option<f64>,
+    /// Provenance score terms that contributed to the posterior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance_score_terms: Vec<String>,
+    /// Net log-odds shift from provenance features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_log_odds_shift: Option<f64>,
 }
 
 /// Inference artifact: inference results for all candidates.
@@ -804,6 +821,11 @@ mod tests {
                 confidence: "high".to_string(),
                 recommended_action: "kill".to_string(),
                 score: 92,
+                blast_radius_risk_level: None,
+                blast_radius_total_affected: None,
+                provenance_evidence_completeness: None,
+                provenance_score_terms: Vec::new(),
+                provenance_log_odds_shift: None,
             }],
         }
     }

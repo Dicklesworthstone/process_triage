@@ -46,6 +46,11 @@ mod tests {
             confidence: if score > 70 { "high" } else { "medium" }.to_string(),
             recommended_action: action.to_string(),
             score,
+            blast_radius_risk_level: None,
+            blast_radius_total_affected: None,
+            provenance_evidence_completeness: None,
+            provenance_score_terms: Vec::new(),
+            provenance_log_odds_shift: None,
         }
     }
 
@@ -507,6 +512,11 @@ mod tests {
                     confidence: "medium".to_string(),
                     recommended_action: "keep".to_string(),
                     score: 10,
+                    blast_radius_risk_level: None,
+                    blast_radius_total_affected: None,
+                    provenance_evidence_completeness: None,
+                    provenance_score_terms: Vec::new(),
+                    provenance_log_odds_shift: None,
                 },
                 PersistedInference {
                     pid: 2,
@@ -519,6 +529,11 @@ mod tests {
                     confidence: "high".to_string(),
                     recommended_action: "kill".to_string(),
                     score: 80,
+                    blast_radius_risk_level: None,
+                    blast_radius_total_affected: None,
+                    provenance_evidence_completeness: None,
+                    provenance_score_terms: Vec::new(),
+                    provenance_log_odds_shift: None,
                 },
             ],
         };
@@ -572,6 +587,11 @@ mod tests {
                     confidence: "medium".to_string(),
                     recommended_action: "keep".to_string(),
                     score: 12,
+                    blast_radius_risk_level: None,
+                    blast_radius_total_affected: None,
+                    provenance_evidence_completeness: None,
+                    provenance_score_terms: Vec::new(),
+                    provenance_log_odds_shift: None,
                 },
                 PersistedInference {
                     pid: 3,
@@ -584,6 +604,11 @@ mod tests {
                     confidence: "medium".to_string(),
                     recommended_action: "keep".to_string(),
                     score: 8,
+                    blast_radius_risk_level: None,
+                    blast_radius_total_affected: None,
+                    provenance_evidence_completeness: None,
+                    provenance_score_terms: Vec::new(),
+                    provenance_log_odds_shift: None,
                 },
             ],
         };
