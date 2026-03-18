@@ -1515,7 +1515,12 @@ mod tests {
         let narrative = ProvenanceNarrative::from_output(&output);
         let rendered = narrative.render(NarrativeVerbosity::Compact);
         assert!(!rendered.contains('\n'));
-        assert!(rendered.len() <= 120); // Reasonable compact length
+        assert!(
+            rendered.len() <= 80,
+            "Compact headline should be ≤80 chars, got {} chars: {:?}",
+            rendered.len(),
+            rendered
+        );
     }
 
     #[test]

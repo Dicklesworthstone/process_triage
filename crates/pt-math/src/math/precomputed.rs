@@ -54,7 +54,8 @@ impl CachedBetaPrior {
             if self.alpha > 1.0 {
                 return f64::NEG_INFINITY;
             }
-            return -log_beta(1.0, self.beta);
+            // alpha == 1.0: log_beta(1, β) == self.log_beta_val
+            return -self.log_beta_val;
         }
         if x == 1.0 {
             if self.beta < 1.0 {
@@ -63,7 +64,8 @@ impl CachedBetaPrior {
             if self.beta > 1.0 {
                 return f64::NEG_INFINITY;
             }
-            return -log_beta(self.alpha, 1.0);
+            // beta == 1.0: log_beta(α, 1) == self.log_beta_val
+            return -self.log_beta_val;
         }
         let log_x = x.ln();
         let log_one_minus = (-x).ln_1p();
