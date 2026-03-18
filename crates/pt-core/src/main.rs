@@ -2833,6 +2833,10 @@ fn build_tui_rows(
             top_evidence: ledger.top_evidence.clone(),
             confidence: Some(ledger.confidence.label().to_string()),
             plan_preview: Vec::new(),
+            provenance_headline: None,
+            provenance_sections: Vec::new(),
+            provenance_caveats: Vec::new(),
+            blast_radius_risk: None,
         });
 
         cpu_total += proc.cpu_percent;

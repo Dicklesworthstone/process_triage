@@ -370,7 +370,7 @@ impl<'a> ProcessDetail<'a> {
         &self,
         row: &ProcessRow,
         max_lines: usize,
-    ) -> (Vec<FtuiLine<'static>>, Vec<FtuiLine<'static>>) {
+    ) -> (Vec<FtuiLine>, Vec<FtuiLine>) {
         let label = self.label_ftui_style();
         let value = self.value_ftui_style();
 
