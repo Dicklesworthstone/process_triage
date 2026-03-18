@@ -837,6 +837,179 @@ Completions cover all subcommands, options, and argument values — including `-
 
 ---
 
+## How pt Learns From Your Decisions
+
+When you kill or spare a process, `pt` remembers. The learning system normalizes command patterns at three specificity levels and stores them for future sessions:
+
+| Level | What's Preserved | Example |
+|-------|-----------------|---------|
+| **Exact** | Full command with specific args | `node /home/user/project/.bin/jest --watch tests/` |
+| **Standard** | Generalized paths, preserved flags | `node .*/jest --watch .*` |
+| **Broad** | Base command only | `node .*jest.*` |
+
+**Normalization rules** applied automatically:
+- Home paths (`/home/user/...`) → `.*`
+- Temp paths (`/tmp/...`) → `.*`
+- Port numbers (`--port 8080`) → `\d+`
+- UUIDs → `[0-9a-f-]+`
+- Long numbers (4+ digits) → `\d+`
+- Versioned interpreters (`python3.11`) → `python.*`
+
+When `pt` sees a process matching a learned pattern, it adjusts the prior probability — processes you've killed before get a higher abandonment prior, while processes you've spared get a lower one. Three specificity levels prevent both over-fitting (exact match only) and over-generalizing (matching every `node` process).
+
+---
+
+## Critical File Detection
+
+Before killing any process, `pt` checks what files it has open. 20+ detection rules across 9 categories identify files that indicate active work in progress:
+
+| Category | Examples | Strength | Kill Impact |
+|----------|----------|:--------:|-------------|
+| **SQLite WAL/Journal** | `.sqlite-wal`, `.db-journal` | Hard | Blocks kill — active transaction |
+| **Git Locks** | `.git/index.lock`, `packed-refs.lock` | Hard | Blocks kill — repository corruption risk |
+| **Git Rebase/Merge** | `rebase-merge/`, `MERGE_HEAD`, `CHERRY_PICK_HEAD` | Hard | Blocks kill — interactive operation |
+| **System Package Locks** | `/var/lib/dpkg/lock`, `.rpm.lock`, `pacman/db.lck` | Hard | Blocks kill — package manager transaction |
+| **Node Package Locks** | `.package-lock.json`, `.pnpm-lock.yaml` | Hard | Blocks kill — npm/pnpm/yarn install |
+| **Cargo Locks** | `.cargo/registry/.package-cache-lock` | Hard | Blocks kill — cargo registry operation |
+| **Database Files** | `.db`, `.sqlite3`, `.ldb`, `.mdb` | Soft | Warns — possible data loss |
+| **Application Locks** | `.lock`, `.lck`, `/lock/` patterns | Soft | Warns — process may hold coordination lock |
+| **Generic Writes** | Any file open for writing | Soft | Noted — contextual evaluation |
+
+**Hard** detections always block automated kills. **Soft** detections add weight to the blast-radius score and generate remediation hints (e.g., "Wait for database transaction to complete, or checkpoint the WAL file").
+
+---
+
+## Workspace Detection
+
+`pt` determines which git repository and worktree each process belongs to, providing project context for triage decisions:
+
+1. Reads `/proc/[pid]/cwd` to get the process's working directory
+2. Walks up the directory tree looking for `.git`
+3. If `.git` is a file (git worktree), parses the `gitdir:` pointer and resolves back to the main repository root via `commondir`
+4. Reads `HEAD` to determine branch status (on branch, detached HEAD, or corrupted)
+
+This means `pt` can tell you "this stuck `cargo build` is in your `feature/auth` worktree of the `backend` repo" — not just "PID 12345 is running cargo."
+
+A process with a deleted CWD (the directory was removed while the process was running) gets an elevated suspicion score — it's likely orphaned from a branch that was cleaned up.
+
+---
+
+## cgroup Integration
+
+### CPU Throttling (Instead of Killing)
+
+For processes classified as Useful-Bad (misbehaving but needed), `pt` can throttle CPU usage via cgroup controllers instead of killing:
+
+```
+Throttle formula: quota_us = max(target_fraction × period_us, 1000)
+
+Example: 25% throttle = 25,000 µs quota per 100,000 µs period
+         2 cores max  = 200,000 µs quota per 100,000 µs period
+         Minimum      = 1,000 µs (prevents complete starvation)
+```
+
+| Aspect | cgroup v1 | cgroup v2 |
+|--------|-----------|-----------|
+| **Quota file** | `cpu.cfs_quota_us` + `cpu.cfs_period_us` | `cpu.max` (single file: `"quota period"`) |
+| **Weight** | `cpu.shares` (relative) | `cpu.weight` (1-10000) |
+| **Memory** | `memory.limit_in_bytes` | `memory.max` + `memory.high` |
+| **Write order** | Period must be set before quota | Single atomic write |
+| **Detection** | Hierarchy ID != 0 in `/proc/[pid]/cgroup` | Hierarchy ID = 0 |
+
+`pt` auto-detects cgroup version (v1, v2, or hybrid) and uses the appropriate interface. Previous settings are captured for reversal.
+
+### cpuset Quarantine
+
+For extreme cases, `pt` can pin a process to a limited set of CPU cores via the cpuset controller, isolating it from the rest of the system without killing it.
+
+---
+
+## Action Recovery Trees
+
+When an action fails, `pt` doesn't just report the error — it has a structured recovery tree with diagnosis and fallback options:
+
+```
+Kill action failed (Timeout)
+ ├─ Diagnosis: "Process did not terminate within grace period"
+ ├─ Alternative 1: Escalate to SIGKILL (requirements: process exists)
+ ├─ Alternative 2: Investigate D-state (requirements: process in uninterruptible sleep)
+ ├─ Alternative 3: Stop supervisor first, then retry kill
+ └─ Alternative 4: Escalate to user for manual intervention
+```
+
+**Failure categories** with specific recovery strategies:
+
+| Failure | Primary Recovery | Fallback |
+|---------|-----------------|----------|
+| Permission denied | Retry with elevated privileges | Escalate to user |
+| Process not found | Verify goal achieved (may have exited) | Skip |
+| Timeout | Escalate signal (SIGTERM → SIGKILL) | Investigate D-state |
+| Supervisor conflict | Stop supervisor, mask unit, retry | Check for respawn |
+| Identity mismatch | Abort (PID reused — wrong process) | Re-scan and re-plan |
+| Resource conflict | Wait and retry with backoff | Skip |
+
+Recovery is always *forward* (escalate to more forceful actions), never backward (no automatic undo). Reversal metadata is captured so a human can manually undo if needed.
+
+---
+
+## Telemetry: Lock-Free Event Recording
+
+Session telemetry is recorded via an **LMAX Disruptor** — a lock-free, wait-free ring buffer designed for ultra-low-latency event recording:
+
+```
+Producer (triage loop) ──→ [Ring Buffer] ──→ Consumer (Parquet writer)
+                            ↑
+                     Pre-allocated, fixed-size
+                     Cache-line aligned (64 bytes)
+                     Power-of-2 capacity
+                     Bitmask indexing (no modulo)
+```
+
+**Why a disruptor instead of a channel?**
+- **Zero allocation**: All event slots are pre-allocated at startup. No heap allocation during triage.
+- **No contention**: Producer and consumer sequences are on separate cache lines (64-byte alignment via `#[repr(align(64))]`), eliminating false sharing.
+- **Wait-free**: Producer never blocks. If the buffer is full, the event is simply dropped — telemetry should never slow down triage decisions.
+- **Bitmask indexing**: Capacity is always a power of 2, so `index = sequence & (capacity - 1)` avoids expensive modulo operations.
+
+Events are fixed-size structs (timestamp + event type + PID + 128-byte detail buffer) written to Apache Parquet via Arrow schemas for efficient columnar analytics.
+
+---
+
+## Bundle Format Internals
+
+A `.ptb` file is a ZIP archive (optionally encrypted) containing a manifest and session artifacts:
+
+```
+session.ptb (ZIP or encrypted envelope)
+├── manifest.json           # Bundle metadata + file checksums
+├── snapshot.json           # Redacted process state
+├── inference.jsonl         # Per-process posteriors
+├── plan.json              # Generated action plan
+├── actions.json           # Executed actions + outcomes
+├── provenance.json        # Process provenance graph
+└── audit.jsonl            # Action audit trail
+```
+
+### Encryption Envelope
+
+When encrypted, the ZIP payload is wrapped in a `PTBENC01` envelope:
+
+```
+[8 bytes: "PTBENC01"]     Magic header
+[4 bytes: KDF iterations]  PBKDF2 iteration count (default 100,000)
+[16 bytes: salt]           Random salt for key derivation
+[12 bytes: nonce]          Random nonce for ChaCha20
+[remainder: ciphertext]    ChaCha20-Poly1305 authenticated ciphertext
+```
+
+Key derivation uses PBKDF2-HMAC-SHA256 with 100,000 iterations. The resulting 256-bit key feeds ChaCha20-Poly1305 for authenticated encryption. The 16-byte Poly1305 tag provides tamper detection.
+
+### Integrity Verification
+
+Every file in the bundle has a SHA-256 checksum in the manifest. The reader verifies checksums on load and rejects bundles with mismatched hashes. Maximum bundle size for in-memory reading is 100MB (prevents OOM on malicious files).
+
+---
+
 ## Numerical Stability
 
 All Bayesian computation happens in **log-domain** to prevent the floating-point catastrophes that plague naive probability implementations:
