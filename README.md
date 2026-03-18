@@ -15,7 +15,7 @@
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
 ```
 
-**`pt` finds and kills zombie processes so you don't have to.** It uses Bayesian inference over 40+ statistical models, provenance-aware blast-radius estimation, and conformal risk control to classify every process on your machine — then tells you exactly *why* it thinks something should die, and exactly *what would break* if you kill it.
+**`pt` finds and kills zombie processes so you don't have to.** It uses Bayesian inference over 40+ statistical models, provenance-aware blast-radius estimation, and conformal risk control to classify every process on your machine, then tells you exactly *why* it thinks something should die and exactly *what would break* if you kill it.
 
 ---
 
@@ -87,7 +87,7 @@ pt shadow start
 
 **2. Transparent decisions.** Every recommendation comes with a full evidence ledger: which features contributed, how much each shifted the posterior, what the Bayes factor is, and what would break if you proceed. No black boxes.
 
-**3. Provenance-aware safety.** `pt` doesn't just check if a process *looks* abandoned — it traces process lineage, maps shared resources (lockfiles, sockets, listeners), estimates direct and transitive blast radius, and blocks kills that would cascade across the system.
+**3. Provenance-aware safety.** Beyond checking whether a process *looks* abandoned, `pt` traces process lineage, maps shared resources (lockfiles, sockets, listeners), estimates direct and transitive blast radius, and blocks kills that would cascade across the system.
 
 **4. Distribution-free guarantees.** Robot mode uses Mondrian conformal prediction to provide finite-sample FDR control. The coverage guarantee `P(Y in C(X)) >= 1-alpha` holds without parametric assumptions, as long as the calibration data is exchangeable with the test distribution.
 
@@ -110,9 +110,9 @@ Every process on your system passes through a five-stage pipeline:
 
 **Collect** reads `/proc/[pid]/stat`, `/proc/[pid]/io`, `/proc/[pid]/fd`, `/proc/net/tcp`, cgroup controllers, GPU devices, systemd units, and container metadata. It also builds a shared-resource graph mapping which processes hold the same lockfiles, sockets, and listeners.
 
-**Infer** runs the evidence through 40+ statistical models — not just one Bayesian classifier, but an ensemble including changepoint detectors, regime-switching filters, queueing models, extreme value analysis, and conformal predictors. Each model contributes an evidence term to the posterior.
+**Infer** runs the evidence through 40+ statistical models. The ensemble includes changepoint detectors, regime-switching filters, queueing models, extreme value analysis, and conformal predictors. Each model contributes an evidence term to the posterior.
 
-**Decide** picks the optimal action using expected-loss minimization, subject to FDR control, blast-radius constraints, causal safety gates, and configurable policy enforcement. It doesn't just ask "should we kill this?" — it evaluates 8 possible actions (Keep, Renice, Pause, Freeze, Throttle, Quarantine, Restart, Kill) and picks the one with lowest expected loss.
+**Decide** picks the optimal action using expected-loss minimization, subject to FDR control, blast-radius constraints, causal safety gates, and configurable policy enforcement. Rather than a binary kill/spare, it evaluates 8 possible actions (Keep, Renice, Pause, Freeze, Throttle, Quarantine, Restart, Kill) and picks the one with lowest expected loss.
 
 **Act** executes the chosen action with TOCTOU-safe identity verification, staged signal escalation, and rollback on failure. Actions beyond kill include cgroup-based CPU throttling, cpuset quarantine (pin to limited cores), cgroup v2 freezing, and nice-value adjustment.
 
@@ -184,7 +184,7 @@ Critical file detection recognizes 20+ patterns: git locks (`.git/index.lock`), 
 The interactive TUI is built on **ftui** (an Elm-style Model-View-Update framework for terminals):
 
 - **Responsive layout**: adapts to terminal width with breakpoints at 80/120/200 columns (single-panel, two-pane, three-pane)
-- **Process table**: sortable by score, age, CPU, memory — with live filtering via search input
+- **Process table**: sortable by score, age, CPU, memory, with live filtering via search input
 - **Detail panel**: expanded evidence view for the selected process including Bayes factors, evidence term glyphs, and decision rationale
 - **Command palette**: fuzzy-searchable action palette for power users
 - **Inline mode** (`pt run --inline`): confines the UI to a bottom region, preserving terminal scrollback above
@@ -225,7 +225,7 @@ pt learn show 01           # Read a tutorial
 pt learn verify --all      # Verify completion
 ```
 
-Seven built-in tutorials covering first-run safety, stuck test runners, port conflicts, agent workflow, fleet operations, shadow mode, and deep scanning — each with verification steps that confirm you actually ran the commands.
+Seven built-in tutorials covering first-run safety, stuck test runners, port conflicts, agent workflow, fleet operations, shadow mode, and deep scanning. Each includes verification steps that confirm you actually ran the commands.
 
 ---
 
@@ -599,7 +599,7 @@ pt-core fleet scan --inventory hosts.toml --parallel 10
 pt-core fleet plan --fdr-method eby --alpha 0.05
 ```
 
-Fleet mode uses **Chandy-Lamport consistent snapshots** to prevent triage cascades: a process on Host A won't be killed if it's a dependency of a Useful process on Host B. Tentative hosts (timeout/unreachable) trigger conservative fallback — no auto-kills until the cut is complete.
+Fleet mode uses **Chandy-Lamport consistent snapshots** to prevent triage cascades: a process on Host A won't be killed if it's a dependency of a Useful process on Host B. Tentative hosts (timeout/unreachable) trigger conservative fallback; no auto-kills until the cut is complete.
 
 ---
 
@@ -632,7 +632,7 @@ A process consuming 8GB of VRAM on a 12GB GPU gets a higher blast-radius score t
 2. **Marker files**: Checks for `/.dockerenv` (Docker) and `/.containerenv` (Podman)
 3. **Environment variables**: Reads `KUBERNETES_SERVICE_HOST`, `POD_NAME`, `POD_NAMESPACE`, `POD_UID` for Kubernetes metadata
 
-For Kubernetes pods, `pt` extracts the QoS class (Guaranteed / Burstable / BestEffort), pod name, namespace, and container name. Container-managed processes get special treatment in the decision engine — killing a process inside a container that will be restarted by its orchestrator may be pointless.
+For Kubernetes pods, `pt` extracts the QoS class (Guaranteed / Burstable / BestEffort), pod name, namespace, and container name. Container-managed processes get special treatment in the decision engine, since killing a process inside a container that will be restarted by its orchestrator may be pointless.
 
 ---
 
@@ -672,7 +672,7 @@ If the daemon itself exceeds its budget, it backs off automatically.
 
 ## Process Signature Database
 
-`pt` ships with a built-in database of known process signatures — command patterns that indicate specific process types (test runners, dev servers, build tools, agents):
+`pt` ships with a built-in database of known process signatures: command patterns that indicate specific process types (test runners, dev servers, build tools, agents).
 
 ```bash
 pt-core signature list              # Show all signatures
@@ -687,6 +687,157 @@ pt-core signature import sigs.json   # Import from file
 ```
 
 Signatures are matched against a `ProcessMatchContext` that includes the process name, command-line arguments, environment variables, container info, and network state. Matched signatures adjust the Bayesian prior: a `test_runner` signature shifts the prior toward "likely to be stuck if old."
+
+---
+
+## Supervision Detection
+
+`pt` detects 8 types of process supervision to avoid killing managed processes (which would just respawn):
+
+| Supervisor | Detection Method | Confidence |
+|-----------|-----------------|:----------:|
+| **systemd** | Cgroup path + `NOTIFY_SOCKET` env | 0.95 |
+| **launchd** | `XPC_SERVICE_NAME` env | 0.95 |
+| **Docker/containerd** | Cgroup path patterns, `/.dockerenv` | 0.95 |
+| **VS Code** | `VSCODE_PID`, `VSCODE_IPC_HOOK` env | 0.95 |
+| **Claude/Codex** | `CLAUDE_SESSION_ID`, `CODEX_SESSION_ID` env | 0.95 |
+| **GitHub Actions** | `GITHUB_ACTIONS`, `GITHUB_WORKFLOW` env | 0.95 |
+| **tmux/screen** | `TMUX` or `STY` env | 0.30 |
+| **nohup/disown** | Signal mask analysis (`SigIgn` in `/proc/[pid]/status`) | varies |
+
+Supervised processes get higher blast-radius scores because killing them may be futile (the supervisor will restart them). The evidence ledger notes this: "Supervisor may auto-restart (reducing kill effectiveness)."
+
+For nohup detection, `pt` reads the signal mask from `/proc/[pid]/status` and checks whether SIGHUP (bit 0) is ignored. It also looks for `nohup.out` in the file descriptor table. This distinguishes intentional backgrounding from forgotten processes.
+
+---
+
+## User Intent Detection
+
+Before flagging a process, `pt` checks whether a human is actively using it. Nine signal types contribute to a "user intent score" that suppresses false positives:
+
+| Signal | Weight | What It Checks |
+|--------|:------:|---------------|
+| Foreground job | 0.95 | Process group ID matches TTY foreground group |
+| Editor focus | 0.90 | Attached to IDE (VS Code, etc.) |
+| tmux session | 0.85 | Running inside tmux |
+| screen session | 0.85 | Running inside screen |
+| Recent TTY activity | 0.80 | Terminal FD touched within 5 minutes |
+| Active repo context | 0.75 | CWD in a git repo with recent activity |
+| Active TTY | 0.70 | Has controlling terminal |
+| Recent shell activity | 0.65 | Shell parent recently active |
+| SSH session | 0.60 | Connected via SSH |
+
+The final score is computed as `1 - product(1 - w_i)` across all detected signals (probabilistic combination). A high intent score suppresses the abandonment posterior; even an old, idle process is safe if someone just switched to its tmux pane.
+
+---
+
+## Incremental Scanning
+
+Full re-scans are wasteful when most processes haven't changed. The incremental engine tracks a process inventory across sessions and only re-infers processes with material state changes:
+
+| Change Type | Triggers Re-inference? | Detection |
+|-------------|:---------------------:|-----------|
+| New process | Yes | Not in previous inventory |
+| Process exited | Yes (record departure) | In previous but not current |
+| CPU spike (> 5pp) | Yes | `\|current - previous\| > threshold` |
+| RSS spike (> 20%) | Yes | `\|delta\| / previous > fraction` |
+| Process state change | Yes | State enum comparison |
+| Stale entry (> 10 min) | Yes | Forced re-scan |
+| Unchanged | No (age-only update) | No material change detected |
+
+Process identity is tracked via a SHA-256 hash of `(pid, uid, comm, cmd)`, producing a stable 16-character hex fingerprint. The inventory supports up to 100,000 entries with LRU eviction.
+
+---
+
+## Respawn Loop Detection
+
+Killing a supervised process that immediately restarts is pointless. `pt` tracks kill-respawn cycles and adjusts its recommendations:
+
+```
+Kill → respawn in 2s → Kill → respawn in 2s → Kill → respawn in 2s
+                     ↓
+         "Respawn loop detected (3 cycles in 60s)"
+         Recommendation: systemctl stop <unit> instead
+```
+
+After detecting a loop (2+ respawns within 30 seconds of each kill, within a 1-hour window), `pt` discounts the kill action's utility:
+
+```
+utility_multiplier = 1.0 - 0.8 * min(loop_count / 5, 1.0)
+```
+
+At 5+ loops, kill utility drops to 20% of baseline. The recommendation escalates from "kill" to "stop supervisor" to "disable supervisor" as the loop count increases.
+
+---
+
+## Memory Pressure Response
+
+The daemon monitors system memory and escalates scan cadence when pressure rises:
+
+| Mode | Threshold | Scan Interval | Action |
+|------|-----------|:-------------:|--------|
+| Normal | < 80% used | 300s | Continue monitoring |
+| Warning | >= 80% used | 60s | Generate triage plan |
+| Emergency | >= 95% used | 15s | Urgent plan, prioritize high-RSS candidates |
+
+Transitions require 2 consecutive signals at the new level (prevents flapping on momentary spikes). De-escalation also requires 2 consecutive normal readings.
+
+On Linux, `pt` reads Pressure Stall Information (`/proc/pressure/memory`) when available, using `memory.some` as a more accurate signal than raw utilization. PSI thresholds: 20% for warning, 60% for emergency.
+
+---
+
+## Goal-Based Kill Set Selection
+
+Instead of ranking processes individually, `pt` can optimize kill sets to achieve resource goals:
+
+```bash
+pt agent plan --goal "free 4GB memory" --format json
+pt agent plan --goal "free port 8080" --format json
+```
+
+The optimizer evaluates which combination of kills achieves the goal with minimum collateral damage. Three algorithms are available:
+
+| Algorithm | When Used | Guarantee |
+|-----------|-----------|-----------|
+| **Greedy** | Default (any N) | 1 - 1/e approximation for submodular objectives |
+| **DP-exact** | N <= 30 candidates | Optimal solution |
+| **Local search** | Refinement pass | Swap-based improvement on greedy |
+
+Each candidate's "efficiency" is `contribution / expected_loss`, measuring how much resource it frees per unit of risk. The optimizer selects the minimum-cost set that meets the target.
+
+---
+
+## Off-Policy Evaluation
+
+Before deploying a new triage policy (different thresholds, different priors), `pt` can evaluate it against historical decisions without running it live:
+
+| Estimator | Bias | Variance | When to Use |
+|-----------|:----:|:--------:|-------------|
+| **IPS** (Inverse Propensity Scoring) | Unbiased | High | Baseline, sufficient data |
+| **Doubly Robust** | Unbiased if either model correct | Lower | Preferred when available |
+
+The doubly-robust estimator combines importance weighting with a direct reward model:
+
+```
+V_DR = (1/n) * sum[ r_hat(s, pi) + w_i * (r_i - r_hat(s, a_i)) ]
+```
+
+where `w_i = min(pi_new(a|s) / pi_old(a|s), 10.0)` is the clipped importance ratio. The effective sample size `ESS = (sum w_i)^2 / sum w_i^2` must exceed 100 for reliable estimates.
+
+Recommendations: **Deploy** if the 95% CI lower bound exceeds the current policy's value. **Hold** if inconclusive. **Unreliable** if ESS is too low.
+
+---
+
+## Wait-Free /proc Probing
+
+Some processes are in **D-state** (uninterruptible sleep), and reading their `/proc` files can block the entire scan. The prober uses Linux `io_uring` for non-blocking reads:
+
+1. Submit all `/proc/[pid]/*` reads as async I/O operations
+2. Add a global timeout entry (100ms default)
+3. Process completions as they arrive
+4. Mark timed-out probes (the process is likely stuck on I/O)
+
+This prevents a single hung NFS mount or frozen block device from stalling the entire triage pipeline. Processes with timed-out probes get `confidence: "low"` and D-state diagnostics in their plan entry.
 
 ---
 
@@ -772,7 +923,7 @@ When you run `pt agent plan --format json`, the output is a deterministic, resum
 ```
 
 **Key design choices:**
-- **IDs are deterministic** (FNV-1a 64-bit hashes, not UUIDs) — the same inputs always produce the same plan
+- **IDs are deterministic** (FNV-1a 64-bit hashes, not UUIDs); the same inputs always produce the same plan
 - **Zombie routing**: Z-state processes are routed to their parent for `restart` (forcing reap), not killed directly
 - **D-state handling**: Processes in uninterruptible sleep get `confidence: "low"` with diagnostic fields (wchan, I/O counters, D-state duration)
 - **Pre-checks**: Every action has a list of safety checks that must pass before execution (identity verification, protection check, data-loss gate, supervisor check)
@@ -790,7 +941,7 @@ Created ──→ Scanning ──→ Planned ──→ Executing ──→ Compl
    └─→ Cancelled
 ```
 
-Each state is a zero-sized marker type. The method `TypedSession<Scanning>::finish_scan()` returns a `TypedSession<Planned>` — you literally cannot call `start_execution()` on a session that hasn't been planned yet, because the method doesn't exist on that type. Invalid transitions are caught by the compiler, not by runtime checks.
+Each state is a zero-sized marker type. The method `TypedSession<Scanning>::finish_scan()` returns a `TypedSession<Planned>`. You cannot call `start_execution()` on a session that hasn't been planned yet, because the method doesn't exist on that type. Invalid transitions are caught by the compiler, not by runtime checks.
 
 ---
 
@@ -833,7 +984,7 @@ cp completions/pt-core.fish ~/.config/fish/completions/
 cp completions/_pt-core ~/.zfunc/
 ```
 
-Completions cover all subcommands, options, and argument values — including `--format` choices (json, toon, md, jsonl, summary, metrics, prose), `--theme` options (dark, light, high-contrast, no-color), and session IDs.
+Completions cover all subcommands, options, and argument values, including `--format` choices (json, toon, md, jsonl, summary, metrics, prose), `--theme` options (dark, light, high-contrast, no-color), and session IDs.
 
 ---
 
@@ -855,7 +1006,7 @@ When you kill or spare a process, `pt` remembers. The learning system normalizes
 - Long numbers (4+ digits) → `\d+`
 - Versioned interpreters (`python3.11`) → `python.*`
 
-When `pt` sees a process matching a learned pattern, it adjusts the prior probability — processes you've killed before get a higher abandonment prior, while processes you've spared get a lower one. Three specificity levels prevent both over-fitting (exact match only) and over-generalizing (matching every `node` process).
+When `pt` sees a process matching a learned pattern, it adjusts the prior probability: processes you've killed before get a higher abandonment prior, while processes you've spared get a lower one. Three specificity levels prevent both over-fitting (exact match only) and over-generalizing (matching every `node` process).
 
 ---
 
@@ -888,9 +1039,9 @@ Before killing any process, `pt` checks what files it has open. 20+ detection ru
 3. If `.git` is a file (git worktree), parses the `gitdir:` pointer and resolves back to the main repository root via `commondir`
 4. Reads `HEAD` to determine branch status (on branch, detached HEAD, or corrupted)
 
-This means `pt` can tell you "this stuck `cargo build` is in your `feature/auth` worktree of the `backend` repo" — not just "PID 12345 is running cargo."
+This means `pt` can tell you "this stuck `cargo build` is in your `feature/auth` worktree of the `backend` repo," instead of just "PID 12345 is running cargo."
 
-A process with a deleted CWD (the directory was removed while the process was running) gets an elevated suspicion score — it's likely orphaned from a branch that was cleaned up.
+A process with a deleted CWD (the directory was removed while the process was running) gets an elevated suspicion score, since it's likely orphaned from a branch that was cleaned up.
 
 ---
 
@@ -926,7 +1077,7 @@ For extreme cases, `pt` can pin a process to a limited set of CPU cores via the 
 
 ## Action Recovery Trees
 
-When an action fails, `pt` doesn't just report the error — it has a structured recovery tree with diagnosis and fallback options:
+When an action fails, `pt` consults a structured recovery tree with diagnosis and fallback options:
 
 ```
 Kill action failed (Timeout)
@@ -945,7 +1096,7 @@ Kill action failed (Timeout)
 | Process not found | Verify goal achieved (may have exited) | Skip |
 | Timeout | Escalate signal (SIGTERM → SIGKILL) | Investigate D-state |
 | Supervisor conflict | Stop supervisor, mask unit, retry | Check for respawn |
-| Identity mismatch | Abort (PID reused — wrong process) | Re-scan and re-plan |
+| Identity mismatch | Abort (PID reused; wrong process) | Re-scan and re-plan |
 | Resource conflict | Wait and retry with backoff | Skip |
 
 Recovery is always *forward* (escalate to more forceful actions), never backward (no automatic undo). Reversal metadata is captured so a human can manually undo if needed.
@@ -954,7 +1105,7 @@ Recovery is always *forward* (escalate to more forceful actions), never backward
 
 ## Telemetry: Lock-Free Event Recording
 
-Session telemetry is recorded via an **LMAX Disruptor** — a lock-free, wait-free ring buffer designed for ultra-low-latency event recording:
+Session telemetry is recorded via an **LMAX Disruptor**, a lock-free, wait-free ring buffer designed for ultra-low-latency event recording:
 
 ```
 Producer (triage loop) ──→ [Ring Buffer] ──→ Consumer (Parquet writer)
@@ -968,7 +1119,7 @@ Producer (triage loop) ──→ [Ring Buffer] ──→ Consumer (Parquet write
 **Why a disruptor instead of a channel?**
 - **Zero allocation**: All event slots are pre-allocated at startup. No heap allocation during triage.
 - **No contention**: Producer and consumer sequences are on separate cache lines (64-byte alignment via `#[repr(align(64))]`), eliminating false sharing.
-- **Wait-free**: Producer never blocks. If the buffer is full, the event is simply dropped — telemetry should never slow down triage decisions.
+- **Wait-free**: Producer never blocks. If the buffer is full, the event is simply dropped. Telemetry should never slow down triage decisions.
 - **Bitmask indexing**: Capacity is always a power of 2, so `index = sequence & (capacity - 1)` avoids expensive modulo operations.
 
 Events are fixed-size structs (timestamp + event type + PID + 128-byte detail buffer) written to Apache Parquet via Arrow schemas for efficient columnar analytics.
@@ -1021,7 +1172,7 @@ All Bayesian computation happens in **log-domain** to prevent the floating-point
 - Normalization uses log-sum-exp: `log(sum(exp(x_i))) = max(x) + log(sum(exp(x_i - max(x))))`
 - The max-subtraction trick ensures the largest exponent is `exp(0) = 1`, preventing overflow
 
-The `pt-math` crate provides `log_sum_exp`, `log_beta_pdf`, `log_gamma`, `gamma_log_pdf`, and `normalize_log_probs` — all numerically stable. The implementation has been validated with 21 stress tests covering 1000+ parameter combinations with zero panics.
+The `pt-math` crate provides `log_sum_exp`, `log_beta_pdf`, `log_gamma`, `gamma_log_pdf`, and `normalize_log_probs`, all numerically stable. The implementation has been validated with 21 stress tests covering 1000+ parameter combinations with zero panics.
 
 ---
 
@@ -1215,13 +1366,13 @@ The evidence ledger's detailed view that shows every Bayes factor, every evidenc
 `pt` tells you *what* to kill and *why*, with confidence scores and impact estimates. It also uses staged signals (SIGTERM first), validates process identity to prevent PID-reuse mistakes, and logs everything for audit.
 
 **Q: Why so many statistical models? Isn't a simple heuristic enough?**
-Simple heuristics work for obvious cases (zombie processes, 0% CPU for hours). But the interesting cases are ambiguous: a process using 2% CPU might be doing useful background work or might be a stuck event loop. Different models capture different signals — BOCPD catches sudden behavior changes, HSMM models state transitions, queueing theory detects socket stalls. The ensemble gives more robust classification than any single model.
+Simple heuristics work for obvious cases (zombie processes, 0% CPU for hours). But the interesting cases are ambiguous: a process using 2% CPU might be doing useful background work or might be a stuck event loop. Different models capture different signals. BOCPD catches sudden behavior changes, HSMM models state transitions, queueing theory detects socket stalls. The ensemble gives more robust classification than any single model.
 
 **Q: What happens if `pt` kills a supervised process?**
-If the process is managed by systemd, Docker, or another supervisor, the supervisor will typically restart it. `pt` detects supervisor relationships and factors this into its recommendation — supervised processes get a higher blast-radius score (since killing them may not even accomplish anything if they auto-restart), and the evidence ledger notes "Supervisor may auto-restart (reducing kill effectiveness)."
+If the process is managed by systemd, Docker, or another supervisor, the supervisor will typically restart it. `pt` detects supervisor relationships and factors this into its recommendation. Supervised processes get a higher blast-radius score (since killing them may not accomplish anything if they auto-restart), and the evidence ledger notes "Supervisor may auto-restart (reducing kill effectiveness)."
 
 **Q: How does provenance-aware blast radius differ from just counting child processes?**
-Child count is a crude proxy. Blast radius traces *shared resources* — two processes that share a lockfile, a TCP listener on the same port, or a pidfile are connected even if they have no parent-child relationship. Then it propagates *transitively*: if A shares a lockfile with B, and B shares a listener with C, killing A may indirectly affect C. Confidence decays with graph distance (50% per hop by default).
+Child count is a crude proxy. Blast radius traces *shared resources*: two processes that share a lockfile, a TCP listener on the same port, or a pidfile are connected even if they have no parent-child relationship. It then propagates transitively. If A shares a lockfile with B, and B shares a listener with C, killing A may indirectly affect C. Confidence decays with graph distance (50% per hop by default).
 
 **Q: Can I tune the Bayesian priors?**
 Yes. Edit `~/.config/process_triage/priors.json`. Each of the four classes (Useful, Useful-Bad, Abandoned, Zombie) has configurable Beta distribution parameters for CPU, orphan status, TTY, network activity, I/O activity, queue saturation, and runtime (Gamma distribution). The defaults work well for development machines; production servers may want higher `useful.prior_prob`.
@@ -1242,7 +1393,7 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## Origins
 
-Created by **Jeffrey Emanuel** after a session where 23 stuck `bun test` workers and a 31GB Hyprland instance brought a 64-core workstation to its knees. Manual process hunting is tedious — statistical inference should do the work.
+Created by **Jeffrey Emanuel** after a session where 23 stuck `bun test` workers and a 31GB Hyprland instance brought a 64-core workstation to its knees. Manual process hunting is tedious; statistical inference should do the work.
 
 ---
 
