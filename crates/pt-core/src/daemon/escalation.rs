@@ -71,6 +71,39 @@ pub struct EscalationOutcome {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Provenance summary for the escalation scan (when completed).
+    ///
+    /// Contains aggregate provenance metrics: how many candidates had
+    /// provenance evidence, blast-radius distribution, and any evidence
+    /// gaps that reduced confidence in the escalation plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_summary: Option<EscalationProvenanceSummary>,
+}
+
+/// Aggregate provenance summary for a daemon escalation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationProvenanceSummary {
+    /// How many candidates had provenance evidence available.
+    pub candidates_with_evidence: usize,
+    /// How many candidates had no provenance evidence.
+    pub candidates_without_evidence: usize,
+    /// Blast-radius risk distribution across candidates.
+    pub risk_distribution: RiskDistribution,
+    /// Whether any candidate was blocked from auto-mitigation due to
+    /// high blast radius.
+    pub any_blocked_by_blast_radius: bool,
+    /// Evidence completeness across all candidates (0.0 to 1.0).
+    pub mean_evidence_completeness: f64,
+}
+
+/// Distribution of blast-radius risk levels across candidates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RiskDistribution {
+    pub low: usize,
+    pub medium: usize,
+    pub high: usize,
+    pub critical: usize,
+    pub unknown: usize,
 }
 
 /// State tracking for escalation decisions.
@@ -138,6 +171,7 @@ where
             status: EscalationStatus::Deferred,
             reason: format!("{:?}", reason),
             session_id: None,
+            provenance_summary: None,
         };
     }
 
@@ -149,6 +183,7 @@ where
             status: EscalationStatus::Deferred,
             reason: format!("{:?}", DeferReason::LockContention),
             session_id: None,
+            provenance_summary: None,
         };
     }
 
@@ -161,6 +196,7 @@ where
         status: EscalationStatus::Completed,
         reason: "escalation completed".to_string(),
         session_id: None, // Caller fills in after creating the session.
+        provenance_summary: None, // Caller populates after scan completes.
     }
 }
 
@@ -193,6 +229,7 @@ mod tests {
             ewma_value: 8.0,
             threshold: 4.0,
             sustained_ticks: 3,
+            provenance_context: Vec::new(),
         }
     }
 

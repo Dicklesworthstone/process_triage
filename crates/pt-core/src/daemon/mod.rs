@@ -313,6 +313,7 @@ mod tests {
                 status: escalation::EscalationStatus::Completed,
                 reason: String::new(),
                 session_id: None,
+                provenance_summary: None,
             },
         );
 
@@ -340,6 +341,7 @@ mod tests {
                 status: escalation::EscalationStatus::Completed,
                 reason: "test escalation".to_string(),
                 session_id: Some("test-session".to_string()),
+                provenance_summary: None,
             },
         );
 
@@ -366,6 +368,7 @@ mod tests {
                 status: escalation::EscalationStatus::Deferred,
                 reason: "lock held".to_string(),
                 session_id: None,
+                provenance_summary: None,
             },
         );
 
@@ -392,6 +395,7 @@ mod tests {
                 status: escalation::EscalationStatus::Failed,
                 reason: "escalation failed".to_string(),
                 session_id: None,
+                provenance_summary: None,
             },
         );
 
@@ -430,6 +434,7 @@ mod tests {
                     status: escalation::EscalationStatus::Completed,
                     reason: String::new(),
                     session_id: None,
+                    provenance_summary: None,
                 },
             );
         }
