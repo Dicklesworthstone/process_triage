@@ -69,6 +69,17 @@ pub struct CandidateRow {
     // Evidence tags
     /// Evidence tags for quick reference.
     pub evidence_tags: Vec<String>,
+
+    // Provenance
+    /// Provenance narrative headline (one-line summary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_headline: Option<String>,
+    /// Blast-radius risk level (low/medium/high/critical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blast_radius_risk: Option<String>,
+    /// Number of other processes/resources affected if killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blast_radius_affected: Option<usize>,
 }
 
 impl CandidateRow {

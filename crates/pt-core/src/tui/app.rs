@@ -1560,6 +1560,10 @@ mod tests {
             top_evidence: vec![],
             confidence: None,
             plan_preview: vec![],
+            provenance_headline: None,
+            provenance_sections: Vec::new(),
+            provenance_caveats: Vec::new(),
+            blast_radius_risk: None,
         }
     }
 

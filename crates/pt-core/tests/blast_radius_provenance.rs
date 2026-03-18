@@ -5,16 +5,16 @@
 //! provenance graph evolves. Covers direct impact, indirect impact,
 //! continuity deltas, and composed diagnostics.
 
-use pt_core::collect::shared_resource_graph::SharedResourceGraph;
-use pt_core::collect::provenance_continuity::{
-    compute_provenance_delta, pid_continuity, summarize_delta, PidContinuity,
-};
-use pt_core::decision::direct_impact::{compute_direct_impact, DirectImpactConfig};
-use pt_core::decision::indirect_impact::{compute_indirect_impact, IndirectImpactConfig};
 use pt_common::{
     LockMechanism, RawResourceEvidence, ResourceCollectionMethod, ResourceDetails, ResourceKind,
     ResourceState,
 };
+use pt_core::collect::provenance_continuity::{
+    compute_provenance_delta, pid_continuity, summarize_delta, PidContinuity,
+};
+use pt_core::collect::shared_resource_graph::SharedResourceGraph;
+use pt_core::decision::direct_impact::{compute_direct_impact, DirectImpactConfig};
+use pt_core::decision::indirect_impact::{compute_indirect_impact, IndirectImpactConfig};
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -57,20 +57,26 @@ fn listener_ev(pid: u32, port: u16) -> RawResourceEvidence {
 /// - orphan (PID 500): solo lock, no connections
 fn web_stack_graph() -> SharedResourceGraph {
     SharedResourceGraph::from_evidence(&[
-        (100, vec![
-            listener_ev(100, 80),
-            listener_ev(100, 443),
-            lock_ev(100, "/run/app.lock"),
-        ]),
-        (200, vec![
-            listener_ev(200, 3000),
-            lock_ev(200, "/run/app.lock"),
-            lock_ev(200, "/run/db.lock"),
-        ]),
-        (300, vec![
-            listener_ev(300, 5432),
-            lock_ev(300, "/run/db.lock"),
-        ]),
+        (
+            100,
+            vec![
+                listener_ev(100, 80),
+                listener_ev(100, 443),
+                lock_ev(100, "/run/app.lock"),
+            ],
+        ),
+        (
+            200,
+            vec![
+                listener_ev(200, 3000),
+                lock_ev(200, "/run/app.lock"),
+                lock_ev(200, "/run/db.lock"),
+            ],
+        ),
+        (
+            300,
+            vec![listener_ev(300, 5432), lock_ev(300, "/run/db.lock")],
+        ),
         (400, vec![lock_ev(400, "/run/app.lock")]),
         (500, vec![lock_ev(500, "/tmp/orphan.lock")]),
     ])
@@ -89,13 +95,13 @@ fn web_stack_resource_counts_stable() {
 
     // nginx shares app.lock with app and worker.
     assert_eq!(graph.co_holders(100).len(), 2); // 200, 400
-    // app shares with nginx, worker (via app.lock) and db (via db.lock).
+                                                // app shares with nginx, worker (via app.lock) and db (via db.lock).
     assert_eq!(graph.co_holders(200).len(), 3); // 100, 300, 400
-    // db shares with app only.
+                                                // db shares with app only.
     assert_eq!(graph.co_holders(300).len(), 1); // 200
-    // worker shares with nginx and app.
+                                                // worker shares with nginx and app.
     assert_eq!(graph.co_holders(400).len(), 2); // 100, 200
-    // orphan shares with nobody.
+                                                // orphan shares with nobody.
     assert_eq!(graph.co_holders(500).len(), 0);
 }
 
@@ -142,8 +148,16 @@ fn direct_impact_summary_is_human_readable() {
     let graph = web_stack_graph();
     let result = compute_direct_impact(200, &graph, None, &[], &DirectImpactConfig::default());
     // Summary should mention shared resources and listeners.
-    assert!(result.summary.contains("shares"), "summary: {}", result.summary);
-    assert!(result.summary.contains("listener"), "summary: {}", result.summary);
+    assert!(
+        result.summary.contains("shares"),
+        "summary: {}",
+        result.summary
+    );
+    assert!(
+        result.summary.contains("listener"),
+        "summary: {}",
+        result.summary
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -200,14 +214,26 @@ fn incomplete_evidence_inflates_indirect_score() {
 fn delta_detects_worker_joining_web_stack() {
     // Previous: web stack without worker.
     let prev = SharedResourceGraph::from_evidence(&[
-        (100, vec![listener_ev(100, 80), lock_ev(100, "/run/app.lock")]),
-        (200, vec![listener_ev(200, 3000), lock_ev(200, "/run/app.lock")]),
+        (
+            100,
+            vec![listener_ev(100, 80), lock_ev(100, "/run/app.lock")],
+        ),
+        (
+            200,
+            vec![listener_ev(200, 3000), lock_ev(200, "/run/app.lock")],
+        ),
     ]);
 
     // Current: worker joins.
     let curr = SharedResourceGraph::from_evidence(&[
-        (100, vec![listener_ev(100, 80), lock_ev(100, "/run/app.lock")]),
-        (200, vec![listener_ev(200, 3000), lock_ev(200, "/run/app.lock")]),
+        (
+            100,
+            vec![listener_ev(100, 80), lock_ev(100, "/run/app.lock")],
+        ),
+        (
+            200,
+            vec![listener_ev(200, 3000), lock_ev(200, "/run/app.lock")],
+        ),
         (400, vec![lock_ev(400, "/run/app.lock")]),
     ]);
 
@@ -218,7 +244,10 @@ fn delta_detects_worker_joining_web_stack() {
 
     let summary = summarize_delta(&delta);
     assert!(summary.contains("new process"), "summary: {summary}");
-    assert!(summary.contains("growing blast radius"), "summary: {summary}");
+    assert!(
+        summary.contains("growing blast radius"),
+        "summary: {summary}"
+    );
 }
 
 #[test]
@@ -226,8 +255,18 @@ fn delta_detects_db_exiting() {
     let prev = web_stack_graph();
     // Current: db exits.
     let curr = SharedResourceGraph::from_evidence(&[
-        (100, vec![listener_ev(100, 80), lock_ev(100, "/run/app.lock")]),
-        (200, vec![listener_ev(200, 3000), lock_ev(200, "/run/app.lock"), lock_ev(200, "/run/db.lock")]),
+        (
+            100,
+            vec![listener_ev(100, 80), lock_ev(100, "/run/app.lock")],
+        ),
+        (
+            200,
+            vec![
+                listener_ev(200, 3000),
+                lock_ev(200, "/run/app.lock"),
+                lock_ev(200, "/run/db.lock"),
+            ],
+        ),
         (400, vec![lock_ev(400, "/run/app.lock")]),
         (500, vec![lock_ev(500, "/tmp/orphan.lock")]),
     ]);
@@ -240,12 +279,11 @@ fn delta_detects_db_exiting() {
 
 #[test]
 fn pid_continuity_tracks_resource_changes() {
-    let prev = SharedResourceGraph::from_evidence(&[
-        (100, vec![lock_ev(100, "/a.lock")]),
-    ]);
-    let curr = SharedResourceGraph::from_evidence(&[
-        (100, vec![lock_ev(100, "/a.lock"), lock_ev(100, "/b.lock")]),
-    ]);
+    let prev = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
+    let curr = SharedResourceGraph::from_evidence(&[(
+        100,
+        vec![lock_ev(100, "/a.lock"), lock_ev(100, "/b.lock")],
+    )]);
 
     match pid_continuity(100, &prev, &curr) {
         PidContinuity::Continuing {
@@ -278,7 +316,10 @@ fn full_diagnostic_pipeline_for_web_stack() {
         let indirect = compute_indirect_impact(pid, &graph, 1.0, &ii_config);
 
         // Scores should be finite and bounded.
-        assert!(direct.score >= 0.0 && direct.score <= 1.0, "PID {pid} direct");
+        assert!(
+            direct.score >= 0.0 && direct.score <= 1.0,
+            "PID {pid} direct"
+        );
         assert!(
             indirect.adjusted_score >= 0.0 && indirect.adjusted_score <= 1.0,
             "PID {pid} indirect"

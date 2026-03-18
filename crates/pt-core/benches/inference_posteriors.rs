@@ -17,7 +17,7 @@ fn example_evidence_idle_orphan() -> Evidence {
         io_active: Some(false),
         state_flag: None,
         command_category: None,
-            queue_saturated: None,
+        queue_saturated: None,
     }
 }
 
@@ -31,7 +31,7 @@ fn example_evidence_active_tty_net() -> Evidence {
         io_active: Some(true),
         state_flag: None,
         command_category: None,
-            queue_saturated: None,
+        queue_saturated: None,
     }
 }
 

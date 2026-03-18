@@ -1,0 +1,13 @@
+{
+  "enabled": false,
+  "evidence_completeness": 0.0,
+  "confidence_penalty_steps": 0,
+  "blast_radius": {
+    "risk_score": 0.0,
+    "risk_level": "unknown",
+    "confidence": 0.0,
+    "summary": "provenance not available",
+    "total_affected": 0
+  },
+  "redaction_state": "none"
+}

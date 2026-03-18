@@ -4,10 +4,10 @@
 //! negative, extreme values) across all public pt-math functions.
 //! Fulfills bd-g0q5.9 acceptance criteria.
 
-use pt_math::*;
 use pt_math::bayes_factor::*;
 use pt_math::bernoulli::{self, BetaParams};
 use pt_math::dirichlet;
+use pt_math::*;
 
 // ---------------------------------------------------------------------------
 // Pathological input generators
@@ -21,7 +21,7 @@ const PATHOLOGICAL_F64: &[f64] = &[
     f64::NAN,
     f64::INFINITY,
     f64::NEG_INFINITY,
-    f64::MIN_POSITIVE,  // ~5e-324
+    f64::MIN_POSITIVE, // ~5e-324
     f64::MAX,
     f64::MIN,
     1e-300,

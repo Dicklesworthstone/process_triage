@@ -83,6 +83,27 @@
       "sha256": "2e255cef355e078f14f40835eed862c5ee59b1c6a774852b1a2d9f649f8020f1",
       "bytes": 1647,
       "redaction_profile": "safe"
+    },
+    {
+      "path": "provenance_output_disabled.json",
+      "kind": "snapshot",
+      "sha256": "b22dd57de08757a0d1b13df873d62b6640126b14e0f4b71683799033c514f095",
+      "bytes": 284,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "provenance_output_full.json",
+      "kind": "snapshot",
+      "sha256": "4376890c2fe09730d4def107654f84faad9d7db2b270d33271add53dc8891c08",
+      "bytes": 891,
+      "redaction_profile": "safe"
+    },
+    {
+      "path": "provenance_output_redacted_high_blast.json",
+      "kind": "snapshot",
+      "sha256": "66bb89464bebcaf4b10aaadd08a78478ed775b2c40c1249857a77af7e34feb2e",
+      "bytes": 774,
+      "redaction_profile": "safe"
     }
   ],
   "description": "pt-core policy/priors + inference + provenance fixtures",

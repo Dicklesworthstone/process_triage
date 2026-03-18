@@ -114,6 +114,26 @@ pub struct FiredTrigger {
     pub ewma_value: f64,
     pub threshold: f64,
     pub sustained_ticks: u32,
+    /// Provenance context: top contributing PIDs and their blast-radius risk.
+    /// Populated when provenance is enabled; absent otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance_context: Vec<TriggerProvenanceHint>,
+}
+
+/// Provenance hint attached to a daemon trigger.
+///
+/// Provides minimal provenance context so alert consumers know which
+/// processes contributed to the spike and how risky they are to kill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerProvenanceHint {
+    /// Process ID of a top contributor.
+    pub pid: u32,
+    /// Short command name.
+    pub comm: String,
+    /// Blast-radius risk level (low/medium/high/critical/unknown).
+    pub blast_radius_risk: String,
+    /// Whether provenance evidence was available for this process.
+    pub evidence_available: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +174,7 @@ pub fn evaluate_triggers(
                 ewma_value: state.load_ewma,
                 threshold: config.load_threshold,
                 sustained_ticks: state.load_sustained,
+                provenance_context: Vec::new(),
             });
             state.load_cooldown = config.cooldown_ticks;
             state.load_sustained = 0;
@@ -188,6 +209,7 @@ pub fn evaluate_triggers(
                 ewma_value: state.memory_ewma,
                 threshold: config.memory_threshold,
                 sustained_ticks: state.memory_sustained,
+                provenance_context: Vec::new(),
             });
             state.memory_cooldown = config.cooldown_ticks;
             state.memory_sustained = 0;
@@ -216,6 +238,7 @@ pub fn evaluate_triggers(
                 ewma_value: state.orphan_ewma,
                 threshold: config.orphan_threshold as f64,
                 sustained_ticks: state.orphan_sustained,
+                provenance_context: Vec::new(),
             });
             state.orphan_cooldown = config.cooldown_ticks;
             state.orphan_sustained = 0;

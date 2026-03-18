@@ -1,0 +1,37 @@
+{
+  "enabled": true,
+  "evidence_completeness": 0.85,
+  "confidence_penalty_steps": 1,
+  "confidence_notes": [
+    "resource provenance has 2 unresolved edge(s)"
+  ],
+  "score_terms": [
+    "provenance_ownership_orphaned",
+    "provenance_blast_radius_low"
+  ],
+  "blast_radius": {
+    "risk_score": 0.12,
+    "risk_level": "low",
+    "confidence": 0.90,
+    "summary": "Isolated process with no shared resources",
+    "total_affected": 0
+  },
+  "redaction_state": "none",
+  "score_impact": {
+    "log_odds_shift": 0.35,
+    "feature_contributions": [
+      {
+        "feature": "provenance_ownership_orphaned",
+        "abandoned_ll": 0.70,
+        "useful_ll": -0.55,
+        "direction": "toward_abandon"
+      },
+      {
+        "feature": "provenance_blast_radius_low",
+        "abandoned_ll": 0.35,
+        "useful_ll": -0.25,
+        "direction": "toward_abandon"
+      }
+    ]
+  }
+}

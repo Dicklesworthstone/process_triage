@@ -84,6 +84,14 @@ pub struct ProcessRow {
     pub confidence: Option<String>,
     /// Preview lines for the planned actions (stage/prechecks/confidence).
     pub plan_preview: Vec<String>,
+    /// Provenance narrative headline (compact one-liner).
+    pub provenance_headline: Option<String>,
+    /// Provenance narrative sections for full drill-down.
+    pub provenance_sections: Vec<(String, String, String)>, // (glyph, heading, body)
+    /// Provenance caveats (never truncated).
+    pub provenance_caveats: Vec<String>,
+    /// Blast-radius risk level for display.
+    pub blast_radius_risk: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -924,6 +932,10 @@ mod tests {
                 top_evidence: vec!["runtime (2.4 bits toward abandoned)".to_string()],
                 confidence: Some("high".to_string()),
                 plan_preview: Vec::new(),
+                provenance_headline: None,
+                provenance_sections: Vec::new(),
+                provenance_caveats: Vec::new(),
+                blast_radius_risk: None,
             },
             ProcessRow {
                 pid: 5678,

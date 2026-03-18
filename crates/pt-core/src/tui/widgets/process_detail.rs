@@ -20,6 +20,8 @@ pub enum DetailView {
     Summary,
     GalaxyBrain,
     Genealogy,
+    /// Provenance evidence inspector: lineage, blast radius, and caveats.
+    Provenance,
 }
 
 /// Detail pane widget for a selected process.
@@ -186,6 +188,7 @@ impl<'a> ProcessDetail<'a> {
             DetailView::Summary => self.build_summary_sections(row, evidence_height),
             DetailView::GalaxyBrain => self.build_galaxy_brain_sections(row, evidence_height),
             DetailView::Genealogy => self.build_genealogy_sections(),
+            DetailView::Provenance => self.build_provenance_sections(row, evidence_height),
         };
 
         // ── Render paragraphs ───────────────────────────────────────
@@ -362,6 +365,79 @@ impl<'a> ProcessDetail<'a> {
 
         (evidence, action)
     }
+
+    fn build_provenance_sections(
+        &self,
+        row: &ProcessRow,
+        max_lines: usize,
+    ) -> (Vec<FtuiLine<'static>>, Vec<FtuiLine<'static>>) {
+        let label = self.label_ftui_style();
+        let value = self.value_ftui_style();
+
+        let mut evidence = Vec::new();
+
+        // Headline
+        if let Some(ref headline) = row.provenance_headline {
+            evidence.push(FtuiLine::from_spans([FtuiSpan::styled(
+                headline.clone(),
+                label,
+            )]));
+            evidence.push(FtuiLine::default());
+        } else {
+            evidence.push(FtuiLine::from_spans([FtuiSpan::styled(
+                "Provenance: not available",
+                label,
+            )]));
+        }
+
+        // Sections (glyph, heading, body)
+        for (glyph, heading, body) in &row.provenance_sections {
+            if evidence.len() >= max_lines.saturating_sub(2) {
+                break;
+            }
+            evidence.push(FtuiLine::from_spans([
+                FtuiSpan::styled(format!("{} ", glyph), value),
+                FtuiSpan::styled(heading.clone(), label),
+            ]));
+            evidence.push(FtuiLine::from_spans([FtuiSpan::styled(
+                format!("  {}", body),
+                value,
+            )]));
+        }
+
+        // Blast-radius risk badge
+        let mut action = Vec::new();
+        if let Some(ref risk) = row.blast_radius_risk {
+            let risk_style = match risk.as_str() {
+                "critical" | "high" => {
+                    FtuiStyle::new().fg(PackedRgba::rgb(255, 80, 80)).bold()
+                }
+                "medium" => FtuiStyle::new().fg(PackedRgba::rgb(255, 200, 0)),
+                _ => value,
+            };
+            action.push(FtuiLine::from_spans([
+                FtuiSpan::styled("Blast Radius: ", label),
+                FtuiSpan::styled(risk.clone(), risk_style),
+            ]));
+        }
+
+        // Caveats
+        if !row.provenance_caveats.is_empty() {
+            action.push(FtuiLine::from_spans([FtuiSpan::styled(
+                format!("\u{26A0} {} caveat(s)", row.provenance_caveats.len()),
+                FtuiStyle::new().fg(PackedRgba::rgb(255, 200, 0)),
+            )]));
+        }
+
+        if action.is_empty() {
+            action.push(FtuiLine::from_spans([FtuiSpan::styled(
+                "\u{2022} press s to return",
+                value,
+            )]));
+        }
+
+        (evidence, action)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +465,21 @@ mod tests {
             ],
             confidence: Some("high".to_string()),
             plan_preview: Vec::new(),
+            provenance_headline: Some("Provenance: low blast radius; moderate evidence".to_string()),
+            provenance_sections: vec![
+                (
+                    "\u{1F517}".to_string(),
+                    "Provenance Signals".to_string(),
+                    "orphaned (no parent); low blast radius".to_string(),
+                ),
+                (
+                    "\u{1F6E1}".to_string(),
+                    "Blast Radius".to_string(),
+                    "Low risk (score 15%). Isolated process, no shared resources".to_string(),
+                ),
+            ],
+            provenance_caveats: vec!["missing lineage provenance".to_string()],
+            blast_radius_risk: Some("low".to_string()),
         }
     }
 
@@ -399,7 +490,8 @@ mod tests {
         assert_eq!(DetailView::Summary, DetailView::Summary);
         assert_eq!(DetailView::GalaxyBrain, DetailView::GalaxyBrain);
         assert_eq!(DetailView::Genealogy, DetailView::Genealogy);
-        assert_ne!(DetailView::Summary, DetailView::GalaxyBrain);
+        assert_eq!(DetailView::Provenance, DetailView::Provenance);
+        assert_ne!(DetailView::Summary, DetailView::Provenance);
     }
 
     // ── ProcessDetail builder ───────────────────────────────────────

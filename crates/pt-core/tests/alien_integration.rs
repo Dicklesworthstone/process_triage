@@ -12,9 +12,7 @@ use pt_core::inference::conformal_robot::{
     ClassPosteriors, ConformalRobotConfig, ConformalRobotGate, HealthLevel,
 };
 use pt_core::inference::posterior::{compute_posterior, Evidence};
-use pt_core::inference::queueing::{
-    is_queue_saturated, QueueStallConfig, QueueStallDetector,
-};
+use pt_core::inference::queueing::{is_queue_saturated, QueueStallConfig, QueueStallDetector};
 use std::collections::HashMap;
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -317,10 +315,7 @@ fn safety_audit_no_useful_kills() {
     let gate = build_calibrated_gate(500);
     let cut = build_fleet_cut(
         &["host-a", "host-b", "host-c"],
-        &[
-            ("host-a", 10, "host-b", 20),
-            ("host-b", 20, "host-c", 30),
-        ],
+        &[("host-a", 10, "host-b", 20), ("host-b", 20, "host-c", 30)],
         &[("host-a", 10), ("host-b", 20)],
     );
     let config = SnapshotConfig::default();

@@ -77,7 +77,7 @@ fn example_1_bun_test_high_cpu_short_runtime() {
         io_active: Some(true),              // Active I/O
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Test)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -134,7 +134,7 @@ fn example_1_bun_test_stalled_signals_shift_posterior() {
         io_active: Some(false),              // No I/O
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Test)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -189,7 +189,7 @@ fn example_2_gemini_worker_moderate_cpu_normal_runtime() {
         io_active: Some(true),
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Agent)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -230,7 +230,7 @@ fn example_2_gemini_worker_long_runtime_but_active() {
         io_active: Some(true),
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Agent)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -275,7 +275,7 @@ fn example_3_gunicorn_server_normal_operation() {
         io_active: Some(true),
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Server)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -317,7 +317,7 @@ fn example_3_gunicorn_server_even_with_ambiguous_signals() {
         io_active: Some(false),
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Server)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -363,7 +363,7 @@ fn example_4_claude_process_normal_operation() {
         io_active: Some(true),
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Agent)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -403,7 +403,7 @@ fn example_4_claude_process_very_high_cpu() {
         io_active: Some(true),
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Agent)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -447,7 +447,7 @@ fn example_4_claude_process_stalled() {
         io_active: Some(false),
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Agent)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -490,7 +490,7 @@ fn regression_ppid1_alone_is_weak_signal() {
         io_active: Some(true),
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Agent)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -520,7 +520,7 @@ fn regression_high_cpu_is_not_abandoned() {
         io_active: Some(true),
         state_flag: None,
         command_category: None,
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");
@@ -556,7 +556,7 @@ fn regression_daemon_category_protects_against_kill() {
         io_active: Some(false),                     // Might be idle
         state_flag: None,
         command_category: Some(category_index(CommandCategory::Daemon)),
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");

@@ -160,10 +160,10 @@ fn bench_cached_priors(c: &mut Criterion) {
 
     // Simulate full CPU evidence computation: 4 classes × 10K processes
     let priors = [
-        CachedBetaPrior::new(5.0, 3.0),   // useful
-        CachedBetaPrior::new(2.0, 6.0),   // useful_bad
-        CachedBetaPrior::new(1.0, 5.0),   // abandoned
-        CachedBetaPrior::new(1.5, 4.0),   // zombie
+        CachedBetaPrior::new(5.0, 3.0), // useful
+        CachedBetaPrior::new(2.0, 6.0), // useful_bad
+        CachedBetaPrior::new(1.0, 5.0), // abandoned
+        CachedBetaPrior::new(1.5, 4.0), // zombie
     ];
 
     group.bench_function("cpu_evidence_40k/direct", |b| {

@@ -19,11 +19,11 @@ pub mod fleet_fdr;
 pub mod fleet_pattern;
 pub mod fleet_registry;
 pub mod goal_contribution;
-pub mod indirect_impact;
 pub mod goal_optimizer;
 pub mod goal_parser;
 pub mod goal_plan;
 pub mod goal_progress;
+pub mod indirect_impact;
 pub mod load_aware;
 pub mod martingale_gates;
 pub mod mem_pressure;
@@ -51,15 +51,15 @@ pub use blast_radius_estimator::{
     estimate_blast_radius, estimate_blast_radius_batch, BlastRadiusEstimate,
     BlastRadiusEstimatorConfig, RiskLevel, RiskThresholds,
 };
-pub use causal_snapshot::{
-    check_causal_safety, CausalCheckResult, CausalViolation, ConsistentCut, CutValidity,
-    DependencyType, HostSnapshot, Marker, RemoteDependency, SnapshotConfig, SnapshotCoordinator,
-    SnapshotState,
-};
 pub use causal_interventions::{
     apply_outcome, apply_outcomes, expected_recovery, expected_recovery_by_action,
     expected_recovery_for_action, recovery_for_class, recovery_table, InterventionOutcome,
     ProcessClass, RecoveryExpectation, RecoveryTable,
+};
+pub use causal_snapshot::{
+    check_causal_safety, CausalCheckResult, CausalViolation, ConsistentCut, CutValidity,
+    DependencyType, HostSnapshot, Marker, RemoteDependency, SnapshotConfig, SnapshotCoordinator,
+    SnapshotState,
 };
 pub use composite_test::{
     glr_bernoulli, mixture_sprt_bernoulli, mixture_sprt_beta_sequential, mixture_sprt_multiclass,
@@ -72,17 +72,14 @@ pub use contextual_bandits::{
 pub use cvar::{
     compute_cvar, decide_with_cvar, CvarError, CvarLoss, CvarTrigger, RiskSensitiveOutcome,
 };
-pub use direct_impact::{
-    compute_direct_impact, compute_direct_impact_batch, DirectImpactComponents, DirectImpactConfig,
-    DirectImpactResult,
-};
-pub use indirect_impact::{
-    compute_indirect_impact, HopBreakdown, IndirectImpactConfig, IndirectImpactResult,
-};
 pub use dependency_loss::{
     compute_critical_file_inflation, compute_dependency_scaling, scale_kill_loss,
     should_block_kill, CriticalFileInflation, CriticalFileInflationResult, DependencyFactors,
     DependencyScaling, DependencyScalingResult,
+};
+pub use direct_impact::{
+    compute_direct_impact, compute_direct_impact_batch, DirectImpactComponents, DirectImpactConfig,
+    DirectImpactResult,
 };
 pub use dro::{
     apply_dro_gate, compute_adaptive_epsilon, compute_wasserstein_dro, decide_with_dro,
@@ -101,6 +98,9 @@ pub use fdr_selection::{
     by_correction_factor, select_fdr, CandidateSelection, FdrCandidate, FdrError, FdrMethod,
     FdrSelectionResult, TargetIdentity,
 };
+pub use indirect_impact::{
+    compute_indirect_impact, HopBreakdown, IndirectImpactConfig, IndirectImpactResult,
+};
 pub use load_aware::{
     apply_load_to_loss_matrix, compute_load_adjustment, LoadAdjustment, LoadSignals,
 };
@@ -116,16 +116,16 @@ pub use myopic_policy::{
     BlastRadiusSummary, ConstraintSummary, FdrGateSummary, MyopicDecision, MyopicPolicyConfig,
     MyopicPolicyError, PolicyCheckSummary, RobotConstraintSummary, StateContributions,
 };
+pub use ope::{
+    DoublyRobustEstimator, IpsEstimator, LoggedDecision, OpeError, OpeRecommendation, OpeResult,
+};
 pub use provenance_explanation::{
     build_explanation, CounterfactualStory, EvidenceDirection, MissingEvidence,
     PotentialImprovement, ProvenanceExplanation, RankedEvidence,
 };
 pub use provenance_scoring::{
-    compute_provenance_adjusted_score, compute_provenance_adjusted_scores,
-    ActionRecommendation, ProvenanceAdjustedScore, ProvenanceScoringConfig,
-};
-pub use ope::{
-    DoublyRobustEstimator, IpsEstimator, LoggedDecision, OpeError, OpeRecommendation, OpeResult,
+    compute_provenance_adjusted_score, compute_provenance_adjusted_scores, ActionRecommendation,
+    ProvenanceAdjustedScore, ProvenanceScoringConfig,
 };
 pub use robot_constraints::{
     ConstraintCheckResult, ConstraintChecker, ConstraintKind, ConstraintMetrics, ConstraintSource,

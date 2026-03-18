@@ -113,20 +113,10 @@ pub fn estimate_blast_radius(
     evidence_completeness: f64,
     config: &BlastRadiusEstimatorConfig,
 ) -> BlastRadiusEstimate {
-    let direct = compute_direct_impact(
-        pid,
-        graph,
-        lineage,
-        child_pids,
-        &config.direct_config,
-    );
+    let direct = compute_direct_impact(pid, graph, lineage, child_pids, &config.direct_config);
 
-    let indirect = compute_indirect_impact(
-        pid,
-        graph,
-        evidence_completeness,
-        &config.indirect_config,
-    );
+    let indirect =
+        compute_indirect_impact(pid, graph, evidence_completeness, &config.indirect_config);
 
     // Weighted combination.
     let risk_score = (direct.score * config.direct_weight
@@ -234,9 +224,7 @@ fn build_summary(
         .map(|(_, detail)| format!(". {detail}"))
         .unwrap_or_default();
 
-    format!(
-        "PID {pid}: {level_str} risk (score={score:.2}, {confidence_str}) — {affected}{detail}"
-    )
+    format!("PID {pid}: {level_str} risk (score={score:.2}, {confidence_str}) — {affected}{detail}")
 }
 
 #[cfg(test)]
@@ -281,9 +269,22 @@ mod tests {
 
     fn web_stack_graph() -> SharedResourceGraph {
         SharedResourceGraph::from_evidence(&[
-            (100, vec![listener_ev(100, 80), lock_ev(100, "/run/app.lock")]),
-            (200, vec![listener_ev(200, 3000), lock_ev(200, "/run/app.lock"), lock_ev(200, "/run/db.lock")]),
-            (300, vec![listener_ev(300, 5432), lock_ev(300, "/run/db.lock")]),
+            (
+                100,
+                vec![listener_ev(100, 80), lock_ev(100, "/run/app.lock")],
+            ),
+            (
+                200,
+                vec![
+                    listener_ev(200, 3000),
+                    lock_ev(200, "/run/app.lock"),
+                    lock_ev(200, "/run/db.lock"),
+                ],
+            ),
+            (
+                300,
+                vec![listener_ev(300, 5432), lock_ev(300, "/run/db.lock")],
+            ),
             (400, vec![lock_ev(400, "/run/app.lock")]),
             (500, vec![lock_ev(500, "/tmp/orphan.lock")]),
         ])
@@ -308,10 +309,22 @@ mod tests {
 
     #[test]
     fn risk_level_classification() {
-        assert_eq!(classify_risk(0.1, &RiskThresholds::default()), RiskLevel::Low);
-        assert_eq!(classify_risk(0.3, &RiskThresholds::default()), RiskLevel::Medium);
-        assert_eq!(classify_risk(0.6, &RiskThresholds::default()), RiskLevel::High);
-        assert_eq!(classify_risk(0.9, &RiskThresholds::default()), RiskLevel::Critical);
+        assert_eq!(
+            classify_risk(0.1, &RiskThresholds::default()),
+            RiskLevel::Low
+        );
+        assert_eq!(
+            classify_risk(0.3, &RiskThresholds::default()),
+            RiskLevel::Medium
+        );
+        assert_eq!(
+            classify_risk(0.6, &RiskThresholds::default()),
+            RiskLevel::High
+        );
+        assert_eq!(
+            classify_risk(0.9, &RiskThresholds::default()),
+            RiskLevel::Critical
+        );
     }
 
     #[test]

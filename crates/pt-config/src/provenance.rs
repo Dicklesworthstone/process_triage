@@ -483,6 +483,128 @@ impl EffectiveProvenanceControls {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Performance budgets and degradation strategy (bd-ppcl.13)
+// ---------------------------------------------------------------------------
+
+/// Per-context time budgets for provenance subsystem stages.
+///
+/// Each execution context has explicit limits. When a stage exceeds its
+/// budget, the subsystem degrades gracefully rather than blocking the
+/// scan pipeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProvenancePerformanceBudget {
+    /// Maximum milliseconds for lineage collection per candidate.
+    pub lineage_collection_ms: u64,
+    /// Maximum milliseconds for resource evidence collection per candidate.
+    pub resource_collection_ms: u64,
+    /// Maximum milliseconds for graph construction (total).
+    pub graph_construction_ms: u64,
+    /// Maximum milliseconds for blast-radius estimation per candidate.
+    pub blast_radius_ms: u64,
+    /// Maximum milliseconds for narrative rendering per candidate.
+    pub narrative_render_ms: u64,
+    /// Maximum milliseconds for the entire provenance pipeline (total).
+    pub total_pipeline_ms: u64,
+}
+
+impl ProvenancePerformanceBudget {
+    /// Budget for quick scan: tight limits, shed expensive probes first.
+    pub fn quick_scan() -> Self {
+        Self {
+            lineage_collection_ms: 5,
+            resource_collection_ms: 10,
+            graph_construction_ms: 50,
+            blast_radius_ms: 5,
+            narrative_render_ms: 2,
+            total_pipeline_ms: 200,
+        }
+    }
+
+    /// Budget for deep scan: generous limits, collect everything.
+    pub fn deep_scan() -> Self {
+        Self {
+            lineage_collection_ms: 50,
+            resource_collection_ms: 100,
+            graph_construction_ms: 500,
+            blast_radius_ms: 50,
+            narrative_render_ms: 10,
+            total_pipeline_ms: 2000,
+        }
+    }
+
+    /// Budget for daemon mode: very tight, minimize overhead.
+    pub fn daemon() -> Self {
+        Self {
+            lineage_collection_ms: 2,
+            resource_collection_ms: 5,
+            graph_construction_ms: 20,
+            blast_radius_ms: 2,
+            narrative_render_ms: 1,
+            total_pipeline_ms: 100,
+        }
+    }
+
+    /// Budget for fleet mode: moderate limits per host.
+    pub fn fleet() -> Self {
+        Self {
+            lineage_collection_ms: 10,
+            resource_collection_ms: 20,
+            graph_construction_ms: 100,
+            blast_radius_ms: 10,
+            narrative_render_ms: 5,
+            total_pipeline_ms: 500,
+        }
+    }
+
+    /// Get the appropriate budget for an execution context.
+    pub fn for_context(context: ProvenanceExecutionContext) -> Self {
+        match context {
+            ProvenanceExecutionContext::Scan => Self::quick_scan(),
+            ProvenanceExecutionContext::DeepScan => Self::deep_scan(),
+            ProvenanceExecutionContext::Daemon => Self::daemon(),
+            ProvenanceExecutionContext::Fleet => Self::fleet(),
+            ProvenanceExecutionContext::Report => Self::deep_scan(), // Reports use pre-collected data
+        }
+    }
+}
+
+/// What to shed when the pipeline exceeds its time budget.
+///
+/// Ordered from least-impactful to most-impactful. The pipeline sheds
+/// stages in order until it fits within the remaining budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceDegradationLevel {
+    /// Full provenance: all stages run.
+    Full,
+    /// Skip narrative rendering (output raw contract only).
+    SkipNarrative,
+    /// Skip blast-radius estimation (report risk as unknown).
+    SkipBlastRadius,
+    /// Skip resource collection (lineage only).
+    SkipResources,
+    /// Skip all provenance (return disabled output).
+    Disabled,
+}
+
+impl ProvenanceDegradationLevel {
+    /// Whether this level still produces a blast-radius estimate.
+    pub fn has_blast_radius(self) -> bool {
+        self < Self::SkipBlastRadius
+    }
+
+    /// Whether this level still produces narrative rendering.
+    pub fn has_narrative(self) -> bool {
+        self < Self::SkipNarrative
+    }
+
+    /// Whether provenance is active at all.
+    pub fn is_active(self) -> bool {
+        self < Self::Disabled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +699,62 @@ mod tests {
         assert!(surfaces
             .iter()
             .any(|surface| surface.name == "--provenance-posture"));
+    }
+
+    // ── Performance budget tests (bd-ppcl.13) ────────────────────────
+
+    #[test]
+    fn quick_scan_budget_is_tightest() {
+        let quick = ProvenancePerformanceBudget::quick_scan();
+        let deep = ProvenancePerformanceBudget::deep_scan();
+        assert!(quick.total_pipeline_ms < deep.total_pipeline_ms);
+        assert!(quick.lineage_collection_ms < deep.lineage_collection_ms);
+        assert!(quick.resource_collection_ms < deep.resource_collection_ms);
+    }
+
+    #[test]
+    fn daemon_budget_is_tighter_than_quick_scan() {
+        let daemon = ProvenancePerformanceBudget::daemon();
+        let quick = ProvenancePerformanceBudget::quick_scan();
+        assert!(daemon.total_pipeline_ms < quick.total_pipeline_ms);
+    }
+
+    #[test]
+    fn budget_for_context_returns_correct_presets() {
+        let scan = ProvenancePerformanceBudget::for_context(ProvenanceExecutionContext::Scan);
+        let deep = ProvenancePerformanceBudget::for_context(ProvenanceExecutionContext::DeepScan);
+        assert_eq!(scan.total_pipeline_ms, 200);
+        assert_eq!(deep.total_pipeline_ms, 2000);
+    }
+
+    #[test]
+    fn degradation_level_ordering() {
+        assert!(ProvenanceDegradationLevel::Full < ProvenanceDegradationLevel::SkipNarrative);
+        assert!(ProvenanceDegradationLevel::SkipNarrative < ProvenanceDegradationLevel::SkipBlastRadius);
+        assert!(ProvenanceDegradationLevel::SkipBlastRadius < ProvenanceDegradationLevel::SkipResources);
+        assert!(ProvenanceDegradationLevel::SkipResources < ProvenanceDegradationLevel::Disabled);
+    }
+
+    #[test]
+    fn degradation_level_capabilities() {
+        assert!(ProvenanceDegradationLevel::Full.has_blast_radius());
+        assert!(ProvenanceDegradationLevel::Full.has_narrative());
+        assert!(ProvenanceDegradationLevel::Full.is_active());
+
+        assert!(ProvenanceDegradationLevel::SkipNarrative.has_blast_radius());
+        assert!(!ProvenanceDegradationLevel::SkipNarrative.has_narrative());
+
+        assert!(!ProvenanceDegradationLevel::SkipBlastRadius.has_blast_radius());
+
+        assert!(!ProvenanceDegradationLevel::Disabled.is_active());
+    }
+
+    #[test]
+    fn budget_serialization_roundtrip() {
+        let budget = ProvenancePerformanceBudget::quick_scan();
+        let json = serde_json::to_string(&budget).expect("serialize budget");
+        let deser: ProvenancePerformanceBudget =
+            serde_json::from_str(&json).expect("deserialize budget");
+        assert_eq!(deser.total_pipeline_ms, budget.total_pipeline_ms);
     }
 }

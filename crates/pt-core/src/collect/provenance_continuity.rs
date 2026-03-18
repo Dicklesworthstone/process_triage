@@ -166,11 +166,19 @@ pub fn summarize_delta(delta: &ProvenanceDelta) -> String {
         parts.push(format!("{} exited", delta.exited_pids.len()));
     }
     if !delta.gained_resources.is_empty() {
-        let total: usize = delta.gained_resources.iter().map(|r| r.resource_keys.len()).sum();
+        let total: usize = delta
+            .gained_resources
+            .iter()
+            .map(|r| r.resource_keys.len())
+            .sum();
         parts.push(format!("{total} resource(s) gained"));
     }
     if !delta.lost_resources.is_empty() {
-        let total: usize = delta.lost_resources.iter().map(|r| r.resource_keys.len()).sum();
+        let total: usize = delta
+            .lost_resources
+            .iter()
+            .map(|r| r.resource_keys.len())
+            .sum();
         parts.push(format!("{total} resource(s) lost"));
     }
     if !delta.blast_radius_increased.is_empty() {
@@ -293,9 +301,7 @@ mod tests {
     #[test]
     fn detects_new_processes() {
         let prev = SharedResourceGraph::default();
-        let curr = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock")]),
-        ]);
+        let curr = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
         let delta = compute_provenance_delta(&prev, &curr);
         assert!(delta.new_pids.contains(&100));
         assert!(delta.exited_pids.is_empty());
@@ -303,9 +309,7 @@ mod tests {
 
     #[test]
     fn detects_exited_processes() {
-        let prev = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock")]),
-        ]);
+        let prev = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
         let curr = SharedResourceGraph::default();
         let delta = compute_provenance_delta(&prev, &curr);
         assert!(delta.exited_pids.contains(&100));
@@ -314,36 +318,36 @@ mod tests {
 
     #[test]
     fn detects_gained_resources() {
-        let prev = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock")]),
-        ]);
-        let curr = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock"), lock_ev(100, "/b.lock")]),
-        ]);
+        let prev = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
+        let curr = SharedResourceGraph::from_evidence(&[(
+            100,
+            vec![lock_ev(100, "/a.lock"), lock_ev(100, "/b.lock")],
+        )]);
         let delta = compute_provenance_delta(&prev, &curr);
         assert_eq!(delta.gained_resources.len(), 1);
         assert_eq!(delta.gained_resources[0].pid, 100);
-        assert!(delta.gained_resources[0].resource_keys.contains(&"/b.lock".to_string()));
+        assert!(delta.gained_resources[0]
+            .resource_keys
+            .contains(&"/b.lock".to_string()));
     }
 
     #[test]
     fn detects_lost_resources() {
-        let prev = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock"), lock_ev(100, "/b.lock")]),
-        ]);
-        let curr = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock")]),
-        ]);
+        let prev = SharedResourceGraph::from_evidence(&[(
+            100,
+            vec![lock_ev(100, "/a.lock"), lock_ev(100, "/b.lock")],
+        )]);
+        let curr = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
         let delta = compute_provenance_delta(&prev, &curr);
         assert_eq!(delta.lost_resources.len(), 1);
-        assert!(delta.lost_resources[0].resource_keys.contains(&"/b.lock".to_string()));
+        assert!(delta.lost_resources[0]
+            .resource_keys
+            .contains(&"/b.lock".to_string()));
     }
 
     #[test]
     fn detects_blast_radius_increase() {
-        let prev = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/shared.lock")]),
-        ]);
+        let prev = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/shared.lock")])]);
         let curr = SharedResourceGraph::from_evidence(&[
             (100, vec![lock_ev(100, "/shared.lock")]),
             (200, vec![lock_ev(200, "/shared.lock")]),
@@ -356,9 +360,7 @@ mod tests {
 
     #[test]
     fn detects_new_contest() {
-        let prev = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/x.lock")]),
-        ]);
+        let prev = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/x.lock")])]);
         let curr = SharedResourceGraph::from_evidence(&[
             (100, vec![lock_ev(100, "/x.lock")]),
             (200, vec![lock_ev(200, "/x.lock")]),
@@ -372,29 +374,21 @@ mod tests {
     #[test]
     fn pid_continuity_new() {
         let prev = SharedResourceGraph::default();
-        let curr = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock")]),
-        ]);
+        let curr = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
         assert_eq!(pid_continuity(100, &prev, &curr), PidContinuity::New);
     }
 
     #[test]
     fn pid_continuity_exited() {
-        let prev = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock")]),
-        ]);
+        let prev = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
         let curr = SharedResourceGraph::default();
         assert_eq!(pid_continuity(100, &prev, &curr), PidContinuity::Exited);
     }
 
     #[test]
     fn pid_continuity_stable() {
-        let prev = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock")]),
-        ]);
-        let curr = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock")]),
-        ]);
+        let prev = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
+        let curr = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
         match pid_continuity(100, &prev, &curr) {
             PidContinuity::Continuing {
                 blast_radius_delta,
@@ -420,9 +414,7 @@ mod tests {
     #[test]
     fn summary_with_changes() {
         let prev = SharedResourceGraph::default();
-        let curr = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/a.lock")]),
-        ]);
+        let curr = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/a.lock")])]);
         let delta = compute_provenance_delta(&prev, &curr);
         let summary = summarize_delta(&delta);
         assert!(summary.contains("new process"));

@@ -137,7 +137,11 @@ fn rank_evidence(terms: &[(String, f64)], posterior: f64) -> Vec<RankedEvidence>
         .collect();
 
     // Sort by importance descending.
-    ranked.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     ranked
 }
 
@@ -150,7 +154,11 @@ fn describe_evidence(name: &str, log_lik: f64, _posterior: f64) -> String {
         "weakly"
     };
 
-    let direction = if log_lik > 0.0 { "suspicious" } else { "normal" };
+    let direction = if log_lik > 0.0 {
+        "suspicious"
+    } else {
+        "normal"
+    };
 
     match name {
         "cpu" => format!("CPU activity {strength} suggests process is {direction}"),
@@ -262,8 +270,12 @@ fn build_one_liner(
     blast_radius: &BlastRadiusEstimate,
 ) -> String {
     let action = match adjusted.recommendation {
-        crate::decision::provenance_scoring::ActionRecommendation::AutoKill => "auto-kill recommended",
-        crate::decision::provenance_scoring::ActionRecommendation::ConfirmKill => "kill after confirmation",
+        crate::decision::provenance_scoring::ActionRecommendation::AutoKill => {
+            "auto-kill recommended"
+        }
+        crate::decision::provenance_scoring::ActionRecommendation::ConfirmKill => {
+            "kill after confirmation"
+        }
         crate::decision::provenance_scoring::ActionRecommendation::Review => "review recommended",
         crate::decision::provenance_scoring::ActionRecommendation::Block => "kill blocked",
         crate::decision::provenance_scoring::ActionRecommendation::NoAction => "no action",
@@ -354,7 +366,10 @@ mod tests {
         let exp = test_explanation();
         // The test has child_pids = [300, 400].
         assert!(
-            exp.counterfactual.details.iter().any(|d| d.contains("child")),
+            exp.counterfactual
+                .details
+                .iter()
+                .any(|d| d.contains("child")),
             "details: {:?}",
             exp.counterfactual.details,
         );
@@ -366,7 +381,10 @@ mod tests {
         let br = estimate_blast_radius(100, &graph, None, &[], 1.0, &Default::default());
         let adj = compute_provenance_adjusted_score(100, 0.90, &br, &Default::default());
         let exp = build_explanation(100, &adj, &br, &[], false, true);
-        assert!(exp.missing_evidence.iter().any(|m| m.category == "deep_scan"));
+        assert!(exp
+            .missing_evidence
+            .iter()
+            .any(|m| m.category == "deep_scan"));
     }
 
     #[test]
@@ -376,7 +394,9 @@ mod tests {
         let adj = compute_provenance_adjusted_score(100, 0.90, &br, &Default::default());
         let exp = build_explanation(100, &adj, &br, &[], true, true);
         assert!(
-            exp.missing_evidence.iter().any(|m| m.category == "evidence_completeness"),
+            exp.missing_evidence
+                .iter()
+                .any(|m| m.category == "evidence_completeness"),
             "missing: {:?}",
             exp.missing_evidence,
         );
@@ -401,9 +421,9 @@ mod tests {
     #[test]
     fn evidence_direction_correct() {
         let terms = vec![
-            ("runtime".to_string(), 2.0),   // supports kill
-            ("cpu".to_string(), -1.5),       // supports spare
-            ("tty".to_string(), 0.01),       // neutral
+            ("runtime".to_string(), 2.0), // supports kill
+            ("cpu".to_string(), -1.5),    // supports spare
+            ("tty".to_string(), 0.01),    // neutral
         ];
         let ranked = rank_evidence(&terms, 0.8);
         assert_eq!(ranked[0].direction, EvidenceDirection::SupportsKill);

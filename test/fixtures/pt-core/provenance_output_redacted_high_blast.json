@@ -1,0 +1,32 @@
+{
+  "enabled": true,
+  "evidence_completeness": 0.45,
+  "confidence_penalty_steps": 3,
+  "confidence_notes": [
+    "missing lineage provenance",
+    "resource provenance has 3 unresolved edge(s)",
+    "blast-radius estimate is low-confidence"
+  ],
+  "score_terms": [
+    "provenance_blast_radius_high"
+  ],
+  "blast_radius": {
+    "risk_score": 0.82,
+    "risk_level": "high",
+    "confidence": 0.35,
+    "summary": "Process shares 5 lockfiles with 8 peers",
+    "total_affected": 8
+  },
+  "redaction_state": "partial",
+  "score_impact": {
+    "log_odds_shift": -0.10,
+    "feature_contributions": [
+      {
+        "feature": "provenance_blast_radius_high",
+        "abandoned_ll": -0.75,
+        "useful_ll": 0.65,
+        "direction": "toward_useful"
+      }
+    ]
+  }
+}

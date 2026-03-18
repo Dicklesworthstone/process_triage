@@ -202,9 +202,7 @@ mod tests {
 
     #[test]
     fn isolated_process_zero_impact() {
-        let graph = SharedResourceGraph::from_evidence(&[
-            (100, vec![lock_ev(100, "/solo.lock")]),
-        ]);
+        let graph = SharedResourceGraph::from_evidence(&[(100, vec![lock_ev(100, "/solo.lock")])]);
         let result = compute_indirect_impact(100, &graph, 1.0, &Default::default());
         assert_eq!(result.direct_affected, 0);
         assert_eq!(result.transitive_affected, 0);

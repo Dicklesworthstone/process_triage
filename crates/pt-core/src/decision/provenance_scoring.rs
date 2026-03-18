@@ -137,8 +137,10 @@ pub fn compute_provenance_adjusted_score(
             format!(
                 "Adjusted confidence {:.2} below threshold {:.2} \
                  (original={:.2}, risk_penalty={:.2})",
-                adjusted_confidence, config.min_robot_confidence,
-                posterior_confidence, risk_penalty
+                adjusted_confidence,
+                config.min_robot_confidence,
+                posterior_confidence,
+                risk_penalty
             ),
         )
     } else {
@@ -206,9 +208,7 @@ mod tests {
     }
 
     fn isolated_blast_radius(pid: u32) -> BlastRadiusEstimate {
-        let graph = SharedResourceGraph::from_evidence(&[
-            (pid, vec![lock_ev(pid, "/solo.lock")]),
-        ]);
+        let graph = SharedResourceGraph::from_evidence(&[(pid, vec![lock_ev(pid, "/solo.lock")])]);
         estimate_blast_radius(pid, &graph, None, &[], 1.0, &Default::default())
     }
 
@@ -226,9 +226,7 @@ mod tests {
     #[test]
     fn high_confidence_low_risk_allows_auto_kill() {
         let br = isolated_blast_radius(100);
-        let result = compute_provenance_adjusted_score(
-            100, 0.95, &br, &Default::default(),
-        );
+        let result = compute_provenance_adjusted_score(100, 0.95, &br, &Default::default());
         assert!(result.robot_kill_allowed);
         assert_eq!(result.recommendation, ActionRecommendation::AutoKill);
         assert!(result.adjusted_confidence > 0.80);
@@ -248,9 +246,7 @@ mod tests {
     #[test]
     fn low_posterior_produces_no_action() {
         let br = isolated_blast_radius(100);
-        let result = compute_provenance_adjusted_score(
-            100, 0.30, &br, &Default::default(),
-        );
+        let result = compute_provenance_adjusted_score(100, 0.30, &br, &Default::default());
         assert!(!result.robot_kill_allowed);
         assert_eq!(result.recommendation, ActionRecommendation::NoAction);
     }
@@ -258,9 +254,7 @@ mod tests {
     #[test]
     fn risk_penalty_reduces_confidence() {
         let br = isolated_blast_radius(100);
-        let result = compute_provenance_adjusted_score(
-            100, 0.90, &br, &Default::default(),
-        );
+        let result = compute_provenance_adjusted_score(100, 0.90, &br, &Default::default());
         // Low risk = small penalty.
         assert!(result.adjusted_confidence <= result.original_confidence);
         assert!(result.risk_penalty >= 0.0);
@@ -275,9 +269,7 @@ mod tests {
         br.risk_score = 0.95;
         br.risk_level = RiskLevel::Critical;
 
-        let result = compute_provenance_adjusted_score(
-            100, 0.99, &br, &Default::default(),
-        );
+        let result = compute_provenance_adjusted_score(100, 0.99, &br, &Default::default());
         assert!(!result.robot_kill_allowed);
         assert_eq!(result.recommendation, ActionRecommendation::Block);
     }
@@ -304,9 +296,7 @@ mod tests {
         let mut br = isolated_blast_radius(100);
         br.risk_score = 0.0;
 
-        let result = compute_provenance_adjusted_score(
-            100, 0.90, &br, &Default::default(),
-        );
+        let result = compute_provenance_adjusted_score(100, 0.90, &br, &Default::default());
         assert!((result.risk_penalty).abs() < f64::EPSILON);
         assert!((result.adjusted_confidence - 0.90).abs() < f64::EPSILON);
     }
@@ -316,9 +306,7 @@ mod tests {
         let mut br = isolated_blast_radius(100);
         br.risk_score = 0.5;
 
-        let result = compute_provenance_adjusted_score(
-            100, 1.0, &br, &Default::default(),
-        );
+        let result = compute_provenance_adjusted_score(100, 1.0, &br, &Default::default());
         assert!(result.adjusted_confidence >= 0.0);
         assert!(result.adjusted_confidence <= 1.0);
     }
@@ -329,10 +317,7 @@ mod tests {
     fn batch_processes_all_candidates() {
         let br1 = isolated_blast_radius(100);
         let br2 = isolated_blast_radius(200);
-        let candidates = vec![
-            (100, 0.95, br1),
-            (200, 0.30, br2),
-        ];
+        let candidates = vec![(100, 0.95, br1), (200, 0.30, br2)];
         let results = compute_provenance_adjusted_scores(&candidates, &Default::default());
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].pid, 100);
@@ -346,9 +331,7 @@ mod tests {
     #[test]
     fn serde_roundtrip() {
         let br = isolated_blast_radius(100);
-        let result = compute_provenance_adjusted_score(
-            100, 0.90, &br, &Default::default(),
-        );
+        let result = compute_provenance_adjusted_score(100, 0.90, &br, &Default::default());
         let json = serde_json::to_string(&result).unwrap();
         let deser: ProvenanceAdjustedScore = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.pid, 100);

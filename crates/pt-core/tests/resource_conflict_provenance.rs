@@ -78,12 +78,7 @@ fn lockfile_active_state_for_write_mode() {
 
 #[test]
 fn pidfile_active_when_pid_matches() {
-    let ev = pidfile_evidence(
-        5678,
-        "/run/nginx.pid",
-        ResourceState::Active,
-        Some(5678),
-    );
+    let ev = pidfile_evidence(5678, "/run/nginx.pid", ResourceState::Active, Some(5678));
     assert_eq!(ev.state, ResourceState::Active);
     match &ev.details {
         ResourceDetails::Pidfile { recorded_pid, .. } => {
@@ -151,12 +146,7 @@ fn two_processes_same_lockfile_creates_conflict_pair() {
 
 #[test]
 fn pidfile_stale_when_file_missing() {
-    let ev = pidfile_evidence(
-        1234,
-        "/run/deleted-service.pid",
-        ResourceState::Stale,
-        None,
-    );
+    let ev = pidfile_evidence(1234, "/run/deleted-service.pid", ResourceState::Stale, None);
     assert_eq!(ev.state, ResourceState::Stale);
     match &ev.details {
         ResourceDetails::Pidfile { recorded_pid, .. } => {

@@ -34,7 +34,7 @@ fn zombie_state_flag_drives_zombie_posterior() {
         io_active: Some(false),
         state_flag: Some(3), // Z state
         command_category: None,
-            queue_saturated: None,
+        queue_saturated: None,
     };
 
     let result = compute_posterior(&priors, &evidence).expect("posterior computation failed");

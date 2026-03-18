@@ -66,17 +66,18 @@ impl SharedResourceGraph {
 
         for (pid, evidence_list) in per_process {
             for ev in evidence_list {
-                let resource = graph
-                    .resources
-                    .entry(ev.key.clone())
-                    .or_insert_with(|| SharedResource {
-                        key: ev.key.clone(),
-                        kind: ev.kind,
-                        holder_pids: Vec::new(),
-                        holder_states: Vec::new(),
-                        contested: false,
-                        has_conflict: false,
-                    });
+                let resource =
+                    graph
+                        .resources
+                        .entry(ev.key.clone())
+                        .or_insert_with(|| SharedResource {
+                            key: ev.key.clone(),
+                            kind: ev.kind,
+                            holder_pids: Vec::new(),
+                            holder_states: Vec::new(),
+                            contested: false,
+                            has_conflict: false,
+                        });
 
                 // Only add each PID once per resource.
                 if !resource.holder_pids.contains(pid) {
@@ -158,12 +159,7 @@ impl SharedResourceGraph {
             .get(&pid)
             .map(|keys| {
                 keys.iter()
-                    .filter(|k| {
-                        self.resources
-                            .get(*k)
-                            .map(|r| r.contested)
-                            .unwrap_or(false)
-                    })
+                    .filter(|k| self.resources.get(*k).map(|r| r.contested).unwrap_or(false))
                     .count()
             })
             .unwrap_or(0);
@@ -193,9 +189,7 @@ pub struct BlastRadius {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pt_common::{
-        LockMechanism, ResourceCollectionMethod, ResourceDetails,
-    };
+    use pt_common::{LockMechanism, ResourceCollectionMethod, ResourceDetails};
 
     fn lock_ev(pid: u32, path: &str, state: ResourceState) -> RawResourceEvidence {
         RawResourceEvidence {
@@ -239,7 +233,10 @@ mod tests {
 
     #[test]
     fn single_process_single_resource() {
-        let evidence = vec![(100, vec![lock_ev(100, "/var/lock/test", ResourceState::Active)])];
+        let evidence = vec![(
+            100,
+            vec![lock_ev(100, "/var/lock/test", ResourceState::Active)],
+        )];
         let graph = SharedResourceGraph::from_evidence(&evidence);
 
         assert_eq!(graph.resources.len(), 1);
@@ -253,8 +250,14 @@ mod tests {
     #[test]
     fn two_processes_share_lockfile() {
         let evidence = vec![
-            (100, vec![lock_ev(100, "/tmp/.X0-lock", ResourceState::Active)]),
-            (200, vec![lock_ev(200, "/tmp/.X0-lock", ResourceState::Active)]),
+            (
+                100,
+                vec![lock_ev(100, "/tmp/.X0-lock", ResourceState::Active)],
+            ),
+            (
+                200,
+                vec![lock_ev(200, "/tmp/.X0-lock", ResourceState::Active)],
+            ),
         ];
         let graph = SharedResourceGraph::from_evidence(&evidence);
 
@@ -269,8 +272,14 @@ mod tests {
     #[test]
     fn contested_only_when_multiple_active() {
         let evidence = vec![
-            (100, vec![lock_ev(100, "/tmp/test.lock", ResourceState::Active)]),
-            (200, vec![lock_ev(200, "/tmp/test.lock", ResourceState::Stale)]),
+            (
+                100,
+                vec![lock_ev(100, "/tmp/test.lock", ResourceState::Active)],
+            ),
+            (
+                200,
+                vec![lock_ev(200, "/tmp/test.lock", ResourceState::Stale)],
+            ),
         ];
         let graph = SharedResourceGraph::from_evidence(&evidence);
 
@@ -296,10 +305,13 @@ mod tests {
     #[test]
     fn co_holders_across_multiple_resources() {
         let evidence = vec![
-            (100, vec![
-                lock_ev(100, "/lock/a", ResourceState::Active),
-                lock_ev(100, "/lock/b", ResourceState::Active),
-            ]),
+            (
+                100,
+                vec![
+                    lock_ev(100, "/lock/a", ResourceState::Active),
+                    lock_ev(100, "/lock/b", ResourceState::Active),
+                ],
+            ),
             (200, vec![lock_ev(200, "/lock/a", ResourceState::Active)]),
             (300, vec![lock_ev(300, "/lock/b", ResourceState::Active)]),
         ];
@@ -322,10 +334,13 @@ mod tests {
     #[test]
     fn blast_radius_counts_affected() {
         let evidence = vec![
-            (100, vec![
-                lock_ev(100, "/lock/db", ResourceState::Active),
-                listener_ev(100, 5432, ResourceState::Active),
-            ]),
+            (
+                100,
+                vec![
+                    lock_ev(100, "/lock/db", ResourceState::Active),
+                    listener_ev(100, 5432, ResourceState::Active),
+                ],
+            ),
             (200, vec![lock_ev(200, "/lock/db", ResourceState::Active)]),
             (300, vec![listener_ev(300, 5432, ResourceState::Active)]),
         ];

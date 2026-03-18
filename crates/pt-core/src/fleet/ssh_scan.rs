@@ -82,6 +82,31 @@ pub struct HostScanResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub duration_ms: u64,
+    /// Per-host provenance summary (when provenance was active on the remote).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<HostProvenanceSummary>,
+}
+
+/// Provenance summary for a single fleet host.
+///
+/// Fleet scans may have partial or missing provenance evidence because
+/// the remote host may run an older pt version or have provenance
+/// disabled. This struct represents what was available honestly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostProvenanceSummary {
+    /// Whether provenance was active on this host.
+    pub enabled: bool,
+    /// Number of candidates with provenance evidence.
+    pub candidates_with_evidence: usize,
+    /// Mean evidence completeness across candidates (0.0 to 1.0).
+    pub mean_evidence_completeness: f64,
+    /// Number of high/critical blast-radius candidates.
+    pub high_risk_count: usize,
+    /// Whether evidence was degraded (remote had limited probes).
+    pub degraded: bool,
+    /// Reason for degradation (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
 }
 
 /// Result of a fleet-wide scan across all hosts.
@@ -92,6 +117,22 @@ pub struct FleetScanResult {
     pub failed: usize,
     pub results: Vec<HostScanResult>,
     pub duration_ms: u64,
+    /// Fleet-wide provenance aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_aggregate: Option<FleetProvenanceAggregate>,
+}
+
+/// Fleet-wide provenance aggregate across all hosts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetProvenanceAggregate {
+    /// Hosts where provenance was active.
+    pub hosts_with_provenance: usize,
+    /// Hosts where provenance was unavailable or degraded.
+    pub hosts_without_provenance: usize,
+    /// Total high/critical blast-radius candidates across the fleet.
+    pub total_high_risk: usize,
+    /// Fleet-wide mean evidence completeness.
+    pub mean_evidence_completeness: f64,
 }
 
 /// Wrapper for the top-level JSON output of `pt-core scan --format json`.
@@ -159,6 +200,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
                 scan: None,
                 error: Some("ssh binary not found".to_string()),
                 duration_ms: start.elapsed().as_millis() as u64,
+                provenance: None,
             };
         }
         Err(crate::collect::tool_runner::ToolError::Timeout(_)) => {
@@ -168,6 +210,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
                 scan: None,
                 error: Some(format!("timed out after {}s", config.command_timeout)),
                 duration_ms: start.elapsed().as_millis() as u64,
+                provenance: None,
             };
         }
         Err(e) => {
@@ -177,6 +220,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
                 scan: None,
                 error: Some(format!("ssh failed: {}", e)),
                 duration_ms: start.elapsed().as_millis() as u64,
+                provenance: None,
             };
         }
     };
@@ -192,6 +236,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
             scan: None,
             error: Some(format!("exit code {}: {}", code, stderr.trim())),
             duration_ms,
+            provenance: None,
         };
     }
 
@@ -205,6 +250,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
             scan: Some(output.scan),
             error: None,
             duration_ms,
+            provenance: None, // TODO: extract from remote scan output when available
         },
         Err(e) => {
             // Try parsing as bare ScanResult (older pt-core versions)
@@ -215,6 +261,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
                     scan: Some(scan),
                     error: None,
                     duration_ms,
+                    provenance: None,
                 },
                 Err(_) => HostScanResult {
                     host: host.to_string(),
@@ -222,6 +269,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
                     scan: None,
                     error: Some(format!("failed to parse scan output: {}", e)),
                     duration_ms,
+                    provenance: None,
                 },
             }
         }
@@ -299,6 +347,7 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
         failed,
         results,
         duration_ms: start.elapsed().as_millis() as u64,
+        provenance_aggregate: None, // Populated when remote hosts report provenance
     }
 }
 
@@ -523,6 +572,7 @@ mod tests {
             scan: Some(scan),
             error: None,
             duration_ms: 500,
+            provenance: None,
         };
 
         let input = scan_result_to_host_input(&result);
@@ -542,6 +592,7 @@ mod tests {
             scan: None,
             error: Some("connection refused".to_string()),
             duration_ms: 100,
+            provenance: None,
         };
 
         let input = scan_result_to_host_input(&result);
@@ -563,6 +614,7 @@ mod tests {
                     scan: None,
                     error: None,
                     duration_ms: 200,
+                    provenance: None,
                 },
                 HostScanResult {
                     host: "host2".to_string(),
@@ -570,9 +622,11 @@ mod tests {
                     scan: None,
                     error: Some("timeout".to_string()),
                     duration_ms: 30000,
+                    provenance: None,
                 },
             ],
             duration_ms: 30200,
+            provenance_aggregate: None,
         };
 
         let json = serde_json::to_string(&fleet_result).unwrap();
