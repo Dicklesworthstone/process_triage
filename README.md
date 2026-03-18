@@ -457,24 +457,24 @@ pt (Bash wrapper)
 
 ```
 process_triage/
-├── Cargo.toml                     # Workspace root
-├── pt                             # Bash wrapper
-├── install.sh                     # Installer + ECDSA verification
+├── Cargo.toml              # Workspace root
+├── pt                      # Bash wrapper
+├── install.sh              # Installer + ECDSA verification
 ├── crates/
-│   ├── pt-core/                   # Main engine (41 inference + 40 decision + 25 collect modules)
-│   ├── pt-common/                 # Shared types, evidence schemas, provenance IDs
-│   ├── pt-config/                 # Configuration loading, priors, policy validation
-│   ├── pt-math/                   # Log-domain arithmetic, numerical stability
-│   ├── pt-bundle/                 # Session bundles (ZIP + ChaCha20-Poly1305 encryption)
-│   ├── pt-redact/                 # HMAC hashing, PII scrubbing, redaction profiles
-│   ├── pt-telemetry/              # Arrow schemas, Parquet writer, LMAX disruptor
-│   └── pt-report/                 # HTML report templating (Askama + minify-html)
-├── test/                          # BATS test suite
-├── docs/                          # User + architecture documentation
-│   └── math/PROOFS.md             # Formal mathematical guarantees
-├── examples/configs/              # Scenario configurations
-├── fuzz/                          # Fuzz testing targets
-└── benches/                       # Criterion benchmarks
+│   ├── pt-core/            # Main engine (41 inference + 40 decision + 25 collect modules)
+│   ├── pt-common/          # Shared types, evidence schemas, provenance IDs
+│   ├── pt-config/          # Configuration loading, priors, policy validation
+│   ├── pt-math/            # Log-domain arithmetic, numerical stability
+│   ├── pt-bundle/          # Session bundles (ZIP + ChaCha20-Poly1305 encryption)
+│   ├── pt-redact/          # HMAC hashing, PII scrubbing, redaction profiles
+│   ├── pt-telemetry/       # Arrow schemas, Parquet writer, LMAX disruptor
+│   └── pt-report/          # HTML report templating (Askama + minify-html)
+├── test/                   # BATS test suite
+├── docs/                   # User + architecture documentation
+│   └── math/PROOFS.md      # Formal mathematical guarantees
+├── examples/configs/       # Scenario configurations
+├── fuzz/                   # Fuzz testing targets
+└── benches/                # Criterion benchmarks
 ```
 
 ---
@@ -485,19 +485,19 @@ process_triage/
 
 ```
 ~/.config/process_triage/
-├── decisions.json                # Learned kill/spare decisions
-├── priors.json                   # Bayesian hyperparameters
-├── policy.json                   # Safety policy
-└── triage.log                    # Audit log
+├── decisions.json      # Learned kill/spare decisions
+├── priors.json         # Bayesian hyperparameters
+├── policy.json         # Safety policy
+└── triage.log          # Audit log
 
 ~/.local/share/process_triage/
 └── sessions/
     └── pt-20260115-143022-a7xq/
-        ├── manifest.json
-        ├── snapshot.json
-        ├── provenance.json       # Process provenance graph
-        ├── plan.json
-        └── audit.jsonl
+        ├── manifest.json       # Session metadata
+        ├── snapshot.json       # Initial process state
+        ├── provenance.json     # Process provenance graph
+        ├── plan.json           # Generated recommendations
+        └── audit.jsonl         # Action audit trail
 ```
 
 ### Environment Variables
@@ -1109,11 +1109,11 @@ Session telemetry is recorded via an **LMAX Disruptor**, a lock-free, wait-free 
 
 ```
 Producer (triage loop) ──→ [Ring Buffer] ──→ Consumer (Parquet writer)
-                            ↑
-                     Pre-allocated, fixed-size
-                     Cache-line aligned (64 bytes)
-                     Power-of-2 capacity
-                     Bitmask indexing (no modulo)
+                               ↑
+                        Pre-allocated, fixed-size
+                        Cache-line aligned (64 bytes)
+                        Power-of-2 capacity
+                        Bitmask indexing (no modulo)
 ```
 
 **Why a disruptor instead of a channel?**
@@ -1132,13 +1132,13 @@ A `.ptb` file is a ZIP archive (optionally encrypted) containing a manifest and 
 
 ```
 session.ptb (ZIP or encrypted envelope)
-├── manifest.json           # Bundle metadata + file checksums
-├── snapshot.json           # Redacted process state
-├── inference.jsonl         # Per-process posteriors
-├── plan.json              # Generated action plan
-├── actions.json           # Executed actions + outcomes
-├── provenance.json        # Process provenance graph
-└── audit.jsonl            # Action audit trail
+├── manifest.json       # Bundle metadata + file checksums
+├── snapshot.json       # Redacted process state
+├── inference.jsonl     # Per-process posteriors
+├── plan.json           # Generated action plan
+├── actions.json        # Executed actions + outcomes
+├── provenance.json     # Process provenance graph
+└── audit.jsonl         # Action audit trail
 ```
 
 ### Encryption Envelope
@@ -1146,11 +1146,11 @@ session.ptb (ZIP or encrypted envelope)
 When encrypted, the ZIP payload is wrapped in a `PTBENC01` envelope:
 
 ```
-[8 bytes: "PTBENC01"]     Magic header
-[4 bytes: KDF iterations]  PBKDF2 iteration count (default 100,000)
-[16 bytes: salt]           Random salt for key derivation
-[12 bytes: nonce]          Random nonce for ChaCha20
-[remainder: ciphertext]    ChaCha20-Poly1305 authenticated ciphertext
+[8 bytes:  "PTBENC01"]        Magic header
+[4 bytes:  KDF iterations]    PBKDF2 iteration count (default 100,000)
+[16 bytes: salt]              Random salt for key derivation
+[12 bytes: nonce]             Random nonce for ChaCha20
+[rest:     ciphertext]        ChaCha20-Poly1305 authenticated ciphertext
 ```
 
 Key derivation uses PBKDF2-HMAC-SHA256 with 100,000 iterations. The resulting 256-bit key feeds ChaCha20-Poly1305 for authenticated encryption. The 16-byte Poly1305 tag provides tamper detection.
