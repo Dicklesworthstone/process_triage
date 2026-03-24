@@ -223,11 +223,13 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --version)
-                VERSION="${2:-}"
+                [[ -n "${2:-}" ]] || { err "--version requires a value"; exit 1; }
+                VERSION="$2"
                 shift 2
                 ;;
             --dest)
-                DEST="${2:-}"
+                [[ -n "${2:-}" ]] || { err "--dest requires a value"; exit 1; }
+                DEST="$2"
                 shift 2
                 ;;
             --system)
@@ -251,7 +253,8 @@ parse_args() {
                 shift
                 ;;
             --offline)
-                OFFLINE_BUNDLE="${2:-}"
+                [[ -n "${2:-}" ]] || { err "--offline requires a file path"; exit 1; }
+                OFFLINE_BUNDLE="$2"
                 shift 2
                 ;;
             --force)
@@ -690,10 +693,12 @@ acquire_lock() {
         existing_pid="$(cat "${LOCK_ROOT}/pid" 2>/dev/null || true)"
         if [[ -n "$existing_pid" ]] && ! kill -0 "$existing_pid" 2>/dev/null; then
             rm -rf "$LOCK_ROOT"
-            mkdir "$LOCK_ROOT"
-            LOCK_HELD=1
-            printf '%s\n' "$$" > "${LOCK_ROOT}/pid"
-            return 0
+            if mkdir "$LOCK_ROOT" 2>/dev/null; then
+                LOCK_HELD=1
+                printf '%s\n' "$$" > "${LOCK_ROOT}/pid"
+                return 0
+            fi
+            # Another process grabbed the lock between rm and mkdir
         fi
     fi
 

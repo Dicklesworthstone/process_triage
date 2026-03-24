@@ -588,6 +588,13 @@ get_tool_path() {
     command -v "$binary" 2>/dev/null || echo ""
 }
 
+json_escape_value() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "$s"
+}
+
 # ==============================================================================
 # Manifest Generation
 # ==============================================================================
@@ -634,8 +641,8 @@ generate_manifest() {
 
             if check_tool_available "$tool"; then
                 local path version
-                path=$(get_tool_path "$tool")
-                version=$(get_tool_version "$tool")
+                path=$(json_escape_value "$(get_tool_path "$tool")")
+                version=$(json_escape_value "$(get_tool_version "$tool")")
                 printf "\"available\": true, \"path\": \"%s\", \"version\": \"%s\"}" "$path" "$version"
             else
                 printf "\"available\": false}"

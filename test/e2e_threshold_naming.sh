@@ -52,8 +52,8 @@ log "Using: $PT_CORE"
 log ""
 log "--- Test 1: --min-posterior flag works ---"
 
+EXIT_CODE=0
 OUTPUT=$("$PT_CORE" agent plan --min-posterior 0.95 --format json 2>&1) || EXIT_CODE=$?
-EXIT_CODE=${EXIT_CODE:-0}
 
 # Exit code 0 or 1 (no candidates) is acceptable
 if [[ $EXIT_CODE -le 1 ]]; then
@@ -74,8 +74,8 @@ fi
 log ""
 log "--- Test 2: --threshold alias works ---"
 
+EXIT_CODE=0
 OUTPUT=$("$PT_CORE" agent plan --threshold 0.85 --format json 2>&1) || EXIT_CODE=$?
-EXIT_CODE=${EXIT_CODE:-0}
 
 if [[ $EXIT_CODE -le 1 ]]; then
     log_pass "--threshold alias works (exit $EXIT_CODE)"
@@ -146,8 +146,8 @@ log ""
 log "--- Test 6: Boundary value tests ---"
 
 # Test with 0.0 (minimum valid)
+EXIT_CODE=0
 OUTPUT=$("$PT_CORE" agent plan --min-posterior 0.0 --format json 2>&1) || EXIT_CODE=$?
-EXIT_CODE=${EXIT_CODE:-0}
 if [[ $EXIT_CODE -le 1 ]]; then
     log_pass "--min-posterior 0.0 accepted"
 else
@@ -155,8 +155,8 @@ else
 fi
 
 # Test with 1.0 (maximum valid)
+EXIT_CODE=0
 OUTPUT=$("$PT_CORE" agent plan --min-posterior 1.0 --format json 2>&1) || EXIT_CODE=$?
-EXIT_CODE=${EXIT_CODE:-0}
 if [[ $EXIT_CODE -le 1 ]]; then
     log_pass "--min-posterior 1.0 accepted"
 else

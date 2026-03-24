@@ -60,9 +60,12 @@ check_binary() {
     max_bytes=$((max_mb * 1024 * 1024))
 
     # Output JSON for machine parsing
+    local escaped_binary
+    escaped_binary="${binary//\\/\\\\}"
+    escaped_binary="${escaped_binary//\"/\\\"}"
     cat << EOF
 {
-  "binary": "$binary",
+  "binary": "$escaped_binary",
   "size_bytes": $size_bytes,
   "size_kb": $size_kb,
   "size_mb": $size_mb,
