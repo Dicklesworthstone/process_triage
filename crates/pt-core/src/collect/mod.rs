@@ -36,6 +36,7 @@ pub mod lineage_collector;
 pub mod network;
 #[cfg(target_os = "linux")]
 pub mod network_resource_collector;
+#[cfg(target_os = "linux")]
 pub mod prober;
 pub mod proc_parsers;
 pub mod protected;

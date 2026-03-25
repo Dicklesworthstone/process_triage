@@ -29,7 +29,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror.workspace = true
 dirs = "5"
 libc = "0.2"
-io-uring = "0.7"
 regex = "1"
 sha2 = "0.10"
 hex = "0.4"
@@ -191,3 +190,6 @@ required-features = ["test-utils"]
 name = "container_gpu_detection"
 path = "tests/container_gpu_detection.rs"
 required-features = ["test-utils"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
