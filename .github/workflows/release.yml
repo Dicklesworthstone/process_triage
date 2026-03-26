@@ -231,10 +231,15 @@ jobs:
         run: |
           version="${{ needs.validate-version.outputs.version }}"
           mkdir -p release
+          mkdir -p skill/process-triage
 
           # Copy wrapper and installer
           cp pt release/
           cp install.sh release/
+
+          # Package the optional Claude/Codex skill from the installer's canonical payload.
+          bash install.sh --emit-skill-payload > skill/process-triage/SKILL.md
+          tar -czf release/process-triage-skill.tar.gz -C skill process-triage
 
           # Move all built binaries
           for dir in artifacts/*/; do
@@ -359,6 +364,7 @@ jobs:
           ## What's Included
           - `pt` - Main bash wrapper for interactive use
           - `install.sh` - Self-updating installer script
+          - `process-triage-skill.tar.gz` - Optional Claude/Codex skill payload
           - `pt-core-*` - Platform-specific Rust binaries
           - `checksums.sha256` - SHA-256 checksums for verification
           NOTES

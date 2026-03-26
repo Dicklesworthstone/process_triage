@@ -21,6 +21,7 @@
 #   --no-gum               Disable gum formatting
 #   --force                Reinstall even if target version is already present
 #   --no-configure         Skip agent auto-configuration and skill install
+#   --emit-skill-payload   Print the canonical skill SKILL.md to stdout and exit
 #
 set -euo pipefail
 umask 022
@@ -47,6 +48,7 @@ VERIFY=0
 NO_CONFIGURE=0
 NO_VERIFY=0
 VERIFY_SELF=0
+EMIT_SKILL_PAYLOAD=0
 OFFLINE_BUNDLE=""
 LOCK_ROOT="/tmp/pt-install.lock.d"
 LOCK_HELD=0
@@ -203,6 +205,7 @@ Options:
   --no-gum             Disable gum formatting
   --no-configure       Skip agent init + skill install
   --no-verify          Disable checksum/signature verification
+  --emit-skill-payload Print the canonical skill SKILL.md to stdout and exit
   -h, --help           Show help
 
 Environment:
@@ -275,6 +278,10 @@ parse_args() {
                 ;;
             --no-verify)
                 NO_VERIFY=1
+                shift
+                ;;
+            --emit-skill-payload)
+                EMIT_SKILL_PAYLOAD=1
                 shift
                 ;;
             -h|--help)
@@ -1010,6 +1017,14 @@ run_agent_init_for() {
 
 skill_payload() {
     cat <<'EOF'
+---
+name: process-triage
+description: >-
+  Triage system processes with the `pt` wrapper and choose safe remediation.
+  Use when diagnosing runaway processes, comparing `pt scan` and `pt deep-scan`,
+  or using `pt agent` plan/apply workflows.
+---
+
 # process-triage
 
 Use `pt` as the user-facing command and `pt help` for wrapper-aware help.
@@ -1216,6 +1231,10 @@ show_final_summary() {
 
 main() {
     parse_args "$@"
+    if [[ "$EMIT_SKILL_PAYLOAD" -eq 1 ]]; then
+        skill_payload
+        return 0
+    fi
     setup_proxy
     detect_gum
     maybe_self_refresh "$@"

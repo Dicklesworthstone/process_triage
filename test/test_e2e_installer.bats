@@ -380,6 +380,32 @@ setup_installer_test_env() {
     test_end "installer required functions" "pass"
 }
 
+@test "installer: inline skill payload has valid YAML frontmatter" {
+    test_start "installer skill payload" "verify fallback skill output starts with valid frontmatter"
+
+    export PT_REFRESHED=1
+    local first_line
+    local frontmatter_delims
+
+    run bash "$INSTALLER_PATH" --emit-skill-payload
+    [ "$status" -eq 0 ]
+
+    local payload="$output"
+    first_line="$(printf '%s\n' "$payload" | sed -n '1p')"
+    frontmatter_delims="$(
+        printf '%s\n' "$payload" \
+            | awk 'NR <= 8 && $0 == "---" { count++ } END { print count + 0 }'
+    )"
+
+    assert_equals "---" "$first_line" "skill payload should start with YAML frontmatter"
+    assert_equals "2" "$frontmatter_delims" "skill payload should contain opening and closing frontmatter delimiters"
+    assert_contains "$payload" "name: process-triage" "skill payload should declare the skill name"
+    assert_contains "$payload" "description:" "skill payload should include a frontmatter description"
+    assert_contains "$payload" "# process-triage" "skill payload should retain the markdown body"
+
+    test_end "installer skill payload" "pass"
+}
+
 # ==============================================================================
 # FRESH INSTALL TESTS
 # ==============================================================================
