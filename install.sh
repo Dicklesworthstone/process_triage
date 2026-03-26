@@ -1049,12 +1049,6 @@ install_skill_dir() {
     local skill_dir="${base_dir}/process-triage"
 
     mkdir -p "$skill_dir"
-    if download "${RELEASES_URL}/download/v${VERSION}/process-triage-skill.tar.gz" "${TEMP_DIR}/process-triage-skill.tar.gz" 2>/dev/null; then
-        tar -xzf "${TEMP_DIR}/process-triage-skill.tar.gz" -C "$base_dir"
-        printf -v "$status_var" '%s' "downloaded"
-        return 0
-    fi
-
     skill_payload > "${skill_dir}/SKILL.md"
     printf -v "$status_var" '%s' "inline"
 }
