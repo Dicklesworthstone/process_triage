@@ -276,7 +276,12 @@ mod tests {
                     after_claim.wait();
                     rb.write_event(
                         seq,
-                        FixedSizeEvent::from_parts(thread_id as u64, thread_id, thread_id, "x"),
+                        FixedSizeEvent::from_parts(
+                            thread_id as u64,
+                            thread_id as u32,
+                            thread_id as u32,
+                            "x",
+                        ),
                     );
                     rb.commit(seq);
                     seq

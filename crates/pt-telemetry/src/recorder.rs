@@ -17,7 +17,7 @@ use crate::schema::TableName;
 use crate::shadow::EventType;
 use crate::writer::{BatchedWriter, WriterConfig};
 
-/// A thread-safe telemetry recorder that uses a lock-free ring buffer.
+/// A thread-safe telemetry recorder backed by a lock-free ring buffer.
 pub struct TelemetryRecorder {
     ring: Arc<TelemetryRingBuffer>,
     shutdown: Arc<AtomicBool>,
@@ -110,7 +110,7 @@ impl TelemetryRecorder {
 
     /// Record a telemetry event.
     ///
-    /// This call is wait-free for the producer.
+    /// This call is lock-free for the producer and publishes a unique slot.
     pub fn record_event(&self, event_type: EventType, pid: u32, details: &str) {
         if let Some(seq) = self.ring.claim() {
             let timestamp_ns = SystemTime::now()
