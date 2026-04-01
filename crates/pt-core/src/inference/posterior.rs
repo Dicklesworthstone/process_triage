@@ -4,9 +4,12 @@
 //! returns normalized posteriors plus log-odds.
 
 use crate::config::priors::{ClassParams, CommandCategories, DirichletParams, Priors, StateFlags};
+use pt_math::math::precomputed::{CachedBetaPrior, CachedGammaPrior};
 use pt_math::{log_beta, log_beta_pdf, log_gamma, normalize_log_probs_array};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
 /// Evidence for CPU activity.
@@ -136,11 +139,111 @@ pub enum PosteriorError {
     },
 }
 
+#[derive(Debug, Clone)]
+struct PriorsHotPathCache {
+    useful: ClassHotPathCache,
+    useful_bad: ClassHotPathCache,
+    abandoned: ClassHotPathCache,
+    zombie: ClassHotPathCache,
+}
+
+impl PriorsHotPathCache {
+    fn new(priors: &Priors) -> Self {
+        Self {
+            useful: ClassHotPathCache::new(&priors.classes.useful),
+            useful_bad: ClassHotPathCache::new(&priors.classes.useful_bad),
+            abandoned: ClassHotPathCache::new(&priors.classes.abandoned),
+            zombie: ClassHotPathCache::new(&priors.classes.zombie),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClassHotPathCache {
+    cpu_beta: Option<CachedBetaPrior>,
+    runtime_gamma: Option<CachedGammaPrior>,
+}
+
+impl ClassHotPathCache {
+    fn new(params: &ClassParams) -> Self {
+        Self {
+            cpu_beta: (params.cpu_beta.alpha > 0.0 && params.cpu_beta.beta > 0.0)
+                .then(|| CachedBetaPrior::new(params.cpu_beta.alpha, params.cpu_beta.beta)),
+            runtime_gamma: params.runtime_gamma.as_ref().and_then(|gamma| {
+                (gamma.shape > 0.0 && gamma.rate > 0.0)
+                    .then(|| CachedGammaPrior::new(gamma.shape, gamma.rate))
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PriorsHotPathKey {
+    useful: ClassHotPathKey,
+    useful_bad: ClassHotPathKey,
+    abandoned: ClassHotPathKey,
+    zombie: ClassHotPathKey,
+}
+
+impl PriorsHotPathKey {
+    fn from_priors(priors: &Priors) -> Self {
+        Self {
+            useful: ClassHotPathKey::from_params(&priors.classes.useful),
+            useful_bad: ClassHotPathKey::from_params(&priors.classes.useful_bad),
+            abandoned: ClassHotPathKey::from_params(&priors.classes.abandoned),
+            zombie: ClassHotPathKey::from_params(&priors.classes.zombie),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ClassHotPathKey {
+    cpu_alpha_bits: u64,
+    cpu_beta_bits: u64,
+    runtime_present: bool,
+    runtime_shape_bits: u64,
+    runtime_rate_bits: u64,
+}
+
+impl ClassHotPathKey {
+    fn from_params(params: &ClassParams) -> Self {
+        let (runtime_present, runtime_shape_bits, runtime_rate_bits) = params
+            .runtime_gamma
+            .as_ref()
+            .map(|gamma| (true, gamma.shape.to_bits(), gamma.rate.to_bits()))
+            .unwrap_or((false, 0, 0));
+
+        Self {
+            cpu_alpha_bits: params.cpu_beta.alpha.to_bits(),
+            cpu_beta_bits: params.cpu_beta.beta.to_bits(),
+            runtime_present,
+            runtime_shape_bits,
+            runtime_rate_bits,
+        }
+    }
+}
+
+fn hot_path_cache(priors: &Priors) -> Arc<PriorsHotPathCache> {
+    static HOT_PATH_CACHE: OnceLock<Mutex<HashMap<PriorsHotPathKey, Arc<PriorsHotPathCache>>>> =
+        OnceLock::new();
+
+    let key = PriorsHotPathKey::from_priors(priors);
+    let cache = HOT_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .expect("posterior hot-path cache lock poisoned");
+    cache
+        .entry(key)
+        .or_insert_with(|| Arc::new(PriorsHotPathCache::new(priors)))
+        .clone()
+}
+
 /// Compute the posterior P(C|x) for the 4-class model.
 pub fn compute_posterior(
     priors: &Priors,
     evidence: &Evidence,
 ) -> Result<PosteriorResult, PosteriorError> {
+    let cache = hot_path_cache(priors);
     let prior_scores = ClassScores {
         useful: ln_checked(priors.classes.useful.prior_prob, "priors.useful")?,
         useful_bad: ln_checked(priors.classes.useful_bad.prior_prob, "priors.useful_bad")?,
@@ -157,10 +260,30 @@ pub fn compute_posterior(
 
     if let Some(cpu) = &evidence.cpu {
         let term = ClassScores {
-            useful: log_lik_cpu(cpu, &priors.classes.useful, priors)?,
-            useful_bad: log_lik_cpu(cpu, &priors.classes.useful_bad, priors)?,
-            abandoned: log_lik_cpu(cpu, &priors.classes.abandoned, priors)?,
-            zombie: log_lik_cpu(cpu, &priors.classes.zombie, priors)?,
+            useful: log_lik_cpu(
+                cpu,
+                &priors.classes.useful,
+                priors,
+                cache.useful.cpu_beta.as_ref(),
+            )?,
+            useful_bad: log_lik_cpu(
+                cpu,
+                &priors.classes.useful_bad,
+                priors,
+                cache.useful_bad.cpu_beta.as_ref(),
+            )?,
+            abandoned: log_lik_cpu(
+                cpu,
+                &priors.classes.abandoned,
+                priors,
+                cache.abandoned.cpu_beta.as_ref(),
+            )?,
+            zombie: log_lik_cpu(
+                cpu,
+                &priors.classes.zombie,
+                priors,
+                cache.zombie.cpu_beta.as_ref(),
+            )?,
         };
         log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
@@ -171,10 +294,26 @@ pub fn compute_posterior(
 
     if let Some(runtime) = evidence.runtime_seconds {
         let term = ClassScores {
-            useful: log_lik_runtime(runtime, &priors.classes.useful)?,
-            useful_bad: log_lik_runtime(runtime, &priors.classes.useful_bad)?,
-            abandoned: log_lik_runtime(runtime, &priors.classes.abandoned)?,
-            zombie: log_lik_runtime(runtime, &priors.classes.zombie)?,
+            useful: log_lik_runtime(
+                runtime,
+                &priors.classes.useful,
+                cache.useful.runtime_gamma.as_ref(),
+            )?,
+            useful_bad: log_lik_runtime(
+                runtime,
+                &priors.classes.useful_bad,
+                cache.useful_bad.runtime_gamma.as_ref(),
+            )?,
+            abandoned: log_lik_runtime(
+                runtime,
+                &priors.classes.abandoned,
+                cache.abandoned.runtime_gamma.as_ref(),
+            )?,
+            zombie: log_lik_runtime(
+                runtime,
+                &priors.classes.zombie,
+                cache.zombie.runtime_gamma.as_ref(),
+            )?,
         };
         log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
@@ -408,6 +547,7 @@ fn log_lik_cpu(
     cpu: &CpuEvidence,
     priors: &ClassParams,
     config: &Priors,
+    cached_beta: Option<&CachedBetaPrior>,
 ) -> Result<f64, PosteriorError> {
     match cpu {
         CpuEvidence::Fraction { occupancy } => {
@@ -420,11 +560,10 @@ fn log_lik_cpu(
             // Clamp occupancy to avoid -inf at boundaries when alpha/beta > 1
             // 1e-6 corresponds to very low but non-zero probability density
             let clamped = occupancy.clamp(1e-6, 1.0 - 1e-6);
-            Ok(log_beta_pdf(
-                clamped,
-                priors.cpu_beta.alpha,
-                priors.cpu_beta.beta,
-            ))
+            Ok(match cached_beta {
+                Some(beta) => beta.log_pdf(clamped),
+                None => log_beta_pdf(clamped, priors.cpu_beta.alpha, priors.cpu_beta.beta),
+            })
         }
         CpuEvidence::Binomial { k, n, eta } => {
             if *n <= 0.0 || *k < 0.0 || *k > *n || n.is_nan() || k.is_nan() {
@@ -458,7 +597,11 @@ fn log_lik_cpu(
     }
 }
 
-fn log_lik_runtime(runtime: f64, priors: &ClassParams) -> Result<f64, PosteriorError> {
+fn log_lik_runtime(
+    runtime: f64,
+    priors: &ClassParams,
+    cached_gamma: Option<&CachedGammaPrior>,
+) -> Result<f64, PosteriorError> {
     let gamma = match &priors.runtime_gamma {
         Some(g) => g,
         None => return Ok(0.0),
@@ -478,7 +621,10 @@ fn log_lik_runtime(runtime: f64, priors: &ClassParams) -> Result<f64, PosteriorE
             ),
         });
     }
-    Ok(pt_math::gamma_log_pdf(runtime, gamma.shape, gamma.rate))
+    Ok(match cached_gamma {
+        Some(cached) => cached.log_pdf(runtime),
+        None => pt_math::gamma_log_pdf(runtime, gamma.shape, gamma.rate),
+    })
 }
 
 fn log_lik_beta_bernoulli(
@@ -706,6 +852,58 @@ mod tests {
         };
         let result = compute_posterior(&priors, &evidence).expect("posterior");
         assert!(result.posterior.useful.is_finite());
+    }
+
+    #[test]
+    fn cached_cpu_fraction_matches_uncached() {
+        let priors = base_priors();
+        let cache = hot_path_cache(&priors);
+        let cpu = CpuEvidence::Fraction { occupancy: 0.37 };
+
+        let useful_uncached = log_lik_cpu(&cpu, &priors.classes.useful, &priors, None).unwrap();
+        let useful_cached = log_lik_cpu(
+            &cpu,
+            &priors.classes.useful,
+            &priors,
+            cache.useful.cpu_beta.as_ref(),
+        )
+        .unwrap();
+        assert!(approx_eq(useful_uncached, useful_cached, 1e-12));
+
+        let abandoned_uncached =
+            log_lik_cpu(&cpu, &priors.classes.abandoned, &priors, None).unwrap();
+        let abandoned_cached = log_lik_cpu(
+            &cpu,
+            &priors.classes.abandoned,
+            &priors,
+            cache.abandoned.cpu_beta.as_ref(),
+        )
+        .unwrap();
+        assert!(approx_eq(abandoned_uncached, abandoned_cached, 1e-12));
+    }
+
+    #[test]
+    fn cached_runtime_matches_uncached() {
+        let priors = base_priors();
+        let cache = hot_path_cache(&priors);
+
+        let useful_uncached = log_lik_runtime(42.0, &priors.classes.useful, None).unwrap();
+        let useful_cached = log_lik_runtime(
+            42.0,
+            &priors.classes.useful,
+            cache.useful.runtime_gamma.as_ref(),
+        )
+        .unwrap();
+        assert!(approx_eq(useful_uncached, useful_cached, 1e-12));
+
+        let zombie_uncached = log_lik_runtime(42.0, &priors.classes.zombie, None).unwrap();
+        let zombie_cached = log_lik_runtime(
+            42.0,
+            &priors.classes.zombie,
+            cache.zombie.runtime_gamma.as_ref(),
+        )
+        .unwrap();
+        assert!(approx_eq(zombie_uncached, zombie_cached, 1e-12));
     }
 
     // ── ClassScores ─────────────────────────────────────────────────
@@ -1081,25 +1279,25 @@ mod tests {
             hazard_gamma: None,
             competing_hazards: None,
         };
-        assert_eq!(log_lik_runtime(100.0, &class).unwrap(), 0.0);
+        assert_eq!(log_lik_runtime(100.0, &class, None).unwrap(), 0.0);
     }
 
     #[test]
     fn runtime_negative_errors() {
         let priors = base_priors();
-        assert!(log_lik_runtime(-1.0, &priors.classes.useful).is_err());
+        assert!(log_lik_runtime(-1.0, &priors.classes.useful, None).is_err());
     }
 
     #[test]
     fn runtime_zero_errors() {
         let priors = base_priors();
-        assert!(log_lik_runtime(0.0, &priors.classes.useful).is_err());
+        assert!(log_lik_runtime(0.0, &priors.classes.useful, None).is_err());
     }
 
     #[test]
     fn runtime_nan_errors() {
         let priors = base_priors();
-        assert!(log_lik_runtime(f64::NAN, &priors.classes.useful).is_err());
+        assert!(log_lik_runtime(f64::NAN, &priors.classes.useful, None).is_err());
     }
 
     // ── compute_posterior additional tests ───────────────────────────
