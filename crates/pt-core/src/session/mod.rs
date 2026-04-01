@@ -611,6 +611,15 @@ impl SessionHandle {
         serde_json::from_str(&content).map_err(|e| SessionError::Json { path, source: e })
     }
 
+    pub fn read_context(&self) -> Result<SessionContext, SessionError> {
+        let path = self.context_path();
+        let content = std::fs::read_to_string(&path).map_err(|e| SessionError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        serde_json::from_str(&content).map_err(|e| SessionError::Json { path, source: e })
+    }
+
     pub fn write_manifest(&self, manifest: &SessionManifest) -> Result<(), SessionError> {
         write_json_pretty(&self.manifest_path(), manifest)
     }
@@ -1049,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_write_context() {
+    fn handle_read_write_context() {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path());
         let sid = SessionId("pt-20260115-120000-ctx".to_string());
@@ -1059,8 +1068,7 @@ mod tests {
         handle.write_context(&ctx).unwrap();
         assert!(handle.context_path().exists());
 
-        let content = std::fs::read_to_string(handle.context_path()).unwrap();
-        let back: SessionContext = serde_json::from_str(&content).unwrap();
+        let back = handle.read_context().unwrap();
         assert_eq!(back.host_id, "host");
     }
 

@@ -17440,11 +17440,28 @@ fn generate_report_from_session(
     let manifest = handle
         .read_manifest()
         .map_err(|e| pt_report::ReportError::MissingData(format!("manifest: {}", e)))?;
+    let context = match handle.read_context() {
+        Ok(context) => Some(context),
+        Err(pt_core::session::SessionError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
+        }
+        Err(err) => {
+            return Err(pt_report::ReportError::MissingData(format!(
+                "context: {}",
+                err
+            )))
+        }
+    };
 
     // Build overview section from session data
     let overview = OverviewSection {
         session_id: manifest.session_id.clone(),
-        host_id: manifest.session_id.clone(), // Will be refined
+        host_id: context
+            .as_ref()
+            .map(|ctx| ctx.host_id.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
         hostname: None,
         started_at: chrono::DateTime::parse_from_rfc3339(&manifest.timing.created_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -17463,10 +17480,10 @@ fn generate_report_from_session(
         kills_attempted: 0,
         kills_successful: 0,
         spares: 0,
-        os_family: None,
+        os_family: context.as_ref().map(|ctx| ctx.os.family.clone()),
         os_version: None,
         kernel_version: None,
-        arch: None,
+        arch: context.as_ref().map(|ctx| ctx.os.arch.clone()),
         cores: None,
         memory_bytes: None,
         pt_version: None,
@@ -17522,6 +17539,106 @@ fn generate_report_from_session(
     };
 
     generator.generate(data)
+}
+
+#[cfg(all(test, feature = "report"))]
+mod report_generation_tests {
+    use super::*;
+    use pt_report::{ReportConfig, ReportGenerator, ReportTheme};
+
+    fn make_report_handle(session_id: &SessionId) -> (tempfile::TempDir, SessionHandle) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(&session_id.0);
+        fs::create_dir_all(&dir).unwrap();
+        (
+            tmp,
+            SessionHandle {
+                id: session_id.clone(),
+                dir,
+            },
+        )
+    }
+
+    #[test]
+    fn generate_report_from_session_uses_context_host_metadata() {
+        let session_id = SessionId("pt-20260115-120000-rpt".to_string());
+        let (_tmp, handle) = make_report_handle(&session_id);
+        let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+        handle.write_manifest(&manifest).unwrap();
+        handle
+            .write_context(&SessionContext {
+                schema_version: SCHEMA_VERSION.to_string(),
+                session_id: session_id.0.clone(),
+                generated_at: "2026-01-15T12:00:00Z".to_string(),
+                host_id: "host-from-context".to_string(),
+                run_id: "run-123".to_string(),
+                label: None,
+                os: pt_core::session::SessionOs {
+                    family: "test-os".to_string(),
+                    arch: "test-arch".to_string(),
+                },
+            })
+            .unwrap();
+
+        let generator = ReportGenerator::new(
+            ReportConfig::new()
+                .with_theme(ReportTheme::Light)
+                .with_title("Session Report Test".to_string()),
+        );
+        let html = generate_report_from_session(&generator, &handle).unwrap();
+        let host_row =
+            "Host ID</dt>\n                <dd class=\"font-mono\">host-from-context</dd>";
+        let wrong_host_row = format!(
+            "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
+            session_id.0
+        );
+
+        assert!(html.contains(host_row));
+        assert!(!html.contains(&wrong_host_row));
+        assert!(html.contains("test-os"));
+        assert!(html.contains("test-arch"));
+    }
+
+    #[test]
+    fn generate_report_from_session_marks_host_unknown_without_context() {
+        let session_id = SessionId("pt-20260115-120000-noctx".to_string());
+        let (_tmp, handle) = make_report_handle(&session_id);
+        let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+        handle.write_manifest(&manifest).unwrap();
+
+        let generator = ReportGenerator::new(
+            ReportConfig::new()
+                .with_theme(ReportTheme::Light)
+                .with_title("Session Report Test".to_string()),
+        );
+        let html = generate_report_from_session(&generator, &handle).unwrap();
+        let unknown_host_row = "Host ID</dt>\n                <dd class=\"font-mono\">unknown</dd>";
+        let wrong_host_row = format!(
+            "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
+            session_id.0
+        );
+
+        assert!(html.contains(unknown_host_row));
+        assert!(!html.contains(&wrong_host_row));
+    }
+
+    #[test]
+    fn generate_report_from_session_rejects_invalid_context_json() {
+        let session_id = SessionId("pt-20260115-120000-badctx".to_string());
+        let (_tmp, handle) = make_report_handle(&session_id);
+        let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+        handle.write_manifest(&manifest).unwrap();
+        fs::write(handle.context_path(), "{not valid json").unwrap();
+
+        let generator = ReportGenerator::new(
+            ReportConfig::new()
+                .with_theme(ReportTheme::Light)
+                .with_title("Session Report Test".to_string()),
+        );
+        let err = generate_report_from_session(&generator, &handle).unwrap_err();
+
+        assert!(err.to_string().contains("missing required data: context:"));
+    }
 }
 
 /// Generate Slack-friendly summary.

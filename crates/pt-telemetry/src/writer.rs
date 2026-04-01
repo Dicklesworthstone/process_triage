@@ -148,12 +148,22 @@ impl BatchedWriter {
         }
 
         let writer = self.writer.as_mut().ok_or(WriteError::NotInitialized)?;
+        let mut written_batches = 0usize;
+        let mut written_rows = 0usize;
 
-        // Write all buffered batches
-        for batch in self.buffer.drain(..) {
-            writer.write(&batch)?;
+        // Write buffered batches, but keep the current and remaining batches in memory
+        // if a later write fails so callers can decide how to recover.
+        for batch in &self.buffer {
+            if let Err(err) = writer.write(batch) {
+                self.buffer.drain(..written_batches);
+                self.rows_buffered = self.rows_buffered.saturating_sub(written_rows);
+                return Err(err.into());
+            }
+            written_batches += 1;
+            written_rows += batch.num_rows();
         }
 
+        self.buffer.clear();
         self.rows_buffered = 0;
         Ok(())
     }
@@ -220,6 +230,7 @@ impl BatchedWriter {
     /// Build the output path with partitioning.
     fn build_output_path(&self) -> Result<PathBuf, WriteError> {
         let now = chrono::Utc::now();
+        let host_partition = sanitize_path_component(&self.config.host_id, "unknown");
 
         // Partitioning: year=YYYY/month=MM/day=DD/host_id=<hash>/
         let partition_path = self
@@ -229,22 +240,26 @@ impl BatchedWriter {
             .join(format!("year={}", now.format("%Y")))
             .join(format!("month={}", now.format("%m")))
             .join(format!("day={}", now.format("%d")))
-            .join(format!("host_id={}", &self.config.host_id));
+            .join(format!("host_id={host_partition}"));
 
-        // File name: <table>_<timestamp>_<nonce>_<session_suffix>.parquet
-        let session_suffix = self
-            .config
-            .session_id
-            .split('-')
-            .next_back()
-            .unwrap_or("xxxx");
+        // File name: <table>_<timestamp>_<pid>_<nonce>_<session_suffix>.parquet
+        let session_suffix = sanitize_path_component(
+            self.config
+                .session_id
+                .split('-')
+                .next_back()
+                .unwrap_or("xxxx"),
+            "xxxx",
+        );
         let timestamp = now.format("%Y%m%dT%H%M%S%.6fZ");
+        let process_id = std::process::id();
         let counter = OUTPUT_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         let filename = format!(
-            "{}_{}_{}_{}.parquet",
+            "{}_{}_{}_{}_{}.parquet",
             self.table.as_str(),
             timestamp,
+            process_id,
             counter,
             session_suffix,
         );
@@ -253,21 +268,49 @@ impl BatchedWriter {
     }
 }
 
+fn sanitize_path_component(value: &str, fallback: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
+    }
+}
+
 impl Drop for BatchedWriter {
     fn drop(&mut self) {
         // Best-effort flush, close, and rename on drop
+        let mut finalize_ok = true;
         if !self.buffer.is_empty() {
-            let _ = self.flush();
+            if self.flush().is_err() {
+                finalize_ok = false;
+            }
         }
 
         if let Some(writer) = self.writer.take() {
-            let _ = writer.close();
+            if writer.close().is_err() {
+                finalize_ok = false;
+            }
         }
 
-        if let (Some(temp_path), Some(output_path)) =
-            (self.temp_path.take(), self.output_path.take())
-        {
-            let _ = atomic_rename(&temp_path, &output_path);
+        match (self.temp_path.take(), self.output_path.take()) {
+            (Some(temp_path), Some(output_path)) if finalize_ok => {
+                let _ = atomic_rename(&temp_path, &output_path);
+            }
+            (Some(temp_path), _) => {
+                let _ = fs::remove_file(temp_path);
+            }
+            _ => {}
         }
     }
 }
@@ -290,6 +333,9 @@ pub fn default_telemetry_dir() -> PathBuf {
 mod tests {
     use super::*;
     use arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn create_test_batch(schema: &Schema) -> RecordBatch {
@@ -322,6 +368,27 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn create_incompatible_batch() -> RecordBatch {
+        let schema = Schema::new(vec![Field::new("wrong", DataType::Utf8, false)]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(vec!["bad-row"]))],
+        )
+        .unwrap()
+    }
+
+    fn collect_paths_with_extension(root: &Path, ext: &str, out: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(root).unwrap();
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_paths_with_extension(&path, ext, out);
+            } else if path.extension().and_then(|value| value.to_str()) == Some(ext) {
+                out.push(path);
+            }
+        }
     }
 
     #[test]
@@ -433,6 +500,88 @@ mod tests {
         assert_ne!(first_path, second_path, "writer outputs should be unique");
         assert!(first_path.exists());
         assert!(second_path.exists());
+    }
+
+    #[test]
+    fn test_flush_failure_keeps_unwritten_batches_buffered() {
+        let temp_dir = TempDir::new().unwrap();
+        let schema = Arc::new(crate::schema::audit_schema());
+        let config = WriterConfig::new(
+            temp_dir.path().to_path_buf(),
+            "pt-20260115-143022-fail".to_string(),
+            "abc123".to_string(),
+        )
+        .with_batch_size(10);
+
+        let mut writer = BatchedWriter::new(TableName::Audit, schema.clone(), config);
+        writer.write(create_test_batch(&schema)).unwrap();
+        writer.write(create_incompatible_batch()).unwrap();
+
+        assert!(writer.flush().is_err(), "expected mismatched batch to fail");
+        assert_eq!(
+            writer.buffer.len(),
+            1,
+            "failed batch should remain buffered"
+        );
+        assert_eq!(
+            writer.rows_buffered, 1,
+            "row count should track unwritten batch"
+        );
+
+        writer.buffer.clear();
+        writer.rows_buffered = 0;
+        let path = writer.close().unwrap();
+
+        let file = File::open(path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let reader = builder.build().unwrap();
+        let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 1, "successful rows should remain persisted");
+    }
+
+    #[test]
+    fn test_drop_after_flush_failure_does_not_publish_partial_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let schema = Arc::new(crate::schema::audit_schema());
+        let config = WriterConfig::new(
+            temp_dir.path().to_path_buf(),
+            "pt-20260115-143022-drop".to_string(),
+            "abc123".to_string(),
+        )
+        .with_batch_size(10);
+
+        let mut writer = BatchedWriter::new(TableName::Audit, schema, config);
+        writer.write(create_incompatible_batch()).unwrap();
+        drop(writer);
+
+        let mut parquet_files = Vec::new();
+        collect_paths_with_extension(temp_dir.path(), "parquet", &mut parquet_files);
+        assert!(
+            parquet_files.is_empty(),
+            "drop should not publish a final parquet file after flush failure",
+        );
+    }
+
+    #[test]
+    fn test_build_output_path_sanitizes_untrusted_components() {
+        let temp_dir = TempDir::new().unwrap();
+        let schema = Arc::new(crate::schema::audit_schema());
+        let config = WriterConfig::new(
+            temp_dir.path().to_path_buf(),
+            "pt-20260115-143022-../a b".to_string(),
+            "../host/root".to_string(),
+        );
+
+        let writer = BatchedWriter::new(TableName::Audit, schema, config);
+        let path = writer.build_output_path().unwrap();
+        let path_str = path.to_string_lossy();
+
+        assert!(path_str.contains("/host_id=___host_root/"));
+        assert!(path_str.ends_with("___a_b.parquet"));
+        assert!(!path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)));
     }
 
     #[test]
