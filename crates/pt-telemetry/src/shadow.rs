@@ -242,6 +242,7 @@ pub struct ProcessEvent {
 
 /// Types of events that can be recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u32)]
 pub enum EventType {
     /// Process spawned a child.
     ChildSpawned,
@@ -267,6 +268,45 @@ pub enum EventType {
     ProcessExit,
     /// Evidence snapshot captured for calibration linkage.
     EvidenceSnapshot,
+}
+
+impl EventType {
+    /// Stable string form for telemetry/audit serialization.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventType::ChildSpawned => "child_spawned",
+            EventType::ChildExited => "child_exited",
+            EventType::CpuSpike => "cpu_spike",
+            EventType::MemorySpike => "memory_spike",
+            EventType::IoSpike => "io_spike",
+            EventType::StateChange => "state_change",
+            EventType::NetworkActivity => "network_activity",
+            EventType::FdChange => "fd_change",
+            EventType::BecameOrphan => "became_orphan",
+            EventType::SupervisorDetected => "supervisor_detected",
+            EventType::ProcessExit => "process_exit",
+            EventType::EvidenceSnapshot => "evidence_snapshot",
+        }
+    }
+
+    /// Recover an event type from the fixed-size ring buffer representation.
+    pub fn from_repr(value: u32) -> Option<Self> {
+        match value {
+            x if x == EventType::ChildSpawned as u32 => Some(EventType::ChildSpawned),
+            x if x == EventType::ChildExited as u32 => Some(EventType::ChildExited),
+            x if x == EventType::CpuSpike as u32 => Some(EventType::CpuSpike),
+            x if x == EventType::MemorySpike as u32 => Some(EventType::MemorySpike),
+            x if x == EventType::IoSpike as u32 => Some(EventType::IoSpike),
+            x if x == EventType::StateChange as u32 => Some(EventType::StateChange),
+            x if x == EventType::NetworkActivity as u32 => Some(EventType::NetworkActivity),
+            x if x == EventType::FdChange as u32 => Some(EventType::FdChange),
+            x if x == EventType::BecameOrphan as u32 => Some(EventType::BecameOrphan),
+            x if x == EventType::SupervisorDetected as u32 => Some(EventType::SupervisorDetected),
+            x if x == EventType::ProcessExit as u32 => Some(EventType::ProcessExit),
+            x if x == EventType::EvidenceSnapshot as u32 => Some(EventType::EvidenceSnapshot),
+            _ => None,
+        }
+    }
 }
 
 /// Belief state (posterior distribution over process classes).

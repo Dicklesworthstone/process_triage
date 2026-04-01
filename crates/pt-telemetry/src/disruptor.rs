@@ -1,8 +1,9 @@
 //! Lock-free telemetry ring buffer using LMAX Disruptor-inspired patterns.
 //!
-//! This module implements bd-g0q5.2.2: high-performance, wait-free telemetry
-//! event recording using a pre-allocated ring buffer and atomic sequences.
+//! This module implements bd-g0q5.2.2: high-performance telemetry event
+//! recording using a pre-allocated ring buffer and atomic sequences.
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum length for details string in FixedSizeEvent.
@@ -35,6 +36,20 @@ impl FixedSizeEvent {
             details_len: 0,
         }
     }
+
+    /// Build an event payload from recorder inputs.
+    pub fn from_parts(timestamp_ns: u64, event_type: u32, pid: u32, details: &str) -> Self {
+        let mut event = Self::new();
+        event.timestamp_ns = timestamp_ns;
+        event.event_type = event_type;
+        event.pid = pid;
+
+        let details_bytes = details.as_bytes();
+        let len = details_bytes.len().min(MAX_DETAILS_LEN);
+        event.details[..len].copy_from_slice(&details_bytes[..len]);
+        event.details_len = len as u32;
+        event
+    }
 }
 
 /// Aligned sequence counter to prevent false sharing.
@@ -51,17 +66,27 @@ impl AlignedSequence {
     }
 }
 
-/// A wait-free ring buffer for telemetry events.
+struct RingSlot {
+    event: UnsafeCell<FixedSizeEvent>,
+    committed_sequence: AtomicU64,
+}
+
+/// A lock-free ring buffer for telemetry events.
 pub struct TelemetryRingBuffer {
     /// Pre-allocated buffer of events.
-    buffer: Vec<FixedSizeEvent>,
+    buffer: Vec<RingSlot>,
     /// Bitmask for fast index wrapping (buffer size - 1).
     mask: u64,
-    /// Sequence counter for the producer (next write position).
+    /// Sequence counter for the producer (next claim position).
     pub producer_sequence: AlignedSequence,
     /// Sequence counter for consumers (minimum read position).
     pub consumer_sequence: AlignedSequence,
 }
+
+// Safety: producers claim unique sequence numbers atomically, write only to
+// their claimed slot, and publish that slot with a release store. Consumers
+// read only slots whose committed sequence matches the requested sequence.
+unsafe impl Sync for TelemetryRingBuffer {}
 
 impl TelemetryRingBuffer {
     /// Create a new ring buffer with the specified capacity.
@@ -75,7 +100,10 @@ impl TelemetryRingBuffer {
 
         let mut buffer = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            buffer.push(FixedSizeEvent::new());
+            buffer.push(RingSlot {
+                event: UnsafeCell::new(FixedSizeEvent::new()),
+                committed_sequence: AtomicU64::new(0),
+            });
         }
 
         Self {
@@ -95,34 +123,49 @@ impl TelemetryRingBuffer {
     ///
     /// Returns the sequence number if available, or None if the buffer is full.
     pub fn claim(&self) -> Option<u64> {
-        let current_producer = self.producer_sequence.value.load(Ordering::Relaxed);
-        let current_consumer = self.consumer_sequence.value.load(Ordering::Acquire);
+        loop {
+            let current_producer = self.producer_sequence.value.load(Ordering::Acquire);
+            let current_consumer = self.consumer_sequence.value.load(Ordering::Acquire);
 
-        if current_producer - current_consumer >= self.capacity() as u64 {
-            return None; // Buffer is full
+            if current_producer - current_consumer >= self.capacity() as u64 {
+                return None; // Buffer is full
+            }
+
+            if self
+                .producer_sequence
+                .value
+                .compare_exchange_weak(
+                    current_producer,
+                    current_producer + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(current_producer);
+            }
+
+            std::hint::spin_loop();
         }
-
-        // We only have one producer in our design (the core triage loop)
-        Some(current_producer)
     }
 
     /// Commit a claimed sequence, making it available for reading.
     pub fn commit(&self, sequence: u64) {
-        // Since we only have one producer, we just increment the sequence.
-        // If we had multiple producers, we would need a more complex strategy
-        // (e.g. another sequence to indicate completion).
-        self.producer_sequence
-            .value
+        self.slot(sequence)
+            .committed_sequence
             .store(sequence + 1, Ordering::Release);
     }
 
     /// Try to read the next available event from the buffer.
     ///
     /// Returns the sequence and event if available.
-    pub fn try_read(&self, last_consumed: u64) -> Option<(u64, &FixedSizeEvent)> {
-        let current_producer = self.producer_sequence.value.load(Ordering::Acquire);
-
-        if last_consumed < current_producer {
+    pub fn try_read(&self, last_consumed: u64) -> Option<(u64, FixedSizeEvent)> {
+        if self
+            .slot(last_consumed)
+            .committed_sequence
+            .load(Ordering::Acquire)
+            == last_consumed + 1
+        {
             Some((last_consumed, self.get(last_consumed)))
         } else {
             None
@@ -138,20 +181,29 @@ impl TelemetryRingBuffer {
 
     /// Get an event at the specified sequence position.
     #[inline]
-    pub fn get(&self, sequence: u64) -> &FixedSizeEvent {
-        &self.buffer[(sequence & self.mask) as usize]
+    pub fn get(&self, sequence: u64) -> FixedSizeEvent {
+        unsafe { *self.slot(sequence).event.get() }
     }
 
-    /// Get a mutable reference to an event at the specified sequence position.
+    /// Overwrite a claimed slot with a fully-formed event payload.
     #[inline]
-    pub unsafe fn get_mut(&mut self, sequence: u64) -> &mut FixedSizeEvent {
-        &mut self.buffer[(sequence & self.mask) as usize]
+    pub fn write_event(&self, sequence: u64, event: FixedSizeEvent) {
+        unsafe {
+            *self.slot(sequence).event.get() = event;
+        }
+    }
+
+    #[inline]
+    fn slot(&self, sequence: u64) -> &RingSlot {
+        &self.buffer[(sequence & self.mask) as usize]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn test_ring_buffer_init() {
@@ -188,5 +240,56 @@ mod tests {
         // Should be able to claim one now
         let seq = rb.claim().expect("Should be able to claim after consume");
         assert_eq!(seq, 4);
+    }
+
+    #[test]
+    fn test_write_and_read_event_roundtrip() {
+        let rb = TelemetryRingBuffer::new(4);
+        let seq = rb.claim().expect("Should be able to claim");
+        let event = FixedSizeEvent::from_parts(123, 7, 4242, "hello");
+        rb.write_event(seq, event);
+        rb.commit(seq);
+
+        let (read_seq, read_event) = rb.try_read(0).expect("Should be able to read");
+        assert_eq!(read_seq, seq);
+        assert_eq!(read_event.timestamp_ns, 123);
+        assert_eq!(read_event.event_type, 7);
+        assert_eq!(read_event.pid, 4242);
+        assert_eq!(read_event.details_len, 5);
+        assert_eq!(&read_event.details[..5], b"hello");
+    }
+
+    #[test]
+    fn test_concurrent_claims_reserve_unique_sequences() {
+        let rb = Arc::new(TelemetryRingBuffer::new(8));
+        let start = Arc::new(Barrier::new(4));
+        let after_claim = Arc::new(Barrier::new(4));
+
+        let handles = (0..4)
+            .map(|thread_id| {
+                let rb = rb.clone();
+                let start = start.clone();
+                let after_claim = after_claim.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    let seq = rb.claim().expect("Should be able to claim");
+                    after_claim.wait();
+                    rb.write_event(
+                        seq,
+                        FixedSizeEvent::from_parts(thread_id as u64, thread_id, thread_id, "x"),
+                    );
+                    rb.commit(seq);
+                    seq
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut claimed = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread join"))
+            .collect::<Vec<_>>();
+        claimed.sort_unstable();
+
+        assert_eq!(claimed, vec![0, 1, 2, 3]);
     }
 }
