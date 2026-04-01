@@ -33,9 +33,9 @@
 //! ```
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -507,25 +507,31 @@ impl ShadowStorage {
 
         // Update indices (only add PID to identity index if not already present)
         self.pid_to_identity.insert(pid, identity.clone());
-        let pids = self.identity_index.entry(identity).or_default();
-        if !pids.contains(&pid) {
-            pids.push(pid);
+        {
+            let pids = self.identity_index.entry(identity).or_default();
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
         }
 
         // Update stats
         self.stats.total_observations += 1;
         self.stats.hot_observations += 1;
         self.stats.total_events += obs.events.len() as u64;
+        self.stats.unique_identities = self.identity_index.len() as u64;
 
         // Add to hot cache
-        let cache = self.hot_cache.entry(pid).or_default();
-        cache.push(obs);
+        {
+            let cache = self.hot_cache.entry(pid).or_default();
+            cache.push(obs);
 
-        // Trim cache if needed
-        let max_size = self.config.cache_size_per_pid;
-        if cache.len() > max_size * 2 {
-            cache.drain(0..max_size);
+            // Trim cache if needed
+            let max_size = self.config.cache_size_per_pid;
+            if cache.len() > max_size * 2 {
+                cache.drain(0..max_size);
+            }
         }
+        self.stats.unique_pids = self.hot_cache.len() as u64;
 
         // Check if compaction is needed
         if self.config.auto_compact {
@@ -603,8 +609,8 @@ impl ShadowStorage {
 
         for (&pid, cache) in &self.hot_cache {
             for obs in cache {
-                if obs.timestamp >= start && obs.timestamp <= end {
-                    for event in &obs.events {
+                for event in &obs.events {
+                    if event.timestamp >= start && event.timestamp <= end {
                         events.push((pid, event.clone()));
                         if events.len() >= limit {
                             truncated = true;
@@ -763,19 +769,15 @@ impl ShadowStorage {
             RetentionTier::Archive => "archive",
         };
 
-        let now = Utc::now();
-        let path = self
+        let dir = self
             .config
             .base_dir
             .join(tier_dir)
-            .join(format!("pid_{}", pid))
-            .join(format!("{}_{}.json", now.format("%Y%m%d_%H%M%S"), pid));
+            .join(format!("pid_{}", pid));
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        fs::create_dir_all(&dir)?;
 
-        let file = File::create(&path)?;
+        let (file, _path) = create_unique_observation_file(&dir, pid, Utc::now())?;
         let writer = BufWriter::new(file);
         serde_json::to_writer(writer, observations)?;
 
@@ -850,25 +852,7 @@ impl ShadowStorage {
         if archive_dir.exists() {
             for entry in fs::read_dir(&archive_dir)? {
                 let entry = entry?;
-                let metadata = entry.metadata()?;
-                if let Ok(modified) = metadata.modified() {
-                    let modified_dt = DateTime::<Utc>::from(modified);
-                    if modified_dt < cutoff {
-                        if entry.path().is_file() {
-                            match fs::remove_file(entry.path()) {
-                                Ok(_) => cleaned += 1,
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => return Err(e.into()),
-                            }
-                        } else if entry.path().is_dir() {
-                            match fs::remove_dir_all(entry.path()) {
-                                Ok(_) => cleaned += 1,
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => return Err(e.into()),
-                            }
-                        }
-                    }
-                }
+                cleaned += cleanup_archive_path(&entry.path(), cutoff)?;
             }
         }
 
@@ -881,6 +865,73 @@ fn hostname_or_default() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn create_unique_observation_file(
+    dir: &Path,
+    pid: u32,
+    now: DateTime<Utc>,
+) -> Result<(File, PathBuf), ShadowStorageError> {
+    let timestamp = now.format("%Y%m%d_%H%M%S%.6f");
+
+    for suffix in 0u32.. {
+        let file_name = if suffix == 0 {
+            format!("{timestamp}_{pid}.json")
+        } else {
+            format!("{timestamp}_{pid}_{suffix}.json")
+        };
+        let path = dir.join(file_name);
+
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    unreachable!("u32 suffix space exhausted while creating observation file")
+}
+
+fn cleanup_archive_path(path: &Path, cutoff: DateTime<Utc>) -> Result<u64, ShadowStorageError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
+    };
+
+    if metadata.is_dir() {
+        let mut cleaned = 0u64;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            cleaned += cleanup_archive_path(&entry.path(), cutoff)?;
+        }
+
+        let mut remaining_entries = fs::read_dir(path)?;
+        if remaining_entries.next().is_none() {
+            match fs::remove_dir(path) {
+                Ok(_) => cleaned += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        return Ok(cleaned);
+    }
+
+    if metadata.is_file() {
+        if let Ok(modified) = metadata.modified() {
+            let modified_dt = DateTime::<Utc>::from(modified);
+            if modified_dt < cutoff {
+                match fs::remove_file(path) {
+                    Ok(_) => return Ok(1),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+    }
+
+    Ok(0)
 }
 
 /// Arrow schema for shadow observations (for Parquet storage).
@@ -1102,6 +1153,49 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_events_query_filters_by_event_timestamp() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = ShadowStorageConfig {
+            base_dir: temp_dir.path().to_path_buf(),
+            auto_compact: false,
+            ..Default::default()
+        };
+
+        let mut storage = ShadowStorage::new(config).unwrap();
+        let now = Utc::now();
+
+        storage
+            .record(Observation {
+                timestamp: now - chrono::Duration::hours(2),
+                pid: 1234,
+                identity_hash: "event-window".to_string(),
+                events: vec![
+                    ProcessEvent {
+                        timestamp: now - chrono::Duration::minutes(5),
+                        event_type: EventType::CpuSpike,
+                        details: Some("inside".to_string()),
+                    },
+                    ProcessEvent {
+                        timestamp: now - chrono::Duration::hours(3),
+                        event_type: EventType::MemorySpike,
+                        details: Some("outside".to_string()),
+                    },
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let events = storage.get_events(
+            now - chrono::Duration::minutes(10),
+            now + chrono::Duration::minutes(10),
+            100,
+        );
+
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].1.details.as_deref(), Some("inside"));
+    }
+
+    #[test]
     fn test_shadow_observations_schema() {
         let schema = shadow_observations_schema();
         assert!(schema.field_with_name("timestamp").is_ok());
@@ -1160,6 +1254,46 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_stats_unique_counts_refresh_without_compaction() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = ShadowStorageConfig {
+            base_dir: temp_dir.path().to_path_buf(),
+            auto_compact: false,
+            ..Default::default()
+        };
+
+        let mut storage = ShadowStorage::new(config).unwrap();
+        storage
+            .record(Observation {
+                pid: 41,
+                identity_hash: "identity-a".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .record(Observation {
+                pid: 42,
+                identity_hash: "identity-b".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .record(Observation {
+                pid: 41,
+                identity_hash: "identity-c".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let stats = storage.stats();
+        assert_eq!(stats.unique_pids, 2, "expected current tracked PID count");
+        assert_eq!(
+            stats.unique_identities, 3,
+            "expected all observed identities to be counted immediately",
+        );
+    }
+
+    #[test]
     fn test_storage_flush_and_persist() {
         let temp_dir = TempDir::new().unwrap();
         let config = ShadowStorageConfig {
@@ -1182,5 +1316,61 @@ mod tests {
 
         // Stats file should exist
         assert!(temp_dir.path().join("stats.json").exists());
+    }
+
+    #[test]
+    fn test_persist_observations_keeps_same_second_writes_distinct() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = ShadowStorageConfig {
+            base_dir: temp_dir.path().to_path_buf(),
+            auto_compact: false,
+            ..Default::default()
+        };
+        let storage = ShadowStorage::new(config).unwrap();
+
+        let first = Observation {
+            timestamp: Utc::now() - chrono::Duration::hours(2),
+            pid: 777,
+            identity_hash: "first".to_string(),
+            ..Default::default()
+        };
+        let second = Observation {
+            timestamp: Utc::now() - chrono::Duration::hours(2),
+            pid: 777,
+            identity_hash: "second".to_string(),
+            ..Default::default()
+        };
+
+        storage
+            .persist_observations(777, &[first], RetentionTier::Warm)
+            .unwrap();
+        storage
+            .persist_observations(777, &[second], RetentionTier::Warm)
+            .unwrap();
+
+        let warm_pid_dir = temp_dir.path().join("warm").join("pid_777");
+        let mut persisted = fs::read_dir(&warm_pid_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        persisted.sort();
+
+        assert_eq!(
+            persisted.len(),
+            2,
+            "expected distinct files for each persist"
+        );
+
+        let identities = persisted
+            .into_iter()
+            .map(|path| {
+                let file = File::open(path).unwrap();
+                let rows: Vec<Observation> = serde_json::from_reader(BufReader::new(file)).unwrap();
+                rows[0].identity_hash.clone()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(identities.iter().any(|value| value == "first"));
+        assert!(identities.iter().any(|value| value == "second"));
     }
 }

@@ -140,3 +140,34 @@ fn shadow_cleanup_removes_expired_archive_files() {
     assert!(cleaned >= 1);
     assert!(!stale_path.exists());
 }
+
+#[test]
+fn shadow_cleanup_removes_expired_nested_archive_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = ShadowStorageConfig {
+        base_dir: temp_dir.path().to_path_buf(),
+        auto_compact: false,
+        delete_expired: true,
+        ..Default::default()
+    };
+
+    let mut storage = ShadowStorage::new(config).unwrap();
+
+    let archive_dir = temp_dir.path().join("archive").join("pid_777");
+    fs::create_dir_all(&archive_dir).unwrap();
+    let stale_path = archive_dir.join("stale.json");
+    fs::write(&stale_path, "[]").unwrap();
+
+    let stale_time =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24 * 40);
+    let stale_ft = FileTime::from_system_time(stale_time);
+    filetime::set_file_times(&stale_path, stale_ft, stale_ft).unwrap();
+
+    let cleaned = storage.cleanup().unwrap();
+    assert!(cleaned >= 1);
+    assert!(!stale_path.exists());
+    assert!(
+        !archive_dir.exists(),
+        "empty per-pid archive directory should be removed after cleanup",
+    );
+}
