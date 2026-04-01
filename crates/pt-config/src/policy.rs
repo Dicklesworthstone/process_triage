@@ -2,10 +2,11 @@
 //!
 //! These types match the policy.schema.json specification.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Complete policy configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Policy {
     pub schema_version: String,
 
@@ -41,7 +42,7 @@ pub struct Policy {
 }
 
 /// Time-to-decision bound configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DecisionTimeBound {
     pub enabled: bool,
     pub min_seconds: u64,
@@ -67,7 +68,7 @@ impl Default for DecisionTimeBound {
 }
 
 /// Loss matrix by class for each action.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LossMatrix {
     pub useful: LossRow,
     pub useful_bad: LossRow,
@@ -76,7 +77,7 @@ pub struct LossMatrix {
 }
 
 /// Loss values for each action against a class.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LossRow {
     pub keep: f64,
 
@@ -148,7 +149,7 @@ impl Default for LossMatrix {
 }
 
 /// Safety guardrails and protected patterns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Guardrails {
     pub protected_patterns: Vec<PatternEntry>,
 
@@ -220,7 +221,7 @@ impl Default for Guardrails {
 }
 
 /// Pattern entry for matching commands/processes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PatternEntry {
     pub pattern: String,
 
@@ -243,7 +244,7 @@ fn default_true() -> bool {
 }
 
 /// Pattern matching type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PatternKind {
     Regex,
@@ -262,7 +263,7 @@ impl PatternKind {
 }
 
 /// Robot/agent automation gates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RobotMode {
     pub enabled: bool,
     pub min_posterior: f64,
@@ -288,7 +289,7 @@ pub struct RobotMode {
 }
 
 /// Signature-informed inference fast-path controls.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SignatureFastPath {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -303,7 +304,7 @@ fn default_fast_path_threshold() -> f64 {
 }
 
 /// Confidence level enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfidenceLevel {
     Low,
@@ -312,7 +313,7 @@ pub enum ConfidenceLevel {
 }
 
 /// False discovery rate control settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FdrControl {
     pub enabled: bool,
     pub method: FdrMethod,
@@ -329,7 +330,7 @@ pub struct FdrControl {
 }
 
 /// FDR control method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FdrMethod {
     /// Benjamini-Hochberg
@@ -355,7 +356,7 @@ impl FdrMethod {
 }
 
 /// Alpha-investing parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AlphaInvesting {
     #[serde(default)]
     pub w0: Option<f64>,
@@ -368,7 +369,7 @@ pub struct AlphaInvesting {
 }
 
 /// Data loss prevention gates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DataLossGates {
     pub block_if_open_write_fds: bool,
 
@@ -387,7 +388,7 @@ pub struct DataLossGates {
 }
 
 /// Load-aware decision configuration for adaptive thresholds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LoadAwareDecision {
     pub enabled: bool,
     #[serde(default = "default_queue_high")]
@@ -404,7 +405,7 @@ pub struct LoadAwareDecision {
     pub multipliers: LoadMultipliers,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LoadWeights {
     pub queue: f64,
     pub load: f64,
@@ -412,7 +413,7 @@ pub struct LoadWeights {
     pub psi: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LoadMultipliers {
     pub keep_max: f64,
     pub reversible_min: f64,

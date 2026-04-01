@@ -252,10 +252,28 @@ teardown() {
     local schema
     schema=$(pt config schema --file policy 2>/dev/null)
 
-    # Schema printing is currently a stub; enforce that it fails closed but returns structured JSON.
-    run jq -e '.schema_version, .session_id, .generated_at, .status, .message' <<<"$schema"
+    run jq -e '.type == "object"' <<<"$schema"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Schema for policy"* ]]
+    run jq -e '.title == "Policy"' <<<"$schema"
+    [ "$status" -eq 0 ]
+    run jq -e '(.properties.guardrails["$ref"] == "#/$defs/Guardrails") or (.properties.guardrails.type == "object")' <<<"$schema"
+    [ "$status" -eq 0 ]
+    run jq -e '.["$defs"].Guardrails.properties.protected_patterns.type == "array"' <<<"$schema"
+    [ "$status" -eq 0 ]
+}
+
+@test "pt config schema --file priors is valid JSON schema" {
+    skip_if_no_jq
+
+    local schema
+    schema=$(pt config schema --file priors 2>/dev/null)
+
+    run jq -e '.type == "object"' <<<"$schema"
+    [ "$status" -eq 0 ]
+    run jq -e '.title == "Priors"' <<<"$schema"
+    [ "$status" -eq 0 ]
+    run jq -e '(.properties.classes["$ref"] == "#/$defs/ClassPriors") or (.properties.classes.type == "object")' <<<"$schema"
+    [ "$status" -eq 0 ]
 }
 
 @test "pt config show --file policy includes protected_patterns" {

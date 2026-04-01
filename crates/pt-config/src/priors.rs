@@ -2,10 +2,11 @@
 //!
 //! These types match the priors.schema.json specification.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Complete priors configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Priors {
     pub schema_version: String,
 
@@ -55,7 +56,7 @@ pub struct Priors {
 }
 
 /// Per-class Bayesian hyperparameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ClassPriors {
     pub useful: ClassParams,
     pub useful_bad: ClassParams,
@@ -64,7 +65,7 @@ pub struct ClassPriors {
 }
 
 /// Parameters for a single process class.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ClassParams {
     pub prior_prob: f64,
     pub cpu_beta: BetaParams,
@@ -93,7 +94,7 @@ pub struct ClassParams {
 }
 
 /// Beta distribution parameters: Beta(alpha, beta).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct BetaParams {
     pub alpha: f64,
     pub beta: f64,
@@ -160,7 +161,7 @@ impl Default for BetaParams {
 
 /// Gamma distribution parameters: Gamma(shape, rate).
 /// Note: uses RATE parameterization (rate = 1/scale).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GammaParams {
     pub shape: f64,
     pub rate: f64,
@@ -180,13 +181,13 @@ impl GammaParams {
 }
 
 /// Dirichlet distribution parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DirichletParams {
     pub alpha: Vec<f64>,
 }
 
 /// Competing hazard rates for a class.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CompetingHazards {
     #[serde(default)]
     pub finish: Option<GammaParams>,
@@ -199,7 +200,7 @@ pub struct CompetingHazards {
 }
 
 /// Piecewise-constant hazard regime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HazardRegime {
     pub name: String,
 
@@ -213,7 +214,7 @@ pub struct HazardRegime {
 }
 
 /// Semi-Markov state duration parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SemiMarkovParams {
     #[serde(default)]
     pub useful_duration: Option<GammaParams>,
@@ -229,7 +230,7 @@ pub struct SemiMarkovParams {
 }
 
 /// Change-point detection priors.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ChangePointParams {
     #[serde(default)]
     pub p_before: Option<BetaParams>,
@@ -245,7 +246,7 @@ pub struct ChangePointParams {
 }
 
 /// Causal intervention outcome priors.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CausalInterventions {
     #[serde(default)]
     pub pause: Option<InterventionPriors>,
@@ -261,7 +262,7 @@ pub struct CausalInterventions {
 }
 
 /// Per-class intervention outcome priors.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InterventionPriors {
     #[serde(default)]
     pub useful: Option<BetaParams>,
@@ -277,7 +278,7 @@ pub struct InterventionPriors {
 }
 
 /// Command category Dirichlet priors.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CommandCategories {
     pub category_names: Vec<String>,
 
@@ -298,7 +299,7 @@ pub struct CommandCategories {
 }
 
 /// Process state flag Dirichlet priors.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StateFlags {
     pub flag_names: Vec<String>,
 
@@ -319,7 +320,7 @@ pub struct StateFlags {
 }
 
 /// Hierarchical/empirical Bayes settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HierarchicalParams {
     #[serde(default)]
     pub shrinkage_enabled: Option<bool>,
@@ -332,7 +333,7 @@ pub struct HierarchicalParams {
 }
 
 /// Robust Bayes / credal set settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RobustBayesParams {
     #[serde(default)]
     pub class_prior_bounds: Option<ClassPriorBounds>,
@@ -348,7 +349,7 @@ pub struct RobustBayesParams {
 }
 
 /// Prior probability bounds for credal sets.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ClassPriorBounds {
     #[serde(default)]
     pub useful: Option<PriorBounds>,
@@ -364,14 +365,14 @@ pub struct ClassPriorBounds {
 }
 
 /// Lower/upper bounds for a class prior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PriorBounds {
     pub lower: f64,
     pub upper: f64,
 }
 
 /// Error rate tracking priors.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorRateParams {
     #[serde(default)]
     pub false_kill: Option<BetaParams>,
@@ -381,7 +382,7 @@ pub struct ErrorRateParams {
 }
 
 /// BOCPD (Bayesian Online Change-Point Detection) settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BocpdParams {
     #[serde(default)]
     pub hazard_lambda: Option<f64>,

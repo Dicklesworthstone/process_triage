@@ -1469,13 +1469,13 @@ struct ConfigArgs {
 enum ConfigCommands {
     /// Show current configuration
     Show {
-        /// Show specific config file (priors, policy, capabilities)
+        /// Show specific config file (priors or policy)
         #[arg(long)]
         file: Option<String>,
     },
     /// Print JSON schema for configuration files
     Schema {
-        /// Schema to print (priors, policy, capabilities)
+        /// Schema to print (priors or policy)
         #[arg(long)]
         file: String,
     },
@@ -7044,14 +7044,7 @@ fn run_agent_fleet_transfer_diff(
 fn run_config(global: &GlobalOpts, args: &ConfigArgs) -> ExitCode {
     match &args.command {
         ConfigCommands::Show { file } => run_config_show(global, file.as_deref()),
-        ConfigCommands::Schema { file } => {
-            output_stub(
-                global,
-                "config schema",
-                &format!("Schema for {} not yet implemented", file),
-            );
-            ExitCode::Clean
-        }
+        ConfigCommands::Schema { file } => run_config_schema(global, file),
         ConfigCommands::Validate { path } => run_config_validate(global, path.as_ref()),
         ConfigCommands::ListPresets => run_config_list_presets(global),
         ConfigCommands::ShowPreset { preset } => run_config_show_preset(global, preset),
@@ -7187,6 +7180,51 @@ fn run_config_show(global: &GlobalOpts, file_filter: Option<&str>) -> ExitCode {
             println!("Schema version: {}", snapshot.policy_schema_version);
             println!();
             println!("Session: {}", session_id);
+        }
+    }
+
+    ExitCode::Clean
+}
+
+fn generate_config_schema(file: &str) -> Result<serde_json::Value, String> {
+    match file.trim().to_ascii_lowercase().as_str() {
+        "priors" => serde_json::to_value(schemars::schema_for!(pt_core::config::Priors))
+            .map_err(|e| format!("failed to serialize priors schema: {}", e)),
+        "policy" => serde_json::to_value(schemars::schema_for!(pt_core::config::Policy))
+            .map_err(|e| format!("failed to serialize policy schema: {}", e)),
+        other => Err(format!(
+            "unsupported config schema '{}'; expected one of: priors, policy",
+            other
+        )),
+    }
+}
+
+fn run_config_schema(global: &GlobalOpts, file: &str) -> ExitCode {
+    let schema = match generate_config_schema(file) {
+        Ok(schema) => schema,
+        Err(message) => {
+            eprintln!("config schema: {}", message);
+            return ExitCode::ArgsError;
+        }
+    };
+
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, schema));
+        }
+        OutputFormat::Summary => {
+            println!(
+                "config schema: {} ({})",
+                file.trim().to_ascii_lowercase(),
+                schema
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("untitled")
+            );
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            println!("{}", serde_json::to_string_pretty(&schema).unwrap());
         }
     }
 
@@ -10252,6 +10290,31 @@ fn output_stub_with_session(
             println!();
             println!("Session: {}", session_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod config_schema_tests {
+    use super::generate_config_schema;
+
+    #[test]
+    fn policy_config_schema_exposes_guardrails() {
+        let schema = generate_config_schema("policy").expect("policy schema should generate");
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].get("guardrails").is_some());
+    }
+
+    #[test]
+    fn priors_config_schema_exposes_classes() {
+        let schema = generate_config_schema("priors").expect("priors schema should generate");
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].get("classes").is_some());
+    }
+
+    #[test]
+    fn config_schema_rejects_unknown_names() {
+        let err = generate_config_schema("capabilities").unwrap_err();
+        assert!(err.contains("unsupported config schema"));
     }
 }
 
