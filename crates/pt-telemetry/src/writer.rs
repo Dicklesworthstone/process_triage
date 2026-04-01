@@ -4,6 +4,7 @@
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -14,6 +15,8 @@ use parquet::file::properties::{WriterProperties, WriterVersion};
 use thiserror::Error;
 
 use crate::schema::TableName;
+
+static OUTPUT_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Errors from telemetry writer operations.
 #[derive(Error, Debug)]
@@ -228,15 +231,23 @@ impl BatchedWriter {
             .join(format!("day={}", now.format("%d")))
             .join(format!("host_id={}", &self.config.host_id));
 
-        // File name: <table>_<timestamp>_<session_suffix>.parquet
+        // File name: <table>_<timestamp>_<nonce>_<session_suffix>.parquet
         let session_suffix = self
             .config
             .session_id
             .split('-')
             .next_back()
             .unwrap_or("xxxx");
+        let timestamp = now.format("%Y%m%dT%H%M%S%.6fZ");
+        let counter = OUTPUT_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        let filename = format!("{}_{}.parquet", self.table.as_str(), session_suffix,);
+        let filename = format!(
+            "{}_{}_{}_{}.parquet",
+            self.table.as_str(),
+            timestamp,
+            counter,
+            session_suffix,
+        );
 
         Ok(partition_path.join(filename))
     }
@@ -395,7 +406,33 @@ mod tests {
         assert!(path_str.contains("/month="));
         assert!(path_str.contains("/day="));
         assert!(path_str.contains("/host_id=abc123/"));
-        assert!(path_str.ends_with("audit_a7xq.parquet"));
+        assert!(path_str.contains("/audit_"));
+        assert!(path_str.ends_with("_a7xq.parquet"));
+    }
+
+    #[test]
+    fn test_multiple_writers_same_session_do_not_collide() {
+        let temp_dir = TempDir::new().unwrap();
+        let schema = Arc::new(crate::schema::audit_schema());
+        let config = WriterConfig::new(
+            temp_dir.path().to_path_buf(),
+            "pt-20260115-143022-a7xq".to_string(),
+            "abc123".to_string(),
+        )
+        .with_batch_size(1);
+
+        let mut first = BatchedWriter::new(TableName::Audit, schema.clone(), config.clone());
+        first.write(create_test_batch(&schema)).unwrap();
+        let first_path = first.close().unwrap();
+
+        let second_batch = create_test_batch(&schema);
+        let mut second = BatchedWriter::new(TableName::Audit, schema, config);
+        second.write(second_batch).unwrap();
+        let second_path = second.close().unwrap();
+
+        assert_ne!(first_path, second_path, "writer outputs should be unique");
+        assert!(first_path.exists());
+        assert!(second_path.exists());
     }
 
     #[test]
