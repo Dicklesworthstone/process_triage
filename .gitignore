@@ -39,6 +39,7 @@ a.out
 .ntm/
 ._*
 *.png
+!gh_og_share_image.png
 
 # Dependency upgrade progress (in-progress work)
 UPGRADE_LOG.md
