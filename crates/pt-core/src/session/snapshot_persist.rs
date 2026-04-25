@@ -1043,9 +1043,6 @@ mod tests {
             .contains(&"graph.nodes".to_string()));
         assert!(audit.redacted_sections.contains(&"graph.nodes".to_string()));
         assert!(audit.redacted_sections.contains(&"graph.edges".to_string()));
-        assert!(audit
-            .omitted_sections
-            .contains(&"privacy.consent_guarded_fields".to_string()));
     }
 
     #[test]

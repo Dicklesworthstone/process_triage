@@ -25,9 +25,8 @@ pub struct FixedSizeEvent {
     pub details_len: u32,
 }
 
-impl FixedSizeEvent {
-    /// Create a new empty event.
-    pub fn new() -> Self {
+impl Default for FixedSizeEvent {
+    fn default() -> Self {
         Self {
             timestamp_ns: 0,
             event_type: 0,
@@ -35,6 +34,14 @@ impl FixedSizeEvent {
             details: [0u8; MAX_DETAILS_LEN],
             details_len: 0,
         }
+    }
+}
+
+impl FixedSizeEvent {
+    /// Create a new empty event.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Build an event payload from recorder inputs.

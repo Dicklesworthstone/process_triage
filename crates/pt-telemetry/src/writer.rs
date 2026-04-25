@@ -148,18 +148,16 @@ impl BatchedWriter {
         }
 
         let writer = self.writer.as_mut().ok_or(WriteError::NotInitialized)?;
-        let mut written_batches = 0usize;
         let mut written_rows = 0usize;
 
         // Write buffered batches, but keep the current and remaining batches in memory
         // if a later write fails so callers can decide how to recover.
-        for batch in &self.buffer {
+        for (written_batches, batch) in self.buffer.iter().enumerate() {
             if let Err(err) = writer.write(batch) {
                 self.buffer.drain(..written_batches);
                 self.rows_buffered = self.rows_buffered.saturating_sub(written_rows);
                 return Err(err.into());
             }
-            written_batches += 1;
             written_rows += batch.num_rows();
         }
 
@@ -291,11 +289,10 @@ impl Drop for BatchedWriter {
     fn drop(&mut self) {
         // Best-effort flush, close, and rename on drop
         let mut finalize_ok = true;
-        if !self.buffer.is_empty() {
-            if self.flush().is_err() {
+        if !self.buffer.is_empty()
+            && self.flush().is_err() {
                 finalize_ok = false;
             }
-        }
 
         if let Some(writer) = self.writer.take() {
             if writer.close().is_err() {

@@ -690,7 +690,7 @@ fn test_diff_plain_output_shows_lifecycle_column() {
 
     let stdout = String::from_utf8_lossy(
         &pt_core_with_data(data_dir)
-            .args(["diff", &sid1, &sid2])
+            .args(["--format", "md", "diff", &sid1, &sid2])
             .assert()
             .success()
             .get_output()

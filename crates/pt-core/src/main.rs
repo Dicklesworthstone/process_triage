@@ -18589,10 +18589,9 @@ fn parse_duration(s: &str) -> Option<chrono::Duration> {
         (stripped, 'd')
     } else if let Some(stripped) = s.strip_suffix('h') {
         (stripped, 'h')
-    } else if let Some(stripped) = s.strip_suffix('m') {
-        (stripped, 'm')
     } else {
-        return None;
+        let stripped = s.strip_suffix('m')?;
+        (stripped, 'm')
     };
 
     let num: i64 = num_str.parse().ok()?;

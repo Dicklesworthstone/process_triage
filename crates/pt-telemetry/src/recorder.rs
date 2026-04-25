@@ -64,21 +64,18 @@ impl TelemetryRecorder {
                     last_sequence = seq + 1;
                     ring_clone.advance_consumer(seq);
 
-                    if pending_rows.len() >= config.batch_size.max(1) {
-                        if flush_pending_rows(&mut writer, &config, &mut pending_rows).is_ok() {
+                    if pending_rows.len() >= config.batch_size.max(1)
+                        && flush_pending_rows(&mut writer, &config, &mut pending_rows).is_ok() {
                             last_flush = Instant::now();
                         }
-                    }
                 }
 
                 let shutdown_requested = shutdown_clone.load(Ordering::Acquire);
                 if !pending_rows.is_empty()
                     && (shutdown_requested || last_flush.elapsed() >= flush_interval)
-                {
-                    if flush_pending_rows(&mut writer, &config, &mut pending_rows).is_ok() {
+                    && flush_pending_rows(&mut writer, &config, &mut pending_rows).is_ok() {
                         last_flush = Instant::now();
                     }
-                }
 
                 if shutdown_requested {
                     let producer_sequence =

@@ -380,7 +380,8 @@ mod tests {
         let pid = std::process::id();
         let status = read_proc_status(pid);
         let status = status.expect("should read own /proc/status");
-        assert!(status.ruid > 0 || status.ruid == 0); // root or non-root
+        // ruid is u32; just assert we read a status record successfully.
+        let _ = status.ruid;
     }
 
     #[cfg(target_os = "linux")]

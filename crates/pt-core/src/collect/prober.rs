@@ -119,7 +119,7 @@ impl Prober {
                 .user_data(idx as u64);
 
                 unsafe {
-                    if let Err(_) = sq.push(&read_e) {
+                    if sq.push(&read_e).is_err() {
                         break;
                     }
                 }
@@ -154,8 +154,8 @@ impl Prober {
                 break;
             }
 
-            let mut cq = self.ring.completion();
-            while let Some(cqe) = cq.next() {
+            let cq = self.ring.completion();
+            for cqe in cq {
                 let user_data = cqe.user_data();
                 if user_data == u64::MAX {
                     // Global timeout triggered
@@ -263,8 +263,10 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_probe_batch_timeout() {
-        let mut config = ProberConfig::default();
-        config.probe_timeout = Duration::from_nanos(1); // Impossible timeout
+        let config = ProberConfig {
+            probe_timeout: Duration::from_nanos(1), // Impossible timeout
+            ..ProberConfig::default()
+        };
 
         let mut prober = Prober::new(config).unwrap();
         let paths = vec![PathBuf::from("/proc/self/stat")];

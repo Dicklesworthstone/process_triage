@@ -184,7 +184,7 @@ fn resolve_worktree_repo_root(gitdir: &Path) -> Option<PathBuf> {
     // Fallback: if gitdir contains "worktrees", walk up
     let mut parent = gitdir.to_path_buf();
     while parent.pop() {
-        if parent.file_name().map_or(false, |n| n == ".git") {
+        if parent.file_name().is_some_and(|n| n == ".git") {
             return parent.parent().map(|p| p.to_path_buf());
         }
     }
@@ -369,7 +369,7 @@ mod tests {
         assert_eq!(nf, PathResolutionError::NotFound);
 
         let other =
-            io_error_to_resolution(std::io::Error::new(std::io::ErrorKind::Other, "something"));
+            io_error_to_resolution(std::io::Error::other("something"));
         match other {
             PathResolutionError::IoError { message } => assert!(message.contains("something")),
             _ => panic!("expected IoError variant"),

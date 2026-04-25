@@ -18,9 +18,7 @@
 //! High blast radius reduces confidence even when the posterior is
 //! strong, requiring human review for risky kills.
 
-use crate::decision::blast_radius_estimator::{
-    BlastRadiusEstimate, BlastRadiusEstimatorConfig, RiskLevel,
-};
+use crate::decision::blast_radius_estimator::{BlastRadiusEstimate, RiskLevel};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for provenance-adjusted scoring.
