@@ -54,16 +54,13 @@ LOCK_ROOT="/tmp/pt-install.lock.d"
 LOCK_HELD=0
 TEMP_DIR=""
 HAS_GUM=0
-WSL=0
 OS=""
 ARCH=""
-TARGET=""
 PLATFORM=""
 PROXY_ARGS=()
 DOWNLOADED_ARTIFACT=""
 INSTALLED_WRAPPER_VERSION=""
 INSTALLED_CORE_VERSION=""
-SUMMARY_LINES=()
 AGENT_LINES=()
 BACKUP_LINES=()
 
@@ -162,6 +159,16 @@ draw_box() {
         printf "\033[%sm║\033[0m  %b%*s  \033[%sm║\033[0m\n" "$color" "$line" "$pad" "" "$color"
     done
     printf "\033[%sm╚%s╝\033[0m\n" "$color" "$border"
+}
+
+status_path() {
+    local path="$1"
+    if [[ -n "${HOME:-}" && "$path" == "$HOME"/* ]]; then
+        # shellcheck disable=SC2088 # This is display text, not an executable shell path.
+        printf '~/%s\n' "${path#"$HOME"/}"
+    else
+        printf '%s\n' "$path"
+    fi
 }
 
 show_header() {
@@ -506,7 +513,6 @@ detect_platform() {
     esac
 
     if [[ "$OS" == "linux" && -f /proc/version ]] && grep -qi microsoft /proc/version 2>/dev/null; then
-        WSL=1
         warn "WSL detected; continuing with Linux install"
     fi
 
@@ -528,12 +534,7 @@ detect_platform() {
     esac
 
     case "$PLATFORM" in
-        linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-        linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
-        linux-x86_64-musl) TARGET="x86_64-unknown-linux-musl" ;;
-        linux-aarch64-musl) TARGET="aarch64-unknown-linux-musl" ;;
-        macos-x86_64) TARGET="x86_64-apple-darwin" ;;
-        macos-aarch64) TARGET="aarch64-apple-darwin" ;;
+        linux-x86_64|linux-aarch64|linux-x86_64-musl|linux-aarch64-musl|macos-x86_64|macos-aarch64) ;;
         *)
             warn "No prebuilt for ${PLATFORM}; will fall back to source"
             FROM_SOURCE=1
@@ -896,10 +897,10 @@ path_line_for_shell() {
     local shell_name="$2"
     case "$shell_name" in
         fish)
-            printf 'if not contains "%s" $PATH\n    set -gx PATH "%s" $PATH\nend\n' "$install_dir" "$install_dir"
+            printf "if not contains \"%s\" \$PATH\n    set -gx PATH \"%s\" \$PATH\nend\n" "$install_dir" "$install_dir"
             ;;
         *)
-            printf 'case ":$PATH:" in\n  *:"%s":*) ;;\n  *) export PATH="%s:$PATH" ;;\nesac\n' "$install_dir" "$install_dir"
+            printf "case \":\$PATH:\" in\n  *:\"%s\":*) ;;\n  *) export PATH=\"%s:\$PATH\" ;;\nesac\n" "$install_dir" "$install_dir"
             ;;
     esac
 }
@@ -1195,11 +1196,15 @@ show_agent_scan_notice() {
 }
 
 show_final_summary() {
+    local dest_display
+    dest_display="$(status_path "$DEST")"
+
     local lines=(
-        "Installed pt ${VERSION} to ${DEST}"
-        "Installed pt-core ${CORE_VERSION} to ${DEST}"
+        "Installed pt ${VERSION} to ${dest_display}"
+        "Installed pt-core ${CORE_VERSION} to ${dest_display}"
     )
 
+    AGENT_LINES=()
     [[ "$CLAUDE_STATUS" != "skipped" ]] && AGENT_LINES+=("Claude Code: ${CLAUDE_STATUS}")
     [[ "$CODEX_STATUS" != "skipped" ]] && AGENT_LINES+=("Codex CLI: ${CODEX_STATUS}")
     [[ "$COPILOT_STATUS" != "skipped" ]] && AGENT_LINES+=("GitHub Copilot CLI: ${COPILOT_STATUS}")
@@ -1212,8 +1217,10 @@ show_final_summary() {
     lines+=("${AGENT_LINES[@]}")
     lines+=("${BACKUP_LINES[@]}")
     lines+=("Run: pt --help")
-    lines+=("Uninstall: rm -f ${DEST}/pt ${DEST}/pt-core")
-    lines+=("If you enabled PATH updates, remove the '# process_triage installer PATH' block from your shell files to revert them.")
+    lines+=("Managed paths:")
+    lines+=("  wrapper: $(status_path "${DEST}/pt")")
+    lines+=("  core:    $(status_path "${DEST}/pt-core")")
+    lines+=("  PATH marker: # process_triage installer PATH")
 
     echo ""
     if [[ "$HAS_GUM" -eq 1 && "$QUIET" -eq 0 ]]; then

@@ -406,6 +406,22 @@ setup_installer_test_env() {
     test_end "installer skill payload" "pass"
 }
 
+@test "installer: final summary lists managed paths without destructive commands" {
+    test_start "installer summary" "verify final guidance is inventory-only"
+
+    run awk '/^show_final_summary\(\)/,/^}/' "$INSTALLER_PATH"
+
+    [ "$status" -eq 0 ]
+    assert_contains "$output" "Managed paths:" "summary should identify installer-managed files"
+    assert_contains "$output" "wrapper:" "summary should include the wrapper path"
+    assert_contains "$output" "core:" "summary should include the core binary path"
+    assert_contains "$output" "PATH marker: # process_triage installer PATH" "summary should identify the managed PATH marker"
+    assert_not_contains "$output" "Uninstall:" "summary should not print uninstall instructions"
+    assert_not_contains "$output" "rm -f" "summary should not print destructive commands"
+
+    test_end "installer summary" "pass"
+}
+
 # ==============================================================================
 # FRESH INSTALL TESTS
 # ==============================================================================
