@@ -1065,7 +1065,7 @@ maybe_configure_agents() {
     run_agent_init_for "cursor" CURSOR_STATUS
     run_agent_init_for "windsurf" WINDSURF_STATUS
     if agent_present "gemini"; then
-        GEMINI_STATUS="unsupported"
+        GEMINI_STATUS="detected; no automatic setup"
     fi
 
     if [[ -d "$HOME/.claude" || "$CLAUDE_STATUS" == "configured" ]]; then
