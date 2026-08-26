@@ -240,17 +240,9 @@ Installs `pt` (bash wrapper) and `pt-core` (Rust engine) to `~/.local/bin/`.
 
 ### Package Managers
 
-```bash
-# Homebrew (macOS/Linux)
-brew tap process-triage/tap && brew install pt
-
-# Scoop (Windows via WSL2)
-scoop bucket add process-triage https://github.com/process-triage/scoop-bucket
-scoop install pt
-
-# Winget (Windows native)
-winget install --id ProcessTriage.pt --source winget
-```
+There is no Homebrew formula, Scoop manifest, or winget package for `pt` yet.
+Use the install script above (it works on macOS and Linux, and inside WSL2 on
+Windows), or build from source below.
 
 ### From Source
 
@@ -268,7 +260,7 @@ ln -s "$(pwd)/pt" ~/.local/bin/pt
 VERIFY=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
 ```
 
-**Platforms:** Linux x86_64 (primary), Linux aarch64, macOS x86_64, macOS aarch64, Windows x86_64 (via WSL2/Scoop/Winget)
+**Platforms:** Linux x86_64 (primary), Linux aarch64, macOS x86_64, macOS aarch64, Windows x86_64 (via WSL2 only, using the Linux install)
 
 ---
 
