@@ -89,3 +89,11 @@ storage.sqlite3-wal.corrupt-*
 .beads/recovery_*/
 target-*/
 crates/*/target*/
+
+# === agent ephemeral residue 2026-09-15 ===
+# br live write locks (.write.lock, .br-db-write-*.lock, .br-jsonl-write-*.lock).
+.beads/*.lock
+# rustc ICE dumps and per-host gate wrappers.
+rustc-ice-*.txt
+/.gate_*.sh
+/.verify_*.sh
