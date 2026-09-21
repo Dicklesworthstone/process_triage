@@ -4,7 +4,14 @@
   "title": "Policy Schema",
   "description": "Schema for policy.json defining loss matrix, guardrails, and robot-mode gates.",
   "type": "object",
-  "required": ["schema_version", "loss_matrix", "guardrails", "robot_mode", "fdr_control", "data_loss_gates"],
+  "required": [
+    "schema_version",
+    "loss_matrix",
+    "guardrails",
+    "robot_mode",
+    "fdr_control",
+    "data_loss_gates"
+  ],
   "additionalProperties": false,
   "properties": {
     "schema_version": {
@@ -113,7 +120,12 @@
       "type": "object",
       "description": "Safety guardrails and protected patterns",
       "additionalProperties": false,
-      "required": ["protected_patterns", "never_kill_ppid", "max_kills_per_run", "min_process_age_seconds"],
+      "required": [
+        "protected_patterns",
+        "never_kill_ppid",
+        "max_kills_per_run",
+        "min_process_age_seconds"
+      ],
       "properties": {
         "protected_patterns": {
           "type": "array",
@@ -169,7 +181,13 @@
       "type": "object",
       "description": "Robot/agent automation gates",
       "additionalProperties": false,
-      "required": ["enabled", "min_posterior", "max_blast_radius_mb", "max_kills", "require_known_signature"],
+      "required": [
+        "enabled",
+        "min_posterior",
+        "max_blast_radius_mb",
+        "max_kills",
+        "require_known_signature"
+      ],
       "properties": {
         "enabled": { "type": "boolean" },
         "min_posterior": { "type": "number", "minimum": 0, "maximum": 1 },

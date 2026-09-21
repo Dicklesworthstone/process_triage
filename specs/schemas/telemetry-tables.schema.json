@@ -40,7 +40,18 @@
         "name": { "type": "string" },
         "type": {
           "type": "string",
-          "enum": ["STRING", "INT8", "INT16", "INT32", "INT64", "FLOAT", "DOUBLE", "BOOLEAN", "TIMESTAMP_MICROS", "LIST<STRING>"]
+          "enum": [
+            "STRING",
+            "INT8",
+            "INT16",
+            "INT32",
+            "INT64",
+            "FLOAT",
+            "DOUBLE",
+            "BOOLEAN",
+            "TIMESTAMP_MICROS",
+            "LIST<STRING>"
+          ]
         },
         "nullable": { "type": "boolean" },
         "description": { "type": "string" },
@@ -122,20 +133,93 @@
           "name": "runs",
           "description": "Session metadata and summary",
           "columns": [
-            {"name": "session_id", "type": "STRING", "nullable": false, "description": "Session identifier", "dictionary_encoded": true},
-            {"name": "host_id", "type": "STRING", "nullable": false, "description": "Hashed host identifier"},
-            {"name": "mode", "type": "STRING", "nullable": false, "description": "Session mode", "dictionary_encoded": true},
-            {"name": "deep_scan", "type": "BOOLEAN", "nullable": false, "description": "Deep scan enabled"},
-            {"name": "started_at", "type": "TIMESTAMP_MICROS", "nullable": false, "description": "Session start (UTC)"},
-            {"name": "ended_at", "type": "TIMESTAMP_MICROS", "nullable": true, "description": "Session end (UTC)"},
-            {"name": "duration_ms", "type": "INT64", "nullable": true, "description": "Duration in milliseconds"},
-            {"name": "state", "type": "STRING", "nullable": false, "description": "Final session state", "dictionary_encoded": true},
-            {"name": "processes_scanned", "type": "INT32", "nullable": false, "description": "Total processes examined"},
-            {"name": "candidates_found", "type": "INT32", "nullable": false, "description": "Candidates flagged"},
-            {"name": "kills_successful", "type": "INT32", "nullable": false, "description": "Successful kills"},
-            {"name": "pt_version", "type": "STRING", "nullable": false, "description": "pt wrapper version"},
-            {"name": "pt_core_version", "type": "STRING", "nullable": false, "description": "pt-core version"},
-            {"name": "schema_version", "type": "STRING", "nullable": false, "description": "Telemetry schema version"}
+            {
+              "name": "session_id",
+              "type": "STRING",
+              "nullable": false,
+              "description": "Session identifier",
+              "dictionary_encoded": true
+            },
+            {
+              "name": "host_id",
+              "type": "STRING",
+              "nullable": false,
+              "description": "Hashed host identifier"
+            },
+            {
+              "name": "mode",
+              "type": "STRING",
+              "nullable": false,
+              "description": "Session mode",
+              "dictionary_encoded": true
+            },
+            {
+              "name": "deep_scan",
+              "type": "BOOLEAN",
+              "nullable": false,
+              "description": "Deep scan enabled"
+            },
+            {
+              "name": "started_at",
+              "type": "TIMESTAMP_MICROS",
+              "nullable": false,
+              "description": "Session start (UTC)"
+            },
+            {
+              "name": "ended_at",
+              "type": "TIMESTAMP_MICROS",
+              "nullable": true,
+              "description": "Session end (UTC)"
+            },
+            {
+              "name": "duration_ms",
+              "type": "INT64",
+              "nullable": true,
+              "description": "Duration in milliseconds"
+            },
+            {
+              "name": "state",
+              "type": "STRING",
+              "nullable": false,
+              "description": "Final session state",
+              "dictionary_encoded": true
+            },
+            {
+              "name": "processes_scanned",
+              "type": "INT32",
+              "nullable": false,
+              "description": "Total processes examined"
+            },
+            {
+              "name": "candidates_found",
+              "type": "INT32",
+              "nullable": false,
+              "description": "Candidates flagged"
+            },
+            {
+              "name": "kills_successful",
+              "type": "INT32",
+              "nullable": false,
+              "description": "Successful kills"
+            },
+            {
+              "name": "pt_version",
+              "type": "STRING",
+              "nullable": false,
+              "description": "pt wrapper version"
+            },
+            {
+              "name": "pt_core_version",
+              "type": "STRING",
+              "nullable": false,
+              "description": "pt-core version"
+            },
+            {
+              "name": "schema_version",
+              "type": "STRING",
+              "nullable": false,
+              "description": "Telemetry schema version"
+            }
           ],
           "partitioning": ["year", "month", "day", "host_id"],
           "sorting": ["session_id"],
@@ -147,15 +231,59 @@
           "name": "outcomes",
           "description": "Action outcomes and feedback",
           "columns": [
-            {"name": "session_id", "type": "STRING", "nullable": false, "description": "Session identifier", "dictionary_encoded": true},
-            {"name": "outcome_ts", "type": "TIMESTAMP_MICROS", "nullable": false, "description": "Outcome timestamp"},
-            {"name": "pid", "type": "INT32", "nullable": false, "description": "Process ID"},
-            {"name": "start_id", "type": "STRING", "nullable": false, "description": "Stable process identity"},
-            {"name": "recommendation", "type": "STRING", "nullable": false, "description": "System recommendation", "dictionary_encoded": true},
-            {"name": "decision", "type": "STRING", "nullable": false, "description": "Final decision", "dictionary_encoded": true},
-            {"name": "action_successful", "type": "BOOLEAN", "nullable": true, "description": "Action succeeded"},
-            {"name": "user_feedback", "type": "STRING", "nullable": true, "description": "User feedback", "dictionary_encoded": true},
-            {"name": "score", "type": "FLOAT", "nullable": false, "description": "Score at decision"}
+            {
+              "name": "session_id",
+              "type": "STRING",
+              "nullable": false,
+              "description": "Session identifier",
+              "dictionary_encoded": true
+            },
+            {
+              "name": "outcome_ts",
+              "type": "TIMESTAMP_MICROS",
+              "nullable": false,
+              "description": "Outcome timestamp"
+            },
+            { "name": "pid", "type": "INT32", "nullable": false, "description": "Process ID" },
+            {
+              "name": "start_id",
+              "type": "STRING",
+              "nullable": false,
+              "description": "Stable process identity"
+            },
+            {
+              "name": "recommendation",
+              "type": "STRING",
+              "nullable": false,
+              "description": "System recommendation",
+              "dictionary_encoded": true
+            },
+            {
+              "name": "decision",
+              "type": "STRING",
+              "nullable": false,
+              "description": "Final decision",
+              "dictionary_encoded": true
+            },
+            {
+              "name": "action_successful",
+              "type": "BOOLEAN",
+              "nullable": true,
+              "description": "Action succeeded"
+            },
+            {
+              "name": "user_feedback",
+              "type": "STRING",
+              "nullable": true,
+              "description": "User feedback",
+              "dictionary_encoded": true
+            },
+            {
+              "name": "score",
+              "type": "FLOAT",
+              "nullable": false,
+              "description": "Score at decision"
+            }
           ],
           "partitioning": ["year", "month", "day", "host_id"],
           "sorting": ["session_id", "outcome_ts"],

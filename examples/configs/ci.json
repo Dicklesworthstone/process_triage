@@ -73,17 +73,10 @@
       }
     ],
     "force_review_patterns": [],
-    "protected_users": [
-      "root"
-    ],
+    "protected_users": ["root"],
     "protected_groups": [],
-    "protected_categories": [
-      "ci_runner",
-      "container"
-    ],
-    "never_kill_ppid": [
-      1
-    ],
+    "protected_categories": ["ci_runner", "container"],
+    "never_kill_ppid": [1],
     "never_kill_pid": [],
     "max_kills_per_run": 10,
     "max_kills_per_minute": 5,
@@ -100,13 +93,8 @@
     "max_kills": 10,
     "require_known_signature": false,
     "require_policy_snapshot": null,
-    "allow_categories": [
-      "test_runner",
-      "build_tool"
-    ],
-    "exclude_categories": [
-      "ci_runner"
-    ],
+    "allow_categories": ["test_runner", "build_tool"],
+    "exclude_categories": ["ci_runner"],
     "require_human_for_supervised": false
   },
   "signature_fast_path": {

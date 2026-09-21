@@ -83,9 +83,7 @@
       "label": "pytest",
       "confidence": "high",
       "redaction": "none",
-      "evidence_ids": [
-        "pv_procfs_1a603ecf40793644"
-      ],
+      "evidence_ids": ["pv_procfs_1a603ecf40793644"],
       "attributes": {
         "pid": 41,
         "cmd": "pytest -k provenance"
@@ -97,9 +95,7 @@
       "label": "<workspace:redacted>",
       "confidence": "low",
       "redaction": "full",
-      "evidence_ids": [
-        "pv_git_e187a34b9f3c8f0d"
-      ],
+      "evidence_ids": ["pv_git_e187a34b9f3c8f0d"],
       "attributes": {
         "repo_root": "<repo:redacted>"
       }
@@ -110,9 +106,7 @@
       "label": "<host:redacted>",
       "confidence": "medium",
       "redaction": "full",
-      "evidence_ids": [
-        "pv_derived_03b76dbe9f5cb0e4"
-      ],
+      "evidence_ids": ["pv_derived_03b76dbe9f5cb0e4"],
       "attributes": {
         "scope": "fleet"
       }
@@ -126,9 +120,7 @@
       "to": "pn_workspace_53b6a161ab1d514e",
       "confidence": "low",
       "redaction": "partial",
-      "evidence_ids": [
-        "pv_git_e187a34b9f3c8f0d"
-      ],
+      "evidence_ids": ["pv_git_e187a34b9f3c8f0d"],
       "derived_from_edge_ids": [],
       "attributes": {
         "reason": "cwd_under_workspace"
@@ -141,9 +133,7 @@
       "to": "pn_host_4e63f37a0ca5ae75",
       "confidence": "medium",
       "redaction": "partial",
-      "evidence_ids": [
-        "pv_derived_03b76dbe9f5cb0e4"
-      ],
+      "evidence_ids": ["pv_derived_03b76dbe9f5cb0e4"],
       "derived_from_edge_ids": [],
       "attributes": {
         "reason": "fleet_summary_only"
@@ -205,18 +195,13 @@
       "code": "workspace_withheld_by_policy",
       "message": "workspace provenance was withheld by privacy policy",
       "confidence": "low",
-      "evidence_ids": [
-        "pv_git_e187a34b9f3c8f0d"
-      ]
+      "evidence_ids": ["pv_git_e187a34b9f3c8f0d"]
     },
     {
       "code": "confidence_downgraded_due_to_missing_workspace",
       "message": "workspace linkage confidence was downgraded after redaction",
       "confidence": "low",
-      "evidence_ids": [
-        "pv_git_e187a34b9f3c8f0d",
-        "pv_derived_03b76dbe9f5cb0e4"
-      ]
+      "evidence_ids": ["pv_git_e187a34b9f3c8f0d", "pv_derived_03b76dbe9f5cb0e4"]
     }
   ]
 }

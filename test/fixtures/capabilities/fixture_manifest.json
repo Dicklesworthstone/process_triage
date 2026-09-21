@@ -5,12 +5,8 @@
   "capture_time": "2026-02-05T01:38:07.504397Z",
   "source": {
     "origin": "manual-curated",
-    "command": [
-      "capabilities fixture"
-    ],
-    "paths": [
-      "test/fixtures/capabilities"
-    ]
+    "command": ["capabilities fixture"],
+    "paths": ["test/fixtures/capabilities"]
   },
   "tool_versions": {
     "fixture_capture": "1.0.0",

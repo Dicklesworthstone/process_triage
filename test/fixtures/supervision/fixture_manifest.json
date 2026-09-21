@@ -5,12 +5,8 @@
   "capture_time": "2026-02-05T05:59:30Z",
   "source": {
     "origin": "manual-curated",
-    "command": [
-      "supervision fixtures"
-    ],
-    "paths": [
-      "test/fixtures/supervision"
-    ]
+    "command": ["supervision fixtures"],
+    "paths": ["test/fixtures/supervision"]
   },
   "tool_versions": {
     "fixture_capture": "1.0.0",

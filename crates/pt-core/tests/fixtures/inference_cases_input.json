@@ -26,7 +26,7 @@
     {
       "case_id": "mixed_idle_with_tty",
       "evidence": {
-        "cpu": { "type": "fraction", "occupancy": 0.10 },
+        "cpu": { "type": "fraction", "occupancy": 0.1 },
         "runtime_seconds": 36000,
         "orphan": false,
         "tty": true,

@@ -3,7 +3,7 @@
   "description": "Test fixture priors for unit tests",
   "classes": {
     "useful": {
-      "prior_prob": 0.70,
+      "prior_prob": 0.7,
       "cpu_beta": { "alpha": 5.0, "beta": 3.0 },
       "runtime_gamma": { "shape": 2.0, "rate": 0.0001 },
       "orphan_beta": { "alpha": 1.0, "beta": 20.0 },
@@ -21,7 +21,7 @@
       "io_active_beta": { "alpha": 2.0, "beta": 6.0 }
     },
     "abandoned": {
-      "prior_prob": 0.20,
+      "prior_prob": 0.2,
       "cpu_beta": { "alpha": 1.0, "beta": 8.0 },
       "runtime_gamma": { "shape": 1.0, "rate": 0.00001 },
       "orphan_beta": { "alpha": 6.0, "beta": 2.0 },
@@ -52,7 +52,21 @@
   },
   "command_categories": {
     "_comment": "Dirichlet priors over 13 command categories: Test, DevServer, Agent, Server, Daemon, Build, Editor, Shell, Database, Vcs, PackageManager, Container, Unknown. Higher alpha = more likely for that class.",
-    "category_names": ["test", "devserver", "agent", "server", "daemon", "build", "editor", "shell", "database", "vcs", "package_manager", "container", "unknown"],
+    "category_names": [
+      "test",
+      "devserver",
+      "agent",
+      "server",
+      "daemon",
+      "build",
+      "editor",
+      "shell",
+      "database",
+      "vcs",
+      "package_manager",
+      "container",
+      "unknown"
+    ],
     "useful": {
       "_comment": "Useful processes span all categories, weighted toward servers and editors",
       "alpha": [3.0, 4.0, 5.0, 8.0, 8.0, 3.0, 6.0, 4.0, 4.0, 3.0, 3.0, 5.0, 2.0]

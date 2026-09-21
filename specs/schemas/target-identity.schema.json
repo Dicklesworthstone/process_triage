@@ -4,15 +4,7 @@
   "title": "Target Identity",
   "description": "Identity tuple used to safely target a process instance",
   "type": "object",
-  "required": [
-    "schema_version",
-    "pid",
-    "start_time_ticks",
-    "boot_id",
-    "uid",
-    "euid",
-    "start_id"
-  ],
+  "required": ["schema_version", "pid", "start_time_ticks", "boot_id", "uid", "euid", "start_id"],
   "properties": {
     "schema_version": {
       "type": "string",

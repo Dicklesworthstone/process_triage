@@ -71,7 +71,23 @@
           "description": "Which /proc/PID/* files are readable by current user",
           "items": {
             "type": "string",
-            "enum": ["stat", "status", "io", "cgroup", "wchan", "fd", "maps", "smaps", "schedstat", "sched", "ns", "environ", "cmdline", "cwd", "exe"]
+            "enum": [
+              "stat",
+              "status",
+              "io",
+              "cgroup",
+              "wchan",
+              "fd",
+              "maps",
+              "smaps",
+              "schedstat",
+              "sched",
+              "ns",
+              "environ",
+              "cmdline",
+              "cwd",
+              "exe"
+            ]
           }
         }
       }
@@ -95,7 +111,21 @@
           "description": "Available cgroup controllers",
           "items": {
             "type": "string",
-            "enum": ["cpu", "cpuset", "memory", "io", "pids", "rdma", "hugetlb", "cpuacct", "devices", "freezer", "net_cls", "net_prio", "blkio"]
+            "enum": [
+              "cpu",
+              "cpuset",
+              "memory",
+              "io",
+              "pids",
+              "rdma",
+              "hugetlb",
+              "cpuacct",
+              "devices",
+              "freezer",
+              "net_cls",
+              "net_prio",
+              "blkio"
+            ]
           }
         }
       }

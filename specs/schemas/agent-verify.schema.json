@@ -67,7 +67,15 @@
         "action": { "type": "string" },
         "outcome": {
           "type": "string",
-          "enum": ["confirmed_dead", "confirmed_stopped", "still_running", "respawned", "pid_reused", "cascaded", "timeout"]
+          "enum": [
+            "confirmed_dead",
+            "confirmed_stopped",
+            "still_running",
+            "respawned",
+            "pid_reused",
+            "cascaded",
+            "timeout"
+          ]
         },
         "time_to_death_ms": { "type": "integer" },
         "resources_freed": {

@@ -14,7 +14,7 @@
       "patterns": {
         "process_names": ["^node$"],
         "arg_patterns": ["jest", "--runInBand"],
-        "environment_vars": {"JEST_WORKER_ID": ".*"},
+        "environment_vars": { "JEST_WORKER_ID": ".*" },
         "working_dir_patterns": ["/repo/.+"],
         "socket_paths": ["/tmp/jest-"],
         "pid_files": [],
@@ -22,8 +22,8 @@
         "min_matches": 2
       },
       "priors": {
-        "abandoned": {"alpha": 2.0, "beta": 6.0},
-        "useful": {"alpha": 6.0, "beta": 2.0}
+        "abandoned": { "alpha": 2.0, "beta": 6.0 },
+        "useful": { "alpha": 6.0, "beta": 2.0 }
       },
       "expectations": {
         "typical_lifetime_seconds": 600,

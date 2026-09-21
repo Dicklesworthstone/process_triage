@@ -14,10 +14,7 @@
   },
   "commands": [
     {
-      "argv": [
-        "./install.sh",
-        "--dry-run"
-      ],
+      "argv": ["./install.sh", "--dry-run"],
       "exit_code": 0,
       "duration_ms": 980
     }

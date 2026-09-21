@@ -98,7 +98,15 @@
     },
     "verify_outcome": {
       "type": "string",
-      "enum": ["confirmed_dead", "confirmed_stopped", "still_running", "respawned", "pid_reused", "cascaded", "timeout"],
+      "enum": [
+        "confirmed_dead",
+        "confirmed_stopped",
+        "still_running",
+        "respawned",
+        "pid_reused",
+        "cascaded",
+        "timeout"
+      ],
       "description": "Post-action verification outcome"
     },
     "decision_robustness": {

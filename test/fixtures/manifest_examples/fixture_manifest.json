@@ -5,12 +5,8 @@
   "capture_time": "2026-02-04T21:15:52.057142Z",
   "source": {
     "origin": "manual-curated",
-    "command": [
-      "fixtures manifest examples"
-    ],
-    "paths": [
-      "test/fixtures/manifest_examples"
-    ]
+    "command": ["fixtures manifest examples"],
+    "paths": ["test/fixtures/manifest_examples"]
   },
   "tool_versions": {
     "fixture_capture": "1.0.0",

@@ -7,9 +7,7 @@
     "resource provenance has 3 unresolved edge(s)",
     "blast-radius estimate is low-confidence"
   ],
-  "score_terms": [
-    "provenance_blast_radius_high"
-  ],
+  "score_terms": ["provenance_blast_radius_high"],
   "blast_radius": {
     "risk_score": 0.82,
     "risk_level": "high",
@@ -19,7 +17,7 @@
   },
   "redaction_state": "partial",
   "score_impact": {
-    "log_odds_shift": -0.10,
+    "log_odds_shift": -0.1,
     "feature_contributions": [
       {
         "feature": "provenance_blast_radius_high",

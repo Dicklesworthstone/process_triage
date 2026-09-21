@@ -5,7 +5,7 @@
 
   "classes": {
     "useful": {
-      "prior_prob": 0.70,
+      "prior_prob": 0.7,
       "cpu_beta": {
         "alpha": 2.0,
         "beta": 5.0,
@@ -44,7 +44,7 @@
     },
 
     "useful_bad": {
-      "prior_prob": 0.10,
+      "prior_prob": 0.1,
       "cpu_beta": {
         "alpha": 8.0,
         "beta": 2.0,
@@ -190,7 +190,11 @@
         "rate": 1800.0,
         "_comment": "Moderate hazard increase. Mean = 0.000833/sec"
       },
-      "trigger_conditions": ["io_read_bytes_delta == 0", "io_write_bytes_delta == 0", "duration > 300"]
+      "trigger_conditions": [
+        "io_read_bytes_delta == 0",
+        "io_write_bytes_delta == 0",
+        "duration > 300"
+      ]
     },
     {
       "name": "cpu_spinloop",
@@ -254,47 +258,118 @@
 
   "causal_interventions": {
     "pause": {
-      "useful": {"alpha": 2.0, "beta": 8.0, "_comment": "Pause rarely helps useful: P(recover) ~ 0.2"},
-      "useful_bad": {"alpha": 5.0, "beta": 5.0, "_comment": "Pause sometimes helps: P(recover) ~ 0.5"},
-      "abandoned": {"alpha": 1.0, "beta": 9.0, "_comment": "Pause won't help abandoned: P(recover) ~ 0.1"},
-      "zombie": {"alpha": 1.0, "beta": 20.0, "_comment": "Pause doesn't help zombies: P(recover) ~ 0.05"}
+      "useful": {
+        "alpha": 2.0,
+        "beta": 8.0,
+        "_comment": "Pause rarely helps useful: P(recover) ~ 0.2"
+      },
+      "useful_bad": {
+        "alpha": 5.0,
+        "beta": 5.0,
+        "_comment": "Pause sometimes helps: P(recover) ~ 0.5"
+      },
+      "abandoned": {
+        "alpha": 1.0,
+        "beta": 9.0,
+        "_comment": "Pause won't help abandoned: P(recover) ~ 0.1"
+      },
+      "zombie": {
+        "alpha": 1.0,
+        "beta": 20.0,
+        "_comment": "Pause doesn't help zombies: P(recover) ~ 0.05"
+      }
     },
     "throttle": {
-      "useful": {"alpha": 1.0, "beta": 9.0, "_comment": "Throttle hurts useful: P(recover) ~ 0.1"},
-      "useful_bad": {"alpha": 6.0, "beta": 4.0, "_comment": "Throttle often helps bad: P(recover) ~ 0.6"},
-      "abandoned": {"alpha": 1.0, "beta": 10.0, "_comment": "Throttle won't help abandoned: P(recover) ~ 0.09"},
-      "zombie": {"alpha": 1.0, "beta": 20.0, "_comment": "Throttle doesn't help zombies: P(recover) ~ 0.05"}
+      "useful": {
+        "alpha": 1.0,
+        "beta": 9.0,
+        "_comment": "Throttle hurts useful: P(recover) ~ 0.1"
+      },
+      "useful_bad": {
+        "alpha": 6.0,
+        "beta": 4.0,
+        "_comment": "Throttle often helps bad: P(recover) ~ 0.6"
+      },
+      "abandoned": {
+        "alpha": 1.0,
+        "beta": 10.0,
+        "_comment": "Throttle won't help abandoned: P(recover) ~ 0.09"
+      },
+      "zombie": {
+        "alpha": 1.0,
+        "beta": 20.0,
+        "_comment": "Throttle doesn't help zombies: P(recover) ~ 0.05"
+      }
     },
     "kill": {
-      "useful": {"alpha": 1.0, "beta": 15.0, "_comment": "Kill is wrong for useful: P(recover) ~ 0.06"},
-      "useful_bad": {"alpha": 3.0, "beta": 7.0, "_comment": "Kill sometimes appropriate: P(recover) ~ 0.3"},
-      "abandoned": {"alpha": 9.0, "beta": 1.0, "_comment": "Kill is right for abandoned: P(recover) ~ 0.9"},
-      "zombie": {"alpha": 8.0, "beta": 2.0, "_comment": "Kill is right for zombie: P(recover) ~ 0.8"}
+      "useful": {
+        "alpha": 1.0,
+        "beta": 15.0,
+        "_comment": "Kill is wrong for useful: P(recover) ~ 0.06"
+      },
+      "useful_bad": {
+        "alpha": 3.0,
+        "beta": 7.0,
+        "_comment": "Kill sometimes appropriate: P(recover) ~ 0.3"
+      },
+      "abandoned": {
+        "alpha": 9.0,
+        "beta": 1.0,
+        "_comment": "Kill is right for abandoned: P(recover) ~ 0.9"
+      },
+      "zombie": {
+        "alpha": 8.0,
+        "beta": 2.0,
+        "_comment": "Kill is right for zombie: P(recover) ~ 0.8"
+      }
     },
     "restart": {
-      "useful": {"alpha": 7.0, "beta": 3.0, "_comment": "Restart helps useful: P(recover) ~ 0.7"},
-      "useful_bad": {"alpha": 6.0, "beta": 4.0, "_comment": "Restart helps bad: P(recover) ~ 0.6"},
-      "abandoned": {"alpha": 3.0, "beta": 7.0, "_comment": "Restart questionable for abandoned: P(recover) ~ 0.3"},
-      "zombie": {"alpha": 2.0, "beta": 8.0, "_comment": "Restart rarely helps zombies: P(recover) ~ 0.2"}
+      "useful": { "alpha": 7.0, "beta": 3.0, "_comment": "Restart helps useful: P(recover) ~ 0.7" },
+      "useful_bad": {
+        "alpha": 6.0,
+        "beta": 4.0,
+        "_comment": "Restart helps bad: P(recover) ~ 0.6"
+      },
+      "abandoned": {
+        "alpha": 3.0,
+        "beta": 7.0,
+        "_comment": "Restart questionable for abandoned: P(recover) ~ 0.3"
+      },
+      "zombie": {
+        "alpha": 2.0,
+        "beta": 8.0,
+        "_comment": "Restart rarely helps zombies: P(recover) ~ 0.2"
+      }
     }
   },
 
   "command_categories": {
-    "category_names": ["test", "devserver", "agent", "build", "daemon", "shell", "ide", "database", "webserver", "unknown"],
+    "category_names": [
+      "test",
+      "devserver",
+      "agent",
+      "build",
+      "daemon",
+      "shell",
+      "ide",
+      "database",
+      "webserver",
+      "unknown"
+    ],
     "_comment": "Dirichlet alpha vectors: higher values = more expected for that class",
-    "useful": {"alpha": [1.0, 3.0, 2.0, 2.0, 5.0, 3.0, 4.0, 5.0, 5.0, 2.0]},
-    "useful_bad": {"alpha": [3.0, 4.0, 2.0, 4.0, 2.0, 2.0, 3.0, 2.0, 2.0, 3.0]},
-    "abandoned": {"alpha": [8.0, 6.0, 5.0, 3.0, 1.0, 4.0, 3.0, 1.0, 1.0, 5.0]},
-    "zombie": {"alpha": [2.0, 1.0, 1.0, 2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 3.0]}
+    "useful": { "alpha": [1.0, 3.0, 2.0, 2.0, 5.0, 3.0, 4.0, 5.0, 5.0, 2.0] },
+    "useful_bad": { "alpha": [3.0, 4.0, 2.0, 4.0, 2.0, 2.0, 3.0, 2.0, 2.0, 3.0] },
+    "abandoned": { "alpha": [8.0, 6.0, 5.0, 3.0, 1.0, 4.0, 3.0, 1.0, 1.0, 5.0] },
+    "zombie": { "alpha": [2.0, 1.0, 1.0, 2.0, 1.0, 2.0, 1.0, 1.0, 1.0, 3.0] }
   },
 
   "state_flags": {
     "flag_names": ["R", "S", "D", "Z", "T"],
     "_comment": "R=running, S=sleeping, D=uninterruptible, Z=zombie, T=stopped",
-    "useful": {"alpha": [3.0, 10.0, 1.0, 0.1, 1.0]},
-    "useful_bad": {"alpha": [5.0, 5.0, 2.0, 0.1, 1.0]},
-    "abandoned": {"alpha": [1.0, 8.0, 2.0, 1.0, 3.0]},
-    "zombie": {"alpha": [0.1, 0.1, 0.1, 10.0, 0.1]}
+    "useful": { "alpha": [3.0, 10.0, 1.0, 0.1, 1.0] },
+    "useful_bad": { "alpha": [5.0, 5.0, 2.0, 0.1, 1.0] },
+    "abandoned": { "alpha": [1.0, 8.0, 2.0, 1.0, 3.0] },
+    "zombie": { "alpha": [0.1, 0.1, 0.1, 10.0, 0.1] }
   },
 
   "hierarchical": {
@@ -305,10 +380,10 @@
 
   "robust_bayes": {
     "class_prior_bounds": {
-      "useful": {"lower": 0.50, "upper": 0.85},
-      "useful_bad": {"lower": 0.05, "upper": 0.20},
-      "abandoned": {"lower": 0.05, "upper": 0.30},
-      "zombie": {"lower": 0.01, "upper": 0.15}
+      "useful": { "lower": 0.5, "upper": 0.85 },
+      "useful_bad": { "lower": 0.05, "upper": 0.2 },
+      "abandoned": { "lower": 0.05, "upper": 0.3 },
+      "zombie": { "lower": 0.01, "upper": 0.15 }
     },
     "safe_bayes_eta": 1.0,
     "auto_eta_enabled": false,

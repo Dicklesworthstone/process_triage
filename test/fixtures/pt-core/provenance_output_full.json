@@ -2,17 +2,12 @@
   "enabled": true,
   "evidence_completeness": 0.85,
   "confidence_penalty_steps": 1,
-  "confidence_notes": [
-    "resource provenance has 2 unresolved edge(s)"
-  ],
-  "score_terms": [
-    "provenance_ownership_orphaned",
-    "provenance_blast_radius_low"
-  ],
+  "confidence_notes": ["resource provenance has 2 unresolved edge(s)"],
+  "score_terms": ["provenance_ownership_orphaned", "provenance_blast_radius_low"],
   "blast_radius": {
     "risk_score": 0.12,
     "risk_level": "low",
-    "confidence": 0.90,
+    "confidence": 0.9,
     "summary": "Isolated process with no shared resources",
     "total_affected": 0
   },
@@ -22,7 +17,7 @@
     "feature_contributions": [
       {
         "feature": "provenance_ownership_orphaned",
-        "abandoned_ll": 0.70,
+        "abandoned_ll": 0.7,
         "useful_ll": -0.55,
         "direction": "toward_abandon"
       },

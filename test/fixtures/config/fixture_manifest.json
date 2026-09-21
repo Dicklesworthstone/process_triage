@@ -5,12 +5,8 @@
   "capture_time": "2026-02-04T21:15:51.936379Z",
   "source": {
     "origin": "manual-copy",
-    "command": [
-      "cp crates/pt-config/tests/fixtures/*.json test/fixtures/config/"
-    ],
-    "paths": [
-      "crates/pt-config/tests/fixtures"
-    ]
+    "command": ["cp crates/pt-config/tests/fixtures/*.json test/fixtures/config/"],
+    "paths": ["crates/pt-config/tests/fixtures"]
   },
   "tool_versions": {
     "fixture_capture": "1.0.0",

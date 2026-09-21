@@ -5,12 +5,8 @@
   "capture_time": "2026-02-05T02:52:30.007980Z",
   "source": {
     "origin": "manual-curated",
-    "command": [
-      "shadow fixtures"
-    ],
-    "paths": [
-      "test/fixtures/shadow"
-    ]
+    "command": ["shadow fixtures"],
+    "paths": ["test/fixtures/shadow"]
   },
   "tool_versions": {
     "fixture_capture": "1.0.0",

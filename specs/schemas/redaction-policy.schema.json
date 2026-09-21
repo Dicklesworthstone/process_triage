@@ -77,19 +77,41 @@
   "$defs": {
     "action": {
       "type": "string",
-      "enum": ["allow", "redact", "hash", "normalize", "normalize+hash", "truncate", "detect+action"],
+      "enum": [
+        "allow",
+        "redact",
+        "hash",
+        "normalize",
+        "normalize+hash",
+        "truncate",
+        "detect+action"
+      ],
       "description": "Redaction action to apply"
     },
     "field_class": {
       "type": "string",
       "enum": [
-        "cmdline", "cmd", "cmdline_arg",
-        "env_name", "env_value",
-        "path_home", "path_tmp", "path_system", "path_project",
-        "hostname", "ip_address",
-        "url", "url_host", "url_path", "url_credentials",
-        "username", "uid", "pid", "port",
-        "container_id", "systemd_unit",
+        "cmdline",
+        "cmd",
+        "cmdline_arg",
+        "env_name",
+        "env_value",
+        "path_home",
+        "path_tmp",
+        "path_system",
+        "path_project",
+        "hostname",
+        "ip_address",
+        "url",
+        "url_host",
+        "url_path",
+        "url_credentials",
+        "username",
+        "uid",
+        "pid",
+        "port",
+        "container_id",
+        "systemd_unit",
         "free_text"
       ],
       "description": "Field classification"

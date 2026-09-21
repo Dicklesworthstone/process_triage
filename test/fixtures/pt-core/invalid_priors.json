@@ -3,19 +3,19 @@
   "description": "Invalid priors for error testing - priors don't sum to 1",
   "classes": {
     "useful": {
-      "prior_prob": 0.90,
+      "prior_prob": 0.9,
       "cpu_beta": { "alpha": 5.0, "beta": 3.0 }
     },
     "useful_bad": {
-      "prior_prob": 0.50,
+      "prior_prob": 0.5,
       "cpu_beta": { "alpha": 9.0, "beta": 1.0 }
     },
     "abandoned": {
-      "prior_prob": 0.30,
+      "prior_prob": 0.3,
       "cpu_beta": { "alpha": -1.0, "beta": 8.0 }
     },
     "zombie": {
-      "prior_prob": 0.10,
+      "prior_prob": 0.1,
       "cpu_beta": { "alpha": 1.0, "beta": 100.0 }
     }
   }

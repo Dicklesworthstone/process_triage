@@ -9,10 +9,7 @@
       "cp crates/pt-core/tests/fixtures/*.json test/fixtures/pt-core/",
       "add provenance fixture pack and debug trace fixtures"
     ],
-    "paths": [
-      "crates/pt-core/tests/fixtures",
-      "test/fixtures/pt-core"
-    ]
+    "paths": ["crates/pt-core/tests/fixtures", "test/fixtures/pt-core"]
   },
   "tool_versions": {
     "fixture_capture": "1.0.0",

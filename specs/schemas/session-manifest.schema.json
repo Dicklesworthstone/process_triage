@@ -30,7 +30,16 @@
     },
     "state": {
       "type": "string",
-      "enum": ["created", "scanning", "planned", "executing", "completed", "cancelled", "failed", "archived"],
+      "enum": [
+        "created",
+        "scanning",
+        "planned",
+        "executing",
+        "completed",
+        "cancelled",
+        "failed",
+        "archived"
+      ],
       "description": "Current session state"
     },
     "state_history": {
@@ -42,7 +51,16 @@
         "properties": {
           "state": {
             "type": "string",
-            "enum": ["created", "scanning", "planned", "executing", "completed", "cancelled", "failed", "archived"]
+            "enum": [
+              "created",
+              "scanning",
+              "planned",
+              "executing",
+              "completed",
+              "cancelled",
+              "failed",
+              "archived"
+            ]
           },
           "ts": {
             "type": "string",
@@ -109,10 +127,7 @@
           "description": "Session creation timestamp (UTC)"
         },
         "completed_at": {
-          "oneOf": [
-            { "type": "string", "format": "date-time" },
-            { "type": "null" }
-          ],
+          "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }],
           "description": "Session completion timestamp (UTC)"
         },
         "duration_ms": {
@@ -238,10 +253,7 @@
           "description": "Retention policy name"
         },
         "expires_at": {
-          "oneOf": [
-            { "type": "string", "format": "date-time" },
-            { "type": "null" }
-          ],
+          "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }],
           "description": "When this session expires (null = never)"
         },
         "preserve_for_priors": {
@@ -314,11 +326,11 @@
       "parent_session_id": null,
       "state": "completed",
       "state_history": [
-        {"state": "created", "ts": "2026-01-15T14:30:22Z"},
-        {"state": "scanning", "ts": "2026-01-15T14:30:23Z"},
-        {"state": "planned", "ts": "2026-01-15T14:30:45Z"},
-        {"state": "executing", "ts": "2026-01-15T14:31:02Z"},
-        {"state": "completed", "ts": "2026-01-15T14:31:15Z"}
+        { "state": "created", "ts": "2026-01-15T14:30:22Z" },
+        { "state": "scanning", "ts": "2026-01-15T14:30:23Z" },
+        { "state": "planned", "ts": "2026-01-15T14:30:45Z" },
+        { "state": "executing", "ts": "2026-01-15T14:31:02Z" },
+        { "state": "completed", "ts": "2026-01-15T14:31:15Z" }
       ],
       "mode": "interactive",
       "deep_scan": true,

@@ -3,14 +3,14 @@
   "description": "Valid priors fixture for config validation tests",
   "classes": {
     "useful": {
-      "prior_prob": 0.70,
+      "prior_prob": 0.7,
       "cpu_beta": { "alpha": 5.0, "beta": 3.0 },
       "orphan_beta": { "alpha": 1.0, "beta": 20.0 },
       "tty_beta": { "alpha": 5.0, "beta": 3.0 },
       "net_beta": { "alpha": 4.0, "beta": 4.0 }
     },
     "useful_bad": {
-      "prior_prob": 0.10,
+      "prior_prob": 0.1,
       "cpu_beta": { "alpha": 7.0, "beta": 2.0 },
       "orphan_beta": { "alpha": 2.0, "beta": 8.0 },
       "tty_beta": { "alpha": 4.0, "beta": 4.0 },

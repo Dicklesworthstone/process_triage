@@ -116,19 +116,10 @@
         "notes": "Queue processors"
       }
     ],
-    "protected_users": [
-      "root"
-    ],
+    "protected_users": ["root"],
     "protected_groups": [],
-    "protected_categories": [
-      "database",
-      "webserver",
-      "container",
-      "init"
-    ],
-    "never_kill_ppid": [
-      1
-    ],
+    "protected_categories": ["database", "webserver", "container", "init"],
+    "never_kill_ppid": [1],
     "never_kill_pid": [],
     "max_kills_per_run": 5,
     "max_kills_per_minute": 2,
@@ -146,11 +137,7 @@
     "require_known_signature": true,
     "require_policy_snapshot": true,
     "allow_categories": [],
-    "exclude_categories": [
-      "database",
-      "webserver",
-      "container"
-    ],
+    "exclude_categories": ["database", "webserver", "container"],
     "require_human_for_supervised": true
   },
   "signature_fast_path": {

@@ -48,7 +48,17 @@
         },
         "state": {
           "type": "string",
-          "enum": ["created", "planned", "approved", "executing", "interrupted", "completed", "verified", "cancelled", "failed"]
+          "enum": [
+            "created",
+            "planned",
+            "approved",
+            "executing",
+            "interrupted",
+            "completed",
+            "verified",
+            "cancelled",
+            "failed"
+          ]
         },
         "mode": {
           "type": "string"

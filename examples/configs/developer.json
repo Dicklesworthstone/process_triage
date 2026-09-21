@@ -55,16 +55,10 @@
       }
     ],
     "force_review_patterns": [],
-    "protected_users": [
-      "root"
-    ],
+    "protected_users": ["root"],
     "protected_groups": [],
-    "protected_categories": [
-      "database"
-    ],
-    "never_kill_ppid": [
-      1
-    ],
+    "protected_categories": ["database"],
+    "never_kill_ppid": [1],
     "never_kill_pid": [],
     "max_kills_per_run": 20,
     "max_kills_per_minute": 10,
@@ -81,11 +75,7 @@
     "max_kills": 15,
     "require_known_signature": false,
     "require_policy_snapshot": null,
-    "allow_categories": [
-      "test_runner",
-      "dev_server",
-      "build_tool"
-    ],
+    "allow_categories": ["test_runner", "dev_server", "build_tool"],
     "exclude_categories": [],
     "require_human_for_supervised": false
   },
