@@ -1758,7 +1758,37 @@ use pt_core::logging::{
 // Main entry point
 // ============================================================================
 
+/// Restore the default `SIGPIPE` disposition so a closed stdout pipe ends the
+/// process quietly instead of aborting it.
+///
+/// The Rust runtime ignores `SIGPIPE` before `main` runs, which turns every
+/// write to a closed pipe into an `EPIPE` error. `print!`/`println!` treat
+/// that error as fatal ("failed printing to stdout: Broken pipe") and, with
+/// the release profile's `panic = "abort"`, the process dies with `SIGABRT`
+/// and a core dump whenever a consumer such as `head`, `tail`, or an early
+/// exiting `jq` closes the pipe (GH #11). Restoring `SIG_DFL` makes the kernel
+/// terminate the process with `SIGPIPE` on the first such write, which is the
+/// conventional, silent behavior for command-line tools.
+///
+/// Network sockets are unaffected: the standard library sends on
+/// `TcpStream` with `MSG_NOSIGNAL` (or `SO_NOSIGPIPE`), so the daemon's
+/// metrics endpoint keeps receiving `EPIPE` errors rather than the signal.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: `signal(2)` with `SIG_DFL` only changes the disposition of
+    // SIGPIPE for this process. It runs first thing in `main`, before any
+    // threads are spawned or any I/O is performed, so no handler can race it.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 fn main() {
+    restore_default_sigpipe();
+
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let format_source = matches.value_source("format");
