@@ -161,7 +161,31 @@ impl EnvironDatabase {
                 .with_value("vscode"),
         );
 
-        // Claude
+        // Claude Code. The names it actually exports (verified from a live session on
+        // 2026-09-24): CLAUDECODE=1, CLAUDE_CODE_SESSION_ID, CLAUDE_CODE_ENTRYPOINT,
+        // CLAUDE_PID. The older names below are kept for earlier releases.
+        self.add(
+            EnvPattern::new("claude", SupervisorCategory::Agent, "CLAUDECODE", 0.95)
+                .with_value("1"),
+        );
+        self.add(EnvPattern::new(
+            "claude",
+            SupervisorCategory::Agent,
+            "CLAUDE_CODE_SESSION_ID",
+            0.95,
+        ));
+        self.add(EnvPattern::new(
+            "claude",
+            SupervisorCategory::Agent,
+            "CLAUDE_CODE_ENTRYPOINT",
+            0.90,
+        ));
+        self.add(EnvPattern::new(
+            "claude",
+            SupervisorCategory::Agent,
+            "CLAUDE_PID",
+            0.90,
+        ));
         self.add(EnvPattern::new(
             "claude",
             SupervisorCategory::Agent,
@@ -485,6 +509,31 @@ mod tests {
             .filter(|p| p.supervisor_name == "vscode")
             .collect();
         assert!(!vscode_patterns.is_empty());
+    }
+
+    /// The environment a current Claude Code session actually exports must be
+    /// recognized (the database previously only knew names Claude Code never sets).
+    #[test]
+    fn current_claude_code_environment_is_recognized() {
+        let db = EnvironDatabase::with_defaults();
+        let env: HashMap<String, String> = [
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_SESSION_ID", "3f1c"),
+            ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let matches = db.find_matches(&env);
+        assert!(
+            matches.iter().any(|(p, _)| p.supervisor_name == "claude"),
+            "claude env not recognized: {matches:?}"
+        );
+        // CLAUDECODE requires the value "1".
+        let other: HashMap<String, String> = [("CLAUDECODE".to_string(), "0".to_string())]
+            .into_iter()
+            .collect();
+        assert!(db.find_matches(&other).is_empty());
     }
 
     #[test]

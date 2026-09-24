@@ -12975,13 +12975,30 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         summary["goal_selected_count"] = serde_json::json!(kill_candidates.len());
     }
 
+    // Bayesian FDR estimate of the kill set: the expected fraction of recommended
+    // kills that are NOT abandoned/zombie, under the model's own posterior. (This
+    // replaces a hard-coded `fleet_fdr: 0.03` placeholder.)
+    let kill_set_fdr_estimate = {
+        let kill_pids: HashSet<u32> = kill_candidates.iter().copied().collect();
+        let not_abandoned: Vec<f64> = candidates
+            .iter()
+            .filter(|c| kill_pids.contains(&(c["pid"].as_u64().unwrap_or(0) as u32)))
+            .filter_map(|c| {
+                let p = &c["posterior"];
+                Some(1.0 - (p["abandoned"].as_f64()? + p["zombie"].as_f64()?))
+            })
+            .collect();
+        (!not_abandoned.is_empty())
+            .then(|| not_abandoned.iter().sum::<f64>() / not_abandoned.len() as f64)
+    };
+
     // Build recommendations section (new structured format)
     let mut recommendations = serde_json::json!({
         "kill_set": kill_candidates,
         "review_set": review_candidates,
         "spare_set": spare_candidates,
         "expected_memory_freed_gb": (expected_memory_freed_gb * 100.0).round() / 100.0,
-        "fleet_fdr": 0.03, // Placeholder - would come from fleet-wide statistics
+        "kill_set_fdr_estimate": kill_set_fdr_estimate,
     });
     if let Some(goal) = &goal_summary {
         recommendations["goal"] = goal.clone();
