@@ -3,7 +3,6 @@
 //! Shows selection summary, action plan preview, and quick stats.
 
 use ftui::text::{Line as FtuiLine, Span as FtuiSpan, Text as FtuiText};
-use ftui::widgets::block::Block as FtuiBlock;
 use ftui::widgets::paragraph::Paragraph as FtuiParagraph;
 use ftui::widgets::Widget as FtuiWidget;
 use ftui::PackedRgba;
@@ -105,7 +104,7 @@ impl<'a> AuxPanel<'a> {
             .map(|t| t.stylesheet().get_or_default("border.normal"))
             .unwrap_or_default();
 
-        let block = FtuiBlock::bordered()
+        let block = super::panel_block()
             .title(" Action Preview ")
             .border_style(border_style);
 

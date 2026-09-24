@@ -29,3 +29,13 @@ pub use process_table::{
 };
 pub use search_input::{SearchInput, SearchInputState};
 pub use status_bar::{StatusBar, StatusMode};
+
+/// A bordered panel block with NO inner padding.
+///
+/// ftui 0.2.1 made `Block::bordered()` default to one cell of padding on every
+/// side. pt's layouts were designed without padding: the 3-row search box then
+/// had a zero-height inner area (its placeholder vanished) and every panel shifted
+/// by one column. All pt panels use this constructor instead of `bordered()`.
+pub(crate) fn panel_block<'a>() -> ftui::widgets::block::Block<'a> {
+    ftui::widgets::block::Block::bordered().padding(ftui::layout::Sides::all(0))
+}

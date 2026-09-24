@@ -7343,7 +7343,36 @@ fn apply_process_tree_safety(
         }
     };
 
+    let is_active = |c: &serde_json::Value| {
+        !matches!(
+            c.get("recommended_action").and_then(|v| v.as_str()),
+            Some("keep") | Some("review") | None
+        )
+    };
+
     let mut downgraded = 0;
+    // Agent rule first: no automatic action at all (SIGSTOP of an agent's tool process
+    // can hang the agent just as a kill can break it).
+    if agent_rule {
+        for c in candidates.iter_mut() {
+            if !is_active(c) {
+                continue;
+            }
+            let pid = pid_of(c);
+            if let Some(agent) = agent_ancestor(pid) {
+                downgrade(
+                    c,
+                    format!(
+                        "Downgraded to review: started by live agent session {agent}; \
+                         the agent may be waiting on it"
+                    ),
+                    "agent_descendant",
+                );
+                kill_set.remove(&pid);
+                downgraded += 1;
+            }
+        }
+    }
     loop {
         let mut changed = false;
         for c in candidates.iter_mut() {
@@ -7363,15 +7392,6 @@ fn apply_process_tree_safety(
                          not being killed; killing this process would take it down too"
                     ),
                     "live_child",
-                );
-            } else if let Some(agent) = agent_rule.then(|| agent_ancestor(pid)).flatten() {
-                downgrade(
-                    c,
-                    format!(
-                        "Kill downgraded to review: started by live agent session {agent}; \
-                         the agent may be waiting on it"
-                    ),
-                    "agent_descendant",
                 );
             } else {
                 continue;
@@ -10580,6 +10600,17 @@ mod process_tree_safety_tests {
         assert_eq!(n, 4);
         let v301 = values.iter().find(|v| v["pid"] == 301).unwrap();
         assert_eq!(v301["tree_safety"]["rule"], "agent_descendant");
+
+        // Non-kill active actions under a live agent are capped too (SIGSTOP of an
+        // agent's tool process can hang the agent); keep stays keep.
+        let mut more = [
+            serde_json::json!({"pid": 301, "recommended_action": "pause"}),
+            serde_json::json!({"pid": 200, "recommended_action": "keep"}),
+        ];
+        let mut refs: Vec<&mut serde_json::Value> = more.iter_mut().collect();
+        assert_eq!(apply_process_tree_safety(&mut refs, &procs, true), 1);
+        assert_eq!(more[0]["recommended_action"], "review");
+        assert_eq!(more[1]["recommended_action"], "keep");
     }
 }
 
@@ -12527,10 +12558,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             policy_blocked_count += 1;
             recommended_action = "review";
         }
-        // Agent CLI sessions (claude/codex/agy/...) are never pre-selected for a kill:
-        // they may be mid-task. Surface them for manual review instead.
+        // Agent CLI sessions (claude/codex/agy/...) never get an automatic action
+        // (kill, pause/SIGSTOP, renice, ...): they may be mid-task. Surface them for
+        // manual review instead. (The fleet reality e2e caught `pause` recommended
+        // for 8 live codex sessions when only `kill` was downgraded.)
         let agent_force_review = decision_policy.guardrails.builtin_protection
-            && recommended_action == "kill"
+            && !matches!(recommended_action, "keep" | "review")
             && pt_core::collect::protected::builtin_force_review_match(&proc.cmd).is_some();
         if agent_force_review {
             recommended_action = "review";
@@ -12544,8 +12577,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 .map(|v| format!("Policy blocked: {}", v.message))
                 .unwrap_or_else(|| "Policy blocked".to_string())
         } else if agent_force_review {
-            "Kill downgraded to review: AI agent CLI session (may be mid-task); \
-             kill only after manual review"
+            "Downgraded to review: AI agent CLI session (may be mid-task); \
+             act only after manual review"
                 .to_string()
         } else {
             format!(

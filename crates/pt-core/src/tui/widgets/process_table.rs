@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 
 use ftui::layout::Constraint as FtuiConstraint;
 use ftui::text::{Line as FtuiLine, Span as FtuiSpan, Text as FtuiText};
-use ftui::widgets::block::Block as FtuiBlock;
 use ftui::widgets::table::{Row as FtuiRow, Table as FtuiTable, TableState as FtuiTableState};
 use ftui::widgets::StatefulWidget as FtuiStatefulWidget;
 use ftui::PackedRgba;
@@ -418,7 +417,7 @@ impl<'a> FtuiStatefulWidget for ProcessTable<'a> {
                 .map(|t| t.class("status.warning"))
                 .unwrap_or_default();
 
-            let block = FtuiBlock::bordered()
+            let block = super::panel_block()
                 .title(&title)
                 .border_style(border_style);
 
@@ -432,7 +431,7 @@ impl<'a> FtuiStatefulWidget for ProcessTable<'a> {
 
         let parts = self.build_ftui_table_parts(state, area.width);
 
-        let block = FtuiBlock::bordered()
+        let block = super::panel_block()
             .title(&title)
             .border_style(border_style);
 
@@ -480,7 +479,7 @@ impl<'a> ProcessTable<'a> {
                 .map(|t| t.class("status.warning"))
                 .unwrap_or_default();
 
-            let block = FtuiBlock::bordered()
+            let block = super::panel_block()
                 .title(&title)
                 .border_style(border_style);
 
@@ -494,7 +493,7 @@ impl<'a> ProcessTable<'a> {
 
         let parts = self.build_ftui_table_parts(state, area.width);
 
-        let block = FtuiBlock::bordered()
+        let block = super::panel_block()
             .title(&title)
             .border_style(border_style);
 

@@ -5,7 +5,7 @@
 use ftui::layout::Constraint as FtuiConstraint;
 use ftui::layout::Flex;
 use ftui::text::{Line as FtuiLine, Span as FtuiSpan, Text as FtuiText};
-use ftui::widgets::block::{Alignment as FtuiAlignment, Block as FtuiBlock};
+use ftui::widgets::block::Alignment as FtuiAlignment;
 use ftui::widgets::paragraph::Paragraph as FtuiParagraph;
 use ftui::widgets::Widget as FtuiWidget;
 use ftui::PackedRgba;
@@ -114,7 +114,7 @@ impl<'a> ProcessDetail<'a> {
             .map(|t| t.stylesheet().get_or_default("border.normal"))
             .unwrap_or_default();
 
-        let block = FtuiBlock::bordered()
+        let block = super::panel_block()
             .title(" Detail ")
             .border_style(border_style);
 

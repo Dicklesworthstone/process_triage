@@ -4,7 +4,7 @@
 //! Uses ftui's Block and Paragraph for rendering.
 
 use ftui::text::{Line as FtuiLine, Span as FtuiSpan, Text as FtuiText};
-use ftui::widgets::block::{Alignment as FtuiAlignment, Block as FtuiBlock};
+use ftui::widgets::block::Alignment as FtuiAlignment;
 use ftui::widgets::paragraph::Paragraph as FtuiParagraph;
 use ftui::widgets::Widget as FtuiWidget;
 use ftui::PackedRgba;
@@ -154,7 +154,7 @@ impl<'a> ConfigEditor<'a> {
             " Configuration "
         };
 
-        let block = FtuiBlock::bordered()
+        let block = super::panel_block()
             .title(title)
             .border_style(self.border_ftui_style(focused));
 

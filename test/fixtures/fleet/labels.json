@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Label rules for the live fleet reality e2e (scripts/fleet_reality_e2e.py). Rules, not captured data: process_triage is a public repository and fleet command lines are private. Every must_not_act class below was rated P(abandoned)~1.0 by pt 2.1.0 on the 2026-09-24 fleet scan.",
+  "must_not_act": {
+    "_comment": "Candidates matching these must never be recommended for any action other than keep/review (kill, restart, pause, renice, throttle, freeze, quarantine are all violations). Regexes are matched against the full command line.",
+    "agent_cli": "(^|/)(claude|codex|agy|agy-real|gemini|cursor-agent|aider|opencode|goose)(\\s|$)|/claude/versions/|@anthropic-ai/claude-code|@openai/codex|/codex-(linux|darwin)-",
+    "mux_server": "(^|/)((frankenterm|wezterm)-mux-server|tmux|zellij|screen)(:|\\s|$)",
+    "mux_transport": "^(\\S*/)?(nc|ncat|netcat|socat)\\s.*(frankenterm|wezterm|tmux|zellij)",
+    "ssh_control_master": "^(\\S*/)?ssh\\s(.*\\s)?(-M{1,2}|-oControlMaster=\\S+|ControlMaster=(yes|auto|autoask|ask))(\\s|$)",
+    "session_infra": "^(\\S*/)?(sshd(-session)?|login|agetty|getty|\\(sd-pam\\)|systemd|dbus-daemon|dbus-broker|pipewire|wireplumber|pulseaudio|gpg-agent|ssh-agent)(:|\\s|$)",
+    "db_web_worker": "^(postgres:|nginx: |mysqld|redis-server|/mattermost/)",
+    "interactive_shell": "^-?(\\S*/)?(ba|z|fi|da|k|tc)?sh(\\s+(-l|--login|-i))*$",
+    "pt_itself": "(^|/)pt-core(\\s|$)"
+  },
+  "should_surface": {
+    "_comment": "Informational (not a gate): processes a human would want to see near the top. Reported as recall of these classes among candidates with suspicion score >= 50.",
+    "orphan_sleep_timer": "^(\\S*/)?sleep\\s+[0-9]{4,}$",
+    "stale_http_server": "python3? -m http\\.server",
+    "headless_browser": "(Xvfb|chrome.*--headless|chrome.*swiftshader)",
+    "test_runner": "(cargo (test|nextest)|bun test|pytest|jest|vitest)"
+  },
+  "gates": {
+    "must_not_act_violations_max": 0,
+    "candidates_younger_than_min_age_max": 0,
+    "impossible_age_max": 0,
+    "plan_wall_seconds_max": 60
+  }
+}

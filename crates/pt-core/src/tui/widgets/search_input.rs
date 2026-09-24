@@ -2,7 +2,6 @@
 //!
 //! Uses ftui's built-in TextInput for rendering.
 
-use ftui::widgets::block::Block as FtuiBlock;
 use ftui::widgets::input::TextInput as FtuiTextInput;
 use ftui::widgets::Widget as FtuiWidget;
 use ftui::Style as FtuiStyle;
@@ -72,9 +71,7 @@ impl<'a> SearchInput<'a> {
             })
             .unwrap_or_default();
 
-        let block = FtuiBlock::bordered()
-            .title(title)
-            .border_style(border_style);
+        let block = super::panel_block().title(title).border_style(border_style);
 
         let inner = block.inner(area);
         FtuiWidget::render(&block, area, frame);
@@ -143,9 +140,7 @@ impl<'a> SearchInput<'a> {
             })
             .unwrap_or_default();
 
-        let block = FtuiBlock::bordered()
-            .title(title)
-            .border_style(border_style);
+        let block = super::panel_block().title(title).border_style(border_style);
 
         let inner = block.inner(area);
         FtuiWidget::render(&block, area, frame);

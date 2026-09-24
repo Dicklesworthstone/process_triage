@@ -4,7 +4,6 @@
 //! Uses ftui's Modal + Block + Paragraph for rendering.
 
 use ftui::text::{Line as FtuiLine, Span as FtuiSpan, Text as FtuiText};
-use ftui::widgets::block::Block as FtuiBlock;
 use ftui::widgets::modal::{Modal, ModalPosition, ModalSizeConstraints};
 use ftui::widgets::paragraph::Paragraph as FtuiParagraph;
 use ftui::widgets::Widget as FtuiWidget;
@@ -275,7 +274,7 @@ impl<'a> HelpOverlay<'a> {
             })
             .unwrap_or_default();
 
-        let block = FtuiBlock::bordered()
+        let block = super::panel_block()
             .title(" Help ")
             .border_style(border_style);
 
