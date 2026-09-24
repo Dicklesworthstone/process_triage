@@ -289,10 +289,9 @@ impl Drop for BatchedWriter {
     fn drop(&mut self) {
         // Best-effort flush, close, and rename on drop
         let mut finalize_ok = true;
-        if !self.buffer.is_empty()
-            && self.flush().is_err() {
-                finalize_ok = false;
-            }
+        if !self.buffer.is_empty() && self.flush().is_err() {
+            finalize_ok = false;
+        }
 
         if let Some(writer) = self.writer.take() {
             if writer.close().is_err() {

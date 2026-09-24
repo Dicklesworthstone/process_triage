@@ -950,6 +950,10 @@ mod tests {
                 top_evidence: Vec::new(),
                 confidence: Some("medium".to_string()),
                 plan_preview: Vec::new(),
+                provenance_headline: None,
+                provenance_sections: Vec::new(),
+                provenance_caveats: Vec::new(),
+                blast_radius_risk: None,
             },
             ProcessRow {
                 pid: 9012,
@@ -964,6 +968,10 @@ mod tests {
                 top_evidence: Vec::new(),
                 confidence: Some("low".to_string()),
                 plan_preview: Vec::new(),
+                provenance_headline: None,
+                provenance_sections: Vec::new(),
+                provenance_caveats: Vec::new(),
+                blast_radius_risk: None,
             },
         ]
     }

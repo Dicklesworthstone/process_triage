@@ -807,10 +807,15 @@ pub fn local_search_improve(
                 if still_feasible {
                     // Perform swap.
                     result.total_loss += loss_delta;
-                    for g in 0..goals.len() {
+                    for (g, total) in result
+                        .total_contributions
+                        .iter_mut()
+                        .enumerate()
+                        .take(goals.len())
+                    {
                         let old_c = old.contributions.get(g).copied().unwrap_or(0.0);
                         let new_c = replacement.contributions.get(g).copied().unwrap_or(0.0);
-                        result.total_contributions[g] += new_c - old_c;
+                        *total += new_c - old_c;
                     }
                     result.selected[i] = SelectedAction {
                         id: replacement.id.clone(),

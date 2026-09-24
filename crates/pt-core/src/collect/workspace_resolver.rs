@@ -368,8 +368,7 @@ mod tests {
         let nf = io_error_to_resolution(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
         assert_eq!(nf, PathResolutionError::NotFound);
 
-        let other =
-            io_error_to_resolution(std::io::Error::other("something"));
+        let other = io_error_to_resolution(std::io::Error::other("something"));
         match other {
             PathResolutionError::IoError { message } => assert!(message.contains("something")),
             _ => panic!("expected IoError variant"),

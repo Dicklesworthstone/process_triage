@@ -355,11 +355,7 @@ impl CommandNormalizer {
             "test", "serve", "dev", "build", "watch", "run", "start", "exec", "lint", "check",
             "format", "compile", "bundle",
         ];
-        if important_subcommands.contains(&arg.to_lowercase().as_str()) {
-            return true;
-        }
-
-        false
+        important_subcommands.contains(&arg.to_lowercase().as_str())
     }
 
     /// Check if an argument is a primary flag (worth keeping at broad level).

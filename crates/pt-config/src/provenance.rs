@@ -730,8 +730,12 @@ mod tests {
     #[test]
     fn degradation_level_ordering() {
         assert!(ProvenanceDegradationLevel::Full < ProvenanceDegradationLevel::SkipNarrative);
-        assert!(ProvenanceDegradationLevel::SkipNarrative < ProvenanceDegradationLevel::SkipBlastRadius);
-        assert!(ProvenanceDegradationLevel::SkipBlastRadius < ProvenanceDegradationLevel::SkipResources);
+        assert!(
+            ProvenanceDegradationLevel::SkipNarrative < ProvenanceDegradationLevel::SkipBlastRadius
+        );
+        assert!(
+            ProvenanceDegradationLevel::SkipBlastRadius < ProvenanceDegradationLevel::SkipResources
+        );
         assert!(ProvenanceDegradationLevel::SkipResources < ProvenanceDegradationLevel::Disabled);
     }
 

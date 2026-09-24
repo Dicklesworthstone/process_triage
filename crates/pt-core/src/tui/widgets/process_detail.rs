@@ -409,9 +409,7 @@ impl<'a> ProcessDetail<'a> {
         let mut action = Vec::new();
         if let Some(ref risk) = row.blast_radius_risk {
             let risk_style = match risk.as_str() {
-                "critical" | "high" => {
-                    FtuiStyle::new().fg(PackedRgba::rgb(255, 80, 80)).bold()
-                }
+                "critical" | "high" => FtuiStyle::new().fg(PackedRgba::rgb(255, 80, 80)).bold(),
                 "medium" => FtuiStyle::new().fg(PackedRgba::rgb(255, 200, 0)),
                 _ => value,
             };
@@ -465,7 +463,9 @@ mod tests {
             ],
             confidence: Some("high".to_string()),
             plan_preview: Vec::new(),
-            provenance_headline: Some("Provenance: low blast radius; moderate evidence".to_string()),
+            provenance_headline: Some(
+                "Provenance: low blast radius; moderate evidence".to_string(),
+            ),
             provenance_sections: vec![
                 (
                     "\u{1F517}".to_string(),

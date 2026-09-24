@@ -696,11 +696,21 @@ impl ConstraintChecker {
             self.kill_count.fetch_add(1, Ordering::Release);
         }
         // Use saturating add to prevent u64 wrapping that could bypass blast radius checks
-        self.accumulated_blast_bytes
-            .fetch_update(Ordering::Release, Ordering::Acquire, |current| {
-                Some(current.saturating_add(memory_bytes))
-            })
-            .unwrap(); // safe: closure always returns Some
+        // (Explicit CAS loop: `fetch_update` is deprecated on current nightly and its
+        // replacement `try_update` is newer than the 1.88 MSRV.)
+        let mut current = self.accumulated_blast_bytes.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_add(memory_bytes);
+            match self.accumulated_blast_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Get current metrics.

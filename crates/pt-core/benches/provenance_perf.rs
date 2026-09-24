@@ -18,7 +18,9 @@ use pt_common::{
     ResourceKind, ResourceState,
 };
 use pt_core::collect::shared_resource_graph::SharedResourceGraph;
-use pt_core::decision::blast_radius_estimator::{estimate_blast_radius, BlastRadiusEstimatorConfig};
+use pt_core::decision::blast_radius_estimator::{
+    estimate_blast_radius, BlastRadiusEstimatorConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -39,7 +41,10 @@ fn lock_evidence(pid: u32, path: &str) -> RawResourceEvidence {
     }
 }
 
-fn build_evidence_set(n_processes: usize, n_shared_locks: usize) -> Vec<(u32, Vec<RawResourceEvidence>)> {
+fn build_evidence_set(
+    n_processes: usize,
+    n_shared_locks: usize,
+) -> Vec<(u32, Vec<RawResourceEvidence>)> {
     let mut evidence = Vec::with_capacity(n_processes);
     for i in 0..n_processes {
         let pid = 1000 + i as u32;
@@ -69,9 +74,7 @@ fn sample_provenance_output(n_terms: usize) -> CandidateProvenanceOutput {
         enabled: true,
         evidence_completeness: 0.85,
         confidence_penalty_steps: 1,
-        confidence_notes: vec![
-            "resource provenance has 2 unresolved edge(s)".to_string(),
-        ],
+        confidence_notes: vec!["resource provenance has 2 unresolved edge(s)".to_string()],
         score_terms: features.iter().map(|f| f.feature.clone()).collect(),
         blast_radius: CandidateBlastRadiusOutput {
             risk_score: 0.35,
@@ -98,7 +101,10 @@ fn bench_resource_graph_construction(c: &mut Criterion) {
     for &(n_procs, n_shared) in &[(10, 2), (50, 5), (200, 10)] {
         let evidence = build_evidence_set(n_procs, n_shared);
         group.bench_with_input(
-            BenchmarkId::new("from_evidence", format!("{}proc_{}shared", n_procs, n_shared)),
+            BenchmarkId::new(
+                "from_evidence",
+                format!("{}proc_{}shared", n_procs, n_shared),
+            ),
             &evidence,
             |b, ev| {
                 b.iter(|| {

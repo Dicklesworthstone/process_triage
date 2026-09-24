@@ -85,6 +85,10 @@ fn sample_row(trace: Option<String>) -> ProcessRow {
         top_evidence: vec!["PPID=1".to_string(), "Idle>2h".to_string()],
         confidence: Some("high".to_string()),
         plan_preview: vec!["SIGTERM -> SIGKILL".to_string()],
+        provenance_headline: None,
+        provenance_sections: Vec::new(),
+        provenance_caveats: Vec::new(),
+        blast_radius_risk: None,
     }
 }
 

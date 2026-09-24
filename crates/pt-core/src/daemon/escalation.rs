@@ -195,7 +195,7 @@ where
     EscalationOutcome {
         status: EscalationStatus::Completed,
         reason: "escalation completed".to_string(),
-        session_id: None, // Caller fills in after creating the session.
+        session_id: None,         // Caller fills in after creating the session.
         provenance_summary: None, // Caller populates after scan completes.
     }
 }

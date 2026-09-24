@@ -308,6 +308,7 @@ fn scan_result_conversion_zombie_becomes_candidate() {
         scan: Some(scan),
         error: None,
         duration_ms: 150,
+        provenance: None,
     };
 
     let input = scan_result_to_host_input(&host_result);
@@ -334,6 +335,7 @@ fn scan_result_conversion_normal_process_filtered_out() {
         scan: Some(scan),
         error: None,
         duration_ms: 200,
+        provenance: None,
     };
 
     let input = scan_result_to_host_input(&host_result);
@@ -381,6 +383,7 @@ fn scan_result_conversion_mixed_processes() {
         scan: Some(scan),
         error: None,
         duration_ms: 300,
+        provenance: None,
     };
 
     let input = scan_result_to_host_input(&host_result);
@@ -407,6 +410,7 @@ fn scan_result_conversion_failed_host_produces_empty_input() {
         scan: None,
         error: Some("connection refused".to_string()),
         duration_ms: 5000,
+        provenance: None,
     };
 
     let input = scan_result_to_host_input(&host_result);
@@ -654,7 +658,7 @@ fn safety_budget_allocation() {
     assert!((session.safety_budget.alpha_spent).abs() < f64::EPSILON);
 
     // Each host gets 0.03 (= 0.09 / 3)
-    for (_, alloc) in &session.safety_budget.host_allocations {
+    for alloc in session.safety_budget.host_allocations.values() {
         assert!((*alloc - 0.03).abs() < f64::EPSILON);
     }
 }
@@ -824,6 +828,7 @@ fn e2e_scan_to_fleet_session_pipeline() {
                 scan: Some(host1_scan),
                 error: None,
                 duration_ms: 200,
+                provenance: None,
             },
             HostScanResult {
                 host: "web2".to_string(),
@@ -831,6 +836,7 @@ fn e2e_scan_to_fleet_session_pipeline() {
                 scan: Some(host2_scan),
                 error: None,
                 duration_ms: 300,
+                provenance: None,
             },
             HostScanResult {
                 host: "db1".to_string(),
@@ -838,9 +844,11 @@ fn e2e_scan_to_fleet_session_pipeline() {
                 scan: Some(host3_scan),
                 error: None,
                 duration_ms: 150,
+                provenance: None,
             },
         ],
         duration_ms: 350,
+        provenance_aggregate: None,
     };
 
     // Convert scan results to host inputs.
@@ -911,6 +919,7 @@ fn e2e_mixed_success_failure_fleet() {
                 scan: Some(good_scan),
                 error: None,
                 duration_ms: 200,
+                provenance: None,
             },
             HostScanResult {
                 host: "fail-host1".to_string(),
@@ -918,6 +927,7 @@ fn e2e_mixed_success_failure_fleet() {
                 scan: None,
                 error: Some("connection refused".to_string()),
                 duration_ms: 5000,
+                provenance: None,
             },
             HostScanResult {
                 host: "fail-host2".to_string(),
@@ -925,9 +935,11 @@ fn e2e_mixed_success_failure_fleet() {
                 scan: None,
                 error: Some("timeout".to_string()),
                 duration_ms: 30000,
+                provenance: None,
             },
         ],
         duration_ms: 30100,
+        provenance_aggregate: None,
     };
 
     let host_inputs: Vec<HostInput> = fleet_result
@@ -1170,6 +1182,7 @@ fn fleet_scan_result_json_roundtrip() {
                 scan: Some(scan),
                 error: None,
                 duration_ms: 100,
+                provenance: None,
             },
             HostScanResult {
                 host: "fail".to_string(),
@@ -1177,9 +1190,11 @@ fn fleet_scan_result_json_roundtrip() {
                 scan: None,
                 error: Some("timeout".to_string()),
                 duration_ms: 30000,
+                provenance: None,
             },
         ],
         duration_ms: 30100,
+        provenance_aggregate: None,
     };
 
     let json = serde_json::to_string(&result).unwrap();

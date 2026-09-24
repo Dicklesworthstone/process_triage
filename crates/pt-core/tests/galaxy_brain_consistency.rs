@@ -1476,7 +1476,7 @@ fn test_galaxy_brain_why_summary_no_secrets() {
                 "why_summary for {} contains sensitive pattern '{}': {}",
                 name,
                 pattern_name,
-                &ledger.why_summary
+                ledger.why_summary
             );
         }
 
