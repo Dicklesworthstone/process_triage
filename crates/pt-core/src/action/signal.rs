@@ -91,6 +91,29 @@ impl SignalActionRunner {
         }
     }
 
+    /// Open a pidfd pinned to the planned process (Linux >= 5.3), if available.
+    ///
+    /// `Ok(None)` means pidfds are unsupported here (fall back to `kill(2)`).
+    #[cfg(target_os = "linux")]
+    fn pinned_pidfd(&self, action: &PlanAction) -> Result<Option<PidFd>, ActionError> {
+        let pid = action.target.pid.0;
+        let Some(fd) = PidFd::open(pid)? else {
+            return Ok(None);
+        };
+        // The pidfd now refers to whatever process holds `pid` right now. Confirm it
+        // is the planned one (exact start ticks). If the pid was reused after the
+        // open, /proc shows the newcomer and we refuse; if it is reused after this
+        // check, signals sent through the pidfd fail with ESRCH instead of hitting
+        // the newcomer.
+        match self.read_starttime(pid) {
+            Some(current) if ids_match_starttime(&action.target.start_id.0, current) => {
+                Ok(Some(fd))
+            }
+            Some(_) => Err(ActionError::IdentityMismatch),
+            None => Err(ActionError::ProcessNotFound),
+        }
+    }
+
     /// Check if a process exists.
     #[cfg(unix)]
     fn process_exists(&self, pid: u32) -> bool {
@@ -189,6 +212,12 @@ impl SignalActionRunner {
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
 
+        #[cfg(target_os = "linux")]
+        if !use_group {
+            if let Some(pidfd) = self.pinned_pidfd(action)? {
+                return pidfd.send(libc::SIGSTOP);
+            }
+        }
         self.send_signal(target, libc::SIGSTOP, use_group)?;
         Ok(())
     }
@@ -198,6 +227,25 @@ impl SignalActionRunner {
     fn execute_kill(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
+
+        // Linux: SIGTERM and the SIGKILL escalation both go through one pidfd pinned
+        // to the verified process, closing the PID-reuse window completely.
+        #[cfg(target_os = "linux")]
+        if !use_group {
+            if let Some(pidfd) = self.pinned_pidfd(action)? {
+                pidfd.send(libc::SIGTERM)?;
+                let grace = Duration::from_millis(self.config.term_grace_ms);
+                return match self.wait_for_state_change(pid, true, None, grace) {
+                    Ok(()) => Ok(()),
+                    Err(ActionError::Timeout) => match pidfd.send(libc::SIGKILL) {
+                        // Exited between the grace timeout and SIGKILL: done.
+                        Err(ActionError::ProcessNotFound) => Ok(()),
+                        other => other,
+                    },
+                    Err(e) => Err(e),
+                };
+            }
+        }
 
         // Stage 1: SIGTERM
         self.send_signal(target, libc::SIGTERM, use_group)?;
@@ -459,40 +507,100 @@ impl super::executor::IdentityProvider for LiveIdentityProvider {
     }
 }
 
-/// Check if two start_ids match (handle format variations).
+/// A pidfd (Linux >= 5.3): a file descriptor pinned to one specific process.
+/// Signals sent through it can never reach a process that later reuses the PID.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PidFd(libc::c_int);
+
+#[cfg(target_os = "linux")]
+impl PidFd {
+    /// `Ok(None)` when the kernel lacks pidfd support.
+    fn open(pid: u32) -> Result<Option<Self>, ActionError> {
+        // SAFETY: plain syscall with integer arguments; the returned fd is owned below.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if fd >= 0 {
+            return Ok(Some(PidFd(fd as libc::c_int)));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ESRCH) => Err(ActionError::ProcessNotFound),
+            Some(libc::ENOSYS) => Ok(None),
+            _ => Err(ActionError::Failed(format!("pidfd_open({pid}): {err}"))),
+        }
+    }
+
+    fn send(&self, signal: i32) -> Result<(), ActionError> {
+        // SAFETY: valid owned fd; null siginfo is allowed; flags must be 0.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0,
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ESRCH) => Err(ActionError::ProcessNotFound),
+            Some(libc::EPERM) => Err(ActionError::PermissionDenied),
+            _ => Err(ActionError::Failed(format!("pidfd_send_signal: {err}"))),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PidFd {
+    fn drop(&mut self) {
+        // SAFETY: we own this fd and close it exactly once.
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
+/// Values of a `boot_id:start_ticks:pid` start id that are known (not placeholders).
+fn parse_start_id(id: &str) -> (Option<&str>, Option<u64>, Option<u32>) {
+    let parts: Vec<&str> = id.split(':').collect();
+    let known = |s: &str| !s.is_empty() && !matches!(s, "unknown" | "synthetic");
+    match parts.as_slice() {
+        [ticks] => (None, ticks.parse().ok(), None),
+        [boot, ticks, pid] => (
+            Some(*boot).filter(|b| known(b)),
+            ticks.parse().ok(),
+            pid.parse().ok(),
+        ),
+        _ => (None, None, None),
+    }
+}
+
+/// Check whether a plan's start_id identifies the same process as the live one.
+///
+/// Both boot ids (when known), pids (when present) and start ticks must agree
+/// exactly. Plans record exact /proc start ticks on Linux, so the old +-150-tick
+/// tolerance (for ps-estimated ids) only widened the PID-reuse window, and the old
+/// check ignored the boot id entirely.
 fn ids_match(expected: &str, current: &str) -> bool {
-    // Direct match
     if expected == current {
         return true;
     }
-
-    // Extract starttime portion and compare
-    // Format may be: "boot_id:starttime:pid" or just "starttime" or "boot:starttime:pid"
-    fn extract_starttime(id: &str) -> Option<&str> {
-        let parts: Vec<&str> = id.split(':').collect();
-        match parts.len() {
-            1 => Some(parts[0]),
-            3 => Some(parts[1]),
-            _ => None,
+    let (e_boot, e_ticks, e_pid) = parse_start_id(expected);
+    let (c_boot, c_ticks, c_pid) = parse_start_id(current);
+    if let (Some(a), Some(b)) = (e_boot, c_boot) {
+        if a != b {
+            return false;
         }
     }
-
-    match (extract_starttime(expected), extract_starttime(current)) {
-        (Some(e), Some(c)) => {
-            // Try integer comparison with fuzzy window (to handle ps rounding)
-            if let (Ok(e_ticks), Ok(c_ticks)) = (e.parse::<u64>(), c.parse::<u64>()) {
-                // If diff is within 1 second (100Hz = 100 ticks), treat as match
-                // We use 150 to be safe against rounding + small drift
-                let diff = e_ticks.abs_diff(c_ticks);
-                if diff <= 150 {
-                    return true;
-                }
-            }
-            // Fallback to exact string match
-            e == c
+    if let (Some(a), Some(b)) = (e_pid, c_pid) {
+        if a != b {
+            return false;
         }
-        _ => false,
     }
+    matches!((e_ticks, c_ticks), (Some(a), Some(b)) if a == b)
 }
 
 /// Check whether a start_id string matches a raw starttime value (u64).
@@ -514,8 +622,8 @@ fn ids_match_starttime(start_id: &str, current_starttime: u64) -> bool {
     if let Some(expected) = extract_starttime(start_id) {
         #[cfg(target_os = "linux")]
         {
-            // Linux ticks (usually 100Hz) - allow 1.5s jitter
-            expected.abs_diff(current_starttime) <= 150
+            // Exact: plan start ids carry the kernel's start ticks (see ids_match).
+            expected == current_starttime
         }
         #[cfg(target_os = "macos")]
         {
@@ -550,8 +658,12 @@ mod tests {
     }
 
     #[test]
-    fn ids_match_starttime_only() {
-        assert!(ids_match("abc:123:456", "def:123:789"));
+    fn ids_match_requires_same_boot_and_pid() {
+        // Same ticks after a reboot, or on another pid, is a different process.
+        assert!(!ids_match("abc:123:456", "def:123:456"));
+        assert!(!ids_match("abc:123:456", "abc:123:789"));
+        // Unknown/synthetic boot ids do not veto a match.
+        assert!(ids_match("unknown:123:456", "abc:123:456"));
     }
 
     #[test]
@@ -560,13 +672,36 @@ mod tests {
     }
 
     #[test]
-    fn ids_match_fuzzy() {
-        // Within 1 second (100 ticks)
-        assert!(ids_match("abc:10000:456", "abc:10050:456"));
-        // Within 1.5 seconds (150 ticks)
-        assert!(ids_match("abc:10000:456", "abc:10150:456"));
-        // Too far (200 ticks)
-        assert!(!ids_match("abc:10000:456", "abc:10200:456"));
+    fn ids_match_is_exact_on_ticks() {
+        // Start ticks come from /proc: any difference means a different process.
+        assert!(!ids_match("abc:10000:456", "abc:10001:456"));
+        assert!(!ids_match("abc:10000:456", "abc:10150:456"));
+        assert!(ids_match("abc:10000:456", "abc:10000:456"));
+    }
+
+    /// pidfd-pinned signaling: open a pidfd for a live child, send it a signal and
+    /// check the kernel delivered it; after the child is reaped, the same pidfd must
+    /// report ESRCH instead of reaching whatever reuses the pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_signals_only_the_pinned_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let Some(fd) = PidFd::open(pid).expect("pidfd_open") else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return; // kernel without pidfd support
+        };
+        fd.send(libc::SIGTERM).expect("signal via pidfd");
+        let status = child.wait().expect("wait child");
+        assert!(!status.success(), "child should have died from SIGTERM");
+        assert!(matches!(
+            fd.send(libc::SIGTERM),
+            Err(ActionError::ProcessNotFound)
+        ));
     }
 
     #[cfg(unix)]
