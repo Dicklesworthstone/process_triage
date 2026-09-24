@@ -147,8 +147,9 @@ fn create_custom_session(
     processes: Vec<PersistedProcess>,
     inferences: Vec<PersistedInference>,
 ) -> String {
-    std::env::set_var("PROCESS_TRIAGE_DATA", data_dir);
-    let store = SessionStore::from_env().expect("session store");
+    // Not set_var + from_env: tests in this binary run in parallel, each with its own
+    // data dir, and a process-global env var lets one test's session land in another's.
+    let store = SessionStore::at_data_dir(std::path::Path::new(data_dir));
     let sid = SessionId(session_id.to_string());
     let manifest = SessionManifest::new(&sid, None, SessionMode::RobotPlan, None);
     let handle = store.create(&manifest).expect("create session");

@@ -171,21 +171,31 @@ show_history() {
         exit 1
     fi
 
+    # Entries are {"kill": N, "spare": M, ...} per "level|pattern|args" key (written by
+    # `pt-core agent label`), or legacy "kill"/"spare" strings. Each verdict is stored at
+    # exact/standard/broad levels; list the standard level to count it once.
+    local rows='def counts: if type == "string"
+            then {kill: (if . == "kill" then 1 else 0 end), spare: (if . == "spare" then 1 else 0 end)}
+            else {kill: (.kill // 0), spare: (.spare // 0)} end;
+        [to_entries[]
+         | select((.key | startswith("exact|") or startswith("broad|")) | not)
+         | {pattern: (.key | ltrimstr("standard|") | rtrimstr("|")), c: (.value | counts)}]'
+
     local total
-    total="$(jq 'length' "$decisions_file")"
+    total="$(jq "$rows | length" "$decisions_file")"
     if [[ "$total" == "0" ]]; then
         printf 'No decision history.\n'
         return 0
     fi
 
     local kill_count spare_count
-    kill_count="$(jq '[.[] | select(. == "kill")] | length' "$decisions_file")"
-    spare_count="$(jq '[.[] | select(. == "spare")] | length' "$decisions_file")"
+    kill_count="$(jq "$rows | map(.c.kill) | add" "$decisions_file")"
+    spare_count="$(jq "$rows | map(.c.spare) | add" "$decisions_file")"
 
-    printf 'Decision history (%s total)\n' "$total"
+    printf 'Decision history (%s patterns)\n' "$total"
     printf 'kill: %s\n' "$kill_count"
     printf 'spare: %s\n' "$spare_count"
-    jq -r 'to_entries[] | "\(.value)\t\(.key)"' "$decisions_file"
+    jq -r "$rows | .[] | \"kill=\\(.c.kill) spare=\\(.c.spare)\\t\\(.pattern)\"" "$decisions_file"
 }
 
 clear_history() {
@@ -389,6 +399,12 @@ main() {
     # to the explicit deep-scan subcommand exposed by pt-core.
     if [[ "${forwarded_args[0]:-}" == "scan" && "${forwarded_args[1]:-}" == "deep" ]]; then
         forwarded_args=("deep-scan" "${forwarded_args[@]:2}")
+    fi
+
+    # pt-core only reads PROCESS_TRIAGE_CONFIG; keep `pt history` and pt-core on the
+    # same config dir (and decisions.json) when the wrapper-level override is used.
+    if [[ -n "${PT_CONFIG_DIR:-}" && -z "${PROCESS_TRIAGE_CONFIG:-}" ]]; then
+        export PROCESS_TRIAGE_CONFIG="$PT_CONFIG_DIR"
     fi
 
     # Forward to pt-core

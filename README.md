@@ -998,7 +998,13 @@ Completions cover all subcommands, options, and argument values, including `--fo
 
 ## How pt Learns From Your Decisions
 
-When you kill or spare a process, `pt` remembers. The learning system normalizes command patterns at three specificity levels and stores them for future sessions:
+`pt` remembers human verdicts, per command pattern, in `decisions.json` in your config directory:
+
+- **Kills you confirm in the TUI** are recorded once they succeed (dry-run, shadow, failed and blocked actions are not).
+- **Explicit labels**: `pt agent label --pid 1234 --kill` or `pt agent label --cmd "python3 -m http.server 8000" --spare`.
+- **Robot/agent applies are never recorded**, so the model cannot teach itself its own mistakes.
+
+Each verdict is stored at three specificity levels:
 
 | Level | What's Preserved | Example |
 |-------|-----------------|---------|
@@ -1014,7 +1020,7 @@ When you kill or spare a process, `pt` remembers. The learning system normalizes
 - Long numbers (4+ digits) → `\d+`
 - Versioned interpreters (`python3.11`) → `python.*`
 
-When `pt` sees a process matching a learned pattern, it adjusts the prior probability: processes you've killed before get a higher abandonment prior, while processes you've spared get a lower one. Three specificity levels prevent both over-fitting (exact match only) and over-generalizing (matching every `node` process).
+When a process matches a learned pattern (most specific level with any verdicts wins), its class prior is replaced by a Beta-Binomial estimate, `P(abandoned) = (kills + 2·g) / (kills + spares + 2)`, where `g` is the global abandoned+zombie prior, clamped to [0.02, 0.95] so live evidence can still overturn it. One kill moves a default 0.25 prior to about 0.5; one spare moves it to about 0.17. This applies in `pt agent plan` (candidates show `inference.learned_prior`), the TUI and `pt agent explain`, and it takes precedence over the signature fast path. `pt history` lists the patterns and counts; `pt clear` resets them.
 
 ---
 
@@ -1363,7 +1369,7 @@ cargo run -p pt-core -- run
 By design, no. Interactive mode always asks for confirmation. Robot mode requires 95%+ posterior confidence, passes through conformal FDR control, and checks blast-radius risk. Protected processes are never flagged regardless of score.
 
 **Q: How does it learn from my decisions?**
-Kill/spare decisions are saved to `decisions.json`. When `pt` sees a similar command pattern again, it adjusts the prior based on your past choices.
+Kills you confirm in the TUI and verdicts you give with `pt agent label --kill|--spare` are saved to `decisions.json`. When `pt` sees a similar command pattern again, it replaces the prior with one learned from those counts (see "How pt Learns From Your Decisions"). Robot/agent applies are not learned from.
 
 **Q: Does it phone home?**
 No. All data stays on your machine. No telemetry, no analytics, no network calls (except `install.sh` downloading the binary).

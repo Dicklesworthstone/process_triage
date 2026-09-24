@@ -73,9 +73,7 @@ fn plan_action(action: Action, identity: &ProcessIdentity) -> PlanAction {
 
 /// Create a session holding a one-action plan; return the session id.
 fn session_with_plan(data_dir: &Path, action: PlanAction) -> String {
-    std::env::set_var("PROCESS_TRIAGE_DATA", data_dir);
-    let store = SessionStore::from_env().expect("store");
-    std::env::remove_var("PROCESS_TRIAGE_DATA");
+    let store = SessionStore::at_data_dir(data_dir);
     let session_id = SessionId::new();
     let handle = store
         .create(&SessionManifest::new(

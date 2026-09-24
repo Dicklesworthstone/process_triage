@@ -366,6 +366,14 @@ impl SessionStore {
         })
     }
 
+    /// Store rooted at an explicit data directory (what `PROCESS_TRIAGE_DATA` selects),
+    /// without reading or mutating process-global environment.
+    pub fn at_data_dir(data_dir: &Path) -> Self {
+        Self {
+            sessions_root: data_dir.join(SESSIONS_DIR_NAME),
+        }
+    }
+
     pub fn sessions_root(&self) -> &Path {
         &self.sessions_root
     }

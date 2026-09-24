@@ -697,6 +697,9 @@ enum AgentCommands {
     /// List current prior configuration
     ListPriors(AgentListPriorsArgs),
 
+    /// Record a human kill/spare verdict so future plans learn from it
+    Label(AgentLabelArgs),
+
     /// View pending plans and notifications
     Inbox(AgentInboxArgs),
 
@@ -1353,6 +1356,31 @@ struct AgentListPriorsArgs {
     /// Include all hyperparameters (extended output)
     #[arg(long)]
     extended: bool,
+}
+
+#[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("target").required(true).args(["pid", "cmd"])))]
+#[command(group(clap::ArgGroup::new("verdict").required(true).args(["kill", "spare"])))]
+struct AgentLabelArgs {
+    /// Live process whose command pattern to label
+    #[arg(long)]
+    pid: Option<u32>,
+
+    /// Command line to label (instead of a live --pid)
+    #[arg(long)]
+    cmd: Option<String>,
+
+    /// Process name for --cmd (default: basename of its first word)
+    #[arg(long, requires = "cmd")]
+    comm: Option<String>,
+
+    /// Processes like this should be killed
+    #[arg(long)]
+    kill: bool,
+
+    /// Processes like this should be left alone
+    #[arg(long)]
+    spare: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2029,13 +2057,24 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     let config = load_config(&config_options).map_err(|e| format!("load config: {}", e))?;
     let priors = config.priors.clone();
     let policy = config.policy.clone();
+    // Kills the human confirms here are recorded; later scans (TUI and agent plan)
+    // use them as learned priors. An unreadable store disables learning, not the TUI.
+    let decisions = match pt_core::decision::decision_store::DecisionStore::load(&config.config_dir)
+    {
+        Ok(store) => Some(store),
+        Err(e) => {
+            eprintln!("pt: decision learning disabled: {}", e);
+            None
+        }
+    };
 
     let TuiBuildOutput {
         rows,
         plan_candidates,
         goal_summary,
         goal_order,
-    } = build_tui_data_from_live_scan(global, args, &priors, &policy)?;
+    } = build_tui_data_from_live_scan(global, args, &priors, &policy, decisions.as_ref())?;
+    let decisions = Arc::new(Mutex::new(decisions));
 
     let _ = handle.update_state(SessionState::Planned);
 
@@ -2098,6 +2137,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let min_age_r = args.min_age;
         let goal_r = args.goal.clone();
         let policy_scan_r = policy.clone();
+        let decisions_r = Arc::clone(&decisions);
 
         let refresh_fn: Arc<dyn Fn() -> Result<Vec<ProcessRow>, String> + Send + Sync> =
             Arc::new(move || {
@@ -2120,6 +2160,9 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     let targeted = deep_scan_target_pids(&filter_result.passed, &probe_advice);
                     collect_deep_signals_for_pids(&targeted)
                 };
+                let decisions = decisions_r
+                    .lock()
+                    .map_err(|_| "decision store lock poisoned".to_string())?;
                 let output = build_tui_rows(
                     &filter_result.passed,
                     min_age_r,
@@ -2128,7 +2171,9 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     &priors_r,
                     &policy_r,
                     goal_r.as_deref(),
+                    decisions.as_ref(),
                 );
+                drop(decisions);
                 let mut guard = plan_cache_r
                     .lock()
                     .map_err(|_| "plan cache lock poisoned".to_string())?;
@@ -2143,6 +2188,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let handle_e = handle.clone();
         let dry_run = global.dry_run;
         let shadow = global.shadow;
+        let decisions_e = Arc::clone(&decisions);
 
         let execute_fn: Arc<dyn Fn(Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync> =
             Arc::new(move |selected: Vec<u32>| {
@@ -2151,6 +2197,13 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     .map_err(|_| "plan cache lock poisoned".to_string())?;
                 let plan =
                     build_plan_from_selection(&session_id_e, &policy_e, &selected, &candidates)?;
+                let commands: HashMap<u32, (String, String)> = selected
+                    .iter()
+                    .filter_map(|pid| {
+                        let c = candidates.get(pid)?;
+                        Some((*pid, (c.comm.clone(), c.cmd.clone())))
+                    })
+                    .collect();
                 drop(candidates); // release lock before I/O
 
                 if plan.actions.is_empty() {
@@ -2176,6 +2229,11 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     Ok(result) => {
                         write_outcomes_from_execution(&handle_e, &plan, &result)
                             .map_err(|e| format!("write outcomes: {}", e))?;
+                        if let Ok(mut guard) = decisions_e.lock() {
+                            if let Some(store) = guard.as_mut() {
+                                record_confirmed_kills(store, &plan, &result, &commands);
+                            }
+                        }
                         let final_state = if result.summary.actions_failed > 0 {
                             SessionState::Failed
                         } else {
@@ -2238,6 +2296,47 @@ struct PlanCandidateInput {
     ppid: Option<u32>,
     decision: pt_core::decision::DecisionOutcome,
     process_state: pt_core::collect::ProcessState,
+    comm: String,
+    cmd: String,
+}
+
+/// Record a "kill" verdict for every kill the human confirmed in the TUI that
+/// actually succeeded. Failed, blocked and non-kill actions teach nothing.
+#[cfg(feature = "ui")]
+fn record_confirmed_kills(
+    store: &mut pt_core::decision::decision_store::DecisionStore,
+    plan: &Plan,
+    result: &pt_core::action::ExecutionResult,
+    commands: &HashMap<u32, (String, String)>,
+) {
+    use pt_core::action::ActionStatus;
+    use pt_core::decision::decision_store::Verdict;
+
+    let mut recorded = false;
+    for outcome in &result.outcomes {
+        if !matches!(outcome.status, ActionStatus::Success) {
+            continue;
+        }
+        let Some(action) = plan
+            .actions
+            .iter()
+            .find(|a| a.action_id == outcome.action_id)
+        else {
+            continue;
+        };
+        if action.action != Action::Kill {
+            continue;
+        }
+        if let Some((comm, cmd)) = commands.get(&action.target.pid.0) {
+            store.record(comm, cmd, Verdict::Kill);
+            recorded = true;
+        }
+    }
+    if recorded {
+        if let Err(e) = store.save() {
+            tracing::warn!(error = %e, "failed to save decision store");
+        }
+    }
 }
 
 #[cfg(feature = "ui")]
@@ -2254,6 +2353,7 @@ fn build_tui_data_from_live_scan(
     args: &RunArgs,
     priors: &Priors,
     policy: &pt_core::config::Policy,
+    decisions: Option<&pt_core::decision::decision_store::DecisionStore>,
 ) -> Result<TuiBuildOutput, String> {
     let scan_options = QuickScanOptions {
         pids: vec![],
@@ -2282,6 +2382,7 @@ fn build_tui_data_from_live_scan(
         priors,
         policy,
         args.goal.as_deref(),
+        decisions,
     ))
 }
 
@@ -2707,6 +2808,7 @@ fn estimate_queue_metrics(info: &pt_core::collect::NetworkInfo, io_active: bool)
 }
 
 #[cfg(feature = "ui")]
+#[allow(clippy::too_many_arguments)]
 fn build_tui_rows(
     processes: &[ProcessRecord],
     min_age: Option<u64>,
@@ -2715,6 +2817,7 @@ fn build_tui_rows(
     priors: &Priors,
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
+    decisions: Option<&pt_core::decision::decision_store::DecisionStore>,
 ) -> TuiBuildOutput {
     const MIN_POSTERIOR: f64 = 0.7;
     const MAX_CANDIDATES: usize = 50;
@@ -2765,10 +2868,12 @@ fn build_tui_rows(
             command_category: None,
         };
 
-        let posterior_result = match compute_posterior(priors, &evidence) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let learned_priors = decisions.and_then(|d| d.priors_for(&proc.comm, &proc.cmd, priors));
+        let posterior_result =
+            match compute_posterior(learned_priors.as_ref().unwrap_or(priors), &evidence) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
         let mut decision_outcome =
             match decide_action(&posterior_result.posterior, &decision_policy, &feasibility) {
                 Ok(d) => d,
@@ -2850,6 +2955,8 @@ fn build_tui_rows(
                 ppid: Some(proc.ppid.0),
                 decision: decision_outcome.clone(),
                 process_state: proc.state,
+                comm: proc.comm.clone(),
+                cmd: proc.cmd.clone(),
             },
         );
 
@@ -5552,6 +5659,7 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
         AgentCommands::Diff(args) => run_agent_diff(global, args),
         AgentCommands::Sessions(args) => run_agent_sessions(global, args),
         AgentCommands::ListPriors(args) => run_agent_list_priors(global, args),
+        AgentCommands::Label(args) => run_agent_label(global, args),
         AgentCommands::Inbox(args) => run_agent_inbox(global, args),
         AgentCommands::Tail(args) => run_agent_tail(global, args),
         AgentCommands::Watch(args) => run_agent_watch(global, args),
@@ -11988,6 +12096,15 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     };
     let priors = config.priors.clone();
+    // Human kill/spare verdicts per command pattern become learned priors below.
+    let decision_store =
+        match pt_core::decision::decision_store::DecisionStore::load(&config.config_dir) {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("agent plan: ignoring unreadable decision store: {}", e);
+                Default::default()
+            }
+        };
     let policy = config.policy;
     let fast_path_config = FastPathConfig {
         enabled: policy.signature_fast_path.enabled,
@@ -12214,14 +12331,20 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let mut fast_path_used = false;
         let mut fast_path_skip_reason: Option<&'static str> = None;
         let prior_source_label: String;
+        let learned_prior = decision_store.learned_prior(&proc.comm, &proc.cmd, &priors);
+        let learned_overrides = learned_prior.as_ref().map(|learned| {
+            pt_core::decision::decision_store::DecisionStore::overrides_for(learned, &priors)
+        });
         let prior_context = PriorContext {
             global_priors: &priors,
             signature_match: signature_match.as_ref(),
             category_defaults: None,
-            user_overrides: None,
+            user_overrides: learned_overrides.as_ref(),
         };
 
-        let (mut posterior_result, mut ledger) = if let Some(sig_match) = signature_match.as_ref() {
+        // A human verdict on this pattern outranks the signature fast path.
+        let fast_path_signature = signature_match.as_ref().filter(|_| learned_prior.is_none());
+        let (mut posterior_result, mut ledger) = if let Some(sig_match) = fast_path_signature {
             match try_signature_fast_path(&fast_path_config, Some(sig_match), proc.pid.0) {
                 Ok(Some(fast_path)) => {
                     fast_path_used = true;
@@ -12684,6 +12807,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "inference": {
                 "mode": if fast_path_used { "signature_fast_path" } else { "bayesian" },
                 "prior_source": prior_source_label,
+                "learned_prior": learned_prior,
                 "fast_path": {
                     "enabled": fast_path_config.enabled,
                     "used": fast_path_used,
@@ -13422,7 +13546,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
     };
 
     // Load priors from config or use defaults
-    let priors = match load_priors_for_explain(global) {
+    let (priors, decisions) = match load_priors_for_explain(global) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("agent explain: failed to load priors: {}", e);
@@ -13470,7 +13594,8 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         let record = scan_result.processes.iter().find(|p| p.pid.0 == *pid);
         match record {
             Some(proc) => {
-                let explanation = build_process_explanation(proc, &priors, args);
+                let explanation =
+                    build_process_explanation(proc, &priors, decisions.as_ref(), args);
                 explanations.push(explanation);
             }
             None => {
@@ -13597,25 +13722,43 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
     ExitCode::Clean
 }
 
-/// Load priors from config with fallback to defaults.
-fn load_priors_for_explain(global: &GlobalOpts) -> Result<Priors, ConfigError> {
+/// Load priors (and learned decisions, if readable) from config with fallback to defaults.
+fn load_priors_for_explain(
+    global: &GlobalOpts,
+) -> Result<
+    (
+        Priors,
+        Option<pt_core::decision::decision_store::DecisionStore>,
+    ),
+    ConfigError,
+> {
     let opts = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
         priors_path: None,
         policy_path: None,
     };
     match load_config(&opts) {
-        Ok(resolved) => Ok(resolved.priors),
-        Err(_) => Ok(Priors::default()),
+        Ok(resolved) => {
+            let decisions =
+                pt_core::decision::decision_store::DecisionStore::load(&resolved.config_dir).ok();
+            Ok((resolved.priors, decisions))
+        }
+        Err(_) => Ok((Priors::default(), None)),
     }
 }
 
 /// Build a JSON explanation for a single process.
 fn build_process_explanation(
     proc: &ProcessRecord,
-    priors: &Priors,
+    global_priors: &Priors,
+    decisions: Option<&pt_core::decision::decision_store::DecisionStore>,
     args: &AgentExplainArgs,
 ) -> serde_json::Value {
+    // Human kill/spare verdicts for this command pattern replace the class prior.
+    let learned_prior =
+        decisions.and_then(|d| d.learned_prior(&proc.comm, &proc.cmd, global_priors));
+    let learned_priors = decisions.and_then(|d| d.priors_for(&proc.comm, &proc.cmd, global_priors));
+    let priors = learned_priors.as_ref().unwrap_or(global_priors);
     // Convert ProcessRecord to Evidence
     let evidence = Evidence {
         cpu: Some(CpuEvidence::Fraction {
@@ -13664,6 +13807,7 @@ fn build_process_explanation(
             "abandoned": posterior_result.posterior.abandoned,
             "zombie": posterior_result.posterior.zombie,
         },
+        "learned_prior": learned_prior,
     });
 
     // Add Bayes factors if galaxy_brain mode or requested
@@ -16118,6 +16262,95 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         }
     }
 
+    ExitCode::Clean
+}
+
+fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
+    use pt_core::decision::decision_store::{DecisionStore, Verdict};
+
+    let options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        priors_path: None,
+        policy_path: None,
+    };
+    let config = match load_config(&options) {
+        Ok(c) => c,
+        Err(e) => return output_config_error(global, &e),
+    };
+
+    let (comm, cmd) = if let Some(pid) = args.pid {
+        let scan = match quick_scan(&QuickScanOptions {
+            pids: vec![pid],
+            include_kernel_threads: false,
+            timeout: Some(std::time::Duration::from_secs(10)),
+            progress: None,
+        }) {
+            Ok(scan) => scan,
+            Err(e) => {
+                eprintln!("agent label: failed to read process {}: {}", pid, e);
+                return ExitCode::InternalError;
+            }
+        };
+        match scan.processes.into_iter().find(|p| p.pid.0 == pid) {
+            Some(p) => (p.comm, p.cmd),
+            None => {
+                eprintln!("agent label: process {} not found", pid);
+                return ExitCode::ArgsError;
+            }
+        }
+    } else {
+        let cmd = args.cmd.clone().unwrap_or_default();
+        let comm = args.comm.clone().unwrap_or_else(|| {
+            let first = cmd.split_whitespace().next().unwrap_or("");
+            first.rsplit('/').next().unwrap_or(first).to_string()
+        });
+        (comm, cmd)
+    };
+    if comm.is_empty() {
+        eprintln!("agent label: empty command");
+        return ExitCode::ArgsError;
+    }
+
+    let verdict = if args.kill {
+        Verdict::Kill
+    } else {
+        Verdict::Spare
+    };
+    let mut store = match DecisionStore::load(&config.config_dir) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("agent label: {}", e);
+            return ExitCode::IoError;
+        }
+    };
+    store.record(&comm, &cmd, verdict);
+    if let Err(e) = store.save() {
+        eprintln!("agent label: {}", e);
+        return ExitCode::IoError;
+    }
+    let learned = store.learned_prior(&comm, &cmd, &config.priors);
+
+    let response = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "verdict": verdict,
+        "comm": comm,
+        "patterns": DecisionStore::pattern_keys(&comm, &cmd),
+        "learned_prior": learned,
+        "store": config.config_dir.join(pt_core::decision::decision_store::DECISIONS_FILE),
+    });
+    match global.format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Exitcode => {}
+        _ => {
+            let p = learned.map(|l| l.abandonment_prior).unwrap_or(f64::NAN);
+            println!(
+                "Recorded {:?} for '{}'; learned P(abandoned) for this pattern: {:.2}",
+                verdict, comm, p
+            );
+        }
+    }
     ExitCode::Clean
 }
 

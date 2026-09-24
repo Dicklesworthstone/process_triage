@@ -137,9 +137,32 @@ EOF
         "$PT_SCRIPT" history
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Decision history (2 total)"* ]]
+    [[ "$output" == *"Decision history (2 patterns)"* ]]
     [[ "$output" == *"kill: 1"* ]]
-    [[ "$output" == *$'kill\tbun test --watch'* ]]
+    [[ "$output" == *$'kill=1 spare=0\tbun test --watch'* ]]
+    [[ "$output" == *$'kill=0 spare=1\tvim'* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: history counts pt-core decision store entries once per verdict" {
+    local config_dir="${TEST_DIR}/config"
+    mkdir -p "$config_dir"
+    # `pt-core agent label` stores each verdict at exact/standard/broad levels.
+    cat > "${config_dir}/decisions.json" << 'EOF'
+{"exact|node|jest --watch tests/":{"kill":2,"spare":1},"standard|node|jest --watch":{"kill":2,"spare":1,"last":"spare"},"broad|node|":{"kill":2,"spare":1}}
+EOF
+
+    run env \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        PROCESS_TRIAGE_CONFIG="$config_dir" \
+        "$PT_SCRIPT" history
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Decision history (1 patterns)"* ]]
+    [[ "$output" == *"kill: 2"* ]]
+    [[ "$output" == *"spare: 1"* ]]
+    [[ "$output" == *$'kill=2 spare=1\tnode|jest --watch'* ]]
     [ ! -f "$MOCK_LOG" ]
 }
 
@@ -202,8 +225,12 @@ EOF
         "$PT_SCRIPT" --shell --version
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"pt ${PT_WRAPPER_VERSION}"* ]]
-    [ ! -f "$MOCK_LOG" ]
+    # Same contract as the CI install check: first line "pt version X.Y.Z",
+    # second line names the pt-core engine the wrapper will run.
+    [[ "${lines[0]}" == "pt version ${PT_WRAPPER_VERSION}" ]]
+    [[ "${lines[1]}" == *"($MOCK_PT_CORE)"* ]]
+    # pt-core is only asked for its own version; the wrapper flags are not forwarded.
+    grep -q '^ARGS=--version$' "$MOCK_LOG"
 }
 
 @test "wrapper: update enforces VERIFY=1 for installer invocation" {

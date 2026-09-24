@@ -8,6 +8,7 @@ pub mod causal_snapshot;
 pub mod composite_test;
 pub mod contextual_bandits;
 pub mod cvar;
+pub mod decision_store;
 pub mod dependency_loss;
 pub mod direct_impact;
 pub mod dro;
