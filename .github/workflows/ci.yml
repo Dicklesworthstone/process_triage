@@ -298,7 +298,8 @@ jobs:
 
       - name: Test --version
         run: |
-          version=$("$HOME/.local/bin/pt" --version)
+          # First line is the wrapper version; the second names the pt-core engine.
+          version=$("$HOME/.local/bin/pt" --version | head -n 1)
           echo "Version output: $version"
 
           if [[ ! "$version" =~ ^pt\ version\ [0-9]+\.[0-9]+\.[0-9]+$ ]]; then

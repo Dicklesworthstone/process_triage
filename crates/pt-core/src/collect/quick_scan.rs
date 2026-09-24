@@ -154,6 +154,13 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
 
     let mut processed = 0usize;
     const PROGRESS_STEP: usize = 200;
+    // Read system clock facts once per scan (per-process re-reads of /proc/stat
+    // are expensive on many-core hosts).
+    let clock = if platform == "linux" {
+        LinuxClock::read()
+    } else {
+        None
+    };
 
     for (line_num, line_result) in lines.enumerate() {
         let line = line_result?;
@@ -168,7 +175,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
             }
         }
 
-        match parse_ps_line(&line, &platform, &boot_id) {
+        match parse_ps_line_with_timing(&line, &platform, &boot_id, None, clock.as_ref()) {
             Ok(record) => {
                 // Filter kernel threads if not requested AND not targeting specific PIDs.
                 // If user explicitly asks for specific PIDs, we respect that even for kernel threads.
@@ -370,13 +377,20 @@ fn build_ps_command(platform: &str, options: &QuickScanOptions) -> Result<Comman
     Ok(cmd)
 }
 
-/// Parse a single line of ps output into a ProcessRecord.
+/// Parse a single line of ps output into a ProcessRecord (reads the clock itself;
+/// the scan loop reuses one `LinuxClock` instead).
+#[cfg(test)]
 fn parse_ps_line(
     line: &str,
     platform: &str,
     boot_id: &Option<String>,
 ) -> Result<ProcessRecord, String> {
-    parse_ps_line_with_timing(line, platform, boot_id, None)
+    let clock = if platform == "linux" {
+        LinuxClock::read()
+    } else {
+        None
+    };
+    parse_ps_line_with_timing(line, platform, boot_id, None, clock.as_ref())
 }
 
 /// Parse a single line of ps output like `parse_ps_line`, but with deterministic
@@ -387,7 +401,7 @@ fn parse_ps_line_synthetic(
     boot_id: &Option<String>,
     now_unix: i64,
 ) -> Result<ProcessRecord, String> {
-    parse_ps_line_with_timing(line, platform, boot_id, Some(now_unix))
+    parse_ps_line_with_timing(line, platform, boot_id, Some(now_unix), None)
 }
 
 fn parse_ps_line_with_timing(
@@ -395,16 +409,42 @@ fn parse_ps_line_with_timing(
     platform: &str,
     boot_id: &Option<String>,
     synthetic_now_unix: Option<i64>,
+    clock: Option<&LinuxClock>,
 ) -> Result<ProcessRecord, String> {
     let parsed = parse_ps_fields(line)?;
-    let (start_time_unix, elapsed) = match synthetic_now_unix {
-        Some(now_unix) => parse_timing_field_at(platform, parsed.etimes_str, now_unix)?,
-        None => parse_timing_field(platform, parsed.etimes_str)?,
+
+    // On Linux, prefer the kernel's exact start time over `ps etimes`.
+    let exact = match (synthetic_now_unix, clock) {
+        (None, Some(clock)) => linux_exact_timing(parsed.pid, clock),
+        _ => None,
     };
 
-    let start_id = match synthetic_now_unix {
-        Some(_) => compute_start_id_synthetic(platform, boot_id, start_time_unix, parsed.pid),
-        None => compute_start_id(platform, boot_id, start_time_unix, elapsed, parsed.pid),
+    let (start_time_unix, elapsed, start_id) = if let Some(exact) = exact {
+        let boot = boot_id.as_deref().unwrap_or("unknown");
+        (
+            exact.start_time_unix,
+            exact.elapsed,
+            StartId::from_linux(boot, exact.start_ticks, parsed.pid),
+        )
+    } else {
+        let (mut start_time_unix, mut elapsed) = match synthetic_now_unix {
+            Some(now_unix) => parse_timing_field_at(platform, parsed.etimes_str, now_unix)?,
+            None => parse_timing_field(platform, parsed.etimes_str)?,
+        };
+        // /proc was unreadable (process exiting, or raced): never trust an impossible
+        // ps age (observed etimes=4123168608 on a host up 27 days). Unknown age is
+        // treated as "just started", which also keeps the process out of candidates.
+        if let Some(clock) = clock {
+            if elapsed.as_secs_f64() > clock.uptime + 1.0 {
+                elapsed = Duration::ZERO;
+                start_time_unix = chrono::Utc::now().timestamp();
+            }
+        }
+        let start_id = match synthetic_now_unix {
+            Some(_) => compute_start_id_synthetic(platform, boot_id, start_time_unix, parsed.pid),
+            None => compute_start_id(platform, boot_id, start_time_unix, elapsed, parsed.pid),
+        };
+        (start_time_unix, elapsed, start_id)
     };
 
     let tty = if parsed.tty_raw == "?" || parsed.tty_raw == "-" {
@@ -679,6 +719,67 @@ fn linux_start_ticks_from_btime(_start_time_unix: i64) -> Option<u64> {
     None
 }
 
+/// Exact process timing read from the kernel.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct ExactTiming {
+    /// `/proc/<pid>/stat` field 22: start time in clock ticks since boot.
+    start_ticks: u64,
+    elapsed: Duration,
+    start_time_unix: i64,
+}
+
+/// Exact start ticks / elapsed time from `/proc/<pid>/stat`.
+///
+/// `ps etimes` is not trustworthy: on a live host procps reported
+/// `etimes = 4123168608` (≈ 47 721 days) for ordinary processes, which pt then
+/// scored as "ancient". It also has 1-second resolution, which blurs the start
+/// ticks used for identity (start_id) checks before signaling.
+#[cfg(target_os = "linux")]
+fn linux_exact_timing(pid: u32, clock: &LinuxClock) -> Option<ExactTiming> {
+    let stat = super::proc_parsers::parse_proc_stat(pid)?;
+    let start_secs = stat.starttime as f64 / clock.hz as f64;
+    // A start time after "now" means we read a different/garbled record.
+    if start_secs > clock.uptime + 1.0 {
+        return None;
+    }
+    Some(ExactTiming {
+        start_ticks: stat.starttime,
+        elapsed: Duration::from_secs_f64((clock.uptime - start_secs).max(0.0)),
+        start_time_unix: clock.boot_time + (stat.starttime / clock.hz) as i64,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_exact_timing(_pid: u32, _clock: &LinuxClock) -> Option<ExactTiming> {
+    None
+}
+
+/// Per-scan system clock facts. Read ONCE per scan: `/proc/stat` is large and
+/// expensive to generate on many-core hosts, and reading it per process made quick
+/// scans time out on a 128-core machine.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct LinuxClock {
+    hz: u64,
+    uptime: f64,
+    boot_time: i64,
+}
+
+impl LinuxClock {
+    #[cfg(target_os = "linux")]
+    fn read() -> Option<Self> {
+        Some(Self {
+            hz: clock_ticks_per_second()?,
+            uptime: read_uptime_seconds()?,
+            boot_time: read_boot_time_unix()?,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read() -> Option<Self> {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn read_uptime_seconds() -> Option<f64> {
     let bytes = std::fs::read("/proc/uptime").ok()?;
@@ -813,13 +914,55 @@ mod tests {
         assert!(scan.metadata.process_count > 0);
     }
 
+    /// A garbage `etimes` from procps (observed live: 4123168608 s) must not become the
+    /// process age on Linux: the kernel's /proc/<pid>/stat start time wins, and the
+    /// start_id carries the exact start ticks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_timing_ignores_garbage_ps_etimes() {
+        let pid = std::process::id();
+        let stat = super::super::proc_parsers::parse_proc_stat(pid).expect("own stat");
+        let line = format!(
+            "{pid} 1 1000 testuser {pid} {pid} S 0.5 10240 20480 pts/0 Tue Jan 14 10:30:00 2026 4123168608 bash /bin/bash"
+        );
+        let boot_id = Some("test-boot-id".to_string());
+        let record = parse_ps_line(&line, "linux", &boot_id).expect("parse");
+        let uptime = read_uptime_seconds().expect("uptime");
+        assert!(
+            record.elapsed.as_secs_f64() <= uptime + 1.0,
+            "elapsed {:?} exceeds uptime {uptime}",
+            record.elapsed
+        );
+        assert_eq!(
+            record.start_id,
+            StartId::from_linux("test-boot-id", stat.starttime, pid)
+        );
+    }
+
+    /// When /proc is unavailable for a pid, an etimes larger than uptime is discarded.
+    #[test]
+    fn impossible_ps_age_is_discarded_when_proc_is_unavailable() {
+        // PID 4194304 == PID_MAX_LIMIT on 64-bit Linux: never a live pid, so /proc misses.
+        let line = "4194304 1 1000 u 4194304 4194304 S 0.0 10 20 ? Tue Jan 14 10:30:00 2026 4123168608 bash bash";
+        let clock = LinuxClock {
+            hz: 100,
+            uptime: 2_323_130.0,
+            boot_time: 1_788_000_000,
+        };
+        let rec = parse_ps_line_with_timing(line, "linux", &Some("b".into()), None, Some(&clock))
+            .expect("parse");
+        assert_eq!(rec.elapsed, Duration::ZERO);
+    }
+
     #[test]
     fn test_parse_ps_line_linux() {
         // Sample Linux ps output line
         let line = "1234 1 1000 testuser 1234 1234 S 0.5 10240 20480 pts/0 Tue Jan 14 10:30:00 2026 3600 bash /bin/bash -c echo hello";
         let boot_id = Some("test-boot-id".to_string());
 
-        let result = parse_ps_line(line, "linux", &boot_id);
+        // Deterministic path: on a live Linux host PID 1234 may exist, and its real
+        // /proc start time (preferred over ps etimes) would replace the 3600 s here.
+        let result = parse_ps_line_synthetic(line, "linux", &boot_id, 1_800_000_000);
         assert!(result.is_ok(), "Parse failed: {:?}", result);
 
         let record = result.unwrap();

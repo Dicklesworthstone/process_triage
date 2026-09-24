@@ -449,9 +449,14 @@ fn diff_empty_candidates() {
 // ============================================================================
 
 #[test]
-fn query_returns_success() {
-    // Root query command still returns a guidance stub and should stay successful.
-    pt_core_fast().args(["query"]).assert().success();
+fn query_without_subcommand_is_usage_error() {
+    // Root query without a subcommand prints guidance; it is a usage error, not success
+    // (agents must not read a guidance stub as a completed query).
+    pt_core_fast()
+        .args(["query"])
+        .assert()
+        .code(10)
+        .stdout(predicates::str::contains("query sessions"));
 }
 
 #[test]
@@ -491,14 +496,20 @@ fn query_sessions_subcommand() {
 }
 
 #[test]
-fn query_actions_subcommand() {
-    pt_core_fast().args(["query", "actions"]).assert().success();
+fn query_actions_subcommand_reports_missing_capability() {
+    // Not implemented yet: must say so with exit 11 (CapabilityError), never exit 0.
+    pt_core_fast()
+        .args(["query", "actions"])
+        .assert()
+        .code(11)
+        .stdout(predicates::str::contains("not yet implemented"));
 }
 
 #[test]
-fn query_telemetry_subcommand() {
+fn query_telemetry_subcommand_reports_missing_capability() {
     pt_core_fast()
         .args(["query", "telemetry"])
         .assert()
-        .success();
+        .code(11)
+        .stdout(predicates::str::contains("not yet implemented"));
 }

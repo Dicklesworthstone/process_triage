@@ -350,7 +350,12 @@ main() {
     fi
 
     if [[ "${forwarded_args[0]:-}" == "--version" || "${forwarded_args[0]:-}" == "-V" ]]; then
-        printf 'pt %s\n' "$VERSION"
+        # Report both halves: the wrapper and the engine can be updated independently
+        # (the fleet had wrapper/core skew that `pt --version` used to hide).
+        local core_version
+        core_version="$("$pt_core" --version 2>/dev/null | head -n 1)"
+        printf 'pt version %s\n' "$VERSION"
+        printf '%s (%s)\n' "${core_version:-pt-core unknown}" "$pt_core"
         exit 0
     fi
 
@@ -387,8 +392,11 @@ main() {
     fi
 
     # Forward to pt-core
-    # We use 'exec' to replace the shell process
-    exec "$pt_core" "${forwarded_args[@]}"
+    # We use 'exec' to replace the shell process.
+    # The ${arr[@]+"${arr[@]}"} form is required: macOS ships bash 3.2, where
+    # "${arr[@]}" on an empty array is an "unbound variable" error under `set -u`
+    # (bare `pt` crashed there before reaching pt-core).
+    exec "$pt_core" ${forwarded_args[@]+"${forwarded_args[@]}"}
 }
 
 main "$@"

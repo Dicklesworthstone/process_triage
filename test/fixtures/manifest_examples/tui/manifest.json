@@ -31,15 +31,15 @@
     {
       "path": "snapshots/tui_snapshot.json",
       "kind": "snapshot",
-      "sha256": "5dba3c9e687ab39d6e814675de25047df7eee21cf4df1a9f026ab0d8a1f5fadc",
-      "bytes": 79,
+      "sha256": "d8b784192c4038887819bb930d26e56c508c0900f6cc46e465a221de1a886420",
+      "bytes": 80,
       "redaction_profile": "safe"
     },
     {
       "path": "plans/tui_plan.json",
       "kind": "plan",
-      "sha256": "0e6302cd4d857b323b4cc5d48da42a6f4bb0384739db7fafac833c56766b197f",
-      "bytes": 75,
+      "sha256": "4c97a646570e56a0ddc01c0a71573b81f89cb888993a45d809ccada219983052",
+      "bytes": 76,
       "redaction_profile": "safe"
     },
     {
@@ -62,5 +62,5 @@
     },
     "flake_retries": 0
   },
-  "manifest_sha256": "3c492f0adefb8d2be456e7139de98ccf1f9b0e902ce682dbca6607915250cb72"
+  "manifest_sha256": "85dea880f12fb60cb7d9d918a73fcec6960e68cb9c68cdc4e548fa02b3df007f"
 }

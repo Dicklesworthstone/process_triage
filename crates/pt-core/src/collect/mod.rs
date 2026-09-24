@@ -106,8 +106,9 @@ pub use protected::{
 
 // Re-export cgroup types
 pub use cgroup::{
-    collect_cgroup_details, collect_cgroup_from_content, effective_cores_from_quota, CgroupDetails,
-    CgroupProvenance, CgroupVersion, CpuLimitSource, CpuLimits, MemoryLimitSource, MemoryLimits,
+    classify_cgroup_path, collect_cgroup_details, collect_cgroup_from_content,
+    effective_cores_from_quota, read_cgroup_role, CgroupDetails, CgroupProvenance, CgroupRole,
+    CgroupVersion, CpuLimitSource, CpuLimits, MemoryLimitSource, MemoryLimits,
 };
 
 // Re-export systemd types (available on all platforms; collection functions
@@ -162,7 +163,8 @@ pub use lineage_collector::collect_lineage_for_pid;
 // Re-export network resource collector types
 #[cfg(target_os = "linux")]
 pub use network_resource_collector::{
-    collect_fd_ipc_resources, collect_listener_resources, detect_listener_conflicts,
+    collect_fd_ipc_resources, collect_listener_resources, collect_listener_resources_from,
+    detect_listener_conflicts,
 };
 
 // Re-export workspace resolver types

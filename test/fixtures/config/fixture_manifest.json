@@ -32,15 +32,15 @@
     {
       "path": "invalid_priors_bad_beta.json",
       "kind": "priors",
-      "sha256": "c4bc73935f59e657a86cbdb05413a4039bfa6dcabf215c0a7ac1327d186d455f",
-      "bytes": 1118,
+      "sha256": "0ababac52b070047127d4eb0aec5bbc408cf33a6602d9e2732808fe91d139740",
+      "bytes": 1116,
       "redaction_profile": "safe"
     },
     {
       "path": "invalid_priors_bad_sum.json",
       "kind": "priors",
-      "sha256": "351950dd2e72ce97e4e1967832ed5cbcba0fd010233672e2837f0349204e1b4a",
-      "bytes": 1118,
+      "sha256": "a6f7c41e7167180f595e831aa861ef3e37df30221fffa3ae03cfc34f3abfed78",
+      "bytes": 1115,
       "redaction_profile": "safe"
     },
     {
@@ -53,11 +53,11 @@
     {
       "path": "valid_priors.json",
       "kind": "priors",
-      "sha256": "12957396cad46fc0268cc9a3e06fef0ae72738fb23637da444172688a8e3471d",
-      "bytes": 1121,
+      "sha256": "04682f0fe5ca8e81850e5ba0f802abadbada86162f8262217852e328c1eda3e4",
+      "bytes": 1119,
       "redaction_profile": "safe"
     }
   ],
   "description": "Config priors/policy fixtures for no-mock tests",
-  "manifest_sha256": "2f404e1afdb4df2a4df9f2f9abfaa077809cb1708b6c2c3b8cb43e27e7c0425b"
+  "manifest_sha256": "04dd11516f5c49568e58ebc3c41ab1cdd56c0fd1e9ed93b3e6a9e62cbfef0f6a"
 }

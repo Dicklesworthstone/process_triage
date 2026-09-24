@@ -484,9 +484,179 @@ pub fn effective_cores_from_quota(quota_us: Option<i64>, period_us: Option<u64>)
     }
 }
 
+/// Coarse role of a process derived from its systemd cgroup placement.
+///
+/// This is what lets pt tell a *system service* (supervised, never a kill candidate)
+/// from a *workload someone started in a login session* (a legitimate candidate even
+/// when it runs as root or has been reparented to PID 1). On the reality-check fleet,
+/// protecting "any root process" and "any child of PID 1" hid every build on the
+/// root-run worker hosts while still missing postgres/nginx worker children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CgroupRole {
+    /// A system unit: `/system.slice/<name>.service`, `/init.scope`, or other
+    /// system-slice service placement.
+    SystemService,
+    /// A unit of a user's service manager: `user@UID.service/.../<name>.service`
+    /// (or the user manager itself).
+    UserService,
+    /// Inside a container runtime's cgroup (docker, podman, containerd, k8s, lxc).
+    Container,
+    /// A login session: `/user.slice/user-UID.slice/session-N.scope`.
+    LoginSession,
+    /// A transient scope started on behalf of a user (tmux-spawn-*, app-*, run-*).
+    TransientScope,
+    /// No systemd placement could be determined (cgroup v1 without systemd, macOS, ...).
+    Unknown,
+}
+
+impl CgroupRole {
+    /// Workloads started by a person/agent (as opposed to supervised services).
+    pub fn is_user_workload(self) -> bool {
+        matches!(self, CgroupRole::LoginSession | CgroupRole::TransientScope)
+    }
+
+    /// Supervised by systemd or a container runtime: killing is futile or harmful.
+    pub fn is_supervised_service(self) -> bool {
+        matches!(
+            self,
+            CgroupRole::SystemService | CgroupRole::UserService | CgroupRole::Container
+        )
+    }
+}
+
+/// Classify a cgroup v2 unified path (the `0::<path>` line of `/proc/<pid>/cgroup`).
+pub fn classify_cgroup_path(path: &str) -> CgroupRole {
+    let path = path.trim();
+    if path.is_empty() || path == "/" {
+        return CgroupRole::Unknown;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("/docker-")
+        || lower.contains("/docker/")
+        || lower.contains("kubepods")
+        || lower.contains("libpod-")
+        || lower.contains("/lxc")
+        || lower.contains("containerd")
+        || lower.contains("/crio-")
+    {
+        return CgroupRole::Container;
+    }
+    let last = path.rsplit('/').next().unwrap_or("");
+    if let Some(idx) = path.find(".service/") {
+        // Nested below a service unit. Distinguish the user manager's children
+        // (`user@UID.service/...`) from anything nested inside a system service.
+        let unit_start = path[..idx].rfind('/').map(|i| i + 1).unwrap_or(0);
+        let unit = &path[unit_start..idx];
+        if unit.starts_with("user@") {
+            return if last.ends_with(".service") || last == "init.scope" {
+                CgroupRole::UserService
+            } else if last.ends_with(".scope") || last.ends_with(".slice") {
+                CgroupRole::TransientScope
+            } else {
+                CgroupRole::UserService
+            };
+        }
+        return CgroupRole::SystemService;
+    }
+    if last.starts_with("session-") && last.ends_with(".scope") {
+        return CgroupRole::LoginSession;
+    }
+    if last == "init.scope" || last.ends_with(".service") {
+        return if path.contains("user@") {
+            CgroupRole::UserService
+        } else {
+            CgroupRole::SystemService
+        };
+    }
+    if last.ends_with(".scope") {
+        return CgroupRole::TransientScope;
+    }
+    CgroupRole::Unknown
+}
+
+/// Classify a live process by reading `/proc/<pid>/cgroup` (Linux only).
+pub fn read_cgroup_role(pid: u32) -> CgroupRole {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(bytes) = fs::read(format!("/proc/{pid}/cgroup")) else {
+            return CgroupRole::Unknown;
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        let mut v1_systemd: Option<&str> = None;
+        for line in content.lines() {
+            let mut parts = line.splitn(3, ':');
+            let (Some(h), Some(ctrl), Some(path)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if h == "0" && ctrl.is_empty() {
+                return classify_cgroup_path(path);
+            }
+            if ctrl == "name=systemd" {
+                v1_systemd = Some(path);
+            }
+        }
+        v1_systemd
+            .map(classify_cgroup_path)
+            .unwrap_or(CgroupRole::Unknown)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        CgroupRole::Unknown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_cgroup_paths_from_fleet() {
+        use CgroupRole::*;
+        let cases = [
+            ("/system.slice/nginx.service", SystemService),
+            ("/system.slice/postgresql@18-main.service", SystemService),
+            ("/system.slice/cron.service", SystemService),
+            ("/init.scope", SystemService),
+            ("/system.slice/docker-0123abcd.scope", Container),
+            (
+                "/kubepods.slice/kubepods-burstable.slice/cri-containerd-ab.scope",
+                Container,
+            ),
+            ("/user.slice/user-0.slice/session-12.scope", LoginSession),
+            ("/user.slice/user-1000.slice/session-3.scope", LoginSession),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/init.scope",
+                UserService,
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/pm2.service",
+                UserService,
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-1c2d.scope",
+                TransientScope,
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app-foot-123.scope",
+                TransientScope,
+            ),
+            ("/system.slice/run-u42.scope", TransientScope),
+            ("/", Unknown),
+            ("", Unknown),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(classify_cgroup_path(path), expected, "path {path}");
+        }
+        assert!(LoginSession.is_user_workload());
+        assert!(TransientScope.is_user_workload());
+        assert!(!SystemService.is_user_workload());
+        assert!(SystemService.is_supervised_service());
+        assert!(Container.is_supervised_service());
+        assert!(!Unknown.is_supervised_service() && !Unknown.is_user_workload());
+    }
 
     #[test]
     fn test_parse_cgroup_v2() {

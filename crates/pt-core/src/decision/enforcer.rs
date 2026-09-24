@@ -176,6 +176,10 @@ pub struct ProcessCandidate {
     pub wchan: Option<String>,
     /// Critical files detected (for data-loss safety gate).
     pub critical_files: Vec<CriticalFile>,
+    /// systemd/container placement (Linux). With `guardrails.builtin_protection`,
+    /// supervised services are blocked and login-session workloads are exempt from
+    /// `never_kill_ppid` / `protected_users` (same rule as the scan-time filter).
+    pub cgroup_role: Option<crate::collect::CgroupRole>,
 
     // ── Provenance fields (bd-ppcl.11) ────────────────────────────
     /// Blast-radius risk level from provenance graph analysis.
@@ -363,6 +367,8 @@ pub struct PolicyEnforcer {
     robot_mode: RobotMode,
     /// Data loss gates.
     data_loss_gates: DataLossGates,
+    /// `guardrails.builtin_protection`.
+    builtin_protection: bool,
     /// Policy snapshot timestamp for hot-reload detection.
     loaded_at: Instant,
 }
@@ -448,6 +454,7 @@ impl PolicyEnforcer {
             rate_limiter: Arc::new(rate_limiter),
             robot_mode: policy.robot_mode.clone(),
             data_loss_gates: policy.data_loss_gates.clone(),
+            builtin_protection: policy.guardrails.builtin_protection,
             loaded_at: Instant::now(),
         })
     }
@@ -476,8 +483,52 @@ impl PolicyEnforcer {
             });
         }
 
-        // Check protected PPIDs
-        if self.never_kill_ppid.contains(&candidate.ppid) {
+        // Built-in live-infrastructure protection (mirrors collect::protected).
+        let mut session_workload = false;
+        if self.builtin_protection {
+            let argv0 = candidate.cmdline.split_whitespace().next().unwrap_or("");
+            let comm = argv0.rsplit('/').next().unwrap_or(argv0);
+            if let Some((rule, notes)) =
+                crate::collect::protected::builtin_protection_match(comm, &candidate.cmdline)
+            {
+                return PolicyCheckResult::blocked(PolicyViolation {
+                    kind: ViolationKind::ProtectedPattern,
+                    message: format!("built-in protection: {notes}"),
+                    rule: rule.to_string(),
+                    context: None,
+                });
+            }
+            if let Some(role) = candidate.cgroup_role {
+                if role.is_supervised_service() {
+                    return PolicyCheckResult::blocked(PolicyViolation {
+                        kind: ViolationKind::ProtectedPattern,
+                        message: format!(
+                            "supervised service (cgroup {role:?}); stop the unit instead"
+                        ),
+                        rule: "builtin.supervised_service".to_string(),
+                        context: None,
+                    });
+                }
+                session_workload = role.is_user_workload();
+            }
+            if let Some((rule, notes)) =
+                crate::collect::protected::builtin_force_review_match(&candidate.cmdline)
+            {
+                if robot_mode {
+                    return PolicyCheckResult::blocked(PolicyViolation {
+                        kind: ViolationKind::ForceReview,
+                        message: format!("{notes} (robot mode)"),
+                        rule: rule.to_string(),
+                        context: None,
+                    });
+                }
+                warnings.push(format!("{rule}: {notes}"));
+            }
+        }
+
+        // Check protected PPIDs (login-session workloads reparented to init are
+        // orphans, i.e. candidates, when built-in protection classified them)
+        if !session_workload && self.never_kill_ppid.contains(&candidate.ppid) {
             return PolicyCheckResult::blocked(PolicyViolation {
                 kind: ViolationKind::ProtectedPpid,
                 message: format!(
@@ -511,9 +562,11 @@ impl PolicyEnforcer {
             }
         }
 
-        // Check protected user
+        // Check protected user (login-session workloads exempt, see above)
         if let Some(ref user) = candidate.user {
-            if self.protected_users.contains(&user.to_lowercase()) {
+            if !(session_workload && crate::collect::protected::is_root_user(user))
+                && self.protected_users.contains(&user.to_lowercase())
+            {
                 return PolicyCheckResult::blocked(PolicyViolation {
                     kind: ViolationKind::ProtectedUser,
                     message: format!("user '{}' is protected", user),
@@ -1145,6 +1198,7 @@ mod tests {
             process_state: None, // Normal processes have no special state
             wchan: None,
             critical_files: Vec::new(),
+            cgroup_role: None,
             blast_radius_risk_level: None,
             blast_radius_total_affected: None,
             provenance_evidence_completeness: None,
@@ -2476,12 +2530,7 @@ mod tests {
             result.violation.as_ref().unwrap().kind,
             ViolationKind::ProvenanceGate
         );
-        assert!(result
-            .violation
-            .as_ref()
-            .unwrap()
-            .message
-            .contains("high"));
+        assert!(result.violation.as_ref().unwrap().message.contains("high"));
     }
 
     #[test]

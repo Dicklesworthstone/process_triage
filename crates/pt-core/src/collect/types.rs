@@ -174,9 +174,27 @@ impl ProcessRecord {
         self.tty.is_some()
     }
 
-    /// Check if process is orphaned (parent is init/PID 1).
+    /// Check if process is orphaned: reparented to init/launchd (PID 1) after its
+    /// original parent died.
+    ///
+    /// `ppid == 1` alone is wrong: every daemon and (on macOS) every GUI app is a
+    /// direct child of init/launchd. Those are started as their own session leader
+    /// (`setsid`, so `sid == pid`); a genuinely orphaned process keeps the session of
+    /// the shell/job that spawned it (`sid != pid`). On the 2026-09-24 fleet scan the
+    /// old definition rated Chrome, Spotify, Zed and login shells "abandoned".
+    ///
+    /// macOS `ps` reports `sess` as 0 for every process, so there the process-group
+    /// leadership (`pgid == pid`, which launchd also establishes) is used instead.
     pub fn is_orphan(&self) -> bool {
-        self.ppid.0 == 1
+        if self.ppid.0 != 1 {
+            return false;
+        }
+        let own_leader = match (self.sid, self.pgid) {
+            (Some(sid), _) if sid != 0 => sid == self.pid.0,
+            (_, Some(pgid)) if pgid != 0 => pgid == self.pid.0,
+            _ => false,
+        };
+        !own_leader
     }
 
     /// Get elapsed time in seconds.
@@ -225,6 +243,47 @@ pub struct ScanMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(pid: u32, ppid: u32, sid: Option<u32>) -> ProcessRecord {
+        ProcessRecord {
+            pid: ProcessId(pid),
+            ppid: ProcessId(ppid),
+            uid: 501,
+            user: "u".to_string(),
+            pgid: sid,
+            sid,
+            start_id: StartId::from_linux("b", 1, pid),
+            comm: "x".to_string(),
+            cmd: "x".to_string(),
+            state: ProcessState::Sleeping,
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            vsz_bytes: 0,
+            tty: None,
+            start_time_unix: 0,
+            elapsed: std::time::Duration::from_secs(7200),
+            source: "test".to_string(),
+            container_info: None,
+        }
+    }
+
+    #[test]
+    fn orphan_requires_lost_session_not_just_ppid_1() {
+        // launchd/init-started app or daemon: its own session leader -> not orphaned.
+        assert!(!record(1920, 1, Some(1920)).is_orphan());
+        // Reparented after its shell died: still in the old session -> orphaned.
+        assert!(record(4058817, 1, Some(4000000)).is_orphan());
+        // Unknown session: fall back to the parent check.
+        assert!(record(77, 1, None).is_orphan());
+        assert!(!record(77, 500, Some(10)).is_orphan());
+        // macOS: sess is always 0, use process-group leadership.
+        let mut app = record(2548, 1, Some(0));
+        app.pgid = Some(2548);
+        assert!(!app.is_orphan());
+        let mut job = record(3100, 1, Some(0));
+        job.pgid = Some(3000);
+        assert!(job.is_orphan());
+    }
 
     #[test]
     fn test_process_state_from_char() {

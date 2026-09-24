@@ -4,93 +4,93 @@
     {
       "case_id": "idle_orphan_low_io",
       "posterior": {
-        "useful": 1.3580509094554107e-14,
-        "useful_bad": 2.416421326496237e-20,
-        "abandoned": 0.537422692603861,
-        "zombie": 0.4625773073961246
+        "useful": 0.01080879191427037,
+        "useful_bad": 0.005594081278602078,
+        "abandoned": 0.6719117624209086,
+        "zombie": 0.31168536438621897
       },
       "classification": "abandoned",
       "confidence": "low",
       "top_evidence": [
         {
-          "feature": "cpu",
-          "direction": "supports abandoned",
-          "strength": "decisive",
-          "delta_bits": 22.78868139295719
-        },
-        {
           "feature": "runtime",
           "direction": "supports abandoned",
-          "strength": "decisive",
-          "delta_bits": 15.003833868629053
+          "strength": "strong",
+          "delta_bits": 2.1640425613334453
         },
         {
           "feature": "orphan",
           "direction": "supports abandoned",
-          "strength": "decisive",
-          "delta_bits": 3.9772799234999168
+          "strength": "substantial",
+          "delta_bits": 1.9886399617499584
+        },
+        {
+          "feature": "prior",
+          "direction": "supports useful",
+          "strength": "substantial",
+          "delta_bits": -1.807354922057604
         }
       ]
     },
     {
       "case_id": "active_tty_net",
       "posterior": {
-        "useful": 0.9945676641389708,
-        "useful_bad": 0.005432217123659855,
-        "abandoned": 1.187373700952328e-7,
-        "zombie": 2.567777444534649e-64
+        "useful": 0.9778485301160212,
+        "useful_bad": 0.019314299517638144,
+        "abandoned": 0.0026278135554252437,
+        "zombie": 0.00020935681091526214
       },
       "classification": "useful",
-      "confidence": "very_high",
+      "confidence": "high",
       "top_evidence": [
         {
           "feature": "cpu",
           "direction": "supports useful",
-          "strength": "decisive",
-          "delta_bits": -12.054095520550755
+          "strength": "strong",
+          "delta_bits": -2.1640425613334453
+        },
+        {
+          "feature": "prior",
+          "direction": "supports useful",
+          "strength": "substantial",
+          "delta_bits": -1.807354922057604
         },
         {
           "feature": "io_active",
           "direction": "supports useful",
-          "strength": "strong",
-          "delta_bits": -3.044394119358454
-        },
-        {
-          "feature": "tty",
-          "direction": "supports useful",
-          "strength": "strong",
-          "delta_bits": -2.8479969065549504
+          "strength": "substantial",
+          "delta_bits": -1.522197059679227
         }
       ]
     },
     {
       "case_id": "mixed_idle_with_tty",
       "posterior": {
-        "useful": 0.03493015770182757,
-        "useful_bad": 8.815742428234433e-8,
-        "abandoned": 0.9650357848427937,
-        "zombie": 0.000033969297953539424
+        "useful": 0.5752717552221259,
+        "useful_bad": 0.07508516009887006,
+        "abandoned": 0.341503823440333,
+        "zombie": 0.008139261238670831
       },
-      "classification": "abandoned",
-      "confidence": "high",
+      "classification": "useful",
+      "confidence": "low",
       "top_evidence": [
         {
           "feature": "cpu",
           "direction": "supports abandoned",
-          "strength": "decisive",
-          "delta_bits": 8.813451394658067
+          "strength": "strong",
+          "delta_bits": 2.1640425613334453
+        },
+        {
+          "feature": "prior",
+          "direction": "supports useful",
+          "strength": "substantial",
+          "delta_bits": -1.807354922057604
         },
         {
           "feature": "tty",
           "direction": "supports useful",
-          "strength": "strong",
-          "delta_bits": -2.8479969065549504
-        },
-        {
-          "feature": "orphan",
-          "direction": "supports useful",
           "strength": "substantial",
-          "delta_bits": -1.929610672108602
+          "delta_bits": -1.4239984532774752
         }
       ]
     }

@@ -1974,6 +1974,16 @@ fn run_interactive(global: &GlobalOpts, args: &RunArgs) -> ExitCode {
     let _ = args;
     #[cfg(feature = "ui")]
     {
+        use std::io::IsTerminal;
+        if global.robot || !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            output_stub(
+                global,
+                "run",
+                "Interactive mode needs a terminal; for scripts and agents use \
+                 `pt agent plan` / `pt agent apply`",
+            );
+            return ExitCode::CapabilityError;
+        }
         match run_interactive_tui(global, args) {
             Ok(()) => ExitCode::Clean,
             Err(err) => {
@@ -1989,7 +1999,7 @@ fn run_interactive(global: &GlobalOpts, args: &RunArgs) -> ExitCode {
             "run",
             "Interactive mode requires the `ui` feature (build with --features ui)",
         );
-        ExitCode::PartialFail
+        ExitCode::CapabilityError
     }
 }
 
@@ -2736,10 +2746,8 @@ fn build_tui_rows(
         if proc.pid.0 == 0 || proc.pid.0 == 1 {
             continue;
         }
-        if let Some(threshold) = min_age {
-            if proc.elapsed.as_secs() < threshold {
-                continue;
-            }
+        if proc.elapsed.as_secs() < min_age.unwrap_or(policy.guardrails.min_process_age_seconds) {
+            continue;
         }
 
         let deep = deep_signals.and_then(|m| m.get(&proc.pid.0).copied());
@@ -2803,13 +2811,9 @@ fn build_tui_rows(
                 }
             }
         }
-        let max_posterior = posterior_result
-            .posterior
-            .useful
-            .max(posterior_result.posterior.useful_bad)
-            .max(posterior_result.posterior.abandoned)
-            .max(posterior_result.posterior.zombie);
-        if max_posterior < MIN_POSTERIOR {
+        // Show rows where some intervention is plausibly warranted (never max-class:
+        // that admitted confidently-useful processes).
+        if posterior_result.posterior.intervention_probability() < MIN_POSTERIOR {
             continue;
         }
 
@@ -2819,7 +2823,7 @@ fn build_tui_rows(
             _ => "REVIEW",
         };
 
-        let score = (max_posterior * 100.0).round() as u32;
+        let score = posterior_result.posterior.suspicion_score();
         let runtime = format_duration_human(proc.elapsed.as_secs());
         let memory = format_memory_human(proc.rss_bytes);
         let galaxy_brain = render_galaxy_brain(
@@ -3010,7 +3014,7 @@ fn build_tui_rows(
 
 #[cfg(target_os = "linux")]
 use pt_core::collect::{
-    collect_fd_ipc_resources, collect_lineage_for_pid, collect_listener_resources,
+    collect_fd_ipc_resources, collect_lineage_for_pid, collect_listener_resources_from,
     collect_local_resource_evidence, detect_listener_conflicts, parse_fd, parse_proc_net_tcp,
     parse_proc_net_udp, NetworkSnapshot, SharedResourceGraph,
 };
@@ -3088,6 +3092,8 @@ fn build_provenance_inference_bundle(processes: &[&ProcessRecord]) -> Provenance
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut per_process_resources: Vec<(u32, Vec<pt_common::RawResourceEvidence>)> = Vec::new();
     let mut all_resources = Vec::new();
+    // One socket-table snapshot for the whole scan (was re-parsed per process).
+    let network_snapshot = NetworkSnapshot::collect();
 
     for proc in processes {
         let pid = proc.pid.0;
@@ -3096,16 +3102,21 @@ fn build_provenance_inference_bundle(processes: &[&ProcessRecord]) -> Provenance
 
         let fd_info = parse_fd(pid);
         let mut resources = collect_local_resource_evidence(pid, fd_info.as_ref());
-        resources.extend(collect_listener_resources(pid));
+        resources.extend(collect_listener_resources_from(pid, &network_snapshot));
         resources.extend(collect_fd_ipc_resources(pid));
         all_resources.extend(resources.iter().cloned());
         per_process_resources.push((pid, resources));
     }
 
+    let index_of_pid: HashMap<u32, usize> = per_process_resources
+        .iter()
+        .enumerate()
+        .map(|(i, (pid, _))| (*pid, i))
+        .collect();
     for conflict in detect_listener_conflicts(&all_resources) {
-        if let Some((_, resources)) = per_process_resources
-            .iter_mut()
-            .find(|(pid, _)| *pid == conflict.owner_pid)
+        if let Some((_, resources)) = index_of_pid
+            .get(&conflict.owner_pid)
+            .map(|&i| &mut per_process_resources[i])
         {
             if let Some(existing) = resources
                 .iter_mut()
@@ -4027,7 +4038,8 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
             "deep-scan",
             "Deep scan is currently supported on Linux only",
         );
-        ExitCode::Clean
+        // Not a success: agents must not read a stub as a completed deep scan.
+        ExitCode::CapabilityError
     }
 }
 
@@ -4040,7 +4052,7 @@ fn run_query(global: &GlobalOpts, args: &QueryArgs) -> ExitCode {
                 "query actions",
                 "Query actions mode not yet implemented",
             );
-            ExitCode::Clean
+            ExitCode::CapabilityError
         }
         Some(QueryCommands::Telemetry { .. }) => {
             output_stub(
@@ -4048,7 +4060,7 @@ fn run_query(global: &GlobalOpts, args: &QueryArgs) -> ExitCode {
                 "query telemetry",
                 "Query telemetry mode not yet implemented",
             );
-            ExitCode::Clean
+            ExitCode::CapabilityError
         }
         None => {
             if let Some(expr) = &args.query {
@@ -4057,14 +4069,15 @@ fn run_query(global: &GlobalOpts, args: &QueryArgs) -> ExitCode {
                     "query",
                     &format!("Query expression '{}' is not yet implemented", expr),
                 );
+                ExitCode::CapabilityError
             } else {
                 output_stub(
                     global,
                     "query",
                     "Use subcommands like `query sessions --limit 10`",
                 );
+                ExitCode::ArgsError
             }
-            ExitCode::Clean
         }
     }
 }
@@ -4976,7 +4989,7 @@ fn run_report(global: &GlobalOpts, _args: &ReportArgs) -> ExitCode {
         "report",
         "Report generation requires building with the `report` feature",
     );
-    ExitCode::Clean
+    ExitCode::CapabilityError
 }
 
 fn run_check(global: &GlobalOpts, args: &CheckArgs) -> ExitCode {
@@ -7262,31 +7275,190 @@ fn run_config_schema(global: &GlobalOpts, file: &str) -> ExitCode {
 }
 
 /// Validate configuration files.
+/// Plan post-pass: process-tree safety for kill recommendations.
+///
+/// 1. A process with a live (non-zombie) child that is not itself recommended for a
+///    kill must not be killed: an idle wrapper shell waiting on an active build is
+///    not abandoned, and killing it kills the build (observed on rch workers).
+///    Iterated to a fixpoint, since downgrading a child can require downgrading its
+///    parent.
+/// 2. With built-in protection, descendants of a live AI agent CLI session are capped
+///    at review: the agent may be waiting on them (observed: `tail -F | ugrep`
+///    monitors started by live Claude sessions).
+///
+/// Returns the number of downgraded candidates.
+fn apply_process_tree_safety(
+    candidates: &mut [&mut serde_json::Value],
+    processes: &[ProcessRecord],
+    agent_rule: bool,
+) -> usize {
+    let parent_of: HashMap<u32, u32> = processes.iter().map(|p| (p.pid.0, p.ppid.0)).collect();
+    let by_pid: HashMap<u32, &ProcessRecord> = processes.iter().map(|p| (p.pid.0, p)).collect();
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for p in processes {
+        if !p.state.is_zombie() {
+            children.entry(p.ppid.0).or_default().push(p.pid.0);
+        }
+    }
+    let pid_of = |c: &serde_json::Value| c.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let is_kill = |c: &serde_json::Value| {
+        c.get("recommended_action").and_then(|v| v.as_str()) == Some("kill")
+    };
+    let mut kill_set: HashSet<u32> = candidates
+        .iter()
+        .filter(|c| is_kill(c))
+        .map(|c| pid_of(c))
+        .collect();
+
+    let agent_ancestor = |pid: u32| -> Option<u32> {
+        let mut cur = parent_of.get(&pid).copied();
+        let mut hops = 0;
+        while let Some(p) = cur {
+            if p <= 1 || hops > 64 {
+                return None;
+            }
+            if let Some(rec) = by_pid.get(&p) {
+                if pt_core::collect::protected::builtin_force_review_match(&rec.cmd).is_some() {
+                    return Some(p);
+                }
+            }
+            cur = parent_of.get(&p).copied();
+            hops += 1;
+        }
+        None
+    };
+
+    let downgrade = |c: &mut serde_json::Value, reason: String, rule: &str| {
+        if let Some(obj) = c.as_object_mut() {
+            obj.insert(
+                "recommended_action".to_string(),
+                serde_json::json!("review"),
+            );
+            obj.insert("recommendation".to_string(), serde_json::json!("REVIEW"));
+            obj.insert("action_rationale".to_string(), serde_json::json!(reason));
+            obj.insert(
+                "tree_safety".to_string(),
+                serde_json::json!({ "rule": rule }),
+            );
+        }
+    };
+
+    let mut downgraded = 0;
+    loop {
+        let mut changed = false;
+        for c in candidates.iter_mut() {
+            if !is_kill(c) {
+                continue;
+            }
+            let pid = pid_of(c);
+            let live_child = children
+                .get(&pid)
+                .and_then(|kids| kids.iter().find(|k| !kill_set.contains(k)).copied());
+            if let Some(child) = live_child {
+                let child_cmd = by_pid.get(&child).map(|r| r.comm.as_str()).unwrap_or("?");
+                downgrade(
+                    c,
+                    format!(
+                        "Kill downgraded to review: has live child {child} ({child_cmd}) that is \
+                         not being killed; killing this process would take it down too"
+                    ),
+                    "live_child",
+                );
+            } else if let Some(agent) = agent_rule.then(|| agent_ancestor(pid)).flatten() {
+                downgrade(
+                    c,
+                    format!(
+                        "Kill downgraded to review: started by live agent session {agent}; \
+                         the agent may be waiting on it"
+                    ),
+                    "agent_descendant",
+                );
+            } else {
+                continue;
+            }
+            kill_set.remove(&pid);
+            downgraded += 1;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    downgraded
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigFileKind {
+    Priors,
+    Policy,
+}
+
+/// Classify a config file by its JSON content (policy vs priors).
+fn detect_config_file_kind(path: &std::path::Path) -> Result<ConfigFileKind, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read file: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("not valid JSON: {e}"))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "expected a JSON object".to_string())?;
+    let is_policy = ["loss_matrix", "guardrails", "robot_mode"]
+        .iter()
+        .any(|k| obj.contains_key(*k));
+    let is_priors = obj.contains_key("classes");
+    match (is_policy, is_priors) {
+        (true, false) => Ok(ConfigFileKind::Policy),
+        (false, true) => Ok(ConfigFileKind::Priors),
+        (true, true) => Err("file mixes policy and priors keys".to_string()),
+        (false, false) => Err(
+            "unrecognized config file: expected a policy (loss_matrix/guardrails) \
+             or priors (classes) document"
+                .to_string(),
+        ),
+    }
+}
+
 fn run_config_validate(global: &GlobalOpts, path: Option<&String>) -> ExitCode {
     let session_id = SessionId::new();
 
     // Build config options
     let options = if let Some(p) = path {
-        // Validate specific file
         let path_buf = PathBuf::from(p);
-        if p.contains("priors") {
-            ConfigOptions {
-                config_dir: None,
-                priors_path: Some(path_buf),
-                policy_path: None,
-            }
-        } else if p.contains("policy") {
-            ConfigOptions {
-                config_dir: None,
-                priors_path: None,
-                policy_path: Some(path_buf),
-            }
-        } else {
-            // Assume it's a config directory
+        if path_buf.is_dir() {
             ConfigOptions {
                 config_dir: Some(path_buf),
                 priors_path: None,
                 policy_path: None,
+            }
+        } else {
+            // A specific file: decide what it is from its CONTENT. (Guessing from the
+            // filename made `config validate junk.json` load defaults and report
+            // "valid" for any file whose name lacked "priors"/"policy".)
+            match detect_config_file_kind(&path_buf) {
+                Ok(ConfigFileKind::Priors) => ConfigOptions {
+                    config_dir: None,
+                    priors_path: Some(path_buf),
+                    policy_path: None,
+                },
+                Ok(ConfigFileKind::Policy) => ConfigOptions {
+                    config_dir: None,
+                    priors_path: None,
+                    policy_path: Some(path_buf),
+                },
+                Err(message) => {
+                    let response = serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "session_id": session_id.0,
+                        "generated_at": chrono::Utc::now().to_rfc3339(),
+                        "status": "invalid",
+                        "path": p,
+                        "error": message,
+                    });
+                    if matches!(global.format, OutputFormat::Json | OutputFormat::Toon) {
+                        println!("{}", format_structured_output(global, response));
+                    }
+                    eprintln!("config validate: error: {p}: {message}");
+                    return ExitCode::ArgsError;
+                }
             }
         }
     } else {
@@ -8397,11 +8569,11 @@ fn run_telemetry(global: &GlobalOpts, _args: &TelemetryArgs) -> ExitCode {
         } => run_telemetry_prune(global, _args, keep, *dry_run, *keep_everything),
         TelemetryCommands::Export { .. } => {
             output_stub(global, "telemetry export", "Export not yet implemented");
-            ExitCode::Clean
+            ExitCode::CapabilityError
         }
         TelemetryCommands::Redact { .. } => {
             output_stub(global, "telemetry redact", "Redaction not yet implemented");
-            ExitCode::Clean
+            ExitCode::CapabilityError
         }
     }
 }
@@ -10324,6 +10496,125 @@ fn output_stub_with_session(
 }
 
 #[cfg(test)]
+mod process_tree_safety_tests {
+    use super::apply_process_tree_safety;
+    use pt_common::{ProcessId, StartId};
+    use pt_core::collect::{ProcessRecord, ProcessState};
+
+    fn rec(pid: u32, ppid: u32, cmd: &str, state: ProcessState) -> ProcessRecord {
+        ProcessRecord {
+            pid: ProcessId(pid),
+            ppid: ProcessId(ppid),
+            uid: 1000,
+            user: "u".to_string(),
+            pgid: Some(pid),
+            sid: Some(pid),
+            start_id: StartId::from_linux("b", 1, pid),
+            comm: cmd.split_whitespace().next().unwrap_or("").to_string(),
+            cmd: cmd.to_string(),
+            state,
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            vsz_bytes: 0,
+            tty: None,
+            start_time_unix: 0,
+            elapsed: std::time::Duration::from_secs(7200),
+            source: "test".to_string(),
+            container_info: None,
+        }
+    }
+
+    fn cand(pid: u32) -> serde_json::Value {
+        serde_json::json!({"pid": pid, "recommended_action": "kill", "recommendation": "KILL"})
+    }
+
+    #[test]
+    fn tree_safety_rules() {
+        use ProcessState::{Sleeping as S, Zombie as Z};
+        let procs = vec![
+            // Idle wrapper waiting on an active build that is not a candidate.
+            rec(100, 1, "sh -c cargo test", S),
+            rec(101, 100, "cargo test -p x", S),
+            // Fully stuck chain: both recommended for kill -> both stay.
+            rec(200, 1, "sh -c sleep 99999", S),
+            rec(201, 200, "sleep 99999", S),
+            // Monitor started by a live agent session.
+            rec(300, 1, "claude --dangerously-skip-permissions", S),
+            rec(301, 300, "tail -F /tmp/gate.log", S),
+            // Parent whose only child is a zombie it never reaps -> kill stays.
+            rec(400, 1, "leaky-parent", S),
+            rec(401, 400, "[defunct]", Z),
+            // Chain where the leaf is spared: the downgrade propagates upward.
+            rec(500, 1, "sh -c wrapper", S),
+            rec(501, 500, "sh -c inner", S),
+            rec(502, 501, "python server.py", S),
+        ];
+        let mut values = [
+            cand(100),
+            cand(200),
+            cand(201),
+            cand(301),
+            cand(400),
+            cand(500),
+            cand(501),
+        ];
+        let mut refs: Vec<&mut serde_json::Value> = values.iter_mut().collect();
+        let n = apply_process_tree_safety(&mut refs, &procs, true);
+        let action = |pid: u64| {
+            values.iter().find(|v| v["pid"] == pid).unwrap()["recommended_action"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(action(100), "review", "wrapper with live child");
+        assert_eq!(action(200), "kill");
+        assert_eq!(action(201), "kill");
+        assert_eq!(action(301), "review", "agent descendant");
+        assert_eq!(
+            action(400),
+            "kill",
+            "zombie children do not protect the parent"
+        );
+        assert_eq!(action(501), "review");
+        assert_eq!(action(500), "review", "downgrade propagates to ancestors");
+        assert_eq!(n, 4);
+        let v301 = values.iter().find(|v| v["pid"] == 301).unwrap();
+        assert_eq!(v301["tree_safety"]["rule"], "agent_descendant");
+    }
+}
+
+#[cfg(test)]
+mod config_file_kind_tests {
+    use super::{detect_config_file_kind, ConfigFileKind};
+
+    fn write(dir: &tempfile::TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn detects_by_content_not_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/configs");
+        // Shipped example profiles are policies even though "policy" is not in the name.
+        for name in ["developer.json", "server.json", "ci.json"] {
+            assert_eq!(
+                detect_config_file_kind(&repo.join(name)),
+                Ok(ConfigFileKind::Policy),
+                "{name}"
+            );
+        }
+        let priors = write(&dir, "x.json", r#"{"schema_version":"1","classes":{}}"#);
+        assert_eq!(detect_config_file_kind(&priors), Ok(ConfigFileKind::Priors));
+        let junk = write(&dir, "policy_junk.json", r#"{"hello":1}"#);
+        assert!(detect_config_file_kind(&junk).is_err());
+        let not_json = write(&dir, "priors.json", "nope");
+        assert!(detect_config_file_kind(&not_json).is_err());
+    }
+}
+
+#[cfg(test)]
 mod config_schema_tests {
     use super::generate_config_schema;
 
@@ -11109,13 +11400,16 @@ fn generate_narrative_summary(
 
         // Provenance narrative (when available)
         if let Some(prov) = candidate.get("provenance_inference") {
-            if prov.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if prov
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 if let Ok(prov_output) =
                     serde_json::from_value::<CandidateProvenanceOutput>(prov.clone())
                 {
                     let narrative = pt_common::ProvenanceNarrative::from_output(&prov_output);
-                    let rendered =
-                        narrative.render(pt_common::NarrativeVerbosity::Standard);
+                    let rendered = narrative.render(pt_common::NarrativeVerbosity::Standard);
                     for line in rendered.lines() {
                         output.push_str(&format!("   {}\n", line));
                     }
@@ -11262,12 +11556,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                     );
 
                     let posterior = &posterior_result.posterior;
-                    let max_posterior = posterior
-                        .useful
-                        .max(posterior.useful_bad)
-                        .max(posterior.abandoned)
-                        .max(posterior.zombie);
-                    let score = (max_posterior * 100.0).round() as u32;
+                    let score = posterior.suspicion_score();
 
                     let recommended_action = match decision_outcome.optimal_action {
                         Action::Keep => "keep",
@@ -11782,10 +12071,16 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
     // Process each candidate: compute posterior, make decision, build candidate output.
     //
-    // Collect all candidates above threshold with their max_posterior for sorting, plus
-    // a compact persisted snapshot (inventory + inference) so `diff` can compare sessions.
-    let mut all_candidates: Vec<(f64, serde_json::Value, PersistedProcess, PersistedInference)> =
-        Vec::new();
+    // Collect all candidates above threshold with their ranking key
+    // (P(abandoned or zombie), P(intervention)) plus a compact persisted snapshot
+    // (inventory + inference) so `diff` can compare sessions.
+    #[allow(clippy::type_complexity)]
+    let mut all_candidates: Vec<(
+        (f64, f64),
+        serde_json::Value,
+        PersistedProcess,
+        PersistedInference,
+    )> = Vec::new();
     let mut policy_blocked_count = 0usize;
     let mut signature_match_count = 0usize;
     let mut signature_fast_path_used_count = 0usize;
@@ -11804,16 +12099,16 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     };
     let mut shadow_recorded = 0u64;
 
-    // Apply min-age filter before sampling (if configured)
-    let eligible_processes: Vec<_> = if let Some(min_age) = args.min_age {
-        filter_result
-            .passed
-            .iter()
-            .filter(|proc| proc.elapsed.as_secs() >= min_age)
-            .collect()
-    } else {
-        filter_result.passed.iter().collect()
-    };
+    // Apply min-age filter before sampling: --min-age, else the policy guardrail
+    // (a 0-minute-old compiler at 10% CPU is never an abandonment candidate).
+    let effective_min_age = args
+        .min_age
+        .unwrap_or(decision_policy.guardrails.min_process_age_seconds);
+    let eligible_processes: Vec<_> = filter_result
+        .passed
+        .iter()
+        .filter(|proc| proc.elapsed.as_secs() >= effective_min_age)
+        .collect();
 
     // Apply sampling if requested (for testing)
     let processes_to_infer: Vec<_> = if let Some(sample_size) = args.sample_size {
@@ -12113,13 +12408,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
         decision_outcome.rationale.category = signature_category.clone();
 
-        // Determine max posterior class for filtering
+        // Candidate filtering uses P(intervention warranted) = 1 - P(useful); ranking and
+        // the user-facing score use P(abandoned or zombie). The max over classes is never
+        // used: it made confidently-useful processes pass the threshold and rank first.
         let posterior = &posterior_result.posterior;
-        let max_posterior = posterior
-            .useful
-            .max(posterior.useful_bad)
-            .max(posterior.abandoned)
-            .max(posterior.zombie);
+        let intervention_probability = posterior.intervention_probability();
+        let abandonment_probability = posterior.abandonment_probability();
 
         // Determine recommended action string (used for shadow recording and plan output)
         let mut recommended_action = match decision_outcome.optimal_action {
@@ -12161,7 +12455,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
 
         // Apply threshold filter
-        if max_posterior < args.min_posterior {
+        if intervention_probability < args.min_posterior {
             continue;
         }
 
@@ -12183,7 +12477,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             group: None,
             category: decision_outcome.rationale.category.clone(),
             age_seconds: proc.elapsed.as_secs(),
-            posterior: Some(max_posterior),
+            posterior: Some(match decision_outcome.optimal_action {
+                Action::Kill | Action::Restart => abandonment_probability,
+                _ => intervention_probability,
+            }),
             memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
             has_known_signature: decision_outcome
                 .rationale
@@ -12197,6 +12494,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             process_state: Some(proc.state),
             wchan: None,
             critical_files: Vec::new(),
+            cgroup_role: decision_policy
+                .guardrails
+                .builtin_protection
+                .then(|| pt_core::collect::read_cgroup_role(proc.pid.0)),
             #[cfg(target_os = "linux")]
             blast_radius_risk_level: Some(
                 format!("{:?}", provenance_adjustment.blast_radius.risk_level).to_lowercase(),
@@ -12208,15 +12509,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             #[cfg(not(target_os = "linux"))]
             blast_radius_total_affected: None,
             #[cfg(target_os = "linux")]
-            provenance_evidence_completeness: Some(
-                provenance_adjustment.evidence_completeness,
-            ),
+            provenance_evidence_completeness: Some(provenance_adjustment.evidence_completeness),
             #[cfg(not(target_os = "linux"))]
             provenance_evidence_completeness: None,
             #[cfg(target_os = "linux")]
-            provenance_confidence_penalty: Some(
-                provenance_adjustment.confidence_penalty_steps,
-            ),
+            provenance_confidence_penalty: Some(provenance_adjustment.confidence_penalty_steps),
             #[cfg(not(target_os = "linux"))]
             provenance_confidence_penalty: None,
         };
@@ -12230,6 +12527,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             policy_blocked_count += 1;
             recommended_action = "review";
         }
+        // Agent CLI sessions (claude/codex/agy/...) are never pre-selected for a kill:
+        // they may be mid-task. Surface them for manual review instead.
+        let agent_force_review = decision_policy.guardrails.builtin_protection
+            && recommended_action == "kill"
+            && pt_core::collect::protected::builtin_force_review_match(&proc.cmd).is_some();
+        if agent_force_review {
+            recommended_action = "review";
+        }
         let policy_value = serde_json::to_value(&policy_result)
             .unwrap_or_else(|_| serde_json::json!({ "allowed": policy_result.allowed }));
         let action_rationale = if policy_blocked {
@@ -12238,6 +12543,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 .as_ref()
                 .map(|v| format!("Policy blocked: {}", v.message))
                 .unwrap_or_else(|| "Policy blocked".to_string())
+        } else if agent_force_review {
+            "Kill downgraded to review: AI agent CLI session (may be mid-task); \
+             kill only after manual review"
+                .to_string()
         } else {
             format!(
                 "Action {:?} selected{}",
@@ -12268,8 +12577,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let age_seconds = proc.elapsed.as_secs();
         let age_human = format_duration_human(age_seconds);
 
-        // Calculate a composite score (0-100) based on max posterior
-        let score = (max_posterior * 100.0).round() as u32;
+        // User-facing suspicion score (0-100) = 100 * P(abandoned or zombie)
+        let score = posterior.suspicion_score();
         let voi_summary = sequential_probe.as_ref().map(|(decision, ledger)| {
             serde_json::json!({
                 "should_probe": decision.should_probe,
@@ -12360,8 +12669,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             },
             "supervisor": supervisor_info_for_plan(proc.pid.0),
             "uncertainty": {
-                "entropy": ledger.bayes_factors.len() as f64 * 0.1, // Simplified
-                "confidence_interval": [(max_posterior - 0.1).max(0.0), (max_posterior + 0.1).min(1.0)],
+                // Shannon entropy (bits) of the 4-class posterior: 0 = certain, 2 = uniform.
+                "posterior_entropy_bits": posterior.entropy_bits(),
+                "abandonment_probability": abandonment_probability,
+                "intervention_probability": intervention_probability,
             },
             "recommendation": recommended_action.to_uppercase(),
             "recommended_action": recommended_action,
@@ -12444,14 +12755,23 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                     .iter()
                     .map(|t| t.log_likelihood.abandoned - t.log_likelihood.useful)
                     .sum();
-                if shift.abs() > f64::EPSILON { Some(shift) } else { None }
+                if shift.abs() > f64::EPSILON {
+                    Some(shift)
+                } else {
+                    None
+                }
             },
             #[cfg(not(target_os = "linux"))]
             provenance_log_odds_shift: None,
         };
 
-        // Store candidate with max_posterior for sorting (no early break!)
-        all_candidates.push((max_posterior, candidate, persisted_proc, persisted_inf));
+        // Store candidate with its ranking key (no early break!)
+        all_candidates.push((
+            (abandonment_probability, intervention_probability),
+            candidate,
+            persisted_proc,
+            persisted_inf,
+        ));
     }
 
     if let Some(ref e) = emitter {
@@ -12477,8 +12797,24 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     }
 
-    // Sort candidates by max_posterior descending (highest confidence first)
-    all_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Process-tree safety: never kill a process whose live children are not being
+    // killed too, and cap descendants of live agent sessions at review.
+    {
+        let mut candidate_values: Vec<&mut serde_json::Value> =
+            all_candidates.iter_mut().map(|c| &mut c.1).collect();
+        apply_process_tree_safety(
+            &mut candidate_values,
+            &scan_result.processes,
+            decision_policy.guardrails.builtin_protection,
+        );
+    }
+
+    // Rank by P(abandoned or zombie), then by P(intervention warranted), descending.
+    all_candidates.sort_by(|a, b| {
+        b.0 .0
+            .total_cmp(&a.0 .0)
+            .then_with(|| b.0 .1.total_cmp(&a.0 .1))
+    });
 
     // Capture count before truncation for summary stats
     let above_threshold_count = all_candidates.len();
@@ -12723,6 +13059,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "robot": global.robot,
             "shadow": global.shadow,
             "min_age": args.min_age,
+            "effective_min_age": effective_min_age,
             "sample_size": args.sample_size,
             "include_kernel_threads": args.include_kernel_threads,
             "deep": args.deep,
@@ -13273,7 +13610,7 @@ fn build_process_explanation(
                     "log_bf": bf.log_bf,
                     "bf": bf.bf,
                     "delta_bits": bf.delta_bits,
-                    "direction": format!("{}", bf.direction),
+                    "direction": bf.direction.to_string(),
                     "strength": bf.strength.clone(),
                 })
             })
@@ -13872,13 +14209,15 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let total_actions = actions_to_apply.len() as u64;
     let mut action_index = 0u64;
 
-    let candidate_posterior = |scores: &pt_core::inference::ClassScores| {
-        scores
-            .useful
-            .max(scores.useful_bad)
-            .max(scores.abandoned)
-            .max(scores.zombie)
-    };
+    // The robot `min_posterior` gate must compare the probability of the event that
+    // justifies the action, never the max over classes (a 96%-useful process would
+    // otherwise pass a 0.95 kill gate). Kill/restart resolve abandonment; every other
+    // action is justified by "not useful".
+    let candidate_posterior =
+        |scores: &pt_core::inference::ClassScores, action: Action| match action {
+            Action::Kill | Action::Restart => scores.abandonment_probability(),
+            _ => scores.intervention_probability(),
+        };
     let emit_action_event = |event_name: &str,
                              index: u64,
                              elapsed_ms: Option<u64>,
@@ -14015,7 +14354,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
 
             let candidate = RobotCandidate {
-                posterior: action.rationale.posterior.as_ref().map(candidate_posterior),
+                posterior: action
+                    .rationale
+                    .posterior
+                    .as_ref()
+                    .map(|scores| candidate_posterior(scores, action.action)),
                 memory_mb: action.rationale.memory_mb,
                 has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
                 category: action.rationale.category.clone(),
@@ -14130,7 +14473,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
                 let start = std::time::Instant::now();
                 let candidate = RobotCandidate {
-                    posterior: action.rationale.posterior.as_ref().map(candidate_posterior),
+                    posterior: action
+                        .rationale
+                        .posterior
+                        .as_ref()
+                        .map(|scores| candidate_posterior(scores, action.action)),
                     memory_mb: action.rationale.memory_mb,
                     has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
                     category: action.rationale.category.clone(),
@@ -16926,10 +17273,11 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             if proc.pid.0 == 0 || proc.pid.0 == 1 {
                 continue;
             }
-            if let Some(min_age) = args.min_age {
-                if proc.elapsed.as_secs() < min_age {
-                    continue;
-                }
+            let min_age = args
+                .min_age
+                .unwrap_or(policy.guardrails.min_process_age_seconds);
+            if proc.elapsed.as_secs() < min_age {
+                continue;
             }
 
             let Some(eval) = evaluate_watch_candidate(proc, &priors, &decision_policy) else {

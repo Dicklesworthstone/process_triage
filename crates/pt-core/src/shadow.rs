@@ -100,12 +100,7 @@ impl ShadowRecorder {
         self.had_records = true;
         let identity_hash = compute_identity_hash(proc);
         let state_char = proc.state.to_string().chars().next().unwrap_or('?');
-        let max_posterior = posterior
-            .useful
-            .max(posterior.useful_bad)
-            .max(posterior.abandoned)
-            .max(posterior.zombie);
-        let score = (max_posterior * 100.0) as f32;
+        let score = (posterior.abandonment_probability() * 100.0) as f32;
 
         let belief = BeliefState {
             p_abandoned: posterior.abandoned as f32,

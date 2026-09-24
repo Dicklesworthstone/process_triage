@@ -60,6 +60,34 @@ impl ClassScores {
     fn as_vec(&self) -> [f64; 4] {
         [self.useful, self.useful_bad, self.abandoned, self.zombie]
     }
+
+    /// Probability that the process is abandoned or a zombie: the event a kill resolves.
+    ///
+    /// This, not the max over classes, is what "how suspicious is this process" means.
+    /// A 99%-useful process has a max-class value of 0.99 but an abandonment
+    /// probability of ~0.
+    pub fn abandonment_probability(&self) -> f64 {
+        (self.abandoned + self.zombie).clamp(0.0, 1.0)
+    }
+
+    /// Probability that some intervention is warranted (anything but useful).
+    pub fn intervention_probability(&self) -> f64 {
+        (1.0 - self.useful).clamp(0.0, 1.0)
+    }
+
+    /// Suspicion score on the 0-100 scale shown to users: `100 * P(abandoned or zombie)`.
+    pub fn suspicion_score(&self) -> u32 {
+        (self.abandonment_probability() * 100.0).round() as u32
+    }
+
+    /// Shannon entropy of the class distribution in bits (0 = certain, 2 = uniform).
+    pub fn entropy_bits(&self) -> f64 {
+        self.as_vec()
+            .iter()
+            .filter(|p| **p > 0.0)
+            .map(|p| -p * p.log2())
+            .sum()
+    }
 }
 
 /// Evidence term contribution per class.
@@ -91,6 +119,13 @@ pub fn apply_evidence_terms(
         return Ok(base.clone());
     }
 
+    let extra_terms: Vec<EvidenceTerm> = extra_terms
+        .into_iter()
+        .map(|t| EvidenceTerm {
+            log_likelihood: robust_term(t.log_likelihood),
+            ..t
+        })
+        .collect();
     let mut log_unnormalized = base.log_posterior;
     for term in &extra_terms {
         log_unnormalized = add_scores(log_unnormalized, term.log_likelihood);
@@ -252,7 +287,7 @@ pub fn compute_posterior(
     };
 
     let mut log_unnormalized = prior_scores;
-    let mut evidence_terms = Vec::new();
+    let mut evidence_terms = Vec::with_capacity(10);
     evidence_terms.push(EvidenceTerm {
         feature: "prior".to_string(),
         log_likelihood: prior_scores,
@@ -285,7 +320,6 @@ pub fn compute_posterior(
                 cache.zombie.cpu_beta.as_ref(),
             )?,
         };
-        log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "cpu".to_string(),
             log_likelihood: term,
@@ -315,7 +349,6 @@ pub fn compute_posterior(
                 cache.zombie.runtime_gamma.as_ref(),
             )?,
         };
-        log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "runtime".to_string(),
             log_likelihood: term,
@@ -337,7 +370,6 @@ pub fn compute_posterior(
             )?,
             zombie: log_lik_beta_bernoulli(orphan, &priors.classes.zombie.orphan_beta, "orphan")?,
         };
-        log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "orphan".to_string(),
             log_likelihood: term,
@@ -351,7 +383,6 @@ pub fn compute_posterior(
             abandoned: log_lik_beta_bernoulli(tty, &priors.classes.abandoned.tty_beta, "tty")?,
             zombie: log_lik_beta_bernoulli(tty, &priors.classes.zombie.tty_beta, "tty")?,
         };
-        log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "tty".to_string(),
             log_likelihood: term,
@@ -365,7 +396,6 @@ pub fn compute_posterior(
             abandoned: log_lik_beta_bernoulli(net, &priors.classes.abandoned.net_beta, "net")?,
             zombie: log_lik_beta_bernoulli(net, &priors.classes.zombie.net_beta, "net")?,
         };
-        log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "net".to_string(),
             log_likelihood: term,
@@ -395,7 +425,6 @@ pub fn compute_posterior(
                 "io_active",
             )?,
         };
-        log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "io_active".to_string(),
             log_likelihood: term,
@@ -425,7 +454,6 @@ pub fn compute_posterior(
                 "queue_saturated",
             )?,
         };
-        log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "queue_saturated".to_string(),
             log_likelihood: term,
@@ -459,7 +487,6 @@ pub fn compute_posterior(
                 "zombie",
             )?,
         };
-        log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "state_flag".to_string(),
             log_likelihood: term,
@@ -493,11 +520,28 @@ pub fn compute_posterior(
                 "zombie",
             )?,
         };
-        log_unnormalized = add_scores(log_unnormalized, term);
         evidence_terms.push(EvidenceTerm {
             feature: "command_category".to_string(),
             log_likelihood: term,
         });
+    }
+
+    // Combine prior + robustified evidence (see `robust_term`); the ledger keeps the
+    // effective terms so explanations match the decision. A kernel-reported terminal
+    // state (Zombie/Dead) is an observed fact, not a misspecified statistical
+    // feature, so that single term is used as-is.
+    let terminal_state = evidence.state_flag.is_some_and(|idx| {
+        priors
+            .state_flags
+            .as_ref()
+            .and_then(|f| f.flag_names.get(idx))
+            .is_some_and(|name| name == "Zombie" || name == "Dead")
+    });
+    for term in evidence_terms.iter_mut().skip(1) {
+        if !(terminal_state && term.feature == "state_flag") {
+            term.log_likelihood = robust_term(term.log_likelihood);
+        }
+        log_unnormalized = add_scores(log_unnormalized, term.log_likelihood);
     }
 
     let log_arr = log_unnormalized.as_vec();
@@ -522,6 +566,51 @@ pub fn compute_posterior(
         log_odds_abandoned_useful: log_posterior.abandoned - log_posterior.useful,
         evidence_terms,
     })
+}
+
+/// Maximum log-likelihood ratio (nats) a single evidence term may contribute between
+/// any two classes (bounded influence; e^3 ≈ 20:1).
+pub const TERM_CLIP_NATS: f64 = 3.0;
+
+/// Safe-Bayes tempering exponent applied to evidence (not to the prior).
+pub const EVIDENCE_TEMPERING: f64 = 0.5;
+
+/// Robustify one evidence term: clip its class log-likelihoods to within
+/// `TERM_CLIP_NATS` of the best class, then temper by `EVIDENCE_TEMPERING`.
+///
+/// Why: the likelihood model is misspecified and its features are correlated
+/// (orphan / no-tty / no-io / no-net all measure "detached"). Raw naive Bayes let a
+/// single term dominate (runtime for a week-old process: ~48 nats; CPU for an idle
+/// daemon: ~13 nats), so every long-running process, including live agent sessions,
+/// terminal multiplexers and databases, scored P(abandoned) = 1.000 on a 20-host fleet
+/// scan (2026-09-24). With a reachable Kill action that overconfidence is dangerous.
+/// Clipping bounds each feature's influence; tempering (a power posterior, as in
+/// Safe-Bayes / Grünwald) corrects the double counting of correlated features. A
+/// constant shift per term does not change the posterior, so terms are stored
+/// relative to their best class.
+pub fn robust_term(term: ClassScores) -> ClassScores {
+    let best = term
+        .useful
+        .max(term.useful_bad)
+        .max(term.abandoned)
+        .max(term.zombie);
+    if !best.is_finite() {
+        return term;
+    }
+    // Hard evidence (a class ruled out, log-likelihood -inf) stays hard.
+    let f = |v: f64| {
+        if v.is_finite() {
+            EVIDENCE_TEMPERING * (v - best).max(-TERM_CLIP_NATS)
+        } else {
+            v
+        }
+    };
+    ClassScores {
+        useful: f(term.useful),
+        useful_bad: f(term.useful_bad),
+        abandoned: f(term.abandoned),
+        zombie: f(term.zombie),
+    }
 }
 
 fn add_scores(a: ClassScores, b: ClassScores) -> ClassScores {
@@ -754,6 +843,97 @@ mod tests {
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() <= tol
+    }
+
+    #[test]
+    fn suspicion_score_is_abandonment_not_max_class() {
+        // Confidently useful: max-class would be 99, suspicion must be ~0.
+        let useful = ClassScores {
+            useful: 0.99,
+            useful_bad: 0.005,
+            abandoned: 0.004,
+            zombie: 0.001,
+        };
+        assert_eq!(useful.suspicion_score(), 1);
+        assert!(approx_eq(useful.intervention_probability(), 0.01, 1e-12));
+
+        // Confidently useful_bad (e.g. a stalled but live process): intervention is
+        // warranted but it is not abandoned.
+        let stalled = ClassScores {
+            useful: 0.0,
+            useful_bad: 1.0,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        assert_eq!(stalled.suspicion_score(), 0);
+        assert!(approx_eq(stalled.intervention_probability(), 1.0, 1e-12));
+
+        let abandoned = ClassScores {
+            useful: 0.02,
+            useful_bad: 0.03,
+            abandoned: 0.9,
+            zombie: 0.05,
+        };
+        assert_eq!(abandoned.suspicion_score(), 95);
+        assert!(approx_eq(abandoned.abandonment_probability(), 0.95, 1e-12));
+    }
+
+    #[test]
+    fn robust_term_clips_tempers_and_keeps_hard_evidence() {
+        let raw = ClassScores {
+            useful: -60.0, // e.g. week-old runtime under a light-tailed Gamma
+            useful_bad: -10.0,
+            abandoned: -12.0,
+            zombie: f64::NEG_INFINITY,
+        };
+        let r = robust_term(raw);
+        // Best class maps to 0; others are clipped to -TERM_CLIP_NATS then tempered.
+        assert!(approx_eq(r.useful_bad, 0.0, 1e-12));
+        assert!(approx_eq(
+            r.useful,
+            -EVIDENCE_TEMPERING * TERM_CLIP_NATS,
+            1e-12
+        ));
+        assert!(approx_eq(r.abandoned, -EVIDENCE_TEMPERING * 2.0, 1e-12));
+        assert!(
+            r.zombie.is_infinite() && r.zombie < 0.0,
+            "ruled-out class stays ruled out"
+        );
+    }
+
+    /// No single feature may move the posterior by more than the clip, whatever the
+    /// raw likelihood says (bounded influence).
+    #[test]
+    fn single_feature_influence_is_bounded() {
+        let priors = Priors::default();
+        let ancient = Evidence {
+            runtime_seconds: Some(365.0 * 24.0 * 3600.0),
+            ..Evidence::default()
+        };
+        let base = compute_posterior(&priors, &Evidence::default()).unwrap();
+        let aged = compute_posterior(&priors, &ancient).unwrap();
+        let shift = (aged.log_posterior.abandoned - aged.log_posterior.useful)
+            - (base.log_posterior.abandoned - base.log_posterior.useful);
+        assert!(
+            shift.abs() <= EVIDENCE_TEMPERING * TERM_CLIP_NATS + 1e-9,
+            "runtime alone shifted log-odds by {shift}"
+        );
+    }
+
+    #[test]
+    fn entropy_bits_bounds() {
+        let certain = ClassScores {
+            useful: 1.0,
+            ..ClassScores::default()
+        };
+        assert!(approx_eq(certain.entropy_bits(), 0.0, 1e-12));
+        let uniform = ClassScores {
+            useful: 0.25,
+            useful_bad: 0.25,
+            abandoned: 0.25,
+            zombie: 0.25,
+        };
+        assert!(approx_eq(uniform.entropy_bits(), 2.0, 1e-12));
     }
 
     fn base_priors() -> Priors {

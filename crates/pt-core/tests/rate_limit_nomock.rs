@@ -43,6 +43,7 @@ fn killable_candidate() -> ProcessCandidate {
         process_state: None,
         wchan: None,
         critical_files: Vec::new(),
+        cgroup_role: None,
         blast_radius_risk_level: None,
         blast_radius_total_affected: None,
         provenance_evidence_completeness: None,

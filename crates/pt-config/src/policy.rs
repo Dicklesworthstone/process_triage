@@ -109,6 +109,16 @@ impl Default for LossRow {
     }
 }
 
+/// Loss-matrix design rule for the `abandoned` and `zombie` rows:
+///
+/// A non-terminal action (renice/pause/throttle/restart) applied to an abandoned
+/// process leaves its memory, ports, locks and file descriptors held, so its loss
+/// must stay close to the loss of `keep` (it only removes part of the harm).
+/// Only `kill` actually resolves an abandoned process. For zombies, renice/pause/
+/// throttle have no effect at all (loss == keep); `kill`/`restart` are routed to
+/// the parent by the planner. If these rows let a cheap reversible action tie or
+/// beat `kill`, the argmin can never recommend a kill (observed on a 20-host fleet
+/// on 2026-09-24: 0 kill recommendations, everything became `renice`).
 impl Default for LossMatrix {
     fn default() -> Self {
         Self {
@@ -130,19 +140,19 @@ impl Default for LossMatrix {
             },
             abandoned: LossRow {
                 keep: 5.0,
-                pause: Some(0.2),
-                throttle: Some(0.3),
+                pause: Some(3.5),
+                throttle: Some(4.0),
                 kill: 0.1,
-                restart: Some(1.0),
-                renice: Some(0.1),
+                restart: Some(4.0),
+                renice: Some(4.5),
             },
             zombie: LossRow {
                 keep: 1.0,
-                pause: Some(0.1),
-                throttle: Some(0.1),
+                pause: Some(1.0),
+                throttle: Some(1.0),
                 kill: 0.1,
                 restart: Some(0.1),
-                renice: Some(0.1),
+                renice: Some(1.0),
             },
         }
     }
@@ -185,6 +195,16 @@ pub struct Guardrails {
 
     #[serde(default)]
     pub require_confirmation: Option<bool>,
+
+    /// Built-in protection for live infrastructure, on top of the patterns above:
+    /// terminal multiplexers, SSH ControlMasters, session daemons, interactive shells,
+    /// pt's own invoker chain, systemd/container-supervised services (Linux cgroups),
+    /// plus force-review (never robot-killed) for agent CLIs. On Linux it also makes
+    /// login-session workloads eligible even when they run as a protected user (e.g.
+    /// root build workers) or were reparented to PID 1 (orphans). Disable only when a
+    /// policy lists all of this explicitly.
+    #[serde(default = "default_true")]
+    pub builtin_protection: bool,
 }
 
 impl Default for Guardrails {
@@ -214,8 +234,11 @@ impl Default for Guardrails {
             max_kills_per_minute: Some(5),
             max_kills_per_hour: Some(20),
             max_kills_per_day: Some(100),
-            min_process_age_seconds: 300,
+            // Also the default candidate min-age for plan/TUI/watch when --min-age is not
+            // given (README: "minimum age threshold is 1 hour by default").
+            min_process_age_seconds: 3600,
             require_confirmation: Some(true),
+            builtin_protection: true,
         }
     }
 }
@@ -984,7 +1007,7 @@ mod tests {
     fn guardrails_default_limits() {
         let g = Guardrails::default();
         assert_eq!(g.max_kills_per_run, 10);
-        assert_eq!(g.min_process_age_seconds, 300);
+        assert_eq!(g.min_process_age_seconds, 3600);
         assert_eq!(g.never_kill_ppid, vec![1]);
     }
 

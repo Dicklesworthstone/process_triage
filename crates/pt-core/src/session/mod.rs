@@ -407,7 +407,40 @@ impl SessionStore {
             dir,
         };
         handle.write_manifest(manifest)?;
+        self.auto_gc();
         Ok(handle)
+    }
+
+    /// Enforce the session retention policy (`PROCESS_TRIAGE_RETENTION` days,
+    /// default 7; `0`/`off`/`never` disables). Best-effort and throttled to once per
+    /// hour via a marker file, so it adds nothing measurable to normal runs.
+    ///
+    /// Before this existed nothing ever removed sessions: a dev box accumulated
+    /// 3 017 session dirs (289 MB) from one test burst.
+    fn auto_gc(&self) {
+        let Some(retention) = retention_from_env(std::env::var("PROCESS_TRIAGE_RETENTION").ok())
+        else {
+            return;
+        };
+        let marker = self.sessions_root.join(".last_gc");
+        let recently_ran = std::fs::metadata(&marker)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < std::time::Duration::from_secs(3600));
+        if recently_ran {
+            return;
+        }
+        let _ = std::fs::write(&marker, b"");
+        if let Ok(result) = self.cleanup_sessions(retention) {
+            if result.removed_count > 0 {
+                tracing::debug!(
+                    removed = result.removed_count,
+                    preserved = result.preserved_count,
+                    "session retention cleanup"
+                );
+            }
+        }
     }
 
     pub fn open(&self, session_id: &SessionId) -> Result<SessionHandle, SessionError> {
@@ -529,11 +562,12 @@ impl SessionStore {
         Ok(summaries)
     }
 
-    /// Remove old sessions while preserving telemetry and audit data.
+    /// Remove sessions older than `older_than`.
     ///
-    /// Sessions in the following states are preserved regardless of age:
-    /// - Executing (may be in progress)
-    /// - Planned (awaiting approval)
+    /// Only `Executing` sessions are preserved regardless of age (an action may be in
+    /// progress). A `Planned`/`Scanning` session older than the retention window is
+    /// stale: its identity-bound plan can no longer be applied safely, so keeping it
+    /// forever only accumulates disk (every unapplied `agent plan` ends in `Planned`).
     pub fn cleanup_sessions(&self, older_than: Duration) -> Result<CleanupResult, SessionError> {
         let options = ListSessionsOptions {
             older_than: Some(older_than),
@@ -550,10 +584,7 @@ impl SessionStore {
 
         for session in sessions {
             // Preserve sessions that might be in use
-            if matches!(
-                session.state,
-                SessionState::Executing | SessionState::Planned | SessionState::Scanning
-            ) {
+            if matches!(session.state, SessionState::Executing) {
                 result.preserved_count += 1;
                 continue;
             }
@@ -692,6 +723,23 @@ fn count_actions(session_dir: &Path) -> Option<u32> {
     let content = std::fs::read_to_string(&outcomes_path).ok()?;
     let count = content.lines().filter(|l| !l.trim().is_empty()).count();
     Some(count as u32)
+}
+
+/// Default session retention in days (README: `PROCESS_TRIAGE_RETENTION`, default 7).
+const DEFAULT_RETENTION_DAYS: i64 = 7;
+
+/// Parse `PROCESS_TRIAGE_RETENTION` (whole days). `None` disables automatic cleanup.
+fn retention_from_env(value: Option<String>) -> Option<Duration> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Some(Duration::days(DEFAULT_RETENTION_DAYS)),
+        Some(v) if matches!(v.to_ascii_lowercase().as_str(), "0" | "off" | "never") => None,
+        Some(v) => Some(Duration::days(
+            v.parse::<i64>()
+                .ok()
+                .filter(|d| *d > 0)
+                .unwrap_or(DEFAULT_RETENTION_DAYS),
+        )),
+    }
 }
 
 fn resolve_sessions_root() -> Result<PathBuf, SessionError> {
@@ -1259,6 +1307,54 @@ mod tests {
         assert_eq!(result.preserved_count, 1);
         assert_eq!(result.removed_count, 0);
         assert!(store.session_dir(&sid).exists());
+    }
+
+    #[test]
+    fn cleanup_removes_stale_planned_and_scanning_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        for (suffix, state) in [
+            ("plan", SessionState::Planned),
+            ("scan", SessionState::Scanning),
+        ] {
+            let sid = SessionId(format!("pt-20260101-000000-{suffix}"));
+            let m = SessionManifest::new(&sid, None, SessionMode::RobotPlan, None);
+            store.create(&m).unwrap().update_state(state).unwrap();
+        }
+        let result = store.cleanup_sessions(Duration::zero()).unwrap();
+        assert_eq!(result.removed_count, 2);
+        assert_eq!(result.preserved_count, 0);
+    }
+
+    #[test]
+    fn retention_env_parsing() {
+        assert_eq!(retention_from_env(None), Some(Duration::days(7)));
+        assert_eq!(retention_from_env(Some("".into())), Some(Duration::days(7)));
+        assert_eq!(
+            retention_from_env(Some("30".into())),
+            Some(Duration::days(30))
+        );
+        assert_eq!(retention_from_env(Some("0".into())), None);
+        assert_eq!(retention_from_env(Some("off".into())), None);
+        assert_eq!(
+            retention_from_env(Some("junk".into())),
+            Some(Duration::days(7))
+        );
+    }
+
+    #[test]
+    fn create_runs_throttled_auto_gc_without_touching_fresh_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let sid = SessionId("pt-20260101-000000-new1".to_string());
+        let m = SessionManifest::new(&sid, None, SessionMode::RobotPlan, None);
+        store.create(&m).unwrap();
+        assert!(store.session_dir(&sid).exists(), "fresh session kept");
+        assert!(tmp.path().join(".last_gc").exists(), "gc marker written");
+        let listed = store
+            .list_sessions(&ListSessionsOptions::default())
+            .unwrap();
+        assert_eq!(listed.len(), 1, "marker file is not listed as a session");
     }
 
     #[test]

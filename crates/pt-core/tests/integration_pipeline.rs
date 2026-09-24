@@ -170,12 +170,8 @@ fn candidates_sorted_by_posterior_not_pid_order() {
         let posterior = compute_posterior(&priors, &evidence)
             .expect("posterior computation failed")
             .posterior;
-        let max = posterior
-            .useful
-            .max(posterior.useful_bad)
-            .max(posterior.abandoned)
-            .max(posterior.zombie);
-        scored.push((max, proc.pid.0));
+        // Same ranking key as `agent plan`: P(abandoned or zombie), not max-class.
+        scored.push((posterior.abandonment_probability(), proc.pid.0));
     }
 
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));

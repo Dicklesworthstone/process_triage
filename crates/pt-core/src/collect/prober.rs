@@ -50,6 +50,10 @@ impl Default for ProberConfig {
 pub struct Prober {
     ring: IoUring,
     config: ProberConfig,
+    /// Batch generation, encoded in the high 32 bits of every `user_data`, so that
+    /// late completions from an earlier (timed-out) batch are never attributed to
+    /// the current one.
+    generation: u32,
 }
 
 struct ProbeState {
@@ -60,21 +64,52 @@ struct ProbeState {
     failed: bool,
 }
 
+/// Low-32-bit `user_data` tags for the non-read entries of a batch.
+const TAG_TIMEOUT: u64 = 0xFFFF_FFFF;
+const TAG_CANCEL: u64 = 0xFFFF_FFFE;
+
 impl Prober {
     /// Create a new prober with the given configuration.
     ///
     /// Falls back to returning an error if io_uring is not supported.
     pub fn new(config: ProberConfig) -> io::Result<Self> {
         let ring = IoUring::new(config.ring_entries)?;
-        Ok(Self { ring, config })
+        Ok(Self {
+            ring,
+            config,
+            generation: 0,
+        })
     }
 
-    /// Submit a batch of probe requests and wait for completion or timeout.
+    /// Submit probe requests and wait for completion or timeout.
+    ///
+    /// Paths are processed in chunks that fit the submission ring together with
+    /// the batch's timeout entry. (Pushing more reads than the ring holds used to
+    /// drop the excess reads, and the timeout entry with them, so a batch could
+    /// block forever on a D-state process.)
     pub fn probe_batch(&mut self, paths: &[PathBuf]) -> Vec<ProbeResult> {
+        let chunk = self.config.ring_entries.saturating_sub(2).max(1) as usize;
+        let mut results = Vec::with_capacity(paths.len());
+        for part in paths.chunks(chunk) {
+            results.extend(self.probe_chunk(part));
+        }
+        results
+    }
+
+    /// Probe at most `ring_entries - 2` paths.
+    ///
+    /// Memory-safety contract: a read's buffer and file are only released after its
+    /// completion has been reaped. Reads still in flight after the timeout (and after
+    /// a cancellation attempt) are leaked on purpose: the kernel may still write into
+    /// them, and a leak is safe where a free is not.
+    fn probe_chunk(&mut self, paths: &[PathBuf]) -> Vec<ProbeResult> {
         let mut results = Vec::with_capacity(paths.len());
         if paths.is_empty() {
             return results;
         }
+        self.generation = self.generation.wrapping_add(1);
+        let generation_bits = u64::from(self.generation) << 32;
+        let tag = move |low: u64| generation_bits | low;
 
         let mut states: Vec<ProbeState> = Vec::with_capacity(paths.len());
 
@@ -104,8 +139,15 @@ impl Prober {
             return results;
         }
 
-        // Submit reads and a global timeout
-        let mut submitted_count = 0;
+        // The timespec must stay alive until the kernel has consumed the timeout SQE
+        // (at submit); it previously lived in an inner block that ended before submit.
+        let ts = types::Timespec::new()
+            .sec(self.config.probe_timeout.as_secs())
+            .nsec(self.config.probe_timeout.subsec_nanos());
+
+        // Submit reads plus one timeout. `probe_batch` sized the chunk so all fit.
+        let mut submitted = vec![false; states.len()];
+        let mut submitted_count = 0usize;
         {
             let mut sq = self.ring.submission();
             for (idx, state) in states.iter_mut().enumerate() {
@@ -116,66 +158,76 @@ impl Prober {
                     state.buffer.len() as u32,
                 )
                 .build()
-                .user_data(idx as u64);
+                .user_data(tag(idx as u64));
 
-                unsafe {
-                    if sq.push(&read_e).is_err() {
-                        break;
-                    }
+                // SAFETY: the buffer and file live in `states`, which outlives the
+                // read (released only after its CQE is reaped, else leaked below).
+                if unsafe { sq.push(&read_e) }.is_err() {
+                    break;
                 }
+                submitted[idx] = true;
                 submitted_count += 1;
             }
 
-            // Add a linked timeout if supported, or a global timeout entry.
-            // For simplicity and broad compatibility, we'll use a global timeout
-            // entry with a special user_data.
-            let ts = types::Timespec::new()
-                .sec(self.config.probe_timeout.as_secs())
-                .nsec(self.config.probe_timeout.subsec_nanos());
-            let timeout_e = opcode::Timeout::new(&ts).build().user_data(u64::MAX);
-
-            unsafe {
-                let _ = sq.push(&timeout_e);
+            // Completes after `submitted_count` completions (normal case) or when
+            // the probe timeout expires (-ETIME), whichever comes first.
+            let timeout_e = opcode::Timeout::new(&ts)
+                .count(submitted_count as u32)
+                .build()
+                .user_data(tag(TAG_TIMEOUT));
+            // SAFETY: `ts` outlives the submit below.
+            if unsafe { sq.push(&timeout_e) }.is_err() {
+                // Cannot happen with chunking; without a timeout we must not wait.
+                drop(sq);
+                error!("io_uring: no room for timeout entry; skipping blocking wait");
             }
         }
 
         if let Err(e) = self.ring.submit() {
             error!(error = %e, "Failed to submit io_uring requests");
-            return results;
+            // Nothing was handed to the kernel; release everything normally.
+            submitted_count = 0;
+            submitted.iter_mut().for_each(|s| *s = false);
         }
 
-        let mut completed_count = 0;
+        let mut completed_count = 0usize;
         let mut timed_out = false;
+        let mut timeout_reaped = submitted_count == 0;
 
         while completed_count < submitted_count && !timed_out {
-            // Wait for at least one completion
             if let Err(e) = self.ring.submit_and_wait(1) {
                 error!(error = %e, "io_uring wait failed");
                 break;
             }
-
-            let cq = self.ring.completion();
-            for cqe in cq {
+            for cqe in self.ring.completion() {
                 let user_data = cqe.user_data();
-                if user_data == u64::MAX {
-                    // Global timeout triggered
-                    timed_out = true;
+                if user_data & 0xFFFF_FFFF_0000_0000 != generation_bits {
+                    continue; // late completion from an earlier batch
+                }
+                let low = user_data & 0xFFFF_FFFF;
+                if low == TAG_TIMEOUT {
+                    timeout_reaped = true;
+                    if cqe.result() == -libc::ETIME {
+                        timed_out = true;
+                    }
                     continue;
                 }
-
-                let idx = user_data as usize;
+                if low == TAG_CANCEL {
+                    continue;
+                }
+                let idx = low as usize;
                 if idx < states.len() && !states[idx].completed {
                     let res = cqe.result();
                     if res >= 0 {
                         states[idx].buffer.truncate(res as usize);
                     } else {
+                        states[idx].failed = true;
                         results.push(ProbeResult {
                             path: states[idx].path.clone(),
                             data: Vec::new(),
                             timed_out: false,
                             error: Some(io::Error::from_raw_os_error(-res)),
                         });
-                        states[idx].failed = true;
                     }
                     states[idx].completed = true;
                     completed_count += 1;
@@ -183,8 +235,64 @@ impl Prober {
             }
         }
 
+        // Timed out with reads still in flight: ask the kernel to cancel them, then
+        // reap whatever completes without blocking. Anything still in flight after
+        // that is leaked below instead of freed.
+        let in_flight: Vec<usize> = (0..states.len())
+            .filter(|&i| submitted[i] && !states[i].completed)
+            .collect();
+        if !in_flight.is_empty() {
+            {
+                let mut sq = self.ring.submission();
+                for &idx in &in_flight {
+                    let cancel = opcode::AsyncCancel::new(tag(idx as u64))
+                        .build()
+                        .user_data(tag(TAG_CANCEL));
+                    // SAFETY: AsyncCancel references no user memory.
+                    if unsafe { sq.push(&cancel) }.is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = self.ring.submit();
+            for cqe in self.ring.completion() {
+                let user_data = cqe.user_data();
+                if user_data & 0xFFFF_FFFF_0000_0000 != generation_bits {
+                    continue;
+                }
+                let idx = (user_data & 0xFFFF_FFFF) as usize;
+                if idx < states.len() && submitted[idx] && !states[idx].completed {
+                    // Completed or cancelled: the kernel is done with the buffer.
+                    // Report it as timed out either way (the deadline passed).
+                    states[idx].completed = true;
+                    states[idx].failed = true;
+                    results.push(ProbeResult {
+                        path: states[idx].path.clone(),
+                        data: Vec::new(),
+                        timed_out: true,
+                        error: None,
+                    });
+                }
+            }
+        }
+        // An unreaped timeout entry is harmless: it references `ts` only at submit
+        // time and its late CQE is filtered by generation.
+        let _ = timeout_reaped;
+
         // Finalize results
-        for state in states {
+        for (idx, state) in states.into_iter().enumerate() {
+            if submitted[idx] && !state.completed {
+                // Still owned by the kernel: leak buffer + fd (memory-safe) and report
+                // the probe as timed out (likely a D-state process).
+                results.push(ProbeResult {
+                    path: state.path.clone(),
+                    data: Vec::new(),
+                    timed_out: true,
+                    error: None,
+                });
+                std::mem::forget(state);
+                continue;
+            }
             if state.completed {
                 if state.failed {
                     continue;
@@ -241,6 +349,58 @@ mod tests {
                 res.path,
                 res.error
             );
+            assert!(!res.data.is_empty());
+        }
+    }
+
+    /// Regression: more paths than ring entries used to silently drop the excess
+    /// reads (and the timeout entry), reporting them as timed out.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn batch_larger_than_ring_returns_every_result() {
+        let config = ProberConfig {
+            ring_entries: 8,
+            probe_timeout: Duration::from_secs(5),
+            ..ProberConfig::default()
+        };
+        let mut prober = Prober::new(config).unwrap();
+        let paths: Vec<PathBuf> = (0..50)
+            .map(|i| {
+                if i % 2 == 0 {
+                    PathBuf::from("/proc/self/stat")
+                } else {
+                    PathBuf::from("/proc/self/status")
+                }
+            })
+            .collect();
+        let results = prober.probe_batch(&paths);
+        assert_eq!(results.len(), 50);
+        for res in &results {
+            assert!(!res.timed_out, "{:?} timed out", res.path);
+            assert!(res.error.is_none(), "{:?}: {:?}", res.path, res.error);
+            assert!(!res.data.is_empty());
+        }
+    }
+
+    /// A batch following a timed-out batch must not receive its stale completions.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn batches_after_a_timeout_are_not_corrupted() {
+        let mut prober = Prober::new(ProberConfig {
+            probe_timeout: Duration::from_nanos(1),
+            ..ProberConfig::default()
+        })
+        .unwrap();
+        let _ = prober.probe_batch(&[PathBuf::from("/proc/self/status")]);
+        prober.config.probe_timeout = Duration::from_secs(5);
+        let results = prober.probe_batch(&[
+            PathBuf::from("/proc/self/stat"),
+            PathBuf::from("/proc/self/status"),
+        ]);
+        assert_eq!(results.len(), 2);
+        for res in results {
+            assert!(!res.timed_out);
+            assert!(res.error.is_none());
             assert!(!res.data.is_empty());
         }
     }

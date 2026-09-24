@@ -171,19 +171,21 @@ fn developer_preset() -> Policy {
             },
             abandoned: LossRow {
                 keep: 10.0, // Higher penalty for keeping abandoned (want to catch them)
-                pause: Some(0.1),
-                throttle: Some(0.2),
+                // Non-terminal actions leave the abandoned process's resources held
+                // (see LossMatrix::default docs), so they stay close to `keep`.
+                pause: Some(7.0),
+                throttle: Some(8.0),
                 kill: 0.05, // Very low penalty for killing abandoned
-                restart: Some(0.5),
-                renice: Some(0.05),
+                restart: Some(8.0),
+                renice: Some(9.0),
             },
             zombie: LossRow {
                 keep: 5.0,
-                pause: Some(0.05),
-                throttle: Some(0.05),
+                pause: Some(5.0),
+                throttle: Some(5.0),
                 kill: 0.01,
                 restart: Some(0.05),
-                renice: Some(0.01),
+                renice: Some(5.0),
             },
         },
 
@@ -215,6 +217,7 @@ fn developer_preset() -> Policy {
             max_kills_per_day: Some(200),
             min_process_age_seconds: 1800, // 30 minutes (shorter than default)
             require_confirmation: Some(true), // Still interactive by default
+            builtin_protection: true,
         },
 
         robot_mode: RobotMode {
@@ -300,19 +303,21 @@ fn server_preset() -> Policy {
             },
             abandoned: LossRow {
                 keep: 3.0, // Lower penalty for keeping abandoned (prefer false negatives)
-                pause: Some(0.3),
-                throttle: Some(0.5),
+                // Non-terminal actions leave the abandoned process's resources held
+                // (see LossMatrix::default docs), so they stay close to `keep`.
+                pause: Some(2.1),
+                throttle: Some(2.4),
                 kill: 0.5, // Still prefer killing abandoned, but carefully
-                restart: Some(2.0),
-                renice: Some(0.2),
+                restart: Some(2.4),
+                renice: Some(2.7),
             },
             zombie: LossRow {
                 keep: 2.0,
-                pause: Some(0.2),
-                throttle: Some(0.2),
+                pause: Some(2.0),
+                throttle: Some(2.0),
                 kill: 0.2,
                 restart: Some(0.5),
-                renice: Some(0.1),
+                renice: Some(2.0),
             },
         },
 
@@ -411,6 +416,7 @@ fn server_preset() -> Policy {
             max_kills_per_day: Some(30),
             min_process_age_seconds: 14400, // 4 hours
             require_confirmation: Some(true),
+            builtin_protection: true,
         },
 
         robot_mode: RobotMode {
@@ -515,19 +521,21 @@ fn ci_preset() -> Policy {
             },
             abandoned: LossRow {
                 keep: 5.0,
-                pause: Some(0.2),
-                throttle: Some(0.3),
+                // Non-terminal actions leave the abandoned process's resources held
+                // (see LossMatrix::default docs), so they stay close to `keep`.
+                pause: Some(3.5),
+                throttle: Some(4.0),
                 kill: 0.2,
-                restart: Some(1.0),
-                renice: Some(0.1),
+                restart: Some(4.0),
+                renice: Some(4.5),
             },
             zombie: LossRow {
                 keep: 3.0,
-                pause: Some(0.1),
-                throttle: Some(0.1),
+                pause: Some(3.0),
+                throttle: Some(3.0),
                 kill: 0.1,
                 restart: Some(0.2),
-                renice: Some(0.05),
+                renice: Some(3.0),
             },
         },
 
@@ -576,6 +584,7 @@ fn ci_preset() -> Policy {
             max_kills_per_day: Some(100),
             min_process_age_seconds: 3600, // 1 hour (long enough for most CI jobs)
             require_confirmation: Some(false), // NO interactive prompts
+            builtin_protection: true,
         },
 
         robot_mode: RobotMode {
@@ -831,6 +840,7 @@ fn paranoid_preset() -> Policy {
             max_kills_per_day: Some(10),
             min_process_age_seconds: 86400, // 24 hours
             require_confirmation: Some(true),
+            builtin_protection: true,
         },
 
         robot_mode: RobotMode {

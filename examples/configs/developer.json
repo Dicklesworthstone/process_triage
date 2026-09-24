@@ -24,19 +24,19 @@
     },
     "abandoned": {
       "keep": 10.0,
-      "pause": 0.1,
-      "throttle": 0.2,
+      "pause": 7.0,
+      "throttle": 8.0,
       "kill": 0.05,
-      "restart": 0.5,
-      "renice": 0.05
+      "restart": 8.0,
+      "renice": 9.0
     },
     "zombie": {
       "keep": 5.0,
-      "pause": 0.05,
-      "throttle": 0.05,
+      "pause": 5.0,
+      "throttle": 5.0,
       "kill": 0.01,
       "restart": 0.05,
-      "renice": 0.01
+      "renice": 5.0
     }
   },
   "guardrails": {

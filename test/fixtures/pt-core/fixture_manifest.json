@@ -21,22 +21,22 @@
     {
       "path": "inference_cases_expected.json",
       "kind": "config",
-      "sha256": "28d121c895a775665d0ab39d0fcfe74eabf5105d588a80eeb0276eb954423e5d",
-      "bytes": 2613,
+      "sha256": "b46b43666af7d0d0635460328ad1eacb2492982c20372e60d1380b8f202b76e8",
+      "bytes": 2614,
       "redaction_profile": "safe"
     },
     {
       "path": "inference_cases_input.json",
       "kind": "config",
-      "sha256": "3adea54563c1b90e80f4867ec42fd09011f465836a37e7c3212a8f6083880ef1",
-      "bytes": 844,
+      "sha256": "d1fe152e255545a5000e844674780788e89e2858b2bc5e1ac384e45ecff0ba19",
+      "bytes": 843,
       "redaction_profile": "safe"
     },
     {
       "path": "invalid_priors.json",
       "kind": "priors",
-      "sha256": "d0fc4561cd303b37081f5beaf71f01f365ada05ec1f276a0111559fd4401dbd8",
-      "bytes": 526,
+      "sha256": "ae57783a76fba590cb10c64a0e91623440a8d3ea72fa77acabb65c9add43756b",
+      "bytes": 522,
       "redaction_profile": "safe"
     },
     {
@@ -70,15 +70,15 @@
     {
       "path": "provenance_privacy_snapshot.json",
       "kind": "snapshot",
-      "sha256": "b2f47920901e538e4b97414c6abc1692e5a02d364aec4386e1247f71130d403a",
-      "bytes": 5799,
+      "sha256": "7ff40d03e234c9d89dc9d0959071ee3b0b24118f9b173a343125e0f8fa819a48",
+      "bytes": 5679,
       "redaction_profile": "safe"
     },
     {
       "path": "priors.json",
       "kind": "priors",
-      "sha256": "2e255cef355e078f14f40835eed862c5ee59b1c6a774852b1a2d9f649f8020f1",
-      "bytes": 1647,
+      "sha256": "9903dbd003c80395c78c007b7ae648c68d37ebfb7be40d5524fe9a66ab62e7ad",
+      "bytes": 1645,
       "redaction_profile": "safe"
     },
     {
@@ -91,18 +91,18 @@
     {
       "path": "provenance_output_full.json",
       "kind": "snapshot",
-      "sha256": "4376890c2fe09730d4def107654f84faad9d7db2b270d33271add53dc8891c08",
-      "bytes": 891,
+      "sha256": "e6993803557f68dca1f04010307d1b2cb82dc7cc9e90528b4f635e146b8d70cb",
+      "bytes": 869,
       "redaction_profile": "safe"
     },
     {
       "path": "provenance_output_redacted_high_blast.json",
       "kind": "snapshot",
-      "sha256": "66bb89464bebcaf4b10aaadd08a78478ed775b2c40c1249857a77af7e34feb2e",
-      "bytes": 774,
+      "sha256": "3d7246edade475208ac20f04ddb11d8a64ca46a4100df078ac22756d96185b55",
+      "bytes": 765,
       "redaction_profile": "safe"
     }
   ],
   "description": "pt-core policy/priors + inference + provenance fixtures",
-  "manifest_sha256": "71010c849efb13a706548195057e88d961ae9788ad59cd7d58eb597e2973b7a5"
+  "manifest_sha256": "244520ac40d2284f307a05d6cab3bd0098f7bb45abe4801f1d79f51717ab3f92"
 }

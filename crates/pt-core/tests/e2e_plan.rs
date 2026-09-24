@@ -1109,18 +1109,12 @@ mod inference_safety {
                 return;
             }
 
-            let mut prev_max_posterior: Option<f64> = None;
+            // Ranking key: P(abandoned or zombie), i.e. the suspicion the score shows
+            // (never max-over-classes, which ranked confidently-useful processes first).
+            let mut prev_suspicion: Option<f64> = None;
 
             for (i, candidate) in candidates.iter().enumerate() {
                 if let Some(posterior) = candidate.get("posterior") {
-                    let useful = posterior
-                        .get("useful")
-                        .and_then(|z| z.as_f64())
-                        .unwrap_or(0.0);
-                    let useful_bad = posterior
-                        .get("useful_bad")
-                        .and_then(|z| z.as_f64())
-                        .unwrap_or(0.0);
                     let abandoned = posterior
                         .get("abandoned")
                         .and_then(|z| z.as_f64())
@@ -1129,18 +1123,24 @@ mod inference_safety {
                         .get("zombie")
                         .and_then(|z| z.as_f64())
                         .unwrap_or(0.0);
+                    let suspicion = abandoned + zombie;
 
-                    let max_posterior = useful.max(useful_bad).max(abandoned).max(zombie);
-
-                    if let Some(prev) = prev_max_posterior {
+                    if let Some(prev) = prev_suspicion {
                         assert!(
-                            max_posterior <= prev + 0.0001, // Small epsilon for float comparison
-                            "Candidates not sorted by posterior at index {}: prev={:.4}, curr={:.4}",
-                            i, prev, max_posterior
+                            suspicion <= prev + 0.0001, // Small epsilon for float comparison
+                            "Candidates not sorted by P(abandoned or zombie) at index {}: prev={:.4}, curr={:.4}",
+                            i, prev, suspicion
+                        );
+                    }
+                    if let Some(score) = candidate.get("score").and_then(|s| s.as_u64()) {
+                        assert_eq!(
+                            score,
+                            (suspicion * 100.0).round() as u64,
+                            "score must equal 100 * P(abandoned or zombie)"
                         );
                     }
 
-                    prev_max_posterior = Some(max_posterior);
+                    prev_suspicion = Some(suspicion);
                 }
             }
         }

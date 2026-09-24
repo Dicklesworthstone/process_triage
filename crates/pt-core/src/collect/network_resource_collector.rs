@@ -15,10 +15,23 @@ use pt_common::{
 /// and Unix sockets, then converts them to `RawResourceEvidence` for provenance.
 #[cfg(target_os = "linux")]
 pub fn collect_listener_resources(pid: u32) -> Vec<RawResourceEvidence> {
+    collect_listener_resources_from(pid, &super::network::NetworkSnapshot::collect())
+}
+
+/// Like [`collect_listener_resources`], but against a shared socket snapshot.
+///
+/// Scans that evaluate many candidates must take ONE `NetworkSnapshot` and pass it
+/// here: re-parsing all of `/proc/net/{tcp,tcp6,udp,udp6,unix}` per candidate made
+/// `agent plan` take 366 s on a loaded 64-core host (2026-09-24 fleet run).
+#[cfg(target_os = "linux")]
+pub fn collect_listener_resources_from(
+    pid: u32,
+    snapshot: &super::network::NetworkSnapshot,
+) -> Vec<RawResourceEvidence> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut resources = Vec::new();
 
-    if let Some(net_info) = super::network::collect_network_info(pid) {
+    if let Some(net_info) = snapshot.get_process_info(pid) {
         // Convert listening ports to resource evidence
         for port in &net_info.listen_ports {
             resources.push(RawResourceEvidence {

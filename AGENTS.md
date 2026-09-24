@@ -167,8 +167,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Verify formatting
 cargo fmt --check
 
-# Also check with the ui feature enabled
-cargo check -p pt-core --features ui
+# Also check the lean build (ui/report/daemon are DEFAULT features since 2026-09-24)
+cargo check -p pt-core --no-default-features
 ```
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
@@ -342,7 +342,7 @@ pt help         # Show help
 
 | Concept | Description |
 |---------|-------------|
-| **Score** | 0-100+ rating of how suspicious a process is |
+| **Score** | 0-100 suspicion = 100 × P(abandoned or zombie) (never max-over-classes) |
 | **KILL** | Score >= 50, pre-selected for killing |
 | **REVIEW** | Score 20-49, worth checking |
 | **SPARE** | Score < 20, probably safe |
@@ -363,11 +363,11 @@ Protected (never flagged):
 #### Running the TUI (ftui)
 
 ```bash
-# Run the interactive TUI from source
-cargo run -p pt-core --features ui -- run
+# Run the interactive TUI from source (`ui` is a default feature)
+cargo run -p pt-core -- run
 
 # Inline mode preserves terminal scrollback by confining UI to a bottom region
-cargo run -p pt-core --features ui -- run --inline
+cargo run -p pt-core -- run --inline
 ```
 
 #### Configuration
@@ -386,7 +386,7 @@ cargo run -p pt-core --features ui -- run --inline
 
 ### Troubleshooting
 
-**TUI won't run**: The TUI requires building `pt-core` with `--features ui`.
+**TUI won't run**: The TUI needs a terminal (non-TTY/robot runs exit 11 and point to `pt agent plan`) and the `ui` feature (default; absent only in `--no-default-features` builds).
 
 **No candidates found**: System may be clean, or minimum age (1 hour) not reached.
 

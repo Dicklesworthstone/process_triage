@@ -102,37 +102,30 @@ fn score_process(process: &ProcessRecord, db: &SignatureDatabase) -> (f64, Optio
     )
 }
 
-fn build_plan_items(
-    processes: &[ProcessRecord],
-    db: &SignatureDatabase,
-    min_score: f64,
-) -> Vec<serde_json::Value> {
-    let mut plan_items = Vec::new();
-
-    for process in processes {
-        let (final_score, top_signature) = score_process(process, db);
-        if final_score < min_score {
-            continue;
-        }
-
-        let recommendation = if final_score > 0.8 {
-            "kill"
-        } else if final_score > 0.4 {
-            "pause"
-        } else {
-            "keep"
-        };
-
-        plan_items.push(serde_json::json!({
-            "pid": process.pid.0,
-            "comm": process.comm,
-            "score": final_score,
-            "recommended_action": recommendation,
-            "reason": top_signature.unwrap_or_else(|| "suspicious process state".to_string()),
-        }));
+/// Arguments for `pt-core agent plan` derived from `pt_plan` tool params.
+fn plan_command_args(params: &serde_json::Value) -> Vec<String> {
+    let mut args = vec![
+        "agent".to_string(),
+        "plan".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+    if params
+        .get("deep")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        args.push("--deep".to_string());
     }
-
-    plan_items
+    if let Some(min) = params.get("min_score").and_then(|v| v.as_f64()) {
+        args.push("--min-posterior".to_string());
+        args.push(min.clamp(0.0, 1.0).to_string());
+    }
+    if let Some(min_age) = params.get("min_age").and_then(|v| v.as_u64()) {
+        args.push("--min-age".to_string());
+        args.push(min_age.to_string());
+    }
+    args
 }
 
 /// Build the list of available MCP tool definitions.
@@ -201,9 +194,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "pt_plan".to_string(),
-            description:
-                "Generate a triage plan with recommended actions for suspicious processes."
-                    .to_string(),
+            description: "Generate a triage plan with the same engine, protections and \
+                 output as `pt agent plan --format json`."
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -214,8 +207,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "min_score": {
                         "type": "number",
-                        "description": "Minimum score to include",
-                        "default": 0.5
+                        "description": "Minimum P(intervention warranted) in [0,1] (agent plan --min-posterior)"
+                    },
+                    "min_age": {
+                        "type": "integer",
+                        "description": "Minimum process age in seconds (default: policy guardrail, 1 hour)"
                     }
                 },
                 "required": [],
@@ -424,28 +420,30 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
     }
 }
 
+/// `pt_plan`: run the real planning engine (`pt-core agent plan`), not a second
+/// heuristic. The previous MCP-only scorer ignored protection, the posterior and the
+/// loss matrix, and recommended `kill` for zombies (which a signal cannot reap).
 fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
-    let deep = params
-        .get("deep")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let min_score = params
-        .get("min_score")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.5);
-    let scan_result = collect_scan_result(deep)?;
-    let db = load_signature_db_with_user_entries();
-    let plan_items = build_plan_items(&scan_result.processes, &db, min_score);
-
-    let result = serde_json::json!({
-        "plan_id": format!("mcp-{}", chrono::Utc::now().timestamp()),
-        "candidates": plan_items,
-    });
-
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate pt-core: {e}"))?;
+    let output = std::process::Command::new(&exe)
+        .args(plan_command_args(params))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run `{} agent plan`: {e}", exe.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    // agent plan exits 0 (nothing to do) or 1 (plan ready); anything else is an error.
+    let ok = matches!(output.status.code(), Some(0) | Some(1));
+    if !ok || serde_json::from_str::<serde_json::Value>(&stdout).is_err() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr.lines().rev().take(5).collect::<Vec<_>>().join("\n");
+        return Err(format!(
+            "agent plan failed (exit {:?}): {tail}",
+            output.status.code()
+        ));
+    }
     Ok(vec![ToolContent {
         content_type: "text".to_string(),
-        text: serde_json::to_string_pretty(&result)
-            .map_err(|e| format!("Serialization error: {}", e))?,
+        text: stdout,
     }])
 }
 
@@ -659,33 +657,28 @@ mod tests {
     }
 
     #[test]
-    fn tool_plan_succeeds() {
-        let db = SignatureDatabase::with_defaults();
-        let processes = vec![ProcessRecord {
-            pid: pt_common::ProcessId(4242),
-            ppid: pt_common::ProcessId(1),
-            uid: 1000,
-            user: "tester".to_string(),
-            pgid: Some(4242),
-            sid: Some(4242),
-            start_id: pt_common::StartId("synthetic:123:4242".to_string()),
-            comm: "defunct-worker".to_string(),
-            cmd: "defunct-worker".to_string(),
-            state: ProcessState::Zombie,
-            cpu_percent: 0.0,
-            rss_bytes: 0,
-            vsz_bytes: 0,
-            tty: None,
-            start_time_unix: 0,
-            elapsed: std::time::Duration::from_secs(600),
-            source: "test".to_string(),
-            container_info: None,
-        }];
-
-        let plan = build_plan_items(&processes, &db, 0.5);
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0]["pid"], 4242);
-        assert_eq!(plan[0]["recommended_action"], "kill");
+    fn plan_tool_maps_params_to_agent_plan_args() {
+        assert_eq!(
+            plan_command_args(&serde_json::json!({})),
+            ["agent", "plan", "--format", "json"]
+        );
+        assert_eq!(
+            plan_command_args(&serde_json::json!({"deep": true, "min_score": 0.9, "min_age": 60})),
+            [
+                "agent",
+                "plan",
+                "--format",
+                "json",
+                "--deep",
+                "--min-posterior",
+                "0.9",
+                "--min-age",
+                "60"
+            ]
+        );
+        // Out-of-range scores are clamped into a valid posterior.
+        let args = plan_command_args(&serde_json::json!({"min_score": 7.0}));
+        assert_eq!(args[args.len() - 1], "1");
     }
 
     #[test]

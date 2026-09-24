@@ -61,7 +61,11 @@ pt-telemetry = { path = "../pt-telemetry" }
 pt-report = { path = "../pt-report", optional = true }
 
 [features]
-default = []
+# Shipped features are on by default so every build path (release.yml, install.sh
+# source builds, `cargo install`, dsr) produces the product the README describes:
+# bare `pt` opens the TUI, `pt report` renders HTML, `pt-core daemon` exists.
+# (Before 2026-09-24 default was empty and every released binary lacked all three.)
+default = ["ui", "report", "daemon"]
 deep = []           # Enable expensive/privileged probes (lsof, ss, perf/eBPF)
 report = ["pt-report"]  # HTML report generator
 daemon = []         # Dormant monitoring mode

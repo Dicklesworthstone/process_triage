@@ -32,11 +32,11 @@
     {
       "path": "shadow_report.json",
       "kind": "config",
-      "sha256": "ea550a39fdb7941ad89db63d01ceb23da8236cee17d292839d8c28f7c8e00dec",
-      "bytes": 695,
+      "sha256": "eb8a7d3efe878a1f58696d9e208ab621b23b4182c485f51639803414b2f9bb14",
+      "bytes": 696,
       "redaction_profile": "safe"
     }
   ],
   "description": "Shadow mode fixtures (observations + report)",
-  "manifest_sha256": "147f8e5779e202d2e6ac40b4d613e842ca63d16079baa076e13f67afab8aa8f1"
+  "manifest_sha256": "d4d8e147f599681011ef75692b48323a7b0005b2363f888db9b47b2e2bccb80d"
 }

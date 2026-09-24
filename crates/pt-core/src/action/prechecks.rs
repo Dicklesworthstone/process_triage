@@ -301,6 +301,34 @@ impl From<&DataLossGates> for LivePreCheckConfig {
     }
 }
 
+/// Whether `/proc/locks` content lists `pid` as a lock holder or blocked waiter.
+///
+/// Holder lines: `1: POSIX  ADVISORY  WRITE 12345 08:02:1234 0 EOF`.
+/// Waiter lines insert `->`: `1: -> POSIX  ADVISORY  WRITE 12346 08:02:1234 0 EOF`,
+/// shifting every field by one; the old fixed-index parse missed all waiters.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_locks_mentions_pid(content: &str, pid: u32) -> bool {
+    let pid_str = pid.to_string();
+    content.lines().any(|line| {
+        let mut parts = line.split_whitespace().skip(1).peekable(); // skip "N:"
+        if parts.peek() == Some(&"->") {
+            parts.next();
+        }
+        // class (POSIX/FLOCK/OFDLCK/LEASE), mode (ADVISORY/MANDATORY), type, pid
+        parts.nth(3) == Some(pid_str.as_str())
+    })
+}
+
+/// Whether an open-file target (a `/proc/<pid>/fd` link or an lsof NAME) is a file
+/// whose pending writes could be lost by killing the process.
+fn is_persistent_file_target(target: &str) -> bool {
+    target.starts_with('/')
+        && !target.ends_with(" (deleted)")
+        && !["/dev/", "/proc/", "/sys/", "/run/user/"]
+            .iter()
+            .any(|prefix| target.starts_with(prefix))
+}
+
 /// Live pre-check provider that reads from /proc (Linux) or sysctl/lsof (macOS).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct LivePreCheckProvider {
@@ -458,6 +486,15 @@ impl LivePreCheckProvider {
 
             for entry in entries.flatten() {
                 let fd_name = entry.file_name();
+                // Only writes to real, persistent files can lose data. stdout/stderr
+                // to a pty/pipe, sockets, /dev/null, anon inodes and deleted files do
+                // not; counting them blocked essentially every kill.
+                let Ok(target) = std::fs::read_link(entry.path()) else {
+                    continue;
+                };
+                if !is_persistent_file_target(&target.to_string_lossy()) {
+                    continue;
+                }
                 let fdinfo_path = format!("{fdinfo_dir}/{}", fd_name.to_string_lossy());
 
                 if let Ok(content_bytes) = std::fs::read(&fdinfo_path) {
@@ -489,6 +526,7 @@ impl LivePreCheckProvider {
             {
                 let write_count = files
                     .iter()
+                    .filter(|f| f.file_type == "REG" && is_persistent_file_target(&f.name))
                     .filter(|f| {
                         if let Some(ref mode) = f.mode {
                             mode.contains('w') || mode.contains('u')
@@ -560,16 +598,7 @@ impl LivePreCheckProvider {
                 return false;
             };
 
-            let pid_str = pid.to_string();
-            for line in content.lines() {
-                // Format: 1: POSIX  ADVISORY  WRITE 12345 ...
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 4 && parts[4] == pid_str {
-                    return true;
-                }
-            }
-
-            false
+            proc_locks_mentions_pid(&content, pid)
         }
         #[cfg(target_os = "macos")]
         {
@@ -847,8 +876,40 @@ impl PreCheckProvider for LivePreCheckProvider {
                 };
             }
 
-            // Check protected users
-            if filter.protected_users().contains(&user.to_lowercase()) {
+            // Built-in live-infrastructure protection (same rules as the scan filter)
+            let mut session_workload = false;
+            if filter.builtin_enabled() {
+                if crate::collect::protected::live_invoker_chain_pids().contains(&pid) {
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckNotProtected,
+                        reason: "pt itself or one of its invoking processes".to_string(),
+                    };
+                }
+                if let Some((rule, notes)) =
+                    crate::collect::protected::builtin_protection_match(&comm, &cmd)
+                {
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckNotProtected,
+                        reason: format!("{rule}: {notes}"),
+                    };
+                }
+                let role = crate::collect::read_cgroup_role(pid);
+                if role.is_supervised_service() {
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckNotProtected,
+                        reason: format!(
+                            "supervised service (cgroup {role:?}); stop the unit instead"
+                        ),
+                    };
+                }
+                session_workload = role.is_user_workload();
+            }
+
+            // Check protected users (login-session workloads are exempt, see
+            // ProtectedFilter::is_protected_with_role)
+            if !(session_workload && crate::collect::protected::is_root_user(&user))
+                && filter.protected_users().contains(&user.to_lowercase())
+            {
                 debug!(pid, %user, "process owned by protected user");
                 return PreCheckResult::Blocked {
                     check: PreCheck::CheckNotProtected,
@@ -1167,6 +1228,46 @@ impl PreCheckProvider for NoopPreCheckProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_locks_parses_holders_and_waiters() {
+        let content = "1: POSIX  ADVISORY  WRITE 12345 08:02:1234 0 EOF\n\
+                       1: -> POSIX  ADVISORY  WRITE 12346 08:02:1234 0 EOF\n\
+                       2: FLOCK  ADVISORY  WRITE 777 00:1a:99 0 EOF\n\
+                       3: OFDLCK ADVISORY  READ  -1 00:1a:5 0 EOF\n";
+        assert!(proc_locks_mentions_pid(content, 12345), "holder");
+        assert!(proc_locks_mentions_pid(content, 12346), "blocked waiter");
+        assert!(proc_locks_mentions_pid(content, 777), "flock holder");
+        assert!(
+            !proc_locks_mentions_pid(content, 1),
+            "lock index is not a pid"
+        );
+        assert!(!proc_locks_mentions_pid(content, 99), "inode is not a pid");
+        assert!(!proc_locks_mentions_pid("", 12345));
+    }
+
+    #[test]
+    fn persistent_file_targets_only() {
+        for t in [
+            "/data/projects/app/db.sqlite",
+            "/home/ubuntu/.cache/x.log",
+            "/tmp/build.out",
+        ] {
+            assert!(is_persistent_file_target(t), "{t}");
+        }
+        for t in [
+            "/dev/pts/3",
+            "/dev/null",
+            "pipe:[123]",
+            "socket:[456]",
+            "anon_inode:[eventfd]",
+            "/proc/1/status",
+            "/tmp/old.log (deleted)",
+            "/run/user/1000/bus",
+        ] {
+            assert!(!is_persistent_file_target(t), "{t}");
+        }
+    }
 
     // ── PreCheckResult ──────────────────────────────────────────────
 
@@ -1718,10 +1819,18 @@ mod tests {
         use super::*;
 
         #[test]
-        fn live_provider_defaults() {
+        fn live_provider_defaults_block_own_invoker_chain() {
+            // pt must never act on itself or its callers. This also makes the check
+            // independent of the user running the tests (the old "self is not
+            // protected" assertion failed whenever tests ran as root).
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-            assert!(provider.check_not_protected(pid).is_passed());
+            match provider.check_not_protected(pid) {
+                PreCheckResult::Blocked { reason, .. } => {
+                    assert!(reason.contains("invoking"), "unexpected reason: {reason}")
+                }
+                other => panic!("own process must be protected, got {other:?}"),
+            }
         }
 
         #[test]
@@ -1893,8 +2002,8 @@ mod tests {
             let checks = vec![PreCheck::CheckNotProtected, PreCheck::VerifyProcessState];
             let results = provider.run_checks(&checks, pid, None);
             assert_eq!(results.len(), 2);
-            // Self should not be protected
-            assert!(results[0].is_passed());
+            // Self is always protected (invoker chain)
+            assert!(!results[0].is_passed());
             // Self should have valid process state
             assert!(results[1].is_passed());
         }

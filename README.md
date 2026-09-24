@@ -188,7 +188,7 @@ The interactive TUI is built on **ftui** (an Elm-style Model-View-Update framewo
 - **Command palette**: fuzzy-searchable action palette for power users
 - **Inline mode** (`pt run --inline`): confines the UI to a bottom region, preserving terminal scrollback above
 
-Build with `cargo run -p pt-core --features ui -- run`.
+From source: `cargo run -p pt-core -- run` (the `ui` feature is on by default).
 
 ### Session Diffing
 
@@ -214,7 +214,16 @@ Each delta includes `score_drift` (how much the score changed), `worsened`/`impr
 pt-core mcp   # Start JSON-RPC 2.0 server over stdio
 ```
 
-Available tools: `scan` (quick or deep), `score_process` (score a specific PID), `list_resources`, `read_resource`. AI agents can use this to query process state, run scans, and make triage decisions without CLI parsing.
+Available tools:
+
+- `pt_plan`: the same engine, protections and output as `pt agent plan --format json`.
+- `pt_scan`: a process listing with signature-match scores.
+- `pt_explain`: a PID's evidence.
+- `pt_history`: recent sessions.
+- `pt_signatures`
+- `pt_capabilities`
+
+AI agents can use these to query process state, run scans, and make triage decisions without CLI parsing.
 
 ### Learning Tutorials
 
@@ -372,7 +381,15 @@ Every kill target is verified by a triple `<boot_id>:<start_time_ticks>:<pid>` t
 
 ### Protected Processes
 
-These are **never** flagged: `systemd`, `dbus`, `sshd`, `cron`, `docker`, `containerd`, `postgres`, `mysql`, `redis`, `nginx`, `apache`, `caddy`, and any root-owned process. Configurable via `policy.json`.
+Protection has two layers:
+
+- **Policy** (`policy.json` → `guardrails`): protected patterns (defaults `systemd`, `sshd`), protected users (default `root`), protected categories (`database`, `webserver`), PIDs, and children of PID 1.
+- **Built-in** (`guardrails.builtin_protection`, on by default):
+  - terminal multiplexers (tmux, zellij, screen, wezterm/frankenterm mux servers), SSH ControlMasters (e.g. rch's shared connections), session infrastructure (sshd sessions, `systemd --user`, dbus, pipewire, agents), and interactive shells;
+  - `pt` itself and every process that invoked it;
+  - on Linux, anything supervised by systemd (`system.slice/*.service`, user units) or a container runtime, which covers postgres/nginx/mysql workers, docker containers and the like;
+  - AI agent CLIs (claude, codex, gemini/agy, …) are never pre-selected or robot-killed; they are shown for manual review.
+- On Linux, a workload started inside a login session (for example a build running as root over SSH on a build worker, or an orphan reparented to PID 1) is **not** covered by the root-user / PID-1 rules, because it is a candidate rather than a system service.
 
 ### Staged Kill Signals
 
@@ -580,17 +597,17 @@ pt report --session <id> --output report.html --include-ledger --embed-assets
 
 ## Fleet Mode
 
-`pt` supports multi-host triage with distributed safety guarantees:
+`pt` can plan across several hosts over SSH (each host needs `pt-core` installed):
 
 ```bash
-# Scan a fleet of hosts via SSH
-pt-core fleet scan --inventory hosts.toml --parallel 10
+# Plan across hosts (inventory: TOML, YAML or JSON by extension)
+pt-core agent fleet plan --inventory hosts.toml --parallel 10
 
-# Pooled FDR control across hosts (e-value Benjamini-Yekutieli)
-pt-core fleet plan --fdr-method eby --alpha 0.05
+# Or list hosts directly; pooled FDR across hosts (e-value Benjamini-Yekutieli)
+pt-core agent fleet plan --hosts trj,ts1,hz3 --max-fdr 0.05
 ```
 
-Fleet mode uses **Chandy-Lamport consistent snapshots** to prevent triage cascades: a process on Host A won't be killed if it's a dependency of a Useful process on Host B. Tentative hosts (timeout/unreachable) trigger conservative fallback; no auto-kills until the cut is complete.
+Current status: fleet **planning** (SSH scan and pooled e-BY FDR across hosts) works. Fleet **apply** only reports planned actions; remote execution is not implemented yet. The Chandy-Lamport consistent-snapshot coordinator exists as a library but is not wired into fleet planning yet, so cross-host dependencies are not considered today.
 
 ---
 
@@ -1194,7 +1211,9 @@ For each candidate, `pt` computes the expected loss for all 8 possible actions u
 E[L(action)] = sum_c P(c | evidence) * L(action, c)
 ```
 
-The loss matrix encodes domain knowledge: killing a useful process is very expensive (loss = 100), but keeping an abandoned process is only moderately costly (loss = 10). The action with minimum expected loss wins.
+The loss matrix encodes domain knowledge. With the defaults, killing a useful process costs 500, keeping an abandoned one costs 5, and killing an abandoned one costs 0.1. Reversible actions (renice/pause/throttle) on an abandoned process cost 3.5–4.5, because they leave its memory, ports and locks held. So Kill wins only when P(useful) is below roughly 0.7%. The action with minimum expected loss wins.
+
+The displayed **score** is `100 × P(abandoned or zombie)`. It measures how suspicious a process is, not how confident the model is about some class.
 
 ### Value of Information
 
@@ -1318,10 +1337,12 @@ ls -la ~/.local/bin/pt-core
 
 ### TUI won't run
 
-The TUI requires building with `--features ui`:
+The TUI needs an interactive terminal; in scripts, CI or agent sessions `pt run`
+exits with code 11 and points to `pt agent plan`. It also needs the `ui` feature,
+which is on by default (only `--no-default-features` builds lack it):
 
 ```bash
-cargo run -p pt-core --features ui -- run
+cargo run -p pt-core -- run
 ```
 
 ---

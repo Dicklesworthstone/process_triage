@@ -788,6 +788,93 @@ mod tests {
         assert!(outcome.rationale.tie_break);
     }
 
+    /// Regression for the 2026-09-24 fleet finding: with the shipped loss matrices a
+    /// confidently-abandoned process must be recommended for Kill, not Renice.
+    #[test]
+    fn confident_abandoned_recommends_kill_under_shipped_policies() {
+        use crate::config::{get_preset, PresetName};
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.001,
+            abandoned: 0.997,
+            zombie: 0.001,
+        };
+        let mut policies = vec![("default", Policy::default())];
+        for name in [PresetName::Developer, PresetName::Server, PresetName::Ci] {
+            policies.push((name.as_str(), get_preset(name)));
+        }
+        for (label, policy) in policies {
+            let outcome = decide_action(&posterior, &policy, &ActionFeasibility::allow_all())
+                .expect("decision");
+            assert_eq!(
+                outcome.optimal_action,
+                Action::Kill,
+                "{label}: expected kill, losses = {:?}",
+                outcome.expected_loss
+            );
+        }
+    }
+
+    /// A process that is probably useful must never be killed, and an uncertain one
+    /// must get a reversible action rather than a kill.
+    #[test]
+    fn uncertain_or_useful_never_recommends_kill_under_default_policy() {
+        let policy = Policy::default();
+        for posterior in [
+            ClassScores {
+                useful: 0.9,
+                useful_bad: 0.05,
+                abandoned: 0.05,
+                zombie: 0.0,
+            },
+            ClassScores {
+                useful: 0.05,
+                useful_bad: 0.0,
+                abandoned: 0.95,
+                zombie: 0.0,
+            },
+        ] {
+            let outcome = decide_action(&posterior, &policy, &ActionFeasibility::allow_all())
+                .expect("decision");
+            assert_ne!(
+                outcome.optimal_action,
+                Action::Kill,
+                "posterior {posterior:?} -> {:?}",
+                outcome.expected_loss
+            );
+        }
+    }
+
+    /// Structural invariant of the shipped abandoned rows: kill is the only action that
+    /// resolves an abandoned process, so it must be strictly cheaper than every
+    /// non-terminal action (otherwise the argmin can never pick it).
+    #[test]
+    fn shipped_abandoned_rows_make_kill_strictly_cheapest() {
+        use crate::config::{get_preset, PresetName};
+        let mut matrices = vec![("default", Policy::default().loss_matrix)];
+        for name in [PresetName::Developer, PresetName::Server, PresetName::Ci] {
+            matrices.push((name.as_str(), get_preset(name).loss_matrix));
+        }
+        for (label, m) in matrices {
+            let row = &m.abandoned;
+            for (action, loss) in [
+                ("keep", Some(row.keep)),
+                ("pause", row.pause),
+                ("throttle", row.throttle),
+                ("restart", row.restart),
+                ("renice", row.renice),
+            ] {
+                if let Some(loss) = loss {
+                    assert!(
+                        row.kill < loss,
+                        "{label}: abandoned.kill {} must be < abandoned.{action} {loss}",
+                        row.kill
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn invalid_posterior_rejected() {
         let policy = policy_for_tests();

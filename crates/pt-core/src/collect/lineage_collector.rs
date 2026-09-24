@@ -124,17 +124,35 @@ fn read_proc_status(pid: u32) -> Option<ProcStatus> {
 }
 
 /// Resolve a UID to a username, if possible.
+///
+/// `/etc/passwd` is parsed once per process lifetime; this runs for every scanned
+/// process, and re-reading the file each time showed up in large scans.
 fn resolve_username(uid: u32) -> Option<String> {
-    let path = "/etc/passwd";
-    let content = fs::read_to_string(path).ok()?;
-    let uid_str = uid.to_string();
+    static USERS: std::sync::OnceLock<std::collections::HashMap<u32, String>> =
+        std::sync::OnceLock::new();
+    USERS
+        .get_or_init(|| {
+            fs::read_to_string("/etc/passwd")
+                .map(|content| parse_passwd(&content))
+                .unwrap_or_default()
+        })
+        .get(&uid)
+        .cloned()
+}
+
+fn parse_passwd(content: &str) -> std::collections::HashMap<u32, String> {
+    let mut users = std::collections::HashMap::new();
     for line in content.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 3 && fields[2] == uid_str {
-            return Some(fields[0].to_string());
+        let mut fields = line.split(':');
+        let (Some(name), Some(_), Some(uid)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        if let Ok(uid) = uid.parse::<u32>() {
+            // First entry wins, like a linear scan of the file.
+            users.entry(uid).or_insert_with(|| name.to_string());
         }
     }
-    None
+    users
 }
 
 /// Build TTY evidence from /proc/[pid]/stat fields.
@@ -301,17 +319,27 @@ fn is_containerized(pid: u32) -> bool {
         }
     }
 
-    // Check for /.dockerenv marker
-    if std::path::Path::new("/.dockerenv").exists() {
-        return true;
-    }
-
-    false
+    // Check for the /.dockerenv marker inside the process's own root filesystem
+    // (checking pt's root would tag every host process when pt runs in a container).
+    std::path::Path::new(&format!("/proc/{pid}/root/.dockerenv")).exists()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_passwd_first_entry_wins_and_skips_garbage() {
+        let users = parse_passwd(
+            "root:x:0:0:root:/root:/bin/bash\n\
+             garbage line\n\
+             ubuntu:x:1000:1000::/home/ubuntu:/bin/zsh\n\
+             alias:x:1000:1000::/home/alias:/bin/sh\n",
+        );
+        assert_eq!(users.get(&0).map(String::as_str), Some("root"));
+        assert_eq!(users.get(&1000).map(String::as_str), Some("ubuntu"));
+        assert_eq!(users.len(), 2);
+    }
 
     #[test]
     fn tty_device_name_pts() {
