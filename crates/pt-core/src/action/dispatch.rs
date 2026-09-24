@@ -49,8 +49,51 @@ impl Default for CompositeActionRunner {
     }
 }
 
+/// Refuse cgroup-wide actions unless the target is the only process in its cgroup.
+///
+/// Freeze/throttle/quarantine write to the target's *existing* cgroup
+/// (`cgroup.freeze`, `cpu.max`, `cpuset.cpus`). In a shared cgroup (a login
+/// session scope, a tmux spawn scope, a container) that would freeze/throttle every
+/// member, possibly including the user's shell, other agents, or pt itself. Until
+/// pt moves the target into a dedicated leaf cgroup, it only acts when the cgroup
+/// holds the target alone.
+#[cfg(target_os = "linux")]
+fn ensure_exclusive_cgroup(pid: u32) -> Result<(), ActionError> {
+    let path = crate::collect::collect_cgroup_details(pid)
+        .and_then(|d| d.unified_path)
+        .ok_or_else(|| ActionError::Failed(format!("cannot resolve cgroup of pid {pid}")))?;
+    let procs_file = format!("/sys/fs/cgroup{path}/cgroup.procs");
+    let content = std::fs::read_to_string(&procs_file)
+        .map_err(|e| ActionError::Failed(format!("cannot read {procs_file}: {e}")))?;
+    let others = shared_cgroup_members(&content, pid);
+    if others > 0 {
+        return Err(ActionError::Failed(format!(
+            "refusing: cgroup {path} is shared with {others} other process(es) and would \
+             affect them all (leaf-cgroup isolation not implemented)"
+        )));
+    }
+    Ok(())
+}
+
+/// Number of processes other than `pid` listed in `cgroup.procs` content.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn shared_cgroup_members(procs_content: &str, pid: u32) -> usize {
+    procs_content
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .filter(|p| *p != pid)
+        .count()
+}
+
 impl ActionRunner for CompositeActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
+        #[cfg(target_os = "linux")]
+        if matches!(
+            action.action,
+            Action::Freeze | Action::Throttle | Action::Quarantine
+        ) {
+            ensure_exclusive_cgroup(action.target.pid.0)?;
+        }
         match action.action {
             Action::Keep => Ok(()),
             Action::Pause | Action::Resume | Action::Kill => self.signal.execute(action),
@@ -153,6 +196,14 @@ mod tests {
         };
         let plan = generate_plan(&bundle);
         plan.actions[0].clone()
+    }
+
+    #[test]
+    fn shared_cgroup_members_counts_others() {
+        assert_eq!(shared_cgroup_members("123\n", 123), 0);
+        assert_eq!(shared_cgroup_members("123\n456\n789\n", 123), 2);
+        assert_eq!(shared_cgroup_members("", 123), 0);
+        assert_eq!(shared_cgroup_members("456\n", 123), 1);
     }
 
     #[test]

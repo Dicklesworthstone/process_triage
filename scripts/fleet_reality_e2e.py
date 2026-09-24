@@ -50,13 +50,20 @@ set -u
 BIN="$1"; DATA="$2"
 export PROCESS_TRIAGE_DATA="$DATA" PROCESS_TRIAGE_RETENTION=off
 mkdir -p "$DATA"
-UPTIME=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo 0)
-T0=$(date +%s%N)
-nice -n 19 timeout 900 "$BIN" agent plan --format json --max-candidates 5000 \
+# Portable (Linux + macOS): uptime from /proc or kern.boottime; ms clock via perl.
+if [ -r /proc/uptime ]; then
+  UPTIME=$(cut -d' ' -f1 /proc/uptime)
+else
+  BOOT=$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/.*sec = ([0-9]+).*/\1/')
+  UPTIME=$(( $(date +%s) - ${BOOT:-0} ))
+fi
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
+T0=$(now_ms)
+nice -n 19 "$BIN" agent plan --format json --max-candidates 5000 \
   >"$DATA/.plan.json" 2>"$DATA/.plan.err"
 RC=$?
-T1=$(date +%s%N)
-echo "@@META rc=$RC ms=$(( (T1 - T0) / 1000000 )) uptime=$UPTIME version=$("$BIN" --version 2>/dev/null)"
+T1=$(now_ms)
+echo "@@META rc=$RC ms=$(( T1 - T0 )) uptime=$UPTIME version=$("$BIN" --version 2>/dev/null)"
 echo "@@PLAN"; cat "$DATA/.plan.json"
 echo "@@ERR"; tail -c 4000 "$DATA/.plan.err"
 """

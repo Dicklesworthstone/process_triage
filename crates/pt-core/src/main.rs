@@ -1137,9 +1137,7 @@ struct AgentExplainArgs {
 }
 
 #[cfg(target_os = "linux")]
-use pt_core::action::{
-    ActionRunner, IdentityProvider, LiveIdentityProvider, SignalActionRunner, SignalConfig,
-};
+use pt_core::action::{ActionRunner, IdentityProvider, LiveIdentityProvider};
 use pt_core::decision::{
     goal_optimizer::{
         optimize_greedy, optimize_ilp, OptCandidate, OptimizationResult, ResourceGoal,
@@ -2645,7 +2643,8 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
     collect_deep_signals_for_pids(&pids)
 }
 
-#[cfg(feature = "ui")]
+// Linux-only: built from /proc/net socket data (the only caller is Linux-gated too).
+#[cfg(all(feature = "ui", target_os = "linux"))]
 #[derive(Debug, Clone, Copy)]
 struct QueueMetrics {
     saturated: bool,
@@ -2655,7 +2654,7 @@ struct QueueMetrics {
     backlog_sockets: usize,
 }
 
-#[cfg(feature = "ui")]
+#[cfg(all(feature = "ui", target_os = "linux"))]
 fn estimate_queue_metrics(info: &pt_core::collect::NetworkInfo, io_active: bool) -> QueueMetrics {
     const QUEUE_SATURATION_THRESHOLD: u32 = 4096;
 
@@ -14467,7 +14466,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         #[cfg(target_os = "linux")]
         {
             let identity_provider = LiveIdentityProvider::new();
-            let signal_runner = SignalActionRunner::new(SignalConfig::default());
+            // Composite runner: signals (kill/pause/resume), renice, and on Linux
+            // freeze/throttle/quarantine (refused unless the target owns its cgroup).
+            // Previously only signals could run, so every other planned action failed.
+            let action_runner = pt_core::action::CompositeActionRunner::with_defaults();
 
             for action in &actions_to_apply {
                 action_index = action_index.saturating_add(1);
@@ -14614,10 +14616,17 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                     continue;
                 }
-                match signal_runner.execute(action) {
+                match action_runner.execute(action) {
                     Ok(()) => {
                         if action.action == Action::Kill {
-                            checker.record_action(0, true);
+                            // Accumulate the real memory footprint so
+                            // --max-total-blast-radius is enforced (was always 0).
+                            let bytes = action
+                                .rationale
+                                .memory_mb
+                                .map(|mb| (mb.max(0.0) * 1024.0 * 1024.0) as u64)
+                                .unwrap_or(0);
+                            checker.record_action(bytes, true);
                         }
                         succeeded += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -17851,7 +17860,7 @@ mod provenance_scoring_tests {
     }
 }
 
-#[cfg(all(test, feature = "ui"))]
+#[cfg(all(test, feature = "ui", target_os = "linux"))]
 mod queue_metrics_tests {
     use super::*;
     use pt_core::collect::{

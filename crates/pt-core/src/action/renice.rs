@@ -223,9 +223,10 @@ impl ReniceActionRunner {
 
         debug!(pid, nice_value, "executing renice action");
 
+        let previous = self.get_nice_value(pid);
         // Capture previous nice value for logging (reversal metadata can be captured separately)
         if self.config.capture_reversal {
-            if let Some(previous) = self.get_nice_value(pid) {
+            if let Some(previous) = previous {
                 debug!(
                     pid,
                     previous_nice = previous,
@@ -233,6 +234,16 @@ impl ReniceActionRunner {
                     "renice: capturing prior state"
                 );
             }
+        }
+
+        // Renice only ever LOWERS priority. A process already at or below the target
+        // priority (nice >= target) is left alone: setting the target would raise its
+        // priority, which is not what this action means and fails with EACCES for
+        // unprivileged users (observed on a host whose sessions run at nice -4 while
+        // pt ran under `nice`).
+        if previous.is_some_and(|p| p >= nice_value) {
+            info!(pid, previous_nice = ?previous, nice_value, "renice: already at or below target priority");
+            return Ok(());
         }
 
         self.set_priority(pid, nice_value)?;
@@ -251,7 +262,8 @@ impl ReniceActionRunner {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         match self.get_nice_value(pid) {
-            Some(actual) if actual == expected => Ok(()),
+            // At or below the target priority (never raised by execute_renice).
+            Some(actual) if actual >= expected => Ok(()),
             Some(actual) => Err(ActionError::Failed(format!(
                 "nice value mismatch: expected {expected}, got {actual}"
             ))),
