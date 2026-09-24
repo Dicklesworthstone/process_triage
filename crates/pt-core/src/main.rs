@@ -12269,7 +12269,16 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         #[cfg(target_os = "linux")]
         let provenance_adjustment = {
-            let adjustment = derive_provenance_adjustment(proc.pid.0, &provenance_bundle);
+            let mut adjustment = derive_provenance_adjustment(proc.pid.0, &provenance_bundle);
+            // The base `orphan` term already carries "reparented to init"; counting the
+            // lineage's orphaned verdict again double-counts one fact under naive Bayes.
+            // Keep it only when it adds information (lineage sees an orphan that the
+            // base check does not, e.g. reparented to a user subreaper).
+            if proc.is_orphan() {
+                adjustment
+                    .evidence_terms
+                    .retain(|t| t.feature != "provenance_ownership_orphaned");
+            }
             if !adjustment.evidence_terms.is_empty() {
                 match apply_evidence_terms(&posterior_result, adjustment.evidence_terms.clone()) {
                     Ok(adjusted) => {
@@ -12948,6 +12957,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut review_candidates: Vec<u32> = Vec::new();
     let mut spare_candidates: Vec<u32> = Vec::new();
     let mut expected_memory_freed_bytes: u64 = 0;
+    // Goal-selected processes whose own recommendation is not `kill` (policy block,
+    // agent force-review, tree safety, or simply not confident enough) need a human:
+    // a goal must never bypass per-candidate safety.
+    let mut goal_selected_needing_review: Vec<u32> = Vec::new();
     for candidate in &candidates {
         let pid = candidate["pid"].as_u64().unwrap_or(0) as u32;
         let action = candidate["recommended_action"].as_str().unwrap_or("");
@@ -12956,9 +12969,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .as_ref()
             .map(|selected| selected.contains(&pid))
             .unwrap_or(false);
-        if selected_by_goal || action == "kill" {
+        if action == "kill" {
             kill_candidates.push(pid);
             expected_memory_freed_bytes += memory_mb * 1024 * 1024;
+        } else if selected_by_goal {
+            goal_selected_needing_review.push(pid);
+            review_candidates.push(pid);
         } else if action == "keep" {
             spare_candidates.push(pid);
         } else {
@@ -13004,7 +13020,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .get("achievable")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        summary["goal_selected_count"] = serde_json::json!(kill_candidates.len());
+        summary["goal_selected_count"] =
+            serde_json::json!(goal_selected.as_ref().map(|s| s.len()).unwrap_or(0));
+        summary["goal_selected_needing_review"] = serde_json::json!(goal_selected_needing_review);
     }
 
     // Bayesian FDR estimate of the kill set: the expected fraction of recommended
@@ -13833,10 +13851,14 @@ fn supervisor_info_for_plan(_pid: u32) -> serde_json::Value {
 }
 
 #[cfg(target_os = "linux")]
+/// Robot-mode supervision gate. Fails CLOSED: if supervision cannot be determined
+/// (detection error, or the process environment is unreadable, e.g. another user's
+/// process without privileges), the process is treated as supervised, so robot
+/// mode requires a human instead of assuming "nobody is attached".
 fn is_supervised_for_robot(pid: u32) -> bool {
     match detect_supervision(pid) {
-        Ok(result) => is_human_supervised(&result),
-        Err(_) => false,
+        Ok(result) => is_human_supervised(&result) || result.environ.is_none(),
+        Err(_) => true,
     }
 }
 

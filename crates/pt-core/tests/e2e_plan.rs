@@ -288,6 +288,58 @@ mod plan_options {
         }
     }
 
+    /// A goal must never bypass per-candidate safety: every pid in the kill set is a
+    /// candidate whose own recommendation is `kill`; goal picks that are not
+    /// kill-recommended are listed for review instead.
+    #[test]
+    fn plan_goal_never_puts_non_kill_candidates_in_kill_set() {
+        let output = pt_core_fast()
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--goal",
+                "free 64GB RAM",
+                "--threshold",
+                "0",
+                "--min-age",
+                "0",
+                "--max-candidates",
+                "200",
+            ])
+            .assert()
+            .code(predicate::in_iter([0, 1, 5]))
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).expect("valid JSON");
+        let candidates = json["candidates"].as_array().cloned().unwrap_or_default();
+        let action_of = |pid: u64| {
+            candidates
+                .iter()
+                .find(|c| c["pid"].as_u64() == Some(pid))
+                .and_then(|c| c["recommended_action"].as_str())
+                .map(str::to_string)
+        };
+        let kill_set = json["recommendations"]["kill_set"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for pid in kill_set.iter().filter_map(|v| v.as_u64()) {
+            assert_eq!(
+                action_of(pid).as_deref(),
+                Some("kill"),
+                "pid {pid} is in kill_set without a kill recommendation"
+            );
+        }
+        if let Some(needing_review) = json["summary"]["goal_selected_needing_review"].as_array() {
+            for pid in needing_review.iter().filter_map(|v| v.as_u64()) {
+                assert_ne!(action_of(pid).as_deref(), Some("kill"));
+            }
+        }
+    }
+
     #[test]
     fn plan_includes_signature_inference_metadata() {
         let output = pt_core_fast()
