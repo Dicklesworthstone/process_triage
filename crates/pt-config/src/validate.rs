@@ -191,18 +191,10 @@ pub fn validate_policy(policy: &crate::policy::Policy) -> ValidationResult<()> {
         });
     }
 
-    // Validate guardrails
-    if policy.guardrails.never_kill_ppid.is_empty() {
-        return Err(ValidationError::SemanticError(
-            "guardrails.never_kill_ppid must contain at least PID 1".to_string(),
-        ));
-    }
-
-    if !policy.guardrails.never_kill_ppid.contains(&1) {
-        return Err(ValidationError::SemanticError(
-            "guardrails.never_kill_ppid must contain PID 1 (init)".to_string(),
-        ));
-    }
+    // guardrails.never_kill_ppid is the operator's choice (default [1]). It is no
+    // longer mandatory: PID 1 itself is hard-blocked in the enforcer, and on systemd
+    // hosts services are protected by cgroup placement, so requiring [1] only hid
+    // every PID-1 child (e.g. zombie parents) on hosts that opted out.
 
     validate_load_aware(&policy.load_aware)?;
 
@@ -604,17 +596,17 @@ mod tests {
     }
 
     #[test]
-    fn policy_guardrails_empty() {
+    fn policy_guardrails_empty_ppid_list_allowed() {
         let mut policy = crate::policy::Policy::default();
         policy.guardrails.never_kill_ppid = vec![];
-        assert!(validate_policy(&policy).is_err());
+        assert!(validate_policy(&policy).is_ok());
     }
 
     #[test]
-    fn policy_guardrails_missing_pid1() {
+    fn policy_guardrails_ppid_list_without_pid1_allowed() {
         let mut policy = crate::policy::Policy::default();
         policy.guardrails.never_kill_ppid = vec![2, 3];
-        assert!(validate_policy(&policy).is_err());
+        assert!(validate_policy(&policy).is_ok());
     }
 
     #[test]

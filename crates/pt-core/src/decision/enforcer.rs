@@ -473,6 +473,16 @@ impl PolicyEnforcer {
         // Only enforce most rules for destructive actions
         let is_destructive = matches!(action, Action::Kill | Action::Restart);
 
+        // PID 0/1 are untouchable regardless of policy (never_kill_pid may be empty).
+        if candidate.pid <= 1 {
+            return PolicyCheckResult::blocked(PolicyViolation {
+                kind: ViolationKind::ProtectedPid,
+                message: format!("PID {} is init/kernel and is never acted on", candidate.pid),
+                rule: "builtin.pid1".to_string(),
+                context: None,
+            });
+        }
+
         // Check protected PIDs (always, for any action)
         if self.never_kill_pid.contains(&candidate.pid) {
             return PolicyCheckResult::blocked(PolicyViolation {
@@ -1222,6 +1232,21 @@ mod tests {
         let result = enforcer.check_action(&candidate, Action::Keep, false);
         assert!(result.allowed);
         assert!(result.violation.is_none());
+    }
+
+    #[test]
+    fn pid1_blocked_even_with_empty_never_kill_pid() {
+        let mut policy = test_policy();
+        policy.guardrails.never_kill_pid = vec![];
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+
+        for pid in [0, 1] {
+            let mut candidate = test_candidate();
+            candidate.pid = pid;
+            let result = enforcer.check_action(&candidate, Action::Kill, false);
+            assert!(!result.allowed, "pid {pid}");
+            assert_eq!(result.violation.as_ref().unwrap().rule, "builtin.pid1");
+        }
     }
 
     #[test]

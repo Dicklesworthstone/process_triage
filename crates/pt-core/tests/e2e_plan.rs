@@ -1423,3 +1423,253 @@ fn plan_age_matches_proc_start_time() {
         "plan age {age} outside /proc age window [{before:.2}, {after:.2}]"
     );
 }
+
+/// `agent plan --deep` feeds deep-scan evidence into the posterior: a process
+/// holding a TCP connection gets a `net` ledger term, which the quick scan
+/// cannot see.
+#[cfg(target_os = "linux")]
+#[test]
+fn plan_deep_adds_network_evidence() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    // bash opens fd 3 to the listener, then execs sleep, which inherits it.
+    let mut child = std::process::Command::new("bash")
+        .args([
+            "-c",
+            &format!("exec 3<>/dev/tcp/127.0.0.1/{port}; exec sleep 120"),
+        ])
+        .spawn()
+        .expect("spawn bash");
+    let pid = child.id();
+    let _conn = listener.accept().expect("accept");
+    std::thread::sleep(Duration::from_millis(500));
+    let data_dir = tempdir().expect("data dir");
+
+    let plan = |deep: bool| -> Value {
+        let mut args = vec![
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--max-candidates",
+            "100000",
+        ];
+        if deep {
+            args.push("--deep");
+        }
+        let output = pt_core()
+            .env("PROCESS_TRIAGE_DATA", data_dir.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args(&args)
+            .output()
+            .expect("run plan");
+        serde_json::from_slice(&output.stdout).expect("plan JSON")
+    };
+    let factors = |json: &Value| -> Vec<String> {
+        json["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .find(|c| c["pid"].as_u64() == Some(u64::from(pid)))
+            .unwrap_or_else(|| panic!("pid {pid} not in plan"))["evidence"]
+            .as_array()
+            .expect("evidence")
+            .iter()
+            .filter_map(|e| e["factor"].as_str().map(String::from))
+            .collect()
+    };
+
+    let quick = plan(false);
+    let deep = plan(true);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        !factors(&quick).contains(&"net".to_string()),
+        "quick plan has no network evidence: {:?}",
+        factors(&quick)
+    );
+    assert!(
+        factors(&deep).contains(&"net".to_string()),
+        "deep plan should carry a net term: {:?}",
+        factors(&deep)
+    );
+    assert!(quick["summary"]["deep_scan_ms"].is_null());
+    assert!(
+        deep["summary"]["deep_scan_ms"].is_u64(),
+        "{}",
+        deep["summary"]
+    );
+    assert!(
+        deep["summary"]["deep_evidence_pids"].as_u64().unwrap_or(0) > 0,
+        "{}",
+        deep["summary"]
+    );
+}
+
+/// A real zombie is never reniced/killed/paused: the plan routes it to its parent.
+#[cfg(target_os = "linux")]
+#[test]
+fn plan_routes_zombie_to_parent() {
+    // sh forks `sleep 0`, then execs `sleep 120`, which never reaps it.
+    let mut parent = std::process::Command::new("sh")
+        .args(["-c", "sleep 0 & exec sleep 120"])
+        .spawn()
+        .expect("spawn parent");
+    let parent_pid = parent.id();
+    std::thread::sleep(Duration::from_secs(1));
+    let data_dir = tempdir().expect("data dir");
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", data_dir.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--max-candidates",
+            "100000",
+        ])
+        .output()
+        .expect("run plan");
+    let _ = parent.kill();
+    let _ = parent.wait();
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("plan JSON");
+    let zombie = json["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|c| c["ppid"].as_u64() == Some(u64::from(parent_pid)))
+        .unwrap_or_else(|| panic!("zombie child of {parent_pid} not in plan"))
+        .clone();
+    assert!(
+        zombie["state"].as_str().unwrap_or("").starts_with('Z'),
+        "{zombie}"
+    );
+    let routing = &zombie["zombie_routing"];
+    assert_eq!(routing["route_to"], "parent", "{zombie}");
+    assert_eq!(routing["parent_pid"], parent_pid, "{zombie}");
+    assert_eq!(routing["parent_comm"], "sleep", "{zombie}");
+    let rec = zombie["recommendation"].as_str().unwrap_or("");
+    assert!(
+        ![
+            "KILL",
+            "RENICE",
+            "PAUSE",
+            "FREEZE",
+            "THROTTLE",
+            "QUARANTINE"
+        ]
+        .contains(&rec),
+        "zombie got a direct action {rec}: {zombie}"
+    );
+    // A live process has no routing block.
+    let parent_candidate = json["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["pid"].as_u64() == Some(u64::from(parent_pid)));
+    if let Some(p) = parent_candidate {
+        assert!(p["zombie_routing"].is_null(), "{p}");
+    }
+}
+
+/// The plan runs the same data-loss check apply does: with kill made the cheapest
+/// action, a process holding a regular file open for writing is policy-blocked in
+/// the plan, and one with stdio on /dev/null is not.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn plan_blocks_kill_of_open_writer() {
+    let config_dir = tempdir().expect("config dir");
+    let mut policy = pt_core::config::Policy::default();
+    for row in [
+        &mut policy.loss_matrix.useful,
+        &mut policy.loss_matrix.useful_bad,
+        &mut policy.loss_matrix.abandoned,
+        &mut policy.loss_matrix.zombie,
+    ] {
+        row.keep = 10.0;
+        row.kill = 0.0;
+    }
+    policy.guardrails.min_process_age_seconds = 0;
+    std::fs::write(
+        config_dir.path().join("policy.json"),
+        serde_json::to_vec_pretty(&policy).expect("serialize policy"),
+    )
+    .expect("write policy.json");
+
+    let file_dir = tempdir().expect("file dir");
+    let log = file_dir.path().join("journal.log");
+    let spawn = |script: String| {
+        std::process::Command::new("sh")
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn")
+    };
+    let mut writer = spawn(format!("exec sleep 305 3>>'{}'", log.display()));
+    let mut idle = spawn("exec sleep 306".to_string());
+    std::thread::sleep(Duration::from_millis(500));
+
+    let data_dir = tempdir().expect("data dir");
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", data_dir.path())
+        .env("PROCESS_TRIAGE_CONFIG", config_dir.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--max-candidates",
+            "100000",
+        ])
+        .output()
+        .expect("run plan");
+    let _ = writer.kill();
+    let _ = writer.wait();
+    let _ = idle.kill();
+    let _ = idle.wait();
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "plan JSON ({e}); stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let candidate = |pid: u32| -> Value {
+        json["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .find(|c| c["pid"].as_u64() == Some(u64::from(pid)))
+            .unwrap_or_else(|| panic!("pid {pid} not in plan"))
+            .clone()
+    };
+    let w = candidate(writer.id());
+    assert_eq!(w["policy"]["allowed"], false, "{w}");
+    assert_eq!(
+        w["policy"]["violation"]["rule"], "data_loss_gates.block_if_open_write_fds",
+        "{w}"
+    );
+    let i = candidate(idle.id());
+    assert_ne!(
+        i["policy"]["violation"]["rule"], "data_loss_gates.block_if_open_write_fds",
+        "{i}"
+    );
+}

@@ -125,7 +125,6 @@ mod e2e_scenarios {
         // fdr_control needs target_fdr, enabled, method, alpha
         // data_loss_gates needs block_if_open_write_fds, block_if_locked_files, block_if_active_tty
         // loss values must be non-negative
-        // guardrails.never_kill_ppid must contain at least 1
         writeln!(
             file,
             r#"{{ 

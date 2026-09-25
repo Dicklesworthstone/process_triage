@@ -150,8 +150,15 @@ impl ActionFeasibility {
                 action: Action::Unfreeze,
                 reason: "zombie process (Z state): cannot unfreeze a dead process".to_string(),
             });
-            // Note: Restart might work if it targets the parent/supervisor,
-            // but that's handled at a higher level (zombie routing)
+            for action in [Action::Renice, Action::Throttle, Action::Quarantine] {
+                disabled.push(DisabledAction {
+                    action,
+                    reason: "zombie process (Z state): uses no CPU or memory; only its \
+                             parent can reap it"
+                        .to_string(),
+                });
+            }
+            // Restart stays: it is routed to the parent (the plan's `zombie` block).
         }
 
         if is_disksleep && !is_zombie {
@@ -1021,23 +1028,20 @@ mod tests {
             "Unfreeze should be disabled for zombie"
         );
 
-        // Other actions should still be allowed (they might target parent/supervisor)
-        assert!(
-            feasibility.is_allowed(Action::Keep),
-            "Keep should be allowed for zombie"
-        );
-        assert!(
-            feasibility.is_allowed(Action::Restart),
-            "Restart should be allowed (supervisor)"
-        );
-        assert!(
-            feasibility.is_allowed(Action::Renice),
-            "Renice should be allowed for zombie"
-        );
-        assert!(
-            feasibility.is_allowed(Action::Throttle),
-            "Throttle should be allowed for zombie"
-        );
+        // Only Keep and Restart (routed to the parent) remain: a zombie uses no
+        // resources, so renice/throttle/quarantine are meaningless.
+        for action in [Action::Keep, Action::Restart] {
+            assert!(
+                feasibility.is_allowed(action),
+                "{action:?} allowed for zombie"
+            );
+        }
+        for action in [Action::Renice, Action::Throttle, Action::Quarantine] {
+            assert!(
+                !feasibility.is_allowed(action),
+                "{action:?} disabled for zombie"
+            );
+        }
 
         // Verify reason messages
         let kill_reason = feasibility

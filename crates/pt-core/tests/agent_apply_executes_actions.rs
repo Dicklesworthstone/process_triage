@@ -339,3 +339,29 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
     assert_eq!(status, "precheck_blocked", "protected target: {json}");
     assert!(mux.alive(), "protected process must survive");
 }
+
+/// The data-loss gate blocks a kill of a process holding a regular file open for
+/// writing (the other tests' targets, with stdio on /dev/null, are killable).
+#[test]
+fn agent_apply_data_loss_gate_blocks_kill_of_open_writer() {
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    write_test_policy(config_dir.path());
+    let file_dir = TempDir::new().expect("file dir");
+    let log = file_dir.path().join("journal.log");
+
+    let writer = ForeignTarget::spawn(&format!("sleep 304 3>>'{}'", log.display()));
+    let pid = writer.pid;
+    std::thread::sleep(Duration::from_millis(300));
+    let identity = live_identity(pid);
+    let target = format!("{}:{}", pid, identity.start_id.0);
+
+    let s = session_with_plan(data_dir.path(), plan_action(Action::Kill, &identity));
+    let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &target);
+    assert_eq!(status, "precheck_blocked", "open writer: {json}");
+    assert!(
+        json.to_string().contains("open write fds"),
+        "blocked by the data-loss gate: {json}"
+    );
+    assert!(writer.alive(), "open writer must survive");
+}

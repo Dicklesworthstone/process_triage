@@ -52,7 +52,7 @@ write_invalid_policy_dir() {
     local target_dir="$1"
     mkdir -p "$target_dir"
     cp "$FIXTURES_DIR/valid_priors.json" "$target_dir/priors.json"
-    cp "$FIXTURES_DIR/invalid_policy_missing_pid1.json" "$target_dir/policy.json"
+    cp "$FIXTURES_DIR/invalid_policy_bad_alpha.json" "$target_dir/policy.json"
 }
 
 log_case_event() {
@@ -270,6 +270,6 @@ run_cmd_logged() {
     local err_file="$ARTIFACT_STDERR_DIR/invalid_policy.stderr"
     local error_msg
     error_msg=$(jq -r '.error.message' "$err_file")
-    [[ "$error_msg" == *"PID 1"* ]]
+    [[ "$error_msg" == *"alpha"* ]]
 
 }

@@ -350,6 +350,68 @@ fn is_persistent_file_target(target: &str) -> bool {
             .any(|prefix| target.starts_with(prefix))
 }
 
+/// Number of persistent regular files `pid` holds open for writing: the data-loss
+/// gate's definition, shared by `agent plan` and the apply-time pre-check. `None`
+/// when the process's open files cannot be read.
+pub fn open_write_fd_count(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let fd_dir = format!("/proc/{pid}/fd");
+        let fdinfo_dir = format!("/proc/{pid}/fdinfo");
+        let entries = std::fs::read_dir(&fd_dir).ok()?;
+        let mut write_count = 0;
+
+        for entry in entries.flatten() {
+            let fd_name = entry.file_name();
+            // Only writes to real, persistent files can lose data. stdout/stderr
+            // to a pty/pipe, sockets, /dev/null, anon inodes and deleted files do
+            // not; counting them blocked essentially every kill.
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            if !is_persistent_file_target(&target.to_string_lossy()) {
+                continue;
+            }
+            let fdinfo_path = format!("{fdinfo_dir}/{}", fd_name.to_string_lossy());
+            let Ok(content_bytes) = std::fs::read(&fdinfo_path) else {
+                continue;
+            };
+            let content = String::from_utf8_lossy(&content_bytes);
+            let flags = content
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:"))
+                .and_then(|v| u32::from_str_radix(v.trim(), 8).ok());
+            // O_WRONLY = 1, O_RDWR = 2
+            if let Some(flags) = flags {
+                if matches!(flags & 0o3, 1 | 2) {
+                    write_count += 1;
+                }
+            }
+        }
+        Some(write_count)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (files, _) =
+            crate::collect::macos::collect_lsof_info(pid, Duration::from_secs(5)).ok()?;
+        let write_count = files
+            .iter()
+            .filter(|f| f.file_type == "REG" && is_persistent_file_target(&f.name))
+            .filter(|f| {
+                f.mode
+                    .as_ref()
+                    .is_some_and(|mode| mode.contains('w') || mode.contains('u'))
+            })
+            .count() as u32;
+        Some(write_count)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Live pre-check provider that reads from /proc (Linux) or sysctl/lsof (macOS).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct LivePreCheckProvider {
@@ -511,78 +573,8 @@ impl LivePreCheckProvider {
 
     /// Check if process has open write file descriptors.
     fn has_open_write_fds(&self, pid: u32) -> (bool, u32) {
-        #[cfg(target_os = "linux")]
-        {
-            let fd_dir = format!("/proc/{pid}/fd");
-            let fdinfo_dir = format!("/proc/{pid}/fdinfo");
-
-            let Ok(entries) = std::fs::read_dir(&fd_dir) else {
-                return (false, 0);
-            };
-
-            let mut write_count = 0;
-
-            for entry in entries.flatten() {
-                let fd_name = entry.file_name();
-                // Only writes to real, persistent files can lose data. stdout/stderr
-                // to a pty/pipe, sockets, /dev/null, anon inodes and deleted files do
-                // not; counting them blocked essentially every kill.
-                let Ok(target) = std::fs::read_link(entry.path()) else {
-                    continue;
-                };
-                if !is_persistent_file_target(&target.to_string_lossy()) {
-                    continue;
-                }
-                let fdinfo_path = format!("{fdinfo_dir}/{}", fd_name.to_string_lossy());
-
-                if let Ok(content_bytes) = std::fs::read(&fdinfo_path) {
-                    let content = String::from_utf8_lossy(&content_bytes);
-                    // Check flags field for write mode
-                    for line in content.lines() {
-                        if line.starts_with("flags:") {
-                            if let Some(flags_str) = line.split_whitespace().nth(1) {
-                                if let Ok(flags) = u32::from_str_radix(flags_str, 8) {
-                                    // O_WRONLY = 1, O_RDWR = 2
-                                    let access_mode = flags & 0o3;
-                                    if access_mode == 1 || access_mode == 2 {
-                                        write_count += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            (write_count > self.config.max_open_write_fds, write_count)
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // Use lsof to find open write descriptors
-            if let Ok((files, _)) =
-                crate::collect::macos::collect_lsof_info(pid, Duration::from_secs(5))
-            {
-                let write_count = files
-                    .iter()
-                    .filter(|f| f.file_type == "REG" && is_persistent_file_target(&f.name))
-                    .filter(|f| {
-                        if let Some(ref mode) = f.mode {
-                            mode.contains('w') || mode.contains('u')
-                        } else {
-                            false
-                        }
-                    })
-                    .count() as u32;
-
-                (write_count > self.config.max_open_write_fds, write_count)
-            } else {
-                (false, 0)
-            }
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            (false, 0)
-        }
+        let write_count = open_write_fd_count(pid).unwrap_or(0);
+        (write_count > self.config.max_open_write_fds, write_count)
     }
 
     /// Best-effort check for recent I/O activity (write-heavy).

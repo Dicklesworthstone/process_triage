@@ -2583,7 +2583,8 @@ fn precheck_label(check: &pt_core::plan::PreCheck) -> &'static str {
     }
 }
 
-#[cfg(feature = "ui")]
+/// Deep-scan evidence per pid (network, I/O, socket queues), used by the TUI and by
+/// `agent plan --deep`.
 #[derive(Debug, Clone, Copy)]
 struct DeepSignals {
     net_active: Option<bool>,
@@ -2662,7 +2663,6 @@ fn deep_scan_target_pids(
         .collect()
 }
 
-#[cfg(feature = "ui")]
 fn collect_deep_signals_for_pids(pids: &[u32]) -> Option<HashMap<u32, DeepSignals>> {
     #[cfg(target_os = "linux")]
     {
@@ -2726,7 +2726,7 @@ fn collect_deep_signals_for_pids(pids: &[u32]) -> Option<HashMap<u32, DeepSignal
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pids;
-        eprintln!("run: deep scan not supported on this platform; using quick scan");
+        eprintln!("deep scan not supported on this platform; using quick-scan evidence only");
         None
     }
 }
@@ -2738,7 +2738,7 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
 }
 
 // Linux-only: built from /proc/net socket data (the only caller is Linux-gated too).
-#[cfg(all(feature = "ui", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct QueueMetrics {
     saturated: bool,
@@ -2748,7 +2748,7 @@ struct QueueMetrics {
     backlog_sockets: usize,
 }
 
-#[cfg(all(feature = "ui", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn estimate_queue_metrics(info: &pt_core::collect::NetworkInfo, io_active: bool) -> QueueMetrics {
     const QUEUE_SATURATION_THRESHOLD: u32 = 4096;
 
@@ -12291,6 +12291,18 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     for p in &scan_result.processes {
         *child_counts.entry(p.ppid.0).or_default() += 1;
     }
+    // Zombies are routed to their parent, so the plan names it and says whether
+    // it is protected.
+    let comm_by_pid: HashMap<u32, &str> = scan_result
+        .processes
+        .iter()
+        .map(|p| (p.pid.0, p.comm.as_str()))
+        .collect();
+    let protected_rule_by_pid: HashMap<u32, &str> = filter_result
+        .filtered
+        .iter()
+        .map(|m| (m.pid, m.pattern.as_str()))
+        .collect();
 
     tracing::info!(
         total_scanned = total_scanned,
@@ -12374,6 +12386,19 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     #[cfg(target_os = "linux")]
     let provenance_bundle = build_provenance_inference_bundle(&processes_to_infer);
 
+    // --deep: one batched deep scan (sockets, I/O, queue backlog) over the
+    // candidates, overlaid onto the quick-scan evidence below.
+    let deep_scan_start = std::time::Instant::now();
+    let deep_signals: Option<HashMap<u32, DeepSignals>> = if args.deep {
+        let pids: Vec<u32> = processes_to_infer.iter().map(|p| p.pid.0).collect();
+        collect_deep_signals_for_pids(&pids)
+    } else {
+        None
+    };
+    let deep_scan_ms = args
+        .deep
+        .then(|| deep_scan_start.elapsed().as_millis() as u64);
+
     let candidates_evaluated = processes_to_infer.len();
     let total_processes = candidates_evaluated as u64;
     let mut processed = 0u64;
@@ -12403,8 +12428,16 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
         processed = processed.saturating_add(1);
 
-        // Build evidence from process record
-        let evidence = Evidence::from_snapshot(proc);
+        // Build evidence from process record, plus deep signals when requested
+        let deep = deep_signals
+            .as_ref()
+            .and_then(|m| m.get(&proc.pid.0).copied());
+        let evidence = Evidence {
+            net: deep.and_then(|d| d.net_active),
+            io_active: deep.and_then(|d| d.io_active),
+            queue_saturated: deep.and_then(|d| d.queue_saturated),
+            ..Evidence::from_snapshot(proc)
+        };
 
         let mut match_ctx = ProcessMatchContext::with_comm(&proc.comm);
         if !proc.cmd.is_empty() {
@@ -12720,6 +12753,26 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             continue;
         }
 
+        // Data-loss evidence for destructive recommendations: the same open-writer
+        // count apply's pre-check uses, so the plan says up front what apply refuses.
+        let destructive = matches!(
+            decision_outcome.optimal_action,
+            Action::Kill | Action::Restart
+        );
+        let open_write_fds = destructive
+            .then(|| pt_core::action::prechecks::open_write_fd_count(proc.pid.0))
+            .flatten();
+        #[cfg(target_os = "linux")]
+        let critical_files = if destructive {
+            pt_core::collect::parse_fd(proc.pid.0)
+                .map(|fd| fd.critical_writes)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let critical_files = Vec::new();
+
         let process_candidate = pt_core::decision::ProcessCandidate {
             pid: proc.pid.0 as i32,
             ppid: proc.ppid.0 as i32,
@@ -12737,14 +12790,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 .rationale
                 .has_known_signature
                 .unwrap_or(false),
-            open_write_fds: None,
+            open_write_fds,
             has_locked_files: None,
             has_active_tty: Some(proc.has_tty()),
             seconds_since_io: None,
             cwd_deleted: None,
             process_state: Some(proc.state),
             wchan: None,
-            critical_files: Vec::new(),
+            critical_files,
             cgroup_role: decision_policy
                 .guardrails
                 .builtin_protection
@@ -12863,11 +12916,28 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             None
         };
 
+        // A zombie is already dead: only its parent can reap it, so the remedy
+        // targets the parent (nudge with SIGCHLD, then restart/stop it).
+        let zombie_routing = proc.state.is_zombie().then(|| {
+            let parent = proc.ppid.0;
+            serde_json::json!({
+                "route_to": "parent",
+                "parent_pid": parent,
+                "parent_comm": comm_by_pid.get(&parent).copied(),
+                "parent_protected_by": protected_rule_by_pid.get(&parent).copied(),
+                "steps": [
+                    format!("kill -CHLD {parent}  # ask the parent to reap"),
+                    format!("if the zombie persists, restart or stop parent {parent}"),
+                ],
+            })
+        });
+
         // Build candidate JSON (action tracking moved to after sorting)
         let mut candidate = serde_json::json!({
             "pid": proc.pid.0,
             "ppid": proc.ppid.0,
             "state": proc.state.to_string(),
+            "zombie_routing": zombie_routing,
             "start_id": format!("{}:{}", proc.pid.0, proc.start_time_unix),
             "uid": proc.uid,
             "user": &proc.user,
@@ -13212,6 +13282,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "protected_filtered": protected_filtered_count,
         "protected_by_rule": protected_by_rule,
         "candidates_evaluated": candidates_evaluated,
+        "deep_scan_ms": deep_scan_ms,
+        "deep_evidence_pids": deep_signals.as_ref().map(|m| m.len()),
         "above_threshold": above_threshold_count,  // Candidates meeting threshold before truncation
         "candidates_returned": candidates.len(),   // After truncation to max_candidates
         "kill_recommendations": kill_candidates.len(),
@@ -18208,7 +18280,7 @@ mod provenance_scoring_tests {
     }
 }
 
-#[cfg(all(test, feature = "ui", target_os = "linux"))]
+#[cfg(all(test, target_os = "linux"))]
 mod queue_metrics_tests {
     use super::*;
     use pt_core::collect::{

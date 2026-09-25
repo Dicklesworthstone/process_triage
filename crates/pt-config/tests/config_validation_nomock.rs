@@ -116,10 +116,10 @@ fn test_validate_policy_fixture_ok() {
 }
 
 #[test]
-fn test_validate_policy_rejects_missing_pid1() {
-    let policy = load_policy_fixture("invalid_policy_missing_pid1.json");
-    let err = validate_policy(&policy).expect_err("missing PID 1 should fail validation");
-    assert!(matches!(err, ValidationError::SemanticError(_)));
+fn test_validate_policy_accepts_ppid_list_without_pid1() {
+    // never_kill_ppid is the operator's choice; PID 1 itself is hard-blocked in the enforcer.
+    let policy = load_policy_fixture("policy_ppid_without_pid1.json");
+    validate_policy(&policy).expect("never_kill_ppid without PID 1 is valid");
 }
 
 #[test]

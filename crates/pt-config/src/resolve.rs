@@ -129,8 +129,8 @@ fn resolve_single_config(
     }
 
     // 4. XDG config directory
-    if let Some(xdg_config) = dirs::config_dir() {
-        let path = xdg_config.join(APP_NAME).join(filename);
+    if let Some(app_dir) = xdg_config_dir() {
+        let path = app_dir.join(filename);
         if path.exists() {
             *source = ConfigSource::XdgConfig;
             return Some(path);
@@ -149,9 +149,15 @@ fn resolve_single_config(
     None
 }
 
-/// Get the XDG config directory for process-triage.
+/// Get the XDG config directory for process-triage. `XDG_CONFIG_HOME` wins on every
+/// platform (`dirs::config_dir` ignores it on macOS, where it returns
+/// `~/Library/Application Support`).
 pub fn xdg_config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(APP_NAME))
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+        .map(|d| d.join(APP_NAME))
 }
 
 /// Get the system config directory.
