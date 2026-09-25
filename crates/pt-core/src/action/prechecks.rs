@@ -893,6 +893,16 @@ impl PreCheckProvider for LivePreCheckProvider {
                         reason: format!("{rule}: {notes}"),
                     };
                 }
+                if let Some((daemon_pid, daemon)) =
+                    crate::collect::protected::live_service_ancestor(pid)
+                {
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckNotProtected,
+                        reason: format!(
+                            "builtin.service_child: worker/plugin of service {daemon} (pid {daemon_pid})"
+                        ),
+                    };
+                }
                 let role = crate::collect::read_cgroup_role(pid);
                 if role.is_supervised_service() {
                     return PreCheckResult::Blocked {

@@ -12308,6 +12308,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let filter_result = protected_filter.filter_scan_result(&scan_result);
     let protected_filtered_count = filter_result.filtered.len();
     let total_scanned = filter_result.total_before;
+    // Why processes were not evaluated: count per protection rule (no command lines).
+    let mut protected_by_rule: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for m in &filter_result.filtered {
+        *protected_by_rule.entry(m.pattern.clone()).or_default() += 1;
+    }
 
     tracing::info!(
         total_scanned = total_scanned,
@@ -13237,6 +13243,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut summary = serde_json::json!({
         "total_processes_scanned": total_scanned,
         "protected_filtered": protected_filtered_count,
+        "protected_by_rule": protected_by_rule,
         "candidates_evaluated": candidates_evaluated,
         "above_threshold": above_threshold_count,  // Candidates meeting threshold before truncation
         "candidates_returned": candidates.len(),   // After truncation to max_candidates
