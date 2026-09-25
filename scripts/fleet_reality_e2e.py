@@ -188,6 +188,8 @@ def evaluate(result: dict, labels: dict) -> dict:
         "counts": {
             "scanned": summary.get("total_processes_scanned"),
             "protected": summary.get("protected_filtered"),
+            # Why they were protected (rule -> count), e.g. builtin.service_child.
+            "protected_by_rule": summary.get("protected_by_rule", {}),
             "evaluated": summary.get("candidates_evaluated"),
             "candidates": len(cands),
             "actions": actions,
@@ -255,6 +257,9 @@ def main() -> int:
         print(f"[{status}] {host} ({rep['version']}): {res['plan_ms']/1000:.1f}s scanned={c['scanned']} "
               f"protected={c['protected']} candidates={c['candidates']} actions={c['actions']} "
               f"violations={len(rep['violations'])}")
+        services = {k: v for k, v in c["protected_by_rule"].items() if k.startswith("builtin.service")}
+        if services:
+            print(f"        protected services: {services}")
         for v in rep["violations"][:5]:
             print(f"        !! {v['class']} pid={v['pid']} {v['action']} score={v['score']} :: {v['command'][:90]}")
 

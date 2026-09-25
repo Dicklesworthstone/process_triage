@@ -544,6 +544,8 @@ impl ProtectedFilter {
         } else {
             HashSet::new()
         };
+        let by_pid: std::collections::HashMap<u32, &ProcessRecord> =
+            scan_result.processes.iter().map(|p| (p.pid.0, p)).collect();
 
         for record in &scan_result.processes {
             let protection = if invoker_chain.contains(&record.pid.0) {
@@ -556,7 +558,21 @@ impl ProtectedFilter {
                     notes: Some("pt itself or one of the processes that invoked it".to_string()),
                 })
             } else {
-                self.is_protected(record)
+                self.is_protected(record).or_else(|| {
+                    let (daemon_pid, daemon) = self
+                        .builtin
+                        .then(|| service_ancestor(record.pid.0, &by_pid))??;
+                    Some(ProtectedMatch {
+                        pid: record.pid.0,
+                        comm: record.comm.clone(),
+                        cmd_truncated: truncate_cmd(&record.cmd, 80),
+                        matched_field: MatchedField::Builtin,
+                        pattern: "builtin.service_child".to_string(),
+                        notes: Some(format!(
+                            "worker/plugin of service {daemon} (pid {daemon_pid})"
+                        )),
+                    })
+                })
             };
             if let Some(match_info) = protection {
                 debug!(
@@ -686,6 +702,14 @@ static BUILTIN_PROTECTED: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::Laz
             "login/desktop session infrastructure",
         ),
         builtin_rule(
+            SERVICE_DAEMON_RULE,
+            CommOrCmd,
+            // comm keeps the daemon name when the server rewrites its title
+            // ("postgres: 18/main: io worker", "nginx: worker process").
+            r"^(\S*/)?(postgres|postmaster|mysqld|mariadbd|mongod|mongos|redis-server|redis-sentinel|valkey-server|keydb-server|memcached|nginx|httpd|apache2|caddy|haproxy|traefik|envoy|php-fpm[0-9.]*|clickhouse\S*|influxd|etcd|rabbitmq-server|beam\.smp|mattermost|minio|elasticsearch|opensearch)(:|\s|$)",
+            "database / web / message server (and, via parent identity, its workers and plugins)",
+        ),
+        builtin_rule(
             "builtin.interactive_shell",
             Cmd,
             r"^-?(\S*/)?(ba|z|fi|da|k|tc|c|nu|x)?sh(\s+(-l|--login|-i|--interactive))*$",
@@ -751,6 +775,83 @@ pub fn invoker_chain_pids(processes: &[ProcessRecord]) -> HashSet<u32> {
 /// login-session workloads).
 pub fn is_root_user(user: &str) -> bool {
     user.eq_ignore_ascii_case("root")
+}
+
+/// Name of the built-in rule for database / web / message servers.
+pub const SERVICE_DAEMON_RULE: &str = "builtin.service_daemon";
+
+/// Maximum ancestor depth walked for parent-identity protection.
+const MAX_ANCESTOR_DEPTH: usize = 64;
+
+/// Whether a process is itself a database / web / message server.
+pub fn is_service_daemon(comm: &str, cmd: &str) -> bool {
+    builtin_protection_match(comm, cmd).is_some_and(|(rule, _)| rule == SERVICE_DAEMON_RULE)
+}
+
+/// Nearest ancestor of `pid` that is a service daemon (`(pid, comm)`), walking the
+/// parent chain with `parent_of`/`identity_of`. Workers and plugins inherit their
+/// server's protection by parent identity, whatever title they give themselves.
+fn service_ancestor_with(
+    pid: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    identity_of: impl Fn(u32) -> Option<(String, String)>,
+) -> Option<(u32, String)> {
+    let mut current = pid;
+    for _ in 0..MAX_ANCESTOR_DEPTH {
+        let parent = parent_of(current)?;
+        if parent <= 1 || parent == current {
+            return None;
+        }
+        if let Some((comm, cmd)) = identity_of(parent) {
+            if is_service_daemon(&comm, &cmd) {
+                return Some((parent, comm));
+            }
+        }
+        current = parent;
+    }
+    None
+}
+
+/// [`service_ancestor_with`] over a scan (no extra syscalls).
+pub fn service_ancestor(
+    pid: u32,
+    processes: &std::collections::HashMap<u32, &ProcessRecord>,
+) -> Option<(u32, String)> {
+    service_ancestor_with(
+        pid,
+        |p| processes.get(&p).map(|r| r.ppid.0),
+        |p| processes.get(&p).map(|r| (r.comm.clone(), r.cmd.clone())),
+    )
+}
+
+/// [`service_ancestor_with`] against live OS state, for apply-time checks.
+pub fn live_service_ancestor(pid: u32) -> Option<(u32, String)> {
+    service_ancestor_with(pid, live_ppid, live_identity)
+}
+
+/// `(comm, cmdline)` of a live process.
+fn live_identity(pid: u32) -> Option<(String, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let cmd = String::from_utf8_lossy(&raw)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some((comm.trim_end().to_string(), cmd))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // ps `comm=` is the executable path; the rule accepts a leading path.
+        super::macos::read_process_snapshot(pid).map(|s| (s.comm.clone(), s.comm))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// Parent PID of a live process, read from the OS.
@@ -830,6 +931,103 @@ mod tests {
 
     fn default_filter() -> ProtectedFilter {
         ProtectedFilter::from_guardrails(&crate::config::policy::Guardrails::default()).unwrap()
+    }
+
+    /// Database / web servers are protected by name even under rewritten titles
+    /// (vmi workers, 2026-09-24: "postgres: 18/main: io worker" was rated abandoned).
+    #[test]
+    fn builtin_protects_service_daemons_by_name() {
+        let protected = [
+            ("postgres", "postgres: 18/main: io worker 2"),
+            (
+                "postgres",
+                "/usr/lib/postgresql/18/bin/postgres -D /var/lib/postgresql/18/main",
+            ),
+            ("nginx", "nginx: worker process"),
+            (
+                "nginx",
+                "nginx: master process /usr/sbin/nginx -g daemon on;",
+            ),
+            ("redis-server", "/usr/bin/redis-server 127.0.0.1:6379"),
+            ("mysqld", "/usr/sbin/mysqld"),
+            ("mattermost", "/opt/mattermost/bin/mattermost"),
+            ("php-fpm8.3", "php-fpm: pool www"),
+            (
+                "clickhouse-serv",
+                "/usr/bin/clickhouse-server --config-file=/etc/x.xml",
+            ),
+        ];
+        for (comm, cmd) in protected {
+            assert!(is_service_daemon(comm, cmd), "{comm} / {cmd}");
+        }
+        let not_daemons = [
+            ("python3", "python3 -m pytest tests/test_postgres.py"),
+            ("psql", "psql -h localhost -U app"),
+            ("node", "node scripts/nginx-config-gen.js"),
+            ("cargo", "cargo run --bin redis-server-mock"),
+        ];
+        for (comm, cmd) in not_daemons {
+            assert!(!is_service_daemon(comm, cmd), "{comm} / {cmd}");
+        }
+    }
+
+    /// Workers and plugins inherit protection from their server by parent identity,
+    /// whatever they call themselves; unrelated processes do not.
+    #[test]
+    fn service_children_are_protected_by_parent_identity() {
+        // PIDs above Linux's pid_max (2^22) never exist, so no live cgroup role leaks in;
+        // the unrelated tree hangs off a non-init parent (PPID 1 is protected by default).
+        const B: u32 = 1 << 22;
+        let scan_result = ScanResult {
+            processes: vec![
+                make_test_record(
+                    B + 100,
+                    1,
+                    "mattermost",
+                    "/opt/mattermost/bin/mattermost",
+                    "mm",
+                ),
+                make_test_record(
+                    B + 101,
+                    B + 100,
+                    "plugin-linux-am",
+                    "plugins/com.mattermost.calls/server/dist/plugin-linux-amd64",
+                    "mm",
+                ),
+                make_test_record(
+                    B + 102,
+                    B + 101,
+                    "ffmpeg",
+                    "ffmpeg -i pipe:0 out.webm",
+                    "mm",
+                ),
+                make_test_record(B + 200, B + 999, "sleep", "sleep 100", "mm"),
+                make_test_record(B + 201, B + 200, "sleep", "sleep 5", "mm"),
+            ],
+            metadata: super::super::types::ScanMetadata {
+                scan_type: "quick".to_string(),
+                platform: "linux".to_string(),
+                boot_id: None,
+                started_at: "2026-09-24T12:00:00Z".to_string(),
+                duration_ms: 1,
+                process_count: 5,
+                warnings: vec![],
+            },
+        };
+        let result = default_filter().filter_scan_result(&scan_result);
+        let passed: Vec<u32> = result.passed.iter().map(|p| p.pid.0).collect();
+        assert_eq!(passed, vec![B + 200, B + 201]);
+        let child = result
+            .filtered
+            .iter()
+            .find(|m| m.pid == B + 102)
+            .expect("grandchild filtered");
+        assert_eq!(child.pattern, "builtin.service_child");
+        let notes = child.notes.as_deref().unwrap();
+        assert!(
+            notes.contains(&format!("mattermost (pid {})", B + 100)),
+            "{notes}"
+        );
     }
 
     /// Every case here was rated P(abandoned) ~ 1.0 on the 2026-09-24 fleet scan.
@@ -928,17 +1126,18 @@ mod tests {
             m.matched_field,
             MatchedField::Ppid | MatchedField::User
         ));
-        // System services are protected regardless of user.
-        let nginx = make_test_record(
+        // System services are protected regardless of user (a unit the name rules
+        // do not know, so only its cgroup placement protects it).
+        let app = make_test_record(
             4131051,
             4131046,
-            "nginx",
-            "nginx: worker process",
+            "gunicorn",
+            "/srv/app/.venv/bin/gunicorn app:app --workers 4",
             "www-data",
         );
         assert_eq!(
             filter
-                .is_protected_with_role(&nginx, CgroupRole::SystemService)
+                .is_protected_with_role(&app, CgroupRole::SystemService)
                 .unwrap()
                 .matched_field,
             MatchedField::SupervisedService
