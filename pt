@@ -270,7 +270,8 @@ Wrapper options:
 
 Wrapper commands:
   help            Show wrapper-aware top-level help
-  update          Run the signed installer update flow
+  update          Run the verified installer update flow (fails closed on unsigned releases;
+                  --no-verify to override); \`pt update rollback|list-backups|...\` go to pt-core
   history         Show learned decision memory from decisions.json
   clear [TEXT]    Clear learned decisions (only patterns containing TEXT) after confirmation
   deep            Alias for \`deep-scan\`
@@ -347,8 +348,23 @@ main() {
         exit 1
     }
 
-    # Special handling for 'update' (wrapper-level)
+    # `pt update <subcommand>` (rollback, list-backups, show-backup, verify-backup,
+    # prune-backups, ...) is pt-core's backup management: pass it through.
+    if [[ "${forwarded_args[0]:-}" == "update" && -n "${forwarded_args[1]:-}" \
+        && "${forwarded_args[1]}" != -* ]]; then
+        exec "$pt_core" "${forwarded_args[@]}"
+    fi
+
+    # Bare `pt update [--no-verify]`: run the target release's signed installer.
     if [[ "${forwarded_args[0]:-}" == "update" ]]; then
+        local verify_arg="--verify"
+        if [[ "${forwarded_args[1]:-}" == "--no-verify" ]]; then
+            verify_arg="--no-verify"
+            echo "Warning: --no-verify: installing WITHOUT signature/checksum verification." >&2
+        elif [[ -n "${forwarded_args[1]:-}" ]]; then
+            echo "Error: unknown update option '${forwarded_args[1]}' (use --no-verify, or a pt-core update subcommand such as rollback)." >&2
+            exit 2
+        fi
         local target_version
         if target_version="$(fetch_latest_release_version)"; then
             :
@@ -359,23 +375,29 @@ main() {
         local target_install_url="${INSTALL_BASE_URL}/v${target_version}/install.sh"
 
         echo "Updating Process Triage to v${target_version}..."
+        # Verification is requested with the --verify ARGUMENT: installers up to and
+        # including v2.1.0 reset VERIFY=0 at startup, so the env var alone was ignored
+        # and every `pt update` installed unverified. The env var is kept for newer ones.
+        local verify_env=1
+        [[ "$verify_arg" == "--no-verify" ]] && verify_env=0
+        local -a installer_env=("VERIFY=${verify_env}")
+        if [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
+            installer_env+=("PT_RELEASE_PUBLIC_KEY_FINGERPRINT=${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}")
+        fi
+        local status=0
         if command -v curl &>/dev/null; then
-            if [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
-                curl -fsSL "$target_install_url" | env VERIFY=1 PT_RELEASE_PUBLIC_KEY_FINGERPRINT="${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}" bash
-            else
-                curl -fsSL "$target_install_url" | env VERIFY=1 bash
-            fi
+            curl -fsSL "$target_install_url" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
         elif command -v wget &>/dev/null; then
-            if [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
-                wget -qO- "$target_install_url" | env VERIFY=1 PT_RELEASE_PUBLIC_KEY_FINGERPRINT="${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}" bash
-            else
-                wget -qO- "$target_install_url" | env VERIFY=1 bash
-            fi
+            wget -qO- "$target_install_url" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
         else
             echo "Error: neither curl nor wget is available to run installer." >&2
             exit 1
         fi
-        exit $?
+        if [[ $status -ne 0 && "$verify_arg" == "--verify" ]]; then
+            echo "Update aborted: the release could not be verified (unsigned release or key mismatch)." >&2
+            echo "Nothing was installed. To install it anyway, unverified: pt update --no-verify" >&2
+        fi
+        exit $status
     fi
 
     if [[ "${forwarded_args[0]:-}" == "--version" || "${forwarded_args[0]:-}" == "-V" ]]; then

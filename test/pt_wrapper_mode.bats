@@ -262,7 +262,9 @@ set -euo pipefail
 cat <<'INSTALLER'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${VERIFY:-}" != "1" ]]; then
+# Like the published installers (<= v2.1.0), which reset VERIFY=0 at startup:
+# only the --verify argument turns verification on.
+if [[ " $* " != *" --verify "* ]]; then
   echo "VERIFY missing" >&2
   exit 44
 fi
@@ -300,7 +302,9 @@ if [[ "$url" == *"/v9.9.9/install.sh" ]]; then
   cat <<'INSTALLER'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${VERIFY:-}" != "1" ]]; then
+# Like the published installers (<= v2.1.0), which reset VERIFY=0 at startup:
+# only the --verify argument turns verification on.
+if [[ " $* " != *" --verify "* ]]; then
   echo "VERIFY missing" >&2
   exit 44
 fi
@@ -345,7 +349,9 @@ if [[ "$url" == *"/v${PT_WRAPPER_VERSION}/install.sh" ]]; then
   cat <<'INSTALLER'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${VERIFY:-}" != "1" ]]; then
+# Like the published installers (<= v2.1.0), which reset VERIFY=0 at startup:
+# only the --verify argument turns verification on.
+if [[ " $* " != *" --verify "* ]]; then
   echo "VERIFY missing" >&2
   exit 44
 fi
@@ -374,4 +380,71 @@ EOF
     if grep -q '/v9.9.9;injected/install.sh' "$curl_log"; then
         fail "unexpected injected installer URL should never be requested"
     fi
+}
+
+# Mock curl serving an installer that records its args and fails verification, like
+# a real installer facing an unsigned release.
+write_unsigned_release_curl() {
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+url="${@: -1}"
+if [[ "$url" == *"/main/VERSION" ]]; then
+  echo "9.9.9"
+  exit 0
+fi
+cat <<'INSTALLER'
+#!/usr/bin/env bash
+printf 'INSTALLER_ARGS=%s\n' "$*" >> "$PT_INSTALLER_LOG"
+if [[ " $* " == *" --verify "* ]]; then
+  echo "Release v9.9.9 does not publish release-signing-public.pem" >&2
+  exit 1
+fi
+exit 0
+INSTALLER
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+}
+
+@test "wrapper: update fails closed on an unverifiable release and says how to override" {
+    write_unsigned_release_curl
+    local log="${TEST_DIR}/installer.log"
+
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_INSTALLER_LOG="$log" \
+        PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Update aborted: the release could not be verified"* ]]
+    [[ "$output" == *"pt update --no-verify"* ]]
+    grep -q '^INSTALLER_ARGS=--verify$' "$log"
+}
+
+@test "wrapper: update --no-verify is an explicit, warned opt-out" {
+    write_unsigned_release_curl
+    local log="${TEST_DIR}/installer.log"
+
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_INSTALLER_LOG="$log" \
+        PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update --no-verify
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WITHOUT signature/checksum verification"* ]]
+    grep -q '^INSTALLER_ARGS=--no-verify$' "$log"
+}
+
+@test "wrapper: update subcommands pass through to pt-core backup management" {
+    for sub in "list-backups" "rollback 2.0.5 --force"; do
+        rm -f "$MOCK_LOG"
+        # shellcheck disable=SC2086
+        run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+            "$PT_SCRIPT" update $sub
+        [ "$status" -eq 0 ]
+        grep -q "^ARGS=update ${sub}$" "$MOCK_LOG"
+    done
+}
+
+@test "wrapper: update rejects unknown options instead of ignoring them" {
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" update --yolo
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"unknown update option '--yolo'"* ]]
 }
