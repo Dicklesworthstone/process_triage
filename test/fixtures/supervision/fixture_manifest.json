@@ -18,8 +18,8 @@
     {
       "path": "cases.json",
       "kind": "config",
-      "sha256": "461f96158998abeeb9f3c52ab2d2f3028308b3fc63c72a168c43e6f21c2a23d1",
-      "bytes": 1965,
+      "sha256": "4d1c1ca35a46afbbf9a0f780cef7e74200e03e85027718072504e07ad404793a",
+      "bytes": 1970,
       "redaction_profile": "safe"
     },
     {
@@ -31,5 +31,5 @@
     }
   ],
   "description": "Supervision detection fixtures + JSONL logs for no-mock tests",
-  "manifest_sha256": "ea044cd167de97ccbf80d1035d552f28d6652afa792882db11e7f9a5f224633c"
+  "manifest_sha256": "f2ce7b88be930ac8dbe0a249006651d114dac165b22f4095e28f85a4acaf3ef2"
 }

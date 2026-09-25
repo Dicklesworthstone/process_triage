@@ -386,8 +386,8 @@ mod environ_tests {
         let db = EnvironDatabase::with_defaults();
         let mut env = HashMap::new();
 
-        // CLAUDE_SESSION_ID
-        env.insert("CLAUDE_SESSION_ID".to_string(), "abc123".to_string());
+        // CLAUDE_CODE_SESSION_ID (what Claude Code actually sets)
+        env.insert("CLAUDE_CODE_SESSION_ID".to_string(), "abc123".to_string());
         let matches = db.find_matches(&env);
         assert!(!matches.is_empty());
         assert!(matches.iter().any(|(p, _)| p.supervisor_name == "claude"));

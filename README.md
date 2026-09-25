@@ -713,7 +713,7 @@ Signatures are matched against a `ProcessMatchContext` that includes the process
 | **launchd** | `XPC_SERVICE_NAME` env | 0.95 |
 | **Docker/containerd** | Cgroup path patterns, `/.dockerenv` | 0.95 |
 | **VS Code** | `VSCODE_PID`, `VSCODE_IPC_HOOK` env | 0.95 |
-| **Claude/Codex** | `CLAUDE_SESSION_ID`, `CODEX_SESSION_ID` env | 0.95 |
+| **Claude/Codex** | `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID` env | 0.95 |
 | **GitHub Actions** | `GITHUB_ACTIONS`, `GITHUB_WORKFLOW` env | 0.95 |
 | **tmux/screen** | `TMUX` or `STY` env | 0.30 |
 | **nohup/disown** | Signal mask analysis (`SigIgn` in `/proc/[pid]/status`) | varies |

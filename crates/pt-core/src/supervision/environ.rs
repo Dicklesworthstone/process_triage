@@ -188,25 +188,6 @@ impl EnvironDatabase {
             "CLAUDE_PID",
             0.90,
         ));
-        self.add(EnvPattern::new(
-            "claude",
-            SupervisorCategory::Agent,
-            "CLAUDE_SESSION_ID",
-            0.95,
-        ));
-        self.add(EnvPattern::new(
-            "claude",
-            SupervisorCategory::Agent,
-            "CLAUDE_CODE_SESSION",
-            0.95,
-        ));
-        self.add(EnvPattern::new(
-            "claude",
-            SupervisorCategory::Agent,
-            "CLAUDE_ENTRYPOINT",
-            0.90,
-        ));
-
         // Codex
         self.add(EnvPattern::new(
             "codex",

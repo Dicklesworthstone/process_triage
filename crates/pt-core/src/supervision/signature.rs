@@ -28,7 +28,7 @@
 //!
 //! [signatures.patterns]
 //! process_names = ["^claude$", "^claude-code$", "^claude-cli$"]
-//! environment_vars = { CLAUDE_SESSION_ID = ".*", CLAUDE_CODE_SESSION = ".*" }
+//! environment_vars = { CLAUDECODE = "1", CLAUDE_CODE_SESSION_ID = ".*" }
 //! socket_paths = ["/tmp/claude-"]
 //! pid_files = []
 //! parent_patterns = []
@@ -1274,9 +1274,10 @@ impl SignatureDatabase {
                 .with_notes("Anthropic Claude AI agent")
                 .with_process_patterns(vec![r"^claude$", r"^claude-code$", r"^claude-cli$"])
                 .with_env_patterns(HashMap::from([
-                    ("CLAUDE_SESSION_ID".into(), ".*".into()),
-                    ("CLAUDE_CODE_SESSION".into(), ".*".into()),
-                    ("CLAUDE_ENTRYPOINT".into(), ".*".into()),
+                    // Set by Claude Code in its child processes (observed 2026-09).
+                    ("CLAUDECODE".into(), "1".into()),
+                    ("CLAUDE_CODE_SESSION_ID".into(), ".*".into()),
+                    ("CLAUDE_CODE_ENTRYPOINT".into(), ".*".into()),
                 ]))
                 .with_socket_paths(vec!["/tmp/claude-"])
                 .as_builtin(),

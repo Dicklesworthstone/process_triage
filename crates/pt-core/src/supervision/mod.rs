@@ -13,7 +13,7 @@
 //! # Detection Methods
 //!
 //! - **Ancestry**: Parent or ancestor matches supervisor pattern
-//! - **Environment**: Variables like CLAUDE_SESSION_ID, VSCODE_PID, etc.
+//! - **Environment**: Variables like CLAUDECODE, CLAUDE_CODE_SESSION_ID, VSCODE_PID, etc.
 //! - **Sockets**: Connected to known supervisor IPC paths
 //! - **Locks**: PID files in known automation directories (future)
 //! - **TTY**: Terminal attribution for tmux/screen sessions (future)

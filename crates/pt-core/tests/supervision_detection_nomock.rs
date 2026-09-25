@@ -261,9 +261,9 @@ fn test_nomock_environ_supervision_spawned_process() {
 
     let mut child = Command::new("sleep")
         .arg("5")
-        .env("CLAUDE_SESSION_ID", "session-1234")
+        .env("CLAUDE_CODE_SESSION_ID", "session-1234")
         .spawn()
-        .expect("spawn sleep process with CLAUDE_SESSION_ID");
+        .expect("spawn sleep process with CLAUDE_CODE_SESSION_ID");
 
     let pid = child.id();
     let env = match read_environ(pid) {
@@ -278,8 +278,8 @@ fn test_nomock_environ_supervision_spawned_process() {
             return;
         }
     };
-    if !env.contains_key("CLAUDE_SESSION_ID") {
-        eprintln!("Skipping no-mock env test: CLAUDE_SESSION_ID not visible in /proc");
+    if !env.contains_key("CLAUDE_CODE_SESSION_ID") {
+        eprintln!("Skipping no-mock env test: CLAUDE_CODE_SESSION_ID not visible in /proc");
         let _ = child.kill();
         let _ = child.wait();
         return;

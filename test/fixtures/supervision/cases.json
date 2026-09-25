@@ -44,7 +44,7 @@
       "kind": "env_map",
       "input": {
         "env": {
-          "CLAUDE_SESSION_ID": "session-1234",
+          "CLAUDE_CODE_SESSION_ID": "session-1234",
           "PATH": "/usr/bin"
         }
       },
