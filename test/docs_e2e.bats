@@ -17,7 +17,9 @@ setup() {
 }
 
 @test "docs mention pt learn onboarding entrypoint" {
-    run bash -lc "cd '$REPO_ROOT' && rg -n '^- `pt learn`|pt learn verify' docs/tutorials/README.md"
+    # Backticks escaped: unescaped inside "..." they were command substitution that
+    # ran `pt learn` in the outer shell and mangled the pattern.
+    run bash -lc "cd '$REPO_ROOT' && rg -n '^- \`pt learn\`|pt learn verify' docs/tutorials/README.md"
     [ "$status" -eq 0 ]
 }
 

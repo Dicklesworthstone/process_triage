@@ -359,25 +359,31 @@ Every process is classified into one of four states via Bayesian posterior updat
 
 ### Evidence Sources
 
-| Evidence | What It Measures | Impact |
-|----------|------------------|--------|
-| CPU activity | Active computation vs idle | Idle + old = suspicious |
-| Runtime vs expected lifetime | Overdue processes | Long-running test = likely stuck |
-| Parent PID | Orphaned (PPID=1)? | Orphans are suspicious |
-| I/O activity | Recent file/network I/O | No I/O for hours = abandoned |
-| TTY state | Interactive or detached? | Detached old processes = suspicious |
-| Network queues | Socket rx/tx queue depth | Deep queues = stalled (useful-bad) |
-| Command category | Test runner, dev server, build tool? | Sets prior expectations |
-| Past decisions | Have you spared similar processes? | Learns from your patterns |
+| Evidence | What It Measures | Impact | Used by |
+|----------|------------------|--------|---------|
+| CPU activity | Active computation vs idle | Idle + old = suspicious | all |
+| Runtime | Age of the process | Old = more suspicious | all |
+| Orphan | Reparented to init and lost its session | Orphans are suspicious | all |
+| TTY state | Controlling terminal or detached? | Detached old processes = suspicious | all |
+| Kernel state | Running, sleeping, zombie, D-state | Zombie = terminal | all |
+| Lineage / shared resources | Ownership, listeners, lockfiles, blast radius | Shifts toward useful when others depend on it | `agent plan` (Linux) |
+| I/O and network activity | Recent file/network I/O | No I/O for hours = abandoned | TUI deep evidence |
+| Network queues | Socket rx/tx queue depth | Deep queues = stalled (useful-bad) | TUI deep evidence |
+| Signatures | Test runner, dev server, build tool? | Sets the prior | all |
+| Past decisions | Have you killed or spared similar processes? | Sets the prior per pattern | all |
 
 ### Confidence Levels
 
-| Level | Posterior | Robot Mode |
+`confidence` in plans labels how peaked the posterior is:
+
+| Level | Posterior | Meaning |
 |-------|-----------|------------|
-| `very_high` | > 0.99 | Auto-kill eligible |
-| `high` | > 0.95 | Auto-kill eligible |
+| `very_high` | > 0.99 | Strong evidence |
+| `high` | > 0.95 | Clears the default robot `min_posterior` |
 | `medium` | > 0.80 | Requires confirmation |
 | `low` | < 0.80 | Review only |
+
+Robot eligibility is decided by `robot_mode.min_posterior` against the probability that justifies the action (P(abandoned or zombie) for kill), not by this label.
 
 ---
 
@@ -481,7 +487,7 @@ process_triage/
 │   └── math/PROOFS.md      # Formal mathematical guarantees
 ├── examples/configs/       # Scenario configurations
 ├── fuzz/                   # Fuzz testing targets
-└── benches/                # Criterion benchmarks
+└── crates/pt-core/benches/ # Criterion benchmarks
 ```
 
 ---
