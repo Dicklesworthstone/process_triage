@@ -477,6 +477,63 @@ mod tests {
         assert!(results[0].error.is_none() && !results[0].data.is_empty());
     }
 
+    /// Fault injection: a read that really stalls in the kernel (a pipe whose writer
+    /// never writes) must time out alone, cancel cleanly, leave the other reads of
+    /// its batch intact, and its late completion (data written after the timeout)
+    /// must not leak into the next batch.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stalled_read_times_out_without_corrupting_later_batches() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds is a valid 2-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let stalled = PathBuf::from(format!("/proc/self/fd/{read_fd}"));
+
+        let mut prober = Prober::new(ProberConfig {
+            probe_timeout: Duration::from_millis(200),
+            ..ProberConfig::default()
+        })
+        .unwrap();
+        let results = prober.probe_batch(&[stalled.clone(), PathBuf::from("/proc/self/stat")]);
+        assert_eq!(results.len(), 2);
+        let pipe_res = results.iter().find(|r| r.path == stalled).unwrap();
+        assert!(
+            pipe_res.timed_out,
+            "stalled read must time out: {pipe_res:?}"
+        );
+        assert!(pipe_res.data.is_empty());
+        let stat_res = results.iter().find(|r| r.path != stalled).unwrap();
+        assert!(
+            !stat_res.timed_out && !stat_res.data.is_empty(),
+            "{stat_res:?}"
+        );
+
+        // Unblock the (cancelled or still pending) read after the fact.
+        let junk = b"LATE-PIPE-DATA";
+        // SAFETY: valid fd and buffer.
+        unsafe { libc::write(write_fd, junk.as_ptr().cast(), junk.len()) };
+
+        prober.config.probe_timeout = Duration::from_secs(5);
+        for _ in 0..3 {
+            let results = prober.probe_batch(&[PathBuf::from("/proc/self/stat")]);
+            assert_eq!(results.len(), 1);
+            let res = &results[0];
+            assert!(!res.timed_out && res.error.is_none(), "{res:?}");
+            assert!(
+                !res.data.windows(junk.len()).any(|w| w == junk),
+                "late pipe completion leaked into a later batch"
+            );
+            let pid = std::process::id().to_string();
+            assert!(String::from_utf8_lossy(&res.data).starts_with(&pid));
+        }
+        // SAFETY: closing fds this test created.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_probe_batch_not_found() {
