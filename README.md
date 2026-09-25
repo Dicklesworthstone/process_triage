@@ -1360,7 +1360,7 @@ cargo run -p pt-core -- run
 
 ## Limitations
 
-- **Linux-first**: Deep scan features (`/proc` parsing, cgroup limits, io_uring probes) require Linux. macOS has basic collection via `ps`/`lsof`, and on macOS `pt` currently **recommends only**: `agent apply` reports every action as `unsupported_platform` and the TUI cannot execute. Enabling it waits on a macOS protection model (launchd domains, Apple platform binaries).
+- **Linux-first**: Deep scan features (`/proc` parsing, cgroup limits, io_uring probes) require Linux. macOS has basic collection via `ps`/`lsof`/`proc_pidinfo`. Actions on macOS: kill, pause/resume and renice run (identity is revalidated to the microsecond immediately before each signal; there is no pidfd, so a tiny PID-reuse window remains), while freeze/throttle/quarantine need cgroups and are Linux-only. Session-safety checks (same session, SSH chain, TTY) read `/proc` and are weaker on macOS; the macOS protection model and the data-loss gate (via `lsof`, failing closed) still apply.
 - **No Windows native**: Windows support is via WSL2 only.
 - **Calibration needed**: Conformal prediction gates require 20+ human-reviewed calibration samples before they activate. Until then, robot mode uses posterior-only gating.
 - **Single-machine focus**: Fleet mode exists but is newer and less battle-tested than single-host triage.
