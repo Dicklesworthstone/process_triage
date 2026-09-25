@@ -208,7 +208,6 @@ fn explain_missing_session_returns_args_error() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn explain_live_process_returns_explanation() {
     with_temp_data_dir(|dir| {
         // Spawn a known process so we have a valid PID to explain

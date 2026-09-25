@@ -1,4 +1,5 @@
-#![cfg(feature = "test-utils")]
+// Every check reads /proc/<pid>/*: nothing to check on other platforms.
+#![cfg(all(feature = "test-utils", target_os = "linux"))]
 
 use pt_core::collect;
 use pt_core::test_utils::ProcessHarness;

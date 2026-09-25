@@ -32,7 +32,10 @@ enum CaseKind {
     EnvMap,
 }
 
+// Fixture structs mirror the JSON schema; the systemd/cgroup fields are only read by
+// the Linux cases.
 #[derive(Debug, Deserialize)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct FixtureCase {
     id: String,
     kind: CaseKind,
@@ -41,6 +44,7 @@ struct FixtureCase {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct FixtureInput {
     pid: Option<u32>,
     systemctl_show: Option<String>,
@@ -49,6 +53,7 @@ struct FixtureInput {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct FixtureExpected {
     unit_name: Option<String>,
     unit_type: Option<String>,

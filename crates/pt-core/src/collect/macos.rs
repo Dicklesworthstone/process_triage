@@ -48,7 +48,7 @@ pub struct MacOsPsSnapshot {
 // ============================================================================
 
 /// System Integrity Protection status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SipStatus {
     /// SIP is enabled (default macOS configuration).
     Enabled,
@@ -57,13 +57,8 @@ pub enum SipStatus {
     /// SIP status is partially enabled (custom configuration).
     CustomConfiguration,
     /// Unable to determine SIP status.
+    #[default]
     Unknown,
-}
-
-impl Default for SipStatus {
-    fn default() -> Self {
-        SipStatus::Unknown
-    }
 }
 
 /// Detect SIP status by running `csrutil status`.
@@ -759,7 +754,7 @@ pub fn macos_scan(options: &MacOsScanOptions) -> Result<MacOsScanResult, MacOsSc
         emitter.emit(
             ProgressEvent::new(event_names::DEEP_SCAN_STARTED, Phase::DeepScan)
                 .with_progress(0, Some(total_pids))
-                .with_detail("capabilities", &format!("{:?}", capabilities.sip_status)),
+                .with_detail("capabilities", format!("{:?}", capabilities.sip_status)),
         );
     }
 
@@ -841,7 +836,7 @@ pub fn macos_scan(options: &MacOsScanOptions) -> Result<MacOsScanResult, MacOsSc
         processes.push(record);
 
         let current = scanned.fetch_add(1, Ordering::Relaxed) + 1;
-        if current % PROGRESS_STEP == 0 {
+        if current.is_multiple_of(PROGRESS_STEP) {
             if let Some(emitter) = options.progress.as_ref() {
                 emitter.emit(
                     ProgressEvent::new(event_names::DEEP_SCAN_PROGRESS, Phase::DeepScan)

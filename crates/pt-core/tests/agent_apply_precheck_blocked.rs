@@ -1,6 +1,9 @@
 //! Agent apply precheck-blocked tests.
 //!
 //! Ensures agent apply returns PolicyBlocked when a live precheck blocks an action.
+//! Live prechecks and action execution are Linux-only.
+
+#![cfg(target_os = "linux")]
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;

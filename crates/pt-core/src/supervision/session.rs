@@ -33,7 +33,9 @@
 use super::environ::read_environ;
 use super::types::SupervisionEvidence;
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "linux")]
 use std::fs;
 use thiserror::Error;
 use tracing::{debug, trace};
@@ -379,6 +381,7 @@ impl Default for SessionConfig {
 }
 
 /// Shell process names for parent shell detection.
+#[cfg(target_os = "linux")]
 const SHELL_NAMES: &[&str] = &[
     "bash", "sh", "zsh", "fish", "dash", "tcsh", "csh", "ksh", "ash",
 ];
@@ -431,32 +434,24 @@ impl SessionAnalyzer {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn get_stat(&mut self, _pid: u32) -> Option<()> {
-        None
-    }
-
     /// Walk the parent chain from a PID up to init.
+    #[cfg(target_os = "linux")]
     fn get_ancestry(&mut self, pid: u32) -> Vec<u32> {
         let mut chain = vec![pid];
+        let mut current = pid;
+        let mut visited = HashSet::new();
+        visited.insert(pid);
 
-        #[cfg(target_os = "linux")]
-        {
-            let mut current = pid;
-            let mut visited = HashSet::new();
-            visited.insert(pid);
-
-            for _ in 0..self.config.max_ancestry_depth {
-                if let Some(stat) = self.get_stat(current) {
-                    if stat.ppid == 0 || stat.ppid == current || visited.contains(&stat.ppid) {
-                        break;
-                    }
-                    visited.insert(stat.ppid);
-                    chain.push(stat.ppid);
-                    current = stat.ppid;
-                } else {
+        for _ in 0..self.config.max_ancestry_depth {
+            if let Some(stat) = self.get_stat(current) {
+                if stat.ppid == 0 || stat.ppid == current || visited.contains(&stat.ppid) {
                     break;
                 }
+                visited.insert(stat.ppid);
+                chain.push(stat.ppid);
+                current = stat.ppid;
+            } else {
+                break;
             }
         }
 
@@ -464,6 +459,7 @@ impl SessionAnalyzer {
     }
 
     /// Check if a process name is a shell.
+    #[cfg(target_os = "linux")]
     fn is_shell(&self, comm: &str) -> bool {
         SHELL_NAMES.contains(&comm)
     }
@@ -647,10 +643,10 @@ impl SessionAnalyzer {
 
         // Check 5: SSH chain protection
         if self.config.protect_ssh_chains {
-            // Check if pt is in an SSH session
+            // Check if pt is in an SSH session (the ancestry check needs /proc)
+            #[cfg(target_os = "linux")]
             if let Some(pt_ssh) = detect_ssh_connection(pt_pid) {
                 // If target is sshd and in our ancestry, protect it
-                #[cfg(target_os = "linux")]
                 if let Some(stat) = self.get_stat(target_pid) {
                     if stat.comm == "sshd" {
                         let pt_ancestry = self.get_ancestry(pt_pid);
@@ -704,7 +700,7 @@ impl SessionAnalyzer {
             None
         };
 
-        let mut result = if is_protected {
+        let result = if is_protected {
             SessionResult::protected(
                 protection_types,
                 reason.expect("is_protected is true"),
@@ -715,9 +711,12 @@ impl SessionAnalyzer {
         };
 
         #[cfg(target_os = "linux")]
-        if let Some(stat) = self.get_stat(target_pid) {
-            result = result.with_session_info(stat.session as u32, stat.pgrp as u32, stat.tty_nr);
-        }
+        let result = match self.get_stat(target_pid) {
+            Some(stat) => {
+                result.with_session_info(stat.session as u32, stat.pgrp as u32, stat.tty_nr)
+            }
+            None => result,
+        };
 
         Ok(result)
     }

@@ -1,3 +1,6 @@
+// parse_fd_dir parses /proc/<pid>/fd, a Linux-only interface.
+#![cfg(target_os = "linux")]
+
 use pt_core::collect::parse_fd_dir;
 use std::fs;
 use tempfile::tempdir;

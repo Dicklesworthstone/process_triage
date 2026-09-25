@@ -601,7 +601,7 @@ mod signature_integration_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod combined_detection_tests {
     use super::super::*;
 
@@ -634,7 +634,7 @@ mod combined_detection_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod terminal_multiplexer_integration_tests {
     use crate::supervision::{
         detect_environ_supervision, detect_supervision, read_environ, SupervisorCategory,

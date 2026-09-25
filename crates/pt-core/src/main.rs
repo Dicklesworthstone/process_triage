@@ -10,10 +10,12 @@
 use clap::parser::ValueSource;
 use clap::FromArgMatches;
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use pt_common::{CandidateProvenanceOutput, OutputFormat, SessionId, SCHEMA_VERSION};
+// Provenance inference reads /proc lineage (Linux only).
+#[cfg(target_os = "linux")]
 use pt_common::{
-    normalize_lineage, CandidateProvenanceOutput, OutputFormat, OwnershipState,
-    ProvenanceConfidence, ProvenanceFeatureInput, ProvenanceRedactionState, RawLineageEvidence,
-    SessionId, SCHEMA_VERSION,
+    normalize_lineage, OwnershipState, ProvenanceConfidence, ProvenanceFeatureInput,
+    ProvenanceRedactionState, RawLineageEvidence,
 };
 #[cfg(feature = "ui")]
 use pt_common::{IdentityQuality, ProcessIdentity};
@@ -2733,6 +2735,7 @@ fn collect_deep_signals_for_pids(pids: &[u32]) -> Option<HashMap<u32, DeepSignal
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = pids;
         eprintln!("run: deep scan not supported on this platform; using quick scan");
         None
     }
@@ -3130,14 +3133,18 @@ use pt_core::decision::goal_progress::{
     ProgressConfig,
 };
 use pt_core::decision::{
-    apply_load_to_loss_matrix, compute_load_adjustment, decide_action, estimate_blast_radius,
-    Action, ActionFeasibility, BlastRadiusEstimate, BlastRadiusEstimatorConfig, LoadSignals,
-    RiskLevel,
+    apply_load_to_loss_matrix, compute_load_adjustment, decide_action, Action, ActionFeasibility,
+    LoadSignals,
 };
+#[cfg(target_os = "linux")]
+use pt_core::decision::{
+    estimate_blast_radius, BlastRadiusEstimate, BlastRadiusEstimatorConfig, RiskLevel,
+};
+#[cfg(target_os = "linux")]
+use pt_core::inference::{apply_evidence_terms, ClassScores, Confidence, EvidenceTerm};
 use pt_core::inference::{
-    apply_evidence_terms, compute_posterior, compute_posterior_with_overrides,
-    try_signature_fast_path, ClassScores, Confidence, CpuEvidence, Evidence, EvidenceLedger,
-    EvidenceTerm, FastPathConfig, FastPathSkipReason, PriorContext,
+    compute_posterior, compute_posterior_with_overrides, try_signature_fast_path, CpuEvidence,
+    Evidence, EvidenceLedger, FastPathConfig, FastPathSkipReason, PriorContext,
 };
 use pt_core::supervision::signature::{MatchLevel, ProcessMatchContext, SignatureDatabase};
 
@@ -12466,6 +12473,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         // A human verdict on this pattern outranks the signature fast path.
         let fast_path_signature = signature_match.as_ref().filter(|_| learned_prior.is_none());
+        // Adjusted below by Linux-only provenance evidence.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let (mut posterior_result, mut ledger) = if let Some(sig_match) = fast_path_signature {
             match try_signature_fast_path(&fast_path_config, Some(sig_match), proc.pid.0) {
                 Ok(Some(fast_path)) => {
@@ -14148,6 +14157,7 @@ fn first_precheck_block(
     None
 }
 
+#[cfg(target_os = "linux")]
 fn precheck_label_for_apply(check: &pt_core::plan::PreCheck) -> &'static str {
     use pt_core::plan::PreCheck;
     match check {
@@ -14630,7 +14640,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     };
 
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
+    // Only the Linux executor runs actions; elsewhere every action is unsupported.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut succeeded = 0usize;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut failed = 0usize;
     let mut skipped = 0usize;
     let mut blocked_by_constraints = 0usize;

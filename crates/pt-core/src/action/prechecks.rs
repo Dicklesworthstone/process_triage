@@ -11,7 +11,9 @@
 #[cfg(target_os = "linux")]
 use crate::collect::parse_io;
 use crate::collect::protected::ProtectedFilter;
-use crate::collect::systemd::{collect_systemd_unit, SystemdUnit, SystemdUnitType};
+#[cfg(target_os = "linux")]
+use crate::collect::systemd::collect_systemd_unit;
+use crate::collect::systemd::{SystemdUnit, SystemdUnitType};
 use crate::collect::ProcessState;
 use crate::config::policy::{DataLossGates, Guardrails};
 use crate::plan::PreCheck;
@@ -24,6 +26,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace};
 
+#[cfg(any(target_os = "linux", test))]
 fn recent_io_probe_window(window: Duration) -> Duration {
     if window.is_zero() {
         Duration::from_millis(10)
@@ -104,6 +107,7 @@ pub struct SupervisorInfo {
 
 impl SupervisorInfo {
     /// Create supervisor info for a systemd-managed process.
+    #[cfg(any(target_os = "linux", test))]
     fn from_systemd_unit(unit: SystemdUnit, pid: u32) -> Self {
         let is_main = unit.is_main_process || unit.main_pid == Some(pid);
         let unit_name = unit.name.clone();
@@ -536,10 +540,7 @@ impl LivePreCheckProvider {
                     })
                     .count() as u32;
 
-                (
-                    write_count > self.config.max_open_write_fds as u32,
-                    write_count,
-                )
+                (write_count > self.config.max_open_write_fds, write_count)
             } else {
                 (false, 0)
             }
@@ -720,30 +721,17 @@ impl LivePreCheckProvider {
     }
 
     /// Read kernel wait channel.
+    #[cfg(target_os = "linux")]
     fn read_wchan(&self, pid: u32) -> Option<String> {
-        #[cfg(target_os = "linux")]
-        {
-            let wchan_path = format!("/proc/{pid}/wchan");
-            let wchan_bytes = std::fs::read(&wchan_path).ok()?;
-            let wchan = String::from_utf8_lossy(&wchan_bytes).trim().to_string();
+        let wchan_path = format!("/proc/{pid}/wchan");
+        let wchan_bytes = std::fs::read(&wchan_path).ok()?;
+        let wchan = String::from_utf8_lossy(&wchan_bytes).trim().to_string();
 
-            // "0" means not blocked, return None in that case
-            if wchan == "0" || wchan.is_empty() {
-                None
-            } else {
-                Some(wchan)
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // macOS doesn't expose wchan via sysctl in a simple string way
-            let _ = pid;
+        // "0" means not blocked, return None in that case
+        if wchan == "0" || wchan.is_empty() {
             None
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = pid;
-            None
+        } else {
+            Some(wchan)
         }
     }
 
