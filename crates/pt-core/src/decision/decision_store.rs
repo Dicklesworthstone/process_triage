@@ -32,6 +32,19 @@ pub const PRIOR_STRENGTH: f64 = 2.0;
 pub const LEARNED_PRIOR_MIN: f64 = 0.02;
 pub const LEARNED_PRIOR_MAX: f64 = 0.95;
 
+/// Verdicts lose half their weight for every this many days since the pattern was
+/// last labeled, so habits that changed long ago fade back toward the global prior.
+pub const DECAY_HALF_LIFE_DAYS: f64 = 180.0;
+
+/// Weight of a pattern's counts given when it was last labeled (1.0 if unknown).
+fn decay_weight(updated_at: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> f64 {
+    let Some(ts) = updated_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) else {
+        return 1.0;
+    };
+    let age_days = (now - ts.with_timezone(&chrono::Utc)).num_seconds().max(0) as f64 / 86_400.0;
+    0.5_f64.powf(age_days / DECAY_HALF_LIFE_DAYS)
+}
+
 /// A human verdict about a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +96,8 @@ pub struct LearnedPrior {
     pub pattern_key: String,
     pub kill: u32,
     pub spare: u32,
+    /// Age decay applied to the counts (1.0 = labeled just now).
+    pub weight: f64,
     /// Posterior mean P(abandoned or zombie) after combining with the global prior.
     pub abandonment_prior: f64,
 }
@@ -285,13 +300,15 @@ impl DecisionStore {
                     .map(|c| (key, c))
             })
             .map(|(key, c)| {
-                let p = (f64::from(c.kill) + PRIOR_STRENGTH * global_ab)
-                    / (f64::from(c.total()) + PRIOR_STRENGTH);
+                let w = decay_weight(c.updated_at.as_deref(), chrono::Utc::now());
+                let p = (w * f64::from(c.kill) + PRIOR_STRENGTH * global_ab)
+                    / (w * f64::from(c.total()) + PRIOR_STRENGTH);
                 let p = p.clamp(LEARNED_PRIOR_MIN, LEARNED_PRIOR_MAX);
                 LearnedPrior {
                     pattern_key: key,
                     kill: c.kill,
                     spare: c.spare,
+                    weight: w,
                     abandonment_prior: p,
                 }
             })
@@ -415,6 +432,31 @@ mod tests {
         let store = DecisionStore::load(dir.path()).unwrap();
         let learned = store.learned_prior("node", cmd, &global()).unwrap();
         assert_eq!((learned.kill, learned.spare), (17, 1));
+    }
+
+    #[test]
+    fn old_verdicts_decay_toward_the_global_prior() {
+        let now = chrono::Utc::now();
+        let year_ago = (now - chrono::Duration::days(360)).to_rfc3339();
+        assert!((decay_weight(Some(&year_ago), now) - 0.25).abs() < 1e-3);
+        assert_eq!(decay_weight(None, now), 1.0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let g = global();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        for _ in 0..4 {
+            store.record("sleep", "sleep 100", Verdict::Kill);
+            store.record("cat", "cat /dev/zero", Verdict::Kill);
+        }
+        for key in DecisionStore::pattern_keys("cat", "cat /dev/zero") {
+            store.entries.get_mut(&key).unwrap().updated_at = Some(year_ago.clone());
+        }
+        let fresh = store.learned_prior("sleep", "sleep 100", &g).unwrap();
+        let stale = store.learned_prior("cat", "cat /dev/zero", &g).unwrap();
+        assert!((stale.weight - 0.25).abs() < 1e-3);
+        let base = g.classes.abandoned.prior_prob + g.classes.zombie.prior_prob;
+        assert!(fresh.abandonment_prior > stale.abandonment_prior);
+        assert!(stale.abandonment_prior > base, "decayed, not erased");
     }
 
     #[test]

@@ -181,6 +181,26 @@ EOF
     [ ! -f "$MOCK_LOG" ]
 }
 
+@test "wrapper: clear with a scope forgets only matching patterns" {
+    local config_dir="${TEST_DIR}/config"
+    mkdir -p "$config_dir"
+    cat > "${config_dir}/decisions.json" << 'EOF'
+{"standard|node|jest --watch":{"kill":2,"spare":0},"broad|node|":{"kill":2,"spare":0},"standard|vim|":{"kill":0,"spare":1}}
+EOF
+
+    run bash -lc "printf 'y\n' | env PT_CORE_PATH='$MOCK_PT_CORE' PT_WRAPPER_TEST_LOG='$MOCK_LOG' PROCESS_TRIAGE_CONFIG='$config_dir' '$PT_SCRIPT' clear node"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'Cleared 2 decisions matching "node".'* ]]
+    [ "$(jq -c 'keys' "${config_dir}/decisions.json")" = '["standard|vim|"]' ]
+
+    # Declining the confirmation changes nothing.
+    run bash -lc "printf 'n\n' | env PT_CORE_PATH='$MOCK_PT_CORE' PT_WRAPPER_TEST_LOG='$MOCK_LOG' PROCESS_TRIAGE_CONFIG='$config_dir' '$PT_SCRIPT' clear vim"
+    [ "$status" -eq 1 ]
+    [ "$(jq -c 'keys' "${config_dir}/decisions.json")" = '["standard|vim|"]' ]
+    [ ! -f "$MOCK_LOG" ]
+}
+
 @test "wrapper: top-level help shows wrapper-only commands and flags" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \

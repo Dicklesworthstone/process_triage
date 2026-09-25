@@ -199,6 +199,8 @@ show_history() {
 }
 
 clear_history() {
+    # Optional scope: only forget patterns containing this text (e.g. `pt clear jest`).
+    local scope="${1:-}"
     local config_dir decisions_file
     config_dir="$(resolve_config_dir)"
     decisions_file="$(ensure_decisions_file "$config_dir")"
@@ -214,15 +216,23 @@ clear_history() {
     fi
 
     local total
-    total="$(jq 'length' "$decisions_file")"
+    total="$(jq --arg s "$scope" '[keys[] | select(contains($s))] | length' "$decisions_file")"
     if [[ "$total" == "0" ]]; then
-        printf 'Decision history already empty.\n'
+        if [[ -n "$scope" ]]; then
+            printf 'No decisions match "%s".\n' "$scope"
+        else
+            printf 'Decision history already empty.\n'
+        fi
         return 0
     fi
 
     local reply=""
     if [[ -t 0 && -z "${CI:-}" && -z "${TEST_MODE:-}" ]]; then
-        printf 'Clear all decision history? [y/N] ' >&2
+        if [[ -n "$scope" ]]; then
+            printf 'Clear %s decision entries matching "%s"? [y/N] ' "$total" "$scope" >&2
+        else
+            printf 'Clear all decision history? [y/N] ' >&2
+        fi
         read -r reply || true
     else
         read -r reply || true
@@ -233,8 +243,17 @@ clear_history() {
         exit 1
     fi
 
-    printf '{}\n' > "$decisions_file"
-    printf 'Cleared %s decision%s.\n' "$total" "$([[ "$total" == "1" ]] && printf '' || printf 's')"
+    local plural
+    plural="$([[ "$total" == "1" ]] && printf '' || printf 's')"
+    if [[ -z "$scope" ]]; then
+        printf '{}\n' > "$decisions_file"
+        printf 'Cleared %s decision%s.\n' "$total" "$plural"
+        return 0
+    fi
+    local tmp="${decisions_file}.tmp.$$"
+    jq --arg s "$scope" 'with_entries(select(.key | contains($s) | not))' "$decisions_file" > "$tmp"
+    mv "$tmp" "$decisions_file"
+    printf 'Cleared %s decision%s matching "%s".\n' "$total" "$plural" "$scope"
 }
 
 show_wrapper_help() {
@@ -253,7 +272,7 @@ Wrapper commands:
   help            Show wrapper-aware top-level help
   update          Run the signed installer update flow
   history         Show learned decision memory from decisions.json
-  clear           Clear learned decision memory after confirmation
+  clear [TEXT]    Clear learned decisions (only patterns containing TEXT) after confirmation
   deep            Alias for \`deep-scan\`
 
 Core commands:
@@ -385,7 +404,7 @@ main() {
     fi
 
     if [[ "${forwarded_args[0]:-}" == "clear" ]]; then
-        clear_history
+        clear_history "${forwarded_args[1]:-}"
         exit 0
     fi
 

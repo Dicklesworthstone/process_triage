@@ -10721,6 +10721,122 @@ mod process_tree_safety_tests {
     }
 }
 
+#[cfg(all(test, feature = "ui"))]
+mod tui_learning_tests {
+    use super::record_confirmed_kills;
+    use pt_common::{IdentityQuality, ProcessIdentity, StartId};
+    use pt_core::action::{ActionResult, ActionStatus, ExecutionResult, ExecutionSummary};
+    use pt_core::config::Priors;
+    use pt_core::decision::decision_store::DecisionStore;
+    use pt_core::decision::Action;
+    use pt_core::plan::{
+        ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, GatesSummary, Plan,
+        PlanAction,
+    };
+    use std::collections::HashMap;
+
+    fn action(id: &str, pid: u32, action: Action) -> PlanAction {
+        PlanAction {
+            action_id: id.to_string(),
+            target: ProcessIdentity::full(
+                pid,
+                StartId(format!("b:{pid}:1")),
+                1000,
+                None,
+                None,
+                IdentityQuality::Full,
+            ),
+            action,
+            order: 0,
+            stage: 0,
+            timeouts: ActionTimeouts::default(),
+            pre_checks: Vec::new(),
+            rationale: ActionRationale {
+                expected_loss: None,
+                expected_recovery: None,
+                expected_recovery_stddev: None,
+                posterior_odds_abandoned_vs_useful: None,
+                sprt_boundary: None,
+                posterior: None,
+                memory_mb: None,
+                has_known_signature: None,
+                category: None,
+            },
+            on_success: Vec::new(),
+            on_failure: Vec::new(),
+            blocked: false,
+            routing: ActionRouting::Direct,
+            confidence: ActionConfidence::Normal,
+            original_zombie_target: None,
+            d_state_diagnostics: None,
+        }
+    }
+
+    fn outcome(id: &str, status: ActionStatus) -> ActionResult {
+        ActionResult {
+            action_id: id.to_string(),
+            status,
+            time_ms: 1,
+            details: None,
+        }
+    }
+
+    #[test]
+    fn only_successful_kills_are_learned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        let plan = Plan {
+            plan_id: "p".to_string(),
+            session_id: "s".to_string(),
+            generated_at: String::new(),
+            policy_id: None,
+            policy_version: "1".to_string(),
+            actions: vec![
+                action("a1", 11, Action::Kill),
+                action("a2", 12, Action::Kill),
+                action("a3", 13, Action::Pause),
+            ],
+            pre_toggled: Vec::new(),
+            gates_summary: GatesSummary {
+                total_candidates: 3,
+                blocked_candidates: 0,
+                pre_toggled_actions: 0,
+            },
+        };
+        let result = ExecutionResult {
+            summary: ExecutionSummary {
+                actions_attempted: 3,
+                actions_succeeded: 2,
+                actions_failed: 1,
+            },
+            outcomes: vec![
+                outcome("a1", ActionStatus::Success),
+                outcome("a2", ActionStatus::PermissionDenied),
+                outcome("a3", ActionStatus::Success),
+            ],
+        };
+        let commands: HashMap<u32, (String, String)> = [
+            (11, ("sleep".to_string(), "sleep 900".to_string())),
+            (12, ("vim".to_string(), "vim notes.txt".to_string())),
+            (13, ("cat".to_string(), "cat".to_string())),
+        ]
+        .into_iter()
+        .collect();
+
+        record_confirmed_kills(&mut store, &plan, &result, &commands);
+
+        // Persisted, and only the successful kill counts.
+        let store = DecisionStore::load(dir.path()).unwrap();
+        let g = Priors::default();
+        let killed = store
+            .learned_prior("sleep", "sleep 900", &g)
+            .expect("kill learned");
+        assert_eq!((killed.kill, killed.spare), (1, 0));
+        assert!(store.learned_prior("vim", "vim notes.txt", &g).is_none());
+        assert!(store.learned_prior("cat", "cat", &g).is_none());
+    }
+}
+
 #[cfg(test)]
 mod config_file_kind_tests {
     use super::{detect_config_file_kind, ConfigFileKind};
