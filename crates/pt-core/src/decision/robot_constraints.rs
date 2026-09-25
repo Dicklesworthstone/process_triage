@@ -737,6 +737,21 @@ impl ConstraintChecker {
     }
 }
 
+/// The probability the robot `min_posterior` gate compares for `action`: the event
+/// that justifies it. Kill/restart resolve abandonment (P(abandoned) + P(zombie));
+/// every other action is justified by "not useful" (1 - P(useful)). Never the max
+/// over classes, which let a 96%-useful process pass a 0.95 kill gate.
+pub fn gate_posterior(
+    scores: &crate::inference::ClassScores,
+    action: crate::decision::Action,
+) -> f64 {
+    use crate::decision::Action;
+    match action {
+        Action::Kill | Action::Restart => scores.abandonment_probability(),
+        _ => scores.intervention_probability(),
+    }
+}
+
 /// Candidate information needed for constraint checking.
 #[derive(Debug, Clone, Default)]
 pub struct RobotCandidate {
@@ -827,6 +842,54 @@ mod tests {
             exclude_categories: Vec::new(),
             require_human_for_supervised: true,
         }
+    }
+
+    /// Regression (bd-zi8p.4): a 96%-useful process must not pass a 0.95 kill gate.
+    /// The old gate compared the max class posterior (0.96 for "useful").
+    #[test]
+    fn useful_process_does_not_pass_kill_gate() {
+        use crate::decision::Action;
+        use crate::inference::ClassScores;
+        let scores = ClassScores {
+            useful: 0.96,
+            useful_bad: 0.01,
+            abandoned: 0.02,
+            zombie: 0.01,
+        };
+        let checker =
+            ConstraintChecker::new(RuntimeRobotConstraints::from_policy(&test_robot_mode()));
+        let candidate = |p: f64| {
+            RobotCandidate::new()
+                .with_posterior(p)
+                .with_kill_action(true)
+                .with_policy_snapshot(true)
+                .with_memory_mb(1.0)
+        };
+
+        let p = gate_posterior(&scores, Action::Kill);
+        assert!((p - 0.03).abs() < 1e-12);
+        assert!(!checker.check_candidate(&candidate(p)).allowed);
+        // The old max-over-classes value would have passed the same gate.
+        assert!(checker.check_candidate(&candidate(0.96)).allowed);
+
+        // Non-kill actions are justified by "not useful": 0.04 here, also blocked.
+        let p = gate_posterior(&scores, Action::Pause);
+        assert!((p - 0.04).abs() < 1e-12);
+        assert!(
+            !checker
+                .check_candidate(&candidate(p).with_kill_action(false))
+                .allowed
+        );
+
+        // A confidently abandoned process passes the kill gate.
+        let abandoned = ClassScores {
+            useful: 0.01,
+            useful_bad: 0.01,
+            abandoned: 0.97,
+            zombie: 0.01,
+        };
+        let p = gate_posterior(&abandoned, Action::Kill);
+        assert!(checker.check_candidate(&candidate(p)).allowed);
     }
 
     #[test]

@@ -448,3 +448,21 @@ EOF
     [ "$status" -eq 2 ]
     [[ "$output" == *"unknown update option '--yolo'"* ]]
 }
+
+@test "wrapper: runs under bash 3.2 (macOS /bin/bash) with no arguments" {
+    # Bare `pt` expanded an empty array under `set -u`, which is an "unbound
+    # variable" error in bash 3.2, before pt-core ever ran.
+    if ! /bin/bash -c '[[ ${BASH_VERSINFO[0]} -eq 3 ]]' 2>/dev/null; then
+        skip "/bin/bash is not bash 3.x on this host"
+    fi
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        /bin/bash "$PT_SCRIPT"
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=$' "$MOCK_LOG"
+
+    rm -f "$MOCK_LOG"
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        /bin/bash "$PT_SCRIPT" --version
+    [ "$status" -eq 0 ]
+    [[ "${lines[0]}" == "pt version ${PT_WRAPPER_VERSION}" ]]
+}

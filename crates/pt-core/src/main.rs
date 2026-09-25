@@ -47,8 +47,8 @@ use pt_core::learn::{
 };
 
 use pt_core::output::predictions::{
-    apply_field_selection, CpuPrediction, MemoryPrediction, PredictionDiagnostics, PredictionField,
-    PredictionFieldSelector, Predictions, TrajectoryAssessment, TrajectoryLabel, Trend,
+    apply_field_selection, PredictionDiagnostics, PredictionField, PredictionFieldSelector,
+    Predictions, TrajectoryAssessment, TrajectoryLabel,
 };
 use pt_core::output::{encode_toon_value, CompactConfig, FieldSelector, TokenEfficientOutput};
 #[cfg(feature = "ui")]
@@ -11453,21 +11453,12 @@ fn parse_prediction_fields(spec: &str) -> Result<PredictionFieldSelector, String
     Ok(PredictionFieldSelector { include })
 }
 
-fn build_stub_predictions(proc: &ProcessRecord) -> Predictions {
-    let window_secs = proc.elapsed.as_secs_f64().max(0.0);
+fn build_stub_predictions() -> Predictions {
+    // One snapshot has no trend: memory/CPU trends are absent (they used to claim
+    // "stable" with slope 0), and the diagnostics say why.
     Predictions {
-        memory: Some(MemoryPrediction {
-            rss_slope_bytes_per_sec: 0.0,
-            trend: Trend::Stable,
-            confidence: 0.0,
-            window_secs,
-        }),
-        cpu: Some(CpuPrediction {
-            usage_slope_pct_per_sec: 0.0,
-            trend: Trend::Stable,
-            confidence: 0.0,
-            window_secs,
-        }),
+        memory: None,
+        cpu: None,
         eta_abandoned: None,
         eta_resource_limit: None,
         trajectory: Some(TrajectoryAssessment {
@@ -12325,6 +12316,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     for m in &filter_result.filtered {
         *protected_by_rule.entry(m.pattern.clone()).or_default() += 1;
     }
+    // Direct children per pid over the whole scan (protected processes included),
+    // for each candidate's blast radius.
+    let mut child_counts: HashMap<u32, usize> = HashMap::new();
+    for p in &scan_result.processes {
+        *child_counts.entry(p.ppid.0).or_default() += 1;
+    }
 
     tracing::info!(
         total_scanned = total_scanned,
@@ -12896,7 +12893,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .unwrap_or_else(|_| serde_json::json!({"enabled": false}));
 
         let predictions = if args.include_predictions {
-            let mut predictions = build_stub_predictions(proc);
+            let mut predictions = build_stub_predictions();
             if let Some(selector) = &prediction_field_selector {
                 predictions = apply_field_selection(&predictions, selector);
             }
@@ -12958,7 +12955,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "blast_radius": {
                 "memory_mb": proc.rss_bytes / (1024 * 1024),
                 "cpu_pct": proc.cpu_percent,
-                "child_count": 0, // Would need child enumeration
+                "child_count": child_counts.get(&proc.pid.0).copied().unwrap_or(0),
                 "risk_level": if proc.rss_bytes > 1024 * 1024 * 1024 { "medium" } else { "low" },
             },
             "reversibility": match decision_outcome.optimal_action {
@@ -14605,15 +14602,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let total_actions = actions_to_apply.len() as u64;
     let mut action_index = 0u64;
 
-    // The robot `min_posterior` gate must compare the probability of the event that
-    // justifies the action, never the max over classes (a 96%-useful process would
-    // otherwise pass a 0.95 kill gate). Kill/restart resolve abandonment; every other
-    // action is justified by "not useful".
-    let candidate_posterior =
-        |scores: &pt_core::inference::ClassScores, action: Action| match action {
-            Action::Kill | Action::Restart => scores.abandonment_probability(),
-            _ => scores.intervention_probability(),
-        };
+    // The robot `min_posterior` gate compares the probability of the event that
+    // justifies the action, never the max over classes (see gate_posterior).
+    let candidate_posterior = pt_core::decision::robot_constraints::gate_posterior;
     let emit_action_event = |event_name: &str,
                              index: u64,
                              elapsed_ms: Option<u64>,

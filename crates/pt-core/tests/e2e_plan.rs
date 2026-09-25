@@ -1297,3 +1297,129 @@ mod inference_safety {
         }
     }
 }
+
+/// Age of `pid` in seconds from /proc (the kernel's own start ticks + btime): an
+/// independent check on the ages the plan reports.
+#[cfg(target_os = "linux")]
+fn proc_age_seconds(pid: u32) -> f64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+    let after_comm = stat.rsplit_once(')').expect("comm").1;
+    // After ")": state is field 3 overall; starttime is field 22 -> index 19 here.
+    let start_ticks: f64 = after_comm
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let btime: f64 = std::fs::read_to_string("/proc/stat")
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: sysconf has no preconditions.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    now - (btime + start_ticks / hz)
+}
+
+/// blast_radius.child_count is the real number of direct children (it was a
+/// hard-coded 0).
+#[cfg(unix)]
+#[test]
+fn plan_blast_radius_counts_real_children() {
+    let mut parent = std::process::Command::new("sh")
+        .args(["-c", "sleep 60 & sleep 60 & wait"])
+        .spawn()
+        .expect("spawn parent");
+    let pid = parent.id();
+    std::thread::sleep(Duration::from_millis(500));
+    let data_dir = tempdir().expect("data dir");
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", data_dir.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--max-candidates",
+            "100000",
+        ])
+        .output()
+        .expect("run plan");
+    // Kill the sleeps (children of sh) and sh itself.
+    let _ = std::process::Command::new("pkill")
+        .args(["-P", &pid.to_string()])
+        .status();
+    let _ = parent.kill();
+    let _ = parent.wait();
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("plan JSON");
+    let candidate = json["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|c| c["pid"].as_u64() == Some(u64::from(pid)))
+        .unwrap_or_else(|| panic!("pid {pid} not in plan"))
+        .clone();
+    assert_eq!(candidate["blast_radius"]["child_count"], 2, "{candidate}");
+}
+
+/// A candidate's age in the plan equals the kernel's start time, to the second.
+#[cfg(target_os = "linux")]
+#[test]
+fn plan_age_matches_proc_start_time() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    std::thread::sleep(Duration::from_secs(3));
+    let data_dir = tempdir().expect("data dir");
+
+    let before = proc_age_seconds(pid);
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", data_dir.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--max-candidates",
+            "100000",
+        ])
+        .output()
+        .expect("run plan");
+    let after = proc_age_seconds(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("plan JSON");
+    let candidate = json["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|c| c["pid"].as_u64() == Some(u64::from(pid)))
+        .unwrap_or_else(|| panic!("pid {pid} not in plan"))
+        .clone();
+    let age = candidate["age_seconds"].as_f64().expect("age_seconds");
+    assert!(
+        age >= before.floor() - 1.0 && age <= after.ceil() + 1.0,
+        "plan age {age} outside /proc age window [{before:.2}, {after:.2}]"
+    );
+}

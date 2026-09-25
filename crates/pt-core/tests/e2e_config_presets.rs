@@ -487,6 +487,62 @@ fn test_config_validate_with_exported_preset() {
     assert_eq!(json["status"], "valid");
 }
 
+/// The file type comes from the content, not the name: a policy saved as
+/// `priors.json` validates as a policy, and a JSON file that is neither is rejected
+/// (it used to load defaults and report "valid").
+#[test]
+fn test_config_validate_detects_file_kind_by_content() {
+    let dir = tempdir().expect("tempdir");
+    let misnamed_policy = dir.path().join("priors.json");
+    pt_core()
+        .args([
+            "--format",
+            "json",
+            "config",
+            "export-preset",
+            "developer",
+            "--output",
+            misnamed_policy.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let output = pt_core()
+        .args([
+            "--format",
+            "json",
+            "config",
+            "validate",
+            misnamed_policy.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("parse JSON");
+    assert_eq!(json["status"], "valid");
+    assert_eq!(json["policy"]["using_defaults"], false, "{json}");
+    assert_eq!(json["priors"]["using_defaults"], true, "{json}");
+
+    let junk = dir.path().join("policy_backup.json");
+    fs::write(&junk, r#"{"hello": 1}"#).expect("write junk");
+    let output = pt_core()
+        .args([
+            "--format",
+            "json",
+            "config",
+            "validate",
+            junk.to_str().unwrap(),
+        ])
+        .assert()
+        .code(10)
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("parse JSON");
+    assert_eq!(json["status"], "invalid");
+}
+
 #[test]
 fn test_config_validate_invalid_json_fails() {
     let dir = tempdir().expect("tempdir");
