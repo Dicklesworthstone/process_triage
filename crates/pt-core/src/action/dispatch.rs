@@ -2,7 +2,7 @@
 
 use super::executor::{ActionError, ActionRunner};
 use crate::decision::Action;
-use crate::plan::PlanAction;
+use crate::plan::{ActionRouting, PlanAction};
 
 use super::renice::ReniceActionRunner;
 use super::signal::SignalActionRunner;
@@ -104,6 +104,12 @@ impl ActionRunner for CompositeActionRunner {
             Action::Throttle => self.throttle.execute(action),
             #[cfg(target_os = "linux")]
             Action::Quarantine | Action::Unquarantine => self.quarantine.execute(action),
+            // A zombie's remedy targets its parent: nudge it to reap. (A real
+            // restart of the parent needs supervisor support, bd-qr40.6.)
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Action::Restart if action.routing == ActionRouting::ZombieToParent => {
+                self.signal.nudge_parent_to_reap(action)
+            }
             Action::Restart => Err(ActionError::Failed(
                 "restart requires supervisor support".to_string(),
             )),
@@ -129,6 +135,10 @@ impl ActionRunner for CompositeActionRunner {
             Action::Throttle => self.throttle.verify(action),
             #[cfg(target_os = "linux")]
             Action::Quarantine | Action::Unquarantine => self.quarantine.verify(action),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Action::Restart if action.routing == ActionRouting::ZombieToParent => {
+                self.signal.verify_zombie_reaped(action)
+            }
             Action::Restart => Ok(()),
             #[cfg(not(target_os = "linux"))]
             Action::Freeze

@@ -183,9 +183,8 @@ impl SignalActionRunner {
                 if !self.process_exists(pid) {
                     return Ok(());
                 }
-                // On Linux, consider a zombie process as "exited" for our purposes
-                // (we successfully terminated it, even if parent hasn't reaped it)
-                #[cfg(target_os = "linux")]
+                // A zombie counts as "exited" (we terminated it, even if the parent
+                // hasn't reaped it yet).
                 if let Some('Z') = self.get_process_state(pid) {
                     return Ok(());
                 }
@@ -302,6 +301,48 @@ impl SignalActionRunner {
         }
 
         Ok(())
+    }
+
+    /// Zombie routed to its parent (`ActionRouting::ZombieToParent`): ask the parent
+    /// to reap with SIGCHLD. Harmless (the default disposition is ignore); the zombie
+    /// itself is never signaled and the parent is never killed or restarted here.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn nudge_parent_to_reap(&self, action: &PlanAction) -> Result<(), ActionError> {
+        #[cfg(target_os = "linux")]
+        if let Some(pidfd) = self.pinned_pidfd(action)? {
+            return pidfd.send(libc::SIGCHLD);
+        }
+        #[cfg(target_os = "macos")]
+        self.check_identity_now(action)?;
+        self.send_signal(action.target.pid.0, libc::SIGCHLD, false)
+    }
+
+    /// The routed zombie is gone (reaped), or a different process now holds its pid.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn verify_zombie_reaped(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let Some(zombie) = action.original_zombie_target.as_ref() else {
+            return Ok(());
+        };
+        let pid = zombie.pid.0;
+        let reaped = || {
+            self.get_process_state(pid) != Some('Z')
+                || self
+                    .read_starttime(pid)
+                    .is_some_and(|st| !ids_match_starttime(&zombie.start_id.0, st))
+        };
+        let start = Instant::now();
+        let timeout = Duration::from_millis(self.config.verify_timeout_ms);
+        while start.elapsed() < timeout {
+            if reaped() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(self.config.poll_interval_ms));
+        }
+        Err(ActionError::Failed(format!(
+            "zombie {pid} persists: parent {} did not reap it on SIGCHLD; \
+             restart or stop the parent to clear it",
+            action.target.pid.0
+        )))
     }
 
     /// Verify a pause action succeeded.

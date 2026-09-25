@@ -340,6 +340,97 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
     assert!(mux.alive(), "protected process must survive");
 }
 
+/// Pid of `parent`'s zombie child, once it has one.
+fn zombie_child_of(parent: u32) -> u32 {
+    for _ in 0..50 {
+        let out = ProcessCommand::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,stat="])
+            .output()
+            .expect("ps");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let found = text.lines().find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() >= 3 && f[1] == parent.to_string() && f[2].starts_with('Z'))
+                .then(|| f[0].parse().ok())
+                .flatten()
+        });
+        if let Some(pid) = found {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("no zombie child of {parent}");
+}
+
+/// A zombie-to-parent route: Restart on the parent carrying the zombie's identity.
+fn zombie_route(parent: &ProcessIdentity, zombie: &ProcessIdentity) -> PlanAction {
+    let mut action = plan_action(Action::Restart, parent);
+    action.routing = ActionRouting::ZombieToParent;
+    action.original_zombie_target = Some(zombie.clone());
+    action
+}
+
+/// Applying a zombie route nudges the parent with SIGCHLD and reports honestly when
+/// the parent does not reap: the zombie persists, the parent is not harmed.
+#[test]
+fn agent_apply_zombie_route_reports_non_reaping_parent() {
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    write_test_policy(config_dir.path());
+
+    // The target sh forks `sleep 0`, then execs `sleep 307`, which never reaps it.
+    let parent = ForeignTarget::spawn("sh -c 'sleep 0 & exec sleep 307'");
+    let zombie_pid = zombie_child_of(parent.pid);
+    let parent_identity = live_identity(parent.pid);
+    let zombie_identity = live_identity(zombie_pid);
+    let target = format!("{}:{}", parent.pid, parent_identity.start_id.0);
+
+    let s = session_with_plan(
+        data_dir.path(),
+        zombie_route(&parent_identity, &zombie_identity),
+    );
+    let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &target);
+    assert_ne!(status, "success", "non-reaping parent: {json}");
+    assert!(json.to_string().contains("persists"), "{json}");
+    assert!(parent.alive(), "the parent must not be harmed");
+    assert_eq!(state_of(zombie_pid), Some('Z'), "zombie still there");
+}
+
+/// A parent that reaps on SIGCHLD clears its zombie when pt applies the route.
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_zombie_route_reaps_via_sigchld() {
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    write_test_policy(config_dir.path());
+
+    // Child exits first (zombie); only then does the parent install a SIGCHLD
+    // handler that reaps, so the zombie waits for pt's nudge.
+    let script = "import os, signal, time\n\
+                  if os.fork() == 0: os._exit(0)\n\
+                  time.sleep(1)\n\
+                  signal.signal(signal.SIGCHLD, lambda s, f: os.waitpid(-1, os.WNOHANG))\n\
+                  time.sleep(300)\n";
+    let script_dir = TempDir::new().expect("script dir");
+    let script_path = script_dir.path().join("reaper.py");
+    fs::write(&script_path, script).expect("write script");
+    let parent = ForeignTarget::spawn(&format!("python3 '{}'", script_path.display()));
+    let zombie_pid = zombie_child_of(parent.pid);
+    std::thread::sleep(Duration::from_millis(1500)); // handler installed
+    let parent_identity = live_identity(parent.pid);
+    let zombie_identity = live_identity(zombie_pid);
+    let target = format!("{}:{}", parent.pid, parent_identity.start_id.0);
+
+    let s = session_with_plan(
+        data_dir.path(),
+        zombie_route(&parent_identity, &zombie_identity),
+    );
+    let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &target);
+    assert_eq!(status, "success", "reaping parent: {json}");
+    assert_ne!(state_of(zombie_pid), Some('Z'), "zombie reaped");
+    assert!(parent.alive(), "the parent must not be harmed");
+}
+
 /// The data-loss gate blocks a kill of a process holding a regular file open for
 /// writing (the other tests' targets, with stdio on /dev/null, are killable).
 #[test]

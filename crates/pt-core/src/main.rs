@@ -14959,7 +14959,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                     continue;
                 }
-                match action_runner.execute(action) {
+                // "success" means the effect was observed (stopped, reniced, exited,
+                // zombie reaped), not merely that the syscall returned.
+                match action_runner
+                    .execute(action)
+                    .and_then(|()| action_runner.verify(action))
+                {
                     Ok(()) => {
                         if action.action == Action::Kill {
                             // Accumulate the real memory footprint so
