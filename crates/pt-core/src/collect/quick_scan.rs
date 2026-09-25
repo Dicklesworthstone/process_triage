@@ -1245,6 +1245,8 @@ mod tests {
         );
     }
 
+    // Children of kthreadd (PID 2) are kernel threads on Linux only.
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_is_kernel_thread_kworker() {
         let kworker = make_record(42, 2, "[kworker/0:0-eve]", ProcessState::Idle);
@@ -1252,6 +1254,14 @@ mod tests {
             is_kernel_thread(&kworker),
             "kworker should be detected as kernel thread"
         );
+    }
+
+    // On macOS PID 2 is an ordinary process; its children are not kernel threads.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_ppid_2_is_not_kernel_thread_on_macos() {
+        let child = make_record(42, 2, "some-daemon", ProcessState::Sleeping);
+        assert!(!is_kernel_thread(&child));
     }
 
     #[test]

@@ -348,7 +348,7 @@ jobs:
 
           ### Verify Installation
           ```bash
-          VERIFY=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
+          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash -s -- --verify
           ```
 
           ### Manual Installation

@@ -5,8 +5,11 @@
 use super::types::{EvidenceType, SupervisionEvidence, SupervisorCategory};
 #[cfg(target_os = "linux")]
 use crate::collect::network::parse_proc_net_unix;
+#[cfg(target_os = "linux")]
 use std::collections::HashSet;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use thiserror::Error;
 

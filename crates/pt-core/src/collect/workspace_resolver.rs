@@ -10,10 +10,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pt_common::{
-    HeadState, PathResolutionError, RawPathEvidence, RawWorkspaceEvidence,
-    WorkspaceCollectionMethod,
-};
+use pt_common::{HeadState, PathResolutionError, RawPathEvidence};
+#[cfg(target_os = "linux")]
+use pt_common::{RawWorkspaceEvidence, WorkspaceCollectionMethod};
 
 /// Resolve workspace evidence for a process by its PID.
 ///
@@ -56,6 +55,7 @@ fn read_proc_cwd(pid: u32) -> Option<RawPathEvidence> {
 }
 
 /// Read a symlink and attempt to canonicalize its target.
+#[cfg(target_os = "linux")]
 fn read_and_canonicalize_link(link: &Path) -> Option<RawPathEvidence> {
     match fs::read_link(link) {
         Ok(target) => {

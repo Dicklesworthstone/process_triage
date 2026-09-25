@@ -4,8 +4,10 @@
 //! into child processes.
 
 use super::types::{EvidenceType, SupervisionEvidence, SupervisorCategory};
+#[cfg(any(target_os = "linux", test))]
 use crate::collect::parse_environ_content;
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
 use thiserror::Error;
 

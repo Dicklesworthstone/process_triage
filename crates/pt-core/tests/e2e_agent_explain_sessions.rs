@@ -208,7 +208,6 @@ fn explain_missing_session_returns_args_error() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn explain_live_process_returns_explanation() {
     with_temp_data_dir(|dir| {
         // Spawn a known process so we have a valid PID to explain
@@ -271,6 +270,57 @@ fn explain_live_process_returns_explanation() {
             );
             assert!(expl.get("posterior").is_some(), "Expected posterior field",);
         }
+    });
+}
+
+/// Explain reports why agent plan would skip a process (and that an ordinary one
+/// is not skipped).
+#[test]
+fn explain_reports_protection_reason() {
+    with_temp_data_dir(|dir| {
+        // argv0 "tmux: server" is what a tmux server shows; the built-in multiplexer
+        // rule protects it.
+        let mux = ProcessCommand::new("bash")
+            .args(["-c", "exec -a 'tmux: server' sleep 31"])
+            .spawn()
+            .expect("spawn fake mux");
+        let _mux = ChildGuard { child: mux };
+        let plain = ProcessCommand::new("sleep")
+            .arg("32")
+            .spawn()
+            .expect("spawn sleep");
+        let plain_pid = plain.id();
+        let _plain = ChildGuard { child: plain };
+        let mux_pid = _mux.child.id();
+        std::thread::sleep(Duration::from_millis(300));
+
+        let session_id = create_session_with_plan(dir, test_identity(mux_pid), false);
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args(["--format", "json", "agent", "explain", "--session"])
+            .arg(&session_id.0)
+            .arg("--pids")
+            .arg(format!("{mux_pid},{plain_pid}"))
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).expect("valid JSON");
+        let by_pid = |pid: u32| {
+            json["explanations"]
+                .as_array()
+                .expect("explanations")
+                .iter()
+                .find(|e| e["pid"].as_u64() == Some(u64::from(pid)))
+                .cloned()
+                .unwrap_or_else(|| panic!("pid {pid} not explained: {json}"))
+        };
+        let mux = by_pid(mux_pid);
+        assert_eq!(mux["protection"]["protected"], true, "{mux}");
+        assert_eq!(mux["protection"]["rule"], "builtin.multiplexer", "{mux}");
+        let plain = by_pid(plain_pid);
+        assert_eq!(plain["protection"]["protected"], false, "{plain}");
     });
 }
 

@@ -4,8 +4,7 @@
 //! deterministically in CI and on developer machines.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use pt_core::collect::parse_proc_stat_content;
-use pt_core::collect::proc_parsers::parse_io_content;
+use pt_core::collect::proc_parsers::{parse_io_content, parse_proc_stat_content};
 
 fn bench_parse_proc_stat_content(c: &mut Criterion) {
     // Minimum viable `/proc/<pid>/stat` content for fields accessed in parse_proc_stat_content.

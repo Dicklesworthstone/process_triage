@@ -137,6 +137,7 @@ pub fn read_signal_mask(_pid: u32) -> Result<SignalMask, NohupError> {
 }
 
 /// Parse signal mask from /proc/<pid>/status content.
+#[cfg(any(target_os = "linux", test))]
 fn parse_signal_mask(content: &str, pid: u32) -> Result<SignalMask, NohupError> {
     let mut mask = SignalMask::default();
 

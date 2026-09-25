@@ -442,7 +442,21 @@ impl ProtectedFilter {
                 ));
             }
         }
-        let session_workload = self.builtin && role.is_user_workload();
+        let mut session_workload = self.builtin && role.is_user_workload();
+        // macOS has no cgroups (the role is always Unknown there): classify by owner
+        // and executable instead.
+        if self.builtin && cfg!(target_os = "macos") && role == super::cgroup::CgroupRole::Unknown {
+            match macos_placement(&record.user, &record.comm, &record.cmd) {
+                MacPlacement::System(notes) => {
+                    return Some(make(
+                        MatchedField::Builtin,
+                        "builtin.macos_system".to_string(),
+                        Some(notes.to_string()),
+                    ));
+                }
+                MacPlacement::UserWorkload => session_workload = true,
+            }
+        }
 
         // Check protected PIDs first (fast lookup)
         if self.protected_pids.contains(&pid) {
@@ -692,7 +706,9 @@ static BUILTIN_PROTECTED: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::Laz
         builtin_rule(
             "builtin.mux_transport",
             Cmd,
-            r"^(\S*/)?(nc|ncat|netcat|socat)\s.*(frankenterm|wezterm|tmux|zellij|screen)",
+            // Local (`nc -U .../frankenterm/sock`) or over ssh (`ssh host nc -U ...`,
+            // `ssh host wezterm cli proxy`), e.g. a GUI terminal's remote domain.
+            r"^(\S*/)?(ssh\s.*\s)?(nc|ncat|netcat|socat)\s.*(frankenterm|wezterm|tmux|zellij|screen)|^(\S*/)?ssh\s.*\s(frankenterm|wezterm)\s+cli\s+proxy",
             "terminal multiplexer client transport: carries a live remote session",
         ),
         builtin_rule(
@@ -775,6 +791,49 @@ pub fn invoker_chain_pids(processes: &[ProcessRecord]) -> HashSet<u32> {
 /// login-session workloads).
 pub fn is_root_user(user: &str) -> bool {
     user.eq_ignore_ascii_case("root")
+}
+
+/// Where a macOS process sits, for built-in protection (macOS has no cgroups).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacPlacement {
+    /// Part of the system or a GUI app: protected, with the reason.
+    System(&'static str),
+    /// Owned by a real user and outside Apple's system paths and app bundles: a
+    /// candidate even when reparented to launchd (PID 1), like a Linux session workload.
+    UserWorkload,
+}
+
+/// Classify a macOS process from its owner and executable.
+///
+/// - `root` and system role accounts (`_windowserver`, `_spotlight`, `daemon`,
+///   `nobody`) run the launchd system domain;
+/// - Apple platform binaries live under /System, /usr/libexec, /usr/sbin, /sbin,
+///   /Library/Apple (not /usr/bin: user scripts run through /usr/bin/python3 etc.);
+/// - anything inside a `.app` bundle is a GUI app or one of its helpers.
+///
+/// Everything else (a user's dev server, script, or orphan whose terminal closed) is
+/// evaluated. User launchd agents land here too: they are process-group leaders, so
+/// they carry no orphan evidence, and restart/stop goes through launchctl.
+pub fn macos_placement(user: &str, comm: &str, cmd: &str) -> MacPlacement {
+    const APPLE_PATHS: [&str; 5] = [
+        "/System/",
+        "/usr/libexec/",
+        "/usr/sbin/",
+        "/sbin/",
+        "/Library/Apple/",
+    ];
+    if is_root_user(user) || user.starts_with('_') || matches!(user, "daemon" | "nobody") {
+        return MacPlacement::System("macOS system domain (root or a system role account)");
+    }
+    let exe = cmd.split_whitespace().next().unwrap_or("");
+    let from_apple = |s: &str| APPLE_PATHS.iter().any(|p| s.starts_with(p));
+    if from_apple(comm) || from_apple(exe) {
+        return MacPlacement::System("Apple platform binary");
+    }
+    if comm.contains(".app/Contents/") || cmd.contains(".app/Contents/") {
+        return MacPlacement::System("macOS app bundle (GUI app or one of its helpers)");
+    }
+    MacPlacement::UserWorkload
 }
 
 /// Name of the built-in rule for database / web / message servers.
@@ -933,6 +992,78 @@ mod tests {
         ProtectedFilter::from_guardrails(&crate::config::policy::Guardrails::default()).unwrap()
     }
 
+    #[test]
+    fn macos_placement_protects_system_and_apps_but_not_user_workloads() {
+        use MacPlacement::*;
+        let system = [
+            ("root", "/usr/sbin/cfprefsd", "/usr/sbin/cfprefsd daemon"),
+            ("_windowserver", "WindowServer", "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon"),
+            ("nobody", "x", "x"),
+            ("alice", "/usr/libexec/trustd", "/usr/libexec/trustd --agent"),
+            ("alice", "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder", "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"),
+            ("alice", "Google Chrome Helper", "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=renderer"),
+            ("alice", "Zed", "/Applications/Zed.app/Contents/MacOS/zed"),
+        ];
+        for (user, comm, cmd) in system {
+            assert!(
+                matches!(macos_placement(user, comm, cmd), System(_)),
+                "{user} {cmd}"
+            );
+        }
+        let workloads = [
+            ("alice", "python3", "python3 -m http.server 8000"),
+            (
+                "alice",
+                "node",
+                "/Users/alice/.nvm/versions/node/v22/bin/node server.js",
+            ),
+            ("alice", "sleep", "sleep 7777"),
+            ("alice", "python3", "/usr/bin/python3 train.py"),
+            (
+                "alice",
+                "com.microsoft.teams2.agent",
+                "/Users/alice/Library/Application Support/x/com.microsoft.teams2.agent",
+            ),
+        ];
+        for (user, comm, cmd) in workloads {
+            assert_eq!(
+                macos_placement(user, comm, cmd),
+                UserWorkload,
+                "{user} {cmd}"
+            );
+        }
+    }
+
+    /// On macOS a user's orphan (reparented to launchd, PID 1) is a candidate, while
+    /// system, Apple and app-bundle processes stay protected.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_user_orphans_are_evaluated() {
+        let filter = default_filter();
+        let orphan = make_test_record(
+            1 << 22,
+            1,
+            "python3",
+            "python3 -m http.server 8000",
+            "alice",
+        );
+        assert!(
+            filter.is_protected(&orphan).is_none(),
+            "user orphan must be evaluated"
+        );
+        let helper = make_test_record(
+            (1 << 22) + 1,
+            1,
+            "Slack Helper",
+            "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app/Contents/MacOS/Slack Helper",
+            "alice",
+        );
+        let m = filter.is_protected(&helper).expect("app helper protected");
+        assert_eq!(m.pattern, "builtin.macos_system");
+        let daemon = make_test_record((1 << 22) + 2, 1, "trustd", "/usr/libexec/trustd", "alice");
+        assert!(filter.is_protected(&daemon).is_some());
+    }
+
     /// Database / web servers are protected by name even under rewritten titles
     /// (vmi workers, 2026-09-24: "postgres: 18/main: io worker" was rated abandoned).
     #[test]
@@ -1048,6 +1179,9 @@ mod tests {
             ("bash", "bash --login"),
             ("login", "login -- ubuntu"),
             ("nc", "nc -U /run/user/1000/frankenterm/sock"),
+            // A Mac's terminal remote domain (mac-mini-max, 16 of these, ppid 1, 30 h old).
+            ("ssh", "ssh -i /Users/u/.ssh/key -o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=30 u@host nc -U /run/user/1000/frankenterm/sock"),
+            ("ssh", "ssh -T host wezterm cli proxy"),
         ];
         let filter = default_filter();
         for (comm, cmd) in cases {
@@ -1068,6 +1202,8 @@ mod tests {
             ("cargo", "/root/.rustup/toolchains/nightly/bin/cargo test --locked --all-targets"),
             ("sleep", "sleep 14400"),
             ("ssh", "ssh ts2 uptime"),
+            ("ssh", "ssh ts2 tmux ls"),
+            ("ssh", "ssh ts2 nc -z db 5432"),
             ("node", "node /data/projects/app/node_modules/.bin/next dev"),
             ("bun", "bun test"),
         ];
@@ -1122,10 +1258,12 @@ mod tests {
         let m = filter
             .is_protected_with_role(&rec, CgroupRole::Unknown)
             .expect("protected without cgroup evidence");
-        assert!(matches!(
-            m.matched_field,
-            MatchedField::Ppid | MatchedField::User
-        ));
+        // (On macOS root is the launchd system domain: protected by that built-in rule.)
+        assert!(
+            matches!(m.matched_field, MatchedField::Ppid | MatchedField::User)
+                || (cfg!(target_os = "macos") && m.matched_field == MatchedField::Builtin),
+            "{m:?}"
+        );
         // System services are protected regardless of user (a unit the name rules
         // do not know, so only its cgroup placement protects it).
         let app = make_test_record(

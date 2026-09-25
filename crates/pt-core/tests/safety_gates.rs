@@ -16,9 +16,10 @@ use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
 use pt_core::action::executor::{
     ActionExecutor, ActionStatus, NoopActionRunner, StaticIdentityProvider,
 };
+#[cfg(target_os = "linux")]
+use pt_core::action::prechecks::PreCheckResult;
 use pt_core::action::prechecks::{
     LivePreCheckConfig, LivePreCheckProvider, NoopPreCheckProvider, PreCheckProvider,
-    PreCheckResult,
 };
 use pt_core::collect::{ProcessRecord, ProcessState, ProtectedFilter, ScanMetadata, ScanResult};
 use pt_core::config::Policy;
@@ -379,6 +380,7 @@ mod zombie_handling {
         // (The decision engine should handle this routing)
     }
 
+    #[cfg(target_os = "linux")]
     fn parse_state_from_stat(stat: &str) -> ProcessState {
         // Format: pid (comm) state ...
         if let Some(close_paren) = stat.rfind(')') {

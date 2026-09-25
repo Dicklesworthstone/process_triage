@@ -14,6 +14,7 @@
 use super::nohup::{detect_nohup, BackgroundIntent, NohupError, NohupResult};
 use super::{detect_supervision, CombinedResult, DetectionError, SupervisorCategory};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
 use std::fs;
 use thiserror::Error;
 
@@ -431,17 +432,19 @@ impl OrphanAnalyzer {
             result.confidence = 0.7;
             result.explanation =
                 "On macOS, PPID=1 (launchd) is often expected for daemons".to_string();
-            return Ok(result);
         }
 
         // No supervision or intentional backgrounding detected
         // This is unexpected reparenting - evidence of abandonment
-        result.unexpected_reparenting = true;
-        result.reason = ReparentingReason::ReparentedToInitWithoutSupervision;
-        result.confidence = 0.8;
-        result.explanation =
-            "Process orphaned to init with no detected supervision or intentional backgrounding"
-                .to_string();
+        #[cfg(not(target_os = "macos"))]
+        {
+            result.unexpected_reparenting = true;
+            result.reason = ReparentingReason::ReparentedToInitWithoutSupervision;
+            result.confidence = 0.8;
+            result.explanation =
+                "Process orphaned to init with no detected supervision or intentional backgrounding"
+                    .to_string();
+        }
 
         Ok(result)
     }

@@ -564,6 +564,7 @@ impl Drop for PidFd {
 }
 
 /// Values of a `boot_id:start_ticks:pid` start id that are known (not placeholders).
+#[cfg(any(target_os = "linux", test))]
 fn parse_start_id(id: &str) -> (Option<&str>, Option<u64>, Option<u32>) {
     let parts: Vec<&str> = id.split(':').collect();
     let known = |s: &str| !s.is_empty() && !matches!(s, "unknown" | "synthetic");
@@ -584,6 +585,7 @@ fn parse_start_id(id: &str) -> (Option<&str>, Option<u64>, Option<u32>) {
 /// exactly. Plans record exact /proc start ticks on Linux, so the old +-150-tick
 /// tolerance (for ps-estimated ids) only widened the PID-reuse window, and the old
 /// check ignored the boot id entirely.
+#[cfg(any(target_os = "linux", test))]
 fn ids_match(expected: &str, current: &str) -> bool {
     if expected == current {
         return true;

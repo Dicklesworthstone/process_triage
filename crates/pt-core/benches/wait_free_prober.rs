@@ -1,7 +1,11 @@
+#[cfg(target_os = "linux")]
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+#[cfg(target_os = "linux")]
 use pt_core::collect::{deep_scan, DeepScanOptions};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 fn bench_deep_scan_wait_free(c: &mut Criterion) {
     let mut group = c.benchmark_group("deep_scan");
     group.measurement_time(Duration::from_secs(10));
@@ -38,5 +42,11 @@ fn bench_deep_scan_wait_free(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(target_os = "linux")]
 criterion_group!(benches, bench_deep_scan_wait_free);
+#[cfg(target_os = "linux")]
 criterion_main!(benches);
+
+// Deep scan (and its wait-free prober) is Linux-only.
+#[cfg(not(target_os = "linux"))]
+fn main() {}

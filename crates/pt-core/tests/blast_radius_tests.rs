@@ -14,6 +14,7 @@ use pt_core::decision::robot_constraints::{
     ConstraintChecker, ConstraintKind, RobotCandidate, RuntimeRobotConstraints,
 };
 use pt_core::inference::belief_prop::{BeliefPropConfig, BeliefPropagator, ProcessNode, State};
+#[cfg(target_os = "linux")]
 use pt_core::inference::impact::{ImpactComponents, ImpactSeverity, SupervisorLevel};
 use std::collections::HashMap;
 
@@ -526,6 +527,8 @@ fn test_risk_propagation_no_coupling() {
 // Unit Tests: Impact Scoring
 // ============================================================================
 
+// pt_core::inference::impact is Linux-only.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_impact_score_isolated_process() {
     // Low impact: no children, no network, no critical files
@@ -546,6 +549,7 @@ fn test_impact_score_isolated_process() {
     assert_eq!(severity, ImpactSeverity::Low);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_impact_score_supervised_process() {
     // High impact: supervised by agent
@@ -559,6 +563,7 @@ fn test_impact_score_supervised_process() {
     assert_eq!(weight, 1.0, "Agent supervision should have max protection");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_impact_score_child_count_effect() {
     // Test that child count affects impact through ImpactComponents
@@ -586,6 +591,7 @@ fn test_impact_score_child_count_effect() {
     assert!(many_children.child_count > with_children.child_count);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_impact_severity_thresholds() {
     assert_eq!(ImpactSeverity::from_score(0.0), ImpactSeverity::Low);

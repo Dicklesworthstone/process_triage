@@ -759,7 +759,8 @@ MOCK_CURL
     run bash "$INSTALLER_PATH"
 
     [ "$status" -ne 0 ]
-    [[ "$output" == *"Could not download signature for pt"* ]]
+    [[ "$output" == *"does not publish pt.sig"* ]]
+    [ ! -e "$INSTALL_DEST/pt" ]
 
     test_end "missing pt signature" "pass"
 }
@@ -778,7 +779,8 @@ MOCK_CURL
     run bash "$INSTALLER_PATH"
 
     [ "$status" -ne 0 ]
-    [[ "$output" == *"Could not download signature for pt-core"* ]]
+    [[ "$output" == *"does not publish pt-core-"*".sig"* ]]
+    [ ! -e "$INSTALL_DEST/pt-core" ]
 
     test_end "missing pt-core signature" "pass"
 }

@@ -6,10 +6,13 @@
 use super::types::{
     AncestryEntry, EvidenceType, SupervisionEvidence, SupervisionResult, SupervisorDatabase,
 };
+#[cfg(target_os = "linux")]
 use crate::collect::proc_parsers::{parse_proc_cmdline, parse_proc_stat};
 use pt_common::ProcessId;
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use thiserror::Error;
 

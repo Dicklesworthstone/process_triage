@@ -31,6 +31,7 @@ mod deep_scan;
 #[cfg(target_os = "linux")]
 pub mod gpu;
 pub mod incremental;
+#[cfg(target_os = "linux")]
 pub mod lineage_collector;
 #[cfg(target_os = "linux")]
 pub mod network;

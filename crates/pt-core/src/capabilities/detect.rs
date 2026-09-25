@@ -1086,6 +1086,14 @@ mod tests {
             assert!(sources.procfs);
             assert!(sources.sysfs);
         }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS has no procfs/sysfs; collection goes through ps/lsof/sysctl.
+            assert!(!sources.procfs);
+            assert!(!sources.sysfs);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = sources;
     }
 
     #[test]

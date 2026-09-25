@@ -477,7 +477,7 @@ EOF
     run_installer
 
     [ "$status" -ne 0 ]
-    [[ "$output" == *"Could not download signature for pt"* ]]
+    [[ "$output" == *"does not publish pt.sig"* ]]
 
     test_end "tampered missing signature" "pass"
 }

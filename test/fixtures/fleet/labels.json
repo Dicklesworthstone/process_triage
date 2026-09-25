@@ -5,7 +5,7 @@
     "_comment": "Candidates matching these must never be recommended for any action other than keep/review (kill, restart, pause, renice, throttle, freeze, quarantine are all violations). Regexes are matched against the full command line.",
     "agent_cli": "(^|/)(claude|codex|agy|agy-real|gemini|cursor-agent|aider|opencode|goose)(\\s|$)|/claude/versions/|@anthropic-ai/claude-code|@openai/codex|/codex-(linux|darwin)-",
     "mux_server": "(^|/)((frankenterm|wezterm)-mux-server|tmux|zellij|screen)(:|\\s|$)",
-    "mux_transport": "^(\\S*/)?(nc|ncat|netcat|socat)\\s.*(frankenterm|wezterm|tmux|zellij)",
+    "mux_transport": "^(\\S*/)?(ssh\\s.*\\s)?(nc|ncat|netcat|socat)\\s.*(frankenterm|wezterm|tmux|zellij)|^(\\S*/)?ssh\\s.*\\s(frankenterm|wezterm)\\s+cli\\s+proxy",
     "ssh_control_master": "^(\\S*/)?ssh\\s(.*\\s)?(-M{1,2}|-oControlMaster=\\S+|ControlMaster=(yes|auto|autoask|ask))(\\s|$)",
     "session_infra": "^(\\S*/)?(sshd(-session)?|login|agetty|getty|\\(sd-pam\\)|systemd|dbus-daemon|dbus-broker|pipewire|wireplumber|pulseaudio|gpg-agent|ssh-agent)(:|\\s|$)",
     "db_web_worker": "^(postgres:|nginx: |mysqld|redis-server|/mattermost/)",

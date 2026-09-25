@@ -22,11 +22,15 @@ use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
 use pt_core::action::executor::{
     ActionExecutor, ActionStatus, ExecutionResult, NoopActionRunner, StaticIdentityProvider,
 };
+use pt_core::action::prechecks::NoopPreCheckProvider;
+// Live prechecks and nice-value checks are exercised by Linux-only tests.
+#[cfg(target_os = "linux")]
 use pt_core::action::prechecks::{
-    LivePreCheckConfig, LivePreCheckProvider, NoopPreCheckProvider, PreCheckProvider,
-    PreCheckResult,
+    LivePreCheckConfig, LivePreCheckProvider, PreCheckProvider, PreCheckResult,
 };
-use pt_core::action::{ReniceActionRunner, ReniceConfig, SignalActionRunner, SignalConfig};
+#[cfg(target_os = "linux")]
+use pt_core::action::ReniceConfig;
+use pt_core::action::{ReniceActionRunner, SignalActionRunner, SignalConfig};
 use pt_core::decision::Action;
 use pt_core::plan::{
     ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, GatesSummary, Plan,
@@ -666,12 +670,21 @@ mod staged_kill_escalation {
         let mut is_zombie = false;
         for i in 0..20 {
             #[cfg(target_os = "linux")]
-            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
-                if stat.contains(") Z ") {
-                    is_zombie = true;
-                    ctx.log("zombie_detected", json!({ "pid": pid, "attempts": i + 1 }));
-                    break;
-                }
+            let zombie_now = std::fs::read_to_string(format!("/proc/{}/stat", pid))
+                .is_ok_and(|stat| stat.contains(") Z "));
+            #[cfg(not(target_os = "linux"))]
+            let zombie_now = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim_start()
+                        .starts_with('Z')
+                });
+            if zombie_now {
+                is_zombie = true;
+                ctx.log("zombie_detected", json!({ "pid": pid, "attempts": i + 1 }));
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1118,6 +1131,8 @@ mod renice_action {
 // SCENARIO 5: Cgroup Throttle Action (Placeholder - pending sj6.6)
 // ============================================================================
 
+// cgroup v2 throttling is Linux-only.
+#[cfg(target_os = "linux")]
 mod cgroup_throttle_action {
     use super::*;
     use pt_core::action::executor::ActionRunner;
@@ -1388,6 +1403,8 @@ mod cgroup_throttle_action {
 // SCENARIO 6: Cgroup Freeze Action (Placeholder - pending sj6.5)
 // ============================================================================
 
+// cgroup v2 freezing is Linux-only.
+#[cfg(target_os = "linux")]
 mod cgroup_freeze_action {
     use super::*;
     use pt_core::action::executor::ActionRunner;
