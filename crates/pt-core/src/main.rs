@@ -13678,7 +13678,11 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
     };
 
     // Load priors from config or use defaults
-    let (priors, decisions) = match load_priors_for_explain(global) {
+    let ExplainContext {
+        priors,
+        decisions,
+        protected,
+    } = match load_priors_for_explain(global) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("agent explain: failed to load priors: {}", e);
@@ -13726,8 +13730,12 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         let record = scan_result.processes.iter().find(|p| p.pid.0 == *pid);
         match record {
             Some(proc) => {
-                let explanation =
+                let mut explanation =
                     build_process_explanation(proc, &priors, decisions.as_ref(), args);
+                if let Some(ref filter) = protected {
+                    // agent plan skips protected processes; say so and why.
+                    explanation["protection"] = explain_protection(filter, proc);
+                }
                 explanations.push(explanation);
             }
             None => {
@@ -13855,27 +13863,56 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
 }
 
 /// Load priors (and learned decisions, if readable) from config with fallback to defaults.
-fn load_priors_for_explain(
-    global: &GlobalOpts,
-) -> Result<
-    (
-        Priors,
-        Option<pt_core::decision::decision_store::DecisionStore>,
-    ),
-    ConfigError,
-> {
+fn load_priors_for_explain(global: &GlobalOpts) -> Result<ExplainContext, ConfigError> {
     let opts = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
         priors_path: None,
         policy_path: None,
     };
-    match load_config(&opts) {
+    let (priors, decisions, guardrails) = match load_config(&opts) {
         Ok(resolved) => {
             let decisions =
                 pt_core::decision::decision_store::DecisionStore::load(&resolved.config_dir).ok();
-            Ok((resolved.priors, decisions))
+            (resolved.priors, decisions, resolved.policy.guardrails)
         }
-        Err(_) => Ok((Priors::default(), None)),
+        Err(_) => (Priors::default(), None, Default::default()),
+    };
+    Ok(ExplainContext {
+        priors,
+        decisions,
+        protected: ProtectedFilter::from_guardrails(&guardrails).ok(),
+    })
+}
+
+/// What `agent explain` evaluates a process against.
+struct ExplainContext {
+    priors: Priors,
+    decisions: Option<pt_core::decision::decision_store::DecisionStore>,
+    protected: Option<ProtectedFilter>,
+}
+
+/// Why a process would be skipped by `agent plan` (not evaluated), if it would be.
+fn explain_protection(filter: &ProtectedFilter, proc: &ProcessRecord) -> serde_json::Value {
+    let hit = filter
+        .is_protected(proc)
+        .map(|m| (m.pattern, m.notes))
+        .or_else(|| {
+            filter
+                .builtin_enabled()
+                .then(|| pt_core::collect::protected::live_service_ancestor(proc.pid.0))
+                .flatten()
+                .map(|(pid, daemon)| {
+                    (
+                        "builtin.service_child".to_string(),
+                        Some(format!("worker/plugin of service {daemon} (pid {pid})")),
+                    )
+                })
+        });
+    match hit {
+        Some((rule, notes)) => {
+            serde_json::json!({ "protected": true, "rule": rule, "notes": notes })
+        }
+        None => serde_json::json!({ "protected": false }),
     }
 }
 

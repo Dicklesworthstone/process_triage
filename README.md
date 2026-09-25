@@ -393,6 +393,7 @@ Protection has two layers:
   - database / web / message servers by name, even under rewritten titles (`postgres: … io worker`, `nginx: worker process`; also mysqld/mariadbd, redis/valkey, mongod, memcached, httpd/apache2, caddy, haproxy, traefik, php-fpm, clickhouse, etcd, rabbitmq, mattermost, minio, elasticsearch), **and every descendant of one** (workers, plugins), wherever they run: systemd, docker or a plain shell. `pt agent plan` reports the per-rule counts in `summary.protected_by_rule`;
   - on Linux, anything supervised by systemd (`system.slice/*.service`, user units) or a container runtime, which covers postgres/nginx/mysql workers, docker containers and the like;
   - AI agent CLIs (claude, codex, gemini/agy, …) are never pre-selected or robot-killed; they are shown for manual review.
+- On macOS (no cgroups), placement comes from owner and executable: `root` and system role accounts (`_windowserver`, …), Apple platform binaries (`/System`, `/usr/libexec`, `/usr/sbin`, `/sbin`, `/Library/Apple`) and anything inside a `.app` bundle (GUI apps and their helpers) are protected (`builtin.macos_system`). A real user's other processes are evaluated even after being reparented to launchd (PID 1), which is how a dev server orphaned by a closed terminal looks there.
 - On Linux, a workload started inside a login session (for example a build running as root over SSH on a build worker, or an orphan reparented to PID 1) is **not** covered by the root-user / PID-1 rules, because it is a candidate rather than a system service.
 
 ### Staged Kill Signals
