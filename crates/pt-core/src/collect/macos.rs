@@ -684,8 +684,8 @@ pub struct MacBsdInfo {
     pub ppid: u32,
 }
 
-/// Read [`MacBsdInfo`] for `pid`; `None` if it is gone or not readable.
-pub fn read_bsd_info(pid: u32) -> Option<MacBsdInfo> {
+/// Raw `proc_bsdinfo` for `pid`; `None` if it is gone or not readable.
+fn raw_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     let pid = i32::try_from(pid).ok()?;
     // SAFETY: proc_bsdinfo is plain old data; proc_pidinfo writes at most `size` bytes.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -699,9 +699,57 @@ pub fn read_bsd_info(pid: u32) -> Option<MacBsdInfo> {
             size,
         )
     };
-    if n != size {
-        return None;
-    }
+    (n == size).then_some(info)
+}
+
+/// Session facts for `pid` in the shape of a Linux `/proc/<pid>/stat` record (the
+/// fields session safety uses: pid, comm, state, ppid, pgrp, session, tty, tpgid;
+/// the rest are zero). `tty_nr` is 0 when there is no controlling terminal, as on
+/// Linux.
+pub fn read_session_stat(pid: u32) -> Option<crate::collect::proc_parsers::ProcessStat> {
+    let info = raw_bsd_info(pid)?;
+    // SAFETY: getsid only reads kernel state for the pid.
+    let session = unsafe { libc::getsid(pid as libc::pid_t) };
+    // SAFETY: pbi_comm is a NUL-terminated C string within the struct (zeroed first).
+    let comm = unsafe { std::ffi::CStr::from_ptr(info.pbi_comm.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    // NODEV (all bits set) means no controlling terminal.
+    let tty_nr = if info.e_tdev == u32::MAX {
+        0
+    } else {
+        info.e_tdev as i32
+    };
+    let state = match info.pbi_status {
+        1 => 'I', // SIDL
+        2 => 'R', // SRUN
+        3 => 'S', // SSLEEP
+        4 => 'T', // SSTOP
+        5 => 'Z', // SZOMB
+        _ => '?',
+    };
+    Some(crate::collect::proc_parsers::ProcessStat {
+        pid,
+        comm,
+        state,
+        ppid: info.pbi_ppid,
+        pgrp: info.pbi_pgid as i32,
+        session,
+        tty_nr,
+        tpgid: info.e_tpgid as i32,
+        utime: 0,
+        stime: 0,
+        starttime: 0,
+        vsize: 0,
+        rss: 0,
+        nice: info.pbi_nice,
+        num_threads: 0,
+    })
+}
+
+/// Read [`MacBsdInfo`] for `pid`; `None` if it is gone or not readable.
+pub fn read_bsd_info(pid: u32) -> Option<MacBsdInfo> {
+    let info = raw_bsd_info(pid)?;
     Some(MacBsdInfo {
         start_us: info
             .pbi_start_tvsec

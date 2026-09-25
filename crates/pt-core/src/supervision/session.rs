@@ -33,7 +33,7 @@
 use super::environ::read_environ;
 use super::types::SupervisionEvidence;
 use serde::Serialize;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -180,7 +180,9 @@ impl From<SessionEvidence> for SupervisionEvidence {
 }
 
 #[cfg(target_os = "linux")]
-use crate::collect::{parse_proc_stat, ProcessStat};
+use crate::collect::parse_proc_stat;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::collect::proc_parsers::ProcessStat;
 
 /// SSH connection information.
 #[derive(Debug, Clone, Serialize)]
@@ -381,7 +383,7 @@ impl Default for SessionConfig {
 }
 
 /// Shell process names for parent shell detection.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const SHELL_NAMES: &[&str] = &[
     "bash", "sh", "zsh", "fish", "dash", "tcsh", "csh", "ksh", "ash",
 ];
@@ -390,7 +392,7 @@ const SHELL_NAMES: &[&str] = &[
 pub struct SessionAnalyzer {
     config: SessionConfig,
     /// Cache of parsed proc stats.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     stat_cache: HashMap<u32, ProcessStat>,
 }
 
@@ -399,7 +401,7 @@ impl SessionAnalyzer {
     pub fn new() -> Self {
         Self {
             config: SessionConfig::default(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             stat_cache: HashMap::new(),
         }
     }
@@ -408,25 +410,30 @@ impl SessionAnalyzer {
     pub fn with_config(config: SessionConfig) -> Self {
         Self {
             config,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             stat_cache: HashMap::new(),
         }
     }
 
     /// Clear the internal cache.
     pub fn clear_cache(&mut self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.stat_cache.clear();
     }
 
-    /// Get or fetch ProcessStat for a pid.
-    #[cfg(target_os = "linux")]
+    /// Get or fetch the session facts for a pid (/proc on Linux, proc_pidinfo +
+    /// getsid on macOS).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn get_stat(&mut self, pid: u32) -> Option<ProcessStat> {
         if let Some(stat) = self.stat_cache.get(&pid) {
             return Some(stat.clone());
         }
 
-        if let Some(stat) = parse_proc_stat(pid) {
+        #[cfg(target_os = "linux")]
+        let fetched = parse_proc_stat(pid);
+        #[cfg(target_os = "macos")]
+        let fetched = crate::collect::macos::read_session_stat(pid);
+        if let Some(stat) = fetched {
             self.stat_cache.insert(pid, stat.clone());
             Some(stat)
         } else {
@@ -435,7 +442,7 @@ impl SessionAnalyzer {
     }
 
     /// Walk the parent chain from a PID up to init.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn get_ancestry(&mut self, pid: u32) -> Vec<u32> {
         let mut chain = vec![pid];
         let mut current = pid;
@@ -459,7 +466,7 @@ impl SessionAnalyzer {
     }
 
     /// Check if a process name is a shell.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn is_shell(&self, comm: &str) -> bool {
         SHELL_NAMES.contains(&comm)
     }
@@ -471,7 +478,7 @@ impl SessionAnalyzer {
         let mut protection_types = Vec::new();
         let mut evidence = Vec::new();
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             // Get stat info for both processes
             let target_stat = self
@@ -582,8 +589,8 @@ impl SessionAnalyzer {
                     }
                 }
 
-                // Also check if target is in a tmux process tree (Linux only for ancestry check)
-                #[cfg(target_os = "linux")]
+                // Also check if target is in a tmux process tree
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 if let Some(stat) = self.get_stat(target_pid) {
                     if stat.comm == "tmux" || stat.comm == "tmux: server" {
                         // Check if this tmux serves our session
@@ -621,7 +628,7 @@ impl SessionAnalyzer {
                 }
 
                 // Also check if target is in a screen process tree
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 if let Some(stat) = self.get_stat(target_pid) {
                     if stat.comm == "screen" || stat.comm == "SCREEN" {
                         let target_ancestry = self.get_ancestry(pt_pid);
@@ -643,8 +650,8 @@ impl SessionAnalyzer {
 
         // Check 5: SSH chain protection
         if self.config.protect_ssh_chains {
-            // Check if pt is in an SSH session (the ancestry check needs /proc)
-            #[cfg(target_os = "linux")]
+            // Check if pt is in an SSH session (needs the process ancestry)
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Some(pt_ssh) = detect_ssh_connection(pt_pid) {
                 // If target is sshd and in our ancestry, protect it
                 if let Some(stat) = self.get_stat(target_pid) {
@@ -710,7 +717,7 @@ impl SessionAnalyzer {
             SessionResult::not_protected()
         };
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let result = match self.get_stat(target_pid) {
             Some(stat) => {
                 result.with_session_info(stat.session as u32, stat.pgrp as u32, stat.tty_nr)
@@ -876,6 +883,84 @@ mod tests {
         assert!(config.protect_parent_shells);
         assert!(config.protect_multiplexers);
         assert!(config.protect_ssh_chains);
+    }
+
+    /// Session safety on the live OS (Linux /proc, macOS proc_pidinfo + getsid).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod live_session_tests {
+        use super::*;
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        struct Reap(std::process::Child, Option<u32>);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                if let Some(pid) = self.1 {
+                    // SAFETY: kill(2) on a pid this test created.
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                }
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// `sh` leads a new session; returns it plus the pid of a non-leader member.
+        fn foreign_session() -> Reap {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 60 </dev/null >/dev/null 2>&1 & echo $!; wait"])
+                .stdout(Stdio::piped())
+                .env_remove("SSH_CONNECTION")
+                .env_remove("SSH_CLIENT");
+            // SAFETY: setsid is async-signal-safe and only affects the child.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut leader = cmd.spawn().expect("spawn");
+            let mut line = String::new();
+            std::io::BufReader::new(leader.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let member = line.trim().parse().expect("member pid");
+            Reap(leader, Some(member))
+        }
+
+        fn types(target: u32) -> Vec<SessionProtectionType> {
+            let mut analyzer = SessionAnalyzer::new();
+            analyzer
+                .analyze(target, std::process::id())
+                .expect("analyze")
+                .protection_types
+        }
+
+        #[test]
+        fn own_session_child_is_protected() {
+            let child = Reap(Command::new("sleep").arg("60").spawn().unwrap(), None);
+            let t = types(child.0.id());
+            assert!(t.contains(&SessionProtectionType::SameSession), "{t:?}");
+        }
+
+        #[test]
+        fn foreign_session_leader_is_protected_member_is_not() {
+            let session = foreign_session();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let leader = types(session.0.id());
+            assert!(
+                leader.contains(&SessionProtectionType::SessionLeader),
+                "{leader:?}"
+            );
+            let member = types(session.1.unwrap());
+            assert!(
+                !member.contains(&SessionProtectionType::SameSession)
+                    && !member.contains(&SessionProtectionType::SessionLeader),
+                "{member:?}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
