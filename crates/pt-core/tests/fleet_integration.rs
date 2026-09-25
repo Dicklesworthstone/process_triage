@@ -21,6 +21,7 @@ use pt_core::session::fleet::{
 fn plan(total: u64, candidates: &[(u32, &str, &str, &str, f64)]) -> RemotePlan {
     RemotePlan {
         generated_at: "2026-09-25T10:00:00Z".to_string(),
+        pt_version: Some("2.1.0".to_string()),
         total_processes: total,
         candidates: candidates
             .iter()

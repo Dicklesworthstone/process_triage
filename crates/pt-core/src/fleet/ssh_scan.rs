@@ -157,6 +157,9 @@ pub struct RemoteCandidate {
 pub struct RemotePlan {
     /// When the host produced the plan (RFC 3339).
     pub generated_at: String,
+    /// pt version that produced the plan on the host.
+    #[serde(default)]
+    pub pt_version: Option<String>,
     pub total_processes: u64,
     pub candidates: Vec<RemoteCandidate>,
 }
@@ -189,6 +192,7 @@ pub fn parse_remote_plan(json: &str) -> Result<RemotePlan, String> {
         .collect::<Result<Vec<_>, &str>>()?;
     Ok(RemotePlan {
         generated_at: v["generated_at"].as_str().unwrap_or_default().to_string(),
+        pt_version: v["pt_version"].as_str().map(str::to_string),
         total_processes,
         candidates,
     })
@@ -275,6 +279,17 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
+
+    if output.timed_out {
+        return HostScanResult {
+            host: host.to_string(),
+            success: false,
+            plan: None,
+            error: Some(format!("timed out after {}s", config.command_timeout)),
+            duration_ms,
+            provenance: None,
+        };
+    }
 
     // `agent plan` exits 0 (nothing to do) or 1 (plan has candidates).
     if !matches!(output.exit_code, Some(0) | Some(1)) {
@@ -495,6 +510,7 @@ mod tests {
 
     const PLAN_JSON: &str = r#"{
         "generated_at": "2026-09-25T10:00:00Z",
+        "pt_version": "2.1.0",
         "summary": {"total_processes_scanned": 412},
         "candidates": [
             {"pid": 4242, "command_short": "sleep", "classification": "zombie",
@@ -510,6 +526,7 @@ mod tests {
     fn parse_remote_plan_reads_the_hosts_decisions() {
         let plan = parse_remote_plan(PLAN_JSON).unwrap();
         assert_eq!(plan.generated_at, "2026-09-25T10:00:00Z");
+        assert_eq!(plan.pt_version.as_deref(), Some("2.1.0"));
         assert_eq!(plan.total_processes, 412);
         assert_eq!(plan.candidates.len(), 2);
         let z = &plan.candidates[0];

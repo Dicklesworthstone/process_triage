@@ -927,6 +927,11 @@ pub fn run_tool(
     let mut config = ToolConfig::default();
     if let Some(t) = timeout {
         config.default_timeout = t;
+        // A standalone call's budget is its own timeout. (The default 5 s budget
+        // silently capped every call: a 300 s ssh was SIGTERMed after 5 s.)
+        config.budget_ms = config
+            .budget_ms
+            .max(u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
     }
     if let Some(m) = max_output {
         config.max_output_bytes = m;
@@ -1056,6 +1061,17 @@ mod tests {
         );
         // Process should have been killed (allow extra slack for busy CI)
         assert!(output.duration < Duration::from_secs(5));
+    }
+
+    /// Regression: the free `run_tool` capped every call at the default 5 s budget,
+    /// whatever timeout the caller asked for (fleet ssh plans died with 255).
+    #[test]
+    fn run_tool_honors_timeouts_longer_than_default_budget() {
+        let output =
+            run_tool("sleep", &["6"], Some(Duration::from_secs(20)), None).expect("sleep runs");
+        assert!(!output.timed_out, "{output:?}");
+        assert_eq!(output.exit_code, Some(0), "{output:?}");
+        assert!(output.duration >= Duration::from_secs(6));
     }
 
     #[test]

@@ -5880,6 +5880,17 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
             "failed": scan_result.failed,
             "duration_ms": scan_result.duration_ms,
         },
+        // Which pt produced each host's plan; hosts on another version than this
+        // one are flagged (their decisions follow that version's model).
+        "host_versions": scan_result.results.iter().map(|r| {
+            let version = r.plan.as_ref().and_then(|p| p.pt_version.clone());
+            serde_json::json!({
+                "host": r.host,
+                "success": r.success,
+                "pt_version": version,
+                "matches_local": version.as_deref() == Some(env!("CARGO_PKG_VERSION")),
+            })
+        }).collect::<Vec<_>>(),
         "inputs": {
             "hosts_spec": args.hosts,
             "inventory_path": args.inventory,
@@ -5919,6 +5930,17 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
                 scan_result.duration_ms,
             );
             println!("Fleet session: {}", fleet_session_id.0);
+            for r in scan_result.results.iter().filter(|r| r.success) {
+                let version = r.plan.as_ref().and_then(|p| p.pt_version.as_deref());
+                if version != Some(env!("CARGO_PKG_VERSION")) {
+                    println!(
+                        "  {}: pt {} (local {})",
+                        r.host,
+                        version.unwrap_or("unknown"),
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
+            }
             if !warnings.is_empty() {
                 println!();
                 println!("Warnings:");
