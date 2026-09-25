@@ -188,7 +188,6 @@ harness = false
 [[test]]
 name = "fleet_integration"
 path = "tests/fleet_integration.rs"
-required-features = ["test-utils"]
 
 [[test]]
 name = "container_gpu_detection"

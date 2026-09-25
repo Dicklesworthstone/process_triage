@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use pt_core::fleet::discovery::{FleetDiscoveryConfig, ProviderConfig, ProviderRegistry};
 use pt_core::fleet::inventory::{parse_inventory_str, InventoryFormat};
 use pt_core::fleet::ssh_scan::{
-    scan_result_to_host_input, FleetScanResult, HostScanResult, SshScanConfig,
+    parse_remote_plan, scan_result_to_host_input, FleetScanResult, HostScanResult, RemoteCandidate,
+    RemotePlan, SshScanConfig,
 };
-use pt_core::mock_process::{MockProcessBuilder, MockScanBuilder};
 use pt_core::session::fleet::{
     create_fleet_session, record_alpha_spend, CandidateInfo, FleetSession, HostInput,
 };
@@ -16,6 +16,24 @@ use pt_core::session::fleet::{
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// A host's `agent plan` result: (pid, comm, classification, recommendation, score).
+fn plan(total: u64, candidates: &[(u32, &str, &str, &str, f64)]) -> RemotePlan {
+    RemotePlan {
+        generated_at: "2026-09-25T10:00:00Z".to_string(),
+        total_processes: total,
+        candidates: candidates
+            .iter()
+            .map(|&(pid, comm, class, rec, score)| RemoteCandidate {
+                pid,
+                comm: comm.to_string(),
+                classification: class.to_string(),
+                recommendation: rec.to_string(),
+                score,
+            })
+            .collect(),
+    }
+}
 
 fn host_input(id: &str, candidates: Vec<CandidateInfo>) -> HostInput {
     HostInput {
@@ -293,113 +311,71 @@ fn ssh_config_defaults_are_sane() {
 }
 
 #[test]
-fn scan_result_conversion_zombie_becomes_candidate() {
-    let zombie = MockProcessBuilder::new()
-        .pid(42)
-        .comm("dead_worker")
-        .state_zombie()
-        .elapsed_hours(2)
-        .build();
-    let scan = MockScanBuilder::new().with_process(zombie).build();
-
-    let host_result = HostScanResult {
-        host: "server1".to_string(),
-        success: true,
-        scan: Some(scan),
-        error: None,
-        duration_ms: 150,
-        provenance: None,
-    };
-
-    let input = scan_result_to_host_input(&host_result);
-    assert_eq!(input.host_id, "server1");
-    assert_eq!(input.candidates.len(), 1);
-    assert_eq!(input.candidates[0].classification, "zombie");
-    assert_eq!(input.candidates[0].recommended_action, "kill");
-    assert!(input.candidates[0].score > 0.9);
-}
-
-#[test]
-fn scan_result_conversion_normal_process_filtered_out() {
-    let normal = MockProcessBuilder::new()
-        .pid(100)
-        .comm("nginx")
-        .cpu_percent(2.0)
-        .elapsed_days(7)
-        .build();
-    let scan = MockScanBuilder::new().with_process(normal).build();
-
-    let host_result = HostScanResult {
-        host: "web1".to_string(),
-        success: true,
-        scan: Some(scan),
-        error: None,
-        duration_ms: 200,
-        provenance: None,
-    };
-
-    let input = scan_result_to_host_input(&host_result);
-    // Normal process has score 0.1, filtered out (< 0.3 threshold)
-    assert!(input.candidates.is_empty());
-}
-
-#[test]
-fn scan_result_conversion_mixed_processes() {
-    let zombie = MockProcessBuilder::new()
-        .pid(1)
-        .comm("zombie1")
-        .state_zombie()
-        .elapsed_hours(1)
-        .build();
-    let stopped_old = MockProcessBuilder::new()
-        .pid(2)
-        .comm("abandoned1")
-        .state_stopped()
-        .elapsed_hours(5)
-        .build();
-    let normal = MockProcessBuilder::new()
-        .pid(3)
-        .comm("nginx")
-        .cpu_percent(10.0)
-        .elapsed_days(1)
-        .build();
-    let stopped_recent = MockProcessBuilder::new()
-        .pid(4)
-        .comm("debugged")
-        .state_stopped()
-        .elapsed_secs(300)
-        .build();
-
-    let scan = MockScanBuilder::new()
-        .with_process(zombie)
-        .with_process(stopped_old)
-        .with_process(normal)
-        .with_process(stopped_recent)
-        .build();
-
+fn host_plan_conversion_keeps_the_hosts_decisions() {
     let host_result = HostScanResult {
         host: "dev1".to_string(),
         success: true,
-        scan: Some(scan),
+        plan: Some(plan(
+            4,
+            &[
+                (1, "zombie1", "zombie", "RESTART", 0.97),
+                (2, "abandoned1", "abandoned", "REVIEW", 0.8),
+                (4, "debugged", "useful_bad", "KEEP", 0.2),
+            ],
+        )),
         error: None,
         duration_ms: 300,
         provenance: None,
     };
 
     let input = scan_result_to_host_input(&host_result);
-    // zombie (0.95 > 0.3), stopped_old (0.7 > 0.3), stopped_recent (0.5 > 0.3)
-    // normal (0.1 < 0.3) → filtered
-    assert_eq!(input.candidates.len(), 3);
+    assert_eq!(input.host_id, "dev1");
     assert_eq!(input.total_processes, 4);
-
-    let sigs: Vec<&str> = input
+    let got: Vec<(u32, &str, &str)> = input
         .candidates
         .iter()
-        .map(|c| c.signature.as_str())
+        .map(|c| (c.pid, c.signature.as_str(), c.recommended_action.as_str()))
         .collect();
-    assert!(sigs.contains(&"zombie1"));
-    assert!(sigs.contains(&"abandoned1"));
-    assert!(sigs.contains(&"debugged"));
+    // Nothing is re-classified: the zombie keeps its parent-routed action.
+    assert_eq!(
+        got,
+        vec![
+            (1, "zombie1", "restart"),
+            (2, "abandoned1", "review"),
+            (4, "debugged", "keep"),
+        ]
+    );
+}
+
+/// Contract: the real `pt-core agent plan` output parses into a RemotePlan with
+/// every candidate the plan returned.
+#[test]
+fn real_agent_plan_output_parses_as_remote_plan() {
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let output = assert_cmd::cargo::cargo_bin_cmd!("pt-core")
+        .timeout(std::time::Duration::from_secs(300))
+        .env("PT_SKIP_GLOBAL_LOCK", "1")
+        .env("PROCESS_TRIAGE_DATA", data_dir.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .args(["--format", "json", "agent", "plan", "--min-posterior", "0"])
+        .output()
+        .expect("run agent plan");
+    assert!(
+        matches!(output.status.code(), Some(0) | Some(1)),
+        "agent plan exit {:?}",
+        output.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = parse_remote_plan(&stdout).expect("agent plan output parses");
+    let raw: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed.total_processes > 0);
+    assert_eq!(
+        parsed.candidates.len(),
+        raw["candidates"].as_array().unwrap().len()
+    );
+    assert!(parsed.candidates.iter().all(|c| c.pid > 0
+        && !c.recommendation.is_empty()
+        && (0.0..=1.0 + 1e-9).contains(&c.score)));
 }
 
 #[test]
@@ -407,7 +383,7 @@ fn scan_result_conversion_failed_host_produces_empty_input() {
     let host_result = HostScanResult {
         host: "unreachable".to_string(),
         success: false,
-        scan: None,
+        plan: None,
         error: Some("connection refused".to_string()),
         duration_ms: 5000,
         provenance: None,
@@ -767,55 +743,16 @@ fn fleet_session_persists_to_disk_and_restores() {
 
 #[test]
 fn e2e_scan_to_fleet_session_pipeline() {
-    // Simulate a 3-host fleet scan result.
-    let host1_scan = MockScanBuilder::new()
-        .with_process(
-            MockProcessBuilder::new()
-                .pid(1)
-                .comm("zombie_worker")
-                .state_zombie()
-                .elapsed_hours(3)
-                .build(),
-        )
-        .with_process(
-            MockProcessBuilder::new()
-                .pid(2)
-                .comm("nginx")
-                .cpu_percent(5.0)
-                .elapsed_days(30)
-                .build(),
-        )
-        .build();
-
-    let host2_scan = MockScanBuilder::new()
-        .with_process(
-            MockProcessBuilder::new()
-                .pid(10)
-                .comm("zombie_worker")
-                .state_zombie()
-                .elapsed_hours(2)
-                .build(),
-        )
-        .with_process(
-            MockProcessBuilder::new()
-                .pid(11)
-                .comm("stale_job")
-                .state_stopped()
-                .elapsed_hours(8)
-                .build(),
-        )
-        .build();
-
-    let host3_scan = MockScanBuilder::new()
-        .with_process(
-            MockProcessBuilder::new()
-                .pid(20)
-                .comm("stuck_io")
-                .state_disksleep()
-                .elapsed_hours(2)
-                .build(),
-        )
-        .build();
+    // A 3-host fleet: each host's own `agent plan` candidates.
+    let host1_scan = plan(2, &[(1, "zombie_worker", "zombie", "RESTART", 0.97)]);
+    let host2_scan = plan(
+        2,
+        &[
+            (10, "zombie_worker", "zombie", "RESTART", 0.96),
+            (11, "stale_job", "abandoned", "REVIEW", 0.8),
+        ],
+    );
+    let host3_scan = plan(1, &[(20, "stuck_io", "useful_bad", "REVIEW", 0.6)]);
 
     let fleet_result = FleetScanResult {
         total_hosts: 3,
@@ -825,7 +762,7 @@ fn e2e_scan_to_fleet_session_pipeline() {
             HostScanResult {
                 host: "web1".to_string(),
                 success: true,
-                scan: Some(host1_scan),
+                plan: Some(host1_scan),
                 error: None,
                 duration_ms: 200,
                 provenance: None,
@@ -833,7 +770,7 @@ fn e2e_scan_to_fleet_session_pipeline() {
             HostScanResult {
                 host: "web2".to_string(),
                 success: true,
-                scan: Some(host2_scan),
+                plan: Some(host2_scan),
                 error: None,
                 duration_ms: 300,
                 provenance: None,
@@ -841,7 +778,7 @@ fn e2e_scan_to_fleet_session_pipeline() {
             HostScanResult {
                 host: "db1".to_string(),
                 success: true,
-                scan: Some(host3_scan),
+                plan: Some(host3_scan),
                 error: None,
                 duration_ms: 150,
                 provenance: None,
@@ -859,11 +796,8 @@ fn e2e_scan_to_fleet_session_pipeline() {
         .collect();
 
     assert_eq!(host_inputs.len(), 3);
-    // web1: zombie_worker is candidate (0.95), nginx filtered (0.1)
     assert_eq!(host_inputs[0].candidates.len(), 1);
-    // web2: zombie_worker (0.95) + stale_job stopped>1hr (0.7)
     assert_eq!(host_inputs[1].candidates.len(), 2);
-    // db1: stuck_io disksleep>600s (0.6)
     assert_eq!(host_inputs[2].candidates.len(), 1);
 
     // Create fleet session.
@@ -897,16 +831,7 @@ fn e2e_scan_to_fleet_session_pipeline() {
 #[test]
 fn e2e_mixed_success_failure_fleet() {
     // Some hosts succeed, some fail — the fleet session should still be created.
-    let good_scan = MockScanBuilder::new()
-        .with_process(
-            MockProcessBuilder::new()
-                .pid(1)
-                .comm("zombie")
-                .state_zombie()
-                .elapsed_hours(1)
-                .build(),
-        )
-        .build();
+    let good_scan = plan(1, &[(1, "zombie", "zombie", "RESTART", 0.97)]);
 
     let fleet_result = FleetScanResult {
         total_hosts: 3,
@@ -916,7 +841,7 @@ fn e2e_mixed_success_failure_fleet() {
             HostScanResult {
                 host: "ok-host".to_string(),
                 success: true,
-                scan: Some(good_scan),
+                plan: Some(good_scan),
                 error: None,
                 duration_ms: 200,
                 provenance: None,
@@ -924,7 +849,7 @@ fn e2e_mixed_success_failure_fleet() {
             HostScanResult {
                 host: "fail-host1".to_string(),
                 success: false,
-                scan: None,
+                plan: None,
                 error: Some("connection refused".to_string()),
                 duration_ms: 5000,
                 provenance: None,
@@ -932,7 +857,7 @@ fn e2e_mixed_success_failure_fleet() {
             HostScanResult {
                 host: "fail-host2".to_string(),
                 success: false,
-                scan: None,
+                plan: None,
                 error: Some("timeout".to_string()),
                 duration_ms: 30000,
                 provenance: None,
@@ -1166,10 +1091,8 @@ fn fleet_session_many_candidates_per_host() {
 
 #[test]
 fn fleet_scan_result_json_roundtrip() {
-    let scan = MockScanBuilder::new()
-        .with_process(MockProcessBuilder::new().pid(1).comm("test").build())
-        .with_warning("test warning")
-        .build();
+    let scan = plan(1, &[(1, "test", "abandoned", "REVIEW", 0.7)]);
+    let expected = scan.clone();
 
     let result = FleetScanResult {
         total_hosts: 2,
@@ -1179,7 +1102,7 @@ fn fleet_scan_result_json_roundtrip() {
             HostScanResult {
                 host: "ok".to_string(),
                 success: true,
-                scan: Some(scan),
+                plan: Some(scan),
                 error: None,
                 duration_ms: 100,
                 provenance: None,
@@ -1187,7 +1110,7 @@ fn fleet_scan_result_json_roundtrip() {
             HostScanResult {
                 host: "fail".to_string(),
                 success: false,
-                scan: None,
+                plan: None,
                 error: Some("timeout".to_string()),
                 duration_ms: 30000,
                 provenance: None,
@@ -1202,8 +1125,8 @@ fn fleet_scan_result_json_roundtrip() {
     assert_eq!(restored.total_hosts, 2);
     assert_eq!(restored.successful, 1);
     assert_eq!(restored.failed, 1);
-    assert!(restored.results[0].scan.is_some());
-    assert!(restored.results[1].scan.is_none());
+    assert_eq!(restored.results[0].plan.as_ref(), Some(&expected));
+    assert!(restored.results[1].plan.is_none());
 }
 
 // ===========================================================================

@@ -802,9 +802,13 @@ struct AgentFleetPlanArgs {
     #[arg(long, default_value = "10")]
     parallel: u32,
 
-    /// Per-host timeout (seconds)
-    #[arg(long, default_value = "30")]
+    /// Per-host timeout (seconds) for the remote `agent plan`
+    #[arg(long, default_value = "120")]
     timeout: u64,
+
+    /// Remote pt-core command (default: `pt-core` on the host's PATH)
+    #[arg(long)]
+    remote_binary: Option<String>,
 
     /// Continue if a host fails
     #[arg(long)]
@@ -5782,18 +5786,23 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
             }
         };
 
-    // Perform SSH scanning of remote hosts
+    // Run each host's own `agent plan` over SSH.
     let parallel = args.parallel.max(1) as usize;
+    let defaults = SshScanConfig::default();
     let ssh_config = SshScanConfig {
         connect_timeout: args.timeout.min(30),
         command_timeout: args.timeout,
         parallel,
         continue_on_error: args.continue_on_error,
-        ..SshScanConfig::default()
+        remote_binary: args
+            .remote_binary
+            .clone()
+            .unwrap_or_else(|| defaults.remote_binary.clone()),
+        ..defaults
     };
 
     eprintln!(
-        "[fleet] Scanning {} hosts (parallel={}, timeout={}s)...",
+        "[fleet] Running `agent plan` on {} hosts (parallel={}, timeout={}s)...",
         hosts.len(),
         ssh_config.parallel,
         ssh_config.command_timeout,
@@ -5802,7 +5811,7 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
     let scan_result = ssh_scan_fleet(&hosts, &ssh_config);
 
     eprintln!(
-        "[fleet] Scan complete: {}/{} succeeded in {}ms",
+        "[fleet] Plans complete: {}/{} succeeded in {}ms",
         scan_result.successful, scan_result.total_hosts, scan_result.duration_ms,
     );
 

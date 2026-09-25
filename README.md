@@ -620,7 +620,7 @@ pt-core agent fleet plan --inventory hosts.toml --parallel 10
 pt-core agent fleet plan --hosts trj,ts1,hz3 --max-fdr 0.05
 ```
 
-Current status: fleet **planning** (SSH scan and pooled e-BY FDR across hosts) works. Fleet **apply** only reports planned actions; remote execution is not implemented yet. The Chandy-Lamport consistent-snapshot coordinator exists as a library but is not wired into fleet planning yet, so cross-host dependencies are not considered today.
+Current status: fleet **planning** works: each host runs its own `pt-core agent plan` over SSH (so protection, cgroup placement and the posterior are evaluated on that host), and the fleet aggregates those decisions with pooled e-BY FDR across hosts. Hosts need `pt-core` on their PATH. Fleet **apply** only reports planned actions; remote execution is not implemented yet. The Chandy-Lamport consistent-snapshot coordinator exists as a library but is not wired into fleet planning yet, so cross-host dependencies are not considered today.
 
 ---
 

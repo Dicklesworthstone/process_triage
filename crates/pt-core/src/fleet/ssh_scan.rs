@@ -1,9 +1,12 @@
-//! SSH-based remote scanning for fleet mode.
+//! SSH-based remote planning for fleet mode.
 //!
-//! Executes `pt-core scan --format json` on remote hosts via the `ssh` command
-//! and parses the JSON output into `ScanResult` structures.
+//! Runs `pt-core --format json agent plan` on each host via `ssh`, so every host
+//! is judged by pt's real decision pipeline with its own live checks (protection,
+//! cgroup placement, posterior, loss matrix, policy). The fleet only aggregates
+//! those per-host decisions; it never re-classifies processes itself. (It used
+//! to fetch a raw scan and apply a local state heuristic that, for example,
+//! recommended `kill` for every zombie and every process stopped for an hour.)
 
-use crate::collect::{ProcessRecord, ScanResult};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -78,7 +81,8 @@ pub enum SshScanError {
 pub struct HostScanResult {
     pub host: String,
     pub success: bool,
-    pub scan: Option<ScanResult>,
+    /// The host's own `agent plan` result (present when `success`).
+    pub plan: Option<RemotePlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub duration_ms: u64,
@@ -135,14 +139,59 @@ pub struct FleetProvenanceAggregate {
     pub mean_evidence_completeness: f64,
 }
 
-/// Wrapper for the top-level JSON output of `pt-core scan --format json`.
-#[derive(Debug, Deserialize)]
-struct RemoteScanOutput {
-    #[allow(dead_code)]
-    schema_version: Option<String>,
-    #[allow(dead_code)]
-    session_id: Option<String>,
-    scan: ScanResult,
+/// One candidate from a host's own `agent plan`: its decision, passed through.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteCandidate {
+    pub pid: u32,
+    /// Short command name (`command_short` in the plan).
+    pub comm: String,
+    pub classification: String,
+    /// The plan's recommendation (e.g. `KILL`, `REVIEW`, `KEEP`).
+    pub recommendation: String,
+    /// P(abandoned or zombie) from the host's posterior.
+    pub score: f64,
+}
+
+/// A host's `agent plan` result, as much as fleet aggregation needs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RemotePlan {
+    /// When the host produced the plan (RFC 3339).
+    pub generated_at: String,
+    pub total_processes: u64,
+    pub candidates: Vec<RemoteCandidate>,
+}
+
+/// Parse `pt-core --format json agent plan` output.
+pub fn parse_remote_plan(json: &str) -> Result<RemotePlan, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("not JSON: {e}"))?;
+    let total_processes = v["summary"]["total_processes_scanned"]
+        .as_u64()
+        .ok_or("not an `agent plan` output: summary.total_processes_scanned missing")?;
+    let candidates = v["candidates"]
+        .as_array()
+        .ok_or("not an `agent plan` output: candidates missing")?
+        .iter()
+        .map(|c| {
+            let pid = c["pid"]
+                .as_u64()
+                .and_then(|p| u32::try_from(p).ok())
+                .ok_or("candidate without pid")?;
+            let text = |key: &str| c[key].as_str().unwrap_or_default().to_string();
+            let p = |class: &str| c["posterior"][class].as_f64().unwrap_or(0.0);
+            Ok(RemoteCandidate {
+                pid,
+                comm: text("command_short"),
+                classification: text("classification"),
+                recommendation: text("recommendation"),
+                score: p("abandoned") + p("zombie"),
+            })
+        })
+        .collect::<Result<Vec<_>, &str>>()?;
+    Ok(RemotePlan {
+        generated_at: v["generated_at"].as_str().unwrap_or_default().to_string(),
+        total_processes,
+        candidates,
+    })
 }
 
 /// Build the SSH command arguments for scanning a remote host.
@@ -176,8 +225,8 @@ fn build_ssh_args(host: &str, config: &SshScanConfig) -> Vec<String> {
     };
     args.push(target);
 
-    // Remote command
-    args.push(format!("{} scan --format json", config.remote_binary));
+    // Remote command: the host's real planning pipeline (read-only).
+    args.push(format!("{} --format json agent plan", config.remote_binary));
 
     args
 }
@@ -197,7 +246,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
             return HostScanResult {
                 host: host.to_string(),
                 success: false,
-                scan: None,
+                plan: None,
                 error: Some("ssh binary not found".to_string()),
                 duration_ms: start.elapsed().as_millis() as u64,
                 provenance: None,
@@ -207,7 +256,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
             return HostScanResult {
                 host: host.to_string(),
                 success: false,
-                scan: None,
+                plan: None,
                 error: Some(format!("timed out after {}s", config.command_timeout)),
                 duration_ms: start.elapsed().as_millis() as u64,
                 provenance: None,
@@ -217,7 +266,7 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
             return HostScanResult {
                 host: host.to_string(),
                 success: false,
-                scan: None,
+                plan: None,
                 error: Some(format!("ssh failed: {}", e)),
                 duration_ms: start.elapsed().as_millis() as u64,
                 provenance: None,
@@ -227,52 +276,37 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    if !output.success() {
+    // `agent plan` exits 0 (nothing to do) or 1 (plan has candidates).
+    if !matches!(output.exit_code, Some(0) | Some(1)) {
         let stderr = output.stderr_str();
         let code = output.exit_code.unwrap_or(-1);
         return HostScanResult {
             host: host.to_string(),
             success: false,
-            scan: None,
+            plan: None,
             error: Some(format!("exit code {}: {}", code, stderr.trim())),
             duration_ms,
             provenance: None,
         };
     }
 
-    let stdout = output.stdout_str();
-
-    // Parse the JSON output
-    match serde_json::from_str::<RemoteScanOutput>(&stdout) {
-        Ok(output) => HostScanResult {
+    match parse_remote_plan(&output.stdout_str()) {
+        Ok(plan) => HostScanResult {
             host: host.to_string(),
             success: true,
-            scan: Some(output.scan),
+            plan: Some(plan),
             error: None,
             duration_ms,
-            provenance: None, // TODO: extract from remote scan output when available
+            provenance: None,
         },
-        Err(e) => {
-            // Try parsing as bare ScanResult (older pt-core versions)
-            match serde_json::from_str::<ScanResult>(&stdout) {
-                Ok(scan) => HostScanResult {
-                    host: host.to_string(),
-                    success: true,
-                    scan: Some(scan),
-                    error: None,
-                    duration_ms,
-                    provenance: None,
-                },
-                Err(_) => HostScanResult {
-                    host: host.to_string(),
-                    success: false,
-                    scan: None,
-                    error: Some(format!("failed to parse scan output: {}", e)),
-                    duration_ms,
-                    provenance: None,
-                },
-            }
-        }
+        Err(e) => HostScanResult {
+            host: host.to_string(),
+            success: false,
+            plan: None,
+            error: Some(format!("failed to parse agent plan output: {e}")),
+            duration_ms,
+            provenance: None,
+        },
     }
 }
 
@@ -355,39 +389,26 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
 pub fn scan_result_to_host_input(result: &HostScanResult) -> crate::session::fleet::HostInput {
     use crate::session::fleet::{CandidateInfo, HostInput};
 
-    match &result.scan {
-        Some(scan) => {
-            // Build candidate info from processes.
-            // In a real fleet scan, this would go through inference to get
-            // classifications and scores. For now, we use state-based heuristics.
-            let candidates: Vec<CandidateInfo> = scan
-                .processes
+    match &result.plan {
+        // The host's own decisions, unchanged.
+        Some(plan) => HostInput {
+            host_id: result.host.clone(),
+            session_id: format!("ssh-{}", result.host),
+            scanned_at: plan.generated_at.clone(),
+            total_processes: u32::try_from(plan.total_processes).unwrap_or(u32::MAX),
+            candidates: plan
+                .candidates
                 .iter()
-                .filter_map(|p| {
-                    let (classification, action, score) = classify_process(p);
-                    if score > 0.3 {
-                        Some(CandidateInfo {
-                            pid: p.pid.0,
-                            signature: p.comm.clone(),
-                            classification,
-                            recommended_action: action,
-                            score,
-                            e_value: None,
-                        })
-                    } else {
-                        None
-                    }
+                .map(|c| CandidateInfo {
+                    pid: c.pid,
+                    signature: c.comm.clone(),
+                    classification: c.classification.clone(),
+                    recommended_action: c.recommendation.to_ascii_lowercase(),
+                    score: c.score,
+                    e_value: None,
                 })
-                .collect();
-
-            HostInput {
-                host_id: result.host.clone(),
-                session_id: format!("ssh-{}", result.host),
-                scanned_at: scan.metadata.started_at.clone(),
-                total_processes: scan.metadata.process_count as u32,
-                candidates,
-            }
-        }
+                .collect(),
+        },
         None => HostInput {
             host_id: result.host.clone(),
             session_id: format!("ssh-{}-failed", result.host),
@@ -398,43 +419,9 @@ pub fn scan_result_to_host_input(result: &HostScanResult) -> crate::session::fle
     }
 }
 
-/// Simple state-based process classification for fleet scanning.
-///
-/// Returns (classification, recommended_action, score).
-fn classify_process(process: &ProcessRecord) -> (String, String, f64) {
-    use crate::collect::ProcessState;
-
-    match process.state {
-        ProcessState::Zombie => ("zombie".to_string(), "kill".to_string(), 0.95),
-        ProcessState::Stopped => {
-            if process.elapsed.as_secs() > 3600 {
-                ("abandoned".to_string(), "kill".to_string(), 0.7)
-            } else {
-                ("stopped".to_string(), "review".to_string(), 0.5)
-            }
-        }
-        ProcessState::DiskSleep => {
-            if process.elapsed.as_secs() > 600 {
-                ("stuck".to_string(), "review".to_string(), 0.6)
-            } else {
-                ("io_wait".to_string(), "spare".to_string(), 0.2)
-            }
-        }
-        ProcessState::Running | ProcessState::Sleeping => {
-            if process.cpu_percent > 90.0 && process.elapsed.as_secs() > 3600 {
-                ("runaway".to_string(), "review".to_string(), 0.5)
-            } else {
-                ("normal".to_string(), "spare".to_string(), 0.1)
-            }
-        }
-        _ => ("unknown".to_string(), "spare".to_string(), 0.1),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock_process::{MockProcessBuilder, MockScanBuilder};
 
     #[test]
     fn default_config() {
@@ -455,9 +442,10 @@ mod tests {
         assert!(args.contains(&"ConnectTimeout=10".to_string()));
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(args.contains(&"myhost".to_string()));
-        assert!(args
-            .iter()
-            .any(|a| a.contains("pt-core scan --format json")));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("pt-core --format json agent plan")
+        );
     }
 
     #[test]
@@ -499,77 +487,55 @@ mod tests {
             ..SshScanConfig::default()
         };
         let args = build_ssh_args("myhost", &config);
-        assert!(args
-            .iter()
-            .any(|a| a.contains("/opt/pt/bin/pt-core scan --format json")));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/opt/pt/bin/pt-core --format json agent plan")
+        );
+    }
+
+    const PLAN_JSON: &str = r#"{
+        "generated_at": "2026-09-25T10:00:00Z",
+        "summary": {"total_processes_scanned": 412},
+        "candidates": [
+            {"pid": 4242, "command_short": "sleep", "classification": "zombie",
+             "recommendation": "RESTART",
+             "posterior": {"useful": 0.01, "useful_bad": 0.01, "abandoned": 0.08, "zombie": 0.9}},
+            {"pid": 777, "command_short": "node", "classification": "useful",
+             "recommendation": "KEEP",
+             "posterior": {"useful": 0.9, "useful_bad": 0.05, "abandoned": 0.05, "zombie": 0.0}}
+        ]
+    }"#;
+
+    #[test]
+    fn parse_remote_plan_reads_the_hosts_decisions() {
+        let plan = parse_remote_plan(PLAN_JSON).unwrap();
+        assert_eq!(plan.generated_at, "2026-09-25T10:00:00Z");
+        assert_eq!(plan.total_processes, 412);
+        assert_eq!(plan.candidates.len(), 2);
+        let z = &plan.candidates[0];
+        assert_eq!((z.pid, z.comm.as_str()), (4242, "sleep"));
+        assert_eq!(z.classification, "zombie");
+        assert_eq!(z.recommendation, "RESTART");
+        assert!((z.score - 0.98).abs() < 1e-9, "P(abandoned)+P(zombie)");
     }
 
     #[test]
-    fn classify_zombie_process() {
-        let p = MockProcessBuilder::new()
-            .pid(1)
-            .comm("zombie_proc")
-            .state_zombie()
-            .elapsed_hours(1)
-            .build();
-        let (class, action, score) = classify_process(&p);
-        assert_eq!(class, "zombie");
-        assert_eq!(action, "kill");
-        assert!(score > 0.9);
+    fn parse_remote_plan_rejects_other_output() {
+        assert!(parse_remote_plan("not json").is_err());
+        // A raw `scan` output (what fleet used to fetch) is not a plan.
+        assert!(parse_remote_plan(r#"{"scan": {"processes": []}}"#).is_err());
+        assert!(parse_remote_plan(
+            r#"{"summary": {"total_processes_scanned": 1}, "candidates": [{"command_short": "x"}]}"#
+        )
+        .is_err());
     }
 
     #[test]
-    fn classify_stopped_old_process() {
-        let p = MockProcessBuilder::new()
-            .pid(2)
-            .comm("old_worker")
-            .state_stopped()
-            .elapsed_hours(2)
-            .build();
-        let (class, action, score) = classify_process(&p);
-        assert_eq!(class, "abandoned");
-        assert_eq!(action, "kill");
-        assert!(score > 0.5);
-    }
-
-    #[test]
-    fn classify_running_process() {
-        let p = MockProcessBuilder::new()
-            .pid(3)
-            .comm("nginx")
-            .cpu_percent(5.0)
-            .elapsed_days(1)
-            .build();
-        let (class, action, score) = classify_process(&p);
-        assert_eq!(class, "normal");
-        assert_eq!(action, "spare");
-        assert!(score < 0.3);
-    }
-
-    #[test]
-    fn scan_result_to_host_input_success() {
-        let zombie = MockProcessBuilder::new()
-            .pid(100)
-            .comm("zombie_test")
-            .state_zombie()
-            .elapsed_hours(1)
-            .build();
-        let normal = MockProcessBuilder::new()
-            .pid(101)
-            .comm("nginx")
-            .cpu_percent(1.0)
-            .elapsed_days(1)
-            .build();
-
-        let scan = MockScanBuilder::new()
-            .with_process(zombie)
-            .with_process(normal)
-            .build();
-
+    fn host_input_passes_remote_decisions_through_unchanged() {
         let result = HostScanResult {
             host: "host1".to_string(),
             success: true,
-            scan: Some(scan),
+            plan: Some(parse_remote_plan(PLAN_JSON).unwrap()),
             error: None,
             duration_ms: 500,
             provenance: None,
@@ -577,11 +543,13 @@ mod tests {
 
         let input = scan_result_to_host_input(&result);
         assert_eq!(input.host_id, "host1");
-        assert_eq!(input.total_processes, 2);
-        // Only the zombie should be a candidate (score > 0.3)
-        assert_eq!(input.candidates.len(), 1);
-        assert_eq!(input.candidates[0].signature, "zombie_test");
-        assert_eq!(input.candidates[0].classification, "zombie");
+        assert_eq!(input.total_processes, 412);
+        assert_eq!(input.scanned_at, "2026-09-25T10:00:00Z");
+        assert_eq!(input.candidates.len(), 2);
+        // The zombie keeps the host's routed action; nothing re-labels it `kill`.
+        assert_eq!(input.candidates[0].recommended_action, "restart");
+        assert_eq!(input.candidates[1].recommended_action, "keep");
+        assert_eq!(input.candidates[1].signature, "node");
     }
 
     #[test]
@@ -589,7 +557,7 @@ mod tests {
         let result = HostScanResult {
             host: "host2".to_string(),
             success: false,
-            scan: None,
+            plan: None,
             error: Some("connection refused".to_string()),
             duration_ms: 100,
             provenance: None,
@@ -611,7 +579,7 @@ mod tests {
                 HostScanResult {
                     host: "host1".to_string(),
                     success: true,
-                    scan: None,
+                    plan: None,
                     error: None,
                     duration_ms: 200,
                     provenance: None,
@@ -619,7 +587,7 @@ mod tests {
                 HostScanResult {
                     host: "host2".to_string(),
                     success: false,
-                    scan: None,
+                    plan: None,
                     error: Some("timeout".to_string()),
                     duration_ms: 30000,
                     provenance: None,
@@ -657,46 +625,5 @@ mod tests {
         assert_eq!(result.successful, 0);
         assert_eq!(result.failed, 0);
         assert!(result.results.is_empty());
-    }
-
-    #[test]
-    fn classify_disk_sleep_long() {
-        let p = MockProcessBuilder::new()
-            .pid(10)
-            .comm("stuck_io")
-            .state_disksleep()
-            .elapsed_hours(1)
-            .build();
-        let (class, action, score) = classify_process(&p);
-        assert_eq!(class, "stuck");
-        assert_eq!(action, "review");
-        assert!(score > 0.5);
-    }
-
-    #[test]
-    fn classify_disk_sleep_short() {
-        let p = MockProcessBuilder::new()
-            .pid(11)
-            .comm("io_op")
-            .state_disksleep()
-            .elapsed_secs(60)
-            .build();
-        let (class, _action, score) = classify_process(&p);
-        assert_eq!(class, "io_wait");
-        assert!(score < 0.3);
-    }
-
-    #[test]
-    fn classify_stopped_recent() {
-        let p = MockProcessBuilder::new()
-            .pid(12)
-            .comm("debugged")
-            .state_stopped()
-            .elapsed_secs(300)
-            .build();
-        let (class, action, score) = classify_process(&p);
-        assert_eq!(class, "stopped");
-        assert_eq!(action, "review");
-        assert!(score > 0.3 && score < 0.7);
     }
 }
