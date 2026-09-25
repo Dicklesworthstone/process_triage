@@ -54,6 +54,12 @@ pub struct Prober {
     /// late completions from an earlier (timed-out) batch are never attributed to
     /// the current one.
     generation: u32,
+    /// Set when a failed submit left entries queued in a ring that could not be
+    /// replaced: that ring must never be submitted again.
+    poisoned: bool,
+    /// Test hook: make the next batch's submit fail.
+    #[cfg(test)]
+    fail_next_submit: bool,
 }
 
 struct ProbeState {
@@ -78,7 +84,22 @@ impl Prober {
             ring,
             config,
             generation: 0,
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_submit: false,
         })
+    }
+
+    /// Replace the ring, discarding any entries queued but never submitted. If a new
+    /// ring cannot be created, poison the prober so the old queue is never submitted.
+    fn replace_ring(&mut self) {
+        match IoUring::new(self.config.ring_entries) {
+            Ok(ring) => self.ring = ring,
+            Err(e) => {
+                error!(error = %e, "io_uring: cannot replace ring after failed submit; disabling prober");
+                self.poisoned = true;
+            }
+        }
     }
 
     /// Submit probe requests and wait for completion or timeout.
@@ -106,6 +127,19 @@ impl Prober {
         let mut results = Vec::with_capacity(paths.len());
         if paths.is_empty() {
             return results;
+        }
+        if self.poisoned {
+            return paths
+                .iter()
+                .map(|path| ProbeResult {
+                    path: path.clone(),
+                    data: Vec::new(),
+                    timed_out: false,
+                    error: Some(io::Error::other(
+                        "io_uring prober disabled after a failed submit",
+                    )),
+                })
+                .collect();
         }
         self.generation = self.generation.wrapping_add(1);
         let generation_bits = u64::from(self.generation) << 32;
@@ -183,9 +217,23 @@ impl Prober {
             }
         }
 
-        if let Err(e) = self.ring.submit() {
+        #[cfg(test)]
+        let forced_failure = std::mem::take(&mut self.fail_next_submit);
+        #[cfg(not(test))]
+        let forced_failure = false;
+        let submit_result = if forced_failure {
+            Err(io::Error::other("injected submit failure"))
+        } else {
+            self.ring.submit().map(|_| ())
+        };
+        if let Err(e) = submit_result {
             error!(error = %e, "Failed to submit io_uring requests");
-            // Nothing was handed to the kernel; release everything normally.
+            // io_uring_enter consumed nothing, but the pushed entries are still queued
+            // in this ring and would reach the kernel on its next submit, pointing at
+            // this batch's buffers and at `ts` on this stack frame. Discard them by
+            // replacing the ring (a dropped ring never submits its queue); only then
+            // is releasing everything normally safe.
+            self.replace_ring();
             submitted_count = 0;
             submitted.iter_mut().for_each(|s| *s = false);
         }
@@ -403,6 +451,30 @@ mod tests {
             assert!(res.error.is_none());
             assert!(!res.data.is_empty());
         }
+    }
+
+    /// After a failed submit no entry of that batch may stay queued (it would reach
+    /// the kernel on the next submit pointing at freed buffers and a dead stack
+    /// frame), and the prober keeps working.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn failed_submit_leaves_nothing_queued() {
+        let mut prober = Prober::new(ProberConfig::default()).unwrap();
+        prober.fail_next_submit = true;
+        let failed = prober.probe_batch(&[
+            PathBuf::from("/proc/self/stat"),
+            PathBuf::from("/proc/self/status"),
+        ]);
+        assert_eq!(failed.len(), 2);
+        assert!(failed.iter().all(|r| r.data.is_empty()));
+        assert!(
+            prober.ring.submission().is_empty(),
+            "stale entries of the failed batch are still queued"
+        );
+
+        let results = prober.probe_batch(&[PathBuf::from("/proc/self/stat")]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].error.is_none() && !results[0].data.is_empty());
     }
 
     #[test]

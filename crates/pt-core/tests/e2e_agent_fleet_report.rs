@@ -132,6 +132,34 @@ fn create_fixture_fleet_session() -> String {
     session_id.0
 }
 
+/// Fleet apply executes nothing remotely yet: it lists the plan but must not exit 0,
+/// so no script mistakes it for an apply that ran.
+#[test]
+fn fleet_apply_reports_not_implemented_and_exits_nonzero() {
+    with_temp_data_dir(|data_dir| {
+        let fleet_session_id = create_fixture_fleet_session();
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", data_dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "fleet",
+                "apply",
+                "--fleet-session",
+                &fleet_session_id,
+            ])
+            .assert()
+            .code(11)
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).expect("valid json");
+        assert_eq!(json["status"], "not_implemented");
+        assert_eq!(json["planned_actions"]["total_kill_candidates"], 5);
+    });
+}
+
 #[test]
 fn fleet_report_json_contains_expected_sections() {
     with_temp_data_dir(|data_dir| {

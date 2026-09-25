@@ -68,10 +68,12 @@ use pt_core::session::{
     SessionStore, SessionSummary,
 };
 use pt_core::shadow::ShadowRecorder;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use pt_core::supervision::{detect_supervision, is_human_supervised};
 #[cfg(target_os = "linux")]
 use pt_core::supervision::{
-    detect_supervision, is_human_supervised, AppActionType, AppSupervisionAnalyzer,
-    AppSupervisorType, ContainerActionType, ContainerSupervisionAnalyzer,
+    AppActionType, AppSupervisionAnalyzer, AppSupervisorType, ContainerActionType,
+    ContainerSupervisionAnalyzer,
 };
 #[cfg(feature = "ui")]
 use pt_core::tui::widgets::ProcessRow;
@@ -6004,8 +6006,10 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
         "fleet_session_id": fleet.fleet_session_id,
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "command": "agent fleet apply",
-        "status": "dry_run",
-        "note": "Fleet apply currently reports planned actions. Remote execution requires --confirm flag (not yet implemented).",
+        // Nothing is executed remotely yet: report the plan, but exit non-zero so no
+        // script mistakes this for an apply that ran.
+        "status": "not_implemented",
+        "note": "Remote execution is not implemented; nothing was applied. This lists the planned actions. Apply per host with `pt-core agent apply` on that host.",
         "session_dir": session_dir.display().to_string(),
         "planned_actions": {
             "total_kill_candidates": total_kills,
@@ -6035,12 +6039,12 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
             );
             println!();
             println!(
-                "Note: Remote execution not yet implemented. Use --format json for full details."
+                "Note: remote execution is not implemented; nothing was applied. Run `pt-core agent apply` on each host."
             );
         }
     }
 
-    ExitCode::Clean
+    ExitCode::CapabilityError
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14163,7 +14167,7 @@ fn supervisor_info_for_plan(_pid: u32) -> serde_json::Value {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 /// Robot-mode supervision gate. Fails CLOSED: if supervision cannot be determined
 /// (detection error, or the process environment is unreadable, e.g. another user's
 /// process without privileges), the process is treated as supervised, so robot
@@ -14175,9 +14179,10 @@ fn is_supervised_for_robot(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// No supervision evidence on this platform: fail closed (a human must confirm).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn is_supervised_for_robot(_pid: u32) -> bool {
-    false
+    true
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
