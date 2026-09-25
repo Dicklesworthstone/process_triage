@@ -377,6 +377,78 @@ fn tools_call_explain_requires_pid_or_comm() {
     );
 }
 
+/// pt_scan scores are pt's posterior P(abandoned or zombie), not an ad-hoc
+/// signature+state number; protected processes are marked and listed last.
+#[test]
+fn tools_call_scan_scores_are_posterior_probabilities() {
+    let mut s = server();
+    let resp = send_rpc(
+        &mut s,
+        1,
+        "tools/call",
+        serde_json::json!({"name": "pt_scan", "arguments": {}}),
+    );
+    let result = assert_success(&resp);
+    assert_eq!(result["isError"], false);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let procs = parsed["processes"].as_array().expect("processes");
+    assert!(!procs.is_empty());
+    let mut seen_protected = false;
+    for p in procs {
+        let score = p["score"].as_f64().expect("score");
+        assert!((0.0..=1.0).contains(&score), "{p}");
+        let post = &p["posterior"];
+        let ab = post["abandoned"].as_f64().unwrap() + post["zombie"].as_f64().unwrap();
+        assert!(
+            (score - ab).abs() < 1e-9,
+            "score must be P(abandoned+zombie): {p}"
+        );
+        assert_eq!(
+            p["suspicion_score"].as_u64().unwrap(),
+            (score * 100.0).round() as u64
+        );
+        let protected = !p["protected"].is_null();
+        assert!(
+            !(seen_protected && !protected),
+            "unprotected after protected: {p}"
+        );
+        seen_protected |= protected;
+    }
+}
+
+/// pt_explain reports the posterior and protection for a live process.
+#[test]
+fn tools_call_explain_reports_posterior_and_protection() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let mut s = server();
+    let resp = send_rpc(
+        &mut s,
+        1,
+        "tools/call",
+        serde_json::json!({"name": "pt_explain", "arguments": {"pid": child.id()}}),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let result = assert_success(&resp);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let post = &parsed["posterior"];
+    let ab = post["abandoned"].as_f64().unwrap() + post["zombie"].as_f64().unwrap();
+    assert!(
+        (parsed["score"].as_f64().unwrap() - ab).abs() < 1e-9,
+        "{parsed}"
+    );
+    assert!(parsed.get("protected").is_some(), "{parsed}");
+    assert!(
+        parsed["evidence"].as_array().is_some_and(|e| !e.is_empty()),
+        "{parsed}"
+    );
+}
+
 #[test]
 fn tools_call_explain_nonexistent_pid() {
     let mut s = server();

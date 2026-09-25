@@ -97,6 +97,40 @@ pub struct EvidenceTerm {
     pub log_likelihood: ClassScores,
 }
 
+impl Evidence {
+    /// Evidence available from a single quick-scan record (CPU occupancy, runtime,
+    /// orphan, controlling TTY, kernel state): the same features `agent plan`,
+    /// `agent explain` and the TUI start from before deep/provenance evidence.
+    pub fn from_snapshot(proc: &crate::collect::ProcessRecord) -> Self {
+        use crate::collect::ProcessState;
+        Evidence {
+            cpu: Some(CpuEvidence::Fraction {
+                occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
+            }),
+            // A zero age (just started at tick granularity, or unknown) carries no
+            // runtime evidence; passing 0 made the posterior fail and the process
+            // silently vanish from plans, scans and explanations.
+            runtime_seconds: Some(proc.elapsed.as_secs_f64()).filter(|s| *s > 0.0),
+            orphan: Some(proc.is_orphan()),
+            tty: Some(proc.has_tty()),
+            net: None,
+            io_active: None,
+            state_flag: match proc.state {
+                ProcessState::Running => Some(0),
+                ProcessState::Sleeping => Some(1),
+                ProcessState::DiskSleep => Some(2),
+                ProcessState::Zombie => Some(3),
+                ProcessState::Stopped => Some(4),
+                ProcessState::Idle => Some(5),
+                ProcessState::Dead => Some(6),
+                ProcessState::Unknown => None,
+            },
+            command_category: None,
+            queue_saturated: None,
+        }
+    }
+}
+
 /// Posterior computation result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PosteriorResult {
@@ -843,6 +877,44 @@ mod tests {
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() <= tol
+    }
+
+    /// A zero age (just started, or unknown) must not make the posterior fail: the
+    /// process used to vanish from plans, scans and explanations.
+    #[test]
+    fn snapshot_evidence_with_zero_age_still_has_a_posterior() {
+        use crate::collect::{ProcessRecord, ProcessState};
+        use pt_common::{ProcessId, StartId};
+        let record = ProcessRecord {
+            pid: ProcessId(4242),
+            ppid: ProcessId(1),
+            uid: 1000,
+            user: "u".to_string(),
+            pgid: Some(4242),
+            sid: Some(100),
+            start_id: StartId("b:1:4242".to_string()),
+            comm: "sleep".to_string(),
+            cmd: "sleep 60".to_string(),
+            state: ProcessState::Sleeping,
+            cpu_percent: 0.0,
+            rss_bytes: 1024,
+            vsz_bytes: 2048,
+            tty: None,
+            start_time_unix: 0,
+            elapsed: std::time::Duration::ZERO,
+            source: "test".to_string(),
+            container_info: None,
+        };
+        let evidence = Evidence::from_snapshot(&record);
+        assert!(evidence.runtime_seconds.is_none());
+        let result = compute_posterior(&Priors::default(), &evidence).expect("posterior");
+        assert!(result.posterior.useful > 0.0);
+
+        let aged = ProcessRecord {
+            elapsed: std::time::Duration::from_secs(7200),
+            ..record
+        };
+        assert_eq!(Evidence::from_snapshot(&aged).runtime_seconds, Some(7200.0));
     }
 
     #[test]

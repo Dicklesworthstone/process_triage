@@ -6,7 +6,7 @@
 use crate::collect::ScanMetadata;
 #[cfg(target_os = "linux")]
 use crate::collect::{deep_scan, DeepScanOptions};
-use crate::collect::{quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanResult};
+use crate::collect::{quick_scan, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
 use crate::signature_cli::load_user_signatures;
 use crate::supervision::signature::ProcessMatchContext;
@@ -33,7 +33,7 @@ fn collect_scan_result(deep: bool) -> Result<ScanResult, String> {
                         start_id: p.start_id,
                         comm: p.comm,
                         cmd: p.cmdline,
-                        state: ProcessState::from_char(p.state),
+                        state: crate::collect::ProcessState::from_char(p.state),
                         cpu_percent: 0.0,
                         rss_bytes: p.mem.as_ref().map(|m| m.resident * 4096).unwrap_or(0),
                         vsz_bytes: p.mem.as_ref().map(|m| m.size * 4096).unwrap_or(0),
@@ -77,7 +77,58 @@ fn load_signature_db_with_user_entries() -> SignatureDatabase {
     db
 }
 
-fn score_process(process: &ProcessRecord, db: &SignatureDatabase) -> (f64, Option<String>) {
+/// What the MCP tools score against: the configured priors and protection rules,
+/// the same ones `agent plan` uses.
+struct Evaluator {
+    priors: crate::config::Priors,
+    protected: Option<crate::collect::protected::ProtectedFilter>,
+}
+
+impl Evaluator {
+    fn load() -> Self {
+        match crate::config::load_config(&crate::config::ConfigOptions::default()) {
+            Ok(config) => Self {
+                protected: crate::collect::protected::ProtectedFilter::from_guardrails(
+                    &config.policy.guardrails,
+                )
+                .ok(),
+                priors: config.priors,
+            },
+            Err(_) => Self {
+                priors: crate::config::Priors::default(),
+                protected: crate::collect::protected::ProtectedFilter::from_guardrails(
+                    &crate::config::policy::Guardrails::default(),
+                )
+                .ok(),
+            },
+        }
+    }
+
+    /// Posterior class probabilities from the process snapshot (None if the model
+    /// cannot evaluate it).
+    fn posterior(&self, process: &ProcessRecord) -> Option<crate::inference::ClassScores> {
+        crate::inference::compute_posterior(
+            &self.priors,
+            &crate::inference::Evidence::from_snapshot(process),
+        )
+        .ok()
+        .map(|r| r.posterior)
+    }
+
+    /// `{rule, notes}` if `agent plan` would skip this process as protected.
+    fn protection(&self, process: &ProcessRecord) -> serde_json::Value {
+        match self
+            .protected
+            .as_ref()
+            .and_then(|f| f.is_protected(process))
+        {
+            Some(m) => serde_json::json!({ "rule": m.pattern, "notes": m.notes }),
+            None => serde_json::Value::Null,
+        }
+    }
+}
+
+fn top_signature(process: &ProcessRecord, db: &SignatureDatabase) -> Option<String> {
     let ctx = ProcessMatchContext {
         comm: &process.comm,
         cmdline: Some(process.cmd.as_str()),
@@ -86,20 +137,9 @@ fn score_process(process: &ProcessRecord, db: &SignatureDatabase) -> (f64, Optio
         socket_paths: None,
         parent_comm: None,
     };
-
-    let matches = db.match_process(&ctx);
-    let sig_score = matches.iter().map(|m| m.score).fold(0.0, f64::max);
-    let state_score = match process.state {
-        ProcessState::Zombie => 0.9,
-        ProcessState::Stopped => 0.5,
-        ProcessState::DiskSleep => 0.3,
-        _ => 0.05,
-    };
-
-    (
-        (sig_score + state_score).min(1.0),
-        matches.first().map(|m| m.signature.name.clone()),
-    )
+    db.match_process(&ctx)
+        .first()
+        .map(|m| m.signature.name.clone())
 }
 
 /// Arguments for `pt-core agent plan` derived from `pt_plan` tool params.
@@ -277,19 +317,29 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         .unwrap_or(0.0);
     let scan_result = collect_scan_result(deep)?;
     let db = load_signature_db_with_user_entries();
+    let evaluator = Evaluator::load();
 
-    // Process and filter candidates
+    // Score = P(abandoned or zombie) from the same posterior `agent plan` uses (it was
+    // a signature-match score plus a state bonus, not a probability).
     let mut candidates = Vec::new();
     for p in &scan_result.processes {
-        let (final_score, top_signature) = score_process(p, &db);
-
-        if final_score >= min_score {
-            candidates.push((p, final_score, top_signature));
+        let Some(posterior) = evaluator.posterior(p) else {
+            continue;
+        };
+        let score = posterior.abandonment_probability();
+        if score >= min_score {
+            let protected = evaluator.protection(p);
+            candidates.push((p, score, posterior, protected, top_signature(p, &db)));
         }
     }
 
-    // Sort by score descending
-    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Unprotected first (protected ones are never acted on), then by score.
+    candidates.sort_by(|a, b| {
+        a.3.is_null()
+            .cmp(&b.3.is_null())
+            .reverse()
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
 
     let result = serde_json::json!({
         "scanned_at": scan_result.metadata.started_at,
@@ -297,7 +347,8 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         "platform": scan_result.metadata.platform,
         "total_processes": scan_result.processes.len(),
         "returned": candidates.len(),
-        "processes": candidates.iter().take(200).map(|(p, score, top_signature)| {
+        "score_definition": "P(abandoned or zombie) from pt's posterior (0-1); suspicion_score = 100 x score",
+        "processes": candidates.iter().take(200).map(|(p, score, posterior, protected, top_signature)| {
             serde_json::json!({
                 "pid": p.pid.0,
                 "ppid": p.ppid.0,
@@ -311,6 +362,9 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
                 "vsz_bytes": p.vsz_bytes,
                 "elapsed_sec": p.elapsed.as_secs(),
                 "score": score,
+                "suspicion_score": posterior.suspicion_score(),
+                "posterior": posterior,
+                "protected": protected,
                 "top_signature": top_signature,
             })
         }).collect::<Vec<_>>(),
@@ -367,12 +421,28 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 
             let matches = db.match_process(&ctx);
 
-            let state_risk = match p.state {
-                ProcessState::Zombie => "high",
-                ProcessState::Stopped => "medium",
-                ProcessState::DiskSleep => "elevated",
-                _ => "low",
-            };
+            // The same posterior and protection rules `agent plan` uses.
+            let evaluator = Evaluator::load();
+            let result = crate::inference::compute_posterior(
+                &evaluator.priors,
+                &crate::inference::Evidence::from_snapshot(p),
+            )
+            .ok();
+            let evidence_terms: Vec<serde_json::Value> = result
+                .as_ref()
+                .map(|r| {
+                    r.evidence_terms
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "feature": t.feature,
+                                "log_likelihood": t.log_likelihood,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let posterior = result.map(|r| r.posterior);
 
             let result = serde_json::json!({
                 "pid": p.pid.0,
@@ -393,11 +463,11 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                         "score": m.score,
                     })
                 }).collect::<Vec<_>>(),
-                "evidence": {
-                    "state_risk": state_risk,
-                    "age_seconds": p.elapsed.as_secs(),
-                    "memory_rss_bytes": p.rss_bytes,
-                },
+                "posterior": posterior,
+                "score": posterior.map(|s| s.abandonment_probability()),
+                "suspicion_score": posterior.map(|s| s.suspicion_score()),
+                "protected": evaluator.protection(p),
+                "evidence": evidence_terms,
             });
 
             Ok(vec![ToolContent {

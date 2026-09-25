@@ -2614,19 +2614,7 @@ fn compute_probe_advice(
     let available_probes = [pt_core::decision::ProbeType::DeepScan];
 
     for proc in processes {
-        let evidence = Evidence {
-            cpu: Some(CpuEvidence::Fraction {
-                occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
-            }),
-            runtime_seconds: Some(proc.elapsed.as_secs_f64()),
-            orphan: Some(proc.is_orphan()),
-            tty: Some(proc.has_tty()),
-            net: None,
-            io_active: None,
-            queue_saturated: None,
-            state_flag: state_to_flag(proc.state),
-            command_category: None,
-        };
+        let evidence = Evidence::from_snapshot(proc);
 
         let Ok(posterior) = compute_posterior(priors, &evidence) else {
             continue;
@@ -2860,17 +2848,10 @@ fn build_tui_rows(
         let deep = deep_signals.and_then(|m| m.get(&proc.pid.0).copied());
         let probe = probe_advice.and_then(|m| m.get(&proc.pid.0));
         let evidence = Evidence {
-            cpu: Some(CpuEvidence::Fraction {
-                occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
-            }),
-            runtime_seconds: Some(proc.elapsed.as_secs_f64()),
-            orphan: Some(proc.is_orphan()),
-            tty: Some(proc.has_tty()),
             net: deep.and_then(|d| d.net_active),
             io_active: deep.and_then(|d| d.io_active),
             queue_saturated: deep.and_then(|d| d.queue_saturated),
-            state_flag: state_to_flag(proc.state),
-            command_category: None,
+            ..Evidence::from_snapshot(proc)
         };
 
         let learned_priors = decisions.and_then(|d| d.priors_for(&proc.comm, &proc.cmd, priors));
@@ -3145,8 +3126,8 @@ use pt_core::decision::{
 #[cfg(target_os = "linux")]
 use pt_core::inference::{apply_evidence_terms, ClassScores, Confidence, EvidenceTerm};
 use pt_core::inference::{
-    compute_posterior, compute_posterior_with_overrides, try_signature_fast_path, CpuEvidence,
-    Evidence, EvidenceLedger, FastPathConfig, FastPathSkipReason, PriorContext,
+    compute_posterior, compute_posterior_with_overrides, try_signature_fast_path, Evidence,
+    EvidenceLedger, FastPathConfig, FastPathSkipReason, PriorContext,
 };
 use pt_core::supervision::signature::{MatchLevel, ProcessMatchContext, SignatureDatabase};
 
@@ -11780,19 +11761,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
 
                 let feasibility = ActionFeasibility::allow_all();
                 for proc in &filter_result.passed {
-                    let evidence = Evidence {
-                        cpu: Some(CpuEvidence::Fraction {
-                            occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
-                        }),
-                        runtime_seconds: Some(proc.elapsed.as_secs_f64()),
-                        orphan: Some(proc.is_orphan()),
-                        tty: Some(proc.has_tty()),
-                        net: None,
-                        io_active: None,
-                        state_flag: state_to_flag(proc.state),
-                        command_category: None,
-                        queue_saturated: None,
-                    };
+                    let evidence = Evidence::from_snapshot(proc);
 
                     let posterior_result = match compute_posterior(&priors, &evidence) {
                         Ok(r) => r,
@@ -12435,19 +12404,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         processed = processed.saturating_add(1);
 
         // Build evidence from process record
-        let evidence = Evidence {
-            cpu: Some(CpuEvidence::Fraction {
-                occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
-            }),
-            runtime_seconds: Some(proc.elapsed.as_secs_f64()),
-            orphan: Some(proc.is_orphan()),
-            tty: Some(proc.has_tty()),
-            net: None,
-            io_active: None,
-            state_flag: state_to_flag(proc.state),
-            command_category: None,
-            queue_saturated: None,
-        };
+        let evidence = Evidence::from_snapshot(proc);
 
         let mut match_ctx = ProcessMatchContext::with_comm(&proc.comm);
         if !proc.cmd.is_empty() {
@@ -13929,20 +13886,8 @@ fn build_process_explanation(
         decisions.and_then(|d| d.learned_prior(&proc.comm, &proc.cmd, global_priors));
     let learned_priors = decisions.and_then(|d| d.priors_for(&proc.comm, &proc.cmd, global_priors));
     let priors = learned_priors.as_ref().unwrap_or(global_priors);
-    // Convert ProcessRecord to Evidence
-    let evidence = Evidence {
-        cpu: Some(CpuEvidence::Fraction {
-            occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
-        }),
-        runtime_seconds: Some(proc.elapsed.as_secs_f64()),
-        orphan: Some(proc.is_orphan()),
-        tty: Some(proc.has_tty()),
-        net: None,       // Would need network scan
-        io_active: None, // Would need /proc inspection
-        state_flag: state_to_flag(proc.state),
-        command_category: None, // Would need category classifier
-        queue_saturated: None,
-    };
+    // Convert ProcessRecord to Evidence (same snapshot features as agent plan)
+    let evidence = Evidence::from_snapshot(proc);
 
     // Compute posterior
     let posterior_result = match compute_posterior(priors, &evidence) {
@@ -14012,21 +13957,6 @@ fn build_process_explanation(
     }
 
     explanation
-}
-
-/// Map ProcessState to state flag index for priors.
-fn state_to_flag(state: pt_core::collect::ProcessState) -> Option<usize> {
-    use pt_core::collect::ProcessState;
-    match state {
-        ProcessState::Running => Some(0),
-        ProcessState::Sleeping => Some(1),
-        ProcessState::DiskSleep => Some(2),
-        ProcessState::Zombie => Some(3),
-        ProcessState::Stopped => Some(4),
-        ProcessState::Idle => Some(5),
-        ProcessState::Dead => Some(6),
-        ProcessState::Unknown => None,
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -17848,19 +17778,7 @@ fn evaluate_watch_candidate(
     priors: &Priors,
     policy: &pt_core::config::Policy,
 ) -> Option<WatchEval> {
-    let evidence = Evidence {
-        cpu: Some(CpuEvidence::Fraction {
-            occupancy: (proc.cpu_percent / 100.0).clamp(0.0, 1.0),
-        }),
-        runtime_seconds: Some(proc.elapsed.as_secs_f64()),
-        orphan: Some(proc.is_orphan()),
-        tty: Some(proc.has_tty()),
-        net: None,
-        io_active: None,
-        state_flag: state_to_flag(proc.state),
-        command_category: None,
-        queue_saturated: None,
-    };
+    let evidence = Evidence::from_snapshot(proc);
 
     let posterior_result = compute_posterior(priors, &evidence).ok()?;
     let decision_outcome = decide_action(
