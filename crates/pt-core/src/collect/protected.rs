@@ -785,6 +785,33 @@ pub fn builtin_force_review_match(cmd: &str) -> Option<(&'static str, &'static s
     builtin_match(&BUILTIN_FORCE_REVIEW, "", cmd)
 }
 
+/// Which AI agent CLI a command line runs (`claude`, `codex`, `gemini`, `cursor`,
+/// `aider`, ...), for processes the agent-CLI rule matches; `None` otherwise.
+pub fn agent_kind(cmd: &str) -> Option<&'static str> {
+    static KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\b(claude|codex|cursor-agent|agy|gemini|aider|opencode|goose|amp|crush|qwen|droid)\b|(?:^|[/\s;&|('\x22])(cod)(?:\s|$)",
+        )
+        .expect("agent kind regex")
+    });
+    builtin_force_review_match(cmd)?;
+    let caps = KIND.captures(cmd)?;
+    let name = caps.get(1).or_else(|| caps.get(2))?.as_str();
+    Some(match name {
+        "claude" => "claude",
+        "codex" | "cod" => "codex",
+        "agy" | "gemini" => "gemini",
+        "cursor-agent" => "cursor",
+        "aider" => "aider",
+        "opencode" => "opencode",
+        "goose" => "goose",
+        "amp" => "amp",
+        "crush" => "crush",
+        "qwen" => "qwen",
+        _ => "droid",
+    })
+}
+
 /// PIDs of this pt process and all of its ancestors (the invoking shell, agent CLI,
 /// tmux pane, multiplexer...). pt must never recommend killing its own caller chain.
 pub fn invoker_chain_pids(processes: &[ProcessRecord]) -> HashSet<u32> {
@@ -1254,6 +1281,32 @@ mod tests {
                     .is_none(),
                 "{cmd:?} must stay a candidate"
             );
+        }
+    }
+
+    #[test]
+    fn agent_kind_names_the_agent() {
+        let cases = [
+            ("claude --dangerously-skip-permissions", Some("claude")),
+            (
+                "/home/u/.local/share/claude/versions/2.1.280 --session-id 1",
+                Some("claude"),
+            ),
+            (
+                "node /usr/lib/node_modules/@openai/codex/bin/codex.js",
+                Some("codex"),
+            ),
+            (
+                "zsh -ic 'cd /data/campus; cod --no-alt-screen'",
+                Some("codex"),
+            ),
+            ("agy --yolo", Some("gemini")),
+            ("cursor-agent -p fix", Some("cursor")),
+            ("rg codex src/", None),
+            ("cargo test -p campus", None),
+        ];
+        for (cmd, want) in cases {
+            assert_eq!(agent_kind(cmd), want, "{cmd:?}");
         }
     }
 

@@ -1673,3 +1673,49 @@ fn plan_blocks_kill_of_open_writer() {
         "{i}"
     );
 }
+
+/// An agent CLI is identified in the plan (`agent_kind`) and never gets an
+/// automatic action.
+#[cfg(unix)]
+#[test]
+fn plan_identifies_agent_cli_kind() {
+    // argv[0] = "claude": looks like a Claude Code session to pt.
+    let mut agent = std::process::Command::new("bash")
+        .args(["-c", "exec -a claude sleep 120"])
+        .spawn()
+        .expect("spawn agent lookalike");
+    let pid = agent.id();
+    std::thread::sleep(Duration::from_millis(500));
+    let data_dir = tempdir().expect("data dir");
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", data_dir.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--max-candidates",
+            "100000",
+        ])
+        .output()
+        .expect("run plan");
+    let _ = agent.kill();
+    let _ = agent.wait();
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("plan JSON");
+    let c = json["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|c| c["pid"].as_u64() == Some(u64::from(pid)))
+        .unwrap_or_else(|| panic!("pid {pid} not in plan"))
+        .clone();
+    assert_eq!(c["agent_kind"], "claude", "{c}");
+    let rec = c["recommendation"].as_str().unwrap_or("");
+    assert!(matches!(rec, "KEEP" | "REVIEW"), "agent got {rec}: {c}");
+}

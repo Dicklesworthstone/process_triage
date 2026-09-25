@@ -32,7 +32,7 @@ pub struct QuickScanOptions {
     /// Include kernel threads (Linux only).
     pub include_kernel_threads: bool,
 
-    /// Timeout for ps command (default: 10 seconds).
+    /// Timeout for ps command (default: 30 seconds).
     pub timeout: Option<Duration>,
 
     /// Optional progress event emitter.
@@ -109,7 +109,10 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         .map_err(|e| QuickScanError::CommandFailed(e.to_string()))?;
 
     let pid = child.id();
-    let timeout = options.timeout.unwrap_or(Duration::from_secs(10));
+    // `ps` takes well under a second on a healthy host; the generous default only
+    // matters on CPU-starved hosts (the ones most in need of triage), where 10 s
+    // made the whole plan fail (ts2 under load, pt at nice 19).
+    let timeout = options.timeout.unwrap_or(Duration::from_secs(30));
     let finished = Arc::new(AtomicBool::new(false));
     let finished_clone = finished.clone();
     let timed_out = Arc::new(AtomicBool::new(false));

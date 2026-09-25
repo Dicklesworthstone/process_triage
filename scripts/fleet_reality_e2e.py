@@ -158,7 +158,9 @@ def evaluate(result: dict, labels: dict) -> dict:
                     break
         if min_age is not None and age < min_age:
             young.append({"pid": c.get("pid"), "age_seconds": age})
-        if age > result["uptime_s"] + 60:
+        # Uptime is sampled before the plan runs; a boot-time process is legitimately
+        # up to the plan's own duration older than that sample.
+        if age > result["uptime_s"] + result["plan_ms"] / 1000 + 60:
             impossible.append({"pid": c.get("pid"), "age_seconds": age})
         for cls, rx in surf.items():
             if rx.search(cmd):
