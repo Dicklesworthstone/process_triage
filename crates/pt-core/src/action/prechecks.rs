@@ -419,10 +419,43 @@ pub struct LivePreCheckProvider {
     config: LivePreCheckConfig,
     /// Known supervisor comm names.
     known_supervisors: HashSet<String>,
+    /// Recent-I/O results sampled up front for many pids (see `prime_recent_io`).
+    #[cfg(target_os = "linux")]
+    recent_io: std::sync::Mutex<std::collections::HashMap<u32, bool>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl LivePreCheckProvider {
+    /// Sample recent I/O for all `pids` in ONE probe window and cache the results,
+    /// so applying N destructive actions costs one window instead of N (it slept
+    /// the full window, 60 s by default, per target). Pids not primed are probed
+    /// individually as before.
+    pub fn prime_recent_io(&self, pids: &[u32]) {
+        // macOS has no per-process I/O counters: has_recent_io is always false there.
+        #[cfg(not(target_os = "linux"))]
+        let _ = pids;
+        #[cfg(target_os = "linux")]
+        if self.config.block_if_recent_io_seconds > 0 && !pids.is_empty() {
+            let before: Vec<(u32, crate::collect::IoStats)> = pids
+                .iter()
+                .filter_map(|&pid| parse_io(pid).map(|io| (pid, io)))
+                .collect();
+            if before.is_empty() {
+                return;
+            }
+            std::thread::sleep(recent_io_probe_window(Duration::from_secs(
+                self.config.block_if_recent_io_seconds,
+            )));
+            let mut cache = self.recent_io.lock().unwrap_or_else(|e| e.into_inner());
+            for (pid, b) in before {
+                // Gone or unreadable after the window: no recent I/O to protect.
+                let active = parse_io(pid)
+                    .is_some_and(|a| a.write_bytes > b.write_bytes || a.wchar > b.wchar);
+                cache.insert(pid, active);
+            }
+        }
+    }
+
     /// Create a new provider with the given guardrails and config.
     pub fn new(
         guardrails: Option<&Guardrails>,
@@ -452,6 +485,8 @@ impl LivePreCheckProvider {
             protected_filter,
             config,
             known_supervisors,
+            #[cfg(target_os = "linux")]
+            recent_io: Default::default(),
         })
     }
 
@@ -568,6 +603,8 @@ impl LivePreCheckProvider {
             protected_filter,
             config: LivePreCheckConfig::default(),
             known_supervisors,
+            #[cfg(target_os = "linux")]
+            recent_io: Default::default(),
         }
     }
 
@@ -583,6 +620,14 @@ impl LivePreCheckProvider {
     fn has_recent_io(&self, pid: u32, window: Duration) -> bool {
         #[cfg(target_os = "linux")]
         {
+            if let Some(&cached) = self
+                .recent_io
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&pid)
+            {
+                return cached;
+            }
             let before = parse_io(pid);
             let Some(before) = before else {
                 return false;

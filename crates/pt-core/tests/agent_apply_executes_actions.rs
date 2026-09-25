@@ -164,6 +164,11 @@ fn plan_action(action: Action, identity: &ProcessIdentity) -> PlanAction {
 
 /// Create a session holding a one-action plan; return the session id.
 fn session_with_plan(data_dir: &Path, action: PlanAction) -> String {
+    session_with_actions(data_dir, vec![action])
+}
+
+/// Create a session holding a plan with `actions`; return the session id.
+fn session_with_actions(data_dir: &Path, actions: Vec<PlanAction>) -> String {
     let store = SessionStore::at_data_dir(data_dir);
     let session_id = SessionId::new();
     let handle = store
@@ -183,18 +188,18 @@ fn session_with_plan(data_dir: &Path, action: PlanAction) -> String {
         ))
         .expect("write context");
     let plan = Plan {
-        plan_id: format!("plan-{}", action.action_id),
+        plan_id: format!("plan-{}", actions[0].action_id),
         session_id: session_id.0.clone(),
         generated_at: chrono::Utc::now().to_rfc3339(),
         policy_id: None,
         policy_version: "1.0.0".to_string(),
-        actions: vec![action],
-        pre_toggled: Vec::new(),
         gates_summary: GatesSummary {
-            total_candidates: 1,
+            total_candidates: actions.len(),
             blocked_candidates: 0,
             pre_toggled_actions: 0,
         },
+        actions,
+        pre_toggled: Vec::new(),
     };
     let decision_dir = handle.dir.join("decision");
     fs::create_dir_all(&decision_dir).expect("decision dir");
@@ -429,6 +434,66 @@ fn agent_apply_zombie_route_reaps_via_sigchld() {
     assert_eq!(status, "success", "reaping parent: {json}");
     assert_ne!(state_of(zombie_pid), Some('Z'), "zombie reaped");
     assert!(parent.alive(), "the parent must not be harmed");
+}
+
+/// The recent-I/O data-loss probe runs once for all targets (it slept the full
+/// 60 s window per target), and still blocks a process that writes periodically.
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_probes_recent_io_once_for_all_targets() {
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    write_test_policy(config_dir.path());
+    let file_dir = TempDir::new().expect("file dir");
+    let log = file_dir.path().join("heartbeat.log");
+
+    let a = ForeignTarget::spawn("sleep 308");
+    let b = ForeignTarget::spawn("sleep 309");
+    // Opens, appends and closes every 5 s: no fd held open, only recent I/O shows it.
+    let w = ForeignTarget::spawn(&format!(
+        "sh -c 'while :; do echo x >> \"{}\"; sleep 5; done'",
+        log.display()
+    ));
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut actions = Vec::new();
+    let mut targets = Vec::new();
+    for (i, pid) in [a.pid, b.pid, w.pid].into_iter().enumerate() {
+        let identity = live_identity(pid);
+        targets.push(format!("{}:{}", pid, identity.start_id.0));
+        let mut action = plan_action(Action::Kill, &identity);
+        action.action_id = format!("a-kill-{i}");
+        actions.push(action);
+    }
+    let s = session_with_actions(data_dir.path(), actions);
+
+    let started = std::time::Instant::now();
+    let (_, json) = apply(data_dir.path(), config_dir.path(), &s, &targets.join(","));
+    let elapsed = started.elapsed();
+
+    let status_of = |pid: u32| {
+        json["outcomes"]
+            .as_array()
+            .expect("outcomes")
+            .iter()
+            .find(|o| o["pid"].as_u64() == Some(u64::from(pid)))
+            .cloned()
+            .unwrap_or_else(|| panic!("no outcome for {pid}: {json}"))
+    };
+    assert_eq!(status_of(a.pid)["status"], "success", "{json}");
+    assert_eq!(status_of(b.pid)["status"], "success", "{json}");
+    let wo = status_of(w.pid);
+    assert_eq!(wo["status"], "precheck_blocked", "{json}");
+    assert!(
+        wo["reason"].as_str().unwrap_or("").contains("recent I/O"),
+        "{wo}"
+    );
+    assert!(w.alive(), "periodic writer must survive");
+    // Three gated targets: one shared 60 s window, not three (>= 180 s).
+    assert!(
+        elapsed < Duration::from_secs(110),
+        "apply took {elapsed:?}: the probe window is not shared"
+    );
 }
 
 /// The data-loss gate blocks a kill of a process holding a regular file open for

@@ -14679,6 +14679,21 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         )
         .unwrap_or_else(|_| LivePreCheckProvider::with_defaults())
     };
+    // One recent-I/O probe window for every target the data-loss gate will check,
+    // instead of one full window per target.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let gated: Vec<u32> = actions_to_apply
+            .iter()
+            .filter(|a| !a.blocked && !completed_action_ids.contains(&a.action_id))
+            .filter(|a| {
+                pt_core::plan::effective_pre_checks(a)
+                    .contains(&pt_core::plan::PreCheck::CheckDataLossGate)
+            })
+            .map(|a| a.target.pid.0)
+            .collect();
+        precheck_provider.prime_recent_io(&gated);
+    }
 
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
     // Only the Linux/macOS executor runs actions; elsewhere every action is unsupported.
