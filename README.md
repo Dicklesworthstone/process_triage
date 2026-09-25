@@ -14,7 +14,7 @@
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
 ```
 
-**`pt` finds and kills zombie processes so you don't have to.** It uses Bayesian inference over 40+ statistical models, provenance-aware blast-radius estimation, and conformal risk control to classify every process on your machine, then tells you exactly *why* it thinks something should die and exactly *what would break* if you kill it.
+**`pt` finds abandoned processes and helps you get rid of them safely.** It scores every process with a Bayesian posterior (CPU, age, orphan status, terminal, state, plus process lineage and shared resources on Linux), refuses to touch live infrastructure (multiplexers, SSH masters, databases, agent sessions, your own shell), and tells you *why* each candidate looks abandoned. It is deliberately conservative: most candidates come back as `review` or `pause`, and a `kill` recommendation needs overwhelming evidence.
 
 ---
 
@@ -26,15 +26,17 @@ Manually hunting them with `ps aux | grep` is tedious, error-prone, and teaches 
 
 ## The Solution
 
-`pt` automates detection with statistical inference, estimates collateral damage via process provenance graphs, and presents ranked candidates with full evidence transparency:
+`pt` automates detection with statistical inference, skips protected processes before scoring, and presents ranked candidates with the evidence behind each score (`pt` opens the TUI; `pt agent plan` gives the same ranking as JSON):
 
-```bash
-$ pt scan
- KILL  PID 84721  bun test          score=87  age=3h22m  cpu=0.0%  mem=1.2GB  orphan
- KILL  PID 71003  next dev          score=72  age=2d4h   cpu=0.1%  mem=340MB  detached
- REVIEW PID 55190 cargo build       score=34  age=45m    cpu=12%   mem=890MB
- SPARE  PID 1204  postgres          protected (infrastructure)
+```text
+ SCORE  ACTION  PID     AGE    CPU   MEM     COMMAND
+   85   pause   412233  260h   0.0%  12MB    python3 -m http.server 61493 --bind 127.0.0.1   (orphan)
+   83   review  90121   211h   0.2%  134MB   chrome --headless ...                            (orphan)
+   46   review  48758   1h     0.0%  1MB     sleep 8888                                       (orphan)
+        spare   1204            protected: builtin.service_daemon (postgres)
 ```
+
+The score is 100 × P(abandoned or zombie). The action is the one with the lowest expected loss under the policy's loss matrix, which makes `kill` rare by design (see [the 8 actions](#the-8-actions)).
 
 ## Why pt?
 
@@ -43,11 +45,11 @@ $ pt scan
 | Finds abandoned processes automatically | - | - | Yes |
 | Bayesian confidence scoring | - | - | Yes |
 | Explains *why* a process is suspicious | - | - | Yes |
-| Estimates blast radius before kill | - | - | Yes |
+| Estimates blast radius before kill (Linux) | - | - | Yes |
 | Learns from your past decisions | - | - | Yes |
-| Protected process lists | - | - | Yes |
-| Fleet-wide distributed triage | - | - | Yes |
-| Conformal FDR control for automation | - | - | Yes |
+| Built-in protection for live infrastructure | - | - | Yes |
+| Fleet-wide planning over SSH | - | - | Yes |
+| Guardrails for automation (posterior, RSS, kill caps, live pre-checks) | - | - | Yes |
 | Safe kill signals (SIGTERM → SIGKILL) | - | - | Yes |
 | Interactive TUI | - | Yes | Yes |
 
@@ -62,14 +64,12 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/ma
 # Interactive mode — scan, review, confirm, kill
 pt
 
-# Quick scan — just show candidates, don't kill anything
-pt scan
-
-# Deep scan — collect network, I/O, queue depth evidence for higher confidence
-pt deep
-
-# Agent/robot mode — structured JSON output for CI/automation
+# Scored candidates without acting (JSON; what agents and scripts use)
 pt agent plan --format json
+
+# Raw process snapshot / raw deep /proc records (no scoring)
+pt scan
+pt deep
 
 # Compare two sessions to see what changed
 pt diff --last
@@ -82,15 +82,13 @@ pt shadow start
 
 ## Design Philosophy
 
-**1. Conservative by default.** No process is ever killed without explicit confirmation. Robot mode requires 95%+ posterior confidence, passes through conformal prediction gates, and checks blast-radius risk before any automated action.
+**1. Conservative by default.** No process is ever killed without explicit confirmation. Robot mode is off unless enabled in policy, needs `--yes`, a posterior of at least `min_posterior` (0.95) for the event that justifies the action, per-action and total RSS limits, a kill cap, and live pre-checks (identity, protection, session safety, data-loss gate) immediately before acting.
 
-**2. Transparent decisions.** Every recommendation comes with a full evidence ledger: which features contributed, how much each shifted the posterior, what the Bayes factor is, and what would break if you proceed. No black boxes.
+**2. Transparent decisions.** Every recommendation comes with its evidence: which features contributed, how much each shifted the posterior, and the expected loss of every action (`pt agent explain --galaxy-brain`, the TUI detail pane, `pt report --include-ledger`).
 
-**3. Provenance-aware safety.** Beyond checking whether a process *looks* abandoned, `pt` traces process lineage, maps shared resources (lockfiles, sockets, listeners), estimates direct and transitive blast radius, and blocks kills that would cascade across the system.
+**3. Protection before scoring.** Terminal multiplexers, SSH ControlMasters, session infrastructure, interactive shells, database/web servers and their workers, pt's own caller chain, systemd/container-supervised services, and on macOS system and app-bundle processes are never candidates. AI agent CLIs are only ever shown for review.
 
-**4. Distribution-free guarantees.** Robot mode uses Mondrian conformal prediction to provide finite-sample FDR control. The coverage guarantee `P(Y in C(X)) >= 1-alpha` holds without parametric assumptions, as long as the calibration data is exchangeable with the test distribution.
-
-**5. No mocks, no fakes.** Core inference modules are tested against real system state, not mocked /proc filesystems. If the test passes, the code works on real machines.
+**4. Real processes in tests.** Parsers, collectors and the action layer are tested against real /proc and real spawned processes; a live read-only fleet gate (`scripts/fleet_reality_e2e.py`) checks plans on real hosts. Some higher-level tests use synthetic process builders.
 
 ---
 
@@ -107,19 +105,19 @@ Every process on your system passes through a five-stage pipeline:
            25 modules      41 modules      40 modules      13 modules      5 formats
 ```
 
-**Collect** reads `/proc/[pid]/stat`, `/proc/[pid]/io`, `/proc/[pid]/fd`, `/proc/net/tcp`, cgroup controllers, GPU devices, systemd units, and container metadata. It also builds a shared-resource graph mapping which processes hold the same lockfiles, sockets, and listeners.
+**Collect** takes a process snapshot (`ps` plus exact start times from `/proc` or `proc_pidinfo`), cgroup placement, and on Linux process lineage and a shared-resource graph (listeners, sockets, lockfiles).
 
-**Infer** runs the evidence through 40+ statistical models. The ensemble includes changepoint detectors, regime-switching filters, queueing models, extreme value analysis, and conformal predictors. Each model contributes an evidence term to the posterior.
+**Infer** computes a 4-class posterior (useful, useful-but-bad, abandoned, zombie) by naive Bayes over CPU occupancy, age, orphan status, controlling terminal and kernel state, with each term clipped and tempered so no single signal dominates. On Linux, lineage and shared-resource evidence add terms; signature matches and your own past verdicts (`pt agent label`, TUI kills) set the prior. The TUI also uses deep network/I/O evidence when it collects it.
 
-**Decide** picks the optimal action using expected-loss minimization, subject to FDR control, blast-radius constraints, causal safety gates, and configurable policy enforcement. Rather than a binary kill/spare, it evaluates 8 possible actions (Keep, Renice, Pause, Freeze, Throttle, Quarantine, Restart, Kill) and picks the one with lowest expected loss.
+**Decide** picks the action with the lowest expected loss under the policy's loss matrix, among the actions feasible for the process state, then applies protection, supervision and policy enforcement. Rather than a binary kill/spare, it evaluates Keep, Renice, Pause, Freeze, Throttle, Quarantine, Restart and Kill.
 
-**Act** executes the chosen action with TOCTOU-safe identity verification, staged signal escalation, and rollback on failure. Actions beyond kill include cgroup-based CPU throttling, cpuset quarantine (pin to limited cores), cgroup v2 freezing, and nice-value adjustment.
+**Act** re-verifies identity (exact start time; a pidfd on Linux) and runs live pre-checks immediately before each signal, then escalates SIGTERM → SIGKILL. Renice, pause/resume and kill run on Linux and macOS; freeze, throttle and quarantine are Linux-only and refused unless the target owns its cgroup. Failures are reported; there is no automatic rollback.
 
-**Report** produces output in JSON, TOON (token-optimized), HTML, or interactive TUI. Every report includes the evidence ledger, Bayes factor breakdown, provenance explanation with counterfactual stories, and missing-evidence diagnostics.
+**Report** produces JSON, TOON (token-optimized), Markdown, HTML reports, or the interactive TUI, with the evidence ledger and Bayes factors.
 
-### The Statistical Models
+### Experimental Library Models
 
-`pt` doesn't rely on a single classifier. It runs an ensemble of 40+ specialized models, each contributing evidence terms to the posterior:
+The workspace also ships these models as tested library code. **None of them is wired into `agent plan`, the TUI, or `agent apply` yet**; they are candidates to be added only where they measurably improve decisions:
 
 | Model | What It Detects | How It Works |
 |-------|----------------|--------------|
@@ -146,20 +144,22 @@ All computation happens in log-domain using numerically stable log-sum-exp to pr
 
 Most tools only know "kill" or "don't kill." `pt` evaluates 8 possible actions ranked by expected loss:
 
-| Action | Signal/Mechanism | Reversible | When Used |
+| Action | Signal/Mechanism | Reversible | Executes on |
 |--------|-----------------|:--:|-----------|
-| **Keep** | No action | Yes | Process is useful or uncertain |
-| **Renice** | `nice` value adjustment | Yes | Low-priority but not harmful |
-| **Pause** | `SIGSTOP` | Yes | Temporarily stop for investigation |
-| **Freeze** | cgroup v2 freezer | Yes | More robust than SIGSTOP (handles children) |
-| **Throttle** | cgroup CPU quota | Yes | Limit CPU without stopping |
-| **Quarantine** | cpuset controller | Yes | Pin to limited cores |
-| **Restart** | Kill + supervisor respawn | Partial | Supervised process that needs cycling |
-| **Kill** | SIGTERM → SIGKILL | No | Process is abandoned/zombie |
+| **Keep** | No action | Yes | - |
+| **Renice** | lower priority (`nice`), never raises it | Yes | Linux, macOS |
+| **Pause** | `SIGSTOP` (resume: `SIGCONT`) | Yes | Linux, macOS |
+| **Freeze** | cgroup v2 freezer | Yes | Linux, if the target owns its cgroup |
+| **Throttle** | cgroup CPU quota | Yes | Linux, if the target owns its cgroup |
+| **Quarantine** | cpuset controller | Yes | Linux, if the target owns its cgroup |
+| **Restart** | via the supervisor | Partial | not executable yet (planned, e.g. for a zombie's parent); apply reports it as failed |
+| **Kill** | SIGTERM → SIGKILL | No | Linux, macOS |
+
+**Why `kill` is rare.** The default loss matrix makes killing a useful process 500 times worse than leaving an abandoned one paused, so `kill` wins only when P(useful) is below about 0.7% of P(abandoned). The posterior is deliberately conservative, so on real machines idle orphans usually come back as `pause` or `review`. Your own verdicts (`pt agent label --kill`) raise the prior for a command pattern; the loss matrix is configurable in `policy.json`.
 
 ### Evidence Collection: What /proc Files Are Parsed
 
-On Linux, `pt` reads 12+ files per process during a deep scan:
+On Linux, `pt deep` reads 12+ files per process (raw records; the TUI turns network/I/O activity into evidence terms, `agent plan` does not yet use them):
 
 | File | Data Extracted |
 |------|---------------|
@@ -176,7 +176,7 @@ On Linux, `pt` reads 12+ files per process during a deep scan:
 | `/proc/net/udp` | UDP socket state |
 | `/proc/net/unix` | Unix domain sockets with reference counts |
 
-Critical file detection recognizes 20+ patterns: git locks (`.git/index.lock`), package manager locks (dpkg, apt, rpm, npm, pnpm, yarn, cargo), SQLite WAL/journal files, database write handles, and generic `.lock`/`.lck` files.
+Critical file detection recognizes 20+ patterns: git locks (`.git/index.lock`), package manager locks (dpkg, apt, rpm, npm, pnpm, yarn, cargo), SQLite WAL/journal files, database write handles, and generic `.lock`/`.lck` files. At apply time the data-loss gate blocks any target holding a regular file open for writing or a file lock; the categorized critical-file rules are not yet attached to plans.
 
 ### The TUI
 
@@ -288,21 +288,24 @@ Runs the full triage workflow: **Scan** → **Review** → **Confirm** → **Kil
 
 Use `pt run --inline` to preserve terminal scrollback.
 
-### 2. Scan Only
+### 2. Scored Candidates Without Acting
 
 ```bash
-pt scan        # Quick scan (~1 second)
-pt deep        # Deep scan with I/O, network, queue depth probes (~10-30 seconds)
+pt agent plan --format json                 # ranked candidates, evidence, recommended actions
+pt agent explain --session <id> --pids 1234 # why one process scored the way it did
 ```
+
+`pt scan` and `pt deep` print raw process snapshots (JSON by default), not scores.
 
 ### 3. Agent/Robot Mode
 
 ```bash
-pt agent plan --format json       # Structured JSON plan
-pt agent plan --format toon       # Token-optimized output
-pt agent apply --session <id>     # Execute a plan
-pt agent verify --session <id>    # Confirm outcomes
-pt agent watch --format jsonl     # Stream events
+pt agent plan --format json            # Structured JSON plan
+pt agent plan --format toon            # Token-optimized output
+pt agent apply --session <id> --yes    # Execute a plan (needs robot_mode.enabled=true in policy)
+pt agent verify --session <id>         # Confirm outcomes
+pt agent label --pid 1234 --kill       # Teach pt your verdict for this command pattern
+pt agent watch --format jsonl          # Stream events
 ```
 
 ### 4. Shadow Mode (calibration)
@@ -321,10 +324,12 @@ pt shadow stop                    # Stop observer
 |---------|-------------|---------|
 | `pt` | Interactive triage (scan + review + kill) | `pt` |
 | `pt run --inline` | Interactive with preserved scrollback | `pt run --inline` |
-| `pt scan` | Quick scan, show candidates | `pt scan` |
-| `pt deep` | Deep scan with extra probes | `pt deep` |
-| `pt agent plan` | Generate structured plan | `pt agent plan --format json` |
-| `pt agent apply` | Execute a plan | `pt agent apply --session <id>` |
+| `pt scan` | Raw process snapshot (no scoring) | `pt scan` |
+| `pt deep` | Raw deep /proc records (Linux) | `pt deep` |
+| `pt agent plan` | Scored, ranked candidates + plan | `pt agent plan --format json` |
+| `pt agent explain` | Evidence for specific PIDs | `pt agent explain --session <id> --pids 1234` |
+| `pt agent label` | Record your kill/spare verdict | `pt agent label --pid 1234 --spare` |
+| `pt agent apply` | Execute a plan (robot mode) | `pt agent apply --session <id> --yes` |
 | `pt agent verify` | Confirm outcomes | `pt agent verify --session <id>` |
 | `pt agent watch` | Stream events | `pt agent watch --format jsonl` |
 | `pt agent report` | Generate HTML report | `pt agent report --session <id>` |
@@ -404,34 +409,22 @@ Protection has two layers:
 
 ### Provenance-Aware Blast Radius
 
-`pt` goes beyond simple process metrics. It builds a **shared-resource graph** mapping which processes share lockfiles, sockets, listeners, and pidfiles. Before any kill, it estimates:
-
-- **Direct impact**: co-holders of shared resources, supervised processes, children
-- **Indirect impact**: transitive dependencies via BFS with confidence decay
-- **Risk classification**: Low / Medium / High / Critical
-
-```
-blast_radius:
-  risk_level: Medium
-  total_affected: 3
-  risk_score: 0.35
-  direct: "shares 2 resource(s) with 3 process(es), owns 1 active listener(s)"
-  counterfactual: "Killing would affect 3 other processes"
-```
-
-High-risk kills require confirmation. Critical-risk kills are blocked in robot mode.
+On Linux, `pt agent plan` builds a **shared-resource graph** mapping which processes share lockfiles, sockets, listeners, and pidfiles, and estimates each candidate's direct impact (co-holders of shared resources, supervised processes, children). A high estimated blast radius lowers the abandonment posterior; it is evidence, not a hard block. Plans also report each candidate's RSS, CPU and number of direct children. Separately, a process-tree pass never recommends killing a process whose live children would not also be killed, and caps anything under a live agent session at `review`.
 
 ### Robot/Agent Safety Gates
 
+All of these apply in `pt agent apply` (robot mode is off by default: `robot_mode.enabled`):
+
 | Gate | Default | Purpose |
 |------|---------|---------|
-| `min_posterior` | 0.95 | Minimum Bayesian confidence |
-| `conformal_alpha` | 0.05 | FDR control via Mondrian conformal prediction |
-| `max_blast_radius` | Critical | Block kills above this risk level |
-| `max_kills` | 10 | Per-session kill limit |
-| `fdr_budget` | 0.05 | e-value Benjamini-Hochberg correction |
-| `causal_snapshot` | Complete | Require fleet-wide consistent cut |
-| `protected_patterns` | (see above) | Always enforced |
+| `robot_mode.min_posterior` | 0.95 | P(abandoned or zombie) for kill/restart, 1 − P(useful) for other actions |
+| `robot_mode.max_blast_radius_mb` | 4096 | Per-action RSS limit (`--max-total-blast-radius` for the run) |
+| `robot_mode.max_kills` | 5 | Per-run kill limit |
+| `robot_mode.require_human_for_supervised` | true | Processes under an agent/IDE/CI need a human (fails closed if unknown) |
+| protection rules | on | Built-in + `guardrails.protected_*`, re-checked live before each action |
+| live pre-checks | always | Identity, protection, session safety, data-loss gate, supervisor; a plan cannot opt out |
+
+Fleet plans additionally pool kill decisions across hosts with e-value Benjamini-Yekutieli FDR control; single-host plans report the expected false-discovery rate of their kill set.
 
 ---
 
@@ -440,30 +433,31 @@ High-risk kills require confirmation. Critical-risk kills are blocked in robot m
 ```
 pt (Bash wrapper)
  └─ pt-core (Rust binary, 8 crates, 100+ modules)
-     ├─ Collect ─────── /proc parsing, network queues, cgroup limits,
-     │                  GPU detection, systemd units, containers,
-     │                  lockfile/pidfile ownership, workspace resolver,
-     │                  shared-resource graph, provenance continuity
+     ├─ Collect ─────── ps + exact /proc (Linux) / proc_pidinfo (macOS)
+     │                  timing, cgroup placement, lineage, shared-resource
+     │                  graph (Linux), deep /proc probes via io_uring
      │
-     ├─ Infer ──────── Bayesian posteriors (log-domain), BOCPD, HSMM,
-     │                  Kalman filters, conformal prediction (Mondrian),
-     │                  queueing-theoretic stall detection (M/M/1 + EWMA),
-     │                  belief propagation, Hawkes processes, EVT,
-     │                  martingale testing, context-tree weighting
+     ├─ Infer ──────── 4-class naive-Bayes posterior (log-domain, clipped
+     │                  and tempered terms), signature + learned priors,
+     │                  provenance terms (Linux)
      │
-     ├─ Decide ─────── Expected-loss minimization, FDR control (eBH/eBY),
-     │                  Value of Information, active sensing, CVaR,
-     │                  distributionally robust optimization,
-     │                  blast-radius estimation, provenance scoring,
-     │                  causal snapshots (Chandy-Lamport), Gittins indices
+     ├─ Decide ─────── Expected-loss minimization, protection and policy
+     │                  enforcement, process-tree safety, Value of
+     │                  Information (deep-scan hint), goal optimizer,
+     │                  fleet e-BY FDR
      │
-     ├─ Act ────────── SIGTERM → SIGKILL escalation, cgroup throttle,
-     │                  cpuset quarantine, renice, process freeze,
-     │                  recovery trees, rollback on failure
+     ├─ Act ────────── identity-pinned signals (pidfd on Linux),
+     │                  SIGTERM → SIGKILL, renice, pause/resume,
+     │                  cgroup freeze/throttle/quarantine (Linux), live
+     │                  pre-checks
      │
-     └─ Report ─────── JSON/TOON/HTML output, evidence ledger,
-                        Galaxy-Brain cards, provenance explanations,
-                        counterfactual stories, session bundles
+     └─ Report ─────── JSON/TOON/Markdown/HTML output, evidence ledger,
+                        Galaxy-Brain cards, session bundles
+
+ Library-only (tested, not wired into commands yet): BOCPD, HSMM, IMM,
+ Kalman, CTW, Hawkes, EVT, conformal, martingales, CVaR, DRO, Gittins,
+ causal snapshots, recovery trees, user-intent, workspace and GPU
+ collectors, incremental scanning, OPE, contextual bandits.
 ```
 
 ### Workspace Structure
