@@ -25,6 +25,13 @@ use std::process::{Child, Command as ProcessCommand};
 use std::time::Duration;
 use tempfile::TempDir;
 
+/// How apply delivers signals to a single verified process: a pidfd bound to it on
+/// Linux; kill(2) right after an exact start-time recheck on macOS (no pidfds).
+#[cfg(target_os = "linux")]
+const SIGNAL_PATH: &str = "pidfd";
+#[cfg(target_os = "macos")]
+const SIGNAL_PATH: &str = "kill";
+
 /// A target process in a foreign session and not its leader: how a process left
 /// behind by a terminal looks. (pt's own session and session leaders are protected by
 /// the session-safety pre-check, which apply always runs.) `sh` leads the new session,
@@ -274,10 +281,16 @@ fn agent_apply_executes_renice_then_kill_on_live_process() {
         "unexpected nice after renice (before {nice_before})"
     );
 
+    assert!(
+        json["outcomes"][0]["signal_path"].is_null(),
+        "renice sends no signal"
+    );
+
     // 2) Kill.
     let s2 = session_with_plan(data_dir.path(), plan_action(Action::Kill, &identity));
     let (status, json) = apply(data_dir.path(), config_dir.path(), &s2, &target);
     assert_eq!(status, "success", "kill outcome: {json}");
+    assert_eq!(json["outcomes"][0]["signal_path"], SIGNAL_PATH, "{json}");
     let exited = (0..50).any(|_| {
         if !victim.alive() {
             return true;
@@ -312,10 +325,12 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
     let s = session_with_plan(data_dir.path(), plan_action(Action::Pause, &identity));
     let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &target);
     assert_eq!(status, "success", "pause outcome: {json}");
+    assert_eq!(json["outcomes"][0]["signal_path"], SIGNAL_PATH, "{json}");
     assert_eq!(state_of(pid), Some('T'), "child should be stopped");
     let s = session_with_plan(data_dir.path(), plan_action(Action::Resume, &identity));
     let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &target);
     assert_eq!(status, "success", "resume outcome: {json}");
+    assert_eq!(json["outcomes"][0]["signal_path"], SIGNAL_PATH, "{json}");
     assert_ne!(state_of(pid), Some('T'), "child should run again");
 
     // A plan whose identity no longer matches the live process (PID reuse) must not

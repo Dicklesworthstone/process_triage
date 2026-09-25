@@ -14976,10 +14976,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
                 // "success" means the effect was observed (stopped, reniced, exited,
                 // zombie reaped), not merely that the syscall returned.
-                match action_runner
+                let result = action_runner
                     .execute(action)
-                    .and_then(|()| action_runner.verify(action))
-                {
+                    .and_then(|()| action_runner.verify(action));
+                // pidfd (bound to the verified process) or kill(2) with re-verify.
+                let signal_path = action_runner.take_signal_path();
+                match result {
                     Ok(()) => {
                         if action.action == Action::Kill {
                             // Accumulate the real memory footprint so
@@ -14993,7 +14995,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         }
                         succeeded += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "success", "time_ms": elapsed_ms}));
+                        outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "success", "time_ms": elapsed_ms, "signal_path": signal_path}));
                         emit_action_event(
                             pt_core::events::event_names::ACTION_COMPLETE,
                             action_index,
@@ -15006,7 +15008,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     Err(e) => {
                         failed += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "failed", "error": format!("{:?}", e), "time_ms": elapsed_ms}));
+                        outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "failed", "error": format!("{:?}", e), "time_ms": elapsed_ms, "signal_path": signal_path}));
                         emit_action_event(
                             pt_core::events::event_names::ACTION_FAILED,
                             action_index,

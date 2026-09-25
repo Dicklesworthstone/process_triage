@@ -40,11 +40,29 @@ impl Default for SignalConfig {
 #[derive(Debug)]
 pub struct SignalActionRunner {
     config: SignalConfig,
+    /// How the last signal was delivered: "pidfd", "kill" or "kill_group".
+    last_path: std::sync::Mutex<Option<&'static str>>,
 }
 
 impl SignalActionRunner {
     pub fn new(config: SignalConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            last_path: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn note_path(&self, path: &'static str) {
+        *self.last_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+    }
+
+    /// How the most recent signal was delivered ("pidfd", "kill", "kill_group"),
+    /// clearing it; `None` if no signal was sent since the last call.
+    pub fn take_signal_path(&self) -> Option<&'static str> {
+        self.last_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     pub fn with_defaults() -> Self {
@@ -76,6 +94,7 @@ impl SignalActionRunner {
         } else {
             target_id as i32
         };
+        self.note_path(if use_group { "kill_group" } else { "kill" });
 
         let result = unsafe { libc::kill(target_pid, signal) };
         if result == 0 {
@@ -107,6 +126,7 @@ impl SignalActionRunner {
         // the newcomer.
         match self.read_starttime(pid) {
             Some(current) if ids_match_starttime(&action.target.start_id.0, current) => {
+                self.note_path("pidfd");
                 Ok(Some(fd))
             }
             Some(_) => Err(ActionError::IdentityMismatch),
@@ -383,6 +403,16 @@ impl SignalActionRunner {
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
 
+        #[cfg(target_os = "linux")]
+        if !use_group {
+            if let Some(pidfd) = self.pinned_pidfd(action)? {
+                return pidfd.send(libc::SIGCONT);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if !use_group {
+            self.check_identity_now(action)?;
+        }
         self.send_signal(target, libc::SIGCONT, use_group)?;
         Ok(())
     }

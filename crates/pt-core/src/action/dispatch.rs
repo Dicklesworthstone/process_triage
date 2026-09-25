@@ -43,6 +43,14 @@ impl CompositeActionRunner {
     }
 }
 
+impl CompositeActionRunner {
+    /// How the most recent signal was delivered ("pidfd", "kill", "kill_group"),
+    /// clearing it; `None` when the last action sent no signal.
+    pub fn take_signal_path(&self) -> Option<&'static str> {
+        self.signal.take_signal_path()
+    }
+}
+
 impl Default for CompositeActionRunner {
     fn default() -> Self {
         Self::with_defaults()
