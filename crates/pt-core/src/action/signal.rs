@@ -161,9 +161,10 @@ impl SignalActionRunner {
         fields.get(19)?.parse::<u64>().ok()
     }
 
+    /// Exact start time in microseconds (the value macOS start ids carry).
     #[cfg(target_os = "macos")]
     fn read_starttime(&self, pid: u32) -> Option<u64> {
-        crate::collect::read_process_snapshot(pid).map(|info| info.start_time_unix)
+        crate::collect::macos::read_bsd_info(pid).map(|info| info.start_us)
     }
 
     /// Wait for a process to reach a target state or exit.
@@ -218,8 +219,23 @@ impl SignalActionRunner {
                 return pidfd.send(libc::SIGSTOP);
             }
         }
+        #[cfg(target_os = "macos")]
+        if !use_group {
+            self.check_identity_now(action)?;
+        }
         self.send_signal(target, libc::SIGSTOP, use_group)?;
         Ok(())
+    }
+
+    /// macOS has no pidfd: re-check the exact identity immediately before signaling,
+    /// keeping the PID-reuse window as small as the platform allows.
+    #[cfg(target_os = "macos")]
+    fn check_identity_now(&self, action: &PlanAction) -> Result<(), ActionError> {
+        match self.read_starttime(action.target.pid.0) {
+            Some(current) if ids_match_starttime(&action.target.start_id.0, current) => Ok(()),
+            Some(_) => Err(ActionError::IdentityMismatch),
+            None => Err(ActionError::ProcessNotFound),
+        }
     }
 
     /// Execute a kill action (SIGTERM → SIGKILL).
@@ -245,6 +261,11 @@ impl SignalActionRunner {
                     Err(e) => Err(e),
                 };
             }
+        }
+
+        #[cfg(target_os = "macos")]
+        if !use_group {
+            self.check_identity_now(action)?;
         }
 
         // Stage 1: SIGTERM
@@ -507,6 +528,33 @@ impl super::executor::IdentityProvider for LiveIdentityProvider {
     }
 }
 
+/// Live identity provider for macOS: exact start time (microseconds) and uid from
+/// `proc_pidinfo`, the same source the scan records in start ids.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+pub struct LiveIdentityProvider;
+
+#[cfg(target_os = "macos")]
+impl LiveIdentityProvider {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl super::executor::IdentityProvider for LiveIdentityProvider {
+    fn revalidate(&self, target: &pt_common::ProcessIdentity) -> Result<bool, ActionError> {
+        let pid = target.pid.0;
+        let Some(info) = crate::collect::macos::read_bsd_info(pid) else {
+            return Ok(false); // gone, or identity cannot be confirmed
+        };
+        let (_, expected_start, expected_pid) = parse_start_id(&target.start_id.0);
+        Ok(expected_start == Some(info.start_us)
+            && expected_pid.is_none_or(|p| p == pid)
+            && info.uid == target.uid)
+    }
+}
+
 /// A pidfd (Linux >= 5.3): a file descriptor pinned to one specific process.
 /// Signals sent through it can never reach a process that later reuses the PID.
 #[cfg(target_os = "linux")]
@@ -564,7 +612,7 @@ impl Drop for PidFd {
 }
 
 /// Values of a `boot_id:start_ticks:pid` start id that are known (not placeholders).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn parse_start_id(id: &str) -> (Option<&str>, Option<u64>, Option<u32>) {
     let parts: Vec<&str> = id.split(':').collect();
     let known = |s: &str| !s.is_empty() && !matches!(s, "unknown" | "synthetic");
@@ -621,24 +669,9 @@ fn ids_match_starttime(start_id: &str, current_starttime: u64) -> bool {
         st.parse::<u64>().ok()
     }
 
-    if let Some(expected) = extract_starttime(start_id) {
-        #[cfg(target_os = "linux")]
-        {
-            // Exact: plan start ids carry the kernel's start ticks (see ids_match).
-            expected == current_starttime
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // macOS starttime is in seconds - allow 2s jitter
-            expected.abs_diff(current_starttime) <= 2
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            expected == current_starttime
-        }
-    } else {
-        false
-    }
+    // Exact: start ids carry the kernel's start ticks (Linux) or the exact start time in
+    // microseconds from proc_pidinfo (macOS); a tolerance only widens PID reuse.
+    extract_starttime(start_id) == Some(current_starttime)
 }
 
 #[cfg(test)]

@@ -26,6 +26,23 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace};
 
+/// User name for a uid via the system resolver (getpwuid_r; Directory Services on macOS).
+#[cfg(target_os = "macos")]
+fn user_name_for_uid(uid: u32) -> Option<String> {
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: passwd is plain old data; getpwuid_r writes into `pwd` and `buf` only,
+    // and sets `result` to &pwd on success or null when there is no such user.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: pw_name points into `buf`, NUL-terminated by getpwuid_r.
+    let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+    Some(name.to_string_lossy().into_owned())
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn recent_io_probe_window(window: Duration) -> Duration {
     if window.is_zero() {
@@ -401,15 +418,32 @@ impl LivePreCheckProvider {
         }
         #[cfg(target_os = "macos")]
         {
-            // On macOS, getting the full cmdline requires a more complex sysctl call
-            // (KERN_PROCARGS2). For now, fallback to comm if unavailable.
-            self.read_comm(pid)
+            // Full argv via ps (the command-line protection rules need the arguments,
+            // e.g. `ssh -M`, `-zsh`, `ssh host nc -U .../sock`); comm as a fallback.
+            let pid_arg = pid.to_string();
+            crate::collect::tool_runner::run_tool(
+                "ps",
+                &["-p", &pid_arg, "-o", "args="],
+                Some(std::time::Duration::from_secs(5)),
+                None,
+            )
+            .ok()
+            .filter(|out| out.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|args| !args.is_empty())
+            .or_else(|| self.read_comm(pid))
         }
     }
 
     /// Read process owner username.
     fn read_user(&self, pid: u32) -> Option<String> {
         let uid = self.read_uid(pid)?;
+        // macOS keeps real users in Directory Services, not /etc/passwd: ask the
+        // system resolver so operator-listed protected users match by name.
+        #[cfg(target_os = "macos")]
+        if let Some(name) = user_name_for_uid(uid) {
+            return Some(name);
+        }
         // Try to resolve UID to username safely
         #[cfg(unix)]
         {
@@ -526,7 +560,7 @@ impl LivePreCheckProvider {
         {
             // Use lsof to find open write descriptors
             if let Ok((files, _)) =
-                crate::collect::macos::collect_lsof_info(pid, Duration::from_secs(2))
+                crate::collect::macos::collect_lsof_info(pid, Duration::from_secs(5))
             {
                 let write_count = files
                     .iter()
@@ -777,6 +811,17 @@ impl LivePreCheckProvider {
         // Try to get systemd unit info with full metadata (Linux only)
         #[cfg(target_os = "linux")]
         {
+            // A login session (session-N.scope) or transient scope holds whatever a user
+            // started; systemd does not supervise or restart it. Treating it as a unit
+            // blocked every action on processes started over SSH ("use systemctl stop
+            // session-N.scope", which would end the whole login).
+            if crate::collect::read_cgroup_role(pid).is_user_workload() {
+                trace!(
+                    pid,
+                    "login-session / transient-scope workload: not supervised"
+                );
+                return None;
+            }
             let cgroup_unit = self.extract_cgroup_unit(pid);
             if let Some(unit) = collect_systemd_unit(pid, cgroup_unit.as_deref()) {
                 // Filter out slice-only units (e.g., user.slice) - these aren't real supervision
@@ -901,6 +946,19 @@ impl PreCheckProvider for LivePreCheckProvider {
                     };
                 }
                 session_workload = role.is_user_workload();
+                // macOS has no cgroups: same owner/executable placement as the scan.
+                if cfg!(target_os = "macos") {
+                    use crate::collect::protected::{macos_placement, MacPlacement};
+                    match macos_placement(&user, &comm, &cmd) {
+                        MacPlacement::System(notes) => {
+                            return PreCheckResult::Blocked {
+                                check: PreCheck::CheckNotProtected,
+                                reason: format!("builtin.macos_system: {notes}"),
+                            };
+                        }
+                        MacPlacement::UserWorkload => session_workload = true,
+                    }
+                }
             }
 
             // Check protected users (login-session workloads are exempt, see
@@ -942,6 +1000,18 @@ impl PreCheckProvider for LivePreCheckProvider {
 
         // Check open write file descriptors
         if self.config.block_if_open_write_fds {
+            // macOS inspects open files with lsof; if that fails the gate must fail
+            // closed, not report "no open files" (it silently passed when lsof was
+            // not on PATH).
+            #[cfg(target_os = "macos")]
+            if let Err(e) = crate::collect::macos::collect_lsof_info(pid, Duration::from_secs(5)) {
+                return PreCheckResult::Blocked {
+                    check: PreCheck::CheckDataLossGate,
+                    reason: format!(
+                        "cannot inspect open files ({e}); refusing without data-loss evidence"
+                    ),
+                };
+            }
             let (exceeds_max, write_count) = self.has_open_write_fds(pid);
             if exceeds_max {
                 debug!(pid, write_count, "process has open write fds");
@@ -1808,6 +1878,36 @@ mod tests {
         assert!(json.contains("unit_name"));
         // systemd_unit skipped when None
         assert!(!json.contains("systemd_unit"));
+    }
+
+    // ── macOS-specific tests ────────────────────────────────────────
+
+    #[cfg(target_os = "macos")]
+    mod macos_tests {
+        use super::*;
+
+        /// The data-loss gate sees a regular file held open for writing (via lsof).
+        #[test]
+        fn data_loss_gate_blocks_open_write_handle_on_macos() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("target.log");
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", &format!("exec sleep 30 >> '{}'", log.display())])
+                .spawn()
+                .expect("spawn writer");
+            std::thread::sleep(Duration::from_millis(300));
+            let provider =
+                LivePreCheckProvider::new(None, LivePreCheckConfig::default()).expect("provider");
+            let result = provider.check_data_loss(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            match result {
+                PreCheckResult::Blocked { reason, .. } => {
+                    assert!(reason.contains("open write fds"), "{reason}")
+                }
+                other => panic!("open write handle must block, got {other:?}"),
+            }
+        }
     }
 
     // ── Linux-specific tests ────────────────────────────────────────

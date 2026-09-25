@@ -487,6 +487,20 @@ fn plan_zombie_actions(candidate: &DecisionCandidate, blocked: bool) -> Option<V
     Some(actions)
 }
 
+/// Pre-checks to run for `action` at apply time: the ones the plan lists plus every
+/// check pt itself generates for that action type. A plan (hand-written, stale, or
+/// tampered) can add checks but never opt out of protection, session safety,
+/// data-loss or supervisor checks.
+pub fn effective_pre_checks(action: &PlanAction) -> Vec<PreCheck> {
+    let mut checks = action.pre_checks.clone();
+    for check in pre_checks_for(action.action) {
+        if !checks.contains(&check) {
+            checks.push(check);
+        }
+    }
+    checks
+}
+
 fn pre_checks_for(action: Action) -> Vec<PreCheck> {
     let mut checks = vec![
         PreCheck::VerifyIdentity,

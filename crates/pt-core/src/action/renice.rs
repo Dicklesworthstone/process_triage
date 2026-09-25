@@ -137,7 +137,23 @@ impl ReniceActionRunner {
         fields.get(16)?.parse::<i32>().ok()
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// Current nice value via getpriority(2).
+    #[cfg(target_os = "macos")]
+    fn get_nice_value(&self, pid: u32) -> Option<i32> {
+        // getpriority can legitimately return -1, so errors are told apart by errno.
+        // SAFETY: plain libc calls on a pid; errno is thread-local.
+        unsafe {
+            *libc::__error() = 0;
+            let value = libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t);
+            if value == -1 && *libc::__error() != 0 {
+                None
+            } else {
+                Some(value)
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn get_nice_value(&self, _pid: u32) -> Option<i32> {
         None
     }

@@ -419,12 +419,30 @@ fn parse_ps_line_with_timing(
         _ => None,
     };
 
+    // On macOS, the exact start time (microseconds) from proc_pidinfo; the action layer
+    // revalidates identity against the same value before signaling.
+    #[cfg(target_os = "macos")]
+    let mac_start_us = match synthetic_now_unix {
+        None => crate::collect::macos::read_bsd_info(parsed.pid).map(|info| info.start_us),
+        Some(_) => None,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mac_start_us: Option<u64> = None;
+
     let (start_time_unix, elapsed, start_id) = if let Some(exact) = exact {
         let boot = boot_id.as_deref().unwrap_or("unknown");
         (
             exact.start_time_unix,
             exact.elapsed,
             StartId::from_linux(boot, exact.start_ticks, parsed.pid),
+        )
+    } else if let Some(start_us) = mac_start_us {
+        let boot = boot_id.as_deref().unwrap_or("unknown");
+        let now_us = u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap_or(0);
+        (
+            (start_us / 1_000_000) as i64,
+            Duration::from_micros(now_us.saturating_sub(start_us)),
+            StartId::from_macos(boot, start_us, parsed.pid),
         )
     } else {
         let (mut start_time_unix, mut elapsed) = match synthetic_now_unix {

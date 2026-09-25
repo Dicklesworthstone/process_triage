@@ -202,8 +202,11 @@ impl<'a> ActionExecutor<'a> {
             return ActionStatus::Skipped;
         }
 
+        // The plan's pre-checks plus the ones pt requires for this action type.
+        let pre_checks = crate::plan::effective_pre_checks(action);
+
         // Run identity verification pre-check first
-        if action.pre_checks.contains(&PreCheck::VerifyIdentity) {
+        if pre_checks.contains(&PreCheck::VerifyIdentity) {
             match self.identity_provider.revalidate(&action.target) {
                 Ok(true) => {}
                 Ok(false) => return ActionStatus::IdentityMismatch,
@@ -222,7 +225,7 @@ impl<'a> ActionExecutor<'a> {
         if let Some(provider) = self.pre_check_provider {
             let pid = action.target.pid.0;
             let sid = action.target.sid;
-            let results = provider.run_checks(&action.pre_checks, pid, sid);
+            let results = provider.run_checks(&pre_checks, pid, sid);
 
             // If any pre-check fails, block the action
             for result in results {

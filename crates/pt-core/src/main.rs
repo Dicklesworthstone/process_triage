@@ -1141,7 +1141,7 @@ struct AgentExplainArgs {
     what_if: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use pt_core::action::{ActionRunner, IdentityProvider, LiveIdentityProvider};
 use pt_core::decision::{
     goal_optimizer::{
@@ -2444,7 +2444,7 @@ fn execute_plan_actions(
     policy: &pt_core::config::Policy,
     plan: &Plan,
 ) -> Result<pt_core::action::ExecutionResult, String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use pt_core::action::{
             ActionExecutor, CompositeActionRunner, LiveIdentityProvider, LivePreCheckConfig,
@@ -2465,7 +2465,7 @@ fn execute_plan_actions(
             .execute_plan(plan)
             .map_err(|e| format!("execute plan: {}", e))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = policy;
         let _ = handle;
@@ -14180,12 +14180,18 @@ fn is_supervised_for_robot(_pid: u32) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn first_precheck_block(
     provider: &dyn pt_core::action::prechecks::PreCheckProvider,
     action: &PlanAction,
 ) -> Option<(pt_core::plan::PreCheck, String)> {
-    let results = provider.run_checks(&action.pre_checks, action.target.pid.0, action.target.sid);
+    // The plan's pre-checks plus the ones pt requires for this action type: a plan
+    // cannot opt out of protection or session-safety checks.
+    let results = provider.run_checks(
+        &pt_core::plan::effective_pre_checks(action),
+        action.target.pid.0,
+        action.target.sid,
+    );
     for result in results {
         if let pt_core::action::prechecks::PreCheckResult::Blocked { check, reason } = result {
             return Some((check, reason));
@@ -14194,7 +14200,7 @@ fn first_precheck_block(
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn precheck_label_for_apply(check: &pt_core::plan::PreCheck) -> &'static str {
     use pt_core::plan::PreCheck;
     match check {
@@ -14666,7 +14672,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let constraints_summary = constraints.active_constraints_summary();
     let _ = handle.update_state(SessionState::Executing);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let precheck_provider = {
         use pt_core::action::{LivePreCheckConfig, LivePreCheckProvider};
         LivePreCheckProvider::new(
@@ -14677,10 +14683,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     };
 
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
-    // Only the Linux executor runs actions; elsewhere every action is unsupported.
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    // Only the Linux/macOS executor runs actions; elsewhere every action is unsupported.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
     let mut succeeded = 0usize;
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
     let mut failed = 0usize;
     let mut skipped = 0usize;
     let mut blocked_by_constraints = 0usize;
@@ -14769,7 +14775,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 continue;
             }
 
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Some((check, reason)) = first_precheck_block(&precheck_provider, action) {
                 blocked_by_prechecks += 1;
                 outcomes.push(serde_json::json!({
@@ -14802,7 +14808,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             );
         }
     } else {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let identity_provider = LiveIdentityProvider::new();
             // Composite runner: signals (kill/pause/resume), renice, and on Linux
@@ -14998,7 +15004,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             for action in &actions_to_apply {
                 action_index = action_index.saturating_add(1);

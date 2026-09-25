@@ -133,7 +133,7 @@ impl MacOsCapabilities {
     pub fn detect() -> Self {
         let sip_status = detect_sip_status();
         let lsof_available = crate::collect::tool_runner::run_tool(
-            "lsof",
+            lsof_path(),
             &["-v"],
             Some(std::time::Duration::from_secs(2)),
             None,
@@ -524,13 +524,24 @@ fn flush_lsof_entry(
     }
 }
 
+/// `lsof` lives in /usr/sbin on macOS, which is often missing from PATH (launchd
+/// agents, cron, minimal shells); without it the data-loss gate could not inspect
+/// open files.
+pub fn lsof_path() -> &'static str {
+    if std::path::Path::new("/usr/sbin/lsof").exists() {
+        "/usr/sbin/lsof"
+    } else {
+        "lsof"
+    }
+}
+
 /// Collect open files and network connections for a PID using lsof.
 pub fn collect_lsof_info(
     pid: u32,
     timeout: Duration,
 ) -> Result<(Vec<OpenFile>, Vec<MacOsNetworkConnection>), MacOsScanError> {
     let output = match run_tool(
-        "lsof",
+        lsof_path(),
         &["-p", &pid.to_string(), "-F", "ftna"],
         Some(timeout),
         None,
@@ -661,6 +672,44 @@ pub fn collect_environ(pid: u32) -> Option<HashMap<String, String>> {
     } else {
         Some(environ)
     }
+}
+
+/// Exact identity facts for a live process from `proc_pidinfo(PROC_PIDTBSDINFO)`
+/// (public `<libproc.h>` API).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacBsdInfo {
+    /// Process start time, microseconds since the Unix epoch (exact, unlike `ps etime`).
+    pub start_us: u64,
+    pub uid: u32,
+    pub ppid: u32,
+}
+
+/// Read [`MacBsdInfo`] for `pid`; `None` if it is gone or not readable.
+pub fn read_bsd_info(pid: u32) -> Option<MacBsdInfo> {
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: proc_bsdinfo is plain old data; proc_pidinfo writes at most `size` bytes.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    Some(MacBsdInfo {
+        start_us: info
+            .pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+        uid: info.pbi_uid,
+        ppid: info.pbi_ppid,
+    })
 }
 
 /// Read a minimal process snapshot using `ps`.

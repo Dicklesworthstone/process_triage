@@ -42,7 +42,7 @@ pub use renice::{
     ReniceActionRunner, ReniceConfig, ReniceResult, ReniceReversalMetadata, DEFAULT_NICE_VALUE,
     MAX_NICE_VALUE,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use signal::LiveIdentityProvider;
 #[cfg(unix)]
 pub use signal::{SignalActionRunner, SignalConfig};
@@ -54,7 +54,7 @@ pub use supervisor::{
     SupervisorParameters, SupervisorPlanAction, SupervisorType,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use prechecks::LivePreCheckProvider;
 pub use prechecks::{
     LivePreCheckConfig, NoopPreCheckProvider, PreCheckError, PreCheckProvider, PreCheckResult,
