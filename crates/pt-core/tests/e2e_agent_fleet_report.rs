@@ -160,6 +160,32 @@ fn fleet_apply_reports_not_implemented_and_exits_nonzero() {
     });
 }
 
+/// The documented `--session` spelling works for fleet commands.
+#[test]
+fn fleet_status_accepts_documented_session_flag() {
+    with_temp_data_dir(|data_dir| {
+        let fleet_session_id = create_fixture_fleet_session();
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", data_dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "fleet",
+                "status",
+                "--session",
+                &fleet_session_id,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).expect("valid json");
+        assert!(json.to_string().contains(&fleet_session_id), "{json}");
+    });
+}
+
 #[test]
 fn fleet_report_json_contains_expected_sections() {
     with_temp_data_dir(|data_dir| {

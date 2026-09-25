@@ -2,14 +2,14 @@
 
 Goal: Run pt across multiple hosts safely and aggregate results.
 
-## Planned fleet commands (contract)
+## Fleet commands
 
 ```bash
-# Planned interface (may not be implemented yet)
+# Runs `pt-core agent plan` on every host over SSH and aggregates the results
 pt agent fleet plan --hosts fleet-hosts.txt --format json
 pt agent fleet status --session <fleet-session-id>
-# Apply only after review
-pt agent fleet apply --session <fleet-session-id> --recommended --yes
+# `pt agent fleet apply --session <id>` only reports what it would do:
+# remote execution is not implemented yet; apply on each host with `pt agent apply`.
 ```
 
 ## Safe alternative today (plan-only via SSH)

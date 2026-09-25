@@ -829,8 +829,8 @@ struct AgentFleetPlanArgs {
 
 #[derive(Args, Debug)]
 struct AgentFleetApplyArgs {
-    /// Fleet session ID
-    #[arg(long)]
+    /// Fleet session ID (also accepted as --session)
+    #[arg(long, alias = "session")]
     fleet_session: String,
 
     /// Max concurrent host connections
@@ -848,8 +848,8 @@ struct AgentFleetApplyArgs {
 
 #[derive(Args, Debug)]
 struct AgentFleetReportArgs {
-    /// Fleet session ID
-    #[arg(long)]
+    /// Fleet session ID (also accepted as --session)
+    #[arg(long, alias = "session")]
     fleet_session: String,
 
     /// Output path for report (optional for JSON output)
@@ -863,8 +863,8 @@ struct AgentFleetReportArgs {
 
 #[derive(Args, Debug)]
 struct AgentFleetStatusArgs {
-    /// Fleet session ID
-    #[arg(long)]
+    /// Fleet session ID (also accepted as --session)
+    #[arg(long, alias = "session")]
     fleet_session: String,
 }
 

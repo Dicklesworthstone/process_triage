@@ -597,7 +597,9 @@ pt-core agent import-priors --from <path> [OPTIONS]
 
 ### `pt-core agent fleet plan`
 
-Fleet-wide planning (multi-host).
+Fleet-wide planning (multi-host): runs `pt-core --format json agent plan` on each
+host over SSH and aggregates the per-host decisions (pooled e-BY FDR, recurring
+patterns).
 
 ```
 pt-core agent fleet plan --hosts <file|list> [OPTIONS]
@@ -606,16 +608,25 @@ pt-core agent fleet plan --hosts <file|list> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--hosts <spec>` | Host file or comma-separated list |
-| `--parallel <N>` | Concurrent connections |
+| `--inventory <path>` | Inventory file (TOML/YAML/JSON) instead of `--hosts` |
+| `--discovery-config <path>` | Discovery config instead of `--hosts` |
+| `--parallel <N>` | Concurrent connections (default 10) |
+| `--timeout <secs>` | Per-host timeout for the remote plan (default 120) |
+| `--remote-binary <cmd>` | Remote pt-core command (default `pt-core` on PATH) |
+| `--continue-on-error` | Keep going when a host fails |
+| `--max-fdr <alpha>` | Fleet-wide false-discovery budget for kills |
+| `--label <text>` | Fleet session label |
+| `--host-profile <name>` | Recorded in the output only; not applied to remote plans yet |
 
 ---
 
 ### `pt-core agent fleet apply`
 
-Fleet-wide action execution.
+Fleet-wide action execution. Not implemented yet: reports the planned actions and
+exits with a capability error (11); apply on each host with `agent apply`.
 
 ```
-pt-core agent fleet apply --session <fleet-session-id> [OPTIONS]
+pt-core agent fleet apply --fleet-session <fleet-session-id> [OPTIONS]   # alias: --session
 ```
 
 ---
@@ -625,7 +636,7 @@ pt-core agent fleet apply --session <fleet-session-id> [OPTIONS]
 Fleet session status.
 
 ```
-pt-core agent fleet status --session <fleet-session-id> [OPTIONS]
+pt-core agent fleet status --fleet-session <fleet-session-id> [OPTIONS]   # alias: --session
 ```
 
 ---

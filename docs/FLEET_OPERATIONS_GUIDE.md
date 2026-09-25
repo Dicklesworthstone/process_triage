@@ -105,8 +105,8 @@ Goal: find idle build processes consuming memory.
 
 ```bash
 pt agent fleet plan --hosts fleet-hosts.txt --format json
-# Review candidates and apply only if approved
-pt agent fleet apply --session <fleet-session-id> --recommended --yes --format json
+# Review candidates, then act per host (fleet apply does not execute remotely yet):
+ssh build-01 'pt agent plan --format json'   # then `pt agent apply` on that host
 ```
 
 Tips:
@@ -119,8 +119,8 @@ Goal: terminate stale dev servers across laptops.
 
 ```bash
 pt agent fleet plan --hosts dev-hosts.txt --format json
-# Filter for dev servers in the plan output
-pt agent fleet apply --session <fleet-session-id> --only dev-server --yes
+# Filter for dev servers in the plan output, then apply on each host:
+ssh devbox-01 'pt agent plan --format json'   # then `pt agent apply` there
 ```
 
 Tips:
@@ -134,8 +134,8 @@ Goal: find test runners stuck for hours.
 ```bash
 pt agent fleet plan --hosts ci-hosts.txt --format json
 pt agent fleet status --session <fleet-session-id>
-# Apply only after reviewing evidence and resource impact
-pt agent fleet apply --session <fleet-session-id> --recommended --yes
+# After reviewing evidence and resource impact, apply on the affected hosts
+# (`pt agent fleet apply` currently only reports; remote execution is not implemented).
 ```
 
 Tips:
