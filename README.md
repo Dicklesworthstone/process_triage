@@ -233,7 +233,7 @@ pt learn show 01           # Read a tutorial
 pt learn verify --all      # Verify completion
 ```
 
-Seven built-in tutorials covering first-run safety, stuck test runners, port conflicts, agent workflow, fleet operations, shadow mode, and deep scanning. Each includes verification steps that confirm you actually ran the commands.
+Built-in tutorials cover first-run safety, stuck test runners, port conflicts, agent workflow, fleet operations, shadow mode, and deep scanning. `pt learn verify` smoke-runs each tutorial's commands under a time budget to check they still work.
 
 ---
 
@@ -492,20 +492,22 @@ process_triage/
 
 ```
 ~/.config/process_triage/
-├── decisions.json      # Learned kill/spare decisions
-├── priors.json         # Bayesian hyperparameters
-├── policy.json         # Safety policy
-└── triage.log          # Audit log
+├── decisions.json      # Learned kill/spare verdicts per command pattern
+├── priors.json         # Bayesian hyperparameters (optional)
+└── policy.json         # Safety policy (optional)
 
 ~/.local/share/process_triage/
 └── sessions/
     └── pt-20260115-143022-a7xq/
-        ├── manifest.json       # Session metadata
-        ├── snapshot.json       # Initial process state
-        ├── provenance.json     # Process provenance graph
-        ├── plan.json           # Generated recommendations
-        └── audit.jsonl         # Action audit trail
+        ├── manifest.json            # Session metadata and state
+        ├── context.json             # Host / run context
+        ├── scan/snapshot.json       # Process snapshot
+        ├── decision/plan.json       # Generated plan
+        ├── action/outcomes.jsonl    # Action outcomes
+        └── logs/session.jsonl       # Session event log
 ```
+
+On macOS the same layout lives under `~/Library/Application Support/` unless `XDG_*` or `PROCESS_TRIAGE_*` variables are set.
 
 ### Environment Variables
 
@@ -515,8 +517,7 @@ process_triage/
 | `PROCESS_TRIAGE_DATA` | `~/.local/share/process_triage` | Data/session directory |
 | `PT_OUTPUT_FORMAT` | (unset) | Default output format (`json`, `toon`) |
 | `NO_COLOR` | (unset) | Disable colored output |
-| `PROCESS_TRIAGE_RETENTION` | `7` | Session retention in days |
-| `PROCESS_TRIAGE_NO_PERSIST` | (unset) | Disable session persistence |
+| `PROCESS_TRIAGE_RETENTION` | `7` | Session retention in days (`off` disables the automatic cleanup) |
 | `PT_BUNDLE_PASSPHRASE` | (unset) | Default bundle encryption passphrase |
 
 ### Priors Configuration (`priors.json`)
@@ -538,10 +539,15 @@ See [docs/PRIORS_SCHEMA.md](docs/PRIORS_SCHEMA.md) for the full specification.
 
 ### Policy Configuration (`policy.json`)
 
+A policy file is a complete document (`schema_version`, `loss_matrix`, `guardrails`, `robot_mode`, `fdr_control`, `data_loss_gates`); start from `pt-core config show` or a preset (`pt-core config export-preset developer --output policy.json`) and edit. The parts you usually change:
+
 ```json
 {
-  "protected_patterns": ["systemd", "sshd", "docker", "postgres"],
-  "min_process_age_seconds": 3600,
+  "guardrails": {
+    "protected_patterns": [{ "pattern": "my-daemon", "kind": "literal", "case_insensitive": true }],
+    "min_process_age_seconds": 3600,
+    "builtin_protection": true
+  },
   "robot_mode": {
     "enabled": false,
     "min_posterior": 0.99,
@@ -550,6 +556,8 @@ See [docs/PRIORS_SCHEMA.md](docs/PRIORS_SCHEMA.md) for the full specification.
   }
 }
 ```
+
+Check a file with `pt-core config validate policy.json`.
 
 ---
 
@@ -563,11 +571,11 @@ All data stays local. Nothing is sent anywhere.
 | Evidence samples | Audit trail | Configurable (default: 7 days) |
 | Kill/spare decisions | Learning | Indefinite (user-controlled) |
 | Provenance graphs | Blast-radius estimation | Session lifetime |
-| Session manifests | Reproducibility | Configurable (default: 30 days) |
+| Session directories | Reproducibility | 7 days (`PROCESS_TRIAGE_RETENTION`), cleaned automatically; executing sessions are kept |
 
 ### Redaction
 
-Sensitive data is hashed/redacted before persistence. Four profiles: `minimal` (hashes only), `standard` (redacted paths), `debug` (full detail, local only), `share` (anonymized for export).
+Bundles and reports are redacted with one of three profiles: `minimal`, `safe` (default for sharing), `forensic` (full detail, local only).
 
 See [docs/PROVENANCE_PRIVACY_MODEL.md](docs/PROVENANCE_PRIVACY_MODEL.md) and [docs/PROVENANCE_CONTROLS_AND_ROLLOUT.md](docs/PROVENANCE_CONTROLS_AND_ROLLOUT.md).
 
@@ -614,11 +622,9 @@ Current status: fleet **planning** (SSH scan and pooled e-BY FDR across hosts) w
 
 ### GPU Process Detection
 
-`pt` detects GPU-bound processes via `nvidia-smi` (CUDA) and `rocm-smi` (AMD ROCm):
+> **Status: library-only.** The Linux GPU collector below is implemented and tested, but `pt deep`, plans and blast radius do not call it yet.
 
-```bash
-$ pt deep   # Automatically detects GPU processes
-```
+The collector reads `nvidia-smi` (CUDA) and `rocm-smi` (AMD ROCm):
 
 | Field Collected | NVIDIA | AMD |
 |----------------|:------:|:---:|
@@ -629,7 +635,7 @@ $ pt deep   # Automatically detects GPU processes
 | Per-process GPU memory | Yes | Yes |
 | Driver version | Yes | Yes |
 
-A process consuming 8GB of VRAM on a 12GB GPU gets a higher blast-radius score than one using 200MB. If neither `nvidia-smi` nor `rocm-smi` is available, GPU detection silently degrades with a provenance warning.
+If neither `nvidia-smi` nor `rocm-smi` is available, GPU detection degrades with a provenance warning.
 
 ### Container and Kubernetes Detection
 
@@ -639,7 +645,7 @@ A process consuming 8GB of VRAM on a 12GB GPU gets a higher blast-radius score t
 2. **Marker files**: Checks for `/.dockerenv` (Docker) and `/.containerenv` (Podman)
 3. **Environment variables**: Reads `KUBERNETES_SERVICE_HOST`, `POD_NAME`, `POD_NAMESPACE`, `POD_UID` for Kubernetes metadata
 
-For Kubernetes pods, `pt` extracts the QoS class (Guaranteed / Burstable / BestEffort), pod name, namespace, and container name. Container-managed processes get special treatment in the decision engine, since killing a process inside a container that will be restarted by its orchestrator may be pointless.
+For Kubernetes pods, `pt` extracts the QoS class (Guaranteed / Burstable / BestEffort), pod name, namespace, and container name. Processes whose cgroup places them in a container are protected (killing them is futile or harmful when an orchestrator restarts them); stop the container instead.
 
 ---
 
@@ -659,11 +665,11 @@ The daemon runs a tick-based event loop (default: every 60 seconds) that evaluat
 
 | Trigger | Default Threshold | What It Detects |
 |---------|------------------|-----------------|
-| Load average | > 2.0 sustained | CPU overload |
-| Orphan count | > 10 | Process leak |
+| Load average | > 4.0 | CPU overload |
+| Orphan count | > 20 | Process leak |
 | Memory pressure | > 85% used | Memory exhaustion |
 
-When a trigger fires for multiple consecutive ticks (sustained window), the daemon escalates: it runs a quick scan, infers posteriors, generates a plan, and optionally executes low-risk actions or sends notifications.
+When a trigger fires for 3 consecutive ticks, the daemon escalates: it runs `agent plan` and posts the result to the inbox (`pt-core agent inbox`) and as a desktop notification. It never acts on its own.
 
 ### Self-Limiting
 
@@ -683,17 +689,16 @@ If the daemon itself exceeds its budget, it backs off automatically.
 
 ```bash
 pt-core signature list              # Show all signatures
-pt-core signature add \
-  --name "stuck-jest" \
-  --pattern "jest" \
-  --arg-pattern "--runInBand" \
-  --category test_runner             # Add custom signature
+pt-core signature add stuck-jest \
+  --category other \
+  --pattern jest \
+  --arg-pattern=--runInBand         # Add custom signature (categories: agent, ide, ci, orchestrator, terminal, other)
 
-pt-core signature export > sigs.json # Export for sharing
-pt-core signature import sigs.json   # Import from file
+pt-core signature export sigs.json  # Export for sharing
+pt-core signature import sigs.json  # Import from file
 ```
 
-Signatures are matched against a `ProcessMatchContext` that includes the process name, command-line arguments, environment variables, container info, and network state. Matched signatures adjust the Bayesian prior: a `test_runner` signature shifts the prior toward "likely to be stuck if old."
+Signatures are matched against the process name and command line (and, where collected, environment and sockets). A matched signature sets the Bayesian prior: test-runner signatures such as jest or pytest shift it toward "likely abandoned if old", dev-server signatures toward "likely useful".
 
 ---
 
@@ -710,17 +715,16 @@ Signatures are matched against a `ProcessMatchContext` that includes the process
 | **Claude/Codex** | `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID` env | 0.95 |
 | **GitHub Actions** | `GITHUB_ACTIONS`, `GITHUB_WORKFLOW` env | 0.95 |
 | **tmux/screen** | `TMUX` or `STY` env | 0.30 |
-| **nohup/disown** | Signal mask analysis (`SigIgn` in `/proc/[pid]/status`) | varies |
 
-Supervised processes get higher blast-radius scores because killing them may be futile (the supervisor will restart them). The evidence ledger notes this: "Supervisor may auto-restart (reducing kill effectiveness)."
-
-For nohup detection, `pt` reads the signal mask from `/proc/[pid]/status` and checks whether SIGHUP (bit 0) is ignored. It also looks for `nohup.out` in the file descriptor table. This distinguishes intentional backgrounding from forgotten processes.
+Supervision is reported per candidate in the plan (`supervisor`). Processes placed in a systemd service or container cgroup are protected outright, and robot mode requires a human for anything supervised by an agent, IDE or CI job (failing closed when it cannot tell). A nohup/disown detector (SIGHUP in `SigIgn`, `nohup.out`) exists in the library but is not used in scoring yet.
 
 ---
 
 ## User Intent Detection
 
-Before flagging a process, `pt` checks whether a human is actively using it. Nine signal types contribute to a "user intent score" that suppresses false positives:
+> **Status: library-only.** The collector below exists and is tested, but no command uses its score yet. Today, live-use protection comes from the built-in rules (interactive shells, multiplexers, agent sessions) and from session safety at apply time.
+
+The intended design: before flagging a process, check whether a human is actively using it. Nine signal types contribute to a "user intent score" that suppresses false positives:
 
 | Signal | Weight | What It Checks |
 |--------|:------:|---------------|
@@ -740,6 +744,8 @@ The final score is computed as `1 - product(1 - w_i)` across all detected signal
 
 ## Incremental Scanning
 
+> **Status: library-only.** Every command currently re-scans and re-scores all processes (a full plan takes about a second on a typical host).
+
 Full re-scans are wasteful when most processes haven't changed. The incremental engine tracks a process inventory across sessions and only re-infers processes with material state changes:
 
 | Change Type | Triggers Re-inference? | Detection |
@@ -757,6 +763,8 @@ Process identity is tracked via a SHA-256 hash of `(pid, uid, comm, cmd)`, produ
 ---
 
 ## Respawn Loop Detection
+
+> **Status:** `pt agent verify --check-respawn` reports whether killed processes came back. The loop tracker and utility discount described below are library-only.
 
 Killing a supervised process that immediately restarts is pointless. `pt` tracks kill-respawn cycles and adjusts its recommendations:
 
@@ -779,7 +787,9 @@ At 5+ loops, kill utility drops to 20% of baseline. The recommendation escalates
 
 ## Memory Pressure Response
 
-The daemon monitors system memory and escalates scan cadence when pressure rises:
+> **Status: library-only.** The shipped daemon uses one memory trigger (≥ 85% used for 3 ticks, see [Daemon](#how-it-works)); the graded modes below are implemented in `mem_pressure.rs` but not wired into the daemon yet.
+
+The designed behavior: monitor system memory and escalate scan cadence when pressure rises:
 
 | Mode | Threshold | Scan Interval | Action |
 |------|-----------|:-------------:|--------|
@@ -799,22 +809,18 @@ Instead of ranking processes individually, `pt` can optimize kill sets to achiev
 
 ```bash
 pt agent plan --goal "free 4GB memory" --format json
-pt agent plan --goal "free port 8080" --format json
+pt agent plan --goal "release port 8080" --format json
 ```
 
-The optimizer evaluates which combination of kills achieves the goal with minimum collateral damage. Three algorithms are available:
-
-| Algorithm | When Used | Guarantee |
-|-----------|-----------|-----------|
-| **Greedy** | Default (any N) | 1 - 1/e approximation for submodular objectives |
-| **DP-exact** | N <= 30 candidates | Optimal solution |
-| **Local search** | Refinement pass | Swap-based improvement on greedy |
+The optimizer evaluates which combination of kills achieves the goal with minimum collateral damage: exact branch-and-bound for a single goal, greedy for combined goals. Only candidates whose own recommendation is `kill` enter the kill set; goal-selected processes with a milder recommendation are listed for review.
 
 Each candidate's "efficiency" is `contribution / expected_loss`, measuring how much resource it frees per unit of risk. The optimizer selects the minimum-cost set that meets the target.
 
 ---
 
 ## Off-Policy Evaluation
+
+> **Status: library-only.** No command exposes these estimators yet.
 
 Before deploying a new triage policy (different thresholds, different priors), `pt` can evaluate it against historical decisions without running it live:
 
@@ -844,7 +850,7 @@ Some processes are in **D-state** (uninterruptible sleep), and reading their `/p
 3. Process completions as they arrive
 4. Mark timed-out probes (the process is likely stuck on I/O)
 
-This prevents a single hung NFS mount or frozen block device from stalling the entire triage pipeline. Processes with timed-out probes get `confidence: "low"` and D-state diagnostics in their plan entry.
+This keeps a single hung NFS mount or frozen block device from stalling `pt deep` and the TUI's deep collection (reads still in flight at the timeout are leaked, never freed, so the kernel can't write into reused memory). Separately, plans give D-state processes low-confidence actions with D-state diagnostics.
 
 ---
 
@@ -861,18 +867,17 @@ PID 84721 (bun test) — Score: 87 — Classification: Abandoned
   ⏱  runtime       Bayes factor: 5.23   strong   → supports abandoned
   👻 orphan        Bayes factor: 3.71   strong   → supports abandoned
   🖥  tty           Bayes factor: 0.89   weak     → supports useful
-  🌐 net           Bayes factor: 1.12   weak     → supports abandoned
-  💾 io_active     Bayes factor: 4.55   strong   → supports abandoned
-  🚦 queue_sat     Bayes factor: 1.00   neutral
   🚩 state_flag    Bayes factor: 1.34   weak     → supports abandoned
 
   Posterior: P(abandoned)=0.87  P(useful)=0.06  P(useful_bad)=0.04  P(zombie)=0.03
   Log-odds (abandoned vs useful): 2.67 bits
 ```
 
+(`net`, `io_active` and `queue_sat` terms appear in the TUI when it has deep evidence for the process.)
+
 Each evidence term has a glyph, a Bayes factor (ratio of likelihoods), a strength label (decisive/strong/substantial/weak), and a direction (which class it supports). The strength thresholds follow standard Bayesian interpretation: decisive = |delta_bits| > 3.3 (>10:1 odds), strong = > 2.0 (>4:1), substantial = > 1.0 (>2:1).
 
-Access this via `pt deep` (interactive) or `pt agent plan --deep --format json` (structured).
+Access this via `pt agent explain --session <id> --pids <pid> --galaxy-brain`, the TUI detail pane, or `pt report --include-ledger`.
 
 ---
 
@@ -931,15 +936,15 @@ When you run `pt agent plan --format json`, the output is a deterministic, resum
 
 **Key design choices:**
 - **IDs are deterministic** (FNV-1a 64-bit hashes, not UUIDs); the same inputs always produce the same plan
-- **Zombie routing**: Z-state processes are routed to their parent for `restart` (forcing reap), not killed directly
+- **Zombie routing**: Z-state processes are routed to their parent for `restart` (forcing reap), not killed directly (restart is not executable yet, so apply reports these as failed)
 - **D-state handling**: Processes in uninterruptible sleep get `confidence: "low"` with diagnostic fields (wchan, I/O counters, D-state duration)
-- **Pre-checks**: Every action has a list of safety checks that must pass before execution (identity verification, protection check, data-loss gate, supervisor check)
+- **Pre-checks**: Every action lists safety checks that must pass before execution (identity verification, protection check, session safety, data-loss gate, supervisor check); `agent apply` always runs at least the checks pt generates for that action type, whatever the plan file says
 
 ---
 
-## Session Lifecycle (Type-State Machine)
+## Session Lifecycle
 
-Sessions enforce valid state transitions at **compile time** using Rust's type system:
+Commands track session state at runtime (`manifest.json`). A type-state API that would enforce the transitions below at **compile time** exists in the library but the commands do not use it yet:
 
 ```
 Created ──→ Scanning ──→ Planned ──→ Executing ──→ Completed
@@ -964,34 +969,30 @@ The `pt` script is a thin Bash wrapper that locates and execs `pt-core`:
 5. `/usr/local/bin/pt-core`
 6. PATH lookup via `which`
 
-**UI mode selection**: Checks for TTY, CI environment, and `$TERM` to decide between TUI and shell mode. Override with `--shell`, `--tui`, or `$PT_UI_MODE`.
+**UI mode**: bare `pt` runs the TUI when it has a terminal; without one (or in robot mode) `pt run` exits 11 and points you to `pt agent plan`. The wrapper still accepts `--shell`/`--tui` and exports `PT_UI_MODE`, but pt-core currently ignores them.
 
 **Built-in commands**:
 - `pt update` — Fetches the latest version and runs its installer with `--verify` (fails closed on unsigned releases; `--no-verify` overrides); `pt update rollback|list-backups|show-backup|verify-backup|prune-backups` manage pt-core backups
-- `pt history` — Shows past kill/spare decisions (requires `jq`)
-- `pt clear` — Resets decision memory with confirmation
+- `pt history` — Shows learned kill/spare verdicts per pattern (requires `jq`)
+- `pt clear [TEXT]` — Forgets learned verdicts (only patterns containing TEXT) after confirmation
 - `pt deep` — Alias for `deep-scan`
+- `pt --version` — Wrapper version plus the pt-core engine it will run
 
-The wrapper is deliberately simple (~200 lines of shellcheck-clean Bash) so the Rust engine can be updated independently.
+The wrapper is deliberately small (under 500 lines of shellcheck-clean Bash) so the Rust engine can be updated independently.
 
 ---
 
 ## Shell Completions
 
-Tab completion is available for Bash, Fish, and Zsh:
+Generate completions for your installed version (they cover all subcommands, options and value choices such as `--format` and `--theme`):
 
 ```bash
-# Bash
-source completions/pt-core.bash
-
-# Fish
-cp completions/pt-core.fish ~/.config/fish/completions/
-
-# Zsh
-cp completions/_pt-core ~/.zfunc/
+pt-core completions bash > ~/.local/share/bash-completion/completions/pt-core
+pt-core completions zsh  > ~/.zfunc/_pt-core
+pt-core completions fish > ~/.config/fish/completions/pt-core.fish
 ```
 
-Completions cover all subcommands, options, and argument values, including `--format` choices (json, toon, md, jsonl, summary, metrics, prose), `--theme` options (dark, light, high-contrast, no-color), and session IDs.
+The checked-in files under `completions/` are snapshots and may lag behind the CLI.
 
 ---
 
@@ -1039,13 +1040,15 @@ Before killing any process, `pt` checks what files it has open. 20+ detection ru
 | **Application Locks** | `.lock`, `.lck`, `/lock/` patterns | Soft | Warns — process may hold coordination lock |
 | **Generic Writes** | Any file open for writing | Soft | Noted — contextual evaluation |
 
-**Hard** detections always block automated kills. **Soft** detections add weight to the blast-radius score and generate remediation hints (e.g., "Wait for database transaction to complete, or checkpoint the WAL file").
+These categories are implemented in the collector and policy enforcer, but plans do not attach critical files to candidates yet, so the category rules do not fire. What does run: `agent apply`'s data-loss gate blocks any target holding a regular file open for writing (on macOS via `lsof`, failing closed if it can't inspect) or holding a file lock.
 
 ---
 
 ## Workspace Detection
 
-`pt` determines which git repository and worktree each process belongs to, providing project context for triage decisions:
+> **Status: library-only.** The resolver is implemented and tested but not used by plans or scoring yet.
+
+The design: `pt` determines which git repository and worktree each process belongs to, providing project context for triage decisions:
 
 1. Reads `/proc/[pid]/cwd` to get the process's working directory
 2. Walks up the directory tree looking for `.git`
@@ -1080,7 +1083,7 @@ Example: 25% throttle = 25,000 µs quota per 100,000 µs period
 | **Write order** | Period must be set before quota | Single atomic write |
 | **Detection** | Hierarchy ID != 0 in `/proc/[pid]/cgroup` | Hierarchy ID = 0 |
 
-`pt` auto-detects cgroup version (v1, v2, or hybrid) and uses the appropriate interface. Previous settings are captured for reversal.
+`pt` auto-detects cgroup version (v1, v2, or hybrid) and uses the appropriate interface. Previous settings are captured for reversal. Linux only, and refused unless the target is the only process in its cgroup: limiting a shared cgroup would throttle or freeze its neighbours too, and most shell-launched dev processes share one.
 
 ### cpuset Quarantine
 
@@ -1090,7 +1093,9 @@ For extreme cases, `pt` can pin a process to a limited set of CPU cores via the 
 
 ## Action Recovery Trees
 
-When an action fails, `pt` consults a structured recovery tree with diagnosis and fallback options:
+> **Status: library-only.** `agent apply` reports failed actions with their status; it does not consult these trees or retry automatically yet.
+
+The design: when an action fails, consult a structured recovery tree with diagnosis and fallback options:
 
 ```
 Kill action failed (Timeout)
@@ -1118,7 +1123,9 @@ Recovery is always *forward* (escalate to more forceful actions), never backward
 
 ## Telemetry: Lock-Free Event Recording
 
-Session telemetry is recorded via an **LMAX Disruptor**, a lock-free, wait-free ring buffer designed for ultra-low-latency event recording:
+> **Status: library-only.** The `pt-telemetry` crate contains the disruptor below; shipped commands record sessions as JSON/JSONL files and shadow observations through shadow storage, not through this ring buffer.
+
+The design uses an **LMAX Disruptor**, a lock-free, wait-free ring buffer designed for ultra-low-latency event recording:
 
 ```
 Producer (triage loop) ──→ [Ring Buffer] ──→ Consumer (Parquet writer)
@@ -1196,11 +1203,10 @@ The inference engine is backed by formal mathematical guarantees documented in [
 | Guarantee | Method | Invariant |
 |-----------|--------|-----------|
 | Posterior sums to 1 | Log-sum-exp normalization | `sum P(C\|x) = 1` |
-| FDR control | e-value eBH/eBY | `E[FDP] <= alpha` |
-| Coverage | Mondrian conformal prediction | `P(Y in C(X)) >= 1-alpha` |
+| FDR control (fleet plans) | e-value eBY | `E[FDP] <= alpha` |
 | Numerical stability | Log-domain arithmetic | No overflow/underflow |
-| Queue stall detection | M/M/1 queueing theory | `P(N >= L) = rho^L` |
-| Fleet safety | Chandy-Lamport snapshots | No kills on invalid cut |
+
+Library-only (not applied by any command yet): Mondrian conformal coverage, M/M/1 stall probabilities, Chandy-Lamport consistent cuts.
 
 ---
 
@@ -1222,7 +1228,7 @@ The displayed **score** is `100 × P(abandoned or zombie)`. It measures how susp
 
 ### Value of Information
 
-Before committing to an action, `pt` evaluates whether gathering more evidence would change the decision. The VoI framework considers 9 probe types:
+Before committing to an action, `pt` evaluates whether gathering more evidence would change the decision. Commands currently weigh one probe, a deep scan: the TUI runs it for candidates where it is worth it, and `agent plan` reports it as a hint. The library framework models 9 probe types:
 
 | Probe | Cost | What It Reveals |
 |-------|------|-----------------|
@@ -1240,20 +1246,20 @@ A probe is only worth taking if its expected information gain exceeds its cost: 
 
 ### FDR Control for Multiple Kill Decisions
 
-When triaging many processes at once, killing the top-N by score without correction inflates the false discovery rate. `pt` uses e-value based multiple testing:
+When triaging many processes at once, killing the top-N by score without correction inflates the false discovery rate. Single-host plans report the expected false-discovery rate of their kill set (`kill_set_fdr_estimate`); fleet plans pool kill decisions across hosts with e-value multiple testing:
 
 - **eBH** (e-value Benjamini-Hochberg): assumes positive regression dependency
 - **eBY** (e-value Benjamini-Yekutieli): conservative, handles arbitrary dependence
 
 The correction factor `c(m) = H_m = sum 1/j` for eBY means you can kill fewer processes per session, but each kill has a controlled false discovery rate.
 
-### Contextual Bandits for Action Selection
+### Contextual Bandits for Action Selection (library-only)
 
-For processes where the optimal action is uncertain, `pt` uses a LinUCB contextual bandit with ridge regression per-action models. This balances exploitation (take the action with best historical outcomes) against exploration (try actions we're uncertain about to gather data).
+Not used by any command yet. The design: for processes where the optimal action is uncertain, use a LinUCB contextual bandit with ridge regression per-action models. This balances exploitation (take the action with best historical outcomes) against exploration (try actions we're uncertain about to gather data).
 
-### Gittins Index for Probe Scheduling
+### Gittins Index for Probe Scheduling (library-only)
 
-The Wonham filter (continuous-time Bayesian filter using matrix exponential `exp(Q * dt)`) estimates the current regime, and the Gittins index computes the optimal probe order under discounted rewards. This determines whether to invest time in a deeper scan or commit to an action now.
+Not used by any command yet. The Wonham filter (continuous-time Bayesian filter using matrix exponential `exp(Q * dt)`) estimates the current regime, and the Gittins index computes the optimal probe order under discounted rewards. This determines whether to invest time in a deeper scan or commit to an action now.
 
 ---
 
@@ -1290,12 +1296,13 @@ Every `/proc` parser must handle arbitrary garbage input without panicking or co
 
 Ready-to-use profiles in [examples/configs/](examples/configs/):
 
-| Profile | Use Case | Min Age | Robot Mode | Max Kills |
+| Profile | Use Case | Min Age | Robot Mode | Robot max kills / per-run limit |
 |---------|----------|---------|:----------:|-----------|
-| `developer.json` | Aggressive dev cleanup | 30 min | Off | Unlimited |
-| `server.json` | Conservative production | 4 hours | Off | 3 |
-| `ci.json` | CI/CD automation | 15 min | On | 10 |
-| `fleet.json` | Multi-host discovery | 1 hour | On | 5/host |
+| `developer.json` | Dev-machine cleanup | 30 min | Off | 15 / 20 |
+| `server.json` | Conservative production | 4 hours | Off | 3 / 5 |
+| `ci.json` | CI/CD automation | 1 hour | On | 10 / 10 |
+
+`fleet.json` and `fleet.inventory.json` are fleet host-discovery configs, not policies.
 
 ```bash
 pt-core config validate examples/configs/developer.json --format summary
@@ -1304,19 +1311,6 @@ pt-core config validate examples/configs/developer.json --format summary
 ---
 
 ## Troubleshooting
-
-### "gum: command not found"
-
-```bash
-# Debian/Ubuntu
-sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg
-echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list
-sudo apt update && sudo apt install gum
-
-# macOS
-brew install gum
-```
 
 ### "No candidates found"
 
@@ -1356,40 +1350,41 @@ cargo run -p pt-core -- run
 
 - **Linux-first**: Deep scan features (`/proc` parsing, cgroup limits, io_uring probes) require Linux. macOS has basic collection via `ps`/`lsof`/`proc_pidinfo`. Actions on macOS: kill, pause/resume and renice run (identity is revalidated to the microsecond immediately before each signal; there is no pidfd, so a tiny PID-reuse window remains), while freeze/throttle/quarantine need cgroups and are Linux-only. Session safety (same session, session leader, parent shell, SSH chain), the macOS protection model and the data-loss gate (via `lsof`, failing closed) all apply on macOS.
 - **No Windows native**: Windows support is via WSL2 only.
-- **Calibration needed**: Conformal prediction gates require 20+ human-reviewed calibration samples before they activate. Until then, robot mode uses posterior-only gating.
-- **Single-machine focus**: Fleet mode exists but is newer and less battle-tested than single-host triage.
-- **No automatic recovery**: `pt` kills processes but doesn't restart them. If the process has a supervisor (systemd, Docker), the supervisor handles restart.
+- **Uncalibrated posterior**: the posterior is deliberately conservative and not yet calibrated against labeled outcomes, so `kill` recommendations are rare; most candidates come back as `pause` or `review`. Robot mode gates on the posterior only (no conformal gate is applied yet).
+- **Single-machine focus**: Fleet mode plans across hosts over SSH; fleet apply does not execute remotely yet.
+- **No automatic recovery or restart**: `pt` reports failed actions but does not retry or roll back, and the `restart` action is not executable yet. Supervised services are protected; stop them through their supervisor.
+- **Library-only modules**: many advanced models and collectors in the workspace (see [Experimental Library Models](#experimental-library-models)) are tested but not wired into commands yet.
 
 ---
 
 ## FAQ
 
 **Q: Will `pt` ever kill something it shouldn't?**
-By design, no. Interactive mode always asks for confirmation. Robot mode requires 95%+ posterior confidence, passes through conformal FDR control, and checks blast-radius risk. Protected processes are never flagged regardless of score.
+It is built to avoid that. Interactive mode always asks for confirmation. Robot mode is off by default and, when enabled, needs `--yes`, 95%+ posterior for the event that justifies the action, RSS and kill-count limits, and live pre-checks (identity, protection, session safety, data-loss gate) immediately before each action. Protected processes are never candidates. It is still software: start with `pt agent plan` and review what it proposes.
 
 **Q: How does it learn from my decisions?**
 Kills you confirm in the TUI and verdicts you give with `pt agent label --kill|--spare` are saved to `decisions.json`. When `pt` sees a similar command pattern again, it replaces the prior with one learned from those counts (see "How pt Learns From Your Decisions"). Robot/agent applies are not learned from.
 
 **Q: Does it phone home?**
-No. All data stays on your machine. No telemetry, no analytics, no network calls (except `install.sh` downloading the binary).
+No. All data stays on your machine. No telemetry, no analytics, no network calls except `install.sh`/`pt update` downloading releases and SSH to your own hosts in fleet mode.
 
 **Q: Can I use it in CI/CD?**
 Yes. `pt agent plan --format json` produces structured output with exit codes. Set `robot_mode.enabled = true` in `policy.json` and configure safety gates appropriately.
 
 **Q: What's the "Galaxy-Brain" mode?**
-The evidence ledger's detailed view that shows every Bayes factor, every evidence term contribution, and the full posterior computation. Available via `pt deep` or `pt agent plan --deep --format json`.
+The evidence ledger's detailed view that shows every Bayes factor, every evidence term contribution, and the full posterior computation. Available via `pt agent explain --session <id> --pids <pid> --galaxy-brain` and in the TUI.
 
 **Q: How is this different from `kill -9`?**
 `pt` tells you *what* to kill and *why*, with confidence scores and impact estimates. It also uses staged signals (SIGTERM first), validates process identity to prevent PID-reuse mistakes, and logs everything for audit.
 
-**Q: Why so many statistical models? Isn't a simple heuristic enough?**
-Simple heuristics work for obvious cases (zombie processes, 0% CPU for hours). But the interesting cases are ambiguous: a process using 2% CPU might be doing useful background work or might be a stuck event loop. Different models capture different signals. BOCPD catches sudden behavior changes, HSMM models state transitions, queueing theory detects socket stalls. The ensemble gives more robust classification than any single model.
+**Q: Why a Bayesian posterior instead of a simple heuristic?**
+Simple heuristics work for obvious cases (zombie processes, 0% CPU for hours). The interesting cases are ambiguous: a process using 2% CPU might be doing useful background work or might be a stuck event loop. A posterior combines weak signals consistently, says how uncertain it is, and lets the action choice weigh the cost of being wrong. Richer models (change points, regime switching, queueing) exist in the library and will be wired in only where they measurably improve decisions.
 
 **Q: What happens if `pt` kills a supervised process?**
-If the process is managed by systemd, Docker, or another supervisor, the supervisor will typically restart it. `pt` detects supervisor relationships and factors this into its recommendation. Supervised processes get a higher blast-radius score (since killing them may not accomplish anything if they auto-restart), and the evidence ledger notes "Supervisor may auto-restart (reducing kill effectiveness)."
+It won't in normal use: processes placed in a systemd service or container cgroup are protected, and database/web servers and their workers are protected by name and ancestry. `pt agent verify --check-respawn` reports whether a killed process came back.
 
 **Q: How does provenance-aware blast radius differ from just counting child processes?**
-Child count is a crude proxy. Blast radius traces *shared resources*: two processes that share a lockfile, a TCP listener on the same port, or a pidfile are connected even if they have no parent-child relationship. It then propagates transitively. If A shares a lockfile with B, and B shares a listener with C, killing A may indirectly affect C. Confidence decays with graph distance (50% per hop by default).
+On Linux it also traces *shared resources*: two processes that share a lockfile, a TCP listener on the same port, or a pidfile are connected even without a parent-child relationship, and a large shared footprint lowers the abandonment posterior. Plans also report each candidate's direct child count.
 
 **Q: Can I tune the Bayesian priors?**
 Yes. Edit `~/.config/process_triage/priors.json`. Each of the four classes (Useful, Useful-Bad, Abandoned, Zombie) has configurable Beta distribution parameters for CPU, orphan status, TTY, network activity, I/O activity, queue saturation, and runtime (Gamma distribution). The defaults work well for development machines; production servers may want higher `useful.prior_prob`.
@@ -1397,8 +1392,8 @@ Yes. Edit `~/.config/process_triage/priors.json`. Each of the four classes (Usef
 **Q: What's TOON output format?**
 TOON is a token-optimized structured output format designed for AI agents. It's more compact than JSON (fewer tokens for the same information), making it cheaper to consume in LLM contexts. Use `pt agent plan --format toon` or set `PT_OUTPUT_FORMAT=toon`.
 
-**Q: How accurate is the queue stall detection?**
-The M/M/1 queueing model estimates traffic intensity (rho) from socket queue depths parsed from `/proc/net/tcp`. It uses EWMA smoothing to avoid false positives from transient spikes. A process is flagged as stalled when rho exceeds 0.9 and the smoothed queue depth exceeds 4KB for at least 2 consecutive observations. The signal feeds into the posterior as a Beta-Bernoulli evidence term favoring the Useful-Bad class.
+**Q: Does `pt` detect stalled sockets?**
+In the TUI, when it collects deep evidence for a candidate: a socket backlog with a high estimated stall probability, more than 4 KB queued, or no I/O becomes a `queue_saturated` evidence term favoring Useful-Bad. `agent plan` does not use it yet. A fuller M/M/1 + EWMA model exists in the library only.
 
 ---
 
