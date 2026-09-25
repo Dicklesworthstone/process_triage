@@ -718,6 +718,16 @@ static BUILTIN_PROTECTED: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::Laz
             "login/desktop session infrastructure",
         ),
         builtin_rule(
+            "builtin.session_host",
+            CommOrCmd,
+            // Things a person is looking at or that host a session: terminal
+            // emulators, display servers/compositors (incl. kiosk `cage`) and live
+            // monitors. Headless `Xvfb` is deliberately absent (orphaned Xvfb from
+            // test runs are real candidates).
+            r"^(\S*/)?(foot|footclient|kitty|alacritty|wezterm-gui|ghostty|gnome-terminal-server|konsole|xfce4-terminal|tilix|terminator|xterm|urxvt|Xorg|Xwayland|cage|sway|Hyprland|weston|labwc|river|niri|gnome-shell|kwin_wayland|kwin_x11|htop|btop|btm|top|atop|glances|nvtop)(:|\s|$)",
+            "terminal emulator, display server or live monitor: someone's screen",
+        ),
+        builtin_rule(
             SERVICE_DAEMON_RULE,
             CommOrCmd,
             // comm keeps the daemon name when the server rewrites its title
@@ -1197,6 +1207,28 @@ mod tests {
         }
     }
 
+    /// Dashboards and session hosts from the fleet (foot/cage kiosk, htop) and
+    /// terminal emulators are someone's screen.
+    #[test]
+    fn builtin_protects_session_hosts_and_monitors() {
+        let filter = default_filter();
+        for (comm, cmd) in [
+            ("foot", "foot --server"),
+            ("cage", "cage -- foot htop"),
+            ("htop", "htop"),
+            ("btop", "/usr/bin/btop"),
+            ("kitty", "/usr/bin/kitty"),
+            ("Xwayland", "/usr/bin/Xwayland :0 -rootless"),
+            ("sway", "sway"),
+        ] {
+            let rec = make_test_record(4242, 3000, comm, cmd, "ubuntu");
+            let m = filter
+                .is_protected_with_role(&rec, CgroupRole::TransientScope)
+                .unwrap_or_else(|| panic!("{cmd:?} must be protected"));
+            assert_eq!(m.pattern, "builtin.session_host", "{cmd:?}");
+        }
+    }
+
     #[test]
     fn builtin_does_not_protect_real_candidates() {
         let cases = [
@@ -1210,6 +1242,8 @@ mod tests {
             ("ssh", "ssh ts2 nc -z db 5432"),
             ("node", "node /data/projects/app/node_modules/.bin/next dev"),
             ("bun", "bun test"),
+            ("Xvfb", "Xvfb :99 -screen 0 1280x1024x24"),
+            ("topgrade", "topgrade --yes"),
         ];
         let filter = default_filter();
         for (comm, cmd) in cases {
