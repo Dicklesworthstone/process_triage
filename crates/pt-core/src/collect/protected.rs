@@ -740,7 +740,11 @@ static BUILTIN_FORCE_REVIEW: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::
         vec![builtin_rule(
             "builtin.agent_cli",
             BuiltinField::Cmd,
-            r"(^|/)(claude|codex|agy|agy-real|gemini|cursor-agent|aider|opencode|goose|amp|crush|qwen|droid)(\s|$)|/claude/versions/|/\.?claude-code/|@anthropic-ai/claude-code|@openai/codex|/codex-(linux|darwin)-|@google/gemini-cli",
+            // Direct invocation, or an agent in command position inside a shell's -c
+            // script (start of the script, or after ; & | ( or a quote), e.g.
+            // `zsh -ic '...; cod --no-alt-screen ...'` (`cod` is an installer's codex
+            // wrapper). Mentions as arguments (`rg codex src/`) do not count.
+            r#"(^|/)(claude|codex|cod|agy|agy-real|gemini|cursor-agent|aider|opencode|goose|amp|crush|qwen|droid)(\s|$)|^(\S*/)?(ba|z|da|fi|k)?sh\s+-[A-Za-z]*c[A-Za-z]*\s+(['"]?|.*[;&|('"]\s*)(claude|codex|cod|agy|gemini|cursor-agent|aider|opencode)(\s|$)|/claude/versions/|/\.?claude-code/|@anthropic-ai/claude-code|@openai/codex|/codex-(linux|darwin)-|@google/gemini-cli"#,
             "AI agent CLI session: may be mid-task; kill only after manual review",
         )]
     },
@@ -1228,6 +1232,11 @@ mod tests {
             "/home/ubuntu/.local/bin/agy-real --model Gemini 3.8 Flash (High) --dangerously-skip-permissions",
             "/home/ubuntu/.bun/install/global/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
             "codex --yolo",
+            // Seen on css (2026-09-25): an agent launched from a shell -c script via an
+            // installer wrapper `cod` (which execs codex); rated "pause" before.
+            r#"/usr/bin/zsh -ic path=("$RUN_DIR/bin" $path); cod --no-alt-screen -C "$RUN_DIR/work" "$@" mtdt-codex"#,
+            "cod --no-alt-screen",
+            "bash -lc 'cd /repo && claude -p fix-tests'",
         ] {
             assert!(builtin_force_review_match(cmd).is_some(), "{cmd}");
         }
@@ -1235,6 +1244,8 @@ mod tests {
             "cargo test -p claude_parser",
             "vim claude.md",
             "rg codex src/",
+            "bash -c 'rg codex src/'",
+            "sh -c 'make codec'",
         ] {
             assert!(builtin_force_review_match(cmd).is_none(), "{cmd}");
         }

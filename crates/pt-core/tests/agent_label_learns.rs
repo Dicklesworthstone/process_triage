@@ -24,7 +24,9 @@ impl Drop for ChildGuard {
 
 fn pt_core(config_dir: &Path, data_dir: &Path) -> assert_cmd::Command {
     let mut cmd = cargo_bin_cmd!("pt-core");
-    cmd.timeout(Duration::from_secs(180))
+    // Full-host plans (--min-age 0, every process) took ~150 s on a build host at
+    // load 350; the timeout only guards against hangs.
+    cmd.timeout(Duration::from_secs(600))
         .env("PT_SKIP_GLOBAL_LOCK", "1")
         .env("PROCESS_TRIAGE_CONFIG", config_dir)
         .env("PROCESS_TRIAGE_DATA", data_dir)

@@ -3,7 +3,7 @@
   "description": "Label rules for the live fleet reality e2e (scripts/fleet_reality_e2e.py). Rules, not captured data: process_triage is a public repository and fleet command lines are private. Every must_not_act class below was rated P(abandoned)~1.0 by pt 2.1.0 on the 2026-09-24 fleet scan.",
   "must_not_act": {
     "_comment": "Candidates matching these must never be recommended for any action other than keep/review (kill, restart, pause, renice, throttle, freeze, quarantine are all violations). Regexes are matched against the full command line.",
-    "agent_cli": "(^|/)(claude|codex|agy|agy-real|gemini|cursor-agent|aider|opencode|goose)(\\s|$)|/claude/versions/|@anthropic-ai/claude-code|@openai/codex|/codex-(linux|darwin)-",
+    "agent_cli": "(^|/)(claude|codex|cod|agy|agy-real|gemini|cursor-agent|aider|opencode|goose)(\\s|$)|^(\\S*/)?(ba|z|da|fi|k)?sh\\s+-[A-Za-z]*c[A-Za-z]*\\s+(['\"]?|.*[;&|('\"]\\s*)(claude|codex|cod|agy|gemini|cursor-agent|aider|opencode)(\\s|$)|/claude/versions/|@anthropic-ai/claude-code|@openai/codex|/codex-(linux|darwin)-",
     "mux_server": "(^|/)((frankenterm|wezterm)-mux-server|tmux|zellij|screen)(:|\\s|$)",
     "mux_transport": "^(\\S*/)?(ssh\\s.*\\s)?(nc|ncat|netcat|socat)\\s.*(frankenterm|wezterm|tmux|zellij)|^(\\S*/)?ssh\\s.*\\s(frankenterm|wezterm)\\s+cli\\s+proxy",
     "ssh_control_master": "^(\\S*/)?ssh\\s(.*\\s)?(-M{1,2}|-oControlMaster=\\S+|ControlMaster=(yes|auto|autoask|ask))(\\s|$)",
