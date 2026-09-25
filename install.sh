@@ -44,7 +44,9 @@ QUIET=0
 NO_GUM=0
 FORCE_INSTALL=0
 FROM_SOURCE=0
-VERIFY=0
+# Honor VERIFY=1 from the environment (documented; `curl ... | VERIFY=1 bash`).
+# A plain VERIFY=0 here silently discarded it, so "verified" installs were not.
+VERIFY="${VERIFY:-0}"
 NO_CONFIGURE=0
 NO_VERIFY=0
 VERIFY_SELF=0
@@ -308,6 +310,8 @@ parse_args() {
     fi
     if [[ "${VERIFY:-0}" == "1" ]]; then
         VERIFY=1
+    else
+        VERIFY=0
     fi
     if [[ "$NO_VERIFY" -eq 1 ]]; then
         VERIFY=0

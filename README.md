@@ -265,9 +265,12 @@ ln -s "$(pwd)/pt" ~/.local/bin/pt
 ### Verified Install
 
 ```bash
-# Verify ECDSA signatures + checksums (fail-closed on missing/invalid metadata)
-VERIFY=1 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash
+# Verify ECDSA signatures + checksums (fail-closed on missing/invalid metadata).
+# Pass --verify to bash (a `VERIFY=1 curl ... | bash` prefix only reaches curl).
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh | bash -s -- --verify
 ```
+
+Releases up to v2.1.0 were published without signatures, so a verified install of them fails closed ("does not publish release-signing-public.pem") and installs nothing. `pt update` verifies by default and says so when it refuses; `pt update --no-verify` installs unverified on explicit request.
 
 **Platforms:** Linux x86_64 (primary), Linux aarch64, macOS x86_64, macOS aarch64, Windows x86_64 (via WSL2 only, using the Linux install)
 
@@ -969,7 +972,7 @@ The `pt` script is a thin Bash wrapper that locates and execs `pt-core`:
 **UI mode selection**: Checks for TTY, CI environment, and `$TERM` to decide between TUI and shell mode. Override with `--shell`, `--tui`, or `$PT_UI_MODE`.
 
 **Built-in commands**:
-- `pt update` — Fetches latest version, runs signed installer
+- `pt update` — Fetches the latest version and runs its installer with `--verify` (fails closed on unsigned releases; `--no-verify` overrides); `pt update rollback|list-backups|show-backup|verify-backup|prune-backups` manage pt-core backups
 - `pt history` — Shows past kill/spare decisions (requires `jq`)
 - `pt clear` — Resets decision memory with confirmation
 - `pt deep` — Alias for `deep-scan`
