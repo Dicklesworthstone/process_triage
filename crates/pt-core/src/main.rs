@@ -13355,6 +13355,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "candidates_evaluated": candidates_evaluated,
         "deep_scan_ms": deep_scan_ms,
         "deep_evidence_pids": deep_signals.as_ref().map(|m| m.len()),
+        // Per-signal coverage: on a starved host a deep scan can return a pid
+        // without its network or I/O data, which silently weakens the evidence.
+        "deep_coverage": deep_signals.as_ref().map(|m| serde_json::json!({
+            "requested": candidates_evaluated,
+            "net": m.values().filter(|d| d.net_active.is_some()).count(),
+            "io": m.values().filter(|d| d.io_active.is_some()).count(),
+            "queue": m.values().filter(|d| d.queue_saturated.is_some()).count(),
+        })),
         "above_threshold": above_threshold_count,  // Candidates meeting threshold before truncation
         "candidates_returned": candidates.len(),   // After truncation to max_candidates
         "kill_recommendations": kill_candidates.len(),

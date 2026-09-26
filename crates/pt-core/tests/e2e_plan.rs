@@ -1505,6 +1505,14 @@ fn plan_deep_adds_network_evidence() {
         deep["summary"]
     );
     assert!(
+        deep["summary"]["deep_coverage"]["net"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "{}",
+        deep["summary"]
+    );
+    assert!(
         deep["summary"]["deep_evidence_pids"].as_u64().unwrap_or(0) > 0,
         "{}",
         deep["summary"]
