@@ -812,6 +812,26 @@ pub fn agent_kind(cmd: &str) -> Option<&'static str> {
     })
 }
 
+/// Seconds since the terminal `tty` (as `ps` reports it: `pts/3`, `ttys003`) last
+/// saw input or output: the device's atime/mtime, which is what `w` shows as IDLE.
+/// `None` when the device cannot be stat'ed.
+#[cfg(unix)]
+pub fn tty_idle_seconds(tty: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let path = if tty.starts_with('/') {
+        std::path::PathBuf::from(tty)
+    } else {
+        std::path::Path::new("/dev").join(tty)
+    };
+    let md = std::fs::metadata(path).ok()?;
+    let last_io = md.atime().max(md.mtime());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(now.saturating_sub(last_io).max(0) as u64)
+}
+
 /// PIDs of this pt process and all of its ancestors (the invoking shell, agent CLI,
 /// tmux pane, multiplexer...). pt must never recommend killing its own caller chain.
 pub fn invoker_chain_pids(processes: &[ProcessRecord]) -> HashSet<u32> {
@@ -1282,6 +1302,24 @@ mod tests {
                 "{cmd:?} must stay a candidate"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tty_idle_seconds_reads_last_io_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = dir.path().join("pts-test");
+        let f = std::fs::File::create(&dev).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(past)
+                .set_modified(past),
+        )
+        .unwrap();
+        let idle = tty_idle_seconds(dev.to_str().unwrap()).expect("stat");
+        assert!((595..=660).contains(&idle), "idle {idle}");
+        assert_eq!(tty_idle_seconds("/nonexistent/pts/999"), None);
     }
 
     #[test]

@@ -12184,6 +12184,9 @@ fn fast_path_skip_reason_label(reason: FastPathSkipReason) -> &'static str {
     }
 }
 
+/// An agent CLI whose terminal had input/output within this window is live.
+const AGENT_LIVE_TTY_IDLE_SECS: u64 = 30 * 60;
+
 fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let _lock = match acquire_global_lock(global, "agent plan") {
         Ok(lock) => lock,
@@ -12911,6 +12914,29 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         if agent_force_review {
             recommended_action = "review";
         }
+        // Agent liveness: an agent CLI whose terminal saw input/output recently is
+        // in use (possibly waiting for its human), so it is kept, not surfaced for
+        // review. Only the agent itself: its children are judged on their own
+        // evidence (a hung test runner under a live agent stays a candidate).
+        let agent_kind = pt_core::collect::protected::agent_kind(&proc.cmd);
+        #[cfg(unix)]
+        let agent_tty_idle = agent_kind
+            .and(proc.tty.as_deref())
+            .and_then(pt_core::collect::protected::tty_idle_seconds);
+        #[cfg(not(unix))]
+        let agent_tty_idle: Option<u64> = None;
+        let agent_live = agent_tty_idle.is_some_and(|idle| idle < AGENT_LIVE_TTY_IDLE_SECS);
+        if agent_live && recommended_action == "review" {
+            recommended_action = "keep";
+        }
+        let agent_liveness = agent_kind.map(|_| {
+            serde_json::json!({
+                "tty": proc.tty,
+                "tty_idle_seconds": agent_tty_idle,
+                "live": agent_live,
+                "window_seconds": AGENT_LIVE_TTY_IDLE_SECS,
+            })
+        });
         let policy_value = serde_json::to_value(&policy_result)
             .unwrap_or_else(|_| serde_json::json!({ "allowed": policy_result.allowed }));
         let action_rationale = if policy_blocked {
@@ -13007,7 +13033,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "pid": proc.pid.0,
             "ppid": proc.ppid.0,
             "state": proc.state.to_string(),
-            "agent_kind": pt_core::collect::protected::agent_kind(&proc.cmd),
+            "agent_kind": agent_kind,
+            "agent_liveness": agent_liveness,
             "zombie_routing": zombie_routing,
             "start_id": format!("{}:{}", proc.pid.0, proc.start_time_unix),
             "uid": proc.uid,
