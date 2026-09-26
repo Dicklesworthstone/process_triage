@@ -442,8 +442,9 @@ main() {
         forwarded_args=("deep-scan" "${forwarded_args[@]:2}")
     fi
 
-    # pt-core only reads PROCESS_TRIAGE_CONFIG; keep `pt history` and pt-core on the
-    # same config dir (and decisions.json) when the wrapper-level override is used.
+    # pt-core reads --config (env PT_CONFIG_DIR) first, then PROCESS_TRIAGE_CONFIG;
+    # export the latter too so every pt-core code path and `pt history` agree on the
+    # config dir (and decisions.json).
     if [[ -n "${PT_CONFIG_DIR:-}" && -z "${PROCESS_TRIAGE_CONFIG:-}" ]]; then
         export PROCESS_TRIAGE_CONFIG="$PT_CONFIG_DIR"
     fi
