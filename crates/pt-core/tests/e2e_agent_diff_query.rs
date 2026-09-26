@@ -505,6 +505,39 @@ fn query_actions_subcommand_reports_missing_capability() {
         .stdout(predicates::str::contains("not yet implemented"));
 }
 
+/// Every stub command reports `"status": "stub"` and exits 11 (CapabilityError),
+/// never 0. (`output_stub` returns that exit code and is `#[must_use]`, so new
+/// stubs cannot silently exit 0; this checks the shipped ones end to end.)
+#[test]
+fn every_stub_command_exits_capability_error() {
+    let mut stubs: Vec<Vec<&str>> = vec![
+        vec!["query", "actions"],
+        vec!["query", "telemetry"],
+        vec!["query", "last hour kills"],
+        vec![
+            "telemetry",
+            "export",
+            "-o",
+            "/nonexistent/pt-export.parquet",
+        ],
+        vec!["telemetry", "redact"],
+    ];
+    if !cfg!(target_os = "linux") {
+        stubs.push(vec!["deep-scan"]);
+    }
+    for args in stubs {
+        let output = pt_core_fast()
+            .args(["--format", "json"])
+            .args(&args)
+            .output()
+            .expect("run stub");
+        assert_eq!(output.status.code(), Some(11), "{args:?}");
+        let json: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("{args:?}: stub output not JSON ({e})"));
+        assert_eq!(json["status"], "stub", "{args:?}: {json}");
+    }
+}
+
 #[test]
 fn query_telemetry_subcommand_reports_missing_capability() {
     pt_core_fast()

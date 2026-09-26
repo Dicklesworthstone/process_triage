@@ -1587,9 +1587,10 @@ enum TelemetryCommands {
         #[arg(short, long)]
         output: String,
 
-        /// Export format (parquet, csv, json)
-        #[arg(long, default_value = "parquet")]
-        format: String,
+        /// Export format (parquet, csv, json). (Named `--export-format`: a `format`
+        /// arg here collided with the global `--format` and panicked on every call.)
+        #[arg(long = "export-format", default_value = "parquet")]
+        export_format: String,
     },
     /// Prune old telemetry data
     Prune {
@@ -1950,6 +1951,56 @@ fn parse_output_format(value: &str) -> Option<OutputFormat> {
 }
 
 #[cfg(test)]
+mod cli_definition_tests {
+    use clap::CommandFactory;
+
+    /// clap's own consistency check over every subcommand.
+    #[test]
+    fn cli_definition_is_consistent() {
+        super::Cli::command().debug_assert();
+    }
+
+    /// A subcommand arg with the id of a global arg but a different value type makes
+    /// clap panic at runtime on access (`telemetry export` had its own `format:
+    /// String` vs the global `OutputFormat` and panicked on every call).
+    /// `debug_assert` does not catch this. (Same-type shadows such as the local
+    /// `dry_run` flags merge with the global one without panicking.)
+    #[test]
+    fn no_subcommand_arg_shadows_a_global_arg_with_another_type() {
+        // clap's AnyValueId is not public; its Debug form is the value type's name.
+        type Globals = std::collections::HashMap<String, String>;
+        fn value_type(arg: &clap::Arg) -> String {
+            format!("{:?}", arg.get_value_parser().type_id())
+        }
+        fn walk(cmd: &clap::Command, globals: &Globals, path: &str, bad: &mut Vec<String>) {
+            for sub in cmd.get_subcommands() {
+                let here = format!("{path} {}", sub.get_name());
+                for arg in sub.get_arguments().filter(|a| !a.is_global_set()) {
+                    if let Some(global_type) = globals.get(arg.get_id().as_str()) {
+                        if value_type(arg) != *global_type {
+                            bad.push(format!("{here}: {}", arg.get_id()));
+                        }
+                    }
+                }
+                walk(sub, globals, &here, bad);
+            }
+        }
+        let cli = super::Cli::command();
+        let globals: Globals = cli
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .map(|a| (a.get_id().to_string(), value_type(a)))
+            .collect();
+        let mut bad = Vec::new();
+        walk(&cli, &globals, "pt-core", &mut bad);
+        assert!(
+            bad.is_empty(),
+            "type-clashing shadows of global args: {bad:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod output_format_tests {
     use super::parse_output_format;
     use pt_common::OutputFormat;
@@ -2010,13 +2061,12 @@ fn run_interactive(global: &GlobalOpts, args: &RunArgs) -> ExitCode {
     {
         use std::io::IsTerminal;
         if global.robot || !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-            output_stub(
+            return output_stub(
                 global,
                 "run",
                 "Interactive mode needs a terminal; for scripts and agents use \
                  `pt agent plan` / `pt agent apply`",
             );
-            return ExitCode::CapabilityError;
         }
         match run_interactive_tui(global, args) {
             Ok(()) => ExitCode::Clean,
@@ -2032,8 +2082,7 @@ fn run_interactive(global: &GlobalOpts, args: &RunArgs) -> ExitCode {
             global,
             "run",
             "Interactive mode requires the `ui` feature (build with --features ui)",
-        );
-        ExitCode::CapabilityError
+        )
     }
 }
 
@@ -4133,49 +4182,37 @@ fn run_deep_scan(global: &GlobalOpts, _args: &DeepScanArgs) -> ExitCode {
 
     #[cfg(not(target_os = "linux"))]
     {
+        // Not a success: agents must not read a stub as a completed deep scan.
         output_stub(
             global,
             "deep-scan",
             "Deep scan is currently supported on Linux only",
-        );
-        // Not a success: agents must not read a stub as a completed deep scan.
-        ExitCode::CapabilityError
+        )
     }
 }
 
 fn run_query(global: &GlobalOpts, args: &QueryArgs) -> ExitCode {
     match &args.command {
         Some(QueryCommands::Sessions { limit }) => run_query_sessions(global, *limit),
-        Some(QueryCommands::Actions { .. }) => {
-            output_stub(
-                global,
-                "query actions",
-                "Query actions mode not yet implemented",
-            );
-            ExitCode::CapabilityError
-        }
-        Some(QueryCommands::Telemetry { .. }) => {
-            output_stub(
-                global,
-                "query telemetry",
-                "Query telemetry mode not yet implemented",
-            );
-            ExitCode::CapabilityError
-        }
+        Some(QueryCommands::Actions { .. }) => output_stub(
+            global,
+            "query actions",
+            "Query actions mode not yet implemented",
+        ),
+        Some(QueryCommands::Telemetry { .. }) => output_stub(
+            global,
+            "query telemetry",
+            "Query telemetry mode not yet implemented",
+        ),
         None => {
             if let Some(expr) = &args.query {
                 output_stub(
                     global,
                     "query",
                     &format!("Query expression '{}' is not yet implemented", expr),
-                );
-                ExitCode::CapabilityError
+                )
             } else {
-                output_stub(
-                    global,
-                    "query",
-                    "Use subcommands like `query sessions --limit 10`",
-                );
+                println!("query: use a subcommand, e.g. `query sessions --limit 10`");
                 ExitCode::ArgsError
             }
         }
@@ -5088,8 +5125,7 @@ fn run_report(global: &GlobalOpts, _args: &ReportArgs) -> ExitCode {
         global,
         "report",
         "Report generation requires building with the `report` feature",
-    );
-    ExitCode::CapabilityError
+    )
 }
 
 fn run_check(global: &GlobalOpts, args: &CheckArgs) -> ExitCode {
@@ -8718,12 +8754,10 @@ fn run_telemetry(global: &GlobalOpts, _args: &TelemetryArgs) -> ExitCode {
             keep_everything,
         } => run_telemetry_prune(global, _args, keep, *dry_run, *keep_everything),
         TelemetryCommands::Export { .. } => {
-            output_stub(global, "telemetry export", "Export not yet implemented");
-            ExitCode::CapabilityError
+            output_stub(global, "telemetry export", "Export not yet implemented")
         }
         TelemetryCommands::Redact { .. } => {
-            output_stub(global, "telemetry redact", "Redaction not yet implemented");
-            ExitCode::CapabilityError
+            output_stub(global, "telemetry redact", "Redaction not yet implemented")
         }
     }
 }
@@ -10607,10 +10641,15 @@ fn print_version(global: &GlobalOpts) {
     }
 }
 
-fn output_stub(global: &GlobalOpts, command: &str, message: &str) {
+/// Report an unimplemented/unavailable command (`"status": "stub"`) and return the
+/// exit code callers must propagate: a stub never exits 0, so no script or agent
+/// mistakes it for a completed operation.
+#[must_use = "return the stub's CapabilityError exit code"]
+fn output_stub(global: &GlobalOpts, command: &str, message: &str) -> ExitCode {
     let session_id = SessionId::new();
 
     output_stub_with_session(global, &session_id, command, message);
+    ExitCode::CapabilityError
 }
 
 fn output_stub_with_session(
