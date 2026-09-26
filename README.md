@@ -1425,6 +1425,6 @@ MIT License (with OpenAI/Anthropic Rider) — see [LICENSE](LICENSE) for details
 
 Built with Rust, Bash, and hard-won frustration.
 
-[Documentation](docs/) · [Agent Guide](docs/AGENT_INTEGRATION_GUIDE.md) · [Math Proofs](docs/math/PROOFS.md) · [Issues](https://github.com/Dicklesworthstone/process_triage/issues)
+[Documentation](docs/) · [Tutorials](docs/tutorials/README.md) · [Architecture](docs/architecture/README.md) · [ADRs](docs/adr/) · [Demos](docs/demos/README.md) · [Agent Guide](docs/AGENT_INTEGRATION_GUIDE.md) · [Math Proofs](docs/math/PROOFS.md) · [Issues](https://github.com/Dicklesworthstone/process_triage/issues)
 
 </div>

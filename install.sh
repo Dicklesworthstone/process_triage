@@ -52,7 +52,7 @@ NO_VERIFY=0
 VERIFY_SELF=0
 EMIT_SKILL_PAYLOAD=0
 OFFLINE_BUNDLE=""
-LOCK_ROOT="/tmp/pt-install.lock.d"
+LOCK_ROOT="${PT_INSTALL_LOCK_DIR:-/tmp/pt-install.lock.d}"
 LOCK_HELD=0
 TEMP_DIR=""
 HAS_GUM=0
@@ -222,6 +222,7 @@ Environment:
   PT_CORE_VERSION                         pt-core version override
   PT_SYSTEM=1                             System install shortcut
   PT_NO_PATH=1                            Skip PATH updates
+  PT_INSTALL_LOCK_DIR                     Installer lock dir (default /tmp/pt-install.lock.d)
   VERIFY=1                                Require verification
   PT_RELEASE_PUBLIC_KEY_FILE              PEM file for release verification
   PT_RELEASE_PUBLIC_KEY_PEM               PEM contents for release verification
@@ -571,12 +572,17 @@ resolve_version() {
         latest="$(
             curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -o /dev/null -w '%{url_effective}' \
                 "${RELEASES_URL}/latest" 2>/dev/null \
-                | sed -E 's|.*/tag/v?([0-9]+\.[0-9]+\.[0-9]+)$|\1|' \
+                | sed -nE 's|.*/tag/v?([0-9]+\.[0-9]+\.[0-9]+)$|\1|p' \
                 || true
         )"
     fi
     if [[ -z "$latest" ]]; then
         latest="$(fetch_stdout "$(append_cache_buster "${RAW_URL}/VERSION")" 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    # Only a real version string counts (a redirect to a non-tag page or an error
+    # body used to become the "version" and failed later inside tar).
+    if [[ ! "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+        latest=""
     fi
     if [[ -z "$latest" ]]; then
         err "Could not resolve latest version"
@@ -893,6 +899,11 @@ extract_core_archive() {
     local archive="$1"
     local extract_dir="$2"
     mkdir -p "$extract_dir"
+    if [[ ! -s "$archive" ]] || ! tar -tzf "$archive" >/dev/null 2>&1; then
+        err "pt-core archive is empty or corrupt: $(basename "$archive")"
+        err "Nothing was installed. Re-run the installer, or build from source (--from-source)."
+        exit 1
+    fi
     tar -xzf "$archive" -C "$extract_dir" pt-core 2>/dev/null || tar -xzf "$archive" -C "$extract_dir"
 }
 

@@ -104,11 +104,12 @@ jobs:
           size_mb=$((size / 1024 / 1024))
           echo "Binary size: ${size_mb}MB (${size} bytes)"
 
-          # Warn if over 15MB
-          if [ $size_mb -gt 15 ]; then
-            echo "::warning::Binary size (${size_mb}MB) exceeds 15MB target"
+          # Budget for the shipped features (ui+report+daemon): measured 28.4MB
+          # on 2026-09-25 (test/musl_e2e.bats).
+          if [ $size_mb -gt 32 ]; then
+            echo "::warning::Binary size (${size_mb}MB) exceeds 32MB budget"
           else
-            echo "✓ Binary size is within target (< 15MB)"
+            echo "✓ Binary size is within budget (< 32MB)"
           fi
 
       - name: Upload binary

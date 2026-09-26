@@ -47,7 +47,8 @@ check_binary() {
 
     # Get size in bytes
     local size_bytes
-    size_bytes=$(stat -c%s "$binary" 2>/dev/null || stat -f%z "$binary" 2>/dev/null)
+    # -L: measure the file a symlink points to, not the link itself.
+    size_bytes=$(stat -L -c%s "$binary" 2>/dev/null || stat -L -f%z "$binary" 2>/dev/null)
 
     # Convert to MB
     local size_mb

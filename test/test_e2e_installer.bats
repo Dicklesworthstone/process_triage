@@ -286,6 +286,9 @@ setup_installer_test_env() {
 
     setup_test_env
 
+    # Per-test installer lock (the default /tmp lock is shared with real installs).
+    export PT_INSTALL_LOCK_DIR="${TEST_DIR}/pt-install.lock.d"
+
     # Create directories
     export INSTALL_DEST="${TEST_DIR}/install_target"
     export ASSETS_DIR="${TEST_DIR}/assets"
@@ -358,24 +361,12 @@ setup_installer_test_env() {
 
     source "$temp_script"
 
-    # Check required functions exist
-    run type detect_os
-    [ "$status" -eq 0 ]
-
-    run type detect_arch
-    [ "$status" -eq 0 ]
-
-    run type download
-    [ "$status" -eq 0 ]
-
-    run type sha256_file
-    [ "$status" -eq 0 ]
-
-    run type install_binary
-    [ "$status" -eq 0 ]
-
-    run type add_to_path
-    [ "$status" -eq 0 ]
+    # Check required functions exist (names as of the March 2026 installer overhaul)
+    for fn in detect_platform download sha256_file install_binary maybe_add_path \
+        extract_core_archive resolve_version; do
+        run type "$fn"
+        [ "$status" -eq 0 ] || { echo "missing installer function: $fn"; false; }
+    done
 
     test_end "installer required functions" "pass"
 }
@@ -804,8 +795,13 @@ MOCK_CURL
     export PT_REFRESHED=1
     # Don't set PT_NO_PATH
 
+    # Rc files are only edited on request (--easy-mode); by default the installer
+    # prints a hint and leaves them alone.
     run bash "$INSTALLER_PATH"
+    [ "$status" -eq 0 ]
+    [ ! -s "$HOME/.bashrc" ]
 
+    run bash "$INSTALLER_PATH" --easy-mode
     [ "$status" -eq 0 ]
 
     # Check bashrc was modified
@@ -816,28 +812,27 @@ MOCK_CURL
     test_end "PATH bashrc" "pass"
 }
 
-@test "installer: adds to PATH in zshrc" {
-    test_start "PATH zshrc" "verify PATH added to .zshrc"
+@test "installer: adds to PATH in zshenv" {
+    test_start "PATH zshenv" "verify --easy-mode adds PATH to .zshenv"
 
     setup_installer_test_env "1.0.0" "Linux" "x86_64"
 
     export HOME="${TEST_DIR}/home"
     mkdir -p "$HOME"
-    touch "$HOME/.zshrc"
 
     export DEST="${HOME}/.local/bin"
     export SHELL="/bin/zsh"
     export PT_REFRESHED=1
 
-    run bash "$INSTALLER_PATH"
+    run bash "$INSTALLER_PATH" --easy-mode
 
     [ "$status" -eq 0 ]
 
-    # Check zshrc was modified
-    run cat "$HOME/.zshrc"
+    # zsh gets the PATH line in .zshenv (read by every zsh, interactive or not)
+    run cat "$HOME/.zshenv"
     assert_contains "$output" "$DEST"
 
-    test_end "PATH zshrc" "pass"
+    test_end "PATH zshenv" "pass"
 }
 
 @test "installer: PT_NO_PATH=1 skips PATH modification" {
@@ -984,8 +979,8 @@ MOCK_CURL
     test_end "version fetch error" "pass"
 }
 
-@test "installer: continues if pt-core download fails" {
-    test_start "pt-core optional" "verify pt wrapper installs even if pt-core fails"
+@test "installer: pt-core download failure falls back to source, else fails cleanly" {
+    test_start "pt-core required" "no half-install when pt-core cannot be obtained"
 
     setup_installer_test_env "1.0.0" "Linux" "x86_64"
 
@@ -996,18 +991,27 @@ MOCK_CURL
     export PT_NO_PATH=1
     export PT_REFRESHED=1
 
-    run bash "$INSTALLER_PATH"
+    # Hermetic: with cargo on PATH the source fallback would clone from GitHub.
+    local no_cargo_path="" dir
+    local IFS=:
+    for dir in $PATH; do
+        [[ -x "$dir/cargo" ]] || no_cargo_path="${no_cargo_path:+$no_cargo_path:}$dir"
+    done
+    unset IFS
+
+    PATH="$no_cargo_path" run bash "$INSTALLER_PATH"
 
     test_info "Output: $output"
 
-    # pt wrapper should still install successfully
-    [ -f "$INSTALL_DEST/pt" ]
-    [ -x "$INSTALL_DEST/pt" ]
+    # The installer tries a source build; without cargo in this environment it
+    # must fail with a clear message and install nothing (a `pt` wrapper without
+    # pt-core cannot run).
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"falling back to source build"* ]]
+    [[ "$output" == *"cargo is required"* ]]
+    [ ! -e "$INSTALL_DEST/pt" ]
 
-    # Should warn about pt-core
-    [[ "$output" == *"pt-core"* ]] || [[ "$output" == *"Failed"* ]] || true
-
-    test_end "pt-core optional" "pass"
+    test_end "pt-core required" "pass"
 }
 
 # ==============================================================================

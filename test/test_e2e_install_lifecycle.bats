@@ -214,6 +214,9 @@ setup_lifecycle_env() {
 
     setup_test_env
 
+    # Per-test installer lock (the default /tmp lock is shared with real installs).
+    export PT_INSTALL_LOCK_DIR="${TEST_DIR}/pt-install.lock.d"
+
     export INSTALL_DEST="${TEST_DIR}/install_target"
     export ASSETS_V1="${TEST_DIR}/assets_v1"
     export ASSETS_V2="${TEST_DIR}/assets_v2"
@@ -497,7 +500,7 @@ EOF
     test_end "tampered fingerprint" "pass"
 }
 
-@test "tampered: empty tarball does not crash installer" {
+@test "tampered: empty tarball fails cleanly without a partial install" {
     test_start "tampered empty tarball" "empty tarball handled gracefully"
 
     setup_lifecycle_env "1.0.0" "2.0.0"
@@ -512,9 +515,12 @@ EOF
     run_installer
     test_info "Exit: $status Output: $output"
 
-    # pt wrapper should still install (it's independent)
-    [ -f "$INSTALL_DEST/pt" ]
-    [ -x "$INSTALL_DEST/pt" ]
+    # A clear error instead of raw gzip/tar noise, and no half-install: a `pt`
+    # wrapper without pt-core cannot run.
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"archive is empty or corrupt"* ]]
+    [ ! -e "$INSTALL_DEST/pt" ]
+    [ ! -e "$INSTALL_DEST/pt-core" ]
 
     test_end "tampered empty tarball" "pass"
 }
