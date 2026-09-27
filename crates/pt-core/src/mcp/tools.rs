@@ -8,9 +8,17 @@ use crate::collect::ScanMetadata;
 use crate::collect::{deep_scan, DeepScanOptions};
 use crate::collect::{quick_scan, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
+use crate::scoring::{load_signature_database, ProcessScore, Scorer};
 use crate::signature_cli::load_user_signatures;
 use crate::supervision::signature::ProcessMatchContext;
 use crate::supervision::{SignatureDatabase, SupervisorCategory};
+use std::path::PathBuf;
+
+/// The config directory `agent plan` uses (env overrides, then the XDG default).
+fn config_dir() -> PathBuf {
+    crate::config::resolve_config_dir(&crate::config::ConfigOptions::default())
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
 
 fn collect_scan_result(deep: bool) -> Result<ScanResult, String> {
     if deep {
@@ -67,21 +75,16 @@ fn collect_scan_result(deep: bool) -> Result<ScanResult, String> {
 }
 
 fn load_signature_db_with_user_entries() -> SignatureDatabase {
-    let mut db = SignatureDatabase::new();
-    db.add_default_signatures();
-    if let Some(user_schema) = load_user_signatures() {
-        for sig in user_schema.signatures {
-            let _ = db.add(sig);
-        }
-    }
-    db
+    load_signature_database(&config_dir()).0
 }
 
-/// What the MCP tools score against: the configured priors and protection rules,
-/// the same ones `agent plan` uses.
+/// What the MCP tools score against: the scorer and protection rules `agent plan`
+/// uses (priors, learned verdicts, signatures, desktop-app ownership, provenance).
 struct Evaluator {
-    priors: crate::config::Priors,
+    scorer: Scorer,
     protected: Option<crate::collect::protected::ProtectedFilter>,
+    /// `agent plan`'s default age floor for candidates.
+    min_age_seconds: u64,
 }
 
 impl Evaluator {
@@ -92,27 +95,53 @@ impl Evaluator {
                     &config.policy.guardrails,
                 )
                 .ok(),
-                priors: config.priors,
+                min_age_seconds: config.policy.guardrails.min_process_age_seconds,
+                scorer: Scorer::from_config(&config).0,
             },
-            Err(_) => Self {
-                priors: crate::config::Priors::default(),
-                protected: crate::collect::protected::ProtectedFilter::from_guardrails(
-                    &crate::config::policy::Guardrails::default(),
-                )
-                .ok(),
-            },
+            Err(_) => {
+                let policy = crate::config::Policy::default();
+                Self {
+                    protected: crate::collect::protected::ProtectedFilter::from_guardrails(
+                        &policy.guardrails,
+                    )
+                    .ok(),
+                    min_age_seconds: policy.guardrails.min_process_age_seconds,
+                    scorer: Scorer::new(
+                        crate::config::Priors::default(),
+                        Default::default(),
+                        load_signature_db_with_user_entries(),
+                        crate::scoring::fast_path_config(&policy),
+                    ),
+                }
+            }
         }
     }
 
-    /// Posterior class probabilities from the process snapshot (None if the model
-    /// cannot evaluate it).
+    /// Collect provenance as `agent plan` does: for the unprotected processes old
+    /// enough to be candidates, plus `extra` (processes asked about explicitly).
+    fn collect_provenance(&mut self, processes: &[ProcessRecord], extra: &[&ProcessRecord]) {
+        let mut set: Vec<&ProcessRecord> = processes
+            .iter()
+            .filter(|p| p.elapsed.as_secs() >= self.min_age_seconds && self.protection(p).is_null())
+            .collect();
+        for process in extra {
+            if !set.iter().any(|p| p.pid == process.pid) {
+                set.push(process);
+            }
+        }
+        self.scorer.collect_provenance(&set);
+    }
+
+    /// The process's score, as `agent plan` computes it (None if the model cannot
+    /// evaluate it).
+    fn score(&self, process: &ProcessRecord) -> Option<ProcessScore<'_>> {
+        self.scorer
+            .score(process, crate::inference::Evidence::from_snapshot(process))
+    }
+
+    /// Posterior class probabilities (None if the model cannot evaluate it).
     fn posterior(&self, process: &ProcessRecord) -> Option<crate::inference::ClassScores> {
-        crate::inference::compute_posterior(
-            &self.priors,
-            &crate::inference::Evidence::from_snapshot(process),
-        )
-        .ok()
-        .map(|r| r.posterior)
+        self.score(process).map(|s| s.posterior.posterior)
     }
 
     /// `{rule, notes}` if `agent plan` would skip this process as protected.
@@ -317,7 +346,8 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         .unwrap_or(0.0);
     let scan_result = collect_scan_result(deep)?;
     let db = load_signature_db_with_user_entries();
-    let evaluator = Evaluator::load();
+    let mut evaluator = Evaluator::load();
+    evaluator.collect_provenance(&scan_result.processes, &[]);
 
     // Score = P(abandoned or zombie) from the same posterior `agent plan` uses (it was
     // a signature-match score plus a state bonus, not a probability).
@@ -411,27 +441,18 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 parent_comm: None,
             };
 
-            let mut db = SignatureDatabase::new();
-            db.add_default_signatures();
-            if let Some(user_schema) = load_user_signatures() {
-                for sig in user_schema.signatures {
-                    let _ = db.add(sig);
-                }
-            }
-
+            let db = load_signature_db_with_user_entries();
             let matches = db.match_process(&ctx);
 
-            // The same posterior and protection rules `agent plan` uses.
-            let evaluator = Evaluator::load();
-            let result = crate::inference::compute_posterior(
-                &evaluator.priors,
-                &crate::inference::Evidence::from_snapshot(p),
-            )
-            .ok();
-            let evidence_terms: Vec<serde_json::Value> = result
+            // The same score and protection rules `agent plan` uses.
+            let mut evaluator = Evaluator::load();
+            evaluator.collect_provenance(&scan.processes, &[p]);
+            let score = evaluator.score(p);
+            let evidence_terms: Vec<serde_json::Value> = score
                 .as_ref()
-                .map(|r| {
-                    r.evidence_terms
+                .map(|s| {
+                    s.posterior
+                        .evidence_terms
                         .iter()
                         .map(|t| {
                             serde_json::json!({
@@ -442,7 +463,9 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                         .collect()
                 })
                 .unwrap_or_default();
-            let posterior = result.map(|r| r.posterior);
+            let prior_source = score.as_ref().map(|s| s.prior_source.clone());
+            let desktop_app = score.as_ref().and_then(|s| s.desktop_app.clone());
+            let posterior = score.map(|s| s.posterior.posterior);
 
             let result = serde_json::json!({
                 "pid": p.pid.0,
@@ -467,6 +490,8 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 "score": posterior.map(|s| s.abandonment_probability()),
                 "suspicion_score": posterior.map(|s| s.suspicion_score()),
                 "protected": evaluator.protection(p),
+                "prior_source": prior_source,
+                "desktop_app": desktop_app,
                 "evidence": evidence_terms,
             });
 
@@ -595,7 +620,7 @@ fn tool_signatures(params: &serde_json::Value) -> Result<Vec<ToolContent>, Strin
         }
     }
 
-    if let Some(user_schema) = load_user_signatures() {
+    if let Some(user_schema) = load_user_signatures(&config_dir()) {
         for sig in &user_schema.signatures {
             if let Some(parsed) = category_filter {
                 if sig.category != parsed {

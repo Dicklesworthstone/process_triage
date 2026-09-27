@@ -575,13 +575,45 @@ pub fn classify_cgroup_path(path: &str) -> CgroupRole {
     CgroupRole::Unknown
 }
 
-/// Classify a live process by reading `/proc/<pid>/cgroup` (Linux only).
-pub fn read_cgroup_role(pid: u32) -> CgroupRole {
+/// The systemd service a cgroup path places a process in, as `(unit, user_manager)`:
+/// `user_manager` is true for units of a user's service manager (`systemctl --user`).
+/// `None` unless the placement is a supervised service (a system or user `.service`);
+/// login sessions, transient scopes and containers are not services.
+pub fn systemd_service_unit(path: &str) -> Option<(&str, bool)> {
+    if !matches!(
+        classify_cgroup_path(path),
+        CgroupRole::SystemService | CgroupRole::UserService
+    ) {
+        return None;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let idx = segments.iter().rposition(|s| s.ends_with(".service"))?;
+    let user_manager = segments[..idx]
+        .iter()
+        .any(|s| s.starts_with("user@") && s.ends_with(".service"));
+    Some((segments[idx], user_manager))
+}
+
+/// The XDG desktop application unit a cgroup path places a process in, if any:
+/// `app-<launcher>-<AppID>-<RANDOM>.scope` or `app-<launcher>-<AppID>@<RANDOM>.service`
+/// below a user's service manager, which is how graphical sessions (GNOME, KDE,
+/// uwsm, ...) launch applications (systemd's desktop-environment conventions).
+pub fn desktop_app_unit(path: &str) -> Option<&str> {
+    if !path.contains("/user@") {
+        return None;
+    }
+    path.rsplit('/').find(|segment| {
+        segment.starts_with("app-")
+            && (segment.ends_with(".scope") || segment.ends_with(".service"))
+    })
+}
+
+/// The systemd cgroup path of a live process (`0::<path>` on cgroup v2, else the v1
+/// `name=systemd` hierarchy). Linux only; `None` elsewhere or when unreadable.
+pub fn read_systemd_cgroup_path(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        let Ok(bytes) = fs::read(format!("/proc/{pid}/cgroup")) else {
-            return CgroupRole::Unknown;
-        };
+        let bytes = fs::read(format!("/proc/{pid}/cgroup")).ok()?;
         let content = String::from_utf8_lossy(&bytes);
         let mut v1_systemd: Option<&str> = None;
         for line in content.lines() {
@@ -591,21 +623,26 @@ pub fn read_cgroup_role(pid: u32) -> CgroupRole {
                 continue;
             };
             if h == "0" && ctrl.is_empty() {
-                return classify_cgroup_path(path);
+                return Some(path.trim().to_string());
             }
             if ctrl == "name=systemd" {
                 v1_systemd = Some(path);
             }
         }
-        v1_systemd
-            .map(classify_cgroup_path)
-            .unwrap_or(CgroupRole::Unknown)
+        v1_systemd.map(|p| p.trim().to_string())
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
-        CgroupRole::Unknown
+        None
     }
+}
+
+/// Classify a live process by reading `/proc/<pid>/cgroup` (Linux only).
+pub fn read_cgroup_role(pid: u32) -> CgroupRole {
+    read_systemd_cgroup_path(pid)
+        .map(|path| classify_cgroup_path(&path))
+        .unwrap_or(CgroupRole::Unknown)
 }
 
 #[cfg(test)]
@@ -656,6 +693,69 @@ mod tests {
         assert!(SystemService.is_supervised_service());
         assert!(Container.is_supervised_service());
         assert!(!Unknown.is_supervised_service() && !Unknown.is_user_workload());
+    }
+
+    #[test]
+    fn systemd_service_unit_names_the_unit_and_manager() {
+        let cases = [
+            ("/system.slice/nginx.service", Some(("nginx.service", false))),
+            (
+                "/system.slice/postgresql@18-main.service",
+                Some(("postgresql@18-main.service", false)),
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/pm2.service",
+                Some(("pm2.service", true)),
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app-slack@4f2.service",
+                Some(("app-slack@4f2.service", true)),
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/session.slice/wayland-wm@hyprland.desktop.service",
+                Some(("wayland-wm@hyprland.desktop.service", true)),
+            ),
+            // Not services: login session, transient scopes, containers, init.
+            ("/user.slice/user-1000.slice/session-1.scope", None),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app-Hyprland-slack-123.scope",
+                None,
+            ),
+            ("/system.slice/docker-0123abcd.scope", None),
+            ("/init.scope", None),
+            ("/", None),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(systemd_service_unit(path), expected, "path {path}");
+        }
+    }
+
+    #[test]
+    fn desktop_app_unit_recognizes_xdg_application_units() {
+        let cases = [
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app-Hyprland-slack-4821.scope",
+                Some("app-Hyprland-slack-4821.scope"),
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-org.gnome.Nautilus-2211.scope",
+                Some("app-gnome-org.gnome.Nautilus-2211.scope"),
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.konsole@a1b2.service",
+                Some("app-org.kde.konsole@a1b2.service"),
+            ),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-1c2d.scope",
+                None,
+            ),
+            ("/user.slice/user-1000.slice/session-3.scope", None),
+            ("/system.slice/app-fake.service", None),
+            ("/user.slice/user-1000.slice/user@1000.service/app.slice", None),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(desktop_app_unit(path), expected, "path {path}");
+        }
     }
 
     #[test]

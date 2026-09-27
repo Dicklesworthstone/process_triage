@@ -6,7 +6,7 @@
 use crate::exit_codes::ExitCode;
 use crate::output::encode_toon_value;
 use crate::supervision::pattern_persistence::{AllPatternStats, DisabledPatterns};
-use crate::supervision::signature::ProcessMatchContext;
+use crate::supervision::signature::{ProcessMatchContext, SignaturePriors};
 use crate::supervision::{
     SignatureDatabase, SignaturePatterns, SignatureSchema, SupervisorCategory, SupervisorSignature,
     SCHEMA_VERSION as SIG_SCHEMA_VERSION,
@@ -14,6 +14,7 @@ use crate::supervision::{
 use clap::{Args, Subcommand};
 use pt_common::{OutputFormat, SessionId, SCHEMA_VERSION};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Bundle path for exported user signatures.
 pub const BUNDLE_SIGNATURES_PATH: &str = "signatures/user_signatures.json";
@@ -77,6 +78,12 @@ pub enum SignatureCommands {
         /// Priority (higher = checked first)
         #[arg(long, default_value = "100")]
         priority: u32,
+        /// What matching processes usually are. Sets the signature's class priors,
+        /// which is what changes their score: `useful` (normal; keep them) or
+        /// `abandoned` (usually left behind; safe to clean up). Without it the
+        /// signature only labels matches.
+        #[arg(long, value_enum, value_name = "CLASS")]
+        prior: Option<SignaturePriorClass>,
     },
     /// Remove a user signature
     Remove {
@@ -142,17 +149,38 @@ pub enum SignatureCommands {
     },
 }
 
-/// Get the path to user signatures file
-pub fn user_signatures_path() -> std::path::PathBuf {
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("process_triage");
+/// Class prior a user signature assigns to the processes it matches.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignaturePriorClass {
+    /// Normal, wanted processes (~90% useful prior).
+    Useful,
+    /// Processes that are usually left behind (~80% abandoned prior).
+    Abandoned,
+}
+
+impl SignaturePriorClass {
+    /// The class priors this choice stands for.
+    pub fn priors(self) -> SignaturePriors {
+        match self {
+            SignaturePriorClass::Useful => SignaturePriors::likely_useful(),
+            SignaturePriorClass::Abandoned => SignaturePriors::likely_abandoned(),
+        }
+    }
+}
+
+/// Path to the user signatures file in a config directory.
+///
+/// Every command resolves `config_dir` the same way as the rest of the configuration
+/// (`--config` / `PT_CONFIG_DIR`, then `PROCESS_TRIAGE_CONFIG`, then
+/// `$XDG_CONFIG_HOME/process_triage`; see [`crate::config::resolve_config_dir`]), so
+/// signatures follow a config-directory override (GH #18).
+pub fn user_signatures_path(config_dir: &Path) -> PathBuf {
     config_dir.join("signatures.json")
 }
 
-/// Load user signatures from config directory
-pub fn load_user_signatures() -> Option<SignatureSchema> {
-    let path = user_signatures_path();
+/// Load user signatures from a config directory
+pub fn load_user_signatures(config_dir: &Path) -> Option<SignatureSchema> {
+    let path = user_signatures_path(config_dir);
     if path.exists() {
         match std::fs::read_to_string(&path) {
             Ok(content) => match SignatureSchema::from_json(&content) {
@@ -172,9 +200,12 @@ pub fn load_user_signatures() -> Option<SignatureSchema> {
     }
 }
 
-/// Save user signatures to config directory
-pub fn save_user_signatures(schema: &SignatureSchema) -> Result<(), std::io::Error> {
-    let path = user_signatures_path();
+/// Save user signatures to a config directory
+pub fn save_user_signatures(
+    config_dir: &Path,
+    schema: &SignatureSchema,
+) -> Result<(), std::io::Error> {
+    let path = user_signatures_path(config_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -184,25 +215,21 @@ pub fn save_user_signatures(schema: &SignatureSchema) -> Result<(), std::io::Err
 }
 
 /// Get the path to disabled signatures file
-fn disabled_signatures_path() -> std::path::PathBuf {
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("process_triage")
-        .join("patterns");
-    config_dir.join("disabled.json")
+fn disabled_signatures_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("patterns").join("disabled.json")
 }
 
 /// Get the path to pattern statistics file
-fn pattern_stats_path() -> std::path::PathBuf {
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("process_triage");
+fn pattern_stats_path(config_dir: &Path) -> PathBuf {
     config_dir.join("pattern_stats.json")
 }
 
-/// Save disabled patterns to config directory
-pub fn save_disabled_patterns(disabled: &DisabledPatterns) -> Result<(), std::io::Error> {
-    let path = disabled_signatures_path();
+/// Save disabled patterns to a config directory
+pub fn save_disabled_patterns(
+    config_dir: &Path,
+    disabled: &DisabledPatterns,
+) -> Result<(), std::io::Error> {
+    let path = disabled_signatures_path(config_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -225,15 +252,16 @@ pub fn parse_category(s: &str) -> Option<SupervisorCategory> {
     }
 }
 
-/// Run the signature command dispatcher
-pub fn run_signature(format: &OutputFormat, args: &SignatureArgs) -> ExitCode {
+/// Run the signature command dispatcher. `config_dir` is the resolved configuration
+/// directory (see [`user_signatures_path`]).
+pub fn run_signature(format: &OutputFormat, config_dir: &Path, args: &SignatureArgs) -> ExitCode {
     match &args.command {
         SignatureCommands::List {
             user_only,
             builtin_only,
             category,
-        } => run_signature_list(format, *user_only, *builtin_only, *category),
-        SignatureCommands::Show { name } => run_signature_show(format, name),
+        } => run_signature_list(format, config_dir, *user_only, *builtin_only, *category),
+        SignatureCommands::Show { name } => run_signature_show(format, config_dir, name),
         SignatureCommands::Add {
             name,
             category,
@@ -243,8 +271,10 @@ pub fn run_signature(format: &OutputFormat, args: &SignatureArgs) -> ExitCode {
             confidence,
             notes,
             priority,
+            prior,
         } => run_signature_add(
             format,
+            config_dir,
             name,
             *category,
             patterns,
@@ -253,34 +283,38 @@ pub fn run_signature(format: &OutputFormat, args: &SignatureArgs) -> ExitCode {
             *confidence,
             notes.as_deref(),
             *priority,
+            *prior,
         ),
-        SignatureCommands::Remove { name, force } => run_signature_remove(format, name, *force),
+        SignatureCommands::Remove { name, force } => {
+            run_signature_remove(format, config_dir, name, *force)
+        }
         SignatureCommands::Test {
             process_name,
             cmdline,
             all,
-        } => run_signature_test(format, process_name, cmdline.as_deref(), *all),
-        SignatureCommands::Validate => run_signature_validate(format),
+        } => run_signature_test(format, config_dir, process_name, cmdline.as_deref(), *all),
+        SignatureCommands::Validate => run_signature_validate(format, config_dir),
         SignatureCommands::Export { output, user_only } => {
-            run_signature_export(format, output, *user_only)
+            run_signature_export(format, config_dir, output, *user_only)
         }
         SignatureCommands::Disable { name, reason } => {
-            run_signature_disable(format, name, reason.as_deref())
+            run_signature_disable(format, config_dir, name, reason.as_deref())
         }
-        SignatureCommands::Enable { name } => run_signature_enable(format, name),
+        SignatureCommands::Enable { name } => run_signature_enable(format, config_dir, name),
         SignatureCommands::Import {
             input,
             dry_run,
             passphrase,
-        } => run_signature_import(format, input, *dry_run, passphrase.as_deref()),
+        } => run_signature_import(format, config_dir, input, *dry_run, passphrase.as_deref()),
         SignatureCommands::Stats { min_matches, sort } => {
-            run_signature_stats(format, *min_matches, sort)
+            run_signature_stats(format, config_dir, *min_matches, sort)
         }
     }
 }
 
 fn run_signature_list(
     format: &OutputFormat,
+    config_dir: &Path,
     user_only: bool,
     builtin_only: bool,
     category_filter: Option<SupervisorCategory>,
@@ -310,7 +344,7 @@ fn run_signature_list(
 
     // Load user signatures
     if !builtin_only {
-        if let Some(user_schema) = load_user_signatures() {
+        if let Some(user_schema) = load_user_signatures(config_dir) {
             for sig in &user_schema.signatures {
                 if let Some(cat) = category_filter {
                     if sig.category != cat {
@@ -366,7 +400,7 @@ fn run_signature_list(
     ExitCode::Clean
 }
 
-fn run_signature_show(format: &OutputFormat, name: &str) -> ExitCode {
+fn run_signature_show(format: &OutputFormat, config_dir: &Path, name: &str) -> ExitCode {
     let session_id = SessionId::new();
 
     // Check built-in first
@@ -411,7 +445,7 @@ fn run_signature_show(format: &OutputFormat, name: &str) -> ExitCode {
     }
 
     // Check user signatures
-    if let Some(user_schema) = load_user_signatures() {
+    if let Some(user_schema) = load_user_signatures(config_dir) {
         for sig in &user_schema.signatures {
             if sig.name == name {
                 let output = serde_json::json!({
@@ -457,6 +491,7 @@ fn run_signature_show(format: &OutputFormat, name: &str) -> ExitCode {
 #[allow(clippy::too_many_arguments)]
 fn run_signature_add(
     format: &OutputFormat,
+    config_dir: &Path,
     name: &str,
     category: SupervisorCategory,
     patterns: &[String],
@@ -465,6 +500,7 @@ fn run_signature_add(
     confidence: f64,
     notes: Option<&str>,
     priority: u32,
+    prior: Option<SignaturePriorClass>,
 ) -> ExitCode {
     let session_id = SessionId::new();
 
@@ -496,12 +532,12 @@ fn run_signature_add(
         confidence_weight: confidence,
         notes: notes.map(|s| s.to_string()),
         builtin: false,
-        priors: Default::default(),
+        priors: prior.map(SignaturePriorClass::priors).unwrap_or_default(),
         expectations: Default::default(),
     };
 
     // Load or create user schema
-    let mut schema = load_user_signatures().unwrap_or_else(|| SignatureSchema {
+    let mut schema = load_user_signatures(config_dir).unwrap_or_else(|| SignatureSchema {
         schema_version: SIG_SCHEMA_VERSION,
         signatures: Vec::new(),
         metadata: None,
@@ -516,11 +552,15 @@ fn run_signature_add(
     schema.signatures.push(new_sig);
 
     // Save
-    if let Err(e) = save_user_signatures(&schema) {
+    if let Err(e) = save_user_signatures(config_dir, &schema) {
         eprintln!("Failed to save signature: {}", e);
         return ExitCode::ArgsError;
     }
 
+    let prior_label = prior.map(|p| match p {
+        SignaturePriorClass::Useful => "useful",
+        SignaturePriorClass::Abandoned => "abandoned",
+    });
     match format {
         OutputFormat::Json | OutputFormat::Toon => {
             let output = serde_json::json!({
@@ -530,24 +570,36 @@ fn run_signature_add(
                 "command": "signature add",
                 "status": "success",
                 "name": name,
-                "path": user_signatures_path().display().to_string(),
+                "prior": prior_label,
+                "path": user_signatures_path(config_dir).display().to_string(),
             });
             println!("{}", format_signature_output(format, output));
         }
         _ => {
             println!("Added signature '{}' to user signatures", name);
-            println!("Saved to: {}", user_signatures_path().display());
+            match prior_label {
+                Some(label) => println!("Matching processes get the '{label}' class prior"),
+                None => {
+                    println!("No --prior given: matches are labeled but their score is unchanged")
+                }
+            }
+            println!("Saved to: {}", user_signatures_path(config_dir).display());
         }
     }
 
     ExitCode::Clean
 }
 
-fn run_signature_remove(format: &OutputFormat, name: &str, force: bool) -> ExitCode {
+fn run_signature_remove(
+    format: &OutputFormat,
+    config_dir: &Path,
+    name: &str,
+    force: bool,
+) -> ExitCode {
     let session_id = SessionId::new();
 
     // Load user signatures
-    let mut schema = match load_user_signatures() {
+    let mut schema = match load_user_signatures(config_dir) {
         Some(s) => s,
         None => {
             eprintln!("No user signatures file found");
@@ -570,7 +622,7 @@ fn run_signature_remove(format: &OutputFormat, name: &str, force: bool) -> ExitC
     }
 
     // Save
-    if let Err(e) = save_user_signatures(&schema) {
+    if let Err(e) = save_user_signatures(config_dir, &schema) {
         eprintln!("Failed to save: {}", e);
         return ExitCode::ArgsError;
     }
@@ -597,6 +649,7 @@ fn run_signature_remove(format: &OutputFormat, name: &str, force: bool) -> ExitC
 
 fn run_signature_test(
     format: &OutputFormat,
+    config_dir: &Path,
     process_name: &str,
     cmdline: Option<&str>,
     all: bool,
@@ -608,7 +661,7 @@ fn run_signature_test(
     db.add_default_signatures();
 
     // Add user signatures
-    if let Some(user_schema) = load_user_signatures() {
+    if let Some(user_schema) = load_user_signatures(config_dir) {
         for sig in user_schema.signatures {
             let _ = db.add(sig);
         }
@@ -677,9 +730,9 @@ fn run_signature_test(
     ExitCode::Clean
 }
 
-fn run_signature_validate(format: &OutputFormat) -> ExitCode {
+fn run_signature_validate(format: &OutputFormat, config_dir: &Path) -> ExitCode {
     let session_id = SessionId::new();
-    let path = user_signatures_path();
+    let path = user_signatures_path(config_dir);
 
     if !path.exists() {
         match format {
@@ -752,7 +805,12 @@ fn run_signature_validate(format: &OutputFormat) -> ExitCode {
     }
 }
 
-fn run_signature_export(format: &OutputFormat, output_path: &str, user_only: bool) -> ExitCode {
+fn run_signature_export(
+    format: &OutputFormat,
+    config_dir: &Path,
+    output_path: &str,
+    user_only: bool,
+) -> ExitCode {
     let session_id = SessionId::new();
 
     let mut all_sigs = Vec::new();
@@ -767,7 +825,7 @@ fn run_signature_export(format: &OutputFormat, output_path: &str, user_only: boo
     }
 
     // Load user signatures
-    if let Some(user_schema) = load_user_signatures() {
+    if let Some(user_schema) = load_user_signatures(config_dir) {
         for sig in user_schema.signatures {
             all_sigs.push(sig);
         }
@@ -819,6 +877,7 @@ fn run_signature_export(format: &OutputFormat, output_path: &str, user_only: boo
 
 fn run_signature_import(
     format: &OutputFormat,
+    config_dir: &Path,
     input_path: &str,
     dry_run: bool,
     passphrase: Option<&str>,
@@ -884,7 +943,7 @@ fn run_signature_import(
     }
 
     // Load existing user signatures for merge
-    let existing = load_user_signatures().unwrap_or_else(|| SignatureSchema {
+    let existing = load_user_signatures(config_dir).unwrap_or_else(|| SignatureSchema {
         schema_version: SIG_SCHEMA_VERSION,
         signatures: Vec::new(),
         metadata: None,
@@ -945,7 +1004,7 @@ fn run_signature_import(
         }
     }
 
-    if let Err(e) = save_user_signatures(&merged) {
+    if let Err(e) = save_user_signatures(config_dir, &merged) {
         eprintln!("Failed to save: {}", e);
         return ExitCode::IoError;
     }
@@ -1004,7 +1063,12 @@ fn load_signatures_from_bundle(
     serde_json::from_str(&text).map_err(|e| format!("Failed to parse signatures: {}", e))
 }
 
-fn run_signature_disable(format: &OutputFormat, name: &str, reason: Option<&str>) -> ExitCode {
+fn run_signature_disable(
+    format: &OutputFormat,
+    config_dir: &Path,
+    name: &str,
+    reason: Option<&str>,
+) -> ExitCode {
     let session_id = SessionId::new();
 
     // First check if the signature exists (in either built-in or user signatures)
@@ -1015,7 +1079,7 @@ fn run_signature_disable(format: &OutputFormat, name: &str, reason: Option<&str>
 
     // Also check user signatures
     if !found {
-        if let Some(user_schema) = load_user_signatures() {
+        if let Some(user_schema) = load_user_signatures(config_dir) {
             found = user_schema.signatures.iter().any(|s| s.name == name);
         }
     }
@@ -1039,7 +1103,7 @@ fn run_signature_disable(format: &OutputFormat, name: &str, reason: Option<&str>
     }
 
     // Load or create disabled patterns
-    let disabled_path = disabled_signatures_path();
+    let disabled_path = disabled_signatures_path(config_dir);
     let mut disabled = if disabled_path.exists() {
         match DisabledPatterns::from_file(&disabled_path) {
             Ok(d) => d,
@@ -1075,7 +1139,7 @@ fn run_signature_disable(format: &OutputFormat, name: &str, reason: Option<&str>
     disabled.disable(name, reason);
 
     // Save
-    if let Err(e) = save_disabled_patterns(&disabled) {
+    if let Err(e) = save_disabled_patterns(config_dir, &disabled) {
         eprintln!("Failed to save disabled patterns: {}", e);
         return ExitCode::ArgsError;
     }
@@ -1104,11 +1168,11 @@ fn run_signature_disable(format: &OutputFormat, name: &str, reason: Option<&str>
     ExitCode::Clean
 }
 
-fn run_signature_enable(format: &OutputFormat, name: &str) -> ExitCode {
+fn run_signature_enable(format: &OutputFormat, config_dir: &Path, name: &str) -> ExitCode {
     let session_id = SessionId::new();
 
     // Load disabled patterns
-    let disabled_path = disabled_signatures_path();
+    let disabled_path = disabled_signatures_path(config_dir);
     let mut disabled = if disabled_path.exists() {
         match DisabledPatterns::from_file(&disabled_path) {
             Ok(d) => d,
@@ -1145,7 +1209,7 @@ fn run_signature_enable(format: &OutputFormat, name: &str) -> ExitCode {
     disabled.enable(name);
 
     // Save
-    if let Err(e) = save_disabled_patterns(&disabled) {
+    if let Err(e) = save_disabled_patterns(config_dir, &disabled) {
         eprintln!("Failed to save disabled patterns: {}", e);
         return ExitCode::ArgsError;
     }
@@ -1170,11 +1234,16 @@ fn run_signature_enable(format: &OutputFormat, name: &str) -> ExitCode {
     ExitCode::Clean
 }
 
-fn run_signature_stats(format: &OutputFormat, min_matches: u32, sort_by: &str) -> ExitCode {
+fn run_signature_stats(
+    format: &OutputFormat,
+    config_dir: &Path,
+    min_matches: u32,
+    sort_by: &str,
+) -> ExitCode {
     let session_id = SessionId::new();
 
     // Load pattern stats
-    let stats_path = pattern_stats_path();
+    let stats_path = pattern_stats_path(config_dir);
     let stats = if stats_path.exists() {
         match AllPatternStats::from_file(&stats_path) {
             Ok(s) => s,
@@ -1389,30 +1458,53 @@ mod tests {
 
     // ── user_signatures_path ────────────────────────────────────────
 
+    /// Every signature file lives in the resolved config directory, not a fixed
+    /// `~/.config/process_triage` (GH #18).
     #[test]
-    fn user_signatures_path_ends_with_json() {
-        let path = user_signatures_path();
-        assert!(path.to_string_lossy().ends_with("signatures.json"));
+    fn signature_files_live_in_the_given_config_dir() {
+        let dir = Path::new("/tmp/ptcfg");
+        assert_eq!(
+            user_signatures_path(dir),
+            PathBuf::from("/tmp/ptcfg/signatures.json")
+        );
+        assert_eq!(
+            disabled_signatures_path(dir),
+            PathBuf::from("/tmp/ptcfg/patterns/disabled.json")
+        );
+        assert_eq!(
+            pattern_stats_path(dir),
+            PathBuf::from("/tmp/ptcfg/pattern_stats.json")
+        );
     }
 
     #[test]
-    fn user_signatures_path_contains_process_triage() {
-        let path = user_signatures_path();
-        assert!(path.to_string_lossy().contains("process_triage"));
+    fn user_signatures_round_trip_through_a_config_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("nested").join("cfg");
+        assert!(load_user_signatures(&config_dir).is_none());
+        let schema = SignatureSchema {
+            schema_version: SIG_SCHEMA_VERSION,
+            signatures: vec![
+                SupervisorSignature::new("herdr", SupervisorCategory::Terminal)
+                    .with_process_patterns(vec!["^herdr$"])
+                    .with_priors(SignaturePriorClass::Useful.priors()),
+            ],
+            metadata: None,
+        };
+        save_user_signatures(&config_dir, &schema).expect("save");
+        assert!(user_signatures_path(&config_dir).exists());
+        let loaded = load_user_signatures(&config_dir).expect("load");
+        assert_eq!(loaded.signatures, schema.signatures);
+        assert!(!loaded.signatures[0].priors.is_empty());
     }
 
-    // ── disabled_signatures_path / pattern_stats_path ───────────────
-
     #[test]
-    fn disabled_path_ends_with_disabled_json() {
-        let path = disabled_signatures_path();
-        assert!(path.to_string_lossy().ends_with("disabled.json"));
-    }
-
-    #[test]
-    fn pattern_stats_path_ends_with_json() {
-        let path = pattern_stats_path();
-        assert!(path.to_string_lossy().ends_with("pattern_stats.json"));
+    fn prior_classes_set_opposite_priors() {
+        let useful = SignaturePriorClass::Useful.priors();
+        let abandoned = SignaturePriorClass::Abandoned.priors();
+        let mean = |b: Option<crate::config::priors::BetaParams>| b.expect("set").mean();
+        assert!(mean(useful.useful) > 0.8 && mean(useful.abandoned) < 0.2);
+        assert!(mean(abandoned.abandoned) > 0.7 && mean(abandoned.useful) < 0.3);
     }
 
     // ── SignatureSchema serde ───────────────────────────────────────

@@ -399,13 +399,14 @@ Protection has two layers:
 
 - **Policy** (`policy.json` → `guardrails`): protected patterns (defaults `systemd`, `sshd`), protected users (default `root`), protected categories (`database`, `webserver`), PIDs, and children of PID 1.
 - **Built-in** (`guardrails.builtin_protection`, on by default):
-  - terminal multiplexers (tmux, zellij, screen, wezterm/frankenterm mux servers), SSH ControlMasters (e.g. rch's shared connections), session infrastructure (sshd sessions, `systemd --user`, dbus, pipewire, agents), interactive shells, and what is on someone's screen: terminal emulators, display servers/compositors (including kiosk `cage`) and live monitors such as `htop`/`btop` (headless `Xvfb` stays a candidate);
+  - terminal multiplexers (tmux, zellij, screen, wezterm/frankenterm mux servers), SSH ControlMasters (e.g. rch's shared connections), session infrastructure (sshd sessions, `systemd --user`, dbus, pipewire, agents), the display-manager / session-manager process that holds a graphical login (`sddm-helper`, `gdm-session-worker`, `lightdm --session-child`, `greetd`, `uwsm start`, `gnome-session-binary`, `ksmserver`, …), interactive shells, and what is on someone's screen: terminal emulators, display servers/compositors (including kiosk `cage`) and live monitors such as `htop`/`btop` (headless `Xvfb` stays a candidate);
   - `pt` itself and every process that invoked it;
   - database / web / message servers by name, even under rewritten titles (`postgres: … io worker`, `nginx: worker process`; also mysqld/mariadbd, redis/valkey, mongod, memcached, httpd/apache2, caddy, haproxy, traefik, php-fpm, clickhouse, etcd, rabbitmq, mattermost, minio, elasticsearch), **and every descendant of one** (workers, plugins), wherever they run: systemd, docker or a plain shell. `pt agent plan` reports the per-rule counts in `summary.protected_by_rule`;
   - on Linux, anything supervised by systemd (`system.slice/*.service`, user units) or a container runtime, which covers postgres/nginx/mysql workers, docker containers and the like;
   - AI agent CLIs (claude, codex, gemini/agy, …) are never pre-selected or robot-killed; they are shown for manual review.
 - On macOS (no cgroups), placement comes from owner and executable: `root` and system role accounts (`_windowserver`, …), Apple platform binaries (`/System`, `/usr/libexec`, `/usr/sbin`, `/sbin`, `/Library/Apple`) and anything inside a `.app` bundle (GUI apps and their helpers) are protected (`builtin.macos_system`). A real user's other processes are evaluated even after being reparented to launchd (PID 1), which is how a dev server orphaned by a closed terminal looks there.
 - On Linux, a workload started inside a login session (for example a build running as root over SSH on a build worker, or an orphan reparented to PID 1) is **not** covered by the root-user / PID-1 rules, because it is a candidate rather than a system service.
+- Desktop applications are evaluated, not protected, but scored as what they are: a process without a terminal in an XDG application unit of the user's systemd manager (`app-*.scope` / `app-*.service`, which is how GNOME, KDE and uwsm launch apps) gets desktop-app ownership evidence toward useful, and its missing TTY is not counted against it. An idle app left open for days is not a candidate; a runaway one still can be. Commands typed into a terminal emulator share its unit but have a TTY, so they are judged on their own evidence.
 
 ### Staged Kill Signals
 
@@ -499,6 +500,7 @@ process_triage/
 ```
 ~/.config/process_triage/
 ├── decisions.json      # Learned kill/spare verdicts per command pattern
+├── signatures.json     # User signatures (`pt-core signature add/import`)
 ├── priors.json         # Bayesian hyperparameters (optional)
 └── policy.json         # Safety policy (optional)
 
@@ -513,7 +515,7 @@ process_triage/
         └── logs/session.jsonl       # Session event log
 ```
 
-On macOS the same layout lives under `~/Library/Application Support/` unless `XDG_*` or `PROCESS_TRIAGE_*` variables are set.
+The config directory is `$XDG_CONFIG_HOME/process_triage` (default `~/.config/process_triage`) on every platform; `--config` / `PT_CONFIG_DIR`, then `PROCESS_TRIAGE_CONFIG`, override it, and every file above (signatures included) follows the override. The data directory defaults to `~/.local/share/process_triage` on Linux and `~/Library/Application Support/process_triage` on macOS; `PROCESS_TRIAGE_DATA` or `XDG_DATA_HOME` override it.
 
 ### Environment Variables
 
@@ -695,16 +697,25 @@ If the daemon itself exceeds its budget, it backs off automatically.
 
 ```bash
 pt-core signature list              # Show all signatures
+pt-core signature add herdr-server \
+  --category terminal \
+  --pattern '^herdr$' \
+  --arg-pattern '^server$' \
+  --prior useful                    # "this is normal": matching processes score as useful
 pt-core signature add stuck-jest \
   --category other \
   --pattern jest \
-  --arg-pattern=--runInBand         # Add custom signature (categories: agent, ide, ci, orchestrator, terminal, other)
+  --arg-pattern=--runInBand \
+  --prior abandoned                 # "usually left behind"
+pt-core signature test herdr --cmdline 'herdr server'   # Which signature matches?
 
 pt-core signature export sigs.json  # Export for sharing
 pt-core signature import sigs.json  # Import from file
 ```
 
-Signatures are matched against the process name and command line (and, where collected, environment and sockets). A matched signature sets the Bayesian prior: test-runner signatures such as jest or pytest shift it toward "likely abandoned if old", dev-server signatures toward "likely useful".
+Categories: `agent`, `ide`, `ci`, `orchestrator`, `terminal`, `other`. `--pattern` matches the process name, `--arg-pattern` the command line (repeat either; all arg patterns must match). User signatures live in `signatures.json` in the config directory.
+
+Signatures are matched against the process name and command line. A matched signature with priors sets the class prior: `--prior useful` (about 90% useful) or `--prior abandoned` (about 80% abandoned). Built-in test-runner and build-tool signatures (jest, pytest, webpack, ...) lean toward "likely abandoned if old", dev-server signatures toward "likely useful"; their argument patterns match the tool as a command word (`node_modules/.bin/jest`, `python -m pytest`), not any path that contains the name. A signature added without `--prior` only labels its matches. Signature and learned priors apply the same way in `pt agent plan`, the TUI, `pt agent explain`, `snapshot`, `watch` and the MCP tools.
 
 ---
 
@@ -722,7 +733,7 @@ Signatures are matched against the process name and command line (and, where col
 | **GitHub Actions** | `GITHUB_ACTIONS`, `GITHUB_WORKFLOW` env | 0.95 |
 | **tmux/screen** | `TMUX` or `STY` env | 0.30 |
 
-Supervision is reported per candidate in the plan (`supervisor`). Processes placed in a systemd service or container cgroup are protected outright, and robot mode requires a human for anything supervised by an agent, IDE or CI job (failing closed when it cannot tell). A nohup/disown detector (SIGHUP in `SigIgn`, `nohup.out`) exists in the library but is not used in scoring yet.
+Supervision is reported per candidate in the plan (`supervisor`); for a process in a systemd service it gives the unit, the manager (`system` or `user`) and the `systemctl [--user] restart <unit>` command. Processes placed in a systemd service or container cgroup are protected outright, and robot mode requires a human for anything supervised by an agent, IDE or CI job (failing closed when it cannot tell). A nohup/disown detector (SIGHUP in `SigIgn`, `nohup.out`) exists in the library but is not used in scoring yet.
 
 ---
 

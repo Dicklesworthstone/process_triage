@@ -210,3 +210,73 @@ fn label_rejects_missing_verdict_and_target() {
         .code(2);
     assert!(!config_dir.path().join("decisions.json").exists());
 }
+
+/// GH #16/#18/#13: `signature add --prior useful` under a `PT_CONFIG_DIR` override
+/// writes the signature there, and both `agent plan` and `agent explain` score the
+/// matching live process with the signature's prior.
+#[test]
+fn signature_prior_from_config_override_reaches_plan_and_explain() {
+    let config_dir = TempDir::new().expect("config dir");
+    let other_config = TempDir::new().expect("other config dir");
+    let data_dir = TempDir::new().expect("data dir");
+    let child = ProcessCommand::new("sleep")
+        .arg("619")
+        .spawn()
+        .expect("spawn sleep");
+    let guard = ChildGuard(child);
+    let pid = guard.0.id();
+
+    // PT_CONFIG_DIR (the --config flag's env) outranks PROCESS_TRIAGE_CONFIG.
+    let out = pt_core(other_config.path(), data_dir.path())
+        .env("PT_CONFIG_DIR", config_dir.path())
+        .args([
+            "--format",
+            "json",
+            "signature",
+            "add",
+            "sleep-619",
+            "--category",
+            "other",
+            "--pattern",
+            "^sleep$",
+            "--arg-pattern",
+            r"(^|\s)619$",
+            "--prior",
+            "useful",
+        ])
+        .output()
+        .expect("run signature add");
+    assert!(
+        out.status.success(),
+        "signature add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let added: Value = serde_json::from_slice(&out.stdout).expect("add output is JSON");
+    assert_eq!(added["prior"], "useful", "{added}");
+    assert!(config_dir.path().join("signatures.json").exists());
+    assert!(!other_config.path().join("signatures.json").exists());
+
+    let planned = plan_candidate(config_dir.path(), data_dir.path(), pid);
+    assert_eq!(planned["signature"]["name"], "sleep-619", "{planned}");
+    assert_eq!(
+        planned["inference"]["prior_source"], "signature",
+        "{planned}"
+    );
+
+    let explained = explain(config_dir.path(), data_dir.path(), pid);
+    assert_eq!(explained["signature"]["name"], "sleep-619", "{explained}");
+    assert_eq!(explained["prior_source"], "signature", "{explained}");
+    assert_eq!(
+        explained["classification"], planned["classification"],
+        "plan {planned}\nexplain {explained}"
+    );
+    let useful = |v: &Value| v["posterior"]["useful"].as_f64().expect("useful");
+    assert!(
+        (useful(&explained) - useful(&planned)).abs() < 0.05,
+        "plan and explain agree: plan {} explain {}",
+        useful(&planned),
+        useful(&explained)
+    );
+    // The "useful" prior dominates a seconds-old idle sleep.
+    assert!(useful(&planned) > 0.5, "{planned}");
+}

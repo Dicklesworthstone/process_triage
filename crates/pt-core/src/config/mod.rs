@@ -157,8 +157,11 @@ pub fn load_config(options: &ConfigOptions) -> Result<ResolvedConfig, ConfigErro
     })
 }
 
-/// Resolve the config directory using the standard resolution order.
-fn resolve_config_dir(options: &ConfigOptions) -> Result<PathBuf, ConfigError> {
+/// Resolve the config directory using the standard resolution order: the explicit
+/// option (`--config`, env `PT_CONFIG_DIR`), then `PROCESS_TRIAGE_CONFIG`, then
+/// `$XDG_CONFIG_HOME/process_triage` (default `~/.config/process_triage`). Every
+/// file pt keeps in its config directory resolves through here.
+pub fn resolve_config_dir(options: &ConfigOptions) -> Result<PathBuf, ConfigError> {
     // 1. Explicit option
     if let Some(dir) = &options.config_dir {
         return Ok(dir.clone());

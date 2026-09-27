@@ -11,19 +11,13 @@ use clap::parser::ValueSource;
 use clap::FromArgMatches;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use pt_common::{CandidateProvenanceOutput, OutputFormat, SessionId, SCHEMA_VERSION};
-// Provenance inference reads /proc lineage (Linux only).
-#[cfg(target_os = "linux")]
-use pt_common::{
-    normalize_lineage, OwnershipState, ProvenanceConfidence, ProvenanceFeatureInput,
-    ProvenanceRedactionState, RawLineageEvidence,
-};
 #[cfg(feature = "ui")]
 use pt_common::{IdentityQuality, ProcessIdentity};
 use pt_core::calibrate::{validation::ValidationEngine, CalibrationError};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::collect::protected::ProtectedFilter;
 #[cfg(target_os = "linux")]
-use pt_core::collect::{systemd::collect_systemd_unit, ContainerRuntime};
+use pt_core::collect::ContainerRuntime;
 use pt_core::config::{
     get_preset, list_presets, load_config, ConfigError, ConfigOptions, PresetName, Priors,
 };
@@ -1896,9 +1890,11 @@ fn main() {
         Some(Commands::Daemon(args)) => run_daemon(&cli.global, &args),
         Some(Commands::Telemetry(args)) => run_telemetry(&cli.global, &args),
         Some(Commands::Shadow(args)) => run_shadow(&cli.global, &args),
-        Some(Commands::Signature(args)) => {
-            pt_core::signature_cli::run_signature(&cli.global.format, &args)
-        }
+        Some(Commands::Signature(args)) => pt_core::signature_cli::run_signature(
+            &cli.global.format,
+            &resolved_config_dir(&cli.global),
+            &args,
+        ),
         Some(Commands::Schema(args)) => run_schema(&cli.global, &args),
         Some(Commands::Mcp(args)) => run_mcp(&args),
         Some(Commands::Update(args)) => run_update(&cli.global, &args),
@@ -2125,12 +2121,30 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         }
     };
 
+    // The same scorer as `agent plan`; each scan scores with the verdicts recorded so far.
+    let (signatures, signature_warnings) =
+        pt_core::scoring::load_signature_database(&config.config_dir);
+    for warning in signature_warnings {
+        eprintln!("pt: warning: {warning}");
+    }
+    let base_scorer = Scorer::new(
+        priors.clone(),
+        Default::default(),
+        signatures,
+        pt_core::scoring::fast_path_config(&policy),
+    );
+    let scorer_with = |decisions: Option<&pt_core::decision::decision_store::DecisionStore>| {
+        let mut scorer = base_scorer.clone();
+        scorer.decisions = decisions.cloned().unwrap_or_default();
+        scorer
+    };
+
     let TuiBuildOutput {
         rows,
         plan_candidates,
         goal_summary,
         goal_order,
-    } = build_tui_data_from_live_scan(global, args, &priors, &policy, decisions.as_ref())?;
+    } = build_tui_data_from_live_scan(global, args, scorer_with(decisions.as_ref()), &policy)?;
     let decisions = Arc::new(Mutex::new(decisions));
 
     let _ = handle.update_state(SessionState::Planned);
@@ -2187,7 +2201,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
 
         // Build refresh closure
         let plan_cache_r = Arc::clone(&plan_candidates);
-        let priors_r = priors.clone();
+        let scorer_r = base_scorer.clone();
         let policy_r = policy.clone();
         let timeout_r = global.timeout;
         let deep_r = args.deep;
@@ -2209,28 +2223,20 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                 let protected_filter = ProtectedFilter::from_guardrails(&policy_scan_r.guardrails)
                     .map_err(|e| format!("filter error: {}", e))?;
                 let filter_result = protected_filter.filter_scan_result(&scan_result);
-                let probe_advice =
-                    compute_probe_advice(&filter_result.passed, &priors_r, &policy_r);
-                let deep_signals = if deep_r {
-                    collect_deep_signals(&filter_result.passed)
-                } else {
-                    let targeted = deep_scan_target_pids(&filter_result.passed, &probe_advice);
-                    collect_deep_signals_for_pids(&targeted)
-                };
-                let decisions = decisions_r
+                let mut scorer = scorer_r.clone();
+                scorer.decisions = decisions_r
                     .lock()
-                    .map_err(|_| "decision store lock poisoned".to_string())?;
-                let output = build_tui_rows(
+                    .map_err(|_| "decision store lock poisoned".to_string())?
+                    .clone()
+                    .unwrap_or_default();
+                let output = score_tui_rows(
                     &filter_result.passed,
                     min_age_r,
-                    deep_signals.as_ref(),
-                    Some(&probe_advice),
-                    &priors_r,
+                    deep_r,
+                    scorer,
                     &policy_r,
                     goal_r.as_deref(),
-                    decisions.as_ref(),
                 );
-                drop(decisions);
                 let mut guard = plan_cache_r
                     .lock()
                     .map_err(|_| "plan cache lock poisoned".to_string())?;
@@ -2408,9 +2414,8 @@ struct TuiBuildOutput {
 fn build_tui_data_from_live_scan(
     global: &GlobalOpts,
     args: &RunArgs,
-    priors: &Priors,
+    scorer: Scorer,
     policy: &pt_core::config::Policy,
-    decisions: Option<&pt_core::decision::decision_store::DecisionStore>,
 ) -> Result<TuiBuildOutput, String> {
     let scan_options = QuickScanOptions {
         pids: vec![],
@@ -2423,24 +2428,50 @@ fn build_tui_data_from_live_scan(
     let protected_filter = ProtectedFilter::from_guardrails(&policy.guardrails)
         .map_err(|e| format!("protected filter error: {}", e))?;
     let filter_result = protected_filter.filter_scan_result(&scan_result);
-    let probe_advice = compute_probe_advice(&filter_result.passed, priors, policy);
-    let deep_signals = if args.deep {
-        collect_deep_signals(&filter_result.passed)
-    } else {
-        let targeted = deep_scan_target_pids(&filter_result.passed, &probe_advice);
-        collect_deep_signals_for_pids(&targeted)
-    };
-
-    Ok(build_tui_rows(
+    Ok(score_tui_rows(
         &filter_result.passed,
         args.min_age,
-        deep_signals.as_ref(),
-        Some(&probe_advice),
-        priors,
+        args.deep,
+        scorer,
         policy,
         args.goal.as_deref(),
-        decisions,
     ))
+}
+
+/// Score a filtered scan for the TUI: provenance for the processes old enough to be
+/// candidates (as `agent plan` collects it), VOI probe advice, deep signals (all
+/// processes with `--deep`, else where the advice asks for them), then rows.
+#[cfg(feature = "ui")]
+fn score_tui_rows(
+    processes: &[ProcessRecord],
+    min_age: Option<u64>,
+    deep: bool,
+    mut scorer: Scorer,
+    policy: &pt_core::config::Policy,
+    goal_str: Option<&str>,
+) -> TuiBuildOutput {
+    let min_age = min_age.unwrap_or(policy.guardrails.min_process_age_seconds);
+    let eligible: Vec<&ProcessRecord> = processes
+        .iter()
+        .filter(|proc| proc.elapsed.as_secs() >= min_age)
+        .collect();
+    scorer.collect_provenance(&eligible);
+    let probe_advice = compute_probe_advice(processes, &scorer, policy);
+    let deep_signals = if deep {
+        collect_deep_signals(processes)
+    } else {
+        let targeted = deep_scan_target_pids(processes, &probe_advice);
+        collect_deep_signals_for_pids(&targeted)
+    };
+    build_tui_rows(
+        processes,
+        Some(min_age),
+        deep_signals.as_ref(),
+        Some(&probe_advice),
+        &scorer,
+        policy,
+        goal_str,
+    )
 }
 
 #[cfg(feature = "ui")]
@@ -2660,7 +2691,7 @@ struct ProbeAdvice {
 #[cfg(feature = "ui")]
 fn compute_probe_advice(
     processes: &[ProcessRecord],
-    priors: &Priors,
+    scorer: &Scorer,
     policy: &pt_core::config::Policy,
 ) -> HashMap<u32, ProbeAdvice> {
     let mut advice = HashMap::new();
@@ -2668,13 +2699,11 @@ fn compute_probe_advice(
     let available_probes = [pt_core::decision::ProbeType::DeepScan];
 
     for proc in processes {
-        let evidence = Evidence::from_snapshot(proc);
-
-        let Ok(posterior) = compute_posterior(priors, &evidence) else {
+        let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
             continue;
         };
         let Ok((decision, _)) = pt_core::decision::decide_sequential(
-            &posterior.posterior,
+            &score.posterior.posterior,
             policy,
             &ActionFeasibility::allow_all(),
             &cost_model,
@@ -2860,10 +2889,9 @@ fn build_tui_rows(
     min_age: Option<u64>,
     deep_signals: Option<&HashMap<u32, DeepSignals>>,
     probe_advice: Option<&HashMap<u32, ProbeAdvice>>,
-    priors: &Priors,
+    scorer: &Scorer,
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
-    decisions: Option<&pt_core::decision::decision_store::DecisionStore>,
 ) -> TuiBuildOutput {
     const MIN_POSTERIOR: f64 = 0.7;
     const MAX_CANDIDATES: usize = 50;
@@ -2907,12 +2935,10 @@ fn build_tui_rows(
             ..Evidence::from_snapshot(proc)
         };
 
-        let learned_priors = decisions.and_then(|d| d.priors_for(&proc.comm, &proc.cmd, priors));
-        let posterior_result =
-            match compute_posterior(learned_priors.as_ref().unwrap_or(priors), &evidence) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+        let Some(score) = scorer.score(proc, evidence) else {
+            continue;
+        };
+        let posterior_result = score.posterior;
         let mut decision_outcome =
             match decide_action(&posterior_result.posterior, &decision_policy, &feasibility) {
                 Ok(d) => d,
@@ -2921,8 +2947,7 @@ fn build_tui_rows(
 
         // Populate rationale fields available in current context
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
-        let mut ledger =
-            EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
+        let mut ledger = score.ledger;
         if let Some(probe) = probe {
             if probe.should_probe
                 && probe.recommended_probe == Some(pt_core::decision::ProbeType::DeepScan)
@@ -3158,11 +3183,7 @@ fn build_tui_rows(
 }
 
 #[cfg(target_os = "linux")]
-use pt_core::collect::{
-    collect_fd_ipc_resources, collect_lineage_for_pid, collect_listener_resources_from,
-    collect_local_resource_evidence, detect_listener_conflicts, parse_fd, parse_proc_net_tcp,
-    parse_proc_net_udp, NetworkSnapshot, SharedResourceGraph,
-};
+use pt_core::collect::{parse_fd, parse_proc_net_tcp, parse_proc_net_udp, NetworkSnapshot};
 use pt_core::collect::{quick_scan, ProcessRecord, QuickScanOptions, ScanResult};
 use pt_core::decision::goal_progress::{
     self, ActionOutcome as GoalActionOutcome, GoalMetric, GoalProgressReport, MetricSnapshot,
@@ -3172,336 +3193,8 @@ use pt_core::decision::{
     apply_load_to_loss_matrix, compute_load_adjustment, decide_action, Action, ActionFeasibility,
     LoadSignals,
 };
-#[cfg(target_os = "linux")]
-use pt_core::decision::{
-    estimate_blast_radius, BlastRadiusEstimate, BlastRadiusEstimatorConfig, RiskLevel,
-};
-#[cfg(target_os = "linux")]
-use pt_core::inference::{apply_evidence_terms, ClassScores, Confidence, EvidenceTerm};
-use pt_core::inference::{
-    compute_posterior, compute_posterior_with_overrides, try_signature_fast_path, Evidence,
-    EvidenceLedger, FastPathConfig, FastPathSkipReason, PriorContext,
-};
-use pt_core::supervision::signature::{MatchLevel, ProcessMatchContext, SignatureDatabase};
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
-struct ProvenanceInferenceBundle {
-    resource_graph: SharedResourceGraph,
-    lineages: HashMap<u32, RawLineageEvidence>,
-    children: HashMap<u32, Vec<u32>>,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
-struct ProvenanceScoreAdjustment {
-    evidence_terms: Vec<EvidenceTerm>,
-    evidence_completeness: f64,
-    confidence_penalty_steps: usize,
-    confidence_notes: Vec<String>,
-    blast_radius: BlastRadiusEstimate,
-}
-
-#[cfg(target_os = "linux")]
-impl ProvenanceScoreAdjustment {
-    /// Convert to the stable output contract type for JSON/TOON/agent consumers.
-    ///
-    /// Delegates to `CandidateProvenanceOutput::from_parts` so the contract
-    /// logic (direction thresholds, score-impact construction) lives in one
-    /// place in pt-common rather than being duplicated here.
-    fn to_candidate_output(&self) -> CandidateProvenanceOutput {
-        let feature_inputs: Vec<ProvenanceFeatureInput> = self
-            .evidence_terms
-            .iter()
-            .map(|term| ProvenanceFeatureInput {
-                feature: term.feature.clone(),
-                abandoned_ll: term.log_likelihood.abandoned,
-                useful_ll: term.log_likelihood.useful,
-            })
-            .collect();
-
-        CandidateProvenanceOutput::from_parts(
-            self.evidence_completeness,
-            self.confidence_penalty_steps,
-            self.confidence_notes.clone(),
-            &feature_inputs,
-            self.blast_radius.risk_score,
-            &format!("{:?}", self.blast_radius.risk_level).to_lowercase(),
-            self.blast_radius.confidence,
-            &self.blast_radius.summary,
-            self.blast_radius.total_affected,
-            ProvenanceRedactionState::None,
-        )
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn build_provenance_inference_bundle(processes: &[&ProcessRecord]) -> ProvenanceInferenceBundle {
-    let mut lineages = HashMap::new();
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut per_process_resources: Vec<(u32, Vec<pt_common::RawResourceEvidence>)> = Vec::new();
-    let mut all_resources = Vec::new();
-    // One socket-table snapshot for the whole scan (was re-parsed per process).
-    let network_snapshot = NetworkSnapshot::collect();
-
-    for proc in processes {
-        let pid = proc.pid.0;
-        children.entry(proc.ppid.0).or_default().push(pid);
-        lineages.insert(pid, collect_lineage_for_pid(pid));
-
-        let fd_info = parse_fd(pid);
-        let mut resources = collect_local_resource_evidence(pid, fd_info.as_ref());
-        resources.extend(collect_listener_resources_from(pid, &network_snapshot));
-        resources.extend(collect_fd_ipc_resources(pid));
-        all_resources.extend(resources.iter().cloned());
-        per_process_resources.push((pid, resources));
-    }
-
-    let index_of_pid: HashMap<u32, usize> = per_process_resources
-        .iter()
-        .enumerate()
-        .map(|(i, (pid, _))| (*pid, i))
-        .collect();
-    for conflict in detect_listener_conflicts(&all_resources) {
-        if let Some((_, resources)) = index_of_pid
-            .get(&conflict.owner_pid)
-            .map(|&i| &mut per_process_resources[i])
-        {
-            if let Some(existing) = resources
-                .iter_mut()
-                .find(|resource| resource.key == conflict.key && resource.kind == conflict.kind)
-            {
-                existing.state = conflict.state;
-                existing.observed_at = conflict.observed_at.clone();
-            } else {
-                resources.push(conflict);
-            }
-        }
-    }
-
-    let resource_graph = SharedResourceGraph::from_evidence(&per_process_resources);
-
-    ProvenanceInferenceBundle {
-        resource_graph,
-        lineages,
-        children,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn provenance_confidence_score(confidence: ProvenanceConfidence) -> f64 {
-    match confidence {
-        ProvenanceConfidence::High => 1.0,
-        ProvenanceConfidence::Medium => 0.75,
-        ProvenanceConfidence::Low => 0.45,
-        ProvenanceConfidence::Unknown => 0.2,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn downgrade_confidence(confidence: Confidence, steps: usize) -> Confidence {
-    let mut downgraded = confidence;
-    for _ in 0..steps {
-        downgraded = match downgraded {
-            Confidence::VeryHigh => Confidence::High,
-            Confidence::High => Confidence::Medium,
-            Confidence::Medium | Confidence::Low => Confidence::Low,
-        };
-    }
-    downgraded
-}
-
-#[cfg(target_os = "linux")]
-fn provenance_term(
-    feature: &str,
-    useful: f64,
-    useful_bad: f64,
-    abandoned: f64,
-    zombie: f64,
-) -> EvidenceTerm {
-    EvidenceTerm {
-        feature: feature.to_string(),
-        log_likelihood: ClassScores {
-            useful,
-            useful_bad,
-            abandoned,
-            zombie,
-        },
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn derive_provenance_adjustment(
-    pid: u32,
-    bundle: &ProvenanceInferenceBundle,
-) -> ProvenanceScoreAdjustment {
-    let lineage = bundle.lineages.get(&pid);
-    let normalized_lineage = lineage.map(normalize_lineage);
-    let child_pids = bundle
-        .children
-        .get(&pid)
-        .map(|children| children.as_slice())
-        .unwrap_or(&[]);
-
-    let mut resolved_resources = 0usize;
-    let mut unresolved_resources = 0usize;
-    let mut conflict_resources = 0usize;
-
-    if let Some(keys) = bundle.resource_graph.process_resources.get(&pid) {
-        for key in keys {
-            let Some(resource) = bundle.resource_graph.resources.get(key) else {
-                continue;
-            };
-            let Some(holder_state) = resource.holder_states.iter().find(|state| state.pid == pid)
-            else {
-                continue;
-            };
-            match holder_state.state {
-                pt_common::ResourceState::Active | pt_common::ResourceState::Stale => {
-                    resolved_resources += 1;
-                }
-                pt_common::ResourceState::Partial | pt_common::ResourceState::Missing => {
-                    unresolved_resources += 1;
-                }
-                pt_common::ResourceState::Conflicted => {
-                    unresolved_resources += 1;
-                    conflict_resources += 1;
-                }
-            }
-        }
-    }
-
-    let lineage_confidence = normalized_lineage
-        .as_ref()
-        .map(|lineage| lineage.confidence)
-        .unwrap_or(ProvenanceConfidence::Unknown);
-    let lineage_score = provenance_confidence_score(lineage_confidence);
-    let resource_score = if resolved_resources + unresolved_resources == 0 {
-        0.7
-    } else {
-        resolved_resources as f64 / (resolved_resources + unresolved_resources) as f64
-    };
-    let mut evidence_completeness = ((lineage_score + resource_score) / 2.0).clamp(0.0, 1.0);
-
-    let mut confidence_notes = Vec::new();
-    let mut confidence_penalty_steps = 0usize;
-
-    if lineage.is_none() {
-        confidence_notes.push("missing lineage provenance".to_string());
-        confidence_penalty_steps += 1;
-    }
-    if unresolved_resources > 0 {
-        confidence_notes.push(format!(
-            "resource provenance has {unresolved_resources} unresolved edge(s)"
-        ));
-        confidence_penalty_steps += 1;
-    }
-    if let Some(normalized_lineage) = normalized_lineage.as_ref() {
-        if !normalized_lineage.downgrade_reasons.is_empty() {
-            confidence_notes.extend(normalized_lineage.downgrade_reasons.iter().cloned());
-            confidence_penalty_steps += 1;
-        }
-    }
-    if conflict_resources > 0 {
-        confidence_notes.push(format!(
-            "resource provenance has {conflict_resources} conflicting edge(s)"
-        ));
-    }
-
-    if !confidence_notes.is_empty() {
-        evidence_completeness = (evidence_completeness - 0.1).clamp(0.0, 1.0);
-    }
-
-    let blast_radius = estimate_blast_radius(
-        pid,
-        &bundle.resource_graph,
-        lineage,
-        child_pids,
-        evidence_completeness,
-        &BlastRadiusEstimatorConfig::default(),
-    );
-
-    if blast_radius.confidence < 0.5 {
-        confidence_notes.push("blast-radius estimate is low-confidence".to_string());
-        confidence_penalty_steps += 1;
-    }
-
-    let mut evidence_terms = Vec::new();
-    if let Some(normalized_lineage) = normalized_lineage.as_ref() {
-        match &normalized_lineage.ownership {
-            OwnershipState::Orphaned => {
-                evidence_terms.push(provenance_term(
-                    "provenance_ownership_orphaned",
-                    -0.55,
-                    -0.10,
-                    0.70,
-                    0.20,
-                ));
-            }
-            OwnershipState::Supervised { .. }
-            | OwnershipState::InitChild
-            | OwnershipState::AgentOwned { .. } => {
-                evidence_terms.push(provenance_term(
-                    "provenance_ownership_supervised",
-                    0.60,
-                    0.20,
-                    -0.70,
-                    -0.20,
-                ));
-            }
-            OwnershipState::ShellOwned { .. } => {
-                evidence_terms.push(provenance_term(
-                    "provenance_ownership_shell",
-                    0.35,
-                    0.15,
-                    -0.35,
-                    -0.10,
-                ));
-            }
-            OwnershipState::Unknown => {}
-        }
-    }
-
-    if blast_radius.direct.components.listener_count > 0 {
-        evidence_terms.push(provenance_term(
-            "provenance_active_listener",
-            0.55,
-            0.20,
-            -0.60,
-            -0.15,
-        ));
-    }
-
-    match blast_radius.risk_level {
-        RiskLevel::High | RiskLevel::Critical => {
-            evidence_terms.push(provenance_term(
-                "provenance_blast_radius_high",
-                0.65,
-                0.30,
-                -0.75,
-                -0.20,
-            ));
-        }
-        RiskLevel::Low if blast_radius.total_affected == 0 => {
-            evidence_terms.push(provenance_term(
-                "provenance_blast_radius_low",
-                -0.25,
-                -0.05,
-                0.35,
-                0.10,
-            ));
-        }
-        RiskLevel::Medium | RiskLevel::Low => {}
-    }
-
-    ProvenanceScoreAdjustment {
-        evidence_terms,
-        evidence_completeness,
-        confidence_penalty_steps: confidence_penalty_steps.min(3),
-        confidence_notes,
-        blast_radius,
-    }
-}
+use pt_core::inference::Evidence;
+use pt_core::scoring::{match_level_label, Scorer};
 
 fn progress_emitter(global: &GlobalOpts) -> Option<Arc<dyn ProgressEmitter>> {
     match global.format {
@@ -4619,7 +4312,9 @@ fn run_bundle_create(
     }
 
     // Include user signatures if available
-    if let Some(user_schema) = pt_core::signature_cli::load_user_signatures() {
+    if let Some(user_schema) =
+        pt_core::signature_cli::load_user_signatures(&resolved_config_dir(global))
+    {
         if !user_schema.signatures.is_empty() {
             if let Ok(json) = serde_json::to_string_pretty(&user_schema) {
                 writer.add_file(
@@ -6734,12 +6429,7 @@ fn run_agent_fleet_transfer_export(
     };
 
     let signatures_opt: Option<PersistedSchema> = if args.include_signatures {
-        let config_dir = global
-            .config
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| dirs::config_dir().map(|d| d.join("process_triage")))
-            .unwrap_or_else(|| PathBuf::from("."));
+        let config_dir = resolved_config_dir(global);
         let mut lib = PatternLibrary::new(&config_dir);
         if lib.load().is_ok() {
             Some(lib.export(&[
@@ -7007,18 +6697,10 @@ fn run_agent_fleet_transfer_import(
     }
 
     if let Some(ref final_priors) = merged_priors {
-        let priors_path = config.snapshot().priors_path.unwrap_or_else(|| {
-            global
-                .config
-                .as_ref()
-                .map(|c| PathBuf::from(c).join("priors.json"))
-                .unwrap_or_else(|| {
-                    dirs::config_dir()
-                        .unwrap_or_else(|| PathBuf::from("."))
-                        .join("pt")
-                        .join("priors.json")
-                })
-        });
+        let priors_path = config
+            .snapshot()
+            .priors_path
+            .unwrap_or_else(|| resolved_config_dir(global).join("priors.json"));
 
         if !args.no_backup && priors_path.exists() {
             let backup = priors_path.with_extension("json.bak");
@@ -7050,12 +6732,7 @@ fn run_agent_fleet_transfer_import(
     }
 
     let sig_result = if let Some(ref incoming_sigs) = bundle.signatures {
-        let config_dir = global
-            .config
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| dirs::config_dir().map(|d| d.join("process_triage")))
-            .unwrap_or_else(|| PathBuf::from("."));
+        let config_dir = resolved_config_dir(global);
         let mut lib = PatternLibrary::new(&config_dir);
         let _ = lib.load();
 
@@ -11818,11 +11495,23 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             ..Default::default()
         };
         if let Ok(config) = load_config(&config_options) {
-            let priors = config.priors.clone();
+            let (mut scorer, scorer_warnings) = Scorer::from_config(&config);
+            for warning in scorer_warnings {
+                eprintln!("agent snapshot: warning: {warning}");
+            }
             let policy = config.policy;
 
             if let Ok(protected_filter) = ProtectedFilter::from_guardrails(&policy.guardrails) {
                 let filter_result = protected_filter.filter_scan_result(scan_result);
+                // Provenance over the processes `agent plan` would evaluate, so their
+                // inference matches the plan's.
+                let min_age = policy.guardrails.min_process_age_seconds;
+                let plan_eligible: Vec<&ProcessRecord> = filter_result
+                    .passed
+                    .iter()
+                    .filter(|proc| proc.elapsed.as_secs() >= min_age)
+                    .collect();
+                scorer.collect_provenance(&plan_eligible);
 
                 let mut persisted_inventory_records: Vec<PersistedProcess> = Vec::new();
                 let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
@@ -11831,24 +11520,17 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
 
                 let feasibility = ActionFeasibility::allow_all();
                 for proc in &filter_result.passed {
-                    let evidence = Evidence::from_snapshot(proc);
-
-                    let posterior_result = match compute_posterior(&priors, &evidence) {
-                        Ok(r) => r,
-                        Err(_) => continue,
+                    let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
+                        continue;
                     };
+                    let posterior_result = score.posterior;
+                    let ledger = score.ledger;
 
                     let decision_outcome =
                         match decide_action(&posterior_result.posterior, &policy, &feasibility) {
                             Ok(d) => d,
                             Err(_) => continue,
                         };
-
-                    let ledger = EvidenceLedger::from_posterior_result(
-                        &posterior_result,
-                        Some(proc.pid.0),
-                        None,
-                    );
 
                     let posterior = &posterior_result.posterior;
                     let score = posterior.suspicion_score();
@@ -12164,26 +11846,6 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     ExitCode::Clean
 }
 
-fn match_level_label(level: MatchLevel) -> &'static str {
-    match level {
-        MatchLevel::None => "none",
-        MatchLevel::GenericCategory => "generic_category",
-        MatchLevel::CommandOnly => "command_only",
-        MatchLevel::CommandPlusArgs => "command_plus_args",
-        MatchLevel::ExactCommand => "exact_command",
-        MatchLevel::MultiPattern => "multi_pattern",
-    }
-}
-
-fn fast_path_skip_reason_label(reason: FastPathSkipReason) -> &'static str {
-    match reason {
-        FastPathSkipReason::Disabled => "disabled",
-        FastPathSkipReason::NoMatch => "no_match",
-        FastPathSkipReason::ScoreBelowThreshold => "score_below_threshold",
-        FastPathSkipReason::NoPriors => "no_priors",
-    }
-}
-
 /// An agent CLI whose terminal had input/output within this window is live.
 const AGENT_LIVE_TTY_IDLE_SECS: u64 = 30 * 60;
 
@@ -12255,34 +11917,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
-    let priors = config.priors.clone();
-    // Human kill/spare verdicts per command pattern become learned priors below.
-    let decision_store =
-        match pt_core::decision::decision_store::DecisionStore::load(&config.config_dir) {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("agent plan: ignoring unreadable decision store: {}", e);
-                Default::default()
-            }
-        };
-    let policy = config.policy;
-    let fast_path_config = FastPathConfig {
-        enabled: policy.signature_fast_path.enabled,
-        min_confidence_threshold: policy.signature_fast_path.min_confidence_threshold,
-        require_explicit_priors: policy.signature_fast_path.require_explicit_priors,
-    };
-
-    let mut signature_db = SignatureDatabase::with_defaults();
-    if let Some(user_schema) = pt_core::signature_cli::load_user_signatures() {
-        for signature in user_schema.signatures {
-            if let Err(err) = signature_db.add(signature) {
-                eprintln!(
-                    "agent plan: warning: skipping invalid user signature during load: {}",
-                    err
-                );
-            }
-        }
+    // Priors, human kill/spare verdicts, built-in + user signatures and the fast-path
+    // policy: the same scorer every other surface uses.
+    let (mut scorer, scorer_warnings) = pt_core::scoring::Scorer::from_config(&config);
+    for warning in scorer_warnings {
+        eprintln!("agent plan: warning: {warning}");
     }
+    let fast_path_config = scorer.fast_path.clone();
+    let policy = config.policy;
 
     let rate_limit_path = resolve_data_dir_for_lock().map(|dir| dir.join("rate_limit.json"));
     let enforcer = match pt_core::decision::PolicyEnforcer::new(&policy, rate_limit_path.as_deref())
@@ -12456,8 +12098,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let _current_cpu_pct: f64 = processes_to_infer.iter().map(|p| p.cpu_percent).sum();
     let probe_cost_model = pt_core::decision::ProbeCostModel::default();
     let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
-    #[cfg(target_os = "linux")]
-    let provenance_bundle = build_provenance_inference_bundle(&processes_to_infer);
+    scorer.collect_provenance(&processes_to_infer);
 
     // --deep: one batched deep scan (sockets, I/O, queue backlog) over the
     // candidates, overlaid onto the quick-scan evidence below.
@@ -12512,200 +12153,27 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             ..Evidence::from_snapshot(proc)
         };
 
-        let mut match_ctx = ProcessMatchContext::with_comm(&proc.comm);
-        if !proc.cmd.is_empty() {
-            match_ctx = match_ctx.cmdline(&proc.cmd);
-        }
-        let signature_match = signature_db.best_match(&match_ctx);
+        // One scoring path for every surface: learned verdicts, signatures (and their
+        // fast path), desktop-application ownership and provenance.
+        let Some(score) = scorer.score(proc, evidence) else {
+            continue;
+        };
+        let posterior_result = score.posterior;
+        let ledger = score.ledger;
+        let prior_source_label = score.prior_source;
+        let signature_match = score.signature;
+        let learned_prior = score.learned_prior;
+        let fast_path_used = score.fast_path_used;
+        let fast_path_skip_reason = score.fast_path_skip_reason;
+        let desktop_app = score.desktop_app;
+        #[cfg(target_os = "linux")]
+        let provenance_adjustment = score.provenance;
         if signature_match.is_some() {
             signature_match_count = signature_match_count.saturating_add(1);
         }
-
-        let mut fast_path_used = false;
-        let mut fast_path_skip_reason: Option<&'static str> = None;
-        let prior_source_label: String;
-        let learned_prior = decision_store.learned_prior(&proc.comm, &proc.cmd, &priors);
-        let learned_overrides = learned_prior.as_ref().map(|learned| {
-            pt_core::decision::decision_store::DecisionStore::overrides_for(learned, &priors)
-        });
-        let prior_context = PriorContext {
-            global_priors: &priors,
-            signature_match: signature_match.as_ref(),
-            category_defaults: None,
-            user_overrides: learned_overrides.as_ref(),
-        };
-
-        // A human verdict on this pattern outranks the signature fast path.
-        let fast_path_signature = signature_match.as_ref().filter(|_| learned_prior.is_none());
-        // Adjusted below by Linux-only provenance evidence.
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-        let (mut posterior_result, mut ledger) = if let Some(sig_match) = fast_path_signature {
-            match try_signature_fast_path(&fast_path_config, Some(sig_match), proc.pid.0) {
-                Ok(Some(fast_path)) => {
-                    fast_path_used = true;
-                    signature_fast_path_used_count =
-                        signature_fast_path_used_count.saturating_add(1);
-                    prior_source_label = "signature_fast_path".to_string();
-                    (fast_path.posterior, fast_path.ledger)
-                }
-                Ok(None) => match compute_posterior_with_overrides(&prior_context, &evidence) {
-                    Ok((result, source_info)) => {
-                        prior_source_label = source_info.source.to_string();
-                        let ledger =
-                            EvidenceLedger::from_posterior_result(&result, Some(proc.pid.0), None);
-                        (result, ledger)
-                    }
-                    Err(_) => continue,
-                },
-                Err(reason) => {
-                    fast_path_skip_reason = Some(fast_path_skip_reason_label(reason));
-                    match compute_posterior_with_overrides(&prior_context, &evidence) {
-                        Ok((result, source_info)) => {
-                            prior_source_label = source_info.source.to_string();
-                            let ledger = EvidenceLedger::from_posterior_result(
-                                &result,
-                                Some(proc.pid.0),
-                                None,
-                            );
-                            (result, ledger)
-                        }
-                        Err(_) => continue,
-                    }
-                }
-            }
-        } else {
-            match compute_posterior_with_overrides(&prior_context, &evidence) {
-                Ok((result, source_info)) => {
-                    prior_source_label = source_info.source.to_string();
-                    let ledger =
-                        EvidenceLedger::from_posterior_result(&result, Some(proc.pid.0), None);
-                    (result, ledger)
-                }
-                Err(_) => continue,
-            }
-        };
-
-        #[cfg(target_os = "linux")]
-        let provenance_adjustment = {
-            let mut adjustment = derive_provenance_adjustment(proc.pid.0, &provenance_bundle);
-            // The base `orphan` term already carries "reparented to init"; counting the
-            // lineage's orphaned verdict again double-counts one fact under naive Bayes.
-            // Keep it only when it adds information (lineage sees an orphan that the
-            // base check does not, e.g. reparented to a user subreaper).
-            if proc.is_orphan() {
-                adjustment
-                    .evidence_terms
-                    .retain(|t| t.feature != "provenance_ownership_orphaned");
-            }
-            if !adjustment.evidence_terms.is_empty() {
-                match apply_evidence_terms(&posterior_result, adjustment.evidence_terms.clone()) {
-                    Ok(adjusted) => {
-                        posterior_result = adjusted;
-                        ledger = EvidenceLedger::from_posterior_result(
-                            &posterior_result,
-                            Some(proc.pid.0),
-                            None,
-                        );
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            pid = proc.pid.0,
-                            error = %err,
-                            "Failed to apply provenance-derived evidence terms"
-                        );
-                    }
-                }
-            }
-
-            if adjustment.confidence_penalty_steps > 0 {
-                let downgraded =
-                    downgrade_confidence(ledger.confidence, adjustment.confidence_penalty_steps);
-                if downgraded != ledger.confidence {
-                    ledger.confidence = downgraded;
-                }
-                if !adjustment.confidence_notes.is_empty() {
-                    let joined = adjustment.confidence_notes.join("; ");
-                    ledger
-                        .top_evidence
-                        .push(format!("Provenance confidence downgrade: {joined}"));
-                    ledger.why_summary =
-                        format!("{} Provenance caveats: {}.", ledger.why_summary, joined);
-                }
-            }
-
-            for term in &adjustment.evidence_terms {
-                let glyph = if term.feature.contains("blast_radius") {
-                    "🛡"
-                } else {
-                    "🔗"
-                };
-                ledger
-                    .evidence_glyphs
-                    .insert(term.feature.clone(), glyph.to_string());
-            }
-
-            tracing::debug!(
-                pid = proc.pid.0,
-                evidence_completeness = adjustment.evidence_completeness,
-                blast_radius_risk = adjustment.blast_radius.risk_score,
-                blast_radius_confidence = adjustment.blast_radius.confidence,
-                blast_radius_level = ?adjustment.blast_radius.risk_level,
-                confidence_penalty_steps = adjustment.confidence_penalty_steps,
-                score_terms = ?adjustment
-                    .evidence_terms
-                    .iter()
-                    .map(|term| term.feature.clone())
-                    .collect::<Vec<_>>(),
-                notes = ?adjustment.confidence_notes,
-                "Applied provenance-derived scoring adjustments"
-            );
-
-            // Explanation-trace diagnostics: emit per-feature evidence selection
-            // events so provenance decisions can be diagnosed from the trace log.
-            for term in &adjustment.evidence_terms {
-                let net_shift = term.log_likelihood.abandoned - term.log_likelihood.useful;
-                let direction = if net_shift > 0.1 {
-                    "toward_abandon"
-                } else if net_shift < -0.1 {
-                    "toward_useful"
-                } else {
-                    "neutral"
-                };
-                tracing::trace!(
-                    pid = proc.pid.0,
-                    feature = %term.feature,
-                    abandoned_ll = term.log_likelihood.abandoned,
-                    useful_ll = term.log_likelihood.useful,
-                    net_shift = net_shift,
-                    direction = direction,
-                    "provenance_evidence_selected"
-                );
-            }
-
-            if adjustment.confidence_penalty_steps > 0 {
-                tracing::trace!(
-                    pid = proc.pid.0,
-                    steps = adjustment.confidence_penalty_steps,
-                    reasons = ?adjustment.confidence_notes,
-                    evidence_completeness = adjustment.evidence_completeness,
-                    "provenance_confidence_downgraded"
-                );
-            }
-
-            if adjustment.blast_radius.total_affected > 0 {
-                tracing::trace!(
-                    pid = proc.pid.0,
-                    risk_score = adjustment.blast_radius.risk_score,
-                    risk_level = ?adjustment.blast_radius.risk_level,
-                    total_affected = adjustment.blast_radius.total_affected,
-                    confidence = adjustment.blast_radius.confidence,
-                    summary = %adjustment.blast_radius.summary,
-                    "provenance_blast_radius_computed"
-                );
-            }
-
-            adjustment
-        };
+        if fast_path_used {
+            signature_fast_path_used_count = signature_fast_path_used_count.saturating_add(1);
+        }
 
         let signature_name = signature_match.as_ref().map(|m| m.signature.name.clone());
         let signature_level = signature_match
@@ -12715,28 +12183,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let signature_category = signature_match
             .as_ref()
             .map(|m| format!("{:?}", m.signature.category));
-
-        if let Some(sig_match) = signature_match.as_ref() {
-            if !fast_path_used {
-                ledger.top_evidence.insert(
-                    0,
-                    format!(
-                        "Signature match: {} (score={:.2}, level={})",
-                        sig_match.signature.name,
-                        sig_match.score,
-                        match_level_label(sig_match.level)
-                    ),
-                );
-                ledger.why_summary = format!(
-                    "Matched signature '{}' (score {:.2}, level {}, prior source {}). {}",
-                    sig_match.signature.name,
-                    sig_match.score,
-                    match_level_label(sig_match.level),
-                    prior_source_label,
-                    ledger.why_summary
-                );
-            }
-        }
 
         // Apply state-based feasibility constraints so decisioning does not
         // recommend fundamentally invalid actions (e.g., kill for zombie/D-state).
@@ -12876,21 +12322,27 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 .builtin_protection
                 .then(|| pt_core::collect::read_cgroup_role(proc.pid.0)),
             #[cfg(target_os = "linux")]
-            blast_radius_risk_level: Some(
-                format!("{:?}", provenance_adjustment.blast_radius.risk_level).to_lowercase(),
-            ),
+            blast_radius_risk_level: provenance_adjustment
+                .as_ref()
+                .map(|p| format!("{:?}", p.blast_radius.risk_level).to_lowercase()),
             #[cfg(not(target_os = "linux"))]
             blast_radius_risk_level: None,
             #[cfg(target_os = "linux")]
-            blast_radius_total_affected: Some(provenance_adjustment.blast_radius.total_affected),
+            blast_radius_total_affected: provenance_adjustment
+                .as_ref()
+                .map(|p| p.blast_radius.total_affected),
             #[cfg(not(target_os = "linux"))]
             blast_radius_total_affected: None,
             #[cfg(target_os = "linux")]
-            provenance_evidence_completeness: Some(provenance_adjustment.evidence_completeness),
+            provenance_evidence_completeness: provenance_adjustment
+                .as_ref()
+                .map(|p| p.evidence_completeness),
             #[cfg(not(target_os = "linux"))]
             provenance_evidence_completeness: None,
             #[cfg(target_os = "linux")]
-            provenance_confidence_penalty: Some(provenance_adjustment.confidence_penalty_steps),
+            provenance_confidence_penalty: provenance_adjustment
+                .as_ref()
+                .map(|p| p.confidence_penalty_steps),
             #[cfg(not(target_os = "linux"))]
             provenance_confidence_penalty: None,
         };
@@ -12995,8 +12447,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             })
         });
         #[cfg(target_os = "linux")]
-        let provenance_summary = serde_json::to_value(provenance_adjustment.to_candidate_output())
-            .unwrap_or_else(|_| serde_json::json!({"enabled": false}));
+        let provenance_summary = provenance_adjustment
+            .as_ref()
+            .and_then(|p| serde_json::to_value(p.to_candidate_output()).ok())
+            .unwrap_or_else(|| serde_json::json!({"enabled": false}));
 
         let predictions = if args.include_predictions {
             let mut predictions = build_stub_predictions();
@@ -13065,6 +12519,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 "mode": if fast_path_used { "signature_fast_path" } else { "bayesian" },
                 "prior_source": prior_source_label,
                 "learned_prior": learned_prior,
+                "desktop_app": desktop_app,
                 "fast_path": {
                     "enabled": fast_path_config.enabled,
                     "used": fast_path_used,
@@ -13149,23 +12604,27 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             recommended_action: recommended_action.to_string(),
             score,
             #[cfg(target_os = "linux")]
-            blast_radius_risk_level: Some(
-                format!("{:?}", provenance_adjustment.blast_radius.risk_level).to_lowercase(),
-            ),
+            blast_radius_risk_level: provenance_adjustment
+                .as_ref()
+                .map(|p| format!("{:?}", p.blast_radius.risk_level).to_lowercase()),
             #[cfg(not(target_os = "linux"))]
             blast_radius_risk_level: None,
             #[cfg(target_os = "linux")]
-            blast_radius_total_affected: Some(provenance_adjustment.blast_radius.total_affected),
+            blast_radius_total_affected: provenance_adjustment
+                .as_ref()
+                .map(|p| p.blast_radius.total_affected),
             #[cfg(not(target_os = "linux"))]
             blast_radius_total_affected: None,
             #[cfg(target_os = "linux")]
-            provenance_evidence_completeness: Some(provenance_adjustment.evidence_completeness),
+            provenance_evidence_completeness: provenance_adjustment
+                .as_ref()
+                .map(|p| p.evidence_completeness),
             #[cfg(not(target_os = "linux"))]
             provenance_evidence_completeness: None,
             #[cfg(target_os = "linux")]
             provenance_score_terms: provenance_adjustment
-                .evidence_terms
                 .iter()
+                .flat_map(|p| &p.evidence_terms)
                 .map(|t| t.feature.clone())
                 .collect(),
             #[cfg(not(target_os = "linux"))]
@@ -13173,8 +12632,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             #[cfg(target_os = "linux")]
             provenance_log_odds_shift: {
                 let shift: f64 = provenance_adjustment
-                    .evidence_terms
                     .iter()
+                    .flat_map(|p| &p.evidence_terms)
                     .map(|t| t.log_likelihood.abandoned - t.log_likelihood.useful)
                     .sum();
                 if shift.abs() > f64::EPSILON {
@@ -13813,11 +13272,11 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         }
     };
 
-    // Load priors from config or use defaults
+    // Load the plan's scorer from config or use defaults
     let ExplainContext {
-        priors,
-        decisions,
+        mut scorer,
         protected,
+        min_age_seconds,
     } = match load_priors_for_explain(global) {
         Ok(p) => p,
         Err(e) => {
@@ -13859,6 +13318,14 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         }
     };
 
+    collect_explain_provenance(
+        global,
+        &mut scorer,
+        protected.as_ref(),
+        min_age_seconds,
+        &scan_result.processes,
+    );
+
     // Build explanations for each process
     let mut explanations: Vec<serde_json::Value> = Vec::new();
 
@@ -13866,8 +13333,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         let record = scan_result.processes.iter().find(|p| p.pid.0 == *pid);
         match record {
             Some(proc) => {
-                let mut explanation =
-                    build_process_explanation(proc, &priors, decisions.as_ref(), args);
+                let mut explanation = build_process_explanation(proc, &scorer, args);
                 if let Some(ref filter) = protected {
                     // agent plan skips protected processes; say so and why.
                     explanation["protection"] = explain_protection(filter, proc);
@@ -13998,33 +13464,93 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
     ExitCode::Clean
 }
 
-/// Load priors (and learned decisions, if readable) from config with fallback to defaults.
+/// The config directory pt reads and writes (`--config`/`PT_CONFIG_DIR`, then
+/// `PROCESS_TRIAGE_CONFIG`, then the XDG default), as every config file resolves it.
+fn resolved_config_dir(global: &GlobalOpts) -> PathBuf {
+    pt_core::config::resolve_config_dir(&config_options(global))
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// The scorer `agent plan` would use (priors, learned verdicts, signatures), with
+/// fallback to defaults when the config cannot be loaded.
 fn load_priors_for_explain(global: &GlobalOpts) -> Result<ExplainContext, ConfigError> {
-    let opts = ConfigOptions {
-        config_dir: global.config.as_ref().map(PathBuf::from),
-        priors_path: None,
-        policy_path: None,
-    };
-    let (priors, decisions, guardrails) = match load_config(&opts) {
+    let (scorer, guardrails) = match load_config(&config_options(global)) {
         Ok(resolved) => {
-            let decisions =
-                pt_core::decision::decision_store::DecisionStore::load(&resolved.config_dir).ok();
-            (resolved.priors, decisions, resolved.policy.guardrails)
+            let (scorer, warnings) = Scorer::from_config(&resolved);
+            for warning in warnings {
+                eprintln!("agent explain: warning: {warning}");
+            }
+            (scorer, resolved.policy.guardrails)
         }
-        Err(_) => (Priors::default(), None, Default::default()),
+        Err(_) => {
+            let policy = pt_core::config::Policy::default();
+            let (signatures, _) =
+                pt_core::scoring::load_signature_database(&resolved_config_dir(global));
+            let scorer = Scorer::new(
+                Priors::default(),
+                Default::default(),
+                signatures,
+                pt_core::scoring::fast_path_config(&policy),
+            );
+            (scorer, policy.guardrails)
+        }
     };
     Ok(ExplainContext {
-        priors,
-        decisions,
+        scorer,
         protected: ProtectedFilter::from_guardrails(&guardrails).ok(),
+        min_age_seconds: guardrails.min_process_age_seconds,
     })
 }
 
 /// What `agent explain` evaluates a process against.
 struct ExplainContext {
-    priors: Priors,
-    decisions: Option<pt_core::decision::decision_store::DecisionStore>,
+    scorer: Scorer,
     protected: Option<ProtectedFilter>,
+    /// `agent plan`'s default age floor for candidates.
+    min_age_seconds: u64,
+}
+
+/// Collect provenance the way `agent plan` does: over the processes plan would
+/// evaluate (unprotected and old enough) plus the ones being explained, so the
+/// explanation carries the same lineage, listener and blast-radius terms.
+fn collect_explain_provenance(
+    global: &GlobalOpts,
+    scorer: &mut Scorer,
+    protected: Option<&ProtectedFilter>,
+    min_age_seconds: u64,
+    targets: &[ProcessRecord],
+) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let scan_options = QuickScanOptions {
+        pids: vec![],
+        include_kernel_threads: false,
+        timeout: global.timeout.map(std::time::Duration::from_secs),
+        progress: None,
+    };
+    let population = match quick_scan(&scan_options) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("agent explain: warning: provenance scan failed: {e}");
+            scorer.collect_provenance(&targets.iter().collect::<Vec<_>>());
+            return;
+        }
+    };
+    let passed = match protected {
+        Some(filter) => filter.filter_scan_result(&population).passed,
+        None => population.processes,
+    };
+    let mut set: Vec<&ProcessRecord> = passed
+        .iter()
+        .filter(|proc| proc.elapsed.as_secs() >= min_age_seconds)
+        .collect();
+    for target in targets {
+        if !set.iter().any(|proc| proc.pid == target.pid) {
+            set.push(target);
+        }
+    }
+    scorer.collect_provenance(&set);
 }
 
 /// Why a process would be skipped by `agent plan` (not evaluated), if it would be.
@@ -14055,32 +13581,21 @@ fn explain_protection(filter: &ProtectedFilter, proc: &ProcessRecord) -> serde_j
 /// Build a JSON explanation for a single process.
 fn build_process_explanation(
     proc: &ProcessRecord,
-    global_priors: &Priors,
-    decisions: Option<&pt_core::decision::decision_store::DecisionStore>,
+    scorer: &Scorer,
     args: &AgentExplainArgs,
 ) -> serde_json::Value {
-    // Human kill/spare verdicts for this command pattern replace the class prior.
-    let learned_prior =
-        decisions.and_then(|d| d.learned_prior(&proc.comm, &proc.cmd, global_priors));
-    let learned_priors = decisions.and_then(|d| d.priors_for(&proc.comm, &proc.cmd, global_priors));
-    let priors = learned_priors.as_ref().unwrap_or(global_priors);
-    // Convert ProcessRecord to Evidence (same snapshot features as agent plan)
-    let evidence = Evidence::from_snapshot(proc);
-
-    // Compute posterior
-    let posterior_result = match compute_posterior(priors, &evidence) {
-        Ok(r) => r,
-        Err(e) => {
-            return serde_json::json!({
-                "pid": proc.pid.0,
-                "comm": proc.comm,
-                "error": format!("posterior computation failed: {}", e),
-            });
-        }
+    // Scored exactly as `agent plan` scores it (learned verdicts, signatures,
+    // desktop-app ownership, provenance), from the same snapshot evidence.
+    let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
+        return serde_json::json!({
+            "pid": proc.pid.0,
+            "comm": proc.comm,
+            "error": "posterior computation failed",
+        });
     };
-
-    // Build evidence ledger
-    let ledger = EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
+    let posterior_result = &score.posterior;
+    let ledger = &score.ledger;
+    let learned_prior = &score.learned_prior;
 
     // Build base explanation
     let mut explanation = serde_json::json!({
@@ -14101,7 +13616,16 @@ fn build_process_explanation(
             "abandoned": posterior_result.posterior.abandoned,
             "zombie": posterior_result.posterior.zombie,
         },
+        "score": posterior_result.posterior.suspicion_score(),
+        "prior_source": score.prior_source,
         "learned_prior": learned_prior,
+        "signature": score.signature.as_ref().map(|m| serde_json::json!({
+            "name": m.signature.name,
+            "category": format!("{:?}", m.signature.category),
+            "score": m.score,
+            "match_level": match_level_label(m.level),
+        })),
+        "desktop_app": score.desktop_app,
     });
 
     // Add Bayes factors if galaxy_brain mode or requested
@@ -14145,6 +13669,8 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
     let mut unit: Option<String> = None;
     let mut recommended_action = "kill".to_string();
     let mut supervisor_command: Option<String> = None;
+    // Which systemd manager owns the unit ("system" or "user"), for systemd.
+    let mut manager: Option<&str> = None;
 
     // Prefer container supervision if present
     if let Ok(result) = ContainerSupervisionAnalyzer::new()
@@ -14220,24 +13746,23 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
         }
     }
 
-    // systemd supervision
+    // systemd supervision: the service unit the process's cgroup places it in, for the
+    // system manager or a user's manager (GH #19: the unit was never looked up, so
+    // this never fired).
     if !detected {
-        if let Some(unit_info) = collect_systemd_unit(pid, None) {
+        if let Some((service, user_manager)) = pt_core::collect::read_systemd_cgroup_path(pid)
+            .and_then(|path| {
+                pt_core::collect::systemd_service_unit(&path)
+                    .map(|(service, user)| (service.to_string(), user))
+            })
+        {
             detected = true;
             supervisor_type = Some("systemd".to_string());
-            unit = Some(unit_info.name.clone());
-            let (action_label, command) = match unit_info.unit_type {
-                pt_core::collect::systemd::SystemdUnitType::Scope => (
-                    "systemctl_stop",
-                    format!("systemctl stop {}", unit_info.name),
-                ),
-                _ => (
-                    "systemctl_restart",
-                    format!("systemctl restart {}", unit_info.name),
-                ),
-            };
-            recommended_action = action_label.to_string();
-            supervisor_command = Some(command);
+            manager = Some(if user_manager { "user" } else { "system" });
+            let scope = if user_manager { "--user " } else { "" };
+            recommended_action = "systemctl_restart".to_string();
+            supervisor_command = Some(format!("systemctl {scope}restart {service}"));
+            unit = Some(service);
         }
     }
 
@@ -14257,6 +13782,7 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
         "detected": detected,
         "type": supervisor_type,
         "unit": unit,
+        "manager": manager,
         "recommended_action": recommended_action,
         "supervisor_command": supervisor_command,
     })
@@ -14268,6 +13794,7 @@ fn supervisor_info_for_plan(_pid: u32) -> serde_json::Value {
         "detected": false,
         "type": serde_json::Value::Null,
         "unit": serde_json::Value::Null,
+        "manager": serde_json::Value::Null,
         "recommended_action": "kill",
         "supervisor_command": serde_json::Value::Null,
     })
@@ -17027,18 +16554,10 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
     };
 
     // Determine priors output path
-    let priors_path = config.snapshot().priors_path.unwrap_or_else(|| {
-        global
-            .config
-            .as_ref()
-            .map(|c| PathBuf::from(c).join("priors.json"))
-            .unwrap_or_else(|| {
-                dirs::config_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("pt")
-                    .join("priors.json")
-            })
-    });
+    let priors_path = config
+        .snapshot()
+        .priors_path
+        .unwrap_or_else(|| resolved_config_dir(global).join("priors.json"));
 
     // Check host profile compatibility
     if let Some(ref filter_profile) = args.host_profile {
@@ -17822,7 +17341,12 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
-    let priors = config.priors;
+    // The same scorer as `agent plan`.
+    let (mut scorer, scorer_warnings) = Scorer::from_config(&config);
+    for warning in scorer_warnings {
+        eprintln!("agent watch: warning: {warning}");
+    }
+    let config_dir = config.config_dir.clone();
     let policy = config.policy;
 
     let scan_options = QuickScanOptions {
@@ -17889,18 +17413,22 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
 
         let mut current: HashMap<u32, WatchCandidate> = HashMap::new();
 
-        for proc in &filtered.passed {
-            if proc.pid.0 == 0 || proc.pid.0 == 1 {
-                continue;
-            }
-            let min_age = args
-                .min_age
-                .unwrap_or(policy.guardrails.min_process_age_seconds);
-            if proc.elapsed.as_secs() < min_age {
-                continue;
-            }
+        // Verdicts recorded since the last pass count on this one.
+        if let Ok(decisions) = pt_core::decision::decision_store::DecisionStore::load(&config_dir) {
+            scorer.decisions = decisions;
+        }
+        let min_age = args
+            .min_age
+            .unwrap_or(policy.guardrails.min_process_age_seconds);
+        let eligible: Vec<&ProcessRecord> = filtered
+            .passed
+            .iter()
+            .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
+            .collect();
+        scorer.collect_provenance(&eligible);
 
-            let Some(eval) = evaluate_watch_candidate(proc, &priors, &decision_policy) else {
+        for proc in eligible {
+            let Some(eval) = evaluate_watch_candidate(proc, &scorer, &decision_policy) else {
                 continue;
             };
             if eval.confidence < threshold.min_prob {
@@ -17976,12 +17504,10 @@ struct WatchEval {
 
 fn evaluate_watch_candidate(
     proc: &ProcessRecord,
-    priors: &Priors,
+    scorer: &Scorer,
     policy: &pt_core::config::Policy,
 ) -> Option<WatchEval> {
-    let evidence = Evidence::from_snapshot(proc);
-
-    let posterior_result = compute_posterior(priors, &evidence).ok()?;
+    let posterior_result = scorer.score(proc, Evidence::from_snapshot(proc))?.posterior;
     let decision_outcome = decide_action(
         &posterior_result.posterior,
         policy,
@@ -18258,154 +17784,6 @@ mod watch_tests {
             event.get("event").and_then(|v| v.as_str()),
             Some("baseline_anomaly")
         );
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod provenance_scoring_tests {
-    use super::*;
-    use pt_common::{
-        AncestorEntry, LineageCollectionMethod, LockMechanism, RawResourceEvidence,
-        ResourceCollectionMethod, ResourceDetails, ResourceKind, ResourceState, SupervisorEvidence,
-        SupervisorKind,
-    };
-
-    fn lock_ev(pid: u32, path: &str, state: ResourceState) -> RawResourceEvidence {
-        RawResourceEvidence {
-            kind: ResourceKind::Lockfile,
-            key: path.to_string(),
-            owner_pid: pid,
-            collection_method: ResourceCollectionMethod::ProcFd,
-            state,
-            details: ResourceDetails::Lockfile {
-                path: path.to_string(),
-                mechanism: LockMechanism::Existence,
-            },
-            observed_at: "2026-03-17T00:00:00Z".to_string(),
-        }
-    }
-
-    fn listener_ev(pid: u32, port: u16) -> RawResourceEvidence {
-        RawResourceEvidence {
-            kind: ResourceKind::Listener,
-            key: format!("tcp:0.0.0.0:{port}"),
-            owner_pid: pid,
-            collection_method: ResourceCollectionMethod::ProcNet,
-            state: ResourceState::Active,
-            details: ResourceDetails::Listener {
-                protocol: "tcp".to_string(),
-                port,
-                bind_address: "0.0.0.0".to_string(),
-            },
-            observed_at: "2026-03-17T00:00:00Z".to_string(),
-        }
-    }
-
-    fn lineage(pid: u32, ppid: u32, supervisor: Option<SupervisorEvidence>) -> RawLineageEvidence {
-        RawLineageEvidence {
-            pid,
-            ppid,
-            pgid: pid,
-            sid: pid,
-            uid: 1000,
-            user: Some("ubuntu".to_string()),
-            tty: None,
-            supervisor,
-            ancestors: if ppid > 1 {
-                vec![AncestorEntry {
-                    pid: ppid,
-                    comm: "bash".to_string(),
-                    uid: 1000,
-                }]
-            } else {
-                Vec::new()
-            },
-            collection_method: LineageCollectionMethod::Synthetic,
-            observed_at: "2026-03-17T00:00:00Z".to_string(),
-        }
-    }
-
-    fn feature_names(adjustment: &ProvenanceScoreAdjustment) -> Vec<&str> {
-        adjustment
-            .evidence_terms
-            .iter()
-            .map(|term| term.feature.as_str())
-            .collect()
-    }
-
-    #[test]
-    fn orphaned_low_blast_radius_elevates_abandonment_features() {
-        let bundle = ProvenanceInferenceBundle {
-            resource_graph: SharedResourceGraph::from_evidence(&[]),
-            lineages: HashMap::from([(100, lineage(100, 1, None))]),
-            children: HashMap::new(),
-        };
-
-        let adjustment = derive_provenance_adjustment(100, &bundle);
-        let features = feature_names(&adjustment);
-
-        assert!(features.contains(&"provenance_ownership_orphaned"));
-        assert!(features.contains(&"provenance_blast_radius_low"));
-        assert!(adjustment.confidence_penalty_steps >= 1);
-        assert!(adjustment
-            .confidence_notes
-            .iter()
-            .any(|note| note.contains("PPID=1") || note.contains("ancestor chain")));
-    }
-
-    #[test]
-    fn supervised_listener_suppresses_false_positive_path() {
-        let bundle = ProvenanceInferenceBundle {
-            resource_graph: SharedResourceGraph::from_evidence(&[(
-                200,
-                vec![listener_ev(200, 8080)],
-            )]),
-            lineages: HashMap::from([(
-                200,
-                lineage(
-                    200,
-                    2,
-                    Some(SupervisorEvidence {
-                        kind: SupervisorKind::Systemd,
-                        unit_name: Some("api.service".to_string()),
-                        auto_restart: Some(true),
-                        confidence: ProvenanceConfidence::High,
-                    }),
-                ),
-            )]),
-            children: HashMap::new(),
-        };
-
-        let adjustment = derive_provenance_adjustment(200, &bundle);
-        let features = feature_names(&adjustment);
-
-        assert!(features.contains(&"provenance_ownership_supervised"));
-        assert!(features.contains(&"provenance_active_listener"));
-        assert!(adjustment.evidence_completeness >= 0.8);
-    }
-
-    #[test]
-    fn missing_and_conflicted_provenance_downgrades_confidence() {
-        let bundle = ProvenanceInferenceBundle {
-            resource_graph: SharedResourceGraph::from_evidence(&[(
-                300,
-                vec![lock_ev(300, "/tmp/shared.lock", ResourceState::Conflicted)],
-            )]),
-            lineages: HashMap::new(),
-            children: HashMap::new(),
-        };
-
-        let adjustment = derive_provenance_adjustment(300, &bundle);
-
-        assert!(adjustment.confidence_penalty_steps >= 2);
-        assert!(adjustment
-            .confidence_notes
-            .iter()
-            .any(|note| note.contains("missing lineage provenance")));
-        assert!(adjustment
-            .confidence_notes
-            .iter()
-            .any(|note| note.contains("unresolved edge")));
     }
 }
 

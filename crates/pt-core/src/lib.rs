@@ -33,6 +33,7 @@ pub mod plan;
 pub mod plugin;
 pub mod replay;
 pub mod schema;
+pub mod scoring;
 pub mod session;
 pub mod shadow;
 pub mod signature_cli;

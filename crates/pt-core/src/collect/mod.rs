@@ -107,9 +107,10 @@ pub use protected::{
 
 // Re-export cgroup types
 pub use cgroup::{
-    classify_cgroup_path, collect_cgroup_details, collect_cgroup_from_content,
-    effective_cores_from_quota, read_cgroup_role, CgroupDetails, CgroupProvenance, CgroupRole,
-    CgroupVersion, CpuLimitSource, CpuLimits, MemoryLimitSource, MemoryLimits,
+    classify_cgroup_path, collect_cgroup_details, collect_cgroup_from_content, desktop_app_unit,
+    effective_cores_from_quota, read_cgroup_role, read_systemd_cgroup_path, systemd_service_unit,
+    CgroupDetails, CgroupProvenance, CgroupRole, CgroupVersion, CpuLimitSource, CpuLimits,
+    MemoryLimitSource, MemoryLimits,
 };
 
 // Re-export systemd types (available on all platforms; collection functions
