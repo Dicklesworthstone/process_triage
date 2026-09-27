@@ -257,6 +257,16 @@ impl ProcessExpectations {
     }
 }
 
+/// Argument regex that matches `names` (a regex alternation) only as a command word:
+/// the program itself or a path component, optionally with a `.js`/`.cjs`/`.mjs`/`.py`
+/// suffix (`jest`, `node_modules/.bin/jest`, `node_modules/jest/bin/jest.js`,
+/// `python -m pytest`), never inside another word or a dot-directory. A bare `webpack`
+/// matched every Electron app, whose code lives under `resources/app/.webpack/`, and
+/// its "likely abandoned" priors then flipped those apps to abandoned (GH #15).
+pub fn command_word_pattern(names: &str) -> String {
+    format!(r"(^|[\s/])({names})(\.[cm]?js|\.py)?(\s|/|@|$)")
+}
+
 /// A unified supervisor signature combining all detection patterns.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorSignature {
@@ -424,6 +434,13 @@ impl SupervisorSignature {
     /// Add argument patterns.
     pub fn with_arg_patterns(mut self, patterns: Vec<&str>) -> Self {
         self.patterns.arg_patterns = patterns.into_iter().map(String::from).collect();
+        self
+    }
+
+    /// Match the command line when it runs one of `names` (a regex alternation) as a
+    /// command word; see [`command_word_pattern`].
+    pub fn with_command_word_arg(mut self, names: &str) -> Self {
+        self.patterns.arg_patterns = vec![command_word_pattern(names)];
         self
     }
 
@@ -1587,7 +1604,7 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("Jest JavaScript test runner")
                 .with_process_patterns(vec![r"^jest$"])
-                .with_arg_patterns(vec![r"jest"])
+                .with_command_word_arg("jest")
                 .with_env_patterns(HashMap::from([("JEST_WORKER_ID".into(), ".*".into())]))
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
@@ -1599,7 +1616,7 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("Mocha JavaScript test runner")
                 .with_process_patterns(vec![r"^mocha$", r"^_mocha$"])
-                .with_arg_patterns(vec![r"mocha"])
+                .with_command_word_arg("_?mocha")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1610,7 +1627,7 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("Vitest test runner")
                 .with_process_patterns(vec![r"^vitest$"])
-                .with_arg_patterns(vec![r"vitest"])
+                .with_command_word_arg("vitest")
                 .with_env_patterns(HashMap::from([("VITEST".into(), "true".into())]))
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
@@ -1622,7 +1639,9 @@ impl SignatureDatabase {
                 .with_confidence(0.85)
                 .with_notes("pytest Python test runner")
                 .with_process_patterns(vec![r"^pytest$", r"^py\.test$"])
-                .with_arg_patterns(vec![r"pytest", r"py\.test"])
+                // One alternation: arg patterns are ANDed, so the former separate
+                // `pytest` and `py\.test` patterns never matched `python -m pytest`.
+                .with_command_word_arg(r"pytest|py\.test")
                 .with_env_patterns(HashMap::from([("PYTEST_CURRENT_TEST".into(), ".*".into())]))
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
@@ -1654,7 +1673,7 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("RSpec Ruby test runner")
                 .with_process_patterns(vec![r"^rspec$"])
-                .with_arg_patterns(vec![r"rspec"])
+                .with_command_word_arg("rspec")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1665,7 +1684,7 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("PHPUnit test runner")
                 .with_process_patterns(vec![r"^phpunit$"])
-                .with_arg_patterns(vec![r"phpunit"])
+                .with_command_word_arg("phpunit")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1686,7 +1705,7 @@ impl SignatureDatabase {
                 .with_confidence(0.85)
                 .with_notes("Playwright E2E test runner")
                 .with_process_patterns(vec![r"^playwright$"])
-                .with_arg_patterns(vec![r"playwright"])
+                .with_command_word_arg("playwright")
                 .with_env_patterns(HashMap::from([(
                     "PLAYWRIGHT_BROWSERS_PATH".into(),
                     ".*".into(),
@@ -1701,7 +1720,7 @@ impl SignatureDatabase {
                 .with_confidence(0.85)
                 .with_notes("Cypress E2E test runner")
                 .with_process_patterns(vec![r"^Cypress$", r"^cypress$"])
-                .with_arg_patterns(vec![r"cypress"])
+                .with_command_word_arg("[Cc]ypress")
                 .with_env_patterns(HashMap::from([(
                     "CYPRESS_CACHE_FOLDER".into(),
                     ".*".into(),
@@ -1728,7 +1747,7 @@ impl SignatureDatabase {
                 .with_confidence(0.85)
                 .with_notes("Vite development server")
                 .with_process_patterns(vec![r"^vite$"])
-                .with_arg_patterns(vec![r"vite"])
+                .with_command_word_arg("vite")
                 .with_priors(SignaturePriors::likely_useful())
                 .with_expectations(ProcessExpectations::dev_server())
                 .as_builtin(),
@@ -1796,7 +1815,7 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("Webpack bundler")
                 .with_process_patterns(vec![r"^webpack$"])
-                .with_arg_patterns(vec![r"webpack"])
+                .with_command_word_arg("webpack(-cli)?")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1807,7 +1826,7 @@ impl SignatureDatabase {
                 .with_confidence(0.85)
                 .with_notes("esbuild bundler")
                 .with_process_patterns(vec![r"^esbuild$"])
-                .with_arg_patterns(vec![r"esbuild"])
+                .with_command_word_arg("esbuild")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1818,7 +1837,7 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("Rollup bundler")
                 .with_process_patterns(vec![r"^rollup$"])
-                .with_arg_patterns(vec![r"rollup"])
+                .with_command_word_arg("rollup")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1829,7 +1848,7 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("TypeScript compiler")
                 .with_process_patterns(vec![r"^tsc$"])
-                .with_arg_patterns(vec![r"tsc\b", r"typescript"])
+                .with_command_word_arg("tsc")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -2073,7 +2092,7 @@ impl SignatureDatabase {
                 .with_confidence(0.75)
                 .with_notes("ESLint JavaScript linter")
                 .with_process_patterns(vec![r"^eslint$"])
-                .with_arg_patterns(vec![r"eslint"])
+                .with_command_word_arg("eslint")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -2084,7 +2103,7 @@ impl SignatureDatabase {
                 .with_confidence(0.75)
                 .with_notes("Prettier code formatter")
                 .with_process_patterns(vec![r"^prettier$"])
-                .with_arg_patterns(vec![r"prettier"])
+                .with_command_word_arg("prettier")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -2114,7 +2133,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("clippy", SupervisorCategory::Other)
                 .with_confidence(0.80)
                 .with_notes("Clippy Rust linter")
-                .with_arg_patterns(vec![r"clippy"])
+                .with_command_word_arg("(cargo-)?clippy(-driver)?")
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -2738,6 +2757,65 @@ mod tests {
         assert!(!matches_partial
             .iter()
             .any(|m| m.signature.name == "jest-watch" && m.details.args_matched));
+    }
+
+    /// Built-in tool signatures match the tool as a command word only (GH #15:
+    /// Electron apps ship their code in `resources/app/.webpack/` and all matched the
+    /// "likely abandoned" webpack signature).
+    #[test]
+    fn builtin_tool_args_match_command_words_not_substrings() {
+        let db = SignatureDatabase::with_defaults();
+        let best = |comm: &str, cmd: &str| {
+            let ctx = ProcessMatchContext::with_comm(comm).cmdline(cmd);
+            db.best_match(&ctx).map(|m| m.signature.name.clone())
+        };
+        for (comm, cmd, expected) in [
+            (
+                "node",
+                "node ./node_modules/.bin/webpack --watch",
+                "webpack",
+            ),
+            (
+                "node",
+                "node /app/node_modules/webpack/bin/webpack.js --mode production",
+                "webpack",
+            ),
+            ("node", "node ./node_modules/.bin/jest --runInBand", "jest"),
+            ("python3", "python3 -m pytest tests/ -x", "pytest"),
+            (
+                "python3",
+                "/usr/bin/python3 /usr/bin/py.test tests",
+                "pytest",
+            ),
+            (
+                "node",
+                "node node_modules/typescript/bin/tsc --watch",
+                "tsc",
+            ),
+            (
+                "node",
+                "node ./node_modules/.bin/esbuild src/app.ts --bundle",
+                "esbuild",
+            ),
+            ("node", "node ./node_modules/.bin/vitest run", "vitest"),
+        ] {
+            assert_eq!(best(comm, cmd).as_deref(), Some(expected), "{cmd:?}");
+        }
+        for (comm, cmd) in [
+            // LM Studio worker and a generic Electron main process.
+            (
+                "node",
+                "/home/u/.lmstudio/.internal/utils/node /opt/lm-studio/resources/app/.webpack/lib/llmworker.js",
+            ),
+            (
+                "lm-studio",
+                "/opt/lm-studio/lm-studio --type=renderer --app-path=/opt/lm-studio/resources/app --enable-sandbox /opt/lm-studio/resources/app/.webpack/renderer/main_window/index.js",
+            ),
+            ("node", "node server.js --favorites-invite"),
+            ("rg", "rg jestConfig src/"),
+        ] {
+            assert_eq!(best(comm, cmd), None, "{cmd:?}");
+        }
     }
 
     #[test]
