@@ -429,26 +429,25 @@ impl ToolRunner {
         let result = self.execute_with_timeout(&mut child, timeout, max_output);
 
         let duration = start.elapsed();
-        let duration_ms = duration.as_millis() as u64;
+        // Charge whole milliseconds, rounded up, and at least 1 ms per run. Truncating
+        // made every sub-millisecond run free, so a budget never ran out for fast
+        // tools (and a 1 ms budget survived an `echo` on a fast host: GH #21).
+        let charged_ms = charged_budget_ms(duration);
 
-        // Adjust budget: refund unused portion or consume excess (if any)
-        // We reserved allocated_ms. We used duration_ms.
-        // If duration_ms < allocated_ms, we refund (allocated_ms - duration_ms).
-        // If duration_ms > allocated_ms, we consume extra (duration_ms - allocated_ms).
-        // The net effect is we want used_ms to increase by duration_ms total.
-        // Currently it has increased by allocated_ms.
-        // So we add (duration_ms - allocated_ms).
-        if duration_ms < allocated_ms {
+        // Adjust budget: we reserved allocated_ms and charge charged_ms, so move
+        // used_ms by the difference (refund or extra charge).
+        if charged_ms < allocated_ms {
             self.used_ms
-                .fetch_sub(allocated_ms - duration_ms, Ordering::SeqCst);
+                .fetch_sub(allocated_ms - charged_ms, Ordering::SeqCst);
         } else {
             self.used_ms
-                .fetch_add(duration_ms - allocated_ms, Ordering::SeqCst);
+                .fetch_add(charged_ms - allocated_ms, Ordering::SeqCst);
         }
 
         info!(
             command = %spec.command,
-            duration_ms,
+            duration_ms = duration.as_millis() as u64,
+            charged_ms,
             success = result.is_ok(),
             "tool execution complete"
         );
@@ -821,6 +820,14 @@ impl ToolRunner {
     }
 }
 
+/// Budget charged for a run that took `duration`: whole milliseconds, rounded up,
+/// never less than 1 ms (a run is never free).
+fn charged_budget_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros().div_ceil(1000))
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
 /// Set non-blocking mode on a file descriptor.
 #[cfg(unix)]
 fn set_nonblocking(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
@@ -1110,14 +1117,25 @@ mod tests {
     }
 
     #[test]
+    fn charged_budget_rounds_up_to_whole_milliseconds() {
+        assert_eq!(charged_budget_ms(Duration::ZERO), 1);
+        assert_eq!(charged_budget_ms(Duration::from_micros(1)), 1);
+        assert_eq!(charged_budget_ms(Duration::from_micros(1000)), 1);
+        assert_eq!(charged_budget_ms(Duration::from_micros(1001)), 2);
+        assert_eq!(charged_budget_ms(Duration::from_millis(250)), 250);
+    }
+
+    #[test]
     fn test_budget_exhaustion() {
         let runner = ToolRunnerBuilder::new()
             .use_nice(false)
             .budget_ms(1) // Very small budget
             .build();
 
-        // First run should succeed but exhaust budget
+        // Every run is charged at least 1 ms, so the first run uses up the budget
+        // however fast the host is.
         let _ = runner.run_tool("echo", &["test"], None);
+        assert!(runner.budget_exhausted());
 
         // Second run should fail
         let result = runner.run_tool("echo", &["test2"], None);
