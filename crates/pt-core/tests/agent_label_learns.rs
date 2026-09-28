@@ -256,6 +256,12 @@ fn signature_prior_from_config_override_reaches_plan_and_explain() {
     assert!(config_dir.path().join("signatures.json").exists());
     assert!(!other_config.path().join("signatures.json").exists());
 
+    // Runtime is evidence, so the sleep's posterior moves between invocations: the
+    // useful class has the largest runtime-gamma shape (default priors), so
+    // P(useful) rises with age while the process is seconds-to-hours old, and a
+    // full-host plan can take minutes on a loaded host. Bracket the plan between
+    // two explains instead of comparing across an unknown time gap.
+    let explained_before = explain(config_dir.path(), data_dir.path(), pid);
     let planned = plan_candidate(config_dir.path(), data_dir.path(), pid);
     assert_eq!(planned["signature"]["name"], "sleep-619", "{planned}");
     assert_eq!(
@@ -271,9 +277,13 @@ fn signature_prior_from_config_override_reaches_plan_and_explain() {
         "plan {planned}\nexplain {explained}"
     );
     let useful = |v: &Value| v["posterior"]["useful"].as_f64().expect("useful");
+    // Same scorer: the plan's posterior lies between the explains that bracket it
+    // (the slack only absorbs CPU-sample jitter).
     assert!(
-        (useful(&explained) - useful(&planned)).abs() < 0.05,
-        "plan and explain agree: plan {} explain {}",
+        useful(&explained_before) - 0.01 <= useful(&planned)
+            && useful(&planned) <= useful(&explained) + 0.01,
+        "plan and explain agree: explain before {} plan {} explain after {}",
+        useful(&explained_before),
         useful(&planned),
         useful(&explained)
     );
