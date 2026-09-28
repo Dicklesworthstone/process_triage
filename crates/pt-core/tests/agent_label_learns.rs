@@ -226,6 +226,27 @@ fn signature_prior_from_config_override_reaches_plan_and_explain() {
     let guard = ChildGuard(child);
     let pid = guard.0.id();
 
+    // Runtime is evidence, and after clipping (TERM_CLIP_NATS) it is flat for the
+    // first ~80 s, pulls P(useful) down until ~7 min (abandoned gains) and pushes it
+    // back up afterwards: not monotonic. A full-host plan can take minutes on a
+    // loaded host, so plan and explain would see different ages and a different
+    // posterior. Default priors without the runtime term make the posterior
+    // age-independent, so plan and explain must agree.
+    let mut priors = pt_core::config::Priors::default();
+    for class in [
+        &mut priors.classes.useful,
+        &mut priors.classes.useful_bad,
+        &mut priors.classes.abandoned,
+        &mut priors.classes.zombie,
+    ] {
+        class.runtime_gamma = None;
+    }
+    std::fs::write(
+        config_dir.path().join("priors.json"),
+        serde_json::to_string_pretty(&priors).expect("serialize priors"),
+    )
+    .expect("write priors");
+
     // PT_CONFIG_DIR (the --config flag's env) outranks PROCESS_TRIAGE_CONFIG.
     let out = pt_core(other_config.path(), data_dir.path())
         .env("PT_CONFIG_DIR", config_dir.path())
@@ -256,12 +277,6 @@ fn signature_prior_from_config_override_reaches_plan_and_explain() {
     assert!(config_dir.path().join("signatures.json").exists());
     assert!(!other_config.path().join("signatures.json").exists());
 
-    // Runtime is evidence, so the sleep's posterior moves between invocations: the
-    // useful class has the largest runtime-gamma shape (default priors), so
-    // P(useful) rises with age while the process is seconds-to-hours old, and a
-    // full-host plan can take minutes on a loaded host. Bracket the plan between
-    // two explains instead of comparing across an unknown time gap.
-    let explained_before = explain(config_dir.path(), data_dir.path(), pid);
     let planned = plan_candidate(config_dir.path(), data_dir.path(), pid);
     assert_eq!(planned["signature"]["name"], "sleep-619", "{planned}");
     assert_eq!(
@@ -277,13 +292,10 @@ fn signature_prior_from_config_override_reaches_plan_and_explain() {
         "plan {planned}\nexplain {explained}"
     );
     let useful = |v: &Value| v["posterior"]["useful"].as_f64().expect("useful");
-    // Same scorer: the plan's posterior lies between the explains that bracket it
-    // (the slack only absorbs CPU-sample jitter).
+    // Same scorer (the slack only absorbs CPU-sample jitter).
     assert!(
-        useful(&explained_before) - 0.01 <= useful(&planned)
-            && useful(&planned) <= useful(&explained) + 0.01,
-        "plan and explain agree: explain before {} plan {} explain after {}",
-        useful(&explained_before),
+        (useful(&explained) - useful(&planned)).abs() < 0.01,
+        "plan and explain agree: plan {} explain {}",
         useful(&planned),
         useful(&explained)
     );
