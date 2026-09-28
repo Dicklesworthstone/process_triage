@@ -1896,7 +1896,7 @@ fn main() {
             &args,
         ),
         Some(Commands::Schema(args)) => run_schema(&cli.global, &args),
-        Some(Commands::Mcp(args)) => run_mcp(&args),
+        Some(Commands::Mcp(args)) => run_mcp(&cli.global, &args),
         Some(Commands::Update(args)) => run_update(&cli.global, &args),
         Some(Commands::Completions(args)) => {
             clap_complete::generate(
@@ -10194,10 +10194,15 @@ fn collect_shadow_files(dir: &PathBuf, files: &mut Vec<PathBuf>) -> std::io::Res
     Ok(())
 }
 
-fn run_mcp(args: &McpArgs) -> ExitCode {
+fn run_mcp(global: &GlobalOpts, args: &McpArgs) -> ExitCode {
     if args.transport != "stdio" {
         eprintln!("Only 'stdio' transport is currently supported");
         return ExitCode::ArgsError;
+    }
+    // The tools read priors, policy, learned verdicts and signatures from the same
+    // config directory as every CLI command (GH #18).
+    if let Some(dir) = global.config.as_ref() {
+        pt_core::mcp::set_config_dir(PathBuf::from(dir));
     }
 
     let mut server = pt_core::mcp::McpServer::new();

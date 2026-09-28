@@ -178,9 +178,40 @@ pub fn user_signatures_path(config_dir: &Path) -> PathBuf {
     config_dir.join("signatures.json")
 }
 
+/// The file to read for `file_in` (a path builder such as [`user_signatures_path`]) in
+/// `config_dir`: that file, or, when `config_dir` is the default config directory and
+/// the file only exists in the pre-GH #18 location (on macOS
+/// `~/Library/Application Support/process_triage`), that one. Writes always go to
+/// `config_dir`, so the next save migrates the file. A signature that marks processes
+/// useful must not silently vanish on upgrade.
+fn readable_config_file(config_dir: &Path, file_in: fn(&Path) -> PathBuf) -> PathBuf {
+    readable_config_file_in(
+        config_dir,
+        file_in,
+        &crate::config::default_config_dir(),
+        crate::config::legacy_signature_config_dir().as_deref(),
+    )
+}
+
+fn readable_config_file_in(
+    config_dir: &Path,
+    file_in: fn(&Path) -> PathBuf,
+    default_dir: &Path,
+    legacy_dir: Option<&Path>,
+) -> PathBuf {
+    let path = file_in(config_dir);
+    if path.exists() || config_dir != default_dir {
+        return path;
+    }
+    match legacy_dir.filter(|legacy| *legacy != default_dir) {
+        Some(legacy) if file_in(legacy).exists() => file_in(legacy),
+        _ => path,
+    }
+}
+
 /// Load user signatures from a config directory
 pub fn load_user_signatures(config_dir: &Path) -> Option<SignatureSchema> {
-    let path = user_signatures_path(config_dir);
+    let path = readable_config_file(config_dir, user_signatures_path);
     if path.exists() {
         match std::fs::read_to_string(&path) {
             Ok(content) => match SignatureSchema::from_json(&content) {
@@ -732,7 +763,7 @@ fn run_signature_test(
 
 fn run_signature_validate(format: &OutputFormat, config_dir: &Path) -> ExitCode {
     let session_id = SessionId::new();
-    let path = user_signatures_path(config_dir);
+    let path = readable_config_file(config_dir, user_signatures_path);
 
     if !path.exists() {
         match format {
@@ -1103,7 +1134,7 @@ fn run_signature_disable(
     }
 
     // Load or create disabled patterns
-    let disabled_path = disabled_signatures_path(config_dir);
+    let disabled_path = readable_config_file(config_dir, disabled_signatures_path);
     let mut disabled = if disabled_path.exists() {
         match DisabledPatterns::from_file(&disabled_path) {
             Ok(d) => d,
@@ -1172,7 +1203,7 @@ fn run_signature_enable(format: &OutputFormat, config_dir: &Path, name: &str) ->
     let session_id = SessionId::new();
 
     // Load disabled patterns
-    let disabled_path = disabled_signatures_path(config_dir);
+    let disabled_path = readable_config_file(config_dir, disabled_signatures_path);
     let mut disabled = if disabled_path.exists() {
         match DisabledPatterns::from_file(&disabled_path) {
             Ok(d) => d,
@@ -1243,7 +1274,7 @@ fn run_signature_stats(
     let session_id = SessionId::new();
 
     // Load pattern stats
-    let stats_path = pattern_stats_path(config_dir);
+    let stats_path = readable_config_file(config_dir, pattern_stats_path);
     let stats = if stats_path.exists() {
         match AllPatternStats::from_file(&stats_path) {
             Ok(s) => s,
@@ -1496,6 +1527,49 @@ mod tests {
         let loaded = load_user_signatures(&config_dir).expect("load");
         assert_eq!(loaded.signatures, schema.signatures);
         assert!(!loaded.signatures[0].priors.is_empty());
+    }
+
+    /// Before GH #18, macOS kept user signatures in `~/Library/Application Support`;
+    /// with no override, they are still read from there until the next save moves them.
+    #[test]
+    fn default_config_dir_reads_signatures_left_in_the_legacy_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let default_dir = root.path().join("dot-config").join("process_triage");
+        let legacy_dir = root.path().join("app-support").join("process_triage");
+        let override_dir = root.path().join("override");
+        std::fs::create_dir_all(legacy_dir.join("patterns")).expect("mkdir");
+        std::fs::write(user_signatures_path(&legacy_dir), "{}").expect("write");
+        std::fs::write(disabled_signatures_path(&legacy_dir), "{}").expect("write");
+        let read = |dir: &Path, file_in: fn(&Path) -> PathBuf| {
+            readable_config_file_in(dir, file_in, &default_dir, Some(&legacy_dir))
+        };
+
+        // Default dir without the file: the legacy copy.
+        assert_eq!(
+            read(&default_dir, user_signatures_path),
+            user_signatures_path(&legacy_dir)
+        );
+        assert_eq!(
+            read(&default_dir, disabled_signatures_path),
+            disabled_signatures_path(&legacy_dir)
+        );
+        // Nothing in the legacy dir either: the default path.
+        assert_eq!(
+            read(&default_dir, pattern_stats_path),
+            pattern_stats_path(&default_dir)
+        );
+        // An explicit override never reaches back to the legacy dir.
+        assert_eq!(
+            read(&override_dir, user_signatures_path),
+            user_signatures_path(&override_dir)
+        );
+        // Once saved in the default dir, that copy wins.
+        std::fs::create_dir_all(&default_dir).expect("mkdir");
+        std::fs::write(user_signatures_path(&default_dir), "{}").expect("write");
+        assert_eq!(
+            read(&default_dir, user_signatures_path),
+            user_signatures_path(&default_dir)
+        );
     }
 
     #[test]

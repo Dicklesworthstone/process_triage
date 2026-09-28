@@ -173,6 +173,12 @@ pub fn resolve_config_dir(options: &ConfigOptions) -> Result<PathBuf, ConfigErro
     }
 
     // 3. XDG config home
+    Ok(default_config_dir())
+}
+
+/// The config directory when nothing overrides it: `$XDG_CONFIG_HOME/process_triage`,
+/// default `~/.config/process_triage`, on every platform.
+pub fn default_config_dir() -> PathBuf {
     let xdg_config = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -180,8 +186,14 @@ pub fn resolve_config_dir(options: &ConfigOptions) -> Result<PathBuf, ConfigErro
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".config")
         });
+    xdg_config.join(CONFIG_DIR_NAME)
+}
 
-    Ok(xdg_config.join(CONFIG_DIR_NAME))
+/// Where releases before GH #18 kept user signatures, disabled signatures and pattern
+/// stats: `dirs::config_dir()/process_triage`. On Linux that is the default config
+/// directory; on macOS it was `~/Library/Application Support/process_triage`.
+pub fn legacy_signature_config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join(CONFIG_DIR_NAME))
 }
 
 /// Load priors configuration.

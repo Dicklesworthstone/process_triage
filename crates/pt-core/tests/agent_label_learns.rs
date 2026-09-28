@@ -279,4 +279,25 @@ fn signature_prior_from_config_override_reaches_plan_and_explain() {
     );
     // The "useful" prior dominates a seconds-old idle sleep.
     assert!(useful(&planned) > 0.5, "{planned}");
+
+    // The MCP server reads the same config directory (it ignored PT_CONFIG_DIR and
+    // listed the signatures of PROCESS_TRIAGE_CONFIG instead).
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "pt_signatures", "arguments": {"user_only": true}},
+    });
+    let out = pt_core(other_config.path(), data_dir.path())
+        .env("PT_CONFIG_DIR", config_dir.path())
+        .arg("mcp")
+        .write_stdin(format!("{request}\n"))
+        .output()
+        .expect("run mcp");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "mcp failed: {stdout}");
+    assert!(
+        stdout.contains("sleep-619"),
+        "MCP lists the user signature from PT_CONFIG_DIR: {stdout}"
+    );
 }

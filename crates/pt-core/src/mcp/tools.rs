@@ -14,9 +14,10 @@ use crate::supervision::signature::ProcessMatchContext;
 use crate::supervision::{SignatureDatabase, SupervisorCategory};
 use std::path::PathBuf;
 
-/// The config directory `agent plan` uses (env overrides, then the XDG default).
+/// The config directory `agent plan` uses (`--config` / `PT_CONFIG_DIR`, then
+/// `PROCESS_TRIAGE_CONFIG`, then the XDG default).
 fn config_dir() -> PathBuf {
-    crate::config::resolve_config_dir(&crate::config::ConfigOptions::default())
+    crate::config::resolve_config_dir(&crate::mcp::config_options())
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
@@ -89,7 +90,7 @@ struct Evaluator {
 
 impl Evaluator {
     fn load() -> Self {
-        match crate::config::load_config(&crate::config::ConfigOptions::default()) {
+        match crate::config::load_config(&crate::mcp::config_options()) {
             Ok(config) => Self {
                 protected: crate::collect::protected::ProtectedFilter::from_guardrails(
                     &config.policy.guardrails,
