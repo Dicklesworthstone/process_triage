@@ -1652,12 +1652,12 @@ impl SignatureDatabase {
             SupervisorSignature::new("cargo-test", SupervisorCategory::Other)
                 .with_confidence(0.85)
                 .with_notes("Cargo test runner for Rust")
-                // `cargo [+toolchain|--flag]... test|nextest` or `cargo-nextest`. The former
+                // `cargo [+toolchain|--flag]... test|t|nextest` or `cargo-nextest`. The former
                 // `cargo.*test` matched any command line with "cargo" before "test"
                 // anywhere, e.g. every daemon under ~/.cargo/bin/ given a path with "test"
                 // in it, and rated it likely abandoned (GH #15).
                 .with_arg_patterns(vec![
-                    r"(^|[\s/])cargo(\s+[+-]\S+)*\s+(test|nextest)(\s|$)|(^|[\s/])cargo-nextest(\s|$)",
+                    r"(^|[\s/])cargo(\s+[+-]\S+)*\s+(test|t|nextest)(\s|$)|(^|[\s/])cargo-nextest(\s|$)",
                 ])
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
@@ -2811,6 +2811,14 @@ mod tests {
                 "cargo-test",
             ),
             ("cargo", "cargo nextest run", "cargo-test"),
+            // `t` is cargo's built-in alias for `test`.
+            ("cargo", "cargo t -p pt-core", "cargo-test"),
+            ("cargo", "cargo +nightly test", "cargo-test"),
+            (
+                "go",
+                "/usr/local/go/bin/go test -run TestX ./pkg",
+                "go-test",
+            ),
             (
                 "cargo-nextest",
                 "/home/u/.cargo/bin/cargo-nextest nextest run",
@@ -2838,6 +2846,11 @@ mod tests {
                 "/home/u/.cargo/bin/cass index --watch --data-dir /data/tmp/cass-test",
             ),
             ("python3", "python3 seed.py --backend mongo test"),
+            ("cargo", "cargo testify"),
+            ("cargo", "cargo run --bin test"),
+            ("cargo", "cargo tree -p test"),
+            ("bash", "bash ./test-cargo test"),
+            ("go", "go tester ./..."),
         ] {
             assert_eq!(best(comm, cmd), None, "{cmd:?}");
         }
