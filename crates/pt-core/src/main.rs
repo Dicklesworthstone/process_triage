@@ -6736,24 +6736,26 @@ fn run_agent_fleet_transfer_import(
         let config_dir = resolved_config_dir(global);
         let mut lib = PatternLibrary::new(&config_dir)
             .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
-        let _ = lib.load();
-
         let resolution = match strategy {
             MergeStrategy::Replace => ConflictResolution::ReplaceWithImported,
             MergeStrategy::KeepLocal => ConflictResolution::KeepExisting,
             MergeStrategy::Weighted => ConflictResolution::KeepHigherConfidence,
         };
 
-        match lib.import(incoming_sigs.clone(), resolution) {
-            Ok(result) => {
-                let _ = lib.save();
-                Some(serde_json::json!({
-                    "imported": result.imported,
-                    "updated": result.updated,
-                    "skipped": result.skipped,
-                    "conflicts": result.conflicts.len(),
-                }))
-            }
+        // save() rewrites every pattern file, disabled.json and pattern_stats.json
+        // from memory; after a failed load that would replace the user's files with
+        // whatever loaded before the error (possibly nothing).
+        match lib
+            .load()
+            .and_then(|()| lib.import(incoming_sigs.clone(), resolution))
+            .and_then(|result| lib.save().map(|()| result))
+        {
+            Ok(result) => Some(serde_json::json!({
+                "imported": result.imported,
+                "updated": result.updated,
+                "skipped": result.skipped,
+                "conflicts": result.conflicts.len(),
+            })),
             Err(e) => {
                 eprintln!("warning: signature import failed: {}", e);
                 None

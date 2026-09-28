@@ -269,3 +269,84 @@ fn fleet_transfer_ptb_export_and_passphrase_reads() {
         .assert()
         .success();
 }
+
+/// A pattern file that fails to load must not let the import rewrite the user's
+/// pattern files: save() writes every file from memory, so after a failed load it
+/// replaced disabled.json (and the unreadable file) with whatever had loaded
+/// before the error.
+#[test]
+fn fleet_transfer_import_leaves_pattern_files_alone_when_they_fail_to_load() {
+    use pt_core::supervision::pattern_persistence::PatternLibrary;
+    use pt_core::supervision::signature::SupervisorSignature;
+    use pt_core::supervision::SupervisorCategory;
+
+    let temp = TempDir::new().expect("create temp dir");
+    let source_dir = temp.path().join("source");
+    let target_dir = temp.path().join("target");
+    let export_path = temp.path().join("fleet_transfer.json");
+
+    let sig = |name: &str| {
+        SupervisorSignature::new(name, SupervisorCategory::Other)
+            .with_process_patterns(vec![format!("^{name}$").as_str()])
+            .with_confidence(0.8)
+    };
+    write_priors(&source_dir, &Priors::default());
+    write_priors(&target_dir, &Priors::default());
+    let mut source = PatternLibrary::new(&source_dir);
+    source.add_custom(sig("exported")).expect("add exported");
+    source.save().expect("save source");
+
+    let mut target = PatternLibrary::new(&target_dir);
+    target
+        .add_learned(sig("local_learned"))
+        .expect("add learned");
+    target.add_custom(sig("local_custom")).expect("add custom");
+    target
+        .disable_pattern("local_learned", Some("noisy"))
+        .expect("disable");
+    target.save().expect("save target");
+    let patterns = target_dir.join("patterns");
+    fs::write(patterns.join("custom.json"), "{ not json").expect("corrupt custom.json");
+    let snapshot = |dir: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<_> = fs::read_dir(dir)
+            .expect("read patterns dir")
+            .map(|e| {
+                let path = e.expect("entry").path();
+                let bytes = fs::read(&path).expect("read pattern file");
+                (path, bytes)
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let before = snapshot(&patterns);
+
+    pt_core_fast()
+        .args(["--format", "json", "--config"])
+        .arg(&source_dir)
+        .args(["agent", "fleet", "transfer", "export", "--out"])
+        .arg(&export_path)
+        .assert()
+        .success();
+    let bundle: Value =
+        serde_json::from_str(&fs::read_to_string(&export_path).expect("read bundle"))
+            .expect("bundle json");
+    assert!(
+        bundle["signatures"]["patterns"]
+            .as_array()
+            .is_some_and(|p| !p.is_empty()),
+        "bundle carries the exported pattern: {bundle}"
+    );
+
+    let out = pt_core_fast()
+        .args(["--format", "json", "--config"])
+        .arg(&target_dir)
+        .args(["agent", "fleet", "transfer", "import", "--from"])
+        .arg(&export_path)
+        .args(["--merge-strategy", "replace", "--no-backup"])
+        .output()
+        .expect("run import");
+    let response: Value = serde_json::from_slice(&out.stdout).expect("import output is JSON");
+    assert_eq!(snapshot(&patterns), before, "pattern files were rewritten");
+    assert!(response["signatures"].is_null(), "{response}");
+}
