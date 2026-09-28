@@ -200,13 +200,37 @@ fn readable_config_file_in(
     legacy_dir: Option<&Path>,
 ) -> PathBuf {
     let path = file_in(config_dir);
-    if path.exists() || config_dir != default_dir {
+    if path.exists() {
         return path;
     }
-    match legacy_dir.filter(|legacy| *legacy != default_dir) {
-        Some(legacy) if file_in(legacy).exists() => file_in(legacy),
+    match legacy_read_dir_in(config_dir, default_dir, legacy_dir) {
+        Some(legacy) if file_in(&legacy).exists() => file_in(&legacy),
         _ => path,
     }
+}
+
+/// The pre-GH #18 directory to read signature and pattern files from when
+/// `config_dir` lacks them: `Some` only when `config_dir` is the default config
+/// directory (no override) and the old location differs from it (macOS).
+pub fn legacy_read_dir(config_dir: &Path) -> Option<PathBuf> {
+    legacy_read_dir_in(
+        config_dir,
+        &crate::config::default_config_dir(),
+        crate::config::legacy_signature_config_dir().as_deref(),
+    )
+}
+
+fn legacy_read_dir_in(
+    config_dir: &Path,
+    default_dir: &Path,
+    legacy_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if config_dir != default_dir {
+        return None;
+    }
+    legacy_dir
+        .filter(|legacy| *legacy != default_dir)
+        .map(Path::to_path_buf)
 }
 
 /// Load user signatures from a config directory
@@ -1570,6 +1594,26 @@ mod tests {
             read(&default_dir, user_signatures_path),
             user_signatures_path(&default_dir)
         );
+    }
+
+    #[test]
+    fn legacy_read_dir_only_without_an_override_and_only_when_it_differs() {
+        let default_dir = Path::new("/home/u/.config/process_triage");
+        let legacy_dir = Path::new("/home/u/Library/Application Support/process_triage");
+        assert_eq!(
+            legacy_read_dir_in(default_dir, default_dir, Some(legacy_dir)),
+            Some(legacy_dir.to_path_buf())
+        );
+        assert_eq!(
+            legacy_read_dir_in(Path::new("/elsewhere"), default_dir, Some(legacy_dir)),
+            None
+        );
+        // Linux: the old and new locations are the same directory.
+        assert_eq!(
+            legacy_read_dir_in(default_dir, default_dir, Some(default_dir)),
+            None
+        );
+        assert_eq!(legacy_read_dir_in(default_dir, default_dir, None), None);
     }
 
     #[test]

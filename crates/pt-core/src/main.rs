@@ -6430,7 +6430,8 @@ fn run_agent_fleet_transfer_export(
 
     let signatures_opt: Option<PersistedSchema> = if args.include_signatures {
         let config_dir = resolved_config_dir(global);
-        let mut lib = PatternLibrary::new(&config_dir);
+        let mut lib = PatternLibrary::new(&config_dir)
+            .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
         if lib.load().is_ok() {
             Some(lib.export(&[
                 PatternSource::Learned,
@@ -6733,7 +6734,8 @@ fn run_agent_fleet_transfer_import(
 
     let sig_result = if let Some(ref incoming_sigs) = bundle.signatures {
         let config_dir = resolved_config_dir(global);
-        let mut lib = PatternLibrary::new(&config_dir);
+        let mut lib = PatternLibrary::new(&config_dir)
+            .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
         let _ = lib.load();
 
         let resolution = match strategy {
