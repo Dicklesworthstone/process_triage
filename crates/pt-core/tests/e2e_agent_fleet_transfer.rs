@@ -273,7 +273,8 @@ fn fleet_transfer_ptb_export_and_passphrase_reads() {
 /// A pattern file that fails to load must not let the import rewrite the user's
 /// pattern files: save() writes every file from memory, so after a failed load it
 /// replaced disabled.json (and the unreadable file) with whatever had loaded
-/// before the error.
+/// before the error. Nor may the import merge the priors and then report success
+/// with the signatures silently skipped: it fails and writes nothing.
 #[test]
 fn fleet_transfer_import_leaves_pattern_files_alone_when_they_fail_to_load() {
     use pt_core::supervision::pattern_persistence::PatternLibrary;
@@ -290,8 +291,12 @@ fn fleet_transfer_import_leaves_pattern_files_alone_when_they_fail_to_load() {
             .with_process_patterns(vec![format!("^{name}$").as_str()])
             .with_confidence(0.8)
     };
-    write_priors(&source_dir, &Priors::default());
+    write_priors(
+        &source_dir,
+        &priors_with_useful_prob(0.62, 0.11, 0.19, 0.08),
+    );
     write_priors(&target_dir, &Priors::default());
+    let target_priors = fs::read(target_dir.join("priors.json")).expect("read priors");
     let mut source = PatternLibrary::new(&source_dir);
     source.add_custom(sig("exported")).expect("add exported");
     source.save().expect("save source");
@@ -337,6 +342,10 @@ fn fleet_transfer_import_leaves_pattern_files_alone_when_they_fail_to_load() {
             .is_some_and(|p| !p.is_empty()),
         "bundle carries the exported pattern: {bundle}"
     );
+    assert!(
+        !bundle["priors"].is_null(),
+        "bundle carries priors: {bundle}"
+    );
 
     let out = pt_core_fast()
         .args(["--format", "json", "--config"])
@@ -348,5 +357,11 @@ fn fleet_transfer_import_leaves_pattern_files_alone_when_they_fail_to_load() {
         .expect("run import");
     let response: Value = serde_json::from_slice(&out.stdout).expect("import output is JSON");
     assert_eq!(snapshot(&patterns), before, "pattern files were rewritten");
-    assert!(response["signatures"].is_null(), "{response}");
+    assert!(!out.status.success(), "import reported success: {response}");
+    assert_eq!(response["status"], "error", "{response}");
+    assert_eq!(
+        fs::read(target_dir.join("priors.json")).expect("read priors"),
+        target_priors,
+        "priors were merged although the signature import failed"
+    );
 }

@@ -6697,6 +6697,38 @@ fn run_agent_fleet_transfer_import(
         return ExitCode::Clean;
     }
 
+    // Load the local pattern library and merge the bundle's signatures in memory
+    // before writing anything: a failure here must leave both the priors and the
+    // pattern files untouched, not merge the priors and then report success with
+    // the signatures silently skipped. save() rewrites every pattern file,
+    // disabled.json and pattern_stats.json from memory, so it must never follow a
+    // failed load.
+    let pending_signatures = if let Some(ref incoming_sigs) = bundle.signatures {
+        let config_dir = resolved_config_dir(global);
+        let mut lib = PatternLibrary::new(&config_dir)
+            .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
+        let resolution = match strategy {
+            MergeStrategy::Replace => ConflictResolution::ReplaceWithImported,
+            MergeStrategy::KeepLocal => ConflictResolution::KeepExisting,
+            MergeStrategy::Weighted => ConflictResolution::KeepHigherConfidence,
+        };
+        match lib
+            .load()
+            .and_then(|()| lib.import(incoming_sigs.clone(), resolution))
+        {
+            Ok(result) => Some((lib, result)),
+            Err(e) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer import",
+                    &format!("signature import failed, nothing was written: {e}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     if let Some(ref final_priors) = merged_priors {
         let priors_path = config
             .snapshot()
@@ -6732,37 +6764,28 @@ fn run_agent_fleet_transfer_import(
         }
     }
 
-    let sig_result = if let Some(ref incoming_sigs) = bundle.signatures {
-        let config_dir = resolved_config_dir(global);
-        let mut lib = PatternLibrary::new(&config_dir)
-            .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
-        let resolution = match strategy {
-            MergeStrategy::Replace => ConflictResolution::ReplaceWithImported,
-            MergeStrategy::KeepLocal => ConflictResolution::KeepExisting,
-            MergeStrategy::Weighted => ConflictResolution::KeepHigherConfidence,
-        };
-
-        // save() rewrites every pattern file, disabled.json and pattern_stats.json
-        // from memory; after a failed load that would replace the user's files with
-        // whatever loaded before the error (possibly nothing).
-        match lib
-            .load()
-            .and_then(|()| lib.import(incoming_sigs.clone(), resolution))
-            .and_then(|result| lib.save().map(|()| result))
-        {
-            Ok(result) => Some(serde_json::json!({
+    let sig_result = match pending_signatures {
+        Some((mut lib, result)) => {
+            if let Err(e) = lib.save() {
+                eprintln!(
+                    "fleet transfer import: saving signatures failed{}: {}",
+                    if merged_priors.is_some() {
+                        " (priors were already merged)"
+                    } else {
+                        ""
+                    },
+                    e
+                );
+                return ExitCode::IoError;
+            }
+            Some(serde_json::json!({
                 "imported": result.imported,
                 "updated": result.updated,
                 "skipped": result.skipped,
                 "conflicts": result.conflicts.len(),
-            })),
-            Err(e) => {
-                eprintln!("warning: signature import failed: {}", e);
-                None
-            }
+            }))
         }
-    } else {
-        None
+        None => None,
     };
 
     let response = serde_json::json!({
