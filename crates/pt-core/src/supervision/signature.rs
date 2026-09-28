@@ -1652,7 +1652,13 @@ impl SignatureDatabase {
             SupervisorSignature::new("cargo-test", SupervisorCategory::Other)
                 .with_confidence(0.85)
                 .with_notes("Cargo test runner for Rust")
-                .with_arg_patterns(vec![r"(cargo.*test|cargo-nextest)"])
+                // `cargo [+toolchain|--flag]... test|nextest` or `cargo-nextest`. The former
+                // `cargo.*test` matched any command line with "cargo" before "test"
+                // anywhere, e.g. every daemon under ~/.cargo/bin/ given a path with "test"
+                // in it, and rated it likely abandoned (GH #15).
+                .with_arg_patterns(vec![
+                    r"(^|[\s/])cargo(\s+[+-]\S+)*\s+(test|nextest)(\s|$)|(^|[\s/])cargo-nextest(\s|$)",
+                ])
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1662,7 +1668,7 @@ impl SignatureDatabase {
             SupervisorSignature::new("go-test", SupervisorCategory::Other)
                 .with_confidence(0.85)
                 .with_notes("Go test runner")
-                .with_arg_patterns(vec![r"go\s+test"])
+                .with_arg_patterns(vec![r"(^|[\s/])go\s+test(\s|$)"])
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -2798,6 +2804,19 @@ mod tests {
                 "esbuild",
             ),
             ("node", "node ./node_modules/.bin/vitest run", "vitest"),
+            ("cargo", "cargo test --workspace", "cargo-test"),
+            (
+                "cargo",
+                "/home/u/.cargo/bin/cargo +nightly-2026-09-01 test -p pt-core",
+                "cargo-test",
+            ),
+            ("cargo", "cargo nextest run", "cargo-test"),
+            (
+                "cargo-nextest",
+                "/home/u/.cargo/bin/cargo-nextest nextest run",
+                "cargo-test",
+            ),
+            ("go", "go test ./...", "go-test"),
         ] {
             assert_eq!(best(comm, cmd).as_deref(), Some(expected), "{cmd:?}");
         }
@@ -2813,6 +2832,12 @@ mod tests {
             ),
             ("node", "node server.js --favorites-invite"),
             ("rg", "rg jestConfig src/"),
+            // A daemon installed with cargo whose arguments mention "test".
+            (
+                "cass",
+                "/home/u/.cargo/bin/cass index --watch --data-dir /data/tmp/cass-test",
+            ),
+            ("python3", "python3 seed.py --backend mongo test"),
         ] {
             assert_eq!(best(comm, cmd), None, "{cmd:?}");
         }
