@@ -196,6 +196,29 @@ pub fn validate_policy(policy: &crate::policy::Policy) -> ValidationResult<()> {
     // hosts services are protected by cgroup placement, so requiring [1] only hid
     // every PID-1 child (e.g. zombie parents) on hosts that opted out.
 
+    // An empty guardrail pattern matches every command line: it silently protects
+    // (or force-reviews) every process, which is always a typo.
+    for (field, patterns) in [
+        (
+            "guardrails.protected_patterns",
+            &policy.guardrails.protected_patterns,
+        ),
+        (
+            "guardrails.force_review_patterns",
+            &policy.guardrails.force_review_patterns,
+        ),
+    ] {
+        if let Some(index) = patterns
+            .iter()
+            .position(|entry| entry.pattern.trim().is_empty())
+        {
+            return Err(ValidationError::InvalidValue {
+                field: format!("{field}[{index}].pattern"),
+                message: "Must not be empty".to_string(),
+            });
+        }
+    }
+
     validate_load_aware(&policy.load_aware)?;
 
     Ok(())
@@ -607,6 +630,24 @@ mod tests {
         let mut policy = crate::policy::Policy::default();
         policy.guardrails.never_kill_ppid = vec![2, 3];
         assert!(validate_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn policy_guardrails_empty_pattern_rejected() {
+        for force_review in [false, true] {
+            let mut policy = crate::policy::Policy::default();
+            let entry = crate::policy::PatternEntry {
+                pattern: " ".to_string(),
+                ..policy.guardrails.protected_patterns[0].clone()
+            };
+            if force_review {
+                policy.guardrails.force_review_patterns.push(entry);
+            } else {
+                policy.guardrails.protected_patterns.push(entry);
+            }
+            let err = validate_policy(&policy).expect_err("empty pattern accepted");
+            assert!(err.to_string().contains("pattern"), "{err}");
+        }
     }
 
     #[test]
