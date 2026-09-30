@@ -220,6 +220,17 @@ fn session_with_actions(data_dir: &Path, actions: Vec<PlanAction>) -> String {
 
 /// Run a real (non-dry-run) `agent apply` and return the single outcome status.
 fn apply(data_dir: &Path, config_dir: &Path, session: &str, target: &str) -> (String, Value) {
+    apply_with_args(data_dir, config_dir, session, target, &[])
+}
+
+/// [`apply`] with extra `agent apply` arguments.
+fn apply_with_args(
+    data_dir: &Path,
+    config_dir: &Path,
+    session: &str,
+    target: &str,
+    extra: &[&str],
+) -> (String, Value) {
     let out = cargo_bin_cmd!("pt-core")
         .timeout(Duration::from_secs(120))
         .env("PT_SKIP_GLOBAL_LOCK", "1")
@@ -237,6 +248,7 @@ fn apply(data_dir: &Path, config_dir: &Path, session: &str, target: &str) -> (St
             target,
             "--yes",
         ])
+        .args(extra)
         .output()
         .expect("run agent apply");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -535,4 +547,68 @@ fn agent_apply_data_loss_gate_blocks_kill_of_open_writer() {
         "blocked by the data-loss gate: {json}"
     );
     assert!(writer.alive(), "open writer must survive");
+}
+
+/// --max-total-blast-radius accumulates the memory of each kill (bd-qr40.7): apply
+/// recorded 0 bytes per kill, so the run-wide budget never ran out. Three kills of
+/// 100 MB each (plan memory) against a 250 MB budget: two run, the third is refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_total_blast_radius_budget_refuses_kills_past_the_cap() {
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    write_test_policy(config_dir.path());
+
+    let victims = [
+        ForeignTarget::spawn("sleep 311"),
+        ForeignTarget::spawn("sleep 312"),
+        ForeignTarget::spawn("sleep 313"),
+    ];
+    let mut actions = Vec::new();
+    let mut targets = Vec::new();
+    for (i, victim) in victims.iter().enumerate() {
+        let identity = live_identity(victim.pid);
+        targets.push(format!("{}:{}", victim.pid, identity.start_id.0));
+        let mut action = plan_action(Action::Kill, &identity);
+        action.action_id = format!("a-kill-{i}");
+        action.order = i as u32;
+        action.rationale.memory_mb = Some(100.0);
+        actions.push(action);
+    }
+    let s = session_with_actions(data_dir.path(), actions);
+
+    let (_, json) = apply_with_args(
+        data_dir.path(),
+        config_dir.path(),
+        &s,
+        &targets.join(","),
+        &["--max-total-blast-radius", "250"],
+    );
+    let outcomes = json["outcomes"].as_array().expect("outcomes");
+    let statuses: Vec<(u64, &str)> = outcomes
+        .iter()
+        .map(|o| {
+            (
+                o["pid"].as_u64().expect("pid"),
+                o["status"].as_str().expect("status"),
+            )
+        })
+        .collect();
+    let succeeded: Vec<u64> = statuses
+        .iter()
+        .filter(|(_, st)| *st == "success")
+        .map(|(pid, _)| *pid)
+        .collect();
+    let refused: Vec<u64> = statuses
+        .iter()
+        .filter(|(_, st)| *st == "blocked_by_constraints")
+        .map(|(pid, _)| *pid)
+        .collect();
+    assert_eq!(succeeded.len(), 2, "two kills fit in 250 MB: {json}");
+    assert_eq!(refused.len(), 1, "the third would reach 300 MB: {json}");
+    let survivor = victims
+        .iter()
+        .find(|v| u64::from(v.pid) == refused[0])
+        .expect("refused pid is one of ours");
+    assert!(survivor.alive(), "a refused target must survive");
 }
