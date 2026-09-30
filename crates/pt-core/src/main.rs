@@ -12198,6 +12198,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let fast_path_used = score.fast_path_used;
         let fast_path_skip_reason = score.fast_path_skip_reason;
         let desktop_app = score.desktop_app;
+        let desktop_app_credited = score.desktop_app_credited;
         #[cfg(target_os = "linux")]
         let provenance_adjustment = score.provenance;
         if signature_match.is_some() {
@@ -12552,6 +12553,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 "prior_source": prior_source_label,
                 "learned_prior": learned_prior,
                 "desktop_app": desktop_app,
+                "desktop_app_credited": desktop_app_credited,
                 "fast_path": {
                     "enabled": fast_path_config.enabled,
                     "used": fast_path_used,
@@ -13658,6 +13660,7 @@ fn build_process_explanation(
             "match_level": match_level_label(m.level),
         })),
         "desktop_app": score.desktop_app,
+        "desktop_app_credited": score.desktop_app_credited,
     });
 
     // Add Bayes factors if galaxy_brain mode or requested

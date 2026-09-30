@@ -466,6 +466,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 .unwrap_or_default();
             let prior_source = score.as_ref().map(|s| s.prior_source.clone());
             let desktop_app = score.as_ref().and_then(|s| s.desktop_app.clone());
+            let desktop_app_credited = score.as_ref().is_some_and(|s| s.desktop_app_credited);
             let posterior = score.map(|s| s.posterior.posterior);
 
             let result = serde_json::json!({
@@ -493,6 +494,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 "protected": evaluator.protection(p),
                 "prior_source": prior_source,
                 "desktop_app": desktop_app,
+                "desktop_app_credited": desktop_app_credited,
                 "evidence": evidence_terms,
             });
 

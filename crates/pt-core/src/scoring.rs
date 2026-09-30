@@ -115,6 +115,23 @@ fn desktop_app_term() -> EvidenceTerm {
     }
 }
 
+/// Whether the signature that set a process's class prior expects it to be left
+/// behind (e.g. the built-in test runners: `likely_abandoned`). A desktop
+/// application unit then only says who started the process, not that someone is
+/// using it: a jest that an editor extension spawned inside the editor's `app-*`
+/// unit and that has been stuck for hours is still a stuck jest.
+fn signature_expects_abandoned(sig_match: &SignatureMatch<'_>, priors: &Priors) -> bool {
+    let sig_priors = &sig_match.signature.priors;
+    let Some(abandoned) = sig_priors.abandoned.as_ref() else {
+        return false;
+    };
+    let useful = sig_priors
+        .useful
+        .as_ref()
+        .map_or(priors.classes.useful.prior_prob, |useful| useful.mean());
+    abandoned.mean() > useful
+}
+
 /// A process's score, with everything that went into it.
 #[derive(Debug, Clone)]
 pub struct ProcessScore<'a> {
@@ -129,6 +146,9 @@ pub struct ProcessScore<'a> {
     pub fast_path_skip_reason: Option<&'static str>,
     /// The desktop application unit, when the process is a desktop application.
     pub desktop_app: Option<String>,
+    /// Whether the desktop-application ownership term was applied. It is withheld
+    /// when the signature that set the prior expects the process to be abandoned.
+    pub desktop_app_credited: bool,
     /// Provenance adjustment, when the scorer collected provenance.
     #[cfg(target_os = "linux")]
     pub provenance: Option<ProvenanceScoreAdjustment>,
@@ -267,10 +287,22 @@ impl Scorer {
             }
         };
 
-        if desktop_app.is_some() {
+        // Only when the signature actually set the prior (not a learned verdict, and
+        // not a match too weak for its priors to apply).
+        let signature_set_prior =
+            matches!(prior_source.as_str(), "signature" | "signature_fast_path");
+        let abandon_signature = signature
+            .as_ref()
+            .filter(|sig_match| {
+                signature_set_prior && signature_expects_abandoned(sig_match, &self.priors)
+            })
+            .map(|sig_match| sig_match.signature.name.clone());
+        let mut desktop_app_credited = false;
+        if desktop_app.is_some() && abandon_signature.is_none() {
             if let Ok(adjusted) = apply_evidence_terms(&posterior, [desktop_app_term()]) {
                 posterior = adjusted;
                 ledger = EvidenceLedger::from_posterior_result(&posterior, Some(pid), None);
+                desktop_app_credited = true;
             }
         }
 
@@ -303,10 +335,13 @@ impl Scorer {
             });
 
         if let Some(unit) = desktop_app.as_deref() {
-            ledger.top_evidence.insert(
-                0,
-                format!("Desktop application ({unit}) started by the graphical session"),
-            );
+            let line = match abandon_signature.as_deref() {
+                Some(name) => format!(
+                    "Desktop application unit ({unit}), no desktop-app credit: signature '{name}' expects it to be abandoned"
+                ),
+                None => format!("Desktop application ({unit}) started by the graphical session"),
+            };
+            ledger.top_evidence.insert(0, line);
             ledger
                 .evidence_glyphs
                 .insert(DESKTOP_APP_FEATURE.to_string(), "🖥".to_string());
@@ -343,6 +378,7 @@ impl Scorer {
             fast_path_used,
             fast_path_skip_reason,
             desktop_app,
+            desktop_app_credited,
             #[cfg(target_os = "linux")]
             provenance,
         })
@@ -888,6 +924,104 @@ mod tests {
             desktop.desktop_app.as_deref(),
             Some("app-Hyprland-slack-4821.scope")
         );
+        assert!(desktop.desktop_app_credited);
+    }
+
+    fn has_desktop_term(score: &ProcessScore<'_>) -> bool {
+        score
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|t| t.feature == DESKTOP_APP_FEATURE)
+    }
+
+    /// A stuck jest that an editor extension spawned inside the editor's `app-*` unit
+    /// is still a stuck jest: the built-in jest signature expects it to be abandoned,
+    /// so the unit earns it no "someone is using this" credit.
+    #[test]
+    fn desktop_unit_gives_no_credit_when_signature_expects_abandoned() {
+        let scorer = scorer(SignatureDatabase::with_defaults());
+        let jest = record(
+            5150,
+            "node",
+            "node /home/alice/app/node_modules/.bin/jest --runInBand",
+            FOUR_DAYS,
+        );
+        let unit = "app-code-4821.scope".to_string();
+
+        let plain = scorer
+            .score_with_desktop(&jest, Evidence::from_snapshot(&jest), None)
+            .expect("score");
+        let desktop = scorer
+            .score_with_desktop(&jest, Evidence::from_snapshot(&jest), Some(unit.clone()))
+            .expect("score");
+
+        assert_eq!(desktop.prior_source, "signature");
+        assert!(!desktop.desktop_app_credited);
+        assert!(!has_desktop_term(&desktop));
+        assert_eq!(desktop.desktop_app.as_deref(), Some(unit.as_str()));
+        assert!(
+            desktop
+                .ledger
+                .top_evidence
+                .iter()
+                .any(|line| line.contains("no desktop-app credit")
+                    && line.contains("signature 'jest'")),
+            "{:?}",
+            desktop.ledger.top_evidence
+        );
+        assert!(
+            desktop.posterior.posterior.intervention_probability() >= 0.7,
+            "stuck jest in an app unit fell below the plan threshold: {:?}",
+            desktop.posterior.posterior
+        );
+        // Only "no TTY" is neutralized; the unit does not pull it toward useful.
+        assert!(
+            desktop.posterior.posterior.useful <= plain.posterior.posterior.useful + 0.05,
+            "desktop {:?} vs plain {:?}",
+            desktop.posterior.posterior,
+            plain.posterior.posterior
+        );
+    }
+
+    /// Signatures that expect the process to be in use keep the credit, and a
+    /// learned verdict (which replaces the signature prior) restores it.
+    #[test]
+    fn desktop_credit_kept_for_useful_signatures_and_learned_verdicts() {
+        let mut db = SignatureDatabase::with_defaults();
+        db.add(
+            SupervisorSignature::new("editor-helper", SupervisorCategory::Ide)
+                .with_process_patterns(vec!["^edhelper$"])
+                .with_priors(SignaturePriors::likely_useful()),
+        )
+        .expect("valid signature");
+        let mut scorer = scorer(db);
+        let unit = Some("app-code-4821.scope".to_string());
+
+        let helper = record(5160, "edhelper", "edhelper --stdio", FOUR_DAYS);
+        let score = scorer
+            .score_with_desktop(&helper, Evidence::from_snapshot(&helper), unit.clone())
+            .expect("score");
+        assert_eq!(score.prior_source, "signature");
+        assert!(score.desktop_app_credited && has_desktop_term(&score));
+        drop(score);
+
+        let jest = record(
+            5170,
+            "node",
+            "node /home/alice/app/node_modules/.bin/jest --watch",
+            FOUR_DAYS,
+        );
+        for _ in 0..3 {
+            scorer
+                .decisions
+                .record(&jest.comm, &jest.cmd, Verdict::Spare);
+        }
+        let score = scorer
+            .score_with_desktop(&jest, Evidence::from_snapshot(&jest), unit)
+            .expect("score");
+        assert_eq!(score.prior_source, "user");
+        assert!(score.desktop_app_credited && has_desktop_term(&score));
     }
 
     /// A signature's priors reach every surface through the scorer (GH #13/#16): a
