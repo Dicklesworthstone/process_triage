@@ -365,3 +365,130 @@ fn fleet_transfer_import_leaves_pattern_files_alone_when_they_fail_to_load() {
         "priors were merged although the signature import failed"
     );
 }
+
+/// `transfer diff` and `import --dry-run` compare the bundle with the local pattern
+/// library: before, they passed no local signatures, so every incoming signature
+/// was reported as new and nothing as unchanged or local-only.
+#[test]
+fn fleet_transfer_diff_compares_against_local_patterns() {
+    use pt_core::supervision::pattern_persistence::PatternLibrary;
+    use pt_core::supervision::signature::SupervisorSignature;
+    use pt_core::supervision::SupervisorCategory;
+
+    let temp = TempDir::new().expect("create temp dir");
+    let source_dir = temp.path().join("source");
+    let target_dir = temp.path().join("target");
+    let export_path = temp.path().join("fleet_transfer.json");
+
+    let sig = |name: &str, confidence: f64| {
+        SupervisorSignature::new(name, SupervisorCategory::Other)
+            .with_process_patterns(vec![format!("^{name}$").as_str()])
+            .with_confidence(confidence)
+    };
+    write_priors(&source_dir, &Priors::default());
+    write_priors(&target_dir, &Priors::default());
+    let mut source = PatternLibrary::new(&source_dir);
+    source.add_custom(sig("shared", 0.8)).expect("add shared");
+    source.add_custom(sig("retuned", 0.9)).expect("add retuned");
+    source.add_custom(sig("brand_new", 0.7)).expect("add new");
+    source.save().expect("save source");
+    let mut target = PatternLibrary::new(&target_dir);
+    target.add_custom(sig("shared", 0.8)).expect("add shared");
+    target
+        .add_learned(sig("retuned", 0.5))
+        .expect("add retuned");
+    target
+        .add_custom(sig("local_only", 0.6))
+        .expect("add local");
+    target.save().expect("save target");
+
+    pt_core_fast()
+        .args(["--format", "json", "--config"])
+        .arg(&source_dir)
+        .args(["agent", "fleet", "transfer", "export", "--out"])
+        .arg(&export_path)
+        .assert()
+        .success();
+
+    let change_types = |changes: &Value| -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = changes
+            .as_array()
+            .expect("signature_changes array")
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().expect("name").to_string(),
+                    c["change_type"].as_str().expect("change_type").to_string(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let expected: Vec<(String, String)> = [
+        ("brand_new", "added"),
+        ("local_only", "removed"),
+        ("retuned", "updated"),
+        ("shared", "unchanged"),
+    ]
+    .iter()
+    .map(|(n, t)| (n.to_string(), t.to_string()))
+    .collect();
+
+    let out = pt_core_fast()
+        .args(["--format", "json", "--config"])
+        .arg(&target_dir)
+        .args(["agent", "fleet", "transfer", "diff", "--from"])
+        .arg(&export_path)
+        .output()
+        .expect("run diff");
+    assert!(out.status.success(), "diff failed: {out:?}");
+    let response: Value = serde_json::from_slice(&out.stdout).expect("diff output is JSON");
+    assert_eq!(
+        change_types(&response["diff"]["signature_changes"]),
+        expected,
+        "{response}"
+    );
+
+    let out = pt_core_fast()
+        .args(["--format", "json", "--config"])
+        .arg(&target_dir)
+        .args(["agent", "fleet", "transfer", "import", "--from"])
+        .arg(&export_path)
+        .arg("--dry-run")
+        .output()
+        .expect("run dry-run import");
+    assert!(out.status.success(), "dry-run import failed: {out:?}");
+    let response: Value = serde_json::from_slice(&out.stdout).expect("import output is JSON");
+    assert_eq!(
+        change_types(&response["diff"]["details"]["signature_changes"]),
+        expected,
+        "{response}"
+    );
+}
+
+/// An unreadable pattern library fails the export instead of silently producing a
+/// bundle without signatures.
+#[test]
+fn fleet_transfer_export_fails_when_patterns_cannot_load() {
+    let temp = TempDir::new().expect("create temp dir");
+    let config_dir = temp.path().join("config");
+    let export_path = temp.path().join("fleet_transfer.json");
+    write_priors(&config_dir, &Priors::default());
+    fs::create_dir_all(config_dir.join("patterns")).expect("mkdir patterns");
+    fs::write(
+        config_dir.join("patterns").join("custom.json"),
+        "{ not json",
+    )
+    .expect("corrupt custom.json");
+
+    let out = pt_core_fast()
+        .args(["--format", "json", "--config"])
+        .arg(&config_dir)
+        .args(["agent", "fleet", "transfer", "export", "--out"])
+        .arg(&export_path)
+        .output()
+        .expect("run export");
+    assert!(!out.status.success(), "export succeeded: {out:?}");
+    assert!(!export_path.exists(), "a bundle was written");
+}

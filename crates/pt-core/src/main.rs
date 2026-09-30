@@ -6405,9 +6405,7 @@ fn run_agent_fleet_transfer_export(
     args: &AgentFleetTransferExportArgs,
 ) -> ExitCode {
     use pt_core::fleet::transfer::export_bundle;
-    use pt_core::supervision::pattern_persistence::{
-        PatternLibrary, PatternSource, PersistedSchema,
-    };
+    use pt_core::supervision::pattern_persistence::PersistedSchema;
 
     let host_id = pt_core::logging::get_host_id();
 
@@ -6428,18 +6426,11 @@ fn run_agent_fleet_transfer_export(
         None
     };
 
+    // An unreadable pattern library is an error, not a bundle without signatures.
     let signatures_opt: Option<PersistedSchema> = if args.include_signatures {
-        let config_dir = resolved_config_dir(global);
-        let mut lib = PatternLibrary::new(&config_dir)
-            .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
-        if lib.load().is_ok() {
-            Some(lib.export(&[
-                PatternSource::Learned,
-                PatternSource::Custom,
-                PatternSource::Imported,
-            ]))
-        } else {
-            None
+        match load_transfer_signatures(global) {
+            Ok(signatures) => Some(signatures),
+            Err(e) => return output_agent_error(global, "fleet transfer export", &e),
         }
     } else {
         None
@@ -6655,7 +6646,11 @@ fn run_agent_fleet_transfer_import(
         None
     };
 
-    let diff = compute_diff(Some(&config.priors), None, &bundle);
+    let local_signatures = match local_transfer_signatures(global, &bundle) {
+        Ok(local) => local,
+        Err(e) => return output_agent_error(global, "fleet transfer import", &e),
+    };
+    let diff = compute_diff(Some(&config.priors), local_signatures.as_ref(), &bundle);
 
     if args.dry_run {
         let response = serde_json::json!({
@@ -6824,6 +6819,38 @@ fn run_agent_fleet_transfer_import(
     ExitCode::Clean
 }
 
+/// The signatures `fleet transfer` moves between hosts: the learned, custom and
+/// imported patterns of the local pattern library, read from the config directory
+/// (and, without an override, from the pre-GH #18 macOS location for files it
+/// lacks).
+fn load_transfer_signatures(
+    global: &GlobalOpts,
+) -> Result<pt_core::supervision::pattern_persistence::PersistedSchema, String> {
+    use pt_core::supervision::pattern_persistence::{PatternLibrary, PatternSource};
+    let config_dir = resolved_config_dir(global);
+    let mut lib = PatternLibrary::new(&config_dir)
+        .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
+    lib.load()
+        .map_err(|e| format!("could not load the local pattern library: {e}"))?;
+    Ok(lib.export(&[
+        PatternSource::Learned,
+        PatternSource::Custom,
+        PatternSource::Imported,
+    ]))
+}
+
+/// The local side of a signature diff against `bundle`: `None` when the bundle
+/// carries no signatures (nothing to compare).
+fn local_transfer_signatures(
+    global: &GlobalOpts,
+    bundle: &pt_core::fleet::transfer::TransferBundle,
+) -> Result<Option<pt_core::supervision::pattern_persistence::PersistedSchema>, String> {
+    if bundle.signatures.is_none() {
+        return Ok(None);
+    }
+    load_transfer_signatures(global).map(Some)
+}
+
 fn run_agent_fleet_transfer_diff(
     global: &GlobalOpts,
     args: &AgentFleetTransferDiffArgs,
@@ -6893,7 +6920,11 @@ fn run_agent_fleet_transfer_diff(
         Err(e) => return output_config_error(global, &e),
     };
 
-    let diff = compute_diff(Some(&config.priors), None, &bundle);
+    let local_signatures = match local_transfer_signatures(global, &bundle) {
+        Ok(local) => local,
+        Err(e) => return output_agent_error(global, "fleet transfer diff", &e),
+    };
+    let diff = compute_diff(Some(&config.priors), local_signatures.as_ref(), &bundle);
 
     let response = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
