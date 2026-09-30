@@ -272,6 +272,8 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/ma
 
 Releases up to v2.1.0 were published without signatures, so a verified install of them fails closed ("does not publish release-signing-public.pem") and installs nothing. `pt update` verifies by default and says so when it refuses; `pt update --no-verify` installs unverified on explicit request.
 
+The installer and the `pt` wrapper pin the release-signing key: a verified install or `pt update` accepts a release only if its `release-signing-public.pem` has one of the SHA-256 fingerprints (of the DER public key) listed in `TRUSTED_RELEASE_KEY_FINGERPRINTS`, currently `b5084da80f9652304307fa7c3f965ee7840d3815fd863c2b40f4524e00e2e4ee` (first used for v2.2.0). A release signed with any other key is refused even if its signatures are internally consistent. `PT_RELEASE_PUBLIC_KEY_FINGERPRINT` (comma- or space-separated) or `PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE` replaces the built-in list, for example to pin a fork's own key.
+
 **Platforms:** Linux x86_64 (primary), Linux aarch64, macOS x86_64, macOS aarch64, Windows x86_64 (via WSL2 only, using the Linux install)
 
 ---

@@ -252,7 +252,7 @@ jobs:
           echo "Release contents:"
           ls -la release/
 
-      - name: Inject release key fingerprint pins
+      - name: Check release key is pinned
         run: |
           cd release
 
@@ -278,9 +278,14 @@ jobs:
           )"
           printf '%s\n' "$key_fp" > release-signing-public.pem.sha256
 
-          # Pin release artifacts to this fingerprint.
-          sed -i "s|^readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=.*$|readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=\"$key_fp\"|" install.sh
-          sed -i "s|^readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=.*$|readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=\"$key_fp\"|" pt
+          # The pin lists are committed in install.sh and pt; a release signed by
+          # a key they do not list would be refused by every verified install.
+          for f in install.sh pt; do
+            if ! grep -E '^(readonly )?TRUSTED_RELEASE_KEY_FINGERPRINTS=' "$f" | grep -q "$key_fp"; then
+              echo "::error::$f does not pin release key $key_fp (TRUSTED_RELEASE_KEY_FINGERPRINTS)"
+              exit 1
+            fi
+          done
 
           echo "Release key fingerprint: $key_fp"
 

@@ -236,6 +236,10 @@ setup_lifecycle_env() {
     sign_assets_with_key "$ASSETS_V1" "$RELEASE_SIGNING_PRIVATE_KEY"
     sign_assets_with_key "$ASSETS_V2" "$RELEASE_SIGNING_PRIVATE_KEY"
     export PT_RELEASE_PUBLIC_KEY_FILE="$ASSETS_V1/release-signing-public.pem"
+    # The installer pins the real release key; trust this throwaway key explicitly.
+    PT_RELEASE_PUBLIC_KEY_FINGERPRINT="$(openssl pkey -pubin -in "$PT_RELEASE_PUBLIC_KEY_FILE" -outform der \
+        | openssl dgst -sha256 | awk '{print $NF}')"
+    export PT_RELEASE_PUBLIC_KEY_FINGERPRINT
 
     create_mock_uname "$os" "$arch"
     create_versioned_mock_curl "$ASSETS_V1" "$v1" "$ASSETS_V2" "$v2"

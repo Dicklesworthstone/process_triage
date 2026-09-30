@@ -114,6 +114,23 @@ create_release_signatures() {
     openssl pkey -in "$private_key" -pubout -out "$assets_dir/release-signing-public.pem"
 }
 
+# SHA-256 of a public key's DER SubjectPublicKeyInfo (the installer's pin format).
+release_key_fingerprint() {
+    openssl pkey -pubin -in "$1" -outform der | openssl dgst -sha256 | awk '{print $NF}'
+}
+
+# Define the installer's functions in this shell without running main.
+source_installer_functions() {
+    local temp_script="${BATS_TEST_TMPDIR}/installer_functions.sh"
+    sed 's/^main "$@"$//' "$INSTALLER_PATH" > "$temp_script"
+    # shellcheck disable=SC1090
+    source "$temp_script"
+    # Keep bats' errexit; drop the installer's nounset/pipefail.
+    set +u +o pipefail
+}
+
+REAL_RELEASE_DIR="${BATS_TEST_DIRNAME}/fixtures/release_v2.2.0"
+
 # Create mock curl that serves files from a directory
 create_serving_mock_curl() {
     local serve_dir="$1"
@@ -319,6 +336,10 @@ setup_installer_test_env() {
     openssl ecparam -name prime256v1 -genkey -noout -out "$RELEASE_SIGNING_PRIVATE_KEY"
     create_release_signatures "$ASSETS_DIR" "$RELEASE_SIGNING_PRIVATE_KEY"
     export PT_RELEASE_PUBLIC_KEY_FILE="$ASSETS_DIR/release-signing-public.pem"
+    # The installer pins the real release key; trust this throwaway key explicitly.
+    TEST_RELEASE_KEY_FINGERPRINT="$(release_key_fingerprint "$PT_RELEASE_PUBLIC_KEY_FILE")"
+    export TEST_RELEASE_KEY_FINGERPRINT
+    export PT_RELEASE_PUBLIC_KEY_FINGERPRINT="$TEST_RELEASE_KEY_FINGERPRINT"
 
     # Setup mocks
     create_mock_uname "$os" "$arch"
@@ -688,6 +709,117 @@ MOCK_CURL
     [[ "$output" == *"Release public key fingerprint mismatch"* ]]
 
     test_end "fingerprint mismatch" "pass"
+}
+
+@test "installer: built-in pin rejects a release signed by any other key" {
+    # A release whose published key and signatures are all self-consistent, but
+    # made with a key the installer does not pin (e.g. a swapped release asset).
+    setup_installer_test_env "1.0.0" "Linux" "x86_64"
+
+    export DEST="$INSTALL_DEST"
+    export PT_NO_PATH=1
+    export PT_REFRESHED=1
+    unset PT_RELEASE_PUBLIC_KEY_FINGERPRINT PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE
+
+    run bash "$INSTALLER_PATH" --verify
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Release public key fingerprint mismatch"* ]]
+    [[ "$output" == *"Release key: ${TEST_RELEASE_KEY_FINGERPRINT}"* ]]
+    [[ "$output" == *"b5084da80f9652304307fa7c3f965ee7840d3815fd863c2b40f4524e00e2e4ee"* ]]
+    [ ! -f "$INSTALL_DEST/pt" ]
+    [ ! -f "$INSTALL_DEST/pt-core" ]
+}
+
+@test "installer: pin list accepts any listed key (key rotation)" {
+    setup_installer_test_env "1.0.0" "Linux" "x86_64"
+
+    export DEST="$INSTALL_DEST"
+    export PT_NO_PATH=1
+    export PT_REFRESHED=1
+    export PT_RELEASE_PUBLIC_KEY_FINGERPRINT="b5084da80f9652304307fa7c3f965ee7840d3815fd863c2b40f4524e00e2e4ee, ${TEST_RELEASE_KEY_FINGERPRINT^^}"
+
+    run bash "$INSTALLER_PATH" --verify
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Release public key fingerprint verified: ${TEST_RELEASE_KEY_FINGERPRINT:0:16}"* ]]
+    [ -f "$INSTALL_DEST/pt" ]
+    [ -f "$INSTALL_DEST/pt-core" ]
+}
+
+@test "installer: fingerprint file lists several keys, comments skipped" {
+    setup_installer_test_env "1.0.0" "Linux" "x86_64"
+
+    export DEST="$INSTALL_DEST"
+    export PT_NO_PATH=1
+    export PT_REFRESHED=1
+    unset PT_RELEASE_PUBLIC_KEY_FINGERPRINT
+    export PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE="${TEST_DIR}/pins.txt"
+    printf '# retired\n%s  old-key\n%s  release-signing-public.pem\n' \
+        "0000000000000000000000000000000000000000000000000000000000000000" \
+        "$TEST_RELEASE_KEY_FINGERPRINT" > "$PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE"
+
+    run bash "$INSTALLER_PATH" --verify
+    [ "$status" -eq 0 ]
+    [ -f "$INSTALL_DEST/pt-core" ]
+
+    # A missing pin file is an error, not a silent fallback.
+    export DEST="${TEST_DIR}/second_target"
+    export PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE="${TEST_DIR}/no-such-pins.txt"
+    run bash "$INSTALLER_PATH" --verify
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Fingerprint file not found"* ]]
+    [ ! -f "$DEST/pt-core" ]
+}
+
+@test "installer: a malformed pin fails closed instead of disabling the pin" {
+    setup_installer_test_env "1.0.0" "Linux" "x86_64"
+
+    export DEST="$INSTALL_DEST"
+    export PT_NO_PATH=1
+    export PT_REFRESHED=1
+    export PT_RELEASE_PUBLIC_KEY_FINGERPRINT="${TEST_RELEASE_KEY_FINGERPRINT} not-a-fingerprint"
+
+    run bash "$INSTALLER_PATH" --verify
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Invalid release key fingerprint in PT_RELEASE_PUBLIC_KEY_FINGERPRINT: not-a-fingerprint"* ]]
+    [ ! -f "$INSTALL_DEST/pt-core" ]
+}
+
+@test "installer: the real v2.2.0 release key and signatures pass the built-in pin" {
+    source_installer_functions
+    unset PT_RELEASE_PUBLIC_KEY_FINGERPRINT PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE
+
+    [[ "$TRUSTED_RELEASE_KEY_FINGERPRINTS" == *"$(release_key_fingerprint "$REAL_RELEASE_DIR/release-signing-public.pem")"* ]]
+    run check_release_key_pin "$REAL_RELEASE_DIR/release-signing-public.pem"
+    [ "$status" -eq 0 ]
+
+    local sig_out="${BATS_TEST_TMPDIR}/sig"
+    for artifact in pt checksums.sha256; do
+        run verify_file_signature_offline "$REAL_RELEASE_DIR/$artifact" "$artifact" \
+            "$REAL_RELEASE_DIR/release-signing-public.pem" "$sig_out" \
+            "$REAL_RELEASE_DIR/${artifact}.sig"
+        [ "$status" -eq 0 ]
+    done
+    run verify_file_checksum "$REAL_RELEASE_DIR/pt" "pt" "$REAL_RELEASE_DIR/checksums.sha256"
+    [ "$status" -eq 0 ]
+
+    # The same signature does not verify a modified file.
+    cp "$REAL_RELEASE_DIR/pt" "${BATS_TEST_TMPDIR}/pt"
+    printf '# tampered\n' >> "${BATS_TEST_TMPDIR}/pt"
+    run verify_file_signature_offline "${BATS_TEST_TMPDIR}/pt" "pt" \
+        "$REAL_RELEASE_DIR/release-signing-public.pem" "$sig_out" \
+        "$REAL_RELEASE_DIR/pt.sig"
+    [ "$status" -ne 0 ]
+}
+
+@test "installer: pin lists in install.sh and the pt wrapper are identical" {
+    local installer_pins wrapper_pins
+    installer_pins="$(sed -n 's/^TRUSTED_RELEASE_KEY_FINGERPRINTS="\(.*\)"$/\1/p' "$INSTALLER_PATH")"
+    wrapper_pins="$(sed -n 's/^readonly TRUSTED_RELEASE_KEY_FINGERPRINTS="\(.*\)"$/\1/p' "${BATS_TEST_DIRNAME}/../pt")"
+    [ -n "$installer_pins" ]
+    [ "$installer_pins" = "$wrapper_pins" ]
 }
 
 @test "installer: VERIFY=1 fails with corrupted download" {

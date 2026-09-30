@@ -16,13 +16,8 @@ readonly VERSION="2.2.0"
 readonly PT_CORE_BIN="pt-core"
 readonly INSTALL_BASE_URL="https://raw.githubusercontent.com/Dicklesworthstone/process_triage"
 readonly INSTALL_URL="${INSTALL_BASE_URL}/main/install.sh"
-# Release-signing keys `pt update` accepts (SHA-256 of each key's DER
-# SubjectPublicKeyInfo; space separated). Handed to the release's installer as
-# PT_RELEASE_PUBLIC_KEY_FINGERPRINT, so an update is refused if the release is
-# signed by any other key, whatever that installer embeds (an explicit
-# PT_RELEASE_PUBLIC_KEY_FINGERPRINT in the environment wins). Must match
-# TRUSTED_RELEASE_KEY_FINGERPRINTS in install.sh; see there for key rotation.
-readonly TRUSTED_RELEASE_KEY_FINGERPRINTS="b5084da80f9652304307fa7c3f965ee7840d3815fd863c2b40f4524e00e2e4ee"
+# Populated in release artifacts to pin expected installer signing key.
+readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=""
 
 # Locations to search for pt-core
 readonly SEARCH_PATHS=(
@@ -385,10 +380,10 @@ main() {
         # and every `pt update` installed unverified. The env var is kept for newer ones.
         local verify_env=1
         [[ "$verify_arg" == "--no-verify" ]] && verify_env=0
-        local -a installer_env=(
-            "VERIFY=${verify_env}"
-            "PT_RELEASE_PUBLIC_KEY_FINGERPRINT=${PT_RELEASE_PUBLIC_KEY_FINGERPRINT:-$TRUSTED_RELEASE_KEY_FINGERPRINTS}"
-        )
+        local -a installer_env=("VERIFY=${verify_env}")
+        if [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
+            installer_env+=("PT_RELEASE_PUBLIC_KEY_FINGERPRINT=${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}")
+        fi
         local status=0
         if command -v curl &>/dev/null; then
             curl -fsSL "$target_install_url" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
