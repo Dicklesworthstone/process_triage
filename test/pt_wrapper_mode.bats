@@ -397,6 +397,7 @@ cat <<'INSTALLER'
 #!/usr/bin/env bash
 printf 'INSTALLER_ARGS=%s\n' "$*" >> "$PT_INSTALLER_LOG"
 printf 'INSTALLER_PIN=%s\n' "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" >> "$PT_INSTALLER_LOG"
+printf 'INSTALLER_PIN_FILE=%s\n' "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE:-}" >> "$PT_INSTALLER_LOG"
 if [[ " $* " == *" --verify "* ]]; then
   echo "Release v9.9.9 does not publish release-signing-public.pem" >&2
   exit 1
@@ -436,6 +437,16 @@ EOF
     run env PT_RELEASE_PUBLIC_KEY_FINGERPRINT="abc123" PT_CORE_PATH="$MOCK_PT_CORE" \
         PT_INSTALLER_LOG="$log" PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update
     grep -qx "INSTALLER_PIN=abc123" "$log"
+
+    # So is a fingerprint file: the wrapper must not add a
+    # PT_RELEASE_PUBLIC_KEY_FINGERPRINT, which the installer would prefer.
+    : > "$log"
+    run env -u PT_RELEASE_PUBLIC_KEY_FINGERPRINT \
+        PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE="${TEST_DIR}/pins.txt" \
+        PT_CORE_PATH="$MOCK_PT_CORE" \
+        PT_INSTALLER_LOG="$log" PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update
+    grep -qx "INSTALLER_PIN=" "$log"
+    grep -qx "INSTALLER_PIN_FILE=${TEST_DIR}/pins.txt" "$log"
 }
 
 @test "wrapper: update --no-verify is an explicit, warned opt-out" {

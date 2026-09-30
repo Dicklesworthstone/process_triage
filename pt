@@ -20,7 +20,8 @@ readonly INSTALL_URL="${INSTALL_BASE_URL}/main/install.sh"
 # SubjectPublicKeyInfo; space separated). Handed to the release's installer as
 # PT_RELEASE_PUBLIC_KEY_FINGERPRINT, so an update is refused if the release is
 # signed by any other key, whatever that installer embeds (an explicit
-# PT_RELEASE_PUBLIC_KEY_FINGERPRINT in the environment wins). Must match
+# PT_RELEASE_PUBLIC_KEY_FINGERPRINT or PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE in
+# the environment wins). Must match
 # TRUSTED_RELEASE_KEY_FINGERPRINTS in install.sh; see there for key rotation.
 readonly TRUSTED_RELEASE_KEY_FINGERPRINTS="b5084da80f9652304307fa7c3f965ee7840d3815fd863c2b40f4524e00e2e4ee"
 
@@ -385,10 +386,13 @@ main() {
         # and every `pt update` installed unverified. The env var is kept for newer ones.
         local verify_env=1
         [[ "$verify_arg" == "--no-verify" ]] && verify_env=0
-        local -a installer_env=(
-            "VERIFY=${verify_env}"
-            "PT_RELEASE_PUBLIC_KEY_FINGERPRINT=${PT_RELEASE_PUBLIC_KEY_FINGERPRINT:-$TRUSTED_RELEASE_KEY_FINGERPRINTS}"
-        )
+        local -a installer_env=("VERIFY=${verify_env}")
+        # The user's own pin (either variable) is inherited as is; the installer
+        # prefers PT_RELEASE_PUBLIC_KEY_FINGERPRINT, so setting it here would
+        # silently discard a PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE.
+        if [[ -z "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" && -z "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE:-}" ]]; then
+            installer_env+=("PT_RELEASE_PUBLIC_KEY_FINGERPRINT=${TRUSTED_RELEASE_KEY_FINGERPRINTS}")
+        fi
         local status=0
         if command -v curl &>/dev/null; then
             curl -fsSL "$target_install_url" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
