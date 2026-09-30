@@ -1700,7 +1700,17 @@ impl SignatureDatabase {
             SupervisorSignature::new("junit", SupervisorCategory::Other)
                 .with_confidence(0.75)
                 .with_notes("JUnit Java test runner")
-                .with_arg_patterns(vec![r"(junit|org\.junit)"])
+                // A JUnit launcher as the main class (JUnit 4 core, the JUnit 5 console
+                // launcher, IntelliJ, Eclipse), the console launcher jar or Maven's
+                // surefire booter run with -jar, or a Gradle test executor. The former
+                // bare `junit` matched any JVM with a junit jar on its classpath, e.g. a
+                // language server or a Gradle daemon.
+                .with_arg_patterns(vec![concat!(
+                    r"(^|\s)(org\.junit\.runner\.JUnitCore|org\.junit\.platform\.console\.ConsoleLauncher",
+                    r"|com\.intellij\.rt\.junit\.JUnitStarter|org\.eclipse\.jdt\.internal\.junit\.runner\.RemoteTestRunner)(\s|$)",
+                    r"|-jar\s+(\S*/)?(junit-platform-console-standalone|surefire/surefirebooter)[^\s/:]*\.jar(\s|$)",
+                    r"|(^|\s)worker\.org\.gradle\.process\.internal\.worker\.GradleWorkerMain\s+'?Gradle Test Executor\b",
+                )])
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1794,7 +1804,13 @@ impl SignatureDatabase {
             SupervisorSignature::new("django", SupervisorCategory::Other)
                 .with_confidence(0.80)
                 .with_notes("Django Python web server")
-                .with_arg_patterns(vec![r"(manage\.py\s+runserver|django)"])
+                // The development server (`manage.py runserver`, `django-admin runserver`,
+                // `python -m django runserver`). The former bare `django` matched any
+                // command line with the word in a path (a celery worker in
+                // ~/django-app/venv, `rg django`) and gave it dev-server priors.
+                .with_arg_patterns(vec![
+                    r"((^|[\s/])(manage\.py|django-admin(\.py)?)|-m\s+django)\s+runserver(_plus)?(\s|$)",
+                ])
                 .with_env_patterns(HashMap::from([(
                     "DJANGO_SETTINGS_MODULE".into(),
                     ".*".into(),
@@ -1905,7 +1921,16 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("Apache Maven")
                 .with_process_patterns(vec![r"^mvn$"])
-                .with_arg_patterns(vec![r"mvn", r"maven"])
+                // The mvn/mvnw launcher script as an argument of its own (not a
+                // `-Dmaven.home=.../mvn` value), or the JVM it starts (Maven's
+                // classworlds launcher or the wrapper main class). The former `mvn` +
+                // `maven` substrings matched the long-running Maven daemon (mvnd, whose
+                // distribution has a `mvn/` directory) and any JVM whose paths mention
+                // both, and rated them likely abandoned.
+                .with_arg_patterns(vec![concat!(
+                    r"(^|\s)([^\s=]*/)?mvnw?(\s|$)",
+                    r"|(^|\s)(org\.codehaus\.plexus\.classworlds\.launcher\.Launcher|org\.apache\.maven\.wrapper\.MavenWrapperMain)(\s|$)",
+                )])
                 .with_env_patterns(HashMap::from([("MAVEN_HOME".into(), ".*".into())]))
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
@@ -2853,6 +2878,114 @@ mod tests {
             ("go", "go tester ./..."),
         ] {
             assert_eq!(best(comm, cmd), None, "{cmd:?}");
+        }
+    }
+
+    /// junit, maven and django matched bare substrings; they now match the tool's
+    /// launcher, main class or subcommand (the GH #15 treatment of ef8c729).
+    #[test]
+    fn junit_maven_django_match_the_tool_not_substrings() {
+        let db = SignatureDatabase::with_defaults();
+        let matched = |comm: &str, cmd: &str| -> Vec<String> {
+            let ctx = ProcessMatchContext::with_comm(comm).cmdline(cmd);
+            db.match_process(&ctx)
+                .into_iter()
+                .map(|m| m.signature.name.clone())
+                .collect()
+        };
+        for (comm, cmd, expected) in [
+            (
+                "java",
+                "java -cp target/classes:/home/u/.m2/repository/junit/junit/4.13.2/junit-4.13.2.jar org.junit.runner.JUnitCore com.acme.FooTest",
+                "junit",
+            ),
+            (
+                "java",
+                "java -jar /opt/junit/junit-platform-console-standalone-1.10.2.jar --scan-classpath",
+                "junit",
+            ),
+            (
+                "java",
+                "/usr/lib/jvm/java-17/bin/java -ea -Didea.test.cyclic.buffer.size=1048576 -cp /opt/idea/lib/idea_rt.jar:/opt/idea/plugins/junit/lib/junit5-rt.jar com.intellij.rt.junit.JUnitStarter -ideVersion5 -junit5 com.acme.FooTest",
+                "junit",
+            ),
+            (
+                "java",
+                "/usr/lib/jvm/java-17/bin/java -jar /home/u/app/target/surefire/surefirebooter-20260930101500_3.jar /home/u/app/target/surefire 2026-09-30T10-15-00_123-jvmRun1 surefire123.tmp",
+                "junit",
+            ),
+            (
+                "java",
+                "/usr/lib/jvm/java-17/bin/java -Dorg.gradle.internal.worker.tmpdir=/home/u/app/build/tmp/test/work -cp /home/u/.gradle/caches/8.5/workerMain/gradle-worker.jar worker.org.gradle.process.internal.worker.GradleWorkerMain Gradle Test Executor 3",
+                "junit",
+            ),
+            ("mvn", "/bin/sh /usr/bin/mvn clean install", "maven"),
+            ("mvnw", "/bin/sh ./mvnw -q verify", "maven"),
+            (
+                "java",
+                "/usr/lib/jvm/java-17/bin/java -classpath /usr/share/maven/boot/plexus-classworlds-2.7.0.jar -Dclassworlds.conf=/usr/share/maven/bin/m2.conf -Dmaven.home=/usr/share/maven -Dmaven.multiModuleProjectDirectory=/home/u/app org.codehaus.plexus.classworlds.launcher.Launcher clean install",
+                "maven",
+            ),
+            (
+                "java",
+                "java -classpath /home/u/app/.mvn/wrapper/maven-wrapper.jar -Dmaven.multiModuleProjectDirectory=/home/u/app org.apache.maven.wrapper.MavenWrapperMain test",
+                "maven",
+            ),
+            ("python3", "python3 manage.py runserver 0.0.0.0:8000", "django"),
+            ("python", "python ./manage.py runserver_plus", "django"),
+            (
+                "python3",
+                "/home/u/app/venv/bin/python3 /home/u/app/venv/bin/django-admin runserver",
+                "django",
+            ),
+            ("python3", "python3 -m django runserver --settings=app.settings", "django"),
+        ] {
+            let names = matched(comm, cmd);
+            assert!(names.iter().any(|n| n == expected), "{cmd:?}: {names:?}");
+        }
+        for (comm, cmd, unexpected) in [
+            // A language server and a Gradle daemon with junit jars on the classpath.
+            (
+                "java",
+                "java -Declipse.application=org.eclipse.jdt.ls.core.id1 -jar /opt/jdtls/plugins/org.eclipse.equinox.launcher_1.6.jar -data /home/u/.cache/jdtls/ws -cp /home/u/.m2/repository/junit/junit/4.13.2/junit-4.13.2.jar",
+                "junit",
+            ),
+            (
+                "java",
+                "java -Xmx2g -cp /home/u/.gradle/caches/junit-platform-console-standalone-1.10.2.jar:/home/u/.gradle/wrapper/dists/gradle-8.5/lib/gradle-launcher-8.5.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.5",
+                "junit",
+            ),
+            ("vim", "vim src/test/java/org/junit/MyJunitTest.java", "junit"),
+            (
+                "java",
+                "java -cp /home/u/.gradle/caches/8.5/workerMain/gradle-worker.jar worker.org.gradle.process.internal.worker.GradleWorkerMain Gradle Worker Daemon 2",
+                "junit",
+            ),
+            // The Maven daemon is long-running; neither its paths nor maven.* properties
+            // make it a Maven build.
+            (
+                "java",
+                "java -classpath /opt/maven-mvnd/mvn/boot/plexus-classworlds-2.8.0.jar:/opt/maven-mvnd/lib/mvnd-daemon.jar -Dmvnd.home=/opt/maven-mvnd -Dmaven.home=/opt/maven-mvnd/mvn org.mvndaemon.mvnd.daemon.Server",
+                "maven",
+            ),
+            ("mvnd", "/opt/maven-mvnd/bin/mvnd clean install", "maven"),
+            ("less", "less /home/u/.mvn/maven.config", "maven"),
+            // django in a path or a search, not the dev server.
+            (
+                "celery",
+                "/home/u/django-app/venv/bin/python /home/u/django-app/venv/bin/celery -A proj worker",
+                "django",
+            ),
+            ("rg", "rg django src/", "django"),
+            ("python3", "python3 manage.py migrate", "django"),
+            (
+                "gunicorn",
+                "/home/u/app/venv/bin/python /home/u/app/venv/bin/gunicorn app.wsgi --workers 4",
+                "django",
+            ),
+        ] {
+            let names = matched(comm, cmd);
+            assert!(!names.iter().any(|n| n == unexpected), "{cmd:?}: {names:?}");
         }
     }
 
