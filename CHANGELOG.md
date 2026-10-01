@@ -10,6 +10,25 @@ Repository: <https://github.com/Dicklesworthstone/process_triage>
 
 ---
 
+## [v2.2.1] -- 2026-09-30 **[GitHub Release]**
+
+8 commits since v2.2.0 (through `d57f493`).
+A security fix for installs and updates, plus scoring and signature fixes.
+
+### Security
+
+- `install.sh` and `pt update` now accept a release only if it is signed with a known key. Until now a verified install trusted whatever public key the release itself published, so anyone able to replace release assets could re-sign them with their own key and still pass verification. Both scripts carry `TRUSTED_RELEASE_KEY_FINGERPRINTS` (today only the key used since v2.2.0); a release signed with any other key is refused and nothing is installed. `PT_RELEASE_PUBLIC_KEY_FINGERPRINT` or `PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE` replaces the built-in list, for example to pin a fork's own key, and `pt update` keeps a pin you set either way. A malformed entry or a missing pin file is now an error instead of silently meaning "no pin" ([76246de](https://github.com/Dicklesworthstone/process_triage/commit/76246def844a1783ac3d4da3973e5232e9ead021), [d57f493](https://github.com/Dicklesworthstone/process_triage/commit/d57f493f8123739030c032155fec38d38b302bd5))
+
+### Fixed
+
+- A test runner (jest, pytest and similar) started by an editor extension no longer gets "desktop app in use" credit just because it runs inside the editor's app unit. A test runner stuck for hours there was being rated as probably in use. The credit is still given when a learned verdict or a signature says the process is useful; plan, explain and MCP `pt_explain` report `desktop_app_credited` ([7c30364](https://github.com/Dicklesworthstone/process_triage/commit/7c303648180747c9a49198ad4669eca872be2587))
+- The junit, maven and django signatures match the tool itself, not any command line that mentions the word. Language servers and Gradle daemons with a junit jar on their classpath, the long-running Maven daemon (mvnd), and celery workers living in a `django-app` directory were being matched (GH #15) ([65af2b7](https://github.com/Dicklesworthstone/process_triage/commit/65af2b7e04e622f6614d1713ccb5276f96e41526))
+- `agent fleet transfer diff` and `import --dry-run` compare an incoming bundle against your local patterns. Before, they reported every incoming signature as new. `export` now fails and writes nothing when the local pattern library cannot be read, instead of writing a bundle with no signatures ([0ba901a](https://github.com/Dicklesworthstone/process_triage/commit/0ba901af32f9dc2f85dbcfc1f07f5d22bd1139e5))
+
+### Tests
+
+- Regression test that `agent apply --max-total-blast-radius` stops killing once the cap is reached ([95a3e19](https://github.com/Dicklesworthstone/process_triage/commit/95a3e195ce675a6fac781dabca34fcd6a0082ade))
+
 ## [v2.2.0] -- 2026-09-29 **[GitHub Release]**
 
 77 commits since v2.1.0 (through `e2acb79`).
