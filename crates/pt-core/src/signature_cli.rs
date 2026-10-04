@@ -1851,11 +1851,17 @@ mod tests {
         let schema = test_schema(&["bundle_sig_a", "bundle_sig_b"]);
         let json = serde_json::to_string_pretty(&schema).unwrap();
 
+        let mut policy = pt_redact::RedactionPolicy::default();
+        policy.field_rules.insert(
+            "free_text".to_string(),
+            pt_redact::FieldRule::new(pt_redact::Action::Allow),
+        );
         let mut writer = pt_bundle::BundleWriter::new(
             "test-session",
             "test-host",
-            pt_redact::ExportProfile::Safe,
-        );
+            pt_redact::ExportProfile::Forensic,
+        )
+        .with_redaction_engine(pt_redact::RedactionEngine::new(policy).unwrap());
         writer.add_file(
             BUNDLE_SIGNATURES_PATH,
             json.into_bytes(),
@@ -1880,7 +1886,7 @@ mod tests {
         let mut writer = pt_bundle::BundleWriter::new(
             "test-session",
             "test-host",
-            pt_redact::ExportProfile::Safe,
+            pt_redact::ExportProfile::Forensic,
         );
         writer.add_file("other.txt", b"hello".to_vec(), None);
         writer.write(&bundle_path).unwrap();
@@ -1938,11 +1944,17 @@ mod tests {
         let schema = test_schema(&["enc_sig"]);
         let json = serde_json::to_string_pretty(&schema).unwrap();
 
+        let mut policy = pt_redact::RedactionPolicy::default();
+        policy.field_rules.insert(
+            "free_text".to_string(),
+            pt_redact::FieldRule::new(pt_redact::Action::Allow),
+        );
         let mut writer = pt_bundle::BundleWriter::new(
             "test-session",
             "test-host",
-            pt_redact::ExportProfile::Safe,
-        );
+            pt_redact::ExportProfile::Forensic,
+        )
+        .with_redaction_engine(pt_redact::RedactionEngine::new(policy).unwrap());
         writer.add_file(
             BUNDLE_SIGNATURES_PATH,
             json.into_bytes(),
