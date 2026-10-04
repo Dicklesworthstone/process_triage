@@ -198,6 +198,16 @@ impl ProcessExpectations {
         }
     }
 
+    /// A task that normally finishes in about `typical` seconds and almost never
+    /// takes longer than `max` (its 99th percentile).
+    pub fn task_lasting(typical: u64, max: u64) -> Self {
+        Self {
+            typical_lifetime_seconds: Some(typical),
+            max_normal_lifetime_seconds: Some(max),
+            ..Default::default()
+        }
+    }
+
     /// Create expectations for a long-running daemon.
     pub fn daemon() -> Self {
         Self {
@@ -1886,6 +1896,130 @@ impl SignatureDatabase {
                 .as_builtin(),
         );
 
+        // Agent-swarm toolchain: the process kinds the operator playbook
+        // (system-performance-remediation) triages by age. Every one states how long a
+        // normal run lasts, so its "left behind" prior only applies once a process has
+        // outlived that (see scoring's age gate): young ones are judged on evidence.
+
+        // `rch exec -- <cargo ...>` waits for a build that runs on a remote worker: its
+        // own CPU is ~0 by design. Remote test suites can run for hours.
+        let _ = self.add(
+            SupervisorSignature::new("rch-exec", SupervisorCategory::Other)
+                .with_confidence(0.90)
+                .with_notes("Remote compilation helper client; the work runs on a worker")
+                .with_process_patterns(vec![r"^rch$"])
+                .with_arg_patterns(vec![r"(^|\s)exec(\s|$)"])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations {
+                    idle_cpu_normal: true,
+                    ..ProcessExpectations::task_lasting(600, 4 * 3600)
+                })
+                .as_builtin(),
+        );
+
+        // `bun test` (playbook: ignores SIGTERM; stuck runs found after 12+ hours).
+        let _ = self.add(
+            SupervisorSignature::new("bun-test", SupervisorCategory::Other)
+                .with_confidence(0.90)
+                .with_notes("Bun test runner (known to ignore SIGTERM)")
+                .with_process_patterns(vec![r"^bun$"])
+                .with_arg_patterns(vec![r"(^|\s)test(\s|$)"])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::short_lived_task())
+                .as_builtin(),
+        );
+
+        // Compilers and linkers run by a build tool: normally seconds to minutes per
+        // unit; a fat-LTO link can take tens of minutes.
+        let _ = self.add(
+            SupervisorSignature::new("compiler", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Compiler or linker process started by a build")
+                .with_process_patterns(vec![
+                    r"^rustc$",
+                    r"^clippy-driver$",
+                    r"^cc1$",
+                    r"^cc1plus$",
+                    r"^ld$",
+                    r"^ld\.lld$",
+                    r"^lld$",
+                    r"^mold$",
+                ])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations {
+                    cpu_during_run: Some(0.9),
+                    ..ProcessExpectations::task_lasting(60, 3600)
+                })
+                .as_builtin(),
+        );
+
+        // Short git operations (playbook: a `git add` running minutes is stuck).
+        // Network operations (fetch, push, clone) are deliberately not included.
+        let _ = self.add(
+            SupervisorSignature::new("git-local-op", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Local git operation that normally completes in seconds")
+                .with_process_patterns(vec![r"^git$"])
+                .with_arg_patterns(vec![r"^(\S*/)?git\s+(add|status|commit|stash|rev-parse)(\s|$)"])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::task_lasting(5, 300))
+                .as_builtin(),
+        );
+
+        // Vercel CLI queries (not `vercel dev`, which is a dev server).
+        let _ = self.add(
+            SupervisorSignature::new("vercel-cli", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Vercel CLI query/deploy command")
+                .with_arg_patterns(vec![
+                    &command_word_pattern("vercel"),
+                    r"(^|\s)(inspect|env|logs|ls|list|pull|whoami|deploy|build)(\s|$)",
+                ])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::task_lasting(60, 1800))
+                .as_builtin(),
+        );
+
+        // Dependency installs.
+        let _ = self.add(
+            SupervisorSignature::new("package-install", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Package manager install")
+                .with_arg_patterns(vec![
+                    r"(^|[\s/])(npm|pnpm|yarn|bun)(\.[cm]?js)?\s+(install|ci|i|add)(\s|$)",
+                ])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::task_lasting(120, 1800))
+                .as_builtin(),
+        );
+
+        // Shells polling for a condition: `while ! test -f X; do sleep 1; done`
+        // (playbook: orphaned poll loops waiting for files that never appear).
+        let _ = self.add(
+            SupervisorSignature::new("poll-loop-shell", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Shell loop that sleeps until a condition holds")
+                .with_process_patterns(vec![r"^(ba|z|da|k)?sh$"])
+                .with_arg_patterns(vec![r"\b(while|until)\b.*;\s*do\b.*\bsleep\b.*\bdone\b"])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::task_lasting(300, 4 * 3600))
+                .as_builtin(),
+        );
+
+        // MCP servers an agent spawns over stdio: they live as long as their agent,
+        // idling is normal. Labels only (no prior): whether one is left behind comes
+        // from its parent and orphan evidence.
+        let _ = self.add(
+            SupervisorSignature::new("mcp-server", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Model Context Protocol server started by an agent")
+                .with_arg_patterns(vec![
+                    r"(@playwright/mcp|(^|[\s/])playwright-mcp(\s|$)|@morphllm/morphmcp|@modelcontextprotocol/server-)",
+                ])
+                .with_expectations(ProcessExpectations::daemon())
+                .as_builtin(),
+        );
+
         let _ = self.add(
             SupervisorSignature::new("go-build", SupervisorCategory::Other)
                 .with_confidence(0.85)
@@ -3083,5 +3217,98 @@ mod tests {
         );
 
         assert!(multi.score > command_only.score);
+    }
+
+    fn best_name(db: &SignatureDatabase, comm: &str, cmdline: &str) -> Option<String> {
+        db.best_match(&ProcessMatchContext::with_comm(comm).cmdline(cmdline))
+            .map(|m| m.signature.name.clone())
+    }
+
+    /// The agent-swarm toolchain signatures match what they name and nothing nearby.
+    #[test]
+    fn agent_swarm_toolchain_signatures() {
+        let db = SignatureDatabase::with_defaults();
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            // The rch client wins over the generic cargo-build match on its arguments.
+            ("rch", "rch exec -- cargo build -p x", Some("rch-exec")),
+            ("rch", "rch status", None),
+            ("bun", "bun test --watch", Some("bun-test")),
+            ("rustc", "rustc --crate-name foo src/lib.rs", Some("compiler")),
+            ("cc1plus", "/usr/lib/gcc/x86_64-linux-gnu/13/cc1plus -quiet", Some("compiler")),
+            ("rustup", "rustup update", None),
+            ("git", "git add .", Some("git-local-op")),
+            ("git", "/usr/bin/git status --porcelain", Some("git-local-op")),
+            ("git", "git push origin main", None),
+            ("node", "node /home/u/.bun/bin/vercel inspect abc", Some("vercel-cli")),
+            ("node", "node /home/u/.bun/bin/vercel dev", None),
+            ("npm", "npm install", Some("package-install")),
+            ("node", "node /usr/bin/pnpm.cjs install --frozen-lockfile", Some("package-install")),
+            ("npm", "npm run install-hooks", None),
+            (
+                "bash",
+                "bash -c while ! test -f /tmp/done; do sleep 1; done",
+                Some("poll-loop-shell"),
+            ),
+            ("bash", "bash -c make && sleep 1", None),
+            ("node", "node /home/u/.npm/_npx/x/node_modules/.bin/playwright-mcp", Some("mcp-server")),
+            (
+                "node",
+                "node /home/u/.npm/_npx/9f/node_modules/@morphllm/morphmcp/dist/index.js",
+                Some("mcp-server"),
+            ),
+        ];
+        for (comm, cmdline, expected) in cases {
+            let got = best_name(&db, comm, cmdline);
+            match expected {
+                Some(name) => assert_eq!(got.as_deref(), Some(*name), "{comm} | {cmdline}"),
+                // None: no new toolchain signature claims it (another may).
+                None => assert!(
+                    !matches!(
+                        got.as_deref(),
+                        Some(
+                            "rch-exec"
+                                | "bun-test"
+                                | "compiler"
+                                | "git-local-op"
+                                | "vercel-cli"
+                                | "package-install"
+                                | "poll-loop-shell"
+                                | "mcp-server"
+                        )
+                    ),
+                    "{comm} | {cmdline} matched {got:?}"
+                ),
+            }
+        }
+    }
+
+    /// Each one states a normal lifetime (so the scoring age gate applies), except the
+    /// MCP servers, which only label.
+    #[test]
+    fn agent_swarm_toolchain_signatures_state_lifetimes() {
+        let db = SignatureDatabase::with_defaults();
+        for name in [
+            "rch-exec",
+            "bun-test",
+            "compiler",
+            "git-local-op",
+            "vercel-cli",
+            "package-install",
+            "poll-loop-shell",
+        ] {
+            let sig = db
+                .signatures()
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let e = &sig.expectations;
+            assert!(
+                e.typical_lifetime_seconds.unwrap() < e.max_normal_lifetime_seconds.unwrap(),
+                "{name}"
+            );
+            assert!(!sig.priors.is_empty(), "{name}");
+        }
+        let mcp = db.signatures().iter().find(|s| s.name == "mcp-server").unwrap();
+        assert!(mcp.priors.is_empty());
     }
 }

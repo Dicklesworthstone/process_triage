@@ -307,21 +307,23 @@ impl Scorer {
                     proc.elapsed.as_secs_f64(),
                 )
             });
-        let gated_signature = signature
-            .as_ref()
-            .zip(signature_age_weight)
-            .map(|(sig_match, weight)| {
-                age_gated_signature(sig_match.signature, &self.priors, weight)
-            });
-        let gated_match = signature
-            .as_ref()
-            .zip(gated_signature.as_ref())
-            .map(|(sig_match, gated)| SignatureMatch {
-                signature: gated,
-                level: sig_match.level,
-                score: sig_match.score,
-                details: sig_match.details.clone(),
-            });
+        let gated_signature =
+            signature
+                .as_ref()
+                .zip(signature_age_weight)
+                .map(|(sig_match, weight)| {
+                    age_gated_signature(sig_match.signature, &self.priors, weight)
+                });
+        let gated_match =
+            signature
+                .as_ref()
+                .zip(gated_signature.as_ref())
+                .map(|(sig_match, gated)| SignatureMatch {
+                    signature: gated,
+                    level: sig_match.level,
+                    score: sig_match.score,
+                    details: sig_match.details.clone(),
+                });
         let prior_signature = gated_match.as_ref().or(signature.as_ref());
 
         let learned_prior = self
@@ -989,18 +991,18 @@ mod tests {
         assert_eq!(normal_run_finished_by(&daemon, 1000.0), None);
     }
 
-    /// hetzner1, 2026-10-04: a 265 s old `rch exec -- cargo build` (the build runs on a
-    /// remote worker, so the local process idles without a TTY) scored P(abandoned or
-    /// zombie) 0.85, carried by the cargo-build signature's "likely abandoned" prior
-    /// (+2.0 bits). The prior describes builds that outlived a normal run, not one four
-    /// minutes into it. The same build idle for three hours keeps the full prior.
-    #[test]
-    fn young_build_does_not_inherit_the_stuck_build_prior() {
+    /// Young and stuck instances of the same command: the young one must stay below the
+    /// plan's 0.7 candidate threshold, the stuck one must keep the signature's prior.
+    fn assert_age_gated(
+        comm: &str,
+        cmd: &str,
+        signature: &str,
+        young_secs: u64,
+        stuck_secs: u64,
+    ) {
         let scorer = scorer(SignatureDatabase::with_defaults());
-        let cmd = "rch exec -- cargo build -p fs-cli --bin frankensim";
-        let young = record(5200, "rch", cmd, Duration::from_secs(265));
-        let stuck = record(5201, "rch", cmd, Duration::from_secs(3 * 3600));
-
+        let young = record(5200, comm, cmd, Duration::from_secs(young_secs));
+        let stuck = record(5201, comm, cmd, Duration::from_secs(stuck_secs));
         let young_score = scorer
             .score_with_desktop(&young, Evidence::from_snapshot(&young), None)
             .expect("score");
@@ -1009,25 +1011,55 @@ mod tests {
             .expect("score");
 
         assert_eq!(
-            young_score.signature.as_ref().map(|m| m.signature.name.as_str()),
-            Some("cargo-build")
+            young_score
+                .signature
+                .as_ref()
+                .map(|m| m.signature.name.as_str()),
+            Some(signature)
         );
         let young_weight = young_score.signature_age_weight.expect("age weight");
         let stuck_weight = stuck_score.signature_age_weight.expect("age weight");
-        assert!(young_weight < 0.5, "{young_weight}");
-        assert!(stuck_weight > 0.99, "{stuck_weight}");
+        assert!(young_weight < 0.5, "{signature}: {young_weight}");
+        assert!(stuck_weight > 0.99, "{signature}: {stuck_weight}");
 
         let young_p = young_score.posterior.posterior.abandonment_probability();
         let stuck_p = stuck_score.posterior.posterior.abandonment_probability();
         assert!(
             young_p < 0.7,
-            "a 4-minute build is a plan candidate: {:?}",
+            "{signature}: a young run is a plan candidate: {:?}",
             young_score.posterior.posterior
         );
         assert!(
             stuck_p >= 0.7,
-            "a 3-hour idle build lost its prior: {:?}",
+            "{signature}: a stuck run lost its prior: {:?}",
             stuck_score.posterior.posterior
+        );
+    }
+
+    /// hetzner1, 2026-10-04: a 265 s old `rch exec -- cargo build` (the build runs on a
+    /// remote worker, so the local process idles without a TTY) scored P(abandoned or
+    /// zombie) 0.85, carried by the cargo-build signature's "likely abandoned" prior
+    /// (+2.0 bits). It is now an rch client (remote runs can last hours) whose prior
+    /// only applies once it has outlived a normal run.
+    #[test]
+    fn young_remote_build_does_not_inherit_the_stuck_build_prior() {
+        assert_age_gated(
+            "rch",
+            "rch exec -- cargo build -p fs-cli --bin frankensim",
+            "rch-exec",
+            265,
+            6 * 3600,
+        );
+    }
+
+    #[test]
+    fn young_local_build_does_not_inherit_the_stuck_build_prior() {
+        assert_age_gated(
+            "cargo",
+            "cargo build --release",
+            "cargo-build",
+            265,
+            3 * 3600,
         );
     }
 
@@ -1041,7 +1073,12 @@ mod tests {
             .with_priors(SignaturePriors::likely_abandoned());
         db.add(no_lifetime).expect("add");
         let scorer = scorer(db);
-        let proc = record(5300, "stuckthing", "stuckthing --serve", Duration::from_secs(60));
+        let proc = record(
+            5300,
+            "stuckthing",
+            "stuckthing --serve",
+            Duration::from_secs(60),
+        );
         let score = scorer
             .score_with_desktop(&proc, Evidence::from_snapshot(&proc), None)
             .expect("score");
@@ -1049,7 +1086,12 @@ mod tests {
         assert_eq!(score.signature_age_weight, None);
 
         let defaults = scorer_for_defaults();
-        let vite = record(5301, "node", "node /app/node_modules/.bin/vite", Duration::from_secs(60));
+        let vite = record(
+            5301,
+            "node",
+            "node /app/node_modules/.bin/vite",
+            Duration::from_secs(60),
+        );
         let score = defaults
             .score_with_desktop(&vite, Evidence::from_snapshot(&vite), None)
             .expect("score");
@@ -1404,8 +1446,14 @@ mod provenance_tests {
         };
 
         let features = feature_names(&derive_provenance_adjustment(400, &bundle)).join(",");
-        assert!(features.contains("provenance_ownership_orphaned"), "{features}");
-        assert!(!features.contains("provenance_ownership_supervised"), "{features}");
+        assert!(
+            features.contains("provenance_ownership_orphaned"),
+            "{features}"
+        );
+        assert!(
+            !features.contains("provenance_ownership_supervised"),
+            "{features}"
+        );
     }
 
     #[test]
