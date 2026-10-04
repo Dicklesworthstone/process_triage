@@ -14,7 +14,7 @@ use arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
-use pt_bundle::{BundleReader, BundleWriter, BUNDLE_SCHEMA_VERSION};
+use pt_bundle::{BundleError, BundleReader, BundleWriter, FileEntry, BUNDLE_SCHEMA_VERSION};
 use pt_redact::{ExportProfile, FieldClass, KeyMaterial, RedactionEngine, RedactionPolicy};
 use pt_report::{ReportConfig, ReportGenerator, ReportTheme};
 use pt_telemetry::schema::{audit_schema, TableName};
@@ -109,8 +109,9 @@ fn run_full_pipeline(
     profile: ExportProfile,
     temp_dir: &TempDir,
     case_id: &str,
+    include_opaque_telemetry: bool,
 ) -> (Vec<u8>, pt_bundle::BundleManifest, String) {
-    let session_id = format!("pt-20260205-e2e-{}", case_id);
+    let session_id = "pt-20260205-120000-abcd".to_string();
     let host_id = "e2e-pipeline-host";
 
     // Step 1: Write real telemetry (audit table)
@@ -131,6 +132,16 @@ fn run_full_pipeline(
     let key = KeyMaterial::from_bytes([42u8; 32], "pipeline-e2e");
     let engine = RedactionEngine::with_key(policy, key);
     let redacted = engine.redact_with_profile(secret, FieldClass::FreeText, profile);
+    assert!(!redacted.output.contains(secret), "redactor leaked secret");
+
+    // A Parquet archive is explicit local Forensic data. Shared profile tests
+    // contain only formats whose payloads the bundle writer can sanitize.
+    let source_artifact = if include_opaque_telemetry {
+        assert_eq!(profile, ExportProfile::Forensic);
+        json!({"path": "telemetry/audit.parquet", "kind": "parquet"})
+    } else {
+        json!({"path": "plan.json", "kind": "json"})
+    };
 
     // Step 3: Build pipeline JSONL log entries
     let log_entries = [
@@ -143,7 +154,7 @@ fn run_full_pipeline(
             "exit_code": 0,
             "duration_ms": 42,
             "artifacts": [
-                {"path": "telemetry/audit.parquet", "kind": "parquet"},
+                source_artifact,
                 {"path": "summary.json", "kind": "json"}
             ]
         }),
@@ -165,16 +176,60 @@ fn run_full_pipeline(
     // Step 4: Create bundle
     let summary = json!({
         "total_processes": 250,
-        "candidates": 10,
-        "kills": 4,
-        "spares": 6,
-        "note": redacted.output,
+        "candidates": 3,
+        "kills": 2,
+        "spares": 1,
+        "note": secret,
         "profile": format!("{:?}", profile),
         "session_id": &session_id,
         "schema_version": "1.0.0"
     });
 
     let plan = json!({
+        "scan": {"total_processes": 250},
+        "candidates": [
+            {
+                "pid": 1001,
+                "command": "private-worker --token=pipeline-canary",
+                "score": 98.5,
+                "recommended_action": "kill",
+                "posterior": {"useful": 0.01, "useful_bad": 0.005, "abandoned": 0.91, "zombie": 0.075},
+                "age_seconds": 7200,
+                "cpu_percent": 0.3,
+                "memory_mb": 128.75,
+                "evidence_ledger": {
+                    "posterior": {
+                        "posterior": {"useful": 0.01, "useful_bad": 0.005, "abandoned": 0.91, "zombie": 0.075},
+                        "log_odds_abandoned_useful": 4.51085950651685,
+                        "evidence_terms": [{
+                            "feature": "orphan",
+                            "log_likelihood": {"useful": -3.5, "useful_bad": -2.25, "abandoned": 0.0, "zombie": -1.0}
+                        }]
+                    },
+                    "bayes_factors": [{"feature": "orphan", "log_bf": 3.5, "bf": 33.11545195869231}]
+                }
+            },
+            {
+                "pid": 1002,
+                "command": "private-active-worker",
+                "score": 5.0,
+                "recommended_action": "spare",
+                "posterior": {"useful": 0.9, "useful_bad": 0.05, "abandoned": 0.04, "zombie": 0.01},
+                "age_seconds": 1800,
+                "cpu_percent": 21.0,
+                "memory_mb": 64.0
+            },
+            {
+                "pid": 1003,
+                "command": "private-build-worker",
+                "score": 95.0,
+                "recommended_action": "kill",
+                "posterior": {"useful": 0.03, "useful_bad": 0.02, "abandoned": 0.9, "zombie": 0.05},
+                "age_seconds": 10800,
+                "cpu_percent": 0.0,
+                "memory_mb": 256.0
+            }
+        ],
         "recommendations": [
             {"pid": 1001, "action": "kill", "confidence": 0.98, "evidence": ["zombie", "orphan"]},
             {"pid": 1002, "action": "spare", "confidence": 0.72, "evidence": ["active_io"]},
@@ -186,11 +241,23 @@ fn run_full_pipeline(
     let mut bundle_writer = BundleWriter::new(&session_id, host_id, profile)
         .with_pt_version("2.0.0-e2e-test")
         .with_redaction_policy("1.0.0", "sha256-e2e-test-hash")
-        .with_description(format!("E2E pipeline test: {}", case_id));
+        .with_description(format!("E2E pipeline test: {}", case_id))
+        .with_redaction_engine(engine);
     bundle_writer.add_summary(&summary).expect("add summary");
     bundle_writer.add_plan(&plan).expect("add plan");
-    bundle_writer.add_telemetry("audit", parquet_bytes);
+    if include_opaque_telemetry {
+        bundle_writer.add_telemetry("audit", parquet_bytes.clone());
+    }
     bundle_writer.add_log("events", log_jsonl.into_bytes());
+    let outcome = json!({
+        "pid": 1001,
+        "action": "kill",
+        "signal": 15,
+        "success": true,
+        "status": "completed",
+        "timestamp": Utc::now().to_rfc3339()
+    });
+    bundle_writer.add_log("outcomes", format!("{outcome}\n").into_bytes());
 
     let (bundle_bytes, manifest) = bundle_writer.write_to_vec().expect("write bundle");
 
@@ -203,6 +270,14 @@ fn run_full_pipeline(
         case_id,
         failures
     );
+    if include_opaque_telemetry {
+        assert_eq!(
+            reader
+                .read_verified("telemetry/audit.parquet")
+                .expect("read real Parquet archive"),
+            parquet_bytes
+        );
+    }
 
     let generator = ReportGenerator::default_config();
     let html = generator
@@ -227,7 +302,7 @@ fn test_pipeline_all_profiles_produce_bundle_and_report() {
     for (profile, name) in profiles {
         let temp_dir = TempDir::new().expect("tempdir");
         let (bundle_bytes, manifest, html) =
-            run_full_pipeline(profile, &temp_dir, &format!("profile-{}", name));
+            run_full_pipeline(profile, &temp_dir, &format!("profile-{}", name), false);
 
         // Bundle is valid ZIP
         assert_eq!(
@@ -241,6 +316,32 @@ fn test_pipeline_all_profiles_produce_bundle_and_report() {
         assert_eq!(manifest.export_profile, profile);
         assert_eq!(manifest.bundle_version, BUNDLE_SCHEMA_VERSION);
         assert_eq!(manifest.pt_version, Some("2.0.0-e2e-test".to_string()));
+        assert_eq!(manifest.session_id, "pt-20260205-120000-abcd");
+        let mut reader =
+            BundleReader::from_bytes(bundle_bytes.clone()).expect("read profile bundle");
+        let summary: serde_json::Value = reader.read_summary().expect("read profile summary");
+        assert_eq!(summary["total_processes"], 250);
+        assert_eq!(summary["candidates"], 3);
+        assert!(reader.telemetry_files().is_empty());
+        if profile == ExportProfile::Minimal {
+            assert_eq!(manifest.file_count(), 1);
+            assert_eq!(
+                summary,
+                json!({"total_processes": 250, "candidates": 3, "kills": 2, "spares": 1})
+            );
+            assert!(!reader.has_file("plan.json"));
+            assert!(reader.log_files().is_empty());
+        } else {
+            assert_eq!(manifest.file_count(), 4);
+            let plan: serde_json::Value = reader
+                .read_plan()
+                .expect("read profile plan")
+                .expect("plan");
+            assert_eq!(plan["candidates"][0]["score"], 98.5);
+            assert_eq!(plan["candidates"][0]["posterior"]["abandoned"], 0.91);
+            assert_eq!(plan["candidates"][0]["recommended_action"], "kill");
+            assert!(reader.has_file("logs/outcomes.jsonl"));
+        }
 
         // Report is valid HTML
         assert!(
@@ -271,7 +372,8 @@ fn test_pipeline_all_profiles_produce_bundle_and_report() {
 #[test]
 fn test_pipeline_jsonl_logs_pass_schema_validation() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let (bundle_bytes, _, _) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "jsonl-schema");
+    let (bundle_bytes, _, _) =
+        run_full_pipeline(ExportProfile::Safe, &temp_dir, "jsonl-schema", false);
 
     let mut reader = BundleReader::from_bytes(bundle_bytes).expect("open bundle");
     let log_bytes = reader.read_verified("logs/events.jsonl").expect("read log");
@@ -301,18 +403,31 @@ fn test_pipeline_jsonl_logs_pass_schema_validation() {
     // Verify log entries have expected events
     let log_text = {
         let mut reader = BundleReader::from_bytes(
-            run_full_pipeline(ExportProfile::Safe, &temp_dir, "jsonl-events").0,
+            run_full_pipeline(ExportProfile::Safe, &temp_dir, "jsonl-events", false).0,
         )
         .expect("open");
         String::from_utf8(reader.read_verified("logs/events.jsonl").unwrap()).unwrap()
     };
-    assert!(
-        log_text.contains("bundle_create"),
-        "log should contain bundle_create event"
+    let engine = RedactionEngine::with_key(
+        RedactionPolicy::default(),
+        KeyMaterial::from_bytes([42u8; 32], "pipeline-e2e"),
     );
-    assert!(
-        log_text.contains("report_generate"),
-        "log should contain report_generate event"
+    let events: Vec<serde_json::Value> = log_text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse recorded event"))
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0]["event"],
+        engine
+            .redact_with_profile("bundle_create", FieldClass::FreeText, ExportProfile::Safe)
+            .output
+    );
+    assert_eq!(
+        events[1]["event"],
+        engine
+            .redact_with_profile("report_generate", FieldClass::FreeText, ExportProfile::Safe)
+            .output
     );
 
     eprintln!("[INFO] JSONL schema: {} lines validated", line_count);
@@ -322,7 +437,7 @@ fn test_pipeline_jsonl_logs_pass_schema_validation() {
 fn test_pipeline_jsonl_artifact_paths_match_bundle() {
     let temp_dir = TempDir::new().expect("tempdir");
     let (bundle_bytes, manifest, _) =
-        run_full_pipeline(ExportProfile::Safe, &temp_dir, "artifact-match");
+        run_full_pipeline(ExportProfile::Forensic, &temp_dir, "artifact-match", true);
 
     let mut reader = BundleReader::from_bytes(bundle_bytes).expect("open bundle");
     let log_bytes = reader.read_verified("logs/events.jsonl").expect("read log");
@@ -346,10 +461,26 @@ fn test_pipeline_jsonl_artifact_paths_match_bundle() {
 
     // Verify referenced artifacts exist in the bundle manifest
     let manifest_paths: Vec<String> = manifest.files.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(
+        jsonl_artifact_paths.len(),
+        3,
+        "must collect every artifact reference"
+    );
+    let engine = RedactionEngine::with_key(
+        RedactionPolicy::default(),
+        KeyMaterial::from_bytes([42u8; 32], "pipeline-e2e"),
+    );
+    let report_path = engine
+        .redact_with_profile(
+            "report.html",
+            FieldClass::PathProject,
+            ExportProfile::Forensic,
+        )
+        .output;
 
     for artifact_path in &jsonl_artifact_paths {
         // report.html is generated after bundle, so it's not in the bundle itself
-        if artifact_path == "report.html" {
+        if artifact_path == &report_path {
             continue;
         }
         assert!(
@@ -374,7 +505,7 @@ fn test_pipeline_jsonl_artifact_paths_match_bundle() {
 #[test]
 fn test_pipeline_report_includes_required_sections() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let (_, _, html) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "html-sections");
+    let (_, _, html) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "html-sections", false);
 
     // Required HTML structure
     assert!(html.contains("<head>"), "report needs <head>");
@@ -401,11 +532,11 @@ fn test_pipeline_report_includes_required_sections() {
 #[test]
 fn test_pipeline_report_contains_session_data() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let (_, _, html) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "session-data");
+    let (_, _, html) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "session-data", false);
 
     // Session ID should appear in report
     assert!(
-        html.contains("pt-20260205-e2e-session-data"),
+        html.contains("pt-20260205-120000-abcd"),
         "report should contain session ID"
     );
 
@@ -425,15 +556,14 @@ fn test_pipeline_report_theme_variants() {
     ];
 
     for (theme, expected_class) in themes {
-        let session_id = format!("pt-20260205-theme-{:?}", theme);
+        let session_id = "pt-20260205-120300-abcd";
 
         // Build a minimal bundle
-        let mut bundle_writer = BundleWriter::new(&session_id, "theme-host", ExportProfile::Safe)
+        let mut bundle_writer = BundleWriter::new(session_id, "theme-host", ExportProfile::Safe)
             .with_pt_version("2.0.0");
         bundle_writer
             .add_summary(&json!({"total_processes": 10, "candidates": 1}))
             .expect("add summary");
-        bundle_writer.add_telemetry("audit", vec![0x50, 0x41, 0x52, 0x31]);
 
         let (bytes, _) = bundle_writer.write_to_vec().expect("write bundle");
         let mut reader = BundleReader::from_bytes(bytes).expect("open bundle");
@@ -464,7 +594,8 @@ fn test_pipeline_report_theme_variants() {
 #[test]
 fn test_pipeline_report_galaxy_brain_mode() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let (bundle_bytes, _, _) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "galaxy-brain");
+    let (bundle_bytes, _, _) =
+        run_full_pipeline(ExportProfile::Safe, &temp_dir, "galaxy-brain", false);
 
     let mut reader = BundleReader::from_bytes(bundle_bytes).expect("open bundle");
 
@@ -481,6 +612,43 @@ fn test_pipeline_report_galaxy_brain_mode() {
     assert!(
         html.contains("katex"),
         "galaxy-brain report should include KaTeX reference"
+    );
+    assert!(
+        html.contains("Recorded Evidence Ledger"),
+        "must render saved evidence"
+    );
+    assert!(
+        html.contains("recorded-evidence"),
+        "must show the recorded ledger section"
+    );
+    assert!(
+        html.contains("98.5"),
+        "must retain the saved candidate score"
+    );
+    assert!(html.contains("0.91"), "must retain the saved posterior");
+    assert!(
+        html.contains("33.11545195869231"),
+        "must retain the saved Bayes factor"
+    );
+    assert!(
+        html.contains("3.5"),
+        "must retain the saved log Bayes factor"
+    );
+    assert!(
+        html.contains("orphan"),
+        "must retain the recorded evidence feature"
+    );
+    assert!(
+        html.contains("Exact ledger not recorded"),
+        "missing candidate ledgers must remain explicit"
+    );
+    assert!(
+        !html.contains("Prior Probabilities"),
+        "must not substitute unrecorded default priors"
+    );
+    assert!(
+        !html.contains("id=\"tab-galaxy-brain\""),
+        "must not manufacture a generic math section"
     );
 }
 
@@ -501,7 +669,7 @@ fn test_pipeline_secrets_never_leak_through_report() {
     for profile in profiles {
         let temp_dir = TempDir::new().expect("tempdir");
         let case_id = format!("secret-leak-{:?}", profile);
-        let (bundle_bytes, _, html) = run_full_pipeline(profile, &temp_dir, &case_id);
+        let (bundle_bytes, _, html) = run_full_pipeline(profile, &temp_dir, &case_id, false);
 
         // Secret should not appear in bundle summary
         let mut reader = BundleReader::from_bytes(bundle_bytes).expect("open bundle");
@@ -529,7 +697,8 @@ fn test_pipeline_secrets_never_leak_through_report() {
 #[test]
 fn test_pipeline_manifest_completeness() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let (_, manifest, _) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "manifest-check");
+    let (_, manifest, _) =
+        run_full_pipeline(ExportProfile::Forensic, &temp_dir, "manifest-check", true);
 
     // Expected files in bundle
     assert!(
@@ -569,8 +738,15 @@ fn test_pipeline_manifest_completeness() {
     }
 
     // Redaction policy metadata
-    assert_eq!(manifest.redaction_policy_version, "1.0.0");
-    assert_eq!(manifest.redaction_policy_hash, "sha256-e2e-test-hash");
+    let policy = RedactionPolicy::default();
+    let canonical_policy = serde_json::to_value(&policy).expect("canonical policy");
+    let policy_bytes = serde_json::to_vec(&canonical_policy).expect("serialize policy");
+    assert_eq!(manifest.redaction_policy_version, policy.schema_version);
+    assert_eq!(
+        manifest.redaction_policy_hash,
+        FileEntry::compute_checksum(&policy_bytes)
+    );
+    assert_ne!(manifest.redaction_policy_hash, "sha256-e2e-test-hash");
 
     eprintln!(
         "[INFO] Manifest: {} files, all valid",
@@ -582,7 +758,7 @@ fn test_pipeline_manifest_completeness() {
 fn test_pipeline_checksums_verify_on_readback() {
     let temp_dir = TempDir::new().expect("tempdir");
     let (bundle_bytes, manifest, _) =
-        run_full_pipeline(ExportProfile::Safe, &temp_dir, "checksum-verify");
+        run_full_pipeline(ExportProfile::Forensic, &temp_dir, "checksum-verify", true);
 
     let mut reader = BundleReader::from_bytes(bundle_bytes).expect("open bundle");
 
@@ -602,7 +778,7 @@ fn test_pipeline_checksums_verify_on_readback() {
 
     // Full verification should also pass
     let mut reader2 = BundleReader::from_bytes(
-        run_full_pipeline(ExportProfile::Safe, &temp_dir, "checksum-verify2").0,
+        run_full_pipeline(ExportProfile::Forensic, &temp_dir, "checksum-verify2", true).0,
     )
     .expect("open bundle");
     let failures = reader2.verify_all();
@@ -620,7 +796,7 @@ fn test_pipeline_checksums_verify_on_readback() {
 #[test]
 fn test_pipeline_encrypted_bundle_produces_valid_report() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let session_id = "pt-20260205-encrypted-pipeline";
+    let session_id = "pt-20260205-120100-abcd";
     let passphrase = "e2e-pipeline-passphrase";
 
     // Build bundle
@@ -640,11 +816,11 @@ fn test_pipeline_encrypted_bundle_produces_valid_report() {
     let parquet_bytes = fs::read(&parquet_path).expect("read parquet");
 
     let mut bundle_writer =
-        BundleWriter::new(session_id, "enc-host", ExportProfile::Safe).with_pt_version("2.0.0");
+        BundleWriter::new(session_id, "enc-host", ExportProfile::Forensic).with_pt_version("2.0.0");
     bundle_writer
         .add_summary(&json!({"encrypted_pipeline": true, "candidates": 3}))
         .expect("add summary");
-    bundle_writer.add_telemetry("audit", parquet_bytes);
+    bundle_writer.add_telemetry("audit", parquet_bytes.clone());
 
     let bundle_path = temp_dir.path().join("encrypted.ptb");
     let manifest = bundle_writer
@@ -663,7 +839,13 @@ fn test_pipeline_encrypted_bundle_produces_valid_report() {
     let mut reader =
         BundleReader::open_with_passphrase(&bundle_path, Some(passphrase)).expect("open");
     assert_eq!(reader.session_id(), session_id);
-    assert_eq!(reader.export_profile(), ExportProfile::Safe);
+    assert_eq!(reader.export_profile(), ExportProfile::Forensic);
+    assert_eq!(
+        reader
+            .read_verified("telemetry/audit.parquet")
+            .expect("read archived Parquet"),
+        parquet_bytes
+    );
 
     let failures = reader.verify_all();
     assert!(
@@ -681,7 +863,7 @@ fn test_pipeline_encrypted_bundle_produces_valid_report() {
         "report from encrypted bundle should be valid HTML"
     );
     assert!(
-        html.contains("pt-20260205-encrypted-pipeline"),
+        html.contains("pt-20260205-120100-abcd"),
         "report should contain session ID from encrypted bundle"
     );
 
@@ -699,7 +881,7 @@ fn test_pipeline_encrypted_bundle_produces_valid_report() {
 #[test]
 fn test_pipeline_multiple_telemetry_tables_in_bundle() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let session_id = "pt-20260205-multi-telemetry";
+    let session_id = "pt-20260205-120200-abcd";
     let host_id = "multi-host";
 
     // Write audit telemetry
@@ -716,7 +898,7 @@ fn test_pipeline_multiple_telemetry_tables_in_bundle() {
     let audit_bytes = fs::read(&audit_path).expect("read audit");
 
     // Build bundle with multiple telemetry files
-    let mut bundle_writer = BundleWriter::new(session_id, host_id, ExportProfile::Safe)
+    let mut bundle_writer = BundleWriter::new(session_id, host_id, ExportProfile::Forensic)
         .with_pt_version("2.0.0")
         .with_redaction_policy("1.0.0", "sha256-multi-test");
     bundle_writer
@@ -726,8 +908,8 @@ fn test_pipeline_multiple_telemetry_tables_in_bundle() {
             "schema_version": "1.0.0"
         }))
         .expect("add summary");
-    bundle_writer.add_telemetry("audit", audit_bytes);
-    // Add fake proc_samples telemetry
+    bundle_writer.add_telemetry("audit", audit_bytes.clone());
+    // Opaque proc_samples bytes test archive packaging, not Parquet validity.
     bundle_writer.add_telemetry("proc_samples", vec![0x50, 0x41, 0x52, 0x31, 0x00]);
     // Add JSONL log
     let log = json!({
@@ -754,6 +936,18 @@ fn test_pipeline_multiple_telemetry_tables_in_bundle() {
     assert_eq!(
         telemetry_count, 2,
         "bundle should contain 2 telemetry files"
+    );
+    assert_eq!(
+        reader
+            .read_verified("telemetry/audit.parquet")
+            .expect("read audit archive"),
+        audit_bytes
+    );
+    assert_eq!(
+        reader
+            .read_verified("telemetry/proc_samples.parquet")
+            .expect("read opaque archive"),
+        vec![0x50, 0x41, 0x52, 0x31, 0x00]
     );
 
     // Verify full bundle integrity
@@ -788,8 +982,10 @@ fn test_pipeline_produces_deterministic_manifest() {
     let temp_dir = TempDir::new().expect("tempdir");
 
     // Run pipeline twice with same parameters
-    let (_, manifest_1, _) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "determinism-1");
-    let (_, manifest_2, _) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "determinism-2");
+    let (_, manifest_1, _) =
+        run_full_pipeline(ExportProfile::Safe, &temp_dir, "determinism-1", false);
+    let (_, manifest_2, _) =
+        run_full_pipeline(ExportProfile::Safe, &temp_dir, "determinism-2", false);
 
     // Same file count
     assert_eq!(
@@ -822,7 +1018,8 @@ fn test_pipeline_produces_deterministic_manifest() {
 #[test]
 fn test_pipeline_custom_report_title() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let (bundle_bytes, _, _) = run_full_pipeline(ExportProfile::Safe, &temp_dir, "custom-title");
+    let (bundle_bytes, _, _) =
+        run_full_pipeline(ExportProfile::Safe, &temp_dir, "custom-title", false);
 
     let mut reader = BundleReader::from_bytes(bundle_bytes).expect("open bundle");
 
@@ -835,5 +1032,118 @@ fn test_pipeline_custom_report_title() {
     assert!(
         html.contains("My Custom E2E Report"),
         "report should use custom title"
+    );
+}
+
+#[test]
+fn test_safe_structured_pipeline_preserves_saved_candidate_and_evidence() {
+    let private_command = "customer-private-worker --token=safe-report-canary";
+    let mut writer = BundleWriter::new(
+        "pt-20260205-120400-abcd",
+        "customer-private-host",
+        ExportProfile::Safe,
+    );
+    writer
+        .add_summary(&json!({"total_processes": 40, "candidates": 1}))
+        .expect("add Safe summary");
+    writer
+        .add_plan(&json!({
+            "scan": {"total_processes": 40},
+            "candidates": [{
+                "pid": 4242,
+                "command": private_command,
+                "score": 87.5,
+                "recommended_action": "review",
+                "posterior": {"useful": 0.05, "useful_bad": 0.075, "abandoned": 0.8, "zombie": 0.075},
+                "age_seconds": 86400,
+                "cpu_percent": 0.125,
+                "memory_mb": 42.25,
+                "evidence_ledger": {
+                    "posterior": {
+                        "evidence_terms": [{
+                            "feature": "cpu",
+                            "log_likelihood": {"useful": -4.25, "useful_bad": -2.0, "abandoned": -0.125, "zombie": -0.5}
+                        }]
+                    }
+                }
+            }]
+        }))
+        .expect("add saved Safe plan");
+    writer.add_log(
+        "outcomes",
+        b"{\"pid\":4242,\"action\":\"spare\",\"success\":true,\"status\":\"completed\"}\n".to_vec(),
+    );
+
+    let (bytes, manifest) = writer.write_to_vec().expect("write structured Safe bundle");
+    assert_eq!(manifest.export_profile, ExportProfile::Safe);
+    assert_ne!(manifest.host_id, "customer-private-host");
+    let mut reader = BundleReader::from_bytes(bytes).expect("read structured Safe bundle");
+    assert_eq!(reader.session_id(), "pt-20260205-120400-abcd");
+    assert!(reader.verify_all().is_empty());
+    assert!(reader.telemetry_files().is_empty());
+    let plan: serde_json::Value = reader.read_plan().expect("read saved plan").expect("plan");
+    let candidate = &plan["candidates"][0];
+    assert_eq!(candidate["pid"], 4242);
+    assert_eq!(candidate["score"], 87.5);
+    assert_eq!(candidate["recommended_action"], "review");
+    assert_eq!(candidate["posterior"]["abandoned"], 0.8);
+    assert_eq!(
+        candidate["evidence_ledger"]["posterior"]["evidence_terms"][0]["log_likelihood"]["useful"],
+        -4.25
+    );
+    assert!(!plan.to_string().contains(private_command));
+
+    let generator = ReportGenerator::new(ReportConfig::new().with_galaxy_brain(true));
+    let html = generator
+        .generate_from_bundle(&mut reader)
+        .expect("render saved Safe report");
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    assert!(html.contains("recorded-candidates"));
+    assert!(html.contains("4242"));
+    assert!(html.contains("87.5"));
+    assert!(html.contains("review"));
+    assert!(html.contains("Recorded Evidence Ledger"));
+    assert!(html.contains("-4.25"));
+    assert!(html.contains("-0.125"));
+    assert!(html.contains("recorded-outcomes"));
+    assert!(!html.contains(private_command));
+    assert!(!html.contains("customer-private-host"));
+    assert!(!html.contains("Prior Probabilities"));
+}
+
+#[test]
+fn test_safe_pipeline_refuses_opaque_parquet_before_output_creation() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let session_id = "pt-20260205-120500-abcd";
+    let schema = audit_schema();
+    let writer_config = WriterConfig::new(
+        temp_dir.path().join("refusal-telemetry"),
+        session_id.to_string(),
+        "refusal-host".to_string(),
+    )
+    .with_batch_size(1);
+    let mut telemetry =
+        BatchedWriter::new(TableName::Audit, Arc::new(schema.clone()), writer_config);
+    telemetry
+        .write(create_audit_batch(&schema, session_id))
+        .expect("write real audit row");
+    let parquet_path = telemetry.close().expect("finish real Parquet");
+    let parquet_bytes = fs::read(&parquet_path).expect("read real Parquet");
+    assert!(parquet_bytes.starts_with(b"PAR1"));
+
+    let mut writer = BundleWriter::new(session_id, "refusal-host", ExportProfile::Safe);
+    writer
+        .add_summary(&json!({"total_processes": 1, "candidates": 0}))
+        .expect("add Safe summary");
+    writer.add_telemetry("audit", parquet_bytes);
+    let destination = temp_dir.path().join("safe-refused.ptb");
+    assert!(matches!(
+        writer.write(&destination),
+        Err(BundleError::UnsanitizedPayload { path, profile })
+            if path == "telemetry/audit.parquet" && profile == "safe"
+    ));
+    assert!(
+        !destination.exists(),
+        "Safe refusal must not create a bundle"
     );
 }

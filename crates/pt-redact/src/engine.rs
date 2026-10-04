@@ -159,6 +159,113 @@ impl RedactionEngine {
         &self.policy
     }
 
+    /// Sanitize structured session data before export. Unknown strings and map
+    /// keys are pseudonymized; only validated public schema values are retained.
+    /// Environment values are never exported, including with forensic policies.
+    pub fn redact_json_for_export(
+        &self,
+        value: &serde_json::Value,
+        profile: crate::ExportProfile,
+    ) -> serde_json::Value {
+        self.redact_json_field(value, None, profile)
+    }
+
+    fn redact_json_field(
+        &self,
+        value: &serde_json::Value,
+        field: Option<&str>,
+        profile: crate::ExportProfile,
+    ) -> serde_json::Value {
+        use serde_json::Value;
+        let normalized_field = field.unwrap_or("").to_ascii_lowercase();
+        let field = normalized_field.as_str();
+        if matches!(
+            field,
+            "env"
+                | "environ"
+                | "environment"
+                | "environment_variables"
+                | "env_value"
+                | "environment_value"
+                | "environment_json"
+                | "password"
+                | "token"
+                | "secret"
+                | "api_key"
+                | "authorization"
+                | "credential"
+        ) || field.ends_with("_token")
+            || field.ends_with("_secret")
+            || field.contains("password")
+        {
+            return Value::String("[REDACTED]".to_string());
+        }
+        match value {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, value)| {
+                        let exported_key = if is_export_field(key) {
+                            key.clone()
+                        } else {
+                            self.apply_action(key, Action::Hash).output
+                        };
+                        (
+                            exported_key,
+                            self.redact_json_field(value, Some(key), profile),
+                        )
+                    })
+                    .collect(),
+            ),
+            Value::Array(values) => Value::Array(
+                values
+                    .iter()
+                    .map(|value| self.redact_json_field(value, Some(field), profile))
+                    .collect(),
+            ),
+            Value::String(text) => {
+                if self.detector.detect(text).is_some() {
+                    return Value::String("[REDACTED]".to_string());
+                }
+                if is_public_export_string(field, text) {
+                    return value.clone();
+                }
+                let class = match field {
+                    "cmd" | "comm" | "cmdline" | "command" | "cmd_pattern" | "cmdline_raw"
+                    | "command_line" | "argv" | "args" => FieldClass::Cmdline,
+                    "hostname" | "host" | "host_id" => FieldClass::Hostname,
+                    "username" | "user" | "owner" | "uid" => FieldClass::Username,
+                    "path" | "cwd" | "exe" | "executable" | "home" | "artifact_path" => {
+                        FieldClass::PathProject
+                    }
+                    _ => FieldClass::FreeText,
+                };
+                let redacted = self.redact_with_profile(text, class, profile);
+                let output = if profile != crate::ExportProfile::Forensic
+                    && !matches!(
+                        redacted.action_applied,
+                        Action::Hash | Action::NormalizeHash | Action::Redact
+                    ) {
+                    self.apply_action(text, Action::Hash).output
+                } else {
+                    redacted.output
+                };
+                Value::String(output)
+            }
+            Value::Number(_) if matches!(field, "uid" | "gid" | "euid" | "egid") => {
+                if self.policy.action_for_profile(FieldClass::Uid, profile) == Action::Allow {
+                    value.clone()
+                } else {
+                    Value::String(
+                        self.redact_with_profile(&value.to_string(), FieldClass::Uid, profile)
+                            .output,
+                    )
+                }
+            }
+            _ => value.clone(),
+        }
+    }
+
     /// Detect what action to apply based on content analysis.
     fn detect_action(&self, value: &str, field_class: FieldClass) -> Action {
         // Skip detection if disabled
@@ -271,6 +378,159 @@ impl RedactionEngine {
     }
 }
 
+fn is_export_field(key: &str) -> bool {
+    static FIELDS: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
+        once_cell::sync::Lazy::new(|| {
+            "schema_version bundle_version pt_version policy_version session_id
+            generated_at created_at updated_at started_at ended_at completed_at timestamp
+            host_id hostname host os_family os_arch cores memory_total_gb
+            payload integrity_sha256 policy_hash priors_hash config_hash
+            summary total count total_processes total_system_processes
+            protected_filtered record_count records candidate_count candidates
+            action_count kill_count review_count spare_count actions outcomes recommendations kills spares
+            processes_scanned candidates_found kills_attempted kills_successful deep_scan spares
+            total_processes_scanned candidates_evaluated candidates_returned kill_recommendations
+            review_recommendations policy_blocked protected_by_rule
+            os_version kernel_version arch family memory_bytes duration_ms export_profile timing
+            pid ppid uid gid euid egid start_id comm cmd cmdline command command_line command_short
+            cmd_short cmd_full target plan_id pre_toggled gates_summary policy_snapshot
+            cmd_pattern cmdline_raw argv args path cwd exe executable home artifact_path
+            user username owner env environ environment environment_variables
+            state status mode classification confidence recommendation recommended_action
+            action action_id action_type rationale action_rationale score posterior
+            posterior_useful posterior_useful_bad posterior_abandoned posterior_zombie
+            useful useful_bad abandoned zombie expected_loss loss start_time_unix elapsed_secs
+            age_s age_seconds cpu_pct cpu_percent mem_pct mem_mb rss_bytes memory_mb resources cpu memory io
+            read_bytes write_bytes read_rate write_rate io_read_rate io_write_rate
+            is_orphan is_zombie is_protected has_network has_children child_count
+            protected policy policy_blocked blocked_by_gate passed_safety_gates
+            evidence evidence_ledger evidence_terms evidence_tags tags features feature
+            log_likelihood log_posterior log_odds_abandoned_useful bayes_factors bf log_bf delta_bits
+            direction strength top_evidence why_summary evidence_glyphs identity_quality warnings error
+            blast_radius blast_radius_risk_level blast_radius_total_affected risk_level
+            provenance provenance_inference provenance_evidence_completeness provenance_score_terms
+            provenance_log_odds_shift uncertainty posterior_entropy_bits abandonment_probability
+            intervention_probability reversibility success skipped exit_code duration_ms
+            duration_seconds signal reason description scan decision inference event phase case_id artifacts kind
+            above_threshold evaluated scanned protected_count recommended_kill recommended_review
+            recommended_spare total_candidates total_actions successful failed
+            goal goal_progress goal_summary system pressure regime attribution resource_delta"
+                .split_whitespace()
+                .collect()
+        });
+    FIELDS.contains(key)
+}
+
+fn is_public_export_string(field: &str, value: &str) -> bool {
+    if field == "host_id" && value == "unknown" {
+        return true;
+    }
+    if field == "session_id" {
+        static SESSION_ID: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"^pt-[0-9]{8}-[0-9]{6}-[a-z2-7]{4}$")
+                .expect("static session ID regex")
+        });
+        return SESSION_ID.is_match(value);
+    }
+    if matches!(field, "artifact_path" | "path") {
+        return matches!(
+            value,
+            "summary.json"
+                | "plan.json"
+                | "scan/inventory.json"
+                | "scan/provenance.json"
+                | "scan/provenance_audit.json"
+                | "inference/results.json"
+                | "telemetry/audit.parquet"
+                | "telemetry/proc_samples.parquet"
+                | "logs/events.jsonl"
+                | "logs/outcomes.jsonl"
+                | "logs/session.jsonl"
+        );
+    }
+    if matches!(
+        field,
+        "schema_version" | "bundle_version" | "pt_version" | "policy_version"
+    ) {
+        static VERSION: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+                .expect("static public version regex")
+        });
+        return VERSION.is_match(value);
+    }
+    if matches!(
+        field,
+        "integrity_sha256" | "policy_hash" | "priors_hash" | "config_hash"
+    ) {
+        return value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    if matches!(
+        field,
+        "generated_at"
+            | "created_at"
+            | "updated_at"
+            | "started_at"
+            | "ended_at"
+            | "completed_at"
+            | "timestamp"
+    ) {
+        return chrono::DateTime::parse_from_rfc3339(value).is_ok();
+    }
+    if field == "feature" {
+        return matches!(
+            value,
+            "prior"
+                | "cpu"
+                | "runtime"
+                | "orphan"
+                | "tty"
+                | "net"
+                | "io_active"
+                | "queue_saturated"
+                | "state_flag"
+                | "command_category"
+        );
+    }
+    if !matches!(
+        field,
+        "state"
+            | "status"
+            | "mode"
+            | "classification"
+            | "confidence"
+            | "recommendation"
+            | "recommended_action"
+            | "action"
+            | "action_type"
+            | "risk_level"
+            | "blast_radius_risk_level"
+            | "identity_quality"
+            | "reversibility"
+            | "os_family"
+            | "family"
+            | "os_arch"
+            | "arch"
+            | "export_profile"
+    ) {
+        return false;
+    }
+    static VALUES: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
+        once_cell::sync::Lazy::new(|| {
+            "useful useful_bad abandoned zombie kill review spare keep renice pause resume
+            freeze unfreeze throttle quarantine unquarantine restart low medium high critical unknown
+            very_high veryhigh usefulbad normal
+            quickscan deep quick interactive robot agent dry_run planned completed applied running
+            created scanning executing cancelled archived robot_plan robot_apply daemon_alert scan_only export
+            success succeeded failed blocked skipped ok error linux macos darwin x86_64 aarch64
+            blocked_by_plan blocked_by_constraints precheck_blocked identity_mismatch identity_check_failed
+            already_completed shadow unsupported_platform
+            irreversible reversible reversal no_action safe minimal forensic r s d z t i"
+                .split_whitespace()
+                .collect()
+        });
+    VALUES.contains(value.to_ascii_lowercase().as_str())
+}
+
 /// Truncate a value, keeping prefix and suffix.
 fn truncate_value(value: &str, keep_chars: usize) -> String {
     if value.chars().count() <= keep_chars * 2 {
@@ -335,6 +595,66 @@ mod tests {
         let policy = RedactionPolicy::default();
         let key = KeyMaterial::from_bytes([0u8; 32], "test");
         RedactionEngine::with_key(policy, key)
+    }
+
+    #[test]
+    fn structured_export_preserves_evidence_without_private_strings() {
+        let engine = test_engine();
+        let input = serde_json::json!({
+            "schema_version": "1.0.0",
+            "generated_at": "2026-10-04T20:00:00Z",
+            "candidates": [{
+                "pid": 1234, "uid": 1000, "score": 87,
+                "posterior": {"useful": 0.1, "useful_bad": 0.03, "abandoned": 0.8, "zombie": 0.07},
+                "recommended_action": "KILL",
+                "cmd": "python /home/private-customer/job.py",
+                "hostname": "customer-private-host",
+                "cwd": "/home/private-customer/work",
+                "environment": {"ACCESS_TOKEN": "super_secret_token"},
+                "private-customer-map-key": "AKIAIOSFODNN7EXAMPLE"
+            }]
+        });
+        let output = engine.redact_json_for_export(&input, crate::ExportProfile::Safe);
+        let candidate = &output["candidates"][0];
+        assert_eq!(candidate["pid"], 1234);
+        assert_eq!(candidate["score"], 87);
+        assert_eq!(candidate["posterior"]["useful_bad"], 0.03);
+        assert_eq!(candidate["recommended_action"], "KILL");
+        assert_eq!(output["generated_at"], input["generated_at"]);
+        assert_eq!(candidate["environment"], "[REDACTED]");
+        assert_eq!(candidate["uid"], 1000);
+        let text = output.to_string();
+        for canary in [
+            "private-customer",
+            "customer-private-host",
+            "super_secret_token",
+            "AKIAIOSFODNN7EXAMPLE",
+        ] {
+            assert!(!text.contains(canary), "export leaked {canary}");
+        }
+    }
+
+    #[test]
+    fn forensic_allowlist_never_allows_environment_or_credentials() {
+        let mut policy = RedactionPolicy::default();
+        let rule = policy.field_rules.get_mut("cmdline").unwrap();
+        rule.profile_overrides = Some(
+            [("forensic".to_string(), Action::Allow)]
+                .into_iter()
+                .collect(),
+        );
+        let engine = RedactionEngine::with_key(policy, KeyMaterial::from_bytes([0; 32], "test"));
+        let input = serde_json::json!({
+            "cmd": "python private-job.py",
+            "environment": {"HOME": "/home/private-user"},
+            "args": ["AKIAIOSFODNN7EXAMPLE"]
+        });
+        let forensic = engine.redact_json_for_export(&input, crate::ExportProfile::Forensic);
+        let safe = engine.redact_json_for_export(&input, crate::ExportProfile::Safe);
+        assert_eq!(forensic["cmd"], input["cmd"]);
+        assert_ne!(safe["cmd"], input["cmd"]);
+        assert_eq!(forensic["environment"], "[REDACTED]");
+        assert_eq!(forensic["args"][0], "[REDACTED]");
     }
 
     #[test]

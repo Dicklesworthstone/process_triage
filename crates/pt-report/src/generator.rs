@@ -1,7 +1,7 @@
 //! Report generator implementation.
 
 use crate::config::ReportConfig;
-use crate::error::Result;
+use crate::error::{ReportError, Result};
 use crate::sections::*;
 
 use chrono::{DateTime, Utc};
@@ -73,32 +73,153 @@ impl ReportGenerator {
     ) -> Result<String> {
         debug!("Generating report from bundle");
 
-        // Read manifest for metadata
-        let manifest = reader.manifest();
+        let overview = self.build_overview_from_manifest(reader.manifest());
+        // Bundle creation is not session start, and an archive does not establish
+        // that its session completed. Use saved session metadata when available.
+        let mut recorded_overview = serde_json::to_value(&overview)?;
+        recorded_overview["started_at"] = serde_json::Value::Null;
+        recorded_overview["state"] = serde_json::Value::Null;
+        recorded_overview["deep_scan"] = serde_json::Value::Null;
+        if reader.has_file("session/context.json") {
+            let context: serde_json::Value =
+                serde_json::from_slice(&reader.read_verified("session/context.json")?)?;
+            recorded_overview["host_id"] = context["host_id"].clone();
+            recorded_overview["os_family"] = context["os"]["family"].clone();
+            recorded_overview["arch"] = context["os"]["arch"].clone();
+        }
+        if reader.has_file("session/manifest.json") {
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&reader.read_verified("session/manifest.json")?)?;
+            recorded_overview["started_at"] = metadata["timing"]["created_at"].clone();
+            recorded_overview["state"] = metadata["state"].clone();
+            recorded_overview["mode"] = metadata["mode"].clone();
+        }
+        let plan: Option<serde_json::Value> = reader.read_plan()?;
+        let plan = match plan {
+            Some(plan) => plan,
+            None if reader.has_file("summary.json") => {
+                serde_json::json!({"summary": reader.read_summary::<serde_json::Value>()?})
+            }
+            None => serde_json::json!({}),
+        };
+        let outcomes = if reader.has_file("logs/outcomes.jsonl") {
+            parse_outcomes(&reader.read_verified("logs/outcomes.jsonl")?)?
+        } else {
+            Vec::new()
+        };
+        self.generate_recorded_artifacts(overview, recorded_overview, &plan, &outcomes)
+    }
 
-        // Build overview from manifest
-        let overview = self.build_overview_from_manifest(manifest);
+    /// Render recorded plan evidence and outcomes without reconstructing missing
+    /// measurements or applying today's inference configuration to an old session.
+    pub fn generate_from_session_artifacts(
+        &self,
+        overview: OverviewSection,
+        plan: &serde_json::Value,
+        outcomes: &[serde_json::Value],
+    ) -> Result<String> {
+        let recorded_overview = serde_json::to_value(&overview)?;
+        self.generate_recorded_artifacts(overview, recorded_overview, plan, outcomes)
+    }
 
-        // Try to read summary for additional data
-        let _summary: Option<serde_json::Value> = reader.read_summary().ok();
-
-        // Build report data
+    fn generate_recorded_artifacts(
+        &self,
+        overview: OverviewSection,
+        mut recorded_overview: serde_json::Value,
+        plan: &serde_json::Value,
+        outcomes: &[serde_json::Value],
+    ) -> Result<String> {
+        if !plan.is_object()
+            || plan
+                .get("candidates")
+                .is_some_and(|value| !value.is_array())
+        {
+            return Err(ReportError::MissingData(
+                "invalid recorded plan".to_string(),
+            ));
+        }
+        let profile = pt_redact::ExportProfile::parse_str(&self.config.redaction_profile)
+            .ok_or_else(|| ReportError::InvalidConfig("invalid redaction profile".to_string()))?;
+        let engine = pt_redact::RedactionEngine::new(pt_redact::RedactionPolicy::default())
+            .map_err(|error| ReportError::InvalidConfig(error.to_string()))?;
+        let candidate_count = plan["candidates"].as_array().map(Vec::len);
+        recorded_overview["candidates_found"] = candidate_count
+            .map(serde_json::Value::from)
+            .or_else(|| plan.pointer("/summary/candidates_returned").cloned())
+            .or_else(|| plan.pointer("/summary/candidates").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        recorded_overview["processes_scanned"] = plan
+            .pointer("/scan/total_processes")
+            .or_else(|| plan.pointer("/summary/total_processes_scanned"))
+            .or_else(|| plan.pointer("/summary/total_processes"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        // Missing action logs are unknown, not a measured zero. Only count
+        // terminal outcomes whose recorded action can be established.
+        for field in ["kills_attempted", "kills_successful", "spares"] {
+            recorded_overview[field] = serde_json::Value::Null;
+        }
+        if !outcomes.is_empty() {
+            let mut attempted = 0;
+            let mut successful = 0;
+            let mut complete_actions = true;
+            for outcome in outcomes {
+                let action = outcome
+                    .get("action")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| {
+                        let id = outcome.get("action_id")?.as_str()?;
+                        plan["actions"]
+                            .as_array()?
+                            .iter()
+                            .find(|action| action["action_id"] == id)?
+                            .get("action")?
+                            .as_str()
+                    });
+                complete_actions &= action.is_some();
+                let status = outcome["status"].as_str();
+                if action.is_some_and(|action| action.eq_ignore_ascii_case("kill"))
+                    && matches!(status, Some("success" | "failed"))
+                {
+                    attempted += 1;
+                    successful += usize::from(status == Some("success"));
+                }
+            }
+            if complete_actions {
+                recorded_overview["kills_attempted"] = serde_json::json!(attempted);
+                recorded_overview["kills_successful"] = serde_json::json!(successful);
+            }
+        }
+        let overview: OverviewSection = serde_json::from_value(
+            engine.redact_json_for_export(&serde_json::to_value(overview)?, profile),
+        )?;
+        let recorded_overview = engine.redact_json_for_export(&recorded_overview, profile);
+        let recorded = if profile == pt_redact::ExportProfile::Minimal {
+            serde_json::json!({"overview": recorded_overview, "candidate_count": candidate_count, "outcome_count": outcomes.len()})
+        } else {
+            // One engine preserves correlation between candidate and outcome
+            // pseudonyms; sanitize before either HTML or embedded JSON is built.
+            serde_json::json!({
+                "overview": recorded_overview,
+                "plan": engine.redact_json_for_export(plan, profile),
+                "outcomes": outcomes.iter().map(|outcome| engine.redact_json_for_export(outcome, profile)).collect::<Vec<_>>(),
+            })
+        };
         let data = ReportData {
             config: self.config.clone(),
             generated_at: Utc::now(),
             generator_version: env!("CARGO_PKG_VERSION").to_string(),
             overview: Some(overview),
-            candidates: None, // Would be populated from telemetry
+            candidates: None,
             evidence: None,
             actions: None,
-            galaxy_brain: if self.config.galaxy_brain {
-                Some(GalaxyBrainSection::default())
-            } else {
-                None
-            },
+            galaxy_brain: None,
         };
-
-        self.render_html(&data)
+        let sections = self.generate_recorded_sections(&recorded)?;
+        self.finish_html(
+            self.generate_html(&data, &sections, Some(&recorded["overview"])),
+            &data,
+        )
     }
 
     /// Generate report from structured data.
@@ -143,8 +264,10 @@ impl ReportGenerator {
     }
 
     fn render_html(&self, data: &ReportData) -> Result<String> {
-        let html = self.generate_html(data);
+        self.finish_html(self.generate_html(data, "", None), data)
+    }
 
+    fn finish_html(&self, html: String, data: &ReportData) -> Result<String> {
         // Optionally minify
         let output = if cfg!(debug_assertions) {
             html
@@ -166,7 +289,12 @@ impl ReportGenerator {
         Ok(output)
     }
 
-    fn generate_html(&self, data: &ReportData) -> String {
+    fn generate_html(
+        &self,
+        data: &ReportData,
+        recorded_sections: &str,
+        recorded_overview: Option<&serde_json::Value>,
+    ) -> String {
         let title = data.title();
         let theme_class = self.config.theme.css_class();
         let cdn_base = &self.config.cdn_config.base_url;
@@ -176,7 +304,10 @@ impl ReportGenerator {
         let mut cdn_styles = String::new();
         let mut cdn_scripts = String::new();
 
-        if let Some(lib) = libs.get("tailwindcss") {
+        if let Some(lib) = libs
+            .get("tailwindcss")
+            .filter(|_| !self.config.embed_assets)
+        {
             let url = lib.url(cdn_base, "tailwindcss");
             cdn_styles.push_str(&format!(
                 r#"<link rel="stylesheet" href="{}" integrity="{}" crossorigin="anonymous">"#,
@@ -184,7 +315,10 @@ impl ReportGenerator {
             ));
         }
 
-        if let Some(lib) = libs.get("tabulator-tables") {
+        if let Some(lib) = libs
+            .get("tabulator-tables")
+            .filter(|_| !self.config.embed_assets)
+        {
             cdn_styles.push_str(&format!(
                 r#"<link rel="stylesheet" href="{}/tabulator-tables@{}/dist/css/tabulator.min.css" integrity="{}" crossorigin="anonymous">"#,
                 cdn_base, lib.version, lib.sri
@@ -195,14 +329,14 @@ impl ReportGenerator {
             ));
         }
 
-        if let Some(lib) = libs.get("echarts") {
+        if let Some(lib) = libs.get("echarts").filter(|_| !self.config.embed_assets) {
             cdn_scripts.push_str(&format!(
                 r#"<script src="{}/echarts@{}/dist/echarts.min.js" integrity="{}" crossorigin="anonymous"></script>"#,
                 cdn_base, lib.version, lib.sri
             ));
         }
 
-        if self.config.galaxy_brain {
+        if self.config.galaxy_brain && !self.config.embed_assets {
             if let Some(lib) = libs.get("katex") {
                 cdn_styles.push_str(&format!(
                     r#"<link rel="stylesheet" href="{}/katex@{}/dist/katex.min.css" integrity="{}" crossorigin="anonymous">"#,
@@ -216,7 +350,11 @@ impl ReportGenerator {
         }
 
         // Serialize data for JavaScript (escape to keep script tag safe)
-        let data_json = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+        let mut data_json = serde_json::to_value(data).unwrap_or_default();
+        if let Some(overview) = recorded_overview {
+            data_json["overview"] = overview.clone();
+        }
+        let data_json = data_json.to_string();
         let data_json = json_script_escape(&data_json);
 
         format!(
@@ -296,7 +434,7 @@ impl ReportGenerator {
             border-bottom-color: var(--accent-color);
             color: var(--accent-color);
         }}
-        .tab-content {{
+        .js-enabled .tab-content {{
             display: none;
         }}
         .tab-content.active {{
@@ -352,6 +490,7 @@ impl ReportGenerator {
         <!-- Tab Contents -->
         <main>
             {tab_contents}
+            {recorded_sections}
         </main>
 
         <!-- Footer -->
@@ -369,6 +508,7 @@ impl ReportGenerator {
     <script>
         // Report data
         const REPORT_DATA = {data_json};
+        document.documentElement.classList.add('js-enabled');
 
         // Tab switching
         function switchTab(tabId) {{
@@ -464,7 +604,8 @@ impl ReportGenerator {
             generated_at = data.generated_at.format("%Y-%m-%d %H:%M UTC"),
             profile = html_escape(&self.config.redaction_profile),
             tab_buttons = self.generate_tab_buttons(data),
-            tab_contents = self.generate_tab_contents(data),
+            tab_contents = self.generate_tab_contents(data, recorded_overview),
+            recorded_sections = recorded_sections,
             cdn_scripts = cdn_scripts,
             data_json = data_json,
         )
@@ -494,13 +635,115 @@ impl ReportGenerator {
         buttons.join("\n            ")
     }
 
-    fn generate_tab_contents(&self, data: &ReportData) -> String {
+    fn generate_recorded_sections(&self, recorded: &serde_json::Value) -> Result<String> {
+        let mut html = String::new();
+        if let Some(candidates) = recorded
+            .pointer("/plan/candidates")
+            .and_then(|v| v.as_array())
+        {
+            if self.config.sections.candidates {
+                html.push_str("<section class=\"card\" id=\"recorded-candidates\"><h2>Candidate Processes</h2><div style=\"overflow-x:auto\"><table><thead><tr><th>PID</th><th>Command</th><th>Score (0–100)</th><th>Final recommendation</th><th>Useful</th><th>Useful bad</th><th>Abandoned</th><th>Zombie</th><th>Age (seconds)</th><th>CPU (%)</th><th>Memory (MB)</th></tr></thead><tbody>");
+                for candidate in candidates.iter().take(self.config.limits.max_candidates) {
+                    html.push_str("<tr>");
+                    for paths in [
+                        &["/pid"][..],
+                        &["/command", "/cmd"],
+                        &["/score"],
+                        &["/recommended_action", "/recommendation"],
+                        &["/posterior/useful"],
+                        &["/posterior/useful_bad"],
+                        &["/posterior/abandoned"],
+                        &["/posterior/zombie"],
+                        &["/age_seconds", "/age_s"],
+                        &["/cpu_percent", "/cpu_pct"],
+                        &["/memory_mb", "/mem_mb"],
+                    ] {
+                        html.push_str(&format!("<td>{}</td>", recorded_cell(candidate, paths)));
+                    }
+                    html.push_str("</tr>");
+                }
+                html.push_str("</tbody></table></div>");
+                if candidates.len() > self.config.limits.max_candidates {
+                    html.push_str(&format!(
+                        "<p>Showing {} of {} recorded candidates.</p>",
+                        self.config.limits.max_candidates,
+                        candidates.len(),
+                    ));
+                }
+                html.push_str("</section>");
+            }
+            if self.config.galaxy_brain && self.config.sections.evidence {
+                html.push_str("<section class=\"card\" id=\"recorded-evidence\"><h2>Recorded Evidence Ledger</h2><p>These are saved inference terms. Historical priors or calibration results are shown only when recorded.</p>");
+                for candidate in candidates.iter().take(self.config.limits.max_candidates) {
+                    html.push_str(&format!(
+                        "<details><summary>PID {}</summary>",
+                        recorded_cell(candidate, &["/pid"]),
+                    ));
+                    if let Some(ledger) = candidate.get("evidence_ledger").filter(|v| v.is_object())
+                    {
+                        html.push_str(&format!(
+                            "<pre>{}</pre>",
+                            html_escape(&serde_json::to_string_pretty(ledger)?),
+                        ));
+                    } else {
+                        html.push_str("<p>Exact ledger not recorded for this candidate.</p>");
+                    }
+                    html.push_str("</details>");
+                }
+                html.push_str("</section>");
+            }
+        } else if recorded.get("candidate_count").is_some() {
+            html.push_str("<section class=\"card\"><h2>Aggregate Export</h2><p>Per-process candidates and outcomes are omitted by the minimal profile.</p></section>");
+        } else {
+            html.push_str("<section class=\"card\"><h2>Candidate Processes</h2><p>Candidate details were not recorded in this plan.</p></section>");
+        }
+        if self.config.sections.actions {
+            if let Some(outcomes) = recorded.get("outcomes").and_then(|v| v.as_array()) {
+                html.push_str("<section class=\"card\" id=\"recorded-outcomes\"><h2>Recorded Actions and Outcomes</h2>");
+                if outcomes.is_empty() {
+                    html.push_str("<p>No action outcomes were recorded.</p>");
+                }
+                for outcome in outcomes {
+                    html.push_str(&format!(
+                        "<pre>{}</pre>",
+                        html_escape(&serde_json::to_string_pretty(outcome)?),
+                    ));
+                }
+                html.push_str("</section>");
+            }
+        }
+        for (field, title) in [
+            ("goal_progress", "Recorded Goal Progress"),
+            ("system", "Recorded System Pressure"),
+        ] {
+            if let Some(value) = recorded["plan"].get(field).filter(|v| !v.is_null()) {
+                html.push_str(&format!(
+                    "<section class=\"card\"><h2>{title}</h2><pre>{}</pre></section>",
+                    html_escape(&serde_json::to_string_pretty(value)?),
+                ));
+            }
+        }
+        html.push_str(&format!(
+            "<script type=\"application/json\" id=\"recorded-session-data\">{}</script>",
+            json_script_escape(&serde_json::to_string(recorded)?),
+        ));
+        Ok(html)
+    }
+
+    fn generate_tab_contents(
+        &self,
+        data: &ReportData,
+        recorded_overview: Option<&serde_json::Value>,
+    ) -> String {
         let mut contents = Vec::new();
         let sections = &self.config.sections;
 
         if sections.overview {
             if let Some(ref overview) = data.overview {
-                contents.push(self.generate_overview_tab(overview));
+                let overview = recorded_overview
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::to_value(overview).unwrap_or_default());
+                contents.push(self.generate_overview_tab(&overview));
             }
         }
         if sections.candidates {
@@ -527,7 +770,7 @@ impl ReportGenerator {
         contents.join("\n")
     }
 
-    fn generate_overview_tab(&self, overview: &OverviewSection) -> String {
+    fn generate_overview_tab(&self, overview: &serde_json::Value) -> String {
         format!(
             r##"<section id="tab-overview" class="tab-content">
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
@@ -559,7 +802,7 @@ impl ReportGenerator {
                 <dd class="font-mono">{host_id}</dd>
                 <dt style="color: var(--text-secondary)">Started</dt>
                 <dd>{started_at}</dd>
-                <dt style="color: var(--text-secondary)">Duration</dt>
+                <dt style="color: var(--text-secondary)">Duration (ms)</dt>
                 <dd>{duration}</dd>
                 <dt style="color: var(--text-secondary)">Mode</dt>
                 <dd>{mode}</dd>
@@ -577,7 +820,7 @@ impl ReportGenerator {
                 <dd>{arch}</dd>
                 <dt style="color: var(--text-secondary)">Cores</dt>
                 <dd>{cores}</dd>
-                <dt style="color: var(--text-secondary)">Memory</dt>
+                <dt style="color: var(--text-secondary)">Memory (bytes)</dt>
                 <dd>{memory}</dd>
                 <dt style="color: var(--text-secondary)">PT Version</dt>
                 <dd>{pt_version}</dd>
@@ -587,25 +830,22 @@ impl ReportGenerator {
         </div>
     </div>
 </section>"##,
-            processes = overview.processes_scanned,
-            candidates = overview.candidates_found,
-            kills = overview.kills_successful,
-            spares = overview.spares,
-            session_id = html_escape(&overview.session_id),
-            host_id = html_escape(&overview.host_id),
-            started_at = overview.started_at.format("%Y-%m-%d %H:%M:%S UTC"),
-            duration = overview.duration_formatted(),
-            mode = html_escape(&overview.mode),
-            state = html_escape(&overview.state),
-            os = html_escape(overview.os_family.as_deref().unwrap_or("Unknown")),
-            arch = html_escape(overview.arch.as_deref().unwrap_or("Unknown")),
-            cores = overview
-                .cores
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "N/A".to_string()),
-            memory = overview.memory_formatted(),
-            pt_version = html_escape(overview.pt_version.as_deref().unwrap_or("Unknown")),
-            profile = html_escape(&overview.export_profile),
+            processes = recorded_cell(overview, &["/processes_scanned"]),
+            candidates = recorded_cell(overview, &["/candidates_found"]),
+            kills = recorded_cell(overview, &["/kills_successful"]),
+            spares = recorded_cell(overview, &["/spares"]),
+            session_id = recorded_cell(overview, &["/session_id"]),
+            host_id = recorded_cell(overview, &["/host_id"]),
+            started_at = recorded_cell(overview, &["/started_at"]),
+            duration = recorded_cell(overview, &["/duration_ms"]),
+            mode = recorded_cell(overview, &["/mode"]),
+            state = recorded_cell(overview, &["/state"]),
+            os = recorded_cell(overview, &["/os_family"]),
+            arch = recorded_cell(overview, &["/arch"]),
+            cores = recorded_cell(overview, &["/cores"]),
+            memory = recorded_cell(overview, &["/memory_bytes"]),
+            pt_version = recorded_cell(overview, &["/pt_version"]),
+            profile = recorded_cell(overview, &["/export_profile"]),
         )
     }
 
@@ -954,6 +1194,30 @@ impl ActionRow {
     }
 }
 
+/// Parse actual JSONL outcomes, propagating malformed records instead of hiding them.
+pub fn parse_outcomes(bytes: &[u8]) -> Result<Vec<serde_json::Value>> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .map(|line| serde_json::from_slice(line).map_err(ReportError::from))
+        .collect()
+}
+
+fn recorded_cell(record: &serde_json::Value, paths: &[&str]) -> String {
+    paths
+        .iter()
+        .find_map(|path| record.pointer(path).filter(|value| !value.is_null()))
+        .map(|value| {
+            html_escape(
+                &value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string()),
+            )
+        })
+        .unwrap_or_else(|| "Not recorded".to_string())
+}
+
 /// Escape HTML special characters.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -981,6 +1245,161 @@ fn json_script_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_report_preserves_four_classes_and_final_action_without_private_data() {
+        let generator = ReportGenerator::new(
+            ReportConfig::new()
+                .with_embed_assets(true)
+                .with_galaxy_brain(true),
+        );
+        let overview = generator.build_overview_from_manifest(&pt_bundle::BundleManifest::new(
+            "pt-20261004-120500-abcd",
+            "private-customer-host",
+            pt_redact::ExportProfile::Safe,
+        ));
+        let command =
+            "python /home/private-customer/job.py </script><script>private-customer</script>";
+        let plan = serde_json::json!({
+            "scan": {"total_processes": 42},
+            "candidates": [{
+                "pid": 1234, "command": command, "score": 87,
+                "recommended_action": "review",
+                "posterior": {"useful": 0.1, "useful_bad": 0.03, "abandoned": 0.8, "zombie": 0.07},
+                "environment": {"API_KEY": "AKIAIOSFODNN7EXAMPLE"},
+                "evidence_ledger": {"evidence_terms": [{
+                    "feature": "cpu",
+                    "log_likelihood": {"useful": -2.0, "useful_bad": -1.0, "abandoned": -0.4, "zombie": -3.0}
+                }]}
+            }],
+        });
+        let outcomes = vec![serde_json::json!({
+            "pid": 1234, "command": command, "action": "kill", "status": "blocked",
+        })];
+        let html = generator
+            .generate_from_session_artifacts(overview, &plan, &outcomes)
+            .unwrap();
+        assert!(html.contains("<td>1234</td>"));
+        assert!(html.contains("<td>87</td><td>review</td>"));
+        assert!(html.contains("<td>0.1</td><td>0.03</td><td>0.8</td><td>0.07</td>"));
+        assert!(html.contains("Not recorded"));
+        assert!(html.contains("Recorded Evidence Ledger"));
+        assert!(html.contains("log_likelihood"));
+        assert!(html.contains("Recorded Actions and Outcomes"));
+        assert!(!html.contains("private-customer"));
+        assert!(!html.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!html.contains("<script src="));
+        assert!(!html.contains("<link rel=\"stylesheet\""));
+        assert!(!html.contains("P(S=legitimate)"));
+        let embedded = html
+            .split("id=\"recorded-session-data\">")
+            .nth(1)
+            .unwrap()
+            .split("</script>")
+            .next()
+            .unwrap();
+        let recorded: serde_json::Value = serde_json::from_str(embedded).unwrap();
+        assert_eq!(recorded["plan"]["candidates"][0]["pid"], 1234);
+        assert_eq!(recorded["overview"]["processes_scanned"], 42);
+        assert_eq!(recorded["overview"]["kills_successful"], 0);
+        assert!(recorded["overview"]["spares"].is_null());
+        assert_eq!(
+            recorded["plan"]["candidates"][0]["recommended_action"],
+            "review"
+        );
+        assert_eq!(
+            recorded["plan"]["candidates"][0]["command"],
+            recorded["outcomes"][0]["command"]
+        );
+    }
+
+    #[test]
+    fn old_session_reports_do_not_invent_exact_ledgers() {
+        let generator = ReportGenerator::new(ReportConfig::new().with_galaxy_brain(true));
+        let overview = generator.build_overview_from_manifest(&pt_bundle::BundleManifest::new(
+            "pt-20261004-120500-abcd",
+            "host",
+            pt_redact::ExportProfile::Safe,
+        ));
+        let html = generator.generate_from_session_artifacts(
+            overview,
+            &serde_json::json!({"candidates": [{"pid": 1234, "score": 61, "evidence": [{"contribution": 9}]}]}),
+            &[],
+        ).unwrap();
+        assert!(html.contains("Exact ledger not recorded for this candidate."));
+        assert!(!html.contains("Bayesian Inference Model"));
+        assert!(!html.contains("Historical Accuracy"));
+    }
+
+    #[test]
+    fn outcomes_parser_rejects_corrupt_jsonl_and_profile_is_validated() {
+        assert!(parse_outcomes(b"{\"pid\":1234}\nnot-json\n").is_err());
+        assert_eq!(parse_outcomes(b"\n {\"pid\":1234}\n\n").unwrap().len(), 1);
+        let mut config = ReportConfig::new();
+        config.redaction_profile = "invalid".to_string();
+        let generator = ReportGenerator::new(config);
+        let overview = generator.build_overview_from_manifest(&pt_bundle::BundleManifest::new(
+            "pt-20261004-120500-abcd",
+            "host",
+            pt_redact::ExportProfile::Safe,
+        ));
+        assert!(matches!(
+            generator.generate_from_session_artifacts(
+                overview,
+                &serde_json::json!({"candidates": []}),
+                &[]
+            ),
+            Err(ReportError::InvalidConfig(_)),
+        ));
+    }
+
+    #[test]
+    fn recorded_action_counts_join_real_action_ids_and_missing_data_stays_unknown() {
+        let generator = ReportGenerator::default_config();
+        let overview = generator.build_overview_from_manifest(&pt_bundle::BundleManifest::new(
+            "pt-20261004-120500-abcd",
+            "host",
+            pt_redact::ExportProfile::Safe,
+        ));
+        let plan = serde_json::json!({"actions": [
+            {"action_id": "a-one", "action": "kill"},
+            {"action_id": "a-two", "action": "renice"},
+            {"action_id": "a-three", "action": "kill"}
+        ]});
+        for (outcomes, expected) in [
+            (Vec::new(), serde_json::Value::Null),
+            (
+                vec![serde_json::json!({"status": "success"})],
+                serde_json::Value::Null,
+            ),
+            (
+                vec![
+                    serde_json::json!({"action_id": "a-one", "status": "success"}),
+                    serde_json::json!({"action_id": "a-two", "status": "success"}),
+                    serde_json::json!({"action_id": "a-three", "status": "failed"}),
+                ],
+                serde_json::json!(1),
+            ),
+        ] {
+            let html = generator
+                .generate_from_session_artifacts(overview.clone(), &plan, &outcomes)
+                .unwrap();
+            let embedded = html
+                .split("id=\"recorded-session-data\">")
+                .nth(1)
+                .unwrap()
+                .split("</script>")
+                .next()
+                .unwrap();
+            let recorded: serde_json::Value = serde_json::from_str(embedded).unwrap();
+            assert_eq!(recorded["overview"]["kills_successful"], expected);
+            assert!(recorded["overview"]["processes_scanned"].is_null());
+            assert!(recorded["overview"]["candidates_found"].is_null());
+        }
+        assert!(generator
+            .generate_from_session_artifacts(overview, &serde_json::json!({"candidates": 4}), &[])
+            .is_err());
+    }
 
     #[test]
     fn test_report_generator_default() {
