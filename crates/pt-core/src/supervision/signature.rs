@@ -3266,7 +3266,9 @@ mod tests {
                 Some("vercel-cli"),
             ),
             ("node", "node /home/u/.bun/bin/vercel dev", None),
-            ("npm", "npm install", Some("package-install")),
+            // The dedicated npm signature (name + args, also age-gated) outranks the
+            // generic one; package-install covers pnpm/yarn/bun and node-launched forms.
+            ("npm", "npm install", Some("npm")),
             (
                 "node",
                 "node /usr/bin/pnpm.cjs install --frozen-lockfile",

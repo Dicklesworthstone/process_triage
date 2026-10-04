@@ -682,24 +682,26 @@ mod tests {
 
     #[test]
     fn test_recurring_patterns() {
+        // Kill posteriors high enough that the 5% fleet FDR budget admits all three
+        // (expected FDP 0.0117); at ~0.88 they would be held for review.
         let inputs = vec![
             host(
                 "host1",
                 vec![
                     cand(1, "nginx", "useful", "spare", 0.1),
-                    cand(2, "old_worker", "abandoned", "kill", 0.9),
+                    cand(2, "old_worker", "abandoned", "kill", 0.99),
                 ],
             ),
             host(
                 "host2",
                 vec![
                     cand(3, "nginx", "useful", "spare", 0.15),
-                    cand(4, "old_worker", "abandoned", "kill", 0.85),
+                    cand(4, "old_worker", "abandoned", "kill", 0.985),
                 ],
             ),
             host(
                 "host3",
-                vec![cand(5, "old_worker", "abandoned", "kill", 0.88)],
+                vec![cand(5, "old_worker", "abandoned", "kill", 0.99)],
             ),
         ];
         let fleet = create_fleet_session("f3", None, &inputs, 0.05);

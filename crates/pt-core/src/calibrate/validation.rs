@@ -1094,6 +1094,9 @@ mod tests {
             }],
             belief: BeliefState {
                 p_abandoned: 0.1,
+                p_legitimate: 0.9,
+                p_zombie: 0.0,
+                p_useful_but_bad: 0.0,
                 recommendation: "keep".to_string(),
                 ..BeliefState::default()
             },
@@ -1110,7 +1113,10 @@ mod tests {
                 details: Some(serde_json::json!({"comm": "sleep"}).to_string()),
             }],
             belief: BeliefState {
-                p_abandoned: 0.9,
+                p_abandoned: 0.85,
+                p_legitimate: 0.1,
+                p_zombie: 0.05,
+                p_useful_but_bad: 0.0,
                 recommendation: "kill".to_string(),
                 ..BeliefState::default()
             },
@@ -1119,6 +1125,7 @@ mod tests {
         let engine = ValidationEngine::from_shadow_observations(&[obs1, obs2], 0.5);
         assert_eq!(engine.pending_records().len(), 1);
         let record = engine.pending_records()[0];
+        // The latest observation wins, and it predicts P(abandoned or zombie).
         assert!((record.predicted_abandoned - 0.9).abs() < 1e-6);
     }
 
