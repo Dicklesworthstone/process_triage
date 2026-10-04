@@ -1208,6 +1208,29 @@ mod provenance_tests {
     }
 
     #[test]
+    fn reparented_orphan_with_init_ancestor_is_not_scored_supervised() {
+        // The collector walks ancestors up to and including PID 1, so a real orphan
+        // always has a non-empty chain. It used to be classified InitChild and earn
+        // the "supervised" term (+useful), cancelling the base orphan evidence.
+        let mut orphan = lineage(400, 1, None);
+        orphan.sid = 350; // kept the session of the shell that spawned it
+        orphan.ancestors = vec![AncestorEntry {
+            pid: 1,
+            comm: "systemd".to_string(),
+            uid: 0,
+        }];
+        let bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[]),
+            lineages: HashMap::from([(400, orphan)]),
+            children: HashMap::new(),
+        };
+
+        let features = feature_names(&derive_provenance_adjustment(400, &bundle)).join(",");
+        assert!(features.contains("provenance_ownership_orphaned"), "{features}");
+        assert!(!features.contains("provenance_ownership_supervised"), "{features}");
+    }
+
+    #[test]
     fn supervised_listener_suppresses_false_positive_path() {
         let bundle = ProvenanceInferenceBundle {
             resource_graph: SharedResourceGraph::from_evidence(&[(
