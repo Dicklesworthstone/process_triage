@@ -1909,6 +1909,8 @@ impl SignatureDatabase {
                 .with_notes("Remote compilation helper client; the work runs on a worker")
                 .with_process_patterns(vec![r"^rch$"])
                 .with_arg_patterns(vec![r"(^|\s)exec(\s|$)"])
+                // Both: `rch status` is not a client waiting on a build.
+                .with_min_matches(2)
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations {
                     idle_cpu_normal: true,
@@ -1924,6 +1926,8 @@ impl SignatureDatabase {
                 .with_notes("Bun test runner (known to ignore SIGTERM)")
                 .with_process_patterns(vec![r"^bun$"])
                 .with_arg_patterns(vec![r"(^|\s)test(\s|$)"])
+                // Both: `cargo test` must not read as `bun test`.
+                .with_min_matches(2)
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1960,7 +1964,10 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("Local git operation that normally completes in seconds")
                 .with_process_patterns(vec![r"^git$"])
-                .with_arg_patterns(vec![r"^(\S*/)?git\s+(add|status|commit|stash|rev-parse)(\s|$)"])
+                .with_arg_patterns(vec![
+                    r"^(\S*/)?git\s+(add|status|commit|stash|rev-parse)(\s|$)",
+                ])
+                .with_min_matches(2)
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::task_lasting(5, 300))
                 .as_builtin(),
@@ -2001,6 +2008,8 @@ impl SignatureDatabase {
                 .with_notes("Shell loop that sleeps until a condition holds")
                 .with_process_patterns(vec![r"^(ba|z|da|k)?sh$"])
                 .with_arg_patterns(vec![r"\b(while|until)\b.*;\s*do\b.*\bsleep\b.*\bdone\b"])
+                // Both: any other shell is not a poll loop.
+                .with_min_matches(2)
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::task_lasting(300, 4 * 3600))
                 .as_builtin(),
@@ -3233,16 +3242,36 @@ mod tests {
             ("rch", "rch exec -- cargo build -p x", Some("rch-exec")),
             ("rch", "rch status", None),
             ("bun", "bun test --watch", Some("bun-test")),
-            ("rustc", "rustc --crate-name foo src/lib.rs", Some("compiler")),
-            ("cc1plus", "/usr/lib/gcc/x86_64-linux-gnu/13/cc1plus -quiet", Some("compiler")),
+            (
+                "rustc",
+                "rustc --crate-name foo src/lib.rs",
+                Some("compiler"),
+            ),
+            (
+                "cc1plus",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/cc1plus -quiet",
+                Some("compiler"),
+            ),
             ("rustup", "rustup update", None),
             ("git", "git add .", Some("git-local-op")),
-            ("git", "/usr/bin/git status --porcelain", Some("git-local-op")),
+            (
+                "git",
+                "/usr/bin/git status --porcelain",
+                Some("git-local-op"),
+            ),
             ("git", "git push origin main", None),
-            ("node", "node /home/u/.bun/bin/vercel inspect abc", Some("vercel-cli")),
+            (
+                "node",
+                "node /home/u/.bun/bin/vercel inspect abc",
+                Some("vercel-cli"),
+            ),
             ("node", "node /home/u/.bun/bin/vercel dev", None),
             ("npm", "npm install", Some("package-install")),
-            ("node", "node /usr/bin/pnpm.cjs install --frozen-lockfile", Some("package-install")),
+            (
+                "node",
+                "node /usr/bin/pnpm.cjs install --frozen-lockfile",
+                Some("package-install"),
+            ),
             ("npm", "npm run install-hooks", None),
             (
                 "bash",
@@ -3250,7 +3279,11 @@ mod tests {
                 Some("poll-loop-shell"),
             ),
             ("bash", "bash -c make && sleep 1", None),
-            ("node", "node /home/u/.npm/_npx/x/node_modules/.bin/playwright-mcp", Some("mcp-server")),
+            (
+                "node",
+                "node /home/u/.npm/_npx/x/node_modules/.bin/playwright-mcp",
+                Some("mcp-server"),
+            ),
             (
                 "node",
                 "node /home/u/.npm/_npx/9f/node_modules/@morphllm/morphmcp/dist/index.js",
@@ -3308,7 +3341,11 @@ mod tests {
             );
             assert!(!sig.priors.is_empty(), "{name}");
         }
-        let mcp = db.signatures().iter().find(|s| s.name == "mcp-server").unwrap();
+        let mcp = db
+            .signatures()
+            .iter()
+            .find(|s| s.name == "mcp-server")
+            .unwrap();
         assert!(mcp.priors.is_empty());
     }
 }

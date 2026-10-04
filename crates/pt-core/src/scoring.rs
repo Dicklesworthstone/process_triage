@@ -993,13 +993,7 @@ mod tests {
 
     /// Young and stuck instances of the same command: the young one must stay below the
     /// plan's 0.7 candidate threshold, the stuck one must keep the signature's prior.
-    fn assert_age_gated(
-        comm: &str,
-        cmd: &str,
-        signature: &str,
-        young_secs: u64,
-        stuck_secs: u64,
-    ) {
+    fn assert_age_gated(comm: &str, cmd: &str, signature: &str, young_secs: u64, stuck_secs: u64) {
         let scorer = scorer(SignatureDatabase::with_defaults());
         let young = record(5200, comm, cmd, Duration::from_secs(young_secs));
         let stuck = record(5201, comm, cmd, Duration::from_secs(stuck_secs));
