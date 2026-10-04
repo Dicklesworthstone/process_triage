@@ -40,14 +40,14 @@ jobs:
             version="${GITHUB_REF#refs/tags/v}"
           else
             # For workflow_dispatch, use VERSION file
-            version=$(cat VERSION | tr -d '\n')
+            version=$(tr -d '\n' < VERSION)
           fi
-          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Extracted version: $version"
 
       - name: Validate VERSION file matches
         run: |
-          file_version=$(cat VERSION | tr -d '\n')
+          file_version=$(tr -d '\n' < VERSION)
           tag_version="${{ steps.extract.outputs.version }}"
 
           echo "VERSION file: $file_version"
@@ -124,8 +124,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          toolchain: nightly-2026-08-31
           targets: ${{ matrix.target }}
 
       - name: Ensure Rust target is installed
@@ -144,7 +145,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "crates -> .cargo-target"
+          workspaces: ". -> .cargo-target"
           key: ${{ matrix.target }}
 
       - name: Build release binary (native)
@@ -192,13 +193,9 @@ jobs:
           version="${{ needs.validate-version.outputs.version }}"
           mkdir -p dist
 
-          # Copy binary
-          cp "$CARGO_TARGET_DIR/${{ matrix.target }}/release/pt-core" dist/
-
           # Create tarball
-          cd dist
-          tar -czvf ${{ matrix.artifact_name }}-${version}.tar.gz pt-core
-          rm pt-core
+          tar -czvf "dist/${{ matrix.artifact_name }}-${version}.tar.gz" \
+            -C "$CARGO_TARGET_DIR/${{ matrix.target }}/release" pt-core
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -229,7 +226,6 @@ jobs:
 
       - name: Prepare release assets
         run: |
-          version="${{ needs.validate-version.outputs.version }}"
           mkdir -p release
           mkdir -p skill/process-triage
 
@@ -292,7 +288,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd release
-          sha256sum * > checksums.sha256
+          sha256sum -- * > checksums.sha256
           echo ""
           echo "Checksums:"
           cat checksums.sha256
@@ -337,12 +333,10 @@ jobs:
 
           echo ""
           echo "Signed assets:"
-          ls -la *.sig release-signing-public.pem release-signing-public.pem.sha256
+          ls -la ./*.sig release-signing-public.pem release-signing-public.pem.sha256
 
       - name: Generate release notes
         run: |
-          version="${{ needs.validate-version.outputs.version }}"
-
           cat > release-notes.md << 'NOTES'
           ## Installation
 

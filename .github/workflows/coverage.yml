@@ -2,9 +2,9 @@ name: Coverage
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
 
 # Cancel in-progress runs when a new commit is pushed to the same branch
@@ -29,13 +29,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: nightly-2026-08-31
+          components: llvm-tools-preview
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "crates -> target"
+          workspaces: ". -> target"
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -64,15 +67,15 @@ jobs:
       - name: Generate coverage summary
         if: always()
         run: |
-          echo "## Coverage Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Coverage Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           if [ -f coverage/coverage_summary.json ]; then
             line_rate=$(jq -r '.totals.lines.percent' coverage/coverage_summary.json 2>/dev/null || echo "N/A")
             branch_rate=$(jq -r '.totals.branches.percent' coverage/coverage_summary.json 2>/dev/null || echo "N/A")
-            echo "Line Coverage: ${line_rate}%" >> $GITHUB_STEP_SUMMARY
-            echo "Branch Coverage: ${branch_rate}%" >> $GITHUB_STEP_SUMMARY
+            echo "Line Coverage: ${line_rate}%" >> "$GITHUB_STEP_SUMMARY"
+            echo "Branch Coverage: ${branch_rate}%" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Coverage summary not generated" >> $GITHUB_STEP_SUMMARY
+            echo "Coverage summary not generated" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   # ==========================================================================
@@ -83,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: coverage
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout
@@ -100,9 +103,9 @@ jobs:
         run: |
           if [ -f coverage/coverage_summary.json ]; then
             percentage=$(jq -r '.totals.lines.percent' coverage/coverage_summary.json 2>/dev/null || echo "0")
-            echo "percentage=$percentage" >> $GITHUB_OUTPUT
+            echo "percentage=$percentage" >> "$GITHUB_OUTPUT"
           else
-            echo "percentage=0" >> $GITHUB_OUTPUT
+            echo "percentage=0" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create coverage badge JSON
