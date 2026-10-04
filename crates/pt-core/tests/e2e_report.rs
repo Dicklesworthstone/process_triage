@@ -552,6 +552,11 @@ mod galaxy_brain {
 #[test]
 fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
     use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionStore};
+    use pt_core::supervision::signature::{
+        ProcessExpectations, SignaturePriors, SignatureSchema, SupervisorSignature,
+    };
+    use pt_core::supervision::SupervisorCategory;
+    use std::collections::HashMap;
     use std::fs;
     let data_dir = tempdir().unwrap().keep();
     let config_dir = tempdir().unwrap().keep();
@@ -627,6 +632,26 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
     )
     .unwrap();
 
+    // Export the actual signature producer's schema, including its typed
+    // environment map, rather than a reduced JSON fixture with only public keys.
+    let mut signatures = SignatureSchema::new();
+    let mut signature =
+        SupervisorSignature::new("private-customer-worker", SupervisorCategory::Other)
+            .with_process_patterns(vec!["private-customer-worker"])
+            .with_env_patterns(HashMap::from([(
+                "PRIVATE_CUSTOMER_TOKEN".to_string(),
+                "AKIAIOSFODNN7EXAMPLE".to_string(),
+            )]));
+    signature.priors = SignaturePriors::likely_abandoned();
+    signature.expectations = ProcessExpectations::short_lived_task();
+    signatures.add(signature);
+    signatures.validate().unwrap();
+    fs::write(
+        pt_core::signature_cli::user_signatures_path(&config_dir),
+        signatures.to_json().unwrap(),
+    )
+    .unwrap();
+
     let plain_bundle = data_dir.join("session.ptb");
     for encrypted in [false, true] {
         let destination = if encrypted {
@@ -663,6 +688,24 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         assert!(reader.has_file("scan/inventory.json"));
         assert!(reader.has_file("inference/results.json"));
         assert!(reader.has_file("logs/session.jsonl"));
+        let saved_signatures: SignatureSchema = reader
+            .read_json(pt_core::signature_cli::BUNDLE_SIGNATURES_PATH)
+            .unwrap();
+        saved_signatures.validate().unwrap();
+        assert_eq!(saved_signatures.schema_version, signatures.schema_version);
+        assert_eq!(saved_signatures.signatures.len(), 1);
+        let saved_signature = &saved_signatures.signatures[0];
+        assert_eq!(saved_signature.category, SupervisorCategory::Other);
+        assert_eq!(saved_signature.priors, signatures.signatures[0].priors);
+        assert_eq!(
+            saved_signature.expectations,
+            signatures.signatures[0].expectations
+        );
+        assert_eq!(saved_signature.patterns.environment_vars.len(), 1);
+        for (name, value) in &saved_signature.patterns.environment_vars {
+            assert_ne!(name, "PRIVATE_CUSTOMER_TOKEN");
+            assert_eq!(value, "[REDACTED]");
+        }
         let saved_manifest: Value = reader.read_json("session/manifest.json").unwrap();
         assert_eq!(saved_manifest["timing"]["created_at"], started_at);
         assert_eq!(saved_manifest["state"], "created");
@@ -728,6 +771,24 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         assert!(html.contains("created"));
     }
 
+    let signature_path = pt_core::signature_cli::user_signatures_path(&config_dir);
+    fs::write(&signature_path, b"not-json").unwrap();
+    let refused = data_dir.join("invalid-signatures-refused.ptb");
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", &data_dir)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(&config_dir)
+        .args(["bundle", "create", "--session", &session_id.0, "--output"])
+        .arg(&refused)
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid user signatures"));
+    assert!(!refused.exists());
+    fs::write(&signature_path, signatures.to_json().unwrap()).unwrap();
+
     // A present malformed artifact must refuse publication, rather than produce
     // a successful export silently missing part of the recorded session.
     let inference_path = handle.dir.join("inference/results.json");
@@ -765,6 +826,41 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         .get_output()
         .clone();
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid provenance audit"));
+    assert!(!refused.exists());
+
+    // A requested telemetry directory that cannot be enumerated must stop the
+    // export. Use another real session so the malformed audit above cannot be
+    // the cause of this refusal, and retain both fixtures for diagnosis.
+    let telemetry_session = pt_common::SessionId::new();
+    let telemetry_handle = SessionStore::at_data_dir(&data_dir)
+        .create(&SessionManifest::new(
+            &telemetry_session,
+            None,
+            SessionMode::RobotPlan,
+            None,
+        ))
+        .unwrap();
+    fs::write(telemetry_handle.dir.join("telemetry"), b"not a directory").unwrap();
+    let refused = data_dir.join("unreadable-telemetry-refused.ptb");
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", &data_dir)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(&config_dir)
+        .args([
+            "bundle",
+            "create",
+            "--session",
+            &telemetry_session.0,
+            "--include-telemetry",
+            "--output",
+        ])
+        .arg(&refused)
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read requested telemetry"));
     assert!(!refused.exists());
 }
 

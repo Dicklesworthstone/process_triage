@@ -4335,7 +4335,7 @@ fn run_bundle_create(
                         return ExitCode::IoError;
                     }
                 };
-                let metadata = match entry.metadata() {
+                let metadata = match std::fs::metadata(entry.path()) {
                     Ok(metadata) => metadata,
                     Err(error) => {
                         eprintln!("bundle create: cannot inspect telemetry: {error}");
@@ -4371,18 +4371,51 @@ fn run_bundle_create(
         }
     }
 
-    // Include user signatures if available
-    if let Some(user_schema) =
-        pt_core::signature_cli::load_user_signatures(&resolved_config_dir(global))
-    {
-        if !user_schema.signatures.is_empty() {
-            if let Ok(json) = serde_json::to_string_pretty(&user_schema) {
-                writer.add_file(
-                    pt_core::signature_cli::BUNDLE_SIGNATURES_PATH,
-                    json.into_bytes(),
-                    Some(FileType::Json),
-                );
+    // A missing optional signature file is acceptable; a present unreadable or
+    // invalid one must not silently disappear from an otherwise successful export.
+    let config_dir = resolved_config_dir(global);
+    let signature_path = pt_core::signature_cli::user_signatures_path(&config_dir);
+    let signature_bytes = match std::fs::read(&signature_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match pt_core::signature_cli::legacy_read_dir(&config_dir) {
+                Some(legacy_dir) => {
+                    match std::fs::read(pt_core::signature_cli::user_signatures_path(&legacy_dir)) {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => {
+                            eprintln!("bundle create: cannot read user signatures: {error}");
+                            return ExitCode::IoError;
+                        }
+                    }
+                }
+                None => None,
             }
+        }
+        Err(error) => {
+            eprintln!("bundle create: cannot read user signatures: {error}");
+            return ExitCode::IoError;
+        }
+    };
+    if let Some(signature_bytes) = signature_bytes {
+        let user_schema: pt_core::supervision::signature::SignatureSchema =
+            match serde_json::from_slice(&signature_bytes) {
+                Ok(schema) => schema,
+                Err(error) => {
+                    eprintln!("bundle create: invalid user signatures: {error}");
+                    return ExitCode::IoError;
+                }
+            };
+        if let Err(error) = user_schema.validate() {
+            eprintln!("bundle create: invalid user signatures: {error}");
+            return ExitCode::IoError;
+        }
+        if !user_schema.signatures.is_empty() {
+            writer.add_file(
+                pt_core::signature_cli::BUNDLE_SIGNATURES_PATH,
+                signature_bytes,
+                Some(FileType::Json),
+            );
         }
     }
 
