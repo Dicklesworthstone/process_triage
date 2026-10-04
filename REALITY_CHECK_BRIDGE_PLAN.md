@@ -1,6 +1,6 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Execution update — 2026-10-04 22:45 UTC
+## Execution update — 2026-10-04 23:35 UTC
 
 The assessment below describes the inspected baseline. The working tree now connects the canonical executable
 Plan to agent planning, saves the exact scorer ledger, enforces the current/saved policy age floor at apply,
@@ -21,9 +21,20 @@ Actual strict remote validation so far:
 - The prior 65 focused precheck tests passed. A later audit strengthened the unlinked regular-file case: a writable
   unnamed regular file now blocks, while a FIFO and read-only file remain permitted. Rerun evidence is required.
 - Workspace all-targets check passed for the earlier 21:46 source upload. It does not certify the current tree.
-  Current formatting and diff checks pass; final compiler, clippy, lean and full regression gates remain pending.
+  Changed safety/sharing paths pass formatting and diff checks. Workspace formatting currently fails in other
+  concurrently edited files; final compiler, clippy, lean and full regression gates remain pending.
 - Dependency updates are tested individually and recorded in `UPGRADE_LOG.md`. Current remaining large migrations
   and known audit findings must not be described as a completed latest-version or vulnerability-free upgrade.
+- The full bundle/redaction/report suites passed at 22:53, before the later typed Plan/signature and artifact-path
+  collision corrections. Actual producer round trips and those corrections require another execution pass.
+- Eleven compatible dependency upgrades passed affected consumers one at a time. The frozen lockfile is
+  SHA256 `55957d71fd29bac6cd6fc18a79809d6db81036a54b0fec36ab5153ea4d7f4455`; the cached audit still exits 1 for
+  rkyv, with LRU unsound and paste unmaintained warnings. Standalone fuzz lock/campaign remain unvalidated.
+- Strict remote current-source CLI acceptance timed out in admission without running; no local fallback ran.
+  The retry is pending capacity. No green result is inferred from waiting, commits or independent source agreement.
+- Source now connects the existing typed kernel-pressure reader/assessment to snapshot, plan and TUI load inputs,
+  preserves unavailable readings as null, records signature age weights, and maps usage errors to ArgsError 10.
+  These additional producer connections remain unverified until the current binary tests and compiler gates run.
 
 ### Active completion checklist
 
@@ -43,6 +54,12 @@ Actual strict remote validation so far:
 - [ ] Complete sequential compatible dependency consumer tests, freeze the lockfile and rerun security audit.
 - [ ] Obtain the existing pending permission for migrations exceeding ten source files before starting them.
 - [ ] Run current-tree workspace all-targets check, warning-denying clippy, formatting and lean check.
+- [ ] Verify actual Safe Plan and SignatureSchema typed round trips, preserving checks, routing and numeric evidence.
+- [ ] Verify distinct secret artifact filenames preserve both payloads/checksums and duplicate paths refuse publication.
+- [ ] Verify malformed signatures/provenance audit and unreadable requested telemetry refuse before output creation.
+- [ ] Verify snapshot/plan kernel-pressure readings and their persisted schema; review remaining unknown-value consumers.
+- [ ] Verify CLI usage error 10 and explicit help/version 0, including existing label/degraded-environment expectations.
+- [ ] Complete bd-uacs.3 apply/TUI policy-enforcer and persistent kill-count wiring with real cross-run rate-limit proof.
 - [ ] Run appropriate workspace regressions; distinguish pre-existing failures from new ones using evidence.
 - [ ] Re-execute workflow static checks and review scanner findings before committing.
 - [ ] Complete fresh original-acceptance review and the real-work/honesty inventories; close only proven tasks.
