@@ -191,7 +191,9 @@ EOF
     run bash -lc "printf 'y\n' | env PT_CORE_PATH='$MOCK_PT_CORE' PT_WRAPPER_TEST_LOG='$MOCK_LOG' PROCESS_TRIAGE_CONFIG='$config_dir' '$PT_SCRIPT' clear node"
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *'Cleared 2 decisions matching "node".'* ]]
+    # Counted as `pt history` lists patterns (one verdict is stored at three levels),
+    # but every level of a matching pattern is forgotten.
+    [[ "$output" == *'Cleared 1 decision matching "node".'* ]]
     [ "$(jq -c 'keys' "${config_dir}/decisions.json")" = '["standard|vim|"]' ]
 
     # Declining the confirmation changes nothing.
@@ -416,7 +418,9 @@ EOF
         PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update
 
     [ "$status" -ne 0 ]
-    [[ "$output" == *"Update aborted: the release could not be verified"* ]]
+    # The installer's own reason is shown; the wrapper does not guess another one.
+    [[ "$output" == *"does not publish release-signing-public.pem"* ]]
+    [[ "$output" == *"installer exited with status 1"* ]]
     [[ "$output" == *"pt update --no-verify"* ]]
     grep -q '^INSTALLER_ARGS=--verify$' "$log"
 }
@@ -495,4 +499,116 @@ EOF
         /bin/bash "$PT_SCRIPT" --version
     [ "$status" -eq 0 ]
     [[ "${lines[0]}" == "pt version ${PT_WRAPPER_VERSION}" ]]
+}
+
+# A copy of the wrapper in its own directory with a HOME and PATH where no pt-core
+# exists, so a pt-core installed on the test host cannot be found.
+isolated_wrapper() {
+    local dir="${TEST_DIR}/isolated"
+    mkdir -p "$dir" "${TEST_DIR}/home"
+    cp "$PT_SCRIPT" "$dir/pt"
+    chmod +x "$dir/pt"
+    printf '%s\n' "$dir/pt"
+}
+
+@test "wrapper: wrapper commands work without pt-core (update is the repair path)" {
+    local pt
+    pt="$(isolated_wrapper)"
+    local -a env_args=(env -u PT_CORE_PATH HOME="${TEST_DIR}/home" PATH="/usr/bin:/bin"
+        PROCESS_TRIAGE_CONFIG="${TEST_DIR}/no-config")
+
+    run "${env_args[@]}" "$pt" help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Process Triage wrapper for pt-core"* ]]
+
+    run "${env_args[@]}" "$pt" history
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"No decision history."* ]]
+
+    run "${env_args[@]}" "$pt" --version
+    [ "$status" -eq 0 ]
+    [[ "${lines[0]}" == "pt version ${PT_WRAPPER_VERSION}" ]]
+    [[ "${lines[1]}" == "pt-core not found" ]]
+
+    run "${env_args[@]}" "$pt" scan
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"'pt-core' binary not found"* ]]
+}
+
+@test "wrapper: a symlinked wrapper finds pt-core next to its real location" {
+    # From-source install: `ln -s "$(pwd)/pt" ~/.local/bin/pt` must run the repo's
+    # target/release/pt-core, not whatever pt-core is installed elsewhere.
+    local repo="${TEST_DIR}/repo" bin="${TEST_DIR}/bin"
+    mkdir -p "${repo}/target/release" "$bin" "${TEST_DIR}/home"
+    cp "$PT_SCRIPT" "${repo}/pt"
+    chmod +x "${repo}/pt"
+    cp "$MOCK_PT_CORE" "${repo}/target/release/pt-core"
+    ln -s "${repo}/pt" "${bin}/pt"
+
+    run env -u PT_CORE_PATH HOME="${TEST_DIR}/home" PATH="/usr/bin:/bin" \
+        PT_WRAPPER_TEST_LOG="$MOCK_LOG" "${bin}/pt" scan --format json
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=scan --format json$' "$MOCK_LOG"
+}
+
+@test "wrapper: history does not create the config directory" {
+    local config_dir="${TEST_DIR}/never-created"
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PROCESS_TRIAGE_CONFIG="$config_dir" \
+        "$PT_SCRIPT" history
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"No decision history."* ]]
+    [ ! -e "$config_dir" ]
+}
+
+@test "wrapper: clear TEXT matches patterns, never the level prefix" {
+    local config_dir="${TEST_DIR}/config"
+    mkdir -p "$config_dir"
+    cat > "${config_dir}/decisions.json" << 'EOF'
+{"exact|^node$|x\\.js":{"kill":1,"spare":0},"standard|node|.*x.js":{"kill":1,"spare":0}}
+EOF
+    # "act" is in "exact|", not in any pattern.
+    run bash -lc "printf 'y\n' | env PT_CORE_PATH='$MOCK_PT_CORE' PROCESS_TRIAGE_CONFIG='$config_dir' '$PT_SCRIPT' clear act"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'No decisions match "act".'* ]]
+    [ "$(jq 'length' "${config_dir}/decisions.json")" = "2" ]
+}
+
+@test "wrapper: --shell/--tui after the command are passed on, not swallowed" {
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" agent plan --label --tui
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=agent plan --label --tui$' "$MOCK_LOG"
+}
+
+@test "wrapper: an unusable PT_CORE_PATH is an error, not a silent fallback" {
+    run env PT_CORE_PATH="${TEST_DIR}/missing-pt-core" PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" scan
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"PT_CORE_PATH=${TEST_DIR}/missing-pt-core is not an executable file"* ]]
+    [ ! -f "$MOCK_LOG" ]
+}
+
+@test "wrapper: update rejects extra arguments after --no-verify" {
+    run env PT_CORE_PATH="$MOCK_PT_CORE" "$PT_SCRIPT" update --no-verify --force
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"unexpected arguments to 'pt update'"* ]]
+}
+
+@test "wrapper: update reports a download failure as such, not as a verification failure" {
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+url="${@: -1}"
+if [[ "$url" == *"/main/VERSION" ]]; then
+  echo "9.9.9"
+  exit 0
+fi
+echo "curl: (22) The requested URL returned error: 404" >&2
+exit 22
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"could not download the v9.9.9 installer"* ]]
+    [[ "$output" != *"verif"* ]]
 }
