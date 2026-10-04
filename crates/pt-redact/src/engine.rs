@@ -154,6 +154,13 @@ impl RedactionEngine {
         &self.key.key_id
     }
 
+    /// An opaque, keyed identifier for artifact addressing. Unlike display
+    /// redaction, detected secrets must not collapse distinct inputs into one
+    /// placeholder. Use the full digest regardless of display truncation policy.
+    pub fn artifact_identifier(&self, path: &str) -> String {
+        self.key.hash(&format!("bundle-artifact:{path}"), 32)
+    }
+
     /// Get a reference to the policy.
     pub fn policy(&self) -> &RedactionPolicy {
         &self.policy
@@ -555,7 +562,7 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
     if field == "strength" {
         return matches!(
             value,
-            "decisive" | "strong" | "moderate" | "weak" | "neutral"
+            "decisive" | "strong" | "substantial" | "moderate" | "weak" | "neutral"
         );
     }
     if field == "category" {

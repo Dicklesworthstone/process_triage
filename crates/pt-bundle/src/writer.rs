@@ -5,6 +5,7 @@
 use crate::encryption;
 use crate::{BundleError, BundleManifest, BundleProvenanceSummary, FileEntry, Result};
 use pt_redact::{ExportProfile, RedactionEngine, RedactionPolicy};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Cursor, Write};
 use std::path::Path;
@@ -216,6 +217,14 @@ impl BundleWriter {
             }
         }
 
+        let mut exported_paths = HashSet::new();
+        for (path, _) in &self.files {
+            if !exported_paths.insert(path) {
+                return Err(BundleError::CorruptedManifest(
+                    "duplicate exported artifact path".to_string(),
+                ));
+            }
+        }
         for entry in &mut self.manifest.files {
             if let Some((_, bytes)) = self.files.iter().find(|(path, _)| path == &entry.path) {
                 entry.sha256 = FileEntry::compute_checksum(bytes);
@@ -543,11 +552,8 @@ fn export_artifact_path(engine: &RedactionEngine, path: &str) -> String {
     ) {
         return path.to_string();
     }
-    let redacted =
-        engine.redact_json_for_export(&serde_json::json!({"path": path}), ExportProfile::Safe);
-    let pseudonym: String = redacted["path"]
-        .as_str()
-        .unwrap()
+    let pseudonym: String = engine
+        .artifact_identifier(path)
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .collect();
@@ -644,6 +650,49 @@ mod tests {
         let outcome: serde_json::Value = serde_json::from_slice(&log).unwrap();
         assert_eq!(outcome["cmd"], plan["candidates"][0]["cmd"]);
         assert_eq!(outcome["success"], true);
+    }
+
+    #[test]
+    fn secret_artifact_names_remain_distinct_and_duplicate_paths_refuse_publication() {
+        let mut writer = BundleWriter::new("session-test", "host-test", "run-test");
+        for (path, score) in [
+            ("AKIAIOSFODNN7EXAMPLE.json", 17),
+            ("AKIAIOSFODNN8EXAMPLE.json", 83),
+        ] {
+            writer
+                .add_json(path, &serde_json::json!({"score": score}))
+                .unwrap();
+        }
+        let (bytes, manifest) = writer.write_to_vec().unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        assert_ne!(manifest.files[0].path, manifest.files[1].path);
+        let mut reader = crate::BundleReader::from_bytes(bytes).unwrap();
+        assert!(reader.verify_all().is_empty());
+        let mut scores = Vec::new();
+        for entry in manifest.files {
+            assert!(!entry.path.contains("AKIAIOSFODNN"));
+            let payload: serde_json::Value = reader.read_json(&entry.path).unwrap();
+            scores.push(payload["score"].as_u64().unwrap());
+        }
+        scores.sort_unstable();
+        assert_eq!(scores, vec![17, 83]);
+
+        let dir = TempDir::new().unwrap().keep();
+        for profile in [ExportProfile::Safe, ExportProfile::Forensic] {
+            let mut writer = BundleWriter::new("session-test", "host-test", "run-test")
+                .with_export_profile(profile);
+            for score in [17, 83] {
+                writer
+                    .add_json("same.json", &serde_json::json!({"score": score}))
+                    .unwrap();
+            }
+            let destination = dir.join(format!("duplicate-{profile}.ptb"));
+            assert!(matches!(
+                writer.write(&destination),
+                Err(BundleError::CorruptedManifest(_))
+            ));
+            assert!(!destination.exists());
+        }
     }
 
     #[test]
