@@ -539,6 +539,7 @@ fn export_artifact_path(engine: &RedactionEngine, path: &str) -> String {
             | "logs/events.jsonl"
             | "logs/outcomes.jsonl"
             | "logs/session.jsonl"
+            | "signatures/user_signatures.json"
     ) {
         return path.to_string();
     }

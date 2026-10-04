@@ -4318,31 +4318,55 @@ fn run_bundle_create(
     // Optionally include telemetry data
     if include_telemetry {
         let telemetry_dir = handle.dir.join("telemetry");
-        if telemetry_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&telemetry_dir) {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    if entry_path.is_file() {
-                        if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                            if let Ok(content) = std::fs::read(&entry_path) {
-                                let file_type = if name.ends_with(".parquet") {
-                                    FileType::Parquet
-                                } else if name.ends_with(".jsonl") {
-                                    FileType::Log
-                                } else if name.ends_with(".json") {
-                                    FileType::Json
-                                } else {
-                                    FileType::Binary
-                                };
-                                writer.add_file(
-                                    format!("telemetry/{}", name),
-                                    content,
-                                    Some(file_type),
-                                );
-                            }
-                        }
+        let entries = match std::fs::read_dir(&telemetry_dir) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                eprintln!("bundle create: cannot read requested telemetry: {error}");
+                return ExitCode::IoError;
+            }
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        eprintln!("bundle create: cannot enumerate telemetry: {error}");
+                        return ExitCode::IoError;
                     }
+                };
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        eprintln!("bundle create: cannot inspect telemetry: {error}");
+                        return ExitCode::IoError;
+                    }
+                };
+                if !metadata.is_file() {
+                    continue;
                 }
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
+                    eprintln!("bundle create: telemetry filename is not valid UTF-8");
+                    return ExitCode::IoError;
+                };
+                let content = match std::fs::read(entry.path()) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        eprintln!("bundle create: cannot read telemetry file: {error}");
+                        return ExitCode::IoError;
+                    }
+                };
+                let file_type = if name.ends_with(".parquet") {
+                    FileType::Parquet
+                } else if name.ends_with(".jsonl") {
+                    FileType::Log
+                } else if name.ends_with(".json") {
+                    FileType::Json
+                } else {
+                    FileType::Binary
+                };
+                writer.add_file(format!("telemetry/{name}"), content, Some(file_type));
             }
         }
     }

@@ -179,6 +179,22 @@ impl RedactionEngine {
         use serde_json::Value;
         let normalized_field = field.unwrap_or("").to_ascii_lowercase();
         let field = normalized_field.as_str();
+        if field == "environment_vars" {
+            return match value {
+                Value::Object(fields) => Value::Object(
+                    fields
+                        .keys()
+                        .map(|key| {
+                            (
+                                self.apply_action(key, Action::Hash).output,
+                                Value::String("[REDACTED]".to_string()),
+                            )
+                        })
+                        .collect(),
+                ),
+                _ => Value::String("[REDACTED]".to_string()),
+            };
+        }
         if matches!(
             field,
             "env"
@@ -400,6 +416,11 @@ fn is_export_field(key: &str) -> bool {
             expected_recovery expected_recovery_stddev posterior_odds_abandoned_vs_useful
             sprt_boundary log_odds_threshold numerator denominator has_known_signature category
             wchan io_read_bytes io_write_bytes d_state_duration_ms
+            signatures metadata name patterns confidence_weight notes builtin priors expectations priority
+            process_names arg_patterns environment_vars working_dir_patterns socket_paths pid_files
+            parent_patterns min_matches typical_lifetime_seconds max_normal_lifetime_seconds
+            cpu_during_run idle_cpu_normal expected_memory_bytes expects_network expects_disk_io
+            alpha beta author url check
             cmd_pattern cmdline_raw argv args path cwd exe executable home artifact_path
             user username owner env environ environment environment_variables
             state status mode classification confidence recommendation recommended_action
@@ -453,6 +474,7 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
                 | "logs/events.jsonl"
                 | "logs/outcomes.jsonl"
                 | "logs/session.jsonl"
+                | "signatures/user_signatures.json"
         );
     }
     if matches!(
@@ -498,10 +520,13 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
                 | "command_category"
         );
     }
-    if field == "quality" {
-        return matches!(value, "Full" | "NoBootId" | "PidOnly");
+    if matches!(field, "quality" | "identity_quality") {
+        return matches!(
+            value,
+            "Full" | "NoBootId" | "PidOnly" | "full" | "no_boot_id" | "pid_only"
+        );
     }
-    if field == "pre_checks" {
+    if matches!(field, "pre_checks" | "check") {
         return matches!(
             value,
             "verify_identity"
@@ -511,6 +536,7 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
                 | "check_supervisor"
                 | "check_agent_supervision"
                 | "verify_process_state"
+                | "process_tree"
         );
     }
     if field == "routing" {
@@ -531,6 +557,15 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
             value,
             "decisive" | "strong" | "moderate" | "weak" | "neutral"
         );
+    }
+    if field == "category" {
+        return matches!(
+            value,
+            "agent" | "ide" | "ci" | "orchestrator" | "terminal" | "other"
+        );
+    }
+    if matches!(field, "numerator" | "denominator") {
+        return matches!(value, "useful" | "useful_bad" | "abandoned" | "zombie");
     }
     if !matches!(
         field,
@@ -559,7 +594,7 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
         once_cell::sync::Lazy::new(|| {
             "useful useful_bad abandoned zombie kill review spare keep renice pause resume
             freeze unfreeze throttle quarantine unquarantine restart low medium high critical unknown
-            very_high veryhigh usefulbad normal very_low
+            very_high veryhigh usefulbad normal very_low report_failure zombie_reaped
             quickscan deep quick interactive robot agent dry_run planned completed applied running
             created scanning executing cancelled archived robot_plan robot_apply daemon_alert scan_only export
             success succeeded failed blocked skipped ok error linux macos darwin x86_64 aarch64
