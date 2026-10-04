@@ -450,8 +450,8 @@ machine, only of individual processes, so it cannot do the job its own origin st
   (bd-l3s5.1/.2/.3/.5/.7 open); the live fleet gate (`scripts/fleet_reality_e2e.py`) is manual; fuzz targets never run.
 
 Test run (`cargo test --workspace --no-fail-fast` via rch, worker vmi1227854, tests running as root, 2026-10-04):
-≈6 100 passed / 11 failed / 9 ignored across the first ~100 test binaries. The failures fall into four classes, each
-now tracked:
+**6 835 passed / 11 failed / 25 ignored across 138 test binaries** (exit 101). The failures fall into four classes,
+each now tracked:
 * `agent_apply_dry_run_returns_actions_ok`, `agent_apply_executes_renice_then_kill_on_live_process` —
   `blocked_by_prechecks` for the spawned target (environment-sensitive live prechecks) → WS11.10a (`bd-uacs.11`).
 * `e2e_plan.rs`: `plan_blast_radius_counts_real_children`, `plan_blocks_kill_of_open_writer`,
