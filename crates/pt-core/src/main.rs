@@ -1827,8 +1827,22 @@ fn restore_default_sigpipe() {}
 fn main() {
     restore_default_sigpipe();
 
-    let matches = Cli::command().get_matches();
-    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let matches = Cli::command().try_get_matches().unwrap_or_else(|error| {
+        let code = if matches!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+        ) {
+            ExitCode::Clean
+        } else {
+            ExitCode::ArgsError
+        };
+        let _ = error.print();
+        std::process::exit(code.as_i32());
+    });
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| {
+        let _ = error.print();
+        std::process::exit(ExitCode::ArgsError.as_i32());
+    });
     let format_source = matches.value_source("format");
     cli.global.format = resolve_output_format(cli.global.format, format_source);
 

@@ -115,6 +115,10 @@ A plan without that snapshot uses the current policy's floor.
 for ancestry, protected-process filtering, and parent routing, and records the selection in
 `args.pids`. Applying a plan still requires an explicit action selection and the usual safety checks.
 
+CLI usage errors, including unknown flags, conflicting selectors and missing required arguments,
+exit with `ArgsError` (10). Explicit `--help` and `--version` requests exit 0. Exit 2 is reserved
+for `ActionsOk`; an invalid invocation cannot report that actions succeeded.
+
 ---
 
 ## Resumability Contract

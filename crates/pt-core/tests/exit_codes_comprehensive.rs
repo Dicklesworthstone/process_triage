@@ -5,6 +5,44 @@
 
 use pt_core::exit_codes::ExitCode;
 
+#[test]
+fn cli_usage_errors_follow_the_agent_exit_contract() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use predicates::prelude::*;
+
+    for args in [
+        vec!["agent", "apply", "--definitely-not-a-flag"],
+        vec!["nonexistent-command"],
+        vec!["config", "export-preset"],
+        vec!["agent", "apply", "--pids", "not-a-pid"],
+    ] {
+        cargo_bin_cmd!("pt-core")
+            .args(args)
+            .assert()
+            .code(ExitCode::ArgsError.as_i32())
+            .stderr(predicate::str::contains("error:"));
+    }
+}
+
+#[test]
+fn cli_help_and_version_remain_successful_without_actions() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use predicates::prelude::*;
+
+    for args in [vec!["--help"], vec!["agent", "plan", "--help"]] {
+        cargo_bin_cmd!("pt-core")
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Usage:"));
+    }
+    cargo_bin_cmd!("pt-core")
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pt-core"));
+}
+
 // ============================================================================
 // Exit Code Value Tests
 // ============================================================================
