@@ -367,6 +367,14 @@ pub fn read_pressure_snapshot() -> PressureSnapshot {
     read_pressure_snapshot_from(Path::new("/"), super::cpu_capacity::num_logical_cpus())
 }
 
+/// Read a pressure snapshot of this machine. Without /proc every source reports
+/// unavailable with its reason; only the CPU count is known.
+#[cfg(not(target_os = "linux"))]
+pub fn read_pressure_snapshot() -> PressureSnapshot {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    read_pressure_snapshot_from(Path::new("/"), cpus)
+}
+
 /// Stall fractions (0..1) of one resource over a window, from PSI `total` counters.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StallFractions {

@@ -2919,7 +2919,7 @@ fn build_tui_rows(
     const MIN_POSTERIOR: f64 = 0.7;
     const MAX_CANDIDATES: usize = 50;
 
-    let system_state = collect_system_state();
+    let system_state = collect_system_state(Some(processes));
     let load_adjustment = if policy.load_aware.enabled {
         let signals = LoadSignals::from_system_state(&system_state, processes.len());
         compute_load_adjustment(&policy.load_aware, &signals)
@@ -3207,7 +3207,7 @@ fn build_tui_rows(
 
 #[cfg(target_os = "linux")]
 use pt_core::collect::{parse_fd, parse_proc_net_tcp, parse_proc_net_udp, NetworkSnapshot};
-use pt_core::collect::{quick_scan, ProcessRecord, QuickScanOptions, ScanResult};
+use pt_core::collect::{quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanResult};
 use pt_core::decision::goal_progress::{
     self, ActionOutcome as GoalActionOutcome, GoalMetric, GoalProgressReport, MetricSnapshot,
     ProgressConfig,
@@ -11196,19 +11196,53 @@ fn output_capabilities(global: &GlobalOpts) {
 // ============================================================================
 
 /// Collect system state for snapshot output.
-fn collect_system_state() -> serde_json::Value {
-    let load = collect_load_averages();
-    let cores = collect_cpu_count();
-    let memory = collect_memory_info();
+fn collect_system_state(processes: Option<&[ProcessRecord]>) -> serde_json::Value {
+    use pt_core::collect::pressure::read_pressure_snapshot;
+    use pt_core::decision::pressure_regime::{assess, PressureThresholds, ProcessCensus};
+
+    let snapshot = read_pressure_snapshot();
+    let census = processes.map(|processes| ProcessCensus {
+        zombies: processes
+            .iter()
+            .filter(|process| process.state == ProcessState::Zombie)
+            .count() as u32,
+        dstate: processes
+            .iter()
+            .filter(|process| process.state == ProcessState::DiskSleep)
+            .count() as u32,
+    });
+    let assessment = assess(
+        &snapshot,
+        None,
+        census.as_ref(),
+        &PressureThresholds::default(),
+    );
+    let load = snapshot
+        .load
+        .map(|load| vec![load.one, load.five, load.fifteen]);
+    let total = snapshot.meminfo.and_then(|memory| memory.total);
+    let available = snapshot.meminfo.and_then(|memory| memory.available);
+    let gib = |bytes: u64| bytes as f64 / 1_073_741_824.0;
+    let memory = serde_json::json!({
+        "total_gb": total.map(gib),
+        "available_gb": available.map(gib),
+        "used_gb": total.zip(available).map(|(total, available)| gib(total.saturating_sub(available))),
+    });
     let process_count = collect_process_count();
-    let psi = collect_psi();
+    let psi = serde_json::json!({
+        "cpu": snapshot.cpu.and_then(|resource| resource.some).map(|line| line.avg10),
+        "memory": snapshot.memory.and_then(|resource| resource.some).map(|line| line.avg10),
+        "io": snapshot.io.and_then(|resource| resource.some).map(|line| line.avg10),
+    });
 
     serde_json::json!({
         "load": load,
-        "cores": cores,
+        "cores": snapshot.cpus,
         "memory": memory,
         "process_count": process_count,
         "psi": psi,
+        "pressure": snapshot,
+        "assessment": assessment,
     })
 }
 
@@ -11306,33 +11340,6 @@ fn collect_process_count() -> u32 {
                 .count() as u32
         })
         .unwrap_or(0)
-}
-
-/// Read PSI (Pressure Stall Information) from /proc/pressure/.
-fn collect_psi() -> serde_json::Value {
-    fn read_psi_file(resource: &str) -> Option<f64> {
-        let path = format!("/proc/pressure/{}", resource);
-        std::fs::read_to_string(&path).ok().and_then(|content| {
-            // Parse "some avg10=X.XX avg60=Y.YY avg300=Z.ZZ total=N"
-            // We want avg10 for recent pressure
-            for line in content.lines() {
-                if line.starts_with("some") {
-                    for part in line.split_whitespace() {
-                        if let Some(val) = part.strip_prefix("avg10=") {
-                            return val.parse().ok();
-                        }
-                    }
-                }
-            }
-            None
-        })
-    }
-
-    serde_json::json!({
-        "cpu": read_psi_file("cpu").unwrap_or(0.0),
-        "memory": read_psi_file("memory").unwrap_or(0.0),
-        "io": read_psi_file("io").unwrap_or(0.0),
-    })
 }
 
 /// Get the system hostname.
@@ -11714,7 +11721,6 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     }
 
     // Collect system state and capabilities
-    let system_state = collect_system_state();
     let caps = get_capabilities();
     let host_id = pt_core::logging::get_host_id();
     let timestamp = chrono::Utc::now();
@@ -11735,6 +11741,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             None
         }
     };
+
+    let system_state =
+        collect_system_state(scan_result.as_ref().map(|scan| scan.processes.as_slice()));
 
     // Persist compact artifacts when we have a scan result.
     if let Some(ref scan_result) = scan_result {
@@ -12322,7 +12331,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "Protected filter applied"
     );
 
-    let system_state = collect_system_state();
+    let system_state = collect_system_state(Some(&scan_result.processes));
     let load_adjustment = if policy.load_aware.enabled {
         let signals = LoadSignals::from_system_state(&system_state, filter_result.passed.len());
         compute_load_adjustment(&policy.load_aware, &signals)
@@ -12459,6 +12468,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let posterior_result = score.posterior;
         let ledger = score.ledger;
         let prior_source_label = score.prior_source;
+        let signature_age_weight = score.signature_age_weight;
         let signature_match = score.signature;
         let learned_prior = score.learned_prior;
         let fast_path_used = score.fast_path_used;
@@ -12817,6 +12827,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "inference": {
                 "mode": if fast_path_used { "signature_fast_path" } else { "bayesian" },
                 "prior_source": prior_source_label,
+                "signature_age_weight": signature_age_weight,
                 "learned_prior": learned_prior,
                 "desktop_app": desktop_app,
                 "desktop_app_credited": desktop_app_credited,
@@ -13295,6 +13306,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "host_id": pt_core::logging::get_host_id(),
         "host": host_info,
+        "system_state": system_state,
         "scan": scan_info,
         "command": "agent plan",
         "args": {
@@ -13964,6 +13976,7 @@ fn build_process_explanation(
         },
         "score": posterior_result.posterior.suspicion_score(),
         "prior_source": score.prior_source,
+        "signature_age_weight": score.signature_age_weight,
         "learned_prior": learned_prior,
         "signature": score.signature.as_ref().map(|m| serde_json::json!({
             "name": m.signature.name,
@@ -17868,7 +17881,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
     }
 
     loop {
-        let system_state = collect_system_state();
+        let system_state = collect_system_state(None);
         if baseline.is_none() {
             baseline = Some(WatchBaseline::from_state(&system_state));
         }

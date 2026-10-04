@@ -426,6 +426,20 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         String::from_utf8_lossy(&planned.stderr)
     );
     let document: Value = serde_json::from_slice(&planned.stdout).expect("actual plan JSON");
+    let pressure: pt_core::collect::pressure::PressureSnapshot =
+        serde_json::from_value(document["system_state"]["pressure"].clone())
+            .expect("actual typed kernel-pressure reading is persisted");
+    assert!(pressure.sampled_at_ms > 0);
+    assert!(pressure.cpus > 0);
+    let meminfo = fs::read_to_string("/proc/meminfo").expect("kernel memory inventory");
+    let total_kib: u64 = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|value| value.split_whitespace().next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(pressure.meminfo.unwrap().total, Some(total_kib * 1024));
     assert_eq!(document["args"]["pids"], serde_json::json!([pid]));
     assert_eq!(document["candidates"].as_array().unwrap().len(), 1);
     let session = document["session_id"].as_str().expect("actual session ID");

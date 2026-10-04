@@ -427,6 +427,14 @@ fn is_export_field(key: &str) -> bool {
             process_names arg_patterns environment_vars working_dir_patterns socket_paths pid_files
             parent_patterns min_matches typical_lifetime_seconds max_normal_lifetime_seconds
             cpu_during_run idle_cpu_normal expected_memory_bytes expects_network expects_disk_io
+            signature_age_weight system_state pressure assessment sampled_at_ms cpus psi
+            some full avg10 avg60 avg300 one five fifteen runnable meminfo vmstat file_handles
+            total_gb available_gb used_gb process_count unavailable source reason load_ratio
+            free available buffers cached swap_cached anon shmem slab slab_reclaimable
+            slab_unreclaimable dirty writeback swap_total swap_free committed_as commit_limit
+            pswpin pswpout pgmajfault pgscan_direct allocstall compact_stall oom_kill allocated max
+            worst regimes kind severity sustained explanation cpu_some memory_some io_some
+            memory_used_fraction zombies dstate irq
             alpha beta author url check
             cmd_pattern cmdline_raw argv args path cwd exe executable home artifact_path
             user username owner env environ environment environment_variables
@@ -457,6 +465,25 @@ fn is_export_field(key: &str) -> bool {
 }
 
 fn is_public_export_string(field: &str, value: &str) -> bool {
+    if matches!(field, "worst" | "severity") {
+        return matches!(value, "ok" | "warn" | "crit");
+    }
+    if field == "kind" {
+        return matches!(
+            value,
+            "cpu_contention"
+                | "io_bound"
+                | "memory_exhaustion"
+                | "cache_bloat"
+                | "swap_thrash"
+                | "swap_paradox"
+                | "swap_exhaustion"
+                | "oom_kills"
+                | "fd_exhaustion"
+                | "zombie_leak"
+                | "dstate_storm"
+        );
+    }
     if field == "host_id" && value == "unknown" {
         return true;
     }
