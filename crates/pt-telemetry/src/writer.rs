@@ -434,6 +434,35 @@ mod tests {
     }
 
     #[test]
+    fn test_lz4_raw_parquet_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let schema = Arc::new(crate::schema::audit_schema());
+        let mut config = WriterConfig::new(
+            temp_dir.path().to_path_buf(),
+            "pt-20260115-143022-lz4".to_string(),
+            "test-host".to_string(),
+        );
+        config.compression = Compression::LZ4_RAW;
+        let batch = create_test_batch(&schema);
+        let mut writer = BatchedWriter::new(TableName::Audit, schema, config);
+        writer.write(batch.clone()).unwrap();
+        let output_path = writer.close().unwrap();
+
+        let file = File::open(output_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        assert_eq!(builder.metadata().num_row_groups(), 1);
+        for column in builder.metadata().row_group(0).columns() {
+            assert_eq!(column.compression(), Compression::LZ4_RAW);
+        }
+        let batches = builder
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches, vec![batch]);
+    }
+
+    #[test]
     fn test_close_without_writes_returns_empty_buffer() {
         let temp_dir = TempDir::new().unwrap();
         let schema = Arc::new(crate::schema::audit_schema());

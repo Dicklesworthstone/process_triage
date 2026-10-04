@@ -45,7 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Prometheus metrics (optional, behind "metrics" feature)
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14.0", optional = true }
 tiny_http = { version = "0.12", optional = true }
 
 # TUI dependencies (optional, behind "ui" feature)
