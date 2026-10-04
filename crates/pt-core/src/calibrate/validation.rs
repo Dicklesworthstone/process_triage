@@ -32,6 +32,10 @@ use super::{
     CalibrationData, CalibrationError, CalibrationQuality,
 };
 
+/// Labels of each class (confirmed abandoned / confirmed not) needed before a report
+/// computes calibration metrics.
+pub const MIN_LABELS_PER_CLASS: usize = 5;
+
 /// How a process actually terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroundTruth {
@@ -51,6 +55,10 @@ pub enum GroundTruth {
     StillRunning,
     /// Tracking window expired without resolution.
     Expired,
+    /// The process disappeared between observations and how it ended was not seen:
+    /// it may have finished its work, been killed by its user, or crashed. Says
+    /// nothing about abandonment, so it never counts as a label.
+    Vanished,
 }
 
 impl GroundTruth {
@@ -64,7 +72,10 @@ impl GroundTruth {
 
     /// Whether this outcome is resolved (not pending).
     pub fn is_resolved(&self) -> bool {
-        !matches!(self, GroundTruth::StillRunning | GroundTruth::Expired)
+        !matches!(
+            self,
+            GroundTruth::StillRunning | GroundTruth::Expired | GroundTruth::Vanished
+        )
     }
 }
 
@@ -161,7 +172,18 @@ pub struct ValidationReport {
     pub resolved_predictions: usize,
     /// Predictions still pending.
     pub pending_predictions: usize,
-    /// Overall calibration metrics (from resolved data).
+    /// Resolved outcomes that confirm abandonment / that refute it.
+    #[serde(default)]
+    pub positive_labels: usize,
+    #[serde(default)]
+    pub negative_labels: usize,
+    /// Predictions whose process ended without an observable outcome (e.g. it
+    /// vanished between shadow samples): closed, but not labels.
+    #[serde(default)]
+    pub unlabeled_outcomes: usize,
+    /// Overall calibration metrics (from resolved data). `None` until both classes
+    /// have at least `MIN_LABELS_PER_CLASS` labels: with one class only, calibration
+    /// figures are meaningless.
     pub metrics: Option<CalibrationMetrics>,
     /// Overall calibration quality.
     pub quality: Option<CalibrationQuality>,
@@ -362,7 +384,13 @@ impl ValidationEngine {
     }
 
     /// Build a validation engine from shadow-mode observations.
+    ///
+    /// The prediction calibrated is P(abandoned or zombie), the quantity pt displays
+    /// as its score and gates robot kills on (not P(abandoned) alone).
     pub fn from_shadow_observations(observations: &[Observation], threshold: f64) -> Self {
+        let predicted = |obs: &Observation| {
+            f64::from(obs.belief.p_abandoned + obs.belief.p_zombie).clamp(0.0, 1.0)
+        };
         let mut engine = ValidationEngine::new(threshold);
         let mut ordered: Vec<&Observation> = observations.iter().collect();
         ordered.sort_by_key(|a| a.timestamp);
@@ -380,7 +408,7 @@ impl ValidationEngine {
                     engine.upsert_prediction(
                         obs.identity_hash.clone(),
                         obs.pid,
-                        obs.belief.p_abandoned as f64,
+                        predicted(obs),
                         obs.belief.recommendation.clone(),
                         None,
                         comm,
@@ -406,7 +434,7 @@ impl ValidationEngine {
             engine.upsert_prediction(
                 obs.identity_hash.clone(),
                 obs.pid,
-                obs.belief.p_abandoned as f64,
+                predicted(obs),
                 obs.belief.recommendation.clone(),
                 None,
                 comm,
@@ -492,7 +520,17 @@ impl ValidationEngine {
             (min_t, max_t)
         };
 
-        let metrics = if cal_data.len() >= 10 {
+        let positive_labels = cal_data.iter().filter(|d| d.actual).count();
+        let negative_labels = cal_data.len() - positive_labels;
+        let both_classes =
+            positive_labels >= MIN_LABELS_PER_CLASS && negative_labels >= MIN_LABELS_PER_CLASS;
+        let unlabeled_outcomes = self
+            .records
+            .iter()
+            .filter(|r| r.ground_truth.is_some_and(|gt| !gt.is_resolved()))
+            .count();
+
+        let metrics = if both_classes && cal_data.len() >= 10 {
             compute_metrics(&cal_data, self.threshold).ok()
         } else {
             None
@@ -502,7 +540,7 @@ impl ValidationEngine {
             .as_ref()
             .map(|m| CalibrationQuality::from_metrics(m.ece, m.brier_score));
 
-        let bias = if cal_data.len() >= 20 {
+        let bias = if both_classes && cal_data.len() >= 20 {
             analyze_bias(&cal_data).ok()
         } else {
             None
@@ -518,6 +556,9 @@ impl ValidationEngine {
             total_predictions: self.records.len(),
             resolved_predictions: resolved.len(),
             pending_predictions: pending.len(),
+            positive_labels,
+            negative_labels,
+            unlabeled_outcomes,
             metrics,
             quality,
             by_category,
@@ -771,18 +812,24 @@ fn map_exit_event(event: &ProcessEvent) -> (GroundTruth, Option<i32>, Option<i32
     }
 
     if ground_truth.is_none() {
-        if exit_signal.is_some() || exit_code.unwrap_or(0) != 0 {
-            ground_truth = Some(GroundTruth::Crash);
-            if outcome_source.is_none() {
-                outcome_source = Some("shadow:exit_status".to_string());
+        let crashed = exit_signal.is_some() || exit_code.is_some_and(|code| code != 0);
+        ground_truth = Some(match exit_code {
+            _ if crashed => {
+                if outcome_source.is_none() {
+                    outcome_source = Some("shadow:exit_status".to_string());
+                }
+                GroundTruth::Crash
             }
-        } else {
-            ground_truth = Some(GroundTruth::NormalExit);
-        }
+            Some(_) => GroundTruth::NormalExit,
+            // Gone, with no exit status: the shadow recorder only sees that a process
+            // is missing from the next scan. That used to read as a normal exit, which
+            // made every resolved shadow label "not abandoned".
+            None => GroundTruth::Vanished,
+        });
     }
 
     (
-        ground_truth.unwrap_or(GroundTruth::NormalExit),
+        ground_truth.unwrap_or(GroundTruth::Vanished),
         exit_code,
         exit_signal,
         outcome_source,
@@ -1119,14 +1166,86 @@ mod tests {
         };
 
         let engine = ValidationEngine::from_shadow_observations(&[obs1, obs2], 0.5);
-        let resolved = engine.resolved_records();
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].ground_truth, Some(GroundTruth::NormalExit));
-        assert_eq!(resolved[0].comm, "worker");
+        // Missing from the next scan, exit unseen: closed, but not a label. (It used
+        // to resolve as NormalExit, i.e. "not abandoned", for every shadow outcome.)
+        assert!(engine.resolved_records().is_empty());
+        assert!(engine.pending_records().is_empty());
+        let record = &engine.records()[0];
+        assert_eq!(record.ground_truth, Some(GroundTruth::Vanished));
+        assert_eq!(record.comm, "worker");
+        assert_eq!(record.outcome_source.as_deref(), Some("shadow:missing"));
+        let report = engine.compute_report().unwrap();
+        assert_eq!(report.unlabeled_outcomes, 1);
+        assert_eq!((report.positive_labels, report.negative_labels), (0, 0));
+    }
+
+    #[test]
+    fn shadow_prediction_is_abandoned_or_zombie() {
+        let now = Utc::now();
+        let obs = Observation {
+            timestamp: now,
+            pid: 12,
+            identity_hash: "hash_z".to_string(),
+            state: StateSnapshot::default(),
+            events: vec![],
+            belief: BeliefState {
+                p_abandoned: 0.5,
+                p_zombie: 0.3,
+                recommendation: "kill".to_string(),
+                ..BeliefState::default()
+            },
+        };
+        let engine = ValidationEngine::from_shadow_observations(&[obs], 0.5);
+        let record = &engine.pending_records()[0];
+        assert!((record.predicted_abandoned - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn exit_status_decides_normal_exit_or_crash() {
+        let event = |details: serde_json::Value| ProcessEvent {
+            timestamp: Utc::now(),
+            event_type: EventType::ProcessExit,
+            details: Some(details.to_string()),
+        };
         assert_eq!(
-            resolved[0].outcome_source.as_deref(),
-            Some("shadow:missing")
+            map_exit_event(&event(serde_json::json!({"exit_code": 0}))).0,
+            GroundTruth::NormalExit
         );
+        assert_eq!(
+            map_exit_event(&event(serde_json::json!({"exit_code": 2}))).0,
+            GroundTruth::Crash
+        );
+        assert_eq!(
+            map_exit_event(&event(serde_json::json!({"exit_signal": 9}))).0,
+            GroundTruth::Crash
+        );
+        assert_eq!(
+            map_exit_event(&event(serde_json::json!({"reason": "missing"}))).0,
+            GroundTruth::Vanished
+        );
+    }
+
+    /// With one class only, calibration figures are meaningless: no metrics.
+    #[test]
+    fn report_needs_labels_of_both_classes() {
+        let mut engine = ValidationEngine::new(0.5);
+        for i in 0..30 {
+            let hash = format!("neg_{i}");
+            engine.track_prediction(
+                hash.clone(),
+                i,
+                0.9,
+                "kill".into(),
+                None,
+                "proc".into(),
+                None,
+            );
+            engine.record_outcome(&hash, GroundTruth::NormalExit, Some(0), None);
+        }
+        let report = engine.compute_report().unwrap();
+        assert_eq!((report.positive_labels, report.negative_labels), (0, 30));
+        assert!(report.metrics.is_none());
+        assert!(report.bias.is_none());
     }
 
     // --- GroundTruth serde roundtrip ---
@@ -1142,6 +1261,7 @@ mod tests {
             GroundTruth::SystemShutdown,
             GroundTruth::StillRunning,
             GroundTruth::Expired,
+            GroundTruth::Vanished,
         ];
         for gt in &variants {
             let json = serde_json::to_string(gt).unwrap();
@@ -1161,6 +1281,7 @@ mod tests {
         assert!(!GroundTruth::SystemShutdown.is_abandoned());
         assert!(!GroundTruth::StillRunning.is_abandoned());
         assert!(!GroundTruth::Expired.is_abandoned());
+        assert!(!GroundTruth::Vanished.is_abandoned());
     }
 
     #[test]
@@ -1173,6 +1294,7 @@ mod tests {
         assert!(GroundTruth::SystemShutdown.is_resolved());
         assert!(!GroundTruth::StillRunning.is_resolved());
         assert!(!GroundTruth::Expired.is_resolved());
+        assert!(!GroundTruth::Vanished.is_resolved());
     }
 
     // --- ValidationRecord serde ---
@@ -1404,7 +1526,8 @@ mod tests {
             details: None,
         };
         let (gt, code, signal, _source) = map_exit_event(&event);
-        assert_eq!(gt, GroundTruth::NormalExit);
+        // Nothing observed about the exit: not evidence of a normal exit.
+        assert_eq!(gt, GroundTruth::Vanished);
         assert!(code.is_none());
         assert!(signal.is_none());
     }
@@ -1417,8 +1540,8 @@ mod tests {
             details: Some(serde_json::json!({"reason": "oom"}).to_string()),
         };
         let (gt, _code, _signal, source) = map_exit_event(&event);
-        // No exit_code or signal, defaults to NormalExit
-        assert_eq!(gt, GroundTruth::NormalExit);
+        // No exit_code or signal: the outcome is unknown, not a normal exit.
+        assert_eq!(gt, GroundTruth::Vanished);
         assert_eq!(source.as_deref(), Some("shadow:oom"));
     }
 
