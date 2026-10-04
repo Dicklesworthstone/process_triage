@@ -13,7 +13,7 @@
 
 load "./test_helper/common.bash"
 
-PT_CORE="${BATS_TEST_DIRNAME}/../target/release/pt-core"
+PT_CORE="${PT_CORE:-}"
 
 # Schema version pattern: X.Y.Z
 SCHEMA_VERSION_PATTERN='^[0-9]+\.[0-9]+\.[0-9]+$'
@@ -22,23 +22,34 @@ SCHEMA_VERSION_PATTERN='^[0-9]+\.[0-9]+\.[0-9]+$'
 SESSION_ID_PATTERN='^pt-[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$'
 
 setup_file() {
-    # Ensure pt-core is built
-    if [[ ! -x "$PT_CORE" ]]; then
-        echo "# Building pt-core..." >&3
-        (cd "${BATS_TEST_DIRNAME}/.." && cargo build --release 2>/dev/null) || {
-            echo "ERROR: Failed to build pt-core" >&2
-            exit 1
-        }
+    if [[ -z "$PT_CORE" || ! -x "$PT_CORE" ]]; then
+        printf 'Set PT_CORE to an explicitly prepared executable pt-core binary.\n' >&2
+        return 1
     fi
+    command -v jq >/dev/null || return 1
 }
 
 setup() {
-    setup_test_env
+    # The shared helper builds Cargo implicitly. Keep this contract suite bound
+    # to the caller's prepared binary and retain all artifacts for inspection.
+    TEST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pt-agent-contract.XXXXXX")
+    export TEST_DIR
+    export CONFIG_DIR="${TEST_DIR}/config"
+    export DATA_DIR="${TEST_DIR}/data"
+    export TEST_LOG_FILE="${TEST_LOG_FILE:-${TEST_DIR}/test.jsonl}"
+    mkdir -p "$CONFIG_DIR" "$DATA_DIR"
+    printf '{}\n' > "${CONFIG_DIR}/decisions.json"
     export PROCESS_TRIAGE_CONFIG="$CONFIG_DIR"
+    export PROCESS_TRIAGE_DATA="$DATA_DIR"
+    export PROCESS_TRIAGE_RETENTION=off
+    export TEST_MODE=1 CI=true NO_COLOR=1
+    CONTRACT_TARGET_PID=""
+    CONTRACT_TARGET_TICKS=""
     test_start "$BATS_TEST_NAME" "Agent CLI contract test"
 }
 
 teardown() {
+    cleanup_contract_target
     test_end "$BATS_TEST_NAME" "${BATS_TEST_COMPLETED:-fail}"
     teardown_test_env
 }
@@ -130,6 +141,169 @@ extract_json() {
     echo "$output" | grep -v '^{"event":' | jq -s 'last' 2>/dev/null
 }
 
+# Read Linux start ticks and state without assuming comm lacks spaces or ')'.
+contract_target_identity() {
+    local pid="$1" stat
+    local -a fields
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    IFS= read -r stat < "/proc/${pid}/stat" || return 1
+    read -r -a fields <<< "${stat##*) }"
+    [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s %s\n' "${fields[19]}" "${fields[0]}"
+}
+
+contract_target_is_alive() {
+    local identity
+    [[ -n "$CONTRACT_TARGET_PID" && -n "$CONTRACT_TARGET_TICKS" ]] || return 1
+    [[ -r "/proc/${CONTRACT_TARGET_PID}/stat" ]] || return 1
+    identity=$(contract_target_identity "$CONTRACT_TARGET_PID") || return 1
+    [[ "$identity" == "$CONTRACT_TARGET_TICKS "* && "${identity#* }" != "Z" ]]
+}
+
+cleanup_contract_target() {
+    # Recheck the actual /proc identity immediately before each signal. Never
+    # signal a reused PID or any process not spawned by this test.
+    if contract_target_is_alive; then
+        kill -TERM -- "$CONTRACT_TARGET_PID"
+        sleep 0.05
+        if contract_target_is_alive; then
+            kill -KILL -- "$CONTRACT_TARGET_PID"
+        fi
+    fi
+}
+
+# Capture real stdout/stderr separately and log every command's actual result.
+# BATS run retains the exit status, including PlanReady (1) and refusals.
+contract_step() {
+    local step="$1" limit="$2"
+    shift 2
+    local started ended step_status stdout_digest stderr_digest
+    started=$(date +%s%3N)
+    if timeout "$limit" "$PT_CORE" "$@" \
+        > "${CONTRACT_LOG_DIR}/${step}.stdout" \
+        2> "${CONTRACT_LOG_DIR}/${step}.stderr"; then
+        step_status=0
+    else
+        step_status=$?
+    fi
+    ended=$(date +%s%3N)
+    stdout_digest=$(sha256sum "${CONTRACT_LOG_DIR}/${step}.stdout")
+    stderr_digest=$(sha256sum "${CONTRACT_LOG_DIR}/${step}.stderr")
+    jq -cn --arg step "$step" --arg command "$PT_CORE" \
+        --argjson exit_code "$step_status" --argjson elapsed_ms "$((ended - started))" \
+        --arg stdout_sha256 "${stdout_digest%% *}" \
+        --arg stderr_sha256 "${stderr_digest%% *}" --args \
+        '{step:$step, command:$command, args:$ARGS.positional, exit_code:$exit_code,
+          elapsed_ms:$elapsed_ms, stdout_sha256:$stdout_sha256, stderr_sha256:$stderr_sha256}' \
+        -- "$@" >> "${CONTRACT_LOG_DIR}/steps.jsonl"
+    cat "${CONTRACT_LOG_DIR}/${step}.stdout"
+    cat "${CONTRACT_LOG_DIR}/${step}.stderr" >&2
+    return "$step_status"
+}
+
+@test "Contract: real plan applies and verifies its saved live identity" {
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        skip "Linux-only /proc+setsid identity regression; other platform contract tests remain enabled"
+    fi
+    command -v setsid >/dev/null
+    command -v timeout >/dev/null
+    command -v sha256sum >/dev/null
+    CONTRACT_LOG_DIR="${BATS_TEST_DIRNAME}/../target/test-logs/e2e/agent_loop/bats-$(date +%s%N)-$$"
+    mkdir -p "$CONTRACT_LOG_DIR"
+    test_info "Actual command logs: $CONTRACT_LOG_DIR"
+
+    run contract_step policy_defaults 30 --format json config show --file policy
+    test_info "$output"
+    assert_equals "0" "$status" "default policy must come from the real binary"
+    # Only this isolated fixture chooses kill deterministically. Runtime checks
+    # remain enabled; this is execution/identity evidence, not calibration or FDR.
+    jq '.policy
+        | .robot_mode.enabled = true
+        | .robot_mode.min_posterior = 0
+        | .guardrails.min_process_age_seconds = 0
+        | .fdr_control.enabled = false
+        | .loss_matrix |= with_entries(.value |= . +
+            {keep:1000, kill:0, pause:1000, throttle:1000, restart:1000, renice:1000})' \
+        "${CONTRACT_LOG_DIR}/policy_defaults.stdout" > "${CONFIG_DIR}/policy.json"
+
+    # The reaping shell leads a foreign session; its sleep child has no agent
+    # environment, terminal, writable log FD, or relationship to our ancestors.
+    local duration="900.$$"
+    env -i PATH=/usr/bin:/bin setsid --fork sh -c \
+        "sleep \"\$1\" </dev/null >/dev/null 2>&1 & target=\$!; printf '%s\\n' \"\$target\"; exec >/dev/null; wait \"\$target\"" \
+        sh "$duration" > "${CONTRACT_LOG_DIR}/target.pid" \
+        2> "${CONTRACT_LOG_DIR}/target-launch.stderr"
+    local attempt
+    cat "${CONTRACT_LOG_DIR}/target-launch.stderr" >&2
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        [[ -s "${CONTRACT_LOG_DIR}/target.pid" ]] && break
+        sleep 0.01
+    done
+    IFS= read -r CONTRACT_TARGET_PID < "${CONTRACT_LOG_DIR}/target.pid"
+    [[ "$CONTRACT_TARGET_PID" =~ ^[0-9]+$ ]]
+    local identity
+    identity=$(contract_target_identity "$CONTRACT_TARGET_PID")
+    CONTRACT_TARGET_TICKS="${identity%% *}"
+    contract_target_is_alive
+    local boot_id expected_start_id
+    IFS= read -r boot_id < /proc/sys/kernel/random/boot_id
+    expected_start_id="${boot_id}:${CONTRACT_TARGET_TICKS}:${CONTRACT_TARGET_PID}"
+
+    run contract_step plan 180 --format json agent plan --min-posterior 0 \
+        --min-age 0 --max-candidates 20 --pids "$CONTRACT_TARGET_PID"
+    test_info "$output"
+    assert_equals "1" "$status" "actual planner must return PlanReady"
+    jq -e --argjson pid "$CONTRACT_TARGET_PID" \
+        '.args.pids == [$pid] and (.candidates | length) == 1
+         and .candidates[0].pid == $pid' "${CONTRACT_LOG_DIR}/plan.stdout"
+    local session_id saved_plan action_id
+    session_id=$(jq -er '.session_id' "${CONTRACT_LOG_DIR}/plan.stdout")
+    [[ "$session_id" =~ $SESSION_ID_PATTERN ]]
+    saved_plan="${DATA_DIR}/sessions/${session_id}/decision/plan.json"
+    [[ -s "$saved_plan" ]]
+    jq -e --argjson pid "$CONTRACT_TARGET_PID" --arg start_id "$expected_start_id" \
+        '.actions | length == 1 and
+         (.[0] | .target.pid == $pid and .target.start_id == $start_id
+          and .action == "kill" and .blocked == false
+          and (.pre_checks | length) > 0 and .rationale.posterior != null)' "$saved_plan"
+    action_id=$(jq -er '.actions[0].action_id' "$saved_plan")
+    jq -e --arg command "sleep $duration" \
+        '.candidates[0].command == $command and .candidates[0].command_short == "sleep"' "$saved_plan"
+    jq -e --slurpfile saved "$saved_plan" '. == $saved[0]' "${CONTRACT_LOG_DIR}/plan.stdout"
+
+    run contract_step stale_identity 30 --format json agent apply --session "$session_id" \
+        --targets "${CONTRACT_TARGET_PID}:stale-start-id" --yes
+    test_info "$output"
+    assert_equals "10" "$status" "stale supplied identity must be refused with ArgsError"
+    [[ "$(cat "${CONTRACT_LOG_DIR}/stale_identity.stderr")" == *"does not match a saved action"* ]]
+    contract_target_is_alive
+    [[ ! -e "${DATA_DIR}/sessions/${session_id}/action/outcomes.jsonl" ]]
+
+    run contract_step apply 240 --format json agent apply --session "$session_id" \
+        --targets "${CONTRACT_TARGET_PID}:${expected_start_id}" --yes
+    test_info "$output"
+    assert_equals "2" "$status" "the actual saved action must return ActionsOk"
+    jq -e --argjson pid "$CONTRACT_TARGET_PID" --arg action_id "$action_id" \
+        '(.outcomes | length) == 1 and .outcomes[0].pid == $pid
+         and .outcomes[0].action_id == $action_id and .outcomes[0].status == "success"' \
+        "${CONTRACT_LOG_DIR}/apply.stdout"
+    if contract_target_is_alive; then
+        test_error "The target survived the reported successful action"
+        false
+    fi
+
+    run contract_step verify 60 --format json agent verify --session "$session_id"
+    test_info "$output"
+    assert_equals "0" "$status" "verify must confirm the real action"
+    jq -e --argjson pid "$CONTRACT_TARGET_PID" --arg start_id "$expected_start_id" \
+        'any(.action_outcomes[]; .target.pid == $pid and .target.start_id == $start_id
+            and .outcome == "confirmed_dead")' "${CONTRACT_LOG_DIR}/verify.stdout"
+    jq -e -s 'length == 5 and all(.[]; .command != "" and (.args | type) == "array"
+        and (.stdout_sha256 | length) == 64 and (.stderr_sha256 | length) == 64
+        and .elapsed_ms >= 0)' "${CONTRACT_LOG_DIR}/steps.jsonl"
+    BATS_TEST_COMPLETED=pass
+}
+
 #==============================================================================
 # NON-INTERACTIVITY TESTS
 #==============================================================================
@@ -139,7 +313,7 @@ extract_json() {
     test_info "Testing non-interactivity (closed stdin)"
 
     # Run with stdin from /dev/null - should not hang
-    run timeout 30 bash -c "echo '' | $PT_CORE agent plan --standalone --format json --min-age 99999999 --max-candidates 0"
+    run timeout 30 "$PT_CORE" agent plan --standalone --format json --min-age 99999999 --max-candidates 0 </dev/null
 
     # Should complete (exit code doesn't matter, just shouldn't hang)
     test_info "Command completed with exit code: $status"
@@ -1365,7 +1539,7 @@ extract_json() {
     has_snapshot=$(echo "$file_json" | jq 'has("snapshot")')
     assert_equals "true" "$has_snapshot" "should have snapshot"
 
-    rm -f "$output_file"
+    test_info "Retained exported file: $output_file"
     BATS_TEST_COMPLETED=pass
 }
 

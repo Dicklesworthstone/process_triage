@@ -10,9 +10,10 @@
 use clap::parser::ValueSource;
 use clap::FromArgMatches;
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use pt_common::{CandidateProvenanceOutput, OutputFormat, SessionId, SCHEMA_VERSION};
-#[cfg(feature = "ui")]
-use pt_common::{IdentityQuality, ProcessIdentity};
+use pt_common::{
+    CandidateProvenanceOutput, IdentityQuality, OutputFormat, ProcessIdentity, SessionId,
+    SCHEMA_VERSION,
+};
 use pt_core::calibrate::{validation::ValidationEngine, CalibrationError};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::collect::protected::ProtectedFilter;
@@ -45,7 +46,6 @@ use pt_core::output::predictions::{
     Predictions, TrajectoryAssessment, TrajectoryLabel,
 };
 use pt_core::output::{encode_toon_value, CompactConfig, FieldSelector, TokenEfficientOutput};
-#[cfg(feature = "ui")]
 use pt_core::plan::{generate_plan, DecisionBundle, DecisionCandidate};
 use pt_core::session::compare::generate_comparison_report;
 use pt_core::session::diff::{
@@ -596,6 +596,10 @@ struct ReportArgs {
     /// Include detailed math ledger
     #[arg(long)]
     include_ledger: bool,
+
+    /// Generate self-contained HTML with built-in styles and readable tables
+    #[arg(long)]
+    embed_assets: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1026,6 +1030,11 @@ struct AgentPlanArgs {
     #[arg(long, default_value = "20")]
     max_candidates: u32,
 
+    /// Restrict inference to selected PIDs (comma-separated); ancestry and safety
+    /// checks still use the full scan.
+    #[arg(long, value_delimiter = ',')]
+    pids: Vec<u32>,
+
     /// Minimum posterior probability threshold for candidate selection
     #[arg(
         long = "min-posterior",
@@ -1159,11 +1168,11 @@ struct AgentApplyArgs {
     session: String,
 
     /// PIDs to act on (default: all recommended)
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', conflicts_with_all = ["targets", "recommended"])]
     pids: Vec<u32>,
 
     /// Specific targets with identity (pid:start_id)
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', conflicts_with = "recommended")]
     targets: Vec<String>,
 
     /// Skip safety gate confirmations
@@ -4061,7 +4070,6 @@ fn run_bundle_create(
     use pt_redact::ExportProfile;
 
     let session_id = SessionId::new();
-    let host_id = pt_core::logging::get_host_id();
     let passphrase = resolve_bundle_passphrase(passphrase_arg);
 
     if encrypt && passphrase.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
@@ -4158,52 +4166,85 @@ fn run_bundle_create(
         }
     };
 
+    // Preserve the source session's host, including imported sessions; the
+    // machine creating the archive is not necessarily the machine scanned.
+    let source_host_id = match handle.read_context() {
+        Ok(context) => context.host_id,
+        Err(pt_core::session::SessionError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            "unknown".to_string()
+        }
+        Err(error) => {
+            eprintln!("bundle create: cannot read session context: {error}");
+            return ExitCode::IoError;
+        }
+    };
     // Create bundle writer
-    let mut writer = BundleWriter::new(&target_session.0, &host_id, export_profile)
+    let mut writer = BundleWriter::new(&target_session.0, &source_host_id, export_profile)
         .with_pt_version(env!("CARGO_PKG_VERSION"))
         .with_description(format!("Export of session {}", target_session.0));
 
-    // Add manifest.json from session
-    let manifest_path = handle.manifest_path();
-    if let Ok(content) = std::fs::read(&manifest_path) {
-        writer.add_file("session/manifest.json", content, Some(FileType::Json));
-    }
-
-    // Add context.json from session
-    let context_path = handle.context_path();
-    if let Ok(content) = std::fs::read(&context_path) {
-        writer.add_file("session/context.json", content, Some(FileType::Json));
-    }
-
-    // Add plan.json if present
-    let plan_path = handle.dir.join("decision/plan.json");
-    if plan_path.exists() {
-        if let Ok(content) = std::fs::read(&plan_path) {
-            writer.add_file("plan.json", content, Some(FileType::Json));
-        }
-    }
-
-    // Add snapshot.json if present
-    let snapshot_path = handle.dir.join("scan/snapshot.json");
-    if snapshot_path.exists() {
-        if let Ok(content) = std::fs::read(&snapshot_path) {
-            writer.add_file("snapshot.json", content, Some(FileType::Json));
-        }
-    }
-
-    // Add inference results if present
-    let posteriors_path = handle.dir.join("inference/posteriors.json");
-    if posteriors_path.exists() {
-        if let Ok(content) = std::fs::read(&posteriors_path) {
-            writer.add_file("inference/posteriors.json", content, Some(FileType::Json));
-        }
-    }
-
-    // Add audit trail if present
-    let audit_path = handle.dir.join("action/outcomes.jsonl");
-    if audit_path.exists() {
-        if let Ok(content) = std::fs::read(&audit_path) {
-            writer.add_file("logs/outcomes.jsonl", content, Some(FileType::Log));
+    // Optional artifacts may be absent; existing unreadable artifacts must not
+    // silently disappear from a successful export. The session manifest is required.
+    for (source, destination, file_type, required) in [
+        (
+            "manifest.json",
+            "session/manifest.json",
+            FileType::Json,
+            true,
+        ),
+        (
+            "context.json",
+            "session/context.json",
+            FileType::Json,
+            false,
+        ),
+        ("decision/plan.json", "plan.json", FileType::Json, false),
+        (
+            "scan/inventory.json",
+            "scan/inventory.json",
+            FileType::Json,
+            false,
+        ),
+        (
+            "inference/results.json",
+            "inference/results.json",
+            FileType::Json,
+            false,
+        ),
+        (
+            "action/outcomes.jsonl",
+            "logs/outcomes.jsonl",
+            FileType::Log,
+            false,
+        ),
+        (
+            "logs/session.jsonl",
+            "logs/session.jsonl",
+            FileType::Log,
+            false,
+        ),
+        (
+            "scan/provenance.json",
+            "scan/provenance.json",
+            FileType::Json,
+            false,
+        ),
+        (
+            "scan/provenance_audit.json",
+            "scan/provenance_audit.json",
+            FileType::Json,
+            false,
+        ),
+    ] {
+        match std::fs::read(handle.dir.join(source)) {
+            Ok(content) => writer.add_file(destination, content, Some(file_type)),
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("bundle create: cannot read {source}: {error}");
+                return ExitCode::IoError;
+            }
         }
     }
 
@@ -4211,10 +4252,6 @@ fn run_bundle_create(
     let provenance_snapshot_path = handle.dir.join("scan/provenance.json");
     let provenance_audit_path = handle.dir.join("scan/provenance_audit.json");
     if provenance_snapshot_path.exists() {
-        if let Ok(content) = std::fs::read(&provenance_snapshot_path) {
-            writer.add_file("scan/provenance.json", content, Some(FileType::Json));
-        }
-
         let mut provenance_summary = BundleProvenanceSummary {
             snapshot_path: "scan/provenance.json".to_string(),
             audit_path: None,
@@ -4234,20 +4271,18 @@ fn run_bundle_create(
         };
 
         if provenance_audit_path.exists() {
-            match std::fs::read_to_string(&provenance_audit_path).ok().and_then(|raw| {
-                serde_json::from_str::<
-                    pt_core::session::snapshot_persist::ProvenancePersistenceAudit,
-                >(&raw)
-                .ok()
-            }) {
-                Some(audit) => {
-                    if let Ok(content) = std::fs::read(&provenance_audit_path) {
-                        writer.add_file(
-                            "scan/provenance_audit.json",
-                            content,
-                            Some(FileType::Json),
-                        );
-                    }
+            let raw = match std::fs::read(&provenance_audit_path) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    eprintln!("bundle create: cannot read provenance audit: {error}");
+                    return ExitCode::IoError;
+                }
+            };
+            match serde_json::from_slice::<
+                pt_core::session::snapshot_persist::ProvenancePersistenceAudit,
+            >(&raw)
+            {
+                Ok(audit) => {
                     provenance_summary.audit_path = Some("scan/provenance_audit.json".to_string());
                     provenance_summary.provenance_schema_version =
                         Some(audit.provenance_schema_version);
@@ -4266,9 +4301,10 @@ fn run_bundle_create(
                     provenance_summary.omitted_sections = audit.omitted_sections;
                     provenance_summary.compatibility_notes = audit.migration_notes;
                 }
-                None => provenance_summary.compatibility_notes.push(
-                    "provenance audit sidecar was present but unreadable; bundle consumers should treat provenance compatibility details as partial".to_string(),
-                ),
+                Err(error) => {
+                    eprintln!("bundle create: invalid provenance audit: {error}");
+                    return ExitCode::IoError;
+                }
             }
         } else {
             provenance_summary.compatibility_notes.push(
@@ -4804,7 +4840,7 @@ fn run_report(global: &GlobalOpts, args: &ReportArgs) -> ExitCode {
         out: args.output.clone(),
         profile: "safe".to_string(),
         galaxy_brain: args.include_ledger,
-        embed_assets: false,
+        embed_assets: args.embed_assets,
         report_format: "html".to_string(),
         prose_style: "conversational".to_string(),
         title: None,
@@ -10426,7 +10462,7 @@ fn output_stub_with_session(
 
 #[cfg(test)]
 mod process_tree_safety_tests {
-    use super::apply_process_tree_safety;
+    use super::{apply_process_tree_safety, build_agent_action_plan, process_identity_from_record};
     use pt_common::{ProcessId, StartId};
     use pt_core::collect::{ProcessRecord, ProcessState};
 
@@ -10455,6 +10491,68 @@ mod process_tree_safety_tests {
 
     fn cand(pid: u32) -> serde_json::Value {
         serde_json::json!({"pid": pid, "recommended_action": "kill", "recommendation": "KILL"})
+    }
+
+    #[test]
+    fn executable_plan_preserves_final_safety_downgrades_and_canonical_identity() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use pt_core::plan::{DecisionCandidate, PreCheck};
+        let policy = pt_core::config::Policy::default();
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let inputs = [100, 200, 300]
+            .into_iter()
+            .map(|pid| {
+                let process = rec(pid, 1, "sleep 600", ProcessState::Sleeping);
+                (
+                    pid,
+                    DecisionCandidate {
+                        identity: process_identity_from_record(&process),
+                        ppid: Some(1),
+                        decision: decision.clone(),
+                        blocked_reasons: Vec::new(),
+                        stage_pause_before_kill: false,
+                        process_state: Some(process.state),
+                        parent_identity: None,
+                        d_state_diagnostics: None,
+                    },
+                )
+            })
+            .collect();
+        let candidates = vec![
+            cand(100),
+            serde_json::json!({"pid": 200, "recommended_action": "review"}),
+            serde_json::json!({"pid": 300, "recommended_action": "keep"}),
+        ];
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-10-04T12:00:00Z".to_string(),
+        );
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target.pid.0, 100);
+        assert_eq!(plan.actions[0].target.start_id.0, "b:1:100");
+        assert!(plan.actions[0]
+            .pre_checks
+            .contains(&PreCheck::VerifyIdentity));
+        assert!(plan.actions[0]
+            .pre_checks
+            .contains(&PreCheck::CheckDataLossGate));
+        assert_eq!(plan.actions[0].rationale.posterior, Some(posterior));
+        let mut document = serde_json::to_value(&plan).unwrap();
+        document["candidates"] = serde_json::to_value(candidates).unwrap();
+        let applied: pt_core::plan::Plan = serde_json::from_value(document).unwrap();
+        assert_eq!(applied.plan_id, plan.plan_id);
+        assert_eq!(applied.actions[0].action_id, plan.actions[0].action_id);
     }
 
     #[test]
@@ -11912,6 +12010,53 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
 /// An agent CLI whose terminal had input/output within this window is live.
 const AGENT_LIVE_TTY_IDLE_SECS: u64 = 30 * 60;
 
+fn process_identity_from_record(proc: &ProcessRecord) -> ProcessIdentity {
+    let quality =
+        if proc.start_id.0.starts_with("unknown:") || proc.start_id.0.starts_with("synthetic:") {
+            IdentityQuality::NoBootId
+        } else {
+            IdentityQuality::Full
+        };
+    ProcessIdentity::full(
+        proc.pid.0,
+        proc.start_id.clone(),
+        proc.uid,
+        proc.pgid,
+        proc.sid,
+        quality,
+    )
+}
+
+fn build_agent_action_plan(
+    session_id: &SessionId,
+    policy: &pt_core::config::Policy,
+    candidates: &[serde_json::Value],
+    action_inputs: &HashMap<u32, DecisionCandidate>,
+    generated_at: String,
+) -> Plan {
+    let candidates = candidates
+        .iter()
+        .filter_map(|recorded| {
+            let pid = u32::try_from(recorded["pid"].as_u64()?).ok()?;
+            let mut input = action_inputs.get(&pid)?.clone();
+            let final_action = recorded["recommended_action"].as_str()?;
+            let chosen_action = serde_json::to_value(input.decision.optimal_action).ok()?;
+            // Tree safety, policy, agent supervision and human review have the
+            // final word. Never revive a decision that one of them downgraded.
+            if chosen_action.as_str() != Some(final_action) {
+                input.decision.optimal_action = Action::Keep;
+            }
+            Some(input)
+        })
+        .collect();
+    generate_plan(&DecisionBundle {
+        session_id: session_id.clone(),
+        policy: policy.clone(),
+        candidates,
+        generated_at: Some(generated_at),
+    })
+}
+
 fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let _lock = match acquire_global_lock(global, "agent plan") {
         Ok(lock) => lock,
@@ -12117,6 +12262,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         PersistedProcess,
         PersistedInference,
     )> = Vec::new();
+    let mut action_inputs: HashMap<u32, DecisionCandidate> = HashMap::new();
     let mut policy_blocked_count = 0usize;
     let mut signature_match_count = 0usize;
     let mut signature_fast_path_used_count = 0usize;
@@ -12143,6 +12289,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let eligible_processes: Vec<_> = filter_result
         .passed
         .iter()
+        .filter(|proc| args.pids.is_empty() || args.pids.contains(&proc.pid.0))
         .filter(|proc| proc.elapsed.as_secs() >= effective_min_age)
         .collect();
 
@@ -12554,7 +12701,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "agent_kind": agent_kind,
             "agent_liveness": agent_liveness,
             "zombie_routing": zombie_routing,
-            "start_id": format!("{}:{}", proc.pid.0, proc.start_time_unix),
+            "start_id": proc.start_id.to_string(),
             "uid": proc.uid,
             "user": &proc.user,
             "command": &proc.cmd,
@@ -12595,6 +12742,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             },
             "confidence": ledger.confidence.label(),
             "evidence": evidence_contributions,
+            "evidence_ledger": ledger,
             "provenance_inference": serde_json::to_value(CandidateProvenanceOutput::disabled())
                 .unwrap_or_else(|_| serde_json::json!({"enabled": false})),
             "blast_radius": {
@@ -12712,6 +12860,23 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         };
 
         // Store candidate with its ranking key (no early break!)
+        action_inputs.insert(
+            proc.pid.0,
+            DecisionCandidate {
+                identity: process_identity_from_record(proc),
+                ppid: Some(proc.ppid.0),
+                decision: decision_outcome,
+                blocked_reasons: Vec::new(),
+                stage_pause_before_kill: false,
+                process_state: Some(proc.state),
+                parent_identity: scan_result
+                    .processes
+                    .iter()
+                    .find(|parent| parent.pid == proc.ppid)
+                    .map(process_identity_from_record),
+                d_state_diagnostics: None,
+            },
+        );
         all_candidates.push((
             (abandonment_probability, intervention_probability),
             candidate,
@@ -13035,6 +13200,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "command": "agent plan",
         "args": {
             "max_candidates": args.max_candidates,
+            "pids": args.pids,
             "min_posterior": args.min_posterior,
             "only": args.only,
             "yes": args.yes,
@@ -13070,6 +13236,22 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     if let Some(stub_flags) = stub_flags_section {
         plan_output["stub_flags"] = stub_flags;
     }
+
+    // The persisted and full stdout document carries the executable Plan fields
+    // alongside its recorded candidate evidence. Apply consumes this same contract.
+    let action_plan = build_agent_action_plan(
+        &session_id,
+        &decision_policy,
+        &candidates,
+        &action_inputs,
+        plan_output["generated_at"].as_str().unwrap().to_string(),
+    );
+    if let serde_json::Value::Object(fields) = serde_json::to_value(action_plan).unwrap() {
+        plan_output.as_object_mut().unwrap().extend(fields);
+    }
+    plan_output["policy_snapshot"] = serde_json::json!({
+        "min_process_age_seconds": effective_min_age,
+    });
 
     // Write plan to session
     let decision_dir = handle.dir.join("decision");
@@ -14106,7 +14288,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let plan: Plan = match serde_json::from_str(&plan_content) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("agent apply: invalid plan.json: {}", e);
+            eprintln!(
+                "agent apply: invalid plan.json (expected Plan schema {SCHEMA_VERSION}; inspect with `pt schema Plan`): {e}"
+            );
             return ExitCode::InternalError;
         }
     };
@@ -14149,16 +14333,59 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     } else if !args.pids.is_empty() {
         args.pids.clone()
     } else if !args.targets.is_empty() {
-        args.targets
-            .iter()
-            .filter_map(|t| t.split(':').next().and_then(|p| p.parse().ok()))
-            .collect()
+        let mut selected = Vec::with_capacity(args.targets.len());
+        for target in &args.targets {
+            let Some((pid, start_id)) = target.split_once(':') else {
+                eprintln!("agent apply: invalid target {target:?}; expected pid:start_id");
+                return ExitCode::ArgsError;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                eprintln!("agent apply: invalid target PID in {target:?}");
+                return ExitCode::ArgsError;
+            };
+            if pid == 0 || start_id.is_empty() {
+                eprintln!("agent apply: invalid target {target:?}; expected pid:start_id");
+                return ExitCode::ArgsError;
+            }
+            if !plan
+                .actions
+                .iter()
+                .any(|action| action.target.pid.0 == pid && action.target.start_id.0 == start_id)
+            {
+                eprintln!("agent apply: target identity {target:?} does not match a saved action");
+                return ExitCode::ArgsError;
+            }
+            selected.push(pid);
+        }
+        selected
     } else {
         eprintln!("agent apply: must specify --recommended, --pids, or --targets");
         return ExitCode::ArgsError;
     };
 
-    if let Some(min_age) = args.min_age {
+    let saved_document: serde_json::Value = match serde_json::from_str(&plan_content) {
+        Ok(document) => document,
+        Err(error) => {
+            eprintln!("agent apply: invalid recorded plan policy: {}", error);
+            return ExitCode::InternalError;
+        }
+    };
+    let saved_min_age = match saved_document.pointer("/policy_snapshot/min_process_age_seconds") {
+        Some(value) => match value.as_u64() {
+            Some(age) => age,
+            None => {
+                eprintln!("agent apply: invalid recorded minimum process age");
+                return ExitCode::InternalError;
+            }
+        },
+        None => config.policy.guardrails.min_process_age_seconds,
+    };
+    let min_age = args
+        .min_age
+        .unwrap_or(saved_min_age)
+        .max(saved_min_age)
+        .max(config.policy.guardrails.min_process_age_seconds);
+    if min_age > 0 {
         if !target_pids.is_empty() {
             let scan_options = QuickScanOptions {
                 pids: target_pids.clone(),
@@ -15019,7 +15246,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 }
 
 fn output_apply_nothing(global: &GlobalOpts, sid: &SessionId) {
-    let result = serde_json::json!({"session_id": sid.0, "mode": "robot_apply", "note": "nothing_to_do", "summary": {"attempted": 0}});
+    let result = serde_json::json!({"session_id": sid.0, "mode": "robot_apply", "note": "nothing_to_do", "summary": {"attempted": 0}, "outcomes": []});
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, result));
@@ -17927,7 +18154,6 @@ fn generate_report_from_session(
     handle: &pt_core::session::SessionHandle,
 ) -> pt_report::Result<String> {
     use pt_report::sections::*;
-    use pt_report::ReportData;
 
     // Read manifest for session metadata
     let manifest = handle
@@ -17958,7 +18184,7 @@ fn generate_report_from_session(
         hostname: None,
         started_at: chrono::DateTime::parse_from_rfc3339(&manifest.timing.created_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or_else(|_| chrono::Utc::now()),
+            .map_err(|error| pt_report::ReportError::MissingData(format!("created_at: {error}")))?,
         ended_at: manifest.timing.updated_at.as_ref().and_then(|ts| {
             chrono::DateTime::parse_from_rfc3339(ts)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -17966,7 +18192,10 @@ fn generate_report_from_session(
         }),
         duration_ms: None,
         state: format!("{:?}", manifest.state).to_lowercase(),
-        mode: format!("{:?}", manifest.mode).to_lowercase(),
+        mode: serde_json::to_value(manifest.mode)?
+            .as_str()
+            .expect("SessionMode serializes as a string")
+            .to_string(),
         deep_scan: false,
         processes_scanned: 0,
         candidates_found: 0,
@@ -17983,55 +18212,17 @@ fn generate_report_from_session(
         export_profile: "safe".to_string(),
     };
 
-    // Try to read plan.json for candidate count
+    // A session report needs its recorded plan. Missing or corrupt data is an
+    // error, not a successful report with invented empty candidate counts.
     let plan_path = handle.dir.join("decision").join("plan.json");
-    let candidates_count = if plan_path.exists() {
-        std::fs::read_to_string(&plan_path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-            .and_then(|v| {
-                v.get("candidates")
-                    .and_then(|c| c.as_array())
-                    .map(|a| a.len())
-                    .or_else(|| {
-                        v.get("summary")
-                            .and_then(|s| s.get("candidates_returned"))
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
-                    })
-                    .or_else(|| {
-                        v.get("gates_summary")
-                            .and_then(|g| g.get("total_candidates"))
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
-                    })
-                    .or_else(|| v.get("actions").and_then(|a| a.as_array()).map(|a| a.len()))
-            })
-            .unwrap_or(0)
-    } else {
-        0
+    let plan: serde_json::Value = serde_json::from_slice(&std::fs::read(&plan_path)?)?;
+    let outcomes_path = handle.dir.join("action/outcomes.jsonl");
+    let outcomes = match std::fs::read(&outcomes_path) {
+        Ok(bytes) => pt_report::generator::parse_outcomes(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
     };
-
-    // Build report data
-    let data = ReportData {
-        config: generator.config().clone(),
-        generated_at: chrono::Utc::now(),
-        generator_version: env!("CARGO_PKG_VERSION").to_string(),
-        overview: Some(OverviewSection {
-            candidates_found: candidates_count,
-            ..overview
-        }),
-        candidates: None, // Would be populated from plan.json
-        evidence: None,
-        actions: None,
-        galaxy_brain: if generator.config().galaxy_brain {
-            Some(GalaxyBrainSection::default())
-        } else {
-            None
-        },
-    };
-
-    generator.generate(data)
+    generator.generate_from_session_artifacts(overview, &plan, &outcomes)
 }
 
 #[cfg(all(test, feature = "report"))]
@@ -18067,11 +18258,17 @@ mod report_generation_tests {
                 run_id: "run-123".to_string(),
                 label: None,
                 os: pt_core::session::SessionOs {
-                    family: "test-os".to_string(),
-                    arch: "test-arch".to_string(),
+                    family: "linux".to_string(),
+                    arch: "x86_64".to_string(),
                 },
             })
             .unwrap();
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            r#"{"candidates":[]}"#,
+        )
+        .unwrap();
 
         let generator = ReportGenerator::new(
             ReportConfig::new()
@@ -18079,17 +18276,26 @@ mod report_generation_tests {
                 .with_title("Session Report Test".to_string()),
         );
         let html = generate_report_from_session(&generator, &handle).unwrap();
-        let host_row =
-            "Host ID</dt>\n                <dd class=\"font-mono\">host-from-context</dd>";
+        let redaction =
+            pt_redact::RedactionEngine::new(pt_redact::RedactionPolicy::default()).unwrap();
+        let metadata = redaction.redact_json_for_export(
+            &serde_json::json!({"host_id": "host-from-context"}),
+            pt_redact::ExportProfile::Safe,
+        );
+        let host_row = format!(
+            "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
+            metadata["host_id"].as_str().unwrap(),
+        );
         let wrong_host_row = format!(
             "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
             session_id.0
         );
 
-        assert!(html.contains(host_row));
+        assert!(html.contains(&host_row));
+        assert!(!html.contains("host-from-context"));
         assert!(!html.contains(&wrong_host_row));
-        assert!(html.contains("test-os"));
-        assert!(html.contains("test-arch"));
+        assert!(html.contains("linux"));
+        assert!(html.contains("x86_64"));
     }
 
     #[test]
@@ -18098,6 +18304,13 @@ mod report_generation_tests {
         let (_tmp, handle) = make_report_handle(&session_id);
         let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
         handle.write_manifest(&manifest).unwrap();
+
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            r#"{"candidates":[]}"#,
+        )
+        .unwrap();
 
         let generator = ReportGenerator::new(
             ReportConfig::new()
@@ -18132,33 +18345,54 @@ mod report_generation_tests {
 
         assert!(err.to_string().contains("missing required data: context:"));
     }
+
+    #[test]
+    fn generate_report_from_session_rejects_missing_and_corrupt_plan() {
+        let session_id = SessionId::new();
+        let (_tmp, handle) = make_report_handle(&session_id);
+        handle
+            .write_manifest(&SessionManifest::new(
+                &session_id,
+                None,
+                SessionMode::RobotPlan,
+                None,
+            ))
+            .unwrap();
+        let generator = ReportGenerator::default_config();
+        assert!(matches!(
+            generate_report_from_session(&generator, &handle),
+            Err(pt_report::ReportError::IoError(error)) if error.kind() == std::io::ErrorKind::NotFound,
+        ));
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        fs::write(handle.dir.join("decision/plan.json"), b"not-json").unwrap();
+        assert!(matches!(
+            generate_report_from_session(&generator, &handle),
+            Err(pt_report::ReportError::JsonError(_)),
+        ));
+    }
 }
 
 /// Generate Slack-friendly summary.
 #[cfg(feature = "report")]
 fn generate_slack_summary(prose_style: &str) -> String {
     match prose_style {
-        "terse" => {
-            "*Process Triage Summary*\n• Session completed\n• No critical issues found".to_string()
-        }
-        "formal" => "*Process Triage Report*\n\nThe session has been completed successfully. \
-             All processes have been analyzed according to the configured policy.\n\n\
+        "terse" => "*Process Triage Summary*\n• Report generated\n• Review the recorded evidence and outcomes".to_string(),
+        "formal" => "*Process Triage Report*\n\nA report has been generated from the saved session artifacts. \
+             Consult the HTML report for recorded recommendations and action outcomes.\n\n\
              _Report generated by pt-core_"
             .to_string(),
         "technical" => "*Process Triage Technical Summary*\n\n\
              ```\n\
-             Session: completed\n\
-             Candidates: analyzed\n\
-             Actions: pending review\n\
+             Source: saved session artifacts\n\
+             Missing measurements: explicitly marked\n\
              ```\n\n\
-             See full HTML report for detailed evidence ledger and posterior computations."
+             See the HTML report for recorded evidence, posteriors, and outcomes."
             .to_string(),
         _ => {
             // conversational (default)
-            "*Process Triage Complete* 🎯\n\n\
-             I've finished analyzing your processes. The session has been saved \
-             and you can review the detailed findings in the HTML report.\n\n\
-             Let me know if you'd like me to explain any of the recommendations!"
+            "*Process Triage Report*\n\n\
+             Your report is ready. Review the saved recommendations and action outcomes \
+             in the HTML report. Missing measurements are marked explicitly."
                 .to_string()
         }
     }
@@ -18168,24 +18402,20 @@ fn generate_slack_summary(prose_style: &str) -> String {
 #[cfg(feature = "report")]
 fn generate_prose_summary(prose_style: &str) -> String {
     match prose_style {
-        "terse" => "Session complete. Candidates analyzed. Report ready.".to_string(),
-        "formal" => "The process triage session has concluded. All candidate processes have been \
-             evaluated using Bayesian inference, and recommendations have been generated \
-             based on the configured policy parameters. The full report is available for \
-             your review."
+        "terse" => "Report ready. Review the recorded evidence and outcomes.".to_string(),
+        "formal" => "A process triage report has been generated from the saved session artifacts. \
+             The HTML report presents recorded recommendations and action outcomes, with \
+             missing measurements marked explicitly."
             .to_string(),
-        "technical" => "Process triage session completed. The inference engine computed posterior \
-             probabilities for each candidate across the four-class model (useful, useful_bad, \
-             abandoned, zombie). Expected loss calculations and FDR control were applied \
-             to generate action recommendations. See the galaxy-brain tab in the HTML report \
-             for full mathematical derivations."
+        "technical" => "The report reads saved plan evidence and action outcomes. Four-class \
+             posteriors and exact evidence ledgers are shown when recorded; missing ledgers \
+             and measurements are marked explicitly. Review the HTML report for details."
             .to_string(),
         _ => {
             // conversational (default)
-            "All done! I've analyzed your running processes and identified any that might \
-             be abandoned or stuck. You can check out the full report to see the details \
-             and decide what to do with each one. The report shows my reasoning for each \
-             recommendation, so you'll know exactly why I flagged something."
+            "Your report is ready. You can review the saved recommendations, evidence, \
+             and action outcomes in the HTML report. It marks missing information so \
+             you can see which details were actually recorded."
                 .to_string()
         }
     }

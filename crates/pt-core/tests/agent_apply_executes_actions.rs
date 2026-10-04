@@ -132,6 +132,9 @@ fn write_test_policy(config_dir: &Path) {
     policy.robot_mode.enabled = true;
     policy.robot_mode.min_posterior = 0.0;
     policy.robot_mode.require_human_for_supervised = false;
+    // These fixtures deliberately act on freshly spawned targets. Production
+    // apply now correctly enforces the policy age floor even without --min-age.
+    policy.guardrails.min_process_age_seconds = 0;
     fs::write(
         config_dir.join("policy.json"),
         serde_json::to_string_pretty(&policy).expect("serialize policy"),
@@ -232,7 +235,7 @@ fn apply_with_args(
     extra: &[&str],
 ) -> (String, Value) {
     let out = cargo_bin_cmd!("pt-core")
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(240))
         .env("PT_SKIP_GLOBAL_LOCK", "1")
         .env("PROCESS_TRIAGE_DATA", data_dir)
         .env("PROCESS_TRIAGE_CONFIG", config_dir)
@@ -263,6 +266,353 @@ fn apply_with_args(
         .unwrap_or("missing")
         .to_string();
     (status, json)
+}
+
+/// Exercise the actual planner-to-apply contract, not a hand-authored action.
+/// The isolated policy selects kill to make routing deterministic; this tests
+/// execution and saved identities, not inference calibration or FDR quality.
+#[cfg(target_os = "linux")]
+#[test]
+fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
+    use std::io::{BufRead, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::process::Stdio;
+
+    fn run_step(
+        log_dir: &Path,
+        step: &str,
+        args: &[&str],
+        data_dir: &Path,
+        config_dir: &Path,
+        timeout_seconds: u64,
+    ) -> std::process::Output {
+        let started = std::time::Instant::now();
+        let output = cargo_bin_cmd!("pt-core")
+            .timeout(Duration::from_secs(timeout_seconds))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", data_dir)
+            .env("PROCESS_TRIAGE_CONFIG", config_dir)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args(args)
+            .output()
+            .expect("run actual agent step");
+        static STEP_NUMBER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let index = STEP_NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stdout_path = format!("{index}-{step}.stdout.json");
+        let stderr_path = format!("{index}-{step}.stderr.jsonl");
+        fs::write(log_dir.join(&stdout_path), &output.stdout).expect("save actual stdout");
+        fs::write(log_dir.join(&stderr_path), &output.stderr).expect("save actual stderr");
+        let record = serde_json::json!({
+            "step": step, "command": "pt-core", "args": args,
+            "exit_code": output.status.code(), "success": output.status.success(),
+            "elapsed_ms": started.elapsed().as_millis(),
+            "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&output.stdout),
+            "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&output.stderr),
+            "stdout_path": stdout_path, "stderr_path": stderr_path,
+        });
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("steps.jsonl"))
+            .expect("open step log");
+        writeln!(log, "{record}").expect("record actual step");
+        eprintln!("{record}");
+        output
+    }
+
+    struct BoundTarget(OwnedFd);
+    impl Drop for BoundTarget {
+        fn drop(&mut self) {
+            // SAFETY: the pidfd binds only the process spawned by this test;
+            // unlike a numeric PID it cannot signal a replacement process.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+    }
+
+    // Keep artifacts for inspection and never remove files as test cleanup.
+    let data_dir = TempDir::new().expect("data dir").keep();
+    let config_dir = TempDir::new().expect("config dir").keep();
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-logs/e2e/agent_loop")
+        .join(format!(
+            "{}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            std::process::id()
+        ));
+    fs::create_dir_all(&log_dir).expect("step log directory");
+    let mut policy = Policy::default();
+    policy.robot_mode.enabled = true;
+    policy.robot_mode.min_posterior = 0.0;
+    policy.guardrails.min_process_age_seconds = 0;
+    policy.fdr_control.enabled = false;
+    for row in [
+        &mut policy.loss_matrix.useful,
+        &mut policy.loss_matrix.useful_bad,
+        &mut policy.loss_matrix.abandoned,
+        &mut policy.loss_matrix.zombie,
+    ] {
+        row.keep = 1000.0;
+        row.kill = 0.0;
+        row.pause = Some(1000.0);
+        row.throttle = Some(1000.0);
+        row.restart = Some(1000.0);
+        row.renice = Some(1000.0);
+    }
+    fs::write(
+        config_dir.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).expect("serialize isolated policy"),
+    )
+    .expect("write isolated policy");
+
+    // Detach the reaping shell from the test/agent ancestor chain. The target
+    // itself is neither a session leader nor attached to a terminal or log FD.
+    let unique_seconds = format!("900.{}", std::process::id());
+    let script = format!(
+        "sleep {unique_seconds} </dev/null >/dev/null 2>&1 & target=$!; printf '%s\\n' \"$target\"; exec >/dev/null; wait \"$target\""
+    );
+    let mut launcher = ProcessCommand::new("setsid")
+        .args(["--fork", "sh", "-c", &script])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn detached target");
+    let mut line = String::new();
+    std::io::BufReader::new(launcher.stdout.take().expect("target PID pipe"))
+        .read_line(&mut line)
+        .expect("read detached PID");
+    let pid: u32 = line.trim().parse().expect("detached target PID");
+    assert!(launcher.wait().expect("wait for launcher").success());
+    // SAFETY: pidfd_open does not modify the process. Ownership of the returned
+    // descriptor transfers once to OwnedFd and lasts through all assertions.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+    let _target = BoundTarget(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+    let identity = live_identity(pid);
+
+    let planned = run_step(
+        &log_dir,
+        "plan",
+        &[
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--min-posterior",
+            "0",
+            "--min-age",
+            "0",
+            "--max-candidates",
+            "20",
+            "--pids",
+            &pid.to_string(),
+        ],
+        &data_dir,
+        &config_dir,
+        180,
+    );
+    assert!(
+        planned.status.code() == Some(1),
+        "planner stderr: {}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let document: Value = serde_json::from_slice(&planned.stdout).expect("actual plan JSON");
+    assert_eq!(document["args"]["pids"], serde_json::json!([pid]));
+    assert_eq!(document["candidates"].as_array().unwrap().len(), 1);
+    let session = document["session_id"].as_str().expect("actual session ID");
+    let store = SessionStore::at_data_dir(&data_dir);
+    let handle = store
+        .open(&SessionId::parse(session).expect("canonical session ID"))
+        .expect("open planned session");
+    let persisted = fs::read(handle.dir.join("decision/plan.json")).expect("saved actual plan");
+    let plan: Plan = serde_json::from_slice(&persisted).expect("planner output is executable Plan");
+    let action = plan
+        .actions
+        .iter()
+        .find(|action| action.target.pid.0 == pid)
+        .unwrap_or_else(|| panic!("spawned target absent from actual plan: {document}"));
+    assert_eq!(action.action, Action::Kill);
+    assert_eq!(action.target.start_id, identity.start_id);
+    assert!(
+        !action.pre_checks.is_empty(),
+        "planner must retain required checks"
+    );
+    assert!(action.rationale.posterior.is_some());
+
+    // A supplied stale identity must refuse before runtime work, even when the
+    // saved plan contains a valid action for this same live PID.
+    for invalid_target in [format!("{pid}:stale-start-id"), pid.to_string()] {
+        let refused = run_step(
+            &log_dir,
+            "apply_invalid_identity",
+            &[
+                "--format",
+                "json",
+                "agent",
+                "apply",
+                "--session",
+                session,
+                "--targets",
+                &invalid_target,
+                "--yes",
+            ],
+            &data_dir,
+            &config_dir,
+            30,
+        );
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("agent apply:"),
+            "identity refusal must come from apply: {refused:?}"
+        );
+        assert!(state_of(pid).is_some_and(|state| state != 'Z'));
+        assert!(!handle.dir.join("action/outcomes.jsonl").exists());
+    }
+
+    // Scope the real apply to our one exact identity, regardless of what the
+    // planner observes on the worker. The normal runtime safety checks run.
+    let target = format!("{pid}:{}", identity.start_id.0);
+    let mut tampered: Value = serde_json::from_slice(&persisted).unwrap();
+    for saved_action in tampered["actions"].as_array_mut().unwrap() {
+        saved_action["pre_checks"] = serde_json::json!([]);
+        saved_action["target"]["uid"] = serde_json::json!(identity.uid.wrapping_add(1));
+    }
+    fs::write(
+        handle.dir.join("decision/plan.json"),
+        serde_json::to_vec(&tampered).unwrap(),
+    )
+    .unwrap();
+    let refused = run_step(
+        &log_dir,
+        "apply_tampered_plan",
+        &[
+            "--format",
+            "json",
+            "agent",
+            "apply",
+            "--session",
+            session,
+            "--targets",
+            &target,
+            "--yes",
+        ],
+        &data_dir,
+        &config_dir,
+        240,
+    );
+    let refusal: Value = serde_json::from_slice(&refused.stdout).unwrap_or_else(|error| {
+        panic!(
+            "tampered-plan JSON {error}: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        )
+    });
+    assert_eq!(refusal["outcomes"][0]["status"], "identity_mismatch");
+    assert!(state_of(pid).is_some_and(|state| state != 'Z'));
+    fs::write(handle.dir.join("decision/plan.json"), &persisted).unwrap();
+
+    let applied = run_step(
+        &log_dir,
+        "apply",
+        &[
+            "--format",
+            "json",
+            "agent",
+            "apply",
+            "--session",
+            session,
+            "--targets",
+            &target,
+            "--yes",
+        ],
+        &data_dir,
+        &config_dir,
+        240,
+    );
+    let applied: Value = serde_json::from_slice(&applied.stdout).expect("actual apply JSON");
+    assert_eq!(
+        applied["outcomes"][0]["status"], "success",
+        "actual planned action: {applied}"
+    );
+    assert_eq!(applied["outcomes"].as_array().unwrap().len(), 1);
+    assert_eq!(applied["outcomes"][0]["pid"], pid);
+    assert_eq!(applied["outcomes"][0]["action_id"], action.action_id);
+    assert!(state_of(pid).is_none_or(|state| state == 'Z'));
+
+    let verified = run_step(
+        &log_dir,
+        "verify",
+        &["--format", "json", "agent", "verify", "--session", session],
+        &data_dir,
+        &config_dir,
+        60,
+    );
+    let verification: Value = serde_json::from_slice(&verified.stdout).unwrap_or_else(|error| {
+        panic!(
+            "verify JSON {error}: {}",
+            String::from_utf8_lossy(&verified.stderr)
+        )
+    });
+    let outcome = verification["action_outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|outcome| outcome["target"]["pid"] == pid)
+        .expect("verified target");
+    assert_eq!(outcome["outcome"], "confirmed_dead", "{verification}");
+    assert!(outcome["target"]["cmd_full"]
+        .as_str()
+        .unwrap()
+        .contains(&unique_seconds));
+}
+
+#[test]
+fn agent_apply_enforces_policy_age_floor_when_plan_snapshot_is_missing() {
+    let data_dir = TempDir::new().expect("data dir").keep();
+    let config_dir = TempDir::new().expect("config dir").keep();
+    write_test_policy(&config_dir);
+    let policy_path = config_dir.join("policy.json");
+    let mut policy: Policy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy.guardrails.min_process_age_seconds = 60;
+    fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    let victim = ForeignTarget::spawn("sleep 903");
+    let identity = live_identity(victim.pid);
+    let session = session_with_plan(&data_dir, plan_action(Action::Kill, &identity));
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+    let plan_path = SessionStore::at_data_dir(&data_dir)
+        .open(&SessionId::parse(&session).unwrap())
+        .unwrap()
+        .dir
+        .join("decision/plan.json");
+    for saved_floor in [None, Some(0)] {
+        if let Some(floor) = saved_floor {
+            let mut plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+            plan["policy_snapshot"] = serde_json::json!({"min_process_age_seconds": floor});
+            fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        }
+        let (status, json) = apply_with_args(
+            &data_dir,
+            &config_dir,
+            &session,
+            &target,
+            &["--min-age", "0"],
+        );
+        assert_ne!(
+            status, "success",
+            "CLI or old snapshot must not lower the current policy floor: {json}"
+        );
+        assert!(json["outcomes"].as_array().unwrap().is_empty());
+        assert_eq!(json["summary"]["attempted"], 0);
+        assert!(victim.alive());
+    }
 }
 
 #[test]

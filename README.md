@@ -304,6 +304,7 @@ pt agent explain --session <id> --pids 1234 # why one process scored the way it 
 ```bash
 pt agent plan --format json            # Structured JSON plan
 pt agent plan --format toon            # Token-optimized output
+pt agent plan --pids 1234,5678          # Score selected PIDs with full ancestry/protection checks
 pt agent apply --session <id> --yes    # Execute a plan (needs robot_mode.enabled=true in policy)
 pt agent verify --session <id>         # Confirm outcomes
 pt agent label --pid 1234 --kill       # Teach pt your verdict for this command pattern
@@ -511,8 +512,9 @@ process_triage/
     └── pt-20260115-143022-a7xq/
         ├── manifest.json            # Session metadata and state
         ├── context.json             # Host / run context
-        ├── scan/snapshot.json       # Process snapshot
-        ├── decision/plan.json       # Generated plan
+        ├── scan/inventory.json      # Process identities and commands
+        ├── inference/results.json   # Four-class posteriors
+        ├── decision/plan.json       # Executable plan and recorded evidence
         ├── action/outcomes.jsonl    # Action outcomes
         └── logs/session.jsonl       # Session event log
 ```
@@ -1172,13 +1174,21 @@ A `.ptb` file is a ZIP archive (optionally encrypted) containing a manifest and 
 ```
 session.ptb (ZIP or encrypted envelope)
 ├── manifest.json       # Bundle metadata + file checksums
-├── snapshot.json       # Redacted process state
-├── inference.jsonl     # Per-process posteriors
-├── plan.json           # Generated action plan
-├── actions.json        # Executed actions + outcomes
-├── provenance.json     # Process provenance graph
-└── audit.jsonl         # Action audit trail
+├── session/manifest.json       # Session metadata
+├── session/context.json        # Host / run context
+├── scan/inventory.json         # Redacted process state
+├── inference/results.json      # Four-class posteriors
+├── plan.json                   # Executable plan and recorded evidence
+├── scan/provenance.json        # Process provenance graph, when recorded
+├── scan/provenance_audit.json  # Provenance export audit, when recorded
+├── logs/outcomes.jsonl         # Recorded action outcomes
+└── logs/session.jsonl          # Session event log
 ```
+
+Safe exports sanitize JSON and JSONL before checksums are computed. Minimal exports
+contain only available aggregate counts in `summary.json`. Opaque telemetry and
+process dumps require an explicit forensic export until a format-specific sanitizer
+is available; safe exports refuse them before creating the destination file.
 
 ### Encryption Envelope
 

@@ -62,11 +62,13 @@ snapshot → plan → explain → apply → verify → diff → export/report
 ```
 ~/.local/share/process_triage/sessions/<session_id>/
 ├── manifest.json          # Session metadata
-├── snapshot.json          # Initial system state
-├── plan.json              # Generated plan
-├── telemetry/             # Collected evidence
-├── outcomes.json          # Action outcomes
-└── audit.jsonl            # Audit log
+├── context.json           # Source host and OS context
+├── scan/inventory.json    # Process inventory in a checksum envelope
+├── inference/results.json # Inference results in a checksum envelope
+├── decision/plan.json     # Executable Plan plus rich candidates and recorded evidence
+├── action/outcomes.jsonl  # Recorded action results
+├── logs/session.jsonl     # Session events
+└── telemetry/             # Collected evidence
 ```
 
 ### Session States
@@ -92,10 +94,26 @@ Example: `pt-20260115-143022-a7xq`
 ### Session Context Passing
 
 Commands accept `--session <id>` to reuse context:
-- `plan --session <id>`: Reuses snapshot (skip re-scanning)
+- `plan --session <id>`: Updates the session using a fresh process scan
 - `explain --session <id>`: Retrieves cached inference
 - `apply --session <id>`: Validates against saved plan
 - `verify --session <id>`: Compares against pre-action state
+
+The planner writes the same executable `Plan` contract consumed by apply to
+`decision/plan.json` and includes its fields in structured stdout. Required fields include
+`plan_id`, `session_id`, `generated_at`, `policy_version`, `actions`, `pre_toggled`, and
+`gates_summary`. The rich candidate records remain alongside those fields for review and reports.
+Use `pt schema Plan` to obtain the schema generated from the actual Rust type.
+
+Each executable action records a canonical process identity, required safety checks, timeouts,
+and decision rationale. Final review/keep candidates do not become executable actions. Apply
+rechecks live identities and safety checks, and enforces the saved minimum-age floor from
+`policy_snapshot.min_process_age_seconds`; the current policy or `--min-age` can raise that floor.
+A plan without that snapshot uses the current policy's floor.
+
+`pt agent plan --pids 1234,5678` restricts inference to selected PIDs. It retains the full scan
+for ancestry, protected-process filtering, and parent routing, and records the selection in
+`args.pids`. Applying a plan still requires an explicit action selection and the usual safety checks.
 
 ---
 

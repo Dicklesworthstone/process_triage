@@ -21,9 +21,9 @@ pub struct AgentPlan {
 pub struct PlanCandidate {
     pub pid: u32,
     pub uid: u32,
-    #[serde(default)]
+    #[serde(default, rename = "command_short")]
     pub cmd_short: String,
-    #[serde(default, rename = "cmd_full")]
+    #[serde(default, rename = "command")]
     pub cmd_full: String,
     #[serde(default)]
     pub start_id: Option<String>,
@@ -180,7 +180,10 @@ pub fn verify_plan(
     let mut any_success = false;
 
     for candidate in &plan.candidates {
-        if candidate.recommended_action == "keep" {
+        if matches!(
+            candidate.recommended_action.as_str(),
+            "keep" | "review" | "spare"
+        ) {
             continue;
         }
 
@@ -559,7 +562,7 @@ mod tests {
 
     #[test]
     fn parse_agent_plan_valid_json() {
-        let json = r#"{"session_id":"s1","candidates":[{"pid":1,"uid":0,"cmd_short":"cat","recommended_action":"kill"}]}"#;
+        let json = r#"{"session_id":"s1","candidates":[{"pid":1,"uid":0,"command_short":"cat","recommended_action":"kill"}]}"#;
         let plan = parse_agent_plan(json).unwrap();
         assert_eq!(plan.session_id, "s1");
         assert_eq!(plan.candidates.len(), 1);
@@ -597,7 +600,7 @@ mod tests {
             "generated_at":"2026-01-15T00:00:00Z",
             "candidates":[{
                 "pid":42,"uid":1000,
-                "cmd_short":"node","cmd_full":"node server.js",
+                "command_short":"node","command":"node server.js",
                 "start_id":"boot:100:42",
                 "recommended_action":"kill",
                 "blast_radius":{"memory_mb":256.5,"cpu_pct":3.2}

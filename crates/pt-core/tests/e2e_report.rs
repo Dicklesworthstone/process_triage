@@ -492,18 +492,18 @@ mod galaxy_brain {
     use super::*;
 
     #[test]
-    fn galaxy_brain_tab_present_when_flag_set() {
+    fn recorded_ledger_present_when_flag_set() {
         let tmp = tempdir().unwrap();
         let (_, session_id) = create_session(tmp.path());
         let html = generate_report(tmp.path(), &session_id, &["--galaxy-brain"]);
 
         assert!(
-            html.contains(r#"data-tab="galaxy-brain""#),
-            "Report must have galaxy-brain tab when --galaxy-brain flag is set"
+            html.contains("Recorded Evidence Ledger"),
+            "Report must expose its recorded ledger when --galaxy-brain is set"
         );
         assert!(
-            html.contains(r#"id="tab-galaxy-brain""#),
-            "Report must have galaxy-brain tab content section"
+            html.contains(r#"id="recorded-evidence""#),
+            "Report must have recorded evidence content"
         );
     }
 
@@ -544,6 +544,228 @@ mod galaxy_brain {
             "Galaxy brain must include KaTeX for math rendering"
         );
     }
+}
+
+/// Exercise the actual session -> CLI export -> ZIP reader -> CLI HTML paths.
+/// The planted candidate/outcome values are routing and privacy fixtures, not
+/// proof of a live kill or calibrated inference quality.
+#[test]
+fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
+    use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionStore};
+    use std::fs;
+    let data_dir = tempdir().unwrap().keep();
+    let config_dir = tempdir().unwrap().keep();
+    let session_id = pt_common::SessionId::new();
+    let handle = SessionStore::at_data_dir(&data_dir)
+        .create(&SessionManifest::new(
+            &session_id,
+            None,
+            SessionMode::RobotPlan,
+            None,
+        ))
+        .unwrap();
+    let started_at = handle.read_manifest().unwrap().timing.created_at;
+    handle
+        .write_context(&SessionContext::new(
+            &session_id,
+            "private-customer-host".to_string(),
+            "run-test".to_string(),
+            None,
+        ))
+        .unwrap();
+    for directory in ["decision", "scan", "inference", "action", "logs"] {
+        fs::create_dir_all(handle.dir.join(directory)).unwrap();
+    }
+    let command = "python /home/private-customer/work.py --token AKIAIOSFODNN7EXAMPLE";
+    let plan = serde_json::json!({
+        "session_id": session_id.0,
+        "scan": {"total_processes": 42},
+        "candidates": [{
+            "pid": 1234, "command": command, "score": 87,
+            "recommended_action": "review",
+            "posterior": {"useful": 0.1, "useful_bad": 0.03, "abandoned": 0.8, "zombie": 0.07},
+            "evidence_ledger": {"evidence_terms": [{"feature": "cpu", "log_likelihood": {"abandoned": -0.4, "useful": -2.0}}]},
+            "environment": {"API_KEY": "AKIAIOSFODNN7EXAMPLE"}
+        }],
+    });
+    fs::write(
+        handle.dir.join("decision/plan.json"),
+        serde_json::to_vec(&plan).unwrap(),
+    )
+    .unwrap();
+    for (path, payload) in [
+        (
+            "scan/inventory.json",
+            serde_json::json!({"records": [{"pid": 1234, "cmd": command}]}),
+        ),
+        (
+            "inference/results.json",
+            serde_json::json!({"candidates": [{"pid": 1234, "posterior_useful_bad": 0.03}]}),
+        ),
+    ] {
+        let envelope = serde_json::json!({
+            "schema_version": "1.0.0", "session_id": session_id.0,
+            "payload": payload,
+            "integrity_sha256": pt_bundle::FileEntry::compute_checksum(&serde_json::to_vec(&payload).unwrap()),
+        });
+        fs::write(
+            handle.dir.join(path),
+            serde_json::to_vec(&envelope).unwrap(),
+        )
+        .unwrap();
+    }
+    let outcome =
+        serde_json::json!({"pid": 1234, "action": "kill", "status": "blocked", "command": command});
+    fs::write(
+        handle.dir.join("action/outcomes.jsonl"),
+        format!("{outcome}\n"),
+    )
+    .unwrap();
+    fs::write(
+        handle.dir.join("logs/session.jsonl"),
+        "{\"event\":\"plan_ready\",\"candidate_count\":1}\n",
+    )
+    .unwrap();
+
+    let plain_bundle = data_dir.join("session.ptb");
+    for encrypted in [false, true] {
+        let destination = if encrypted {
+            data_dir.join("encrypted.ptb")
+        } else {
+            plain_bundle.clone()
+        };
+        let mut command = pt_core();
+        command
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(&config_dir)
+            .args([
+                "--format",
+                "json",
+                "bundle",
+                "create",
+                "--session",
+                &session_id.0,
+                "--output",
+            ])
+            .arg(&destination);
+        if encrypted {
+            command.args(["--encrypt", "--passphrase", "test-passphrase"]);
+        }
+        command.assert().success();
+        let mut reader = pt_bundle::BundleReader::open_with_passphrase(
+            &destination,
+            encrypted.then_some("test-passphrase"),
+        )
+        .unwrap();
+        assert!(reader.verify_all().is_empty());
+        assert!(reader.has_file("scan/inventory.json"));
+        assert!(reader.has_file("inference/results.json"));
+        assert!(reader.has_file("logs/session.jsonl"));
+        let saved_manifest: Value = reader.read_json("session/manifest.json").unwrap();
+        assert_eq!(saved_manifest["timing"]["created_at"], started_at);
+        assert_eq!(saved_manifest["state"], "created");
+        assert_eq!(saved_manifest["mode"], "robot_plan");
+        let saved: Value = reader.read_json("inference/results.json").unwrap();
+        assert_eq!(
+            saved["payload"]["candidates"][0]["posterior_useful_bad"],
+            0.03
+        );
+        assert_eq!(
+            saved["integrity_sha256"],
+            pt_bundle::FileEntry::compute_checksum(&serde_json::to_vec(&saved["payload"]).unwrap())
+        );
+        let entries = reader.manifest().files.clone();
+        for entry in entries {
+            let bytes = reader.read_verified(&entry.path).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                !text.contains("private-customer"),
+                "leaked in {}",
+                entry.path
+            );
+            assert!(
+                !text.contains("AKIAIOSFODNN7EXAMPLE"),
+                "leaked in {}",
+                entry.path
+            );
+        }
+    }
+    for bundle_input in [false, true] {
+        let mut command = pt_core();
+        command
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .arg("--config")
+            .arg(&config_dir);
+        if bundle_input {
+            command
+                .args(["agent", "report", "--bundle"])
+                .arg(&plain_bundle)
+                .args(["--galaxy-brain", "--embed-assets"]);
+        } else {
+            command.args([
+                "report",
+                "--session",
+                &session_id.0,
+                "--include-ledger",
+                "--embed-assets",
+            ]);
+        }
+        let output = command.assert().success().get_output().stdout.clone();
+        let html = String::from_utf8(output).unwrap();
+        assert!(html.contains("<td>1234</td>"));
+        assert!(html.contains("<td>87</td><td>review</td>"));
+        assert!(html.contains("log_likelihood"));
+        assert!(html.contains("Recorded Actions and Outcomes"));
+        assert!(html.contains("blocked"));
+        assert!(!html.contains("private-customer"));
+        assert!(!html.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!html.contains("<script src="));
+        assert!(!html.contains("<link rel=\"stylesheet\""));
+        assert!(html.contains(&started_at));
+        assert!(html.contains("robot_plan"));
+        assert!(html.contains("created"));
+    }
+
+    // A present malformed artifact must refuse publication, rather than produce
+    // a successful export silently missing part of the recorded session.
+    let inference_path = handle.dir.join("inference/results.json");
+    let original_inference = fs::read(&inference_path).unwrap();
+    fs::write(&inference_path, b"not-json").unwrap();
+    let refused = data_dir.join("malformed-refused.ptb");
+    pt_core()
+        .env("PROCESS_TRIAGE_DATA", &data_dir)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(&config_dir)
+        .args(["bundle", "create", "--session", &session_id.0, "--output"])
+        .arg(&refused)
+        .assert()
+        .failure();
+    assert!(!refused.exists());
+    fs::write(&inference_path, original_inference).unwrap();
+
+    fs::write(handle.dir.join("scan/provenance.json"), b"{}").unwrap();
+    fs::write(
+        handle.dir.join("scan/provenance_audit.json"),
+        br#"{"warning_count":0}"#,
+    )
+    .unwrap();
+    let refused = data_dir.join("invalid-provenance-audit-refused.ptb");
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", &data_dir)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(&config_dir)
+        .args(["bundle", "create", "--session", &session_id.0, "--output"])
+        .arg(&refused)
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid provenance audit"));
+    assert!(!refused.exists());
 }
 
 // ============================================================================

@@ -344,8 +344,7 @@ fn proc_locks_mentions_pid(content: &str, pid: u32) -> bool {
 /// whose pending writes could be lost by killing the process.
 fn is_persistent_file_target(target: &str) -> bool {
     target.starts_with('/')
-        && !target.ends_with(" (deleted)")
-        && !["/dev/", "/proc/", "/sys/", "/run/user/"]
+        && !["/dev/", "/proc/", "/sys/"]
             .iter()
             .any(|prefix| target.starts_with(prefix))
 }
@@ -361,31 +360,42 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
         let entries = std::fs::read_dir(&fd_dir).ok()?;
         let mut write_count = 0;
 
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.ok()?;
             let fd_name = entry.file_name();
             // Only writes to real, persistent files can lose data. stdout/stderr
-            // to a pty/pipe, sockets, /dev/null, anon inodes and deleted files do
-            // not; counting them blocked essentially every kill.
-            let Ok(target) = std::fs::read_link(entry.path()) else {
-                continue;
+            // to a pty/pipe, sockets, /dev/null and anon inodes do not. Unlinked
+            // regular files can still hold pending data and must remain protected.
+            let target = match std::fs::read_link(entry.path()) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
             };
             if !is_persistent_file_target(&target.to_string_lossy()) {
                 continue;
             }
-            let fdinfo_path = format!("{fdinfo_dir}/{}", fd_name.to_string_lossy());
-            let Ok(content_bytes) = std::fs::read(&fdinfo_path) else {
+            let metadata = match std::fs::metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            if !metadata.is_file() {
                 continue;
+            }
+            let fdinfo_path = format!("{fdinfo_dir}/{}", fd_name.to_string_lossy());
+            let content_bytes = match std::fs::read(&fdinfo_path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
             };
             let content = String::from_utf8_lossy(&content_bytes);
             let flags = content
                 .lines()
                 .find_map(|line| line.strip_prefix("flags:"))
-                .and_then(|v| u32::from_str_radix(v.trim(), 8).ok());
+                .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())?;
             // O_WRONLY = 1, O_RDWR = 2
-            if let Some(flags) = flags {
-                if matches!(flags & 0o3, 1 | 2) {
-                    write_count += 1;
-                }
+            if matches!(flags & 0o3, 1 | 2) {
+                write_count += 1;
             }
         }
         Some(write_count)
@@ -609,9 +619,9 @@ impl LivePreCheckProvider {
     }
 
     /// Check if process has open write file descriptors.
-    fn has_open_write_fds(&self, pid: u32) -> (bool, u32) {
-        let write_count = open_write_fd_count(pid).unwrap_or(0);
-        (write_count > self.config.max_open_write_fds, write_count)
+    fn has_open_write_fds(&self, pid: u32) -> Option<(bool, u32)> {
+        let write_count = open_write_fd_count(pid)?;
+        Some((write_count > self.config.max_open_write_fds, write_count))
     }
 
     /// Best-effort check for recent I/O activity (write-heavy).
@@ -1037,19 +1047,14 @@ impl PreCheckProvider for LivePreCheckProvider {
 
         // Check open write file descriptors
         if self.config.block_if_open_write_fds {
-            // macOS inspects open files with lsof; if that fails the gate must fail
-            // closed, not report "no open files" (it silently passed when lsof was
-            // not on PATH).
-            #[cfg(target_os = "macos")]
-            if let Err(e) = crate::collect::macos::collect_lsof_info(pid, Duration::from_secs(5)) {
+            let Some((exceeds_max, write_count)) = self.has_open_write_fds(pid) else {
                 return PreCheckResult::Blocked {
                     check: PreCheck::CheckDataLossGate,
-                    reason: format!(
-                        "cannot inspect open files ({e}); refusing without data-loss evidence"
-                    ),
+                    reason:
+                        "cannot inspect open files; refusing without complete data-loss evidence"
+                            .to_string(),
                 };
-            }
-            let (exceeds_max, write_count) = self.has_open_write_fds(pid);
+            };
             if exceeds_max {
                 debug!(pid, write_count, "process has open write fds");
                 return PreCheckResult::Blocked {
@@ -1357,6 +1362,8 @@ mod tests {
             "/data/projects/app/db.sqlite",
             "/home/ubuntu/.cache/x.log",
             "/tmp/build.out",
+            "/run/user/1000/work-in-progress.log",
+            "/tmp/old.log (deleted)",
         ] {
             assert!(is_persistent_file_target(t), "{t}");
         }
@@ -1367,8 +1374,6 @@ mod tests {
             "socket:[456]",
             "anon_inode:[eventfd]",
             "/proc/1/status",
-            "/tmp/old.log (deleted)",
-            "/run/user/1000/bus",
         ] {
             assert!(!is_persistent_file_target(t), "{t}");
         }
@@ -1953,6 +1958,117 @@ mod tests {
     mod linux_tests {
         use super::*;
 
+        fn inspect_child_descriptor(
+            script: &str,
+            path: &std::path::Path,
+            stderr_file: Option<std::fs::File>,
+        ) -> (Option<u32>, PreCheckResult) {
+            use std::io::{BufRead, Write};
+            use std::process::{Command, Stdio};
+
+            let mut child = Command::new("sh")
+                .args(["-c", script, "pt-fd-test"])
+                .arg(path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(stderr_file.map(Stdio::from).unwrap_or_else(Stdio::null))
+                .spawn()
+                .expect("spawn descriptor holder");
+            let mut ready = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready.trim(), "ready");
+            let provider = LivePreCheckProvider::new(
+                None,
+                LivePreCheckConfig {
+                    block_if_locked_files: false,
+                    block_if_deleted_cwd: false,
+                    block_if_recent_io_seconds: 0,
+                    ..LivePreCheckConfig::default()
+                },
+            )
+            .unwrap();
+            let count = open_write_fd_count(child.id());
+            let result = provider.check_data_loss(child.id());
+            writeln!(child.stdin.take().unwrap(), "done").unwrap();
+            assert!(child.wait().unwrap().success());
+            (count, result)
+        }
+
+        #[test]
+        fn data_loss_blocks_regular_writer_but_allows_read_only_file() {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let path = dir.join("pending-data.log");
+            std::fs::write(&path, b"existing data").unwrap();
+            let (count, result) = inspect_child_descriptor(
+                "exec 3>>\"$1\"; printf 'ready\\n'; read -r done",
+                &path,
+                None,
+            );
+            assert_eq!(count, Some(1));
+            assert!(
+                matches!(result, PreCheckResult::Blocked { reason, .. } if reason.contains("open write fds"))
+            );
+            let (count, result) = inspect_child_descriptor(
+                "exec 3<\"$1\"; printf 'ready\\n'; read -r done",
+                &path,
+                None,
+            );
+            assert_eq!(count, Some(0));
+            assert!(result.is_passed());
+        }
+
+        #[test]
+        fn data_loss_allows_named_pipe_writer() {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let path = dir.join("ipc.fifo");
+            let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: the path is NUL-terminated and remains valid during mkfifo.
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            let (count, result) = inspect_child_descriptor(
+                "exec 3<>\"$1\"; printf 'ready\\n'; read -r done",
+                &path,
+                None,
+            );
+            assert_eq!(count, Some(0));
+            assert!(result.is_passed());
+        }
+
+        #[test]
+        fn data_loss_blocks_unlinked_regular_writer() {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let dir = tempfile::tempdir().unwrap().keep();
+            // O_TMPFILE creates an unnamed regular file without deleting a path.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_TMPFILE)
+                .open(&dir)
+                .unwrap();
+            assert!(file.metadata().unwrap().is_file());
+            let target = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+            assert!(target.to_string_lossy().ends_with(" (deleted)"));
+            let (count, result) =
+                inspect_child_descriptor("printf 'ready\\n'; read -r done", &dir, Some(file));
+            assert_eq!(count, Some(1));
+            assert!(
+                matches!(result, PreCheckResult::Blocked { reason, .. } if reason.contains("open write fds"))
+            );
+        }
+
+        #[test]
+        fn data_loss_refuses_without_descriptor_evidence() {
+            let provider = LivePreCheckProvider::with_defaults();
+            assert_eq!(open_write_fd_count(u32::MAX), None);
+            assert!(
+                matches!(provider.check_data_loss(u32::MAX), PreCheckResult::Blocked { reason, .. }
+                if reason.contains("complete data-loss evidence"))
+            );
+        }
+
         #[test]
         fn live_provider_defaults_block_own_invoker_chain() {
             // pt must never act on itself or its callers. This also makes the check
@@ -2085,7 +2201,7 @@ mod tests {
         fn live_provider_detects_write_fds() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-            let (_, count) = provider.has_open_write_fds(pid);
+            let (_, count) = provider.has_open_write_fds(pid).expect("inspect own files");
             // Should return a count without panicking
             let _ = count;
         }
