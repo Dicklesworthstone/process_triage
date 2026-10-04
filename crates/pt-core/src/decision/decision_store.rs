@@ -410,8 +410,7 @@ impl DecisionStore {
             })
             .map(|(key, c)| {
                 let (kill_w, spare_w) = c.weights_at(now);
-                let p = (kill_w + PRIOR_STRENGTH * global_ab)
-                    / (kill_w + spare_w + PRIOR_STRENGTH);
+                let p = (kill_w + PRIOR_STRENGTH * global_ab) / (kill_w + spare_w + PRIOR_STRENGTH);
                 let p = p.clamp(LEARNED_PRIOR_MIN, LEARNED_PRIOR_MAX);
                 LearnedPrior {
                     pattern_key: key,
@@ -582,7 +581,9 @@ mod tests {
         }
         store.record_at("sleep", "sleep 600", Verdict::Spare, now);
 
-        let learned = store.learned_prior_at("sleep", "sleep 600", &g, now).unwrap();
+        let learned = store
+            .learned_prior_at("sleep", "sleep 600", &g, now)
+            .unwrap();
         assert_eq!((learned.kill, learned.spare), (50, 1));
         // 50 kills at 0.5^(730/180) ~ 0.06 each ~ 3.0, plus one fresh spare.
         let expected_kill_w = 50.0 * 0.5_f64.powf(730.0 / DECAY_HALF_LIFE_DAYS);
@@ -594,7 +595,10 @@ mod tests {
             "{} vs {expected}",
             learned.abandonment_prior
         );
-        assert!(learned.abandonment_prior < 0.7, "old kills no longer dominate");
+        assert!(
+            learned.abandonment_prior < 0.7,
+            "old kills no longer dominate"
+        );
 
         // Decayed sums survive a save/load round trip and merge with a concurrent writer.
         store.save().unwrap();
@@ -633,7 +637,11 @@ mod tests {
         let learned = store
             .learned_prior("node", "node /srv/y.js", &g)
             .expect("two distinct scripts generalize");
-        assert!(learned.pattern_key.starts_with("broad|"), "{}", learned.pattern_key);
+        assert!(
+            learned.pattern_key.starts_with("broad|"),
+            "{}",
+            learned.pattern_key
+        );
     }
 
     /// A file written before decayed weights and sources existed still loads: raw

@@ -337,7 +337,12 @@ pub fn read_pressure_snapshot_from(root: &Path, cpus: u32) -> PressureSnapshot {
     let vm_text = single("proc/vmstat", &mut unavailable);
     let vmstat = parsed(vm_text, "proc/vmstat", parse_vmstat, &mut unavailable);
     let fnr_text = single("proc/sys/fs/file-nr", &mut unavailable);
-    let file_handles = parsed(fnr_text, "proc/sys/fs/file-nr", parse_file_nr, &mut unavailable);
+    let file_handles = parsed(
+        fnr_text,
+        "proc/sys/fs/file-nr",
+        parse_file_nr,
+        &mut unavailable,
+    );
 
     PressureSnapshot {
         sampled_at_ms: std::time::SystemTime::now()
@@ -409,7 +414,10 @@ fn stall_fractions(
 }
 
 /// Rates between two snapshots of the same machine; `None` unless `after` is later.
-pub fn pressure_window(before: &PressureSnapshot, after: &PressureSnapshot) -> Option<PressureWindow> {
+pub fn pressure_window(
+    before: &PressureSnapshot,
+    after: &PressureSnapshot,
+) -> Option<PressureWindow> {
     let millis = after.sampled_at_ms.checked_sub(before.sampled_at_ms)?;
     if millis == 0 {
         return None;
@@ -479,7 +487,10 @@ mod tests {
         assert!((mem.used_fraction().unwrap() - 0.75).abs() < 1e-9);
         assert_eq!(mem.slab_reclaimable, Some(6_000_000 * 1024));
         assert!(mem.committed_as.is_none());
-        assert!(parse_meminfo("MemFree: 1 kB\n").is_none(), "MemTotal required");
+        assert!(
+            parse_meminfo("MemFree: 1 kB\n").is_none(),
+            "MemTotal required"
+        );
 
         let vm = parse_vmstat(
             "pswpin 10\npswpout 20\npgmajfault 300\nallocstall_dma32 4\nallocstall_normal 5\n\
@@ -517,7 +528,10 @@ mod tests {
         let sources: Vec<&str> = snap.unavailable.iter().map(|u| u.source.as_str()).collect();
         assert!(sources.contains(&"/proc/pressure/cpu"), "{sources:?}");
         assert!(sources.contains(&"/proc/vmstat"), "{sources:?}");
-        assert!(!sources.contains(&"/proc/pressure/irq"), "irq absence is normal");
+        assert!(
+            !sources.contains(&"/proc/pressure/irq"),
+            "irq absence is normal"
+        );
         assert!((snap.load_ratio().unwrap() - 0.1 / 8.0).abs() < 1e-12);
 
         // An unparseable file is reported, not silently dropped.
@@ -565,7 +579,10 @@ mod tests {
         let cpu = window.cpu.unwrap();
         assert!((cpu.some.unwrap() - 0.3).abs() < 1e-12);
         assert!(cpu.full.is_none());
-        assert!(window.memory.is_none(), "missing on both sides stays missing");
+        assert!(
+            window.memory.is_none(),
+            "missing on both sides stays missing"
+        );
         assert_eq!(window.swap_in_per_s, Some(200.0));
         assert_eq!(window.oom_kills, Some(1));
 

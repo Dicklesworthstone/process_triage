@@ -209,7 +209,13 @@ fn stall(
     Some((now, some.avg60 >= band.warn))
 }
 
-fn push(regimes: &mut Vec<Regime>, kind: RegimeKind, severity: Severity, sustained: bool, explanation: String) {
+fn push(
+    regimes: &mut Vec<Regime>,
+    kind: RegimeKind,
+    severity: Severity,
+    sustained: bool,
+    explanation: String,
+) {
     if severity > Severity::Ok {
         regimes.push(Regime {
             kind,
@@ -236,7 +242,8 @@ pub fn assess(
     if let Some((cpu_some, sustained)) = cpu {
         let level = t.cpu_psi.severity(cpu_some);
         severity.cpu = t.cpu_psi.scale(cpu_some);
-        let load_text = load_ratio.map_or(String::new(), |r| format!("; load {r:.1}x the CPU count"));
+        let load_text =
+            load_ratio.map_or(String::new(), |r| format!("; load {r:.1}x the CPU count"));
         push(
             &mut regimes,
             RegimeKind::CpuContention,
@@ -285,7 +292,11 @@ pub fn assess(
 
     // Memory: stall, read against how much RAM is actually available.
     let mem_used = snapshot.meminfo.and_then(|m| m.used_fraction());
-    let memory = stall(snapshot.memory, window.and_then(|w| w.memory?.some), t.memory_psi);
+    let memory = stall(
+        snapshot.memory,
+        window.and_then(|w| w.memory?.some),
+        t.memory_psi,
+    );
     if let Some((mem_some, sustained)) = memory {
         let level = t.memory_psi.severity(mem_some);
         severity.memory = t.memory_psi.scale(mem_some);
@@ -565,7 +576,12 @@ mod tests {
         // hetzner1 2026-10-04: load 4.71 on 8 CPUs, PSI cpu some 2.67 %, 23 of 30 GiB available.
         let mut snap = snapshot(8, 4.71);
         snap.cpu = psi(2.67, 3.80);
-        let a = assess(&snap, None, Some(&ProcessCensus::default()), &PressureThresholds::default());
+        let a = assess(
+            &snap,
+            None,
+            Some(&ProcessCensus::default()),
+            &PressureThresholds::default(),
+        );
         assert_eq!(a.worst, Severity::Ok, "{:?}", a.regimes);
         assert!(a.regimes.is_empty());
         assert_eq!(a.severity, ResourceSeverity::default());
@@ -587,7 +603,11 @@ mod tests {
         snap.io = psi(22.0, 18.0);
         let a = assess(&snap, None, None, &t);
         assert_eq!(kinds(&a), vec![RegimeKind::IoBound]);
-        assert!(a.regimes[0].explanation.contains("not CPU"), "{}", a.regimes[0].explanation);
+        assert!(
+            a.regimes[0].explanation.contains("not CPU"),
+            "{}",
+            a.regimes[0].explanation
+        );
 
         // A momentary spike: avg10 high, avg60 not.
         snap.io = psi(0.0, 0.0);
@@ -723,7 +743,10 @@ mod tests {
             vec![(RegimeKind::CpuContention, Severity::Crit)]
         );
         assert_eq!(tracker.update(&cool).len(), 1, "one quiet sample keeps it");
-        assert!(tracker.update(&cool).is_empty(), "two quiet samples clear it");
+        assert!(
+            tracker.update(&cool).is_empty(),
+            "two quiet samples clear it"
+        );
         // Oscillating hot/cool never enters.
         let mut tracker = RegimeTracker::new(2, 2);
         for _ in 0..5 {

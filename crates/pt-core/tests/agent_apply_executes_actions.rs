@@ -737,9 +737,17 @@ fn agent_apply_subset_and_failed_child_do_not_kill_a_live_parent() {
     let session = session_with_actions(&data_dir, vec![parent_action, child_action]);
     let parent_target = format!("{}:{}", parent.pid, parent_identity.start_id.0);
     let child_target = format!("{}:{}", child_pid, child_identity.start_id.0);
-    for targets in [parent_target.clone(), format!("{parent_target},{child_target}")] {
+    for targets in [
+        parent_target.clone(),
+        format!("{parent_target},{child_target}"),
+    ] {
         let (_, document) = apply(&data_dir, &config_dir, &session, &targets);
         let outcomes = document["outcomes"].as_array().unwrap();
+        assert_eq!(
+            outcomes.len(),
+            if targets == parent_target { 1 } else { 2 },
+            "every selected action must have an outcome: {document}"
+        );
         let parent_outcome = outcomes
             .iter()
             .find(|outcome| outcome["pid"] == parent.pid)

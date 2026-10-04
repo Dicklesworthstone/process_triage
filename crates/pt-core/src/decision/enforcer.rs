@@ -1417,7 +1417,11 @@ mod tests {
         orphan.posterior = Some(0.10);
         for robot_mode in [false, true] {
             let result = enforcer.check_action(&orphan, Action::Keep, robot_mode);
-            assert!(result.allowed, "robot_mode={robot_mode}: {:?}", result.violation);
+            assert!(
+                result.allowed,
+                "robot_mode={robot_mode}: {:?}",
+                result.violation
+            );
         }
 
         // The same candidate is still gated for anything that acts on it.
