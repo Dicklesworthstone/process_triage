@@ -28,7 +28,8 @@ use crate::inference::{
     PriorContext,
 };
 use crate::supervision::signature::{
-    MatchLevel, ProcessMatchContext, SignatureDatabase, SignatureMatch,
+    BetaParams, MatchLevel, ProcessExpectations, ProcessMatchContext, SignatureDatabase,
+    SignatureMatch, SupervisorSignature,
 };
 
 #[cfg(target_os = "linux")]
@@ -132,6 +133,54 @@ fn signature_expects_abandoned(sig_match: &SignatureMatch<'_>, priors: &Priors) 
     abandoned.mean() > useful
 }
 
+/// z-score of the 99th percentile of the standard normal distribution.
+const Z_99: f64 = 2.326_347_874_040_841;
+
+/// Probability that a normal run of a signature's process would have finished by
+/// `age_secs`, under a log-normal lifetime with median `typical_lifetime_seconds` and
+/// 99th percentile `max_normal_lifetime_seconds`. `None` unless both are set and the
+/// maximum exceeds the typical lifetime.
+fn normal_run_finished_by(expectations: &ProcessExpectations, age_secs: f64) -> Option<f64> {
+    let typical = expectations.typical_lifetime_seconds? as f64;
+    let max = expectations.max_normal_lifetime_seconds? as f64;
+    if typical <= 0.0 || max <= typical {
+        return None;
+    }
+    if age_secs <= 0.0 {
+        return Some(0.0);
+    }
+    let mu = typical.ln();
+    let sigma = (max.ln() - mu) / Z_99;
+    Some(pt_math::normal_cdf((age_secs.ln() - mu) / sigma))
+}
+
+/// A signature whose processes are usually left behind (a test runner, a build) sets
+/// that prior for a process that has outlived a normal run, not for one still inside
+/// it: a four-minute-old `cargo build` is not "likely abandoned". Blend each class
+/// prior the signature sets with the global one, weighting the signature by the
+/// probability that a normal run would have finished by now; past the 99th
+/// percentile this is the signature's own prior. Concentrations are kept.
+fn age_gated_signature(
+    signature: &SupervisorSignature,
+    global: &Priors,
+    weight: f64,
+) -> SupervisorSignature {
+    let blend = |sig: &Option<BetaParams>, global_prob: f64| {
+        sig.as_ref().map(|beta| {
+            let concentration = beta.alpha + beta.beta;
+            let mean = (1.0 - weight) * global_prob + weight * beta.mean();
+            BetaParams::new(mean * concentration, (1.0 - mean) * concentration)
+        })
+    };
+    let mut gated = signature.clone();
+    let classes = &global.classes;
+    gated.priors.useful = blend(&signature.priors.useful, classes.useful.prior_prob);
+    gated.priors.useful_bad = blend(&signature.priors.useful_bad, classes.useful_bad.prior_prob);
+    gated.priors.abandoned = blend(&signature.priors.abandoned, classes.abandoned.prior_prob);
+    gated.priors.zombie = blend(&signature.priors.zombie, classes.zombie.prior_prob);
+    gated
+}
+
 /// A process's score, with everything that went into it.
 #[derive(Debug, Clone)]
 pub struct ProcessScore<'a> {
@@ -141,6 +190,10 @@ pub struct ProcessScore<'a> {
     /// verdict, or `signature_fast_path`).
     pub prior_source: String,
     pub signature: Option<SignatureMatch<'a>>,
+    /// When the matched signature expects its processes to be left behind and states
+    /// a normal lifetime: the weight its prior got for this process's age (the
+    /// probability a normal run would have finished by now). `None` otherwise.
+    pub signature_age_weight: Option<f64>,
     pub learned_prior: Option<LearnedPrior>,
     pub fast_path_used: bool,
     pub fast_path_skip_reason: Option<&'static str>,
@@ -245,6 +298,31 @@ impl Scorer {
             match_ctx = match_ctx.cmdline(&proc.cmd);
         }
         let signature = self.signatures.best_match(&match_ctx);
+        let signature_age_weight = signature
+            .as_ref()
+            .filter(|sig_match| signature_expects_abandoned(sig_match, &self.priors))
+            .and_then(|sig_match| {
+                normal_run_finished_by(
+                    &sig_match.signature.expectations,
+                    proc.elapsed.as_secs_f64(),
+                )
+            });
+        let gated_signature = signature
+            .as_ref()
+            .zip(signature_age_weight)
+            .map(|(sig_match, weight)| {
+                age_gated_signature(sig_match.signature, &self.priors, weight)
+            });
+        let gated_match = signature
+            .as_ref()
+            .zip(gated_signature.as_ref())
+            .map(|(sig_match, gated)| SignatureMatch {
+                signature: gated,
+                level: sig_match.level,
+                score: sig_match.score,
+                details: sig_match.details.clone(),
+            });
+        let prior_signature = gated_match.as_ref().or(signature.as_ref());
 
         let learned_prior = self
             .decisions
@@ -254,14 +332,14 @@ impl Scorer {
             .map(|learned| DecisionStore::overrides_for(learned, &self.priors));
         let prior_context = PriorContext {
             global_priors: &self.priors,
-            signature_match: signature.as_ref(),
+            signature_match: prior_signature,
             category_defaults: None,
             user_overrides: learned_overrides.as_ref(),
         };
 
         // A human verdict on this pattern outranks the signature fast path.
         let mut fast_path_skip_reason = None;
-        let fast_path = match signature.as_ref().filter(|_| learned_prior.is_none()) {
+        let fast_path = match prior_signature.filter(|_| learned_prior.is_none()) {
             Some(sig_match) => match try_signature_fast_path(&self.fast_path, Some(sig_match), pid)
             {
                 Ok(result) => result,
@@ -369,11 +447,22 @@ impl Scorer {
             }
         }
 
+        // The age weight only shaped the prior when the signature set it.
+        let signature_age_weight = signature_age_weight.filter(|_| signature_set_prior);
+        if let Some(weight) = signature_age_weight {
+            ledger.top_evidence.push(format!(
+                "Signature prior weighted {:.2} by age: {:.0}% of normal runs have finished by now",
+                weight,
+                weight * 100.0
+            ));
+        }
+
         Some(ProcessScore {
             posterior,
             ledger,
             prior_source,
             signature,
+            signature_age_weight,
             learned_prior,
             fast_path_used,
             fast_path_skip_reason,
@@ -881,6 +970,95 @@ mod tests {
     }
 
     const FOUR_DAYS: Duration = Duration::from_secs(4 * 24 * 3600);
+
+    #[test]
+    fn normal_run_lifetime_is_lognormal_between_typical_and_max() {
+        let build = ProcessExpectations::short_lived_task(); // typical 300 s, max 3600 s
+        let at = |secs: f64| normal_run_finished_by(&build, secs).expect("lifetime model");
+        assert!((at(300.0) - 0.5).abs() < 1e-9, "median");
+        assert!((at(3600.0) - 0.99).abs() < 1e-6, "99th percentile");
+        assert_eq!(at(0.0), 0.0);
+        assert!(at(10.0) < 0.01);
+        assert!(at(30.0) < at(300.0) && at(300.0) < at(3600.0) && at(3600.0) < at(86_400.0));
+
+        assert_eq!(
+            normal_run_finished_by(&ProcessExpectations::default(), 1000.0),
+            None
+        );
+        let daemon = ProcessExpectations::daemon();
+        assert_eq!(normal_run_finished_by(&daemon, 1000.0), None);
+    }
+
+    /// hetzner1, 2026-10-04: a 265 s old `rch exec -- cargo build` (the build runs on a
+    /// remote worker, so the local process idles without a TTY) scored P(abandoned or
+    /// zombie) 0.85, carried by the cargo-build signature's "likely abandoned" prior
+    /// (+2.0 bits). The prior describes builds that outlived a normal run, not one four
+    /// minutes into it. The same build idle for three hours keeps the full prior.
+    #[test]
+    fn young_build_does_not_inherit_the_stuck_build_prior() {
+        let scorer = scorer(SignatureDatabase::with_defaults());
+        let cmd = "rch exec -- cargo build -p fs-cli --bin frankensim";
+        let young = record(5200, "rch", cmd, Duration::from_secs(265));
+        let stuck = record(5201, "rch", cmd, Duration::from_secs(3 * 3600));
+
+        let young_score = scorer
+            .score_with_desktop(&young, Evidence::from_snapshot(&young), None)
+            .expect("score");
+        let stuck_score = scorer
+            .score_with_desktop(&stuck, Evidence::from_snapshot(&stuck), None)
+            .expect("score");
+
+        assert_eq!(
+            young_score.signature.as_ref().map(|m| m.signature.name.as_str()),
+            Some("cargo-build")
+        );
+        let young_weight = young_score.signature_age_weight.expect("age weight");
+        let stuck_weight = stuck_score.signature_age_weight.expect("age weight");
+        assert!(young_weight < 0.5, "{young_weight}");
+        assert!(stuck_weight > 0.99, "{stuck_weight}");
+
+        let young_p = young_score.posterior.posterior.abandonment_probability();
+        let stuck_p = stuck_score.posterior.posterior.abandonment_probability();
+        assert!(
+            young_p < 0.7,
+            "a 4-minute build is a plan candidate: {:?}",
+            young_score.posterior.posterior
+        );
+        assert!(
+            stuck_p >= 0.7,
+            "a 3-hour idle build lost its prior: {:?}",
+            stuck_score.posterior.posterior
+        );
+    }
+
+    /// The age gate never touches a signature whose processes are expected to keep
+    /// running, nor one that states no lifetime.
+    #[test]
+    fn age_gate_only_applies_to_left_behind_signatures_with_lifetimes() {
+        let mut db = SignatureDatabase::new();
+        let no_lifetime = SupervisorSignature::new("stuck-thing", SupervisorCategory::Other)
+            .with_process_patterns(vec!["^stuckthing$"])
+            .with_priors(SignaturePriors::likely_abandoned());
+        db.add(no_lifetime).expect("add");
+        let scorer = scorer(db);
+        let proc = record(5300, "stuckthing", "stuckthing --serve", Duration::from_secs(60));
+        let score = scorer
+            .score_with_desktop(&proc, Evidence::from_snapshot(&proc), None)
+            .expect("score");
+        assert_eq!(score.prior_source, "signature");
+        assert_eq!(score.signature_age_weight, None);
+
+        let defaults = scorer_for_defaults();
+        let vite = record(5301, "node", "node /app/node_modules/.bin/vite", Duration::from_secs(60));
+        let score = defaults
+            .score_with_desktop(&vite, Evidence::from_snapshot(&vite), None)
+            .expect("score");
+        assert_eq!(score.signature_age_weight, None);
+    }
+
+    fn scorer_for_defaults() -> Scorer {
+        scorer(SignatureDatabase::with_defaults())
+    }
 
     /// GH #12: an idle desktop app open for days (slack in its uwsm app scope) was
     /// rated abandoned (0.61) from runtime and "no TTY". As a desktop application it
