@@ -32,17 +32,41 @@ pub const PRIOR_STRENGTH: f64 = 2.0;
 pub const LEARNED_PRIOR_MIN: f64 = 0.02;
 pub const LEARNED_PRIOR_MAX: f64 = 0.95;
 
-/// Verdicts lose half their weight for every this many days since the pattern was
-/// last labeled, so habits that changed long ago fade back toward the global prior.
+/// Each verdict loses half its weight for every this many days since it was given, so
+/// habits that changed long ago fade back toward the global prior.
 pub const DECAY_HALF_LIFE_DAYS: f64 = 180.0;
 
-/// Weight of a pattern's counts given when it was last labeled (1.0 if unknown).
-fn decay_weight(updated_at: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> f64 {
-    let Some(ts) = updated_at.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) else {
+/// A broad pattern (the program name plus a few primary flags, so it also covers
+/// unrelated runs of the same interpreter) only sets the prior once verdicts for at
+/// least this many distinct specific patterns were counted under it: one kill of
+/// `node x.js` says nothing about `node y.js`.
+pub const MIN_SOURCES_FOR_GENERALIZATION: usize = 2;
+
+/// Distinct source patterns remembered per key (enough to apply the rule above).
+const MAX_TRACKED_SOURCES: usize = 16;
+
+fn parse_ts(ts: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    ts.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Decay factor from `since` to `now` (1.0 if `since` is unknown or in the future).
+fn decay_weight(since: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> f64 {
+    let Some(ts) = parse_ts(since) else {
         return 1.0;
     };
-    let age_days = (now - ts.with_timezone(&chrono::Utc)).num_seconds().max(0) as f64 / 86_400.0;
+    let age_days = (now - ts).num_seconds().max(0) as f64 / 86_400.0;
     0.5_f64.powf(age_days / DECAY_HALF_LIFE_DAYS)
+}
+
+/// Stable short id of a pattern key (FNV-1a 64), used to count distinct sources.
+fn source_id(key: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// A human verdict about a process.
@@ -62,11 +86,31 @@ pub struct PatternCounts {
     pub last: Option<Verdict>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// Decayed kill / spare weights as of `updated_at`: every verdict decays from the
+    /// time it was given (exponential decay is memoryless, so these sums are exact).
+    /// Absent in files written before they existed; the raw counts stand in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spare_weight: Option<f64>,
+    /// Ids of the distinct most-specific patterns whose verdicts were counted here
+    /// (capped at `MAX_TRACKED_SOURCES`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
 }
 
 impl PatternCounts {
     fn total(&self) -> u32 {
         self.kill + self.spare
+    }
+
+    /// Decayed (kill, spare) weights at `now`.
+    fn weights_at(&self, now: chrono::DateTime<chrono::Utc>) -> (f64, f64) {
+        let decay = decay_weight(self.updated_at.as_deref(), now);
+        (
+            self.kill_weight.unwrap_or(f64::from(self.kill)) * decay,
+            self.spare_weight.unwrap_or(f64::from(self.spare)) * decay,
+        )
     }
 }
 
@@ -96,7 +140,7 @@ pub struct LearnedPrior {
     pub pattern_key: String,
     pub kill: u32,
     pub spare: u32,
-    /// Age decay applied to the counts (1.0 = labeled just now).
+    /// Effective weight per verdict after age decay (1.0 = all labeled just now).
     pub weight: f64,
     /// Posterior mean P(abandoned or zombie) after combining with the global prior.
     pub abandonment_prior: f64,
@@ -151,12 +195,44 @@ fn read_entries(path: &Path) -> Result<BTreeMap<String, PatternCounts>, Decision
         .collect())
 }
 
+/// Add `delta`'s verdicts to `into`: both weight sums are decayed to the later of the
+/// two timestamps and added there; `last` is the verdict of the later one.
 fn add_counts(into: &mut PatternCounts, delta: &PatternCounts) {
+    let into_ts = parse_ts(into.updated_at.as_deref());
+    let delta_ts = parse_ts(delta.updated_at.as_deref());
+    let at = into_ts.max(delta_ts);
+    let (ik, is) = at.map_or_else(
+        || {
+            (
+                into.kill_weight.unwrap_or(f64::from(into.kill)),
+                into.spare_weight.unwrap_or(f64::from(into.spare)),
+            )
+        },
+        |t| into.weights_at(t),
+    );
+    let (dk, ds) = at.map_or_else(
+        || {
+            (
+                delta.kill_weight.unwrap_or(f64::from(delta.kill)),
+                delta.spare_weight.unwrap_or(f64::from(delta.spare)),
+            )
+        },
+        |t| delta.weights_at(t),
+    );
     into.kill = into.kill.saturating_add(delta.kill);
     into.spare = into.spare.saturating_add(delta.spare);
-    if delta.last.is_some() {
+    into.kill_weight = Some(ik + dk);
+    into.spare_weight = Some(is + ds);
+    if delta.last.is_some() && delta_ts >= into_ts {
         into.last = delta.last;
-        into.updated_at = delta.updated_at.clone();
+    }
+    if let Some(t) = at {
+        into.updated_at = Some(t.to_rfc3339());
+    }
+    for source in &delta.sources {
+        if into.sources.len() < MAX_TRACKED_SOURCES && !into.sources.contains(source) {
+            into.sources.push(source.clone());
+        }
     }
 }
 
@@ -268,26 +344,55 @@ impl DecisionStore {
 
     /// Record a human verdict for a process at every specificity level.
     pub fn record(&mut self, comm: &str, cmdline: &str, verdict: Verdict) {
-        let now = chrono::Utc::now().to_rfc3339();
+        self.record_at(comm, cmdline, verdict, chrono::Utc::now());
+    }
+
+    fn record_at(
+        &mut self,
+        comm: &str,
+        cmdline: &str,
+        verdict: Verdict,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let keys = Self::pattern_keys(comm, cmdline);
+        let Some(most_specific) = keys.first() else {
+            return;
+        };
         let delta = PatternCounts {
             kill: u32::from(verdict == Verdict::Kill),
             spare: u32::from(verdict == Verdict::Spare),
             last: Some(verdict),
-            updated_at: Some(now),
+            updated_at: Some(at.to_rfc3339()),
+            kill_weight: None,
+            spare_weight: None,
+            sources: vec![source_id(most_specific)],
         };
-        for key in Self::pattern_keys(comm, cmdline) {
+        for key in keys {
             add_counts(self.entries.entry(key.clone()).or_default(), &delta);
             add_counts(self.pending.entry(key).or_default(), &delta);
         }
     }
 
-    /// Learned prior for a process: counts of the most specific pattern with any
-    /// decisions, combined with the global prior (Beta-Binomial posterior mean).
+    /// Learned prior for a process: decayed counts of the most specific pattern with
+    /// decisions that may speak for it, combined with the global prior (Beta-Binomial
+    /// posterior mean). Exact and standard patterns always may; a broad one only after
+    /// verdicts for `MIN_SOURCES_FOR_GENERALIZATION` distinct specific patterns were
+    /// counted under it.
     pub fn learned_prior(
         &self,
         comm: &str,
         cmdline: &str,
         global: &Priors,
+    ) -> Option<LearnedPrior> {
+        self.learned_prior_at(comm, cmdline, global, chrono::Utc::now())
+    }
+
+    fn learned_prior_at(
+        &self,
+        comm: &str,
+        cmdline: &str,
+        global: &Priors,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Option<LearnedPrior> {
         let g = &global.classes;
         let global_ab = (g.abandoned.prior_prob + g.zombie.prior_prob).clamp(1e-6, 1.0 - 1e-6);
@@ -297,18 +402,22 @@ impl DecisionStore {
                 self.entries
                     .get(&key)
                     .filter(|c| c.total() > 0)
+                    .filter(|c| {
+                        !key.starts_with("broad|")
+                            || c.sources.len() >= MIN_SOURCES_FOR_GENERALIZATION
+                    })
                     .map(|c| (key, c))
             })
             .map(|(key, c)| {
-                let w = decay_weight(c.updated_at.as_deref(), chrono::Utc::now());
-                let p = (w * f64::from(c.kill) + PRIOR_STRENGTH * global_ab)
-                    / (w * f64::from(c.total()) + PRIOR_STRENGTH);
+                let (kill_w, spare_w) = c.weights_at(now);
+                let p = (kill_w + PRIOR_STRENGTH * global_ab)
+                    / (kill_w + spare_w + PRIOR_STRENGTH);
                 let p = p.clamp(LEARNED_PRIOR_MIN, LEARNED_PRIOR_MAX);
                 LearnedPrior {
                     pattern_key: key,
                     kill: c.kill,
                     spare: c.spare,
-                    weight: w,
+                    weight: (kill_w + spare_w) / f64::from(c.total()),
                     abandonment_prior: p,
                 }
             })
@@ -457,6 +566,101 @@ mod tests {
         let base = g.classes.abandoned.prior_prob + g.classes.zombie.prior_prob;
         assert!(fresh.abandonment_prior > stale.abandonment_prior);
         assert!(stale.abandonment_prior > base, "decayed, not erased");
+    }
+
+    /// Each verdict decays from its own time. Before: a pattern kept one timestamp, so
+    /// 50 kills from two years ago plus one spare today counted as 50 fresh kills.
+    #[test]
+    fn every_verdict_decays_from_its_own_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = global();
+        let now = chrono::Utc::now();
+        let two_years_ago = now - chrono::Duration::days(730);
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        for _ in 0..50 {
+            store.record_at("sleep", "sleep 600", Verdict::Kill, two_years_ago);
+        }
+        store.record_at("sleep", "sleep 600", Verdict::Spare, now);
+
+        let learned = store.learned_prior_at("sleep", "sleep 600", &g, now).unwrap();
+        assert_eq!((learned.kill, learned.spare), (50, 1));
+        // 50 kills at 0.5^(730/180) ~ 0.06 each ~ 3.0, plus one fresh spare.
+        let expected_kill_w = 50.0 * 0.5_f64.powf(730.0 / DECAY_HALF_LIFE_DAYS);
+        let global_ab = g.classes.abandoned.prior_prob + g.classes.zombie.prior_prob;
+        let expected = (expected_kill_w + PRIOR_STRENGTH * global_ab)
+            / (expected_kill_w + 1.0 + PRIOR_STRENGTH);
+        assert!(
+            (learned.abandonment_prior - expected).abs() < 1e-6,
+            "{} vs {expected}",
+            learned.abandonment_prior
+        );
+        assert!(learned.abandonment_prior < 0.7, "old kills no longer dominate");
+
+        // Decayed sums survive a save/load round trip and merge with a concurrent writer.
+        store.save().unwrap();
+        let mut other = DecisionStore::load(dir.path()).unwrap();
+        other.record_at("sleep", "sleep 600", Verdict::Spare, now);
+        other.save().unwrap();
+        let reloaded = DecisionStore::load(dir.path()).unwrap();
+        let learned = reloaded
+            .learned_prior_at("sleep", "sleep 600", &g, now)
+            .unwrap();
+        assert_eq!((learned.kill, learned.spare), (50, 2));
+        let expected = (expected_kill_w + PRIOR_STRENGTH * global_ab)
+            / (expected_kill_w + 2.0 + PRIOR_STRENGTH);
+        assert!((learned.abandonment_prior - expected).abs() < 1e-6);
+    }
+
+    /// One verdict on `node x.js` must not set the prior for `node y.js` (broad
+    /// pattern `node.*`); a second, different node script under the same broad pattern
+    /// makes it a habit worth generalizing.
+    #[test]
+    fn one_script_does_not_speak_for_every_run_of_its_interpreter() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = global();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        store.record("node", "node /home/alice/x.js", Verdict::Kill);
+        assert!(store
+            .learned_prior("node", "node /home/alice/x.js", &g)
+            .is_some());
+        assert!(
+            store.learned_prior("node", "node /srv/y.js", &g).is_none(),
+            "{:?}",
+            store.learned_prior("node", "node /srv/y.js", &g)
+        );
+
+        store.record("node", "node /home/alice/z.js", Verdict::Kill);
+        let learned = store
+            .learned_prior("node", "node /srv/y.js", &g)
+            .expect("two distinct scripts generalize");
+        assert!(learned.pattern_key.starts_with("broad|"), "{}", learned.pattern_key);
+    }
+
+    /// A file written before decayed weights and sources existed still loads: raw
+    /// counts stand in for the weights (exactly the old reading).
+    #[test]
+    fn store_without_weights_or_sources_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = DecisionStore::pattern_keys("sleep", "sleep 100")
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut file = serde_json::Map::new();
+        file.insert(
+            key,
+            serde_json::json!({ "kill": 3, "spare": 1, "last": "kill" }),
+        );
+        std::fs::write(
+            dir.path().join(DECISIONS_FILE),
+            serde_json::Value::Object(file).to_string(),
+        )
+        .unwrap();
+        let store = DecisionStore::load(dir.path()).unwrap();
+        let learned = store
+            .learned_prior("sleep", "sleep 100", &global())
+            .expect("legacy counts apply");
+        assert_eq!((learned.kill, learned.spare), (3, 1));
+        assert!((learned.weight - 1.0).abs() < 1e-12);
     }
 
     #[test]
