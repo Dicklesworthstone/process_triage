@@ -6,11 +6,15 @@ use super::types::{EvidenceType, SupervisionEvidence, SupervisorCategory};
 #[cfg(target_os = "linux")]
 use crate::collect::network::parse_proc_net_unix;
 #[cfg(target_os = "linux")]
-use std::collections::HashSet;
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Errors from IPC detection.
@@ -274,16 +278,20 @@ pub fn read_socket_paths(pid: u32) -> Result<Vec<String>, IpcError> {
     })?;
 
     let mut sockets = Vec::new();
+    let mut socket_inodes = Vec::new();
 
     for entry in entries.flatten() {
         // Read the symlink target
         if let Ok(target) = fs::read_link(entry.path()) {
             let target_str = target.to_string_lossy();
 
-            // Check if it's a socket
-            if target_str.starts_with("socket:[") {
-                // It's a socket, but we can't easily get the path from here
-                // We'd need to parse /proc/net/unix
+            // A socket descriptor: its bound path (if any) is in /proc/net/unix.
+            if let Some(inode) = target_str
+                .strip_prefix("socket:[")
+                .and_then(|s| s.strip_suffix(']'))
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                socket_inodes.push(inode);
                 continue;
             }
 
@@ -294,64 +302,56 @@ pub fn read_socket_paths(pid: u32) -> Result<Vec<String>, IpcError> {
         }
     }
 
-    // Also parse /proc/net/unix for this process's sockets
-    if let Ok(unix_sockets) = read_unix_sockets(pid) {
-        sockets.extend(unix_sockets);
+    if !socket_inodes.is_empty() {
+        let table = unix_socket_paths_by_inode();
+        sockets.extend(
+            socket_inodes
+                .iter()
+                .filter_map(|inode| table.get(inode).cloned()),
+        );
     }
 
     Ok(sockets)
 }
 
+/// How long one parse of /proc/net/unix is reused.
+#[cfg(target_os = "linux")]
+const UNIX_TABLE_TTL: Duration = Duration::from_secs(2);
+
+/// Bound path of every unix socket, by inode, from /proc/net/unix. Supervision
+/// detection asks for it once per candidate; re-parsing the whole table each time made
+/// a plan O(candidates x sockets), which on a busy build host (tens of thousands of
+/// sockets, every /proc/<pid>/fd readable as root) ran past test timeouts. One parse is
+/// shared for `UNIX_TABLE_TTL`, so a long-running daemon still sees fresh data.
+#[cfg(target_os = "linux")]
+fn unix_socket_paths_by_inode() -> Arc<HashMap<u64, String>> {
+    static CACHE: Mutex<Option<(Instant, Arc<HashMap<u64, String>>)>> = Mutex::new(None);
+    let mut cached = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((parsed_at, table)) = cached.as_ref() {
+        if parsed_at.elapsed() < UNIX_TABLE_TTL {
+            return Arc::clone(table);
+        }
+    }
+    let table: HashMap<u64, String> = parse_proc_net_unix("/proc/net/unix")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|socket| {
+            socket
+                .path
+                .filter(|path| !path.is_empty())
+                .map(|path| (socket.inode, path))
+        })
+        .collect();
+    let table = Arc::new(table);
+    *cached = Some((Instant::now(), Arc::clone(&table)));
+    table
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn read_socket_paths(_pid: u32) -> Result<Vec<String>, IpcError> {
     Ok(vec![])
-}
-
-/// Parse /proc/net/unix to find sockets for a specific process.
-#[cfg(target_os = "linux")]
-fn read_unix_sockets(pid: u32) -> Result<Vec<String>, std::io::Error> {
-    // Get inodes from /proc/<pid>/fd
-    let fd_dir = format!("/proc/{}/fd", pid);
-    let mut socket_inodes = HashSet::new();
-
-    if let Ok(entries) = fs::read_dir(&fd_dir) {
-        for entry in entries.flatten() {
-            if let Ok(target) = fs::read_link(entry.path()) {
-                let target_str = target.to_string_lossy();
-                if target_str.starts_with("socket:[") {
-                    // Extract inode number
-                    if let Some(inode_str) = target_str
-                        .strip_prefix("socket:[")
-                        .and_then(|s| s.strip_suffix(']'))
-                    {
-                        if let Ok(inode) = inode_str.parse::<u64>() {
-                            socket_inodes.insert(inode);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if socket_inodes.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Reuse the robust parser from network module
-    let all_unix_sockets = parse_proc_net_unix("/proc/net/unix").unwrap_or_default();
-    let mut paths = Vec::new();
-
-    for socket in all_unix_sockets {
-        if socket_inodes.contains(&socket.inode) {
-            if let Some(path) = socket.path {
-                if !path.is_empty() {
-                    paths.push(path);
-                }
-            }
-        }
-    }
-
-    Ok(paths)
 }
 
 /// Analyzer for IPC-based supervision detection.
@@ -437,6 +437,26 @@ pub fn detect_ipc_supervision(pid: u32) -> Result<IpcResult, IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unix socket this process binds is found through the shared inode table, and
+    /// repeated lookups within the TTL reuse one parse.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_socket_path_found_through_shared_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pt-ipc-test.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // The cache may hold a table from before the bind; let it expire.
+        std::thread::sleep(UNIX_TABLE_TTL + Duration::from_millis(50));
+
+        let sockets = read_socket_paths(std::process::id()).unwrap();
+        let wanted = path.to_string_lossy().to_string();
+        assert!(sockets.contains(&wanted), "{wanted} not in {sockets:?}");
+
+        let first = unix_socket_paths_by_inode();
+        let second = unix_socket_paths_by_inode();
+        assert!(Arc::ptr_eq(&first, &second), "parsed twice within the TTL");
+    }
 
     #[test]
     fn test_ipc_database_defaults() {
