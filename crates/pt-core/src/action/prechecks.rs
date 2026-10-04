@@ -344,7 +344,8 @@ fn proc_locks_mentions_pid(content: &str, pid: u32) -> bool {
 /// whose pending writes could be lost by killing the process.
 fn is_persistent_file_target(target: &str) -> bool {
     target.starts_with('/')
-        && !["/dev/", "/proc/", "/sys/"]
+        && (target.starts_with("/dev/shm/") || !target.starts_with("/dev/"))
+        && !["/proc/", "/sys/"]
             .iter()
             .any(|prefix| target.starts_with(prefix))
 }
@@ -1364,6 +1365,7 @@ mod tests {
             "/tmp/build.out",
             "/run/user/1000/work-in-progress.log",
             "/tmp/old.log (deleted)",
+            "/dev/shm/pending.data",
         ] {
             assert!(is_persistent_file_target(t), "{t}");
         }
@@ -2017,6 +2019,21 @@ mod tests {
             );
             assert_eq!(count, Some(0));
             assert!(result.is_passed());
+        }
+
+        #[test]
+        fn data_loss_blocks_regular_writer_in_dev_shm() {
+            let dir = tempfile::tempdir_in("/dev/shm").unwrap().keep();
+            let path = dir.join("pending-data.log");
+            let (count, result) = inspect_child_descriptor(
+                "exec 3>>\"$1\"; printf 'ready\\n'; read -r done",
+                &path,
+                None,
+            );
+            assert_eq!(count, Some(1));
+            assert!(
+                matches!(result, PreCheckResult::Blocked { reason, .. } if reason.contains("open write fds"))
+            );
         }
 
         #[test]

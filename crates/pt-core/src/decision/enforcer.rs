@@ -469,6 +469,13 @@ impl PolicyEnforcer {
         action: Action,
         robot_mode: bool,
     ) -> PolicyCheckResult {
+        // Keep does nothing, so no gate can block it. Blocking it turned a plain "leave
+        // it alone" into a "review" item (every candidate of a `--robot` plan under the
+        // default policy, every macOS orphan through never_kill_ppid).
+        if action == Action::Keep {
+            return PolicyCheckResult::allowed();
+        }
+
         let mut warnings = Vec::new();
         // Only enforce most rules for destructive actions
         let is_destructive = matches!(action, Action::Kill | Action::Restart);
@@ -1394,6 +1401,28 @@ mod tests {
             result.violation.as_ref().unwrap().kind,
             ViolationKind::RobotModeGate
         );
+    }
+
+    /// Keep is a no-op: robot gates, never_kill_ppid and protection rules must not turn
+    /// "leave it alone" into a review item (a `--robot` plan under the default policy
+    /// used to report every candidate, keeps included, as review).
+    #[test]
+    fn keep_is_never_blocked() {
+        let mut policy = test_policy(); // robot_mode.enabled = false
+        policy.guardrails.never_kill_ppid = vec![1];
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+
+        let mut orphan = test_candidate();
+        orphan.ppid = 1;
+        orphan.posterior = Some(0.10);
+        for robot_mode in [false, true] {
+            let result = enforcer.check_action(&orphan, Action::Keep, robot_mode);
+            assert!(result.allowed, "robot_mode={robot_mode}: {:?}", result.violation);
+        }
+
+        // The same candidate is still gated for anything that acts on it.
+        let result = enforcer.check_action(&orphan, Action::Pause, true);
+        assert!(!result.allowed);
     }
 
     #[test]

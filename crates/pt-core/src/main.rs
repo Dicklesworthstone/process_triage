@@ -10556,6 +10556,23 @@ mod process_tree_safety_tests {
     }
 
     #[test]
+    fn truncated_kill_set_preserves_omitted_live_child() {
+        use ProcessState::Sleeping;
+        let procs = vec![
+            rec(200, 1, "sh -c sleep 99999", Sleeping),
+            rec(201, 200, "sleep 99999", Sleeping),
+        ];
+        let mut candidates = vec![cand(200), cand(201)];
+        let mut refs: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
+        assert_eq!(apply_process_tree_safety(&mut refs, &procs, true), 0);
+        candidates.truncate(1);
+        let mut refs: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
+        assert_eq!(apply_process_tree_safety(&mut refs, &procs, true), 1);
+        assert_eq!(candidates[0]["recommended_action"], "review");
+        assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+    }
+
+    #[test]
     fn tree_safety_rules() {
         use ProcessState::{Sleeping as S, Zombie as Z};
         let procs = vec![
@@ -12930,7 +12947,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     // Capture count before truncation for summary stats
     let above_threshold_count = all_candidates.len();
 
-    // Take top N candidates (sorted by max posterior, not scan order!)
+    // Take top N candidates in suspicion order.
     let mut candidates: Vec<serde_json::Value> = Vec::new();
     let mut persisted_inventory_records: Vec<PersistedProcess> = Vec::new();
     let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
@@ -12941,6 +12958,17 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         candidates.push(candidate_json);
         persisted_inventory_records.push(proc_rec);
         persisted_inference_records.push(inf_rec);
+    }
+
+    // Truncation can remove a child that made its parent's kill safe in the
+    // earlier full candidate set. Re-evaluate the actual final action set.
+    {
+        let mut candidate_values: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
+        apply_process_tree_safety(
+            &mut candidate_values,
+            &scan_result.processes,
+            decision_policy.guardrails.builtin_protection,
+        );
     }
 
     let mut goal_summary: Option<serde_json::Value> = None;
@@ -14416,7 +14444,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     // Filter out completed actions using earlier declaration for --resume mode
-    let actions_to_apply: Vec<_> = plan
+    let mut actions_to_apply: Vec<_> = plan
         .actions
         .iter()
         .filter(|a| target_pids.contains(&a.target.pid.0))
@@ -14434,14 +14462,56 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         progress: None,
     };
 
-    let before_scan_processes = quick_scan(&goal_progress_scan_options)
-        .map(|scan| scan.processes)
-        .unwrap_or_else(|_| Vec::new());
+    let before_scan_processes = match quick_scan(&goal_progress_scan_options) {
+        Ok(scan) => scan.processes,
+        Err(error) => {
+            eprintln!("agent apply: cannot revalidate selected process tree: {error}");
+            return ExitCode::InternalError;
+        }
+    };
+    let mut selected_candidates: Vec<serde_json::Value> = actions_to_apply
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "pid": action.target.pid.0,
+                "recommended_action": action.action,
+            })
+        })
+        .collect();
+    let mut selected_refs: Vec<&mut serde_json::Value> = selected_candidates.iter_mut().collect();
+    apply_process_tree_safety(
+        &mut selected_refs,
+        &before_scan_processes,
+        config.policy.guardrails.builtin_protection,
+    );
+    let tree_refusals: HashMap<u32, String> = selected_candidates
+        .iter()
+        .filter(|candidate| candidate["tree_safety"].is_object())
+        .map(|candidate| {
+            (
+                candidate["pid"].as_u64().unwrap() as u32,
+                candidate["action_rationale"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
     let before_snapshot = capture_metric_snapshot_for_goal_progress(&before_scan_processes);
     let before_by_pid: HashMap<u32, &ProcessRecord> = before_scan_processes
         .iter()
         .map(|proc| (proc.pid.0, proc))
         .collect();
+    // Complete descendants before their parents. Stable sorting retains stages
+    // and ordering for multiple actions targeting the same process.
+    actions_to_apply.sort_by_cached_key(|action| {
+        let mut current = action.target.pid.0;
+        let mut ancestors = HashSet::new();
+        while ancestors.len() < 64 && ancestors.insert(current) {
+            let Some(process) = before_by_pid.get(&current) else {
+                break;
+            };
+            current = process.ppid.0;
+        }
+        std::cmp::Reverse(ancestors.len())
+    });
 
     #[cfg(target_os = "linux")]
     let before_network_snapshot = NetworkSnapshot::collect();
@@ -14736,6 +14806,26 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 continue;
             }
 
+            if let Some(reason) = tree_refusals.get(&action.target.pid.0) {
+                blocked_by_prechecks += 1;
+                outcomes.push(serde_json::json!({
+                    "action_id": action.action_id,
+                    "pid": action.target.pid.0,
+                    "status": "precheck_blocked",
+                    "check": "process_tree",
+                    "reason": reason,
+                }));
+                emit_action_event(
+                    pt_core::events::event_names::ACTION_COMPLETE,
+                    action_index,
+                    None,
+                    action,
+                    "precheck_blocked",
+                    &[("check", serde_json::json!("process_tree"))],
+                );
+                continue;
+            }
+
             skipped += 1;
             outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": if global.dry_run { "dry_run" } else { "shadow" }}));
             emit_action_event(
@@ -14901,6 +14991,52 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                     continue;
                 }
+                let mut tree_reason = tree_refusals.get(&action.target.pid.0).cloned();
+                if action.action == Action::Kill && tree_reason.is_none() {
+                    // A selected child's action may have failed, or a new child
+                    // may have appeared. Refuse the parent while any live child
+                    // remains, even if that child was in the original kill set.
+                    let current_tree = match quick_scan(&goal_progress_scan_options) {
+                        Ok(scan) => scan.processes,
+                        Err(error) => {
+                            eprintln!("agent apply: cannot revalidate process tree: {error}");
+                            return ExitCode::InternalError;
+                        }
+                    };
+                    let mut candidate = serde_json::json!({
+                        "pid": action.target.pid.0,
+                        "recommended_action": "kill",
+                    });
+                    apply_process_tree_safety(
+                        &mut [&mut candidate],
+                        &current_tree,
+                        config.policy.guardrails.builtin_protection,
+                    );
+                    tree_reason = candidate["action_rationale"].as_str().map(String::from);
+                }
+                if let Some(reason) = tree_reason {
+                    blocked_by_prechecks += 1;
+                    outcomes.push(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "precheck_blocked",
+                        "check": "process_tree",
+                        "reason": reason,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        None,
+                        action,
+                        "precheck_blocked",
+                        &[("check", serde_json::json!("process_tree"))],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+
                 // "success" means the effect was observed (stopped, reniced, exited,
                 // zombie reaped), not merely that the syscall returned.
                 let result = action_runner

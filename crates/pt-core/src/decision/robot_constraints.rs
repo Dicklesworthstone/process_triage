@@ -146,12 +146,15 @@ impl RuntimeRobotConstraints {
         }
     }
 
-    /// Override minimum posterior from CLI.
+    /// Override minimum posterior from CLI. Like every other CLI override this can only
+    /// tighten the policy: a lower value than the policy's is ignored.
     pub fn with_min_posterior(mut self, value: Option<f64>) -> Self {
         if let Some(v) = value {
-            self.min_posterior = v;
-            if let Some(ref mut sources) = self.sources {
-                sources.min_posterior = ConstraintSource::CliOverride;
+            if v > self.min_posterior {
+                self.min_posterior = v;
+                if let Some(ref mut sources) = self.sources {
+                    sources.min_posterior = ConstraintSource::CliOverride;
+                }
             }
         }
         self
@@ -912,6 +915,19 @@ mod tests {
 
         assert_eq!(constraints.min_posterior, 0.99);
         assert_eq!(
+            constraints.sources.as_ref().unwrap().min_posterior,
+            ConstraintSource::CliOverride
+        );
+    }
+
+    #[test]
+    fn test_cli_min_posterior_cannot_loosen_policy() {
+        let robot_mode = test_robot_mode(); // min_posterior = 0.95
+        let constraints =
+            RuntimeRobotConstraints::from_policy(&robot_mode).with_min_posterior(Some(0.5));
+
+        assert_eq!(constraints.min_posterior, 0.95);
+        assert_ne!(
             constraints.sources.as_ref().unwrap().min_posterior,
             ConstraintSource::CliOverride
         );
