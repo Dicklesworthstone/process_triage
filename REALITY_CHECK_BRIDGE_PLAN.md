@@ -1,5 +1,58 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
+## Execution update — 2026-10-04 22:45 UTC
+
+The assessment below describes the inspected baseline. The working tree now connects the canonical executable
+Plan to agent planning, saves the exact scorer ledger, enforces the current/saved policy age floor at apply,
+sanitizes bundle payloads before checksums/output, and renders recorded session/bundle candidates and outcomes
+with static offline rows. These are implementation changes awaiting final acceptance, not closed tasks.
+
+Actual strict remote validation so far:
+
+- The first privacy/report run passed bundle, encryption, redaction and most report suites, then failed nine
+  obsolete report-profile fixtures that used opaque Safe archives. The fixtures now exercise raw structured Safe
+  data, explicit Forensic archives and refusal negatives; a subsequent 13 report unit + 14 profile tests passed.
+- The latest actual-action run passed all seven existing live apply tests, including an open writer refusal and
+  renice, pause/resume, kill, zombie-parent routing and blast-radius limits. Two new tests failed: the planner's
+  documented `PlanReady` exit 1 was incorrectly treated as failure, and empty apply JSON lacked an outcomes array.
+  Both are corrected in the working tree; the actual planner-to-apply positive path still needs a successful rerun.
+- Source review found `--targets pid:start_id` discarded the start ID. It now requires a matching saved action
+  identity, rejects malformed selections and conflicting selectors, with planted stale-identity tests pending.
+- The prior 65 focused precheck tests passed. A later audit strengthened the unlinked regular-file case: a writable
+  unnamed regular file now blocks, while a FIFO and read-only file remain permitted. Rerun evidence is required.
+- Workspace all-targets check passed for the earlier 21:46 source upload. It does not certify the current tree.
+  Current formatting and diff checks pass; final compiler, clippy, lean and full regression gates remain pending.
+- Dependency updates are tested individually and recorded in `UPGRADE_LOG.md`. Current remaining large migrations
+  and known audit findings must not be described as a completed latest-version or vulnerability-free upgrade.
+
+### Active completion checklist
+
+- [x] Connect final post-policy candidates to the existing executable Plan builder; preserve canonical identities,
+  required checks, rationale, parent routing and final review/keep decisions.
+- [x] Persist exact four-class evidence ledgers without recomputing historical sessions with current priors.
+- [x] Connect structured profile redaction to plain, encrypted and in-memory archive preparation.
+- [x] Add static escaped report rows and recorded outcomes/ledger rendering; preserve unknown timing/counts.
+- [x] Inspect and repair CI source configuration, including invalid job secret conditions and masked test failures.
+- [ ] Rerun actual planner → apply → verify with a real detached target and stale-identity refusal.
+- [ ] Rerun current-age-floor, regular/unlinked writer, read-only/FIFO and unreadable-evidence cases.
+- [ ] Rerun actual CLI saved-session → plain/encrypted bundle and session/bundle HTML canary regression.
+- [ ] Rerun all sharing/report library and integration suites on current source and lockfile.
+- [ ] Add and execute the BATS twin against the validated binary; prohibit implicit local heavy builds.
+- [ ] Repair and execute the scoped plan/review/apply demo; publish the generated Plan schema.
+- [ ] Verify a tampered plan cannot remove mandatory runtime checks.
+- [ ] Complete sequential compatible dependency consumer tests, freeze the lockfile and rerun security audit.
+- [ ] Obtain the existing pending permission for migrations exceeding ten source files before starting them.
+- [ ] Run current-tree workspace all-targets check, warning-denying clippy, formatting and lean check.
+- [ ] Run appropriate workspace regressions; distinguish pre-existing failures from new ones using evidence.
+- [ ] Re-execute workflow static checks and review scanner findings before committing.
+- [ ] Complete fresh original-acceptance review and the real-work/honesty inventories; close only proven tasks.
+- [ ] Flush Beads, commit reviewed changes and push verified main plus the required legacy branch synchronization.
+
+No calibrated precision/recall, fleet acceptance, macOS live probe, hosted-CI success or encrypted-bundle CLI
+reporting is claimed by these tests. The full original workstream checklist below remains open where its named
+acceptance evidence has not been obtained. Further gaps discovered during execution belong on that checklist
+and their existing Beads rather than being hidden in a completion summary.
+
 ## Current assessment and execution checklist — 2026-10-04
 
 **Evidence boundary:** source inspected at HEAD/tag `d06fa71` / v2.2.1, plus the shared working tree. The
