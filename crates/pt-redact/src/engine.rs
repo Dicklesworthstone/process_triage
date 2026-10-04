@@ -394,6 +394,12 @@ fn is_export_field(key: &str) -> bool {
             os_version kernel_version arch family memory_bytes duration_ms export_profile timing
             pid ppid uid gid euid egid start_id comm cmd cmdline command command_line command_short
             cmd_short cmd_full target plan_id pre_toggled gates_summary policy_snapshot
+            policy_id pgid sid quality pre_checks timeouts order stage blocked routing
+            preflight_ms execute_ms verify_ms on_success on_failure details
+            blocked_candidates pre_toggled_actions original_zombie_target d_state_diagnostics
+            expected_recovery expected_recovery_stddev posterior_odds_abandoned_vs_useful
+            sprt_boundary log_odds_threshold numerator denominator has_known_signature category
+            wchan io_read_bytes io_write_bytes d_state_duration_ms
             cmd_pattern cmdline_raw argv args path cwd exe executable home artifact_path
             user username owner env environ environment environment_variables
             state status mode classification confidence recommendation recommended_action
@@ -407,6 +413,7 @@ fn is_export_field(key: &str) -> bool {
             evidence evidence_ledger evidence_terms evidence_tags tags features feature
             log_likelihood log_posterior log_odds_abandoned_useful bayes_factors bf log_bf delta_bits
             direction strength top_evidence why_summary evidence_glyphs identity_quality warnings error
+            prior runtime orphan tty net io_active queue_saturated state_flag command_category
             blast_radius blast_radius_risk_level blast_radius_total_affected risk_level
             provenance provenance_inference provenance_evidence_completeness provenance_score_terms
             provenance_log_odds_shift uncertainty posterior_entropy_bits abandonment_probability
@@ -491,6 +498,40 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
                 | "command_category"
         );
     }
+    if field == "quality" {
+        return matches!(value, "Full" | "NoBootId" | "PidOnly");
+    }
+    if field == "pre_checks" {
+        return matches!(
+            value,
+            "verify_identity"
+                | "check_not_protected"
+                | "check_session_safety"
+                | "check_data_loss_gate"
+                | "check_supervisor"
+                | "check_agent_supervision"
+                | "verify_process_state"
+        );
+    }
+    if field == "routing" {
+        return matches!(
+            value,
+            "direct"
+                | "zombie_to_parent"
+                | "zombie_to_supervisor"
+                | "zombie_investigate_only"
+                | "d_state_low_confidence"
+        );
+    }
+    if field == "direction" {
+        return matches!(value, "supports abandoned" | "supports useful" | "neutral");
+    }
+    if field == "strength" {
+        return matches!(
+            value,
+            "decisive" | "strong" | "moderate" | "weak" | "neutral"
+        );
+    }
     if !matches!(
         field,
         "state"
@@ -518,7 +559,7 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
         once_cell::sync::Lazy::new(|| {
             "useful useful_bad abandoned zombie kill review spare keep renice pause resume
             freeze unfreeze throttle quarantine unquarantine restart low medium high critical unknown
-            very_high veryhigh usefulbad normal
+            very_high veryhigh usefulbad normal very_low
             quickscan deep quick interactive robot agent dry_run planned completed applied running
             created scanning executing cancelled archived robot_plan robot_apply daemon_alert scan_only export
             success succeeded failed blocked skipped ok error linux macos darwin x86_64 aarch64

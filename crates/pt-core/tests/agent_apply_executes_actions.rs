@@ -448,6 +448,74 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
     );
     assert!(action.rationale.posterior.is_some());
 
+    // Export the actual producer document, including its full executable schema.
+    // A sharing profile pseudonymizes identities but must preserve typed checks,
+    // timeouts, actions, and numerical evidence for inspection.
+    let bundle_path = data_dir.join("actual-plan-safe.ptb");
+    let bundled = run_step(
+        &log_dir,
+        "bundle_actual_plan",
+        &[
+            "--format",
+            "json",
+            "bundle",
+            "create",
+            "--session",
+            session,
+            "--output",
+            bundle_path.to_str().unwrap(),
+        ],
+        &data_dir,
+        &config_dir,
+        60,
+    );
+    assert!(
+        bundled.status.success(),
+        "actual plan export: {}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let mut reader = pt_bundle::BundleReader::open(&bundle_path).unwrap();
+    assert!(reader.verify_all().is_empty());
+    let exported: Plan = reader.read_plan().unwrap().expect("typed exported Plan");
+    assert_eq!(exported.actions.len(), plan.actions.len());
+    for (exported, original) in exported.actions.iter().zip(&plan.actions) {
+        assert_eq!(exported.target.pid, original.target.pid);
+        assert_eq!(exported.target.uid, original.target.uid);
+        assert_eq!(exported.target.pgid, original.target.pgid);
+        assert_eq!(exported.target.sid, original.target.sid);
+        assert_eq!(exported.target.quality, original.target.quality);
+        assert_eq!(exported.action, original.action);
+        assert_eq!(exported.order, original.order);
+        assert_eq!(exported.stage, original.stage);
+        assert_eq!(exported.pre_checks, original.pre_checks);
+        assert_eq!(exported.blocked, original.blocked);
+        assert_eq!(exported.routing, original.routing);
+        assert_eq!(exported.confidence, original.confidence);
+        assert_eq!(
+            serde_json::to_value(&exported.timeouts).unwrap(),
+            serde_json::to_value(&original.timeouts).unwrap()
+        );
+        assert_eq!(exported.rationale.posterior, original.rationale.posterior);
+        assert_eq!(
+            exported.rationale.expected_loss,
+            original.rationale.expected_loss
+        );
+        assert_eq!(
+            exported.rationale.expected_recovery,
+            original.rationale.expected_recovery
+        );
+        assert_eq!(exported.rationale.memory_mb, original.rationale.memory_mb);
+    }
+    assert_eq!(
+        serde_json::to_value(&exported.gates_summary).unwrap(),
+        serde_json::to_value(&plan.gates_summary).unwrap()
+    );
+    assert!(
+        !String::from_utf8(reader.read_verified("plan.json").unwrap())
+            .unwrap()
+            .contains(&unique_seconds)
+    );
+
     // A supplied stale identity must refuse before runtime work, even when the
     // saved plan contains a valid action for this same live PID.
     for invalid_target in [format!("{pid}:stale-start-id"), pid.to_string()] {
