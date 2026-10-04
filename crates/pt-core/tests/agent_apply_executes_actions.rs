@@ -684,6 +684,83 @@ fn agent_apply_enforces_policy_age_floor_when_plan_snapshot_is_missing() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn agent_apply_subset_and_failed_child_do_not_kill_a_live_parent() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    struct ChildGuard(OwnedFd);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            // SAFETY: this descriptor is bound to the child spawned below.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+    }
+    let data_dir = TempDir::new().unwrap().keep();
+    let config_dir = TempDir::new().unwrap().keep();
+    write_test_policy(&config_dir);
+    let writer_path = data_dir.join("child-pending-data.log");
+    let parent = ForeignTarget::spawn(&format!(
+        "sh -c 'sleep 904 3>>\"{}\" & wait'",
+        writer_path.display()
+    ));
+    let children_path = format!("/proc/{0}/task/{0}/children", parent.pid);
+    let mut child_pid = None;
+    for _ in 0..100 {
+        child_pid = fs::read_to_string(&children_path)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok());
+        if child_pid.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let child_pid = child_pid.expect("spawned writer child");
+    // SAFETY: pidfd_open only acquires an identity-bound descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
+    assert!(fd >= 0);
+    let _child = ChildGuard(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+    let parent_identity = live_identity(parent.pid);
+    let child_identity = live_identity(child_pid);
+    let mut parent_action = plan_action(Action::Kill, &parent_identity);
+    parent_action.action_id = "kill-parent".to_string();
+    let mut child_action = plan_action(Action::Kill, &child_identity);
+    child_action.action_id = "kill-child".to_string();
+    let session = session_with_actions(&data_dir, vec![parent_action, child_action]);
+    let parent_target = format!("{}:{}", parent.pid, parent_identity.start_id.0);
+    let child_target = format!("{}:{}", child_pid, child_identity.start_id.0);
+    for targets in [parent_target.clone(), format!("{parent_target},{child_target}")] {
+        let (_, document) = apply(&data_dir, &config_dir, &session, &targets);
+        let outcomes = document["outcomes"].as_array().unwrap();
+        let parent_outcome = outcomes
+            .iter()
+            .find(|outcome| outcome["pid"] == parent.pid)
+            .unwrap();
+        assert_eq!(parent_outcome["status"], "precheck_blocked", "{document}");
+        assert_eq!(parent_outcome["check"], "process_tree", "{document}");
+        assert!(parent.alive());
+        assert!(state_of(child_pid).is_some_and(|state| state != 'Z'));
+        if outcomes.len() == 2 {
+            let child_outcome = outcomes
+                .iter()
+                .find(|outcome| outcome["pid"] == child_pid)
+                .unwrap();
+            assert_eq!(child_outcome["status"], "precheck_blocked", "{document}");
+            assert_eq!(child_outcome["check"], "check_data_loss_gate", "{document}");
+            assert_eq!(outcomes[0]["pid"], child_pid, "child must precede parent");
+        }
+    }
+}
+
+#[test]
 fn agent_apply_executes_renice_then_kill_on_live_process() {
     let data_dir = TempDir::new().expect("data dir");
     let config_dir = TempDir::new().expect("config dir");
