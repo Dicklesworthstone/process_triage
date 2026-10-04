@@ -8,24 +8,29 @@ Goal: Understand what pt reports without taking any actions.
 pt --version
 ```
 
+Both lines should print: the `pt` wrapper version and the `pt-core` engine it runs.
 If `pt` is missing, install per README.
 
-## 2) Run a quick scan (no actions)
+## 2) Take a raw snapshot (no scoring, no actions)
 
 ```bash
 pt scan
 ```
 
-What to look for:
-- KILL: highest suspicion (review carefully)
-- REVIEW: worth checking
-- SPARE: likely safe
+This prints the process snapshot pt works from (JSON by default). It does not rank
+anything; the next step does.
 
-## 3) Inspect JSON output (optional)
+## 3) Rank candidates (plan only, no actions)
 
 ```bash
-pt scan --format json | jq '.summary, .candidates[] | {pid, cmd_short, recommendation, confidence}'
+pt agent plan --format json \
+  | jq '.summary, (.candidates[] | {pid, command_short, age_seconds, score, recommended_action})'
 ```
+
+- `score` is 100 × P(abandoned or zombie).
+- `recommended_action` is the action with the lowest expected loss: usually `keep`,
+  `review` or a reversible one (`pause`, `renice`); `kill` needs overwhelming evidence.
+- Processes younger than one hour are not candidates by default (`--min-age`).
 
 ## 4) Try interactive mode (safe by default)
 
@@ -33,17 +38,15 @@ pt scan --format json | jq '.summary, .candidates[] | {pid, cmd_short, recommend
 pt
 ```
 
-Interactive mode will always ask before taking any action.
-
-## 5) Generate a plan for automation review (plan-only)
-
-```bash
-pt agent plan --format json
-```
-
-This generates a machine-readable plan with evidence and recommendations. No actions are taken.
+Interactive mode always asks before taking any action.
 
 ## Next steps
 
-- If you see a candidate you recognize, run `pt agent explain --pid <pid>` to view evidence.
-- If nothing looks suspicious, you are done. pt does not invent problems.
+To see why one process scored the way it did, explain it within the plan's session:
+
+```bash
+SESSION=$(pt agent plan --format json | jq -r .session_id)
+pt agent explain --session "$SESSION" --pids <pid> --format json
+```
+
+If nothing looks suspicious, you are done. pt does not invent problems.
