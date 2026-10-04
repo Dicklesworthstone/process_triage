@@ -327,6 +327,28 @@ E[FDP] <= alpha
 The factor `c(m) ~ ln(m) + gamma` (Euler-Mascheroni) makes eBY
 more conservative but valid without independence assumptions.
 
+These guarantees need genuine e-values: `E_H0[e_i] <= 1` under the null. A
+posterior probability is not one, and no fixed transform of it (fleet plans once
+used posterior odds cubed) makes it one, so e-BY is applied only to candidates that
+carry real e-values.
+
+### 5.2b Bayesian expected FDR (fleet plans from posteriors)
+
+Fleet plans pool each host's kill recommendations, which carry posteriors
+`p_i = P(abandoned or zombie | x_i)`, not e-values. They are selected by Bayesian
+FDR: sort by `p_i` descending and take the largest `k` with
+
+```
+(1/k) * sum_{i<=k} (1 - p_i) <= alpha
+```
+
+**Guarantee (model-based):** the left side is the posterior expected false
+discovery proportion of the selected set, `E[FDP | x] <= alpha`. If the posteriors
+are calibrated, `E[FDP] <= alpha`. This is a statement about the model, not a
+frequentist guarantee: pt's posterior is not yet calibrated against labeled
+outcomes, so neither is this bound. Implementation: `select_bayes_expected_fdr`
+in `session/fleet.rs`, checked by simulation with truth drawn from the posteriors.
+
 ### 5.3 p-value Derivation
 
 e-values convert to p-values via Markov's inequality:

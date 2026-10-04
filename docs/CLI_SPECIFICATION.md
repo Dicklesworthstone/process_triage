@@ -598,8 +598,9 @@ pt-core agent import-priors --from <path> [OPTIONS]
 ### `pt-core agent fleet plan`
 
 Fleet-wide planning (multi-host): runs `pt-core --format json agent plan` on each
-host over SSH and aggregates the per-host decisions (pooled e-BY FDR, recurring
-patterns).
+host over SSH and aggregates the per-host decisions (pooled kill selection by
+Bayesian expected FDR over the hosts' posteriors, or e-BY when every candidate
+carries an e-value; recurring patterns).
 
 ```
 pt-core agent fleet plan --hosts <file|list> [OPTIONS]

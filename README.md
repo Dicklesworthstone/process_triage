@@ -434,7 +434,7 @@ All of these apply in `pt agent apply` (robot mode is off by default: `robot_mod
 | protection rules | on | Built-in + `guardrails.protected_*`, re-checked live before each action |
 | live pre-checks | always | Identity, protection, session safety, data-loss gate, supervisor; a plan cannot opt out |
 
-Fleet plans additionally pool kill decisions across hosts with e-value Benjamini-Yekutieli FDR control; single-host plans report the expected false-discovery rate of their kill set.
+Fleet plans additionally pool kill decisions across hosts, keeping the posterior expected false-discovery proportion of the pooled kill set within `--max-fdr`; single-host plans report the expected false-discovery rate of their kill set.
 
 ---
 
@@ -454,7 +454,7 @@ pt (Bash wrapper)
      ├─ Decide ─────── Expected-loss minimization, protection and policy
      │                  enforcement, process-tree safety, Value of
      │                  Information (deep-scan hint), goal optimizer,
-     │                  fleet e-BY FDR
+     │                  fleet expected-FDR pooling
      │
      ├─ Act ────────── identity-pinned signals (pidfd on Linux),
      │                  SIGTERM → SIGKILL, renice, pause/resume,
@@ -622,11 +622,11 @@ pt report --session <id> --output report.html --include-ledger --embed-assets
 # Plan across hosts (inventory: TOML, YAML or JSON by extension)
 pt-core agent fleet plan --inventory hosts.toml --parallel 10
 
-# Or list hosts directly; pooled FDR across hosts (e-value Benjamini-Yekutieli)
+# Or list hosts directly; kills pooled across hosts within an expected FDR of 5%
 pt-core agent fleet plan --hosts trj,ts1,hz3 --max-fdr 0.05
 ```
 
-Current status: fleet **planning** works: each host runs its own `pt-core agent plan` over SSH (so protection, cgroup placement and the posterior are evaluated on that host), and the fleet aggregates those decisions with pooled e-BY FDR across hosts. Hosts need `pt-core` on their PATH. Fleet **apply** only reports planned actions; remote execution is not implemented yet. The Chandy-Lamport consistent-snapshot coordinator exists as a library but is not wired into fleet planning yet, so cross-host dependencies are not considered today.
+Current status: fleet **planning** works: each host runs its own `pt-core agent plan` over SSH (so protection, cgroup placement and the posterior are evaluated on that host), and the fleet pools those decisions across hosts by Bayesian expected FDR (the largest kill set, most probable first, whose posterior expected share of wrong kills stays within `--max-fdr`). Hosts need `pt-core` on their PATH. Fleet **apply** only reports planned actions; remote execution is not implemented yet. The Chandy-Lamport consistent-snapshot coordinator exists as a library but is not wired into fleet planning yet, so cross-host dependencies are not considered today.
 
 ---
 
@@ -1232,7 +1232,7 @@ The inference engine is backed by formal mathematical guarantees documented in [
 | Guarantee | Method | Invariant |
 |-----------|--------|-----------|
 | Posterior sums to 1 | Log-sum-exp normalization | `sum P(C\|x) = 1` |
-| FDR control (fleet plans) | e-value eBY | `E[FDP] <= alpha` |
+| FDR control (fleet plans) | Bayesian expected FDR | `E[FDP \| x] <= alpha` (as good as the posterior's calibration) |
 | Numerical stability | Log-domain arithmetic | No overflow/underflow |
 
 Library-only (not applied by any command yet): Mondrian conformal coverage, M/M/1 stall probabilities, Chandy-Lamport consistent cuts.
@@ -1275,12 +1275,7 @@ A probe is only worth taking if its expected information gain exceeds its cost: 
 
 ### FDR Control for Multiple Kill Decisions
 
-When triaging many processes at once, killing the top-N by score without correction inflates the false discovery rate. Single-host plans report the expected false-discovery rate of their kill set (`kill_set_fdr_estimate`); fleet plans pool kill decisions across hosts with e-value multiple testing:
-
-- **eBH** (e-value Benjamini-Hochberg): assumes positive regression dependency
-- **eBY** (e-value Benjamini-Yekutieli): conservative, handles arbitrary dependence
-
-The correction factor `c(m) = H_m = sum 1/j` for eBY means you can kill fewer processes per session, but each kill has a controlled false discovery rate.
+When triaging many processes at once, killing the top-N by score without correction inflates the false discovery rate. Single-host plans report the expected false-discovery rate of their kill set (`kill_set_fdr_estimate`, the mean of 1 − P(abandoned or zombie) over it); fleet plans pool kill decisions across hosts and keep the largest kill set, most probable first, whose posterior expected false-discovery proportion is at most `--max-fdr`. This bound is only as good as the posterior's calibration (see Limitations). e-value procedures (eBH, and eBY for arbitrary dependence) are applied when candidates carry genuine e-values; a posterior probability is not one.
 
 ### Contextual Bandits for Action Selection (library-only)
 
