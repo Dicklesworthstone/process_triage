@@ -269,6 +269,32 @@ impl Default for RedactionPolicy {
             FieldRule::new(Action::DetectAction),
         );
 
+        // Explicit local-detail allowlist for forensic exports. Structured
+        // export still checks secret values and hard-redacts environment and
+        // credential fields before consulting these profile overrides.
+        // Full URLs retain their credential-removing action.
+        for class in [
+            FieldClass::Cmdline,
+            FieldClass::CmdlineArg,
+            FieldClass::PathHome,
+            FieldClass::PathTmp,
+            FieldClass::PathProject,
+            FieldClass::Hostname,
+            FieldClass::IpAddress,
+            FieldClass::UrlHost,
+            FieldClass::UrlPath,
+            FieldClass::Username,
+            FieldClass::ContainerId,
+            FieldClass::FreeText,
+        ] {
+            if let Some(rule) = field_rules.get_mut(&class.to_string()) {
+                rule.profile_overrides = Some(HashMap::from([(
+                    ExportProfile::Forensic.to_string(),
+                    Action::Allow,
+                )]));
+            }
+        }
+
         Self {
             schema_version: POLICY_SCHEMA_VERSION.to_string(),
             default_profile: ExportProfile::Safe,
@@ -306,6 +332,102 @@ mod tests {
             Action::NormalizeHash
         );
         assert_eq!(policy.action_for(FieldClass::Hostname), Action::Hash);
+    }
+
+    #[test]
+    fn default_forensic_allowlist_preserves_sharing_actions_and_credential_guards() {
+        let policy = RedactionPolicy::default();
+        for (class, sharing_action) in [
+            (FieldClass::Cmdline, Action::NormalizeHash),
+            (FieldClass::CmdlineArg, Action::DetectAction),
+            (FieldClass::PathHome, Action::NormalizeHash),
+            (FieldClass::PathTmp, Action::Normalize),
+            (FieldClass::PathProject, Action::Hash),
+            (FieldClass::Hostname, Action::Hash),
+            (FieldClass::IpAddress, Action::Hash),
+            (FieldClass::UrlHost, Action::Hash),
+            (FieldClass::UrlPath, Action::Normalize),
+            (FieldClass::Username, Action::Hash),
+            (FieldClass::ContainerId, Action::Truncate),
+            (FieldClass::FreeText, Action::DetectAction),
+        ] {
+            assert_eq!(
+                policy.action_for_profile(class, ExportProfile::Forensic),
+                Action::Allow,
+                "forensic local detail {class}"
+            );
+            for profile in [ExportProfile::Safe, ExportProfile::Minimal] {
+                assert_eq!(
+                    policy.action_for_profile(class, profile),
+                    sharing_action,
+                    "sharing action for {class} in {profile}"
+                );
+            }
+        }
+        for profile in [
+            ExportProfile::Forensic,
+            ExportProfile::Safe,
+            ExportProfile::Minimal,
+        ] {
+            for class in [FieldClass::EnvValue, FieldClass::UrlCredentials] {
+                assert_eq!(policy.action_for_profile(class, profile), Action::Redact);
+            }
+            assert_eq!(
+                policy.action_for_profile(FieldClass::Url, profile),
+                Action::NormalizeHash
+            );
+        }
+        assert!(policy.detection_enabled);
+    }
+
+    #[test]
+    fn default_forensic_structured_export_preserves_matchers_but_redacts_secrets() {
+        let engine = crate::RedactionEngine::with_key(
+            RedactionPolicy::default(),
+            crate::KeyMaterial::from_bytes([0; 32], "test"),
+        );
+        let input = serde_json::json!({
+            "cmd": "python /home/local-user/work.py",
+            "cwd": "/home/local-user/project",
+            "hostname": "local-worker-host",
+            "username": "local-user",
+            "cmd_pattern": "^worker-(red|blue)$",
+            "patterns": {"process_names": ["^local-worker$"]},
+            "args": ["--verbose", "--token=local-secret", "AKIAIOSFODNN7EXAMPLE"],
+            "environment": {"HOME": "/home/local-user"},
+            "environment_vars": {"PRIVATE_TOKEN": "AKIAIOSFODNN7EXAMPLE"},
+            "env_value": "private-environment-value",
+            "password": "private-password-value"
+        });
+        let forensic = engine.redact_json_for_export(&input, ExportProfile::Forensic);
+        for field in ["cmd", "cwd", "hostname", "username", "cmd_pattern", "patterns"] {
+            assert_eq!(forensic[field], input[field], "forensic field {field}");
+        }
+        assert_eq!(forensic["args"][0], "--verbose");
+        assert_eq!(forensic["args"][1], "[REDACTED]");
+        assert_eq!(forensic["args"][2], "[REDACTED]");
+        assert_eq!(forensic["environment"], "[REDACTED]");
+        let environment_vars = forensic["environment_vars"].as_object().unwrap();
+        assert_eq!(environment_vars.len(), 1);
+        assert!(!environment_vars.contains_key("PRIVATE_TOKEN"));
+        assert!(environment_vars.values().all(|value| value == "[REDACTED]"));
+        let encoded = forensic.to_string();
+        for secret in [
+            "AKIAIOSFODNN7EXAMPLE",
+            "local-secret",
+            "private-environment-value",
+            "private-password-value",
+        ] {
+            assert!(!encoded.contains(secret), "forensic secret {secret}");
+        }
+        let safe = engine.redact_json_for_export(&input, ExportProfile::Safe);
+        for field in ["cmd", "cwd", "hostname", "username", "cmd_pattern"] {
+            assert_ne!(safe[field], input[field], "safe field {field}");
+        }
+        assert_ne!(
+            safe["patterns"]["process_names"][0],
+            input["patterns"]["process_names"][0]
+        );
     }
 
     #[test]
