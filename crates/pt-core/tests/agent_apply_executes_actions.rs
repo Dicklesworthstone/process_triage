@@ -788,13 +788,25 @@ if intermediate == 0:
         os.execve('/usr/bin/sleep', ['sleep', sys.argv[1]], {'PATH': '/usr/bin:/bin'})
     os.write(pid_write, str(target).encode() + b'\n')
     os.close(pid_write)
-    os.read(ack_read, 1)
+    if os.read(ack_read, 1) != b'1':
+        # Before adoption this is our unreaped direct child: its PID cannot be
+        # reused. Bootstrap refusal must kill/reap it without a scanner PID.
+        try:
+            os.kill(target, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(target, 0)
     os._exit(0)
 os.close(pid_write)
 os.close(ack_read)
 with os.fdopen(pid_read) as pipe:
     target = int(pipe.readline())
-pidfd = os.pidfd_open(target)
+try:
+    pidfd = os.pidfd_open(target)
+except BaseException:
+    os.close(ack_write)
+    assert os.waitpid(intermediate, 0) == (intermediate, 0)
+    raise
 try:
     os.write(ack_write, b'1')
     os.close(ack_write)

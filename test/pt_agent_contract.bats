@@ -206,7 +206,6 @@ cleanup_contract_target() {
     # Only the owned subreaper sends cleanup signals, through the original pidfd.
     # Close the controller pipe even after an assertion fails, then reap it.
     if [[ -n "$CONTRACT_CONTROL_FD" ]]; then
-        printf 'cleanup\n' >&"$CONTRACT_CONTROL_FD"
         exec {CONTRACT_CONTROL_FD}>&-
         CONTRACT_CONTROL_FD=""
     fi
@@ -248,13 +247,25 @@ if intermediate == 0:
         os.execve('/usr/bin/sleep', ['sleep', sys.argv[1]], {'PATH': '/usr/bin:/bin'})
     os.write(pid_write, str(target).encode() + b'\n')
     os.close(pid_write)
-    os.read(ack_read, 1)
+    if os.read(ack_read, 1) != b'1':
+        # The original parent still owns this unreaped child, so its PID cannot
+        # be reused. Fail the fixture after genuine bootstrap cleanup.
+        try:
+            os.kill(target, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(target, 0)
     os._exit(0)
 os.close(pid_write)
 os.close(ack_read)
 with os.fdopen(pid_read) as pipe:
     target = int(pipe.readline())
-pidfd = os.pidfd_open(target)
+try:
+    pidfd = os.pidfd_open(target)
+except BaseException:
+    os.close(ack_write)
+    assert os.waitpid(intermediate, 0) == (intermediate, 0)
+    raise
 try:
     os.write(ack_write, b'1')
     os.close(ack_write)
