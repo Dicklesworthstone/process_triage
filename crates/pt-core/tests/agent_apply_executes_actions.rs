@@ -39,6 +39,7 @@ const SIGNAL_PATH: &str = "kill";
 struct ForeignTarget {
     leader: Child,
     pid: u32,
+    _tty_master: Option<std::os::fd::OwnedFd>,
     #[cfg(target_os = "linux")]
     pidfd: std::os::fd::OwnedFd,
     #[cfg(target_os = "macos")]
@@ -47,8 +48,49 @@ struct ForeignTarget {
 
 impl ForeignTarget {
     fn spawn(script: &str) -> Self {
+        Self::spawn_in_session(script, None)
+    }
+
+    fn spawn_with_tty(script: &str) -> Self {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: openpty initializes both descriptors; default terminal settings
+        // and size are requested by null input pointers.
+        let result = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: the two successful descriptors are distinct and uniquely owned.
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        for descriptor in [&master, &slave] {
+            // SAFETY: set close-on-exec on this fixture's live descriptors. The
+            // slave remains available during pre_exec to acquire the terminal.
+            assert_ne!(
+                unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+                -1,
+                "terminal close-on-exec: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Self::spawn_in_session(script, Some((master, slave)))
+    }
+
+    fn spawn_in_session(
+        script: &str,
+        terminal: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
+    ) -> Self {
         use std::io::BufRead;
+        use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
+        let tty_slave = terminal.as_ref().map(|(_, slave)| slave.as_raw_fd());
         let mut cmd = ProcessCommand::new("sh");
         // stdio on /dev/null: an inherited log file open for writing would (rightly)
         // trip the data-loss gate.
@@ -62,11 +104,17 @@ impl ForeignTarget {
         .env_remove("SSH_CONNECTION")
         .env_remove("SSH_CLIENT")
         .env_remove("SSH_TTY");
-        // SAFETY: setsid is async-signal-safe and only affects the child.
+        // SAFETY: these calls only configure the child before exec. The borrowed
+        // slave stays alive in the parent until spawn has completed.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if let Some(slave) = tty_slave {
+                    if libc::ioctl(slave, libc::TIOCSCTTY, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
@@ -89,6 +137,9 @@ impl ForeignTarget {
         Self {
             leader,
             pid,
+            // Keep the master alive so closing it cannot send SIGHUP to the
+            // target before the identity-bound teardown has finished.
+            _tty_master: terminal.map(|(master, _)| master),
             #[cfg(target_os = "linux")]
             pidfd,
             #[cfg(target_os = "macos")]
@@ -418,13 +469,25 @@ fn default_robot_policy_preserves_the_actual_useful_spare_target() {
         serde_json::to_vec_pretty(&policy).unwrap(),
     )
     .unwrap();
-    let victim = ForeignTarget::spawn("sleep 355");
+    let victim = ForeignTarget::spawn_with_tty("sleep 355");
     let identity = live_identity(victim.pid);
+    let observation = quick_scan(&QuickScanOptions {
+        pids: vec![victim.pid],
+        ..QuickScanOptions::default()
+    })
+    .expect("observe the useful target's actual controlling terminal");
+    assert!(observation
+        .processes
+        .iter()
+        .find(|process| process.pid.0 == victim.pid)
+        .expect("owned terminal target is present")
+        .has_tty());
     // Fresh owned targets need explicit age/selection/threshold options. The
     // robot policy itself remains default, and no action is executed.
     let output = cargo_bin_cmd!("pt-core")
-        .env("PT_DATA_DIR", data_dir.path())
-        .env("PT_CONFIG_DIR", config_dir.path())
+        .env("PROCESS_TRIAGE_DATA", data_dir.path())
+        .env("PROCESS_TRIAGE_CONFIG", config_dir.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
         .env("PT_SKIP_GLOBAL_LOCK", "1")
         .timeout(Duration::from_secs(60))
         .args([
@@ -455,7 +518,11 @@ fn default_robot_policy_preserves_the_actual_useful_spare_target() {
         plan["candidates"][0]["recommended_action"], "keep",
         "{plan}"
     );
-    assert_eq!(plan["spare_set"], serde_json::json!([victim.pid]), "{plan}");
+    assert_eq!(
+        plan["recommendations"]["spare_set"],
+        serde_json::json!([victim.pid]),
+        "{plan}"
+    );
     assert!(plan["actions"].as_array().unwrap().is_empty(), "{plan}");
     assert!(victim.alive());
     assert_eq!(live_identity(victim.pid), identity);
