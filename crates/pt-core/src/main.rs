@@ -12085,7 +12085,7 @@ mod process_tree_safety_tests {
             ));
             std::fs::create_dir_all(&log_dir).expect("create retained interactive evidence");
             let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
-            let handle = SessionStore::at_data_dir(log_dir.join("data"))
+            let handle = SessionStore::at_data_dir(&log_dir.join("data"))
                 .create(&manifest)
                 .expect("create actual interactive session");
             (handle, log_dir)
