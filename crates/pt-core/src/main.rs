@@ -328,6 +328,10 @@ enum Commands {
     /// Validate configuration and environment
     Check(CheckArgs),
 
+    /// Read-only host hygiene audit: VM tuning, swap/zram, oomd limits, journald,
+    /// file-handle/inotify limits, zombie parents (suggests commands, never runs them)
+    Doctor(DoctorArgs),
+
     /// Interactive tutorials and onboarding guidance
     Learn(LearnArgs),
 
@@ -621,6 +625,13 @@ struct CheckArgs {
     /// Check all configuration
     #[arg(long)]
     all: bool,
+}
+
+#[derive(Args, Debug)]
+struct DoctorArgs {
+    /// Print the suggested commands as a commented shell script (never executed)
+    #[arg(long)]
+    fix_script: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1926,6 +1937,7 @@ fn main() {
         Some(Commands::Bundle(args)) => run_bundle(&cli.global, &args),
         Some(Commands::Report(args)) => run_report(&cli.global, &args),
         Some(Commands::Check(args)) => run_check(&cli.global, &args),
+        Some(Commands::Doctor(args)) => run_doctor_cmd(&cli.global, &args),
         Some(Commands::Learn(args)) => run_learn(&cli.global, &args),
         Some(Commands::Agent(args)) => run_agent(&cli.global, &args),
         Some(Commands::Config(args)) => run_config(&cli.global, &args),
@@ -5659,6 +5671,58 @@ fn run_report(global: &GlobalOpts, _args: &ReportArgs) -> ExitCode {
         "report",
         "Report generation requires building with the `report` feature",
     )
+}
+
+/// `pt-core doctor`: the read-only host audit. Exits Clean when nothing needs
+/// attention and PlanReady when a warning or critical finding does (the severity is in
+/// `worst`; 2 would read as ActionsOk in pt's exit-code contract).
+fn run_doctor_cmd(global: &GlobalOpts, args: &DoctorArgs) -> ExitCode {
+    use pt_core::doctor::{fix_script, run_doctor, Level};
+    let report = run_doctor();
+    if args.fix_script {
+        print!("{}", fix_script(&report));
+    } else {
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                let value = serde_json::to_value(&report).unwrap_or_default();
+                println!("{}", format_structured_output(global, value));
+            }
+            OutputFormat::Summary => {
+                let count = |l: Level| report.findings.iter().filter(|f| f.level == l).count();
+                println!(
+                    "doctor: {:?} ({} crit, {} warn, {} info)",
+                    report.worst,
+                    count(Level::Crit),
+                    count(Level::Warn),
+                    count(Level::Info)
+                );
+            }
+            _ => {
+                println!("# pt doctor\n");
+                for f in report.findings.iter().filter(|f| f.level > Level::Ok) {
+                    println!("- [{:?}] {}: {}", f.level, f.id, f.summary);
+                    if let Some(rec) = &f.recommended {
+                        println!("  recommended: {rec}");
+                    }
+                    println!("  why: {}", f.rationale);
+                    for c in &f.commands {
+                        println!("  $ {c}");
+                    }
+                }
+                let ok = report
+                    .findings
+                    .iter()
+                    .filter(|f| f.level == Level::Ok)
+                    .count();
+                println!("\n{ok} checks ok. Suggested commands are never run by pt.");
+            }
+        }
+    }
+    if report.worst >= Level::Warn {
+        ExitCode::PlanReady
+    } else {
+        ExitCode::Clean
+    }
 }
 
 fn run_check(global: &GlobalOpts, args: &CheckArgs) -> ExitCode {

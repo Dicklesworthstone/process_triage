@@ -19,6 +19,7 @@ pub mod collect;
 pub mod config;
 pub mod daemon;
 pub mod decision;
+pub mod doctor;
 pub mod events;
 pub mod exit_codes;
 pub mod fleet;

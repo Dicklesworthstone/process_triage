@@ -341,6 +341,7 @@ pt shadow stop                    # Stop observer
 | `pt bundle create` | Export session bundle | `pt bundle create --session <id> --output out.ptb` |
 | `pt report` | HTML report from session | `pt report --session <id> --output report.html` |
 | `pt shadow start` | Start calibration observer | `pt shadow start` |
+| `pt doctor` | Read-only host hygiene audit (prints fixes, never runs them) | `pt doctor --format md` |
 | `pt config validate` | Validate config files | `pt-core config validate policy.json` |
 | `pt --version` | Show version | `pt --version` |
 | `pt --help` | Full help | `pt --help` |
@@ -822,6 +823,27 @@ The designed behavior: monitor system memory and escalate scan cadence when pres
 Transitions require 2 consecutive signals at the new level (prevents flapping on momentary spikes). De-escalation also requires 2 consecutive normal readings.
 
 On Linux, `pt` reads Pressure Stall Information (`/proc/pressure/memory`) when available, using `memory.some` as a more accurate signal than raw utilization. PSI thresholds: 20% for warning, 60% for emergency.
+
+---
+
+## Host Hygiene Audit (`pt doctor`)
+
+Many incidents come from host configuration, not from any one process. `pt doctor` (Linux) reads the machine's settings and reports findings as `ok` / `info` / `warn` / `crit`, each with the observed values, a recommendation, the reason it matters, and the exact commands a person could run. It is **read-only**: nothing is written and no command is executed (`--fix-script` prints them as a commented shell script for review).
+
+| Check | Flags |
+|-------|-------|
+| Current pressure regimes | the same PSI / load / memory / file-handle reading as `agent plan` |
+| `vm.vfs_cache_pressure` | below 100 (critical on large-RAM btrfs hosts, where it let caches grow to 388 GB and systemd-oomd killed every session); when caches are bloated now, says that dropping caches only treats the symptom |
+| `vm.min_free_kbytes` | below the reserve for the machine's RAM (≈256 MB at 16 GB, 512 MB at 32–64 GB, 1 GB at 256 GB, 2 GB at 512 GB) |
+| `vm.dirty_ratio` | percentage limits that allow tens of GB of dirty cache |
+| Swap | no swap; swap nearly full; zram active but not recreated at boot; swap paradox (swapped pages while available RAM is more than twice the swapped amount) |
+| systemd-oomd | whether it runs; a later `MemoryMax=infinity` (or reset) drop-in that negates an earlier `user-.slice` / `user@.service` limit |
+| journald | volatile storage or retention under a day (OOM post-mortems lost) |
+| File handles / inotify | system file table above 75% (with the largest descriptor holders); `max_user_watches` below 524288 |
+| Process table | zombies grouped by parent (a parent with 5+ unreaped children), D-state count |
+| Deleted but open files | disk space held by files deleted while a process still has them open (1 GiB or more), with the holder |
+
+Exit code: 0 when nothing needs attention, 1 when there is a warning or critical finding (the severity is in `worst`). Not yet covered: multiplexer hygiene, pt's own health, a policy section for thresholds, macOS.
 
 ---
 
