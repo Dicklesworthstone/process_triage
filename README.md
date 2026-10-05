@@ -150,8 +150,8 @@ Most tools only know "kill" or "don't kill." `pt` evaluates 8 possible actions r
 | **Renice** | lower priority (`nice`), never raises it | Yes | Linux, macOS |
 | **Pause** | `SIGSTOP` (resume: `SIGCONT`) | Yes | Linux, macOS |
 | **Freeze** | cgroup v2 freezer | Yes | Linux, if the target owns its cgroup |
-| **Throttle** | cgroup CPU quota | Yes | Linux, if the target owns its cgroup |
-| **Quarantine** | cpuset controller | Yes | Linux, if the target owns its cgroup |
+| **Throttle** | cgroup CPU quota | Explicit prior metadata | Linux, in an exclusive leaf |
+| **Quarantine** | cpuset controller | Explicit prior metadata | Linux, in an exclusive leaf |
 | **Restart** | via the supervisor | Partial | not executable yet (planned, e.g. for a zombie's parent); apply reports it as failed |
 | **Kill** | SIGTERM → SIGKILL | No | Linux, macOS |
 
@@ -522,6 +522,15 @@ process_triage/
 ```
 
 The config directory is `$XDG_CONFIG_HOME/process_triage` (default `~/.config/process_triage`) on every platform; `--config` / `PT_CONFIG_DIR`, then `PROCESS_TRIAGE_CONFIG`, override it, and every file above (signatures included) follows the override. (Earlier releases kept `signatures.json`, `pattern_stats.json` and the `patterns/` files in `~/Library/Application Support/process_triage` on macOS; without an override pt still reads each one from there until the config directory has its own copy, and the next `signature` change or `agent fleet transfer import` saves the full contents to the config directory.) The data directory defaults to `~/.local/share/process_triage` on Linux and `~/Library/Application Support/process_triage` on macOS; `PROCESS_TRIAGE_DATA` or `XDG_DATA_HOME` override it.
+
+Fleet configuration transfer supports validated JSON and encrypted `.ptb` export,
+import and diff. An intact `.ptb` transfer requires explicit `--export-profile forensic`;
+Safe and Minimal are redacted sharing profiles and cannot activate configuration.
+Import refuses detected credentials and invalid priors or matchers. Import dry runs
+show the selected strategy's merged values for the reported prior fields. Baseline
+normalization remains unavailable: `--normalize-baseline` refuses until comparable
+measured learning observations are wired. A current process count cannot establish
+the evidence supporting transferred priors. Multi-file activation is not yet atomic.
 
 ### Environment Variables
 
@@ -1014,7 +1023,7 @@ The `pt` script is a thin Bash wrapper that locates and execs `pt-core`:
 5. `/usr/local/bin/pt-core`
 6. PATH lookup via `which`
 
-**UI mode**: bare `pt` runs the TUI when it has a terminal; without one (or in robot mode) `pt run` exits 11 and points you to `pt agent plan`. The wrapper still accepts `--shell`/`--tui` and exports `PT_UI_MODE`, but pt-core currently ignores them.
+**UI mode**: bare `pt` runs the TUI when it has a terminal; without one (or in robot mode) `pt run` exits 11 and points you to `pt agent plan`. Use `pt scan` or `pt agent plan` for noninteractive output.
 
 **Built-in commands**:
 - `pt update` — Fetches the latest version and runs its installer with `--verify` (fails closed on unsigned releases; `--no-verify` overrides); `pt update rollback|list-backups|show-backup|verify-backup|prune-backups` manage pt-core backups
@@ -1128,7 +1137,19 @@ Example: 25% throttle = 25,000 µs quota per 100,000 µs period
 | **Write order** | Period must be set before quota | Single atomic write |
 | **Detection** | Hierarchy ID != 0 in `/proc/[pid]/cgroup` | Hierarchy ID = 0 |
 
-`pt` auto-detects cgroup version (v1, v2, or hybrid) and uses the appropriate interface. Previous settings are captured for reversal. Linux only, and refused unless the target is the only process in its cgroup: limiting a shared cgroup would throttle or freeze its neighbours too, and most shell-launched dev processes share one.
+`pt` detects cgroup v1, v2 and hybrid hierarchies. Mutation currently requires a
+readable unified v2 hierarchy, a full matching process identity, the caller's
+owner, and an exclusive leaf with no descendants. Direct runners also refuse
+PID 1, invoking processes and protected infrastructure. Hybrid v1 fallbacks check
+their own controller's leaf separately; pure v1 mutation is refused. Most
+shell-launched dev processes share a cgroup and cannot be changed safely here.
+These checks are snapshots; automatic creation of a dedicated target leaf is
+not implemented.
+
+The library can capture prior CPU limits and CPU sets for explicit reversal,
+bound to the original process identity and controller path. Unknown prior
+settings are refused. A bare Unquarantine action cannot restore a prior CPU set
+and is refused; durable reversal wiring into the CLI remains incomplete.
 
 ### cpuset Quarantine
 

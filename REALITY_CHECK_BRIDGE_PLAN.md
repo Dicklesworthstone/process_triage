@@ -1,6 +1,845 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Execution update — 2026-10-05 05:27 UTC
+## Current validation — 2026-10-05 18:16 UTC
+
+The combined repaired source is archived at
+`/data/tmp/pt-source-recovery-20261005-1724.se2lcrn6/frozen-source.tar.gz`,
+SHA-256 `0627bc7fb9ca69dc38f807b34173099a69800613d55a7c024a9d864b11176c5d`.
+Its 502-file receipt `current-1724-source.sha256` has SHA-256
+`e153d4d8af3766f5a9a750c7b39a4cd759b6658ca65f0b2d259fdb2a35f7002a`.
+Root and hz2/hz3/hz4/vmi1227854 checksum commands returned 0. All four mandatory
+compiler/formatting gates returned 0 on that source. Nonroot hz3 then completed
+the library, binary and all twelve previously failing integration targets:
+**4,208 passed, zero failed, seven existing ignores, zero filtered**, 14 summaries,
+actual RCH exit 0 at 17:37:42 UTC. Raw
+`current-1724-affected-tests-hz3.log` SHA-256 is
+`bc34078df9a012a28653fedcd302af4211bc3820937404491f66539e9101cbdc`.
+Separate config library coverage passed all 247 tests. These are selected targets,
+not a complete workspace pass. The existing cgroup permission-return branches
+ran but do not prove positive cgroup actuation. All fifteen daemon cases passed
+with their original windows; this does not establish the cause of the old failures.
+
+The exact newly built action-tray executable also passed a direct nonroot native
+renice test at launcher nice 0: owned PID 2652127, full birth/UID identity,
+actual priority 0 -> 10, production execution/verification successful, unchanged
+identity afterward. `current-1724-native-renice-mutation-hz3.log` retains both
+streams, exact executable SHA-256 and command. This is one selected test with
+17 filtered cases, explicitly separate from the unfiltered affected run.
+
+The complete ROOT workspace invocation on this archived source lost SSH at
+17:45:19 UTC (caller exit 1, transport exit 255); remote completion is unconfirmed.
+The observed prefix contains 5,031 passes and four failures, not a complete result:
+three permission fixtures require a nonroot caller, and the PID-1 throttle fixture
+expected refusal but the runner actually succeeded. A read-only check found
+`/sys/fs/cgroup/init.scope/cpu.max` at `25000 100000`. I should have inspected the
+privileged mutation fixtures before launching this run. The test did not record
+the previous value; restoration awaits the operator's intended quota. No guessed
+system-service write has been performed. Normal owner-bound RCH cancellation
+reported exit 130 without terminal acknowledgment; recovery returned RCH-E504
+without replay. Source ownership has not been forcibly cleared.
+
+The original CPU-throttle task `process_triage-sj6.6` is reopened; its original
+positive relief, identity, protection, isolation and reversal criteria remain.
+`bd-qr40.4` is now in progress for actual dedicated-leaf/sibling evidence. Source
+changes add direct-runner protected-PID/full-birth/owner checks, strict exclusive
+leaf checks, captured-identity reversal and explicit refusal of unknown settings.
+They are unverified. Existing unsafe inherited-cgroup positives are being replaced
+with explicitly provisioned delegated-parent fixtures; unavailable prerequisites
+cannot count as live actuation. Unquarantine without recorded state is now refused,
+not called reversible. Snapshot checks still do not provide atomic kernel isolation.
+
+The three complete permission fixtures now share a child-only privilege-drop
+helper, with actual UID/GID/groups/capabilities checks and retained file handles.
+Independent source review corrected a root artifact-path race. Fresh runtime
+validation remains required. No root or nonroot complete workspace pass is claimed. The first
+17:15 repair attempt failed compilation on two ambiguous PID parses; both now
+have explicit u32 types. The prior root job was owner-cancelled, then recovered
+through RCH's normal API with source ownership released; its 137 recovery status
+is not an unexplained OOM or a pass. The failed root-worker source-lock attempt
+returned 103 and did not run cargo locally.
+
+The retained seventeen-file UBS scan remains exit 1: 37 critical, 2,243 warnings,
+2,049 informational findings. Independent review classified every critical row
+(17 test panics, nine public comparisons, eight bounded executable sites, one
+fixed test shell and two valid/guarded initialization sites); it confirmed no new
+critical production defect. Warnings remain unreviewed and the gate stays failed.
+The nineteen dependency updates remain paused at the skill's >10-failure circuit
+breaker pending an actual operator response; the security audit still fails.
+
+Current local edits now differ from the accepted 17:24 archive and are unverified:
+root-compatible permission fixtures, truthful normalization refusal, baseline-field
+validation and actual merged prior values in import previews. The original fleet
+transfer task `process_triage-hc7.3` was reopened at 17:13, preserving all criteria.
+The previous target baseline of 5,000 observations/72 hours/50% CPU was invented.
+Existing snapshot/learning helpers provide no comparable measured trial counts
+behind transferred Beta parameters. A live PID census is occupancy and would
+increase confidence without relevant evidence; it was considered and rejected
+before implementation. Ordinary validated transfers remain the positive path;
+requested normalization must refuse until real learning exposure is wired. This
+is removal of fabrication, not delivery of normalization or task completion.
+
+### Earlier frozen action-kind result
+
+The frozen action-kind workspace invocation finished with **7,144 passes, 23
+failures and 27 existing ignores**, zero filtered tests and actual RCH/Cargo exit
+101 at 16:41:44 UTC. All 139 target summaries are retained. Core's 4,038/main's 42
+passes, the actual Pause/resume/kind-tampering test, the original lifecycle five
+and TUI workflow 64 passed. Twelve targets failed: real signal fixtures; five
+apply-gate fixture targets; action tray; fleet transfer; CLI scenarios; dormant
+daemon; provenance origin; safety gates. Invented birth IDs, nonexistent targets
+and an old poisoned global environment lock account for several failures; these
+are not all the same defect. Fleet's sharing-profile packaging is unimportable,
+shadow's vanished outcome oracle is obsolete, daemon has three unchanged timeout
+failures, worker Git metadata is absent, and the lock fixture never holds flock.
+Raw log `current-action-kind-full-workspace-hz3.log` SHA-256 is
+`522cd6d117b1c841c3de9e4caa40e3148ca0d29527e1508bc1569b494e4cdbba`.
+No workspace pass is claimed. The exact source is preserved separately at
+`/tmp/actionlint-bd-ufqb11/current-action-kind-runtime-recovery-iz2s8zah/frozen500-source.tar.gz`,
+SHA-256 `b5279c174b3452499a06ec419024469aea5f7b35288d785e5d97057d29140d77`.
+The disjoint repairs later received the selected 17:24 acceptance recorded above.
+They do not retroactively change this failed invocation or its archived source.
+
+The action-kind correction is frozen in
+`target/test-logs/privacy/current-action-kind-source.sha256`: SHA-256
+`f19e474f99e76ee38272087a258133759af8b4f3d93c71b90b66764fcaf67d57`,
+500 files, with successful root and three-worker checksum checks at freeze. Workspace
+all-targets checking, warnings-denying workspace Clippy, the lean core check and
+formatting all returned 0. Their raw `current-action-kind-*` logs are retained in
+that directory. The complete workspace runtime invocation runs on
+hz3 as UID 1000 and returned 101 as recorded above. The corrected five-file UBS
+scan returned 1 (31 critical, 2,598 warnings, 1,942 informational findings).
+Independent triage found all critical rule/path/text entries already present in
+the previous scan; this does not waive UBS or certify the unreviewed warnings.
+
+The frozen 14:20 source passed all four mandatory compiler gates and the selected
+eight library targets, core binary tests and five critical integration targets:
+**5,079 passed, zero failed, seven existing ignores**. The retained source receipt is
+`target/test-logs/privacy/current-1420-source.sha256` (500 files). Raw commands and
+results are in `current-1420-libraries-critical-bundles-hz3.log`,
+`current-1420-workspace-check-hz4.log`, `current-1420-workspace-clippy-hz2.log`,
+`current-1420-lean-check-hz2.log` and `current-1448-fmt-check.log` in that directory.
+This is selected coverage; the complete workspace integration/doctest run remains
+open. Its earlier 13:13 attempt failed two unchanged policy-hash assertions and
+later ended with exit 137; its automatic retry was cancelled through the normal
+owner-bound RCH operation. Neither attempt is credited as a pass.
+
+The real bundle failures exposed randomized policy serialization when the
+workspace enables serde_json's preserve_order feature. Policy rule/profile maps
+now use ordered maps, with equivalent-order and meaningful-change tests. Both
+original bundle assertions passed unchanged in the 14:20 invocation. This proves
+stable equivalent instances in that build, not identical bytes across all feature
+configurations. The five deferred-task TUI guards, real producer, respawner and
+strict idempotent-resume neighbors also passed in that invocation.
+
+The 14:50:52 and 14:52:00 Git resets removed the tested source; their actor remains
+unproven. The preserved handwritten changes were restored manually, and a separate
+500-file checksum command returned 0. The tracker retained newer records in its
+database. Normal `br sync --merge --json --no-auto-import` recovered all 958 issues
+with zero deletions, conflicts or forced resolutions; all 421 comments, 595 events
+and 1,938 dependencies were retained. JSONL/base SHA-256 is
+`ce66416ea3f57ffa7dc5ad5cf95a244b373448b5c3c42623adccbde86cc5243f`.
+Sync coverage matches and active cycles remain zero. A newly attempted pre-merge
+snapshot path was missing and that command failed; it is not cited as a successful
+backup. A fresh reconciled source/graph snapshot is retained at
+`/data/tmp/pt-source-recovery-20261005-1518.BK2F0I/`. The independent 500-source-file
+and runtime archive remains at
+`/tmp/actionlint-bd-ufqb11/current-1420-recovery-h9jxfnhm/frozen-source-and-owned-runtime.tar.gz`.
+
+Eleven product tasks were independently closed during the session; two older
+positive-capability closures were reopened on discovered gaps. The current graph
+has 959 total issues, 823 closed, 124 open and twelve in progress (**136 remaining**).
+The earlier 135 figure was arithmetic error. Active dependency cycles are zero;
+one archived closed cycle is preserved. Original Plan/verify acceptance was independently satisfied on the
+frozen source and restored-tree review; `bd-uacs.1/.2` are now closed. Nineteen
+dependency families, including Clap 4.6.7, have bounded runtime/compiler validation.
+The security audit and unchanged-rule UBS scan remain exit 1; neither is waived.
+
+- [x] Restore the tested source exactly and harmonize the surviving graph without
+  deleting records or forcing a winner.
+- [x] Fix deterministic policy serialization and rerun both original bundle hash
+  assertions unchanged in the workspace feature combination.
+- [x] Run the five actual deferred Model task tests and original live producer,
+  respawner and idempotent-resume neighbors on the corrected source.
+- [x] Close `bd-uacs.1`, then `bd-uacs.2`, after restored-tree independent acceptance
+  and durable normal JSONL export; retain their original criteria.
+- [x] Implement `bd-uacs.17` in the existing writer, verifier and pause integration:
+  bind action kind, refuse Pause-to-Kill evidence reuse, retain unchanged budget,
+  outcomes and live birth/owner identity, and obtain independent acceptance.
+  The existing shared writer, strict verifier/matcher, three constructors and real
+  TUI persisted-outcome assertion are source-ready. The extended real Pause fixture
+  retains SIGCONT/stale/protected phases and logs idempotent resume, kind tampering
+  and exact restored-Plan resume. Independent source review found no material
+  blocker. All four frozen-source compiler gates passed. The real Pause/kind test
+  passed, and a direct O_RDONLY/O_NOFOLLOW budget read independently returned
+  ENOENT in the retained existing UID1000 data directory. Independent original-criteria
+  acceptance verified all 55 retained runtime files, seven commands/fourteen streams,
+  original actions 14/lifecycle five/TUI 64 and four compiler gates. Normal closure
+  at 16:45:14 UTC retains full workspace exit 101 and UBS exit 1 explicitly; later
+  local fixture/renice/fleet edits are not certified by the accepted f19 source.
+- [ ] Repair the observed older workspace fixture failures under `bd-ufqb.9/.11`,
+  preserving original scope and no hosted-CI/root-workspace completion claim:
+  - [x] Replace fake birth/owner fields in the four real signal tests with owned
+    quick-scan identities; preserve real effects and add stale/mock Pause refusal.
+  - [x] Replace nonexistent constraint PIDs/global environment mutation with owned
+    targets and command-scoped isolated policy/data; exercise split A+Z=.98 versus
+    max=.49 positive, high-Useful=.99/A+Z=.01 negative, and missing posterior.
+  - [x] Make the dry-run positive reach a real eligible target, retain its original
+    exit/count/precheck assertions, and assert explicit unexecuted resource values.
+  - [x] Repair blocked-Plan, protected-precheck and confirmation fixtures with
+    real owned full identities; preserve original exit/status/count assertions and
+    require survivor identity and genuine NotFound for confirmation side effects.
+  - [x] Repair the action tray's genuine positive identities and require actual
+    SIGTERM versus SIGKILL exit status; retain deliberate identity negatives and
+    all original observation/grace/death windows. Correct renice's monotone-priority
+    oracle and retain separate actual mutation coverage below nice 10.
+  - [x] Fail renice verification when priority cannot be observed. Predicate
+    neighbors are not live unreadable-/proc evidence.
+  - [ ] Restore an explicit importable fleet configuration-transfer contract with
+    checksum, credential and matcher validation; preserve sharing-profile privacy
+    and publish the support/refusal split instead of weakening bundle redaction.
+    - [x] Validate actual encrypted Forensic export/import and activated environment
+      matchers, plus the actual shipped default-priors export without removing prose.
+    - [x] Keep original supplied canonical checksum and outer archive bytes intact;
+      refuse sharing profiles, invalid active/inactive matchers and mutated checksums.
+    - [x] Refuse detected credentials in free-form values and map keys before
+      diagnostic disclosure; typed parse failures use a static error. The corrected
+      new guard scans explicit patterns across full text and unchanged entropy per
+      token. Whole-text entropy from separate low-entropy words is admitted; arbitrary
+      passphrases are not comprehensively detected.
+    - [x] Reject nonfinite prior, Beta and Gamma parameters in the existing validator;
+      prove finite normalized replacement and finite-input overflow refusal on the CLI,
+      preserving configuration bytes and all original 120-second command deadlines.
+      That archived invocation exercised a mathematical 10x fixture based on the
+      invented baseline; it is not measured-host normalization evidence. Subsequent
+      source removes that premise and keeps finite unscaled CLI activation positive.
+    - [ ] Wire comparable measured learning exposure for baseline normalization;
+      until then explicitly refuse requests without inventing local statistics or
+      silently skipping a requested transform. Original hc7.3 remains open.
+    - [ ] Validate supplied baseline numbers and show actual merged values in
+      import dry-run previews; validate all three strategies against saved priors.
+    - [ ] Make multi-file priors/signature activation atomic or recoverable; current
+      validation-before-write does not protect against a later signature save failure.
+  - [x] Keep missing shadow exits unlabelled and add an actually waited known-exit
+    report neighbor; this is report consumption, not calibration-quality evidence.
+  - [ ] Diagnose the three actual daemon timeout failures without widening windows;
+    capture owned diagnostics, and repair real Git/flock fixture setup.
+    The source retains all 15 daemon fixtures, actual child signals/status, state,
+    inbox and command streams. The separate old-3182 native hz4 escalation completed
+    within 7.031 seconds of its unchanged 30-second limit and exited after SIGTERM.
+    That successful reproduction does not explain the old hz3 failures. Original
+    root/nonroot workspace and hosted-CI acceptance remain open under `bd-ufqb.9/.11`.
+  - [x] Run all fifteen instrumented daemon fixtures and genuine Git/flock setups
+    on the corrected nonroot source, preserving windows and original assertions.
+    This supplies current runtime evidence, not a diagnosis of the earlier timeouts.
+  - [ ] Run the entire root and nonroot workspace on the final source, including
+    root-compatible owned privilege-drop fixtures; preserve each failed attempt.
+  - [ ] Restore PID 1's quota only after its intended value is supplied; retain the
+    incident and uncertain remote terminal state without guessing a recovery.
+  - [ ] Validate direct cgroup runner protected-PID, exact birth/UID, caller-owner,
+    invoking-process, infrastructure and leaf guards, including explicit undo.
+  - [ ] Exercise throttle/freeze in a fresh delegated owned leaf and verify an
+    unaffected sibling before, during and after exact reversal; prerequisite
+    absence is unavailable evidence, not delivered positive capability.
+  - [ ] Wire durable quarantine reversal into CLI actions. A bare Unquarantine
+    refusal does not deliver that feature or close its original task.
+  - [ ] Finish complete deterministic fleet diff coverage: remaining Gamma/IO/
+    hazard/category fields and actual matcher/lifecycle changes are omitted.
+    Current preview acceptance covers its nine numeric fields only. Invalid merge
+    strategy now fails CLI parsing instead of silently selecting Weighted; source
+    and runtime regression validation remain pending.
+  - [ ] Independently review the legitimate fixture-fix win/lose split, then run
+    affected targets and all mandatory compiler gates on the new combined source.
+- [ ] Run the complete workspace test suite on the final source; do not replace
+  full coverage with the selected 5,079-test result.
+- [ ] Continue one researched dependency family at a time with real consumer
+  validation after the requested circuit-breaker response: the full run exceeds
+  ten failures, so new dependency changes are paused under library-updater. Keep
+  the pending large-refactor approvals and failing security audit explicit.
+
+### Bounded work and honesty audit — 2026-10-05 15:54 UTC
+
+Window: 14:20–15:54 UTC. Mechanical inputs: current JSONL records, the two original
+Plan/verify closures and criteria, four complete code diffs against the preserved
+14:20 source, unchanged CI/toolchain paths, current gate logs, and the four newest
+reflog entries. The README purpose is to find abandoned processes and help remove
+them safely. This inventory is an assessment, not a release certificate.
+
+Process-artifact worksheet: running code does not branch on this TODO. Consumer:
+the operator explicitly requested a granular list; root uses its unchecked items
+to select work. Gate and observed defect: that request supplies the creation
+authorization; actual resets discarded tested source twice and invalidated old
+results. Retirement: stop updating this session list at handoff; preserve its
+history, with no deletion authorized. Recovery receipts satisfy the integrity
+exception: they preserve source lost in those observed resets; this risk is real;
+existing source hashes, patch and owned raw streams suffice; a weaker summary
+cannot reconstruct source or independently check artifacts. They receive zero
+capability credit. The highest-priority ready capability is action-kind binding;
+an hour implementing/testing it is more valuable than another report. Verdict:
+retain this requested list and minimal recovery data; create no extra machinery.
+
+Real-work inventory, each item classified once: deterministic policy serialization
+USER (tested); action-kind binding USER (runtime unverified); Clap consumer
+validation ENABLER; original producer/respawn/TUI acceptance ENABLER; source
+restoration ENABLER; full workspace validation ENABLER (pending); graph recovery
+and closures PROCESS; documentation/receipt upkeep PROCESS. Tally: USER 2,
+ENABLER 4, PROCESS 2, UNKNOWN 0. No root commit or publication occurred.
+
+1. Most visible tested change: semantically equivalent redaction policies now
+   produce stable hashes in this workspace feature build; both original bundle
+   assertions pass unchanged. The new action-kind refusal is not demo-proven yet.
+2. Graph/assessment work changes no product behavior. Recovery evidence did allow
+   restoring tested source; repeated certificates would add nothing.
+3. Actual consumers exercised the enablers: 5,079 selected tests, including the
+   producer, respawner, TUI and both formerly failing bundle assertions.
+4. The oldest user-relevant open item is `bd-l3s5`, fleet false-positive calibration
+   from September 24. Execution/evidence integrity took priority; this remains a
+   material gap, not something disposable-process tests can close.
+5. Root closed two original tasks after WhiteBeaver's independent acceptance;
+   children made no closures in this window. Reviewer/scanner/research activity
+   receives no product capability credit.
+6. No window commit edits requirements. `.17` records a separately discovered
+   defect; it does not carry an unmet original `.1/.2` criterion into a follow-up.
+
+Verdict: DRIFTING. Cold builds, source recovery and record updates consume too
+much of the window. Correction to root: finish the currently running real safety
+acceptance, then implement the next product gap; do not create new report layers
+or repeat passing checks without a changed source or unresolved concern.
+
+Honesty inventory, adopting the independent auditor's position:
+
+1. No (checked: four complete 14:20-to-current code diffs and unchanged CI paths).
+   Original assertions/windows remain; no new ignores or weakened protections.
+2. No (checked: the extended actual SIGSTOP fixture and three explicit constructor
+   updates). The lifecycle's deliberately synthetic success remains a fault
+   injection test, never evidence of actual execution.
+3. No (checked: changed paths and executed commands). No golden regeneration.
+4. Yes: stricter verifier tests accompany the production fix. The invocation-only
+   remote deadline is 10,800 seconds rather than 3,600 after compilation consumed
+   53 minutes in the earlier failed attempt. Product/test windows and assertions
+   remain unchanged; the earlier exit 137 is retained, with its cause unproven.
+5. No (checked: complete new production hunks). No test-path branch or bypass.
+6. No (checked: selected-runtime terminal summaries and all current gate logs).
+   The 5,079 result is selected coverage; the new full suite has no pass claim.
+7. Yes: the attempted pre-merge backup used a missing directory and failed, while
+   the command sequence continued. It is explicitly withdrawn as backup evidence;
+   the later successfully created snapshot is separately identified above.
+8. No (checked: current source-review, raw runtime and report scope statements).
+   Source agreement is not runtime proof; the new safety fixture remains unproven.
+9. No (checked: top-level status and retained logs). UBS/audit are exit 1, earlier
+   bundle failures/exit 137 remain visible, and broad workspace coverage is open.
+10. No (checked: retained Cargo logs and the new three-resume stream writers).
+    Cited command stderr is retained. No omitted stderr is credited as evidence.
+11. No (checked: original `.1/.2` descriptions, independent final review and
+    closure reasons). Existing-file placement is disclosed, original positive
+    chain and negative neighbors were exercised, and `.17` remains in progress.
+12. No (checked: those original descriptions and current source changes).
+    No requirement was rewritten to match the implementation.
+13. No (checked: current-window closure records). Root alone closed `.1/.2`,
+    citing independent exact-source/raw-artifact review, not an author's vote.
+14. No (checked: current review/scanner/research assignments). Real effects,
+    planted negatives and explicit no-claim boundaries are required.
+15. No (checked: complete four-file delta, raw integrated runtime summaries and
+    current gate terminals). Research suggestions are not credited as upgrades;
+    agreeing source reviews are not additional independent runtime samples.
+16. No (checked: closed original producer/respawn criteria and live positives).
+    The new action-kind task cannot close on unit refusals alone.
+17. No (checked: acceptance wording). Agent agreement remains source review;
+    retained hashes establish artifact identity, not statistical independence.
+18. No (checked: fixed invocation targets and counts). No speedup/calibration
+    metric is claimed; overlapping earlier runs are not summed.
+19. The owner should see the failed backup sequence, expensive repeated cold
+    builds, reset recovery, both non-green scanners and the large remaining graph.
+    Passing compiler checks do not complete the new safety task.
+20. Strongest completed proof: original SHA-bound actual producer/apply/verify
+    and respawner runs, with 57 retained steps/114 streams independently rehashed.
+    A skeptic can rerun the existing tests. New `.17` proof is still pending.
+
+Older-session coverage remains limited to the previously completed six project
+Cass queries with no indexed project hits; this is not a clean-history claim.
+Disposition: the failed-backup claim was corrected in place and disclosed in the
+operator record; dependent mutations must stop after an earlier failed prerequisite
+(RH-16, exact observed results). Invocation deadline changes are recorded separately
+from functional gates (RH-1/RH-2). Earlier failures, lower proof classes and open
+original requirements remain visible (RH-7/RH-9/RH-12). No waiver follows from this
+inventory; no additional certificate or retrospective search machinery is needed.
+
+### Previous validation — 2026-10-05 13:59 UTC
+
+`bd-h2y0` is closed on its original acceptance after WhiteBeaver's independent
+56-step current-native observer and complete retained-artifact recheck: 304 hashes,
+112 streams, 29 HTML reports, 15 ZIPs/75 members and 14 unchanged fixtures. Results
+are retained under `target/test-logs/privacy/pt-independent-forensic-html-ppgtm6p0/`.
+This session has now closed seven tasks on cited independent evidence. Including
+the newly identified action-kind defect, the graph has 127 open and ten in progress,
+137 remaining, with zero active cycles. Exact-ledger persistence, broader report
+flag parity and encrypted/platform acceptance retain their own open criteria.
+
+The corrected 13:13 source passed all four mandatory compiler gates: workspace
+all-targets check, warnings-denying workspace Clippy, lean core check and formatting.
+The native build also returned 0. Its immutable hz4 copy is
+`/data/tmp/pt-current-native-20261005-1348.92ituu/pt-core`, SHA-256
+`3182e7152002d746efe970bb2aa1f84841a2aab4c48cbf0d29e2d81ac4ae4d00`;
+all 500 source files matched the corrected receipt before copying. The unchanged
+62-case BATS suite, original scoped demo, exact published Plan schema and independent
+56-step report observer are now running against this copy. The full workspace test
+run remains compiling on hz3; these source additions still have no runtime credit.
+
+Independent triage accounts for all 57 critical static findings without changing
+scanner rules or exit status. None identifies a new confirmed production defect;
+the 5,039 warnings have not all been reviewed. UBS remains exit 1. The fresh security
+audit also remains exit 1. Eighteen dependency families are completed; the proposed
+Clap family still awaits full runtime validation. The next bounded safety fix,
+`bd-uacs.17`, is
+binding saved successful execution evidence to the canonical action kind, with an
+actual Pause-to-Kill tamper/refusal test. Rust source remains frozen during these
+checks. The ready independent wrapper task `bd-uacs.12` is now in progress in `pt`
+and its existing Bash tests: published-release discovery and removal of ignored
+UI switches, preserving signing pins and explicit verification behavior.
+
+### Previous validation — 2026-10-05 13:15 UTC
+
+The parent-supervision correction, TUI operation/ticket guards and strict resume
+evidence wiring are source-ready. Apply now uses the existing canonical Plan
+parser and session binding; resume uses the verifier's target/execution evidence
+and shared future-timestamp refusal. The real primary includes valid idempotent
+resume and altered PID/birth/UID/time, malformed outcome, duplicate/empty action-ID
+and wrong-session neighbors, preserving saved artifacts, budget bytes and owned
+survivor identity. Five TUI tests run actual deferred Model tasks. These additions
+have no runtime credit yet.
+
+The first full-workspace test and all-targets check both returned Cargo 101 before
+runtime on an unnecessary `as_str()` call on an existing `&str`. That call is now
+removed; formatting and whitespace checks returned 0. The 500-file corrected
+receipt is `target/test-logs/privacy/current-1313-source.sha256`. Two hz2 retries
+were refused before Cargo for slots/pressure; normal scheduling admitted the full
+workspace rerun on hz3 without local fallback or lock interventions. The corrected
+all-targets check is running on hz4. Clippy, lean and final native acceptance remain
+pending.
+
+The fresh unfiltered main-lock audit returned 1: rkyv vulnerability
+`RUSTSEC-2026-0235`, LRU unsoundness `RUSTSEC-2026-0253`, and Paste maintenance
+warning `RUSTSEC-2024-0436`. The unchanged-rule static scan of all 27 changed Rust
+files returned 1 with 57 critical findings; complete current critical triage is
+underway. Neither gate is waived. Eighteen dependency families remain completed;
+Clap is proposed. The existing progress JSON is reconciled, without upgrade credit.
+Recorded outcomes still omit action kind, so tampering only the Plan's action kind
+while retaining an ID/target is a separate unproven completion-binding limitation.
+
+## Execution update — 2026-10-05 12:51 UTC
+
+The corrected 12:24 source actually finished with **4,661 passes, one failure and
+seven existing ignores**, Cargo 101: 4,395 selected library/main tests passed;
+266 executable tests passed. Core's 4,034 include all nine new typed-supervision
+cases, real owned clean/TCP/non-dumpable/supervisord observations, fresh ancestry,
+required parsers and socket-cache positives. Workspace all-targets checking
+returned 0. Clippy on hz4 was refused before Cargo; its hz2 retry returned 101 on
+two `question_mark` lints. Both now use `?` with unchanged typed error semantics;
+new-source Clippy/lean and final checks remain pending.
+
+The sole runtime failure is a production target mismatch, not a fixture defect:
+the real two-zombie producer returns zero routed actions because it requires the
+dead child's unreadable environment, although dispatch signals the known live
+parent with SIGCHLD. Two independent reviewers confirmed the raw plan and actual
+dispatch target. The local correction probes the eligible parent, validates its
+birth/UID before and after probing, records its full supervision subject identity,
+and retains the original child's Unknown diagnostic separately. No unreadability
+exception or general parent restart/kill capability is added. Fresh same-parent
+readable/protected/unreadable producer assertions and live birth/owner neighbors
+are prepared but unexecuted.
+
+Immutable native `a4ea50a8…`, bound to all 500 files of the 12:24 receipt before
+and after, passed **62/62 unchanged BATS, zero skips**, the scoped simulation demo,
+exact published Plan schema and the unchanged independent **56-step report
+observer**. The current report suites passed 46 and 16 tests. These bounded passes
+do not upgrade the failed primary or validate subsequent source changes. Complete
+triage accounts for all 48 static critical findings without suppressing a rule;
+UBS remains exit 1. Separate existing signal-registration, AppleScript escaping
+and resume-evidence binding defects remain on the work list.
+
+The bounded TUI refresh/execute repair is now being implemented in existing files:
+operation serialization, captured confirmed selection and one-use tickets, stale
+completion rejection and failure recovery. It does not complete shared decisions,
+watch/snapshot parity, final filters or the original `bd-uacs.8` workstream.
+
+### Previous execution update — 2026-10-05 12:23 UTC
+
+The 11:24 complete primary rerun retained its original positive chain, identity
+refusals, hourly cap and full I/O windows, then failed at the new zombie fixture's
+exact descriptor assertion: Python's libffi descriptor remained open. The owned
+helper now closes its own extra descriptors before forking. Independent inspection
+of three launches and 90 samples per variant confirmed the original retained FD3
+and the corrected helper has exactly descriptors 0–2 pointing to `/dev/null`.
+The original five-second readiness deadline and exact assertion are unchanged.
+
+The 12:11 receipt freezes 500 source/manifest/test files. Its first strict remote
+test invocation returned Cargo 101 before any runtime test: a new descriptor test
+references a public IPC helper that the supervision module does not re-export.
+The test now calls the existing public `IpcAnalyzer::analyze` API with the same
+permission assertion; its fresh full rerun is pending. The concurrent workspace
+check is still running. Formatting and whitespace checks passed for the receipt.
+The unchanged-rule, all-24-changed-file UBS static scan returned 1 (48 critical,
+4,562 warnings, 3,063 informational findings); complete critical triage is in
+progress. Cargo checks run separately through strict remote offload.
+
+Independent source review found no weakened original producer assertion in the
+new owned non-dumpable CLI phase. Its live refusal exercises the earlier enabled
+data-loss gate; its dry-run refusal exercises mandatory supervision directly.
+Neither has current runtime credit yet. Independent review of the retained 11:07
+respawn run found the original `bd-uacs.2` behavior criteria satisfied; its closure
+still depends on `bd-uacs.1` and current validation.
+
+The next concrete TUI safety defect is PID-only selection surviving refresh while
+the execution cache already contains a replacement incarnation. Clearing at
+refresh completion is insufficient: refresh/execute must be serialized, pending
+selection/confirmation cleared at request, and queued execution refused while a
+refresh is outstanding. This is unimplemented and does not close `bd-uacs.8`.
+
+### Previous execution update — 2026-10-05 11:38 UTC
+
+Six independently reviewed tasks remain closed; the graph now has 127 open and ten
+in progress, **137 remaining**. `bd-toa2.6` is claimed for mandatory-observation gaps.
+There are no active cycles; one historical closed-only cycle remains archived.
+
+The frozen 10:24 proposal actually finished with **4,303 passes, ten failures and seven
+existing ignores**, Cargo 101. Common passed 243; core library passed 4,006 with eight
+failures; main passed 39 with one failure; report passed 15 with one failure. This
+invocation remains failed. The eight workspace fixtures used an inherited TMPDIR inside
+the checkout; their retained fixture helper now selects a verified non-repository root
+without changing resolver behavior or assertions. The main timestamp oracle used a
+noncanonical UTC spelling; it now expects Chrono's exact recorded `Z` representation.
+The real bundle report exposed hashed history keys: finite `state_history`/`ts` support
+now preserves only validated public timestamps and states, retaining secret exclusion.
+
+New source also binds routed action IDs to both complete process identities, omits
+init/protected parents and checks the parent's actual protection, age and memory policy.
+Persisted inference recommendations follow the final canonical Plan. A real producer
+test with two zombies sharing one parent and a protected-parent negative is being added
+to the existing test file. No direct supervisor-restart, collision-proof ID or live
+missing-parent claim follows from this work.
+
+The enabled recent-I/O gate now preserves read/parse failures, birth changes, decreasing
+counters and stale activity as Unknown/refusal. It retains the full configured shared
+window and revalidates cached idle counters. Nine meaningful inline tests include a real
+owned non-dumpable child, readable idle and active-writer positives. These tests ran in
+the passing 11:07 library invocation. Cross-UID, macOS and
+the remaining supervision/locks/TTY/CWD/session/intent observations still need proof.
+
+The corrected 11:07 source passed **4,386 selected library/main tests**, zero failures,
+seven existing ignores: common 243, core 4,025, main 41, redact 61 and report 16. This
+includes the real non-dumpable/idle/writer I/O checks, workspace-fixture corrections,
+terminal history and parent-routing units. Workspace all-targets checking returned 0.
+The executable invocation passed **266 tests and failed one fixture setup assertion**:
+145 CLI, 46 report, 57 MCP, five lifecycle and 13 action tests passed. Its new zombie
+phase inherited a later-modified policy instead of the originally configured policy;
+the exact equality assertion remains, and the 11:24 correction is running the complete
+original primary chain again. All previous failed invocations remain failed.
+
+Clippy caught one redundant borrow; the 11:24 source corrects it without changing
+behavior or allowing a lint. Its first retry was refused before Cargo because hz4
+reported a missing runtime; no local fallback ran. Current Clippy/lean remain pending.
+Clap 4.6.7 remains proposed, not a nineteenth completed family.
+
+Immutable native `7c9f16a1…`, bound to all 500 files of the 11:07 receipt, passed
+**62/62 BATS, zero skips**, the unchanged scoped demo and exact generated Plan schema.
+The independent real-report observer passed **56 CLI steps**, including 13 paired
+terminal/missing/malformed/resumed histories, actual Forensic and explicit Safe labels,
+all original privacy/escaping/signature/refusal checks and ZIP checksums. Its two
+earlier failures were observer setup defects (a valid second-pass hash marker and an
+invalid fixture SessionId); both raw failures remain retained. No marker idempotence,
+archive identity, latency, macOS or fleet claim follows.
+
+Read-only review found a concrete next mandatory-evidence defect: the supervisor
+precheck reads the state field as PPID, while combined supervision detection discards
+leaf read failures. The bounded next slice preserves typed required-probe errors and
+blocks Unknown independently of robot confirmation policy. It remains unvalidated;
+the broader `bd-toa2.6` criteria are not closed by the passing I/O subset.
+The new unsupported-probe refusal also restricts macOS: unavailable ancestry/IPC
+evidence makes planning Review and prevents both apply modes even with confirmation.
+Restoring positive macOS capability requires real supported probes, not an override
+that converts Unknown to absence. No macOS runtime acceptance is credited.
+
+### Previous execution update — 2026-10-05 10:24 UTC
+
+Six tasks are independently closed on their original criteria: `bd-gn74`, `bd-r1mu`,
+`bd-uacs.16`, `bd-pdyb`, `bd-p2ks` and `bd-uacs.3`. The graph contains 128 open and
+nine in-progress issues, **137 remaining**, with no active dependency cycles. The
+last narrow closure changed only `bd-uacs.3`; its original description and all 1,936
+dependencies stayed unchanged. Detailed remaining work is listed below.
+
+The frozen 09:06 source passed all four required compiler gates. Workspace all-targets
+checking has independently retained nonce-bound Cargo exit 0 despite RCH wrapper exit 1
+on an SSH completion-probe failure. Clippy with warnings denied and the lean check returned
+0 normally; lean retains its existing unused queue-fields warning. Formatting passed.
+Current verifier and app consumers passed 38 and 51 tests respectively. The complete
+corrected action/lifecycle run passed **19/19**, reaching the original respawn diagnostic,
+malformed/empty/restored/review checks and PID-reuse oracle. Cargo returned 0; its wrapper
+returned 1 after a release acknowledgement timeout. Independent inspection found the
+remote grant already released; the unreconciled local journal is not relabeled green.
+
+Native `a19a631d…`, built at 09:35:54 UTC and copied at 09:54:13, passed **62/62 BATS,
+zero skips**, exit 0, including the unchanged 30-second closed-stdin check. All 500 worker
+files matched `current-0906-source.sha256` before and after execution. The real producer's
+saved Plan equals stdout; 14 original stream digests, two identity-refusal survivals,
+actual pidfd delivery and confirmed death are retained under
+`target/test-logs/e2e/agent_loop/bats-1791194432637062129-330973/`. The older `653e…`
+61-pass/one-timeout loss remains separate. No latency, calibration or resource-relief
+claim follows from the latest pass.
+
+Independent review found two additional production gaps before closing plan/report work:
+blocked zombie Keep placeholders could appear in executable actions, and actual Planned
+HTML reports carried an invented end time and mislabeled the Forensic profile as Safe.
+The next source batch omits blocked/unroutable actions and unsupported generic Restart;
+valid zombie parent routing retains identity, checks and timeouts. Agent reports reconcile
+by full incarnation, expose real stages/IDs/targets and persist the same Plan once. Reports
+use actual terminal transitions, treat resumed/malformed history as unknown and normalize
+both visible and embedded profile labels from validated active configuration.
+
+`current-1024-source.sha256` freezes these changes with the proposed Clap 4.6.7 update.
+Exactly three manifest lines and six coupled lockfile package records changed; features,
+MSRV, pins and clap_complete are preserved. This is **not** a nineteenth validated family.
+Fresh main/common/core/report consumers are running remotely. Required current compiler,
+Clippy/lean, CLI and real saved-report metadata proofs remain pending. Review also identified
+that bundle redaction's finite timestamp allowlist may omit state-history `ts`; that path
+needs actual test evidence and a validated finite-data correction, not a privacy-gate waiver.
+
+No local heavy fallback, destructive recovery, golden regeneration, macOS/fleet acceptance,
+security-clean result or performance win is claimed. The remaining mandatory-evidence,
+shared decision, root/full-host performance and calibration gaps remain open.
+
+### Previous execution update — 2026-10-05 09:33 UTC
+
+The current frozen source is `target/test-logs/privacy/current-0906-source.sha256`:
+all 500 files match after manual recovery. Reflog records external resets to `origin/main`
+at 09:05:39 and 09:06:48; this team performed neither reset. Reset bytes, a read-only
+database dump and the recovered source patch are retained outside Git in
+`/data/tmp/pt-source-recovery-20261005-0908.C1ebrt/`. Recovery earns no capability credit.
+The audited normal tracker export restored exactly three known status changes, one
+new issue and comments 383–407. There are **128 open and 12 in-progress issues**,
+with no active dependency cycles; exactly three independently evidenced closures
+from this work remain (`bd-gn74`, `bd-r1mu`, `bd-uacs.16`).
+
+Current-lock workspace libraries actually passed **4,891 tests, zero failures,
+seven existing ignores** at 08:28:17 on the 08:15 source. All seven targeted collector
+tests and the case-insensitive credential cases ran. This excludes subsequent app/MCP
+and birth-order test changes. The 08:34 executable batch finished normally at 09:00:
+**358 passed, two failed**, Cargo 101. Main 39, report 46, exit codes 45, MCP 57,
+rate-limit 37 and signatures 117 passed; actions passed 13/14 and lifecycle 4/5.
+No passing subset turns that invocation green.
+
+The real minute-limit test passed the original strict gate: first pre-execution evidence
+to exact third-target refusal was **32.501 seconds**, with two actual pidfd kills,
+exact third-target survival and byte-identical persistent counters. Apply-loop elapsed
+time was 48.809 seconds. Global host memory deltas do not establish per-target relief.
+The failed respawn test reached the correct scan-refusal exit 20, then failed its
+unchanged full-snapshot diagnostic assertion. Production now restores that diagnostic;
+later malformed/empty/restored/review assertions require a new complete run. The
+lifecycle PID-reuse fixture now uses a distinct birth strictly before execution;
+its unchanged PidReused oracle and explicit before/equal/after birth-order unit test
+preserve reuse, ambiguity and real respawn coverage. At 09:23:42 the current verifier
+filter actually passed **38 tests**, including all 23 verifier tests and 15 matching
+audit/session tests. Both corrected integration targets and app consumers remain pending.
+
+Independent current-native privacy evidence passed **16 real CLI steps**. It preserves
+typed original SignatureSchema matching, literal harmless markup with escaped visible
+HTML, exact recorded values, mandatory secret exclusion, five ZIP-member checksums,
+and refusal of Safe/redacted matcher activation without changing user stores. Two
+earlier observer losses remain retained: only two null comment keys were pseudonymized
+without changing typed schema, and a valid second-pass hash marker was not idempotent.
+Neither schema-key identity nor marker idempotence is claimed. The original three
+component secret-exclusion failures subsequently passed unchanged in the 287-test run.
+
+Native `653eab94…` passed the original producer/adopted-orphan chain with actual delivery
+and confirmed death. The full BATS invocation passed **61/62, zero skips**, exit 1:
+the unchanged closed-stdin plan exceeded its 30-second deadline. Its observed kernel
+I/O wait does not establish a latency cause. The scoped dry-run demo and exact generated
+Plan schema passed; bare learn, bare verify and all-tutorial verify returned 0/0/0,
+all seven checks were OK without fallback, and progress remained 0/7. Scratch directories
+remain retained. These native proofs bind to the 08:34 production source, before the
+later diagnostic wording and integration-fixture changes.
+
+Formatting passed on current source. Workspace checking printed successful compilation
+at 09:25:49, but RCH's completion probe failed SSH and retained ownership; its wrapper
+exit 1 is not a completed green gate until independently reconciled. Current Clippy,
+lean checking, corrected runtime and the BATS timeout remain outstanding. No local
+heavy fallback, lock deletion, assertion weakening, golden regeneration, measured
+performance win, calibration guarantee, macOS acceptance or security-clean result is claimed.
+
+### Previous execution update — 2026-10-05 08:18 UTC
+
+The corrected bundle/redaction/report component run completed normally on hz2 at 07:59:10:
+**287 passed, zero failed, exit 0**. All three original failing privacy integration assertions
+executed unchanged and passed. This run binds to the component sources in
+`target/test-logs/privacy/current-0757-source.sha256`; concurrent core work is outside its scope.
+The final frozen 500-file receipt is `current-0815-source.sha256`. Current workspace libraries,
+the seven executable runtime targets and all-target checking were normally admitted remotely at
+08:16:46; their results, final Clippy/lean checks and a new native verification remain pending.
+Formatting passed on this source. No current whole-project green result is claimed yet.
+
+Source review confirms the existing IPC table already has a two-second TTL cache, but planning
+does not share its collected network snapshot with supervision. Each candidate also constructs
+an unused default signature database and recompiles its regexes. These are concrete remaining
+operations, not a quantified explanation of the observed delay. The original root/full-host,
+2,000-process/50,000-socket budget and phase-timing acceptance remain unchanged. `bd-uacs.15`
+is now claimed while this remaining work is investigated; the targeted collector fix alone does
+not close it or establish a competitive performance win.
+
+### Previous execution update — 2026-10-05 08:05 UTC
+
+Immutable native `163b5e62…` passed **62/62 BATS contracts, zero skips**, the scoped documented demo
+and exact generated/published Plan-schema comparison. Its original real signature-prior/adopted-orphan
+chain delivered a pidfd Kill and verified `confirmed_dead`; the demo remained a dry-run and preserved
+the original live identity. These results cover the 06:54 production build, not subsequent privacy,
+collector or tutorial-retention edits. Raw current primary evidence is retained under
+`target/test-logs/e2e/agent_loop/bats-1791186457960368067-641491`.
+
+The corrected minute test's first rerun still failed its conservative completion bound. Raw events
+show actual policy refusal only **5.417 seconds** after first pre-execution evidence, followed by
+**68.25 seconds** of reporting tail work. Apply-loop cumulative latency was **77.275 seconds**;
+the **115.25-second** test duration includes fixture setup and must not be called CLI-only latency.
+Independent review supports the existing exact session/action/PID/phase/status refusal event as the
+endpoint of the original strict within-minute criterion. The final fixture retains `<60s`, genuine
+signals, exact third-target survival and byte-identical counters; its fresh runtime remains pending.
+Neither removed pre-action setup nor report-tail completion time receives performance credit.
+
+The privacy correction narrows raw Forensic handling to finite SignatureSchema names and six string-only
+matcher arrays, routes them through the configured command rule, hashes unrelated free text/arguments,
+and detects whole-command secret/password/token/API-key flags case-insensitively. Environment guards
+remain unconditional. The three original failing assertions and actual CLI round-trip canary are unchanged.
+The first correction retry refused SSH admission before Cargo; the next normally admitted hz2 component
+run started at 07:55:38 with checksum freshness and is compiling. Core collector work was concurrent and
+is outside that component run's compiled scope; it cannot certify the final whole-source tree.
+
+Bare native `learn` passed, but `learn verify` returned exit 3/degraded with a genuine plan timeout.
+The old verifier also reached its existing automatic scratch-directory removal; its inner sessions
+cannot be claimed retained. The further old-native all-tutorial run was stopped using identity-bound
+signals to only its owned verifier/child, with raw return −9 and termination audit retained. Root source
+now retains uniquely named scratch directories and removes automatic cleanup. No successful tutorial
+verification or bounded timeout cleanup latency is claimed; the remaining real default-budget behavior
+requires a new native build. The observed owned plan child was in disk sleep, which is evidence of its
+state rather than proof of the latency's cause.
+
+The target-only collector correction is now source-complete and under review: Linux uses `ps -q`, macOS
+uses `-p`, while empty selections keep the original full-host scans used for ancestry and tree safety.
+It deduplicates requests and refuses invalid IDs, diagnostics and malformed targeted results instead of
+treating failures as vanished targets. Native `ps` semantics were checked with owned targets; the Rust
+collector and current action regressions remain unexecuted. No performance win or broad collector-Bead
+closure is claimed. Exactly three independently evidenced closures remain; the original larger work
+graph, audit and broader UBS failures remain open.
+
+### Previous execution update — 2026-10-05 07:36 UTC
+
+The fresh target-directory workspace library run completed normally at 07:09:22: **4,883 passed,
+zero failed, seven existing ignored** across all eight crates. The three new default-Forensic tests,
+paired recorded-deep-scan HTML/ZIP test, final doctor allocation/classification test and narrowed tutorial
+exit-code test all actually executed and passed. The 500-file `current-0654-source.sha256` receipt matches
+the uploaded worker. A later policy-test struct-initializer style fix is the only 07:03 source delta;
+it fixed an actual Clippy lint without changing production behavior or assertions. Workspace all-targets
+check, warning-denying Clippy, lean check and formatting then passed; lean retains its existing unused
+queue-fields warning. Inventory refusal on hz4 was resolved by ordinary admission to healthy hz2,
+without deleting locks, bypassing admission or running a local heavy fallback.
+
+The current executable batch completed at 07:22:08 with **302 passes and one failure**, Cargo exit 101:
+main 39, report 46, exit codes 45, rate-limit integrations 37, lifecycle 5 and signatures 117 all passed;
+actual action tests passed 13 of 14. The genuine producer/apply/verify and saved hourly-policy drift
+passed, as did both corrected age/nice fixtures. The minute test delivered two real pidfd kills and
+refused the third with exit 4 and the exact minute-limit message, but its incidental startup-inclusive
+60-second timer failed at 104.205 seconds. Its later survival/counter assertions were not reached.
+
+Independent nonauthor review supports retaining the original third-within-minute criterion with the
+same strict 60-second bound measured from the earliest pre-execution evidence timestamp, through the
+second command's completion. Delayed persisted charge time alone is insufficient. The corrected
+fixture also retains raw budget bytes each step, exact identity/delivery/signal-path checks, two sorted
+nonfuture charges, pending=false, third-target original-identity survival and byte-identical refusal
+budget. Win/lose split: valid within-minute execution can pass despite pre-action startup; the removed
+incidental total-CLI-under-60 requirement earns **no latency credit**. The observed 100/104-second
+latency remains an open performance gap. Corrected source is in `current-0734-source.sha256`; its
+fresh one-test runtime is pending. Original Bead criteria and production limits remain unchanged.
+
+The separate fresh component run found **three failures**, Cargo exit 101: one original all-profile
+redaction canary and both bundle/report pipeline tests. Forensic Allow exposed detector gaps for bare
+values, short API-like text and `--secret=` arguments previously hidden by hashing. These are required
+credential-exclusion gates; they will not be weakened. Component/privacy acceptance remains open
+while the smallest production correction is reviewed. The offload subsequently reported unconfirmed
+source-authority release; no automatic replay, lock deletion or local fallback is authorized by that.
+
+An independent real Forensic CLI/report/ZIP probe did preserve a literal markup-containing command
+while escaping visible HTML, preserving its JSON value, retaining exactly two script elements and
+verifying all archive checksums. This positive is bound to immutable native SHA256 `163b5e62…` and
+the 06:54 production source; it does not cancel the three component failures. Current native BATS,
+demo, exact schema and bare tutorial verification are being repeated with both subsequent test-only
+source deltas explicitly recorded.
+
+Exactly **three** Beads have independent closure evidence: `bd-gn74`, `bd-r1mu`, and now `bd-uacs.16`.
+The last used actual native usage/help/version/agent-help exits 10/0/0/0 and preserved the original
+criterion. Sharing/report/guardrails/doctor/platform tasks remain open until their complete original
+acceptance passes. The broader UBS scan still exits 1 despite bounded critical-finding review; the
+doctor-only scan exits 0. Audit findings, the minifier's three-failure stop and unanswered larger
+dependency-migration approval remain unresolved.
+
+### Previous execution update — 2026-10-05 06:52 UTC
+
+The 06:15 source passed workspace all-targets checking at 06:29:17. The subsequent library invocation
+exited 0 at 06:44:20 with 4,879 passing tests and seven existing ignores. Its 500-file uploaded source
+receipt matches, but its cached redaction and report test binaries omit the three new `default_forensic_*`
+cases and `recorded_deep_scan_indicator_agrees_across_session_and_bundle_reports`. Those cases receive
+**no execution credit** from this run. A fresh remote target-directory library build started at 06:50:39;
+its named tests and final result must be inspected before privacy/report acceptance. No cached artifact
+was deleted, no gate was weakened, and no local heavy fallback ran.
+
+The preceding library run exited 101 because a shared deleted-file inode chose PID 501 while its test
+expected PID 500. The doctor reader now sorts numeric PIDs and counts allocated blocks separately from
+logical size. The original 2 GiB sparse fixture remains: it now correctly reports its observed allocation
+and logical length, deduplicated once, at Info below the unchanged allocated-GiB warning threshold.
+A written-file positive checks actual allocation and deduplication; explicit classification-only inputs
+check GiB−1/Info and GiB/Warn. These classification inputs are not live allocation or reclaimed-space
+evidence. Initial reader changes passed in the 06:44 core suite; the final classification assertions still
+require the fresh build. Original `bd-p1o0.19` acceptance is broader and remains open.
+
+Clippy admission on hz4 refused runtime inventory twice and ran no Cargo. Direct installed-component
+inspection found Clippy present; the normal capability refresh reports an inventory-cache lock failure.
+This is an offload blocker, not a compiler failure or permission to bypass admission. Final Clippy,
+lean build, executable integration, default Forensic CLI and current-native contracts remain pending.
+The complete fresh eight-file UBS critical-finding triage is retained; UBS still exits 1, and its warnings
+are not fully triaged. A separate scan of the later doctor changes is running.
+
+### Previous execution update — 2026-10-05 06:15 UTC
+
+The 05:28 source passed workspace all-targets checking and the full runtime targets for main (39), report (46),
+exit codes (45) and lifecycle (5). The action target passed 12 of 14, including the genuine adopted-orphan
+producer/apply/verify, saved hourly-policy drift, minute-limit, real-RSS and respawn tests. The whole invocation
+exited 101: the age-floor test supplied a malformed partial recorded Policy, and `ps` returned `-` for the
+live renice target's initial nice value. Both fixture corrections retain the original action/refusal assertions:
+complete saved Policy with age 0, and Linux kernel `getpriority` with explicit errno handling. Their runtime
+reruns are pending. Raw primary/hourly/minute/respawn logs were independently read and their stream digests
+recomputed, then copied into the existing `target/test-logs/e2e` directories without overwriting or deleting.
+
+The immutable native binary SHA256 `53cca897f3f229cdc30e8a2b031585d975fc1d8e567eb44c4d8c58d068947142`,
+bound to all 500 files in `saved-policy-0528-source.sha256`, passed all 62 BATS contracts, the scoped documented
+dry-run demo and exact generated/published Plan schema comparison. The primary BATS chain preserves default
+loss/FDR settings and demonstrates stale/UID refusals followed by actual Kill and `confirmed_dead` verification.
+These results certify that source and controlled Linux behavior, not calibration or subsequent source changes.
+
+Review found two further original report/sharing gaps: recorded deep-scan status was lost in the bundle adapter,
+and the default Forensic producer hashed fields needed for intact signature activation while an earlier test used
+a custom allow policy. The source now preserves the finite Forensic local-detail allowlist while retaining secret,
+environment and URL-credential guards. The canary invokes the actual CLI Forensic producer and import/matcher
+consumer. Session and real Safe-ZIP HTML adapters derive deep-scan status from unsigned recorded milliseconds,
+preserving zero as enabled, explicit null as disabled, and absent/invalid history as unknown. These source changes
+and the paired HTML/ZIP tests still require execution.
+
+The tutorial Run gate was narrowed from the external all-0–9 acceptance to completed `agent plan` 0/1 and other
+commands 0; policy refusal, partial execution, interruption and unknown codes remain failures. Its real-command
+budgets now replace obsolete help-only defaults, with the before/after evidence retained in `bd-uacs.13`. Bare
+current-native verification and macOS acceptance remain pending. Current workspace checking started remotely
+at 06:12:57 against `current-0615-source.sha256`; the earlier hz3 library build uses its separately recorded
+source and cannot certify later edits. The original hz4 target path has disappeared; the immutable native copy
+and raw evidence remain intact. No local heavy fallback or cache deletion was performed by this team.
+
+Only `bd-gn74` and `bd-r1mu` are independently closed so far. Original P0, sharing/report and platform acceptance
+remain open until their named current-source evidence and nonauthor reviews complete. Audit and UBS remain
+non-green, and the larger dependency migrations retain the existing unanswered skill-required approval.
+
+### Previous execution update — 2026-10-05 05:27 UTC
 
 Independent review declined `bd-uacs.3` closure: the recorded full Policy previously enforced only its age
 floor, and the TUI plan builder could exceed the run cap. The original acceptance remains unchanged. Root
@@ -278,7 +1117,7 @@ Actual strict remote validation so far:
 - [x] Add activation validation while retaining inspectable typed Safe signature exports.
 - [x] Connect apply/TUI current-policy checks and persistent kill accounting with shared execution locking.
 - [x] Reject missing/invalid positive-floor probabilities; intersect category overrides and add tightening property.
-- [ ] Rerun actual planner → apply → verify with a real detached target and stale-identity refusal.
+- [x] Rerun actual planner → apply → verify with a real detached target and stale-identity refusal.
 - [x] Execute canonical verification unit/lifecycle tests with strict saved execution identity and timestamp binding.
 - [x] Execute actual respawner attribution plus foreign-parent, substring and same-tick ambiguity negatives.
 - [x] Independently review CLI/TUI execution evidence and remove the remaining broad goal-progress respawn matcher.
@@ -291,13 +1130,15 @@ Actual strict remote validation so far:
 - [x] Persist kill intent before signaling, reconcile actual delivery without charging refusals, and prove a failed
   final save cannot reset the retained run count or permit a fresh invocation; apply the same live-child guard in TUI.
 - [x] Retain earlier real CLI outcomes if a later process-tree refresh fails; refuse unreadable fallback signal identity.
-- [ ] Investigate the missing initial renice priority observation without weakening its action/effect assertions.
+- [x] Investigate the missing initial renice priority observation without weakening its action/effect assertions.
+- [x] Execute the corrected complete-age-policy and Linux getpriority fixtures on the 06:54 source.
 - [x] Rerun BATS with actual FD-bound launcher evidence and monotonic timings; keep every original positive/negative.
 - [ ] Rerun current-age-floor, regular/unlinked writer, read-only/FIFO and unreadable-evidence cases.
 - [x] Rerun actual CLI saved-session → plain/encrypted bundle and session/plain-bundle HTML canary regression.
 - [x] Rerun sharing/report library and integration suites on the 02:53 source and lockfile (282 tests, 02:58:31).
-- [ ] Repeat affected sharing/report consumers after the subsequently integrated Schemars family update.
-- [ ] Add and execute the BATS twin against the validated binary; prohibit implicit local heavy builds.
+- [x] Repeat affected sharing/report consumers after the subsequently integrated Schemars family update:
+  current corrected component run 287 passed, including the three unchanged original failed assertions.
+- [x] Add and execute the BATS twin against the validated binary; prohibit implicit local heavy builds.
 - [x] Repair and execute the scoped plan/review/apply demo; publish the generated Plan schema.
 - [x] Verify a tampered plan cannot remove mandatory runtime checks.
 - [ ] Complete sequential compatible dependency consumer tests, freeze the lockfile and rerun security audit.
@@ -308,13 +1149,14 @@ Actual strict remote validation so far:
 - [ ] Verify malformed signatures/provenance audit and unreadable requested telemetry refuse before output creation.
 - [ ] Verify snapshot/plan kernel-pressure readings and their persisted schema; review remaining unknown-value consumers.
 - [x] Verify CLI usage error 10 and explicit help/version 0, including existing label/degraded-environment expectations.
-- [ ] Complete bd-uacs.3 apply/TUI policy-enforcer and persistent kill-count wiring with real cross-run rate-limit proof.
+- [x] Complete bd-uacs.3 apply/TUI policy-enforcer and persistent kill-count wiring with real cross-run rate-limit proof;
+  independent closure at 10:02:14 UTC cites exact original within-minute delivery/survival/counter evidence.
 - [ ] Validate independent saved/current policy enforcement after current protections, posterior floors and budget
   limits are loosened; retain stricter-current and exact permitted-boundary positives.
-- [ ] Execute the producer-driven hourly saved-policy drift phase: first delivery charged once, second saved
+- [x] Execute the producer-driven hourly saved-policy drift phase: first delivery charged once, second saved
   target refused with `rate_limit`, exact identity still alive and no additional persistent charge.
-- [ ] Execute TUI planned-cap boundary/refusal and repeat all real headless TUI delivery/accounting regressions.
-- [ ] Execute malformed full-snapshot and legacy-age JSON refusals before any signal or outcome publication.
+- [x] Execute TUI planned-cap boundary/refusal and repeat all real headless TUI delivery/accounting regressions.
+- [x] Execute malformed full-snapshot and legacy-age JSON refusals before any signal or outcome publication.
 - [x] Execute headless TUI real-kill/accounting regression and preserve earlier outcomes on later evidence failure.
 - [x] Execute corrupt/unreadable budget and concurrent-writer tests; report permission evidence separately on root.
 - [x] Execute actual Safe/encrypted bundle import and extracted-JSON refusal without changing existing signatures.
@@ -334,11 +1176,74 @@ Actual strict remote validation so far:
 - [x] Finish the existing report canary's unreadable-telemetry negative without deleting its pre-created directory;
   rerun its complete plain/encrypted/session/bundle/activation/privacy/publication assertions.
 - [x] Independently recompute the latest native BATS step digests and validate its real producer Plan instance.
-- [ ] Replace the primary Rust/BATS forced-loss fixture with the original test-signature/adopted-orphan fixture;
+- [x] Replace the primary Rust/BATS forced-loss fixture with the original test-signature/adopted-orphan fixture;
   execute full native and Rust/BATS apply/verify while preserving default loss/FDR and every safety oracle.
 - [ ] Run appropriate workspace regressions; distinguish pre-existing failures from new ones using evidence.
-- [ ] Rebuild and stage the current SHA-bound native binary; repeat the corrected 62-test BATS suite, scoped
+- [x] Rebuild and stage the saved-policy SHA-bound native binary; repeat the corrected 62-test BATS suite, scoped
   dry-run demo and exact generated/published Plan schema check after the saved-policy production fix.
+- [x] Execute current default-policy Forensic CLI export/import with intact matcher positives and mandatory secret
+  negatives; rerun original all-profile no-secret component consumers without weakening their assertions.
+- [x] Execute paired session/Safe-ZIP HTML deep-scan status, evidence, privacy and unknown-history regression
+  on the 06:54 source; later privacy-policy changes require their affected rerun.
+- [x] Inspect fresh-target test names before granting the new Forensic/deep-scan cases execution credit;
+  source hashes and a successful cached invocation alone did not prove those cases ran.
+- [x] Execute final doctor allocated/logical-size reader, deterministic inode representative and unchanged
+  allocated-GiB classification boundaries; retain original sparse and real allocated-file positives.
+- [x] Run the 06:54-native Forensic HTML probe with visible harmless script-like text and exact recovered JSON;
+  a Safe profile's hashed text alone does not prove the escaping of a displayed local-detail field.
+- [x] Correct the three actual Forensic component failures in production; retain original integration assertions
+  and exact CLI signature export/import positive, including harmless visible markup under the narrowed policy.
+- [x] Execute the strict within-minute gate from actual first pre-execution evidence to the exact refusal event;
+  retain startup/report-tail latency losses, exact identities, actual signals and unchanged saved counters.
+- [ ] Correct targeted `ps` selection while retaining full-host ancestry/tree/provenance scans; execute actual
+  exact-subset, missing/duplicate/invalid PID and diagnostic refusal cases plus the original action/TUI regressions.
+- [x] Execute all seven new collector unit cases on the 08:15 source; preserve current action diagnostic failure
+  and repeat its complete original negative/positive sequence after the production diagnostic correction.
+- [x] Execute all 57 MCP protocol cases, including explicit planner-child configuration and both invalid controls;
+  retain the broader same-snapshot decision/parity and protected-context work on `bd-uacs.8`.
+- [x] Execute narrowed tutorial command/exit matrix and bare current-native `learn verify --all`; retain macOS gap.
+- [x] Execute explicit same-PID before/equal/after birth-order classification on current source; retain exact
+  PidReused/ambiguous/Respawned outcomes and zero invented resource relief.
+- [x] Repeat corrected actual respawn/action and lifecycle integrations on the final 09:06 source: 19/19,
+  Cargo 0; retain separate RCH release-acknowledgement wrapper 1 and released-claim inspection.
+- [x] Execute all existing app-supervision consumers after removing unused signature construction: 51/51;
+  no speedup claim.
+- [x] Repeat the unchanged closed-stdin BATS contract and full native suite: a19a native 62/62, zero skips;
+  retain the older actual 30-second loss and source-bound raw producer-chain evidence.
+- [ ] Finish canonical executable-only action/report reconciliation, including staged remedies, valid parent routing,
+  no-parent zombies, blocked candidates, unsupported Restart and full-incarnation near negatives; execute fresh
+  real producer/apply/verify and independent original bd-uacs.1 acceptance before closure.
+- [x] Correct actual report profile/end metadata across session and verified bundle paths; prove terminal,
+  archived, resumed, missing, malformed and contradictory history with unchanged secret-exclusion/checksum gates.
+- [x] Execute typed recent-I/O read/parse, full-window/birth/cache tests and actual owned unreadable/idle/writer
+  consumers; retain the original shared-window periodic-writer and 110-second acceptance bound.
+- [ ] Finish the other mandatory-observation Unknown paths in `bd-toa2.6`, with real permission/provenance
+  refusals, explicit disabled gates, interactive warning behavior and cross-UID/macOS evidence where required.
+- [x] Execute the supervision slice's typed stat/ancestry/environment/IPC failures, fresh successful negatives,
+  observed-root termination, namespace-correct socket evidence and bind-after-cache positive.
+- [x] Execute actual owned non-dumpable and `supervisord`-parent checks; prove explicit CLI planning/dry-run/live
+  refusal under both human-confirmation policies while preserving enabled data-loss guards and birth identity.
+- [x] Run the corrected two-zombie producer after closing the interpreter's owned persistent `libffi` descriptor;
+  preserve the exact three `/dev/null` descriptors, five-second bootstrap bound and original primary chain.
+- [ ] Validate watch's corrected combined abandoned-plus-zombie probability; finish shared decision/TUI routing,
+  policy thresholds and final `--only` filtering under the original `bd-uacs.8` criteria.
+- [x] Bind routed-zombie mandatory supervision to the actual parent, preserving dead-child diagnostics;
+  execute unchanged two-action/default-policy positive plus real same-parent unreadability/protection and
+  changed-birth/owner negatives before granting the target correction runtime credit.
+- [x] Serialize TUI refresh/execute and invalidate pending confirmation at refresh request; execute actual
+  Model task closures for pre-display cache replacement, stale/duplicate tickets and error recovery.
+- [ ] Check every daemon signal-registration return and surface installation failure; preserve harmless
+  POD initialization and async-signal-safe handlers rather than changing scanner rules.
+- [ ] Fix the existing macOS notification's generated AppleScript string escaping, including backslash
+  before quote; retain the actual macOS parser/runtime acceptance requirement on `bd-zisi`.
+- [x] Bind resumed successful outcomes to canonical action target PID/start/owner and execution evidence;
+  preserve valid idempotent resumption and refuse wrong-target success records with the same action ID.
+- [ ] `bd-uacs.17`: bind saved execution outcomes to the action kind as well as ID/target; require an altered-Plan
+  Pause-to-Kill neighboring refusal and preserve genuine typed CLI/TUI producer records.
+- [x] Validate Clap 4.6.7 on main with actual common library and CLI consumers, then all four compiler gates;
+  only then credit the nineteenth family and continue the next compatible family sequentially.
+- [ ] Repeat current-source compiler/Clippy/lean/library/component gates and source-bound native contracts after
+  the subsequent Forensic, deep-scan, tutorial and fixture changes; do not reuse the 0528 result as their proof.
 - [ ] Re-execute workflow static checks and review scanner findings before committing.
 - [ ] Complete fresh original-acceptance review and the real-work/honesty inventories; close only proven tasks.
 - [ ] Flush Beads, commit reviewed changes and push verified main plus the required legacy branch synchronization.
@@ -603,25 +1508,25 @@ implementation of obsolete alternatives.
 | V2 Confident, conservative kill recommendations | SOURCE: kill can win the loss matrix; no held-out calibrated precision, recall or false-kill guarantee established here. | WS1 `.1/.12`; WS0 `.5/.7`; WS6 `.6` |
 | V3 Advanced models contribute when useful | DISCLOSED: many library modules have no production caller. Activation requires a measured win with the incumbent live. | WS7 `bd-t9qm.*`; ambition `bd-bjrh.*` |
 | V4 Deep evidence and exact historical explanation | PARTIAL: agent plan calls deep collection; I/O uses lifetime counters and saved evidence is rounded. Exact historical ledger is not persisted. | WS4 `bd-u7gc.6`; `bd-h2y0`; `bd-uacs.10` |
-| V5 Agent plan → apply → verify | BROKEN in inspected source: rich planning JSON differs from executable `Plan`; verification command names also differ. | `bd-uacs.1/.2`; WS3 `.9` |
+| V5 Agent plan → apply → verify | WORKING in bounded Linux acceptance: one executable Plan, real adopted-orphan and respawner producer chains, generated-precheck and full-identity refusals, schema/BATS/demo and strict idempotent resume passed. Saved action-kind binding is a separate remaining defect. | `bd-uacs.1/.2/.17`; WS3 `.9` |
 | V6 Advertised actions execute safely | SOURCE: composite dispatch; Restart still errors and planning considers it feasible. Shared cgroups are refused; dedicated-leaf positive capability needs proof. | WS3 `bd-qr40.4/.5/.6/.9` |
 | V7 Identity-safe staged signals | SOURCE: identity and pidfd paths exist; platform/action/PID-reuse acceptance still requires real disposable probes. | WS3 `.9`; ambition `bd-bjrh.6` |
 | V8 Protected infrastructure and caller chain | SOURCE: protection rules exist. Complete agent liveness, root workload visibility, PID-1-child handling and all-surface parity remain acceptance work. | WS2 `bd-toa2.*`; `bd-uacs.7/.8` |
-| V9 Data-loss protection | PARTIAL: regular-descriptor classification and unreadable-evidence handling need repair; recent-I/O and lock read failures can also fail open. | `bd-28v9`; WS2 `.6`; `bd-aq9x`; WS3 `.9` |
+| V9 Data-loss protection | PARTIAL: descriptor classification, typed unreadable supervision and required snapshot refusals have real positive/negative Linux coverage. Complete recent-I/O/lock failure semantics, all callers and platforms remain open. | `bd-28v9`; WS2 `.6`; `bd-aq9x`; WS3 `.9` |
 | V10 Honest robot risk controls | PARTIAL: posterior constraints exist. Calibration, single-host conformal/eBH and full per-action enforcement are not established. | WS1 `.4`; WS7 `.1`; ambition `.5`; `bd-uacs.3/.9` |
 | V11 Human decisions improve future priors | SOURCE: store and scorer consume human verdicts; outcome provenance, decay, pooling, label coverage and held-out improvement need acceptance. | WS6 `bd-codb.*`; `bd-uacs.5/.6` |
 | V12 Interactive TUI in installed product | SOURCE/tag defaults include UI. Real artifact smoke, final safety parity and TUI labeling still need proof. | WS5 `bd-ufqb.1`; WS6 `.5`; `bd-uacs.8` |
 | V13 Daemon monitors safely | SOURCE: daemon path exists; graded memory-pressure logic and service installation remain incomplete. | WS8 `bd-1y2g.5/.6`; proposed WS10 |
 | V14 Fleet planning/apply | PARTIAL: SSH planning exists; apply explicitly reports unsupported and executes nothing remotely; dependency/guarantee claims need proof. | WS8 `bd-1y2g.*`; `bd-uacs.9` |
-| V15 MCP uses the real planner | SOURCE: `mcp/tools.rs::tool_plan` invokes this executable's `agent plan`; same-snapshot parity and MCP transcript remain unproven. | WS7 `bd-t9qm.7`; WS9 |
-| V16 Sharing profiles remove sensitive data | BROKEN: `run_bundle_create` copies raw artifacts; `BundleWriter::add_file` checksums/stores bytes. Safe/minimal is metadata without payload sanitization. | `bd-p2ks`; overlapping `bd-uacs.10` |
-| V17 Reports expose recorded candidates/actions | BROKEN: session and bundle generators set candidates/evidence/actions to `None`; generic three-state math and canned prose are not observed session results. | `bd-h2y0`; overlapping `bd-uacs.10` |
-| V18 Offline readable reports | PARTIAL: candidate table is an empty div until CDN JavaScript renders it; `embed_assets`/fallback configuration has no implementing consumer. | `bd-h2y0`; `bd-uacs.10`; WS9 |
+| V15 MCP uses the real planner | WORKING in bounded protocol acceptance: actual child planner and explicit configuration/PID refusal neighbors passed. Full same-snapshot parity with every surface remains open. | WS7 `bd-t9qm.7`; WS9; `bd-uacs.8` |
+| V16 Sharing profiles remove sensitive data | WORKING in bounded Linux sharing acceptance: payload sanitization occurs before publication, Forensic signature import retains intentional secrets, Safe override removes them, and unchanged mandatory-secret consumers pass. Broader flag/platform acceptance remains open. | closed `bd-p2ks`; overlapping `bd-uacs.10` |
+| V17 Reports expose recorded candidates/actions | WORKING for saved sessions/plain ZIPs: actual four-class candidates, canonical actions/outcomes, evidence/deep status and honest terminal/unknown history passed an independent 56-step observer. Exact historical ledger and broader flags remain open. | closed `bd-h2y0`; `bd-uacs.10`; WS4 `.6` |
+| V18 Offline readable reports | WORKING in that bounded report acceptance: static escaped rows and evidence render without JavaScript; pre-render sharing-profile redaction and session/ZIP consistency passed. Remaining embed/asset flags and encrypted/platform acceptance are separate. | closed `bd-h2y0`; `bd-uacs.10`; WS9 |
 | V19 Telemetry feeds calibration | DISCLOSED: Parquet recorder library is not a demonstrated live calibration input. Storage earns value only with a real consumer. | WS7 `bd-t9qm.9`; WS6 `.6` |
 | V20 Bounded, safe collection | SOURCE: collection code exists; io_uring fault/sanitizer evidence and loaded-host budgets remain required. | WS4 `bd-u7gc.2/.3/.4/.5` |
 | V21 Intent/workspace/GPU/container evidence | DISCLOSED/PARTIAL: multiple collectors remain library-only; robot safety and namespace semantics must survive integration. | WS7 `.10`; WS2 `.6` |
 | V22 Bounded session storage | SOURCE: retention code exists; lifecycle coverage, in-use protection and backlog migration need cited acceptance. Deletion requires authorization. | WS5 `bd-ufqb.6/.7` |
-| V23 Respawn-aware cleanup | PARTIAL: apply has an ad hoc respawn detector; full tracker and supervisor-stop recommendation remain unwired. | WS7 `.2`; `bd-uacs.2`; WS3 `.6` |
+| V23 Respawn-aware cleanup | PARTIAL: one execution-bound verifier/matcher passed a real respawner, plain orphan and owner/command/parent/birth neighbors; the genuine spawner is reported. Full tracking, supervisor-stop execution and broader remedies remain open. | WS7 `.2`; `bd-uacs.2/.17`; WS3 `.6` |
 | V24 Resource-goal plans | PARTIAL: memory/CPU contributions exist; port/fd contributions are zero and goal/final-action agreement needs proof. | WS7 `.8`; WS1 `.11/.12` |
 | V25 Incremental planning and current CPU rates | PARTIAL: `--since`/`--since-time` explicitly ignored; reopening a session rescans; tick-delta utility has no scoring caller. | WS4 `.6` and WS2 `.7` for shared sampling; proposed WS10; caching has no explicit original positive-capability task |
 | V26 Cross-platform release, CI and truthful docs | UNPROVEN in this audit: platform/release gates and README command verification remain. Source or structure tests are insufficient. | WS5 `bd-ufqb.*`; WS9 `bd-75la.*`; acceptance `bd-1bi0`; dependencies `bd-souq` |
@@ -647,7 +1552,7 @@ retained below, but no new pressure-remediation feature is approved as complete 
 
 ### Granular TODO: original workstreams and current additions
 
-Every checkbox is intentionally open. Source already present means verify the remaining acceptance conditions;
+Unchecked items retain their original acceptance conditions. Source already present means verify those conditions;
 it does not mean recreate the implementation or close a task from this checklist. Each claimed completion must cite
 the reachable caller, exact revision/tree, appropriate tests, negative cases and the task's named real probe.
 
@@ -672,7 +1577,7 @@ the reachable caller, exact revision/tree, appropriate tests, negative cases and
 - [ ] `bd-toa2.5`: prove PID 1 remains protected while user PID-1 children are evaluated and real services remain
   protected; validate policy migration and zombie-parent eligibility.
 - [ ] `bd-toa2` epic: close only when the preceding original protection tasks and their acceptance probes are met.
-- [ ] Other-session `bd-uacs.1/.2`: reconcile saved planning, executable targets and verification; chain production
+- [x] Other-session `bd-uacs.1/.2`: reconcile saved planning, executable targets and verification; chain production
   plan → apply → verify on disposable processes, without hand-built executable plans. Resolve command/identity
   field drift and verify only outcomes actually attempted; retain protected-parent routing.
 
@@ -708,22 +1613,22 @@ the reachable caller, exact revision/tree, appropriate tests, negative cases and
 
 **Privacy and reporting: positive user-facing integration**
 
-- [ ] `bd-p2ks`: apply one existing redaction engine/profile policy before archive bytes, checksums or output;
+- [x] `bd-p2ks`: apply one existing redaction engine/profile policy before archive bytes, checksums or output;
   preserve numeric/structural evidence, consistent pseudonyms and explicit forensic behavior. Minimal omits detailed
   process artifacts. Malformed/unknown/opaque sharing content must not bypass sanitization.
-- [ ] `bd-p2ks` tests: plant hostname/home-path/credential/command canaries in a real saved session; invoke actual
+- [x] `bd-p2ks` tests: plant hostname/home-path/credential/command canaries in a real saved session; invoke actual
   bundle create and verify/extract the ZIP, including encrypted and in-memory paths. The current BATS safe/minimal
   tests synthesize already-clean ZIPs and therefore do not establish production export privacy.
-- [ ] `bd-h2y0` with overlapping `bd-uacs.10`: implement one session/bundle adapter for saved candidates and
+- [x] `bd-h2y0` recorded-report scope: implement one session/bundle adapter for saved candidates and
   outcomes. Prefer final rich-plan recommendations; load checksum envelopes deliberately; join outcomes by action ID.
-- [ ] Report rows: retain all four classes, known age/CPU/RSS and actual action verbs; represent unrecorded I/O,
+- [x] Report rows: retain all four classes, known age/CPU/RSS and actual action verbs; represent unrecorded I/O,
   timestamps and recovery as unknown. Do not map useful-bad into “uncertain” or expected RSS into measured recovery.
 - [ ] Report ledger: persist exact scorer ledger/likelihood/prior data in the existing inference artifact; display
   it only when recorded. Label A-versus-U Bayes factors correctly and exclude the prior term from evidence Log BF.
   Rounded integer contributions cannot prove an exact historical ledger.
-- [ ] Report safety/usability: redact visible and embedded JSON fields; escape HTML/script context; render a static
+- [x] Report safety/usability: redact visible and embedded JSON fields; escape HTML/script context; render a static
   candidate table without CDN JavaScript. Remove canned success/prose and unrelated default mathematics.
-- [ ] Report tests: invoke actual session and bundle report paths with a known candidate/action, planted secrets,
+- [x] Report tests in the accepted Linux saved-session/plain-ZIP scope: invoke actual session and bundle report paths with a known candidate/action, planted secrets,
   markup, missing old-session ledger and corrupted data. Assert displayed final action/score and truthful omissions.
 - [ ] Bundle contents/flags: coordinate `bd-uacs.10` actual `scan/inventory.json` and `inference/results.json`
   filenames, shared CLI report flags and README layout; verify round-trip checksums without weakening reader tests.
