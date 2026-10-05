@@ -1,6 +1,28 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Execution update — 2026-10-05 04:59 UTC
+## Execution update — 2026-10-05 05:27 UTC
+
+Independent review declined `bd-uacs.3` closure: the recorded full Policy previously enforced only its age
+floor, and the TUI plan builder could exceed the run cap. The original acceptance remains unchanged. Root
+now applies the original saved and current predicates separately, sharing one durable kill counter; both
+live precheck providers and robot constraint checkers retain their own settings. Evidence collection follows
+either policy. Only numeric budget caps intersect. TUI selection refuses an over-cap executable plan with
+an actionable error. Malformed present snapshots, including their legacy age field, return a structured
+`invalid_policy_snapshot` policy refusal. These are **unvalidated source changes** at this timestamp:
+the strict current workspace all-targets check started at 05:25 and has not returned a compiler result.
+
+The existing primary Rust/BATS fixtures now use typed four-class signature priors and an owned subreaper
+with genuine double-fork/setsid adoption, exact UID/start/parent identity, null descriptors and no inherited
+agent environment. Default loss, FDR configuration, posterior and I/O settings remain intact. The corrected
+BATS primary passed 1/1 against the preceding native binary `4e6ada…`; that result does not certify the new
+production changes or the entire BATS suite. The new Rust phase saves two genuine plans under hourly cap 1,
+delivers one kill, raises the current caps, then requires the second saved plan to refuse without signaling
+or adding another durable charge. Its compiled runtime and the current-source gates remain pending.
+
+The independently closed `bd-gn74` and `bd-r1mu` remain the only feature closures from this batch. Earlier
+positive evidence below is retained with its exact source scope; it does not certify these later edits.
+
+### Previous execution update — 2026-10-05 04:59 UTC
 
 The following is the latest evidence. Older dated entries below retain the failures and their corrections;
 their then-pending statements are historical, not replacements for the current results.
@@ -287,6 +309,12 @@ Actual strict remote validation so far:
 - [ ] Verify snapshot/plan kernel-pressure readings and their persisted schema; review remaining unknown-value consumers.
 - [x] Verify CLI usage error 10 and explicit help/version 0, including existing label/degraded-environment expectations.
 - [ ] Complete bd-uacs.3 apply/TUI policy-enforcer and persistent kill-count wiring with real cross-run rate-limit proof.
+- [ ] Validate independent saved/current policy enforcement after current protections, posterior floors and budget
+  limits are loosened; retain stricter-current and exact permitted-boundary positives.
+- [ ] Execute the producer-driven hourly saved-policy drift phase: first delivery charged once, second saved
+  target refused with `rate_limit`, exact identity still alive and no additional persistent charge.
+- [ ] Execute TUI planned-cap boundary/refusal and repeat all real headless TUI delivery/accounting regressions.
+- [ ] Execute malformed full-snapshot and legacy-age JSON refusals before any signal or outcome publication.
 - [x] Execute headless TUI real-kill/accounting regression and preserve earlier outcomes on later evidence failure.
 - [x] Execute corrupt/unreadable budget and concurrent-writer tests; report permission evidence separately on root.
 - [x] Execute actual Safe/encrypted bundle import and extracted-JSON refusal without changing existing signatures.
@@ -309,6 +337,8 @@ Actual strict remote validation so far:
 - [ ] Replace the primary Rust/BATS forced-loss fixture with the original test-signature/adopted-orphan fixture;
   execute full native and Rust/BATS apply/verify while preserving default loss/FDR and every safety oracle.
 - [ ] Run appropriate workspace regressions; distinguish pre-existing failures from new ones using evidence.
+- [ ] Rebuild and stage the current SHA-bound native binary; repeat the corrected 62-test BATS suite, scoped
+  dry-run demo and exact generated/published Plan schema check after the saved-policy production fix.
 - [ ] Re-execute workflow static checks and review scanner findings before committing.
 - [ ] Complete fresh original-acceptance review and the real-work/honesty inventories; close only proven tasks.
 - [ ] Flush Beads, commit reviewed changes and push verified main plus the required legacy branch synchronization.
@@ -319,6 +349,13 @@ acceptance evidence has not been obtained. Further gaps discovered during execut
 and their existing Beads rather than being hidden in a completion summary.
 
 ### Fresh real-work audit and honesty inventory — 2026-10-05 04:52 UTC
+
+Subsequent correction at 05:27: nonauthor review found the saved-policy/TUI-plan omissions above; preliminary
+eligibility for `bd-uacs.3` was retracted before closure. It remains in progress, with the original requirement
+and a genuine producer-driven drift regression. GoldenKnoll independently closed only `bd-gn74` and `bd-r1mu`
+on their complete positive/negative evidence; root made no feature closure. Later source changes are not
+covered by earlier compiler/native passes. These corrections change answers 5/11/13 in the subsequent window;
+the dated twenty-answer audit below remains the bounded 04:52 record, not an assertion about later work.
 
 Consumer: the operator requested this assessment and granular TODO. Gate: the completion claims below;
 retirement: this session's handoff, retaining the historical record rather than creating another certificate.
