@@ -1346,6 +1346,122 @@ mod tests {
     }
 
     #[test]
+    fn recorded_policy_requests_removed_group_and_builtin_evidence() {
+        let mut current = test_policy();
+        current.guardrails.builtin_protection = false;
+        current.robot_mode.enabled = true;
+        let mut recorded = current.clone();
+        recorded.guardrails.builtin_protection = true;
+        recorded.guardrails.protected_groups = vec!["testgroup".to_string()];
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
+        assert!(enforcer.requires_group_evidence());
+        assert!(enforcer.requires_builtin_placement());
+        let candidate = test_candidate();
+        assert!(PolicyEnforcer::new(&current, None)
+            .unwrap()
+            .check_action(&candidate, Action::Kill, true)
+            .allowed);
+        let check = enforcer.check_action(&candidate, Action::Kill, true);
+        assert_eq!(check.violation.unwrap().kind, ViolationKind::ProtectedGroup);
+        assert!(enforcer.check_action(&candidate, Action::Keep, true).allowed);
+    }
+
+    #[test]
+    fn recorded_policy_does_not_merge_builtin_protection_exceptions() {
+        let mut current = test_policy();
+        current.guardrails.builtin_protection = true;
+        current.robot_mode.enabled = true;
+        let mut recorded = current.clone();
+        recorded.guardrails.builtin_protection = false;
+        let mut candidate = test_candidate();
+        candidate.user = Some("root".to_string());
+        candidate.cgroup_role = Some(crate::collect::CgroupRole::LoginSession);
+        assert!(PolicyEnforcer::new(&current, None)
+            .unwrap()
+            .check_action(&candidate, Action::Kill, true)
+            .allowed);
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
+        assert!(!enforcer.check_action(&candidate, Action::Kill, true).allowed);
+    }
+
+    #[test]
+    fn recorded_data_loss_gates_preserve_enabled_positive_boundaries() {
+        let mut current = test_policy();
+        current.robot_mode.enabled = true;
+        current.data_loss_gates.block_if_open_write_fds = true;
+        current.data_loss_gates.max_open_write_fds = Some(5);
+        let mut recorded = current.clone();
+        recorded.data_loss_gates.block_if_open_write_fds = false;
+        recorded.data_loss_gates.max_open_write_fds = None;
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.open_write_fds = Some(5);
+        assert!(enforcer.check_action(&candidate, Action::Kill, true).allowed);
+        candidate.open_write_fds = Some(6);
+        assert!(!enforcer.check_action(&candidate, Action::Kill, true).allowed);
+        let reversed =
+            PolicyEnforcer::new_with_recorded_policy(&recorded, Some(&current), None).unwrap();
+        assert!(!reversed.check_action(&candidate, Action::Kill, true).allowed);
+        candidate.open_write_fds = Some(5);
+        assert!(reversed.check_action(&candidate, Action::Kill, true).allowed);
+    }
+
+    #[test]
+    fn recorded_budget_shares_one_intent_and_charges_each_delivery_once() {
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state_path = data_dir.join("recorded-budget.json");
+        let mut current = test_policy();
+        current.robot_mode.enabled = true;
+        current.robot_mode.max_kills = 10;
+        current.guardrails.max_kills_per_run = 10;
+        current.guardrails.max_kills_per_minute = Some(10);
+        current.guardrails.max_kills_per_hour = None;
+        current.guardrails.max_kills_per_day = None;
+        let mut recorded = current.clone();
+        recorded.guardrails.max_kills_per_run = 2;
+        recorded.guardrails.max_kills_per_minute = Some(2);
+        recorded.guardrails.max_kills_per_hour = Some(2);
+        recorded.guardrails.max_kills_per_day = Some(2);
+        let enforcer = PolicyEnforcer::new_with_recorded_policy(
+            &current,
+            Some(&recorded),
+            Some(&state_path),
+        )
+        .unwrap();
+        let candidate = test_candidate();
+        for delivered in 0..2 {
+            assert!(enforcer.check_action(&candidate, Action::Kill, true).allowed);
+            assert_eq!(enforcer.current_run_kill_count(), delivered);
+            enforcer.begin_kill_accounting().unwrap();
+            enforcer.finish_kill_accounting(true).unwrap();
+        }
+        assert_eq!(enforcer.current_run_kill_count(), 2);
+        assert_eq!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .violation
+                .unwrap()
+                .kind,
+            ViolationKind::RateLimitExceeded
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(saved["kill_timestamps"].as_array().unwrap().len(), 2);
+        assert_eq!(saved["pending_kill_intent"], false);
+        let fresh = PolicyEnforcer::new_with_recorded_policy(
+            &current,
+            Some(&recorded),
+            Some(&state_path),
+        )
+        .unwrap();
+        assert_eq!(fresh.current_run_kill_count(), 0);
+        assert!(!fresh.check_action(&candidate, Action::Kill, true).allowed);
+    }
+
+    #[test]
     fn robot_confidence_floor_refuses_missing_or_invalid_probability() {
         let mut policy = test_policy();
         policy.robot_mode.enabled = true;
