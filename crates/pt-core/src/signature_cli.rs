@@ -979,6 +979,27 @@ fn run_signature_import(
         }
     };
 
+    // Shared bundles preserve inspectable structure, but redacted matching data
+    // must never become executable detection patterns (hash markers are valid
+    // regex character classes).
+    if let Err(error) = import_schema.validate_for_activation() {
+        let output = serde_json::json!({
+            "schema_version": pt_common::SCHEMA_VERSION,
+            "session_id": session_id.0,
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "command": "signature import",
+            "status": "error",
+            "error": format!("Signatures cannot be activated: {error}"),
+        });
+        match format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                println!("{}", format_signature_output(format, output));
+            }
+            _ => eprintln!("Signatures cannot be activated: {error}"),
+        }
+        return ExitCode::ArgsError;
+    }
+
     if import_schema.signatures.is_empty() {
         let output = serde_json::json!({
             "schema_version": pt_common::SCHEMA_VERSION,
@@ -1103,6 +1124,13 @@ fn load_signatures_from_bundle(
     // and returns a uniform BundleReader<Cursor<Vec<u8>>> type.
     let mut reader = pt_bundle::BundleReader::open_with_passphrase(bundle_path, passphrase)
         .map_err(|e| format!("Failed to open bundle: {}", e))?;
+
+    if reader.export_profile() != pt_redact::ExportProfile::Forensic {
+        return Err(
+            "Redacted sharing bundles cannot activate signatures; import the original signature file"
+                .to_string(),
+        );
+    }
 
     if !reader.has_file(BUNDLE_SIGNATURES_PATH) {
         return Err("Bundle does not contain signatures".to_string());

@@ -706,6 +706,42 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
             assert_ne!(name, "PRIVATE_CUSTOMER_TOKEN");
             assert_eq!(value, "[REDACTED]");
         }
+        // Exercise activation through the CLI, not only typed decoding. The
+        // existing file must survive both the archive and extracted-JSON paths.
+        let import_config = data_dir.join(if encrypted {
+            "encrypted-import-config"
+        } else {
+            "plain-import-config"
+        });
+        fs::create_dir_all(&import_config).unwrap();
+        let existing_bytes = signatures.to_json().unwrap().into_bytes();
+        let import_signature_path = pt_core::signature_cli::user_signatures_path(&import_config);
+        fs::write(&import_signature_path, &existing_bytes).unwrap();
+        let mut import = pt_core();
+        import
+            .arg("--config")
+            .arg(&import_config)
+            .args(["--format", "json", "signature", "import"])
+            .arg(&destination);
+        if encrypted {
+            import.args(["--passphrase", "test-passphrase"]);
+        }
+        import
+            .assert()
+            .code(10)
+            .stdout(predicate::str::contains("cannot activate signatures"));
+        assert_eq!(fs::read(&import_signature_path).unwrap(), existing_bytes);
+        let extracted = import_config.join("shared-signatures.json");
+        fs::write(&extracted, saved_signatures.to_json().unwrap()).unwrap();
+        pt_core()
+            .arg("--config")
+            .arg(&import_config)
+            .args(["--format", "json", "signature", "import"])
+            .arg(&extracted)
+            .assert()
+            .code(10)
+            .stdout(predicate::str::contains("cannot be activated"));
+        assert_eq!(fs::read(&import_signature_path).unwrap(), existing_bytes);
         let saved_manifest: Value = reader.read_json("session/manifest.json").unwrap();
         assert_eq!(saved_manifest["timing"]["created_at"], started_at);
         assert_eq!(saved_manifest["state"], "created");
@@ -735,6 +771,62 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
             );
         }
     }
+    // An intact original remains importable and retains its exact matching
+    // behavior. In particular, it must not match unrelated commands containing
+    // letters from a hash marker's regex character class.
+    let positive_config = data_dir.join("original-import-config");
+    let mut original = SignatureSchema::new();
+    original.add(
+        SupervisorSignature::new("private-original-worker", SupervisorCategory::Other)
+            .with_process_patterns(vec!["^private-original-worker$"])
+            .with_priors(SignaturePriors::likely_abandoned()),
+    );
+    let original_path = data_dir.join("original-signatures.json");
+    fs::write(&original_path, original.to_json().unwrap()).unwrap();
+    pt_core()
+        .arg("--config")
+        .arg(&positive_config)
+        .args(["--format", "json", "signature", "import"])
+        .arg(&original_path)
+        .assert()
+        .success();
+    let matched = pt_core()
+        .arg("--config")
+        .arg(&positive_config)
+        .args([
+            "--format",
+            "json",
+            "signature",
+            "test",
+            "private-original-worker",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let matched: Value = serde_json::from_slice(&matched).unwrap();
+    assert!(matched["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["name"] == "private-original-worker"));
+    let unrelated = pt_core()
+        .arg("--config")
+        .arg(&positive_config)
+        .args(["--format", "json", "signature", "test", "awk"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let unrelated: Value = serde_json::from_slice(&unrelated).unwrap();
+    assert!(!unrelated["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["name"] == "private-original-worker"));
+
     for bundle_input in [false, true] {
         let mut command = pt_core();
         command

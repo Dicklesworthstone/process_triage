@@ -549,6 +549,45 @@ impl SupervisorSignature {
         Ok(())
     }
 
+    /// Validate executable matcher data while preserving structural inspection
+    /// of signatures whose matching fields were redacted during export.
+    pub fn validate_for_activation(&self) -> Result<(), SignatureError> {
+        self.validate()?;
+        self.validate_activation_matchers()
+    }
+
+    fn validate_activation_matchers(&self) -> Result<(), SignatureError> {
+        let check_marker = |field: &str, value: &str| {
+            if value.contains("[HASH:") || value.contains("[REDACTED]") {
+                return Err(SignatureError::Invalid(format!(
+                    "redacted matcher in {field} cannot be activated; use an intact local signature"
+                )));
+            }
+            Ok(())
+        };
+
+        for (field, values) in [
+            ("process_names", self.patterns.process_names.as_slice()),
+            ("arg_patterns", self.patterns.arg_patterns.as_slice()),
+            (
+                "working_dir_patterns",
+                self.patterns.working_dir_patterns.as_slice(),
+            ),
+            ("parent_patterns", self.patterns.parent_patterns.as_slice()),
+            ("socket_paths", self.patterns.socket_paths.as_slice()),
+            ("pid_files", self.patterns.pid_files.as_slice()),
+        ] {
+            for value in values {
+                check_marker(field, value)?;
+            }
+        }
+        for (name, value) in &self.patterns.environment_vars {
+            check_marker("environment_vars.key", name)?;
+            check_marker("environment_vars.value", value)?;
+        }
+        Ok(())
+    }
+
     /// Convert to a SupervisorPattern (process name only).
     pub fn to_supervisor_pattern(&self) -> SupervisorPattern {
         SupervisorPattern::new(
@@ -648,6 +687,16 @@ impl SignatureSchema {
             sig.validate()?;
         }
 
+        Ok(())
+    }
+
+    /// Validate all signatures before activating their matcher data.
+    pub fn validate_for_activation(&self) -> Result<(), SignatureError> {
+        self.validate()?;
+        for signature in &self.signatures {
+            // Structural validation above already checked every regex once.
+            signature.validate_activation_matchers()?;
+        }
         Ok(())
     }
 
@@ -944,7 +993,7 @@ impl SignatureDatabase {
 
     /// Add a signature and compile its patterns.
     pub fn add(&mut self, signature: SupervisorSignature) -> Result<(), SignatureError> {
-        signature.validate()?;
+        signature.validate_for_activation()?;
 
         // Pre-compile all regexes to ensure success before updating state
         let mut proc_res = Vec::with_capacity(signature.patterns.process_names.len());
@@ -2386,6 +2435,89 @@ mod tests {
             sig.validate(),
             Err(SignatureError::InvalidRegex { .. })
         ));
+    }
+
+    #[test]
+    fn activation_rejects_redacted_matchers_and_preserves_intact_matching() {
+        let intact = SupervisorSignature::new("activation-worker", SupervisorCategory::Other)
+            .with_process_patterns(vec![r"^activation-worker$"])
+            .with_arg_patterns(vec![r"(^|\s)--owned-task(\s|$)"])
+            .with_min_matches(2);
+        intact.validate_for_activation().unwrap();
+        let mut schema = SignatureSchema::new();
+        schema.add(intact.clone());
+        schema.validate_for_activation().unwrap();
+        let mut db = SignatureDatabase::new();
+        db.add(intact.clone()).unwrap();
+
+        for marker in ["prefix[HASH:abcd]suffix", "prefix[REDACTED]suffix"] {
+            for field in [
+                "process_names",
+                "arg_patterns",
+                "working_dir_patterns",
+                "parent_patterns",
+                "environment_vars.key",
+                "environment_vars.value",
+                "socket_paths",
+                "pid_files",
+            ] {
+                let mut redacted = intact.clone();
+                match field {
+                    "process_names" => redacted.patterns.process_names.push(marker.to_string()),
+                    "arg_patterns" => redacted.patterns.arg_patterns.push(marker.to_string()),
+                    "working_dir_patterns" => redacted
+                        .patterns
+                        .working_dir_patterns
+                        .push(marker.to_string()),
+                    "parent_patterns" => redacted.patterns.parent_patterns.push(marker.to_string()),
+                    "environment_vars.key" => {
+                        redacted
+                            .patterns
+                            .environment_vars
+                            .insert(marker.to_string(), "^true$".to_string());
+                    }
+                    "environment_vars.value" => {
+                        redacted
+                            .patterns
+                            .environment_vars
+                            .insert("PT_OWNED_TASK".to_string(), marker.to_string());
+                    }
+                    "socket_paths" => redacted.patterns.socket_paths.push(marker.to_string()),
+                    "pid_files" => redacted.patterns.pid_files.push(marker.to_string()),
+                    _ => unreachable!("all matcher fields are covered"),
+                }
+
+                // Both markers are valid regex character classes; structural
+                // inspection must stay possible without allowing activation.
+                redacted.validate().unwrap();
+                assert!(matches!(
+                    redacted.validate_for_activation(),
+                    Err(SignatureError::Invalid(message)) if message.contains(field)
+                ));
+                let mut schema = SignatureSchema::new();
+                schema.add(redacted.clone());
+                schema.validate().unwrap();
+                assert!(matches!(
+                    schema.validate_for_activation(),
+                    Err(SignatureError::Invalid(message)) if message.contains(field)
+                ));
+                assert!(matches!(
+                    db.add(redacted),
+                    Err(SignatureError::Invalid(message)) if message.contains(field)
+                ));
+                assert_eq!(db.signatures(), std::slice::from_ref(&intact));
+            }
+        }
+
+        let matching = ProcessMatchContext::with_comm("activation-worker")
+            .cmdline("activation-worker --owned-task");
+        let actual = db.best_match(&matching).unwrap();
+        assert_eq!(actual.signature.name, "activation-worker");
+        assert!(actual.details.process_name_matched);
+        assert!(actual.details.args_matched);
+        let unrelated = ProcessMatchContext::with_comm("unrelated-worker")
+            .cmdline("unrelated-worker --owned-task");
+        assert!(db.best_match(&unrelated).is_none());
     }
 
     #[test]
