@@ -11796,6 +11796,22 @@ mod process_tree_safety_tests {
             child_pidfd: OwnedFd,
         }
 
+        struct WrapperSetup(Option<Child>);
+
+        impl Drop for WrapperSetup {
+            fn drop(&mut self) {
+                if let Some(leader) = &mut self.0 {
+                    // SAFETY: successful setsid made this unreaped owned Child
+                    // the leader of a new session and process group. Its PID
+                    // cannot be reused before wait, and foreign sessions cannot
+                    // join this group. This only unwinds setup before both
+                    // pidfds exist; normal cleanup pins child and parent below.
+                    unsafe { libc::kill(-(leader.id() as i32), libc::SIGKILL) };
+                    let _ = leader.wait();
+                }
+            }
+        }
+
         impl DetachedWrapper {
             pub(super) fn spawn() -> Self {
                 let mut command = Command::new("sh");
@@ -11819,7 +11835,10 @@ mod process_tree_safety_tests {
                         Ok(())
                     });
                 }
-                let mut leader = command.spawn().expect("spawn detached wrapper reaper");
+                let mut setup = WrapperSetup(Some(
+                    command.spawn().expect("spawn detached wrapper reaper"),
+                ));
+                let leader = setup.0.as_mut().unwrap();
                 let mut line = String::new();
                 std::io::BufReader::new(leader.stdout.take().expect("wrapper stdout"))
                     .read_line(&mut line)
@@ -11836,27 +11855,15 @@ mod process_tree_safety_tests {
                     std::io::Error::last_os_error()
                 );
                 let child_pidfd = unsafe { OwnedFd::from_raw_fd(child_descriptor as i32) };
-                let parent_descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, parent_pid, 0) };
-                if parent_descriptor < 0 {
-                    let error = std::io::Error::last_os_error();
-                    // SAFETY: unwind setup by stopping only the pinned child;
-                    // its shell parent reaps it before the launcher is reaped.
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_pidfd_send_signal,
-                            child_pidfd.as_raw_fd(),
-                            libc::SIGKILL,
-                            std::ptr::null::<libc::siginfo_t>(),
-                            0,
-                        );
-                    }
-                    leader
-                        .wait()
-                        .expect("reap wrapper after failed parent binding");
-                    panic!("bind owned wrapper parent: {error}");
-                }
+                let parent_descriptor =
+                    unsafe { libc::syscall(libc::SYS_pidfd_open, parent_pid, 0) };
+                assert!(
+                    parent_descriptor >= 0,
+                    "bind owned wrapper parent: {}",
+                    std::io::Error::last_os_error()
+                );
                 let parent = DetachedTarget {
-                    leader,
+                    leader: setup.0.take().unwrap(),
                     pid: parent_pid,
                     // SAFETY: the successful descriptor is transferred once.
                     pidfd: unsafe { OwnedFd::from_raw_fd(parent_descriptor as i32) },
@@ -12004,13 +12011,9 @@ mod process_tree_safety_tests {
                     cmd: process.cmd.clone(),
                 },
             )]);
-            let plan = super::super::build_plan_from_selection(
-                &handle.id,
-                policy,
-                &[pid],
-                &candidates,
-            )
-            .expect("produce canonical selected action");
+            let plan =
+                super::super::build_plan_from_selection(&handle.id, policy, &[pid], &candidates)
+                    .expect("produce canonical selected action");
             assert_eq!(plan.actions.len(), 1);
             assert_eq!(plan.actions[0].action, Action::Kill);
             assert_eq!(
@@ -12267,6 +12270,7 @@ mod process_tree_safety_tests {
         assert_eq!(parent.ppid.0, target.parent.leader.id());
         assert_eq!(child.ppid.0, parent.pid.0);
         assert_eq!(child.sid, parent.sid);
+        assert_eq!(parent.sid, Some(target.parent.leader.id()));
         assert_ne!(parent.sid, Some(parent.pid.0));
         // SAFETY: only observe the test caller's own UID and session ID.
         let uid = unsafe { libc::geteuid() };
@@ -12280,11 +12284,19 @@ mod process_tree_safety_tests {
         assert_eq!(selection.actions[0].target, parent_identity);
         assert_eq!(selection.actions.len(), 1);
         assert_ne!(selection.actions[0].target.pid.0, target.child_pid);
+        record(
+            &log_dir,
+            serde_json::json!({"step": "owned_wrapper_selection", "selected_plan": selection, "before": before.processes}),
+        );
 
         let mut state = super::TuiExecutionState::default();
         let (result, evidence) =
             super::execute_tui_plan_selection(&handle, &policy, &selection, &mut state)
                 .expect("retain actual live-child refusal through the callback helper");
+        record(
+            &log_dir,
+            serde_json::json!({"step": "callback_live_child_result", "result": result, "evidence": evidence}),
+        );
         assert_eq!(result.outcomes.len(), 1);
         assert_eq!(result.summary.actions_succeeded, 0);
         assert_eq!(result.summary.actions_failed, 1);
