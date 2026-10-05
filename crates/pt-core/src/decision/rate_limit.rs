@@ -63,6 +63,9 @@ pub enum RateLimitError {
     #[error("failed to save state: {0}")]
     SaveState(String),
 
+    #[error("kill accounting refused: {0}")]
+    KillAccounting(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -193,6 +196,9 @@ struct PersistentState {
     kill_timestamps: VecDeque<u64>,
     /// When this state was last updated.
     last_updated: u64,
+    /// An action was authorized but its delivery result has not been durably saved.
+    #[serde(default)]
+    pending_kill_intent: bool,
 }
 
 impl PersistentState {
@@ -225,6 +231,8 @@ struct RateLimiterState {
     persistent: PersistentState,
     /// Kills in the current run (not persisted, reset on startup).
     kills_this_run: u32,
+    /// Only the instance which prepared an intent may finish it.
+    owns_kill_intent: bool,
 }
 
 /// Sliding window rate limiter for kill operations.
@@ -256,6 +264,7 @@ impl SlidingWindowRateLimiter {
             // kills without preventing read-only commands from constructing us.
             persistent: PersistentState::default(),
             kills_this_run: 0,
+            owns_kill_intent: false,
         };
 
         Ok(Self {
@@ -318,6 +327,14 @@ impl SlidingWindowRateLimiter {
         writer.flush()?;
         writer.get_ref().sync_all()?;
         fs::rename(&temp_path, path)?;
+        #[cfg(unix)]
+        {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            File::open(parent)?.sync_all()?;
+        }
         // On failure retain the temporary data for diagnosis; never discard it.
         Ok(())
     }
@@ -347,11 +364,78 @@ impl SlidingWindowRateLimiter {
         state.persistent.kill_timestamps.push_back(now);
         state.persistent.last_updated = now;
         state.persistent.prune_old(now);
+        state.kills_this_run = state.kills_this_run.saturating_add(1);
         if let Some(path) = &self.state_path {
             Self::save_state(path, &state.persistent)?;
         }
-        state.kills_this_run += 1;
         Ok(())
+    }
+
+    /// Persist a pending intent before signaling. The caller must check policy
+    /// first; an unresolved intent refuses another action even under force.
+    /// Without a configured state file, this guards only this shared instance.
+    pub fn begin_kill_accounting(&self) -> Result<(), RateLimitError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| RateLimitError::SaveState(format!("lock poisoned: {error}")))?;
+        let _lock = self.lock_for_update(&mut state)?;
+        if state.persistent.pending_kill_intent || state.owns_kill_intent {
+            return Err(RateLimitError::KillAccounting(
+                "an unresolved pending kill intent must be reconciled before another kill"
+                    .to_string(),
+            ));
+        }
+        state.persistent.pending_kill_intent = true;
+        state.persistent.last_updated = current_unix_timestamp();
+        if let Some(path) = &self.state_path {
+            Self::save_state(path, &state.persistent)?;
+        }
+        state.owns_kill_intent = true;
+        Ok(())
+    }
+
+    /// Resolve this instance's prepared intent after actual signal delivery.
+    /// A failure before atomic replacement retains the on-disk intent. A
+    /// failure after replacement may leave the counted result on disk; neither
+    /// failure removes the actual per-run charge or permits a repeated finish.
+    /// A non-delivery clears the intent without spending kill budget.
+    pub fn finish_kill_accounting(
+        &self,
+        delivered: bool,
+    ) -> Result<RateLimitCounts, RateLimitError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|error| RateLimitError::SaveState(format!("lock poisoned: {error}")))?;
+        if !state.owns_kill_intent {
+            return Err(RateLimitError::KillAccounting(
+                "this limiter did not prepare the pending kill intent".to_string(),
+            ));
+        }
+        // Charge an observed delivery even if reloading or saving the durable
+        // state fails. Consume ownership so a repeated finish cannot double-charge.
+        state.owns_kill_intent = false;
+        if delivered {
+            state.kills_this_run = state.kills_this_run.saturating_add(1);
+        }
+        let _lock = self.lock_for_update(&mut state)?;
+        if !state.persistent.pending_kill_intent {
+            return Err(RateLimitError::KillAccounting(
+                "the prepared kill intent is missing from the saved budget".to_string(),
+            ));
+        }
+        let now = current_unix_timestamp();
+        if delivered {
+            state.persistent.kill_timestamps.push_back(now);
+        }
+        state.persistent.pending_kill_intent = false;
+        state.persistent.last_updated = now;
+        state.persistent.prune_old(now);
+        if let Some(path) = &self.state_path {
+            Self::save_state(path, &state.persistent)?;
+        }
+        Ok(self.get_counts_internal(&state, now))
     }
 
     /// Check if a kill is allowed without recording it.
@@ -383,6 +467,12 @@ impl SlidingWindowRateLimiter {
         force: bool,
         override_per_run: Option<u32>,
     ) -> Result<RateLimitResult, RateLimitError> {
+        if state.persistent.pending_kill_intent {
+            return Err(RateLimitError::KillAccounting(
+                "an unresolved pending kill intent must be reconciled before another kill"
+                    .to_string(),
+            ));
+        }
         let now = current_unix_timestamp();
         let counts = self.get_counts_internal(state, now);
 
@@ -461,6 +551,12 @@ impl SlidingWindowRateLimiter {
             .map_err(|e| RateLimitError::SaveState(format!("lock poisoned: {}", e)))?;
 
         let _lock = self.lock_for_update(&mut state)?;
+        if state.persistent.pending_kill_intent {
+            return Err(RateLimitError::KillAccounting(
+                "an unresolved pending kill intent must be reconciled before another kill"
+                    .to_string(),
+            ));
+        }
         self.append_kill(&mut state)?;
         Ok(self.get_counts_internal(&state, current_unix_timestamp()))
     }
@@ -595,6 +691,216 @@ mod tests {
             max_per_hour: Some(10),
             max_per_day: Some(50),
         }
+    }
+
+    fn retained_accounting_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = PathBuf::from("target/test-logs/e2e/rate_limit").join(format!(
+            "{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AccountingTarget {
+        child: std::process::Child,
+        pidfd: std::os::fd::OwnedFd,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AccountingTarget {
+        fn spawn() -> Self {
+            use std::os::fd::FromRawFd;
+            let mut child = std::process::Command::new("sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            // SAFETY: the unreaped child belongs to this test, so its PID cannot
+            // be recycled while we open its identity-bound descriptor.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("cannot bind owned accounting target: {error}");
+            }
+            Self {
+                child,
+                // SAFETY: pidfd_open returned a new descriptor owned by us.
+                pidfd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) },
+            }
+        }
+
+        fn deliver_term(&mut self) -> bool {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::ExitStatusExt;
+            // SAFETY: signaling uses only this test's original owned pidfd.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    libc::SIGTERM,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+            let status = self.child.wait().unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGTERM));
+            result == 0
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for AccountingTarget {
+        fn drop(&mut self) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: this cannot signal a reused PID or an unrelated target.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn durable_accounting_records_actual_delivery_for_a_fresh_limiter() {
+        let dir = retained_accounting_dir("delivered");
+        let state_path = dir.join("rate_limit.json");
+        let limiter = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        let mut target = AccountingTarget::spawn();
+
+        assert!(limiter.check(false).unwrap().allowed);
+        limiter.begin_kill_accounting().unwrap();
+        let pending: PersistentState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(pending.pending_kill_intent);
+        assert!(pending.kill_timestamps.is_empty());
+        assert_eq!(limiter.current_run_count().unwrap(), 0);
+        assert!(limiter.check(true).is_err());
+
+        let counts = limiter.finish_kill_accounting(target.deliver_term()).unwrap();
+        assert_eq!((counts.run, counts.minute, counts.hour, counts.day), (1, 1, 1, 1));
+        let saved: PersistentState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(!saved.pending_kill_intent);
+        assert_eq!(saved.kill_timestamps.len(), 1);
+
+        let fresh = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        let counts = fresh.get_counts().unwrap();
+        assert_eq!((counts.run, counts.minute, counts.hour, counts.day), (0, 1, 1, 1));
+        assert!(fresh.check(false).unwrap().allowed);
+        assert!(limiter.finish_kill_accounting(true).is_err());
+        assert_eq!(limiter.current_run_count().unwrap(), 1);
+        assert_eq!(fresh.get_counts().unwrap().day, 1);
+    }
+
+    #[test]
+    fn durable_accounting_non_delivery_releases_intent_without_spending_budget() {
+        let dir = retained_accounting_dir("not-delivered");
+        let state_path = dir.join("rate_limit.json");
+        let owner = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        let other = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        owner.begin_kill_accounting().unwrap();
+        let pending_bytes = fs::read(&state_path).unwrap();
+
+        assert!(other.begin_kill_accounting().is_err());
+        assert!(other.finish_kill_accounting(false).is_err());
+        assert!(other.finish_kill_accounting(true).is_err());
+        assert!(other.check(false).is_err());
+        assert!(other.check(true).is_err());
+        assert!(other.check_and_record(true, None).is_err());
+        assert!(other.record_kill().is_err());
+        assert_eq!(fs::read(&state_path).unwrap(), pending_bytes);
+        assert_eq!(other.current_run_count().unwrap(), 0);
+
+        let counts = owner.finish_kill_accounting(false).unwrap();
+        assert_eq!((counts.run, counts.minute, counts.hour, counts.day), (0, 0, 0, 0));
+        let saved: PersistentState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert!(!saved.pending_kill_intent);
+        assert!(saved.kill_timestamps.is_empty());
+        assert!(owner.check(false).unwrap().allowed);
+        assert!(other.check(false).unwrap().allowed);
+        other.begin_kill_accounting().unwrap();
+        assert!(owner.check(true).is_err());
+        other.finish_kill_accounting(false).unwrap();
+        assert!(owner.check(false).unwrap().allowed);
+        assert_eq!(owner.current_run_count().unwrap(), 0);
+        assert_eq!(other.get_counts().unwrap().day, 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn durable_accounting_failed_final_save_retains_pending_and_actual_run_charge() {
+        let dir = retained_accounting_dir("final-save-failure");
+        let state_path = dir.join("rate_limit.json");
+        let mut limiter = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        let mut target = AccountingTarget::spawn();
+        limiter.begin_kill_accounting().unwrap();
+        let pending_bytes = fs::read(&state_path).unwrap();
+        let alias = dir.join("x".repeat(240));
+        fs::hard_link(&state_path, &alias).unwrap();
+
+        // The real pending file and its .lock remain readable. The unique
+        // .PID.NANOS.tmp basename exceeds Linux NAME_MAX at the temporary-open
+        // boundary, including on root workers. No file is removed or replaced.
+        limiter.state_path = Some(alias.clone());
+        let error = limiter.finish_kill_accounting(target.deliver_term()).unwrap_err();
+        assert!(matches!(&error, RateLimitError::Io(io) if io.raw_os_error() == Some(libc::ENAMETOOLONG)), "{error}");
+        assert_eq!(limiter.current_run_count().unwrap(), 1);
+        assert_eq!(fs::read(&alias).unwrap(), pending_bytes);
+        assert_eq!(fs::read(&state_path).unwrap(), pending_bytes);
+        let saved: PersistentState = serde_json::from_slice(&pending_bytes).unwrap();
+        assert!(saved.pending_kill_intent);
+        assert!(saved.kill_timestamps.is_empty());
+
+        for path in [&state_path, &alias] {
+            let fresh = SlidingWindowRateLimiter::new(test_config(), Some(path)).unwrap();
+            assert!(fresh.check(false).is_err());
+            assert!(fresh.check(true).is_err());
+            assert!(fresh.check_with_override(true, Some(u32::MAX)).is_err());
+            assert!(fresh.check_and_record(false, None).is_err());
+            assert!(fresh.check_and_record(true, None).is_err());
+            assert!(fresh.begin_kill_accounting().is_err());
+            assert!(fresh.finish_kill_accounting(false).is_err());
+            assert!(fresh.record_kill().is_err());
+            assert_eq!(fresh.current_run_count().unwrap(), 0);
+        }
+        assert!(limiter.finish_kill_accounting(true).is_err());
+        assert_eq!(limiter.current_run_count().unwrap(), 1);
+        assert!(limiter.check(true).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn durable_accounting_failed_prepare_never_authorizes_delivery() {
+        let dir = retained_accounting_dir("prepare-failure");
+        let state_path = dir.join("rate_limit.json");
+        SlidingWindowRateLimiter::save_state(&state_path, &PersistentState::default()).unwrap();
+        let saved_bytes = fs::read(&state_path).unwrap();
+        let alias = dir.join("x".repeat(240));
+        fs::hard_link(&state_path, &alias).unwrap();
+        let limiter = SlidingWindowRateLimiter::new(test_config(), Some(&alias)).unwrap();
+        assert!(limiter.check(false).unwrap().allowed);
+
+        let error = limiter.begin_kill_accounting().unwrap_err();
+        assert!(matches!(&error, RateLimitError::Io(io) if io.raw_os_error() == Some(libc::ENAMETOOLONG)), "{error}");
+        assert!(limiter.finish_kill_accounting(true).is_err());
+        assert_eq!(limiter.current_run_count().unwrap(), 0);
+        assert_eq!(fs::read(&state_path).unwrap(), saved_bytes);
+        assert_eq!(fs::read(&alias).unwrap(), saved_bytes);
+        let saved: PersistentState = serde_json::from_slice(&saved_bytes).unwrap();
+        assert!(!saved.pending_kill_intent);
+        assert!(saved.kill_timestamps.is_empty());
     }
 
     #[test]

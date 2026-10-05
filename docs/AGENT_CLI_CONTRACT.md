@@ -557,34 +557,40 @@ When supervised:
 ```json
 {
   "type": "object",
-  "required": ["schema_version", "session_id", "results"],
+  "required": ["session_id", "mode", "summary", "outcomes"],
   "properties": {
-    "schema_version": {"type": "string"},
     "session_id": {"type": "string"},
-    "results": {
+    "mode": {"const": "robot_apply"},
+    "outcomes": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["target", "action", "outcome"],
+        "required": ["action_id", "pid", "status"],
         "properties": {
+          "action_id": {"type": "string"},
+          "pid": {"type": "integer"},
           "target": {"type": "object"},
-          "action": {"type": "string"},
-          "outcome": {
-            "enum": ["success", "skipped", "failed", "blocked"]
-          },
+          "status": {"type": "string"},
           "reason": {"type": "string"},
-          "duration_ms": {"type": "integer"}
+          "time_ms": {"type": "integer"},
+          "command": {"type": "string"},
+          "parent_pid": {"type": "integer"},
+          "parent_identity": {"type": ["object", "null"]},
+          "executed_at": {"type": "string", "format": "date-time"},
+          "execution_clock": {"type": ["object", "null"]}
         }
       }
     },
     "summary": {
       "type": "object",
       "properties": {
-        "total": {"type": "integer"},
-        "successful": {"type": "integer"},
+        "attempted": {"type": "integer"},
+        "succeeded": {"type": "integer"},
         "skipped": {"type": "integer"},
         "failed": {"type": "integer"},
-        "memory_freed_mb": {"type": "number"}
+        "blocked_by_constraints": {"type": "integer"},
+        "blocked_by_prechecks": {"type": "integer"},
+        "resumed_skipped": {"type": "integer"}
       }
     }
   }
@@ -614,30 +620,55 @@ When supervised:
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["target", "action", "outcome"],
+        "required": ["action_id", "target", "action", "outcome"],
         "properties": {
+          "action_id": {"type": "string"},
           "target": {"type": "object"},
           "action": {"type": "string"},
           "outcome": {
-            "enum": ["confirmed_dead", "confirmed_stopped", "still_running", "respawned", "pid_reused", "cascaded", "timeout"]
+            "enum": ["confirmed_dead", "confirmed_stopped", "still_running", "respawned", "pid_reused", "unsupported"]
           },
           "time_to_death_ms": {"type": "integer"},
-          "resources_freed": {"type": "object"},
-          "respawn_detected": {"type": "object"}
+          "expected_resources_freed": {"type": "object"},
+          "respawn_detected": {"type": "object"},
+          "actual": {"type": "string"},
+          "verified": {"type": "boolean"},
+          "note": {"type": "string"}
         }
       }
     },
     "resource_summary": {
       "type": "object",
       "properties": {
-        "memory_freed_mb": {"type": "number"},
+        "expected_freed_mb": {"type": "number"},
         "expected_mb": {"type": "number"},
         "shortfall_reason": {"type": "string"}
+      }
+    },
+    "respawn_check": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "respawned_count": {"type": "integer"},
+        "unknown_count": {"type": "integer"},
+        "warning": {"type": ["string", "null"]}
       }
     }
   }
 }
 ```
+
+Successful saved executions bound to the canonical plan's exact identity are verified. Recorded failed attempts
+remain visible as `unsupported` with `actual: "failed_attempt"`, `verified: false` and follow-up required; they
+make the report `failure` or `partial_success`. A later successful retry resolves only that action's failure.
+Recommendations and dry runs are excluded. Resource fields are expected plan estimates, not measured relief. Exact respawn matches
+require UID, full normalized command, original parent and a later birth; same-tick or same-second ambiguity is
+`unsupported` with `actual: "ambiguous_respawn"`, `verified: false` and a nonzero `unknown_count` when requested.
+
+Apply counts a successfully delivered destructive signal against its kill and memory budgets even if effect
+verification later fails. Mandatory outcome-log or session-state persistence failures return `IoError` while
+preserving actual results in the response. Dry-run/shadow goal reports retain planned expectations and mark
+observed effects as unobserved.
 
 ---
 

@@ -42,6 +42,8 @@ pub struct SignalActionRunner {
     config: SignalConfig,
     /// How the last signal was delivered: "pidfd", "kill" or "kill_group".
     last_path: std::sync::Mutex<Option<&'static str>>,
+    /// A successful SIGTERM/SIGKILL delivery, even if later verification fails.
+    kill_signal_delivered: std::sync::atomic::AtomicBool,
 }
 
 impl SignalActionRunner {
@@ -49,6 +51,7 @@ impl SignalActionRunner {
         Self {
             config,
             last_path: std::sync::Mutex::new(None),
+            kill_signal_delivered: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -63,6 +66,20 @@ impl SignalActionRunner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// Consume actual destructive-signal delivery evidence for budget accounting.
+    pub fn take_kill_signal_delivered(&self) -> bool {
+        self.kill_signal_delivered
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(unix)]
+    fn note_delivered_signal(&self, signal: i32) {
+        if matches!(signal, libc::SIGTERM | libc::SIGKILL) {
+            self.kill_signal_delivered
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub fn with_defaults() -> Self {
@@ -98,6 +115,7 @@ impl SignalActionRunner {
 
         let result = unsafe { libc::kill(target_pid, signal) };
         if result == 0 {
+            self.note_delivered_signal(signal);
             return Ok(());
         }
 
@@ -269,10 +287,15 @@ impl SignalActionRunner {
         if !use_group {
             if let Some(pidfd) = self.pinned_pidfd(action)? {
                 pidfd.send(libc::SIGTERM)?;
+                self.note_delivered_signal(libc::SIGTERM);
                 let grace = Duration::from_millis(self.config.term_grace_ms);
                 return match self.wait_for_state_change(pid, true, None, grace) {
                     Ok(()) => Ok(()),
                     Err(ActionError::Timeout) => match pidfd.send(libc::SIGKILL) {
+                        Ok(()) => {
+                            self.note_delivered_signal(libc::SIGKILL);
+                            Ok(())
+                        }
                         // Exited between the grace timeout and SIGKILL: done.
                         Err(ActionError::ProcessNotFound) => Ok(()),
                         other => other,
@@ -306,14 +329,7 @@ impl SignalActionRunner {
         // Re-validate the starttime to guard against killing a replacement process.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self.process_exists(pid) {
-            if let Some(current_starttime) = self.read_starttime(pid) {
-                let start_id = &action.target.start_id.0;
-                if !ids_match_starttime(start_id, current_starttime) {
-                    return Err(ActionError::IdentityMismatch);
-                }
-            }
-            // If we can't read starttime, the process is likely gone — SIGKILL
-            // will harmlessly fail with ESRCH.
+            self.check_identity_now(action)?;
         }
 
         if self.process_exists(pid) {
@@ -902,6 +918,30 @@ mod tests {
             // Wait for exit
             let status = child.wait().expect("wait failed");
             assert!(!status.success() || status.code().is_none());
+        }
+
+        #[test]
+        fn delivered_kill_is_retained_after_verification_timeout() {
+            let mut child = Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn owned sleep");
+            let pid = child.id();
+            let runner = SignalActionRunner::new(SignalConfig {
+                verify_timeout_ms: 0,
+                ..SignalConfig::default()
+            });
+            assert!(!runner.take_kill_signal_delivered());
+            runner.send_signal(pid, libc::SIGTERM, false).unwrap();
+            // A zero observation window deliberately cannot certify the effect.
+            let observation = runner.wait_for_state_change(pid, true, None, Duration::ZERO);
+            assert!(matches!(observation, Err(ActionError::Timeout)));
+            child.wait().expect("reap signaled child");
+            assert!(runner.take_kill_signal_delivered());
+            assert!(!runner.take_kill_signal_delivered());
+            // No delivery is credited when the syscall itself refuses a target.
+            assert!(runner.send_signal(u32::MAX, libc::SIGTERM, false).is_err());
+            assert!(!runner.take_kill_signal_delivered());
         }
     }
 

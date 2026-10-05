@@ -1200,6 +1200,23 @@ impl PolicyEnforcer {
         self.rate_limiter.record_kill()
     }
 
+    /// Durably prepare kill accounting before any destructive signal is sent.
+    pub fn begin_kill_accounting(&self) -> Result<(), crate::decision::rate_limit::RateLimitError> {
+        self.rate_limiter.begin_kill_accounting()
+    }
+
+    /// Resolve the prepared intent using actual delivery, including actions
+    /// whose later effect verification failed.
+    pub fn finish_kill_accounting(
+        &self,
+        delivered: bool,
+    ) -> Result<
+        crate::decision::rate_limit::RateLimitCounts,
+        crate::decision::rate_limit::RateLimitError,
+    > {
+        self.rate_limiter.finish_kill_accounting(delivered)
+    }
+
     /// Check if the enforcer requires confirmation for actions.
     pub fn requires_confirmation(&self) -> bool {
         self.require_confirmation

@@ -273,27 +273,30 @@ The `plan` command returns candidates with mandatory fields:
 
 ```json
 {
-  "schema_version": "1.0.0",
   "session_id": "pt-20260115-143022-a7xq",
-  "results": [
+  "mode": "robot_apply",
+  "outcomes": [
     {
-      "target": {"pid": 1234, "start_id": "9d2d4e20..."},
-      "action": "kill",
-      "outcome": "success",
-      "duration_ms": 50,
-      "verification": {
-        "process_exited": true,
-        "exit_code": null,
-        "memory_freed_mb": 512
-      }
+      "action_id": "act-1234-kill",
+      "pid": 1234,
+      "target": {"pid": 1234, "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:123456789:1234", "uid": 1000, "quality": "full"},
+      "status": "success",
+      "time_ms": 50,
+      "signal_path": "pidfd",
+      "command": "sleep 1000",
+      "parent_pid": 1200,
+      "executed_at": "2026-01-15T14:30:25Z",
+      "execution_clock": {"boot_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f", "ticks": 123456900}
     }
   ],
   "summary": {
-    "total": 2,
-    "successful": 2,
+    "attempted": 1,
+    "succeeded": 1,
     "skipped": 0,
     "failed": 0,
-    "memory_freed_mb": 1200
+    "blocked_by_constraints": 0,
+    "blocked_by_prechecks": 0,
+    "resumed_skipped": 0
   }
 }
 ```
@@ -311,19 +314,26 @@ The `plan` command returns candidates with mandatory fields:
   },
   "action_outcomes": [
     {
-      "target": {"pid": 1234},
+      "action_id": "act-1234-kill",
+      "target": {"pid": 1234, "start_id": "9d2d4e20-8c2b-4a3a-a8a2-90bcb7a1d86f:123456789:1234", "uid": 1000},
       "action": "kill",
       "outcome": "confirmed_dead",
-      "time_to_death_ms": 50,
-      "resources_freed": {"memory_mb": 1200}
+      "verified": true,
+      "expected_resources_freed": {"memory_mb": 1200}
     }
   ],
   "resource_summary": {
-    "memory_freed_mb": 2400,
-    "expected_mb": 2400
+    "expected_freed_mb": 1200,
+    "expected_mb": 1200
   }
 }
 ```
+
+Verification reads the canonical saved actions and successful execution records. Review, dry-run, blocked and
+unexecuted recommendations are excluded. Expected memory is the plan's estimate; verify does not measure freed
+memory or time to death. With `--check-respawn`, `respawn_check.respawned_count` counts exact UID/command/parent
+matches born after execution, and `unknown_count` identifies ambiguous clock precision. Ambiguous timing returns
+an unverified outcome instead of claiming successful termination. Failed execution states remain failed.
 
 ### Parsing Tips
 
@@ -637,13 +647,13 @@ pt agent apply --session "$SESSION" \
     --recommended --yes \
     --min-posterior 0.95 \
     --max-kills 5 \
-    --max-blast-radius 2GB
+    --max-blast-radius 2048
 
 # Verify and log results
 VERIFY=$(pt agent verify --session "$SESSION" --format json)
-FREED=$(echo "$VERIFY" | jq '.resource_summary.memory_freed_mb')
+EXPECTED_FREED=$(echo "$VERIFY" | jq '.resource_summary.expected_freed_mb')
 
-log "INFO: Cleanup complete - freed ${FREED}MB"
+log "INFO: Cleanup verified - expected relief ${EXPECTED_FREED}MB"
 ```
 
 ### Example 2: CI/CD Pipeline Health Monitor
@@ -763,8 +773,8 @@ def main():
     # Verify
     verify = run_pt("verify", "--session", session_id)
 
-    freed_mb = verify.get("resource_summary", {}).get("memory_freed_mb", 0)
-    print(f"Cleanup complete: freed {freed_mb}MB across {len(high_confidence)} containers")
+    expected_freed_mb = verify.get("resource_summary", {}).get("expected_freed_mb", 0)
+    print(f"Cleanup verified: expected relief {expected_freed_mb}MB across {len(high_confidence)} containers")
 
     # Report success to node-problem-detector
     report_to_npd(verify, "orphaned_containers_cleaned")
@@ -900,9 +910,9 @@ def apply_with_confirmation(session_id: str, pids: list[int]):
     data = json.loads(result.stdout)
     summary = data["summary"]
 
-    return (f"Complete: {summary['successful']} successful, "
+    return (f"Complete: {summary['succeeded']} successful, "
             f"{summary['failed']} failed, "
-            f"{summary['memory_freed_mb']}MB freed")
+            f"{summary['blocked_by_prechecks'] + summary['blocked_by_constraints']} blocked")
 
 # Example usage in an agent loop:
 if __name__ == "__main__":

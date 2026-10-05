@@ -49,6 +49,11 @@ impl CompositeActionRunner {
     pub fn take_signal_path(&self) -> Option<&'static str> {
         self.signal.take_signal_path()
     }
+
+    /// Whether a destructive signal actually reached a target since the last call.
+    pub fn take_kill_signal_delivered(&self) -> bool {
+        self.signal.take_kill_signal_delivered()
+    }
 }
 
 impl Default for CompositeActionRunner {

@@ -218,7 +218,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     drop(_guard);
 
     // Wait for child process to avoid leaving zombies
-    let _ = child.wait();
+    let exit_status = child.wait()?;
 
     let duration = start.elapsed();
     let process_count = processes.len();
@@ -229,6 +229,17 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
             process_count, "Quick scan timed out"
         );
         return Err(QuickScanError::Timeout(timeout));
+    }
+
+    if options.pids.is_empty() && !exit_status.success() {
+        return Err(QuickScanError::CommandFailed(format!(
+            "full process snapshot exited with {exit_status}"
+        )));
+    }
+    if options.pids.is_empty() && processes.is_empty() && warnings.is_empty() {
+        return Err(QuickScanError::CommandFailed(
+            "full process snapshot contains no processes".to_string(),
+        ));
     }
 
     debug!(

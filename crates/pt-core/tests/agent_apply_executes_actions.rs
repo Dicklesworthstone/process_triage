@@ -137,12 +137,25 @@ impl Drop for ForeignTarget {
 }
 
 /// Nice value of a live process (from ps: portable across Linux and macOS).
-fn nice_of(pid: u32) -> Option<i64> {
+fn nice_of(pid: u32) -> Result<i64, String> {
     let out = ProcessCommand::new("ps")
         .args(["-o", "nice=", "-p", &pid.to_string()])
         .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+        .map_err(|error| format!("ps nice for {pid}: {error}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(format!(
+            "ps nice for {pid}: status={}, stdout={stdout:?}, stderr={stderr:?}",
+            out.status
+        ));
+    }
+    stdout.trim().parse().map_err(|error| {
+        format!(
+            "ps nice for {pid}: {error}, status={}, stdout={stdout:?}, stderr={stderr:?}",
+            out.status
+        )
+    })
 }
 
 /// Live identity of `pid` exactly as a plan records it (via the real quick_scan).
@@ -1011,9 +1024,15 @@ fn agent_apply_executes_renice_then_kill_on_live_process() {
     let config_dir = TempDir::new().expect("config dir");
     write_test_policy(config_dir.path());
 
-    let victim = ForeignTarget::spawn("sleep 300");
+    let mut victim = ForeignTarget::spawn("sleep 300");
     let pid = victim.pid;
-    let nice_before = nice_of(pid).expect("read nice");
+    let nice_before = nice_of(pid).unwrap_or_else(|error| {
+        panic!(
+            "read initial nice: {error}; leader={:?}; target_alive={}",
+            victim.leader.try_wait(),
+            victim.alive()
+        )
+    });
 
     // Real identity of the live child, exactly as a plan records it.
     let identity = live_identity(pid);
@@ -1402,4 +1421,903 @@ fn agent_apply_total_blast_radius_budget_refuses_kills_past_the_cap() {
         .find(|v| u64::from(v.pid) == refused[0])
         .expect("refused pid is one of ours");
     assert!(survivor.alive(), "a refused target must survive");
+}
+
+/// Live WS11.2 acceptance. These Linux fixtures exercise the real planner,
+/// persisted execution evidence and CLI verifier, not inference calibration.
+#[cfg(target_os = "linux")]
+mod live_agent_verify {
+    use super::*;
+    use pt_core::action::{IdentityProvider, LiveIdentityProvider};
+    use pt_core::collect::ProcessRecord;
+    use pt_core::session::SessionState;
+    use std::io::{BufRead, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::process::{Output, Stdio};
+
+    struct BoundProcess {
+        identity: ProcessIdentity,
+        fd: OwnedFd,
+    }
+
+    impl BoundProcess {
+        fn bind(identity: ProcessIdentity) -> Option<Self> {
+            // SAFETY: opening a pidfd observes the process without signaling it.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid.0, 0) };
+            if fd < 0 {
+                return None;
+            }
+            // SAFETY: the successful syscall returns a uniquely owned descriptor.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+            if !matches!(LiveIdentityProvider::new().revalidate(&identity), Ok(true)) {
+                return None;
+            }
+            Some(Self { identity, fd })
+        }
+
+        fn signal(&self, signal: i32) -> libc::c_long {
+            // SAFETY: this descriptor can signal only the captured process,
+            // including after its numeric PID becomes reusable.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.fd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            }
+        }
+    }
+
+    impl Drop for BoundProcess {
+        fn drop(&mut self) {
+            self.signal(libc::SIGKILL);
+        }
+    }
+
+    struct Respawner {
+        parent: BoundProcess,
+        _initial_child: BoundProcess,
+    }
+
+    impl Drop for Respawner {
+        fn drop(&mut self) {
+            // Stop the bound spawner before collecting its current children so
+            // killing a replacement cannot cause another replacement to escape.
+            if self.parent.signal(libc::SIGSTOP) == 0 {
+                let parent_pid = self.parent.identity.pid.0;
+                for _ in 0..50 {
+                    if state_of(parent_pid) == Some('T') {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if state_of(parent_pid) == Some('T')
+                    && matches!(
+                        LiveIdentityProvider::new().revalidate(&self.parent.identity),
+                        Ok(true)
+                    )
+                {
+                    if let Ok(children) =
+                        fs::read_to_string(format!("/proc/{parent_pid}/task/{parent_pid}/children"))
+                    {
+                        let pids: Vec<u32> = children
+                            .split_whitespace()
+                            .filter_map(|pid| pid.parse().ok())
+                            .collect();
+                        if pids.is_empty() {
+                            return;
+                        }
+                        if let Ok(scan) = quick_scan(&QuickScanOptions {
+                            pids,
+                            include_kernel_threads: false,
+                            timeout: Some(Duration::from_secs(5)),
+                            progress: None,
+                        }) {
+                            for child in scan.processes {
+                                if child.ppid.0 == parent_pid
+                                    && child.uid == self.parent.identity.uid
+                                {
+                                    let identity = ProcessIdentity {
+                                        pid: child.pid,
+                                        start_id: child.start_id,
+                                        uid: child.uid,
+                                        pgid: child.pgid,
+                                        sid: child.sid,
+                                        quality: IdentityQuality::Full,
+                                    };
+                                    if let Some(owned_child) = BoundProcess::bind(identity) {
+                                        owned_child.signal(libc::SIGKILL);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            self.parent.signal(libc::SIGKILL);
+        }
+    }
+
+    fn detached_child(script: &str) -> (u32, u32) {
+        let mut launcher = ProcessCommand::new("setsid")
+            .args(["--fork", "sh", "-c", script])
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn test-owned detached shell");
+        let mut line = String::new();
+        std::io::BufReader::new(launcher.stdout.take().expect("PID pipe"))
+            .read_line(&mut line)
+            .expect("read owned parent and child");
+        assert!(launcher.wait().expect("wait for setsid launcher").success());
+        let mut pids = line.split_whitespace();
+        let parent = pids.next().expect("parent PID").parse().unwrap();
+        let child = pids.next().expect("child PID").parse().unwrap();
+        assert!(pids.next().is_none(), "unexpected PID record: {line}");
+        (parent, child)
+    }
+
+    fn current_process(pid: u32) -> ProcessRecord {
+        quick_scan(&QuickScanOptions {
+            pids: vec![pid],
+            include_kernel_threads: false,
+            timeout: Some(Duration::from_secs(30)),
+            progress: None,
+        })
+        .expect("scan test-owned process")
+        .processes
+        .into_iter()
+        .find(|process| process.pid.0 == pid)
+        .expect("test-owned process is present")
+    }
+
+    fn orphan(script: &str) -> (BoundProcess, ProcessRecord) {
+        let (former_parent, pid) = detached_child(script);
+        let target = BoundProcess::bind(live_identity(pid)).expect("bind owned orphan");
+        let started = std::time::Instant::now();
+        loop {
+            let process = current_process(pid);
+            if process.ppid.0 != former_parent {
+                assert_ne!(process.sid, Some(pid), "orphan is not a session leader");
+                return (target, process);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "shell did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn run_step(
+        log_dir: &Path,
+        step: &str,
+        args: &[&str],
+        data_dir: &Path,
+        config_dir: &Path,
+        path_override: Option<&std::ffi::OsStr>,
+    ) -> Output {
+        let started = std::time::Instant::now();
+        let mut command = cargo_bin_cmd!("pt-core");
+        command
+            .timeout(Duration::from_secs(240))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", data_dir)
+            .env("PROCESS_TRIAGE_CONFIG", config_dir)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args(args);
+        if let Some(path) = path_override {
+            command.env("PATH", path);
+        }
+        let output = command.output().expect("run actual verify acceptance step");
+        let stdout_path = format!("{step}.stdout.json");
+        let stderr_path = format!("{step}.stderr.jsonl");
+        fs::write(log_dir.join(&stdout_path), &output.stdout).expect("retain stdout");
+        fs::write(log_dir.join(&stderr_path), &output.stderr).expect("retain stderr");
+        let record = serde_json::json!({
+            "step": step, "command": "pt-core", "args": args,
+            "path_override": path_override.map(|path| path.to_string_lossy()),
+            "exit_code": output.status.code(), "elapsed_ms": started.elapsed().as_millis(),
+            "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&output.stdout),
+            "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&output.stderr),
+            "stdout_path": stdout_path, "stderr_path": stderr_path,
+        });
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("steps.jsonl"))
+            .expect("open retained steps");
+        writeln!(log, "{record}").expect("record actual command");
+        eprintln!("{record}");
+        output
+    }
+
+    fn plan_owned(
+        log_dir: &Path,
+        step: &str,
+        pid: u32,
+        expected_recommendation: &str,
+        data_dir: &Path,
+        config_dir: &Path,
+    ) -> (Value, Plan) {
+        let output = run_step(
+            log_dir,
+            step,
+            &[
+                "--format",
+                "json",
+                "--robot",
+                "agent",
+                "plan",
+                "--min-posterior",
+                "0",
+                "--min-age",
+                "0",
+                "--max-candidates",
+                "20",
+                "--pids",
+                &pid.to_string(),
+            ],
+            data_dir,
+            config_dir,
+            None,
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let document: Value = serde_json::from_slice(&output.stdout).expect("actual plan JSON");
+        assert_eq!(document["args"]["pids"], serde_json::json!([pid]));
+        assert_eq!(
+            document["candidates"].as_array().unwrap().len(),
+            1,
+            "{document}"
+        );
+        let candidate = &document["candidates"][0];
+        let identity = live_identity(pid);
+        assert_eq!(candidate["pid"], pid);
+        assert_eq!(candidate["uid"], identity.uid);
+        assert_eq!(candidate["start_id"], identity.start_id.0);
+        assert_eq!(
+            candidate["recommended_action"], expected_recommendation,
+            "{document}"
+        );
+        let session = SessionId::parse(document["session_id"].as_str().unwrap()).unwrap();
+        let handle = SessionStore::at_data_dir(data_dir).open(&session).unwrap();
+        let saved = fs::read(handle.dir.join("decision/plan.json")).expect("actual saved plan");
+        fs::write(log_dir.join(format!("{step}.saved-plan.json")), &saved).unwrap();
+        let plan: Plan = serde_json::from_slice(&saved).expect("canonical executable Plan");
+        match expected_recommendation {
+            "kill" => {
+                assert_eq!(plan.actions.len(), 1);
+                let action = &plan.actions[0];
+                assert_eq!(action.action, Action::Kill);
+                assert!(action.target.matches(&identity));
+                assert!(
+                    !action.pre_checks.is_empty(),
+                    "actual safety checks remain present"
+                );
+                assert!(action.rationale.posterior.is_some());
+            }
+            "review" => assert!(
+                plan.actions.is_empty(),
+                "review-only candidates must not produce executable actions"
+            ),
+            other => panic!("unsupported expected recommendation {other}"),
+        }
+        (document, plan)
+    }
+
+    fn verify(
+        log_dir: &Path,
+        step: &str,
+        session: &str,
+        data_dir: &Path,
+        config_dir: &Path,
+    ) -> (Output, Value) {
+        let output = run_step(
+            log_dir,
+            step,
+            &[
+                "--format",
+                "json",
+                "agent",
+                "verify",
+                "--session",
+                session,
+                "--check-respawn",
+            ],
+            data_dir,
+            config_dir,
+            None,
+        );
+        let document = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("verify JSON {error}: {output:?}"));
+        (output, document)
+    }
+
+    fn apply_owned(
+        log_dir: &Path,
+        step: &str,
+        plan: &Plan,
+        data_dir: &Path,
+        config_dir: &Path,
+    ) -> pt_core::verify::SavedActionOutcome {
+        assert_eq!(plan.actions.len(), 1);
+        let action = &plan.actions[0];
+        assert_eq!(action.action, Action::Kill);
+        assert!(
+            !action.blocked,
+            "the real planner must permit our exact target"
+        );
+        let target = format!("{}:{}", action.target.pid.0, action.target.start_id.0);
+        let output = run_step(
+            log_dir,
+            step,
+            &[
+                "--format",
+                "json",
+                "agent",
+                "apply",
+                "--session",
+                &plan.session_id,
+                "--targets",
+                &target,
+                "--yes",
+            ],
+            data_dir,
+            config_dir,
+            None,
+        );
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let document: Value = serde_json::from_slice(&output.stdout).expect("actual apply JSON");
+        let outcomes = document["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 1, "{document}");
+        assert_eq!(outcomes[0]["action_id"], action.action_id);
+        assert_eq!(outcomes[0]["pid"], action.target.pid.0);
+        assert_eq!(outcomes[0]["status"], "success", "{document}");
+        let session = SessionId::parse(&plan.session_id).unwrap();
+        let handle = SessionStore::at_data_dir(data_dir).open(&session).unwrap();
+        let saved =
+            fs::read(handle.dir.join("action/outcomes.jsonl")).expect("actual saved outcomes");
+        fs::write(log_dir.join(format!("{step}.saved-outcomes.jsonl")), &saved).unwrap();
+        let executions =
+            pt_core::verify::parse_action_outcomes(std::str::from_utf8(&saved).unwrap())
+                .expect("typed successful execution evidence");
+        assert_eq!(executions.len(), 1);
+        let executed = executions.into_iter().next().unwrap();
+        assert_eq!(executed.status, "success");
+        assert!(executed.target.as_ref().unwrap().matches(&action.target));
+        assert_eq!(executed.command.as_deref(), Some("sleep 1000"));
+        assert!(executed.parent_pid.is_some_and(|pid| pid > 0));
+        assert!(executed.executed_at.is_some());
+        assert!(executed
+            .execution_clock
+            .as_ref()
+            .is_some_and(|clock| !clock.boot_id.is_empty() && clock.ticks > 0));
+        executed
+    }
+
+    fn assert_born_after_execution(
+        process: &ProcessRecord,
+        executed: &pt_core::verify::SavedActionOutcome,
+    ) {
+        let clock = executed.execution_clock.as_ref().unwrap();
+        let mut parts = process.start_id.0.rsplitn(3, ':');
+        assert_eq!(parts.next().unwrap().parse::<u32>().unwrap(), process.pid.0);
+        let birth_ticks = parts.next().unwrap().parse::<u64>().unwrap();
+        assert_eq!(parts.next().unwrap(), clock.boot_id);
+        assert!(
+            birth_ticks > clock.ticks,
+            "challenge must pass the post-execution birth-time predicate"
+        );
+    }
+
+    fn recorded_state(log_dir: &Path, step: &str, data_dir: &Path, session: &str) -> SessionState {
+        let session = SessionId::parse(session).unwrap();
+        let handle = SessionStore::at_data_dir(data_dir).open(&session).unwrap();
+        let saved = fs::read(handle.manifest_path()).unwrap();
+        fs::write(log_dir.join(format!("{step}.saved-manifest.json")), &saved).unwrap();
+        serde_json::from_slice::<SessionManifest>(&saved)
+            .unwrap()
+            .state
+    }
+
+    #[test]
+    fn actual_agent_verify_attributes_respawns_and_ignores_unexecuted_candidates() {
+        let data_dir = TempDir::new().unwrap().keep();
+        let config_dir = TempDir::new().unwrap().keep();
+        let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-logs/e2e/agent_verify")
+            .join(format!("{}-{}", std::process::id(), SessionId::new().0));
+        fs::create_dir_all(&log_dir).unwrap();
+        write_test_policy(&config_dir);
+        let policy_path = config_dir.join("policy.json");
+        let mut policy: Policy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+        // This explicit policy permits the PID-scoped disposable fixtures.
+        // The probe checks execution plumbing, not default-policy decisions,
+        // inference quality or FDR calibration; built-in protection stays enabled.
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.never_kill_ppid.clear();
+        policy.fdr_control.enabled = false;
+        policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+        for row in [
+            &mut policy.loss_matrix.useful,
+            &mut policy.loss_matrix.useful_bad,
+            &mut policy.loss_matrix.abandoned,
+            &mut policy.loss_matrix.zombie,
+        ] {
+            row.keep = 1000.0;
+            row.kill = 0.0;
+            row.pause = Some(1000.0);
+            row.throttle = Some(1000.0);
+            row.restart = Some(1000.0);
+            row.renice = Some(1000.0);
+        }
+        fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+
+        let (parent_pid, original_pid) = detached_child(
+            "first=1; while :; do sleep 1000 </dev/null >/dev/null 2>&1 & child=$!; \
+             if [ \"$first\" = 1 ]; then printf '%s %s\\n' \"$$\" \"$child\"; first=0; exec >/dev/null; fi; \
+             wait \"$child\"; sleep 0.2; done",
+        );
+        let respawner = Respawner {
+            parent: BoundProcess::bind(live_identity(parent_pid)).expect("bind owned spawner"),
+            _initial_child: BoundProcess::bind(live_identity(original_pid))
+                .expect("bind owned child"),
+        };
+        let original = current_process(original_pid);
+        assert_eq!(original.ppid.0, parent_pid);
+        assert_eq!(original.cmd, "sleep 1000");
+        let (_, respawn_plan) = plan_owned(
+            &log_dir,
+            "respawn_plan",
+            original_pid,
+            "kill",
+            &data_dir,
+            &config_dir,
+        );
+        assert_eq!(
+            recorded_state(
+                &log_dir,
+                "unexecuted_before",
+                &data_dir,
+                &respawn_plan.session_id
+            ),
+            SessionState::Planned
+        );
+        let (unexecuted_output, unexecuted) = verify(
+            &log_dir,
+            "unexecuted_verify",
+            &respawn_plan.session_id,
+            &data_dir,
+            &config_dir,
+        );
+        assert_eq!(unexecuted_output.status.code(), Some(0), "{unexecuted}");
+        assert!(unexecuted["action_outcomes"].as_array().unwrap().is_empty());
+        assert_eq!(unexecuted["verification"]["overall_status"], "success");
+        assert_eq!(unexecuted["respawn_check"]["respawned_count"], 0);
+        assert_eq!(unexecuted["respawn_check"]["unknown_count"], 0);
+        assert!(state_of(original_pid).is_some_and(|state| state != 'Z'));
+        assert_eq!(
+            recorded_state(
+                &log_dir,
+                "unexecuted_after",
+                &data_dir,
+                &respawn_plan.session_id
+            ),
+            SessionState::Planned
+        );
+
+        // Plant a prior failure in the real unexecuted session. A clean verify
+        // must not revive it; the positive apply below uses a fresh real plan.
+        SessionStore::at_data_dir(&data_dir)
+            .open(&SessionId::parse(&respawn_plan.session_id).unwrap())
+            .unwrap()
+            .update_state(SessionState::Failed)
+            .unwrap();
+        assert_eq!(
+            recorded_state(
+                &log_dir,
+                "unexecuted_failed_before",
+                &data_dir,
+                &respawn_plan.session_id
+            ),
+            SessionState::Failed
+        );
+        let (failed_unexecuted_output, failed_unexecuted) = verify(
+            &log_dir,
+            "unexecuted_prior_failed_verify",
+            &respawn_plan.session_id,
+            &data_dir,
+            &config_dir,
+        );
+        assert_eq!(
+            failed_unexecuted_output.status.code(),
+            Some(0),
+            "{failed_unexecuted}"
+        );
+        assert!(failed_unexecuted["action_outcomes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(failed_unexecuted["respawn_check"]["respawned_count"], 0);
+        assert_eq!(failed_unexecuted["respawn_check"]["unknown_count"], 0);
+        assert_eq!(
+            recorded_state(
+                &log_dir,
+                "unexecuted_failed_after",
+                &data_dir,
+                &respawn_plan.session_id
+            ),
+            SessionState::Failed
+        );
+        assert!(state_of(original_pid).is_some_and(|state| state != 'Z'));
+        let (_, respawn_plan) = plan_owned(
+            &log_dir,
+            "respawn_execution_plan",
+            original_pid,
+            "kill",
+            &data_dir,
+            &config_dir,
+        );
+
+        let respawn_execution = apply_owned(
+            &log_dir,
+            "respawn_apply",
+            &respawn_plan,
+            &data_dir,
+            &config_dir,
+        );
+        let started = std::time::Instant::now();
+        let replacement = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "owned shell did not respawn child"
+            );
+            let children =
+                fs::read_to_string(format!("/proc/{parent_pid}/task/{parent_pid}/children"))
+                    .unwrap();
+            let pids: Vec<u32> = children
+                .split_whitespace()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            if pids.is_empty() {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let scan = quick_scan(&QuickScanOptions {
+                pids,
+                include_kernel_threads: false,
+                timeout: Some(Duration::from_secs(30)),
+                progress: None,
+            })
+            .unwrap();
+            if let Some(process) = scan.processes.into_iter().find(|process| {
+                process.ppid.0 == parent_pid
+                    && process.pid.0 != original_pid
+                    && process.cmd == "sleep 1000"
+                    && !process.state.is_zombie()
+            }) {
+                break process;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _replacement = BoundProcess::bind(live_identity(replacement.pid.0)).unwrap();
+        assert_eq!(replacement.uid, original.uid);
+        assert_ne!(replacement.start_id, original.start_id);
+        assert_born_after_execution(&replacement, &respawn_execution);
+        assert_eq!(respawn_execution.parent_pid, Some(parent_pid));
+        assert!(respawn_execution
+            .parent_identity
+            .as_ref()
+            .unwrap()
+            .matches(&respawner.parent.identity));
+        let (respawn_output, respawned) = verify(
+            &log_dir,
+            "respawn_verify",
+            &respawn_plan.session_id,
+            &data_dir,
+            &config_dir,
+        );
+        assert_eq!(respawn_output.status.code(), Some(3), "{respawned}");
+        assert_eq!(
+            respawned["respawn_check"]["respawned_count"], 1,
+            "{respawned}"
+        );
+        assert_eq!(
+            respawned["respawn_check"]["unknown_count"], 0,
+            "{respawned}"
+        );
+        assert_eq!(
+            recorded_state(
+                &log_dir,
+                "respawn_verified",
+                &data_dir,
+                &respawn_plan.session_id
+            ),
+            SessionState::Failed
+        );
+        let outcomes = respawned["action_outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0]["target"]["pid"], original_pid);
+        assert_eq!(outcomes[0]["outcome"], "respawned", "{respawned}");
+        assert_eq!(outcomes[0]["verified"], false);
+        assert_eq!(outcomes[0]["respawn_detected"]["pid"], replacement.pid.0);
+        assert_eq!(outcomes[0]["respawn_detected"]["parent_pid"], parent_pid);
+        assert_eq!(
+            outcomes[0]["respawn_detected"]["parent_start_id"],
+            respawner.parent.identity.start_id.0
+        );
+
+        let (_orphan, original_orphan) = orphan(
+            "sleep 1000 </dev/null >/dev/null 2>&1 & child=$!; printf '%s %s\\n' \"$$\" \"$child\"",
+        );
+        let (_, orphan_plan) = plan_owned(
+            &log_dir,
+            "orphan_plan",
+            original_orphan.pid.0,
+            "kill",
+            &data_dir,
+            &config_dir,
+        );
+        let orphan_execution = apply_owned(
+            &log_dir,
+            "orphan_apply",
+            &orphan_plan,
+            &data_dir,
+            &config_dir,
+        );
+        assert!(state_of(original_orphan.pid.0).is_none_or(|state| state == 'Z'));
+        assert_eq!(orphan_execution.parent_pid, Some(original_orphan.ppid.0));
+
+        let started = std::time::Instant::now();
+        let execution_clock = orphan_execution.execution_clock.as_ref().unwrap();
+        loop {
+            let now = pt_core::verify::capture_execution_clock().unwrap();
+            assert_eq!(now.boot_id, execution_clock.boot_id);
+            if now.ticks > execution_clock.ticks {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Both challenges are born after the real kill. One has the exact
+        // command but another parent; the other shares the adopter but only
+        // contains the killed command as a substring.
+        let same_command = ForeignTarget::spawn("sleep 1000");
+        let same_command_record = current_process(same_command.pid);
+        assert_eq!(same_command_record.cmd, original_orphan.cmd);
+        assert_eq!(same_command_record.uid, original_orphan.uid);
+        assert_ne!(same_command_record.ppid, original_orphan.ppid);
+        assert_born_after_execution(&same_command_record, &orphan_execution);
+        let (_collision, collision) = orphan(
+            "sleep 10000 </dev/null >/dev/null 2>&1 & child=$!; printf '%s %s\\n' \"$$\" \"$child\"",
+        );
+        assert_eq!(collision.ppid, original_orphan.ppid);
+        assert_eq!(collision.uid, original_orphan.uid);
+        assert!(collision.cmd.contains(&original_orphan.cmd));
+        assert_ne!(collision.cmd, original_orphan.cmd);
+        assert_born_after_execution(&collision, &orphan_execution);
+        fs::write(
+            log_dir.join("live-respawn-and-challenges.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "original": original,
+                "replacement": replacement,
+                "original_orphan": original_orphan,
+                "same_command_other_parent": same_command_record,
+                "substring_collision_same_parent": collision,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (orphan_output, orphan_report) = verify(
+            &log_dir,
+            "orphan_verify_with_collisions",
+            &orphan_plan.session_id,
+            &data_dir,
+            &config_dir,
+        );
+        assert_eq!(orphan_output.status.code(), Some(0), "{orphan_report}");
+        assert_eq!(
+            orphan_report["respawn_check"]["respawned_count"], 0,
+            "{orphan_report}"
+        );
+        assert_eq!(orphan_report["respawn_check"]["unknown_count"], 0);
+        let outcomes = orphan_report["action_outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0]["target"]["pid"], original_orphan.pid.0);
+        assert_eq!(outcomes[0]["outcome"], "confirmed_dead", "{orphan_report}");
+        assert_eq!(outcomes[0]["verified"], true);
+        assert!(outcomes[0].get("respawn_detected").is_none());
+        assert!(orphan_report["resource_summary"]
+            .get("expected_freed_mb")
+            .is_some());
+        assert!(orphan_report["resource_summary"]
+            .get("memory_freed_mb")
+            .is_none());
+        assert!(same_command.alive());
+        assert!(!current_process(collision.pid.0).state.is_zombie());
+
+        // Corrupt observations must not replace the real successful report.
+        // These are explicit subprocess fault injections, not live process proof.
+        let handle = SessionStore::at_data_dir(&data_dir)
+            .open(&SessionId::parse(&orphan_plan.session_id).unwrap())
+            .unwrap();
+        let plan_path = handle.dir.join("decision/plan.json");
+        let original_plan = fs::read(&plan_path).unwrap();
+        let verification_path = handle.dir.join("action/verifications.json");
+        let original_verification = fs::read(&verification_path).unwrap();
+        let original_manifest = fs::read(handle.manifest_path()).unwrap();
+        let mut wrong_session: Value = serde_json::from_slice(&original_plan).unwrap();
+        wrong_session["session_id"] = Value::String(respawn_plan.session_id.clone());
+        fs::write(&plan_path, serde_json::to_vec(&wrong_session).unwrap()).unwrap();
+        let refused = run_step(
+            &log_dir,
+            "wrong_session_verify",
+            &["agent", "verify", "--session", &orphan_plan.session_id],
+            &data_dir,
+            &config_dir,
+            None,
+        );
+        assert_eq!(refused.status.code(), Some(20), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("does not match"));
+        assert!(refused.stdout.is_empty());
+        assert_eq!(fs::read(&verification_path).unwrap(), original_verification);
+        assert_eq!(fs::read(handle.manifest_path()).unwrap(), original_manifest);
+        fs::write(&plan_path, &original_plan).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        for (step, script, message) in [
+            (
+                "failed_ps_verify",
+                "#!/bin/sh\nexit 7\n",
+                "full process snapshot exited",
+            ),
+            (
+                "malformed_ps_verify",
+                "#!/bin/sh\nprintf '%s\\n' 'malformed process row'\n",
+                "incomplete process snapshot",
+            ),
+            (
+                "empty_ps_verify",
+                "#!/bin/sh\nexit 0\n",
+                "full process snapshot contains no processes",
+            ),
+        ] {
+            let probe_dir = log_dir.join(step);
+            fs::create_dir(&probe_dir).unwrap();
+            let ps_path = probe_dir.join("ps");
+            fs::write(&ps_path, script).unwrap();
+            fs::set_permissions(&ps_path, fs::Permissions::from_mode(0o700)).unwrap();
+            let path =
+                std::env::join_paths(std::iter::once(probe_dir).chain(std::env::split_paths(
+                    &std::env::var_os("PATH").expect("actual executable search path"),
+                )))
+                .unwrap();
+            let refused = run_step(
+                &log_dir,
+                step,
+                &["agent", "verify", "--session", &orphan_plan.session_id],
+                &data_dir,
+                &config_dir,
+                Some(&path),
+            );
+            assert_eq!(refused.status.code(), Some(20), "{refused:?}");
+            assert!(String::from_utf8_lossy(&refused.stderr).contains(message));
+            assert!(refused.stdout.is_empty());
+            assert_eq!(fs::read(&verification_path).unwrap(), original_verification);
+            assert_eq!(fs::read(handle.manifest_path()).unwrap(), original_manifest);
+        }
+        let (restored_output, restored) = verify(
+            &log_dir,
+            "restored_valid_observation_verify",
+            &orphan_plan.session_id,
+            &data_dir,
+            &config_dir,
+        );
+        assert_eq!(restored_output.status.code(), Some(0), "{restored}");
+        assert_eq!(restored["action_outcomes"][0]["verified"], true);
+
+        policy
+            .guardrails
+            .force_review_patterns
+            .push(pt_core::config::policy::PatternEntry {
+                pattern: "^sleep 1000$".into(),
+                kind: pt_core::config::policy::PatternKind::Regex,
+                case_insensitive: false,
+                notes: Some("test-owned target requires review".into()),
+            });
+        fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let (review_document, review_plan) = plan_owned(
+            &log_dir,
+            "review_plan",
+            same_command.pid,
+            "review",
+            &data_dir,
+            &config_dir,
+        );
+        assert_eq!(
+            review_document["candidates"][0]["recommended_action"], "review",
+            "{review_document}"
+        );
+        assert!(review_plan.actions.is_empty());
+        assert_eq!(
+            recorded_state(
+                &log_dir,
+                "review_before",
+                &data_dir,
+                &review_plan.session_id
+            ),
+            SessionState::Planned
+        );
+        let (review_output, review_report) = verify(
+            &log_dir,
+            "review_verify",
+            &review_plan.session_id,
+            &data_dir,
+            &config_dir,
+        );
+        assert_eq!(review_output.status.code(), Some(0), "{review_report}");
+        assert!(review_report["action_outcomes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(review_report["verification"]["overall_status"], "success");
+        assert_eq!(review_report["respawn_check"]["respawned_count"], 0);
+        assert_eq!(review_report["respawn_check"]["unknown_count"], 0);
+        assert_eq!(
+            recorded_state(&log_dir, "review_after", &data_dir, &review_plan.session_id),
+            SessionState::Planned
+        );
+        assert!(same_command.alive(), "review-only target must remain alive");
+
+        SessionStore::at_data_dir(&data_dir)
+            .open(&SessionId::parse(&review_plan.session_id).unwrap())
+            .unwrap()
+            .update_state(SessionState::Failed)
+            .unwrap();
+        assert_eq!(
+            recorded_state(
+                &log_dir,
+                "review_failed_before",
+                &data_dir,
+                &review_plan.session_id
+            ),
+            SessionState::Failed
+        );
+        let (failed_review_output, failed_review) = verify(
+            &log_dir,
+            "review_prior_failed_verify",
+            &review_plan.session_id,
+            &data_dir,
+            &config_dir,
+        );
+        assert_eq!(
+            failed_review_output.status.code(),
+            Some(0),
+            "{failed_review}"
+        );
+        assert!(failed_review["action_outcomes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(failed_review["respawn_check"]["respawned_count"], 0);
+        assert_eq!(failed_review["respawn_check"]["unknown_count"], 0);
+        assert_eq!(
+            recorded_state(
+                &log_dir,
+                "review_failed_after",
+                &data_dir,
+                &review_plan.session_id
+            ),
+            SessionState::Failed
+        );
+        assert!(
+            same_command.alive(),
+            "prior failure must not turn review into execution"
+        );
+    }
 }
