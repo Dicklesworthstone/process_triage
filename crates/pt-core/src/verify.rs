@@ -87,6 +87,8 @@ pub struct ActionOutcome {
 pub struct VerifyTarget {
     pub pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd_short: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cmd_full: Option<String>,
@@ -290,6 +292,7 @@ pub fn verify_plan(
         outcomes.push(ActionOutcome {
             target: VerifyTarget {
                 pid: candidate.pid,
+                start_id: candidate.start_id.clone(),
                 cmd_short: if candidate.cmd_short.is_empty() {
                     None
                 } else {
@@ -1410,6 +1413,7 @@ mod tests {
         let report = verify_plan(&plan, &current, Utc::now(), Utc::now());
         let target = &report.action_outcomes[0].target;
         assert_eq!(target.pid, 1);
+        assert_eq!(target.start_id.as_deref(), Some("boot:5:1"));
         assert_eq!(target.cmd_short.as_deref(), Some("cmd1"));
         assert_eq!(target.cmd_full.as_deref(), Some("cmd1 --flag"));
         assert_eq!(target.uid, Some(1000));
