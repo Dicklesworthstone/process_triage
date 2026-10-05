@@ -411,7 +411,7 @@ fn is_export_field(key: &str) -> bool {
             summary total count total_processes total_system_processes
             protected_filtered record_count records candidate_count candidates
             action_count kill_count review_count spare_count actions outcomes recommendations kills spares
-            processes_scanned candidates_found kills_attempted kills_successful deep_scan spares
+            processes_scanned candidates_found kills_attempted kills_successful deep_scan deep_scan_ms spares
             total_processes_scanned candidates_evaluated candidates_returned kill_recommendations
             review_recommendations policy_blocked protected_by_rule
             os_version kernel_version arch family memory_bytes duration_ms export_profile timing

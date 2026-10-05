@@ -154,6 +154,14 @@ impl ReportGenerator {
             .or_else(|| plan.pointer("/summary/total_processes"))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        // The planner records elapsed deep-scan time only when --deep is set;
+        // its explicit null means disabled. Missing history cannot establish
+        // either state, and a zero-millisecond recorded scan still counts.
+        recorded_overview["deep_scan"] = match plan.pointer("/summary/deep_scan_ms") {
+            Some(serde_json::Value::Number(_)) => serde_json::json!(true),
+            Some(serde_json::Value::Null) => serde_json::json!(false),
+            _ => serde_json::Value::Null,
+        };
         // Missing action logs are unknown, not a measured zero. Only count
         // terminal outcomes whose recorded action can be established.
         for field in ["kills_attempted", "kills_successful", "spares"] {
@@ -1245,6 +1253,114 @@ fn json_script_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_deep_scan_indicator_agrees_across_session_and_bundle_reports() {
+        let generator = ReportGenerator::new(
+            ReportConfig::new()
+                .with_embed_assets(true)
+                .with_galaxy_brain(true),
+        );
+        for (summary, expected) in [
+            (
+                serde_json::json!({"deep_scan_ms": 0}),
+                serde_json::json!(true),
+            ),
+            (
+                serde_json::json!({"deep_scan_ms": 17}),
+                serde_json::json!(true),
+            ),
+            (
+                serde_json::json!({"deep_scan_ms": null}),
+                serde_json::json!(false),
+            ),
+            (serde_json::json!({}), serde_json::Value::Null),
+            (
+                serde_json::json!({"deep_scan_ms": "unrecorded"}),
+                serde_json::Value::Null,
+            ),
+        ] {
+            // Controlled saved artifacts exercise actual ZIP and HTML adapters;
+            // they do not establish live deep-probe or inference quality.
+            let plan = serde_json::json!({
+                "summary": summary,
+                "scan": {"total_processes": 42},
+                "candidates": [{
+                    "pid": 4242, "command": "private-deep-scan-worker", "score": 87,
+                    "recommended_action": "pause",
+                    "posterior": {"useful": 0.1, "useful_bad": 0.03, "abandoned": 0.8, "zombie": 0.07},
+                    "evidence_ledger": {"evidence_terms": [{
+                        "feature": "cpu",
+                        "log_likelihood": {"abandoned": -0.4, "useful": -2.0}
+                    }]}
+                }],
+            });
+            let outcome = serde_json::json!({
+                "pid": 4242, "command": "private-deep-scan-worker",
+                "action": "pause", "status": "success",
+            });
+            let mut overview =
+                generator.build_overview_from_manifest(&pt_bundle::BundleManifest::new(
+                    "pt-20261004-120500-abcd",
+                    "private-deep-scan-host",
+                    pt_redact::ExportProfile::Safe,
+                ));
+            // Stale caller defaults must not override the saved indicator.
+            overview.deep_scan = expected != serde_json::json!(true);
+            let session_html = generator
+                .generate_from_session_artifacts(overview, &plan, std::slice::from_ref(&outcome))
+                .unwrap();
+
+            let mut writer = pt_bundle::BundleWriter::new(
+                "pt-20261004-120500-abcd",
+                "private-deep-scan-host",
+                pt_redact::ExportProfile::Safe,
+            );
+            writer.add_plan(&plan).unwrap();
+            writer.add_log("outcomes", format!("{outcome}\n").into_bytes());
+            let (bytes, _) = writer.write_to_vec().unwrap();
+            let mut reader = pt_bundle::BundleReader::from_bytes(bytes).unwrap();
+            assert!(reader.verify_all().is_empty());
+            let bundle_html = generator.generate_from_bundle(&mut reader).unwrap();
+
+            for html in [session_html, bundle_html] {
+                let embedded = html
+                    .split("id=\"recorded-session-data\">")
+                    .nth(1)
+                    .expect("rendered recorded artifacts")
+                    .split("</script>")
+                    .next()
+                    .unwrap();
+                let recorded: serde_json::Value = serde_json::from_str(embedded).unwrap();
+                let report_data = html
+                    .split("const REPORT_DATA = ")
+                    .nth(1)
+                    .expect("rendered report overview")
+                    .split(";\n")
+                    .next()
+                    .unwrap();
+                let report: serde_json::Value = serde_json::from_str(report_data).unwrap();
+                assert_eq!(recorded["overview"]["deep_scan"], expected);
+                assert_eq!(report["overview"]["deep_scan"], expected);
+                assert_eq!(recorded["overview"]["processes_scanned"], 42);
+                assert_eq!(
+                    recorded["plan"]["candidates"][0]["posterior"]["useful_bad"],
+                    0.03
+                );
+                assert_eq!(
+                    recorded["plan"]["candidates"][0]["evidence_ledger"]["evidence_terms"][0]
+                        ["log_likelihood"]["abandoned"],
+                    -0.4,
+                );
+                assert_eq!(recorded["outcomes"][0]["action"], "pause");
+                assert_eq!(recorded["outcomes"][0]["status"], "success");
+                assert!(html.contains("<td>4242</td>"));
+                assert!(html.contains("<td>87</td><td>pause</td>"));
+                assert!(html.contains("Recorded Evidence Ledger"));
+                assert!(!html.contains("private-deep-scan"));
+            }
+        }
+    }
 
     #[test]
     fn recorded_report_preserves_four_classes_and_final_action_without_private_data() {
