@@ -11990,7 +11990,7 @@ mod process_tree_safety_tests {
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::inherit())
+                    .stderr(Stdio::null())
                     .env_remove("SSH_CONNECTION")
                     .env_remove("SSH_CLIENT")
                     .env_remove("SSH_TTY");
@@ -12202,6 +12202,48 @@ mod process_tree_safety_tests {
             writeln!(file, "{evidence}").expect("retain actual interactive evidence");
             file.flush().expect("flush actual interactive evidence");
         }
+
+        pub(super) fn fd_evidence(pid: u32) -> Vec<serde_json::Value> {
+            use std::os::unix::fs::FileTypeExt;
+
+            let mut descriptors = Vec::new();
+            for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .expect("observe actual owned fixture descriptors")
+            {
+                let entry = entry.unwrap();
+                let fd = entry.file_name().to_str().unwrap().parse::<u32>().unwrap();
+                let destination = std::fs::read_link(entry.path()).unwrap();
+                let file_type = std::fs::metadata(entry.path()).unwrap().file_type();
+                let kind = if file_type.is_file() {
+                    "regular"
+                } else if file_type.is_char_device() {
+                    "character"
+                } else if file_type.is_fifo() {
+                    "pipe"
+                } else if file_type.is_socket() {
+                    "socket"
+                } else {
+                    "other"
+                };
+                let fdinfo = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}"))
+                    .expect("retain actual fixture descriptor flags");
+                let flags = fdinfo
+                    .lines()
+                    .find_map(|line| line.strip_prefix("flags:"))
+                    .expect("descriptor must report access flags")
+                    .trim();
+                let access_mode = u64::from_str_radix(flags, 8).unwrap() & libc::O_ACCMODE as u64;
+                let writable_regular = file_type.is_file()
+                    && (access_mode == libc::O_WRONLY as u64 || access_mode == libc::O_RDWR as u64);
+                descriptors.push(serde_json::json!({
+                    "pid": pid, "fd": fd, "destination": destination,
+                    "kind": kind, "fdinfo": fdinfo, "access_mode": access_mode,
+                    "writable_regular": writable_regular,
+                }));
+            }
+            descriptors.sort_by_key(|descriptor| descriptor["fd"].as_u64().unwrap());
+            descriptors
+        }
     }
 
     /// Exercise the TUI's real execution helper, including its saved budget and
@@ -12408,7 +12450,9 @@ mod process_tree_safety_tests {
         use pt_core::collect::{quick_scan, QuickScanOptions};
         use pt_core::session::SessionState;
         use pt_core::verify::{executed_plan_actions, parse_action_outcomes, parse_agent_plan};
-        use tui_live_fixtures::{case, policy, record, wrapper_selection, DetachedWrapper};
+        use tui_live_fixtures::{
+            case, fd_evidence, policy, record, wrapper_selection, DetachedWrapper,
+        };
 
         let (handle, log_dir) = case("tui-live-child");
         let policy = policy(1);
@@ -12452,6 +12496,28 @@ mod process_tree_safety_tests {
         assert_eq!(selection.actions[0].target, parent_identity);
         assert_eq!(selection.actions.len(), 1);
         assert_ne!(selection.actions[0].target.pid.0, target.child_pid);
+        let parent_fds = fd_evidence(target.parent.pid);
+        let child_fds = fd_evidence(target.child_pid);
+        record(
+            &log_dir,
+            serde_json::json!({"step": "owned_wrapper_descriptors", "parent_identity": parent_identity, "parent_fds": parent_fds, "child_identity": child_identity, "child_fds": child_fds}),
+        );
+        // A harness log is real data-loss evidence. Prove this disposable
+        // fixture has no regular-file writer before requiring the tree refusal;
+        // preserve all production data-loss gates and their execution order.
+        for descriptors in [&parent_fds, &child_fds] {
+            for stdio in 0..=2 {
+                assert!(descriptors
+                    .iter()
+                    .any(|descriptor| descriptor["fd"] == stdio));
+            }
+            assert!(
+                descriptors
+                    .iter()
+                    .all(|descriptor| descriptor["writable_regular"] == false),
+                "owned fixture inherited a regular-file writer: {descriptors:?}"
+            );
+        }
         record(
             &log_dir,
             serde_json::json!({"step": "owned_wrapper_selection", "selected_plan": selection, "before": before.processes}),
@@ -20945,7 +21011,7 @@ mod report_generation_tests {
         fs::create_dir_all(handle.dir.join("decision")).unwrap();
         fs::write(
             handle.dir.join("decision/plan.json"),
-            r#"{"candidates":[]}"#,
+            r#"{"candidates":[],"host_id":"host-from-context"}"#,
         )
         .unwrap();
 
@@ -20955,15 +21021,24 @@ mod report_generation_tests {
                 .with_title("Session Report Test".to_string()),
         );
         let html = generate_report_from_session(&generator, &handle).unwrap();
-        let redaction =
-            pt_redact::RedactionEngine::new(pt_redact::RedactionPolicy::default()).unwrap();
-        let metadata = redaction.redact_json_for_export(
-            &serde_json::json!({"host_id": "host-from-context"}),
-            pt_redact::ExportProfile::Safe,
-        );
+        let recorded_data = |html: &str| -> serde_json::Value {
+            let data = html
+                .split("id=\"recorded-session-data\">")
+                .nth(1)
+                .expect("actual recorded session data")
+                .split("</script>")
+                .next()
+                .unwrap();
+            serde_json::from_str(data).expect("recorded session JSON")
+        };
+        let recorded = recorded_data(&html);
+        // Each export has its own random key. Equal host inputs in the same
+        // export must correlate; a separately constructed engine cannot predict
+        // its token. The plan sentinel independently identifies the context host.
+        assert_eq!(recorded["overview"]["host_id"], recorded["plan"]["host_id"]);
         let host_row = format!(
             "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
-            metadata["host_id"].as_str().unwrap(),
+            recorded["plan"]["host_id"].as_str().unwrap(),
         );
         let wrong_host_row = format!(
             "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
@@ -20975,6 +21050,24 @@ mod report_generation_tests {
         assert!(!html.contains(&wrong_host_row));
         assert!(html.contains("linux"));
         assert!(html.contains("x86_64"));
+
+        // Change only the real saved context. The unchanged plan sentinel must
+        // now differ from the overview, ruling out an overview copied from the
+        // plan or a fabricated constant while retaining Safe host redaction.
+        let mut context = handle.read_context().unwrap();
+        context.host_id = "different-context-host".to_string();
+        handle.write_context(&context).unwrap();
+        let changed_html = generate_report_from_session(&generator, &handle).unwrap();
+        let changed = recorded_data(&changed_html);
+        assert_ne!(changed["overview"]["host_id"], changed["plan"]["host_id"]);
+        let changed_host_row = format!(
+            "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
+            changed["overview"]["host_id"].as_str().unwrap(),
+        );
+        assert!(changed_html.contains(&changed_host_row));
+        assert!(!changed_html.contains("host-from-context"));
+        assert!(!changed_html.contains("different-context-host"));
+        assert!(!changed_html.contains(&wrong_host_row));
     }
 
     #[test]
