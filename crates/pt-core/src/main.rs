@@ -2554,7 +2554,19 @@ fn build_plan_from_selection(
         candidates: plan_candidates,
         generated_at: Some(chrono::Utc::now().to_rfc3339()),
     };
-    Ok(generate_plan(&bundle))
+    let plan = generate_plan(&bundle);
+    let planned_kills = plan
+        .actions
+        .iter()
+        .filter(|action| action.action == Action::Kill && !action.blocked)
+        .count();
+    if planned_kills > policy.guardrails.max_kills_per_run as usize {
+        return Err(format!(
+            "selected {planned_kills} kills exceed the per-run policy limit {}; select fewer processes",
+            policy.guardrails.max_kills_per_run,
+        ));
+    }
+    Ok(plan)
 }
 
 #[cfg(feature = "ui")]
@@ -2644,6 +2656,7 @@ fn write_plan_to_session(handle: &SessionHandle, plan: &Plan) -> Result<PathBuf,
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn acquire_execution_policy(
     policy: &pt_core::config::Policy,
+    recorded_policy: Option<&pt_core::config::Policy>,
     handle: &SessionHandle,
 ) -> Result<(GlobalLock, pt_core::decision::PolicyEnforcer), String> {
     let data_dir = handle
@@ -2654,16 +2667,18 @@ fn acquire_execution_policy(
     let lock = GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock"))
         .map_err(|error| format!("cannot lock execution policy: {error}"))?
         .ok_or("another command is executing actions")?;
-    let enforcer =
-        pt_core::decision::PolicyEnforcer::new(policy, Some(&data_dir.join("rate_limit.json")))
-            .map_err(|error| format!("cannot load execution policy: {error}"))?;
+    let enforcer = pt_core::decision::PolicyEnforcer::new_with_recorded_policy(
+        policy,
+        recorded_policy,
+        Some(&data_dir.join("rate_limit.json")),
+    )
+    .map_err(|error| format!("cannot load execution policy: {error}"))?;
     Ok((lock, enforcer))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn check_execution_policy(
     enforcer: &pt_core::decision::PolicyEnforcer,
-    policy: &pt_core::config::Policy,
     action: &pt_core::plan::PlanAction,
     robot: bool,
 ) -> Result<(pt_core::decision::PolicyCheckResult, ProcessRecord), String> {
@@ -2679,7 +2694,7 @@ fn check_execution_policy(
         .iter()
         .find(|proc| proc.pid == action.target.pid)
         .ok_or("target is absent from current policy evidence")?;
-    let group = if policy.guardrails.protected_groups.is_empty() {
+    let group = if !enforcer.requires_group_evidence() {
         None
     } else {
         let output = std::process::Command::new("ps")
@@ -2718,9 +2733,8 @@ fn check_execution_policy(
         process_state: Some(proc.state),
         wchan: None,
         critical_files: Vec::new(),
-        cgroup_role: policy
-            .guardrails
-            .builtin_protection
+        cgroup_role: enforcer
+            .requires_builtin_placement()
             .then(|| pt_core::collect::read_cgroup_role(proc.pid.0)),
         blast_radius_risk_level: None,
         blast_radius_total_affected: None,
@@ -2944,7 +2958,7 @@ fn execute_plan_actions(
             evidence: std::cell::RefCell::new(None),
         };
         let identity_provider = LiveIdentityProvider::new();
-        let (_execution_lock, new_enforcer) = acquire_execution_policy(policy, handle)?;
+        let (_execution_lock, new_enforcer) = acquire_execution_policy(policy, None, handle)?;
         let enforcer = state.enforcer.get_or_insert(new_enforcer);
         let pre_checks = LivePreCheckProvider::new(
             Some(&policy.guardrails),
@@ -2965,7 +2979,7 @@ fn execute_plan_actions(
         let mut execution_evidence = HashMap::new();
         for action in &plan.actions {
             if !action.blocked && action.action != Action::Keep {
-                let (check, _) = match check_execution_policy(enforcer, policy, action, false) {
+                let (check, _) = match check_execution_policy(enforcer, action, false) {
                     Ok(check) => check,
                     Err(error) => {
                         outcomes.push(pt_core::action::ActionResult {
@@ -16779,11 +16793,25 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         },
         None => config.policy.guardrails.min_process_age_seconds,
     };
-    let has_policy_snapshot = saved_document
-        .get("policy_snapshot")
-        .is_some_and(|snapshot| {
-            serde_json::from_value::<pt_core::config::Policy>(snapshot.clone()).is_ok()
-        });
+    let recorded_policy = match saved_document.get("policy_snapshot") {
+        Some(snapshot) => match serde_json::from_value::<pt_core::config::Policy>(snapshot.clone())
+        {
+            Ok(policy) => Some(policy),
+            Err(error) => {
+                eprintln!("agent apply: requires a valid recorded policy snapshot: {error}");
+                println!(
+                    "{}",
+                    format_structured_output(
+                        global,
+                        serde_json::json!({"session_id": sid.0, "error": "invalid_policy_snapshot"}),
+                    )
+                );
+                return ExitCode::PolicyBlocked;
+            }
+        },
+        None => None,
+    };
+    let has_policy_snapshot = recorded_policy.is_some();
     if config
         .policy
         .robot_mode
@@ -16798,7 +16826,16 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .min_age
         .unwrap_or(saved_min_age)
         .max(saved_min_age)
-        .max(config.policy.guardrails.min_process_age_seconds);
+        .max(config.policy.guardrails.min_process_age_seconds)
+        .max(
+            recorded_policy
+                .as_ref()
+                .map_or(0, |policy| policy.guardrails.min_process_age_seconds),
+        );
+    let builtin_protection = config.policy.guardrails.builtin_protection
+        || recorded_policy
+            .as_ref()
+            .is_some_and(|policy| policy.guardrails.builtin_protection);
     if min_age > 0 && !target_pids.is_empty() {
         let scan_options = QuickScanOptions {
             pids: target_pids.clone(),
@@ -16866,7 +16903,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     apply_process_tree_safety(
         &mut selected_refs,
         &before_scan_processes,
-        config.policy.guardrails.builtin_protection,
+        builtin_protection,
     );
     let tree_refusals: HashMap<u32, String> = selected_candidates
         .iter()
@@ -17019,7 +17056,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     // Check if robot mode is enabled in policy (required for agent apply)
-    if !config.policy.robot_mode.enabled && !global.dry_run && !global.shadow {
+    if (!config.policy.robot_mode.enabled
+        || recorded_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.robot_mode.enabled))
+        && !global.dry_run
+        && !global.shadow
+    {
         let err = serde_json::json!({
             "session_id": sid.0,
             "error": "robot_mode_disabled",
@@ -17030,39 +17073,58 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     // Build robot constraints from policy + CLI overrides
-    let constraints = RuntimeRobotConstraints::from_policy(&config.policy.robot_mode)
-        .with_min_posterior(args.min_posterior)
-        .with_max_blast_radius_mb(args.max_blast_radius)
-        .with_max_total_blast_radius_mb(args.max_total_blast_radius)
-        .with_max_kills(args.max_kills)
-        .with_require_known_signature(if args.require_known_signature {
-            Some(true)
-        } else {
-            None
-        })
-        .with_allow_categories(if args.only_categories.is_empty() {
-            None
-        } else {
-            Some(args.only_categories.clone())
-        })
-        .with_exclude_categories(args.exclude_categories.clone());
+    let build_constraints = |policy: &pt_core::config::Policy| {
+        RuntimeRobotConstraints::from_policy(&policy.robot_mode)
+            .with_min_posterior(args.min_posterior)
+            .with_max_blast_radius_mb(args.max_blast_radius)
+            .with_max_total_blast_radius_mb(args.max_total_blast_radius)
+            .with_max_kills(args.max_kills)
+            .with_require_known_signature(if args.require_known_signature {
+                Some(true)
+            } else {
+                None
+            })
+            .with_allow_categories(if args.only_categories.is_empty() {
+                None
+            } else {
+                Some(args.only_categories.clone())
+            })
+            .with_exclude_categories(args.exclude_categories.clone())
+    };
 
+    let constraints = build_constraints(&config.policy);
     let checker = ConstraintChecker::new(constraints.clone());
-    let constraints_summary = constraints.active_constraints_summary();
+    let recorded_checker = recorded_policy
+        .as_ref()
+        .map(|policy| ConstraintChecker::new(build_constraints(policy)));
+    let mut constraints_summary = constraints.active_constraints_summary();
+    if let Some(policy) = &recorded_policy {
+        constraints_summary.extend(
+            build_constraints(policy)
+                .active_constraints_summary()
+                .into_iter()
+                .map(|constraint| format!("recorded {constraint}")),
+        );
+    }
     let _ = handle.update_state(SessionState::Executing);
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let precheck_provider = {
+    let precheck_providers = {
         use pt_core::action::{LivePreCheckConfig, LivePreCheckProvider};
-        LivePreCheckProvider::new(
-            Some(&config.policy.guardrails),
-            LivePreCheckConfig::from(&config.policy.data_loss_gates),
-        )
-        .map_err(|error| eprintln!("agent apply: cannot configure safety checks: {error}"))
+        std::iter::once(&config.policy)
+            .chain(recorded_policy.iter())
+            .map(|policy| {
+                LivePreCheckProvider::new(
+                    Some(&policy.guardrails),
+                    LivePreCheckConfig::from(&policy.data_loss_gates),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| eprintln!("agent apply: cannot configure safety checks: {error}"))
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let precheck_provider = match precheck_provider {
-        Ok(provider) => provider,
+    let precheck_providers = match precheck_providers {
+        Ok(providers) => providers,
         Err(()) => return ExitCode::PolicyBlocked,
     };
     // One recent-I/O probe window for every target the data-loss gate will check,
@@ -17078,7 +17140,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             })
             .map(|a| a.target.pid.0)
             .collect();
-        precheck_provider.prime_recent_io(&gated);
+        // Observe both policies' I/O windows concurrently. Each retains its
+        // own threshold and cache; neither policy can disable the other's gate.
+        std::thread::scope(|scope| {
+            for provider in &precheck_providers {
+                scope.spawn(|| provider.prime_recent_io(&gated));
+            }
+        });
     }
 
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
@@ -17161,7 +17229,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 has_policy_snapshot,
                 is_supervised: is_supervised_for_robot(action.target.pid.0),
             };
-            let check = checker.check_candidate(&candidate);
+            let mut check = checker.check_candidate(&candidate);
+            if check.allowed {
+                if let Some(recorded) = &recorded_checker {
+                    check = recorded.check_candidate(&candidate);
+                }
+            }
             if !check.allowed {
                 blocked_by_constraints += 1;
                 outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "blocked_by_constraints"}));
@@ -17177,7 +17250,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
 
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if let Some((check, reason)) = first_precheck_block(&precheck_provider, action) {
+            if let Some((check, reason)) = precheck_providers
+                .iter()
+                .find_map(|provider| first_precheck_block(provider, action))
+            {
                 blocked_by_prechecks += 1;
                 outcomes.push(serde_json::json!({
                     "action_id": action.action_id,
@@ -17232,7 +17308,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let (_execution_lock, enforcer) =
-                match acquire_execution_policy(&config.policy, &handle) {
+                match acquire_execution_policy(&config.policy, recorded_policy.as_ref(), &handle) {
                     Ok(policy) => policy,
                     Err(error) => {
                         eprintln!("agent apply: {error}");
@@ -17335,7 +17411,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         continue;
                     }
                 }
-                if let Some((check, reason)) = first_precheck_block(&precheck_provider, action) {
+                if let Some((check, reason)) = precheck_providers
+                    .iter()
+                    .find_map(|provider| first_precheck_block(provider, action))
+                {
                     blocked_by_prechecks += 1;
                     let elapsed_ms = start.elapsed().as_millis() as u64;
                     outcomes.push(serde_json::json!({
@@ -17392,7 +17471,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     tree_reason = execution_tree_refusal(
                         action.target.pid.0,
                         &current_tree,
-                        config.policy.guardrails.builtin_protection,
+                        builtin_protection,
                     );
                 }
                 if let Some(reason) = tree_reason {
@@ -17419,7 +17498,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
 
                 let (policy_check, current_process) =
-                    match check_execution_policy(&enforcer, &config.policy, action, true) {
+                    match check_execution_policy(&enforcer, action, true) {
                         Ok(check) => check,
                         Err(error) => {
                             blocked_by_prechecks += 1;
@@ -17476,7 +17555,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     has_policy_snapshot,
                     is_supervised: is_supervised_for_robot(action.target.pid.0),
                 };
-                let check = checker.check_candidate(&candidate);
+                let mut check = checker.check_candidate(&candidate);
+                if check.allowed {
+                    if let Some(recorded) = &recorded_checker {
+                        check = recorded.check_candidate(&candidate);
+                    }
+                }
                 if !check.allowed {
                     blocked_by_constraints += 1;
                     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -17549,6 +17633,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 let kill_signal_delivered = action_runner.take_kill_signal_delivered();
                 if action.action == Action::Kill && kill_signal_delivered {
                     checker.record_action(current_rss_bytes, true);
+                    if let Some(recorded) = &recorded_checker {
+                        recorded.record_action(current_rss_bytes, true);
+                    }
                 }
                 if action.action == Action::Kill {
                     if let Err(error) = enforcer.finish_kill_accounting(kill_signal_delivered) {

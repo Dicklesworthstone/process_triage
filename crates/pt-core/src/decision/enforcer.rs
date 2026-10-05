@@ -369,6 +369,9 @@ pub struct PolicyEnforcer {
     data_loss_gates: DataLossGates,
     /// `guardrails.builtin_protection`.
     builtin_protection: bool,
+    /// The recorded policy independently restricts the current policy. Both
+    /// predicates share one durable limiter and one per-run count.
+    recorded_policy: Option<Box<PolicyEnforcer>>,
     /// Policy snapshot timestamp for hot-reload detection.
     loaded_at: Instant,
 }
@@ -455,8 +458,69 @@ impl PolicyEnforcer {
             robot_mode: policy.robot_mode.clone(),
             data_loss_gates: policy.data_loss_gates.clone(),
             builtin_protection: policy.guardrails.builtin_protection,
+            recorded_policy: None,
             loaded_at: Instant::now(),
         })
+    }
+
+    /// Enforce both policies without merging their protection exceptions or
+    /// charging one delivered kill twice. Only the four numeric budget caps
+    /// are intersected, with an absent window cap meaning no limit.
+    pub fn new_with_recorded_policy(
+        current: &Policy,
+        recorded: Option<&Policy>,
+        state_path: Option<&std::path::Path>,
+    ) -> Result<Self, EnforcerError> {
+        let mut enforcer = Self::new(current, state_path)?;
+        if let Some(recorded) = recorded {
+            let stricter_cap = |left: Option<u32>, right: Option<u32>| match (left, right) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(cap), None) | (None, Some(cap)) => Some(cap),
+                (None, None) => None,
+            };
+            let mut budgets = current.guardrails.clone();
+            budgets.max_kills_per_run = budgets
+                .max_kills_per_run
+                .min(recorded.guardrails.max_kills_per_run);
+            budgets.max_kills_per_minute = stricter_cap(
+                budgets.max_kills_per_minute,
+                recorded.guardrails.max_kills_per_minute,
+            );
+            budgets.max_kills_per_hour = stricter_cap(
+                budgets.max_kills_per_hour,
+                recorded.guardrails.max_kills_per_hour,
+            );
+            budgets.max_kills_per_day = stricter_cap(
+                budgets.max_kills_per_day,
+                recorded.guardrails.max_kills_per_day,
+            );
+            enforcer.rate_limiter = Arc::new(
+                SlidingWindowRateLimiter::from_guardrails(&budgets, state_path)
+                    .map_err(|error| EnforcerError::PolicyInvalid(error.to_string()))?,
+            );
+            let mut recorded_enforcer = Self::new(recorded, None)?;
+            recorded_enforcer.rate_limiter = Arc::clone(&enforcer.rate_limiter);
+            enforcer.recorded_policy = Some(Box::new(recorded_enforcer));
+        }
+        Ok(enforcer)
+    }
+
+    /// Collect evidence needed by either policy, even if the current policy
+    /// removed every protected group or disabled built-in protection.
+    pub fn requires_group_evidence(&self) -> bool {
+        !self.protected_groups.is_empty()
+            || self
+                .recorded_policy
+                .as_ref()
+                .is_some_and(|policy| policy.requires_group_evidence())
+    }
+
+    pub fn requires_builtin_placement(&self) -> bool {
+        self.builtin_protection
+            || self
+                .recorded_policy
+                .as_ref()
+                .is_some_and(|policy| policy.requires_builtin_placement())
     }
 
     /// Check if an action is allowed for a candidate.
@@ -477,6 +541,13 @@ impl PolicyEnforcer {
         }
 
         let mut warnings = Vec::new();
+        if let Some(recorded) = &self.recorded_policy {
+            let check = recorded.check_action(candidate, action, robot_mode);
+            if !check.allowed {
+                return check;
+            }
+            warnings.extend(check.warnings);
+        }
         // Only enforce most rules for destructive actions
         let is_destructive = matches!(action, Action::Kill | Action::Restart);
 
@@ -1220,6 +1291,10 @@ impl PolicyEnforcer {
     /// Check if the enforcer requires confirmation for actions.
     pub fn requires_confirmation(&self) -> bool {
         self.require_confirmation
+            || self
+                .recorded_policy
+                .as_ref()
+                .is_some_and(|policy| policy.requires_confirmation())
     }
 
     /// Get time since policy was loaded.
