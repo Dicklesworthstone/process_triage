@@ -150,8 +150,8 @@ Most tools only know "kill" or "don't kill." `pt` evaluates 8 possible actions r
 | **Renice** | lower priority (`nice`), never raises it | Yes | Linux, macOS |
 | **Pause** | `SIGSTOP` (resume: `SIGCONT`) | Yes | Linux, macOS |
 | **Freeze** | cgroup v2 freezer | Yes | Linux, if the target owns its cgroup |
-| **Throttle** | cgroup CPU quota | Yes | Linux, if the target owns its cgroup |
-| **Quarantine** | cpuset controller | Yes | Linux, if the target owns its cgroup |
+| **Throttle** | cgroup CPU quota | Explicit prior metadata | Linux, in an exclusive leaf |
+| **Quarantine** | cpuset controller | Explicit prior metadata | Linux, in an exclusive leaf |
 | **Restart** | via the supervisor | Partial | not executable yet (planned, e.g. for a zombie's parent); apply reports it as failed |
 | **Kill** | SIGTERM → SIGKILL | No | Linux, macOS |
 
@@ -1137,7 +1137,19 @@ Example: 25% throttle = 25,000 µs quota per 100,000 µs period
 | **Write order** | Period must be set before quota | Single atomic write |
 | **Detection** | Hierarchy ID != 0 in `/proc/[pid]/cgroup` | Hierarchy ID = 0 |
 
-`pt` auto-detects cgroup version (v1, v2, or hybrid) and uses the appropriate interface. Previous settings are captured for reversal. Linux only, and refused unless the target is the only process in its cgroup: limiting a shared cgroup would throttle or freeze its neighbours too, and most shell-launched dev processes share one.
+`pt` detects cgroup v1, v2 and hybrid hierarchies. Mutation currently requires a
+readable unified v2 hierarchy, a full matching process identity, the caller's
+owner, and an exclusive leaf with no descendants. Direct runners also refuse
+PID 1, invoking processes and protected infrastructure. Hybrid v1 fallbacks check
+their own controller's leaf separately; pure v1 mutation is refused. Most
+shell-launched dev processes share a cgroup and cannot be changed safely here.
+These checks are snapshots; automatic creation of a dedicated target leaf is
+not implemented.
+
+The library can capture prior CPU limits and CPU sets for explicit reversal,
+bound to the original process identity and controller path. Unknown prior
+settings are refused. A bare Unquarantine action cannot restore a prior CPU set
+and is refused; durable reversal wiring into the CLI remains incomplete.
 
 ### cpuset Quarantine
 

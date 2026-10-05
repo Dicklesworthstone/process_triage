@@ -1,6 +1,6 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Current validation — 2026-10-05 17:45 UTC
+## Current validation — 2026-10-05 18:16 UTC
 
 The combined repaired source is archived at
 `/data/tmp/pt-source-recovery-20261005-1724.se2lcrn6/frozen-source.tar.gz`,
@@ -26,12 +26,32 @@ identity afterward. `current-1724-native-renice-mutation-hz3.log` retains both
 streams, exact executable SHA-256 and command. This is one selected test with
 17 filtered cases, explicitly separate from the unfiltered affected run.
 
-The complete ROOT workspace invocation on this archived source remains running.
-It has two actual library failures: the new recent-I/O and supervision fixtures
-assert a nonroot caller because root can bypass the permission-denial oracle.
-Repair is in progress: execute the same complete cases in an owned subprocess
-with verified dropped credentials/capabilities, preserving actual PermissionDenied
-assertions. No root or nonroot complete workspace pass is claimed. The first
+The complete ROOT workspace invocation on this archived source lost SSH at
+17:45:19 UTC (caller exit 1, transport exit 255); remote completion is unconfirmed.
+The observed prefix contains 5,031 passes and four failures, not a complete result:
+three permission fixtures require a nonroot caller, and the PID-1 throttle fixture
+expected refusal but the runner actually succeeded. A read-only check found
+`/sys/fs/cgroup/init.scope/cpu.max` at `25000 100000`. I should have inspected the
+privileged mutation fixtures before launching this run. The test did not record
+the previous value; restoration awaits the operator's intended quota. No guessed
+system-service write has been performed. Normal owner-bound RCH cancellation
+reported exit 130 without terminal acknowledgment; recovery returned RCH-E504
+without replay. Source ownership has not been forcibly cleared.
+
+The original CPU-throttle task `process_triage-sj6.6` is reopened; its original
+positive relief, identity, protection, isolation and reversal criteria remain.
+`bd-qr40.4` is now in progress for actual dedicated-leaf/sibling evidence. Source
+changes add direct-runner protected-PID/full-birth/owner checks, strict exclusive
+leaf checks, captured-identity reversal and explicit refusal of unknown settings.
+They are unverified. Existing unsafe inherited-cgroup positives are being replaced
+with explicitly provisioned delegated-parent fixtures; unavailable prerequisites
+cannot count as live actuation. Unquarantine without recorded state is now refused,
+not called reversible. Snapshot checks still do not provide atomic kernel isolation.
+
+The three complete permission fixtures now share a child-only privilege-drop
+helper, with actual UID/GID/groups/capabilities checks and retained file handles.
+Independent source review corrected a root artifact-path race. Fresh runtime
+validation remains required. No root or nonroot complete workspace pass is claimed. The first
 17:15 repair attempt failed compilation on two ambiguous PID parses; both now
 have explicit u32 types. The prior root job was owner-cancelled, then recovered
 through RCH's normal API with source ownership released; its 137 recovery status
@@ -125,8 +145,11 @@ backup. A fresh reconciled source/graph snapshot is retained at
 and runtime archive remains at
 `/tmp/actionlint-bd-ufqb11/current-1420-recovery-h9jxfnhm/frozen-source-and-owned-runtime.tar.gz`.
 
-Eleven product tasks are independently closed; 124 are open and ten in progress (134
-remaining). Original Plan/verify acceptance was independently satisfied on the
+Eleven product tasks were independently closed during the session; two older
+positive-capability closures were reopened on discovered gaps. The current graph
+has 959 total issues, 823 closed, 124 open and twelve in progress (**136 remaining**).
+The earlier 135 figure was arithmetic error. Active dependency cycles are zero;
+one archived closed cycle is preserved. Original Plan/verify acceptance was independently satisfied on the
 frozen source and restored-tree review; `bd-uacs.1/.2` are now closed. Nineteen
 dependency families, including Clap 4.6.7, have bounded runtime/compiler validation.
 The security audit and unchanged-rule UBS scan remain exit 1; neither is waived.
@@ -210,6 +233,20 @@ The security audit and unchanged-rule UBS scan remain exit 1; neither is waived.
     This supplies current runtime evidence, not a diagnosis of the earlier timeouts.
   - [ ] Run the entire root and nonroot workspace on the final source, including
     root-compatible owned privilege-drop fixtures; preserve each failed attempt.
+  - [ ] Restore PID 1's quota only after its intended value is supplied; retain the
+    incident and uncertain remote terminal state without guessing a recovery.
+  - [ ] Validate direct cgroup runner protected-PID, exact birth/UID, caller-owner,
+    invoking-process, infrastructure and leaf guards, including explicit undo.
+  - [ ] Exercise throttle/freeze in a fresh delegated owned leaf and verify an
+    unaffected sibling before, during and after exact reversal; prerequisite
+    absence is unavailable evidence, not delivered positive capability.
+  - [ ] Wire durable quarantine reversal into CLI actions. A bare Unquarantine
+    refusal does not deliver that feature or close its original task.
+  - [ ] Finish complete deterministic fleet diff coverage: remaining Gamma/IO/
+    hazard/category fields and actual matcher/lifecycle changes are omitted.
+    Current preview acceptance covers its nine numeric fields only. Invalid merge
+    strategy now fails CLI parsing instead of silently selecting Weighted; source
+    and runtime regression validation remain pending.
   - [ ] Independently review the legitimate fixture-fix win/lose split, then run
     affected targets and all mandatory compiler gates on the new combined source.
 - [ ] Run the complete workspace test suite on the final source; do not replace
