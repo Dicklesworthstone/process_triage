@@ -1014,11 +1014,17 @@ mod tests {
         fn test_zombie_detection() {
             use std::process::Command;
 
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.wait();
+                }
+            }
             // Spawn a process that exits immediately
             // It will become a zombie because we hold the handle and don't wait() yet
-            let mut child = Command::new("true").spawn().expect("failed to spawn true");
+            let mut child = OwnedChild(Command::new("true").spawn().expect("failed to spawn true"));
 
-            let pid = child.id();
+            let pid = child.0.id();
             let runner = SignalActionRunner::with_defaults();
 
             // Observe this owned child's actual exit without reaping it. Fixture
@@ -1043,7 +1049,7 @@ mod tests {
                 }
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
-                    let _ = child.wait();
+                    let _ = child.0.wait();
                     panic!("observe owned child exit without reaping: {error}");
                 }
             }
@@ -1067,7 +1073,7 @@ mod tests {
             assert!(result.is_ok(), "Zombie should be considered exited");
 
             // Cleanup
-            assert!(child.wait().expect("reap the owned zombie").success());
+            assert!(child.0.wait().expect("reap the owned zombie").success());
         }
     }
 }

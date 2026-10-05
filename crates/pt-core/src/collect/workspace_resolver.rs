@@ -471,6 +471,37 @@ mod tests {
     }
 
     #[test]
+    fn read_head_state_malformed_utf8_boundaries_are_unreadable() {
+        let cases = [
+            ("unicode-byte-42", "€".repeat(14).into_bytes(), Some("€".repeat(14))),
+            ("unicode-byte-40", format!("{}€", "x".repeat(39)).into_bytes(), Some(format!("{}€", "x".repeat(39)))),
+            ("unicode-character-limit", "€".repeat(41).into_bytes(), Some("€".repeat(40))),
+            ("invalid-utf8", vec![0xe2, 0x82], None),
+        ];
+        for (label, contents, expected_prefix) in cases {
+            let fixture = GitFixture::new(label);
+            assert_eq!(read_head_state(&fixture.root), Some(HeadState::Branch { name: "main".to_string() }));
+            // Corrupt only the retained owned repository's actual HEAD. The
+            // first two payloads put byte 40 inside a UTF-8 character.
+            fs::write(fixture.root.join(".git/HEAD"), contents).unwrap();
+            let head = read_head_state(&fixture.root);
+            let Some(HeadState::Unreadable { reason }) = head else {
+                panic!("malformed HEAD must return typed Unreadable: {head:?}");
+            };
+            match expected_prefix {
+                Some(prefix) => assert_eq!(reason, format!("unexpected HEAD content: {prefix}")),
+                None => {
+                    assert!(!reason.is_empty());
+                    assert!(reason.contains("UTF-8"), "invalid bytes must report an encoding error: {reason}");
+                }
+            }
+            let (root, worktree) = find_repo_root(&fixture.subdir);
+            assert_eq!(root.unwrap().effective_path(), fs::canonicalize(&fixture.root).unwrap().to_str().unwrap());
+            assert!(worktree.is_none());
+        }
+    }
+
+    #[test]
     fn parse_gitdir_file_empty_returns_none() {
         let dir = retained_test_dir("empty-gitdir");
         let git_file = dir.join(".git");
@@ -513,15 +544,56 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_workspace_for_own_pid() {
-        let pid = std::process::id();
+    fn resolve_workspace_for_owned_child_pid() {
+        let fixture = GitFixture::new("process-cwd");
+        let original_cwd = std::env::current_dir().unwrap();
+        let mut child = OwnedCwdChild::spawn(&fixture.subdir);
+        let pid = child.child.id();
+        assert!(child.child.try_wait().unwrap().is_none());
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let actual_cwd = fs::read_link(format!("/proc/{pid}/cwd")).unwrap();
+        let expected_cwd = fs::canonicalize(&fixture.subdir).unwrap();
+        assert_eq!(actual_cwd, expected_cwd);
         let evidence = resolve_workspace_for_pid(pid);
 
         assert_eq!(evidence.pid, pid);
-        // We should be able to read our own CWD
-        assert!(evidence.cwd.is_some(), "should read own cwd");
-        // We're running in the process_triage repo
-        assert!(evidence.repo_root.is_some(), "should find repo root");
-        assert!(evidence.head_state.is_some(), "should read HEAD");
+        assert_eq!(evidence.collection_method, WorkspaceCollectionMethod::ProcfsCwdWalk);
+        let cwd = evidence.cwd.as_ref().expect("read actual owned child cwd");
+        assert_eq!(cwd.effective_path(), expected_cwd.to_str().unwrap());
+        assert!(cwd.resolution_error.is_none());
+        let root = evidence.repo_root.as_ref().expect("find actual committed Git root");
+        assert_eq!(root.effective_path(), fs::canonicalize(&fixture.root).unwrap().to_str().unwrap());
+        assert!(root.resolution_error.is_none());
+        assert!(evidence.worktree.is_none());
+        assert_eq!(evidence.head_state, Some(HeadState::Branch { name: "main".to_string() }));
+        chrono::DateTime::parse_from_rfc3339(&evidence.observed_at).unwrap();
+
+        let mut non_repo_child = OwnedCwdChild::spawn(&fixture.non_repo);
+        let non_repo_pid = non_repo_child.child.id();
+        assert_ne!(pid, non_repo_pid);
+        assert!(non_repo_child.child.try_wait().unwrap().is_none());
+        let non_repo_stat = fs::read_to_string(format!("/proc/{non_repo_pid}/stat")).unwrap();
+        let non_repo_evidence = resolve_workspace_for_pid(non_repo_pid);
+        assert_eq!(non_repo_evidence.pid, non_repo_pid);
+        assert_eq!(non_repo_evidence.collection_method, WorkspaceCollectionMethod::ProcfsCwdWalk);
+        let non_repo_cwd = non_repo_evidence.cwd.as_ref().unwrap();
+        assert_eq!(non_repo_cwd.effective_path(), fs::canonicalize(&fixture.non_repo).unwrap().to_str().unwrap());
+        assert!(non_repo_cwd.resolution_error.is_none());
+        assert!(non_repo_evidence.repo_root.is_none());
+        assert!(non_repo_evidence.worktree.is_none());
+        assert_eq!(non_repo_evidence.head_state, Some(HeadState::NotARepo));
+        assert!(child.child.try_wait().unwrap().is_none());
+        assert!(non_repo_child.child.try_wait().unwrap().is_none());
+        assert_eq!(std::env::current_dir().unwrap(), original_cwd);
+
+        // Retain original /proc identity and resolver output beside the real
+        // Git command log; no synthetic evidence is supplied to the resolver.
+        fs::write(
+            fixture.root.parent().unwrap().join("process-evidence.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "repo_child": { "stat": stat, "evidence": evidence },
+                "non_repo_child": { "stat": non_repo_stat, "evidence": non_repo_evidence },
+            })).unwrap(),
+        ).unwrap();
     }
 }
