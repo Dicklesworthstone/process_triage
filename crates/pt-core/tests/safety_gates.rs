@@ -225,7 +225,7 @@ mod data_loss_gates {
 
         // Initialize git repo and hold a lock
         let setup_cmd = format!(
-            "cd {} && git init && touch .git/index.lock && sleep 60",
+            "cd {} && git init --initial-branch=main && touch .git/index.lock && sleep 60",
             dir.path().display()
         );
 

@@ -25,6 +25,10 @@ use std::process::{Child, Command as ProcessCommand};
 use std::time::Duration;
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
+#[path = "support/live_harness.rs"]
+mod live_test_harness;
+
 /// How apply delivers signals to a single verified process: a pidfd bound to it on
 /// Linux; kill(2) right after an exact start-time recheck on macOS (no pidfds).
 #[cfg(target_os = "linux")]
@@ -761,6 +765,11 @@ fn agent_apply_persists_the_kill_budget_across_runs() {
 #[cfg(target_os = "linux")]
 #[test]
 fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
+    if live_test_harness::run_owned_unprivileged_case(
+        "actual_agent_plan_applies_and_verifies_its_saved_live_identity",
+    ) {
+        return;
+    }
     use pt_core::supervision::signature::{
         BetaParams, SignaturePriors, SignatureSchema, SupervisorSignature,
     };
@@ -843,8 +852,11 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
     // Keep artifacts for inspection and never remove files as test cleanup.
     let data_dir = TempDir::new().expect("data dir").keep();
     let config_dir = TempDir::new().expect("config dir").keep();
-    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/test-logs/e2e/agent_loop")
+    let log_dir = std::env::var_os("PT_TEST_UNPRIVILEGED_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-logs/e2e/agent_loop")
+        })
         .join(format!(
             "{}-{}",
             chrono::Utc::now().timestamp_millis(),
