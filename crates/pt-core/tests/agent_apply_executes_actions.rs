@@ -827,80 +827,87 @@ finally:
     os.close(pidfd)
     print('Owned pidfd target reaped; files retained', file=sys.stderr, flush=True)
 "#;
-    let mut reaper = OwnedSubreaper(
-        ProcessCommand::new("python3")
-            .args(["-u", "-c", script, &unique_seconds])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(fs::File::create(log_dir.join("target-launch.stderr")).unwrap())
-            .spawn()
-            .expect("spawn owned subreaper"),
-    );
-    let mut line = String::new();
-    std::io::BufReader::new(reaper.0.stdout.take().expect("adoption evidence pipe"))
-        .read_line(&mut line)
-        .expect("read adopted target evidence");
-    let adoption: Value = serde_json::from_str(&line).expect("actual kernel adoption evidence");
-    let pid: u32 = adoption["pid"].as_u64().unwrap().try_into().unwrap();
-    assert_eq!(adoption["adoptive_parent"], reaper.0.id());
-    // SAFETY: pidfd_open does not modify the process. Ownership of the returned
-    // descriptor transfers once to OwnedFd and lasts through all assertions.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
-    let _target = BoundTarget(unsafe { OwnedFd::from_raw_fd(fd as i32) });
-    let identity = live_identity(pid);
-    let raw_stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    let fields: Vec<_> = raw_stat
-        .rsplit_once(") ")
-        .unwrap()
-        .1
-        .split_whitespace()
-        .collect();
-    assert_eq!(fields[1].parse::<u32>().unwrap(), reaper.0.id());
-    assert_eq!(
-        fields[3].parse::<u32>().unwrap(),
-        adoption["former_parent"].as_u64().unwrap() as u32
-    );
-    assert_ne!(adoption["former_parent"], adoption["adoptive_parent"]);
-    assert_ne!(identity.sid, Some(pid));
-    assert_eq!(fields[4], "0", "orphan must have no controlling terminal");
-    assert_ne!(fields[0], "Z");
-    // SAFETY: getuid has no pointer arguments and only observes this process.
-    assert_eq!(identity.uid, unsafe { libc::getuid() });
-    assert_eq!(
-        fs::read(format!("/proc/{pid}/environ")).unwrap(),
-        b"PATH=/usr/bin:/bin\0"
-    );
-    let mut descriptors = Vec::new();
-    for path in fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
-        let path = path.unwrap().path();
-        let fd: u32 = path.file_name().unwrap().to_str().unwrap().parse().unwrap();
-        let destination = fs::read_link(&path).unwrap();
-        assert_eq!(destination, Path::new("/dev/null"));
-        let raw_fdinfo = fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).unwrap();
-        descriptors
-            .push(serde_json::json!({"fd":fd, "destination":destination, "raw_fdinfo":raw_fdinfo}));
-    }
-    descriptors.sort_by_key(|descriptor| descriptor["fd"].as_u64().unwrap());
-    assert_eq!(
-        descriptors
-            .iter()
-            .map(|descriptor| descriptor["fd"].as_u64().unwrap())
-            .collect::<Vec<_>>(),
-        vec![0, 1, 2]
-    );
-    fs::write(
-        log_dir.join("owned-target-before.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "adoption":adoption, "identity":identity, "raw_stat":raw_stat,
-            "raw_status":fs::read_to_string(format!("/proc/{pid}/status")).unwrap(),
-            "descriptors":descriptors, "data_dir":data_dir, "config_dir":config_dir,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let spawn_owned_orphan = |target_log: &Path, seconds: &str, data: &Path, config: &Path| {
+        let mut reaper = OwnedSubreaper(
+            ProcessCommand::new("python3")
+                .args(["-u", "-c", script, seconds])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(fs::File::create(target_log.join("target-launch.stderr")).unwrap())
+                .spawn()
+                .expect("spawn owned subreaper"),
+        );
+        let mut line = String::new();
+        std::io::BufReader::new(reaper.0.stdout.take().expect("adoption evidence pipe"))
+            .read_line(&mut line)
+            .expect("read adopted target evidence");
+        let adoption: Value = serde_json::from_str(&line).expect("actual kernel adoption evidence");
+        let pid: u32 = adoption["pid"].as_u64().unwrap().try_into().unwrap();
+        assert_eq!(adoption["adoptive_parent"], reaper.0.id());
+        // SAFETY: pidfd_open observes our owned process. Ownership transfers
+        // once to OwnedFd and lasts through all assertions and cleanup.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+        let target = BoundTarget(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+        let identity = live_identity(pid);
+        let raw_stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let fields: Vec<_> = raw_stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        assert_eq!(fields[1].parse::<u32>().unwrap(), reaper.0.id());
+        assert_eq!(
+            fields[3].parse::<u32>().unwrap(),
+            adoption["former_parent"].as_u64().unwrap() as u32
+        );
+        assert_ne!(adoption["former_parent"], adoption["adoptive_parent"]);
+        assert_ne!(identity.sid, Some(pid));
+        assert_eq!(fields[4], "0", "orphan must have no controlling terminal");
+        assert_ne!(fields[0], "Z");
+        // SAFETY: getuid has no pointer arguments and only observes this process.
+        assert_eq!(identity.uid, unsafe { libc::getuid() });
+        assert_eq!(
+            fs::read(format!("/proc/{pid}/environ")).unwrap(),
+            b"PATH=/usr/bin:/bin\0"
+        );
+        let mut descriptors = Vec::new();
+        for path in fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
+            let path = path.unwrap().path();
+            let fd: u32 = path.file_name().unwrap().to_str().unwrap().parse().unwrap();
+            let destination = fs::read_link(&path).unwrap();
+            assert_eq!(destination, Path::new("/dev/null"));
+            let raw_fdinfo = fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).unwrap();
+            descriptors.push(
+                serde_json::json!({"fd":fd, "destination":destination, "raw_fdinfo":raw_fdinfo}),
+            );
+        }
+        descriptors.sort_by_key(|descriptor| descriptor["fd"].as_u64().unwrap());
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor["fd"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        fs::write(
+            target_log.join("owned-target-before.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "adoption":adoption, "identity":identity, "raw_stat":raw_stat,
+                "raw_status":fs::read_to_string(format!("/proc/{pid}/status")).unwrap(),
+                "descriptors":descriptors, "data_dir":data, "config_dir":config,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (reaper, target, identity)
+    };
+    let (mut reaper, _target, identity) =
+        spawn_owned_orphan(&log_dir, &unique_seconds, &data_dir, &config_dir);
+    let pid = identity.pid.0;
 
     // This intentionally strong typed prior is input to the real Bayesian path,
     // not a claim that the prior is calibrated for production processes.
