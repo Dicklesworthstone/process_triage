@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 
 use pt_config::priors::{BetaParams, Priors};
 use pt_core::fleet::transfer::{
-    compute_diff, export_bundle, merge_beta_params, merge_priors, merge_priors_weighted,
-    normalize_baseline, resolve_signature_conflicts, validate_bundle, BaselineStats, MergeStrategy,
-    TransferBundle, TRANSFER_SCHEMA_VERSION,
+    compute_bundle_checksum, compute_diff, export_bundle, merge_beta_params, merge_priors,
+    merge_priors_weighted, normalize_baseline, resolve_signature_conflicts, validate_bundle,
+    BaselineStats, MergeStrategy, TransferBundle, TRANSFER_SCHEMA_VERSION,
 };
 use pt_core::supervision::pattern_persistence::{
     ConflictResolution, PatternSource, PersistedPattern, PersistedSchema,
@@ -323,7 +323,7 @@ fn normalize_clamps_extreme_ratios() {
 fn diff_identical_priors_no_changes() {
     let priors = default_priors();
     let bundle = export_bundle(Some(&priors), None, None, "h1", None).unwrap();
-    let diff = compute_diff(Some(&priors), None, &bundle);
+    let diff = compute_diff(Some(&priors), None, &bundle, None);
     assert!(diff.priors_changes.is_empty());
 }
 
@@ -337,13 +337,14 @@ fn diff_detects_changed_class_priors() {
     incoming.classes.zombie.prior_prob = 0.001;
 
     let bundle = export_bundle(Some(&incoming), None, None, "h2", None).unwrap();
-    let diff = compute_diff(Some(&local), None, &bundle);
+    let diff = compute_diff(Some(&local), None, &bundle, None);
 
     assert!(!diff.priors_changes.is_empty());
     assert!(diff
         .priors_changes
         .iter()
         .any(|c| c.class == "useful" && c.field == "prior_prob"));
+    assert!(diff.priors_changes.iter().all(|c| c.merged_value.is_none()));
 }
 
 #[test]
@@ -352,7 +353,7 @@ fn diff_detects_added_signature() {
     let incoming_sigs = make_persisted_schema(vec![("existing_sig", 0.8), ("new_sig", 0.6)]);
 
     let bundle = export_bundle(None, Some(&incoming_sigs), None, "h3", None).unwrap();
-    let diff = compute_diff(None, Some(&local_sigs), &bundle);
+    let diff = compute_diff(None, Some(&local_sigs), &bundle, None);
 
     assert!(diff.signature_changes.iter().any(|c| c.name == "new_sig"
         && matches!(
@@ -367,7 +368,7 @@ fn diff_detects_removed_signature() {
     let incoming_sigs = make_persisted_schema(vec![("sig_a", 0.8)]);
 
     let bundle = export_bundle(None, Some(&incoming_sigs), None, "h4", None).unwrap();
-    let diff = compute_diff(None, Some(&local_sigs), &bundle);
+    let diff = compute_diff(None, Some(&local_sigs), &bundle, None);
 
     assert!(diff.signature_changes.iter().any(|c| c.name == "sig_b"
         && matches!(
@@ -382,7 +383,7 @@ fn diff_detects_updated_signature_confidence() {
     let incoming_sigs = make_persisted_schema(vec![("sig_x", 0.9)]);
 
     let bundle = export_bundle(None, Some(&incoming_sigs), None, "h5", None).unwrap();
-    let diff = compute_diff(None, Some(&local_sigs), &bundle);
+    let diff = compute_diff(None, Some(&local_sigs), &bundle, None);
 
     assert!(diff.signature_changes.iter().any(|c| c.name == "sig_x"
         && matches!(
@@ -395,7 +396,7 @@ fn diff_detects_updated_signature_confidence() {
 fn diff_unchanged_signature_marked_as_such() {
     let sigs = make_persisted_schema(vec![("same_sig", 0.8)]);
     let bundle = export_bundle(None, Some(&sigs), None, "h6", None).unwrap();
-    let diff = compute_diff(None, Some(&sigs), &bundle);
+    let diff = compute_diff(None, Some(&sigs), &bundle, None);
 
     assert!(diff.signature_changes.iter().any(|c| c.name == "same_sig"
         && matches!(
@@ -423,13 +424,8 @@ fn validate_future_major_version_errors() {
     let priors = default_priors();
     let mut bundle = export_bundle(Some(&priors), None, None, "h1", None).unwrap();
     bundle.schema_version = "2.0.0".to_string();
-    bundle.checksum = String::new();
-    // Need to recompute checksum.
-    let bytes = serde_json::to_vec(&bundle).unwrap();
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    bundle.checksum = hex::encode(hasher.finalize());
+    // An intentionally changed schema fixture needs its canonical checksum.
+    bundle.checksum = compute_bundle_checksum(&bundle).unwrap();
     let err = validate_bundle(&bundle).unwrap_err();
     assert!(err.to_string().contains("unsupported"));
 }
@@ -439,17 +435,23 @@ fn validate_minor_version_bump_warns() {
     let priors = default_priors();
     let mut bundle = export_bundle(Some(&priors), None, None, "h1", None).unwrap();
     bundle.schema_version = "1.1.0".to_string();
-    // Recompute checksum.
-    let mut for_hash = bundle.clone();
-    for_hash.checksum = String::new();
-    let bytes = serde_json::to_vec(&for_hash).unwrap();
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    bundle.checksum = hex::encode(hasher.finalize());
+    // This planted version change is not a captured positive CLI export.
+    bundle.checksum = compute_bundle_checksum(&bundle).unwrap();
 
     let warnings = validate_bundle(&bundle).unwrap();
     assert!(warnings.iter().any(|w| w.code == "schema_version_mismatch"));
+    let supplied_checksum = bundle.checksum.clone();
+    bundle
+        .priors
+        .as_mut()
+        .unwrap()
+        .classes
+        .useful
+        .cpu_beta
+        .alpha += 1.0;
+    let error = validate_bundle(&bundle).unwrap_err();
+    assert!(error.to_string().contains("checksum mismatch"));
+    assert_eq!(bundle.checksum, supplied_checksum);
 }
 
 #[test]
@@ -599,7 +601,7 @@ fn dry_run_diff_does_not_mutate_inputs() {
     let bundle = export_bundle(Some(&incoming), None, None, "h1", None).unwrap();
 
     // Compute diff (dry run).
-    let _diff = compute_diff(Some(&local), None, &bundle);
+    let _diff = compute_diff(Some(&local), None, &bundle, None);
 
     // Local priors should be unchanged.
     assert!((local.classes.useful.prior_prob - local_clone.classes.useful.prior_prob).abs() < 1e-9);

@@ -40,6 +40,12 @@ pub enum TransferError {
 
     #[error("invalid weight: {0}")]
     InvalidWeight(String),
+
+    #[error("invalid transfer configuration: {0}")]
+    InvalidConfiguration(String),
+
+    #[error("transfer contains detected sensitive content; intact configuration transfer refused")]
+    SensitiveContent,
 }
 
 /// Non-fatal warning from bundle validation.
@@ -185,15 +191,20 @@ pub fn export_bundle(
     };
 
     bundle.checksum = compute_bundle_checksum(&bundle)?;
+    validate_bundle(&bundle)?;
     Ok(bundle)
 }
 
 /// Compute the SHA-256 checksum of the bundle content (excluding the checksum field itself).
-fn compute_bundle_checksum(bundle: &TransferBundle) -> Result<String, TransferError> {
+pub fn compute_bundle_checksum(bundle: &TransferBundle) -> Result<String, TransferError> {
     // Serialize a copy with empty checksum so the hash is stable.
     let mut for_hash = bundle.clone();
     for_hash.checksum = String::new();
-    let bytes = serde_json::to_vec(&for_hash)?;
+    let mut value = serde_json::to_value(&for_hash)?;
+    // Reuse the session checksum's canonical object ordering. Nested matcher
+    // HashMaps may be reconstructed with a different order after deserialization.
+    crate::session::snapshot_persist::canonicalize_json(&mut value);
+    let bytes = serde_json::to_vec(&value)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(hex::encode(hasher.finalize()))
@@ -201,6 +212,14 @@ fn compute_bundle_checksum(bundle: &TransferBundle) -> Result<String, TransferEr
 
 /// Validate a transfer bundle, returning warnings for non-fatal issues.
 pub fn validate_bundle(bundle: &TransferBundle) -> Result<Vec<Warning>, TransferError> {
+    // Guard before version/checksum diagnostics, which include supplied fields.
+    // Intact operational configuration must not bypass content checks just
+    // because it is packaged as opaque bytes. Refuse rather than redact its
+    // executable matchers or echo detected values in a diagnostic.
+    let content = serde_json::to_value(bundle)?;
+    if contains_detected_secret(&content, &pt_redact::SecretDetector::new()) {
+        return Err(TransferError::SensitiveContent);
+    }
     let mut warnings = Vec::new();
 
     // 1. Check schema version.
@@ -249,6 +268,52 @@ pub fn validate_bundle(bundle: &TransferBundle) -> Result<Vec<Warning>, Transfer
                 ),
             });
         }
+        pt_config::validate::validate_priors(priors)
+            .map_err(|error| TransferError::InvalidConfiguration(error.to_string()))?;
+    }
+
+    if let Some(signatures) = &bundle.signatures {
+        signatures
+            .validate()
+            .map_err(|error| TransferError::InvalidConfiguration(error.to_string()))?;
+        for pattern in &signatures.patterns {
+            // Inactive patterns can later be activated; validate them as well.
+            pattern
+                .signature
+                .validate_for_activation()
+                .map_err(|error| TransferError::InvalidConfiguration(error.to_string()))?;
+        }
+    }
+
+    if let Some(stats) = &bundle.baseline_stats {
+        if !stats.observation_window_hours.is_finite() || stats.observation_window_hours < 0.0 {
+            return Err(TransferError::InvalidConfiguration(
+                "baseline observation window must be finite and nonnegative".to_string(),
+            ));
+        }
+        if !stats.mean_cpu_utilization.is_finite() || stats.mean_cpu_utilization < 0.0 {
+            return Err(TransferError::InvalidConfiguration(
+                "baseline CPU mean must be finite and nonnegative".to_string(),
+            ));
+        }
+        if stats
+            .class_distribution
+            .values()
+            .any(|fraction| !fraction.is_finite() || !(0.0..=1.0).contains(fraction))
+            || (!stats.class_distribution.is_empty()
+                && (stats.class_distribution.values().sum::<f64>() - 1.0).abs() > 1e-6)
+        {
+            return Err(TransferError::InvalidConfiguration(
+                "baseline class fractions must be finite probabilities summing to one".to_string(),
+            ));
+        }
+        if stats.total_processes_seen == 0
+            && (stats.mean_cpu_utilization != 0.0 || !stats.class_distribution.is_empty())
+        {
+            return Err(TransferError::InvalidConfiguration(
+                "empty baseline cannot contain a CPU mean or class observations".to_string(),
+            ));
+        }
     }
 
     // 4. Check for empty bundle.
@@ -260,6 +325,33 @@ pub fn validate_bundle(bundle: &TransferBundle) -> Result<Vec<Warning>, Transfer
     }
 
     Ok(warnings)
+}
+
+fn contains_detected_secret(
+    value: &serde_json::Value,
+    detector: &pt_redact::SecretDetector,
+) -> bool {
+    match value {
+        serde_json::Value::String(value) => contains_detected_secret_text(value, detector),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| contains_detected_secret(value, detector)),
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            contains_detected_secret_text(key, detector)
+                || contains_detected_secret(value, detector)
+        }),
+        _ => false,
+    }
+}
+
+fn contains_detected_secret_text(value: &str, detector: &pt_redact::SecretDetector) -> bool {
+    // Explicit credential and argument patterns span the complete text. Entropy
+    // describes individual tokens, not an entire prose comment: the shipped
+    // command-category explanation exceeds the detector's entropy threshold.
+    !pt_redact::detect::find_all_secrets(value).is_empty()
+        || value
+            .split_whitespace()
+            .any(|token| detector.detect(token).is_some())
 }
 
 /// Weighted merge of two Beta-distribution parameter sets.
@@ -454,11 +546,13 @@ pub fn normalize_baseline(
     }
 }
 
-/// Compute a diff between local state and an incoming transfer bundle.
+/// Compare local and incoming fields, optionally including the actual merged priors.
+/// Comparison-only callers leave merged values unknown instead of predicting a strategy.
 pub fn compute_diff(
     local_priors: Option<&Priors>,
     local_signatures: Option<&PersistedSchema>,
     incoming: &TransferBundle,
+    merged_priors: Option<&Priors>,
 ) -> TransferDiff {
     let mut priors_changes = Vec::new();
     let mut signature_changes = Vec::new();
@@ -470,24 +564,28 @@ pub fn compute_diff(
             "useful",
             &lp.classes.useful,
             &ip.classes.useful,
+            merged_priors.map(|priors| &priors.classes.useful),
             &mut priors_changes,
         );
         diff_class(
             "useful_bad",
             &lp.classes.useful_bad,
             &ip.classes.useful_bad,
+            merged_priors.map(|priors| &priors.classes.useful_bad),
             &mut priors_changes,
         );
         diff_class(
             "abandoned",
             &lp.classes.abandoned,
             &ip.classes.abandoned,
+            merged_priors.map(|priors| &priors.classes.abandoned),
             &mut priors_changes,
         );
         diff_class(
             "zombie",
             &lp.classes.zombie,
             &ip.classes.zombie,
+            merged_priors.map(|priors| &priors.classes.zombie),
             &mut priors_changes,
         );
     }
@@ -558,8 +656,22 @@ fn diff_class(
     class: &str,
     local: &ClassParams,
     incoming: &ClassParams,
+    merged: Option<&ClassParams>,
     changes: &mut Vec<PriorChange>,
 ) {
+    let merged_values = merged.map(|params| {
+        [
+            params.prior_prob,
+            params.cpu_beta.alpha,
+            params.cpu_beta.beta,
+            params.orphan_beta.alpha,
+            params.orphan_beta.beta,
+            params.tty_beta.alpha,
+            params.tty_beta.beta,
+            params.net_beta.alpha,
+            params.net_beta.beta,
+        ]
+    });
     let fields: Vec<(&str, f64, f64)> = vec![
         ("prior_prob", local.prior_prob, incoming.prior_prob),
         (
@@ -591,14 +703,14 @@ fn diff_class(
         ),
         ("net_beta.beta", local.net_beta.beta, incoming.net_beta.beta),
     ];
-    for (field, lv, iv) in fields {
+    for (index, (field, lv, iv)) in fields.into_iter().enumerate() {
         if (lv - iv).abs() > 1e-9 {
             changes.push(PriorChange {
                 class: class.to_string(),
                 field: field.to_string(),
                 local_value: lv,
                 incoming_value: iv,
-                merged_value: None,
+                merged_value: merged_values.map(|values| values[index]),
             });
         }
     }
@@ -732,6 +844,46 @@ mod tests {
     }
 
     #[test]
+    fn baseline_statistics_refuse_nonfinite_negative_and_inconsistent_values() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let mut baseline = minimal_baseline();
+            baseline.observation_window_hours = invalid;
+            assert!(matches!(
+                export_bundle(None, None, Some(&baseline), "host-owned", None),
+                Err(TransferError::InvalidConfiguration(_))
+            ));
+            baseline = minimal_baseline();
+            baseline.mean_cpu_utilization = invalid;
+            assert!(matches!(
+                export_bundle(None, None, Some(&baseline), "host-owned", None),
+                Err(TransferError::InvalidConfiguration(_))
+            ));
+            baseline = minimal_baseline();
+            baseline
+                .class_distribution
+                .insert("useful".to_string(), invalid);
+            assert!(matches!(
+                export_bundle(None, None, Some(&baseline), "host-owned", None),
+                Err(TransferError::InvalidConfiguration(_))
+            ));
+        }
+        let mut baseline = minimal_baseline();
+        baseline.class_distribution = BTreeMap::from([("useful".to_string(), 1.1)]);
+        assert!(export_bundle(None, None, Some(&baseline), "host-owned", None).is_err());
+        baseline.class_distribution = BTreeMap::from([("useful".to_string(), 0.5)]);
+        assert!(export_bundle(None, None, Some(&baseline), "host-owned", None).is_err());
+        baseline.class_distribution = BTreeMap::from([("useful".to_string(), 1.0)]);
+        export_bundle(None, None, Some(&baseline), "host-owned", None).unwrap();
+        baseline.total_processes_seen = 0;
+        assert!(export_bundle(None, None, Some(&baseline), "host-owned", None).is_err());
+        baseline.class_distribution.clear();
+        assert!(export_bundle(None, None, Some(&baseline), "host-owned", None).is_err());
+        baseline.mean_cpu_utilization = 0.0;
+        baseline.observation_window_hours = 0.0;
+        export_bundle(None, None, Some(&baseline), "host-owned", None).unwrap();
+    }
+
+    #[test]
     fn validate_bundle_checksum_mismatch() {
         let priors = minimal_priors();
         let mut bundle = export_bundle(Some(&priors), None, None, "h1", None).unwrap();
@@ -753,14 +905,172 @@ mod tests {
 
     #[test]
     fn validate_bundle_prior_prob_sum_error() {
-        let mut priors = minimal_priors();
-        priors.classes.useful.prior_prob = 0.9;
-        // Sum will be > 1.0 by a lot.
+        let priors = minimal_priors();
         let mut bundle = export_bundle(Some(&priors), None, None, "h1", None).unwrap();
+        bundle.priors.as_mut().unwrap().classes.useful.prior_prob = 0.9;
+        // Deliberately build a checksummed but invalid incoming configuration.
         bundle.checksum = compute_bundle_checksum(&bundle).unwrap();
-        let result = validate_bundle(&bundle);
-        // Depending on the default priors values, this should fail.
-        assert!(result.is_err() || result.unwrap().iter().any(|w| w.code == "prior_prob_drift"));
+        assert!(matches!(
+            validate_bundle(&bundle),
+            Err(TransferError::PriorProbSum(_))
+        ));
+    }
+
+    #[test]
+    fn checksum_survives_independent_matcher_map_order_and_rejects_tampering() {
+        use crate::supervision::pattern_persistence::{PatternSource, PersistedPattern};
+        use crate::supervision::signature::SupervisorSignature;
+        use crate::supervision::SupervisorCategory;
+
+        let mut signature = SupervisorSignature::new("transfer-owned", SupervisorCategory::Other)
+            .with_process_patterns(vec!["^transfer-owned$"]);
+        let entries = [
+            ("MODE", "^test$"),
+            ("RUNNER", "^owned$"),
+            ("WORKSPACE", "^fixture$"),
+        ];
+        signature.patterns.environment_vars = entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let schema = PersistedSchema {
+            schema_version: 2,
+            patterns: vec![PersistedPattern::new(signature, PatternSource::Custom)],
+            metadata: None,
+        };
+        let bundle = export_bundle(None, Some(&schema), None, "host-owned", None).unwrap();
+        let bytes = serde_json::to_vec_pretty(&bundle).unwrap();
+        for _ in 0..4 {
+            let mut independent: TransferBundle = serde_json::from_slice(&bytes).unwrap();
+            validate_bundle(&independent).expect("unchanged incoming checksum must validate");
+            assert_eq!(independent.checksum, bundle.checksum);
+            let matcher = &mut independent.signatures.as_mut().unwrap().patterns[0]
+                .signature
+                .patterns
+                .environment_vars;
+            *matcher = entries
+                .iter()
+                .rev()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(
+                compute_bundle_checksum(&independent).unwrap(),
+                bundle.checksum
+            );
+            validate_bundle(&independent).unwrap();
+            independent.signatures.as_mut().unwrap().patterns[0]
+                .signature
+                .patterns
+                .environment_vars
+                .insert("MODE".to_string(), "^changed$".to_string());
+            assert!(matches!(
+                validate_bundle(&independent),
+                Err(TransferError::ChecksumMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn checksummed_invalid_priors_and_inactive_redacted_matchers_are_refused() {
+        use crate::supervision::pattern_persistence::{
+            PatternLifecycle, PatternSource, PersistedPattern,
+        };
+        use crate::supervision::signature::SupervisorSignature;
+        use crate::supervision::SupervisorCategory;
+
+        let priors = minimal_priors();
+        let mut bundle = export_bundle(Some(&priors), None, None, "host-owned", None).unwrap();
+        bundle
+            .priors
+            .as_mut()
+            .unwrap()
+            .classes
+            .useful
+            .cpu_beta
+            .alpha = -1.0;
+        bundle.checksum = compute_bundle_checksum(&bundle).unwrap();
+        assert!(matches!(
+            validate_bundle(&bundle),
+            Err(TransferError::InvalidConfiguration(_))
+        ));
+
+        let signature = SupervisorSignature::new("redacted-owned", SupervisorCategory::Other)
+            .with_process_patterns(vec!["[HASH:k1:abcd]"]);
+        let mut pattern = PersistedPattern::new(signature, PatternSource::Custom);
+        pattern.lifecycle = PatternLifecycle::Removed;
+        bundle.priors = None;
+        bundle.signatures = Some(PersistedSchema {
+            schema_version: 2,
+            patterns: vec![pattern],
+            metadata: None,
+        });
+        bundle.checksum = compute_bundle_checksum(&bundle).unwrap();
+        let error = validate_bundle(&bundle).unwrap_err();
+        assert!(matches!(error, TransferError::InvalidConfiguration(_)));
+        assert!(error.to_string().contains("redacted matcher"));
+    }
+
+    #[test]
+    fn intact_transfer_refuses_detected_credentials_in_values_and_keys() {
+        use crate::supervision::pattern_persistence::{PatternSource, PersistedPattern};
+        use crate::supervision::signature::SupervisorSignature;
+        use crate::supervision::SupervisorCategory;
+        let canary = "AKIAIOSFODNN7EXAMPLE";
+        let mut priors = minimal_priors();
+        let clean = export_bundle(Some(&priors), None, None, "host-owned", None).unwrap();
+        for field in ["schema_version", "checksum"] {
+            let mut poisoned = clean.clone();
+            if field == "schema_version" {
+                poisoned.schema_version = canary.to_string();
+            } else {
+                poisoned.checksum = canary.to_string();
+            }
+            let error = validate_bundle(&poisoned).unwrap_err();
+            assert!(matches!(error, TransferError::SensitiveContent));
+            assert!(!error.to_string().contains(canary));
+        }
+        priors.classes.useful.cpu_beta.comment = Some(canary.to_string());
+        let error = export_bundle(Some(&priors), None, None, "host-owned", None).unwrap_err();
+        assert!(matches!(error, TransferError::SensitiveContent));
+        assert!(!error.to_string().contains(canary));
+        let mut signature = SupervisorSignature::new("owned", SupervisorCategory::Other)
+            .with_process_patterns(vec!["^owned$"]);
+        signature
+            .patterns
+            .environment_vars
+            .insert(canary.to_string(), ".*".to_string());
+        let schema = PersistedSchema {
+            schema_version: 2,
+            patterns: vec![PersistedPattern::new(signature, PatternSource::Custom)],
+            metadata: None,
+        };
+        let error = export_bundle(None, Some(&schema), None, "host-owned", None).unwrap_err();
+        assert!(matches!(error, TransferError::SensitiveContent));
+        assert!(!error.to_string().contains(canary));
+    }
+
+    #[test]
+    fn intact_transfer_preserves_shipped_prose_but_refuses_embedded_secret_tokens() {
+        let mut priors: Priors = serde_json::from_str(include_str!(
+            "../../../pt-config/src/schemas/priors.default.json"
+        ))
+        .unwrap();
+        let comment = priors.command_categories.as_ref().unwrap().comment.clone();
+        let bundle = export_bundle(Some(&priors), None, None, "host-owned", None).unwrap();
+        assert_eq!(
+            bundle.priors.unwrap().command_categories.unwrap().comment,
+            comment
+        );
+        for text in [
+            "ordinary note AKIAIOSFODNN7EXAMPLE more text",
+            "ordinary note aB3$cD4@eF5#gH6!iJ7%kL8 more text",
+            "ordinary note --password short-value more text",
+        ] {
+            priors.classes.useful.cpu_beta.comment = Some(text.to_string());
+            let error = export_bundle(Some(&priors), None, None, "host-owned", None).unwrap_err();
+            assert!(matches!(error, TransferError::SensitiveContent));
+            assert!(!error.to_string().contains(text));
+        }
     }
 
     #[test]
@@ -948,7 +1258,7 @@ mod tests {
     fn compute_diff_no_changes() {
         let priors = minimal_priors();
         let bundle = export_bundle(Some(&priors), None, None, "h1", None).unwrap();
-        let diff = compute_diff(Some(&priors), None, &bundle);
+        let diff = compute_diff(Some(&priors), None, &bundle, None);
         assert!(diff.priors_changes.is_empty());
     }
 
@@ -961,7 +1271,7 @@ mod tests {
         incoming.classes.abandoned.prior_prob = 0.004;
         incoming.classes.zombie.prior_prob = 0.001;
         let bundle = export_bundle(Some(&incoming), None, None, "h2", None).unwrap();
-        let diff = compute_diff(Some(&local), None, &bundle);
+        let diff = compute_diff(Some(&local), None, &bundle, None);
         assert!(
             !diff.priors_changes.is_empty(),
             "expected prior changes, got none"
@@ -971,6 +1281,36 @@ mod tests {
             .iter()
             .find(|c| c.class == "useful" && c.field == "prior_prob");
         assert!(useful_change.is_some());
+    }
+
+    #[test]
+    fn compute_diff_reports_raw_and_actual_merged_values_for_each_strategy() {
+        let mut local = minimal_priors();
+        local.classes.useful.cpu_beta.alpha = 2.0;
+        let mut incoming = minimal_priors();
+        incoming.classes.useful.cpu_beta.alpha = 6.0;
+        let bundle = export_bundle(Some(&incoming), None, None, "host-owned", None).unwrap();
+        for (strategy, expected) in [
+            (MergeStrategy::Weighted, 4.0),
+            (MergeStrategy::Replace, 6.0),
+            (MergeStrategy::KeepLocal, 2.0),
+        ] {
+            let merged = merge_priors(&local, &incoming, strategy).unwrap();
+            let diff = compute_diff(Some(&local), None, &bundle, Some(&merged));
+            let change = diff
+                .priors_changes
+                .iter()
+                .find(|change| change.class == "useful" && change.field == "cpu_beta.alpha")
+                .expect("actual changed field reported");
+            assert_eq!(change.local_value, 2.0);
+            assert_eq!(change.incoming_value, 6.0);
+            assert_eq!(change.merged_value, Some(expected));
+        }
+        let comparison = compute_diff(Some(&local), None, &bundle, None);
+        assert!(comparison
+            .priors_changes
+            .iter()
+            .all(|change| change.merged_value.is_none()));
     }
 
     #[test]
@@ -1000,7 +1340,7 @@ mod tests {
         };
         let bundle = export_bundle(None, Some(&incoming_sigs), None, "h3", None).unwrap();
         let local_sigs = PersistedSchema::new();
-        let diff = compute_diff(None, Some(&local_sigs), &bundle);
+        let diff = compute_diff(None, Some(&local_sigs), &bundle, None);
         assert_eq!(diff.signature_changes.len(), 1);
         assert!(matches!(
             diff.signature_changes[0].change_type,
@@ -1076,7 +1416,7 @@ mod tests {
     #[test]
     fn transfer_diff_empty_when_no_data() {
         let bundle = export_bundle(None, None, None, "h1", None).unwrap();
-        let diff = compute_diff(None, None, &bundle);
+        let diff = compute_diff(None, None, &bundle, None);
         assert!(diff.priors_changes.is_empty());
         assert!(diff.signature_changes.is_empty());
         assert!(diff.baseline_adjustments.is_empty());
