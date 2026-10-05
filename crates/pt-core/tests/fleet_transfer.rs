@@ -29,6 +29,8 @@ fn make_baseline(procs: u64, host_type: &str) -> BaselineStats {
         class_distribution: {
             let mut m = BTreeMap::new();
             m.insert("useful".to_string(), 0.7);
+            m.insert("useful_bad".to_string(), 0.15);
+            m.insert("abandoned".to_string(), 0.10);
             m.insert("zombie".to_string(), 0.05);
             m
         },
@@ -77,6 +79,14 @@ fn make_persisted_schema(sigs: Vec<(&str, f64)>) -> PersistedSchema {
 fn bundle_roundtrip_json_with_priors_and_baseline() {
     let priors = default_priors();
     let baseline = make_baseline(10000, "server");
+    let mut incomplete_baseline = baseline.clone();
+    incomplete_baseline.class_distribution.remove("useful_bad");
+    incomplete_baseline.class_distribution.remove("abandoned");
+    assert!(matches!(
+        export_bundle(Some(&priors), None, Some(&incomplete_baseline), "host-a", Some("prod")),
+        Err(pt_core::fleet::transfer::TransferError::InvalidConfiguration(reason))
+            if reason == "baseline class fractions must be finite probabilities summing to one"
+    ));
     let bundle =
         export_bundle(Some(&priors), None, Some(&baseline), "host-a", Some("prod")).unwrap();
 
