@@ -1358,13 +1358,19 @@ mod tests {
         assert!(enforcer.requires_group_evidence());
         assert!(enforcer.requires_builtin_placement());
         let candidate = test_candidate();
-        assert!(PolicyEnforcer::new(&current, None)
-            .unwrap()
-            .check_action(&candidate, Action::Kill, true)
-            .allowed);
+        assert!(
+            PolicyEnforcer::new(&current, None)
+                .unwrap()
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
         let check = enforcer.check_action(&candidate, Action::Kill, true);
         assert_eq!(check.violation.unwrap().kind, ViolationKind::ProtectedGroup);
-        assert!(enforcer.check_action(&candidate, Action::Keep, true).allowed);
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Keep, true)
+                .allowed
+        );
     }
 
     #[test]
@@ -1377,13 +1383,19 @@ mod tests {
         let mut candidate = test_candidate();
         candidate.user = Some("root".to_string());
         candidate.cgroup_role = Some(crate::collect::CgroupRole::LoginSession);
-        assert!(PolicyEnforcer::new(&current, None)
-            .unwrap()
-            .check_action(&candidate, Action::Kill, true)
-            .allowed);
+        assert!(
+            PolicyEnforcer::new(&current, None)
+                .unwrap()
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
         let enforcer =
             PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
-        assert!(!enforcer.check_action(&candidate, Action::Kill, true).allowed);
+        assert!(
+            !enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
     }
 
     #[test]
@@ -1399,14 +1411,30 @@ mod tests {
             PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
         let mut candidate = test_candidate();
         candidate.open_write_fds = Some(5);
-        assert!(enforcer.check_action(&candidate, Action::Kill, true).allowed);
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
         candidate.open_write_fds = Some(6);
-        assert!(!enforcer.check_action(&candidate, Action::Kill, true).allowed);
+        assert!(
+            !enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
         let reversed =
             PolicyEnforcer::new_with_recorded_policy(&recorded, Some(&current), None).unwrap();
-        assert!(!reversed.check_action(&candidate, Action::Kill, true).allowed);
+        assert!(
+            !reversed
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
         candidate.open_write_fds = Some(5);
-        assert!(reversed.check_action(&candidate, Action::Kill, true).allowed);
+        assert!(
+            reversed
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
     }
 
     #[test]
@@ -1425,15 +1453,16 @@ mod tests {
         recorded.guardrails.max_kills_per_minute = Some(2);
         recorded.guardrails.max_kills_per_hour = Some(2);
         recorded.guardrails.max_kills_per_day = Some(2);
-        let enforcer = PolicyEnforcer::new_with_recorded_policy(
-            &current,
-            Some(&recorded),
-            Some(&state_path),
-        )
-        .unwrap();
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), Some(&state_path))
+                .unwrap();
         let candidate = test_candidate();
         for delivered in 0..2 {
-            assert!(enforcer.check_action(&candidate, Action::Kill, true).allowed);
+            assert!(
+                enforcer
+                    .check_action(&candidate, Action::Kill, true)
+                    .allowed
+            );
             assert_eq!(enforcer.current_run_kill_count(), delivered);
             enforcer.begin_kill_accounting().unwrap();
             enforcer.finish_kill_accounting(true).unwrap();
@@ -1451,12 +1480,9 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
         assert_eq!(saved["kill_timestamps"].as_array().unwrap().len(), 2);
         assert_eq!(saved["pending_kill_intent"], false);
-        let fresh = PolicyEnforcer::new_with_recorded_policy(
-            &current,
-            Some(&recorded),
-            Some(&state_path),
-        )
-        .unwrap();
+        let fresh =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), Some(&state_path))
+                .unwrap();
         assert_eq!(fresh.current_run_kill_count(), 0);
         assert!(!fresh.check_action(&candidate, Action::Kill, true).allowed);
     }

@@ -11705,6 +11705,52 @@ mod process_tree_safety_tests {
         }
     }
 
+    #[cfg(feature = "ui")]
+    #[test]
+    fn tui_selection_refuses_a_plan_above_the_run_cap_and_accepts_the_boundary() {
+        use pt_core::decision::{decide_action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 2;
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let candidates: HashMap<_, _> = [100, 200, 300]
+            .into_iter()
+            .map(|pid| {
+                let process = rec(pid, 1, "sleep 600", ProcessState::Sleeping);
+                (
+                    pid,
+                    super::PlanCandidateInput {
+                        identity: super::process_identity_from_record(&process),
+                        ppid: Some(1),
+                        decision: decision.clone(),
+                        process_state: process.state,
+                        comm: process.comm,
+                        cmd: process.cmd,
+                    },
+                )
+            })
+            .collect();
+        let session = pt_common::SessionId::new();
+        let permitted =
+            super::build_plan_from_selection(&session, &policy, &[100, 200], &candidates).unwrap();
+        assert_eq!(permitted.actions.len(), 2);
+        assert!(permitted.actions.iter().all(|action| !action.blocked));
+        let error =
+            super::build_plan_from_selection(&session, &policy, &[100, 200, 300], &candidates)
+                .unwrap_err();
+        assert!(error.contains("selected 3 kills exceed the per-run policy limit 2"));
+        policy.guardrails.max_kills_per_run = 0;
+        assert!(super::build_plan_from_selection(&session, &policy, &[100], &candidates).is_err());
+    }
+
     #[test]
     fn planned_kill_budget_refuses_zero_and_preserves_keep_review() {
         let mut policy = pt_core::config::Policy::default();
