@@ -160,6 +160,46 @@ contract_target_is_alive() {
     [[ "$identity" == "$CONTRACT_TARGET_TICKS "* && "${identity#* }" != "Z" ]]
 }
 
+# Record real descriptor identities after exec; a writable harness capture file
+# is genuine data-loss evidence and must never be hidden by changing policy.
+contract_target_fd_evidence() {
+    local start_id="$1" path fd destination kind flags key value access_mode
+    local writable_regular
+    contract_target_is_alive || return 1
+    for path in /proc/"$CONTRACT_TARGET_PID"/fd/*; do
+        fd=${path##*/}
+        [[ "$fd" =~ ^[0-9]+$ ]] || return 1
+        destination=$(readlink -- "$path") || return 1
+        kind=$(LC_ALL=C stat -Lc '%F' -- "$path") || return 1
+        flags=""
+        while read -r key value; do
+            if [[ "$key" == flags: ]]; then
+                flags=$value
+                break
+            fi
+        done < "/proc/${CONTRACT_TARGET_PID}/fdinfo/${fd}"
+        [[ "$flags" =~ ^[0-7]+$ ]] || return 1
+        access_mode=$((8#$flags & 3))
+        writable_regular=false
+        if [[ -f "$path" ]] && (( access_mode == 1 || access_mode == 2 )); then
+            writable_regular=true
+        fi
+        jq -cn --argjson pid "$CONTRACT_TARGET_PID" --argjson start_ticks "$CONTRACT_TARGET_TICKS" \
+            --arg start_id "$start_id" --argjson fd "$fd" --arg flags "$flags" \
+            --arg kind "$kind" --arg destination "$destination" --argjson access_mode "$access_mode" \
+            --argjson writable_regular "$writable_regular" \
+            '{pid:$pid,start_ticks:$start_ticks,start_id:$start_id,fd:$fd,flags:$flags,
+              kind:$kind,destination:$destination,access_mode:$access_mode,
+              writable_regular:$writable_regular}' >> "${CONTRACT_LOG_DIR}/target-fds.jsonl" || return 1
+    done
+    contract_target_is_alive || return 1
+    jq -e -s --argjson pid "$CONTRACT_TARGET_PID" --arg start_id "$start_id" \
+        'length == 3 and (map(.fd) | sort) == [0,1,2]
+         and all(.[]; .pid == $pid and .start_id == $start_id
+             and .destination == "/dev/null" and .writable_regular == false)' \
+        "${CONTRACT_LOG_DIR}/target-fds.jsonl"
+}
+
 cleanup_contract_target() {
     # Recheck the actual /proc identity immediately before each signal. Never
     # signal a reused PID or any process not spawned by this test.
@@ -174,11 +214,18 @@ cleanup_contract_target() {
 
 # Capture real stdout/stderr separately and log every command's actual result.
 # BATS run retains the exit status, including PlanReady (1) and refusals.
+contract_monotonic_ms() {
+    local uptime _idle
+    read -r uptime _idle < /proc/uptime || return 1
+    [[ "$uptime" =~ ^([0-9]+)\.([0-9]{2})$ ]] || return 1
+    printf '%s\n' "$((10#${BASH_REMATCH[1]} * 1000 + 10#${BASH_REMATCH[2]} * 10))"
+}
+
 contract_step() {
     local step="$1" limit="$2"
     shift 2
     local started ended step_status stdout_digest stderr_digest
-    started=$(date +%s%3N)
+    started=$(contract_monotonic_ms) || return 1
     if timeout "$limit" "$PT_CORE" "$@" \
         > "${CONTRACT_LOG_DIR}/${step}.stdout" \
         2> "${CONTRACT_LOG_DIR}/${step}.stderr"; then
@@ -186,7 +233,7 @@ contract_step() {
     else
         step_status=$?
     fi
-    ended=$(date +%s%3N)
+    ended=$(contract_monotonic_ms) || return 1
     stdout_digest=$(sha256sum "${CONTRACT_LOG_DIR}/${step}.stdout")
     stderr_digest=$(sha256sum "${CONTRACT_LOG_DIR}/${step}.stderr")
     jq -cn --arg step "$step" --arg command "$PT_CORE" \
@@ -194,7 +241,8 @@ contract_step() {
         --arg stdout_sha256 "${stdout_digest%% *}" \
         --arg stderr_sha256 "${stderr_digest%% *}" --args \
         '{step:$step, command:$command, args:$ARGS.positional, exit_code:$exit_code,
-          elapsed_ms:$elapsed_ms, stdout_sha256:$stdout_sha256, stderr_sha256:$stderr_sha256}' \
+          elapsed_ms:$elapsed_ms, elapsed_clock:"linux_boot_uptime",
+          stdout_sha256:$stdout_sha256, stderr_sha256:$stderr_sha256}' \
         -- "$@" >> "${CONTRACT_LOG_DIR}/steps.jsonl"
     cat "${CONTRACT_LOG_DIR}/${step}.stdout"
     cat "${CONTRACT_LOG_DIR}/${step}.stderr" >&2
@@ -206,6 +254,7 @@ contract_step() {
         skip "Linux-only /proc+setsid identity regression; other platform contract tests remain enabled"
     fi
     command -v setsid >/dev/null
+    command -v bash >/dev/null
     command -v timeout >/dev/null
     command -v sha256sum >/dev/null
     CONTRACT_LOG_DIR="${BATS_TEST_DIRNAME}/../target/test-logs/e2e/agent_loop/bats-$(date +%s%N)-$$"
@@ -229,10 +278,22 @@ contract_step() {
     # The reaping shell leads a foreign session; its sleep child has no agent
     # environment, terminal, writable log FD, or relationship to our ancestors.
     local duration="900.$$"
-    env -i PATH=/usr/bin:/bin setsid --fork sh -c \
-        "sleep \"\$1\" </dev/null >/dev/null 2>&1 & target=\$!; printf '%s\\n' \"\$target\"; exec >/dev/null; wait \"\$target\"" \
-        sh "$duration" > "${CONTRACT_LOG_DIR}/target.pid" \
-        2> "${CONTRACT_LOG_DIR}/target-launch.stderr"
+    env -i PATH=/usr/bin:/bin setsid --fork bash -s -- "$duration" \
+        > "${CONTRACT_LOG_DIR}/target.pid" \
+        2> "${CONTRACT_LOG_DIR}/target-launch.stderr" <<'CONTRACT_LAUNCHER'
+        # BATS keeps writable capture FD4 (and possibly other harness FDs).
+        # Close inherited non-stdio descriptors only in this owned launcher.
+        for inherited_path in /proc/$$/fd/*; do
+            inherited_fd=${inherited_path##*/}
+            if (( inherited_fd > 2 )); then
+                exec {inherited_fd}>&-
+            fi
+        done
+        sleep "$1" </dev/null >/dev/null 2>&1 & target=$!
+        printf "%s\n" "$target"
+        exec >/dev/null
+        wait "$target"
+CONTRACT_LAUNCHER
     local attempt
     cat "${CONTRACT_LOG_DIR}/target-launch.stderr" >&2
     for ((attempt = 0; attempt < 200; attempt++)); do
@@ -248,6 +309,15 @@ contract_step() {
     local boot_id expected_start_id
     IFS= read -r boot_id < /proc/sys/kernel/random/boot_id
     expected_start_id="${boot_id}:${CONTRACT_TARGET_TICKS}:${CONTRACT_TARGET_PID}"
+    local target_comm=""
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        contract_target_is_alive
+        IFS= read -r target_comm < "/proc/${CONTRACT_TARGET_PID}/comm"
+        [[ "$target_comm" == sleep ]] && break
+        sleep 0.01
+    done
+    assert_equals "sleep" "$target_comm" "descriptor evidence must observe the exec'd target"
+    contract_target_fd_evidence "$expected_start_id"
 
     run contract_step plan 180 --format json agent plan --min-posterior 0 \
         --min-age 0 --max-candidates 20 --pids "$CONTRACT_TARGET_PID"
