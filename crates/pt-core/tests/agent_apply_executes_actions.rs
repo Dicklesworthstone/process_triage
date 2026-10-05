@@ -39,6 +39,10 @@ const SIGNAL_PATH: &str = "kill";
 struct ForeignTarget {
     leader: Child,
     pid: u32,
+    #[cfg(target_os = "linux")]
+    pidfd: std::os::fd::OwnedFd,
+    #[cfg(target_os = "macos")]
+    identity: ProcessIdentity,
 }
 
 impl ForeignTarget {
@@ -73,7 +77,23 @@ impl ForeignTarget {
             .read_line(&mut line)
             .expect("read target pid");
         let pid = line.trim().parse().expect("target pid");
-        Self { leader, pid }
+        #[cfg(target_os = "linux")]
+        let pidfd = {
+            use std::os::fd::FromRawFd;
+            // SAFETY: pidfd_open observes the test target; OwnedFd takes sole
+            // ownership of the successful descriptor.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) }
+        };
+        Self {
+            leader,
+            pid,
+            #[cfg(target_os = "linux")]
+            pidfd,
+            #[cfg(target_os = "macos")]
+            identity: live_identity(pid),
+        }
     }
 
     fn alive(&self) -> bool {
@@ -84,9 +104,32 @@ impl ForeignTarget {
 
 impl Drop for ForeignTarget {
     fn drop(&mut self) {
-        // SAFETY: plain kill(2) on pids this test created.
+        #[cfg(target_os = "linux")]
+        // SAFETY: the pidfd still refers only to the original test target,
+        // including after it exits and the numeric PID becomes reusable.
         unsafe {
-            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            use std::os::fd::AsRawFd;
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use pt_core::action::{IdentityProvider, LiveIdentityProvider};
+            if matches!(
+                LiveIdentityProvider::new().revalidate(&self.identity),
+                Ok(true)
+            ) {
+                // SAFETY: macOS lacks pidfds; repeat the exact live identity
+                // check immediately before signaling the captured target.
+                unsafe {
+                    libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
         }
         let _ = self.leader.kill();
         let _ = self.leader.wait();

@@ -1935,8 +1935,14 @@ mod tests {
         fn data_loss_gate_blocks_open_write_handle_on_macos() {
             let dir = tempfile::tempdir().unwrap();
             let log = dir.path().join("target.log");
-            let mut child = std::process::Command::new("sh")
-                .args(["-c", &format!("exec sleep 30 >> '{}'", log.display())])
+            let writer = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .expect("open writer");
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .stdout(writer)
                 .spawn()
                 .expect("spawn writer");
             std::thread::sleep(Duration::from_millis(300));
