@@ -1,6 +1,119 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Current validation — 2026-10-05 18:16 UTC
+## Current work and validation — 2026-10-05 18:48 UTC
+
+The core product is materially better, but the project is not finished. Eleven
+original product items have independently accepted closures during this session;
+the original fleet-normalization and CPU-throttle positive tasks were reopened
+when their evidence proved insufficient. The graph now contains 960 issues:
+823 closed, 124 open and thirteen in progress (**137 remaining**). Active cycles
+remain zero. A newly discovered production watchdog race is `bd-u7gc.8`; the
+original root/nonroot workspace task `bd-ufqb.9` blocks on it, without changing
+either task's acceptance criteria.
+
+The earlier ROOT run actually changed PID 1's CPU quota. Read-only observation
+found `/sys/fs/cgroup/init.scope/cpu.max` at `25000 100000`. Its previous value
+was not captured. Restoration remains pending the operator's intended value;
+the kernel's default is not proof of the prior configuration. No guessed write
+has been made. Normal recovery of that exact old RCH job again returned RCH-E504
+without durable completion acknowledgment or replay. It is not a ROOT pass.
+
+Current source adds full birth/owner/protection and sole-member/no-descendant
+guards to the direct cgroup runners and metadata reversal paths. Unknown prior
+settings are refused; bare Unquarantine cannot claim to restore an unknown CPUset.
+The four existing positive fixtures now require an explicitly supplied eligible
+CPU-enabled delegated parent and use only newly owned leaves, with exact controller
+readback, captured reversal and an unchanged owned sibling. None has received that
+prerequisite or delivered positive kernel proof yet. Snapshot checks are not atomic
+isolation; automatic leaf management and durable CLI undo remain incomplete.
+
+ROOT permission fixtures share a child-only privilege-drop helper. Actual credentials,
+capabilities, exact-one-test execution and retained root-created log handles are
+required; source review corrected the original artifact-path race. Runtime acceptance
+is still required. Ordinary fleet import now rejects unknown merge strategies before
+writing and previews the actual merged values of its nine existing reported numeric
+fields. Signature comparison checks the whole matcher/lifecycle in deterministic name
+order. Complete parameter/signature merge previews and measured normalization remain
+open. Requested normalization explicitly refuses absent comparable learning exposure;
+removing fabricated evidence does not deliver the positive feature.
+
+Fresh extended-feature Clippy first exited 101 on two unnecessary lifecycle clones.
+Those were corrected without changing assertions. A subsequent invocation on the
+503-file receipt `5e7e28de855a6f8ab8abae5d01fa0385e1e08995bf8bb109fde32459fde9880b`
+also exited 101: the new merge-strategy test called `expect_err` on a non-Debug CLI
+type. Explicit error matching now preserves the same ValueValidation assertion.
+That frozen source remains archived at
+`/data/tmp/pt-source-recovery-20261005-group.mc47v49r/frozen-source.tar.gz`, SHA-256
+`e96f03a2627800dbb2cd38b582e252758457613f023f4fdbf27bf71b0048f743`.
+Formatting passed on it; compiler/runtime acceptance did not. Its logs remain in
+the same directory. Later source corrections require a fresh receipt and checks.
+
+The UBS scan on the prior immutable `dc5b4222` receipt exited **1**, with 53 critical,
+3,458 warnings and 2,380 informational findings across fifteen files. Independent
+review inspected every critical row without suppression: 22 test/assertion panics,
+eighteen public comparisons, eight bounded executable sites, two fixed test shell
+literals, two zero-valid C structs and one successful-return-guarded initialization.
+Warnings remain unreviewed; this is not a scanner pass or general security claim.
+The review found an adjacent helper defect: ignored `setsid()` failure. It now
+propagates the OS error. The original live group fixture additionally requires
+actual child/caller group separation and new-session leadership before signalling,
+then unchanged full identities and actual S/R state for every resumed member.
+Original effects and 200/100 ms windows remain.
+
+The separate ROOT preflight found two more numeric-PID lifetime defects. Session
+cleanup now uses the verified private group while its owned leader remains unreaped;
+it never signals a potentially reaped/reused grandchild PID. The production ps
+watchdog now serializes its entire check/signal with cancellation before reaping,
+instead of relying on an atomic flag that permits a delayed stale signal. Two new
+live owned-child tests require actual SIGKILL/timeout and cancellation survival,
+with separate same-birth/UID survivors. Source review/runtime validation are pending;
+no forced PID-reuse reproduction or macOS execution is claimed.
+
+Superseded owned check/full-test jobs are cancelled only through RCH's normal
+owner-bound API. The first pair recovered with terminal acknowledgment, source
+release and exit 137 after cancellation; this is not an OOM or a pass. Replacement
+runs must bind their actual source before any acceptance claim. No local heavy-build
+fallback, source-lock clearing, unowned-job cancellation or fixture relaxation occurs.
+
+At 18:21 UTC the local `target/` directory was observed missing. The actor and cause
+are unproven; root did not delete it. Earlier statements below describe historical
+observations, but their target-relative log paths are no longer locally available.
+The independently retained f19 source/runtime archive and the 17:24 source archive
+survive elsewhere. New receipts and both-stream logs live under `/data/tmp/`.
+An initial recovery attempt failed on the missing receipt; an initial UBS launch
+failed with exit 126 before the genuine exit-1 retry. A scoped formatting check
+also failed before an incorrectly continued archive command; that archive was
+preserved but never credited as accepted source. Later dependent commands use
+`set -e` and successful prerequisites. These failures are not hidden by retries.
+
+The nineteen bounded dependency-family updates remain paused pending an actual
+response to the library-updater skill's **“Total test failures exceed 10”** circuit
+breaker. The security audit still fails. No further dependency edit is authorized
+by elapsed time, selected passing tests or an independently reviewed scanner row.
+
+- [x] Correct the failed lifecycle clone lint and unknown-strategy test extraction
+  without weakening either test.
+- [x] Propagate process-group setup failure and strengthen the original live
+  group identity/isolation/resume assertions; source review accepted this delta.
+- [x] Record the discovered watchdog race in `bd-u7gc.8`, claim it and retain the
+  blocking edge into the original full-workspace task.
+- [ ] Independently accept the session-cleanup/watchdog source corrections and
+  run both new real-child cases plus existing collector/session/group neighbors.
+- [ ] Freeze the corrected source once, then complete workspace all-targets check,
+  warnings-denying Clippy, formatting and the lean no-default-features check.
+- [ ] Complete the entire nonroot and ROOT workspace suites on that same source;
+  report all original ignores/unavailable prerequisites separately. No selected
+  run can close the full-workspace requirement.
+- [ ] Run eligible delegated cgroup positives and actual CPU-relief measurement;
+  keep `bd-qr40.4` and `process_triage-sj6.6` open until their original positives pass.
+- [ ] Restore the incident quota only after the intended prior value is supplied
+  and the applicable overwrite authorization is satisfied.
+- [ ] Obtain actual hosted main CI evidence, the unavailable macOS endpoint and
+  measured fleet ground truth; original release/fleet/calibration criteria stay open.
+- [ ] Resume dependency updates only after the circuit-breaker response, preserving
+  MSRV and separately resolving the known vulnerable transitive dependency families.
+
+## Previous validation — 2026-10-05 18:16 UTC
 
 The combined repaired source is archived at
 `/data/tmp/pt-source-recovery-20261005-1724.se2lcrn6/frozen-source.tar.gz`,
