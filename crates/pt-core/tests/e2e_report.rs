@@ -783,11 +783,38 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
     );
     let original_path = data_dir.join("original-signatures.json");
     fs::write(&original_path, original.to_json().unwrap()).unwrap();
+    let mut forensic_policy = pt_redact::RedactionPolicy::default();
+    forensic_policy.field_rules.insert(
+        "free_text".to_string(),
+        pt_redact::FieldRule::new(pt_redact::Action::Allow),
+    );
+    let mut forensic_writer = pt_bundle::BundleWriter::new(
+        &session_id.0,
+        "original-signature-host",
+        pt_redact::ExportProfile::Forensic,
+    )
+    .with_redaction_engine(pt_redact::RedactionEngine::new(forensic_policy).unwrap());
+    forensic_writer.add_file(
+        pt_core::signature_cli::BUNDLE_SIGNATURES_PATH,
+        original.to_json().unwrap().into_bytes(),
+        Some(pt_bundle::FileType::Json),
+    );
+    let forensic_path = data_dir.join("original-signatures.ptb");
+    forensic_writer.write(&forensic_path).unwrap();
     pt_core()
         .arg("--config")
         .arg(&positive_config)
         .args(["--format", "json", "signature", "import"])
         .arg(&original_path)
+        .assert()
+        .success();
+    // Exercise the archive activation route too, with a deliberately intact
+    // Forensic matcher. Sharing-profile refusals above must preserve this path.
+    pt_core()
+        .arg("--config")
+        .arg(&positive_config)
+        .args(["--format", "json", "signature", "import"])
+        .arg(&forensic_path)
         .assert()
         .success();
     let matched = pt_core()
