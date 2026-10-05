@@ -64,6 +64,18 @@ pub struct RedactionEngine {
     detector: SecretDetector,
 }
 
+/// Raw matcher strings are local Forensic details only inside the finite
+/// SignatureSchema structure, never merely because an arbitrary key matches.
+#[derive(Clone, Copy)]
+enum ExportContext {
+    General,
+    SignatureSchema,
+    SignatureList,
+    Signature,
+    Patterns,
+    Matcher,
+}
+
 impl RedactionEngine {
     /// Create a new redaction engine with the given policy.
     ///
@@ -117,15 +129,7 @@ impl RedactionEngine {
 
     /// Apply redaction to a value based on its field class.
     pub fn redact(&self, value: &str, field_class: FieldClass) -> RedactedValue {
-        // Get the action for this field class
-        let mut action = self.policy.action_for(field_class);
-
-        // If action is detect+action, run detection first
-        if action == Action::DetectAction {
-            action = self.detect_action(value, field_class);
-        }
-
-        self.apply_action(value, action)
+        self.redact_with_profile(value, field_class, self.policy.default_profile)
     }
 
     /// Apply redaction with a specific export profile.
@@ -136,6 +140,14 @@ impl RedactionEngine {
         profile: crate::ExportProfile,
     ) -> RedactedValue {
         let mut action = self.policy.action_for_profile(field_class, profile);
+
+        // Explicit local detail must still refuse detected credentials. The
+        // structured exporter applies the same mandatory content guard.
+        if profile == crate::ExportProfile::Forensic && action == Action::Allow {
+            if let Some(secret) = self.detector.detect(value) {
+                action = secret.recommended_action();
+            }
+        }
 
         if action == Action::DetectAction {
             action = self.detect_action(value, field_class);
@@ -174,7 +186,41 @@ impl RedactionEngine {
         value: &serde_json::Value,
         profile: crate::ExportProfile,
     ) -> serde_json::Value {
-        self.redact_json_field(value, None, profile)
+        let context = if value.as_object().is_some_and(|fields| {
+            fields
+                .keys()
+                .all(|key| matches!(key.as_str(), "schema_version" | "signatures" | "metadata"))
+                && fields
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|version| version <= 2)
+                && fields
+                    .get("signatures")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|signatures| {
+                        signatures.iter().all(|signature| {
+                            signature["name"]
+                                .as_str()
+                                .is_some_and(|name| !name.is_empty())
+                                && signature["category"].as_str().is_some_and(|category| {
+                                    is_public_export_string("category", category)
+                                })
+                                && signature["patterns"].as_object().is_some_and(|patterns| {
+                                    patterns.iter().all(|(field, value)| {
+                                        !is_signature_matcher_field(field)
+                                            || value.as_array().is_some_and(|values| {
+                                                values.iter().all(serde_json::Value::is_string)
+                                            })
+                                    })
+                                })
+                        })
+                    })
+        }) {
+            ExportContext::SignatureSchema
+        } else {
+            ExportContext::General
+        };
+        self.redact_json_field(value, None, profile, context)
     }
 
     fn redact_json_field(
@@ -182,6 +228,7 @@ impl RedactionEngine {
         value: &serde_json::Value,
         field: Option<&str>,
         profile: crate::ExportProfile,
+        context: ExportContext,
     ) -> serde_json::Value {
         use serde_json::Value;
         let normalized_field = field.unwrap_or("").to_ascii_lowercase();
@@ -233,9 +280,22 @@ impl RedactionEngine {
                         } else {
                             self.apply_action(key, Action::Hash).output
                         };
+                        let child_context = match (context, key.as_str()) {
+                            (ExportContext::SignatureSchema, "signatures") => {
+                                ExportContext::SignatureList
+                            }
+                            (ExportContext::Signature, "name") => ExportContext::Matcher,
+                            (ExportContext::Signature, "patterns") => ExportContext::Patterns,
+                            (ExportContext::Patterns, field)
+                                if is_signature_matcher_field(field) =>
+                            {
+                                ExportContext::Matcher
+                            }
+                            _ => ExportContext::General,
+                        };
                         (
                             exported_key,
-                            self.redact_json_field(value, Some(key), profile),
+                            self.redact_json_field(value, Some(key), profile, child_context),
                         )
                     })
                     .collect(),
@@ -243,7 +303,14 @@ impl RedactionEngine {
             Value::Array(values) => Value::Array(
                 values
                     .iter()
-                    .map(|value| self.redact_json_field(value, Some(field), profile))
+                    .map(|value| {
+                        let element_context = match context {
+                            ExportContext::SignatureList => ExportContext::Signature,
+                            ExportContext::Matcher => ExportContext::Matcher,
+                            _ => ExportContext::General,
+                        };
+                        self.redact_json_field(value, Some(field), profile, element_context)
+                    })
                     .collect(),
             ),
             Value::String(text) => {
@@ -253,15 +320,24 @@ impl RedactionEngine {
                 if is_public_export_string(field, text) {
                     return value.clone();
                 }
-                let class = match field {
-                    "cmd" | "comm" | "cmdline" | "command" | "cmd_pattern" | "cmdline_raw"
-                    | "command_line" | "argv" | "args" => FieldClass::Cmdline,
-                    "hostname" | "host" | "host_id" => FieldClass::Hostname,
-                    "username" | "user" | "owner" | "uid" => FieldClass::Username,
-                    "path" | "cwd" | "exe" | "executable" | "home" | "artifact_path" => {
-                        FieldClass::PathProject
+                let class = if profile == crate::ExportProfile::Forensic
+                    && matches!(context, ExportContext::Matcher)
+                {
+                    // Matchers use the same explicit local command rule. A
+                    // stricter user policy still hashes or redacts them.
+                    FieldClass::Cmdline
+                } else {
+                    match field {
+                        "cmd" | "comm" | "cmdline" | "command" | "cmd_pattern" | "cmdline_raw"
+                        | "command_line" => FieldClass::Cmdline,
+                        "argv" | "args" => FieldClass::CmdlineArg,
+                        "hostname" | "host" | "host_id" => FieldClass::Hostname,
+                        "username" | "user" | "owner" | "uid" => FieldClass::Username,
+                        "path" | "cwd" | "exe" | "executable" | "home" | "artifact_path" => {
+                            FieldClass::PathProject
+                        }
+                        _ => FieldClass::FreeText,
                     }
-                    _ => FieldClass::FreeText,
                 };
                 let redacted = self.redact_with_profile(text, class, profile);
                 let output = if profile != crate::ExportProfile::Forensic
@@ -405,7 +481,7 @@ fn is_export_field(key: &str) -> bool {
     static FIELDS: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
         once_cell::sync::Lazy::new(|| {
             "schema_version bundle_version pt_version policy_version session_id
-            generated_at created_at updated_at started_at ended_at completed_at timestamp
+            generated_at created_at updated_at started_at ended_at completed_at timestamp ts state_history
             host_id hostname host os_family os_arch cores memory_total_gb
             payload integrity_sha256 policy_hash priors_hash config_hash
             summary total count total_processes total_system_processes
@@ -462,6 +538,18 @@ fn is_export_field(key: &str) -> bool {
                 .collect()
         });
     FIELDS.contains(key)
+}
+
+fn is_signature_matcher_field(field: &str) -> bool {
+    matches!(
+        field,
+        "process_names"
+            | "arg_patterns"
+            | "working_dir_patterns"
+            | "parent_patterns"
+            | "socket_paths"
+            | "pid_files"
+    )
 }
 
 fn is_public_export_string(field: &str, value: &str) -> bool {
@@ -536,6 +624,7 @@ fn is_public_export_string(field: &str, value: &str) -> bool {
             | "ended_at"
             | "completed_at"
             | "timestamp"
+            | "ts"
     ) {
         return chrono::DateTime::parse_from_rfc3339(value).is_ok();
     }
@@ -741,6 +830,69 @@ mod tests {
             "AKIAIOSFODNN7EXAMPLE",
         ] {
             assert!(!text.contains(canary), "export leaked {canary}");
+        }
+    }
+
+    #[test]
+    fn session_state_history_preserves_only_valid_public_timestamps_and_states() {
+        let engine = test_engine();
+        let states = [
+            "created",
+            "scanning",
+            "planned",
+            "executing",
+            "completed",
+            "cancelled",
+            "failed",
+            "archived",
+        ];
+        let timestamp = "2026-10-05T10:00:00.123456789+00:00";
+        let input = serde_json::json!({
+            "schema_version": "1.0.0",
+            "state": "completed",
+            "state_history": states.map(|state| serde_json::json!({
+                "state": state,
+                "ts": timestamp
+            })),
+            "timing": {"created_at": timestamp, "updated_at": timestamp},
+            "posterior": {"useful": 0.1, "useful_bad": 0.03, "abandoned": 0.8, "zombie": 0.07}
+        });
+
+        for profile in [crate::ExportProfile::Safe, crate::ExportProfile::Forensic] {
+            let output = engine.redact_json_for_export(&input, profile);
+            assert_eq!(output["state"], input["state"]);
+            assert_eq!(output["state_history"], input["state_history"]);
+            assert_eq!(output["timing"], input["timing"]);
+            assert_eq!(output["posterior"], input["posterior"]);
+
+            let mut malformed = input.clone();
+            malformed["state_history"][0]["ts"] = serde_json::json!("2026-02-30T10:00:00Z");
+            malformed["state_history"][1]["state"] = serde_json::json!("private-customer-state");
+            malformed["state_history"][2]["ts"] = serde_json::json!("AKIAIOSFODNN7EXAMPLE");
+            malformed["state_history"][4]["ts"] = serde_json::json!("completed");
+            let sanitized = engine.redact_json_for_export(&malformed, profile);
+            assert!(sanitized["state_history"][0]["ts"]
+                .as_str()
+                .unwrap()
+                .starts_with("[HASH:"));
+            assert!(sanitized["state_history"][1]["state"]
+                .as_str()
+                .unwrap()
+                .starts_with("[HASH:"));
+            assert_eq!(sanitized["state_history"][2]["ts"], "[REDACTED]");
+            assert_eq!(sanitized["state_history"][3], input["state_history"][3]);
+            assert!(sanitized["state_history"][4]["ts"]
+                .as_str()
+                .unwrap()
+                .starts_with("[HASH:"));
+            assert_eq!(sanitized["posterior"], input["posterior"]);
+            for private in [
+                "2026-02-30T10:00:00Z",
+                "private-customer-state",
+                "AKIAIOSFODNN7EXAMPLE",
+            ] {
+                assert!(!sanitized.to_string().contains(private));
+            }
         }
     }
 
