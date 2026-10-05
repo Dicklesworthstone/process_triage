@@ -1101,3 +1101,106 @@ fn interleaved_tool_and_resource_calls() {
     );
     assert_success(&resp);
 }
+
+#[test]
+fn actual_mcp_plan_child_uses_the_servers_explicit_config() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    let root = std::env::temp_dir().join(format!("pt-mcp-config-{}", uuid::Uuid::new_v4()));
+    let valid = root.join("valid config");
+    let invalid = root.join("invalid config");
+    std::fs::create_dir_all(&valid).expect("create retained valid config");
+    std::fs::create_dir_all(&invalid).expect("create retained invalid config");
+    std::fs::write(
+        valid.join("policy.json"),
+        serde_json::to_vec_pretty(&pt_core::config::Policy::default()).expect("serialize policy"),
+    )
+    .expect("write valid policy");
+    std::fs::write(invalid.join("policy.json"), b"{").expect("write malformed policy");
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 73,
+        "method": "tools/call",
+        "params": {
+            "name": "pt_plan",
+            "arguments": {"min_age": u64::MAX}
+        }
+    });
+    std::fs::write(root.join("request.json"), request.to_string()).expect("retain request");
+    let mut steps = std::fs::File::create(root.join("steps.jsonl")).expect("retain steps");
+    eprintln!("retained MCP config evidence: {}", root.display());
+
+    for (label, explicit, fallback, expected_error) in [
+        ("explicit_valid", Some(&valid), &invalid, false),
+        ("fallback_invalid", None, &invalid, true),
+        ("explicit_invalid", Some(&invalid), &valid, true),
+    ] {
+        let data = root.join(format!("data-{label}"));
+        let mut command = cargo_bin_cmd!("pt-core");
+        command
+            .timeout(std::time::Duration::from_secs(120))
+            .env_remove("PT_CONFIG_DIR")
+            .env_remove("PT_SKIP_GLOBAL_LOCK")
+            .env("PROCESS_TRIAGE_CONFIG", fallback)
+            .env("PROCESS_TRIAGE_DATA", &data)
+            .env("PROCESS_TRIAGE_RETENTION", "off");
+        if let Some(dir) = explicit {
+            command.arg("--config").arg(dir);
+        }
+        let started = std::time::Instant::now();
+        let output = command
+            .arg("mcp")
+            .write_stdin(format!("{request}\n"))
+            .output()
+            .expect("execute actual MCP server and planner child");
+        std::fs::write(root.join(format!("{label}.stdout")), &output.stdout)
+            .expect("retain MCP stdout");
+        std::fs::write(root.join(format!("{label}.stderr")), &output.stderr)
+            .expect("retain MCP stderr");
+        writeln!(
+            steps,
+            "{}",
+            serde_json::json!({
+                "step": label,
+                "command": "pt-core mcp",
+                "explicit_config": explicit,
+                "fallback_config": fallback,
+                "exit_code": output.status.code(),
+                "elapsed_ms": started.elapsed().as_millis(),
+                "stdout_sha256": hex::encode(Sha256::digest(&output.stdout)),
+                "stderr_sha256": hex::encode(Sha256::digest(&output.stderr))
+            })
+        )
+        .expect("retain MCP step receipt");
+        assert!(output.status.success(), "MCP server failed: {output:?}");
+        let response: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("actual JSON-RPC response");
+        assert_eq!(response["id"], 73);
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(response["result"]["isError"], expected_error, "{response}");
+        let content = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("planner result text");
+        if expected_error {
+            assert!(content.contains("failed to load config"), "{content}");
+        } else {
+            let plan: serde_json::Value = serde_json::from_str(content).expect("real plan JSON");
+            let executable: pt_core::plan::Plan =
+                serde_json::from_value(plan.clone()).expect("real executable Plan");
+            assert!(executable.actions.is_empty(), "{plan}");
+            assert_eq!(plan["candidates"].as_array().expect("candidates").len(), 0);
+            let saved: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    data.join("sessions")
+                        .join(&executable.session_id)
+                        .join("decision/plan.json"),
+                )
+                .expect("actual MCP child saved Plan"),
+            )
+            .expect("saved plan JSON");
+            assert_eq!(saved, plan, "MCP returns the genuine persisted Plan");
+        }
+    }
+}
