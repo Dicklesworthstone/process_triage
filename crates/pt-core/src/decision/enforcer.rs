@@ -1373,6 +1373,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recorded_policy_does_not_merge_builtin_protection_exceptions() {
         let mut current = test_policy();
@@ -1432,6 +1433,38 @@ mod tests {
         candidate.open_write_fds = Some(5);
         assert!(
             reversed
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn recorded_robot_floor_survives_a_looser_current_policy() {
+        let mut current = test_policy();
+        current.robot_mode.enabled = true;
+        current.robot_mode.min_posterior = 0.90;
+        let mut recorded = current.clone();
+        recorded.robot_mode.min_posterior = 0.99;
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
+        let mut candidate = test_candidate();
+        assert!(
+            PolicyEnforcer::new(&current, None)
+                .unwrap()
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        let refusal = enforcer.check_action(&candidate, Action::Kill, true);
+        assert_eq!(refusal.violation.unwrap().rule, "robot_mode.min_posterior");
+        candidate.posterior = Some(0.99);
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        candidate.posterior = None;
+        assert!(
+            !enforcer
                 .check_action(&candidate, Action::Kill, true)
                 .allowed
         );

@@ -1128,14 +1128,22 @@ finally:
         serde_json::to_vec_pretty(&policy).unwrap(),
     )
     .unwrap();
+    let mut malformed_age_snapshot = serde_json::to_value(&policy).unwrap();
+    malformed_age_snapshot["min_process_age_seconds"] = serde_json::json!("invalid");
     for (step, snapshot) in [
         ("apply_missing_snapshot", None),
         (
             "apply_incomplete_snapshot",
             Some(serde_json::json!({"min_process_age_seconds": 0})),
         ),
+        (
+            "apply_malformed_snapshot",
+            Some(serde_json::json!("invalid")),
+        ),
+        ("apply_malformed_snapshot_age", Some(malformed_age_snapshot)),
     ] {
         let mut without_snapshot: Value = serde_json::from_slice(&persisted).unwrap();
+        let has_snapshot = snapshot.is_some();
         if let Some(snapshot) = snapshot {
             without_snapshot["policy_snapshot"] = snapshot;
         } else {
@@ -1170,6 +1178,11 @@ finally:
         assert_eq!(refused.status.code(), Some(4));
         assert!(String::from_utf8_lossy(&refused.stderr)
             .contains("requires a valid recorded policy snapshot"));
+        if has_snapshot {
+            let response: Value = serde_json::from_slice(&refused.stdout).unwrap();
+            assert_eq!(response["error"], "invalid_policy_snapshot");
+            assert_eq!(response["session_id"], session);
+        }
         assert!(state_of(pid).is_some_and(|state| state != 'Z'));
         assert!(!handle.dir.join("action/outcomes.jsonl").exists());
     }
