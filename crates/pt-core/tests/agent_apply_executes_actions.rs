@@ -1554,7 +1554,11 @@ fn agent_apply_enforces_policy_age_floor_when_plan_snapshot_is_missing() {
     for saved_floor in [None, Some(0)] {
         if let Some(floor) = saved_floor {
             let mut plan: Value = serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
-            plan["policy_snapshot"] = serde_json::json!({"min_process_age_seconds": floor});
+            let mut recorded_policy = policy.clone();
+            recorded_policy.guardrails.min_process_age_seconds = floor;
+            let mut snapshot = serde_json::to_value(recorded_policy).unwrap();
+            snapshot["min_process_age_seconds"] = serde_json::json!(floor);
+            plan["policy_snapshot"] = snapshot;
             fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
         }
         let (status, json) = apply_with_args(
@@ -1566,7 +1570,7 @@ fn agent_apply_enforces_policy_age_floor_when_plan_snapshot_is_missing() {
         );
         assert_ne!(
             status, "success",
-            "CLI or old snapshot must not lower the current policy floor: {json}"
+            "CLI or saved policy must not lower the current policy floor: {json}"
         );
         assert!(json["outcomes"].as_array().unwrap().is_empty());
         assert_eq!(json["summary"]["attempted"], 0);
