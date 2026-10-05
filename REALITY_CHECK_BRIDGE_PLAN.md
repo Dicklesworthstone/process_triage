@@ -1,6 +1,6 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Current work and validation — 2026-10-05 19:17 UTC
+## Current work and validation — 2026-10-05 19:50 UTC
 
 The core product is materially better, but the project is not finished. Twelve
 product items have independently accepted closures during this session;
@@ -70,12 +70,37 @@ Source archive SHA-256 is
 `351ba7db1eded690b2f81368db3f67ee0c037ce249503a27ea6dcce08312a238`;
 receipt, archive and both-stream logs live at
 `/data/tmp/pt-source-recovery-20261005-watchdog.wg1cfjxj/`.
-Both complete workspace suites continue on that source; the unrelated fixture
-bootstrap failure already prevents a ROOT pass. Current source differs in two test
-files only: that descriptor-readiness correction and an unknown-strategy expected
-exit correction from 2 (ActionsOk) to the original `.16` contract's 10 (ArgsError).
-The malformed argument, refusal reason, unchanged input/config bytes and original
-command windows are preserved. These deltas need fresh checks/runtime.
+The complete ROOT invocation on c0f2 exited 101: 7,180 passed, four failed and
+27 originally ignored across 139 unfiltered outer targets. Nested privilege-drop
+summaries are excluded from that total. The failures are the descriptor bootstrap,
+the unknown-strategy expected exit and two baseline bundle roundtrips whose fixture
+class fractions summed to 0.75. The older nonroot invocation continues; its observed
+unknown-strategy failure is retained, not credited as a corrected pass.
+
+Current source differs from c0f2 in exactly three test files. The descriptor-readiness
+correction and expected exit correction from 2 (ActionsOk) to the original `.16`
+contract's 10 (ArgsError) preserve the malformed argument, refusal reason, unchanged
+input/config bytes and original command windows. The baseline helper retains its
+original useful/zombie fractions and supplies the missing useful_bad/abandoned
+fractions; the original roundtrip also checks an invalid clone against the exact
+typed fraction-sum refusal. Production validation is unchanged. Independent source
+review accepted all three deltas, including what each corrected fixture admits and
+continues to reject. The old failed invocation remains failed.
+
+The final frozen 503-file receipt is
+`bdf3ff94c17d5788617c2b849af15d4ed097ce324760b1ee25e819711409595a`;
+archive SHA-256 is
+`4c6c7bf2866327fa7abb1b391f30da05f298b0d1e46941b6affd9dae57445f3d`,
+retained under `/data/tmp/pt-source-recovery-20261005-roundtrip.dpnr2svn/`.
+Formatting passed. The fresh complete ROOT run has no observed failure after 55
+completed outer targets (5,521 passed, seven ignored); it is still running, not a
+workspace pass. The final nonroot check/Clippy/lean/full attempt exited 103 awaiting
+worker admission and executed no Cargo commands; strict remote-only behavior
+prevented a local fallback. A separate first-two-correction invocation passed its
+compiler gates and is still executing the two complete affected test binaries.
+The native 62-case BATS contract invocation is also running on final frozen source
+with its exact compiled binary hash and retained temporary artifacts; no result is
+claimed before completion.
 
 The UBS scan on the prior immutable `dc5b4222` receipt exited **1**, with 53 critical,
 3,458 warnings and 2,380 informational findings across fifteen files. Independent
@@ -142,7 +167,7 @@ by elapsed time, selected passing tests or an independently reviewed scanner row
   and the lean no-default-features check, all actual exit zero.
 - [x] Independently accept the bounded watchdog runtime against its original criteria
   and close `bd-u7gc.8` with exact source, actual effects and gate citations.
-- [ ] Check and rerun the two observed test-only corrections without cancelling the
+- [ ] Check and rerun all three observed test-only corrections without cancelling the
   ongoing older full suites or crediting their failures as corrected passes.
 - [ ] Complete the entire nonroot and ROOT workspace suites on that same source;
   report all original ignores/unavailable prerequisites separately. No selected
@@ -154,6 +179,15 @@ by elapsed time, selected passing tests or an independently reviewed scanner row
   and the applicable overwrite authorization is satisfied.
 - [ ] Obtain actual hosted main CI evidence, the unavailable macOS endpoint and
   measured fleet ground truth; original release/fleet/calibration criteria stay open.
+- [ ] Complete the current native 62-case BATS contract invocation, retaining all
+  failures and reporting its bounded scope rather than the entire Bash suite.
+- [ ] Resolve `bd-toa2.10` through one shared live placement classifier and all
+  independent supervision readers. A read-only census found 48 TTY pane processes
+  and 22 terminal-less descendants with same-owner/same-cgroup TTY ancestry; the
+  terminal-less mux server must stay protected. Unit recognition alone must not
+  exempt helpers or unproven reparented processes. Recorded raw paths and stable
+  birth/owner/ancestry observations, protected daemon controls and actual incumbent
+  versus fixed read-only plans are required; census alone proves no repaired behavior.
 - [ ] Resume dependency updates only after the circuit-breaker response, preserving
   MSRV and separately resolving the known vulnerable transitive dependency families.
 
