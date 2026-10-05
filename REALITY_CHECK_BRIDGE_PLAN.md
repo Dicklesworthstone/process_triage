@@ -1,6 +1,6 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Execution update — 2026-10-05 04:26 UTC
+## Execution update — 2026-10-05 04:52 UTC
 
 The following is the latest evidence. Older dated entries below retain the failures and their corrections;
 their then-pending statements are historical, not replacements for the current results.
@@ -8,34 +8,52 @@ their then-pending statements are historical, not replacements for the current r
 - The strict `--workspace --lib --features pt-core/test-utils` run passed 4,854 tests at 04:24:35,
   with zero failures and seven existing ignores. Core passed 3,980; all eight workspace crates executed.
   `final-0413-source.sha256` matched the worker; `final-0413-workspace-lib.log` retains the complete run.
-  The subsequently added 39-byte malformed Unicode HEAD case is test-only and is being rerun separately.
+  All eleven genuine-Git/Unicode workspace tests subsequently passed at 04:28:17, including the added
+  39-byte malformed HEAD case. Their final source receipt is `final-0429-source.sha256`.
 - The 03:58 hz4 upload passed all 14 actual action tests, all 45 exit-code tests and all five lifecycle tests.
   This includes the real saved-plan producer/apply/verify chain, mandatory-check tampering, actual resident-memory
   budget, two-run minute limit, protected group, default robot spare, and real respawn attribution with collision
   negatives. The whole invocation still exited 101: main had two invalid fixtures and report had one.
 - Corrected main now passes all 38 tests, including all five real TUI execution/budget/tree regressions.
-  Report currently passes 45 of 46. The remaining canary passed both session/bundle HTML privacy and exact-time
-  assertions, then failed when its negative fixture tried to write a file over a pre-created telemetry directory.
-  That fixture is being corrected by preserving the directory under a retained sibling name; no deletion.
+  The earlier report run passed 45 of 46, failing when its canary negative tried to write over a pre-created
+  telemetry directory. The directory is now retained under a checked-absent sibling name. The entire corrected
+  canary passed at 04:35:55: one test passed, 45 filtered, normal exit 0 (`final-report-canary-0429.log`).
+  This partition covers all 46 report tests; it is not one full 46-test invocation on the final source.
 - All seven new extraction tests passed twice: genuine verified-byte positives plus malicious destination,
   symlink, existing-file and corrupted-checksum negatives. This is Linux execution evidence, not macOS acceptance.
 - The current production native binary SHA256 `4e6adafda1426da1d14f38c1d164ef41e091e86b8e8f39bc18510c562934eb05`
   passed all 62 BATS contracts. Its isolated demo used the correct `PROCESS_TRIAGE_DATA`/`PROCESS_TRIAGE_CONFIG`,
   returned 0, retained the original live PID/start identity, and saved zero executed verification outcomes.
-  Its generated Plan schema exactly matches the published bytes. Logs: `final-native-bats-0419.log` and
+  Its generated Plan schema exactly matches the published bytes. An independent reviewer recalculated every
+  primary BATS step digest and validated both its actual producer JSON and the demo's saved Plan against that
+  exact schema, including a missing-plan-id negative. Logs: `final-native-bats-0419.log` and
   `final-native-demo-schema-corrected-0423.log`. The first probe's wrong verification-file lookup is retained
   as a probe failure; the corrected probe reran the complete demo rather than assuming its missing assertion.
 - Workspace all-targets check and warning-denying Clippy passed the 03:58/04:03 source. Lean check passed
   at 04:09:17 with one existing unused queue-diagnostic-fields warning. Formatting, shellcheck and actionlint pass.
-  Final compiler/Clippy refresh must include the later test-only corrections; those passes are not yet claimed.
+  Final-source all-targets checking passed at 04:30:26 and warning-denying Clippy passed at 04:46:46 on hz4.
+  `final-0429-source.sha256` matched the uploaded worker. The preceding hz3 Clippy admission refused a runtime
+  inventory-cache lock and ran no Cargo; standard healthy hz4 admission succeeded without a probe bypass.
+  The final lean check and original bundle integrations are pending; the primary fixture correction below
+  will also require a fresh targeted runtime and compiler/Clippy/formatting pass.
 - Eighteen compatible dependency families have affected-consumer evidence; the current lock is
   `dd6f11e6fc7da70dcf994ee08303db3feb3a8ff8389880c0d94ab856a4cef8f0`.
   The fresh cached audit exits 1 for rkyv, with LRU unsound and paste unmaintained findings. The isolated minifier
   experiment stopped after three failures and was not landed. Larger Criterion/TUI migrations await the earlier
   skill-required approval; neither elapsed time nor the full library pass supplies that approval.
 - UBS completed its eleven-file static scan but exited 1: 38 critical, 2,988 warnings and 2,122 informational
-  findings. `status: ok` describes scanner execution, not gate success. Full critical-finding triage is underway;
-  no suppression, waiver, clean-security or publishable-tree claim is made.
+  findings. `status: ok` describes scanner execution, not gate success. Independent reconstruction accounted
+  for all 38 critical findings: test panics, guarded valid C initialization, public-value comparisons and
+  explicit process execution. No confirmed critical defect was found in that bounded review; UBS still exits 1.
+  No suppression, waiver, clean-security or publishable-tree claim is made. Full retained triage is in
+  `/tmp/process-triage-ubs-triage.nk8zOU/triage.md`.
+- Original `bd-uacs.1` acceptance remains open: the existing primary Rust/BATS fixtures forced the loss matrix
+  and disabled FDR, rather than using the required test signature prior. Two actual native probes used an owned
+  subreaper and double-fork/setsid to prove real kernel adoption and null descriptors. The factory 80% prior
+  correctly produced Pause. Explicit synthetic four-class priors (abandoned Beta(999,1), others Beta(1,999))
+  produced an executable Kill with the default loss matrix, FDR and posterior gates intact. Full apply/verify
+  and the smallest existing-fixture correction are in progress. This is controlled plumbing evidence, not
+  calibration or an empirical FDR guarantee.
 
 The product is substantially closer to its safety-first cleanup promise, but it is not finished. Calibration on
 the real false-positive corpus, fleet/macOS acceptance, measured relief/settle windows and the remaining original
@@ -230,27 +248,27 @@ Actual strict remote validation so far:
 - [x] Connect apply/TUI current-policy checks and persistent kill accounting with shared execution locking.
 - [x] Reject missing/invalid positive-floor probabilities; intersect category overrides and add tightening property.
 - [ ] Rerun actual planner → apply → verify with a real detached target and stale-identity refusal.
-- [ ] Execute canonical verification unit/lifecycle tests with strict saved execution identity and timestamp binding.
-- [ ] Execute actual respawner attribution plus foreign-parent, substring and same-tick ambiguity negatives.
-- [ ] Independently review CLI/TUI execution evidence and remove the remaining broad goal-progress respawn matcher.
-- [ ] Count partial kill execution against budgets even when subsequent effect verification fails; prove both entry paths.
-- [ ] Reject failed, empty or incomplete verification snapshots and wrong-session canonical Plans; retain prior reports
+- [x] Execute canonical verification unit/lifecycle tests with strict saved execution identity and timestamp binding.
+- [x] Execute actual respawner attribution plus foreign-parent, substring and same-tick ambiguity negatives.
+- [x] Independently review CLI/TUI execution evidence and remove the remaining broad goal-progress respawn matcher.
+- [x] Count partial kill execution against budgets even when subsequent effect verification fails; prove both entry paths.
+- [x] Reject failed, empty or incomplete verification snapshots and wrong-session canonical Plans; retain prior reports
   and manifests on explicit subprocess fault injection, then re-execute a real positive observation.
-- [ ] Preserve identity-check/unsupported-platform failed retries and reject unrecognized saved outcome statuses.
-- [ ] Preserve every prior canonical TUI action across repeated applies, carry the run budget across callbacks, and
+- [x] Preserve identity-check/unsupported-platform failed retries and reject unrecognized saved outcome statuses.
+- [x] Preserve every prior canonical TUI action across repeated applies, carry the run budget across callbacks, and
   propagate callback/persistence/accounting errors through the outer command exit.
-- [ ] Persist kill intent before signaling, reconcile actual delivery without charging refusals, and prove a failed
+- [x] Persist kill intent before signaling, reconcile actual delivery without charging refusals, and prove a failed
   final save cannot reset the retained run count or permit a fresh invocation; apply the same live-child guard in TUI.
-- [ ] Retain earlier real CLI outcomes if a later process-tree refresh fails; refuse unreadable fallback signal identity.
+- [x] Retain earlier real CLI outcomes if a later process-tree refresh fails; refuse unreadable fallback signal identity.
 - [ ] Investigate the missing initial renice priority observation without weakening its action/effect assertions.
-- [ ] Rerun BATS with actual FD-bound launcher evidence and monotonic timings; keep every original positive/negative.
+- [x] Rerun BATS with actual FD-bound launcher evidence and monotonic timings; keep every original positive/negative.
 - [ ] Rerun current-age-floor, regular/unlinked writer, read-only/FIFO and unreadable-evidence cases.
-- [ ] Rerun actual CLI saved-session → plain/encrypted bundle and session/bundle HTML canary regression.
+- [x] Rerun actual CLI saved-session → plain/encrypted bundle and session/plain-bundle HTML canary regression.
 - [x] Rerun sharing/report library and integration suites on the 02:53 source and lockfile (282 tests, 02:58:31).
 - [ ] Repeat affected sharing/report consumers after the subsequently integrated Schemars family update.
 - [ ] Add and execute the BATS twin against the validated binary; prohibit implicit local heavy builds.
-- [ ] Repair and execute the scoped plan/review/apply demo; publish the generated Plan schema.
-- [ ] Verify a tampered plan cannot remove mandatory runtime checks.
+- [x] Repair and execute the scoped plan/review/apply demo; publish the generated Plan schema.
+- [x] Verify a tampered plan cannot remove mandatory runtime checks.
 - [ ] Complete sequential compatible dependency consumer tests, freeze the lockfile and rerun security audit.
 - [ ] Obtain the existing pending permission for migrations exceeding ten source files before starting them.
 - [ ] Run current-tree workspace all-targets check, warning-denying clippy, formatting and lean check.
@@ -258,27 +276,29 @@ Actual strict remote validation so far:
 - [ ] Verify distinct secret artifact filenames preserve both payloads/checksums and duplicate paths refuse publication.
 - [ ] Verify malformed signatures/provenance audit and unreadable requested telemetry refuse before output creation.
 - [ ] Verify snapshot/plan kernel-pressure readings and their persisted schema; review remaining unknown-value consumers.
-- [ ] Verify CLI usage error 10 and explicit help/version 0, including existing label/degraded-environment expectations.
+- [x] Verify CLI usage error 10 and explicit help/version 0, including existing label/degraded-environment expectations.
 - [ ] Complete bd-uacs.3 apply/TUI policy-enforcer and persistent kill-count wiring with real cross-run rate-limit proof.
-- [ ] Execute headless TUI real-kill/accounting regression and preserve earlier outcomes on later evidence failure.
-- [ ] Execute corrupt/unreadable budget and concurrent-writer tests; report permission evidence separately on root.
-- [ ] Execute actual Safe/encrypted bundle import and extracted-JSON refusal without changing existing signatures.
-- [ ] Execute intact original/Forensic signature import and intended/unrelated matcher behavior.
-- [ ] Verify protected-group evidence on a live target and current policy/CLI missing-posterior refusals.
-- [ ] Verify default robot planning retains a nonempty spare set and generated overrides never loosen policy.
+- [x] Execute headless TUI real-kill/accounting regression and preserve earlier outcomes on later evidence failure.
+- [x] Execute corrupt/unreadable budget and concurrent-writer tests; report permission evidence separately on root.
+- [x] Execute actual Safe/encrypted bundle import and extracted-JSON refusal without changing existing signatures.
+- [x] Execute intact original/Forensic signature import and intended/unrelated matcher behavior.
+- [x] Verify protected-group evidence on a live target and current policy/CLI missing-posterior refusals.
+- [x] Verify default robot planning retains a nonempty spare set and generated overrides never loosen policy.
 - [ ] Execute current-RSS budget proof with saved zero estimates; independently verify reopened `bd-qr40.7`.
-- [ ] Execute missing/incomplete required-snapshot refusals and intact producer-snapshot positive apply.
-- [ ] Execute nonfinite/negative CLI limit refusals before session loading; retain finite boundary positives.
-- [ ] Execute final planned-kill cap and child-before-parent/tree exclusion tests.
+- [x] Execute missing/incomplete required-snapshot refusals and intact producer-snapshot positive apply.
+- [x] Execute nonfinite/negative CLI limit refusals before session loading; retain finite boundary positives.
+- [x] Execute final planned-kill cap and child-before-parent/tree exclusion tests.
 - [ ] Fix and execute bundle extraction destination/symlink boundary (`bd-gn74`) before treating extraction as safe.
 - [ ] Fix macOS notification argument interpolation (`bd-zisi`); require actual macOS evidence for platform acceptance.
 - [ ] Finish `bd-r1mu`: prove both below/above cutoff malformed UTF-8 HEAD files return typed Unreadable;
   preserve genuine main/detached Git and live-process cwd positives, then independently review final gates.
 - [x] Execute all eight workspace library suites on the 04:13 source/lock (4,854 passed, seven existing ignores).
 - [x] Execute corrected main-binary tests on the 04:23 upload (38 passed; all five TUI regressions included).
-- [ ] Finish the existing report canary's unreadable-telemetry negative without deleting its pre-created directory;
+- [x] Finish the existing report canary's unreadable-telemetry negative without deleting its pre-created directory;
   rerun its complete plain/encrypted/session/bundle/activation/privacy/publication assertions.
-- [ ] Independently recompute the latest native BATS step digests and validate its real producer Plan instance.
+- [x] Independently recompute the latest native BATS step digests and validate its real producer Plan instance.
+- [ ] Replace the primary Rust/BATS forced-loss fixture with the original test-signature/adopted-orphan fixture;
+  execute full native and Rust/BATS apply/verify while preserving default loss/FDR and every safety oracle.
 - [ ] Run appropriate workspace regressions; distinguish pre-existing failures from new ones using evidence.
 - [ ] Re-execute workflow static checks and review scanner findings before committing.
 - [ ] Complete fresh original-acceptance review and the real-work/honesty inventories; close only proven tasks.
@@ -289,7 +309,103 @@ reporting is claimed by these tests. The full original workstream checklist belo
 acceptance evidence has not been obtained. Further gaps discovered during execution belong on that checklist
 and their existing Beads rather than being hidden in a completion summary.
 
-### Real-work audit and honesty inventory — 2026-10-05 01:30 UTC
+### Fresh real-work audit and honesty inventory — 2026-10-05 04:52 UTC
+
+Consumer: the operator requested this assessment and granular TODO. Gate: the completion claims below;
+retirement: this session's handoff, retaining the historical record rather than creating another certificate.
+Recovery receipts serve the observed source-overwrite/upload-race defect and receive zero capability credit.
+
+Mechanical audit window: the three newest commits (`39b4a0e`, `e2f6329`, `defa7c0`), their complete fixture
+diffs, current compiler/runtime receipts, the five newest closures and six oldest open Beads. Reflog confirms
+an external maintenance writer made those commits; this team made no commit, reset or push. Classification:
+ENABLER 2 (actual descriptor/host oracles and timestamp/telemetry/Unicode fixtures), PROCESS 1 (assessment and
+tracker evidence), USER 0, UNKNOWN 0. This bounded count is not a quota or a claim about the whole session.
+README purpose: “pt finds abandoned processes and helps you get rid of them safely.”
+
+The six worksheet answers:
+
+1. The largest user-visible improvement exercised in this block is the real producer Plan reaching apply,
+   persistent safety accounting and canonical effect verification. The retained native demo proves a safe
+   scoped dry-run in two minutes; real actions are shown in the 14-test CLI run and headless TUI tests.
+   The original signature/adopted-orphan fixture still needs its full apply/verify proof before P0 closure.
+2. Omitting the PROCESS commit would change no runtime behavior. It records observed failures and prevents
+   unsupported completion claims; more certificates would add no capability. Keep this existing document only.
+3. The corrected fixtures enabled actual consumers: all 38 main tests, the full privacy canary, and eleven
+   genuine Git/Unicode tests now pass. These are named shipping gates, not speculative infrastructure.
+4. The oldest open foundation is `bd-l3s5` (September 24), the real fleet false-positive corpus. The immediate
+   work corrected a broken executable contract and unsafe execution/sharing boundaries. Fleet calibration
+   remains a material gap; success on disposable Linux targets cannot close that foundation.
+5. No feature closure was made by this team in this window. CI repaired real fixtures, the independent
+   reviewer audited original acceptance, and the dependency agent triaged scanner findings. None gets
+   capability credit for a close count, agreeing with another agent or finishing a review.
+6. The PROCESS commit changes no original acceptance. The original P0 remains open after discovering that
+   forced-loss fixtures missed its signature requirement; no follow-up was minted to launder that remainder.
+
+**Verdict: DRIFTING.** This narrow window delivers fixture/gate completion rather than new production code,
+and repeated cold builds plus evidence updates are costly. The earlier production changes now have substantial
+runtime proof, but a large remaining work graph and the literal primary fixture are unresolved. Correction:
+freeze new assessment machinery and unrelated migrations; CI completes the existing default-policy native
+chain and the smallest original fixture correction while root finishes bundle integrations and compiler gates.
+
+The twenty honesty answers (bounded fresh checks above, with known earlier mistakes retained):
+
+1. No (checked: complete three-commit fixture diffs, current CI configuration, final run summaries and reflog).
+   No new ignores, threshold relaxation or protection removal occurred. Nulling a disposable child's inherited
+   log FD changes the fixture, with actual FD/type/access observations before the original live-child oracle.
+   The timestamp fix compares the exact nanosecond instant and rendered recorded value, not a loose substring.
+2. Yes: the earlier fictional 100 MB sleeper fixture was inadequate real-byte evidence. Its Bead was reopened;
+   the real allocating-target/zero-estimate test now passes. Synthetic signature priors and saved-session canaries
+   remain explicitly controlled test data, never measured decision quality or a real-host calibration corpus.
+3. No (checked: changed paths, test diffs and recorded commands). No BLESS or golden regeneration ran.
+4. Yes: tests and CI were changed during implementation. The win/lose split is explicit: genuine Git repositories
+   replace an absent worker `.git` assumption; real zombie exit is observed before the unchanged effect deadline;
+   equivalent UTC serialization preserves the exact saved instant; retained telemetry directory obstruction
+   reaches the intended I/O refusal. These fixes admit legitimate fixtures, not weaker production safety.
+   Larger remote resource deadlines and two test threads affect infrastructure, not functional thresholds.
+5. No (checked: production main/parser patches and actual positive/negative artifacts). No benchmark/test-path
+   success branch was added. Forced-loss fixtures are plumbing evidence and their original P0 shortfall is open.
+6. No (checked: every cited summary includes executed tests). Canary is one pass/45 filtered; resolver is eleven
+   passes/3,976 filtered. The full library run has 4,854 passes, seven existing ignores and zero filtered.
+7. Yes: the earlier remote-wrapper completion mistake and the initially described Clippy attempt that actually
+   refused admission required correction. Durable terminal receipts establish completion; the refused attempt
+   ran no Cargo. Its later standard-admitted hz4 retry genuinely passed at 04:46:46.
+8. Yes: the prior estimate-only fixture inflated its proof class. Actual RSS execution corrects it. Schema checks,
+   synthetic report data, source review, old-lock component tests and native action tests retain distinct scopes.
+9. Yes: external source changes and missed test-only uploads invalidated earlier broad pass claims. Exact hashes
+   exposed them; failed runs are retained and the affected fixtures reran. UBS and audit remain non-green;
+   complementary report partitions are not presented as a single all-green final invocation.
+10. No (checked: retained Cargo tee logs and raw CLI/BATS stdout/stderr with recomputed digests). Cited command
+    stderr is retained. Disposable process null descriptors are the safety fixture, not suppressed CLI evidence.
+11. Yes: the historical real-byte Bead had been closed on invented estimates and remains reopened pending its
+    complete original scope. Root has closed no feature at this timestamp; original P0 acceptance stays intact.
+12. No (checked: original `bd-uacs.1/.2/.3`, `bd-gn74`, `bd-r1mu` descriptions and this TODO). No requirement was
+    reduced to match implementation. Single-host/FDR calibration, fleet and macOS requirements remain open.
+13. Yes: the earlier graph-hygiene closure was self-verified, explicitly PROCESS. Current independent review
+    cites exact source/runtime receipts before any root feature close. External commits are not root publication.
+14. No (checked: current CI and reviewer dispatches). They specify real effects, planted refusals, unchanged gates
+    and no calibration/platform claims, rather than asking only for green tests.
+15. Yes: individual dependency upgrades initially relied on the isolated agent's consumer receipts. Root read
+    their changes and now observed 4,854 integrated library passes under the exact final lock; individual
+    integrations/all-features/MSRV/fuzz still require their own evidence, not inferred completion.
+16. No (checked: recent Bead closures and current handoffs). No current feature was closed on refusals alone;
+    valid byte extraction, actual Kill effects and preserved original matcher positives are mandatory.
+17. No (checked: review dispositions). Independent source agreement is review, not a second runtime sample.
+18. No (checked: frozen commands and reported counts). Overlapping 602-test dependency runs are not summed;
+    no speedup, measured relief, calibrated precision or FDR guarantee is reported.
+19. The owner should see the expensive retry/fixture chain, the original forced-loss mismatch, the earlier
+    estimate claim, external source resets and both non-green scanners. None is hidden by a passing subset.
+20. Strongest evidence: SHA-bound actual CLI action runs with retained before/after identities, real signal
+    delivery, persistent budgets, native BATS raw commands and independently recomputed digests. A skeptic can
+    rerun the existing Rust/BATS tests; the original default-policy chain correction remains pending.
+
+Cass's earlier six bounded project queries found no indexed project sessions; broader inspected hits were
+unrelated. That missing coverage cannot certify older history. Disposition: observed false claims/fixtures were
+corrected in place and retained; known failures are disclosed above and in operator updates. Countermeasures:
+original acceptance and independent closure (RH-1/RH-2/RH-7/RH-9), no regenerated goldens (RH-3), no fixture
+quality inflation (RH-5/RH-12), exact source/terminal receipts and retained stderr (RH-16). Runtime and scanner
+remainders remain unchecked. This inventory supplies no waiver or release certification.
+
+### Historical real-work audit and honesty inventory — 2026-10-05 01:30 UTC
 
 This is the filled anti-ceremony worksheet, not a completion certificate. The mechanical window is the seven
 commits from 01:00 through 01:28 UTC, their test/main/constraint diffs, current dirty fixture imports, the newest
