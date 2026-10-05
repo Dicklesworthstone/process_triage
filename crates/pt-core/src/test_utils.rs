@@ -711,13 +711,27 @@ impl Drop for OwnedCgroupFixture {
                 }
             }
         }
-        let target_exited = self.target.wait_for_exit(Duration::from_secs(2));
-        let sibling_exited = self.sibling.wait_for_exit(Duration::from_secs(2));
+        let _ = self.target.wait_for_exit(Duration::from_secs(2));
+        let _ = self.sibling.wait_for_exit(Duration::from_secs(2));
+        let observe = |handle: &ProcessHandle| match handle.child.lock() {
+            Ok(mut child) => match child.try_wait() {
+                Ok(Some(status)) => serde_json::json!({
+                    "exit_observed": true,
+                    "status": format!("{status:?}"),
+                    "code": status.code(),
+                }),
+                Ok(None) => serde_json::json!({"exit_observed": false, "state": "running"}),
+                Err(error) => {
+                    serde_json::json!({"exit_observed": false, "error": error.to_string()})
+                }
+            },
+            Err(error) => serde_json::json!({"exit_observed": false, "error": error.to_string()}),
+        };
         let cleanup = serde_json::json!({
             "target_identity": self.identity,
             "sibling_identity": self.sibling_identity,
-            "target_exited": target_exited,
-            "sibling_exited": sibling_exited,
+            "target_exit": observe(&self.target),
+            "sibling_exit": observe(&self.sibling),
             "retained_leaf": self.leaf,
             "retained_sibling_leaf": self.sibling_leaf,
         });
