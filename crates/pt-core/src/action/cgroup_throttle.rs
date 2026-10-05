@@ -129,6 +129,7 @@ impl CpuThrottleActionRunner {
     #[cfg(target_os = "linux")]
     fn execute_throttle(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        super::dispatch::ensure_exclusive_cgroup(pid)?;
         debug!(
             pid,
             fraction = self.config.target_fraction,
@@ -378,6 +379,17 @@ impl CpuThrottleActionRunner {
         &self,
         metadata: &ThrottleReversalMetadata,
     ) -> Result<(), ActionError> {
+        super::dispatch::ensure_exclusive_cgroup(metadata.pid)?;
+        let current_path = collect_cgroup_details(metadata.pid)
+            .and_then(|details| details.unified_path)
+            .ok_or_else(|| {
+                ActionError::Failed("cannot resolve current reversal cgroup".to_string())
+            })?;
+        if current_path != metadata.cgroup_path {
+            return Err(ActionError::Failed(
+                "refusing throttle reversal after cgroup membership changed".to_string(),
+            ));
+        }
         match metadata.source {
             CpuLimitSource::CgroupV2CpuMax => {
                 let cpu_max_path = format!("/sys/fs/cgroup{}/cpu.max", metadata.cgroup_path);
@@ -507,6 +519,9 @@ impl ActionRunner for CpuThrottleActionRunner {
 /// Check if cgroup CPU throttle is available for a process.
 #[cfg(target_os = "linux")]
 pub fn can_throttle_process(pid: u32) -> bool {
+    if super::dispatch::ensure_exclusive_cgroup(pid).is_err() {
+        return false;
+    }
     if let Some(details) = collect_cgroup_details(pid) {
         // Check if we have a writable cgroup path
         if let Some(ref unified_path) = details.unified_path {

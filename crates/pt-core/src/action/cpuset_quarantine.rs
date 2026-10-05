@@ -180,6 +180,7 @@ impl CpusetQuarantineActionRunner {
     #[cfg(target_os = "linux")]
     fn execute_quarantine(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        super::dispatch::ensure_exclusive_cgroup(pid)?;
         debug!(
             pid,
             cpus = self.config.target_cpus,
@@ -314,6 +315,7 @@ impl CpusetQuarantineActionRunner {
     #[cfg(target_os = "linux")]
     fn execute_unquarantine(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        super::dispatch::ensure_exclusive_cgroup(pid)?;
         debug!(pid, "executing cpuset unquarantine");
 
         // For unquarantine, we need reversal metadata

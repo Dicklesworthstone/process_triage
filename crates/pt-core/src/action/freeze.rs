@@ -119,6 +119,7 @@ impl FreezeActionRunner {
     #[cfg(target_os = "linux")]
     fn execute_freeze(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        super::dispatch::ensure_exclusive_cgroup(pid)?;
         debug!(pid = pid, "executing freeze");
 
         let freeze_path = self.get_freeze_path(pid)?;
@@ -129,6 +130,7 @@ impl FreezeActionRunner {
     #[cfg(target_os = "linux")]
     fn execute_unfreeze(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        super::dispatch::ensure_exclusive_cgroup(pid)?;
         debug!(pid = pid, "executing unfreeze");
 
         let freeze_path = self.get_freeze_path(pid)?;

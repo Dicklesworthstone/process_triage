@@ -71,42 +71,85 @@ impl Default for CompositeActionRunner {
 /// pt moves the target into a dedicated leaf cgroup, it only acts when the cgroup
 /// holds the target alone.
 #[cfg(target_os = "linux")]
-fn ensure_exclusive_cgroup(pid: u32) -> Result<(), ActionError> {
+pub(super) fn ensure_exclusive_cgroup(pid: u32) -> Result<(), ActionError> {
+    if pid <= 1 {
+        return Err(ActionError::Failed(format!(
+            "refusing cgroup mutation for protected PID {pid}"
+        )));
+    }
     let path = crate::collect::collect_cgroup_details(pid)
         .and_then(|d| d.unified_path)
         .ok_or_else(|| ActionError::Failed(format!("cannot resolve cgroup of pid {pid}")))?;
     let procs_file = format!("/sys/fs/cgroup{path}/cgroup.procs");
     let content = std::fs::read_to_string(&procs_file)
         .map_err(|e| ActionError::Failed(format!("cannot read {procs_file}: {e}")))?;
-    let others = shared_cgroup_members(&content, pid);
+    let others = shared_cgroup_members(&content, pid)?;
     if others > 0 {
         return Err(ActionError::Failed(format!(
             "refusing: cgroup {path} is shared with {others} other process(es) and would \
              affect them all (leaf-cgroup isolation not implemented)"
         )));
     }
+    // Resource limits and freeze state affect descendants too. Require a leaf
+    // rather than inferring isolation from only this directory's process list.
+    let directory = std::path::Path::new(&procs_file)
+        .parent()
+        .ok_or_else(|| ActionError::Failed("cgroup directory is unavailable".to_string()))?;
+    for entry in std::fs::read_dir(directory)
+        .map_err(|error| ActionError::Failed(format!("cannot inspect cgroup {path}: {error}")))?
+    {
+        let entry = entry.map_err(|error| {
+            ActionError::Failed(format!("cannot inspect cgroup entry in {path}: {error}"))
+        })?;
+        if entry
+            .file_type()
+            .map_err(|error| {
+                ActionError::Failed(format!("cannot inspect cgroup entry in {path}: {error}"))
+            })?
+            .is_dir()
+        {
+            return Err(ActionError::Failed(format!(
+                "refusing: cgroup {path} has descendants; an exclusive leaf is required"
+            )));
+        }
+    }
     Ok(())
 }
 
 /// Number of processes other than `pid` listed in `cgroup.procs` content.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn shared_cgroup_members(procs_content: &str, pid: u32) -> usize {
-    procs_content
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .filter(|p| *p != pid)
-        .count()
+fn shared_cgroup_members(procs_content: &str, pid: u32) -> Result<usize, ActionError> {
+    let mut target_present = false;
+    let mut others = 0;
+    for line in procs_content.lines() {
+        let member = line.trim().parse::<u32>().map_err(|_| {
+            ActionError::Failed(
+                "cannot establish cgroup isolation: invalid process list".to_string(),
+            )
+        })?;
+        if member == 0 {
+            return Err(ActionError::Failed(
+                "cannot establish cgroup isolation: invalid zero PID".to_string(),
+            ));
+        }
+        if member == pid {
+            target_present = true;
+        } else {
+            others += 1;
+        }
+    }
+    if !target_present {
+        return Err(ActionError::Failed(format!(
+            "cannot establish cgroup isolation: target PID {pid} is absent"
+        )));
+    }
+    Ok(others)
 }
 
 impl ActionRunner for CompositeActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
-        #[cfg(target_os = "linux")]
-        if matches!(
-            action.action,
-            Action::Freeze | Action::Throttle | Action::Quarantine
-        ) {
-            ensure_exclusive_cgroup(action.target.pid.0)?;
-        }
+        // Each specialized cgroup runner checks isolation at its own write entry,
+        // including callers that use the runner without this dispatcher.
         match action.action {
             Action::Keep => Ok(()),
             Action::Pause | Action::Resume | Action::Kill => self.signal.execute(action),
@@ -223,10 +266,12 @@ mod tests {
 
     #[test]
     fn shared_cgroup_members_counts_others() {
-        assert_eq!(shared_cgroup_members("123\n", 123), 0);
-        assert_eq!(shared_cgroup_members("123\n456\n789\n", 123), 2);
-        assert_eq!(shared_cgroup_members("", 123), 0);
-        assert_eq!(shared_cgroup_members("456\n", 123), 1);
+        assert_eq!(shared_cgroup_members("123\n", 123).unwrap(), 0);
+        assert_eq!(shared_cgroup_members("123\n456\n789\n", 123).unwrap(), 2);
+        assert_eq!(shared_cgroup_members("123\n123\n", 123).unwrap(), 0);
+        for invalid in ["", "456\n", "123\ninvalid\n", "123\n0\n"] {
+            assert!(shared_cgroup_members(invalid, 123).is_err());
+        }
     }
 
     #[test]
