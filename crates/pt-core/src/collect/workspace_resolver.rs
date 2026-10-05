@@ -285,7 +285,10 @@ mod tests {
         // Keep non-repo controls outside the source checkout. No fixture may
         // accidentally inherit an unrelated ancestor's .git marker.
         let (root, worktree) = find_repo_root(&dir);
-        assert!(root.is_none(), "scratch directory has a repository ancestor: {root:?}");
+        assert!(
+            root.is_none(),
+            "scratch directory has a repository ancestor: {root:?}"
+        );
         assert!(worktree.is_none());
         dir
     }
@@ -305,14 +308,26 @@ mod tests {
             let non_repo = dir.join("not-a-repo");
             fs::create_dir_all(&subdir).unwrap();
             fs::create_dir(&non_repo).unwrap();
-            fs::write(root.join("fixture.txt"), "owned workspace resolver Git fixture\n").unwrap();
-            let mut fixture = Self { root, subdir, non_repo, commit: String::new() };
+            fs::write(
+                root.join("fixture.txt"),
+                "owned workspace resolver Git fixture\n",
+            )
+            .unwrap();
+            let mut fixture = Self {
+                root,
+                subdir,
+                non_repo,
+                commit: String::new(),
+            };
             fixture.git(&["init", "--initial-branch=main"]);
             fixture.git(&["add", "--", "fixture.txt"]);
             fixture.git(&["commit", "-m", "Create owned workspace resolver fixture"]);
             fixture.commit = fixture.git(&["rev-parse", "--verify", "HEAD"]);
             assert!(fixture.commit.len() >= 40);
-            assert!(fixture.commit.chars().all(|character| character.is_ascii_hexdigit()));
+            assert!(fixture
+                .commit
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()));
             assert_eq!(fixture.git(&["symbolic-ref", "--short", "HEAD"]), "main");
             fixture
         }
@@ -332,9 +347,12 @@ mod tests {
                 .env_remove("GIT_CONFIG_PARAMETERS")
                 .env_remove("GIT_TEMPLATE_DIR")
                 .args([
-                    "-c", "user.name=Workspace Resolver Fixture",
-                    "-c", "user.email=workspace-resolver@example.invalid",
-                    "-c", "commit.gpgsign=false",
+                    "-c",
+                    "user.name=Workspace Resolver Fixture",
+                    "-c",
+                    "user.email=workspace-resolver@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
                 ])
                 .arg("-C")
                 .arg(&self.root)
@@ -351,7 +369,11 @@ mod tests {
             writeln!(log, "git {args:?}: {}", output.status).unwrap();
             log.write_all(&output.stdout).unwrap();
             log.flush().unwrap();
-            assert!(output.status.success(), "Git fixture command {args:?} failed: {}", output.status);
+            assert!(
+                output.status.success(),
+                "Git fixture command {args:?} failed: {}",
+                output.status
+            );
             String::from_utf8(output.stdout).unwrap().trim().to_string()
         }
     }
@@ -433,7 +455,10 @@ mod tests {
         assert_ne!(fixture.subdir, fixture.root);
         let (root, worktree) = find_repo_root(&fixture.subdir);
         let root = root.expect("should find repo root from the actual nested subdirectory");
-        assert_eq!(root.effective_path(), fs::canonicalize(&fixture.root).unwrap().to_str().unwrap());
+        assert_eq!(
+            root.effective_path(),
+            fs::canonicalize(&fixture.root).unwrap().to_str().unwrap()
+        );
         assert!(root.resolution_error.is_none());
         assert!(worktree.is_none());
     }
@@ -444,20 +469,30 @@ mod tests {
         let subdir = dir.join("nested/directory");
         fs::create_dir_all(&subdir).unwrap();
         let (root, worktree) = find_repo_root(&subdir);
-        assert!(root.is_none(), "owned directory without .git must not be a repo");
+        assert!(
+            root.is_none(),
+            "owned directory without .git must not be a repo"
+        );
         assert!(worktree.is_none());
     }
 
     #[test]
     fn read_head_state_on_this_repo() {
         let fixture = GitFixture::new("head-state");
-        let branch = Some(HeadState::Branch { name: "main".to_string() });
+        let branch = Some(HeadState::Branch {
+            name: "main".to_string(),
+        });
         assert_eq!(read_head_state(&fixture.root), branch);
         fixture.git(&["checkout", "--detach", &fixture.commit]);
-        assert_eq!(fixture.git(&["rev-parse", "--verify", "HEAD"]), fixture.commit);
+        assert_eq!(
+            fixture.git(&["rev-parse", "--verify", "HEAD"]),
+            fixture.commit
+        );
         assert_eq!(
             read_head_state(&fixture.root),
-            Some(HeadState::Detached { commit_prefix: fixture.commit[..7].to_string() })
+            Some(HeadState::Detached {
+                commit_prefix: fixture.commit[..7].to_string()
+            })
         );
         fixture.git(&["checkout", "main"]);
         assert_eq!(read_head_state(&fixture.root), branch);
@@ -473,14 +508,31 @@ mod tests {
     #[test]
     fn read_head_state_malformed_utf8_boundaries_are_unreadable() {
         let cases = [
-            ("unicode-byte-42", "€".repeat(14).into_bytes(), Some("€".repeat(14))),
-            ("unicode-byte-40", format!("{}€", "x".repeat(39)).into_bytes(), Some(format!("{}€", "x".repeat(39)))),
-            ("unicode-character-limit", "€".repeat(41).into_bytes(), Some("€".repeat(40))),
+            (
+                "unicode-byte-42",
+                "€".repeat(14).into_bytes(),
+                Some("€".repeat(14)),
+            ),
+            (
+                "unicode-byte-40",
+                format!("{}€", "x".repeat(39)).into_bytes(),
+                Some(format!("{}€", "x".repeat(39))),
+            ),
+            (
+                "unicode-character-limit",
+                "€".repeat(41).into_bytes(),
+                Some("€".repeat(40)),
+            ),
             ("invalid-utf8", vec![0xe2, 0x82], None),
         ];
         for (label, contents, expected_prefix) in cases {
             let fixture = GitFixture::new(label);
-            assert_eq!(read_head_state(&fixture.root), Some(HeadState::Branch { name: "main".to_string() }));
+            assert_eq!(
+                read_head_state(&fixture.root),
+                Some(HeadState::Branch {
+                    name: "main".to_string()
+                })
+            );
             // Corrupt only the retained owned repository's actual HEAD. The
             // first two payloads put byte 40 inside a UTF-8 character.
             fs::write(fixture.root.join(".git/HEAD"), contents).unwrap();
@@ -492,11 +544,17 @@ mod tests {
                 Some(prefix) => assert_eq!(reason, format!("unexpected HEAD content: {prefix}")),
                 None => {
                     assert!(!reason.is_empty());
-                    assert!(reason.contains("UTF-8"), "invalid bytes must report an encoding error: {reason}");
+                    assert!(
+                        reason.contains("UTF-8"),
+                        "invalid bytes must report an encoding error: {reason}"
+                    );
                 }
             }
             let (root, worktree) = find_repo_root(&fixture.subdir);
-            assert_eq!(root.unwrap().effective_path(), fs::canonicalize(&fixture.root).unwrap().to_str().unwrap());
+            assert_eq!(
+                root.unwrap().effective_path(),
+                fs::canonicalize(&fixture.root).unwrap().to_str().unwrap()
+            );
             assert!(worktree.is_none());
         }
     }
@@ -507,7 +565,12 @@ mod tests {
         let git_file = dir.join(".git");
         fs::write(&git_file, b"").unwrap();
         assert_eq!(parse_gitdir_file(&git_file), None);
-        assert_eq!(read_head_state(&dir), Some(HeadState::Unreadable { reason: "malformed .git file".to_string() }));
+        assert_eq!(
+            read_head_state(&dir),
+            Some(HeadState::Unreadable {
+                reason: "malformed .git file".to_string()
+            })
+        );
     }
 
     #[test]
@@ -557,15 +620,29 @@ mod tests {
         let evidence = resolve_workspace_for_pid(pid);
 
         assert_eq!(evidence.pid, pid);
-        assert_eq!(evidence.collection_method, WorkspaceCollectionMethod::ProcfsCwdWalk);
+        assert_eq!(
+            evidence.collection_method,
+            WorkspaceCollectionMethod::ProcfsCwdWalk
+        );
         let cwd = evidence.cwd.as_ref().expect("read actual owned child cwd");
         assert_eq!(cwd.effective_path(), expected_cwd.to_str().unwrap());
         assert!(cwd.resolution_error.is_none());
-        let root = evidence.repo_root.as_ref().expect("find actual committed Git root");
-        assert_eq!(root.effective_path(), fs::canonicalize(&fixture.root).unwrap().to_str().unwrap());
+        let root = evidence
+            .repo_root
+            .as_ref()
+            .expect("find actual committed Git root");
+        assert_eq!(
+            root.effective_path(),
+            fs::canonicalize(&fixture.root).unwrap().to_str().unwrap()
+        );
         assert!(root.resolution_error.is_none());
         assert!(evidence.worktree.is_none());
-        assert_eq!(evidence.head_state, Some(HeadState::Branch { name: "main".to_string() }));
+        assert_eq!(
+            evidence.head_state,
+            Some(HeadState::Branch {
+                name: "main".to_string()
+            })
+        );
         chrono::DateTime::parse_from_rfc3339(&evidence.observed_at).unwrap();
 
         let mut non_repo_child = OwnedCwdChild::spawn(&fixture.non_repo);
@@ -575,9 +652,18 @@ mod tests {
         let non_repo_stat = fs::read_to_string(format!("/proc/{non_repo_pid}/stat")).unwrap();
         let non_repo_evidence = resolve_workspace_for_pid(non_repo_pid);
         assert_eq!(non_repo_evidence.pid, non_repo_pid);
-        assert_eq!(non_repo_evidence.collection_method, WorkspaceCollectionMethod::ProcfsCwdWalk);
+        assert_eq!(
+            non_repo_evidence.collection_method,
+            WorkspaceCollectionMethod::ProcfsCwdWalk
+        );
         let non_repo_cwd = non_repo_evidence.cwd.as_ref().unwrap();
-        assert_eq!(non_repo_cwd.effective_path(), fs::canonicalize(&fixture.non_repo).unwrap().to_str().unwrap());
+        assert_eq!(
+            non_repo_cwd.effective_path(),
+            fs::canonicalize(&fixture.non_repo)
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
         assert!(non_repo_cwd.resolution_error.is_none());
         assert!(non_repo_evidence.repo_root.is_none());
         assert!(non_repo_evidence.worktree.is_none());
@@ -593,7 +679,9 @@ mod tests {
             serde_json::to_vec_pretty(&serde_json::json!({
                 "repo_child": { "stat": stat, "evidence": evidence },
                 "non_repo_child": { "stat": non_repo_stat, "evidence": non_repo_evidence },
-            })).unwrap(),
-        ).unwrap();
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 }
