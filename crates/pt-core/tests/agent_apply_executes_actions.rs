@@ -636,11 +636,16 @@ fn agent_apply_persists_the_kill_budget_across_runs() {
 }
 
 /// Exercise the actual planner-to-apply contract, not a hand-authored action.
-/// The isolated policy selects kill to make routing deterministic; this tests
-/// execution and saved identities, not inference calibration or FDR quality.
+/// An explicit four-class test signature supplies the prior for our owned orphan;
+/// default loss, FDR, posterior thresholds and runtime checks remain intact.
+/// This tests controlled execution and identities, not calibration or FDR quality.
 #[cfg(target_os = "linux")]
 #[test]
 fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
+    use pt_core::supervision::signature::{
+        BetaParams, SignaturePriors, SignatureSchema, SupervisorSignature,
+    };
+    use pt_core::supervision::SupervisorCategory;
     use std::io::{BufRead, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::Stdio;
@@ -704,6 +709,18 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         }
     }
 
+    struct OwnedSubreaper(Child);
+    impl Drop for OwnedSubreaper {
+        fn drop(&mut self) {
+            // EOF asks this dedicated helper to use its original pidfd and reap
+            // its own child, including when an assertion unwinds the test.
+            drop(self.0.stdin.take());
+            if let Err(error) = self.0.wait() {
+                eprintln!("owned subreaper wait failed: {error}");
+            }
+        }
+    }
+
     // Keep artifacts for inspection and never remove files as test cleanup.
     let data_dir = TempDir::new().expect("data dir").keep();
     let config_dir = TempDir::new().expect("config dir").keep();
@@ -716,55 +733,193 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         ));
     fs::create_dir_all(&log_dir).expect("step log directory");
     let mut policy = Policy::default();
+    let defaults = serde_json::to_value(&policy).unwrap();
     policy.robot_mode.enabled = true;
-    policy.robot_mode.min_posterior = 0.0;
     policy.guardrails.min_process_age_seconds = 0;
-    policy.fdr_control.enabled = false;
-    for row in [
-        &mut policy.loss_matrix.useful,
-        &mut policy.loss_matrix.useful_bad,
-        &mut policy.loss_matrix.abandoned,
-        &mut policy.loss_matrix.zombie,
-    ] {
-        row.keep = 1000.0;
-        row.kill = 0.0;
-        row.pause = Some(1000.0);
-        row.throttle = Some(1000.0);
-        row.restart = Some(1000.0);
-        row.renice = Some(1000.0);
-    }
+    let configured = serde_json::to_value(&policy).unwrap();
+    let mut unchanged_defaults = configured.clone();
+    unchanged_defaults["robot_mode"]["enabled"] = defaults["robot_mode"]["enabled"].clone();
+    unchanged_defaults["guardrails"]["min_process_age_seconds"] =
+        defaults["guardrails"]["min_process_age_seconds"].clone();
+    assert_eq!(unchanged_defaults, defaults);
+    assert_eq!(configured["loss_matrix"], defaults["loss_matrix"]);
+    assert_eq!(configured["fdr_control"], defaults["fdr_control"]);
+    assert_eq!(configured["fdr_control"]["enabled"], true);
+    assert_eq!(
+        configured["robot_mode"]["min_posterior"],
+        defaults["robot_mode"]["min_posterior"]
+    );
+    assert_eq!(configured["guardrails"]["builtin_protection"], true);
+    assert_eq!(
+        configured["guardrails"]["never_kill_ppid"],
+        defaults["guardrails"]["never_kill_ppid"]
+    );
     fs::write(
         config_dir.join("policy.json"),
         serde_json::to_vec_pretty(&policy).expect("serialize isolated policy"),
     )
     .expect("write isolated policy");
 
-    // Detach the reaping shell from the test/agent ancestor chain. The target
-    // itself is neither a session leader nor attached to a terminal or log FD.
-    let unique_seconds = format!("900.{}", std::process::id());
-    let script = format!(
-        "sleep {unique_seconds} </dev/null >/dev/null 2>&1 & target=$!; printf '%s\\n' \"$target\"; exec >/dev/null; wait \"$target\""
+    // The dedicated helper is a kernel child subreaper; do not change the test
+    // process's adoption behavior. Its setsid intermediate exits after the
+    // helper binds a pidfd, genuinely orphaning and adopting the sleep child.
+    let unique_seconds = format!("1000.{}", std::process::id());
+    let script = r#"
+import ctypes, json, os, signal, sys, time
+from pathlib import Path
+assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+pid_read, pid_write = os.pipe()
+ack_read, ack_write = os.pipe()
+intermediate = os.fork()
+if intermediate == 0:
+    os.close(pid_read)
+    os.close(ack_write)
+    os.setsid()
+    target = os.fork()
+    if target == 0:
+        null = os.open('/dev/null', os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        for fd in [int(name) for name in os.listdir('/proc/self/fd') if int(name) > 2]:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        os.execve('/usr/bin/sleep', ['sleep', sys.argv[1]], {'PATH': '/usr/bin:/bin'})
+    os.write(pid_write, str(target).encode() + b'\n')
+    os.close(pid_write)
+    os.read(ack_read, 1)
+    os._exit(0)
+os.close(pid_write)
+os.close(ack_read)
+with os.fdopen(pid_read) as pipe:
+    target = int(pipe.readline())
+pidfd = os.pidfd_open(target)
+try:
+    os.write(ack_write, b'1')
+    os.close(ack_write)
+    assert os.waitpid(intermediate, 0) == (intermediate, 0)
+    deadline = time.monotonic() + 5
+    while Path('/proc/' + str(target) + '/comm').read_text().strip() != 'sleep':
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    print(json.dumps({'pid': target, 'former_parent': intermediate,
+                      'adoptive_parent': os.getpid()}), flush=True)
+    sys.stdin.readline()
+finally:
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL, None, 0)
+    except ProcessLookupError:
+        pass
+    os.waitpid(target, 0)
+    os.close(pidfd)
+    print('Owned pidfd target reaped; files retained', file=sys.stderr, flush=True)
+"#;
+    let mut reaper = OwnedSubreaper(
+        ProcessCommand::new("python3")
+            .args(["-u", "-c", script, &unique_seconds])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(log_dir.join("target-launch.stderr")).unwrap())
+            .spawn()
+            .expect("spawn owned subreaper"),
     );
-    let mut launcher = ProcessCommand::new("setsid")
-        .args(["--fork", "sh", "-c", &script])
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn detached target");
     let mut line = String::new();
-    std::io::BufReader::new(launcher.stdout.take().expect("target PID pipe"))
+    std::io::BufReader::new(reaper.0.stdout.take().expect("adoption evidence pipe"))
         .read_line(&mut line)
-        .expect("read detached PID");
-    let pid: u32 = line.trim().parse().expect("detached target PID");
-    assert!(launcher.wait().expect("wait for launcher").success());
+        .expect("read adopted target evidence");
+    let adoption: Value = serde_json::from_str(&line).expect("actual kernel adoption evidence");
+    let pid: u32 = adoption["pid"].as_u64().unwrap().try_into().unwrap();
+    assert_eq!(adoption["adoptive_parent"], reaper.0.id());
     // SAFETY: pidfd_open does not modify the process. Ownership of the returned
     // descriptor transfers once to OwnedFd and lasts through all assertions.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
     let _target = BoundTarget(unsafe { OwnedFd::from_raw_fd(fd as i32) });
     let identity = live_identity(pid);
+    let raw_stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let fields: Vec<_> = raw_stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    assert_eq!(fields[1].parse::<u32>().unwrap(), reaper.0.id());
+    assert_eq!(
+        fields[3].parse::<u32>().unwrap(),
+        adoption["former_parent"].as_u64().unwrap() as u32
+    );
+    assert_ne!(adoption["former_parent"], adoption["adoptive_parent"]);
+    assert_ne!(identity.sid, Some(pid));
+    assert_eq!(fields[4], "0", "orphan must have no controlling terminal");
+    assert_ne!(fields[0], "Z");
+    // SAFETY: getuid has no pointer arguments and only observes this process.
+    assert_eq!(identity.uid, unsafe { libc::getuid() });
+    assert_eq!(
+        fs::read(format!("/proc/{pid}/environ")).unwrap(),
+        b"PATH=/usr/bin:/bin\0"
+    );
+    let mut descriptors = Vec::new();
+    for path in fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
+        let path = path.unwrap().path();
+        let fd: u32 = path.file_name().unwrap().to_str().unwrap().parse().unwrap();
+        let destination = fs::read_link(&path).unwrap();
+        assert_eq!(destination, Path::new("/dev/null"));
+        let raw_fdinfo = fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).unwrap();
+        descriptors
+            .push(serde_json::json!({"fd":fd, "destination":destination, "raw_fdinfo":raw_fdinfo}));
+    }
+    descriptors.sort_by_key(|descriptor| descriptor["fd"].as_u64().unwrap());
+    assert_eq!(
+        descriptors
+            .iter()
+            .map(|descriptor| descriptor["fd"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    fs::write(
+        log_dir.join("owned-target-before.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "adoption":adoption, "identity":identity, "raw_stat":raw_stat,
+            "raw_status":fs::read_to_string(format!("/proc/{pid}/status")).unwrap(),
+            "descriptors":descriptors, "data_dir":data_dir, "config_dir":config_dir,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // This intentionally strong typed prior is input to the real Bayesian path,
+    // not a claim that the prior is calibrated for production processes.
+    let argument_pattern = format!(r"(^|\s){}$", regex::escape(&unique_seconds));
+    let mut signatures = SignatureSchema::new();
+    signatures.add(
+        SupervisorSignature::new("literal-owned-sleep", SupervisorCategory::Other)
+            .with_process_patterns(vec!["^sleep$"])
+            .with_arg_patterns(vec![&argument_pattern])
+            .with_priors(SignaturePriors {
+                useful: Some(BetaParams::new(1.0, 999.0)),
+                useful_bad: Some(BetaParams::new(1.0, 999.0)),
+                abandoned: Some(BetaParams::new(999.0, 1.0)),
+                zombie: Some(BetaParams::new(1.0, 999.0)),
+            }),
+    );
+    signatures.validate_for_activation().unwrap();
+    fs::write(
+        config_dir.join("signatures.json"),
+        signatures.to_json().unwrap(),
+    )
+    .unwrap();
+    let validated = run_step(
+        &log_dir,
+        "signature_validate",
+        &["--format", "json", "signature", "validate"],
+        &data_dir,
+        &config_dir,
+        30,
+    );
+    assert_eq!(validated.status.code(), Some(0), "{validated:?}");
 
     let planned = run_step(
         &log_dir,
@@ -774,8 +929,6 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
             "json",
             "agent",
             "plan",
-            "--min-posterior",
-            "0",
             "--min-age",
             "0",
             "--max-candidates",
@@ -815,6 +968,10 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         .open(&SessionId::parse(session).expect("canonical session ID"))
         .expect("open planned session");
     let persisted = fs::read(handle.dir.join("decision/plan.json")).expect("saved actual plan");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&persisted).unwrap(),
+        document
+    );
     let plan: Plan = serde_json::from_slice(&persisted).expect("planner output is executable Plan");
     let action = plan
         .actions
@@ -823,6 +980,22 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         .unwrap_or_else(|| panic!("spawned target absent from actual plan: {document}"));
     assert_eq!(action.action, Action::Kill);
     assert_eq!(action.target.start_id, identity.start_id);
+    assert_eq!(action.target.uid, identity.uid);
+    assert_eq!(action.target.sid, identity.sid);
+    assert_eq!(document["candidates"][0]["ppid"], reaper.0.id());
+    assert_eq!(
+        document["candidates"][0]["inference"]["prior_source"],
+        "signature"
+    );
+    assert_eq!(document["candidates"][0]["inference"]["mode"], "bayesian");
+    assert_eq!(
+        document["candidates"][0]["signature"]["name"],
+        "literal-owned-sleep"
+    );
+    assert_eq!(
+        document["candidates"][0]["inference"]["fast_path"]["used"],
+        false
+    );
     assert!(
         !action.pre_checks.is_empty(),
         "planner must retain required checks"
@@ -1037,6 +1210,7 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         &config_dir,
         240,
     );
+    assert_eq!(applied.status.code(), Some(2), "{applied:?}");
     let applied: Value = serde_json::from_slice(&applied.stdout).expect("actual apply JSON");
     assert_eq!(
         applied["outcomes"][0]["status"], "success",
@@ -1055,6 +1229,7 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         &config_dir,
         60,
     );
+    assert_eq!(verified.status.code(), Some(0), "{verified:?}");
     let verification: Value = serde_json::from_slice(&verified.stdout).unwrap_or_else(|error| {
         panic!(
             "verify JSON {error}: {}",
@@ -1072,6 +1247,12 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         .as_str()
         .unwrap()
         .contains(&unique_seconds));
+    drop(reaper.0.stdin.take());
+    assert!(reaper.0.wait().expect("reap owned subreaper").success());
+    eprint!(
+        "{}",
+        fs::read_to_string(log_dir.join("target-launch.stderr")).unwrap()
+    );
 }
 
 #[test]

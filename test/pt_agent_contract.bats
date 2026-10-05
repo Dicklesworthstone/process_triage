@@ -45,11 +45,13 @@ setup() {
     export TEST_MODE=1 CI=true NO_COLOR=1
     CONTRACT_TARGET_PID=""
     CONTRACT_TARGET_TICKS=""
+    CONTRACT_REAPER_PID=""
+    CONTRACT_CONTROL_FD=""
     test_start "$BATS_TEST_NAME" "Agent CLI contract test"
 }
 
 teardown() {
-    cleanup_contract_target
+    cleanup_contract_target || return 1
     test_end "$BATS_TEST_NAME" "${BATS_TEST_COMPLETED:-fail}"
     teardown_test_env
 }
@@ -201,15 +203,97 @@ contract_target_fd_evidence() {
 }
 
 cleanup_contract_target() {
-    # Recheck the actual /proc identity immediately before each signal. Never
-    # signal a reused PID or any process not spawned by this test.
-    if contract_target_is_alive; then
-        kill -TERM -- "$CONTRACT_TARGET_PID"
-        sleep 0.05
-        if contract_target_is_alive; then
-            kill -KILL -- "$CONTRACT_TARGET_PID"
-        fi
+    # Only the owned subreaper sends cleanup signals, through the original pidfd.
+    # Close the controller pipe even after an assertion fails, then reap it.
+    if [[ -n "$CONTRACT_CONTROL_FD" ]]; then
+        printf 'cleanup\n' >&"$CONTRACT_CONTROL_FD"
+        exec {CONTRACT_CONTROL_FD}>&-
+        CONTRACT_CONTROL_FD=""
     fi
+    if [[ -n "$CONTRACT_REAPER_PID" ]]; then
+        local reaper_status=0
+        wait "$CONTRACT_REAPER_PID" || reaper_status=$?
+        CONTRACT_REAPER_PID=""
+        cat "${CONTRACT_LOG_DIR}/target-launch.stderr" >&2
+        return "$reaper_status"
+    fi
+    return 0
+}
+
+contract_start_adopted_target() {
+    local duration="$1" script
+    # A dedicated subprocess owns adoption; do not turn the BATS harness into a
+    # process-global subreaper. The intermediate exits after pidfd binding.
+    script=$(cat <<'CONTRACT_SUBREAPER'
+import ctypes, json, os, signal, sys, time
+from pathlib import Path
+assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+pid_read, pid_write = os.pipe()
+ack_read, ack_write = os.pipe()
+intermediate = os.fork()
+if intermediate == 0:
+    os.close(pid_read)
+    os.close(ack_write)
+    os.setsid()
+    target = os.fork()
+    if target == 0:
+        null = os.open('/dev/null', os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        for fd in [int(name) for name in os.listdir('/proc/self/fd') if int(name) > 2]:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        os.execve('/usr/bin/sleep', ['sleep', sys.argv[1]], {'PATH': '/usr/bin:/bin'})
+    os.write(pid_write, str(target).encode() + b'\n')
+    os.close(pid_write)
+    os.read(ack_read, 1)
+    os._exit(0)
+os.close(pid_write)
+os.close(ack_read)
+with os.fdopen(pid_read) as pipe:
+    target = int(pipe.readline())
+pidfd = os.pidfd_open(target)
+try:
+    os.write(ack_write, b'1')
+    os.close(ack_write)
+    assert os.waitpid(intermediate, 0) == (intermediate, 0)
+    deadline = time.monotonic() + 5
+    while Path('/proc/' + str(target) + '/comm').read_text().strip() != 'sleep':
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    stat = Path('/proc/' + str(target) + '/stat').read_text()
+    fields = stat.rsplit(') ', 1)[1].split()
+    assert int(fields[1]) == os.getpid()
+    assert int(fields[3]) == intermediate and intermediate != target
+    assert fields[4] == '0' and fields[0] != 'Z'
+    environment = Path('/proc/' + str(target) + '/environ').read_bytes()
+    assert environment == b'PATH=/usr/bin:/bin\0'
+    print(json.dumps({'pid': target, 'former_parent': intermediate,
+                      'adoptive_parent': os.getpid(), 'uid': os.getuid(),
+                      'start_ticks': int(fields[19]), 'sid': int(fields[3]),
+                      'tty_nr': int(fields[4]), 'raw_stat': stat,
+                      'raw_status': Path('/proc/' + str(target) + '/status').read_text(),
+                      'environment': environment.decode()}), flush=True)
+    sys.stdin.readline()
+finally:
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL, None, 0)
+    except ProcessLookupError:
+        pass
+    os.waitpid(target, 0)
+    os.close(pidfd)
+    print('Owned pidfd target reaped; files retained', file=sys.stderr, flush=True)
+CONTRACT_SUBREAPER
+    )
+    mkfifo "${CONTRACT_LOG_DIR}/target-control"
+    env -i PATH=/usr/bin:/bin python3 -u -c "$script" "$duration" \
+        < "${CONTRACT_LOG_DIR}/target-control" \
+        > "${CONTRACT_LOG_DIR}/owned-target-before.json" \
+        2> "${CONTRACT_LOG_DIR}/target-launch.stderr" &
+    CONTRACT_REAPER_PID=$!
+    exec {CONTRACT_CONTROL_FD}> "${CONTRACT_LOG_DIR}/target-control"
 }
 
 # Capture real stdout/stderr separately and log every command's actual result.
@@ -253,8 +337,7 @@ contract_step() {
     if [[ "$(uname -s)" != "Linux" ]]; then
         skip "Linux-only /proc+setsid identity regression; other platform contract tests remain enabled"
     fi
-    command -v setsid >/dev/null
-    command -v bash >/dev/null
+    command -v python3 >/dev/null
     command -v timeout >/dev/null
     command -v sha256sum >/dev/null
     CONTRACT_LOG_DIR="${BATS_TEST_DIRNAME}/../target/test-logs/e2e/agent_loop/bats-$(date +%s%N)-$$"
@@ -264,48 +347,42 @@ contract_step() {
     run contract_step policy_defaults 30 --format json config show --file policy
     test_info "$output"
     assert_equals "0" "$status" "default policy must come from the real binary"
-    # Only this isolated fixture chooses kill deterministically. Runtime checks
-    # remain enabled; this is execution/identity evidence, not calibration or FDR.
+    # A declared test signature supplies the prior. Keep default loss, FDR,
+    # posterior thresholds and every runtime guard; this is controlled plumbing,
+    # not evidence that the synthetic prior or statistical FDR is calibrated.
     jq '.policy
         | .robot_mode.enabled = true
-        | .robot_mode.min_posterior = 0
-        | .guardrails.min_process_age_seconds = 0
-        | .fdr_control.enabled = false
-        | .loss_matrix |= with_entries(.value |= . +
-            {keep:1000, kill:0, pause:1000, throttle:1000, restart:1000, renice:1000})' \
+        | .guardrails.min_process_age_seconds = 0' \
         "${CONTRACT_LOG_DIR}/policy_defaults.stdout" > "${CONFIG_DIR}/policy.json"
+    jq -e --slurpfile defaults "${CONTRACT_LOG_DIR}/policy_defaults.stdout" \
+        '. == ($defaults[0].policy | .robot_mode.enabled = true
+            | .guardrails.min_process_age_seconds = 0)
+         and .fdr_control.enabled == true and .guardrails.builtin_protection == true' \
+        "${CONFIG_DIR}/policy.json"
 
-    # The reaping shell leads a foreign session; its sleep child has no agent
-    # environment, terminal, writable log FD, or relationship to our ancestors.
-    local duration="900.$$"
-    env -i PATH=/usr/bin:/bin setsid --fork bash -s -- "$duration" \
-        > "${CONTRACT_LOG_DIR}/target.pid" \
-        2> "${CONTRACT_LOG_DIR}/target-launch.stderr" <<'CONTRACT_LAUNCHER'
-        # BATS keeps writable capture FD4 (and possibly other harness FDs).
-        # Close inherited non-stdio descriptors only in this owned launcher.
-        for inherited_path in /proc/$$/fd/*; do
-            inherited_fd=${inherited_path##*/}
-            if (( inherited_fd > 2 )); then
-                exec {inherited_fd}>&-
-            fi
-        done
-        sleep "$1" </dev/null >/dev/null 2>&1 & target=$!
-        printf "%s\n" "$target"
-        exec >/dev/null
-        wait "$target"
-CONTRACT_LAUNCHER
+    local duration="1000.$$"
+    contract_start_adopted_target "$duration"
     local attempt
     cat "${CONTRACT_LOG_DIR}/target-launch.stderr" >&2
     for ((attempt = 0; attempt < 200; attempt++)); do
-        [[ -s "${CONTRACT_LOG_DIR}/target.pid" ]] && break
+        [[ -s "${CONTRACT_LOG_DIR}/owned-target-before.json" ]] && break
         sleep 0.01
     done
-    IFS= read -r CONTRACT_TARGET_PID < "${CONTRACT_LOG_DIR}/target.pid"
+    CONTRACT_TARGET_PID=$(jq -er '.pid' "${CONTRACT_LOG_DIR}/owned-target-before.json")
     [[ "$CONTRACT_TARGET_PID" =~ ^[0-9]+$ ]]
     local identity
     identity=$(contract_target_identity "$CONTRACT_TARGET_PID")
     CONTRACT_TARGET_TICKS="${identity%% *}"
     contract_target_is_alive
+    local target_uid
+    target_uid=$(id -u)
+    jq -e --argjson reaper "$CONTRACT_REAPER_PID" --argjson uid "$target_uid" \
+        --argjson ticks "$CONTRACT_TARGET_TICKS" \
+        '.adoptive_parent == $reaper and .former_parent != .adoptive_parent
+         and .sid == .former_parent and .sid != .pid and .tty_nr == 0
+         and .start_ticks == $ticks and .uid == $uid
+         and .environment == "PATH=/usr/bin:/bin\u0000"' \
+        "${CONTRACT_LOG_DIR}/owned-target-before.json"
     local boot_id expected_start_id
     IFS= read -r boot_id < /proc/sys/kernel/random/boot_id
     expected_start_id="${boot_id}:${CONTRACT_TARGET_TICKS}:${CONTRACT_TARGET_PID}"
@@ -319,27 +396,46 @@ CONTRACT_LAUNCHER
     assert_equals "sleep" "$target_comm" "descriptor evidence must observe the exec'd target"
     contract_target_fd_evidence "$expected_start_id"
 
-    run contract_step plan 180 --format json agent plan --min-posterior 0 \
+    # Explicit typed schema input, never a hand-built executable Plan. Scope the
+    # argument matcher to this exact disposable command instead of all sleeps.
+    jq -n --arg pattern "(^|\\s)${duration/./\\.}\$" \
+        '{schema_version:2,signatures:[{name:"literal-owned-sleep",category:"other",
+          patterns:{process_names:["^sleep$"],arg_patterns:[$pattern]},
+          priors:{useful:{alpha:1,beta:999},useful_bad:{alpha:1,beta:999},
+                  abandoned:{alpha:999,beta:1},zombie:{alpha:1,beta:999}}}]}' \
+        > "${CONFIG_DIR}/signatures.json"
+    run contract_step signature_validate 30 --format json signature validate
+    test_info "$output"
+    assert_equals "0" "$status" "the real signature loader must validate the four-class input"
+
+    run contract_step plan 180 --format json agent plan \
         --min-age 0 --max-candidates 20 --pids "$CONTRACT_TARGET_PID"
     test_info "$output"
     assert_equals "1" "$status" "actual planner must return PlanReady"
     jq -e --argjson pid "$CONTRACT_TARGET_PID" \
         '.args.pids == [$pid] and (.candidates | length) == 1
-         and .candidates[0].pid == $pid' "${CONTRACT_LOG_DIR}/plan.stdout"
+         and .candidates[0].pid == $pid
+         and .candidates[0].inference.prior_source == "signature"
+         and .candidates[0].inference.mode == "bayesian"
+         and .candidates[0].inference.fast_path.used == false
+         and .candidates[0].signature.name == "literal-owned-sleep"' \
+        "${CONTRACT_LOG_DIR}/plan.stdout"
     local session_id saved_plan action_id
     session_id=$(jq -er '.session_id' "${CONTRACT_LOG_DIR}/plan.stdout")
     [[ "$session_id" =~ $SESSION_ID_PATTERN ]]
     saved_plan="${DATA_DIR}/sessions/${session_id}/decision/plan.json"
     [[ -s "$saved_plan" ]]
-    jq -e --argjson pid "$CONTRACT_TARGET_PID" --arg start_id "$expected_start_id" \
+    jq -e --argjson pid "$CONTRACT_TARGET_PID" --arg start_id "$expected_start_id" --argjson uid "$target_uid" \
         '.actions | length == 1 and
          (.[0] | .target.pid == $pid and .target.start_id == $start_id
+          and .target.uid == $uid
           and .action == "kill" and .blocked == false
           and (.pre_checks | length) > 0 and .rationale.posterior != null)' "$saved_plan"
     action_id=$(jq -er '.actions[0].action_id' "$saved_plan")
     jq -e --arg command "sleep $duration" \
         '.candidates[0].command == $command and .candidates[0].command_short == "sleep"' "$saved_plan"
     jq -e --slurpfile saved "$saved_plan" '. == $saved[0]' "${CONTRACT_LOG_DIR}/plan.stdout"
+    jq -e --argjson reaper "$CONTRACT_REAPER_PID" '.candidates[0].ppid == $reaper' "$saved_plan"
 
     run contract_step stale_identity 30 --format json agent apply --session "$session_id" \
         --targets "${CONTRACT_TARGET_PID}:stale-start-id" --yes
@@ -348,6 +444,20 @@ CONTRACT_LAUNCHER
     [[ "$(cat "${CONTRACT_LOG_DIR}/stale_identity.stderr")" == *"does not match a saved action"* ]]
     contract_target_is_alive
     [[ ! -e "${DATA_DIR}/sessions/${session_id}/action/outcomes.jsonl" ]]
+
+    # Removing saved checks cannot bypass the real runtime identity guard.
+    cp -- "$saved_plan" "${CONTRACT_LOG_DIR}/original-plan.json"
+    jq --argjson uid "$target_uid" \
+        '.actions |= map(.pre_checks = [] | .target.uid = ($uid + 1))' \
+        "${CONTRACT_LOG_DIR}/original-plan.json" > "$saved_plan"
+    run contract_step tampered_uid 240 --format json agent apply --session "$session_id" \
+        --targets "${CONTRACT_TARGET_PID}:${expected_start_id}" --yes
+    test_info "$output"
+    assert_equals "3" "$status" "tampered UID must return ActionsPartial without delivering a signal"
+    jq -e '.outcomes[0].status == "identity_mismatch"' "${CONTRACT_LOG_DIR}/tampered_uid.stdout"
+    contract_target_is_alive
+    cat "${CONTRACT_LOG_DIR}/original-plan.json" > "$saved_plan"
+    cmp -- "$saved_plan" "${CONTRACT_LOG_DIR}/original-plan.json"
 
     run contract_step apply 240 --format json agent apply --session "$session_id" \
         --targets "${CONTRACT_TARGET_PID}:${expected_start_id}" --yes
@@ -368,7 +478,7 @@ CONTRACT_LAUNCHER
     jq -e --argjson pid "$CONTRACT_TARGET_PID" --arg start_id "$expected_start_id" \
         'any(.action_outcomes[]; .target.pid == $pid and .target.start_id == $start_id
             and .outcome == "confirmed_dead")' "${CONTRACT_LOG_DIR}/verify.stdout"
-    jq -e -s 'length == 5 and all(.[]; .command != "" and (.args | type) == "array"
+    jq -e -s 'length == 7 and all(.[]; .command != "" and (.args | type) == "array"
         and (.stdout_sha256 | length) == 64 and (.stderr_sha256 | length) == 64
         and .elapsed_ms >= 0)' "${CONTRACT_LOG_DIR}/steps.jsonl"
     BATS_TEST_COMPLETED=pass
