@@ -11790,6 +11790,115 @@ mod process_tree_safety_tests {
             }
         }
 
+        pub(super) struct DetachedWrapper {
+            pub(super) parent: DetachedTarget,
+            pub(super) child_pid: u32,
+            child_pidfd: OwnedFd,
+        }
+
+        impl DetachedWrapper {
+            pub(super) fn spawn() -> Self {
+                let mut command = Command::new("sh");
+                command
+                    .args([
+                        "-c",
+                        "sh -c 'sleep 600 </dev/null >/dev/null 2>&1 & printf \"%s %s\\n\" \"$$\" \"$!\"; wait' & wait",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .env_remove("SSH_CONNECTION")
+                    .env_remove("SSH_CLIENT")
+                    .env_remove("SSH_TTY");
+                // SAFETY: only the owned child enters a new session.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut leader = command.spawn().expect("spawn detached wrapper reaper");
+                let mut line = String::new();
+                std::io::BufReader::new(leader.stdout.take().expect("wrapper stdout"))
+                    .read_line(&mut line)
+                    .expect("read owned wrapper and child PIDs");
+                let mut pids = line.split_whitespace();
+                let parent_pid = pids.next().unwrap().parse::<u32>().unwrap();
+                let child_pid = pids.next().unwrap().parse::<u32>().unwrap();
+                // SAFETY: these descriptors bind the two processes emitted by
+                // this owned launcher; later cleanup never signals by bare PID.
+                let child_descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
+                assert!(
+                    child_descriptor >= 0,
+                    "bind owned wrapper child: {}",
+                    std::io::Error::last_os_error()
+                );
+                let child_pidfd = unsafe { OwnedFd::from_raw_fd(child_descriptor as i32) };
+                let parent_descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, parent_pid, 0) };
+                if parent_descriptor < 0 {
+                    let error = std::io::Error::last_os_error();
+                    // SAFETY: unwind setup by stopping only the pinned child;
+                    // its shell parent reaps it before the launcher is reaped.
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            child_pidfd.as_raw_fd(),
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0,
+                        );
+                    }
+                    leader
+                        .wait()
+                        .expect("reap wrapper after failed parent binding");
+                    panic!("bind owned wrapper parent: {error}");
+                }
+                let parent = DetachedTarget {
+                    leader,
+                    pid: parent_pid,
+                    // SAFETY: the successful descriptor is transferred once.
+                    pidfd: unsafe { OwnedFd::from_raw_fd(parent_descriptor as i32) },
+                };
+                let wrapper = Self {
+                    parent,
+                    child_pid,
+                    child_pidfd,
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::fs::read_to_string(format!("/proc/{child_pid}/comm"))
+                    .map(|comm| comm.trim() != "sleep")
+                    .unwrap_or(true)
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned child did not finish sleep exec"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                wrapper
+            }
+        }
+
+        impl Drop for DetachedWrapper {
+            fn drop(&mut self) {
+                // SAFETY: stop the pinned child first, letting its wrapper reap
+                // it and exit before the session reaper is waited on. The later
+                // DetachedTarget drop can only signal the pinned original parent.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.child_pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                let _ = self.parent.leader.wait();
+            }
+        }
+
         pub(super) fn case(label: &str) -> (pt_core::session::SessionHandle, std::path::PathBuf) {
             use pt_core::session::{SessionManifest, SessionMode, SessionStore};
 
@@ -11824,12 +11933,29 @@ mod process_tree_safety_tests {
             policy: &pt_core::config::Policy,
             target: &DetachedTarget,
         ) -> pt_core::plan::Plan {
+            selection_for_pid(handle, policy, target.pid, "sleep")
+        }
+
+        pub(super) fn wrapper_selection(
+            handle: &pt_core::session::SessionHandle,
+            policy: &pt_core::config::Policy,
+            target: &DetachedWrapper,
+        ) -> pt_core::plan::Plan {
+            selection_for_pid(handle, policy, target.parent.pid, "sh")
+        }
+
+        fn selection_for_pid(
+            handle: &pt_core::session::SessionHandle,
+            policy: &pt_core::config::Policy,
+            pid: u32,
+            expected_comm: &str,
+        ) -> pt_core::plan::Plan {
             use pt_core::collect::{quick_scan, QuickScanOptions};
             use pt_core::decision::{decide_action, Action, ActionFeasibility};
             use pt_core::inference::ClassScores;
 
             let scan = quick_scan(&QuickScanOptions {
-                pids: vec![target.pid],
+                pids: vec![pid],
                 include_kernel_threads: false,
                 timeout: Some(std::time::Duration::from_secs(30)),
                 progress: None,
@@ -11838,13 +11964,13 @@ mod process_tree_safety_tests {
             let selected: Vec<_> = scan
                 .processes
                 .iter()
-                .filter(|process| process.pid.0 == target.pid)
+                .filter(|process| process.pid.0 == pid)
                 .collect();
             assert_eq!(selected.len(), 1);
             let process = selected[0];
-            assert_eq!(process.pid.0, target.pid);
+            assert_eq!(process.pid.0, pid);
             assert_eq!(
-                process.comm, "sleep",
+                process.comm, expected_comm,
                 "fixture must finish exec before selection"
             );
             assert!(!process.state.is_zombie());
@@ -11881,7 +12007,7 @@ mod process_tree_safety_tests {
             let plan = super::super::build_plan_from_selection(
                 &handle.id,
                 policy,
-                &[target.pid],
+                &[pid],
                 &candidates,
             )
             .expect("produce canonical selected action");
@@ -12100,6 +12226,115 @@ mod process_tree_safety_tests {
         assert_eq!(persisted[0]["status"], "success");
         assert_eq!(persisted[1]["action_id"], plan.actions[1].action_id);
         assert_eq!(persisted[1]["status"], "precheck_blocked");
+    }
+
+    /// An actual wrapper selection must preserve its unselected live child.
+    /// This is headless execution plumbing, not rendered-TUI or calibration proof.
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_selected_wrapper_refuses_its_unselected_live_child() {
+        use pt_core::action::ActionStatus;
+        use pt_core::collect::{quick_scan, QuickScanOptions};
+        use pt_core::session::SessionState;
+        use pt_core::verify::{executed_plan_actions, parse_action_outcomes, parse_agent_plan};
+        use tui_live_fixtures::{case, policy, record, wrapper_selection, DetachedWrapper};
+
+        let (handle, log_dir) = case("tui-live-child");
+        let policy = policy(1);
+        assert!(policy.guardrails.builtin_protection);
+        let target = DetachedWrapper::spawn();
+        let selection = wrapper_selection(&handle, &policy, &target);
+        let options = QuickScanOptions {
+            pids: vec![target.parent.pid, target.child_pid],
+            include_kernel_threads: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
+            progress: None,
+        };
+        let before = quick_scan(&options).expect("collect actual wrapper and child identities");
+        assert!(before.metadata.warnings.is_empty());
+        let parent = before
+            .processes
+            .iter()
+            .find(|process| process.pid.0 == target.parent.pid)
+            .unwrap();
+        let child = before
+            .processes
+            .iter()
+            .find(|process| process.pid.0 == target.child_pid)
+            .unwrap();
+        assert_eq!(parent.comm, "sh");
+        assert_eq!(child.comm, "sleep");
+        assert_eq!(parent.ppid.0, target.parent.leader.id());
+        assert_eq!(child.ppid.0, parent.pid.0);
+        assert_eq!(child.sid, parent.sid);
+        assert_ne!(parent.sid, Some(parent.pid.0));
+        // SAFETY: only observe the test caller's own UID and session ID.
+        let uid = unsafe { libc::geteuid() };
+        let own_session = unsafe { libc::getsid(0) };
+        assert!(own_session >= 0);
+        assert_ne!(parent.sid, Some(own_session as u32));
+        let parent_identity = super::process_identity_from_record(parent);
+        let child_identity = super::process_identity_from_record(child);
+        assert_eq!(parent_identity.uid, uid);
+        assert_eq!(child_identity.uid, uid);
+        assert_eq!(selection.actions[0].target, parent_identity);
+        assert_eq!(selection.actions.len(), 1);
+        assert_ne!(selection.actions[0].target.pid.0, target.child_pid);
+
+        let mut state = super::TuiExecutionState::default();
+        let (result, evidence) =
+            super::execute_tui_plan_selection(&handle, &policy, &selection, &mut state)
+                .expect("retain actual live-child refusal through the callback helper");
+        assert_eq!(result.outcomes.len(), 1);
+        assert_eq!(result.summary.actions_succeeded, 0);
+        assert_eq!(result.summary.actions_failed, 1);
+        assert!(
+            matches!(&result.outcomes[0].status, ActionStatus::PreCheckBlocked { reason, .. } if reason.contains(&format!("has live child {} (sleep)", target.child_pid))),
+            "{:?}",
+            result.outcomes[0]
+        );
+        assert!(
+            evidence.is_empty(),
+            "refusal must occur before runner signal delivery"
+        );
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 0);
+        let after = quick_scan(&options).expect("observe both actually spared processes");
+        assert!(after.metadata.warnings.is_empty());
+        for identity in [&parent_identity, &child_identity] {
+            let live = after
+                .processes
+                .iter()
+                .find(|process| process.pid.0 == identity.pid.0)
+                .expect("original owned identity must remain alive");
+            assert!(!live.state.is_zombie());
+            assert_eq!(super::process_identity_from_record(live), *identity);
+        }
+        let budget_path = log_dir.join("data/rate_limit.json");
+        assert!(
+            !budget_path.exists(),
+            "tree refusal cannot prepare or spend durable kill budget"
+        );
+        let canonical = parse_agent_plan(
+            &std::fs::read_to_string(handle.dir.join("decision/plan.json")).unwrap(),
+        )
+        .unwrap();
+        let saved = parse_action_outcomes(
+            &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(canonical.actions.len(), 1);
+        assert_eq!(canonical.actions[0].target, parent_identity);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].status, "precheck_blocked");
+        assert!(executed_plan_actions(&canonical, &saved)
+            .unwrap()
+            .is_empty());
+        assert_eq!(handle.read_manifest().unwrap().state, SessionState::Failed);
+        assert!(super::finish_tui_session(&handle, &state).is_err());
+        record(
+            &log_dir,
+            serde_json::json!({"step": "wrapper_live_child_refusal", "selected_plan": selection, "before": before.processes, "result": result, "evidence": evidence, "after": after.processes, "saved_plan": canonical, "saved_outcomes": saved}),
+        );
     }
 
     /// Real headless callback plumbing: three selections retain a refused
