@@ -11772,8 +11772,9 @@ mod process_tree_safety_tests {
     #[cfg(feature = "ui")]
     #[test]
     fn tui_selection_refuses_a_plan_above_the_run_cap_and_accepts_the_boundary() {
-        use pt_core::decision::{decide_action, ActionFeasibility};
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
         use pt_core::inference::ClassScores;
+        use std::collections::HashMap;
 
         let mut policy = pt_core::config::Policy::default();
         policy.guardrails.max_kills_per_run = 2;
