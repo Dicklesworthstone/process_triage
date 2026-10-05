@@ -1008,11 +1008,32 @@ try:
                 break
             assert time.monotonic() < deadline
             time.sleep(0.01)
-    descriptors = [{'fd': int(name),
+    # comm changes at exec before the dynamic loader closes its temporary FD.
+    # Reuse the original readiness deadline; never filter a live descriptor or
+    # relax the independent Rust snapshot's exact [0, 1, 2] /dev/null checks.
+    while True:
+        descriptors = []
+        fd_names = []
+        snapshot_race = None
+        try:
+            fd_names = os.listdir('/proc/' + str(target) + '/fd')
+            for name in fd_names:
+                descriptors.append({
+                    'fd': int(name),
                     'destination': os.readlink('/proc/' + str(target) + '/fd/' + name),
-                    'raw_fdinfo': Path('/proc/' + str(target) + '/fdinfo/' + name).read_text()}
-                   for name in os.listdir('/proc/' + str(target) + '/fd')]
-    descriptors.sort(key=lambda descriptor: descriptor['fd'])
+                    'raw_fdinfo': Path('/proc/' + str(target) + '/fdinfo/' + name).read_text()})
+        except FileNotFoundError as error:
+            snapshot_race = str(error)
+        descriptors.sort(key=lambda descriptor: descriptor['fd'])
+        if snapshot_race is None and [item['fd'] for item in descriptors] == [0, 1, 2] \
+                and all(item['destination'] == '/dev/null' for item in descriptors):
+            assert time.monotonic() < deadline, 'owned descriptor readiness deadline expired'
+            break
+        print(json.dumps({'event': 'owned_descriptor_not_ready', 'pid': target,
+                          'fd_names': fd_names, 'descriptors': descriptors,
+                          'snapshot_race': snapshot_race}), file=sys.stderr, flush=True)
+        assert time.monotonic() < deadline, 'owned descriptor readiness deadline expired'
+        time.sleep(0.01)
     print(json.dumps({'pid': target, 'former_parent': intermediate,
                       'adoptive_parent': os.getpid(), 'zombie_children': zombie_children,
                       'descriptors': descriptors}), flush=True)

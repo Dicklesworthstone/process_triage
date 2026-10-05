@@ -216,7 +216,7 @@ fn fleet_transfer_json_export_import_replace_roundtrip() {
         &temp.join("invalid-strategy-artifacts"),
         "unknown-merge-strategy",
     );
-    assert_eq!(refusal.status.code(), Some(2));
+    assert_eq!(refusal.status.code(), Some(10));
     assert!(String::from_utf8_lossy(&refusal.stderr).contains("unknown merge strategy"));
     assert_eq!(config_snapshot(&config_dir), before_invalid_strategy);
     assert_eq!(
