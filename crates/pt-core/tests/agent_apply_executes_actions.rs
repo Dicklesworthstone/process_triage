@@ -1272,6 +1272,252 @@ finally:
         "{}",
         fs::read_to_string(log_dir.join("target-launch.stderr")).unwrap()
     );
+
+    // A separate real producer phase exercises saved/current policy drift.
+    // The default 60s I/O check outlasts a minute-cap probe, so declare an hourly
+    // cap of one. Leave the minute, loss, FDR, posterior and I/O defaults intact.
+    let drift_log = log_dir.join("policy-drift");
+    fs::create_dir_all(&drift_log).unwrap();
+    let drift_data = TempDir::new().expect("drift data dir").keep();
+    let drift_config = TempDir::new().expect("drift config dir").keep();
+    let mut saved_policy = Policy::default();
+    saved_policy.robot_mode.enabled = true;
+    saved_policy.guardrails.min_process_age_seconds = 0;
+    saved_policy.guardrails.max_kills_per_hour = Some(1);
+    let original_defaults = serde_json::to_value(Policy::default()).unwrap();
+    let mut otherwise_default = serde_json::to_value(&saved_policy).unwrap();
+    for (section, field) in [
+        ("robot_mode", "enabled"),
+        ("guardrails", "min_process_age_seconds"),
+        ("guardrails", "max_kills_per_hour"),
+    ] {
+        otherwise_default[section][field] = original_defaults[section][field].clone();
+    }
+    assert_eq!(otherwise_default, original_defaults);
+    fs::write(
+        drift_config.join("policy.json"),
+        serde_json::to_vec_pretty(&saved_policy).unwrap(),
+    )
+    .unwrap();
+    let durations = [
+        format!("1001.{}", std::process::id()),
+        format!("1002.{}", std::process::id()),
+    ];
+    let mut drift_signatures = signatures.clone();
+    drift_signatures.signatures[0].patterns.arg_patterns = vec![format!(
+        r"(^|\s)({}|{})$",
+        regex::escape(&durations[0]),
+        regex::escape(&durations[1])
+    )];
+    drift_signatures.signatures[0].patterns.min_matches = 2;
+    drift_signatures.validate_for_activation().unwrap();
+    fs::write(
+        drift_config.join("signatures.json"),
+        drift_signatures.to_json().unwrap(),
+    )
+    .unwrap();
+    let validated = run_step(
+        &drift_log,
+        "signature_validate",
+        &["--format", "json", "signature", "validate"],
+        &drift_data,
+        &drift_config,
+        30,
+    );
+    assert_eq!(validated.status.code(), Some(0), "{validated:?}");
+    let first_log = drift_log.join("first-target");
+    let second_log = drift_log.join("second-target");
+    fs::create_dir_all(&first_log).unwrap();
+    fs::create_dir_all(&second_log).unwrap();
+    let (mut first_reaper, _first_target, first_identity) =
+        spawn_owned_orphan(&first_log, &durations[0], &drift_data, &drift_config);
+    let (mut second_reaper, _second_target, second_identity) =
+        spawn_owned_orphan(&second_log, &durations[1], &drift_data, &drift_config);
+    let identities = [&first_identity, &second_identity];
+    let mut sessions = Vec::new();
+    let mut produced = Vec::new();
+    // Produce both executable sessions before recording any successful kill.
+    for (index, identity) in identities.iter().enumerate() {
+        let planned = run_step(
+            &drift_log,
+            &format!("plan-{index}"),
+            &[
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--min-age",
+                "0",
+                "--pids",
+                &identity.pid.0.to_string(),
+            ],
+            &drift_data,
+            &drift_config,
+            180,
+        );
+        assert_eq!(planned.status.code(), Some(1), "{planned:?}");
+        let actual: Value = serde_json::from_slice(&planned.stdout).unwrap();
+        assert_eq!(actual["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            actual["candidates"][0]["inference"]["prior_source"],
+            "signature"
+        );
+        assert_eq!(
+            actual["candidates"][0]["signature"]["match_level"],
+            "command_plus_args"
+        );
+        assert_eq!(
+            actual["policy_snapshot"]["guardrails"]["max_kills_per_hour"],
+            1
+        );
+        let session = actual["session_id"].as_str().unwrap().to_string();
+        let handle = SessionStore::at_data_dir(&drift_data)
+            .open(&SessionId::parse(&session).unwrap())
+            .unwrap();
+        let recorded = fs::read(handle.dir.join("decision/plan.json")).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&recorded).unwrap(), actual);
+        let canonical: Plan = serde_json::from_slice(&recorded).unwrap();
+        assert_eq!(canonical.actions.len(), 1);
+        assert_eq!(canonical.actions[0].target, **identity);
+        assert_eq!(canonical.actions[0].action, Action::Kill);
+        assert!(!canonical.actions[0].blocked);
+        assert!(!canonical.actions[0].pre_checks.is_empty());
+        assert!(state_of(identity.pid.0).is_some_and(|state| state != 'Z'));
+        sessions.push(session);
+        produced.push(canonical);
+    }
+    assert!(!drift_data.join("rate_limit.json").exists());
+    let first_target = format!("{}:{}", first_identity.pid.0, first_identity.start_id.0);
+    let applied = run_step(
+        &drift_log,
+        "apply-first",
+        &[
+            "--format",
+            "json",
+            "agent",
+            "apply",
+            "--session",
+            &sessions[0],
+            "--targets",
+            &first_target,
+            "--yes",
+        ],
+        &drift_data,
+        &drift_config,
+        240,
+    );
+    assert_eq!(applied.status.code(), Some(2), "{applied:?}");
+    let first: Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(first["outcomes"].as_array().unwrap().len(), 1);
+    assert_eq!(first["outcomes"][0]["status"], "success");
+    assert_eq!(first["outcomes"][0]["pid"], first_identity.pid.0);
+    assert_eq!(
+        first["outcomes"][0]["action_id"],
+        produced[0].actions[0].action_id
+    );
+    assert!(state_of(first_identity.pid.0).is_none_or(|state| state == 'Z'));
+    let delivered_at = std::time::Instant::now();
+    let verified = run_step(
+        &drift_log,
+        "verify-first",
+        &[
+            "--format",
+            "json",
+            "agent",
+            "verify",
+            "--session",
+            &sessions[0],
+        ],
+        &drift_data,
+        &drift_config,
+        60,
+    );
+    assert_eq!(verified.status.code(), Some(0), "{verified:?}");
+    let verification: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert!(verification["action_outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|outcome| outcome["target"]["pid"] == first_identity.pid.0
+            && outcome["outcome"] == "confirmed_dead"));
+    let before_budget: Value =
+        serde_json::from_slice(&fs::read(drift_data.join("rate_limit.json")).unwrap()).unwrap();
+    assert_eq!(
+        before_budget["kill_timestamps"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(before_budget["pending_kill_intent"], false);
+    let mut current_policy = saved_policy.clone();
+    current_policy.guardrails.max_kills_per_run = 100;
+    current_policy.guardrails.max_kills_per_minute = Some(100);
+    current_policy.guardrails.max_kills_per_hour = Some(100);
+    current_policy.guardrails.max_kills_per_day = Some(1000);
+    fs::write(
+        drift_config.join("policy.json"),
+        serde_json::to_vec_pretty(&current_policy).unwrap(),
+    )
+    .unwrap();
+    let second_target = format!("{}:{}", second_identity.pid.0, second_identity.start_id.0);
+    let refused = run_step(
+        &drift_log,
+        "apply-second-after-current-caps-raised",
+        &[
+            "--format",
+            "json",
+            "agent",
+            "apply",
+            "--session",
+            &sessions[1],
+            "--targets",
+            &second_target,
+            "--yes",
+        ],
+        &drift_data,
+        &drift_config,
+        240,
+    );
+    assert_ne!(refused.status.code(), Some(2), "{refused:?}");
+    let refusal: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refusal["outcomes"].as_array().unwrap().len(), 1);
+    assert_eq!(refusal["outcomes"][0]["pid"], second_identity.pid.0);
+    assert_eq!(
+        refusal["outcomes"][0]["action_id"],
+        produced[1].actions[0].action_id
+    );
+    assert_eq!(refusal["outcomes"][0]["status"], "blocked_by_policy");
+    assert_eq!(refusal["outcomes"][0]["reason"], "rate_limit");
+    assert!(
+        refusal["outcomes"][0]["violation"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 kills already performed this hour (max 1)"),
+        "{refusal}"
+    );
+    assert!(
+        delivered_at.elapsed() < Duration::from_secs(3600),
+        "hour-cap probe exceeded its actual window"
+    );
+    assert!(state_of(second_identity.pid.0).is_some_and(|state| state != 'Z'));
+    assert_eq!(live_identity(second_identity.pid.0), second_identity);
+    let after_budget: Value =
+        serde_json::from_slice(&fs::read(drift_data.join("rate_limit.json")).unwrap()).unwrap();
+    assert_eq!(
+        after_budget["kill_timestamps"],
+        before_budget["kill_timestamps"]
+    );
+    assert_eq!(after_budget["pending_kill_intent"], false);
+    eprintln!("saved hourly cap1/current caps100/100/100/1000; actual post-delivery elapsed={}ms; retained={}", delivered_at.elapsed().as_millis(), drift_log.display());
+    for (reaper, target_log) in [
+        (&mut first_reaper, &first_log),
+        (&mut second_reaper, &second_log),
+    ] {
+        drop(reaper.0.stdin.take());
+        assert!(reaper.0.wait().unwrap().success());
+        eprint!(
+            "{}",
+            fs::read_to_string(target_log.join("target-launch.stderr")).unwrap()
+        );
+    }
 }
 
 #[test]
