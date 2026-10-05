@@ -325,7 +325,8 @@ const UNIX_TABLE_TTL: Duration = Duration::from_secs(2);
 /// shared for `UNIX_TABLE_TTL`, so a long-running daemon still sees fresh data.
 #[cfg(target_os = "linux")]
 fn unix_socket_paths_by_inode() -> Arc<HashMap<u64, String>> {
-    static CACHE: Mutex<Option<(Instant, Arc<HashMap<u64, String>>)>> = Mutex::new(None);
+    type CachedUnixSocketPaths = Option<(Instant, Arc<HashMap<u64, String>>)>;
+    static CACHE: Mutex<CachedUnixSocketPaths> = Mutex::new(None);
     let mut cached = CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
