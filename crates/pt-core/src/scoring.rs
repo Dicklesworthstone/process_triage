@@ -1403,6 +1403,27 @@ mod provenance_tests {
 
     #[test]
     fn orphaned_low_blast_radius_elevates_abandonment_features() {
+        // Reparented to init, still in its spawner's session: an orphan even without
+        // a readable ancestor chain.
+        let mut orphan = lineage(100, 1, None);
+        orphan.sid = 90;
+        let bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[]),
+            lineages: HashMap::from([(100, orphan)]),
+            children: HashMap::new(),
+        };
+
+        let adjustment = derive_provenance_adjustment(100, &bundle);
+        let features = feature_names(&adjustment);
+
+        assert!(features.contains(&"provenance_ownership_orphaned"));
+        assert!(features.contains(&"provenance_blast_radius_low"));
+    }
+
+    /// Its own session leader under PID 1 with no readable chain (hidepid): as likely
+    /// an init-started daemon as an orphan, so no orphan term, and lowered confidence.
+    #[test]
+    fn chainless_session_leader_under_init_is_not_scored_orphaned() {
         let bundle = ProvenanceInferenceBundle {
             resource_graph: SharedResourceGraph::from_evidence(&[]),
             lineages: HashMap::from([(100, lineage(100, 1, None))]),
@@ -1412,13 +1433,12 @@ mod provenance_tests {
         let adjustment = derive_provenance_adjustment(100, &bundle);
         let features = feature_names(&adjustment);
 
-        assert!(features.contains(&"provenance_ownership_orphaned"));
-        assert!(features.contains(&"provenance_blast_radius_low"));
+        assert!(!features.contains(&"provenance_ownership_orphaned"));
         assert!(adjustment.confidence_penalty_steps >= 1);
         assert!(adjustment
             .confidence_notes
             .iter()
-            .any(|note| note.contains("PPID=1") || note.contains("ancestor chain")));
+            .any(|note| note.contains("ancestor chain")));
     }
 
     #[test]
@@ -1446,6 +1466,37 @@ mod provenance_tests {
         );
         assert!(
             !features.contains("provenance_ownership_supervised"),
+            "{features}"
+        );
+    }
+
+    /// A job orphaned under `systemd --user` (a child subreaper) has ppid != 1, so the
+    /// base orphan check misses it; the lineage's orphan term is what carries it.
+    #[test]
+    fn job_reparented_to_user_subreaper_gets_the_orphan_term() {
+        let mut orphan = lineage(500, 2000, None);
+        orphan.sid = 450;
+        orphan.ancestors = vec![
+            AncestorEntry {
+                pid: 2000,
+                comm: "systemd".to_string(),
+                uid: 1000,
+            },
+            AncestorEntry {
+                pid: 1,
+                comm: "systemd".to_string(),
+                uid: 0,
+            },
+        ];
+        let bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[]),
+            lineages: HashMap::from([(500, orphan)]),
+            children: HashMap::new(),
+        };
+
+        let features = feature_names(&derive_provenance_adjustment(500, &bundle)).join(",");
+        assert!(
+            features.contains("provenance_ownership_orphaned"),
             "{features}"
         );
     }
