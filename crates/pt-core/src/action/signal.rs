@@ -264,9 +264,9 @@ impl SignalActionRunner {
         Ok(())
     }
 
-    /// macOS has no pidfd: re-check the exact identity immediately before signaling,
-    /// keeping the PID-reuse window as small as the platform allows.
-    #[cfg(target_os = "macos")]
+    /// Re-check start identity immediately before fallback signaling, including
+    /// escalation when a Linux pidfd is unavailable.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn check_identity_now(&self, action: &PlanAction) -> Result<(), ActionError> {
         match self.read_starttime(action.target.pid.0) {
             Some(current) if ids_match_starttime(&action.target.start_id.0, current) => Ok(()),
