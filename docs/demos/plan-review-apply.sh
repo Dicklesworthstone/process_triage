@@ -50,7 +50,7 @@ if [[ "$apply_status" -ne 0 && "$apply_status" -ne 2 ]]; then
   exit "$apply_status"
 fi
 
-printf 'Verify the actual process state after the simulation:\n'
+printf 'Verify recorded executions; a simulation has no executed actions:\n'
 if VERIFY_JSON=$("$PT_COMMAND" agent verify --session "$SESSION_ID" --format json); then
   verify_status=0
 else
@@ -62,11 +62,4 @@ if [[ "$verify_status" -eq 0 ]]; then
   exit 0
 fi
 
-# Still-running planned targets are expected after a dry-run. Report that
-# nonzero verification honestly; reject every other failure or malformed result.
-if [[ "$verify_status" -eq 3 ]] && printf '%s\n' "$VERIFY_JSON" | jq -e \
-  '(.action_outcomes | length) > 0 and all(.action_outcomes[]; .outcome == "still_running")' >/dev/null; then
-  printf 'Dry-run verification: all planned targets are still running; no action was executed.\n'
-  exit 0
-fi
 exit "$verify_status"

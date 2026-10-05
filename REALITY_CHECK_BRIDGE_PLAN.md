@@ -1,6 +1,6 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Execution update — 2026-10-05 03:16 UTC
+## Execution update — 2026-10-05 03:42 UTC
 
 The assessment below describes the inspected baseline. The working tree now connects the canonical executable
 Plan to agent planning, saves the exact scorer ledger, enforces the current/saved policy age floor at apply,
@@ -163,6 +163,21 @@ Actual strict remote validation so far:
   delivery; a failed completion save leaves the readable pending intent and refuses future kills, including force.
   CLI execution identity/time is refreshed after intent I/O. TUI additionally uses the same final live-child guard
   as CLI. Actual disk-failure, non-delivery and live TUI wrapper negatives and final gates remain pending.
+- The complete 62-test BATS contract suite passed on the retained 02:25 binary; this is earlier-source
+  evidence, not certification of the new durable-intent or extraction changes. The scoped dry-run demo also
+  passed on that binary, but its first invocation used unsupported data/configuration environment names.
+  The demo must be repeated with PROCESS_TRIAGE_DATA/PROCESS_TRIAGE_CONFIG and the current binary.
+- The 02:55 core library run executed zero tests: compilation exposed a Linux fallback identity helper hidden
+  behind a macOS-only cfg. That cfg is corrected without weakening identity checks. A 03:28 retry timed out
+  before remote admission (103); the 03:38 strict remote retry is now compiling the corrected libraries.
+  Durable completion recovery of the failed older job remains pending after an SSH release timeout.
+- Reflog records external resets at 03:25 and 03:26, followed by commits made outside this agent team.
+  Reverted test helpers were restored manually, and patches/copies are retained outside the repository.
+  No reset, deletion, commit or push was performed by this team; exact source receipts remain necessary.
+- Bundle extraction (`bd-gn74`) is now in progress: verified-byte positives and unsafe destination negatives
+  are written, while the production destination boundary is being repaired. No runtime or closure credit yet.
+  A new default-spare fixture is being checked against actual default inference; youth alone may recommend
+  Pause rather than Keep, so that assertion must not be weakened or represented as a default-policy pass.
 
 ### Active completion checklist
 
@@ -192,7 +207,8 @@ Actual strict remote validation so far:
 - [ ] Rerun BATS with actual FD-bound launcher evidence and monotonic timings; keep every original positive/negative.
 - [ ] Rerun current-age-floor, regular/unlinked writer, read-only/FIFO and unreadable-evidence cases.
 - [ ] Rerun actual CLI saved-session → plain/encrypted bundle and session/bundle HTML canary regression.
-- [x] Rerun all sharing/report library and integration suites on current source and lockfile (282 tests, 02:58:31).
+- [x] Rerun sharing/report library and integration suites on the 02:53 source and lockfile (282 tests, 02:58:31).
+- [ ] Repeat affected sharing/report consumers after the subsequently integrated Schemars family update.
 - [ ] Add and execute the BATS twin against the validated binary; prohibit implicit local heavy builds.
 - [ ] Repair and execute the scoped plan/review/apply demo; publish the generated Plan schema.
 - [ ] Verify a tampered plan cannot remove mandatory runtime checks.
