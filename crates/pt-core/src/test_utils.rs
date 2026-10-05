@@ -441,6 +441,299 @@ impl Drop for ProcessHandle {
     }
 }
 
+/// Real cgroup fixtures use only new leaves beneath an explicitly delegated,
+/// already CPU-enabled parent. This never enables controllers or moves the
+/// test runner, and retains every created directory and observation artifact.
+#[cfg(target_os = "linux")]
+pub struct OwnedCgroupFixture {
+    pub target: ProcessHandle,
+    pub sibling: ProcessHandle,
+    pub identity: pt_common::ProcessIdentity,
+    pub sibling_identity: pt_common::ProcessIdentity,
+    pub leaf: PathBuf,
+    pub sibling_leaf: PathBuf,
+    pub artifacts: PathBuf,
+    target_pidfd: std::os::fd::OwnedFd,
+    sibling_pidfd: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl OwnedCgroupFixture {
+    pub fn new() -> std::io::Result<Option<Self>> {
+        use std::fs;
+        let Some(parent) = std::env::var_os("PT_TEST_CGROUP_PARENT") else {
+            eprintln!("UNAVAILABLE: live cgroup actuation requires PT_TEST_CGROUP_PARENT pointing to a preexisting CPU-enabled writable delegated parent; no positive kernel proof");
+            return Ok(None);
+        };
+        let root = Path::new("/sys/fs/cgroup");
+        let parent = fs::canonicalize(parent)?;
+        if parent == root || !parent.starts_with(root) || !parent.is_dir() {
+            return Err(std::io::Error::other(
+                "a delegated cgroup parent below the hierarchy root is required",
+            ));
+        }
+        let enabled = fs::read_to_string(parent.join("cgroup.subtree_control"))?;
+        if !enabled
+            .split_whitespace()
+            .any(|controller| controller == "cpu")
+        {
+            return Err(std::io::Error::other("delegated parent CPU controller is not already enabled; fixture will not enable it"));
+        }
+        let id = uuid::Uuid::new_v4();
+        let leaf = parent.join(format!("pt-owned-{id}"));
+        let sibling_leaf = parent.join(format!("pt-sibling-{id}"));
+        fs::create_dir(&leaf)?;
+        fs::create_dir(&sibling_leaf)?;
+        let artifacts = std::env::temp_dir().join(format!("pt-cgroup-{id}"));
+        fs::create_dir(&artifacts)?;
+        eprintln!(
+            "Retained cgroup fixture parent={} leaf={} sibling={} artifacts={}",
+            parent.display(),
+            leaf.display(),
+            sibling_leaf.display(),
+            artifacts.display()
+        );
+        for directory in [&leaf, &sibling_leaf] {
+            if !fs::read_to_string(directory.join("cgroup.procs"))?
+                .trim()
+                .is_empty()
+            {
+                return Err(std::io::Error::other("new cgroup leaf is not empty"));
+            }
+            for name in ["cpu.max", "cgroup.freeze", "cgroup.events"] {
+                fs::read(directory.join(name))?;
+            }
+        }
+        let harness = ProcessHarness;
+        let target = harness.spawn_sleep(60)?;
+        let sibling = harness.spawn_sleep(60)?;
+        let identity = Self::read_identity(target.pid())?;
+        let sibling_identity = Self::read_identity(sibling.pid())?;
+        // SAFETY: observing this test runner's credentials changes no process.
+        let owner = unsafe { libc::geteuid() };
+        if identity.uid != owner || sibling_identity.uid != owner {
+            return Err(std::io::Error::other(
+                "owned child credentials differ from the test runner",
+            ));
+        }
+        let target_pidfd = Self::open_pidfd(target.pid())?;
+        let sibling_pidfd = Self::open_pidfd(sibling.pid())?;
+        if identity != Self::read_identity(target.pid())?
+            || sibling_identity != Self::read_identity(sibling.pid())?
+        {
+            return Err(std::io::Error::other(
+                "owned process identity changed before migration",
+            ));
+        }
+        fs::write(leaf.join("cgroup.procs"), target.pid().to_string())?;
+        fs::write(sibling_leaf.join("cgroup.procs"), sibling.pid().to_string())?;
+        let fixture = Self {
+            target,
+            sibling,
+            identity,
+            sibling_identity,
+            leaf,
+            sibling_leaf,
+            artifacts,
+            target_pidfd,
+            sibling_pidfd,
+        };
+        fixture.assert_isolated();
+        fixture.record("before");
+        Ok(Some(fixture))
+    }
+
+    pub fn read_identity(pid: u32) -> std::io::Result<pt_common::ProcessIdentity> {
+        let stat = crate::collect::proc_parsers::parse_proc_stat(pid)
+            .ok_or_else(|| std::io::Error::other("actual /proc stat unavailable"))?;
+        let status = crate::collect::proc_parsers::parse_proc_status(pid)
+            .ok_or_else(|| std::io::Error::other("actual /proc owner unavailable"))?;
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        if stat.pid != pid || stat.starttime == 0 || uuid::Uuid::parse_str(boot.trim()).is_err() {
+            return Err(std::io::Error::other(
+                "actual full birth identity unavailable",
+            ));
+        }
+        Ok(pt_common::ProcessIdentity::full(
+            pid,
+            pt_common::StartId::from_linux(boot.trim(), stat.starttime, pid),
+            status.ruid,
+            u32::try_from(stat.pgrp).ok(),
+            u32::try_from(stat.session).ok(),
+            pt_common::IdentityQuality::Full,
+        ))
+    }
+
+    fn open_pidfd(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: this opens a descriptor for the just-spawned, unreaped child.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the successful syscall returned a new descriptor we own.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor as i32) })
+    }
+
+    pub fn assert_alive(&self) {
+        assert!(self.target.is_running() && self.sibling.is_running());
+        assert_eq!(
+            Self::read_identity(self.target.pid()).expect("target identity"),
+            self.identity
+        );
+        assert_eq!(
+            Self::read_identity(self.sibling.pid()).expect("sibling identity"),
+            self.sibling_identity
+        );
+    }
+
+    pub fn assert_isolated(&self) {
+        self.assert_alive();
+        for (pid, directory) in [
+            (self.target.pid(), &self.leaf),
+            (self.sibling.pid(), &self.sibling_leaf),
+        ] {
+            let members: Vec<u32> = std::fs::read_to_string(directory.join("cgroup.procs"))
+                .expect("actual members")
+                .lines()
+                .map(|line| line.parse().expect("strict member PID"))
+                .collect();
+            assert_eq!(members, [pid]);
+            assert!(!std::fs::read_dir(directory)
+                .expect("actual leaf entries")
+                .any(|entry| entry
+                    .expect("leaf entry")
+                    .file_type()
+                    .expect("entry type")
+                    .is_dir()));
+            let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                .expect("actual proc membership");
+            let actual = membership
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .expect("actual unified membership");
+            assert_eq!(
+                Path::new("/sys/fs/cgroup").join(actual.trim_start_matches('/')),
+                *directory
+            );
+        }
+    }
+
+    pub fn controls(directory: &Path) -> Vec<(String, Vec<u8>)> {
+        ["cpu.max", "cgroup.freeze"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    std::fs::read(directory.join(name)).expect("actual controller bytes"),
+                )
+            })
+            .collect()
+    }
+
+    pub fn record(&self, phase: &str) {
+        let directory = self.artifacts.join(phase);
+        std::fs::create_dir(&directory).expect("new retained phase");
+        for (label, leaf, identity) in [
+            ("target", &self.leaf, &self.identity),
+            ("sibling", &self.sibling_leaf, &self.sibling_identity),
+        ] {
+            std::fs::write(
+                directory.join(format!("{label}.identity.json")),
+                serde_json::to_vec_pretty(identity).expect("full identity bytes"),
+            )
+            .expect("retain identity");
+            for name in ["cpu.max", "cgroup.freeze", "cgroup.events", "cgroup.procs"] {
+                std::fs::write(
+                    directory.join(format!("{label}.{name}")),
+                    std::fs::read(leaf.join(name)).expect("actual cgroup bytes"),
+                )
+                .expect("retain cgroup bytes");
+            }
+            for name in ["stat", "status", "cgroup"] {
+                std::fs::write(
+                    directory.join(format!("{label}.proc.{name}")),
+                    std::fs::read(format!("/proc/{}/{name}", identity.pid.0))
+                        .expect("actual process bytes"),
+                )
+                .expect("retain process bytes");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OwnedCgroupFixture {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Only our newly created leaf may need thawing after a failed assertion.
+        // Never write an existing parent or a group containing a foreign PID.
+        for leaf in [&self.leaf, &self.sibling_leaf] {
+            let members = std::fs::read_to_string(leaf.join("cgroup.procs"));
+            let owned_only = members.as_ref().is_ok_and(|text| {
+                text.lines().all(|line| {
+                    line.parse::<u32>()
+                        .is_ok_and(|pid| pid == self.target.pid() || pid == self.sibling.pid())
+                })
+            });
+            let no_children = std::fs::read_dir(leaf).is_ok_and(|mut entries| {
+                entries.all(|entry| {
+                    entry.is_ok_and(|entry| entry.file_type().is_ok_and(|kind| !kind.is_dir()))
+                })
+            });
+            let thaw = owned_only
+                && no_children
+                && std::fs::read_to_string(leaf.join("cgroup.freeze"))
+                    .is_ok_and(|value| value.trim() == "1");
+            if let Some(Err(error)) = thaw.then(|| std::fs::write(leaf.join("cgroup.freeze"), "0"))
+            {
+                eprintln!(
+                    "owned cgroup cleanup thaw failed at {}: {error}",
+                    leaf.display()
+                );
+            }
+        }
+        for descriptor in [&self.target_pidfd, &self.sibling_pidfd] {
+            // SAFETY: the pidfd pins only a child created by this fixture.
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    descriptor.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            } < 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    eprintln!("owned cgroup cleanup signal failed: {error}");
+                }
+            }
+        }
+        let target_exited = self.target.wait_for_exit(Duration::from_secs(2));
+        let sibling_exited = self.sibling.wait_for_exit(Duration::from_secs(2));
+        let cleanup = serde_json::json!({
+            "target_identity": self.identity,
+            "sibling_identity": self.sibling_identity,
+            "target_exited": target_exited,
+            "sibling_exited": sibling_exited,
+            "retained_leaf": self.leaf,
+            "retained_sibling_leaf": self.sibling_leaf,
+        });
+        match serde_json::to_vec_pretty(&cleanup) {
+            Ok(bytes) => {
+                if let Err(error) = std::fs::write(self.artifacts.join("cleanup.json"), bytes) {
+                    eprintln!("owned cgroup cleanup evidence failed: {error}");
+                }
+            }
+            Err(error) => eprintln!("owned cgroup cleanup serialization failed: {error}"),
+        }
+        // ProcessHandle then waits for its own unreaped child. No directories
+        // or evidence files are deleted, and no parent quota is restored.
+    }
+}
+
 /// Snapshot of /proc data for a PID, used for TOCTOU checks.
 #[derive(Debug, Clone)]
 pub struct ProcSnapshot {
