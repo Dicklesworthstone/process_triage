@@ -274,19 +274,22 @@ fn classify_ownership(
 
     // If PPID is 1 (init/systemd child)
     if evidence.ppid == 1 {
-        // Check ancestors for context
+        // Same rule as `ProcessRecord::is_orphan`: a process that kept the session of the
+        // job that spawned it (sid != pid) was reparented to init when its parent died.
+        // This needs no ancestor chain.
+        if evidence.sid != 0 && evidence.sid != evidence.pid {
+            return OwnershipState::Orphaned;
+        }
+        // Its own session leader (or session unknown) with no readable chain (e.g.
+        // /proc/1 hidden by hidepid): an init-started daemon and a self-daemonized
+        // process look alike, so neither orphan nor init child can be claimed.
         if evidence.ancestors.is_empty() {
             *confidence = downgrade(*confidence);
             downgrade_reasons.push(
-                "PPID=1 with no ancestor chain; cannot distinguish init child from orphan"
+                "PPID=1 session leader with no ancestor chain; cannot distinguish an init-started daemon from a self-daemonized process"
                     .to_string(),
             );
-            return OwnershipState::Orphaned;
-        }
-        // Same rule as `ProcessRecord::is_orphan`: a process that kept the session of the
-        // job that spawned it (sid != pid) was reparented to init when its parent died.
-        if evidence.sid != 0 && evidence.sid != evidence.pid {
-            return OwnershipState::Orphaned;
+            return OwnershipState::Unknown;
         }
         // Its own session leader. A systemd PID 1 starts services in a `.service` cgroup,
         // which the collector reports as a supervisor (handled above), so here the process
@@ -300,6 +303,18 @@ fn classify_ownership(
             return OwnershipState::Unknown;
         }
         return OwnershipState::InitChild;
+    }
+
+    // Reparented to a user manager (`systemd --user` is a child subreaper, so orphans
+    // of a login session land there rather than on PID 1). The manager starts its own
+    // units in a new session, so a direct child still in another session is a job
+    // whose parent died. A unit's own processes are reported as supervised above.
+    let parent_is_user_manager = evidence
+        .ancestors
+        .first()
+        .is_some_and(|parent| parent.pid == evidence.ppid && parent.comm == "systemd");
+    if parent_is_user_manager && evidence.sid != 0 && evidence.sid != evidence.pid {
+        return OwnershipState::Orphaned;
     }
 
     // Walk ancestors to find the nearest shell or agent
@@ -415,6 +430,72 @@ mod tests {
 
     #[test]
     fn orphaned_process() {
+        // Reparented to init but still in the session of the job that spawned it: an
+        // orphan, which the session alone shows (no ancestor chain needed).
+        let evidence = RawLineageEvidence {
+            pid: 9999,
+            ppid: 1,
+            pgid: 9999,
+            sid: 4242,
+            uid: 1000,
+            user: Some("bob".to_string()),
+            tty: None,
+            supervisor: None,
+            ancestors: vec![],
+            collection_method: LineageCollectionMethod::Procfs,
+            observed_at: "2026-03-15T20:00:00Z".to_string(),
+        };
+
+        let result = normalize_lineage(&evidence);
+        assert_eq!(result.ownership, OwnershipState::Orphaned);
+        assert!(result.is_orphaned);
+        assert!(!result.session.has_tty);
+    }
+
+    /// `systemd --user` is a child subreaper: a login-session job whose parent died is
+    /// reparented to it, not to PID 1. It keeps its original session; the manager's
+    /// own units are session leaders.
+    #[test]
+    fn job_reparented_to_user_manager_is_orphaned() {
+        let evidence = |sid: u32| RawLineageEvidence {
+            pid: 5000,
+            ppid: 2000,
+            pgid: 5000,
+            sid,
+            uid: 1000,
+            user: Some("dev".to_string()),
+            tty: None,
+            supervisor: None,
+            ancestors: vec![
+                AncestorEntry {
+                    pid: 2000,
+                    comm: "systemd".to_string(),
+                    uid: 1000,
+                },
+                AncestorEntry {
+                    pid: 1,
+                    comm: "systemd".to_string(),
+                    uid: 0,
+                },
+            ],
+            collection_method: LineageCollectionMethod::Procfs,
+            observed_at: "2026-03-15T20:00:00Z".to_string(),
+        };
+
+        let orphan = normalize_lineage(&evidence(4000));
+        assert_eq!(orphan.ownership, OwnershipState::Orphaned);
+        assert!(orphan.is_orphaned);
+
+        let unit_process = normalize_lineage(&evidence(5000));
+        assert_ne!(unit_process.ownership, OwnershipState::Orphaned);
+        assert!(!unit_process.is_orphaned);
+    }
+
+    #[test]
+    fn session_leader_under_init_without_ancestor_chain_is_unknown() {
+        // Own session leader under PID 1, chain unreadable (e.g. hidepid): as likely an
+        // init-started daemon as a self-daemonized process, so not an orphan
+        // (`ProcessRecord::is_orphan` agrees), with lowered confidence.
         let evidence = RawLineageEvidence {
             pid: 9999,
             ppid: 1,
@@ -430,11 +511,13 @@ mod tests {
         };
 
         let result = normalize_lineage(&evidence);
-        assert_eq!(result.ownership, OwnershipState::Orphaned);
-        assert!(result.is_orphaned);
-        assert!(!result.session.has_tty);
-        // Downgraded due to no ancestors
+        assert_eq!(result.ownership, OwnershipState::Unknown);
+        assert!(!result.is_orphaned);
         assert!(result.confidence <= ProvenanceConfidence::Medium);
+        assert!(result
+            .downgrade_reasons
+            .iter()
+            .any(|r| r.contains("no ancestor chain")));
     }
 
     #[test]

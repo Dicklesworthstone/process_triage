@@ -382,11 +382,13 @@ fn tools_call_explain_requires_pid_or_comm() {
 #[test]
 fn tools_call_scan_scores_are_posterior_probabilities() {
     let mut s = server();
+    // min_age 0: score every process (a freshly booted CI runner may have none older
+    // than the default floor).
     let resp = send_rpc(
         &mut s,
         1,
         "tools/call",
-        serde_json::json!({"name": "pt_scan", "arguments": {}}),
+        serde_json::json!({"name": "pt_scan", "arguments": {"min_age": 0}}),
     );
     let result = assert_success(&resp);
     assert_eq!(result["isError"], false);
@@ -415,6 +417,60 @@ fn tools_call_scan_scores_are_posterior_probabilities() {
         );
         seen_protected |= protected;
     }
+}
+
+/// pt_scan applies agent plan's age floor by default: a process started a moment ago
+/// is not scored (it was returned with a suspicion score); `min_age: 0` includes it.
+#[test]
+fn tools_call_scan_skips_processes_younger_than_the_age_floor() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = u64::from(child.id());
+    let scan = |s: &mut McpServer, args: serde_json::Value| {
+        let resp = send_rpc(
+            s,
+            1,
+            "tools/call",
+            serde_json::json!({"name": "pt_scan", "arguments": args}),
+        );
+        let result = assert_success(&resp);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str::<serde_json::Value>(text).unwrap()
+    };
+    let mut s = server();
+    let default = scan(&mut s, serde_json::json!({}));
+    let all = scan(&mut s, serde_json::json!({"min_age": 0}));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        default["min_age_seconds"].as_u64().unwrap() > 0,
+        "{default}"
+    );
+    assert!(
+        default["younger_than_min_age"].as_u64().unwrap() >= 1,
+        "the child is younger than the floor"
+    );
+    let returned_pids = |v: &serde_json::Value| -> Vec<u64> {
+        v["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["pid"].as_u64().unwrap())
+            .collect()
+    };
+    assert!(!returned_pids(&default).contains(&pid));
+    for p in default["processes"].as_array().unwrap() {
+        assert!(
+            p["elapsed_sec"].as_u64().unwrap() >= default["min_age_seconds"].as_u64().unwrap(),
+            "{p}"
+        );
+    }
+
+    assert_eq!(all["min_age_seconds"], 0);
+    assert_eq!(all["younger_than_min_age"], 0);
 }
 
 /// pt_explain reports the posterior and protection for a live process.

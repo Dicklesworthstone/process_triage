@@ -525,13 +525,23 @@ impl SessionStore {
                 }
             }
 
-            // Apply older_than filter
+            // Apply older_than filter. A session whose age cannot be established is
+            // not "older than" anything: an unparsable created_at used to pass this
+            // filter, so retention cleanup deleted such a session at any age. Without
+            // a timestamp, the manifest's modification time is the age.
             if let Some(older_than) = &options.older_than {
-                if let Ok(created) = DateTime::parse_from_rfc3339(&manifest.timing.created_at) {
-                    let created_utc = created.with_timezone(&Utc);
-                    if now.signed_duration_since(created_utc) < *older_than {
-                        continue;
-                    }
+                let created_utc = DateTime::parse_from_rfc3339(&manifest.timing.created_at)
+                    .map(|created| created.with_timezone(&Utc))
+                    .ok()
+                    .or_else(|| {
+                        std::fs::metadata(&manifest_path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .map(DateTime::<Utc>::from)
+                    });
+                match created_utc {
+                    Some(created) if now.signed_duration_since(created) >= *older_than => {}
+                    _ => continue,
                 }
             }
 
@@ -1332,6 +1342,37 @@ mod tests {
         let result = store.cleanup_sessions(Duration::zero()).unwrap();
         assert_eq!(result.removed_count, 2);
         assert_eq!(result.preserved_count, 0);
+    }
+
+    /// A manifest whose created_at does not parse is aged by the manifest's mtime: a
+    /// fresh one is kept (it used to be deleted at any age), an old one is removed.
+    #[test]
+    fn cleanup_ages_sessions_with_unparsable_created_at_by_manifest_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let mut paths = Vec::new();
+        for suffix in ["fres", "stal"] {
+            let sid = SessionId(format!("pt-20260101-000000-{suffix}"));
+            let mut m = SessionManifest::new(&sid, None, SessionMode::RobotPlan, None);
+            m.timing.created_at = "not a timestamp".to_string();
+            let handle = store.create(&m).unwrap();
+            paths.push(handle.dir.join(MANIFEST_FILE));
+        }
+        let ten_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(864_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&paths[1])
+            .unwrap()
+            .set_modified(ten_days_ago)
+            .unwrap();
+
+        let result = store.cleanup_sessions(Duration::days(7)).unwrap();
+        assert_eq!(
+            result.removed_sessions,
+            vec!["pt-20260101-000000-stal".to_string()]
+        );
+        assert!(paths[0].exists(), "fresh session kept");
+        assert!(!paths[1].exists(), "stale session removed");
     }
 
     #[test]

@@ -220,6 +220,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "default": 0.0,
                         "minimum": 0.0,
                         "maximum": 1.0
+                    },
+                    "min_age": {
+                        "type": "integer",
+                        "description": "Minimum process age in seconds (default: policy guardrail, 1 hour, as for pt_plan; 0 returns every process)",
+                        "minimum": 0
                     }
                 },
                 "required": [],
@@ -348,12 +353,22 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     let scan_result = collect_scan_result(deep)?;
     let db = load_signature_db_with_user_entries();
     let mut evaluator = Evaluator::load();
+    // `agent plan`'s age floor: a process younger than this is never a candidate, so
+    // scoring it would only invite acting on a busy new process.
+    if let Some(min_age) = params.get("min_age").and_then(|v| v.as_u64()) {
+        evaluator.min_age_seconds = min_age;
+    }
     evaluator.collect_provenance(&scan_result.processes, &[]);
 
     // Score = P(abandoned or zombie) from the same posterior `agent plan` uses (it was
     // a signature-match score plus a state bonus, not a probability).
     let mut candidates = Vec::new();
+    let mut younger_than_min_age = 0usize;
     for p in &scan_result.processes {
+        if p.elapsed.as_secs() < evaluator.min_age_seconds {
+            younger_than_min_age += 1;
+            continue;
+        }
         let Some(posterior) = evaluator.posterior(p) else {
             continue;
         };
@@ -377,6 +392,8 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         "duration_ms": scan_result.metadata.duration_ms,
         "platform": scan_result.metadata.platform,
         "total_processes": scan_result.processes.len(),
+        "min_age_seconds": evaluator.min_age_seconds,
+        "younger_than_min_age": younger_than_min_age,
         "returned": candidates.len(),
         "score_definition": "P(abandoned or zombie) from pt's posterior (0-1); suspicion_score = 100 x score",
         "processes": candidates.iter().take(200).map(|(p, score, posterior, protected, top_signature)| {

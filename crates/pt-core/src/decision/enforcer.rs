@@ -515,18 +515,33 @@ impl PolicyEnforcer {
                     context: None,
                 });
             }
+            // Same placement as the scan-time filter (cgroup role on Linux, owner and
+            // executable on macOS), so the scan's candidates are not blocked here for it.
             if let Some(role) = candidate.cgroup_role {
-                if role.is_supervised_service() {
-                    return PolicyCheckResult::blocked(PolicyViolation {
-                        kind: ViolationKind::ProtectedPattern,
-                        message: format!(
-                            "supervised service (cgroup {role:?}); stop the unit instead"
-                        ),
-                        rule: "builtin.supervised_service".to_string(),
-                        context: None,
-                    });
+                use crate::collect::protected::{builtin_placement, BuiltinPlacement};
+                let user = candidate.user.as_deref().unwrap_or("");
+                match builtin_placement(role, user, argv0, &candidate.cmdline) {
+                    BuiltinPlacement::SupervisedService => {
+                        return PolicyCheckResult::blocked(PolicyViolation {
+                            kind: ViolationKind::ProtectedPattern,
+                            message: format!(
+                                "supervised service (cgroup {role:?}); stop the unit instead"
+                            ),
+                            rule: "builtin.supervised_service".to_string(),
+                            context: None,
+                        });
+                    }
+                    BuiltinPlacement::MacSystem(notes) => {
+                        return PolicyCheckResult::blocked(PolicyViolation {
+                            kind: ViolationKind::ProtectedPattern,
+                            message: format!("built-in protection: {notes}"),
+                            rule: crate::collect::protected::MACOS_SYSTEM_RULE.to_string(),
+                            context: None,
+                        });
+                    }
+                    BuiltinPlacement::UserWorkload => session_workload = true,
+                    BuiltinPlacement::Unplaced => {}
                 }
-                session_workload = role.is_user_workload();
             }
             if let Some((rule, notes)) =
                 crate::collect::protected::builtin_force_review_match(&candidate.cmdline)
@@ -1477,6 +1492,95 @@ mod tests {
         // The same candidate is still gated for anything that acts on it.
         let result = enforcer.check_action(&orphan, Action::Pause, true);
         assert!(!result.allowed);
+    }
+
+    /// The scan filter and the enforcer place processes alike: under the default
+    /// guardrails (never_kill_ppid [1], protected_users [root]) a process the scan
+    /// evaluates is never blocked by the enforcer for protection, and a protected one
+    /// is never let through. On macOS this runs the owner/executable placement (the
+    /// enforcer used to block every macOS orphan through never_kill_ppid).
+    #[test]
+    fn enforcer_and_scan_filter_agree_on_protection() {
+        use crate::collect::protected::ProtectedFilter;
+        use crate::collect::{CgroupRole, ProcessRecord, ProcessState};
+        use pt_common::{ProcessId, StartId};
+
+        let policy = Policy::default();
+        let filter = ProtectedFilter::from_guardrails(&policy.guardrails).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let roles = [
+            CgroupRole::SystemService,
+            CgroupRole::UserService,
+            CgroupRole::Container,
+            CgroupRole::LoginSession,
+            CgroupRole::TransientScope,
+            CgroupRole::Unknown,
+        ];
+        let commands = [
+            ("python3", "python3 -m http.server 8000"),
+            ("node", "node /home/alice/app/server.js"),
+            ("zed", "/Applications/Zed.app/Contents/MacOS/zed"),
+        ];
+        let mut evaluated = 0;
+        for role in roles {
+            for user in ["alice", "root"] {
+                for ppid in [1u32, 4242] {
+                    for (comm, cmd) in commands {
+                        let record = ProcessRecord {
+                            pid: ProcessId(5000),
+                            ppid: ProcessId(ppid),
+                            uid: if user == "root" { 0 } else { 1000 },
+                            user: user.to_string(),
+                            pgid: Some(4999),
+                            sid: Some(4999),
+                            start_id: StartId::from_linux("test-boot-id", 1, 5000),
+                            comm: comm.to_string(),
+                            cmd: cmd.to_string(),
+                            state: ProcessState::Sleeping,
+                            cpu_percent: 0.0,
+                            rss_bytes: 1 << 20,
+                            vsz_bytes: 2 << 20,
+                            tty: None,
+                            start_time_unix: 1,
+                            elapsed: std::time::Duration::from_secs(7200),
+                            source: "test".to_string(),
+                            container_info: None,
+                        };
+                        let scan_protected = filter.is_protected_with_role(&record, role);
+
+                        let mut candidate = test_candidate();
+                        candidate.pid = 5000;
+                        candidate.ppid = ppid as i32;
+                        candidate.cmdline = cmd.to_string();
+                        candidate.user = Some(user.to_string());
+                        candidate.group = None;
+                        candidate.category = None;
+                        candidate.cgroup_role = Some(role);
+                        let result = enforcer.check_action(&candidate, Action::Kill, false);
+
+                        let case = format!("{role:?} {user} ppid={ppid} {cmd}");
+                        match scan_protected {
+                            Some(m) => assert!(
+                                !result.allowed,
+                                "{case}: scan protects it ({}), enforcer allows it",
+                                m.pattern
+                            ),
+                            None => {
+                                evaluated += 1;
+                                assert!(
+                                    result.allowed,
+                                    "{case}: scan evaluates it, enforcer blocks it: {:?}",
+                                    result.violation
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Session workloads (and on macOS, users' own processes) are evaluated even as
+        // root or as children of PID 1.
+        assert!(evaluated >= 12, "only {evaluated} cases evaluated");
     }
 
     #[test]
