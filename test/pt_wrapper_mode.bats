@@ -29,46 +29,45 @@ set -euo pipefail
 
 {
     printf 'PT_UI_MODE=%s\n' "${PT_UI_MODE:-}"
+    printf 'CORE_PATH=%s\n' "${BASH_SOURCE[0]}"
     printf 'ARGS=%s\n' "$*"
+    printf 'ARG=%s\n' "$@"
 } > "$PT_WRAPPER_TEST_LOG"
 EOF
     chmod +x "$MOCK_PT_CORE"
 }
 
-@test "wrapper: --shell sets mode and strips wrapper flag before forwarding" {
+@test "wrapper: obsolete --shell is forwarded unchanged for core validation" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \
         PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
         "$PT_SCRIPT" --shell scan --format json
 
     [ "$status" -eq 0 ]
-    grep -q '^PT_UI_MODE=shell$' "$MOCK_LOG"
-    grep -q '^ARGS=scan --format json$' "$MOCK_LOG"
+    grep -q '^ARGS=--shell scan --format json$' "$MOCK_LOG"
 }
 
-@test "wrapper: --tui sets mode and strips wrapper flag before forwarding" {
+@test "wrapper: obsolete --tui is forwarded unchanged for core validation" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \
         PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
         "$PT_SCRIPT" --tui run
 
     [ "$status" -eq 0 ]
-    grep -q '^PT_UI_MODE=tui$' "$MOCK_LOG"
-    grep -q '^ARGS=run$' "$MOCK_LOG"
+    grep -q '^ARGS=--tui run$' "$MOCK_LOG"
 }
 
-@test "wrapper: --shell and --tui together fail fast" {
+@test "wrapper: obsolete UI flags are never consumed by the wrapper" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \
         PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
         "$PT_SCRIPT" --shell --tui scan
 
-    [ "$status" -eq 2 ]
-    [[ "$output" == *"--shell and --tui cannot be used together"* ]]
-    [ ! -f "$MOCK_LOG" ]
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=--shell --tui scan$' "$MOCK_LOG"
 }
 
-@test "wrapper: PT_UI_MODE=tui forces tui mode" {
+@test "wrapper: inherited environment passes through without selecting UI mode" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \
         PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
@@ -77,21 +76,21 @@ EOF
 
     [ "$status" -eq 0 ]
     grep -q '^PT_UI_MODE=tui$' "$MOCK_LOG"
+    grep -q '^ARGS=scan$' "$MOCK_LOG"
 }
 
-@test "wrapper: auto mode picks shell in CI/non-interactive contexts" {
-    run env \
+@test "wrapper: CI and noninteractive input do not synthesize PT_UI_MODE" {
+    run env -u PT_UI_MODE \
         PT_CORE_PATH="$MOCK_PT_CORE" \
         PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
-        PT_UI_MODE=auto \
         CI=true \
         "$PT_SCRIPT" scan
 
     [ "$status" -eq 0 ]
-    grep -q '^PT_UI_MODE=shell$' "$MOCK_LOG"
+    grep -q '^PT_UI_MODE=$' "$MOCK_LOG"
 }
 
-@test "wrapper: invalid PT_UI_MODE falls back to auto detection" {
+@test "wrapper: PT_UI_MODE is not interpreted or rewritten" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \
         PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
@@ -100,7 +99,7 @@ EOF
         "$PT_SCRIPT" scan
 
     [ "$status" -eq 0 ]
-    grep -q '^PT_UI_MODE=shell$' "$MOCK_LOG"
+    grep -q '^PT_UI_MODE=invalid_mode$' "$MOCK_LOG"
 }
 
 @test "wrapper: deep alias rewrites to deep-scan before forwarding" {
@@ -185,7 +184,7 @@ EOF
     local config_dir="${TEST_DIR}/config"
     mkdir -p "$config_dir"
     cat > "${config_dir}/decisions.json" << 'EOF'
-{"standard|node|jest --watch":{"kill":2,"spare":0},"broad|node|":{"kill":2,"spare":0},"standard|vim|":{"kill":0,"spare":1}}
+{"exact|node|jest --watch tests/":{"kill":2,"spare":0},"standard|node|jest --watch":{"kill":2,"spare":0},"broad|node|":{"kill":2,"spare":0},"standard|vim|":{"kill":0,"spare":1}}
 EOF
 
     run bash -lc "printf 'y\n' | env PT_CORE_PATH='$MOCK_PT_CORE' PT_WRAPPER_TEST_LOG='$MOCK_LOG' PROCESS_TRIAGE_CONFIG='$config_dir' '$PT_SCRIPT' clear node"
@@ -213,8 +212,10 @@ EOF
     [[ "$output" == *"Process Triage wrapper for pt-core"* ]]
     [[ "$output" == *"history"* ]]
     [[ "$output" == *"clear"* ]]
-    [[ "$output" == *"--shell"* ]]
-    [[ "$output" == *"--tui"* ]]
+    [[ "$output" != *"--shell"* ]]
+    [[ "$output" != *"--tui"* ]]
+    [[ "$output" == *"daemon"* ]]
+    [ "$(printf '%s\n' "$output" | grep -c '^  update ')" -eq 1 ]
     [[ "$output" == *"pt help <subcommand>"* ]]
     [ ! -f "$MOCK_LOG" ]
 }
@@ -240,25 +241,80 @@ EOF
     grep -q '^ARGS=help query$' "$MOCK_LOG"
 }
 
-@test "wrapper: version check still works with wrapper mode flags" {
+@test "wrapper: version reports both halves after leading global options" {
     run env \
         PT_CORE_PATH="$MOCK_PT_CORE" \
         PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
-        "$PT_SCRIPT" --shell --version
+        "$PT_SCRIPT" --config "${TEST_DIR}/config --tui" --format json --quiet --version
 
     [ "$status" -eq 0 ]
     # Same contract as the CI install check: first line "pt version X.Y.Z",
     # second line names the pt-core engine the wrapper will run.
     [[ "${lines[0]}" == "pt version ${PT_WRAPPER_VERSION}" ]]
     [[ "${lines[1]}" == *"($MOCK_PT_CORE)"* ]]
-    # pt-core is only asked for its own version; the wrapper flags are not forwarded.
+    # pt-core is only asked for its own version, not the unrelated global options.
     grep -q '^ARGS=--version$' "$MOCK_LOG"
+}
+
+@test "wrapper: version-looking option values and subcommand arguments remain untouched" {
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        "$PT_SCRIPT" --config --version scan
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=--config --version scan$' "$MOCK_LOG"
+    [[ "$output" != *"pt version"* ]]
+
+    local subcommand_log="${TEST_DIR}/subcommand-version.log"
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$subcommand_log" \
+        "$PT_SCRIPT" agent plan --label --version
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=agent plan --label --version$' "$subcommand_log"
+    [[ "$output" != *"pt version"* ]]
+
+    local equals_log="${TEST_DIR}/equals-version.log"
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$equals_log" \
+        "$PT_SCRIPT" --config=--version --format=json -V
+    [ "$status" -eq 0 ]
+    [[ "${lines[0]}" == "pt version ${PT_WRAPPER_VERSION}" ]]
+    grep -q '^ARGS=--version$' "$equals_log"
+}
+
+@test "wrapper: short clusters report both versions without stealing attached format values" {
+    local args index=0
+    for args in '-qV' '-vvvv --version' '-vqfjson --version'; do
+        index=$((index + 1))
+        local log="${TEST_DIR}/cluster-${index}.log"
+        # shellcheck disable=SC2086  # fixture contains separate literal CLI arguments
+        run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$log" "$PT_SCRIPT" $args
+        [ "$status" -eq 0 ]
+        [[ "${lines[0]}" == "pt version ${PT_WRAPPER_VERSION}" ]]
+        [[ "${lines[1]}" == *"($MOCK_PT_CORE)"* ]]
+        grep -q '^ARGS=--version$' "$log"
+    done
+
+    local attached_log="${TEST_DIR}/attached-format-value.log"
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$attached_log" \
+        "$PT_SCRIPT" -qf--version scan
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=-qf--version scan$' "$attached_log"
+    [[ "$output" != *"pt version"* ]]
+
+    local separate_log="${TEST_DIR}/separate-format-value.log"
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$separate_log" \
+        "$PT_SCRIPT" -qf --version scan
+    [ "$status" -eq 0 ]
+    grep -q '^ARGS=-qf --version scan$' "$separate_log"
+    [[ "$output" != *"pt version"* ]]
 }
 
 @test "wrapper: update enforces VERIFY=1 for installer invocation" {
     cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ "${@: -1}" == */releases/latest ]]; then
+  printf '{"tag_name":"v9.9.9","draft":false,"prerelease":false,"published_at":"2026-10-01T00:00:00Z"}\n'
+  exit 0
+fi
 
 # Return an installer script to stdout. The script fails unless VERIFY=1.
 cat <<'INSTALLER'
@@ -295,8 +351,8 @@ set -euo pipefail
 url="${@: -1}"
 printf '%s\n' "$url" >> "$PT_CURL_LOG"
 
-if [[ "$url" == *"/main/VERSION" ]]; then
-  echo "9.9.9"
+if [[ "$url" == *"/releases/latest" ]]; then
+  printf '{"tag_name":"v9.9.9","draft":false,"prerelease":false,"published_at":"2026-10-01T00:00:00Z"}\n'
   exit 0
 fi
 
@@ -327,11 +383,12 @@ EOF
         "$PT_SCRIPT" update
 
     [ "$status" -eq 0 ]
-    grep -q '/main/VERSION' "$curl_log"
+    grep -qx 'https://api.github.com/repos/Dicklesworthstone/process_triage/releases/latest' "$curl_log"
     grep -q '/v9.9.9/install.sh' "$curl_log"
+    [ "$(wc -l < "$curl_log")" -eq 2 ]
 }
 
-@test "wrapper: update rejects unsafe version metadata and falls back safely" {
+@test "wrapper: update rejects unsafe release metadata without invoking an installer" {
     local curl_log="${TEST_DIR}/curl.log"
 
     cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
@@ -342,23 +399,8 @@ set -euo pipefail
 url="${@: -1}"
 printf '%s\n' "$url" >> "$PT_CURL_LOG"
 
-if [[ "$url" == *"/main/VERSION" ]]; then
-  echo "9.9.9;injected"
-  exit 0
-fi
-
-if [[ "$url" == *"/v${PT_WRAPPER_VERSION}/install.sh" ]]; then
-  cat <<'INSTALLER'
-#!/usr/bin/env bash
-set -euo pipefail
-# Like the published installers (<= v2.1.0), which reset VERIFY=0 at startup:
-# only the --verify argument turns verification on.
-if [[ " $* " != *" --verify "* ]]; then
-  echo "VERIFY missing" >&2
-  exit 44
-fi
-exit 0
-INSTALLER
+if [[ "$url" == *"/releases/latest" ]]; then
+  printf '{"tag_name":"v9.9.9;injected","draft":false,"prerelease":false,"published_at":"2026-10-01T00:00:00Z"}\n'
   exit 0
 fi
 
@@ -374,14 +416,128 @@ EOF
         PATH="${MOCK_BIN_DIR}:$PATH" \
         "$PT_SCRIPT" update
 
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"invalid published release tag"* ]]
+    [[ "$output" != *"Updating Process Triage"* ]]
+    grep -qx 'https://api.github.com/repos/Dicklesworthstone/process_triage/releases/latest' "$curl_log"
+    [ "$(wc -l < "$curl_log")" -eq 1 ]
+}
+
+@test "wrapper: malformed draft prerelease and missing publication metadata fail closed" {
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "${@: -1}" >> "$PT_CURL_LOG"
+printf '%s\n' "$PT_RELEASE_METADATA"
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+
+    local metadata index=0
+    for metadata in \
+        'not-json' \
+        '{"tag_name":"v9.9.9","draft":true,"prerelease":false,"published_at":"2026-10-01T00:00:00Z"}' \
+        '{"tag_name":"v9.9.9","draft":false,"prerelease":true,"published_at":"2026-10-01T00:00:00Z"}' \
+        '{"tag_name":"v9.9.9","draft":false,"prerelease":false,"published_at":null}' \
+        '{"tag_name":999,"draft":false,"prerelease":false,"published_at":"2026-10-01T00:00:00Z"}'; do
+        index=$((index + 1))
+        local log="${TEST_DIR}/metadata-${index}.log"
+        run env PT_RELEASE_METADATA="$metadata" PT_CURL_LOG="$log" \
+            PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update
+        [ "$status" -eq 1 ]
+        [[ "$output" == *"invalid published release metadata"* ]]
+        [[ "$output" != *"Updating Process Triage"* ]]
+        [ "$(wc -l < "$log")" -eq 1 ]
+        grep -qx 'https://api.github.com/repos/Dicklesworthstone/process_triage/releases/latest' "$log"
+    done
+}
+
+@test "wrapper: release metadata network failure is not a verification failure" {
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${@: -1}" >> "$PT_CURL_LOG"
+printf 'curl: (22) HTTP 403 API rate limit\n' >&2
+exit 22
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+    local log="${TEST_DIR}/metadata-network.log"
+    run env PT_CURL_LOG="$log" PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"could not fetch published release metadata"* ]]
+    [[ "$output" == *"HTTP 403 API rate limit"* ]]
+    [[ "$output" != *"verif"* ]]
+    [ "$(wc -l < "$log")" -eq 1 ]
+}
+
+@test "wrapper: update clearly requires jq before any installer is downloaded" {
+    ln -s /bin/bash "${MOCK_BIN_DIR}/bash"
+    ln -s /usr/bin/dirname "${MOCK_BIN_DIR}/dirname"
+    run env PATH="$MOCK_BIN_DIR" "$PT_SCRIPT" update
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"jq is required to read published release metadata"* ]]
+    [[ "$output" != *"Updating Process Triage"* ]]
+}
+
+@test "wrapper: wget fallback reads published metadata and preserves signed installer arguments" {
+    local tool
+    for tool in bash dirname jq mktemp cat env; do
+        ln -s "$(command -v "$tool")" "${MOCK_BIN_DIR}/${tool}"
+    done
+    cat > "${MOCK_BIN_DIR}/wget" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+url="${@: -1}"
+printf '%s\n' "$url" >> "$PT_DOWNLOAD_LOG"
+if [[ "$url" == */releases/latest ]]; then
+  [[ " $* " == *" --header=Accept: application/vnd.github+json "* ]] || exit 32
+  printf '{"tag_name":"v9.9.9","draft":false,"prerelease":false,"published_at":"2026-10-01T00:00:00Z"}\n'
+elif [[ "$url" == */v9.9.9/install.sh ]]; then
+  cat <<'INSTALLER'
+#!/usr/bin/env bash
+printf 'INSTALLER_ARGS=%s\nINSTALLER_VERIFY=%s\n' "$*" "$VERIFY" >> "$PT_INSTALLER_LOG"
+[[ "$*" == --verify && "$VERIFY" == 1 ]] || exit 44
+INSTALLER
+else
+  exit 31
+fi
+EOF
+    chmod +x "${MOCK_BIN_DIR}/wget"
+    local download_log="${TEST_DIR}/wget.log" installer_log="${TEST_DIR}/wget-installer.log"
+    run env PT_DOWNLOAD_LOG="$download_log" PT_INSTALLER_LOG="$installer_log" \
+        PATH="$MOCK_BIN_DIR" TMPDIR="$TEST_DIR" "$PT_SCRIPT" update
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Warning: could not resolve latest VERSION; falling back to v${PT_WRAPPER_VERSION} installer."* ]]
-    [[ "$output" == *"Updating Process Triage to v${PT_WRAPPER_VERSION}..."* ]]
-    grep -q '/main/VERSION' "$curl_log"
-    grep -q "/v${PT_WRAPPER_VERSION}/install.sh" "$curl_log"
-    if grep -q '/v9.9.9;injected/install.sh' "$curl_log"; then
-        fail "unexpected injected installer URL should never be requested"
-    fi
+    [ "$(wc -l < "$download_log")" -eq 2 ]
+    grep -qx 'https://api.github.com/repos/Dicklesworthstone/process_triage/releases/latest' "$download_log"
+    grep -qx 'https://raw.githubusercontent.com/Dicklesworthstone/process_triage/v9.9.9/install.sh' "$download_log"
+    grep -qx 'INSTALLER_ARGS=--verify' "$installer_log"
+    grep -qx 'INSTALLER_VERIFY=1' "$installer_log"
+}
+
+@test "wrapper: update keeps the exact published tag and retains its invoked installer" {
+    local log="${TEST_DIR}/exact-tag.log"
+    cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+url="${@: -1}"
+printf '%s\n' "$url" >> "$PT_CURL_LOG"
+if [[ "$url" == */releases/latest ]]; then
+  printf '{"tag_name":"9.9.9","draft":false,"prerelease":false,"published_at":"2026-10-01T00:00:00Z"}\n'
+elif [[ "$url" == */9.9.9/install.sh ]]; then
+  printf '#!/usr/bin/env bash\nprintf "retained installer invoked\\n"\n'
+else
+  exit 31
+fi
+EOF
+    chmod +x "${MOCK_BIN_DIR}/curl"
+    run env PT_CURL_LOG="$log" TMPDIR="$TEST_DIR" PATH="${MOCK_BIN_DIR}:$PATH" \
+        "$PT_SCRIPT" update
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"retained installer invoked"* ]]
+    grep -qx 'https://raw.githubusercontent.com/Dicklesworthstone/process_triage/9.9.9/install.sh' "$log"
+    local -a installers=("${TEST_DIR}"/pt-install.*)
+    [ "${#installers[@]}" -eq 1 ]
+    [ -f "${installers[0]}" ]
+    grep -q 'retained installer invoked' "${installers[0]}"
+    [ "$(wc -l < "$log")" -eq 2 ]
 }
 
 # Mock curl serving an installer that records its args and fails verification, like
@@ -391,13 +547,14 @@ write_unsigned_release_curl() {
 #!/usr/bin/env bash
 set -euo pipefail
 url="${@: -1}"
-if [[ "$url" == *"/main/VERSION" ]]; then
-  echo "9.9.9"
+if [[ "$url" == *"/releases/latest" ]]; then
+  printf '{"tag_name":"v9.9.9","draft":false,"prerelease":false,"published_at":"2026-10-01T00:00:00Z"}\n'
   exit 0
 fi
 cat <<'INSTALLER'
 #!/usr/bin/env bash
 printf 'INSTALLER_ARGS=%s\n' "$*" >> "$PT_INSTALLER_LOG"
+printf 'INSTALLER_VERIFY=%s\n' "${VERIFY:-}" >> "$PT_INSTALLER_LOG"
 printf 'INSTALLER_PIN=%s\n' "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" >> "$PT_INSTALLER_LOG"
 printf 'INSTALLER_PIN_FILE=%s\n' "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE:-}" >> "$PT_INSTALLER_LOG"
 if [[ " $* " == *" --verify "* ]]; then
@@ -423,6 +580,17 @@ EOF
     [[ "$output" == *"installer exited with status 1"* ]]
     [[ "$output" == *"pt update --no-verify"* ]]
     grep -q '^INSTALLER_ARGS=--verify$' "$log"
+    grep -q '^INSTALLER_VERIFY=1$' "$log"
+}
+
+@test "wrapper: explicit --verify preserves the signed installer refusal" {
+    write_unsigned_release_curl
+    local log="${TEST_DIR}/installer-explicit-verify.log"
+    run env PT_INSTALLER_LOG="$log" PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update --verify
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"does not publish release-signing-public.pem"* ]]
+    grep -q '^INSTALLER_ARGS=--verify$' "$log"
+    grep -q '^INSTALLER_VERIFY=1$' "$log"
 }
 
 @test "wrapper: update hands the installer the pinned release key fingerprints" {
@@ -437,14 +605,14 @@ EOF
     grep -qx "INSTALLER_PIN=${pins}" "$log"
 
     # An explicit fingerprint in the environment is passed through unchanged.
-    : > "$log"
+    log="${TEST_DIR}/installer-explicit-pin.log"
     run env PT_RELEASE_PUBLIC_KEY_FINGERPRINT="abc123" PT_CORE_PATH="$MOCK_PT_CORE" \
         PT_INSTALLER_LOG="$log" PATH="${MOCK_BIN_DIR}:$PATH" "$PT_SCRIPT" update
     grep -qx "INSTALLER_PIN=abc123" "$log"
 
     # So is a fingerprint file: the wrapper must not add a
     # PT_RELEASE_PUBLIC_KEY_FINGERPRINT, which the installer would prefer.
-    : > "$log"
+    log="${TEST_DIR}/installer-pin-file.log"
     run env -u PT_RELEASE_PUBLIC_KEY_FINGERPRINT \
         PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE="${TEST_DIR}/pins.txt" \
         PT_CORE_PATH="$MOCK_PT_CORE" \
@@ -463,16 +631,17 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"WITHOUT signature/checksum verification"* ]]
     grep -q '^INSTALLER_ARGS=--no-verify$' "$log"
+    grep -q '^INSTALLER_VERIFY=0$' "$log"
 }
 
 @test "wrapper: update subcommands pass through to pt-core backup management" {
     for sub in "list-backups" "rollback 2.0.5 --force"; do
-        rm -f "$MOCK_LOG"
+        local log="${TEST_DIR}/backup-${sub%% *}.log"
         # shellcheck disable=SC2086
-        run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+        run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$log" \
             "$PT_SCRIPT" update $sub
         [ "$status" -eq 0 ]
-        grep -q "^ARGS=update ${sub}$" "$MOCK_LOG"
+        grep -q "^ARGS=update ${sub}$" "$log"
     done
 }
 
@@ -494,8 +663,8 @@ EOF
     [ "$status" -eq 0 ]
     grep -q '^ARGS=$' "$MOCK_LOG"
 
-    rm -f "$MOCK_LOG"
-    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$MOCK_LOG" \
+    local version_log="${TEST_DIR}/version.log"
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$version_log" \
         /bin/bash "$PT_SCRIPT" --version
     [ "$status" -eq 0 ]
     [[ "${lines[0]}" == "pt version ${PT_WRAPPER_VERSION}" ]]
@@ -525,6 +694,11 @@ isolated_wrapper() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"No decision history."* ]]
 
+    run "${env_args[@]}" "$pt" clear
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Decision history already empty."* ]]
+    [ ! -e "${TEST_DIR}/no-config" ]
+
     run "${env_args[@]}" "$pt" --version
     [ "$status" -eq 0 ]
     [[ "${lines[0]}" == "pt version ${PT_WRAPPER_VERSION}" ]]
@@ -533,22 +707,34 @@ isolated_wrapper() {
     run "${env_args[@]}" "$pt" scan
     [ "$status" -eq 1 ]
     [[ "$output" == *"'pt-core' binary not found"* ]]
+
+    write_unsigned_release_curl
+    local installer_log="${TEST_DIR}/missing-core-installer.log"
+    run env -u PT_CORE_PATH HOME="${TEST_DIR}/home" PATH="${MOCK_BIN_DIR}:/usr/bin:/bin" \
+        PT_INSTALLER_LOG="$installer_log" "$pt" update
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"does not publish release-signing-public.pem"* ]]
+    [[ "$output" != *"binary not found"* ]]
+    grep -q '^INSTALLER_ARGS=--verify$' "$installer_log"
 }
 
 @test "wrapper: a symlinked wrapper finds pt-core next to its real location" {
     # From-source install: `ln -s "$(pwd)/pt" ~/.local/bin/pt` must run the repo's
     # target/release/pt-core, not whatever pt-core is installed elsewhere.
     local repo="${TEST_DIR}/repo" bin="${TEST_DIR}/bin"
-    mkdir -p "${repo}/target/release" "$bin" "${TEST_DIR}/home"
+    mkdir -p "${repo}/target/release" "$bin" "${TEST_DIR}/home/.local/bin"
     cp "$PT_SCRIPT" "${repo}/pt"
     chmod +x "${repo}/pt"
     cp "$MOCK_PT_CORE" "${repo}/target/release/pt-core"
-    ln -s "${repo}/pt" "${bin}/pt"
+    cp "$MOCK_PT_CORE" "${TEST_DIR}/home/.local/bin/pt-core"
+    ln -s ../repo/pt "${bin}/pt-link"
+    ln -s pt-link "${bin}/pt"
 
     run env -u PT_CORE_PATH HOME="${TEST_DIR}/home" PATH="/usr/bin:/bin" \
         PT_WRAPPER_TEST_LOG="$MOCK_LOG" "${bin}/pt" scan --format json
     [ "$status" -eq 0 ]
     grep -q '^ARGS=scan --format json$' "$MOCK_LOG"
+    grep -qx "CORE_PATH=${repo}/target/release/pt-core" "$MOCK_LOG"
 }
 
 @test "wrapper: history does not create the config directory" {
@@ -578,6 +764,11 @@ EOF
         "$PT_SCRIPT" agent plan --label --tui
     [ "$status" -eq 0 ]
     grep -q '^ARGS=agent plan --label --tui$' "$MOCK_LOG"
+    local value_log="${TEST_DIR}/label-space.log"
+    run env PT_CORE_PATH="$MOCK_PT_CORE" PT_WRAPPER_TEST_LOG="$value_log" \
+        "$PT_SCRIPT" agent plan --label '--shell with spaces'
+    [ "$status" -eq 0 ]
+    grep -qx 'ARG=--shell with spaces' "$value_log"
 }
 
 @test "wrapper: an unusable PT_CORE_PATH is an error, not a silent fallback" {
@@ -585,6 +776,13 @@ EOF
         "$PT_SCRIPT" scan
     [ "$status" -eq 1 ]
     [[ "$output" == *"PT_CORE_PATH=${TEST_DIR}/missing-pt-core is not an executable file"* ]]
+    [ ! -f "$MOCK_LOG" ]
+    local nonexecutable="${TEST_DIR}/nonexecutable-pt-core"
+    printf '#!/usr/bin/env bash\n' > "$nonexecutable"
+    chmod 644 "$nonexecutable"
+    run env PT_CORE_PATH="$nonexecutable" PT_WRAPPER_TEST_LOG="$MOCK_LOG" "$PT_SCRIPT" scan
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"is not an executable file"* ]]
     [ ! -f "$MOCK_LOG" ]
 }
 
@@ -598,8 +796,8 @@ EOF
     cat > "${MOCK_BIN_DIR}/curl" << 'EOF'
 #!/usr/bin/env bash
 url="${@: -1}"
-if [[ "$url" == *"/main/VERSION" ]]; then
-  echo "9.9.9"
+if [[ "$url" == *"/releases/latest" ]]; then
+  printf '{"tag_name":"v9.9.9","draft":false,"prerelease":false,"published_at":"2026-10-01T00:00:00Z"}\n'
   exit 0
 fi
 echo "curl: (22) The requested URL returned error: 404" >&2
