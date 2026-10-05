@@ -200,17 +200,23 @@ setup_test_dirs() {
 setup_test_env() {
     setup_test_dirs
 
-    # Supply a prebuilt core explicitly or use the normal debug artifact.
+    # Supply a prebuilt core explicitly or use a normal debug/release artifact.
     # Compile through RCH before BATS, never implicitly in per-test setup.
     if [[ -z "${PROJECT_ROOT:-}" ]]; then
         PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
         export PROJECT_ROOT
     fi
-    local pt_core_debug="${PT_CORE_PATH:-${PROJECT_ROOT}/target/debug/pt-core}"
-    if [[ -f "$pt_core_debug" && -x "$pt_core_debug" ]]; then
-        export PT_CORE_PATH="$pt_core_debug"
+    local pt_core_binary="${PT_CORE_PATH:-${PT_CORE:-}}"
+    if [[ -z "$pt_core_binary" ]]; then
+        pt_core_binary="${PROJECT_ROOT}/target/debug/pt-core"
+        if [[ ! -f "$pt_core_binary" || ! -x "$pt_core_binary" ]]; then
+            pt_core_binary="${PROJECT_ROOT}/target/release/pt-core"
+        fi
+    fi
+    if [[ -f "$pt_core_binary" && -x "$pt_core_binary" ]]; then
+        export PT_CORE_PATH="$pt_core_binary"
     else
-        test_error "Required pt-core binary is not an executable file: $pt_core_debug"
+        test_error "Required pt-core binary is not an executable file: $pt_core_binary"
         test_error "Build through RCH before BATS, then set PT_CORE_PATH to the retained binary."
         return 1
     fi

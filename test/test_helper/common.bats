@@ -89,3 +89,27 @@ load "./common.bash"
     [ "$status" -eq 1 ]
     [[ "$output" == *"Required pt-core binary is not an executable file"* ]]
 }
+
+@test "test helper selects prebuilt release and CI override without rewriting fixtures" {
+    setup_test_dirs
+    unset PT_CORE_PATH PT_CORE
+    export PROJECT_ROOT="$TEST_DIR/prebuilt-project"
+    mkdir -p "$PROJECT_ROOT/target/release"
+    # These executable fixtures prove selection only, never native core behavior.
+    create_mock_command "core_fixture" "fixture-only" 0
+    cp "$MOCK_BIN/core_fixture" "$PROJECT_ROOT/target/release/pt-core"
+    setup_test_env
+    [ "$PT_CORE_PATH" = "$PROJECT_ROOT/target/release/pt-core" ]
+    [ ! -e "$PROJECT_ROOT/target/debug" ]
+    cmp "$MOCK_BIN/core_fixture" "$PROJECT_ROOT/target/release/pt-core"
+
+    unset PT_CORE_PATH
+    export PT_CORE="$MOCK_BIN/core_fixture"
+    setup_test_env
+    [ "$PT_CORE_PATH" = "$MOCK_BIN/core_fixture" ]
+
+    export PT_CORE_PATH="$TEST_DIR/explicit-missing"
+    run setup_test_env
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Required pt-core binary is not an executable file"* ]]
+}
