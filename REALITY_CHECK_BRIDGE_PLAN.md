@@ -1,6 +1,6 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Execution update — 2026-10-05 04:52 UTC
+## Execution update — 2026-10-05 04:59 UTC
 
 The following is the latest evidence. Older dated entries below retain the failures and their corrections;
 their then-pending statements are historical, not replacements for the current results.
@@ -34,8 +34,9 @@ their then-pending statements are historical, not replacements for the current r
   Final-source all-targets checking passed at 04:30:26 and warning-denying Clippy passed at 04:46:46 on hz4.
   `final-0429-source.sha256` matched the uploaded worker. The preceding hz3 Clippy admission refused a runtime
   inventory-cache lock and ran no Cargo; standard healthy hz4 admission succeeded without a probe bypass.
-  The final lean check and original bundle integrations are pending; the primary fixture correction below
-  will also require a fresh targeted runtime and compiler/Clippy/formatting pass.
+  Final lean checking passed at 04:50:30 with the disclosed existing warning. Original bundle tests passed
+  89/89 under the final lock at 04:54:26 (`final-bundle-integration-0453.log`), zero failed/ignored/filtered.
+  The primary fixture correction below will require a fresh targeted runtime and compiler/Clippy/formatting pass.
 - Eighteen compatible dependency families have affected-consumer evidence; the current lock is
   `dd6f11e6fc7da70dcf994ee08303db3feb3a8ff8389880c0d94ab856a4cef8f0`.
   The fresh cached audit exits 1 for rkyv, with LRU unsound and paste unmaintained findings. The isolated minifier
@@ -51,13 +52,21 @@ their then-pending statements are historical, not replacements for the current r
   and disabled FDR, rather than using the required test signature prior. Two actual native probes used an owned
   subreaper and double-fork/setsid to prove real kernel adoption and null descriptors. The factory 80% prior
   correctly produced Pause. Explicit synthetic four-class priors (abandoned Beta(999,1), others Beta(1,999))
-  produced an executable Kill with the default loss matrix, FDR and posterior gates intact. Full apply/verify
-  and the smallest existing-fixture correction are in progress. This is controlled plumbing evidence, not
-  calibration or an empirical FDR guarantee.
+  produced an executable Kill with the default loss matrix, FDR configuration and posterior gates intact.
+  The full native chain then passed: stale-start refusal 10 and wrong-UID refusal 3 both preserved the live
+  target; unchanged producer Plan restored, actual apply 2 killed it and verify 0 reported `confirmed_dead`.
+  The retained full log is `/tmp/actionlint-bd-ufqb11/native-signature-orphan-full-chain-20261005.log`.
+  The smallest existing Rust/BATS fixture correction and repeatable runtime proof remain in progress.
+  This is controlled plumbing evidence, not calibration, a proven FDR gate or an empirical FDR guarantee.
+- Independent nonauthor verifier GoldenKnoll closed `bd-gn74` at 04:58:14 and `bd-r1mu` at 04:58:34,
+  citing their original production callers, positive/negative tests, exact source/lock receipts and required
+  gates. Original acceptance descriptions and dependencies remain unchanged. `bd-uacs.3` is being audited
+  by a different nonauthor because GoldenKnoll contributed its planned-kill cap; self-certification is refused.
 
 The product is substantially closer to its safety-first cleanup promise, but it is not finished. Calibration on
 the real false-positive corpus, fleet/macOS acceptance, measured relief/settle windows and the remaining original
-workstreams are still required. No feature Bead has been closed by this root while final acceptance is pending.
+workstreams are still required. Only the independently proven narrow Beads above are closed; P0 and the
+remaining original workstreams stay open until their own acceptance evidence exists.
 
 The assessment below describes the inspected baseline. The working tree now connects the canonical executable
 Plan to agent planning, saves the exact scorer ledger, enforces the current/saved policy age floor at apply,
@@ -288,9 +297,9 @@ Actual strict remote validation so far:
 - [x] Execute missing/incomplete required-snapshot refusals and intact producer-snapshot positive apply.
 - [x] Execute nonfinite/negative CLI limit refusals before session loading; retain finite boundary positives.
 - [x] Execute final planned-kill cap and child-before-parent/tree exclusion tests.
-- [ ] Fix and execute bundle extraction destination/symlink boundary (`bd-gn74`) before treating extraction as safe.
+- [x] Fix and execute bundle extraction destination/symlink boundary (`bd-gn74`) before treating extraction as safe.
 - [ ] Fix macOS notification argument interpolation (`bd-zisi`); require actual macOS evidence for platform acceptance.
-- [ ] Finish `bd-r1mu`: prove both below/above cutoff malformed UTF-8 HEAD files return typed Unreadable;
+- [x] Finish `bd-r1mu`: prove both below/above cutoff malformed UTF-8 HEAD files return typed Unreadable;
   preserve genuine main/detached Git and live-process cwd positives, then independently review final gates.
 - [x] Execute all eight workspace library suites on the 04:13 source/lock (4,854 passed, seven existing ignores).
 - [x] Execute corrected main-binary tests on the 04:23 upload (38 passed; all five TUI regressions included).
