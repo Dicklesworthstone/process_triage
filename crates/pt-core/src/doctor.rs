@@ -197,6 +197,64 @@ pub struct HostFacts {
     pub inotify_max_user_watches: Option<u64>,
     pub inotify_max_user_instances: Option<u64>,
     pub procs: ProcTable,
+    /// pt's own session store (filled by [`run_doctor`]; fixtures pass it explicitly).
+    pub pt_sessions: Option<SessionUsage>,
+    /// Whether Pressure Stall Information (/proc/pressure) could be read.
+    pub psi_available: bool,
+}
+
+/// Size of pt's session store.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct SessionUsage {
+    pub root: String,
+    pub sessions: u64,
+    /// Allocated bytes.
+    pub bytes: u64,
+    /// `PROCESS_TRIAGE_RETENTION` as set (unset = the 7-day default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<String>,
+}
+
+fn allocated_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    let own = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            meta.blocks() * 512
+        }
+        #[cfg(not(unix))]
+        {
+            meta.len()
+        }
+    };
+    if meta.is_dir() {
+        own + std::fs::read_dir(path).map_or(0, |entries| {
+            entries.flatten().map(|e| allocated_bytes(&e.path())).sum()
+        })
+    } else {
+        own
+    }
+}
+
+/// Count and size the session directories under `sessions_root` (read-only).
+pub fn read_session_usage(sessions_root: &Path, retention: Option<String>) -> Option<SessionUsage> {
+    let entries = std::fs::read_dir(sessions_root).ok()?;
+    let mut usage = SessionUsage {
+        root: sessions_root.display().to_string(),
+        retention,
+        ..SessionUsage::default()
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with("pt-") && path.is_dir() {
+            usage.sessions += 1;
+            usage.bytes += allocated_bytes(&path);
+        }
+    }
+    Some(usage)
 }
 
 /// The whole audit.
@@ -517,6 +575,8 @@ pub fn read_host_facts_from(root: &Path, clk_tck: u64) -> HostFacts {
         inotify_max_user_watches: read_u64(root, "proc/sys/fs/inotify/max_user_watches"),
         inotify_max_user_instances: read_u64(root, "proc/sys/fs/inotify/max_user_instances"),
         procs: read_proc_table(root, clk_tck),
+        pt_sessions: None,
+        psi_available: false,
     }
 }
 
@@ -998,6 +1058,57 @@ fn check_procs(f: &HostFacts, out: &mut Vec<Finding>) {
     }
 }
 
+fn check_pt(f: &HostFacts, out: &mut Vec<Finding>) {
+    if !f.psi_available {
+        out.push(
+            finding(
+                "pt.psi",
+                Level::Info,
+                "Pressure Stall Information (/proc/pressure) is unavailable: pt's pressure regimes fall back to load and memory figures",
+            )
+            .recommended("a kernel with CONFIG_PSI, booted with psi=1 where it defaults to off")
+            .rationale("PSI measures how long tasks actually wait for CPU, memory and I/O; load average and memory use only hint at it.")
+            .commands(&[
+                "cat /proc/pressure/cpu",
+                "grep -o 'psi=[01]' /proc/cmdline",
+            ]),
+        );
+    }
+    let Some(u) = &f.pt_sessions else {
+        return;
+    };
+    let retention_off = u.retention.as_deref().is_some_and(|r| {
+        matches!(
+            r.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "never"
+        )
+    });
+    let level = if u.sessions > 1000 || u.bytes > GIB {
+        Level::Warn
+    } else if retention_off && u.sessions > 200 {
+        Level::Info
+    } else {
+        Level::Ok
+    };
+    let mut fnd = finding(
+        "pt.sessions",
+        level,
+        format!(
+            "{} pt sessions using {:.1} MiB in {} (retention: {})",
+            u.sessions,
+            u.bytes as f64 / (1u64 << 20) as f64,
+            u.root,
+            u.retention.as_deref().unwrap_or("default, 7 days")
+        ),
+    )
+    .observed(json!(u))
+    .rationale("Every `agent plan` leaves a session directory. Before automatic retention a dev box accumulated 3,017 of them (289 MB) from one test burst; retention (PROCESS_TRIAGE_RETENTION, default 7 days) now runs at most hourly when a session is created.");
+    if level >= Level::Info {
+        fnd = fnd.commands(&["pt agent sessions --cleanup --older-than 7d"]);
+    }
+    out.push(fnd);
+}
+
 fn check_deleted_open(f: &HostFacts, out: &mut Vec<Finding>) {
     let p = &f.procs;
     let Some(largest) = p.deleted_open.first() else {
@@ -1068,13 +1179,27 @@ pub fn audit(facts: &HostFacts, pressure: &PressureAssessment) -> Vec<Finding> {
     check_files(facts, &mut out);
     check_procs(facts, &mut out);
     check_deleted_open(facts, &mut out);
+    check_pt(facts, &mut out);
     out
 }
 
 /// The full read-only audit of the machine under `root`.
 pub fn run_doctor_from(root: &Path, cpus: u32, clk_tck: u64) -> DoctorReport {
-    let facts = read_host_facts_from(root, clk_tck);
+    run_doctor_with(root, cpus, clk_tck, None)
+}
+
+/// [`run_doctor_from`] plus pt's own session store.
+pub fn run_doctor_with(
+    root: &Path,
+    cpus: u32,
+    clk_tck: u64,
+    sessions: Option<SessionUsage>,
+) -> DoctorReport {
+    let mut facts = read_host_facts_from(root, clk_tck);
     let snapshot = read_pressure_snapshot_from(root, cpus);
+    facts.psi_available =
+        snapshot.cpu.is_some() || snapshot.memory.is_some() || snapshot.io.is_some();
+    facts.pt_sessions = sessions;
     let census = ProcessCensus {
         zombies: facts.procs.zombies,
         dstate: facts.procs.dstate,
@@ -1100,7 +1225,20 @@ pub fn run_doctor() -> DoctorReport {
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
     // SAFETY: sysconf has no preconditions.
     let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let mut report = run_doctor_from(Path::new("/"), cpus, if tck > 0 { tck as u64 } else { 100 });
+    let sessions = crate::session::SessionStore::from_env()
+        .ok()
+        .and_then(|store| {
+            read_session_usage(
+                store.sessions_root(),
+                std::env::var("PROCESS_TRIAGE_RETENTION").ok(),
+            )
+        });
+    let mut report = run_doctor_with(
+        Path::new("/"),
+        cpus,
+        if tck > 0 { tck as u64 } else { 100 },
+        sessions,
+    );
     if !cfg!(target_os = "linux") {
         // The checks read /proc, sysctls and systemd files; elsewhere their absence would
         // read as findings ("oomd not running").
@@ -1205,6 +1343,18 @@ mod tests {
                 "[zram0]\nzram-size = 16384\n",
             )
             .write("proc/uptime", "100000.0 50000.0\n")
+            .write(
+                "proc/pressure/cpu",
+                "some avg10=0.10 avg60=0.05 avg300=0.01 total=1000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+            )
+            .write(
+                "proc/pressure/memory",
+                "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+            )
+            .write(
+                "proc/pressure/io",
+                "some avg10=0.20 avg60=0.10 avg300=0.05 total=2000\nfull avg10=0.10 avg60=0.05 avg300=0.01 total=900\n",
+            )
             .proc(1, "systemd", 'S', 0)
             .proc(400, "bash", 'S', 1);
         root
@@ -1247,6 +1397,51 @@ mod tests {
         assert_eq!(mf.level, Level::Warn, "64 MiB on 499 GiB (want 2 GiB)");
         assert_eq!(mf.recommended.as_deref(), Some("2097152"));
         assert_eq!(r.worst, Level::Crit);
+    }
+
+    #[test]
+    fn missing_psi_is_reported_as_info() {
+        let root = Root::new();
+        root.meminfo(16, 8);
+        assert_eq!(find(&root.report(), "pt.psi").unwrap().level, Level::Info);
+        assert!(find(&healthy().report(), "pt.psi").is_none());
+    }
+
+    /// The 3,017-session burst: a store past 1000 sessions warns and suggests the
+    /// cleanup command; a few hundred with retention switched off is worth knowing.
+    #[test]
+    fn session_store_growth_warns_and_suggests_cleanup() {
+        let root = healthy();
+        let store = tempfile::tempdir().unwrap();
+        for i in 0..1001 {
+            std::fs::create_dir(store.path().join(format!("pt-20260101-000000-{i:04}"))).unwrap();
+        }
+        std::fs::create_dir(store.path().join("not-a-session")).unwrap();
+        let usage = read_session_usage(store.path(), None).unwrap();
+        assert_eq!(usage.sessions, 1001);
+
+        let r = run_doctor_with(&root.path(), 8, 100, Some(usage));
+        let f = find(&r, "pt.sessions").unwrap();
+        assert_eq!(f.level, Level::Warn);
+        assert_eq!(
+            f.commands,
+            vec!["pt agent sessions --cleanup --older-than 7d"]
+        );
+
+        let unbounded = SessionUsage {
+            sessions: 250,
+            retention: Some("off".to_string()),
+            ..SessionUsage::default()
+        };
+        let r = run_doctor_with(&root.path(), 8, 100, Some(unbounded));
+        assert_eq!(find(&r, "pt.sessions").unwrap().level, Level::Info);
+
+        let fine = SessionUsage {
+            sessions: 40,
+            ..SessionUsage::default()
+        };
+        let r = run_doctor_with(&root.path(), 8, 100, Some(fine));
+        assert_eq!(find(&r, "pt.sessions").unwrap().level, Level::Ok);
     }
 
     /// With vm.dirty_bytes set the kernel reports dirty_ratio 0 (seen on a real build

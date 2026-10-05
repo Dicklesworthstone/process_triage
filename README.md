@@ -842,8 +842,9 @@ Many incidents come from host configuration, not from any one process. `pt docto
 | File handles / inotify | system file table above 75% (with the largest descriptor holders); `max_user_watches` below 524288 |
 | Process table | zombies grouped by parent (a parent with 5+ unreaped children), D-state count |
 | Deleted but open files | disk space held by files deleted while a process still has them open (1 GiB or more), with the holder |
+| pt itself | PSI unavailable (regimes fall back to load and memory); session store past 1000 sessions or 1 GiB, or growing with retention switched off |
 
-Exit code: 0 when nothing needs attention, 1 when there is a warning or critical finding (the severity is in `worst`). Not yet covered: multiplexer hygiene, pt's own health, a policy section for thresholds, macOS.
+Exit code: 0 when nothing needs attention, 1 when there is a warning or critical finding (the severity is in `worst`). Not yet covered: multiplexer hygiene, a policy section for thresholds, macOS.
 
 ---
 
