@@ -25,11 +25,14 @@ What verification checks:
 - Read-only commands from the tutorial (`scan`, `agent plan`, `deep-scan`,
   `shadow status`, ...) are run for real and must succeed. They use a scratch data
   directory, so verification never adds sessions to your history.
+- A completed `agent plan` may exit 1 when it finds candidates. That verifies the
+  step; a policy refusal, partial failure, or interrupted command does not.
 - Commands that need your values (a session id, a PID) are run with placeholders:
   they fail for lack of a real session, but pt-core must accept their arguments, so a
   tutorial cannot document a flag that does not exist.
 
 Verification is conservative by default:
-- Per-check runtime budget: 750ms (configurable with `--verify-budget-ms`)
-- Total runtime budget: 5000ms (configurable with `--total-budget-ms`)
+- Per-check runtime budget: 45 seconds (configurable with `--verify-budget-ms`)
+- Total runtime budget: 420 seconds, shared across selected tutorials (configurable
+  with `--total-budget-ms`)
 - On budget exhaustion, `pt learn` falls back to static tutorial guidance.
