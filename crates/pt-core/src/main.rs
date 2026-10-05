@@ -1188,15 +1188,15 @@ struct AgentApplyArgs {
     min_age: Option<u64>,
 
     /// Minimum posterior probability required (e.g. 0.99)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_probability)]
     min_posterior: Option<f64>,
 
     /// Max blast radius per action (MB)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_nonnegative_finite)]
     max_blast_radius: Option<f64>,
 
     /// Max total blast radius for the run (MB)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_nonnegative_finite)]
     max_total_blast_radius: Option<f64>,
 
     /// Max kills per run
@@ -1222,6 +1222,24 @@ struct AgentApplyArgs {
     /// Resume interrupted apply (skip already completed actions)
     #[arg(long)]
     resume: bool,
+}
+
+fn parse_nonnegative_finite(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|error| format!("invalid number: {error}"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err("must be finite and nonnegative".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_probability(value: &str) -> Result<f64, String> {
+    let parsed = parse_nonnegative_finite(value)?;
+    if parsed > 1.0 {
+        return Err("probability must be between 0 and 1".to_string());
+    }
+    Ok(parsed)
 }
 
 fn config_options(global: &GlobalOpts) -> ConfigOptions {
@@ -2331,6 +2349,13 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                             SessionState::Completed
                         };
                         let _ = handle_e.update_state(final_state);
+                        if let Some(error) = result.outcomes.iter().find_map(|outcome| {
+                            (outcome.status == pt_core::action::ActionStatus::Success)
+                                .then_some(outcome.details.as_ref())
+                                .flatten()
+                        }) {
+                            return Err(error.clone());
+                        }
                         Ok(ExecutionOutcome {
                             mode: None,
                             attempted: result.summary.actions_attempted,
@@ -2579,7 +2604,7 @@ fn check_execution_policy(
     policy: &pt_core::config::Policy,
     action: &pt_core::plan::PlanAction,
     robot: bool,
-) -> Result<pt_core::decision::PolicyCheckResult, String> {
+) -> Result<(pt_core::decision::PolicyCheckResult, u64), String> {
     let scan = quick_scan(&QuickScanOptions {
         pids: vec![action.target.pid.0],
         include_kernel_threads: false,
@@ -2640,7 +2665,10 @@ fn check_execution_policy(
         provenance_evidence_completeness: None,
         provenance_confidence_penalty: None,
     };
-    Ok(enforcer.check_action(&candidate, action.action, robot))
+    Ok((
+        enforcer.check_action(&candidate, action.action, robot),
+        proc.rss_bytes,
+    ))
 }
 
 #[cfg(feature = "ui")]
@@ -2680,7 +2708,7 @@ fn execute_plan_actions(
         for action in &plan.actions {
             if !action.blocked && action.action != Action::Keep {
                 let check = match check_execution_policy(&enforcer, policy, action, false) {
-                    Ok(check) => check,
+                    Ok((check, _)) => check,
                     Err(error) => {
                         outcomes.push(pt_core::action::ActionResult {
                             action_id: action.action_id.clone(),
@@ -13819,9 +13847,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     if let serde_json::Value::Object(fields) = serde_json::to_value(action_plan).unwrap() {
         plan_output.as_object_mut().unwrap().extend(fields);
     }
-    plan_output["policy_snapshot"] = serde_json::json!({
-        "min_process_age_seconds": effective_min_age,
-    });
+    plan_output["policy_snapshot"] = serde_json::to_value(&decision_policy).unwrap();
+    plan_output["policy_snapshot"]["min_process_age_seconds"] =
+        serde_json::json!(effective_min_age);
+    plan_output["policy_snapshot"]["guardrails"]["min_process_age_seconds"] =
+        serde_json::json!(effective_min_age);
 
     // Write plan to session
     let decision_dir = handle.dir.join("decision");
@@ -14951,6 +14981,15 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         },
         None => config.policy.guardrails.min_process_age_seconds,
     };
+    let has_policy_snapshot = saved_document
+        .get("policy_snapshot")
+        .is_some_and(|snapshot| {
+            serde_json::from_value::<pt_core::config::Policy>(snapshot.clone()).is_ok()
+        });
+    if config.policy.robot_mode.require_policy_snapshot.unwrap_or(false) && !has_policy_snapshot {
+        eprintln!("agent apply: current policy requires a valid recorded policy snapshot");
+        return ExitCode::PolicyBlocked;
+    }
     let min_age = args
         .min_age
         .unwrap_or(saved_min_age)
@@ -15317,7 +15356,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
                 category: action.rationale.category.clone(),
                 is_kill_action: action.action == Action::Kill,
-                has_policy_snapshot: true,
+                has_policy_snapshot,
                 is_supervised: is_supervised_for_robot(action.target.pid.0),
             };
             let check = checker.check_candidate(&candidate);
@@ -15457,37 +15496,6 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
 
                 let start = std::time::Instant::now();
-                let candidate = RobotCandidate {
-                    posterior: action
-                        .rationale
-                        .posterior
-                        .as_ref()
-                        .map(|scores| candidate_posterior(scores, action.action)),
-                    memory_mb: action.rationale.memory_mb,
-                    has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
-                    category: action.rationale.category.clone(),
-                    is_kill_action: action.action == Action::Kill,
-                    has_policy_snapshot: true,
-                    is_supervised: is_supervised_for_robot(action.target.pid.0),
-                };
-                let check = checker.check_candidate(&candidate);
-                if !check.allowed {
-                    blocked_by_constraints += 1;
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "blocked_by_constraints", "time_ms": elapsed_ms}));
-                    emit_action_event(
-                        pt_core::events::event_names::ACTION_COMPLETE,
-                        action_index,
-                        Some(elapsed_ms),
-                        action,
-                        "blocked_by_constraints",
-                        &[],
-                    );
-                    if args.abort_on_unknown {
-                        break;
-                    }
-                    continue;
-                }
                 match identity_provider.revalidate(&action.target) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -15595,7 +15603,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     continue;
                 }
 
-                let policy_check =
+                let (policy_check, current_rss_bytes) =
                     match check_execution_policy(&enforcer, &config.policy, action, true) {
                         Ok(check) => check,
                         Err(error) => {
@@ -15639,6 +15647,45 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     continue;
                 }
 
+                let candidate = RobotCandidate {
+                    posterior: action
+                        .rationale
+                        .posterior
+                        .as_ref()
+                        .map(|scores| candidate_posterior(scores, action.action)),
+                    memory_mb: Some(current_rss_bytes as f64 / (1024.0 * 1024.0)),
+                    has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
+                    category: action.rationale.category.clone(),
+                    is_kill_action: action.action == Action::Kill,
+                    has_policy_snapshot,
+                    is_supervised: is_supervised_for_robot(action.target.pid.0),
+                };
+                let check = checker.check_candidate(&candidate);
+                if !check.allowed {
+                    blocked_by_constraints += 1;
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    outcomes.push(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "blocked_by_constraints",
+                        "violations": check.violations,
+                        "current_rss_bytes": current_rss_bytes,
+                        "time_ms": elapsed_ms,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        Some(elapsed_ms),
+                        action,
+                        "blocked_by_constraints",
+                        &[],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+
                 // "success" means the effect was observed (stopped, reniced, exited,
                 // zombie reaped), not merely that the syscall returned.
                 let result = action_runner
@@ -15651,12 +15698,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         if action.action == Action::Kill {
                             // Accumulate the real memory footprint so
                             // --max-total-blast-radius is enforced (was always 0).
-                            let bytes = action
-                                .rationale
-                                .memory_mb
-                                .map(|mb| (mb.max(0.0) * 1024.0 * 1024.0) as u64)
-                                .unwrap_or(0);
-                            checker.record_action(bytes, true);
+                            checker.record_action(current_rss_bytes, true);
                             if let Err(error) = enforcer.record_kill() {
                                 succeeded += 1;
                                 accounting_error = Some(error.to_string());
