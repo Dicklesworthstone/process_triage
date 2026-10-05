@@ -6,7 +6,7 @@
 //! diff preview before applying changes.
 
 use crate::supervision::pattern_persistence::{
-    ConflictResolution, ImportConflict, PersistedSchema,
+    ConflictResolution, ImportConflict, PersistedPattern, PersistedSchema,
 };
 use pt_config::priors::{BetaParams, ClassParams, Priors};
 use serde::{Deserialize, Serialize};
@@ -592,25 +592,29 @@ pub fn compute_diff(
 
     // ── Signature diff ────────────────────────────────────────────────
     if let Some(incoming_sigs) = &incoming.signatures {
-        let local_names: HashMap<&str, f64> = local_signatures
+        let local_names: BTreeMap<&str, &PersistedPattern> = local_signatures
             .map(|ls| {
                 ls.patterns
                     .iter()
-                    .map(|p| (p.signature.name.as_str(), p.signature.confidence_weight))
+                    .map(|p| (p.signature.name.as_str(), p))
                     .collect()
             })
             .unwrap_or_default();
 
-        let incoming_names: HashMap<&str, f64> = incoming_sigs
+        let incoming_names: BTreeMap<&str, &PersistedPattern> = incoming_sigs
             .patterns
             .iter()
-            .map(|p| (p.signature.name.as_str(), p.signature.confidence_weight))
+            .map(|p| (p.signature.name.as_str(), p))
             .collect();
 
         // Added or updated in incoming.
-        for (name, &inc_conf) in &incoming_names {
-            if let Some(&loc_conf) = local_names.get(name) {
-                let change_type = if (loc_conf - inc_conf).abs() < 1e-9 {
+        for (name, incoming_pattern) in &incoming_names {
+            let inc_conf = incoming_pattern.signature.confidence_weight;
+            if let Some(local_pattern) = local_names.get(name) {
+                let loc_conf = local_pattern.signature.confidence_weight;
+                let change_type = if local_pattern.signature == incoming_pattern.signature
+                    && local_pattern.lifecycle == incoming_pattern.lifecycle
+                {
                     SignatureChangeType::Unchanged
                 } else {
                     SignatureChangeType::Updated
@@ -632,17 +636,18 @@ pub fn compute_diff(
         }
 
         // Removed (in local but not in incoming).
-        for (name, &loc_conf) in &local_names {
+        for (name, local_pattern) in &local_names {
             if !incoming_names.contains_key(name) {
                 signature_changes.push(SignatureChange {
                     name: name.to_string(),
                     change_type: SignatureChangeType::Removed,
-                    local_confidence: Some(loc_conf),
+                    local_confidence: Some(local_pattern.signature.confidence_weight),
                     incoming_confidence: None,
                 });
             }
         }
     }
+    signature_changes.sort_by(|left, right| left.name.cmp(&right.name));
 
     TransferDiff {
         priors_changes,
@@ -1363,6 +1368,50 @@ mod tests {
             MergeStrategy::KeepLocal
         );
         assert!("invalid".parse::<MergeStrategy>().is_err());
+    }
+
+    #[test]
+    fn signature_diff_detects_equal_confidence_matcher_changes_in_name_order() {
+        use crate::supervision::pattern_persistence::PatternSource;
+        use crate::supervision::signature::SupervisorSignature;
+        use crate::supervision::SupervisorCategory;
+
+        let zulu = PersistedPattern::new(
+            SupervisorSignature::new("zulu", SupervisorCategory::Other)
+                .with_process_patterns(vec!["^old-worker$"]),
+            PatternSource::Custom,
+        );
+        let alpha = PersistedPattern::new(
+            SupervisorSignature::new("alpha", SupervisorCategory::Other)
+                .with_process_patterns(vec!["^alpha$"]),
+            PatternSource::Custom,
+        );
+        let local = PersistedSchema {
+            schema_version: 2,
+            patterns: vec![zulu.clone(), alpha],
+            metadata: None,
+        };
+        let unchanged = export_bundle(None, Some(&local), None, "host", None).unwrap();
+        let diff = compute_diff(None, Some(&local), &unchanged, None);
+        assert!(diff
+            .signature_changes
+            .iter()
+            .all(|change| matches!(change.change_type, SignatureChangeType::Unchanged)));
+
+        let mut incoming = local.clone();
+        incoming.patterns[0].signature.patterns.process_names = vec!["^new-worker$".to_string()];
+        let bundle = export_bundle(None, Some(&incoming), None, "host", None).unwrap();
+        let diff = compute_diff(None, Some(&local), &bundle, None);
+        assert_eq!(
+            diff.signature_changes
+                .iter()
+                .map(|change| change.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zulu"]
+        );
+        let changed = &diff.signature_changes[1];
+        assert!(matches!(changed.change_type, SignatureChangeType::Updated));
+        assert_eq!(changed.local_confidence, changed.incoming_confidence);
     }
 
     #[test]
