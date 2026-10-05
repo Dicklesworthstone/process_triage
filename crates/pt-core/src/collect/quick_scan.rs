@@ -14,8 +14,9 @@
 use super::types::{ProcessRecord, ProcessState, ScanMetadata, ScanResult};
 use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};
 use pt_common::{ProcessId, StartId};
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -104,7 +105,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     // Execute and capture output
     let mut child = cmd
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| QuickScanError::CommandFailed(e.to_string()))?;
 
@@ -146,10 +147,20 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         .stdout
         .take()
         .ok_or_else(|| QuickScanError::CommandFailed("Failed to capture stdout".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| QuickScanError::CommandFailed("Failed to capture stderr".to_string()))?;
+    // Drain diagnostics concurrently: a full stderr pipe must not block ps while
+    // this thread waits for another stdout line. Retain a bounded diagnostic prefix.
+    let stderr_reader = thread::spawn(move || drain_ps_stderr(stderr));
 
     let reader = BufReader::new(stdout);
     let mut processes = Vec::new();
     let mut warnings = Vec::new();
+    let requested_pids: HashSet<u32> = options.pids.iter().copied().collect();
+    let mut returned_pids = HashSet::new();
+    let mut selection_error = None;
 
     // Parse output
     let lines = reader.lines();
@@ -180,6 +191,20 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
 
         match parse_ps_line_with_timing(&line, &platform, &boot_id, None, clock.as_ref()) {
             Ok(record) => {
+                if !requested_pids.is_empty() {
+                    if !requested_pids.contains(&record.pid.0) {
+                        selection_error =
+                            Some(format!("ps returned unrequested PID {}", record.pid.0));
+                        continue;
+                    }
+                    if !returned_pids.insert(record.pid.0) {
+                        selection_error = Some(format!(
+                            "ps returned requested PID {} more than once",
+                            record.pid.0
+                        ));
+                        continue;
+                    }
+                }
                 // Filter kernel threads if not requested AND not targeting specific PIDs.
                 // If user explicitly asks for specific PIDs, we respect that even for kernel threads.
                 let is_targeting_specific_pids = !options.pids.is_empty();
@@ -219,6 +244,9 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
 
     // Wait for child process to avoid leaving zombies
     let exit_status = child.wait()?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| QuickScanError::CommandFailed("ps stderr reader panicked".to_string()))??;
 
     let duration = start.elapsed();
     let process_count = processes.len();
@@ -231,17 +259,16 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         return Err(QuickScanError::Timeout(timeout));
     }
 
-    if options.pids.is_empty() && !exit_status.success() {
-        return Err(QuickScanError::CommandFailed(format!(
-            "full process snapshot exited with {exit_status}"
-        )));
+    validate_ps_exit(
+        exit_status,
+        !options.pids.is_empty(),
+        process_count,
+        warnings.len(),
+        &stderr,
+    )?;
+    if let Some(error) = selection_error {
+        return Err(QuickScanError::CommandFailed(error));
     }
-    if options.pids.is_empty() && processes.is_empty() && warnings.is_empty() {
-        return Err(QuickScanError::CommandFailed(
-            "full process snapshot contains no processes".to_string(),
-        ));
-    }
-
     debug!(
         process_count = processes.len(),
         duration_ms = duration.as_millis(),
@@ -269,6 +296,51 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
             warnings,
         },
     })
+}
+
+fn drain_ps_stderr(mut stderr: impl Read) -> std::io::Result<Vec<u8>> {
+    const MAX_DIAGNOSTIC_BYTES: u64 = 16 * 1024;
+    let mut diagnostics = Vec::new();
+    stderr
+        .by_ref()
+        .take(MAX_DIAGNOSTIC_BYTES)
+        .read_to_end(&mut diagnostics)?;
+    std::io::copy(&mut stderr, &mut std::io::sink())?;
+    Ok(diagnostics)
+}
+
+fn validate_ps_exit(
+    status: ExitStatus,
+    targeted: bool,
+    process_count: usize,
+    warning_count: usize,
+    diagnostics: &[u8],
+) -> Result<(), QuickScanError> {
+    // procps reports exit 1 when no requested PID exists. This is absence only
+    // when there are no records, malformed lines, or subprocess diagnostics.
+    let no_match = targeted
+        && status.code() == Some(1)
+        && process_count == 0
+        && warning_count == 0
+        && diagnostics.is_empty();
+    if (!status.success() && !no_match) || !diagnostics.is_empty() {
+        let scope = if targeted { "targeted" } else { "full" };
+        return Err(QuickScanError::CommandFailed(format!(
+            "{scope} process snapshot exited with {status}; diagnostics: {}",
+            String::from_utf8_lossy(diagnostics)
+        )));
+    }
+    if targeted && warning_count != 0 {
+        return Err(QuickScanError::CommandFailed(format!(
+            "targeted process snapshot contains {warning_count} parse warnings"
+        )));
+    }
+    if !targeted && process_count == 0 && warning_count == 0 {
+        return Err(QuickScanError::CommandFailed(
+            "full process snapshot contains no processes".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_header_line(line: &str) -> bool {
@@ -356,13 +428,27 @@ fn read_boot_id() -> Option<String> {
 /// Build the ps command with platform-specific format string.
 fn build_ps_command(platform: &str, options: &QuickScanOptions) -> Result<Command, QuickScanError> {
     let mut cmd = Command::new("ps");
+    if options
+        .pids
+        .iter()
+        .any(|pid| *pid == 0 || *pid > i32::MAX as u32)
+    {
+        return Err(QuickScanError::CommandFailed(
+            "target PID must be a positive pid_t value".to_string(),
+        ));
+    }
+    // Selection and formatting are separate. Combining -e with -p selects the
+    // union, so it silently turns a target-only scan into a full-host scan.
+    if options.pids.is_empty() {
+        cmd.arg("-e");
+    }
 
     match platform {
         "linux" => {
             // Linux ps format: pid ppid uid user pgid sid state %cpu rss vsz tty start_time etimes comm cmd
-            // Using -eo for custom format, -ww for wide output
+            // Using -o for custom format, -ww for wide output
             cmd.args([
-                "-eo",
+                "-o",
                 "pid,ppid,uid,user,pgid,sid,state,%cpu,rss,vsz,tty,lstart,etimes,comm,args",
                 "--no-headers",
                 "-ww",
@@ -372,7 +458,7 @@ fn build_ps_command(platform: &str, options: &QuickScanOptions) -> Result<Comman
             // macOS ps format (BSD style)
             // Note: macOS ps has different field names
             cmd.args([
-                "-eo",
+                "-o",
                 "pid,ppid,uid,user,pgid,sess,state,%cpu,rss,vsz,tty,lstart,etime,comm,args",
             ]);
         }
@@ -383,8 +469,15 @@ fn build_ps_command(platform: &str, options: &QuickScanOptions) -> Result<Comman
 
     // Filter to specific PIDs if requested
     if !options.pids.is_empty() {
-        let pids: Vec<String> = options.pids.iter().map(|p| p.to_string()).collect();
-        cmd.arg("-p");
+        let mut unique_pids = HashSet::new();
+        let pids: Vec<String> = options
+            .pids
+            .iter()
+            .filter(|pid| unique_pids.insert(**pid))
+            .map(|pid| pid.to_string())
+            .collect();
+        // procps quick mode reads only these PIDs. BSD ps uses ordinary -p.
+        cmd.arg(if platform == "linux" { "-q" } else { "-p" });
         cmd.arg(pids.join(","));
     }
 
@@ -917,6 +1010,276 @@ mod tests {
         assert!(is_header_line("pid ppid uid user"));
         assert!(!is_header_line("123 1 0 root"));
         assert!(!is_header_line("999 42 1000 alice"));
+    }
+
+    #[test]
+    fn targeted_ps_selection_is_exclusive_and_deduplicated() {
+        for (platform, selector) in [("linux", "-q"), ("macos", "-p")] {
+            let command = build_ps_command(
+                platform,
+                &QuickScanOptions {
+                    pids: vec![17, 17, 23],
+                    ..Default::default()
+                },
+            )
+            .expect("targeted command");
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert_eq!(args[0], "-o");
+            assert!(!args.contains(&"-e"));
+            assert!(!args.contains(&"-eo"));
+            assert_eq!(&args[args.len() - 2..], &[selector, "17,23"]);
+
+            let full = build_ps_command(platform, &QuickScanOptions::default())
+                .expect("full-host command");
+            let full_args: Vec<_> = full.get_args().map(|arg| arg.to_str().unwrap()).collect();
+            assert_eq!(&full_args[..2], &["-e", "-o"]);
+            assert!(!full_args.contains(&"-p"));
+            assert!(!full_args.contains(&"-q"));
+        }
+    }
+
+    #[test]
+    fn targeted_ps_rejects_zero_and_pid_t_overflow() {
+        for platform in ["linux", "macos"] {
+            for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+                let options = QuickScanOptions {
+                    pids: vec![std::process::id(), pid],
+                    ..Default::default()
+                };
+                assert!(matches!(
+                    build_ps_command(platform, &options),
+                    Err(QuickScanError::CommandFailed(_))
+                ));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ps_exit_classification_distinguishes_absence_from_failure() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // This tests status classification, not live process disappearance.
+        for (targeted, code, records, warnings, diagnostics, allowed) in [
+            (true, 0, 1, 0, "", true),
+            (true, 0, 0, 0, "", true),
+            (true, 0, 0, 1, "", false),
+            (true, 0, 1, 1, "", false),
+            (true, 1, 0, 0, "", true),
+            (true, 1, 1, 0, "", false),
+            (true, 1, 0, 1, "", false),
+            (true, 1, 0, 0, "invalid field", false),
+            (true, 0, 1, 0, "warning", false),
+            (true, 2, 0, 0, "", false),
+            (false, 1, 0, 0, "", false),
+            (false, 0, 0, 0, "", false),
+            (false, 0, 1, 0, "", true),
+        ] {
+            let status = ExitStatus::from_raw(code << 8);
+            assert_eq!(
+                validate_ps_exit(status, targeted, records, warnings, diagnostics.as_bytes())
+                    .is_ok(),
+                allowed,
+                "targeted={targeted}, code={code}, records={records}, warnings={warnings}, diagnostics={diagnostics:?}"
+            );
+        }
+        assert!(validate_ps_exit(ExitStatus::from_raw(libc::SIGTERM), true, 0, 0, &[]).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct OwnedScanChild(std::process::Child);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl OwnedScanChild {
+        fn spawn() -> Self {
+            Self(
+                Command::new("sleep")
+                    .arg("300")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn owned scan target"),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for OwnedScanChild {
+        fn drop(&mut self) {
+            // This direct child remains owned and unreaped until this cleanup;
+            // its PID cannot refer to a replacement process before wait().
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn targeted_quick_scan_returns_only_owned_requested_processes() {
+        let first = OwnedScanChild::spawn();
+        let second = OwnedScanChild::spawn();
+        let excluded = OwnedScanChild::spawn();
+        for requested in [
+            vec![first.pid()],
+            vec![first.pid(), first.pid(), second.pid()],
+        ] {
+            let scan = quick_scan(&QuickScanOptions {
+                pids: requested.clone(),
+                ..Default::default()
+            })
+            .expect("actual targeted scan");
+            let actual: HashSet<_> = scan.processes.iter().map(|record| record.pid.0).collect();
+            let expected: HashSet<_> = requested.iter().copied().collect();
+            crate::test_log!(
+                INFO,
+                "actual targeted scan result",
+                requested = format!("{requested:?}").as_str(),
+                actual = format!("{actual:?}").as_str(),
+                excluded_pid = excluded.pid(),
+                warnings = scan.metadata.warnings.len()
+            );
+            assert_eq!(actual, expected);
+            assert_eq!(scan.processes.len(), expected.len());
+            assert_eq!(scan.metadata.process_count, expected.len());
+            assert!(scan.metadata.warnings.is_empty());
+            assert!(!actual.contains(&excluded.pid()));
+            for record in &scan.processes {
+                assert_eq!(record.ppid.0, std::process::id());
+                assert_eq!(record.uid, unsafe { libc::geteuid() });
+                assert_eq!(
+                    std::path::Path::new(&record.comm).file_name().unwrap(),
+                    "sleep"
+                );
+                let command: Vec<_> = record.cmd.split_whitespace().collect();
+                assert_eq!(command.len(), 2);
+                assert_eq!(
+                    std::path::Path::new(command[0]).file_name().unwrap(),
+                    "sleep"
+                );
+                assert_eq!(command[1], "300");
+                assert!(!record.start_id.0.is_empty());
+                #[cfg(target_os = "linux")]
+                {
+                    let stat = std::fs::read_to_string(format!("/proc/{}/stat", record.pid.0))
+                        .expect("independent owned target stat");
+                    let (_, fields) = stat.rsplit_once(')').expect("stat command terminator");
+                    let start_ticks: u64 = fields
+                        .split_whitespace()
+                        .nth(19)
+                        .expect("stat field 22")
+                        .parse()
+                        .expect("numeric stat start ticks");
+                    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                        .expect("independent boot identity");
+                    assert_eq!(
+                        record.start_id,
+                        StartId::from_linux(boot_id.trim(), start_ticks, record.pid.0)
+                    );
+                }
+            }
+        }
+        let full = quick_scan(&QuickScanOptions::default()).expect("actual full-host scan");
+        for pid in [
+            first.pid(),
+            second.pid(),
+            excluded.pid(),
+            std::process::id(),
+        ] {
+            assert!(full.processes.iter().any(|record| record.pid.0 == pid));
+        }
+        assert!(full.metadata.warnings.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn targeted_quick_scan_missing_and_mixed_pids_are_not_failures() {
+        // Linux allocates PIDs strictly below this kernel limit.
+        let missing: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .expect("kernel PID limit")
+            .trim()
+            .parse()
+            .expect("numeric PID limit");
+        assert!(!std::path::Path::new(&format!("/proc/{missing}")).exists());
+        let target = OwnedScanChild::spawn();
+        for requested in [vec![missing], vec![target.pid(), missing]] {
+            let scan = quick_scan(&QuickScanOptions {
+                pids: requested.clone(),
+                ..Default::default()
+            })
+            .expect("missing PID is genuine absence");
+            let expected = if requested.contains(&target.pid()) {
+                1
+            } else {
+                0
+            };
+            crate::test_log!(
+                INFO,
+                "actual targeted missing-PID scan",
+                requested = format!("{requested:?}").as_str(),
+                process_count = scan.metadata.process_count,
+                warnings = scan.metadata.warnings.len()
+            );
+            assert_eq!(scan.processes.len(), expected);
+            assert_eq!(scan.metadata.process_count, expected);
+            assert!(scan.metadata.warnings.is_empty());
+            assert!(scan
+                .processes
+                .iter()
+                .all(|record| record.pid.0 == target.pid()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn actual_ps_diagnostics_cannot_be_classified_as_absence() {
+        let output = Command::new("ps")
+            .args(["-o", "pt_invalid_format_field", "-q"])
+            .arg(std::process::id().to_string())
+            .output()
+            .expect("actual malformed ps command");
+        assert!(!output.status.success());
+        assert!(!output.stderr.is_empty());
+        assert!(validate_ps_exit(output.status, true, 0, 0, &output.stderr).is_err());
+        crate::test_log!(
+            INFO,
+            "actual ps diagnostic refusal",
+            status = output.status.to_string().as_str(),
+            stderr = String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_drain_handles_more_than_a_pipe_and_bounds_diagnostics() {
+        let mut child = Command::new("sh")
+            .args(["-c", "head -c 131072 /dev/zero >&2; printf ready; exit 2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn actual diagnostic producer");
+        let stderr = child.stderr.take().expect("stderr pipe");
+        let reader = thread::spawn(move || drain_ps_stderr(stderr));
+        let mut stdout = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        let status = child.wait().expect("reap diagnostic producer");
+        let diagnostics = reader.join().unwrap().expect("drain diagnostics");
+        assert_eq!(stdout, b"ready");
+        assert_eq!(diagnostics.len(), 16 * 1024);
+        assert_eq!(status.code(), Some(2));
+        assert!(validate_ps_exit(status, true, 0, 0, &diagnostics).is_err());
     }
 
     #[test]

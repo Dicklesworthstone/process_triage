@@ -276,7 +276,23 @@ mod tests {
     use super::*;
 
     fn retained_test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let checkout_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crate belongs to the source workspace")
+            .canonicalize()
+            .expect("source workspace exists");
+        // Build runners may set TMPDIR inside the checkout. Prefer the OS
+        // temporary directory only when it cannot inherit repository evidence.
+        let scratch_root = [std::env::temp_dir(), PathBuf::from("/tmp")]
+            .into_iter()
+            .filter_map(|path| path.canonicalize().ok())
+            .find(|path| {
+                let (root, worktree) = find_repo_root(path);
+                !path.starts_with(&checkout_root) && root.is_none() && worktree.is_none()
+            })
+            .expect("existing OS scratch directory outside the checkout and any repository");
+        let dir = scratch_root.join(format!(
             "pt-workspace-resolver-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
