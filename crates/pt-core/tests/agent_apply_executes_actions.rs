@@ -348,6 +348,121 @@ fn apply_with_args(
 }
 
 #[test]
+fn agent_apply_refuses_the_live_protected_group_without_spending_budget() {
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    write_test_policy(config_dir.path());
+    let victim = ForeignTarget::spawn("sleep 354");
+    let identity = live_identity(victim.pid);
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+    let group = ProcessCommand::new("ps")
+        .args(["-o", "group=", "-p", &victim.pid.to_string()])
+        .output()
+        .expect("collect the actual target group");
+    assert!(group.status.success(), "group observation: {group:?}");
+    let group = String::from_utf8(group.stdout).expect("group UTF-8");
+    assert!(!group.trim().is_empty(), "group must be known");
+    let policy_path = config_dir.path().join("policy.json");
+    let mut policy: Policy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy.guardrails.protected_groups = vec![group.trim().to_string()];
+    policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+    fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let blocked_session = session_with_plan(data_dir.path(), plan_action(Action::Kill, &identity));
+    let (status, json) = apply(
+        data_dir.path(),
+        config_dir.path(),
+        &blocked_session,
+        &target,
+    );
+    assert_eq!(status, "blocked_by_policy", "{json}");
+    assert_eq!(
+        json["outcomes"][0]["violation"]["rule"], "guardrails.protected_groups",
+        "{json}"
+    );
+    assert!(victim.alive(), "the protected exact target must survive");
+    assert_eq!(live_identity(victim.pid), identity);
+    assert!(
+        !data_dir.path().join("rate_limit.json").exists(),
+        "a refused action must not prepare or spend kill budget"
+    );
+
+    // Removing only this group restriction permits the same live target, with
+    // every other identity, session, writer and built-in check retained.
+    policy.guardrails.protected_groups.clear();
+    fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let permitted_session =
+        session_with_plan(data_dir.path(), plan_action(Action::Kill, &identity));
+    let (status, json) = apply(
+        data_dir.path(),
+        config_dir.path(),
+        &permitted_session,
+        &target,
+    );
+    assert_eq!(status, "success", "{json}");
+    assert!(!victim.alive(), "the actually permitted target must exit");
+    let budget: Value =
+        serde_json::from_slice(&fs::read(data_dir.path().join("rate_limit.json")).unwrap())
+            .unwrap();
+    assert_eq!(budget["kill_timestamps"].as_array().unwrap().len(), 1);
+    assert_eq!(budget["pending_kill_intent"], false);
+}
+
+#[test]
+fn default_robot_policy_preserves_the_actual_useful_spare_target() {
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    let policy = Policy::default();
+    assert!(!policy.robot_mode.enabled);
+    fs::write(
+        config_dir.path().join("policy.json"),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    let victim = ForeignTarget::spawn("sleep 355");
+    let identity = live_identity(victim.pid);
+    // Fresh owned targets need explicit age/selection/threshold options. The
+    // robot policy itself remains default, and no action is executed.
+    let output = cargo_bin_cmd!("pt-core")
+        .env("PT_DATA_DIR", data_dir.path())
+        .env("PT_CONFIG_DIR", config_dir.path())
+        .env("PT_SKIP_GLOBAL_LOCK", "1")
+        .timeout(Duration::from_secs(60))
+        .args([
+            "--format",
+            "json",
+            "--robot",
+            "agent",
+            "plan",
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--pids",
+            &victim.pid.to_string(),
+        ])
+        .output()
+        .expect("run the actual default-policy robot planner");
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "plan status={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).expect("actual plan JSON");
+    assert_eq!(plan["candidates"].as_array().unwrap().len(), 1, "{plan}");
+    assert_eq!(plan["candidates"][0]["pid"], victim.pid);
+    assert_eq!(
+        plan["candidates"][0]["recommended_action"], "keep",
+        "{plan}"
+    );
+    assert_eq!(plan["spare_set"], serde_json::json!([victim.pid]), "{plan}");
+    assert!(plan["actions"].as_array().unwrap().is_empty(), "{plan}");
+    assert!(victim.alive());
+    assert_eq!(live_identity(victim.pid), identity);
+    assert!(!data_dir.path().join("rate_limit.json").exists());
+}
+
+#[test]
 fn agent_apply_persists_the_kill_budget_across_runs() {
     use std::io::Write;
     let data_dir = TempDir::new().expect("data dir");

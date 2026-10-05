@@ -694,11 +694,12 @@ mod tests {
     }
 
     fn retained_accounting_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = PathBuf::from("target/test-logs/e2e/rate_limit").join(format!(
-            "{label}-{}-{nanos}",
-            std::process::id()
-        ));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = PathBuf::from("target/test-logs/e2e/rate_limit")
+            .join(format!("{label}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         path
     }
@@ -783,21 +784,31 @@ mod tests {
 
         assert!(limiter.check(false).unwrap().allowed);
         limiter.begin_kill_accounting().unwrap();
-        let pending: PersistentState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let pending: PersistentState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert!(pending.pending_kill_intent);
         assert!(pending.kill_timestamps.is_empty());
         assert_eq!(limiter.current_run_count().unwrap(), 0);
         assert!(limiter.check(true).is_err());
 
-        let counts = limiter.finish_kill_accounting(target.deliver_term()).unwrap();
-        assert_eq!((counts.run, counts.minute, counts.hour, counts.day), (1, 1, 1, 1));
-        let saved: PersistentState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let counts = limiter
+            .finish_kill_accounting(target.deliver_term())
+            .unwrap();
+        assert_eq!(
+            (counts.run, counts.minute, counts.hour, counts.day),
+            (1, 1, 1, 1)
+        );
+        let saved: PersistentState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert!(!saved.pending_kill_intent);
         assert_eq!(saved.kill_timestamps.len(), 1);
 
         let fresh = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
         let counts = fresh.get_counts().unwrap();
-        assert_eq!((counts.run, counts.minute, counts.hour, counts.day), (0, 1, 1, 1));
+        assert_eq!(
+            (counts.run, counts.minute, counts.hour, counts.day),
+            (0, 1, 1, 1)
+        );
         assert!(fresh.check(false).unwrap().allowed);
         assert!(limiter.finish_kill_accounting(true).is_err());
         assert_eq!(limiter.current_run_count().unwrap(), 1);
@@ -824,8 +835,12 @@ mod tests {
         assert_eq!(other.current_run_count().unwrap(), 0);
 
         let counts = owner.finish_kill_accounting(false).unwrap();
-        assert_eq!((counts.run, counts.minute, counts.hour, counts.day), (0, 0, 0, 0));
-        let saved: PersistentState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            (counts.run, counts.minute, counts.hour, counts.day),
+            (0, 0, 0, 0)
+        );
+        let saved: PersistentState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         assert!(!saved.pending_kill_intent);
         assert!(saved.kill_timestamps.is_empty());
         assert!(owner.check(false).unwrap().allowed);
@@ -854,8 +869,13 @@ mod tests {
         // .PID.NANOS.tmp basename exceeds Linux NAME_MAX at the temporary-open
         // boundary, including on root workers. No file is removed or replaced.
         limiter.state_path = Some(alias.clone());
-        let error = limiter.finish_kill_accounting(target.deliver_term()).unwrap_err();
-        assert!(matches!(&error, RateLimitError::Io(io) if io.raw_os_error() == Some(libc::ENAMETOOLONG)), "{error}");
+        let error = limiter
+            .finish_kill_accounting(target.deliver_term())
+            .unwrap_err();
+        assert!(
+            matches!(&error, RateLimitError::Io(io) if io.raw_os_error() == Some(libc::ENAMETOOLONG)),
+            "{error}"
+        );
         assert_eq!(limiter.current_run_count().unwrap(), 1);
         assert_eq!(fs::read(&alias).unwrap(), pending_bytes);
         assert_eq!(fs::read(&state_path).unwrap(), pending_bytes);
@@ -893,7 +913,10 @@ mod tests {
         assert!(limiter.check(false).unwrap().allowed);
 
         let error = limiter.begin_kill_accounting().unwrap_err();
-        assert!(matches!(&error, RateLimitError::Io(io) if io.raw_os_error() == Some(libc::ENAMETOOLONG)), "{error}");
+        assert!(
+            matches!(&error, RateLimitError::Io(io) if io.raw_os_error() == Some(libc::ENAMETOOLONG)),
+            "{error}"
+        );
         assert!(limiter.finish_kill_accounting(true).is_err());
         assert_eq!(limiter.current_run_count().unwrap(), 0);
         assert_eq!(fs::read(&state_path).unwrap(), saved_bytes);
@@ -1519,6 +1542,8 @@ mod tests {
         assert!(limiter.check(true).is_err());
         assert!(limiter.check_and_record(false, None).is_err());
         assert!(limiter.record_kill().is_err());
+        assert!(limiter.begin_kill_accounting().is_err());
+        assert!(limiter.finish_kill_accounting(true).is_err());
         assert!(limiter.get_counts().is_err());
         assert_eq!(limiter.current_run_count().unwrap(), 0);
         assert_eq!(fs::read_to_string(&state_path).unwrap(), "not valid json");
@@ -1535,6 +1560,8 @@ mod tests {
         assert!(limiter.check(false).is_err());
         assert!(limiter.check_and_record(false, None).is_err());
         assert!(limiter.record_kill().is_err());
+        assert!(limiter.begin_kill_accounting().is_err());
+        assert!(limiter.finish_kill_accounting(true).is_err());
         assert!(state_path.is_dir());
     }
 

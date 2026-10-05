@@ -2571,6 +2571,53 @@ mod tests {
         assert_eq!(enforcer.current_run_kill_count(), 2);
     }
 
+    #[test]
+    fn durable_accounting_wrappers_preserve_pending_refusal_and_non_delivery() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::path::PathBuf::from("target/test-logs/e2e/rate_limit")
+            .join(format!("enforcer-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("rate_limit.json");
+        let policy = test_policy();
+        let owner = PolicyEnforcer::new(&policy, Some(&state_path)).unwrap();
+        let fresh = PolicyEnforcer::new(&policy, Some(&state_path)).unwrap();
+        let candidate = test_candidate();
+        assert!(owner.check_action(&candidate, Action::Kill, false).allowed);
+
+        owner.begin_kill_accounting().unwrap();
+        let pending = std::fs::read(&state_path).unwrap();
+        for enforcer in [&owner, &fresh] {
+            let result = enforcer.check_action(&candidate, Action::Kill, false);
+            assert!(!result.allowed);
+            let violation = result.violation.unwrap();
+            assert_eq!(violation.kind, ViolationKind::RateLimitExceeded);
+            assert!(violation.message.contains("unresolved pending kill intent"));
+            assert_eq!(enforcer.current_run_kill_count(), 0);
+        }
+        assert!(fresh.finish_kill_accounting(false).is_err());
+        assert!(fresh.begin_kill_accounting().is_err());
+        assert_eq!(std::fs::read(&state_path).unwrap(), pending);
+
+        let counts = owner.finish_kill_accounting(false).unwrap();
+        assert_eq!(
+            (counts.run, counts.minute, counts.hour, counts.day),
+            (0, 0, 0, 0)
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(saved["pending_kill_intent"], false);
+        assert_eq!(saved["kill_timestamps"], serde_json::json!([]));
+        assert!(fresh.check_action(&candidate, Action::Kill, false).allowed);
+        fresh.begin_kill_accounting().unwrap();
+        fresh.finish_kill_accounting(false).unwrap();
+        assert!(owner.check_action(&candidate, Action::Kill, false).allowed);
+        assert_eq!(owner.current_run_kill_count(), 0);
+        assert_eq!(fresh.current_run_kill_count(), 0);
+    }
+
     // ── Robot mode hard critical files gate ──────────────────────────
 
     #[test]
