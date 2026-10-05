@@ -423,6 +423,7 @@ impl ProtectedFilter {
             notes,
         };
 
+        let mut session_workload = false;
         if self.builtin {
             if let Some((name, notes)) = builtin_protection_match(&record.comm, &record.cmd) {
                 return Some(make(
@@ -431,30 +432,23 @@ impl ProtectedFilter {
                     Some(notes.to_string()),
                 ));
             }
-            if role.is_supervised_service() {
-                return Some(make(
-                    MatchedField::SupervisedService,
-                    format!("cgroup:{role:?}"),
-                    Some(
-                        "supervised by systemd or a container runtime; stop the unit instead"
-                            .to_string(),
-                    ),
-                ));
-            }
-        }
-        let mut session_workload = self.builtin && role.is_user_workload();
-        // macOS has no cgroups (the role is always Unknown there): classify by owner
-        // and executable instead.
-        if self.builtin && cfg!(target_os = "macos") && role == super::cgroup::CgroupRole::Unknown {
-            match macos_placement(&record.user, &record.comm, &record.cmd) {
-                MacPlacement::System(notes) => {
+            match builtin_placement(role, &record.user, &record.comm, &record.cmd) {
+                BuiltinPlacement::SupervisedService => {
+                    return Some(make(
+                        MatchedField::SupervisedService,
+                        format!("cgroup:{role:?}"),
+                        Some(SUPERVISED_SERVICE_NOTES.to_string()),
+                    ));
+                }
+                BuiltinPlacement::MacSystem(notes) => {
                     return Some(make(
                         MatchedField::Builtin,
-                        "builtin.macos_system".to_string(),
+                        MACOS_SYSTEM_RULE.to_string(),
                         Some(notes.to_string()),
                     ));
                 }
-                MacPlacement::UserWorkload => session_workload = true,
+                BuiltinPlacement::UserWorkload => session_workload = true,
+                BuiltinPlacement::Unplaced => {}
             }
         }
 
@@ -700,7 +694,9 @@ static BUILTIN_PROTECTED: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::Laz
         builtin_rule(
             "builtin.ssh_control_master",
             Cmd,
-            r"^(\S*/)?ssh\s(.*\s)?(-[1246AaCfGgKkMNnqsTtVvXxYy]*M[1246AaCfGgKkMNnqsTtVvXxYy]*|-oControlMaster=\S+|ControlMaster=(yes|auto|autoask|ask))(\s|$)",
+            // Started with -M / ControlMaster=..., or (ControlMaster set in ssh_config)
+            // seen by the title OpenSSH gives the master: `ssh: <ControlPath> [mux]`.
+            r"^(\S*/)?ssh\s(.*\s)?(-[1246AaCfGgKkMNnqsTtVvXxYy]*M[1246AaCfGgKkMNnqsTtVvXxYy]*|-oControlMaster=\S+|ControlMaster=(yes|auto|autoask|ask))(\s|$)|^ssh: \S.* \[mux\]\s*$",
             "SSH ControlMaster: shared connection used by rch and other remote tools",
         ),
         builtin_rule(
@@ -908,6 +904,68 @@ pub fn macos_placement(user: &str, comm: &str, cmd: &str) -> MacPlacement {
     MacPlacement::UserWorkload
 }
 
+/// Rule name for macOS system-domain, Apple and app-bundle processes.
+pub const MACOS_SYSTEM_RULE: &str = "builtin.macos_system";
+
+/// Why a supervised service is protected.
+pub const SUPERVISED_SERVICE_NOTES: &str =
+    "supervised by systemd or a container runtime; stop the unit instead";
+
+/// Where built-in protection places a process. The scan-time filter and the
+/// plan-time policy enforcer both decide through [`builtin_placement`], so a process
+/// the scan evaluates is not blocked later for its placement (the enforcer used to
+/// know only cgroup roles, which macOS never has, and blocked every macOS orphan
+/// through `never_kill_ppid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinPlacement {
+    /// Supervised by systemd or a container runtime: protected (stop the unit instead).
+    SupervisedService,
+    /// macOS system domain, Apple platform binary or app bundle: protected.
+    MacSystem(&'static str),
+    /// Started by a person or agent (login session, transient scope, or a macOS
+    /// user's own process): exempt from `never_kill_ppid`, and from `protected_users`
+    /// for root, because an orphan reparented to PID 1 is a candidate.
+    UserWorkload,
+    /// No placement known (Linux without systemd cgroups: cgroup v1, a container's
+    /// root namespace; a macOS process whose owner is unknown). The configured
+    /// guardrails apply unchanged: children of PID 1 stay protected by
+    /// `never_kill_ppid` and root by `protected_users`.
+    Unplaced,
+}
+
+/// Place a process from its cgroup role and, on macOS (no cgroups), its owner and
+/// executable. See [`BuiltinPlacement`].
+pub fn builtin_placement(
+    role: super::cgroup::CgroupRole,
+    user: &str,
+    comm: &str,
+    cmd: &str,
+) -> BuiltinPlacement {
+    placement_on(cfg!(target_os = "macos"), role, user, comm, cmd)
+}
+
+fn placement_on(
+    macos: bool,
+    role: super::cgroup::CgroupRole,
+    user: &str,
+    comm: &str,
+    cmd: &str,
+) -> BuiltinPlacement {
+    if role.is_supervised_service() {
+        return BuiltinPlacement::SupervisedService;
+    }
+    if role.is_user_workload() {
+        return BuiltinPlacement::UserWorkload;
+    }
+    if macos && role == super::cgroup::CgroupRole::Unknown && !user.is_empty() {
+        return match macos_placement(user, comm, cmd) {
+            MacPlacement::System(notes) => BuiltinPlacement::MacSystem(notes),
+            MacPlacement::UserWorkload => BuiltinPlacement::UserWorkload,
+        };
+    }
+    BuiltinPlacement::Unplaced
+}
+
 /// Name of the built-in rule for database / web / message servers.
 pub const SERVICE_DAEMON_RULE: &str = "builtin.service_daemon";
 
@@ -1062,6 +1120,63 @@ mod tests {
 
     fn default_filter() -> ProtectedFilter {
         ProtectedFilter::from_guardrails(&crate::config::policy::Guardrails::default()).unwrap()
+    }
+
+    /// One placement rule for the scan filter and the enforcer, with the platform
+    /// explicit so the macOS branch is tested on Linux too.
+    #[test]
+    fn builtin_placement_by_platform_and_role() {
+        use BuiltinPlacement::*;
+        use CgroupRole::*;
+        let server = ("alice", "python3", "python3 -m http.server 8000");
+        let place = |macos, role, (user, comm, cmd): (&str, &str, &str)| {
+            placement_on(macos, role, user, comm, cmd)
+        };
+        for macos in [false, true] {
+            for role in [SystemService, UserService, Container] {
+                assert_eq!(place(macos, role, server), SupervisedService, "{role:?}");
+            }
+            for role in [LoginSession, TransientScope] {
+                assert_eq!(place(macos, role, server), UserWorkload, "{role:?}");
+            }
+        }
+        // Linux without systemd placement: guardrails apply unchanged.
+        assert_eq!(place(false, Unknown, server), Unplaced);
+        assert_eq!(
+            place(false, Unknown, ("root", "make", "make -j8")),
+            Unplaced
+        );
+        // macOS: owner and executable decide.
+        assert_eq!(place(true, Unknown, server), UserWorkload);
+        assert!(matches!(
+            place(true, Unknown, ("root", "make", "make -j8")),
+            MacSystem(_)
+        ));
+        assert!(matches!(
+            place(
+                true,
+                Unknown,
+                ("alice", "Zed", "/Applications/Zed.app/Contents/MacOS/zed")
+            ),
+            MacSystem(_)
+        ));
+        assert!(matches!(
+            place(
+                true,
+                Unknown,
+                (
+                    "alice",
+                    "/usr/libexec/trustd",
+                    "/usr/libexec/trustd --agent"
+                )
+            ),
+            MacSystem(_)
+        ));
+        // Owner unknown: nothing vouches for it as a user workload.
+        assert_eq!(
+            place(true, Unknown, ("", "python3", "python3 x.py")),
+            Unplaced
+        );
     }
 
     #[test]
@@ -1243,6 +1358,8 @@ mod tests {
             ("tmux: client", "tmux attach -t main"),
             ("ssh", "ssh -E /home/ubuntu/.ssh/rch/.ssh-connectionUXind1/log -S /home/ubuntu/.ssh/rch/.ssh-connectionUXind1/master -M -f -N vmi1149989"),
             ("ssh", "ssh -o ControlMaster=auto -o ControlPath=/tmp/cm-%r@%h ts2"),
+            // ControlMaster from ssh_config: argv carries no flag, only OpenSSH's title.
+            ("ssh", "ssh: /home/ubuntu/.ssh/sockets/ubuntu@ts2-22 [mux]"),
             ("sshd-session", "sshd-session: ubuntu@notty"),
             ("(sd-pam)", "(sd-pam)"),
             ("systemd", "/usr/lib/systemd/systemd --user"),
@@ -1349,6 +1466,7 @@ mod tests {
             ("ssh", "ssh ts2 uptime"),
             ("ssh", "ssh ts2 tmux ls"),
             ("ssh", "ssh ts2 nc -z db 5432"),
+            ("ssh", "ssh ts2 echo [mux]"),
             ("node", "node /data/projects/app/node_modules/.bin/next dev"),
             ("bun", "bun test"),
             ("Xvfb", "Xvfb :99 -screen 0 1280x1024x24"),
