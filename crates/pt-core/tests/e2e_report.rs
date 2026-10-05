@@ -560,6 +560,10 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
     use std::fs;
     let data_dir = tempdir().unwrap().keep();
     let config_dir = tempdir().unwrap().keep();
+    eprintln!(
+        "recorded session report case retained at {}",
+        data_dir.display()
+    );
     let session_id = pt_common::SessionId::new();
     let handle = SessionStore::at_data_dir(&data_dir)
         .create(&SessionManifest::new(
@@ -570,6 +574,7 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         ))
         .unwrap();
     let started_at = handle.read_manifest().unwrap().timing.created_at;
+    let started_instant = chrono::DateTime::parse_from_rfc3339(&started_at).unwrap();
     handle
         .write_context(&SessionContext::new(
             &session_id,
@@ -878,8 +883,23 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
                 "--embed-assets",
             ]);
         }
-        let output = command.assert().success().get_output().stdout.clone();
-        let html = String::from_utf8(output).unwrap();
+        let assertion = command.assert();
+        let artifact = if bundle_input {
+            "bundle-report"
+        } else {
+            "session-report"
+        };
+        fs::write(
+            data_dir.join(format!("{artifact}.stdout.html")),
+            &assertion.get_output().stdout,
+        )
+        .unwrap();
+        fs::write(
+            data_dir.join(format!("{artifact}.stderr")),
+            &assertion.get_output().stderr,
+        )
+        .unwrap();
+        let html = String::from_utf8(assertion.success().get_output().stdout.clone()).unwrap();
         assert!(html.contains("<td>1234</td>"));
         assert!(html.contains("<td>87</td><td>review</td>"));
         assert!(html.contains("log_likelihood"));
@@ -889,7 +909,32 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         assert!(!html.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(!html.contains("<script src="));
         assert!(!html.contains("<link rel=\"stylesheet\""));
-        assert!(html.contains(&started_at));
+        let recorded_json = html
+            .split("id=\"recorded-session-data\">")
+            .nth(1)
+            .expect("report must embed the actual recorded session overview")
+            .split("</script>")
+            .next()
+            .unwrap();
+        let recorded: Value = serde_json::from_str(recorded_json).unwrap();
+        let reported_started_at = recorded["overview"]["started_at"]
+            .as_str()
+            .expect("recorded overview must contain a start timestamp");
+        // DateTime serializes UTC as Z; preserve the exact saved instant,
+        // including nanoseconds, rather than requiring its original spelling.
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(reported_started_at).unwrap(),
+            started_instant
+        );
+        let started_row = Regex::new(&format!(
+            r"Started</dt>\s*<dd>{}</dd>",
+            regex::escape(reported_started_at),
+        ))
+        .unwrap();
+        assert!(
+            started_row.is_match(&html),
+            "visible Started row must display the actual recorded start timestamp"
+        );
         assert!(html.contains("robot_plan"));
         assert!(html.contains("created"));
     }
@@ -963,7 +1008,27 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
             None,
         ))
         .unwrap();
-    fs::write(telemetry_handle.dir.join("telemetry"), b"not a directory").unwrap();
+    let telemetry_dir = telemetry_handle.dir.join("telemetry");
+    let retained_telemetry_dir = telemetry_handle
+        .dir
+        .join(format!("telemetry-retained-{}", uuid::Uuid::new_v4()));
+    assert!(
+        telemetry_dir.is_dir(),
+        "session creation must prepare telemetry"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&retained_telemetry_dir)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound,
+        "retention destination must not exist, including a dangling symlink"
+    );
+    // Keep the genuine precreated directory; obstruct only this owned session's
+    // requested telemetry path without deletion or permission-based ambiguity.
+    fs::rename(&telemetry_dir, &retained_telemetry_dir).unwrap();
+    assert!(retained_telemetry_dir.is_dir());
+    fs::write(&telemetry_dir, b"not a directory").unwrap();
+    assert!(telemetry_dir.is_file());
     let refused = data_dir.join("unreadable-telemetry-refused.ptb");
     let output = pt_core()
         .env("PROCESS_TRIAGE_DATA", &data_dir)

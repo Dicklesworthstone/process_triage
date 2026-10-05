@@ -21059,10 +21059,12 @@ mod report_generation_tests {
         handle.write_context(&context).unwrap();
         let changed_html = generate_report_from_session(&generator, &handle).unwrap();
         let changed = recorded_data(&changed_html);
-        assert_ne!(changed["overview"]["host_id"], changed["plan"]["host_id"]);
+        let changed_overview_host = changed["overview"]["host_id"].as_str().unwrap();
+        let unchanged_plan_host = changed["plan"]["host_id"].as_str().unwrap();
+        assert_ne!(changed_overview_host, unchanged_plan_host);
         let changed_host_row = format!(
             "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
-            changed["overview"]["host_id"].as_str().unwrap(),
+            changed_overview_host,
         );
         assert!(changed_html.contains(&changed_host_row));
         assert!(!changed_html.contains("host-from-context"));

@@ -509,6 +509,11 @@ mod tests {
     fn read_head_state_malformed_utf8_boundaries_are_unreadable() {
         let cases = [
             (
+                "unicode-byte-39",
+                "€".repeat(13).into_bytes(),
+                Some("€".repeat(13)),
+            ),
+            (
                 "unicode-byte-42",
                 "€".repeat(14).into_bytes(),
                 Some("€".repeat(14)),
@@ -534,7 +539,8 @@ mod tests {
                 })
             );
             // Corrupt only the retained owned repository's actual HEAD. The
-            // first two payloads put byte 40 inside a UTF-8 character.
+            // Two 42-byte payloads put byte 40 inside a UTF-8 character;
+            // the 39-byte payload also exercises the untruncated case.
             fs::write(fixture.root.join(".git/HEAD"), contents).unwrap();
             let head = read_head_state(&fixture.root);
             let Some(HeadState::Unreadable { reason }) = head else {
