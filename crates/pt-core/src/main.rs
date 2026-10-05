@@ -2026,10 +2026,12 @@ mod cli_definition_tests {
             let args = prefix.into_iter().chain(["--merge-strategy", strategy]);
             assert!(super::Cli::try_parse_from(args).is_ok());
         }
-        let error =
-            super::Cli::try_parse_from(prefix.into_iter().chain(["--merge-strategy", "replcae"]))
-                .err()
-                .expect("a typo must not silently select a different merge strategy");
+        let error = match super::Cli::try_parse_from(
+            prefix.into_iter().chain(["--merge-strategy", "replcae"]),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a typo must not silently select a different merge strategy"),
+        };
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
