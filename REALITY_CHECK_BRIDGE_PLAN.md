@@ -1,6 +1,6 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Execution update — 2026-10-04 23:35 UTC
+## Execution update — 2026-10-05 00:48 UTC
 
 The assessment below describes the inspected baseline. The working tree now connects the canonical executable
 Plan to agent planning, saves the exact scorer ledger, enforces the current/saved policy age floor at apply,
@@ -21,8 +21,8 @@ Actual strict remote validation so far:
 - The prior 65 focused precheck tests passed. A later audit strengthened the unlinked regular-file case: a writable
   unnamed regular file now blocks, while a FIFO and read-only file remain permitted. Rerun evidence is required.
 - Workspace all-targets check passed for the earlier 21:46 source upload. It does not certify the current tree.
-  Changed safety/sharing paths pass formatting and diff checks. Workspace formatting currently fails in other
-  concurrently edited files; final compiler, clippy, lean and full regression gates remain pending.
+  Current source passes workspace formatting and diff checks; final compiler, clippy, lean and full regression
+  gates remain pending. The earlier pass does not certify later policy/activation changes.
 - Dependency updates are tested individually and recorded in `UPGRADE_LOG.md`. Current remaining large migrations
   and known audit findings must not be described as a completed latest-version or vulnerability-free upgrade.
 - The full bundle/redaction/report suites passed at 22:53, before the later typed Plan/signature and artifact-path
@@ -30,11 +30,28 @@ Actual strict remote validation so far:
 - Eleven compatible dependency upgrades passed affected consumers one at a time. The frozen lockfile is
   SHA256 `55957d71fd29bac6cd6fc18a79809d6db81036a54b0fec36ab5153ea4d7f4455`; the cached audit still exits 1 for
   rkyv, with LRU unsound and paste unmaintained warnings. Standalone fuzz lock/campaign remain unvalidated.
-- Strict remote current-source CLI acceptance timed out in admission without running; no local fallback ran.
-  The retry is pending capacity. No green result is inferred from waiting, commits or independent source agreement.
+- Two isolated cold remote builds reached their 30-minute deadline without running the current tests. A subsequent
+  workspace-check admission refused critical worker memory pressure (103). No local fallback ran. Current frozen
+  source was uploaded at 00:44/00:45 to hz3/hz4; workspace check and the three CLI regression suites are executing.
+  The check has a larger resource deadline; functional assertions and acceptance thresholds remain unchanged.
+  No green result is inferred from admission, compilation progress, commits or independent source agreement.
 - Source now connects the existing typed kernel-pressure reader/assessment to snapshot, plan and TUI load inputs,
   preserves unavailable readings as null, records signature age weights, and maps usage errors to ArgsError 10.
   These additional producer connections remain unverified until the current binary tests and compiler gates run.
+- A fresh review found redacted signature patterns remained valid regexes and could be activated through import.
+  Source now distinguishes structural inspection from activation, guards every executable matching field in the
+  signature database, and refuses sharing-profile or extracted-redacted imports before saving user signatures.
+  Actual archive/plain import refusals plus an intact original matcher positive are added, awaiting execution.
+- Apply and TUI now hold one execution lock across current-policy checks, real actions, verification and persistent
+  kill accounting. Budget checks reload locked state; corrupt/unreadable budgets refuse kills; concurrent writers
+  retain each other's events. Actual two-run minute-budget and headless TUI success/failure regressions are added.
+  Missing/nonfinite posterior evidence cannot satisfy a positive floor, and CLI category allowlists intersect policy.
+  These changes remain unaccepted until their current-source tests run.
+- The prior disposable-process fixture used numeric-PID cleanup; Linux cleanup now pins the original target with
+  a pidfd. A local wrapper termination was initially mistaken for stopping a durable remote job; durable cancellation
+  and terminal recovery acknowledgment corrected that mistake. The canceled run provides no action-test evidence.
+- Further original acceptance gaps are tracked as `bd-gn74` (bundle extraction destination/symlink boundary) and
+  `bd-zisi` (macOS notification quoting). Neither has an implemented or executed fix in this batch.
 
 ### Active completion checklist
 
@@ -44,6 +61,9 @@ Actual strict remote validation so far:
 - [x] Connect structured profile redaction to plain, encrypted and in-memory archive preparation.
 - [x] Add static escaped report rows and recorded outcomes/ledger rendering; preserve unknown timing/counts.
 - [x] Inspect and repair CI source configuration, including invalid job secret conditions and masked test failures.
+- [x] Add activation validation while retaining inspectable typed Safe signature exports.
+- [x] Connect apply/TUI current-policy checks and persistent kill accounting with shared execution locking.
+- [x] Reject missing/invalid positive-floor probabilities; intersect category overrides and add tightening property.
 - [ ] Rerun actual planner → apply → verify with a real detached target and stale-identity refusal.
 - [ ] Rerun current-age-floor, regular/unlinked writer, read-only/FIFO and unreadable-evidence cases.
 - [ ] Rerun actual CLI saved-session → plain/encrypted bundle and session/bundle HTML canary regression.
@@ -60,6 +80,14 @@ Actual strict remote validation so far:
 - [ ] Verify snapshot/plan kernel-pressure readings and their persisted schema; review remaining unknown-value consumers.
 - [ ] Verify CLI usage error 10 and explicit help/version 0, including existing label/degraded-environment expectations.
 - [ ] Complete bd-uacs.3 apply/TUI policy-enforcer and persistent kill-count wiring with real cross-run rate-limit proof.
+- [ ] Execute headless TUI real-kill/accounting regression and preserve earlier outcomes on later evidence failure.
+- [ ] Execute corrupt/unreadable budget and concurrent-writer tests; report permission evidence separately on root.
+- [ ] Execute actual Safe/encrypted bundle import and extracted-JSON refusal without changing existing signatures.
+- [ ] Execute intact original/Forensic signature import and intended/unrelated matcher behavior.
+- [ ] Verify protected-group evidence on a live target and current policy/CLI missing-posterior refusals.
+- [ ] Verify default robot planning retains a nonempty spare set and generated overrides never loosen policy.
+- [ ] Fix and execute bundle extraction destination/symlink boundary (`bd-gn74`) before treating extraction as safe.
+- [ ] Fix macOS notification argument interpolation (`bd-zisi`); require actual macOS evidence for platform acceptance.
 - [ ] Run appropriate workspace regressions; distinguish pre-existing failures from new ones using evidence.
 - [ ] Re-execute workflow static checks and review scanner findings before committing.
 - [ ] Complete fresh original-acceptance review and the real-work/honesty inventories; close only proven tasks.
