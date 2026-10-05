@@ -204,6 +204,26 @@ fn fleet_transfer_json_export_import_replace_roundtrip() {
         "bundle should include priors"
     );
 
+    let before_invalid_strategy = config_snapshot(&config_dir);
+    let exported_bytes = fs::read(&export_path).expect("retain actual export bytes");
+    let mut invalid_strategy = transfer_command(&config_dir);
+    invalid_strategy
+        .args(["import", "--from"])
+        .arg(&export_path)
+        .args(["--merge-strategy", "replcae"]);
+    let refusal = run_retained(
+        invalid_strategy,
+        &temp.join("invalid-strategy-artifacts"),
+        "unknown-merge-strategy",
+    );
+    assert_eq!(refusal.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refusal.stderr).contains("unknown merge strategy"));
+    assert_eq!(config_snapshot(&config_dir), before_invalid_strategy);
+    assert_eq!(
+        fs::read(&export_path).expect("unchanged export"),
+        exported_bytes
+    );
+
     // Overwrite local priors with config B so import must change them back.
     let local_priors = priors_with_useful_prob(0.30, 0.20, 0.30, 0.20);
     write_priors(&config_dir, &local_priors);

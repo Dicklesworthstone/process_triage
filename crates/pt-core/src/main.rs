@@ -929,8 +929,8 @@ struct AgentFleetTransferImportArgs {
     from: String,
 
     /// Merge strategy: weighted, replace, keep-local
-    #[arg(long)]
-    merge_strategy: Option<String>,
+    #[arg(long, default_value = "weighted")]
+    merge_strategy: pt_core::fleet::transfer::MergeStrategy,
 
     /// Show what would change without modifying
     #[arg(long)]
@@ -2003,12 +2003,33 @@ fn parse_output_format(value: &str) -> Option<OutputFormat> {
 
 #[cfg(test)]
 mod cli_definition_tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     /// clap's own consistency check over every subcommand.
     #[test]
     fn cli_definition_is_consistent() {
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn fleet_import_refuses_unknown_merge_strategy_during_parsing() {
+        let prefix = [
+            "pt-core",
+            "agent",
+            "fleet",
+            "transfer",
+            "import",
+            "--from",
+            "bundle.json",
+        ];
+        for strategy in ["weighted", "replace", "keep-local"] {
+            let args = prefix.into_iter().chain(["--merge-strategy", strategy]);
+            assert!(super::Cli::try_parse_from(args).is_ok());
+        }
+        let error =
+            super::Cli::try_parse_from(prefix.into_iter().chain(["--merge-strategy", "replcae"]))
+                .expect_err("a typo must not silently select a different merge strategy");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     /// A subcommand arg with the id of a global arg but a different value type makes
@@ -7621,12 +7642,7 @@ fn run_agent_fleet_transfer_import(
         );
     }
 
-    let strategy: MergeStrategy = args
-        .merge_strategy
-        .as_deref()
-        .unwrap_or("weighted")
-        .parse()
-        .unwrap_or(MergeStrategy::Weighted);
+    let strategy: MergeStrategy = args.merge_strategy;
 
     let options = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
