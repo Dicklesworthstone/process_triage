@@ -5251,6 +5251,179 @@ fn run_bundle_inspect(
     ExitCode::Clean
 }
 
+#[cfg(unix)]
+fn bundle_extract_path_components(
+    path: &Path,
+    destination: bool,
+) -> std::io::Result<Vec<std::ffi::CString>> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    if path.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "extraction path is empty",
+        ));
+    }
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => {
+                Some(std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "extraction path contains a NUL byte",
+                    )
+                }))
+            }
+            Component::RootDir | Component::CurDir if destination => None,
+            _ => Some(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "extraction paths must use normal directory components",
+            ))),
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn open_bundle_extract_child(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // SAFETY: parent is a live directory descriptor and name is one validated,
+    // NUL-terminated component. New directories are private to the effective UID.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error);
+        }
+    }
+    // Do not trust an EEXIST check: open the child relative to the retained
+    // parent, requiring a directory and refusing a symlink at the actual open.
+    // SAFETY: the borrowed parent and component remain live during openat.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful openat returns a new descriptor with sole ownership.
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn open_bundle_extract_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    // Validate all components before creating any directory. Explicit absolute
+    // and relative destinations remain supported; parent traversal is refused.
+    let names = bundle_extract_path_components(path, true)?;
+    let anchor = if path.is_absolute() { c"/" } else { c"." };
+    // SAFETY: the literal anchor is NUL terminated; AT_FDCWD is a valid anchor.
+    let descriptor = unsafe {
+        libc::openat(
+            libc::AT_FDCWD,
+            anchor.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: take sole ownership of the successful openat descriptor.
+    let mut directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    for name in names {
+        directory = open_bundle_extract_child(&directory, &name)?;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn write_bundle_extracted_file(
+    directory: &std::fs::File,
+    path: &str,
+    content: &[u8],
+) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let names = bundle_extract_path_components(Path::new(path), false)?;
+    let (name, parents) = names.split_last().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no filename")
+    })?;
+    let mut parent = directory.try_clone()?;
+    for component in parents {
+        parent = open_bundle_extract_child(&parent, component)?;
+    }
+    // SAFETY: the live parent descriptor and single NUL-terminated filename
+    // stay borrowed throughout openat. O_EXCL makes creation atomic and refuses
+    // every existing final entry, including regular files, hardlinks and symlinks.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the new descriptor is uniquely owned by this File, which closes it
+    // on every return path. A write failure leaves its new partial file in place.
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    file.write_all(content)?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn open_bundle_extract_directory(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative bundle extraction is unsupported on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+fn write_bundle_extracted_file(
+    _directory: &std::fs::File,
+    _path: &str,
+    _content: &[u8],
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative bundle extraction is unsupported on this platform",
+    ))
+}
+
+fn output_bundle_extract_error(
+    global: &GlobalOpts,
+    session_id: &SessionId,
+    code: &str,
+    message: &str,
+    exit: ExitCode,
+) -> ExitCode {
+    let output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id.0,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "bundle extract",
+        "status": "error",
+        "error_code": code,
+        "error": message,
+    });
+    match global.format {
+        OutputFormat::Md => eprintln!("Error: {}", message),
+        OutputFormat::Jsonl => println!("{}", serde_json::to_string(&output).unwrap()),
+        _ => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
+    }
+    exit
+}
+
 fn run_bundle_extract(
     global: &GlobalOpts,
     path: &str,
@@ -5318,37 +5491,41 @@ fn run_bundle_extract(
         }
     };
 
-    // Determine output directory
+    // An untrusted manifest identifier must never become a default filesystem path.
     let output_dir = match output_arg {
         Some(p) => PathBuf::from(p),
-        None => {
-            // Default: use session ID from manifest
-            PathBuf::from(reader.session_id())
-        }
+        None => match SessionId::parse(reader.session_id()) {
+            Some(id) => PathBuf::from(id.0),
+            None => {
+                return output_bundle_extract_error(
+                    global,
+                    &session_id,
+                    "INVALID_SESSION_ID",
+                    "Bundle session ID is invalid for the default extraction destination",
+                    ExitCode::ArgsError,
+                );
+            }
+        },
     };
 
-    // Create output directory
-    if let Err(e) = std::fs::create_dir_all(&output_dir) {
-        let error_output = serde_json::json!({
-            "schema_version": SCHEMA_VERSION,
-            "session_id": session_id.0,
-            "generated_at": chrono::Utc::now().to_rfc3339(),
-            "command": "bundle extract",
-            "status": "error",
-            "error": format!("Failed to create output directory: {}", e),
-        });
-        match global.format {
-            OutputFormat::Md => eprintln!("Error: Failed to create output directory: {}", e),
-            OutputFormat::Jsonl => {
-                println!(
-                    "{}",
-                    serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())
-                )
-            }
-            _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+    // Keep the opened destination as the authority for all later child opens.
+    let destination = match open_bundle_extract_directory(&output_dir) {
+        Ok(directory) => directory,
+        Err(error) => {
+            let code = if error.kind() == std::io::ErrorKind::Unsupported {
+                "EXTRACTION_UNSUPPORTED_PLATFORM"
+            } else {
+                "UNSAFE_EXTRACTION_DESTINATION"
+            };
+            return output_bundle_extract_error(
+                global,
+                &session_id,
+                code,
+                &format!("Cannot safely open extraction destination: {}", error),
+                ExitCode::InternalError,
+            );
         }
-        return ExitCode::InternalError;
-    }
+    };
 
     // Get list of files to extract
     let file_paths: Vec<String> = reader.files().iter().map(|f| f.path.clone()).collect();
@@ -5365,16 +5542,7 @@ fn run_bundle_extract(
 
         match data {
             Ok(content) => {
-                let dest_path = output_dir.join(file_path);
-                // Create parent directories
-                if let Some(parent) = dest_path.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        errors.push(format!("{}: {}", file_path, e));
-                        continue;
-                    }
-                }
-                // Write file
-                if let Err(e) = std::fs::write(&dest_path, content) {
+                if let Err(e) = write_bundle_extracted_file(&destination, file_path, &content) {
                     errors.push(format!("{}: {}", file_path, e));
                 } else {
                     extracted += 1;

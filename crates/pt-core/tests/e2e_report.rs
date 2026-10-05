@@ -1487,19 +1487,25 @@ mod bundle_extraction {
 
     #[test]
     fn destination_and_ancestor_symlinks_refuse_without_outside_writes() {
-        for ancestor in [false, true] {
+        for placement in ["default", "destination", "ancestor"] {
             let case = retained_case();
             let outside = case.join("outside");
             fs::create_dir(&outside).unwrap();
             fs::write(outside.join("payload.bin"), b"outside bytes must survive").unwrap();
-            symlink(&outside, case.join("working/jump")).unwrap();
-            let (bundle, _) = genuine_bundle(&case, &[("payload.bin", PAYLOAD)]);
-            let destination = if ancestor {
-                Path::new("jump/new/output")
+            let (bundle, session) = genuine_bundle(&case, &[("payload.bin", PAYLOAD)]);
+            let link = case.join("working").join(if placement == "default" {
+                &session
             } else {
-                Path::new("jump")
+                "jump"
+            });
+            symlink(&outside, &link).unwrap();
+            let destination = match placement {
+                "default" => None,
+                "ancestor" => Some(Path::new("jump/new/output")),
+                "destination" => Some(Path::new("jump")),
+                _ => unreachable!(),
             };
-            let (output, value) = extract(&case, &bundle, Some(destination), true);
+            let (output, value) = extract(&case, &bundle, destination, true);
             assert!(!output.status.success());
             assert_eq!(value["status"], "error");
             assert_eq!(value["error_code"], "UNSAFE_EXTRACTION_DESTINATION");
@@ -1508,10 +1514,11 @@ mod bundle_extraction {
                 b"outside bytes must survive"
             );
             assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
-            assert!(fs::symlink_metadata(case.join("working/jump"))
+            assert!(fs::symlink_metadata(&link)
                 .unwrap()
                 .file_type()
                 .is_symlink());
+            assert_eq!(fs::read_link(&link).unwrap(), outside);
         }
     }
 
@@ -1524,12 +1531,15 @@ mod bundle_extraction {
             fs::create_dir(&outside).unwrap();
             fs::create_dir(&destination).unwrap();
             fs::write(outside.join("payload.bin"), b"outside bytes must survive").unwrap();
-            let artifact = if parent {
-                symlink(&outside, destination.join("nested")).unwrap();
-                "nested/payload.bin"
+            let (artifact, link, target) = if parent {
+                let link = destination.join("nested");
+                symlink(&outside, &link).unwrap();
+                ("nested/payload.bin", link, outside.clone())
             } else {
-                symlink(outside.join("payload.bin"), destination.join("payload.bin")).unwrap();
-                "payload.bin"
+                let link = destination.join("payload.bin");
+                let target = outside.join("payload.bin");
+                symlink(&target, &link).unwrap();
+                ("payload.bin", link, target)
             };
             let (bundle, _) = genuine_bundle(&case, &[(artifact, PAYLOAD)]);
             let (output, value) = extract(&case, &bundle, Some(&destination), true);
@@ -1547,6 +1557,7 @@ mod bundle_extraction {
                 b"outside bytes must survive"
             );
             assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+            assert_eq!(fs::read_link(&link).unwrap(), target);
         }
     }
 
