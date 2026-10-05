@@ -587,6 +587,7 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         fs::create_dir_all(handle.dir.join(directory)).unwrap();
     }
     let command = "python /home/private-customer/work.py --token AKIAIOSFODNN7EXAMPLE";
+    let local_command = "python /home/local-user/work.py --verbose";
     let plan = serde_json::json!({
         "session_id": session_id.0,
         "scan": {"total_processes": 42},
@@ -606,7 +607,11 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
     for (path, payload) in [
         (
             "scan/inventory.json",
-            serde_json::json!({"records": [{"pid": 1234, "cmd": command}]}),
+            serde_json::json!({"records": [
+                {"pid": 1234, "cmd": command},
+                {"pid": 1235, "cmd": local_command,
+                 "cwd": "/home/local-user/project", "username": "local-user"}
+            ]}),
         ),
         (
             "inference/results.json",
@@ -788,24 +793,78 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
     );
     let original_path = data_dir.join("original-signatures.json");
     fs::write(&original_path, original.to_json().unwrap()).unwrap();
-    let mut forensic_policy = pt_redact::RedactionPolicy::default();
-    forensic_policy.field_rules.insert(
-        "free_text".to_string(),
-        pt_redact::FieldRule::new(pt_redact::Action::Allow),
-    );
-    let mut forensic_writer = pt_bundle::BundleWriter::new(
-        &session_id.0,
-        "original-signature-host",
-        pt_redact::ExportProfile::Forensic,
+    let forensic_producer_config = data_dir.join("forensic-producer-config");
+    fs::create_dir_all(&forensic_producer_config).unwrap();
+    fs::write(
+        pt_core::signature_cli::user_signatures_path(&forensic_producer_config),
+        original.to_json().unwrap(),
     )
-    .with_redaction_engine(pt_redact::RedactionEngine::new(forensic_policy).unwrap());
-    forensic_writer.add_file(
-        pt_core::signature_cli::BUNDLE_SIGNATURES_PATH,
-        original.to_json().unwrap().into_bytes(),
-        Some(pt_bundle::FileType::Json),
-    );
+    .unwrap();
     let forensic_path = data_dir.join("original-signatures.ptb");
-    forensic_writer.write(&forensic_path).unwrap();
+    // Exercise the default production writer through the CLI. A custom
+    // library redaction engine would conceal a missing Forensic allowlist.
+    let forensic_export = pt_core()
+        .env("PROCESS_TRIAGE_DATA", &data_dir)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(&forensic_producer_config)
+        .args([
+            "--format",
+            "json",
+            "bundle",
+            "create",
+            "--profile",
+            "forensic",
+            "--session",
+            &session_id.0,
+            "--output",
+        ])
+        .arg(&forensic_path)
+        .assert();
+    fs::write(
+        data_dir.join("forensic-create.stdout.json"),
+        &forensic_export.get_output().stdout,
+    )
+    .unwrap();
+    fs::write(
+        data_dir.join("forensic-create.stderr"),
+        &forensic_export.get_output().stderr,
+    )
+    .unwrap();
+    forensic_export.success();
+    let mut forensic_reader = pt_bundle::BundleReader::open(&forensic_path).unwrap();
+    assert_eq!(
+        forensic_reader.export_profile(),
+        pt_redact::ExportProfile::Forensic
+    );
+    assert!(forensic_reader.verify_all().is_empty());
+    let archived_original: SignatureSchema = forensic_reader
+        .read_json(pt_core::signature_cli::BUNDLE_SIGNATURES_PATH)
+        .unwrap();
+    archived_original.validate_for_activation().unwrap();
+    assert_eq!(archived_original, original);
+    let forensic_context: Value = forensic_reader.read_json("session/context.json").unwrap();
+    assert_eq!(forensic_context["host_id"], "private-customer-host");
+    let forensic_inventory: Value = forensic_reader.read_json("scan/inventory.json").unwrap();
+    assert_eq!(forensic_inventory["payload"]["records"][0]["cmd"], "[REDACTED]");
+    assert_eq!(forensic_inventory["payload"]["records"][1]["cmd"], local_command);
+    assert_eq!(
+        forensic_inventory["payload"]["records"][1]["cwd"],
+        "/home/local-user/project"
+    );
+    assert_eq!(forensic_inventory["payload"]["records"][1]["username"], "local-user");
+    let forensic_plan: Value = forensic_reader.read_json("plan.json").unwrap();
+    assert_eq!(forensic_plan["candidates"][0]["command"], "[REDACTED]");
+    assert_eq!(forensic_plan["candidates"][0]["environment"], "[REDACTED]");
+    let forensic_entries = forensic_reader.manifest().files.clone();
+    for entry in forensic_entries {
+        let bytes = forensic_reader.read_verified(&entry.path).unwrap();
+        assert!(
+            !String::from_utf8(bytes).unwrap().contains("AKIAIOSFODNN7EXAMPLE"),
+            "Forensic credential leaked in {}",
+            entry.path
+        );
+    }
     pt_core()
         .arg("--config")
         .arg(&positive_config)
@@ -813,9 +872,8 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         .arg(&original_path)
         .assert()
         .success();
-    // Exercise the archive activation route too, with a deliberately intact
-    // Forensic matcher in a separate config: the raw import must not supply the
-    // match that is supposed to prove archive activation.
+    // Activate the CLI-produced archive in a separate config: the raw import
+    // must not supply the match that is supposed to prove archive activation.
     let forensic_config = data_dir.join("forensic-import-config");
     pt_core()
         .arg("--config")
