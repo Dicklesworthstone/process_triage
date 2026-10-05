@@ -400,7 +400,14 @@ mod tests {
             "password": "private-password-value"
         });
         let forensic = engine.redact_json_for_export(&input, ExportProfile::Forensic);
-        for field in ["cmd", "cwd", "hostname", "username", "cmd_pattern", "patterns"] {
+        for field in [
+            "cmd",
+            "cwd",
+            "hostname",
+            "username",
+            "cmd_pattern",
+            "patterns",
+        ] {
             assert_eq!(forensic[field], input[field], "forensic field {field}");
         }
         assert_eq!(forensic["args"][0], "--verbose");
@@ -428,6 +435,44 @@ mod tests {
             safe["patterns"]["process_names"][0],
             input["patterns"]["process_names"][0]
         );
+    }
+
+    #[test]
+    fn default_forensic_value_apis_preserve_text_without_bypassing_secret_detection() {
+        let engine = crate::RedactionEngine::with_key(
+            RedactionPolicy::default(),
+            crate::KeyMaterial::from_bytes([0; 32], "test"),
+        );
+        for (value, class) in [
+            ("python /home/local-user/work.py", FieldClass::Cmdline),
+            ("--verbose", FieldClass::CmdlineArg),
+            ("^local-worker$", FieldClass::FreeText),
+        ] {
+            assert_eq!(
+                engine
+                    .redact_with_profile(value, class, ExportProfile::Forensic)
+                    .output,
+                value
+            );
+        }
+        let mut forensic_policy = RedactionPolicy::default();
+        forensic_policy.default_profile = ExportProfile::Forensic;
+        let default_forensic = crate::RedactionEngine::with_key(
+            forensic_policy,
+            crate::KeyMaterial::from_bytes([0; 32], "test"),
+        );
+        for class in [
+            FieldClass::Cmdline,
+            FieldClass::CmdlineArg,
+            FieldClass::FreeText,
+        ] {
+            for secret in ["AKIAIOSFODNN7EXAMPLE", "--token=local-secret"] {
+                let explicit = engine.redact_with_profile(secret, class, ExportProfile::Forensic);
+                assert!(!explicit.output.contains(secret), "explicit {class} secret");
+                let implicit = default_forensic.redact(secret, class);
+                assert!(!implicit.output.contains(secret), "default {class} secret");
+            }
+        }
     }
 
     #[test]

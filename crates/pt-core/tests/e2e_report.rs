@@ -846,13 +846,22 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
     let forensic_context: Value = forensic_reader.read_json("session/context.json").unwrap();
     assert_eq!(forensic_context["host_id"], "private-customer-host");
     let forensic_inventory: Value = forensic_reader.read_json("scan/inventory.json").unwrap();
-    assert_eq!(forensic_inventory["payload"]["records"][0]["cmd"], "[REDACTED]");
-    assert_eq!(forensic_inventory["payload"]["records"][1]["cmd"], local_command);
+    assert_eq!(
+        forensic_inventory["payload"]["records"][0]["cmd"],
+        "[REDACTED]"
+    );
+    assert_eq!(
+        forensic_inventory["payload"]["records"][1]["cmd"],
+        local_command
+    );
     assert_eq!(
         forensic_inventory["payload"]["records"][1]["cwd"],
         "/home/local-user/project"
     );
-    assert_eq!(forensic_inventory["payload"]["records"][1]["username"], "local-user");
+    assert_eq!(
+        forensic_inventory["payload"]["records"][1]["username"],
+        "local-user"
+    );
     let forensic_plan: Value = forensic_reader.read_json("plan.json").unwrap();
     assert_eq!(forensic_plan["candidates"][0]["command"], "[REDACTED]");
     assert_eq!(forensic_plan["candidates"][0]["environment"], "[REDACTED]");
@@ -860,7 +869,9 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
     for entry in forensic_entries {
         let bytes = forensic_reader.read_verified(&entry.path).unwrap();
         assert!(
-            !String::from_utf8(bytes).unwrap().contains("AKIAIOSFODNN7EXAMPLE"),
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains("AKIAIOSFODNN7EXAMPLE"),
             "Forensic credential leaked in {}",
             entry.path
         );
