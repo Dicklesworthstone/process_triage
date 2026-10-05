@@ -555,7 +555,11 @@ mod provenance {
         let mut per_process_resources: Vec<(u32, Vec<pt_common::RawResourceEvidence>)> = Vec::new();
         let mut all_resources = Vec::new();
         // One socket-table snapshot for the whole scan (was re-parsed per process).
-        let network_snapshot = NetworkSnapshot::collect();
+        let network_snapshot = if processes.is_empty() {
+            NetworkSnapshot::default()
+        } else {
+            NetworkSnapshot::collect()
+        };
 
         for proc in processes {
             let pid = proc.pid.0;

@@ -4,13 +4,16 @@
 
 use super::types::{EvidenceType, SupervisionEvidence, SupervisorCategory};
 #[cfg(target_os = "linux")]
-use crate::collect::network::parse_proc_net_unix;
+use crate::collect::network::{has_inet_socket_inode, parse_proc_net_unix};
+#[cfg(target_os = "linux")]
+use crate::collect::proc_parsers::read_required_proc_stat;
+use crate::collect::proc_parsers::StatReadError;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
@@ -20,9 +23,10 @@ use thiserror::Error;
 /// Errors from IPC detection.
 #[derive(Debug, Error)]
 pub enum IpcError {
-    #[error("I/O error reading /proc/{pid}/fd: {source}")]
+    #[error("I/O error reading {path} for PID {pid}: {source}")]
     IoError {
         pid: u32,
+        path: String,
         #[source]
         source: std::io::Error,
     },
@@ -32,6 +36,25 @@ pub enum IpcError {
 
     #[error("Permission denied reading /proc/{0}/fd")]
     PermissionDenied(u32),
+
+    #[error("Invalid IPC evidence at {path} for PID {pid}: {reason}")]
+    Parse {
+        pid: u32,
+        path: String,
+        reason: String,
+    },
+
+    #[error("IPC identity evidence failed: {0}")]
+    Identity(#[from] StatReadError),
+
+    #[error("Process {0} changed while reading IPC evidence")]
+    ProcessChanged(u32),
+
+    #[error("IPC evidence for PID {0} is unsupported on this platform")]
+    Unsupported(u32),
+
+    #[error("IPC protocol or socket namespace is unknown for PID {pid}, inode {inode}")]
+    UnclassifiedSocket { pid: u32, inode: u64 },
 }
 
 /// Pattern for detecting supervisor IPC sockets.
@@ -262,53 +285,87 @@ impl IpcDatabase {
 /// Read socket paths connected by a process.
 #[cfg(target_os = "linux")]
 pub fn read_socket_paths(pid: u32) -> Result<Vec<String>, IpcError> {
+    read_socket_paths_with_refresh(pid, false)
+}
+
+#[cfg(target_os = "linux")]
+fn read_socket_paths_with_refresh(pid: u32, refresh: bool) -> Result<Vec<String>, IpcError> {
+    let before = read_required_proc_stat(pid)?;
     let fd_dir = format!("/proc/{}/fd", pid);
-    let fd_path = Path::new(&fd_dir);
-
-    if !fd_path.exists() {
-        return Err(IpcError::ProcessNotFound(pid));
-    }
-
-    let entries = fs::read_dir(fd_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            IpcError::PermissionDenied(pid)
-        } else {
-            IpcError::IoError { pid, source: e }
-        }
+    let entries = fs::read_dir(&fd_dir).map_err(|source| IpcError::IoError {
+        pid,
+        path: fd_dir.clone(),
+        source,
     })?;
 
     let mut sockets = Vec::new();
     let mut socket_inodes = Vec::new();
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|source| IpcError::IoError {
+            pid,
+            path: fd_dir.clone(),
+            source,
+        })?;
         // Read the symlink target
-        if let Ok(target) = fs::read_link(entry.path()) {
-            let target_str = target.to_string_lossy();
+        let target = fs::read_link(entry.path()).map_err(|source| IpcError::IoError {
+            pid,
+            path: entry.path().display().to_string(),
+            source,
+        })?;
+        let target_str = target.to_str().ok_or_else(|| IpcError::Parse {
+            pid,
+            path: entry.path().display().to_string(),
+            reason: "invalid descriptor-link UTF-8".to_string(),
+        })?;
 
-            // A socket descriptor: its bound path (if any) is in /proc/net/unix.
-            if let Some(inode) = target_str
-                .strip_prefix("socket:[")
-                .and_then(|s| s.strip_suffix(']'))
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                socket_inodes.push(inode);
-                continue;
-            }
+        // A socket descriptor: its bound path (if any) is in /proc/net/unix.
+        if let Some(value) = target_str.strip_prefix("socket:[") {
+            let inode = value
+                .strip_suffix(']')
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| IpcError::Parse {
+                    pid,
+                    path: entry.path().display().to_string(),
+                    reason: "invalid socket inode link".to_string(),
+                })?;
+            socket_inodes.push(inode);
+            continue;
+        }
 
-            // Check for Unix socket paths
-            if target_str.starts_with('/') || target_str.starts_with('@') {
-                sockets.push(target_str.to_string());
-            }
+        // Check for Unix socket paths
+        if target_str.starts_with('/') || target_str.starts_with('@') {
+            sockets.push(target_str.to_string());
         }
     }
 
     if !socket_inodes.is_empty() {
-        let table = unix_socket_paths_by_inode();
-        sockets.extend(
-            socket_inodes
+        let mut table = unix_socket_paths_by_inode(pid, refresh)?;
+        if !refresh
+            && socket_inodes
                 .iter()
-                .filter_map(|inode| table.get(inode).cloned()),
-        );
+                .any(|inode| table.get(inode).is_none_or(|path| path.is_none()))
+        {
+            table = unix_socket_paths_by_inode(pid, true)?;
+        }
+        for inode in socket_inodes {
+            if let Some(path) = table.get(&inode) {
+                if let Some(path) = path {
+                    sockets.push(path.clone());
+                }
+            } else if !has_inet_socket_inode(pid, inode).map_err(|source| IpcError::IoError {
+                pid,
+                path: format!("/proc/{pid}/net TCP/UDP tables"),
+                source,
+            })? {
+                return Err(IpcError::UnclassifiedSocket { pid, inode });
+            }
+        }
+    }
+
+    let after = read_required_proc_stat(pid)?;
+    if after.starttime != before.starttime {
+        return Err(IpcError::ProcessChanged(pid));
     }
 
     Ok(sockets)
@@ -318,41 +375,66 @@ pub fn read_socket_paths(pid: u32) -> Result<Vec<String>, IpcError> {
 #[cfg(target_os = "linux")]
 const UNIX_TABLE_TTL: Duration = Duration::from_secs(2);
 
-/// Bound path of every unix socket, by inode, from /proc/net/unix. Supervision
-/// detection asks for it once per candidate; re-parsing the whole table each time made
-/// a plan O(candidates x sockets), which on a busy build host (tens of thousands of
-/// sockets, every /proc/<pid>/fd readable as root) ran past test timeouts. One parse is
-/// shared for `UNIX_TABLE_TTL`, so a long-running daemon still sees fresh data.
+/// A successful table in one observed network namespace. Cached positives can
+/// conservatively block; the analyzer refreshes before admitting a negative.
 #[cfg(target_os = "linux")]
-fn unix_socket_paths_by_inode() -> Arc<HashMap<u64, String>> {
-    type CachedUnixSocketPaths = Option<(Instant, Arc<HashMap<u64, String>>)>;
-    static CACHE: Mutex<CachedUnixSocketPaths> = Mutex::new(None);
+struct CachedUnixSocketPaths {
+    namespace: (u64, u64),
+    parsed_at: Instant,
+    table: Arc<HashMap<u64, Option<String>>>,
+}
+
+#[cfg(target_os = "linux")]
+fn unix_socket_paths_by_inode(
+    pid: u32,
+    refresh: bool,
+) -> Result<Arc<HashMap<u64, Option<String>>>, IpcError> {
+    static CACHE: Mutex<Option<CachedUnixSocketPaths>> = Mutex::new(None);
+    let namespace_path = format!("/proc/{pid}/ns/net");
+    let namespace = fs::metadata(&namespace_path).map_err(|source| IpcError::IoError {
+        pid,
+        path: namespace_path.clone(),
+        source,
+    })?;
+    let namespace = (namespace.dev(), namespace.ino());
     let mut cached = CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((parsed_at, table)) = cached.as_ref() {
-        if parsed_at.elapsed() < UNIX_TABLE_TTL {
-            return Arc::clone(table);
+    if let Some(entry) = cached.as_ref() {
+        if !refresh && entry.namespace == namespace && entry.parsed_at.elapsed() < UNIX_TABLE_TTL {
+            return Ok(Arc::clone(&entry.table));
         }
     }
-    let table: HashMap<u64, String> = parse_proc_net_unix("/proc/net/unix")
-        .unwrap_or_default()
+    let table_path = format!("/proc/{pid}/net/unix");
+    let table: HashMap<u64, Option<String>> = parse_proc_net_unix(&table_path)
+        .map_err(|source| IpcError::IoError {
+            pid,
+            path: table_path,
+            source,
+        })?
         .into_iter()
-        .filter_map(|socket| {
-            socket
-                .path
-                .filter(|path| !path.is_empty())
-                .map(|path| (socket.inode, path))
-        })
+        .map(|socket| (socket.inode, socket.path.filter(|path| !path.is_empty())))
         .collect();
+    let after_namespace = fs::metadata(&namespace_path).map_err(|source| IpcError::IoError {
+        pid,
+        path: namespace_path,
+        source,
+    })?;
+    if (after_namespace.dev(), after_namespace.ino()) != namespace {
+        return Err(IpcError::ProcessChanged(pid));
+    }
     let table = Arc::new(table);
-    *cached = Some((Instant::now(), Arc::clone(&table)));
-    table
+    *cached = Some(CachedUnixSocketPaths {
+        namespace,
+        parsed_at: Instant::now(),
+        table: Arc::clone(&table),
+    });
+    Ok(table)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn read_socket_paths(_pid: u32) -> Result<Vec<String>, IpcError> {
-    Ok(vec![])
+pub fn read_socket_paths(pid: u32) -> Result<Vec<String>, IpcError> {
+    Err(IpcError::Unsupported(pid))
 }
 
 /// Analyzer for IPC-based supervision detection.
@@ -376,7 +458,14 @@ impl IpcAnalyzer {
     /// Analyze a process for supervision via IPC.
     pub fn analyze(&self, pid: u32) -> Result<IpcResult, IpcError> {
         let sockets = read_socket_paths(pid)?;
-        Ok(self.analyze_sockets(&sockets))
+        let result = self.analyze_sockets(&sockets);
+        #[cfg(target_os = "linux")]
+        if !result.is_supervised {
+            // A cached positive can conservatively block; absence needs a fresh table.
+            let sockets = read_socket_paths_with_refresh(pid, true)?;
+            return Ok(self.analyze_sockets(&sockets));
+        }
+        Ok(result)
     }
 
     /// Analyze a list of socket paths.
@@ -454,9 +543,18 @@ mod tests {
         let wanted = path.to_string_lossy().to_string();
         assert!(sockets.contains(&wanted), "{wanted} not in {sockets:?}");
 
-        let first = unix_socket_paths_by_inode();
-        let second = unix_socket_paths_by_inode();
+        let first = unix_socket_paths_by_inode(std::process::id(), false).unwrap();
+        let second = unix_socket_paths_by_inode(std::process::id(), false).unwrap();
         assert!(Arc::ptr_eq(&first, &second), "parsed twice within the TTL");
+
+        // A bind after the warm table must not disappear into cached absence.
+        let later = dir.path().join("pt-later.sock");
+        let _later_listener = std::os::unix::net::UnixListener::bind(&later).unwrap();
+        assert!(read_socket_paths(std::process::id())
+            .unwrap()
+            .contains(&later.to_string_lossy().to_string()));
+        let error = unix_socket_paths_by_inode(u32::MAX, true).unwrap_err();
+        assert!(matches!(error, IpcError::IoError { pid, .. } if pid == u32::MAX));
     }
 
     #[test]
