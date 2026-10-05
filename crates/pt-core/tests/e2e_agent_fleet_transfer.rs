@@ -5,7 +5,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use pt_bundle::{BundleReader, BundleWriter, ExportProfile, FileEntry, FileType};
-use pt_config::priors::Priors;
+use pt_config::priors::{BetaParams, Priors};
 use pt_core::fleet::transfer::{validate_bundle, BaselineStats, TransferBundle};
 use pt_core::supervision::pattern_persistence::{PatternLibrary, PatternLifecycle};
 use pt_core::supervision::signature::{
@@ -320,6 +320,155 @@ fn fleet_transfer_json_export_import_replace_roundtrip() {
         !defaults_config.join("priors.json").exists(),
         "default export wrote config"
     );
+
+    // Preview actual strategy results for distinct configurations, then compare
+    // those same previewed values with the priors saved by real CLI imports.
+    let preview_source = temp.join("preview-source");
+    let preview_path = temp.join("actual-preview-transfer.json");
+    let artifacts = temp.join("artifacts");
+    let mut incoming = priors_with_useful_prob(0.62, 0.11, 0.19, 0.08);
+    incoming.classes.useful.cpu_beta = BetaParams::new(20.0, 80.0);
+    write_priors(&preview_source, &incoming);
+    let mut export = transfer_command(&preview_source);
+    export.args(["export", "--out"]).arg(&preview_path);
+    let out = run_retained(export, &artifacts, "preview-source-export");
+    assert!(
+        out.status.success(),
+        "preview source export failed: {out:?}"
+    );
+    let incoming_bytes = fs::read(&preview_path).expect("actual preview input bytes");
+    let supplied: TransferBundle =
+        serde_json::from_slice(&incoming_bytes).expect("typed actual preview export");
+    validate_bundle(&supplied).expect("supplied preview checksum validates unchanged");
+    let mut local = priors_with_useful_prob(0.30, 0.20, 0.30, 0.20);
+    local.classes.useful.cpu_beta = BetaParams::new(4.0, 16.0);
+    for (strategy, expected_probability, expected_alpha, expected_beta) in [
+        ("weighted", 0.46, 12.0, 48.0),
+        ("replace", 0.62, 20.0, 80.0),
+        ("keep-local", 0.30, 4.0, 16.0),
+    ] {
+        let target = temp.join(format!("preview-{strategy}"));
+        write_priors(&target, &local);
+        let before = config_snapshot(&target);
+        let mut comparison = transfer_command(&target);
+        comparison.args(["diff", "--from"]).arg(&preview_path);
+        let out = run_retained(
+            comparison,
+            &artifacts,
+            &format!("preview-{strategy}-comparison"),
+        );
+        assert!(out.status.success(), "comparison failed: {out:?}");
+        let response: Value = serde_json::from_slice(&out.stdout).expect("comparison JSON");
+        let comparison_changes = response["diff"]["priors_changes"]
+            .as_array()
+            .expect("comparison changes");
+        assert!(
+            !comparison_changes.is_empty(),
+            "distinct inputs had no diff"
+        );
+        assert!(comparison_changes
+            .iter()
+            .all(|change| change.get("merged_value") == Some(&Value::Null)));
+        assert_eq!(config_snapshot(&target), before);
+
+        let mut preview = transfer_command(&target);
+        preview.args(["import", "--from"]).arg(&preview_path).args([
+            "--merge-strategy",
+            strategy,
+            "--dry-run",
+        ]);
+        let out = run_retained(preview, &artifacts, &format!("preview-{strategy}-dry-run"));
+        assert!(out.status.success(), "strategy dry-run failed: {out:?}");
+        let preview: Value = serde_json::from_slice(&out.stdout).expect("strategy preview JSON");
+        assert_eq!(preview["dry_run"], true);
+        let changes = preview["diff"]["details"]["priors_changes"]
+            .as_array()
+            .expect("preview changes");
+        for (field, local_value, incoming_value, expected) in [
+            ("prior_prob", 0.30, 0.62, expected_probability),
+            ("cpu_beta.alpha", 4.0, 20.0, expected_alpha),
+            ("cpu_beta.beta", 16.0, 80.0, expected_beta),
+        ] {
+            let matching: Vec<_> = changes
+                .iter()
+                .filter(|change| change["class"] == "useful" && change["field"] == field)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "missing/duplicate useful {field} preview"
+            );
+            let change = matching[0];
+            assert_prob(
+                change["local_value"].as_f64().expect("local preview value"),
+                local_value,
+            );
+            assert_prob(
+                change["incoming_value"]
+                    .as_f64()
+                    .expect("incoming preview value"),
+                incoming_value,
+            );
+            assert_prob(
+                change["merged_value"]
+                    .as_f64()
+                    .expect("actual merged preview value"),
+                expected,
+            );
+        }
+        assert_eq!(config_snapshot(&target), before, "dry-run modified config");
+
+        let mut import = transfer_command(&target);
+        import.args(["import", "--from"]).arg(&preview_path).args([
+            "--merge-strategy",
+            strategy,
+            "--no-backup",
+        ]);
+        let out = run_retained(import, &artifacts, &format!("preview-{strategy}-live"));
+        assert!(out.status.success(), "strategy live import failed: {out:?}");
+        let saved: Priors = serde_json::from_slice(
+            &fs::read(target.join("priors.json")).expect("read actual strategy priors"),
+        )
+        .expect("parse actual saved strategy priors");
+        pt_config::validate::validate_priors(&saved).expect("actual saved strategy priors valid");
+        for (field, actual, expected) in [
+            (
+                "prior_prob",
+                saved.classes.useful.prior_prob,
+                expected_probability,
+            ),
+            (
+                "cpu_beta.alpha",
+                saved.classes.useful.cpu_beta.alpha,
+                expected_alpha,
+            ),
+            (
+                "cpu_beta.beta",
+                saved.classes.useful.cpu_beta.beta,
+                expected_beta,
+            ),
+        ] {
+            let change = changes
+                .iter()
+                .find(|change| change["class"] == "useful" && change["field"] == field)
+                .expect("same previewed field");
+            assert_prob(actual, expected);
+            assert_prob(
+                actual,
+                change["merged_value"]
+                    .as_f64()
+                    .expect("previewed saved value"),
+            );
+        }
+        assert_eq!(
+            fs::read(&preview_path).expect("unchanged actual CLI input"),
+            incoming_bytes
+        );
+        let unchanged: TransferBundle =
+            serde_json::from_slice(&incoming_bytes).expect("unchanged supplied export");
+        assert_eq!(unchanged.checksum, supplied.checksum);
+        validate_bundle(&unchanged).expect("original supplied checksum remains valid");
+    }
 }
 
 #[test]
@@ -673,6 +822,7 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
             .expect("typed actual export");
     validate_bundle(&valid).expect("actual export valid without checksum replacement");
     let canary = format!("ghp_{}", "a".repeat(36));
+    let baseline_refusal = "baseline normalization requires comparable measured learning observations; local baseline evidence is unavailable";
 
     for (case, expected_reason) in [
         ("redacted-active", "redacted matcher"),
@@ -815,9 +965,9 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
         }
     }
 
-    // Incoming parameters are finite and valid. The real CLI target baseline
-    // has 5000 observations, so this source count clamps normalization to 10x;
-    // scaling alpha=1e308 overflows only during the requested import transform.
+    // Finite incoming parameters and a supplied source baseline cannot stand in
+    // for comparable measured local learning observations. Normalization must
+    // refuse before both dry-run and persistence, rather than invent exposure.
     let mut normalization = valid.clone();
     normalization
         .priors
@@ -838,7 +988,7 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
     validate_bundle(&normalization).expect("finite normalization input validates");
     let payload = serde_json::to_vec_pretty(&normalization).expect("finite normalization input");
     for extension in ["json", "ptb"] {
-        let input = temp.join(format!("normalization-overflow.{extension}"));
+        let input = temp.join(format!("normalization-large-finite.{extension}"));
         if extension == "ptb" {
             let mut writer = BundleWriter::new("transfer", "host-fixture", ExportProfile::Forensic);
             writer.add_file(
@@ -886,28 +1036,26 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
                 command.arg("--dry-run");
             }
             let step = format!(
-                "overflow-{extension}-{}",
+                "large-finite-normalize-refused-{extension}-{}",
                 if dry_run { "dry-run" } else { "live" }
             );
             let out = run_retained(command, &artifacts, &step);
             assert!(
                 !out.status.success(),
-                "overflowing normalized priors accepted: {out:?}"
+                "normalization accepted without measured local evidence: {out:?}"
             );
-            let diagnostic = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
+            assert_eq!(
+                out.status.code(),
+                Some(pt_core::exit_codes::ExitCode::ArgsError.as_i32())
             );
-            assert!(
-                diagnostic.contains("classes.useful.cpu_beta.alpha"),
-                "{diagnostic}"
-            );
-            assert!(diagnostic.contains("finite and positive"), "{diagnostic}");
+            let response: Value =
+                serde_json::from_slice(&out.stdout).expect("normalization refusal JSON");
+            assert_eq!(response["status"], "error");
+            assert_eq!(response["error"].as_str(), Some(baseline_refusal));
             assert_eq!(
                 config_snapshot(&target_dir),
                 before,
-                "normalized import wrote invalid config"
+                "refused normalization modified config"
             );
             assert_eq!(
                 fs::read(&input).expect("unchanged finite input"),
@@ -916,8 +1064,8 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
         }
     }
 
-    // A bounded finite neighbor must succeed through the same 10x transform,
-    // including actual persistence, rather than proving only rejection.
+    // Ordinary intact configuration still transfers without normalization.
+    // Refusal-only normalization does not establish its positive capability.
     let mut finite = normalization.clone();
     finite
         .priors
@@ -928,8 +1076,8 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
         .cpu_beta
         .alpha = 2.0;
     checksum_planted_fixture(&mut finite);
-    validate_bundle(&finite).expect("finite transform input validates");
-    let payload = serde_json::to_vec_pretty(&finite).expect("finite transform payload");
+    validate_bundle(&finite).expect("ordinary finite input validates");
+    let payload = serde_json::to_vec_pretty(&finite).expect("finite intact payload");
     for extension in ["json", "ptb"] {
         let finite_target = temp.join(format!("finite-target-{extension}"));
         write_priors(&finite_target, &Priors::default());
@@ -942,10 +1090,8 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
                 payload.clone(),
                 Some(FileType::Binary),
             );
-            writer
-                .write(&input)
-                .expect("write finite transform archive");
-            let mut reader = BundleReader::open(&input).expect("open finite transform archive");
+            writer.write(&input).expect("write finite intact archive");
+            let mut reader = BundleReader::open(&input).expect("open finite intact archive");
             assert_eq!(
                 reader
                     .read_verified("transfer_bundle.json")
@@ -953,9 +1099,9 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
                 payload
             );
         } else {
-            fs::write(&input, &payload).expect("write finite transform JSON");
+            fs::write(&input, &payload).expect("write finite intact JSON");
         }
-        let input_before = fs::read(&input).expect("finite transform bytes");
+        let input_before = fs::read(&input).expect("finite intact bytes");
         for dry_run in [true, false] {
             let mut command = transfer_command(&finite_target);
             command.args(["import", "--from"]).arg(&input).args([
@@ -968,42 +1114,145 @@ fn fleet_transfer_import_and_diff_refuse_invalid_intact_configuration() {
                 command.arg("--dry-run");
             }
             let step = format!(
-                "normalized-finite-{extension}-{}",
+                "ordinary-normalize-refused-{extension}-{}",
                 if dry_run { "dry-run" } else { "live" }
             );
             let out = run_retained(command, &artifacts, &step);
-            assert!(
-                out.status.success(),
-                "finite normalized import failed: {out:?}"
+            assert_eq!(
+                out.status.code(),
+                Some(pt_core::exit_codes::ExitCode::ArgsError.as_i32())
             );
+            let response: Value =
+                serde_json::from_slice(&out.stdout).expect("ordinary normalization refusal JSON");
+            assert_eq!(response["status"], "error");
+            assert_eq!(response["error"].as_str(), Some(baseline_refusal));
+            assert_eq!(config_snapshot(&finite_target), before_finite);
+            assert_eq!(
+                fs::read(&input).expect("unchanged finite input"),
+                input_before
+            );
+        }
+        for dry_run in [true, false] {
+            let mut command = transfer_command(&finite_target);
+            command.args(["import", "--from"]).arg(&input).args([
+                "--merge-strategy",
+                "replace",
+                "--no-backup",
+            ]);
+            if dry_run {
+                command.arg("--dry-run");
+            }
+            let step = format!(
+                "unscaled-finite-{extension}-{}",
+                if dry_run { "dry-run" } else { "live" }
+            );
+            let out = run_retained(command, &artifacts, &step);
+            assert!(out.status.success(), "finite intact import failed: {out:?}");
             if dry_run {
                 assert_eq!(config_snapshot(&finite_target), before_finite);
             } else {
                 let imported: Priors = serde_json::from_slice(
                     &fs::read(finite_target.join("priors.json"))
-                        .expect("read normalized saved priors"),
+                        .expect("read actual unscaled saved priors"),
                 )
-                .expect("parse actual normalized saved priors");
+                .expect("parse actual unscaled saved priors");
                 pt_config::validate::validate_priors(&imported)
-                    .expect("persisted normalized priors valid");
-                assert_prob(imported.classes.useful.cpu_beta.alpha, 20.0);
+                    .expect("persisted unscaled priors valid");
+                assert_prob(imported.classes.useful.cpu_beta.alpha, 2.0);
                 let source_priors = finite.priors.as_ref().expect("source priors");
                 assert_prob(
                     imported.classes.useful.cpu_beta.beta,
-                    source_priors.classes.useful.cpu_beta.beta * 10.0,
+                    source_priors.classes.useful.cpu_beta.beta,
                 );
                 assert_prob(
                     imported.classes.useful.prior_prob,
                     source_priors.classes.useful.prior_prob,
                 );
+                assert_eq!(
+                    serde_json::to_value(&imported).expect("saved intact priors"),
+                    serde_json::to_value(source_priors).expect("source intact priors")
+                );
                 let mut imported_library = PatternLibrary::new(&finite_target);
                 imported_library
                     .load()
                     .expect("load finite imported signature");
-                assert!(imported_library.get_pattern("incoming").is_some());
+                let imported_signature = &imported_library
+                    .get_pattern("incoming")
+                    .expect("imported intact signature")
+                    .signature;
+                assert_eq!(
+                    imported_signature,
+                    &finite
+                        .signatures
+                        .as_ref()
+                        .expect("source signatures")
+                        .patterns[0]
+                        .signature
+                );
+                let mut database = SignatureDatabase::new();
+                database
+                    .add(imported_signature.clone())
+                    .expect("activate actual imported signature");
+                assert_eq!(
+                    database
+                        .match_process(&ProcessMatchContext::with_comm("incoming"))
+                        .len(),
+                    1
+                );
+                assert!(database
+                    .match_process(&ProcessMatchContext::with_comm("unrelated"))
+                    .is_empty());
             }
             assert_eq!(
                 fs::read(&input).expect("unchanged finite input"),
+                input_before
+            );
+        }
+    }
+
+    // Missing source evidence is also an explicit refusal, never a silent
+    // no-op normalization followed by successful configuration persistence.
+    assert!(valid.baseline_stats.is_none());
+    let payload = fs::read(&valid_path).expect("original source export without baseline");
+    for extension in ["json", "ptb"] {
+        let input = temp.join(format!("normalization-missing-source.{extension}"));
+        if extension == "ptb" {
+            let mut writer = BundleWriter::new("transfer", "host-fixture", ExportProfile::Forensic);
+            writer.add_file(
+                "transfer_bundle.json",
+                payload.clone(),
+                Some(FileType::Binary),
+            );
+            writer.write(&input).expect("write missing-source archive");
+        } else {
+            fs::write(&input, &payload).expect("write missing-source JSON");
+        }
+        let input_before = fs::read(&input).expect("missing-source input bytes");
+        for dry_run in [true, false] {
+            let mut command = transfer_command(&target_dir);
+            command
+                .args(["import", "--from"])
+                .arg(&input)
+                .arg("--normalize-baseline");
+            if dry_run {
+                command.arg("--dry-run");
+            }
+            let step = format!(
+                "missing-source-refused-{extension}-{}",
+                if dry_run { "dry-run" } else { "live" }
+            );
+            let out = run_retained(command, &artifacts, &step);
+            assert_eq!(
+                out.status.code(),
+                Some(pt_core::exit_codes::ExitCode::ArgsError.as_i32())
+            );
+            let response: Value =
+                serde_json::from_slice(&out.stdout).expect("missing-source refusal JSON");
+            assert_eq!(response["status"], "error");
+            assert_eq!(response["error"].as_str(), Some(baseline_refusal));
+            assert_eq!(config_snapshot(&target_dir), before);
+            assert_eq!(
+                fs::read(&input).expect("unchanged missing-source input"),
                 input_before
             );
         }
