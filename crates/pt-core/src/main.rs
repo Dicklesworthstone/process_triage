@@ -16893,33 +16893,35 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
-    let saved_min_age = match saved_document.pointer("/policy_snapshot/min_process_age_seconds") {
-        Some(value) => match value.as_u64() {
-            Some(age) => age,
-            None => {
-                eprintln!("agent apply: invalid recorded minimum process age");
-                return ExitCode::InternalError;
-            }
-        },
-        None => config.policy.guardrails.min_process_age_seconds,
+    let invalid_policy_snapshot = |reason: String| {
+        eprintln!("agent apply: requires a valid recorded policy snapshot: {reason}");
+        println!(
+            "{}",
+            format_structured_output(
+                global,
+                serde_json::json!({"session_id": sid.0, "error": "invalid_policy_snapshot"}),
+            )
+        );
+        ExitCode::PolicyBlocked
     };
     let recorded_policy = match saved_document.get("policy_snapshot") {
         Some(snapshot) => match serde_json::from_value::<pt_core::config::Policy>(snapshot.clone())
         {
             Ok(policy) => Some(policy),
             Err(error) => {
-                eprintln!("agent apply: requires a valid recorded policy snapshot: {error}");
-                println!(
-                    "{}",
-                    format_structured_output(
-                        global,
-                        serde_json::json!({"session_id": sid.0, "error": "invalid_policy_snapshot"}),
-                    )
-                );
-                return ExitCode::PolicyBlocked;
+                return invalid_policy_snapshot(error.to_string());
             }
         },
         None => None,
+    };
+    let saved_min_age = match saved_document.pointer("/policy_snapshot/min_process_age_seconds") {
+        Some(value) => match value.as_u64() {
+            Some(age) => age,
+            None => {
+                return invalid_policy_snapshot("invalid recorded minimum process age".to_string());
+            }
+        },
+        None => config.policy.guardrails.min_process_age_seconds,
     };
     let has_policy_snapshot = recorded_policy.is_some();
     if config
@@ -17253,8 +17255,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         // Observe both policies' I/O windows concurrently. Each retains its
         // own threshold and cache; neither policy can disable the other's gate.
         std::thread::scope(|scope| {
+            let gated = gated.as_slice();
             for provider in &precheck_providers {
-                scope.spawn(|| provider.prime_recent_io(&gated));
+                scope.spawn(move || provider.prime_recent_io(gated));
             }
         });
     }
