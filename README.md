@@ -523,6 +523,15 @@ process_triage/
 
 The config directory is `$XDG_CONFIG_HOME/process_triage` (default `~/.config/process_triage`) on every platform; `--config` / `PT_CONFIG_DIR`, then `PROCESS_TRIAGE_CONFIG`, override it, and every file above (signatures included) follows the override. (Earlier releases kept `signatures.json`, `pattern_stats.json` and the `patterns/` files in `~/Library/Application Support/process_triage` on macOS; without an override pt still reads each one from there until the config directory has its own copy, and the next `signature` change or `agent fleet transfer import` saves the full contents to the config directory.) The data directory defaults to `~/.local/share/process_triage` on Linux and `~/Library/Application Support/process_triage` on macOS; `PROCESS_TRIAGE_DATA` or `XDG_DATA_HOME` override it.
 
+Fleet configuration transfer supports validated JSON and encrypted `.ptb` export,
+import and diff. An intact `.ptb` transfer requires explicit `--export-profile forensic`;
+Safe and Minimal are redacted sharing profiles and cannot activate configuration.
+Import refuses detected credentials and invalid priors or matchers. Import dry runs
+show the selected strategy's merged values for the reported prior fields. Baseline
+normalization remains unavailable: `--normalize-baseline` refuses until comparable
+measured learning observations are wired. A current process count cannot establish
+the evidence supporting transferred priors. Multi-file activation is not yet atomic.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -1014,7 +1023,7 @@ The `pt` script is a thin Bash wrapper that locates and execs `pt-core`:
 5. `/usr/local/bin/pt-core`
 6. PATH lookup via `which`
 
-**UI mode**: bare `pt` runs the TUI when it has a terminal; without one (or in robot mode) `pt run` exits 11 and points you to `pt agent plan`. The wrapper still accepts `--shell`/`--tui` and exports `PT_UI_MODE`, but pt-core currently ignores them.
+**UI mode**: bare `pt` runs the TUI when it has a terminal; without one (or in robot mode) `pt run` exits 11 and points you to `pt agent plan`. Use `pt scan` or `pt agent plan` for noninteractive output.
 
 **Built-in commands**:
 - `pt update` — Fetches the latest version and runs its installer with `--verify` (fails closed on unsigned releases; `--no-verify` overrides); `pt update rollback|list-backups|show-backup|verify-backup|prune-backups` manage pt-core backups

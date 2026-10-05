@@ -31,7 +31,20 @@ Exit codes communicate operation outcome without requiring output parsing.
 | 4 | `POLICY_BLOCKED` | Blocked by safety gates / policy |
 | 5 | `GOAL_UNREACHABLE` | Goal not achievable (insufficient candidates) |
 | 6 | `INTERRUPTED` | Session interrupted / resumable |
-| 10+ | `INTERNAL_ERROR` | Tooling/internal error |
+| 10 | `ARGS_ERROR` | Invalid arguments / command-line usage error |
+| 11 | `CAPABILITY_ERROR` | Required capability missing |
+| 12 | `PERMISSION_ERROR` | Permission denied |
+| 13 | `VERSION_ERROR` | Wrapper/core version mismatch |
+| 14 | `LOCK_ERROR` | Lock contention |
+| 15 | `SESSION_ERROR` | Session not found or invalid |
+| 16 | `IDENTITY_ERROR` | Process identity mismatch |
+| 20 | `INTERNAL_ERROR` | Internal error |
+| 21 | `IO_ERROR` | I/O error |
+| 22 | `TIMEOUT_ERROR` | Operation timed out |
+
+Unknown flags, conflicting selectors and missing required arguments exit with
+`ArgsError` (10) and retain the usage diagnostic. Explicit `--help` and `--version`
+requests exit 0. Exit 2 is reserved for successfully executed actions.
 
 ### Exit Code Modifiers
 

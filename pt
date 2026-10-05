@@ -16,6 +16,7 @@ readonly VERSION="2.2.1"
 readonly PT_CORE_BIN="pt-core"
 readonly INSTALL_BASE_URL="https://raw.githubusercontent.com/Dicklesworthstone/process_triage"
 readonly INSTALL_URL="${INSTALL_BASE_URL}/main/install.sh"
+readonly RELEASE_API_URL="https://api.github.com/repos/Dicklesworthstone/process_triage/releases/latest"
 # Release-signing keys `pt update` accepts (SHA-256 of each key's DER
 # SubjectPublicKeyInfo; space separated). Handed to the release's installer as
 # PT_RELEASE_PUBLIC_KEY_FINGERPRINT, so an update is refused if the release is
@@ -82,70 +83,43 @@ find_pt_core() {
     return 1
 }
 
-fetch_latest_release_version() {
-    local version_url="${INSTALL_BASE_URL}/main/VERSION"
-    local version=""
+fetch_latest_release_tag() {
+    if ! command -v jq &>/dev/null; then
+        printf "Error: jq is required to read published release metadata for 'pt update'.\n" >&2
+        return 1
+    fi
 
+    local metadata tag
     if command -v curl &>/dev/null; then
-        version="$(curl -fsSL "$version_url" 2>/dev/null | tr -d '[:space:]')" || return 1
+        if ! metadata="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$RELEASE_API_URL")"; then
+            printf 'Error: could not fetch published release metadata from %s (network or HTTP error). Nothing was changed.\n' "$RELEASE_API_URL" >&2
+            return 1
+        fi
     elif command -v wget &>/dev/null; then
-        version="$(wget -qO- "$version_url" 2>/dev/null | tr -d '[:space:]')" || return 1
+        if ! metadata="$(wget -qO- --header='Accept: application/vnd.github+json' "$RELEASE_API_URL")"; then
+            printf 'Error: could not fetch published release metadata from %s (network or HTTP error). Nothing was changed.\n' "$RELEASE_API_URL" >&2
+            return 1
+        fi
     else
+        printf 'Error: neither curl nor wget is available to fetch published release metadata.\n' >&2
         return 1
     fi
 
-    # Accept semver-like release tags only (e.g., 2.0.3, 2.0.3-rc1, 2.0.3+build).
-    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*(\+[0-9A-Za-z.-]+)?$ ]]; then
+    # Only GitHub's published full release is an update target. Never fall back
+    # to main/VERSION, which can name a release that has not been published.
+    if ! tag="$(printf '%s' "$metadata" | jq -er '
+        if type == "object" and .draft == false and .prerelease == false
+            and (.published_at | type == "string" and length > 0)
+            and (.tag_name | type == "string")
+        then .tag_name else error("not a published full release") end')"; then
+        printf 'Error: invalid published release metadata from %s. Nothing was changed.\n' "$RELEASE_API_URL" >&2
         return 1
     fi
-
-    printf '%s\n' "$version"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# UI mode selection
-# ══════════════════════════════════════════════════════════════════════════════
-
-detect_auto_ui_mode() {
-    if [[ ! -t 0 || ! -t 1 ]]; then
-        printf 'shell\n'
-        return 0
+    if [[ ! "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*(\+[0-9A-Za-z.-]+)?$ ]]; then
+        printf 'Error: invalid published release tag. Nothing was changed.\n' >&2
+        return 1
     fi
-
-    if [[ "${CI:-}" == "true" || "${CI:-}" == "1" ]]; then
-        printf 'shell\n'
-        return 0
-    fi
-
-    if [[ "${TERM:-}" == "dumb" ]]; then
-        printf 'shell\n'
-        return 0
-    fi
-
-    printf 'tui\n'
-}
-
-resolve_ui_mode() {
-    local cli_mode="${1:-}"
-    local env_mode="${PT_UI_MODE:-auto}"
-
-    if [[ "$cli_mode" == "shell" || "$cli_mode" == "tui" ]]; then
-        printf '%s\n' "$cli_mode"
-        return 0
-    fi
-
-    case "$env_mode" in
-        shell|tui)
-            printf '%s\n' "$env_mode"
-            return 0
-            ;;
-        auto|"")
-            ;;
-        *)
-            ;;
-    esac
-
-    detect_auto_ui_mode
+    printf '%s\n' "$tag"
 }
 
 resolve_config_dir() {
@@ -290,8 +264,6 @@ Process Triage wrapper for pt-core
 Usage: pt [WRAPPER-OPTIONS] [COMMAND]
 
 Wrapper options (before the command):
-      --shell     Force shell/non-TUI mode
-      --tui       Force TUI mode when interactive
   -h, --help      Show this wrapper-aware help
   -V, --version   Show wrapper and pt-core versions
 
@@ -346,7 +318,7 @@ fetch_to_file() {
     fi
 }
 
-# Bare `pt update [--no-verify]`: run the target release's signed installer.
+# Bare `pt update [--verify|--no-verify]`: run the published release's installer.
 run_update() {
     local verify_arg="--verify"
     if [[ $# -gt 1 ]]; then
@@ -356,18 +328,14 @@ run_update() {
     if [[ "${1:-}" == "--no-verify" ]]; then
         verify_arg="--no-verify"
         echo "Warning: --no-verify: installing WITHOUT signature/checksum verification." >&2
-    elif [[ -n "${1:-}" ]]; then
-        echo "Error: unknown update option '$1' (use --no-verify, or a pt-core update subcommand such as rollback)." >&2
+    elif [[ -n "${1:-}" && "$1" != "--verify" ]]; then
+        echo "Error: unknown update option '$1' (use --verify or --no-verify, or a pt-core update subcommand such as rollback)." >&2
         exit 2
     fi
-    local target_version
-    if target_version="$(fetch_latest_release_version)"; then
-        :
-    else
-        target_version="$VERSION"
-        echo "Warning: could not resolve latest VERSION; falling back to v${VERSION} installer." >&2
-    fi
-    local target_install_url="${INSTALL_BASE_URL}/v${target_version}/install.sh"
+    local target_tag target_version
+    target_tag="$(fetch_latest_release_tag)" || exit 1
+    target_version="${target_tag#v}"
+    local target_install_url="${INSTALL_BASE_URL}/${target_tag}/install.sh"
 
     echo "Updating Process Triage to v${target_version}..."
     # Verification is requested with the --verify ARGUMENT: installers up to and
@@ -390,14 +358,11 @@ run_update() {
         echo "Error: could not create a temporary file for the installer." >&2
         exit 1
     }
-    # shellcheck disable=SC2064  # expand now: $installer is local
-    trap "rm -f '${installer}'" EXIT
     if ! fetch_to_file "$target_install_url" "$installer"; then
         echo "Error: could not download the v${target_version} installer from ${target_install_url}" >&2
         echo "(network problem, or that release is not published yet). Nothing was changed." >&2
         exit 1
     fi
-
     # Fed through a pipe, exactly as `curl ... | bash -s` would run it (the installer
     # behaves differently when its stdin is a pipe).
     local status=0
@@ -412,34 +377,63 @@ run_update() {
     exit $status
 }
 
-main() {
-    local cli_mode=""
-    # Wrapper options are only recognized before the command: a later --shell or
-    # --tui belongs to the subcommand (or is an option's value) and is passed on.
+# Recognize the wrapper version after known leading global options without
+# stealing an option's value or interpreting arguments after a subcommand.
+wrapper_version_requested() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --shell|--tui)
-                local mode="${1#--}"
-                if [[ -n "$cli_mode" && "$cli_mode" != "$mode" ]]; then
-                    echo "Error: --shell and --tui cannot be used together." >&2
-                    exit 2
-                fi
-                cli_mode="$mode"
+            --version|-V)
+                return 0
+                ;;
+            --capabilities|--config|--format|-f|--timeout|--fields|--max-tokens)
+                [[ $# -ge 2 ]] || return 1
+                shift 2
+                ;;
+            --capabilities=*|--config=*|--format=*|--timeout=*|--fields=*|--max-tokens=*)
+                shift
+                ;;
+            --verbose|--quiet|--no-color|--robot|--shadow|--dry-run|--standalone|--compact|--estimate-tokens)
+                shift
+                ;;
+            -?*)
+                local short_options="${1#-}"
+                while [[ -n "$short_options" ]]; do
+                    case "${short_options:0:1}" in
+                        V)
+                            return 0
+                            ;;
+                        v|q)
+                            short_options="${short_options:1}"
+                            ;;
+                        f)
+                            # The remainder belongs to -f, even if it looks like
+                            # another flag. Without a remainder, consume its value.
+                            if [[ ${#short_options} -eq 1 ]]; then
+                                [[ $# -ge 2 ]] || return 1
+                                shift
+                            fi
+                            short_options=""
+                            ;;
+                        *)
+                            return 1
+                            ;;
+                    esac
+                done
                 shift
                 ;;
             *)
-                break
+                return 1
                 ;;
         esac
     done
+    return 1
+}
+
+main() {
     local -a forwarded_args=()
     if [[ $# -gt 0 ]]; then
         forwarded_args=("$@")
     fi
-
-    local selected_ui_mode
-    selected_ui_mode="$(resolve_ui_mode "$cli_mode")"
-    export PT_UI_MODE="$selected_ui_mode"
 
     # Wrapper commands that must work without pt-core (`pt update` is the repair path).
     case "${forwarded_args[0]:-}" in
@@ -471,7 +465,7 @@ main() {
     local pt_core find_status=0
     pt_core=$(find_pt_core) || find_status=$?
 
-    if [[ "${forwarded_args[0]:-}" == "--version" || "${forwarded_args[0]:-}" == "-V" ]]; then
+    if wrapper_version_requested ${forwarded_args[@]+"${forwarded_args[@]}"}; then
         # Report both halves: the wrapper and the engine can be updated independently
         # (the fleet had wrapper/core skew that `pt --version` used to hide).
         printf 'pt version %s\n' "$VERSION"
