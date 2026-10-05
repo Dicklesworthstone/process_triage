@@ -591,6 +591,20 @@ mod pause_observe_resume {
         std::thread::sleep(Duration::from_millis(200));
 
         let pgid = proc.pgid().expect("should have pgid");
+        assert_eq!(
+            pgid, pid,
+            "owned child must lead its isolated process group"
+        );
+        // SAFETY: these calls only inspect the caller and the owned child's session.
+        let (caller_pgid, child_sid) = unsafe { (libc::getpgrp(), libc::getsid(pid as i32)) };
+        assert_ne!(
+            pgid as i32, caller_pgid,
+            "child must not share the test group"
+        );
+        assert_eq!(
+            child_sid, pid as i32,
+            "owned child must lead its new session"
+        );
         let group_pids = proc.group_pids();
 
         ctx.log(
@@ -607,6 +621,11 @@ mod pause_observe_resume {
             group_pids.len() >= 2,
             "Expected at least 2 processes in group, got {:?}",
             group_pids
+        );
+        let group_identities: Vec<_> = group_pids.iter().map(|pid| live_identity(*pid)).collect();
+        ctx.log(
+            "live_group_members",
+            json!({ "identities": group_identities }),
         );
 
         // Create runner with process group targeting
@@ -655,15 +674,21 @@ mod pause_observe_resume {
         std::thread::sleep(Duration::from_millis(100));
 
         let mut all_running = true;
-        for gpid in &group_pids {
-            let running = !is_process_stopped(*gpid);
+        for (gpid, identity) in group_pids.iter().zip(&group_identities) {
+            assert_eq!(
+                live_identity(*gpid),
+                *identity,
+                "resumed member must survive"
+            );
+            let state = pt_core::test_utils::get_process_state(*gpid);
+            let running = !is_process_stopped(*gpid) && matches!(state, Some('S' | 'R'));
             if !running {
                 all_running = false;
             }
             ctx.log_verification(
                 "e2e-group-resume",
                 if running { "passed" } else { "failed" },
-                json!({ "member_pid": gpid, "is_running": running }),
+                json!({ "member_pid": gpid, "is_running": running, "state": state }),
             );
         }
         assert!(all_running, "All processes in group should be running");

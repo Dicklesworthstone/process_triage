@@ -262,7 +262,7 @@ fn test_verify_plan_with_real_process_nomock() {
     };
     let report_running = verify_plan(
         &plan,
-        &[execution.clone()],
+        std::slice::from_ref(&execution),
         &records,
         Utc::now(),
         Utc::now(),
@@ -294,7 +294,7 @@ fn test_verify_plan_with_real_process_nomock() {
     ));
     let report_mismatch = verify_plan(
         &plan,
-        &[execution.clone()],
+        std::slice::from_ref(&execution),
         &[reused_record],
         Utc::now(),
         Utc::now(),

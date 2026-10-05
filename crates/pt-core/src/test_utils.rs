@@ -296,7 +296,9 @@ impl ProcessHandle {
             unsafe {
                 cmd.pre_exec(|| {
                     // Create a new session and process group
-                    libc::setsid();
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     Ok(())
                 });
             }
