@@ -203,6 +203,48 @@ path = "/etc/pt/fleet.toml"
 }
 
 #[test]
+fn discovery_yaml_loads_detailed_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    let inventory_path = dir.path().join("hosts.yaml");
+    std::fs::write(
+        &inventory_path,
+        "hosts:\n  - web-1\n  - host: db-1\n    tags:\n      role: database\n",
+    )
+    .unwrap();
+    let discovery_path = dir.path().join("discovery.yaml");
+    std::fs::write(
+        &discovery_path,
+        format!(
+            "providers:\n  - type: static\n    path: \"{}\"\n",
+            inventory_path.display()
+        ),
+    )
+    .unwrap();
+
+    let config = FleetDiscoveryConfig::load_from_path(&discovery_path).unwrap();
+    let inventory = ProviderRegistry::from_config(&config)
+        .unwrap()
+        .discover_all()
+        .unwrap();
+    assert_eq!(inventory.hosts.len(), 2);
+    let hostnames: Vec<_> = inventory
+        .hosts
+        .iter()
+        .map(|host| host.hostname.as_str())
+        .collect();
+    assert!(hostnames.contains(&"web-1"));
+    let database = inventory
+        .hosts
+        .iter()
+        .find(|host| host.hostname == "db-1")
+        .unwrap();
+    assert_eq!(
+        database.tags.get("role").map(String::as_str),
+        Some("database")
+    );
+}
+
+#[test]
 fn discovery_config_dns_provider() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("discovery.toml");

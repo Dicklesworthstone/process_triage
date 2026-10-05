@@ -11,8 +11,8 @@ arrow = { version = "53", features = ["prettyprint"] }
 parquet = { version = "53", features = ["zstd", "snap", "async"] }
 
 # Core dependencies
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 thiserror.workspace = true
 tracing = "0.1"
@@ -25,4 +25,4 @@ pt-common = { path = "../pt-common" }
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"
-serde_json = "1"  # Re-export for test assertions
+serde_json.workspace = true  # Re-export for test assertions
