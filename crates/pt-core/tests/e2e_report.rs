@@ -809,50 +809,54 @@ fn recorded_session_bundle_and_report_preserve_data_without_leaking_canaries() {
         .assert()
         .success();
     // Exercise the archive activation route too, with a deliberately intact
-    // Forensic matcher. Sharing-profile refusals above must preserve this path.
+    // Forensic matcher in a separate config: the raw import must not supply the
+    // match that is supposed to prove archive activation.
+    let forensic_config = data_dir.join("forensic-import-config");
     pt_core()
         .arg("--config")
-        .arg(&positive_config)
+        .arg(&forensic_config)
         .args(["--format", "json", "signature", "import"])
         .arg(&forensic_path)
         .assert()
         .success();
-    let matched = pt_core()
-        .arg("--config")
-        .arg(&positive_config)
-        .args([
-            "--format",
-            "json",
-            "signature",
-            "test",
-            "private-original-worker",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let matched: Value = serde_json::from_slice(&matched).unwrap();
-    assert!(matched["matches"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|entry| entry["name"] == "private-original-worker"));
-    let unrelated = pt_core()
-        .arg("--config")
-        .arg(&positive_config)
-        .args(["--format", "json", "signature", "test", "awk"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let unrelated: Value = serde_json::from_slice(&unrelated).unwrap();
-    assert!(!unrelated["matches"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|entry| entry["name"] == "private-original-worker"));
+    for imported_config in [&positive_config, &forensic_config] {
+        let matched = pt_core()
+            .arg("--config")
+            .arg(imported_config)
+            .args([
+                "--format",
+                "json",
+                "signature",
+                "test",
+                "private-original-worker",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let matched: Value = serde_json::from_slice(&matched).unwrap();
+        assert!(matched["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "private-original-worker"));
+        let unrelated = pt_core()
+            .arg("--config")
+            .arg(imported_config)
+            .args(["--format", "json", "signature", "test", "awk"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let unrelated: Value = serde_json::from_slice(&unrelated).unwrap();
+        assert!(!unrelated["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "private-original-worker"));
+    }
 
     for bundle_input in [false, true] {
         let mut command = pt_core();

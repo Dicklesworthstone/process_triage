@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn secret_artifact_names_remain_distinct_and_duplicate_paths_refuse_publication() {
-        let mut writer = BundleWriter::new("session-test", "host-test", "run-test");
+        let mut writer = BundleWriter::new("session-test", "host-test", ExportProfile::Safe);
         for (path, score) in [
             ("AKIAIOSFODNN7EXAMPLE.json", 17),
             ("AKIAIOSFODNN8EXAMPLE.json", 83),
@@ -679,8 +679,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap().keep();
         for profile in [ExportProfile::Safe, ExportProfile::Forensic] {
-            let mut writer = BundleWriter::new("session-test", "host-test", "run-test")
-                .with_export_profile(profile);
+            let mut writer = BundleWriter::new("session-test", "host-test", profile);
             for score in [17, 83] {
                 writer
                     .add_json("same.json", &serde_json::json!({"score": score}))

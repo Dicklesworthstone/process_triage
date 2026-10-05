@@ -13,7 +13,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use predicates::prelude::*;
-use pt_common::config::policy::Policy;
+use pt_core::config::Policy;
 use serde_json::Value;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -265,7 +265,7 @@ mod blast_radius {
 
 mod protected_patterns {
     use super::*;
-    use pt_common::config::policy::{PatternEntry, PatternKind};
+    use pt_core::config::policy::{PatternEntry, PatternKind};
 
     #[test]
     fn policy_protected_patterns_filter_candidates() {
@@ -951,7 +951,7 @@ mod combined {
         // Configure multiple guardrails simultaneously
         policy.guardrails.max_kills_per_run = 3;
         policy.guardrails.min_process_age_seconds = 300;
-        policy.guardrails.require_confirmation = true;
+        policy.guardrails.require_confirmation = Some(true);
         policy.robot_mode.enabled = true;
         policy.robot_mode.min_posterior = 0.95;
         policy.robot_mode.max_blast_radius_mb = 1024.0;
