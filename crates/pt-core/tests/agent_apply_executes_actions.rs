@@ -76,7 +76,7 @@ impl ForeignTarget {
         std::io::BufReader::new(leader.stdout.take().expect("stdout"))
             .read_line(&mut line)
             .expect("read target pid");
-        let pid = line.trim().parse().expect("target pid");
+        let pid: u32 = line.trim().parse().expect("target pid");
         #[cfg(target_os = "linux")]
         let pidfd = {
             use std::os::fd::FromRawFd;
