@@ -1,6 +1,64 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Current validation — 2026-10-05 17:12 UTC
+## Current validation — 2026-10-05 17:45 UTC
+
+The combined repaired source is archived at
+`/data/tmp/pt-source-recovery-20261005-1724.se2lcrn6/frozen-source.tar.gz`,
+SHA-256 `0627bc7fb9ca69dc38f807b34173099a69800613d55a7c024a9d864b11176c5d`.
+Its 502-file receipt `current-1724-source.sha256` has SHA-256
+`e153d4d8af3766f5a9a750c7b39a4cd759b6658ca65f0b2d259fdb2a35f7002a`.
+Root and hz2/hz3/hz4/vmi1227854 checksum commands returned 0. All four mandatory
+compiler/formatting gates returned 0 on that source. Nonroot hz3 then completed
+the library, binary and all twelve previously failing integration targets:
+**4,208 passed, zero failed, seven existing ignores, zero filtered**, 14 summaries,
+actual RCH exit 0 at 17:37:42 UTC. Raw
+`current-1724-affected-tests-hz3.log` SHA-256 is
+`bc34078df9a012a28653fedcd302af4211bc3820937404491f66539e9101cbdc`.
+Separate config library coverage passed all 247 tests. These are selected targets,
+not a complete workspace pass. The existing cgroup permission-return branches
+ran but do not prove positive cgroup actuation. All fifteen daemon cases passed
+with their original windows; this does not establish the cause of the old failures.
+
+The exact newly built action-tray executable also passed a direct nonroot native
+renice test at launcher nice 0: owned PID 2652127, full birth/UID identity,
+actual priority 0 -> 10, production execution/verification successful, unchanged
+identity afterward. `current-1724-native-renice-mutation-hz3.log` retains both
+streams, exact executable SHA-256 and command. This is one selected test with
+17 filtered cases, explicitly separate from the unfiltered affected run.
+
+The complete ROOT workspace invocation on this archived source remains running.
+It has two actual library failures: the new recent-I/O and supervision fixtures
+assert a nonroot caller because root can bypass the permission-denial oracle.
+Repair is in progress: execute the same complete cases in an owned subprocess
+with verified dropped credentials/capabilities, preserving actual PermissionDenied
+assertions. No root or nonroot complete workspace pass is claimed. The first
+17:15 repair attempt failed compilation on two ambiguous PID parses; both now
+have explicit u32 types. The prior root job was owner-cancelled, then recovered
+through RCH's normal API with source ownership released; its 137 recovery status
+is not an unexplained OOM or a pass. The failed root-worker source-lock attempt
+returned 103 and did not run cargo locally.
+
+The retained seventeen-file UBS scan remains exit 1: 37 critical, 2,243 warnings,
+2,049 informational findings. Independent review classified every critical row
+(17 test panics, nine public comparisons, eight bounded executable sites, one
+fixed test shell and two valid/guarded initialization sites); it confirmed no new
+critical production defect. Warnings remain unreviewed and the gate stays failed.
+The nineteen dependency updates remain paused at the skill's >10-failure circuit
+breaker pending an actual operator response; the security audit still fails.
+
+Current local edits now differ from the accepted 17:24 archive and are unverified:
+root-compatible permission fixtures, truthful normalization refusal, baseline-field
+validation and actual merged prior values in import previews. The original fleet
+transfer task `process_triage-hc7.3` was reopened at 17:13, preserving all criteria.
+The previous target baseline of 5,000 observations/72 hours/50% CPU was invented.
+Existing snapshot/learning helpers provide no comparable measured trial counts
+behind transferred Beta parameters. A live PID census is occupancy and would
+increase confidence without relevant evidence; it was considered and rejected
+before implementation. Ordinary validated transfers remain the positive path;
+requested normalization must refuse until real learning exposure is wired. This
+is removal of fabrication, not delivery of normalization or task completion.
+
+### Earlier frozen action-kind result
 
 The frozen action-kind workspace invocation finished with **7,144 passes, 23
 failures and 27 existing ignores**, zero filtered tests and actual RCH/Cargo exit
@@ -18,9 +76,8 @@ Raw log `current-action-kind-full-workspace-hz3.log` SHA-256 is
 No workspace pass is claimed. The exact source is preserved separately at
 `/tmp/actionlint-bd-ufqb11/current-action-kind-runtime-recovery-iz2s8zah/frozen500-source.tar.gz`,
 SHA-256 `b5279c174b3452499a06ec419024469aea5f7b35288d785e5d97057d29140d77`.
-Local disjoint fixture repairs now differ from that archived/worker source and
-have no compiler/runtime acceptance yet. No new job or source upload will touch
-hz3 while that frozen invocation was running; it has now finished.
+The disjoint repairs later received the selected 17:24 acceptance recorded above.
+They do not retroactively change this failed invocation or its archived source.
 
 The action-kind correction is frozen in
 `target/test-logs/privacy/current-action-kind-source.sha256`: SHA-256
@@ -68,7 +125,7 @@ backup. A fresh reconciled source/graph snapshot is retained at
 and runtime archive remains at
 `/tmp/actionlint-bd-ufqb11/current-1420-recovery-h9jxfnhm/frozen-source-and-owned-runtime.tar.gz`.
 
-Eleven product tasks are independently closed; 124 are open and nine in progress (133
+Eleven product tasks are independently closed; 124 are open and ten in progress (134
 remaining). Original Plan/verify acceptance was independently satisfied on the
 frozen source and restored-tree review; `bd-uacs.1/.2` are now closed. Nineteen
 dependency families, including Clap 4.6.7, have bounded runtime/compiler validation.
@@ -98,43 +155,48 @@ The security audit and unchanged-rule UBS scan remain exit 1; neither is waived.
   local fixture/renice/fleet edits are not certified by the accepted f19 source.
 - [ ] Repair the observed older workspace fixture failures under `bd-ufqb.9/.11`,
   preserving original scope and no hosted-CI/root-workspace completion claim:
-  - [ ] Replace fake birth/owner fields in the four real signal tests with owned
+  - [x] Replace fake birth/owner fields in the four real signal tests with owned
     quick-scan identities; preserve real effects and add stale/mock Pause refusal.
-  - [ ] Replace nonexistent constraint PIDs/global environment mutation with owned
+  - [x] Replace nonexistent constraint PIDs/global environment mutation with owned
     targets and command-scoped isolated policy/data; exercise split A+Z=.98 versus
     max=.49 positive, high-Useful=.99/A+Z=.01 negative, and missing posterior.
-  - [ ] Make the dry-run positive reach a real eligible target, retain its original
+  - [x] Make the dry-run positive reach a real eligible target, retain its original
     exit/count/precheck assertions, and assert explicit unexecuted resource values.
-  - [ ] Repair blocked-Plan, protected-precheck and confirmation fixtures with
+  - [x] Repair blocked-Plan, protected-precheck and confirmation fixtures with
     real owned full identities; preserve original exit/status/count assertions and
     require survivor identity and genuine NotFound for confirmation side effects.
-  - [ ] Repair the action tray's genuine positive identities and require actual
+  - [x] Repair the action tray's genuine positive identities and require actual
     SIGTERM versus SIGKILL exit status; retain deliberate identity negatives and
     all original observation/grace/death windows. Correct renice's monotone-priority
     oracle and retain separate actual mutation coverage below nice 10.
-  - [ ] Fail renice verification when priority cannot be observed. Predicate
+  - [x] Fail renice verification when priority cannot be observed. Predicate
     neighbors are not live unreadable-/proc evidence.
   - [ ] Restore an explicit importable fleet configuration-transfer contract with
     checksum, credential and matcher validation; preserve sharing-profile privacy
     and publish the support/refusal split instead of weakening bundle redaction.
-    - [ ] Validate actual encrypted Forensic export/import and activated environment
+    - [x] Validate actual encrypted Forensic export/import and activated environment
       matchers, plus the actual shipped default-priors export without removing prose.
-    - [ ] Keep original supplied canonical checksum and outer archive bytes intact;
+    - [x] Keep original supplied canonical checksum and outer archive bytes intact;
       refuse sharing profiles, invalid active/inactive matchers and mutated checksums.
-    - [ ] Refuse detected credentials in free-form values and map keys before
+    - [x] Refuse detected credentials in free-form values and map keys before
       diagnostic disclosure; typed parse failures use a static error. The corrected
       new guard scans explicit patterns across full text and unchanged entropy per
       token. Whole-text entropy from separate low-entropy words is admitted; arbitrary
       passphrases are not comprehensively detected.
-    - [ ] Reject nonfinite prior, Beta and Gamma parameters in the existing validator;
+    - [x] Reject nonfinite prior, Beta and Gamma parameters in the existing validator;
       prove finite normalized replacement and finite-input overflow refusal on the CLI,
       preserving configuration bytes and all original 120-second command deadlines.
-    - [ ] Replace the preexisting invented local normalization baseline (5,000 process
-      observations/72 hours/50% CPU) with evidence from the actual local observation
-      store. Current overflow refusal does not make this baseline measured or honest.
+      That archived invocation exercised a mathematical 10x fixture based on the
+      invented baseline; it is not measured-host normalization evidence. Subsequent
+      source removes that premise and keeps finite unscaled CLI activation positive.
+    - [ ] Wire comparable measured learning exposure for baseline normalization;
+      until then explicitly refuse requests without inventing local statistics or
+      silently skipping a requested transform. Original hc7.3 remains open.
+    - [ ] Validate supplied baseline numbers and show actual merged values in
+      import dry-run previews; validate all three strategies against saved priors.
     - [ ] Make multi-file priors/signature activation atomic or recoverable; current
       validation-before-write does not protect against a later signature save failure.
-  - [ ] Keep missing shadow exits unlabelled and add an actually waited known-exit
+  - [x] Keep missing shadow exits unlabelled and add an actually waited known-exit
     report neighbor; this is report consumption, not calibration-quality evidence.
   - [ ] Diagnose the three actual daemon timeout failures without widening windows;
     capture owned diagnostics, and repair real Git/flock fixture setup.
@@ -143,6 +205,11 @@ The security audit and unchanged-rule UBS scan remain exit 1; neither is waived.
     within 7.031 seconds of its unchanged 30-second limit and exited after SIGTERM.
     That successful reproduction does not explain the old hz3 failures. Original
     root/nonroot workspace and hosted-CI acceptance remain open under `bd-ufqb.9/.11`.
+  - [x] Run all fifteen instrumented daemon fixtures and genuine Git/flock setups
+    on the corrected nonroot source, preserving windows and original assertions.
+    This supplies current runtime evidence, not a diagnosis of the earlier timeouts.
+  - [ ] Run the entire root and nonroot workspace on the final source, including
+    root-compatible owned privilege-drop fixtures; preserve each failed attempt.
   - [ ] Independently review the legitimate fixture-fix win/lose split, then run
     affected targets and all mandatory compiler gates on the new combined source.
 - [ ] Run the complete workspace test suite on the final source; do not replace
