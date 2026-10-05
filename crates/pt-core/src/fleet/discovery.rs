@@ -128,7 +128,7 @@ impl FleetDiscoveryConfig {
             DiscoveryConfigFormat::Toml => toml::from_str(content).map_err(|e| {
                 DiscoveryError::Other(format!("failed to parse toml discovery config: {}", e))
             })?,
-            DiscoveryConfigFormat::Yaml => serde_yaml::from_str(content).map_err(|e| {
+            DiscoveryConfigFormat::Yaml => yaml_serde::from_str(content).map_err(|e| {
                 DiscoveryError::Other(format!("failed to parse yaml discovery config: {}", e))
             })?,
             DiscoveryConfigFormat::Json => serde_json::from_str(content).map_err(|e| {
@@ -542,6 +542,41 @@ path = "fleet.toml"
         let input = "providers:\n  - type: static\n    path: hosts.yaml\n";
         let config = FleetDiscoveryConfig::parse_str(input, DiscoveryConfigFormat::Yaml).unwrap();
         assert_eq!(config.providers.len(), 1);
+        match &config.providers[0] {
+            ProviderConfig::Static { path } => assert_eq!(path, "hosts.yaml"),
+            other => panic!("expected Static provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_yaml_malformed_is_error() {
+        let input = "providers: [{type: static, path: hosts.yaml}";
+        let error =
+            FleetDiscoveryConfig::parse_str(input, DiscoveryConfigFormat::Yaml).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("failed to parse yaml discovery config"));
+    }
+
+    #[test]
+    fn parse_yaml_unknown_provider_is_error() {
+        let input = "providers:\n  - type: unknown\n    path: hosts.yaml\n";
+        let error =
+            FleetDiscoveryConfig::parse_str(input, DiscoveryConfigFormat::Yaml).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("failed to parse yaml discovery config"));
+    }
+
+    #[test]
+    fn parse_yaml_missing_static_path_is_error() {
+        let input = "providers:\n  - type: static\n";
+        let error =
+            FleetDiscoveryConfig::parse_str(input, DiscoveryConfigFormat::Yaml).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("failed to parse yaml discovery config"));
+        assert!(error.to_string().contains("path"));
     }
 
     // ── ProviderConfig serde ────────────────────────────────────────
