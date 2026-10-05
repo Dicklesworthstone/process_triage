@@ -50,6 +50,36 @@ pub struct ReportGenerator {
     config: ReportConfig,
 }
 
+/// A session ends at its recorded terminal transition, not at an update or
+/// export. Resumed sessions and incomplete or inconsistent history stay unknown.
+pub fn recorded_session_end(metadata: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let state = metadata["state"].as_str()?;
+    if !matches!(state, "completed" | "cancelled" | "failed" | "archived") {
+        return None;
+    }
+    let history = metadata["state_history"].as_array()?;
+    if history.last()?["state"].as_str()? != state {
+        return None;
+    }
+    let terminal = history
+        .iter()
+        .rev()
+        .find(|transition| transition["state"].as_str() != Some("archived"))?;
+    if !matches!(
+        terminal["state"].as_str()?,
+        "completed" | "cancelled" | "failed"
+    ) {
+        return None;
+    }
+    let started = DateTime::parse_from_rfc3339(metadata["timing"]["created_at"].as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    let ended = DateTime::parse_from_rfc3339(terminal["ts"].as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    (ended >= started).then_some(ended)
+}
+
 impl ReportGenerator {
     /// Create a new report generator with configuration.
     pub fn new(config: ReportConfig) -> Self {
@@ -93,6 +123,7 @@ impl ReportGenerator {
             recorded_overview["started_at"] = metadata["timing"]["created_at"].clone();
             recorded_overview["state"] = metadata["state"].clone();
             recorded_overview["mode"] = metadata["mode"].clone();
+            recorded_overview["ended_at"] = serde_json::to_value(recorded_session_end(&metadata))?;
         }
         let plan: Option<serde_json::Value> = reader.read_plan()?;
         let plan = match plan {
@@ -124,7 +155,7 @@ impl ReportGenerator {
 
     fn generate_recorded_artifacts(
         &self,
-        overview: OverviewSection,
+        mut overview: OverviewSection,
         mut recorded_overview: serde_json::Value,
         plan: &serde_json::Value,
         outcomes: &[serde_json::Value],
@@ -140,6 +171,9 @@ impl ReportGenerator {
         }
         let profile = pt_redact::ExportProfile::parse_str(&self.config.redaction_profile)
             .ok_or_else(|| ReportError::InvalidConfig("invalid redaction profile".to_string()))?;
+        overview.export_profile = profile.to_string();
+        recorded_overview["export_profile"] = serde_json::json!(overview.export_profile);
+        overview.ended_at = serde_json::from_value(recorded_overview["ended_at"].clone())?;
         let engine = pt_redact::RedactionEngine::new(pt_redact::RedactionPolicy::default())
             .map_err(|error| ReportError::InvalidConfig(error.to_string()))?;
         let candidate_count = plan["candidates"].as_array().map(Vec::len);
@@ -156,9 +190,12 @@ impl ReportGenerator {
             .unwrap_or(serde_json::Value::Null);
         // The planner records elapsed deep-scan time only when --deep is set;
         // its explicit null means disabled. Missing history cannot establish
-        // either state, and a zero-millisecond recorded scan still counts.
+        // either state. Only unsigned millisecond durations are usable, and a
+        // zero-millisecond recorded scan still counts.
         recorded_overview["deep_scan"] = match plan.pointer("/summary/deep_scan_ms") {
-            Some(serde_json::Value::Number(_)) => serde_json::json!(true),
+            Some(serde_json::Value::Number(value)) if value.as_u64().is_some() => {
+                serde_json::json!(true)
+            }
             Some(serde_json::Value::Null) => serde_json::json!(false),
             _ => serde_json::Value::Null,
         };
@@ -1255,6 +1292,148 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bundle_reports_use_terminal_history_and_the_active_export_profile() {
+        let started = "2026-01-15T12:00:00Z";
+        let ended = "2026-01-15T12:02:00Z";
+        let updated = "2026-01-15T12:05:00Z";
+        for (state, history, expected_end) in [
+            (
+                "planned",
+                serde_json::json!([{"state":"planned","ts":updated}]),
+                None,
+            ),
+            (
+                "completed",
+                serde_json::json!([{"state":"completed","ts":ended}]),
+                Some(ended),
+            ),
+            (
+                "cancelled",
+                serde_json::json!([{"state":"cancelled","ts":ended}]),
+                Some(ended),
+            ),
+            (
+                "failed",
+                serde_json::json!([{"state":"failed","ts":ended}]),
+                Some(ended),
+            ),
+            (
+                "archived",
+                serde_json::json!([
+                    {"state":"completed","ts":ended}, {"state":"archived","ts":updated}
+                ]),
+                Some(ended),
+            ),
+            ("completed", serde_json::json!([]), None),
+            (
+                "archived",
+                serde_json::json!([{"state":"archived","ts":updated}]),
+                None,
+            ),
+            (
+                "completed",
+                serde_json::json!([{"state":"completed","ts":"malformed"}]),
+                None,
+            ),
+            (
+                "completed",
+                serde_json::json!([{"state":"failed","ts":ended}]),
+                None,
+            ),
+            (
+                "planned",
+                serde_json::json!([
+                    {"state":"failed","ts":ended}, {"state":"planned","ts":updated}
+                ]),
+                None,
+            ),
+            (
+                "archived",
+                serde_json::json!([
+                    {"state":"completed","ts":ended}, {"state":"planned","ts":updated},
+                    {"state":"archived","ts":updated}
+                ]),
+                None,
+            ),
+            (
+                "completed",
+                serde_json::json!([{"state":"completed","ts":"2026-01-15T11:00:00Z"}]),
+                None,
+            ),
+        ] {
+            let metadata = serde_json::json!({
+                "state": state, "state_history": history, "mode": "robot_plan",
+                "timing": {"created_at": started, "updated_at": updated}
+            });
+            // Exercise the real verified ZIP reader and rendered/embedded HTML;
+            // the archive profile deliberately differs from the report override.
+            for active_profile in ["safe", "FORENSIC"] {
+                let mut config = ReportConfig::new().with_embed_assets(true);
+                config.redaction_profile = active_profile.to_string();
+                let generator = ReportGenerator::new(config);
+                let mut writer = pt_bundle::BundleWriter::new(
+                    "pt-20260115-120000-abcd",
+                    "private-metadata-host",
+                    if active_profile == "safe" {
+                        pt_redact::ExportProfile::Forensic
+                    } else {
+                        pt_redact::ExportProfile::Safe
+                    },
+                );
+                writer.add_json("session/manifest.json", &metadata).unwrap();
+                writer
+                    .add_plan(&serde_json::json!({"candidates": []}))
+                    .unwrap();
+                let (bytes, _) = writer.write_to_vec().unwrap();
+                let mut reader = pt_bundle::BundleReader::from_bytes(bytes).unwrap();
+                assert!(reader.verify_all().is_empty());
+                let html = generator.generate_from_bundle(&mut reader).unwrap();
+                let embedded = html
+                    .split("id=\"recorded-session-data\">")
+                    .nth(1)
+                    .unwrap()
+                    .split("</script>")
+                    .next()
+                    .unwrap();
+                let recorded: serde_json::Value = serde_json::from_str(embedded).unwrap();
+                let report_json = html
+                    .split("const REPORT_DATA = ")
+                    .nth(1)
+                    .unwrap()
+                    .split(";\n")
+                    .next()
+                    .unwrap();
+                let report: serde_json::Value = serde_json::from_str(report_json).unwrap();
+                let expected = expected_end.map(|ts| {
+                    DateTime::parse_from_rfc3339(ts)
+                        .unwrap()
+                        .with_timezone(&Utc)
+                });
+                let expected = serde_json::to_value(expected).unwrap();
+                assert_eq!(
+                    recorded["overview"]["ended_at"], expected,
+                    "{state}/{history}"
+                );
+                assert_eq!(
+                    report["overview"]["ended_at"], expected,
+                    "{state}/{history}"
+                );
+                assert_eq!(recorded["overview"]["state"], state);
+                assert_eq!(recorded["overview"]["started_at"], started);
+                assert_eq!(
+                    recorded["overview"]["export_profile"],
+                    active_profile.to_ascii_lowercase()
+                );
+                assert_eq!(
+                    report["overview"]["export_profile"],
+                    active_profile.to_ascii_lowercase()
+                );
+                assert!(!html.contains("private-metadata-host"));
+            }
+        }
+    }
+
+    #[test]
     fn recorded_deep_scan_indicator_agrees_across_session_and_bundle_reports() {
         let generator = ReportGenerator::new(
             ReportConfig::new()
@@ -1277,6 +1456,14 @@ mod tests {
             (serde_json::json!({}), serde_json::Value::Null),
             (
                 serde_json::json!({"deep_scan_ms": "unrecorded"}),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!({"deep_scan_ms": -1}),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!({"deep_scan_ms": 0.5}),
                 serde_json::Value::Null,
             ),
         ] {

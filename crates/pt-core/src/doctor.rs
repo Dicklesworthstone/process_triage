@@ -121,8 +121,10 @@ pub struct ProcTable {
     pub oomd_running: bool,
     /// Largest descriptor holders among the processes whose fd table is readable.
     pub top_fd_holders: Vec<FdHolder>,
-    /// Bytes of deleted regular files still held open (each file counted once).
+    /// Allocated bytes of deleted regular files still open (each inode counted once).
     pub deleted_open_bytes: u64,
+    /// Logical file lengths; sparse files may have much less allocated storage.
+    pub deleted_open_logical_bytes: u64,
     /// The largest of those files, with a process holding each.
     pub deleted_open: Vec<DeletedOpenFile>,
 }
@@ -134,13 +136,15 @@ pub struct DeletedOpenFile {
     pub pid: u32,
     pub comm: String,
     pub path: String,
+    /// Allocated storage observed through the open descriptor, not measured relief.
     pub bytes: u64,
+    pub logical_bytes: u64,
 }
 
 /// Deleted regular files among the open descriptors in `fd_dir`, as `(path, bytes,
 /// (dev, inode))`. memfd and /dev (tmpfs/shm) objects hold memory, not disk, and are
 /// skipped.
-fn deleted_open_files(fd_dir: &[std::fs::DirEntry]) -> Vec<(String, u64, (u64, u64))> {
+fn deleted_open_files(fd_dir: &[std::fs::DirEntry]) -> Vec<(String, u64, u64, (u64, u64))> {
     let mut out = Vec::new();
     for fd in fd_dir {
         let Ok(target) = std::fs::read_link(fd.path()) else {
@@ -161,13 +165,13 @@ fn deleted_open_files(fd_dir: &[std::fs::DirEntry]) -> Vec<(String, u64, (u64, u
             continue;
         }
         #[cfg(unix)]
-        let key = {
+        let (bytes, key) = {
             use std::os::unix::fs::MetadataExt;
-            (meta.dev(), meta.ino())
+            (meta.blocks().saturating_mul(512), (meta.dev(), meta.ino()))
         };
         #[cfg(not(unix))]
-        let key = (0, 0);
-        out.push((path.to_string(), meta.len(), key));
+        let (bytes, key) = (0, (0, 0));
+        out.push((path.to_string(), bytes, meta.len(), key));
     }
     out
 }
@@ -478,7 +482,16 @@ fn read_proc_table(root: &Path, clk_tck: u64) -> ProcTable {
     let Ok(entries) = std::fs::read_dir(root.join("proc")) else {
         return table;
     };
-    for entry in entries.flatten() {
+    // Pick the same representative for a shared inode independently of read_dir order.
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_unstable_by_key(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
+    for entry in entries {
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -507,13 +520,14 @@ fn read_proc_table(root: &Path, clk_tck: u64) -> ProcTable {
         }
         if let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) {
             let fds: Vec<std::fs::DirEntry> = fds.flatten().collect();
-            for (path, bytes, key) in deleted_open_files(&fds) {
+            for (path, bytes, logical_bytes, key) in deleted_open_files(&fds) {
                 if seen_deleted.insert(key) {
                     deleted.push(DeletedOpenFile {
                         pid,
                         comm: comm.clone(),
                         path,
                         bytes,
+                        logical_bytes,
                     });
                 }
             }
@@ -526,6 +540,7 @@ fn read_proc_table(root: &Path, clk_tck: u64) -> ProcTable {
         comms.insert(pid, (comm, start));
     }
     table.deleted_open_bytes = deleted.iter().map(|d| d.bytes).sum();
+    table.deleted_open_logical_bytes = deleted.iter().map(|d| d.logical_bytes).sum();
     deleted.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.pid.cmp(&b.pid)));
     deleted.truncate(10);
     table.deleted_open = deleted;
@@ -1124,17 +1139,18 @@ fn check_deleted_open(f: &HostFacts, out: &mut Vec<Finding>) {
             "disk.deleted_open_files",
             level,
             format!(
-                "{} held by deleted files that are still open; largest: {} ({}) held by {} (pid {})",
+                "{} allocated to deleted files that are still open ({} logical); largest: {} ({}) held by {} (pid {})",
                 gib(p.deleted_open_bytes),
+                gib(p.deleted_open_logical_bytes),
                 largest.path,
                 gib(largest.bytes),
                 largest.comm,
                 largest.pid
             ),
         )
-        .observed(json!({"bytes": p.deleted_open_bytes, "largest": p.deleted_open}))
-        .recommended("restart or stop the holding process to release the space")
-        .rationale("A file deleted while a process holds it open keeps its disk space until the process closes it or exits: the classic \"disk full but du finds nothing\". Restarting the holder releases it; truncating through /proc also works but discards data the process may still use.")
+        .observed(json!({"bytes": p.deleted_open_bytes, "logical_bytes": p.deleted_open_logical_bytes, "largest": p.deleted_open}))
+        .recommended("inspect all holders before restarting or stopping processes")
+        .rationale("Deleted regular files remain open until every holder closes its descriptors. Allocated blocks can be much smaller than logical length for sparse files; the reported allocation is potential reclaim, not measured freed space. The named process is one representative and other processes may hold the same inode.")
         .commands(&[&format!("ls -l /proc/{}/fd | grep deleted", largest.pid)]),
     );
 }
@@ -1670,7 +1686,7 @@ mod tests {
     }
 
     /// Space held by deleted-but-open files: each file once, memfd skipped, the holder
-    /// named. (A 2 GiB sparse file stands in for the open log.)
+    /// named. A large sparse fixture must not fabricate disk pressure.
     #[cfg(unix)]
     #[test]
     fn deleted_open_files_are_found_and_counted_once() {
@@ -1698,13 +1714,52 @@ mod tests {
         }
 
         let r = root.report();
-        assert_eq!(r.facts.procs.deleted_open_bytes, 2 * GIB);
+        use std::os::unix::fs::MetadataExt;
+        let allocated = std::fs::metadata(&held).unwrap().blocks() * 512;
+        assert!(allocated < GIB, "the sparse fixture allocated {allocated}");
+        assert_eq!(r.facts.procs.deleted_open_bytes, allocated);
+        assert_eq!(r.facts.procs.deleted_open_logical_bytes, 2 * GIB);
         assert_eq!(r.facts.procs.deleted_open.len(), 1);
         let f = find(&r, "disk.deleted_open_files").unwrap();
-        assert_eq!(f.level, Level::Warn);
+        assert_eq!(f.level, Level::Info);
         assert!(f.summary.contains("app.log"), "{}", f.summary);
         assert!(f.summary.contains("(pid 500)"), "{}", f.summary);
         assert_eq!(f.commands, vec!["ls -l /proc/500/fd | grep deleted"]);
+
+        // Real allocated blocks retain a positive reader/deduplication oracle.
+        // This is a controlled proc-tree fixture, not live unlinked-file relief.
+        std::fs::write(&held, vec![b'x'; 8192]).unwrap();
+        let allocated = std::fs::metadata(&held).unwrap().blocks() * 512;
+        assert!(allocated > 0);
+        let r = root.report();
+        assert_eq!(r.facts.procs.deleted_open_bytes, allocated);
+        assert_eq!(r.facts.procs.deleted_open_logical_bytes, 8192);
+        assert_eq!(r.facts.procs.deleted_open.len(), 1);
+        let f = find(&r, "disk.deleted_open_files").unwrap();
+        assert_eq!(f.level, Level::Info);
+        assert!(f.summary.contains("(pid 500)"), "{}", f.summary);
+        assert_eq!(f.observed["bytes"], allocated);
+        assert_eq!(f.observed["logical_bytes"], 8192);
+
+        // Classification-only boundary inputs preserve the original large-allocation
+        // warning without presenting a sparse fixture as a measured GiB of storage.
+        for (bytes, expected) in [(GIB - 1, Level::Info), (GIB, Level::Warn)] {
+            let mut facts = r.facts.clone();
+            facts.procs.deleted_open_bytes = bytes;
+            facts.procs.deleted_open_logical_bytes = bytes;
+            facts.procs.deleted_open[0].bytes = bytes;
+            facts.procs.deleted_open[0].logical_bytes = bytes;
+            let mut findings = Vec::new();
+            check_deleted_open(&facts, &mut findings);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].level, expected);
+            assert_eq!(findings[0].observed["bytes"], bytes);
+            assert!(findings[0].rationale.contains("not measured freed space"));
+            assert_eq!(
+                findings[0].commands,
+                vec!["ls -l /proc/500/fd | grep deleted"]
+            );
+        }
     }
 
     #[test]
