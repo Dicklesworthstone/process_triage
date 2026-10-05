@@ -1,6 +1,45 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Execution update — 2026-10-05 03:42 UTC
+## Execution update — 2026-10-05 04:26 UTC
+
+The following is the latest evidence. Older dated entries below retain the failures and their corrections;
+their then-pending statements are historical, not replacements for the current results.
+
+- The strict `--workspace --lib --features pt-core/test-utils` run passed 4,854 tests at 04:24:35,
+  with zero failures and seven existing ignores. Core passed 3,980; all eight workspace crates executed.
+  `final-0413-source.sha256` matched the worker; `final-0413-workspace-lib.log` retains the complete run.
+  The subsequently added 39-byte malformed Unicode HEAD case is test-only and is being rerun separately.
+- The 03:58 hz4 upload passed all 14 actual action tests, all 45 exit-code tests and all five lifecycle tests.
+  This includes the real saved-plan producer/apply/verify chain, mandatory-check tampering, actual resident-memory
+  budget, two-run minute limit, protected group, default robot spare, and real respawn attribution with collision
+  negatives. The whole invocation still exited 101: main had two invalid fixtures and report had one.
+- Corrected main now passes all 38 tests, including all five real TUI execution/budget/tree regressions.
+  Report currently passes 45 of 46. The remaining canary passed both session/bundle HTML privacy and exact-time
+  assertions, then failed when its negative fixture tried to write a file over a pre-created telemetry directory.
+  That fixture is being corrected by preserving the directory under a retained sibling name; no deletion.
+- All seven new extraction tests passed twice: genuine verified-byte positives plus malicious destination,
+  symlink, existing-file and corrupted-checksum negatives. This is Linux execution evidence, not macOS acceptance.
+- The current production native binary SHA256 `4e6adafda1426da1d14f38c1d164ef41e091e86b8e8f39bc18510c562934eb05`
+  passed all 62 BATS contracts. Its isolated demo used the correct `PROCESS_TRIAGE_DATA`/`PROCESS_TRIAGE_CONFIG`,
+  returned 0, retained the original live PID/start identity, and saved zero executed verification outcomes.
+  Its generated Plan schema exactly matches the published bytes. Logs: `final-native-bats-0419.log` and
+  `final-native-demo-schema-corrected-0423.log`. The first probe's wrong verification-file lookup is retained
+  as a probe failure; the corrected probe reran the complete demo rather than assuming its missing assertion.
+- Workspace all-targets check and warning-denying Clippy passed the 03:58/04:03 source. Lean check passed
+  at 04:09:17 with one existing unused queue-diagnostic-fields warning. Formatting, shellcheck and actionlint pass.
+  Final compiler/Clippy refresh must include the later test-only corrections; those passes are not yet claimed.
+- Eighteen compatible dependency families have affected-consumer evidence; the current lock is
+  `dd6f11e6fc7da70dcf994ee08303db3feb3a8ff8389880c0d94ab856a4cef8f0`.
+  The fresh cached audit exits 1 for rkyv, with LRU unsound and paste unmaintained findings. The isolated minifier
+  experiment stopped after three failures and was not landed. Larger Criterion/TUI migrations await the earlier
+  skill-required approval; neither elapsed time nor the full library pass supplies that approval.
+- UBS completed its eleven-file static scan but exited 1: 38 critical, 2,988 warnings and 2,122 informational
+  findings. `status: ok` describes scanner execution, not gate success. Full critical-finding triage is underway;
+  no suppression, waiver, clean-security or publishable-tree claim is made.
+
+The product is substantially closer to its safety-first cleanup promise, but it is not finished. Calibration on
+the real false-positive corpus, fleet/macOS acceptance, measured relief/settle windows and the remaining original
+workstreams are still required. No feature Bead has been closed by this root while final acceptance is pending.
 
 The assessment below describes the inspected baseline. The working tree now connects the canonical executable
 Plan to agent planning, saves the exact scorer ledger, enforces the current/saved policy age floor at apply,
@@ -233,6 +272,13 @@ Actual strict remote validation so far:
 - [ ] Execute final planned-kill cap and child-before-parent/tree exclusion tests.
 - [ ] Fix and execute bundle extraction destination/symlink boundary (`bd-gn74`) before treating extraction as safe.
 - [ ] Fix macOS notification argument interpolation (`bd-zisi`); require actual macOS evidence for platform acceptance.
+- [ ] Finish `bd-r1mu`: prove both below/above cutoff malformed UTF-8 HEAD files return typed Unreadable;
+  preserve genuine main/detached Git and live-process cwd positives, then independently review final gates.
+- [x] Execute all eight workspace library suites on the 04:13 source/lock (4,854 passed, seven existing ignores).
+- [x] Execute corrected main-binary tests on the 04:23 upload (38 passed; all five TUI regressions included).
+- [ ] Finish the existing report canary's unreadable-telemetry negative without deleting its pre-created directory;
+  rerun its complete plain/encrypted/session/bundle/activation/privacy/publication assertions.
+- [ ] Independently recompute the latest native BATS step digests and validate its real producer Plan instance.
 - [ ] Run appropriate workspace regressions; distinguish pre-existing failures from new ones using evidence.
 - [ ] Re-execute workflow static checks and review scanner findings before committing.
 - [ ] Complete fresh original-acceptance review and the real-work/honesty inventories; close only proven tasks.
