@@ -15,16 +15,33 @@ fn cli_usage_errors_follow_the_agent_exit_contract() {
         vec!["nonexistent-command"],
         vec!["config", "export-preset"],
         vec!["agent", "apply", "--pids", "not-a-pid"],
-        vec!["agent", "apply", "--session", "fixture", "--max-total-blast-radius", "NaN"],
-        vec!["agent", "apply", "--session", "fixture", "--max-total-blast-radius", "inf"],
-        vec!["agent", "apply", "--session", "fixture", "--max-blast-radius=-1"],
-        vec!["agent", "apply", "--session", "fixture", "--min-posterior", "1.1"],
     ] {
         cargo_bin_cmd!("pt-core")
             .args(args)
             .assert()
             .code(ExitCode::ArgsError.as_i32())
             .stderr(predicate::str::contains("error:"));
+    }
+}
+
+#[test]
+fn numeric_guardrails_are_validated_before_loading_a_session() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use predicates::prelude::*;
+
+    for (option, value) in [
+        ("--max-total-blast-radius", "NaN"),
+        ("--max-total-blast-radius", "inf"),
+        ("--max-blast-radius", "-1"),
+        ("--min-posterior", "1.1"),
+    ] {
+        cargo_bin_cmd!("pt-core")
+            .args(["agent", "apply", "--session", "not-a-real-session"])
+            .arg(format!("{option}={value}"))
+            .assert()
+            .code(ExitCode::ArgsError.as_i32())
+            .stderr(predicate::str::contains("invalid value"))
+            .stderr(predicate::str::contains(option));
     }
 }
 

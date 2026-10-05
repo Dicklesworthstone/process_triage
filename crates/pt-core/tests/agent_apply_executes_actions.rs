@@ -752,7 +752,10 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         if let Some(snapshot) = snapshot {
             without_snapshot["policy_snapshot"] = snapshot;
         } else {
-            without_snapshot.as_object_mut().unwrap().remove("policy_snapshot");
+            without_snapshot
+                .as_object_mut()
+                .unwrap()
+                .remove("policy_snapshot");
         }
         fs::write(
             handle.dir.join("decision/plan.json"),
@@ -763,8 +766,15 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
             &log_dir,
             step,
             &[
-                "--format", "json", "agent", "apply", "--session", session,
-                "--targets", &target, "--yes",
+                "--format",
+                "json",
+                "agent",
+                "apply",
+                "--session",
+                session,
+                "--targets",
+                &target,
+                "--yes",
             ],
             &data_dir,
             &config_dir,
