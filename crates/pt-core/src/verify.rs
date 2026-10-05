@@ -19,6 +19,8 @@ pub struct SavedActionOutcome {
     pub pid: u32,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<Action>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ProcessIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -229,7 +231,9 @@ pub fn executed_plan_actions<'a>(
     plan: &'a Plan,
     saved: &'a [SavedActionOutcome],
 ) -> Result<Vec<(&'a PlanAction, &'a SavedActionOutcome)>, VerifyError> {
-    Ok(recorded_plan_actions(plan, saved)?
+    let recorded = recorded_plan_actions(plan, saved)?;
+    validate_execution_timestamps(saved, Utc::now())?;
+    Ok(recorded
         .into_iter()
         .filter(|(_, outcome)| outcome.status == "success")
         .collect())
@@ -273,6 +277,12 @@ fn recorded_plan_actions<'a>(
                 outcome.status, outcome.action_id
             )));
         };
+        if outcome.status == "success" && outcome.action != Some(action.action) {
+            return Err(VerifyError::InvalidOutcomes(format!(
+                "{} successful execution action kind {:?} does not match plan action {:?}",
+                outcome.action_id, outcome.action, action.action
+            )));
+        }
         if action.action == Action::Keep {
             continue;
         }
@@ -400,6 +410,7 @@ fn find_respawn_with_birth_order(
     if action.action != Action::Kill
         || action.blocked
         || executed.status != "success"
+        || executed.action != Some(action.action)
         || executed.action_id != action.action_id
         || executed.pid != action.target.pid.0
         || !executed.target.as_ref()?.matches(&action.target)
@@ -464,14 +475,10 @@ fn execution_birth_order(
     Some(process.start_time_unix.cmp(&executed_at.timestamp()))
 }
 
-pub fn verify_plan(
-    plan: &Plan,
+fn validate_execution_timestamps(
     saved: &[SavedActionOutcome],
-    current: &[ProcessRecord],
-    requested_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
-) -> Result<VerificationReport, VerifyError> {
-    let recorded = recorded_plan_actions(plan, saved)?;
+) -> Result<(), VerifyError> {
     for execution in saved
         .iter()
         .filter(|execution| execution.status == "success" || is_failed_attempt(&execution.status))
@@ -483,6 +490,18 @@ pub fn verify_plan(
             )));
         }
     }
+    Ok(())
+}
+
+pub fn verify_plan(
+    plan: &Plan,
+    saved: &[SavedActionOutcome],
+    current: &[ProcessRecord],
+    requested_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+) -> Result<VerificationReport, VerifyError> {
+    let recorded = recorded_plan_actions(plan, saved)?;
+    validate_execution_timestamps(saved, completed_at)?;
     let by_pid: HashMap<_, _> = current
         .iter()
         .map(|process| (process.pid.0, process))
@@ -775,6 +794,7 @@ mod tests {
             action_id: action.action_id.clone(),
             pid: action.target.pid.0,
             status: "success".to_string(),
+            action: Some(action.action),
             target: Some(action.target.clone()),
             command: Some("node app --port 3000".to_string()),
             parent_pid: Some(10),
@@ -881,6 +901,50 @@ mod tests {
             invalid.execution_clock = None;
             assert!(executed_plan_actions(&plan, &[invalid]).is_err());
         }
+    }
+
+    #[test]
+    fn successful_outcomes_require_matching_action_kind_before_keep_or_completion() {
+        for kind in [Action::Keep, Action::Pause, Action::Kill] {
+            let action = make_action(123, kind);
+            let plan = make_plan(vec![action.clone()]);
+            let success = execution(&action);
+            let matched = executed_plan_actions(&plan, std::slice::from_ref(&success)).unwrap();
+            assert_eq!(matched.len(), usize::from(kind != Action::Keep));
+            for recorded_kind in [None, Some(Action::Renice)] {
+                let mut invalid = success.clone();
+                invalid.action = recorded_kind;
+                let error = executed_plan_actions(&plan, &[invalid]).unwrap_err();
+                assert!(
+                    error.to_string().contains("action kind"),
+                    "{kind:?}: {error}"
+                );
+            }
+            let mut wire = serde_json::to_value(&success).unwrap();
+            wire.as_object_mut().unwrap().remove("action");
+            let missing = parse_action_outcomes(&wire.to_string()).unwrap();
+            assert!(missing[0].action.is_none());
+            assert!(executed_plan_actions(&plan, &missing).is_err());
+
+            // A record with no successful effect does not need or invent a kind.
+            let failed = failed_attempt(&action);
+            assert!(failed.action.is_none());
+            assert!(executed_plan_actions(&plan, std::slice::from_ref(&failed))
+                .unwrap()
+                .is_empty());
+            for status in ["skipped", "dry_run", "already_completed"] {
+                let mut skipped = failed.clone();
+                skipped.status = status.to_string();
+                assert!(executed_plan_actions(&plan, &[skipped]).unwrap().is_empty());
+            }
+        }
+
+        let pause = make_action(123, Action::Pause);
+        let saved_pause = execution(&pause);
+        let mut changed = pause;
+        changed.action = Action::Kill;
+        let error = executed_plan_actions(&make_plan(vec![changed]), &[saved_pause]).unwrap_err();
+        assert!(error.to_string().contains("action kind"));
     }
 
     #[test]
@@ -1205,6 +1269,13 @@ mod tests {
         let saved = execution(&action);
         let positive = make_proc(456, 1000, "node app --port 3000", 20, ProcessState::Running);
         assert!(detect_respawn(&action, &saved, std::slice::from_ref(&positive)).is_some());
+        for recorded_kind in [None, Some(Action::Pause)] {
+            let mut wrong_kind = saved.clone();
+            wrong_kind.action = recorded_kind;
+            assert!(
+                detect_respawn(&action, &wrong_kind, std::slice::from_ref(&positive)).is_none()
+            );
+        }
         for field in [
             "uid",
             "parent",
@@ -1441,6 +1512,44 @@ mod tests {
     }
 
     #[test]
+    fn same_pid_birth_order_distinguishes_reuse_ambiguity_and_respawn() {
+        let action = make_action(123, Action::Kill);
+        let saved = execution(&action);
+        let plan = make_plan(vec![action]);
+        for (ticks, expected, actual) in [
+            (999, VerifyOutcome::PidReused, "pid_reused"),
+            (1000, VerifyOutcome::Unsupported, "ambiguous_respawn"),
+            (1001, VerifyOutcome::Respawned, "respawned"),
+        ] {
+            let mut process = make_proc(
+                123,
+                1000,
+                "node app --port 3000",
+                ticks / 100,
+                ProcessState::Running,
+            );
+            process.start_id = StartId(format!("boot:{ticks}:123"));
+            let verified = report(&plan, std::slice::from_ref(&saved), &[process]);
+            let outcome = &verified.action_outcomes[0];
+            assert_eq!(outcome.outcome, expected);
+            assert_eq!(outcome.actual.as_deref(), Some(actual));
+            assert_eq!(outcome.verified, Some(false));
+            assert_eq!(
+                outcome.respawn_detected.is_some(),
+                expected == VerifyOutcome::Respawned
+            );
+            assert_eq!(
+                verified
+                    .resource_summary
+                    .as_ref()
+                    .unwrap()
+                    .expected_freed_mb,
+                0.0
+            );
+        }
+    }
+
+    #[test]
     fn executed_pause_verifies_stopped_but_absence_and_unsupported_effects_are_not_success() {
         for (action_kind, state, present, expected) in [
             (
@@ -1553,6 +1662,13 @@ mod tests {
                 DateTime::from_timestamp(30, 0).unwrap(),
                 DateTime::from_timestamp(31, 0).unwrap()
             ),
+            Err(VerifyError::InvalidTimestamp(_))
+        ));
+        let action = make_action(123, Action::Kill);
+        let mut future = execution(&action);
+        future.executed_at = Some(Utc::now() + chrono::Duration::days(1));
+        assert!(matches!(
+            executed_plan_actions(&make_plan(vec![action]), &[future]),
             Err(VerifyError::InvalidTimestamp(_))
         ));
     }

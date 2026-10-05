@@ -1,12 +1,40 @@
 #![cfg(feature = "test-utils")]
 
-use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};
+use pt_common::{IdentityQuality, ProcessIdentity, StartId};
 use pt_core::action::executor::ActionRunner;
 use pt_core::action::SignalActionRunner;
+use pt_core::collect::{quick_scan, QuickScanOptions};
 use pt_core::decision::Action as PlanActionType;
 use pt_core::plan::{ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, PlanAction};
 use pt_core::test_utils::ProcessHarness;
 use std::time::Duration;
+
+fn live_identity(pid: u32) -> ProcessIdentity {
+    let scan = quick_scan(&QuickScanOptions {
+        pids: vec![pid],
+        ..QuickScanOptions::default()
+    })
+    .expect("scan the owned target");
+    let target = scan
+        .processes
+        .iter()
+        .find(|process| process.pid.0 == pid)
+        .expect("owned target is present in the real scan");
+    assert!(
+        !target.start_id.0.starts_with("unknown:") && !target.start_id.0.starts_with("synthetic:"),
+        "owned target requires its actual kernel birth identity"
+    );
+    let identity = ProcessIdentity::full(
+        pid,
+        target.start_id.clone(),
+        target.uid,
+        target.pgid,
+        target.sid,
+        IdentityQuality::Full,
+    );
+    eprintln!("owned signal target: {}", serde_json::json!(identity));
+    identity
+}
 
 fn empty_rationale() -> ActionRationale {
     ActionRationale {
@@ -39,14 +67,7 @@ fn test_signal_kill_real() {
     let action = PlanAction {
         action_id: "test-kill".to_string(),
         action: PlanActionType::Kill,
-        target: ProcessIdentity {
-            pid: ProcessId(pid),
-            start_id: StartId("mock".to_string()),
-            uid: 1000,
-            pgid: None,
-            sid: None,
-            quality: IdentityQuality::Full,
-        },
+        target: live_identity(pid),
         order: 0,
         stage: 0,
         timeouts: ActionTimeouts::default(),
@@ -94,14 +115,7 @@ fn test_signal_pause_resume_real() {
     let pause_action = PlanAction {
         action_id: "test-pause".to_string(),
         action: PlanActionType::Pause,
-        target: ProcessIdentity {
-            pid: ProcessId(pid),
-            start_id: StartId("mock".to_string()),
-            uid: 1000,
-            pgid: None,
-            sid: None,
-            quality: IdentityQuality::Full,
-        },
+        target: live_identity(pid),
         order: 0,
         stage: 0,
         timeouts: ActionTimeouts::default(),
@@ -115,6 +129,24 @@ fn test_signal_pause_resume_real() {
         original_zombie_target: None,
         d_state_diagnostics: None,
     };
+
+    // A fabricated birth identity must refuse before a signal reaches this child.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut stale = pause_action.clone();
+        stale.target.start_id = StartId("mock".to_string());
+        assert!(matches!(
+            runner.execute(&stale),
+            Err(pt_core::action::ActionError::IdentityMismatch)
+        ));
+        assert_eq!(runner.take_signal_path(), None);
+        assert!(live_identity(pid).matches(&pause_action.target));
+        #[cfg(target_os = "linux")]
+        assert!(
+            !proc.is_stopped(),
+            "refused identity must not pause the target"
+        );
+    }
 
     // Pause
     let result = runner.execute(&pause_action);
@@ -169,6 +201,8 @@ fn test_process_group_pause_resume_real() {
 
     // Get PGID and all PIDs in the group
     let pgid = proc.pgid().expect("should have pgid");
+    let group_identity = live_identity(pid);
+    assert_eq!(group_identity.pgid, Some(pgid));
     let group_pids = proc.group_pids();
     assert!(
         group_pids.len() >= 2,
@@ -186,14 +220,7 @@ fn test_process_group_pause_resume_real() {
     let pause_action = PlanAction {
         action_id: "test-group-pause".to_string(),
         action: PlanActionType::Pause,
-        target: ProcessIdentity {
-            pid: ProcessId(pid),
-            start_id: StartId("mock".to_string()),
-            uid: 1000,
-            pgid: Some(pgid),
-            sid: None,
-            quality: IdentityQuality::Full,
-        },
+        target: group_identity.clone(),
         order: 0,
         stage: 0,
         timeouts: ActionTimeouts::default(),
@@ -226,14 +253,7 @@ fn test_process_group_pause_resume_real() {
     let resume_action = PlanAction {
         action_id: "test-group-resume".to_string(),
         action: PlanActionType::Resume,
-        target: ProcessIdentity {
-            pid: ProcessId(pid),
-            start_id: StartId("mock".to_string()),
-            uid: 1000,
-            pgid: Some(pgid),
-            sid: None,
-            quality: IdentityQuality::Full,
-        },
+        target: group_identity,
         order: 1,
         stage: 1,
         timeouts: ActionTimeouts::default(),
@@ -291,14 +311,7 @@ fn test_zombie_verification_real() {
     let action = PlanAction {
         action_id: "test-kill-zombie".to_string(),
         action: PlanActionType::Kill,
-        target: ProcessIdentity {
-            pid: ProcessId(pid),
-            start_id: StartId("mock".to_string()),
-            uid: 1000,
-            pgid: None,
-            sid: None,
-            quality: IdentityQuality::Full,
-        },
+        target: live_identity(pid),
         order: 0,
         stage: 0,
         timeouts: ActionTimeouts::default(),

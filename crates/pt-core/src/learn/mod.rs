@@ -14,6 +14,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::exit_codes::ExitCode;
+
 pub const LEARN_SCHEMA_VERSION: &str = "1.0.0";
 pub const PROGRESS_FILE_NAME: &str = "learn_progress.json";
 
@@ -436,9 +438,12 @@ fn run_check_with_budget(
                         (true, None)
                     }
                 } else {
-                    // pt's exit-code contract: 0-9 are operational outcomes (a plan with
-                    // candidates exits 1, PlanReady), 10 and up are errors.
-                    (status.code().is_some_and(|c| (0..10).contains(&c)), None)
+                    // A completed plan may contain candidates. Other operational
+                    // outcomes (blocked, partial, interrupted) do not verify a tutorial.
+                    let plan_ready = args.starts_with(&["agent", "plan"])
+                        && !args.iter().any(|arg| matches!(*arg, "--help" | "-h"))
+                        && status.code() == Some(ExitCode::PlanReady.as_i32());
+                    (status.success() || plan_ready, None)
                 };
                 return VerifyCheck {
                     command,
@@ -490,9 +495,10 @@ pub fn verify_tutorial(
     let mut fallback_reason = None;
     let mut all_ok = true;
     let data_dir = std::env::temp_dir().join(format!(
-        "pt-learn-verify-{}-{}",
+        "pt-learn-verify-{}-{}-{}",
         std::process::id(),
-        tutorial.id
+        tutorial.id,
+        uuid::Uuid::new_v4()
     ));
     let _ = std::fs::create_dir_all(&data_dir);
 
@@ -524,8 +530,8 @@ pub fn verify_tutorial(
         }
         checks.push(check);
     }
-    // The scratch data directory this function created for the checks.
-    let _ = std::fs::remove_dir_all(&data_dir);
+    // Retain real check artifacts, including failed or interrupted sessions.
+    // A unique directory avoids overwriting evidence from repeated checks.
 
     VerifyResult {
         tutorial_id: tutorial.id.to_string(),
@@ -641,30 +647,37 @@ mod tests {
         assert_eq!(run.status, "failed");
     }
 
-    /// A Run step passes on pt's operational outcomes, not only exit 0: `agent plan`
-    /// exits 1 (PlanReady) whenever it found candidates, which on a busy host is
-    /// always (real `learn verify --all` on an rch worker failed 4 tutorials this way).
+    /// A genuine completed plan with candidates verifies the tutorial, while
+    /// policy refusals, partial execution and unexpected codes remain failures.
     #[cfg(unix)]
     #[test]
-    fn run_step_accepts_operational_exit_codes() {
+    fn run_step_accepts_only_the_commands_successful_outcomes() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
+        let dir = tempfile::tempdir().unwrap().keep();
+        let data = dir.join("data");
         let budget = Duration::from_secs(5);
-        for (code, want) in [
-            (0, "ok"),
-            (1, "ok"),
-            (4, "ok"),
-            (10, "failed"),
-            (20, "failed"),
-        ] {
-            let fake = dir.path().join(format!("fake-{code}"));
+        for code in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20] {
+            let fake = dir.join(format!("fake-{code}"));
             std::fs::write(&fake, format!("#!/bin/sh\nexit {code}\n")).unwrap();
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let run =
-                run_check_with_budget(&fake, VerifyStep::Run(&["agent", "plan"]), &data, budget);
-            assert_eq!(run.status, want, "exit {code}: {run:?}");
-            assert_eq!(run.exit_code, Some(code));
+            for (args, accepts_candidates) in [
+                (&["agent", "plan"][..], true),
+                (&["agent", "plan", "--deep"][..], true),
+                (&["agent", "plan", "--help"][..], false),
+                (&["scan"][..], false),
+                (&["deep-scan"][..], false),
+                (&["--version"][..], false),
+                (&["shadow", "status"][..], false),
+            ] {
+                let run = run_check_with_budget(&fake, VerifyStep::Run(args), &data, budget);
+                let want = if code == 0 || (code == 1 && accepts_candidates) {
+                    "ok"
+                } else {
+                    "failed"
+                };
+                assert_eq!(run.status, want, "{args:?}, exit {code}: {run:?}");
+                assert_eq!(run.exit_code, Some(code));
+            }
         }
     }
 

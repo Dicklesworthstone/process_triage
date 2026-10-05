@@ -9,7 +9,7 @@
 //! - `CheckSessionSafety`: Verify session safety (not session leader, etc.)
 
 #[cfg(target_os = "linux")]
-use crate::collect::parse_io;
+use crate::collect::proc_parsers::{read_io, read_required_proc_stat};
 use crate::collect::protected::ProtectedFilter;
 #[cfg(target_os = "linux")]
 use crate::collect::systemd::collect_systemd_unit;
@@ -23,6 +23,8 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -50,6 +52,45 @@ fn recent_io_probe_window(window: Duration) -> Duration {
     } else {
         window
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_supervision_cgroup_path(pid: u32, content: &str) -> Result<Option<String>, String> {
+    let invalid =
+        |reason: &str| format!("invalid /proc/{pid}/cgroup supervision evidence: {reason}");
+    let mut unified = None;
+    let mut systemd = None;
+    let mut hierarchies = HashSet::new();
+    for line in content.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(hierarchy), Some(controllers), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(invalid("truncated row"));
+        };
+        let hierarchy: u32 = hierarchy
+            .parse()
+            .map_err(|_| invalid("invalid hierarchy"))?;
+        if !hierarchies.insert(hierarchy) {
+            return Err(invalid("duplicate hierarchy"));
+        }
+        if !path.starts_with('/') || (hierarchy == 0) != controllers.is_empty() {
+            return Err(invalid("invalid path or controllers"));
+        }
+        if hierarchy == 0 {
+            unified = Some(path.to_string());
+        } else if controllers
+            .split(',')
+            .any(|controller| controller == "name=systemd")
+            && systemd.replace(path.to_string()).is_some()
+        {
+            return Err(invalid("duplicate systemd hierarchy"));
+        }
+    }
+    if hierarchies.is_empty() {
+        return Err(invalid("empty table"));
+    }
+    Ok(unified.or(systemd))
 }
 
 /// Errors during pre-check validation.
@@ -423,6 +464,164 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecentIoEvidence {
+    #[cfg(target_os = "linux")]
+    Active,
+    #[cfg(target_os = "linux")]
+    Idle,
+    Unknown(String),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct IoSample {
+    birth_ticks: u64,
+    wchar: u64,
+    write_bytes: u64,
+    started_at: Instant,
+    finished_at: Instant,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct RecentIoObservation {
+    before: Result<IoSample, String>,
+    after: Result<IoSample, String>,
+    window: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl RecentIoObservation {
+    fn evidence(&self) -> RecentIoEvidence {
+        let (before, after) = match (&self.before, &self.after) {
+            (Ok(before), Ok(after)) => (before, after),
+            (Err(before), Err(after)) => {
+                return RecentIoEvidence::Unknown(format!(
+                    "before sample: {before}; after sample: {after}"
+                ));
+            }
+            (Err(reason), _) => {
+                return RecentIoEvidence::Unknown(format!("before sample: {reason}"));
+            }
+            (_, Err(reason)) => {
+                return RecentIoEvidence::Unknown(format!("after sample: {reason}"));
+            }
+        };
+        if before.birth_ticks != after.birth_ticks {
+            return RecentIoEvidence::Unknown(
+                "process birth changed during I/O window".to_string(),
+            );
+        }
+        if !after
+            .started_at
+            .checked_duration_since(before.finished_at)
+            .is_some_and(|elapsed| elapsed >= self.window)
+        {
+            return RecentIoEvidence::Unknown(
+                "I/O samples do not cover the required window".to_string(),
+            );
+        }
+        if after.wchar < before.wchar || after.write_bytes < before.write_bytes {
+            return RecentIoEvidence::Unknown(
+                "I/O counters decreased during observation".to_string(),
+            );
+        }
+        if after.wchar > before.wchar || after.write_bytes > before.write_bytes {
+            RecentIoEvidence::Active
+        } else {
+            RecentIoEvidence::Idle
+        }
+    }
+
+    fn revalidate(&self, current: Result<IoSample, String>) -> RecentIoEvidence {
+        let evidence = self.evidence();
+        if matches!(evidence, RecentIoEvidence::Unknown(_)) {
+            return evidence;
+        }
+        let (after, current) = match (&self.after, current) {
+            (Ok(after), Ok(current)) => (after, current),
+            (_, Err(reason)) => {
+                return RecentIoEvidence::Unknown(format!("cache revalidation: {reason}"));
+            }
+            (Err(reason), _) => return RecentIoEvidence::Unknown(reason.clone()),
+        };
+        if after.birth_ticks != current.birth_ticks {
+            return RecentIoEvidence::Unknown(
+                "process birth changed since cached I/O sample".to_string(),
+            );
+        }
+        let Some(age) = current.started_at.checked_duration_since(after.finished_at) else {
+            return RecentIoEvidence::Unknown(
+                "cached I/O sample is newer than revalidation".to_string(),
+            );
+        };
+        if current.wchar < after.wchar || current.write_bytes < after.write_bytes {
+            return RecentIoEvidence::Unknown(
+                "I/O counters decreased since cached sample".to_string(),
+            );
+        }
+        let increased = current.wchar > after.wchar || current.write_bytes > after.write_bytes;
+        // Equal cumulative counters for the same birth extend a complete idle
+        // window through this fresh read, even when earlier actions were slow.
+        if evidence == RecentIoEvidence::Idle && !increased {
+            return RecentIoEvidence::Idle;
+        }
+        if age > self.window {
+            return RecentIoEvidence::Unknown(
+                "cached activity is stale; a complete new I/O window is required".to_string(),
+            );
+        }
+        RecentIoEvidence::Active
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_io_birth(pid: u32) -> Result<u64, String> {
+    let bytes = std::fs::read(format!("/proc/{pid}/stat"))
+        .map_err(|error| format!("cannot read /proc/{pid}/stat for I/O identity: {error}"))?;
+    parse_io_birth(pid, &String::from_utf8_lossy(&bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_io_birth(pid: u32, content: &str) -> Result<u64, String> {
+    let open = content
+        .find('(')
+        .ok_or_else(|| format!("invalid /proc/{pid}/stat process identity"))?;
+    let close = content
+        .rfind(')')
+        .filter(|close| *close > open)
+        .ok_or_else(|| format!("invalid /proc/{pid}/stat process identity"))?;
+    if content[..open].trim().parse::<u32>().ok() != Some(pid) {
+        return Err(format!("mismatched /proc/{pid}/stat PID"));
+    }
+    content[close + 1..]
+        .split_whitespace()
+        .nth(19)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| format!("missing or invalid /proc/{pid}/stat birth ticks"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_io_sample(pid: u32) -> Result<IoSample, String> {
+    let started_at = Instant::now();
+    let birth_ticks = read_io_birth(pid)?;
+    let io = read_io(pid).map_err(|error| error.to_string())?;
+    if read_io_birth(pid)? != birth_ticks {
+        return Err(format!(
+            "process birth changed while reading /proc/{pid}/io"
+        ));
+    }
+    Ok(IoSample {
+        birth_ticks,
+        wchar: io.wchar,
+        write_bytes: io.write_bytes,
+        started_at,
+        finished_at: Instant::now(),
+    })
+}
+
 /// Live pre-check provider that reads from /proc (Linux) or sysctl/lsof (macOS).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct LivePreCheckProvider {
@@ -432,7 +631,7 @@ pub struct LivePreCheckProvider {
     known_supervisors: HashSet<String>,
     /// Recent-I/O results sampled up front for many pids (see `prime_recent_io`).
     #[cfg(target_os = "linux")]
-    recent_io: std::sync::Mutex<std::collections::HashMap<u32, bool>>,
+    recent_io: std::sync::Mutex<std::collections::HashMap<u32, RecentIoObservation>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -442,27 +641,30 @@ impl LivePreCheckProvider {
     /// the full window, 60 s by default, per target). Pids not primed are probed
     /// individually as before.
     pub fn prime_recent_io(&self, pids: &[u32]) {
-        // macOS has no per-process I/O counters: has_recent_io is always false there.
+        // Unsupported probes become Unknown when the enabled gate is evaluated.
         #[cfg(not(target_os = "linux"))]
         let _ = pids;
         #[cfg(target_os = "linux")]
         if self.config.block_if_recent_io_seconds > 0 && !pids.is_empty() {
-            let before: Vec<(u32, crate::collect::IoStats)> = pids
-                .iter()
-                .filter_map(|&pid| parse_io(pid).map(|io| (pid, io)))
+            let before: Vec<_> = pids.iter().map(|&pid| (pid, read_io_sample(pid))).collect();
+            let window = Duration::from_secs(self.config.block_if_recent_io_seconds);
+            std::thread::sleep(recent_io_probe_window(window));
+            let observations: Vec<_> = before
+                .into_iter()
+                .map(|(pid, before)| {
+                    (
+                        pid,
+                        RecentIoObservation {
+                            before,
+                            after: read_io_sample(pid),
+                            window,
+                        },
+                    )
+                })
                 .collect();
-            if before.is_empty() {
-                return;
-            }
-            std::thread::sleep(recent_io_probe_window(Duration::from_secs(
-                self.config.block_if_recent_io_seconds,
-            )));
             let mut cache = self.recent_io.lock().unwrap_or_else(|e| e.into_inner());
-            for (pid, b) in before {
-                // Gone or unreadable after the window: no recent I/O to protect.
-                let active = parse_io(pid)
-                    .is_some_and(|a| a.write_bytes > b.write_bytes || a.wchar > b.wchar);
-                cache.insert(pid, active);
+            for (pid, observation) in observations {
+                cache.insert(pid, observation);
             }
         }
     }
@@ -625,50 +827,45 @@ impl LivePreCheckProvider {
         Some((write_count > self.config.max_open_write_fds, write_count))
     }
 
-    /// Best-effort check for recent I/O activity (write-heavy).
-    ///
-    /// Uses a short probe window to detect increases in /proc/<pid>/io counters.
-    fn has_recent_io(&self, pid: u32, window: Duration) -> bool {
+    /// Observe a full I/O window, retaining unreadable and invalid evidence.
+    fn has_recent_io(&self, pid: u32, window: Duration) -> RecentIoEvidence {
         #[cfg(target_os = "linux")]
         {
-            if let Some(&cached) = self
+            let cached = self
                 .recent_io
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&pid)
-            {
-                return cached;
+                .cloned();
+            if let Some(cached) = cached {
+                if cached.window != window {
+                    return RecentIoEvidence::Unknown(
+                        "cached I/O window differs from the required window".to_string(),
+                    );
+                }
+                return cached.revalidate(read_io_sample(pid));
             }
-            let before = parse_io(pid);
-            let Some(before) = before else {
-                return false;
-            };
-
+            let before = read_io_sample(pid);
             std::thread::sleep(recent_io_probe_window(window));
-
-            let after = parse_io(pid);
-            let Some(after) = after else {
-                return false;
+            let observation = RecentIoObservation {
+                before,
+                after: read_io_sample(pid),
+                window,
             };
-
-            let write_bytes_delta = after.write_bytes.saturating_sub(before.write_bytes);
-            let wchar_delta = after.wchar.saturating_sub(before.wchar);
-
-            write_bytes_delta > 0 || wchar_delta > 0
+            let evidence = observation.evidence();
+            self.recent_io
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid, observation);
+            evidence
         }
         #[cfg(target_os = "macos")]
         {
-            // No easy /proc/pid/io on macOS. Best effort via lsof is too expensive
-            // for a frequent pre-check. Fallback to false.
             let _ = pid;
             let _ = window;
-            false
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = pid;
-            let _ = window;
-            false
+            RecentIoEvidence::Unknown(
+                "per-process I/O observation is unsupported on macOS".to_string(),
+            )
         }
     }
 
@@ -818,41 +1015,45 @@ impl LivePreCheckProvider {
     }
 
     /// Get parent process comm name.
-    fn get_ppid_comm(&self, pid: u32) -> Option<String> {
+    fn get_ppid_comm(&self, pid: u32) -> Result<Option<String>, String> {
         #[cfg(target_os = "linux")]
         {
-            let stat_path = format!("/proc/{pid}/stat");
-            let content_bytes = std::fs::read(&stat_path).ok()?;
-            let content = String::from_utf8_lossy(&content_bytes);
-
-            // Get PPID (field 4 after comm)
-            let comm_end = content.rfind(')')?;
-            let after_comm = content.get(comm_end + 2..)?;
-            let fields: Vec<&str> = after_comm.split_whitespace().collect();
-            let ppid: u32 = fields.first()?.parse().ok()?;
-
-            // Get parent's comm
-            let parent_comm_path = format!("/proc/{ppid}/comm");
-            let comm_bytes = std::fs::read(&parent_comm_path).ok()?;
-            Some(String::from_utf8_lossy(&comm_bytes).trim().to_string())
+            let before = read_required_proc_stat(pid).map_err(|error| error.to_string())?;
+            if before.ppid == 0 {
+                return Ok(None);
+            }
+            if before.ppid == pid {
+                return Err(format!(
+                    "parent supervision evidence for PID {pid} has a self-parent loop"
+                ));
+            }
+            let parent = read_required_proc_stat(before.ppid).map_err(|error| error.to_string())?;
+            let parent_after =
+                read_required_proc_stat(before.ppid).map_err(|error| error.to_string())?;
+            let after = read_required_proc_stat(pid).map_err(|error| error.to_string())?;
+            if after.starttime != before.starttime
+                || after.ppid != before.ppid
+                || parent_after.starttime != parent.starttime
+                || parent_after.comm != parent.comm
+            {
+                return Err(format!("parent supervision evidence changed for PID {pid}"));
+            }
+            Ok(Some(parent.comm))
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         {
-            crate::collect::read_process_snapshot(pid).and_then(|info| self.read_comm(info.ppid))
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = pid;
-            None
+            Err(format!(
+                "parent supervision evidence for PID {pid} is unsupported on this platform"
+            ))
         }
     }
 
     /// Check if process is managed by a known supervisor.
-    fn is_supervisor_managed(&self, pid: u32) -> Option<SupervisorInfo> {
+    fn is_supervisor_managed(&self, pid: u32) -> Result<Option<SupervisorInfo>, String> {
         // First check for non-systemd supervisors via parent comm
-        if let Some(ppid_comm) = self.get_ppid_comm(pid) {
+        if let Some(ppid_comm) = self.get_ppid_comm(pid)? {
             if self.known_supervisors.contains(&ppid_comm) && ppid_comm != "systemd" {
-                return Some(SupervisorInfo::from_parent_supervisor(&ppid_comm));
+                return Ok(Some(SupervisorInfo::from_parent_supervisor(&ppid_comm)));
             }
         }
 
@@ -863,19 +1064,29 @@ impl LivePreCheckProvider {
             // started; systemd does not supervise or restart it. Treating it as a unit
             // blocked every action on processes started over SSH ("use systemctl stop
             // session-N.scope", which would end the whole login).
-            if crate::collect::read_cgroup_role(pid).is_user_workload() {
+            let cgroup_path = self.read_supervision_cgroup_path(pid)?;
+            if cgroup_path
+                .as_deref()
+                .is_some_and(|path| crate::collect::classify_cgroup_path(path).is_user_workload())
+            {
                 trace!(
                     pid,
                     "login-session / transient-scope workload: not supervised"
                 );
-                return None;
+                return Ok(None);
             }
-            let cgroup_unit = self.extract_cgroup_unit(pid);
+            let cgroup_unit = cgroup_path
+                .as_deref()
+                .and_then(|path| {
+                    path.rsplit('/')
+                        .find(|unit| unit.ends_with(".service") || unit.ends_with(".scope"))
+                })
+                .map(str::to_string);
             if let Some(unit) = collect_systemd_unit(pid, cgroup_unit.as_deref()) {
                 // Filter out slice-only units (e.g., user.slice) - these aren't real supervision
                 if unit.unit_type == SystemdUnitType::Slice {
                     trace!(pid, unit_name = %unit.name, "ignoring slice-only unit");
-                    return None;
+                    return Ok(None);
                 }
 
                 debug!(
@@ -886,7 +1097,7 @@ impl LivePreCheckProvider {
                     "detected systemd unit"
                 );
 
-                return Some(SupervisorInfo::from_systemd_unit(unit, pid));
+                return Ok(Some(SupervisorInfo::from_systemd_unit(unit, pid)));
             }
         }
 
@@ -896,7 +1107,7 @@ impl LivePreCheckProvider {
             if let Some(launchd_service) = crate::collect::macos::detect_launchd_service(pid) {
                 let label = launchd_service.label;
                 let service_target = format!("system/{}", label);
-                return Some(SupervisorInfo {
+                return Ok(Some(SupervisorInfo {
                     supervisor: "launchd".to_string(),
                     unit_name: Some(label.clone()),
                     unit_type: None,
@@ -905,34 +1116,28 @@ impl LivePreCheckProvider {
                         command: format!("launchctl bootout {}", service_target),
                     },
                     systemd_unit: None,
-                });
+                }));
             }
         }
 
-        None
+        Ok(None)
     }
 
-    /// Extract the cgroup unit name (Linux only).
+    /// Read validated current cgroup placement without converting errors to absence.
     #[cfg(target_os = "linux")]
-    fn extract_cgroup_unit(&self, pid: u32) -> Option<String> {
+    fn read_supervision_cgroup_path(&self, pid: u32) -> Result<Option<String>, String> {
+        let before = read_required_proc_stat(pid).map_err(|error| error.to_string())?;
         let cgroup_path = format!("/proc/{pid}/cgroup");
-        let content_bytes = std::fs::read(&cgroup_path).ok()?;
-        let content = String::from_utf8_lossy(&content_bytes);
-
-        for line in content.lines() {
-            // Look for lines with .service or .scope (not .slice - those aren't real supervision)
-            if line.contains(".service") || line.contains(".scope") {
-                // Extract unit name from path like "0::/system.slice/nginx.service"
-                if let Some(start) = line.rfind('/') {
-                    let unit = &line[start + 1..];
-                    if !unit.is_empty() {
-                        return Some(unit.to_string());
-                    }
-                }
-            }
+        let content_bytes = std::fs::read(&cgroup_path)
+            .map_err(|error| format!("cannot read {cgroup_path}: {error}"))?;
+        let content = std::str::from_utf8(&content_bytes)
+            .map_err(|_| format!("invalid UTF-8 at {cgroup_path}"))?;
+        let path = parse_supervision_cgroup_path(pid, content)?;
+        let after = read_required_proc_stat(pid).map_err(|error| error.to_string())?;
+        if after.starttime != before.starttime {
+            return Err(format!("cgroup supervision evidence changed for PID {pid}"));
         }
-
-        None
+        Ok(path)
     }
 }
 
@@ -1086,22 +1291,33 @@ impl PreCheckProvider for LivePreCheckProvider {
             };
         }
 
-        // Check for recent I/O activity (best-effort).
+        // Enabled I/O gates require a complete observation, including identity.
         if self.config.block_if_recent_io_seconds > 0 {
             let window = Duration::from_secs(self.config.block_if_recent_io_seconds);
-            if self.has_recent_io(pid, window) {
-                debug!(
-                    pid,
-                    window_s = self.config.block_if_recent_io_seconds,
-                    "process has recent I/O activity"
-                );
-                return PreCheckResult::Blocked {
-                    check: PreCheck::CheckDataLossGate,
-                    reason: format!(
-                        "recent I/O activity within {}s window",
-                        self.config.block_if_recent_io_seconds
-                    ),
-                };
+            match self.has_recent_io(pid, window) {
+                #[cfg(target_os = "linux")]
+                RecentIoEvidence::Idle => {}
+                RecentIoEvidence::Unknown(reason) => {
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckDataLossGate,
+                        reason: format!("recent I/O evidence unavailable: {reason}"),
+                    };
+                }
+                #[cfg(target_os = "linux")]
+                RecentIoEvidence::Active => {
+                    debug!(
+                        pid,
+                        window_s = self.config.block_if_recent_io_seconds,
+                        "process has recent I/O activity"
+                    );
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckDataLossGate,
+                        reason: format!(
+                            "recent I/O activity within {}s window",
+                            self.config.block_if_recent_io_seconds
+                        ),
+                    };
+                }
             }
         }
 
@@ -1111,7 +1327,16 @@ impl PreCheckProvider for LivePreCheckProvider {
     fn check_supervisor(&self, pid: u32) -> PreCheckResult {
         trace!(pid, "checking supervisor status");
 
-        if let Some(supervisor_info) = self.is_supervisor_managed(pid) {
+        let supervisor_info = match self.is_supervisor_managed(pid) {
+            Ok(info) => info,
+            Err(error) => {
+                return PreCheckResult::Blocked {
+                    check: PreCheck::CheckSupervisor,
+                    reason: format!("supervisor evidence unavailable: {error}"),
+                }
+            }
+        };
+        if let Some(supervisor_info) = supervisor_info {
             let supervisor_name = supervisor_info.supervisor.as_str();
             debug!(
                 pid,
@@ -1164,7 +1389,10 @@ impl PreCheckProvider for LivePreCheckProvider {
                 }
             }
             Err(e) => {
-                trace!(pid, error = %e, "agent supervision detection error, allowing action");
+                return PreCheckResult::Blocked {
+                    check: PreCheck::CheckAgentSupervision,
+                    reason: format!("agent supervision evidence unavailable: {e}"),
+                };
             }
         }
 
@@ -1172,7 +1400,7 @@ impl PreCheckProvider for LivePreCheckProvider {
     }
 
     fn get_supervisor_info(&self, pid: u32) -> Option<SupervisorInfo> {
-        self.is_supervisor_managed(pid)
+        self.is_supervisor_managed(pid).ok().flatten()
     }
 
     fn check_session_safety(&self, pid: u32, sid: Option<u32>) -> PreCheckResult {
@@ -1894,6 +2122,38 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_cgroup_observation_preserves_session_exemptions() {
+        for path in [
+            "/user.slice/user-1000.slice/session-42.scope",
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/owned.scope",
+        ] {
+            let observed = parse_supervision_cgroup_path(42, &format!("0::{path}\n"))
+                .unwrap()
+                .unwrap();
+            assert!(crate::collect::classify_cgroup_path(&observed).is_user_workload());
+        }
+        assert_eq!(
+            parse_supervision_cgroup_path(42, "0::/\n").unwrap(),
+            Some("/".to_string())
+        );
+        assert_eq!(
+            parse_supervision_cgroup_path(42, "5:cpu,cpuacct:/owned\n").unwrap(),
+            None
+        );
+        for content in [
+            "",
+            "0::",
+            "invalid",
+            "0::/\n0::/other\n",
+            "1::/\n",
+            "invalid:name=systemd:/owned\n",
+        ] {
+            let error = parse_supervision_cgroup_path(42, content).unwrap_err();
+            assert!(error.contains("/proc/42/cgroup"), "{error}");
+        }
+    }
+
+    #[test]
     fn supervisor_action_serializes() {
         let restart = SupervisorAction::RestartUnit {
             command: "systemctl restart nginx".to_string(),
@@ -1930,6 +2190,26 @@ mod tests {
     mod macos_tests {
         use super::*;
 
+        #[test]
+        fn recent_io_unsupported_probe_cannot_clear_an_enabled_gate() {
+            let mut config = LivePreCheckConfig {
+                block_if_open_write_fds: false,
+                block_if_locked_files: false,
+                block_if_active_tty: false,
+                block_if_deleted_cwd: false,
+                block_if_recent_io_seconds: 1,
+                enhanced_session_safety: false,
+                ..LivePreCheckConfig::default()
+            };
+            let provider = LivePreCheckProvider::new(None, config.clone()).expect("provider");
+            assert!(matches!(provider.check_data_loss(std::process::id()),
+                PreCheckResult::Blocked { check, reason }
+                    if check == PreCheck::CheckDataLossGate && reason.contains("unsupported on macOS")));
+            config.block_if_recent_io_seconds = 0;
+            let provider = LivePreCheckProvider::new(None, config).expect("disabled provider");
+            assert!(provider.check_data_loss(std::process::id()).is_passed());
+        }
+
         /// The data-loss gate sees a regular file held open for writing (via lsof).
         #[test]
         fn data_loss_gate_blocks_open_write_handle_on_macos() {
@@ -1965,6 +2245,653 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux_tests {
         use super::*;
+        use crate::live_test_harness::run_owned_unprivileged_case;
+
+        fn io_only_provider(seconds: u64) -> LivePreCheckProvider {
+            LivePreCheckProvider::new(
+                None,
+                LivePreCheckConfig {
+                    block_if_open_write_fds: false,
+                    block_if_locked_files: false,
+                    block_if_active_tty: false,
+                    block_if_deleted_cwd: false,
+                    block_if_recent_io_seconds: seconds,
+                    enhanced_session_safety: false,
+                    ..LivePreCheckConfig::default()
+                },
+            )
+            .expect("I/O-only provider")
+        }
+
+        fn io_sample_at(at: Instant, birth_ticks: u64, wchar: u64, write_bytes: u64) -> IoSample {
+            IoSample {
+                birth_ticks,
+                wchar,
+                write_bytes,
+                started_at: at,
+                finished_at: at,
+            }
+        }
+
+        #[test]
+        fn recent_io_requires_valid_full_window_and_same_birth() {
+            let start = Instant::now();
+            let window = Duration::from_secs(1);
+            let before = io_sample_at(start, 42, 0, 0);
+            let after = io_sample_at(start + window, 42, 0, 0);
+            let idle = RecentIoObservation {
+                before: Ok(before.clone()),
+                after: Ok(after.clone()),
+                window,
+            };
+            assert_eq!(idle.evidence(), RecentIoEvidence::Idle);
+            for (sample, reason) in [
+                (io_sample_at(start + window, 43, 0, 0), "birth changed"),
+                (io_sample_at(start, 42, 0, 0), "required window"),
+            ] {
+                let observation = RecentIoObservation {
+                    after: Ok(sample),
+                    ..idle.clone()
+                };
+                assert!(
+                    matches!(observation.evidence(), RecentIoEvidence::Unknown(error)
+                    if error.contains(reason))
+                );
+            }
+            let active = RecentIoObservation {
+                after: Ok(io_sample_at(start + window, 42, 1, 0)),
+                ..idle.clone()
+            };
+            assert_eq!(active.evidence(), RecentIoEvidence::Active);
+            let storage_active = RecentIoObservation {
+                after: Ok(io_sample_at(start + window, 42, 0, 1)),
+                ..idle
+            };
+            assert_eq!(storage_active.evidence(), RecentIoEvidence::Active);
+        }
+
+        #[test]
+        fn recent_io_birth_parser_does_not_default_missing_or_invalid_ticks() {
+            let fields = "S 1 2 3 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0";
+            assert_eq!(
+                parse_io_birth(42, &format!("42 (a ) name) {fields} 123")),
+                Ok(123)
+            );
+            assert_eq!(parse_io_birth(42, &format!("42 (a) {fields} 0")), Ok(0));
+            for content in [
+                "42 (a) S 1".to_string(),
+                format!("42 (a) {fields} invalid"),
+                format!("43 (a) {fields} 123"),
+                "42 a S 1".to_string(),
+            ] {
+                assert!(parse_io_birth(42, &content).is_err(), "{content}");
+            }
+        }
+
+        #[test]
+        fn recent_io_preserves_both_failures_and_refuses_decreasing_counters() {
+            let start = Instant::now();
+            let window = Duration::from_secs(1);
+            let observation = RecentIoObservation {
+                before: Err("permission denied reading I/O".to_string()),
+                after: Err("missing wchar counter".to_string()),
+                window,
+            };
+            assert!(
+                matches!(observation.evidence(), RecentIoEvidence::Unknown(reason)
+                if reason.contains("before sample: permission denied")
+                    && reason.contains("after sample: missing wchar"))
+            );
+            for after in [
+                io_sample_at(start + window, 42, 9, 10),
+                io_sample_at(start + window, 42, 10, 9),
+            ] {
+                let observation = RecentIoObservation {
+                    before: Ok(io_sample_at(start, 42, 10, 10)),
+                    after: Ok(after),
+                    window,
+                };
+                assert!(
+                    matches!(observation.evidence(), RecentIoEvidence::Unknown(reason)
+                    if reason.contains("decreased"))
+                );
+            }
+        }
+
+        #[test]
+        fn recent_io_cache_requires_fresh_identity_and_counter_evidence() {
+            let start = Instant::now();
+            let window = Duration::from_secs(1);
+            let idle = RecentIoObservation {
+                before: Ok(io_sample_at(start, 42, 10, 10)),
+                after: Ok(io_sample_at(start + window, 42, 10, 10)),
+                window,
+            };
+            // The unchanged cumulative counters cover the intervening delay,
+            // so a slow earlier action does not force another per-target sleep.
+            assert_eq!(
+                idle.revalidate(Ok(io_sample_at(start + window * 10, 42, 10, 10))),
+                RecentIoEvidence::Idle
+            );
+            assert_eq!(
+                idle.revalidate(Ok(io_sample_at(start + window * 2, 42, 11, 10))),
+                RecentIoEvidence::Active
+            );
+            for (sample, reason) in [
+                (
+                    io_sample_at(start + window * 2, 43, 10, 10),
+                    "birth changed",
+                ),
+                (io_sample_at(start + window * 2, 42, 9, 10), "decreased"),
+                (io_sample_at(start + window * 2, 42, 10, 9), "decreased"),
+                (io_sample_at(start + window * 10, 42, 11, 10), "stale"),
+            ] {
+                assert!(
+                    matches!(idle.revalidate(Ok(sample)), RecentIoEvidence::Unknown(error)
+                    if error.contains(reason))
+                );
+            }
+            assert!(
+                matches!(idle.revalidate(Err("permission denied".to_string())),
+                RecentIoEvidence::Unknown(reason) if reason.contains("cache revalidation"))
+            );
+            let active = RecentIoObservation {
+                before: Ok(io_sample_at(start, 42, 9, 10)),
+                ..idle
+            };
+            assert!(matches!(
+                active.revalidate(Ok(io_sample_at(start + window * 10, 42, 10, 10))),
+                RecentIoEvidence::Unknown(reason) if reason.contains("stale")
+            ));
+        }
+
+        #[test]
+        fn recent_io_records_missing_targets_and_only_zero_disables_the_gate() {
+            let provider = io_only_provider(1);
+            let began = Instant::now();
+            provider.prime_recent_io(&[u32::MAX]);
+            assert!(began.elapsed() >= Duration::from_secs(1));
+            assert!(provider.recent_io.lock().unwrap().contains_key(&u32::MAX));
+            let result = provider.check_data_loss(u32::MAX);
+            assert!(matches!(result, PreCheckResult::Blocked { check, reason }
+                if check == PreCheck::CheckDataLossGate
+                    && reason.contains("recent I/O evidence unavailable")
+                    && reason.contains("before sample")
+                    && reason.contains("after sample")));
+            assert!(io_only_provider(0).check_data_loss(u32::MAX).is_passed());
+        }
+
+        #[test]
+        fn recent_io_owned_child_readability() {
+            use crate::collect::proc_parsers::IoReadError;
+            use std::io::{Read, Write};
+            use std::process::{Child, Command, Stdio};
+
+            const MODE: &str = "PT_TEST_RECENT_IO_CHILD";
+            if let Ok(mode) = std::env::var(MODE) {
+                assert!(matches!(mode.as_str(), "idle" | "writer" | "unreadable"));
+                let dumpable = if mode == "unreadable" { 0 } else { 1 };
+                // SAFETY: PR_SET_DUMPABLE takes an integer flag and no pointers.
+                // This runs after exec inside only this owned fixture process.
+                let result = unsafe {
+                    libc::prctl(
+                        libc::PR_SET_DUMPABLE,
+                        dumpable as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                    )
+                };
+                assert_eq!(
+                    result,
+                    0,
+                    "set fixture dumpability: {}",
+                    std::io::Error::last_os_error()
+                );
+                println!("PT_RECENT_IO_READY");
+                loop {
+                    if mode == "writer" {
+                        writeln!(std::io::stdout(), "owned writer").expect("write fixture pipe");
+                        std::thread::sleep(Duration::from_millis(100));
+                    } else {
+                        std::thread::park();
+                    }
+                }
+            }
+
+            if run_owned_unprivileged_case(
+                "action::prechecks::tests::linux_tests::recent_io_owned_child_readability",
+            ) {
+                return;
+            }
+            struct OwnedChild {
+                child: Child,
+                reader: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+            }
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    // This unreaped child remains owned by this test, so its
+                    // PID cannot be recycled before kill/wait complete.
+                    let pid = self.child.id();
+                    if let Err(error) = self.child.kill() {
+                        eprintln!("owned I/O fixture pid={pid} cleanup kill: {error}");
+                    }
+                    if let Err(error) = self.child.wait() {
+                        eprintln!("owned I/O fixture pid={pid} cleanup wait: {error}");
+                    }
+                    // Killing/reaping the only pipe writer closes stdout
+                    // before this join, including readiness timeout or panic.
+                    if let Some(reader) = self.reader.take() {
+                        match reader.join() {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                eprintln!("owned I/O fixture pid={pid} stdout drain: {error}");
+                            }
+                            Err(_) => {
+                                eprintln!("owned I/O fixture pid={pid} stdout reader panicked");
+                            }
+                        }
+                    }
+                }
+            }
+            // Privileged callers may bypass procfs access restrictions. Such a
+            // runner must not silently turn this permission-negative into PASS.
+            // SAFETY: geteuid has no arguments or memory effects.
+            assert_ne!(
+                unsafe { libc::geteuid() },
+                0,
+                "requires an unprivileged fixture caller"
+            );
+            for mode in ["idle", "writer", "unreadable"] {
+                let mut child = OwnedChild {
+                    child: Command::new(std::env::current_exe().expect("test executable"))
+                        .args([
+                            "--exact",
+                            "action::prechecks::tests::linux_tests::recent_io_owned_child_readability",
+                            "--nocapture",
+                            "--test-threads=1",
+                        ])
+                        .env(MODE, mode)
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .expect("spawn owned I/O fixture"),
+                    reader: None,
+                };
+                let pid = child.child.id();
+                let birth = read_io_birth(pid).expect("owned child birth");
+                let mut output = child.child.stdout.take().expect("fixture stdout");
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                child.reader = Some(std::thread::spawn(move || {
+                    const READY: &[u8] = b"PT_RECENT_IO_READY\n";
+                    let mut buffer = [0u8; 4096];
+                    let mut pending = Vec::with_capacity(buffer.len() + READY.len());
+                    let mut announced = false;
+                    loop {
+                        let count = match output.read(&mut buffer) {
+                            Ok(0) => {
+                                if !announced {
+                                    let _ = ready_tx
+                                        .send(Err("stdout reached EOF before fixture readiness"
+                                            .to_string()));
+                                }
+                                return Ok(());
+                            }
+                            Ok(count) => count,
+                            Err(error) => {
+                                if !announced {
+                                    let _ = ready_tx.send(Err(format!(
+                                        "stdout read before fixture readiness: {error}"
+                                    )));
+                                }
+                                return Err(error);
+                            }
+                        };
+                        if !announced {
+                            pending.extend_from_slice(&buffer[..count]);
+                            if pending.windows(READY.len()).any(|bytes| bytes == READY) {
+                                let _ = ready_tx.send(Ok(()));
+                                announced = true;
+                                pending.clear();
+                            } else {
+                                let consumed = pending.len().saturating_sub(READY.len() - 1);
+                                drop(pending.drain(..consumed));
+                            }
+                        }
+                        // Continue draining to EOF after READY without storing
+                        // output, so a scheduled writer cannot fill its pipe.
+                    }
+                }));
+                let readiness = ready_rx.recv_timeout(Duration::from_secs(10));
+                assert!(
+                    matches!(readiness, Ok(Ok(()))),
+                    "owned fixture readiness: mode={mode} pid={pid} birth={birth} result={readiness:?}"
+                );
+                if mode == "unreadable" {
+                    let error = read_io(pid).expect_err("actual procfs permission refusal");
+                    assert!(
+                        matches!(&error, IoReadError::Read { source, .. }
+                        if source.kind() == std::io::ErrorKind::PermissionDenied),
+                        "{error}"
+                    );
+                    eprintln!(
+                        "owned I/O fixture pid={pid} birth={birth} mode={mode} read_error={error}"
+                    );
+                } else {
+                    read_io(pid).expect("readable owned I/O fixture");
+                }
+                let provider = io_only_provider(1);
+                provider.prime_recent_io(&[pid]);
+                let result = provider.check_data_loss(pid);
+                eprintln!(
+                    "owned I/O fixture pid={pid} birth={birth} mode={mode} result={result:?}"
+                );
+                match mode {
+                    "idle" => assert!(result.is_passed(), "readable idle child: {result:?}"),
+                    "writer" => assert!(matches!(result, PreCheckResult::Blocked { reason, .. }
+                        if reason.contains("recent I/O activity"))),
+                    "unreadable" => {
+                        assert!(matches!(result, PreCheckResult::Blocked { reason, .. }
+                        if reason.contains("recent I/O evidence unavailable")
+                            && reason.contains("before sample") && reason.contains("after sample")
+                            && reason.contains(&format!("/proc/{pid}/io"))))
+                    }
+                    _ => unreachable!("fixture modes are fixed"),
+                }
+                assert!(child.child.try_wait().expect("owned child state").is_none());
+                assert_eq!(read_io_birth(pid).expect("surviving child birth"), birth);
+            }
+        }
+
+        #[test]
+        fn supervision_owned_process_evidence() {
+            use std::io::Read;
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            use std::process::{Child, Command, Stdio};
+
+            if run_owned_unprivileged_case(
+                "action::prechecks::tests::linux_tests::supervision_owned_process_evidence",
+            ) {
+                return;
+            }
+            // A privileged caller can bypass the permission-negative oracle.
+            // SAFETY: geteuid only observes this test's credentials.
+            assert_ne!(
+                unsafe { libc::geteuid() },
+                0,
+                "requires an unprivileged caller"
+            );
+            const SCRIPT: &str = r#"
+import ctypes, os, signal, socket, sys, time
+libc = ctypes.CDLL(None, use_errno=True)
+mode = sys.argv[1]
+if mode == 'supervisord':
+    assert libc.prctl(15, ctypes.c_char_p(b'supervisord'), 0, 0, 0) == 0
+    child = os.fork()
+    if child:
+        print('PT_SUPERVISION_OWNED', child, flush=True)
+        try:
+            sys.stdin.buffer.read()
+        finally:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            waited, status = os.waitpid(child, 0)
+            assert waited == child
+            print('PT_SUPERVISION_REAPED', child, flush=True)
+        sys.exit(0)
+    mode = 'clean'
+assert libc.prctl(15, ctypes.c_char_p(b'pt-owned'), 0, 0, 0) == 0
+assert libc.prctl(4, 0 if mode == 'unreadable' else 1, 0, 0, 0) == 0
+if mode == 'tcp':
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(1)
+print('PT_SUPERVISION_READY', os.getpid(), flush=True)
+while True:
+    time.sleep(60)
+"#;
+            struct Fixture {
+                child: Child,
+                target: Option<OwnedFd>,
+                reader: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+            }
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    if let Some(target) = &self.target {
+                        // SAFETY: this pidfd was bound to our fixture target.
+                        let rc = unsafe {
+                            libc::syscall(
+                                libc::SYS_pidfd_send_signal,
+                                target.as_raw_fd(),
+                                libc::SIGKILL,
+                                std::ptr::null::<libc::siginfo_t>(),
+                                0,
+                            )
+                        };
+                        if rc != 0 {
+                            eprintln!(
+                                "owned supervision target cleanup: {}",
+                                std::io::Error::last_os_error()
+                            );
+                        }
+                    }
+                    // Before READY, our supervisor may already own its fork.
+                    // Enumerate only this unreaped, test-owned parent's children.
+                    if let Ok(children) = std::fs::read_to_string(format!(
+                        "/proc/{0}/task/{0}/children",
+                        self.child.id()
+                    )) {
+                        for pid in children
+                            .split_whitespace()
+                            .filter_map(|pid| pid.parse::<u32>().ok())
+                        {
+                            // SAFETY: the child relationship was observed while
+                            // the owned fixture parent is still unreaped.
+                            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                            if fd >= 0 {
+                                let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+                                let rc = unsafe {
+                                    libc::syscall(
+                                        libc::SYS_pidfd_send_signal,
+                                        fd.as_raw_fd(),
+                                        libc::SIGKILL,
+                                        std::ptr::null::<libc::siginfo_t>(),
+                                        0,
+                                    )
+                                };
+                                if rc != 0 {
+                                    eprintln!(
+                                        "owned supervisor child pid={pid} cleanup: {}",
+                                        std::io::Error::last_os_error()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    drop(self.child.stdin.take());
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match self.child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(10))
+                            }
+                            other => {
+                                eprintln!("owned supervision parent cleanup state: {other:?}");
+                                if let Err(error) = self.child.kill() {
+                                    eprintln!("owned fixture kill: {error}");
+                                }
+                                if let Err(error) = self.child.wait() {
+                                    eprintln!("owned fixture wait: {error}");
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    // The target is killed and the parent waited before joining
+                    // the continuously drained stdout pipe, including panic paths.
+                    if let Some(reader) = self.reader.take() {
+                        match reader.join() {
+                            Ok(Ok(())) => {}
+                            other => eprintln!("owned supervision reader cleanup: {other:?}"),
+                        }
+                    }
+                }
+            }
+            for mode in ["clean", "tcp", "unreadable", "supervisord"] {
+                let mut fixture = Fixture {
+                    child: Command::new("python3")
+                        .args(["-u", "-c", SCRIPT, mode])
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                        .expect("spawn owned supervision fixture"),
+                    target: None,
+                    reader: None,
+                };
+                let mut output = fixture.child.stdout.take().unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                fixture.reader = Some(std::thread::spawn(move || {
+                    let mut buffer = [0u8; 4096];
+                    let mut pending = Vec::new();
+                    loop {
+                        let count = output.read(&mut buffer)?;
+                        if count == 0 {
+                            return Ok(());
+                        }
+                        pending.extend_from_slice(&buffer[..count]);
+                        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                            let line: Vec<_> = pending.drain(..=end).collect();
+                            let line = std::str::from_utf8(&line).map_err(|error| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                            })?;
+                            if let Some(pid) = line
+                                .strip_prefix("PT_SUPERVISION_READY ")
+                                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                            {
+                                let _ = tx.send(("ready", pid));
+                            } else if let Some(pid) = line
+                                .strip_prefix("PT_SUPERVISION_REAPED ")
+                                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                            {
+                                let _ = tx.send(("reaped", pid));
+                            }
+                        }
+                        if pending.len() > 4096 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "oversized fixture output",
+                            ));
+                        }
+                    }
+                }));
+                let (event, pid) = rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("bounded owned fixture readiness");
+                assert_eq!(event, "ready");
+                // SAFETY: READY identifies this parent's own fixture target.
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                assert!(
+                    fd >= 0,
+                    "bind owned target: {}",
+                    std::io::Error::last_os_error()
+                );
+                fixture.target = Some(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+                let before = read_required_proc_stat(pid).unwrap();
+                let credentials = crate::collect::proc_parsers::parse_proc_status(pid)
+                    .expect("owned fixture credentials");
+                // SAFETY: getuid/geteuid only observe this test's credentials.
+                assert_eq!(credentials.ruid, unsafe { libc::getuid() });
+                assert_eq!(credentials.euid, unsafe { libc::geteuid() });
+                let provider = LivePreCheckProvider::with_defaults();
+                if mode == "unreadable" {
+                    let error = crate::supervision::read_environ(pid).unwrap_err();
+                    assert!(
+                        matches!(&error, crate::supervision::EnvironError::IoError { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied),
+                        "{error}"
+                    );
+                    let error = crate::supervision::IpcAnalyzer::new()
+                        .analyze(pid)
+                        .unwrap_err();
+                    assert!(
+                        matches!(&error, crate::supervision::IpcError::IoError { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied),
+                        "{error}"
+                    );
+                    let result = provider.check_agent_supervision(pid);
+                    assert!(
+                        matches!(&result, PreCheckResult::Blocked { check: PreCheck::CheckAgentSupervision, reason } if reason.contains("evidence unavailable") && reason.contains(&pid.to_string())),
+                        "{result:?}"
+                    );
+                    eprintln!(
+                        "owned supervision pid={pid} birth={} mode={mode} result={result:?}",
+                        before.starttime
+                    );
+                } else if mode == "supervisord" {
+                    assert_eq!(before.ppid, fixture.child.id());
+                    assert_eq!(
+                        read_required_proc_stat(before.ppid).unwrap().comm,
+                        "supervisord"
+                    );
+                    let result = provider.check_supervisor(pid);
+                    assert!(
+                        matches!(&result, PreCheckResult::Blocked { check: PreCheck::CheckSupervisor, reason } if reason.contains("supervisord")),
+                        "{result:?}"
+                    );
+                    eprintln!(
+                        "owned supervision pid={pid} parent={} mode={mode} result={result:?}",
+                        before.ppid
+                    );
+                } else {
+                    if mode == "tcp" {
+                        let inodes: Vec<u64> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+                            .unwrap()
+                            .map(|entry| std::fs::read_link(entry.unwrap().path()).unwrap())
+                            .filter_map(|link| {
+                                link.to_str()
+                                    .and_then(|link| link.strip_prefix("socket:["))
+                                    .and_then(|link| link.strip_suffix(']'))
+                                    .and_then(|inode| inode.parse().ok())
+                            })
+                            .collect();
+                        assert_eq!(inodes.len(), 1);
+                        assert!(
+                            crate::collect::network::has_inet_socket_inode(pid, inodes[0]).unwrap()
+                        );
+                    }
+                    let result =
+                        detect_supervision(pid).expect("complete readable supervision evidence");
+                    assert!(
+                        result.ancestry.is_some()
+                            && result.environ.is_some()
+                            && result.ipc.is_some()
+                    );
+                    assert!(!result.ipc.as_ref().unwrap().is_supervised);
+                    assert!(
+                        !is_human_supervised(&result),
+                        "actual clean fixture is supervised: {result:?}"
+                    );
+                    assert!(provider.check_agent_supervision(pid).is_passed());
+                }
+                assert_eq!(
+                    read_required_proc_stat(pid).unwrap().starttime,
+                    before.starttime
+                );
+                assert!(fixture.child.try_wait().unwrap().is_none());
+                if mode == "supervisord" {
+                    // EOF asks the actual owner to kill and reap its child.
+                    drop(fixture.child.stdin.take());
+                    assert_eq!(
+                        rx.recv_timeout(Duration::from_secs(10))
+                            .expect("bounded owned child reaping"),
+                        ("reaped", pid)
+                    );
+                }
+            }
+        }
 
         fn inspect_child_descriptor(
             script: &str,
@@ -2249,8 +3176,28 @@ mod tests {
         fn live_provider_extract_cgroup_unit() {
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
-            // Just verify the function doesn't panic
-            let _ = provider.extract_cgroup_unit(pid);
+            provider
+                .read_supervision_cgroup_path(pid)
+                .expect("observed cgroup placement");
+        }
+
+        #[test]
+        fn missing_supervision_evidence_blocks_both_required_checks() {
+            let provider = LivePreCheckProvider::with_defaults();
+            for (result, expected) in [
+                (
+                    provider.check_supervisor(u32::MAX),
+                    PreCheck::CheckSupervisor,
+                ),
+                (
+                    provider.check_agent_supervision(u32::MAX),
+                    PreCheck::CheckAgentSupervision,
+                ),
+            ] {
+                assert!(matches!(result, PreCheckResult::Blocked { check, reason }
+                    if check == expected && reason.contains("evidence unavailable")
+                        && reason.contains(&u32::MAX.to_string())));
+            }
         }
 
         #[test]

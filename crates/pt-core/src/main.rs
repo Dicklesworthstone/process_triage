@@ -640,11 +640,11 @@ struct LearnArgs {
     command: Option<LearnCommands>,
 
     /// Per-check verification budget in milliseconds
-    #[arg(long, default_value_t = 750)]
+    #[arg(long, default_value_t = 45_000)]
     verify_budget_ms: u64,
 
     /// Total verification budget in milliseconds
-    #[arg(long, default_value_t = 5000)]
+    #[arg(long, default_value_t = 420_000)]
     total_budget_ms: u64,
 }
 
@@ -913,8 +913,8 @@ struct AgentFleetTransferExportArgs {
     #[arg(long, default_value = "true")]
     include_priors: bool,
 
-    /// Redaction profile (minimal|safe|forensic)
-    #[arg(long)]
+    /// Configuration-transfer profile (.ptb requires forensic; sharing profiles are refused)
+    #[arg(long, value_parser = ["minimal", "safe", "forensic"])]
     export_profile: Option<String>,
 
     /// Passphrase for .ptb encryption
@@ -929,8 +929,8 @@ struct AgentFleetTransferImportArgs {
     from: String,
 
     /// Merge strategy: weighted, replace, keep-local
-    #[arg(long)]
-    merge_strategy: Option<String>,
+    #[arg(long, default_value = "weighted")]
+    merge_strategy: pt_core::fleet::transfer::MergeStrategy,
 
     /// Show what would change without modifying
     #[arg(long)]
@@ -944,7 +944,7 @@ struct AgentFleetTransferImportArgs {
     #[arg(long)]
     passphrase: Option<String>,
 
-    /// Normalize incoming priors using baseline stats
+    /// Request normalization (refused until comparable measured learning baselines exist)
     #[arg(long)]
     normalize_baseline: bool,
 }
@@ -2003,12 +2003,33 @@ fn parse_output_format(value: &str) -> Option<OutputFormat> {
 
 #[cfg(test)]
 mod cli_definition_tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     /// clap's own consistency check over every subcommand.
     #[test]
     fn cli_definition_is_consistent() {
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn fleet_import_refuses_unknown_merge_strategy_during_parsing() {
+        let prefix = [
+            "pt-core",
+            "agent",
+            "fleet",
+            "transfer",
+            "import",
+            "--from",
+            "bundle.json",
+        ];
+        for strategy in ["weighted", "replace", "keep-local"] {
+            let args = prefix.into_iter().chain(["--merge-strategy", strategy]);
+            assert!(super::Cli::try_parse_from(args).is_ok());
+        }
+        let error =
+            super::Cli::try_parse_from(prefix.into_iter().chain(["--merge-strategy", "replcae"]))
+                .expect_err("a typo must not silently select a different merge strategy");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     /// A subcommand arg with the id of a global arg but a different value type makes
@@ -2706,11 +2727,30 @@ fn check_execution_policy(
         .iter()
         .find(|proc| proc.pid == action.target.pid)
         .ok_or("target is absent from current policy evidence")?;
+    let mut candidate = process_policy_candidate(enforcer, proc)?;
+    candidate.category = action.rationale.category.clone();
+    candidate.posterior =
+        action.rationale.posterior.as_ref().map(|scores| {
+            pt_core::decision::robot_constraints::gate_posterior(scores, action.action)
+        });
+    candidate.has_known_signature = action.rationale.has_known_signature.unwrap_or(false);
+    Ok((
+        enforcer.check_action(&candidate, action.action, robot),
+        proc.clone(),
+    ))
+}
+
+/// Target facts shared by live execution and routed-parent planning. Decision
+/// evidence belongs to the remedy's source and is supplied separately.
+fn process_policy_candidate(
+    enforcer: &pt_core::decision::PolicyEnforcer,
+    proc: &ProcessRecord,
+) -> Result<pt_core::decision::ProcessCandidate, String> {
     let group = if !enforcer.requires_group_evidence() {
         None
     } else {
         let output = std::process::Command::new("ps")
-            .args(["-o", "group=", "-p", &action.target.pid.0.to_string()])
+            .args(["-o", "group=", "-p", &proc.pid.0.to_string()])
             .output()
             .map_err(|error| format!("cannot collect protected-group evidence: {error}"))?;
         if !output.status.success() {
@@ -2724,19 +2764,17 @@ fn check_execution_policy(
         }
         Some(group.to_string())
     };
-    let candidate = pt_core::decision::ProcessCandidate {
+    Ok(pt_core::decision::ProcessCandidate {
         pid: proc.pid.0 as i32,
         ppid: proc.ppid.0 as i32,
         cmdline: proc.cmd.clone(),
         user: Some(proc.user.clone()),
         group,
-        category: action.rationale.category.clone(),
+        category: None,
         age_seconds: proc.elapsed.as_secs(),
-        posterior: action.rationale.posterior.as_ref().map(|scores| {
-            pt_core::decision::robot_constraints::gate_posterior(scores, action.action)
-        }),
+        posterior: None,
         memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
-        has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
+        has_known_signature: false,
         open_write_fds: pt_core::action::prechecks::open_write_fd_count(proc.pid.0),
         has_locked_files: None,
         has_active_tty: Some(proc.has_tty()),
@@ -2752,11 +2790,59 @@ fn check_execution_policy(
         blast_radius_total_affected: None,
         provenance_evidence_completeness: None,
         provenance_confidence_penalty: None,
+    })
+}
+
+fn planned_zombie_parent_refusal(
+    parent: &ProcessRecord,
+    protected_filter: &ProtectedFilter,
+    enforcer: &pt_core::decision::PolicyEnforcer,
+    policy: &pt_core::config::Policy,
+    signatures: &pt_core::supervision::SignatureDatabase,
+    source_posterior: &pt_core::inference::ClassScores,
+    robot: bool,
+) -> Option<String> {
+    if parent.pid.0 <= 1 {
+        return Some("parent is init/kernel and is never acted on".to_string());
+    }
+    if let Some(protection) = protected_filter.is_protected(parent) {
+        return Some(format!("parent is protected by {}", protection.pattern));
+    }
+    let mut target = match process_policy_candidate(enforcer, parent) {
+        Ok(target) => target,
+        Err(error) => return Some(format!("parent policy evidence unavailable: {error}")),
     };
-    Ok((
-        enforcer.check_action(&candidate, action.action, robot),
-        proc.clone(),
-    ))
+    if policy.data_loss_gates.block_if_open_write_fds && target.open_write_fds.is_none() {
+        return Some("parent writable-descriptor evidence is unavailable".to_string());
+    }
+    let context = pt_core::supervision::signature::ProcessMatchContext::with_comm(&parent.comm)
+        .cmdline(&parent.cmd);
+    let parent_signature = signatures.best_match(&context);
+    target.has_known_signature = parent_signature.is_some();
+    target.category = parent_signature
+        .as_ref()
+        .map(|matched| matched.signature.category.to_string());
+    // Confidence describes the zombie remedy, not abandonment of its parent.
+    // All target protection, age, memory and signature facts are the parent's.
+    target.posterior = Some(pt_core::decision::robot_constraints::gate_posterior(
+        source_posterior,
+        Action::Restart,
+    ));
+    #[cfg(target_os = "linux")]
+    {
+        target.critical_files = pt_core::collect::parse_fd(parent.pid.0)
+            .map(|fd| fd.critical_writes)
+            .unwrap_or_default();
+    }
+    enforcer
+        .check_action(&target, Action::Restart, robot)
+        .violation
+        .map(|violation| {
+            format!(
+                "parent policy blocked: {} ({})",
+                violation.message, violation.rule
+            )
+        })
 }
 
 /// Bind saved execution evidence to the current identity, before taking action.
@@ -2800,6 +2886,7 @@ fn capture_action_execution_evidence(
         return Err("kill execution clock is unavailable".to_string());
     }
     Ok(serde_json::json!({
+        "action": action.action,
         "target": action.target,
         "command": process.cmd,
         "parent_pid": process.ppid.0,
@@ -3272,9 +3359,13 @@ struct DeepSignals {
     net_active: Option<bool>,
     io_active: Option<bool>,
     queue_saturated: Option<bool>,
+    #[cfg(feature = "ui")]
     queue_lambda: Option<f64>,
+    #[cfg(feature = "ui")]
     queue_mu: Option<f64>,
+    #[cfg(feature = "ui")]
     queue_stall_probability: Option<f64>,
+    #[cfg(feature = "ui")]
     queue_backlog_sockets: Option<usize>,
 }
 
@@ -3394,9 +3485,13 @@ fn collect_deep_signals_for_pids(pids: &[u32]) -> Option<HashMap<u32, DeepSignal
                     net_active,
                     io_active,
                     queue_saturated: queue_metrics.map(|metrics| metrics.saturated),
+                    #[cfg(feature = "ui")]
                     queue_lambda: queue_metrics.map(|metrics| metrics.lambda),
+                    #[cfg(feature = "ui")]
                     queue_mu: queue_metrics.map(|metrics| metrics.mu),
+                    #[cfg(feature = "ui")]
                     queue_stall_probability: queue_metrics.map(|metrics| metrics.stall_probability),
+                    #[cfg(feature = "ui")]
                     queue_backlog_sockets: queue_metrics.map(|metrics| metrics.backlog_sockets),
                 },
             );
@@ -3422,9 +3517,13 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
 #[derive(Debug, Clone, Copy)]
 struct QueueMetrics {
     saturated: bool,
+    #[cfg(feature = "ui")]
     lambda: f64,
+    #[cfg(feature = "ui")]
     mu: f64,
+    #[cfg(feature = "ui")]
     stall_probability: f64,
+    #[cfg(feature = "ui")]
     backlog_sockets: usize,
 }
 
@@ -3473,9 +3572,13 @@ fn estimate_queue_metrics(info: &pt_core::collect::NetworkInfo, io_active: bool)
 
     QueueMetrics {
         saturated,
+        #[cfg(feature = "ui")]
         lambda,
+        #[cfg(feature = "ui")]
         mu,
+        #[cfg(feature = "ui")]
         stall_probability,
+        #[cfg(feature = "ui")]
         backlog_sockets,
     }
 }
@@ -7309,6 +7412,18 @@ fn run_agent_fleet_transfer_export(
     use pt_core::fleet::transfer::export_bundle;
     use pt_core::supervision::pattern_persistence::PersistedSchema;
 
+    let out_path = PathBuf::from(&args.out);
+    let is_ptb = out_path.extension().map(|e| e == "ptb").unwrap_or(false);
+    if matches!(args.export_profile.as_deref(), Some("minimal" | "safe"))
+        || (is_ptb && args.export_profile.as_deref() != Some("forensic"))
+    {
+        return output_agent_error(
+            global,
+            "fleet transfer export",
+            "intact configuration transfer requires forensic profile for .ptb; safe/minimal are sharing profiles, not activatable configuration",
+        );
+    }
+
     let host_id = pt_core::logging::get_host_id();
 
     let options = ConfigOptions {
@@ -7351,7 +7466,6 @@ fn run_agent_fleet_transfer_export(
         }
     };
 
-    let out_path = PathBuf::from(&args.out);
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(err) = std::fs::create_dir_all(parent) {
@@ -7365,8 +7479,6 @@ fn run_agent_fleet_transfer_export(
         }
     }
 
-    let is_ptb = out_path.extension().map(|e| e == "ptb").unwrap_or(false);
-
     if is_ptb {
         use pt_bundle::{BundleWriter, FileType};
         use pt_redact::ExportProfile;
@@ -7377,14 +7489,12 @@ fn run_agent_fleet_transfer_export(
                 return output_agent_error(global, "fleet transfer export", &e.to_string());
             }
         };
-        let export_profile = match args.export_profile.as_deref() {
-            Some("minimal") => ExportProfile::Minimal,
-            Some("forensic") => ExportProfile::Forensic,
-            _ => ExportProfile::Safe,
-        };
-        let mut writer = BundleWriter::new("transfer", &host_id, export_profile)
-            .with_description("Fleet transfer bundle");
-        writer.add_file("transfer_bundle.json", json_bytes, Some(FileType::Json));
+        let mut writer = BundleWriter::new("transfer", &host_id, ExportProfile::Forensic)
+            .with_description("Intact fleet configuration transfer");
+        // export_bundle has validated all typed fields, executable matchers and
+        // detected-secret content. Generic session redaction would invalidate
+        // this operational schema and its checksum, so retain those exact bytes.
+        writer.add_file("transfer_bundle.json", json_bytes, Some(FileType::Binary));
 
         let passphrase = args
             .passphrase
@@ -7449,8 +7559,7 @@ fn run_agent_fleet_transfer_import(
     args: &AgentFleetTransferImportArgs,
 ) -> ExitCode {
     use pt_core::fleet::transfer::{
-        compute_diff, merge_priors, normalize_baseline, validate_bundle, MergeStrategy,
-        TransferBundle,
+        compute_diff, merge_priors, validate_bundle, MergeStrategy, TransferBundle,
     };
     use pt_core::supervision::pattern_persistence::{ConflictResolution, PatternLibrary};
 
@@ -7473,6 +7582,13 @@ fn run_agent_fleet_transfer_import(
                 }
             };
 
+        if reader.manifest().export_profile != pt_redact::ExportProfile::Forensic {
+            return output_agent_error(
+                global,
+                "fleet transfer import",
+                "redacted sharing bundle cannot be activated as fleet configuration",
+            );
+        }
         let data = match reader.read_verified("transfer_bundle.json") {
             Ok(d) => d,
             Err(e) => {
@@ -7481,8 +7597,12 @@ fn run_agent_fleet_transfer_import(
         };
         match serde_json::from_slice(&data) {
             Ok(b) => b,
-            Err(e) => {
-                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            Err(_) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer import",
+                    "invalid fleet transfer configuration",
+                );
             }
         }
     } else {
@@ -7494,8 +7614,12 @@ fn run_agent_fleet_transfer_import(
         };
         match serde_json::from_str(&data) {
             Ok(b) => b,
-            Err(e) => {
-                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            Err(_) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer import",
+                    "invalid fleet transfer configuration",
+                );
             }
         }
     };
@@ -7507,12 +7631,18 @@ fn run_agent_fleet_transfer_import(
         }
     };
 
-    let strategy: MergeStrategy = args
-        .merge_strategy
-        .as_deref()
-        .unwrap_or("weighted")
-        .parse()
-        .unwrap_or(MergeStrategy::Weighted);
+    // Neither the exported configuration nor the local session inventory tracks
+    // the comparable learning observations behind these Beta parameters. A PID
+    // census is occupancy, not evidence for increasing their concentration.
+    if args.normalize_baseline {
+        return output_agent_error(
+            global,
+            "fleet transfer import",
+            "baseline normalization requires comparable measured learning observations; local baseline evidence is unavailable",
+        );
+    }
+
+    let strategy: MergeStrategy = args.merge_strategy;
 
     let options = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
@@ -7525,20 +7655,7 @@ fn run_agent_fleet_transfer_import(
     };
 
     let merged_priors = if let Some(ref incoming_priors) = bundle.priors {
-        let mut incoming = incoming_priors.clone();
-        if args.normalize_baseline {
-            if let Some(ref source_stats) = bundle.baseline_stats {
-                let target_stats = pt_core::fleet::transfer::BaselineStats {
-                    total_processes_seen: 5000,
-                    observation_window_hours: 72.0,
-                    class_distribution: std::collections::BTreeMap::new(),
-                    mean_cpu_utilization: 50.0,
-                    host_type: None,
-                };
-                normalize_baseline(&mut incoming, source_stats, &target_stats);
-            }
-        }
-        match merge_priors(&config.priors, &incoming, strategy) {
+        match merge_priors(&config.priors, incoming_priors, strategy) {
             Ok(m) => Some(m),
             Err(e) => {
                 return output_agent_error(global, "fleet transfer import", &e.to_string());
@@ -7552,7 +7669,17 @@ fn run_agent_fleet_transfer_import(
         Ok(local) => local,
         Err(e) => return output_agent_error(global, "fleet transfer import", &e),
     };
-    let diff = compute_diff(Some(&config.priors), local_signatures.as_ref(), &bundle);
+    if let Some(priors) = &merged_priors {
+        if let Err(error) = pt_config::validate::validate_priors(priors) {
+            return output_agent_error(global, "fleet transfer import", &error.to_string());
+        }
+    }
+    let diff = compute_diff(
+        Some(&config.priors),
+        local_signatures.as_ref(),
+        &bundle,
+        merged_priors.as_ref(),
+    );
 
     if args.dry_run {
         let response = serde_json::json!({
@@ -7778,6 +7905,13 @@ fn run_agent_fleet_transfer_diff(
                 }
             };
 
+        if reader.manifest().export_profile != pt_redact::ExportProfile::Forensic {
+            return output_agent_error(
+                global,
+                "fleet transfer diff",
+                "redacted sharing bundle cannot be used as intact fleet configuration",
+            );
+        }
         let data = match reader.read_verified("transfer_bundle.json") {
             Ok(d) => d,
             Err(e) => {
@@ -7786,8 +7920,12 @@ fn run_agent_fleet_transfer_diff(
         };
         match serde_json::from_slice(&data) {
             Ok(b) => b,
-            Err(e) => {
-                return output_agent_error(global, "fleet transfer diff", &e.to_string());
+            Err(_) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer diff",
+                    "invalid fleet transfer configuration",
+                );
             }
         }
     } else {
@@ -7799,8 +7937,12 @@ fn run_agent_fleet_transfer_diff(
         };
         match serde_json::from_str(&data) {
             Ok(b) => b,
-            Err(e) => {
-                return output_agent_error(global, "fleet transfer diff", &e.to_string());
+            Err(_) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer diff",
+                    "invalid fleet transfer configuration",
+                );
             }
         }
     };
@@ -7826,7 +7968,12 @@ fn run_agent_fleet_transfer_diff(
         Ok(local) => local,
         Err(e) => return output_agent_error(global, "fleet transfer diff", &e),
     };
-    let diff = compute_diff(Some(&config.priors), local_signatures.as_ref(), &bundle);
+    let diff = compute_diff(
+        Some(&config.priors),
+        local_signatures.as_ref(),
+        &bundle,
+        None,
+    );
 
     let response = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -11448,7 +11595,7 @@ fn output_stub_with_session(
 mod process_tree_safety_tests {
     use super::{
         apply_planned_kill_budget, apply_process_tree_safety, build_agent_action_plan,
-        process_identity_from_record,
+        process_identity_from_record, reconcile_agent_action_candidates,
     };
     use pt_common::{ProcessId, StartId};
     use pt_core::collect::{ProcessRecord, ProcessState};
@@ -11527,6 +11674,7 @@ mod process_tree_safety_tests {
             action_id: action.action_id.clone(),
             pid: 100,
             status: "success".to_string(),
+            action: Some(action.action),
             target: Some(action.target.clone()),
             command: Some(process.cmd.clone()),
             parent_pid: Some(10),
@@ -11976,6 +12124,260 @@ mod process_tree_safety_tests {
         let applied: pt_core::plan::Plan = serde_json::from_value(document).unwrap();
         assert_eq!(applied.plan_id, plan.plan_id);
         assert_eq!(applied.actions[0].action_id, plan.actions[0].action_id);
+    }
+
+    #[test]
+    fn displayed_actions_match_stages_routed_targets_and_full_incarnations() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use pt_core::plan::DecisionCandidate;
+
+        let policy = pt_core::config::Policy::default();
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        let parent = rec(900, 1, "parent", ProcessState::Sleeping);
+        let inputs: std::collections::HashMap<_, _> = [100, 200, 300, 400, 500, 600, 700, 800]
+            .into_iter()
+            .map(|pid| {
+                let state = if matches!(pid, 300 | 400) {
+                    ProcessState::Zombie
+                } else {
+                    ProcessState::Sleeping
+                };
+                let process = rec(pid, 900, "sleep 600", state);
+                let mut chosen = decision.clone();
+                chosen.optimal_action = match pid {
+                    200 => Action::Pause,
+                    400 | 800 => Action::Restart,
+                    600 => Action::Keep,
+                    _ => Action::Kill,
+                };
+                (
+                    pid,
+                    DecisionCandidate {
+                        identity: process_identity_from_record(&process),
+                        ppid: Some(900),
+                        decision: chosen,
+                        blocked_reasons: if pid == 500 {
+                            vec!["protected".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                        stage_pause_before_kill: pid == 100,
+                        process_state: Some(state),
+                        parent_identity: (pid == 300)
+                            .then(|| process_identity_from_record(&parent)),
+                        d_state_diagnostics: None,
+                    },
+                )
+            })
+            .collect();
+        let mut candidates: Vec<_> = [100, 200, 300, 400, 500, 600, 700, 800]
+            .into_iter()
+            .map(|pid| serde_json::json!({
+                "pid": pid, "posterior": posterior,
+                "recommended_action": match pid {
+                    200 => "pause", 400 | 800 => "restart", 600 => "keep", 700 => "review", _ => "kill"
+                },
+                "action_rationale": "original evidence", "zombie_routing": {}
+            }))
+            .collect();
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-10-05T12:00:00Z".to_string(),
+        );
+        reconcile_agent_action_candidates(&mut candidates, &inputs, &plan);
+        assert_eq!(plan.actions.len(), 4);
+        assert!(plan
+            .actions
+            .iter()
+            .all(|action| !action.blocked && action.action != Action::Keep));
+        assert_eq!(candidates[0]["recommended_action"], "kill");
+        assert_eq!(
+            candidates[0]["plan_action_ids"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(candidates[1]["recommended_action"], "pause");
+        assert_eq!(candidates[2]["recommended_action"], "restart");
+        assert_eq!(
+            candidates[2]["action_target"],
+            serde_json::to_value(process_identity_from_record(&parent)).unwrap()
+        );
+        for index in [3, 4, 6, 7] {
+            assert_eq!(
+                candidates[index]["recommended_action"], "review",
+                "index {index}"
+            );
+            assert_eq!(
+                candidates[index]["posterior"],
+                serde_json::to_value(posterior).unwrap()
+            );
+        }
+        assert_eq!(candidates[5]["recommended_action"], "keep");
+        let recommended = super::agent_recommended_actions(&plan);
+        assert_eq!(recommended.len(), plan.actions.len());
+        for (recorded, action) in recommended.iter().zip(&plan.actions) {
+            assert_eq!(recorded["pid"], action.target.pid.0);
+            assert_eq!(
+                recorded["action"],
+                serde_json::to_value(action.action).unwrap()
+            );
+            assert_eq!(recorded["stage"], action.stage);
+            assert_eq!(recorded["action_id"], action.action_id);
+        }
+        // Same PID with a different birth, owner or group cannot claim the old
+        // executable action. The plan and its original evidence remain intact.
+        for changed in ["birth", "owner", "group"] {
+            let mut changed_inputs = inputs.clone();
+            let identity = &mut changed_inputs.get_mut(&100).unwrap().identity;
+            match changed {
+                "birth" => identity.start_id = StartId::from_linux("b", 2, 100),
+                "owner" => identity.uid = 1001,
+                "group" => identity.pgid = Some(101),
+                _ => unreachable!(),
+            }
+            let mut reused = vec![cand(100)];
+            reconcile_agent_action_candidates(&mut reused, &changed_inputs, &plan);
+            assert_eq!(reused[0]["recommended_action"], "review", "{changed}");
+            assert_eq!(plan.actions.len(), 4);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervision_subject_is_bound_to_the_observed_birth_and_owner() {
+        let pid = std::process::id();
+        let scan = super::quick_scan(&super::QuickScanOptions {
+            pids: vec![pid],
+            include_kernel_threads: false,
+            timeout: Some(std::time::Duration::from_secs(5)),
+            progress: None,
+        })
+        .expect("observe this test process without signalling it");
+        let process = scan
+            .processes
+            .iter()
+            .find(|process| process.pid.0 == pid)
+            .expect("current process remains observable");
+        let identity = process_identity_from_record(process);
+        let observed = super::supervisor_info_for_plan_identity(&identity);
+        assert_eq!(observed["status"], "observed", "{observed}");
+        assert_eq!(
+            observed["subject_identity"],
+            serde_json::to_value(&identity).unwrap()
+        );
+        let (prefix, recorded_pid) = identity.start_id.0.rsplit_once(':').unwrap();
+        assert_eq!(recorded_pid.parse::<u32>().unwrap(), pid);
+        let (boot, ticks) = prefix.rsplit_once(':').unwrap();
+        for changed in ["birth", "owner"] {
+            let mut stale = identity.clone();
+            if changed == "birth" {
+                stale.start_id = StartId::from_linux(
+                    boot,
+                    ticks.parse::<u64>().unwrap().checked_add(1).unwrap(),
+                    pid,
+                );
+            } else {
+                stale.uid = identity.uid.checked_add(1).unwrap();
+            }
+            let refused = super::supervisor_info_for_plan_identity(&stale);
+            assert_eq!(refused["status"], "unknown", "{changed}: {refused}");
+            assert!(refused["detected"].is_null(), "{changed}: {refused}");
+            assert!(
+                refused["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("identity changed"),
+                "{changed}: {refused}"
+            );
+            assert_eq!(
+                refused["subject_identity"],
+                serde_json::to_value(&stale).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn routed_parent_checks_use_its_own_protection_age_and_memory() {
+        use pt_core::decision::PolicyEnforcer;
+        use pt_core::inference::ClassScores;
+        use pt_core::supervision::SignatureDatabase;
+
+        let mut base_policy = pt_core::config::Policy::default();
+        base_policy.guardrails.builtin_protection = false;
+        base_policy.data_loss_gates.block_if_open_write_fds = false;
+        base_policy.robot_mode.enabled = true;
+        let base_parent = rec(900, 50, "worker", ProcessState::Sleeping);
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.0,
+            zombie: 0.999,
+        };
+        let signatures = SignatureDatabase::new();
+        for case in [
+            "eligible",
+            "init",
+            "named_pid",
+            "service",
+            "user",
+            "young",
+            "memory",
+        ] {
+            let mut policy = base_policy.clone();
+            let mut parent = base_parent.clone();
+            match case {
+                "init" => parent.pid = ProcessId(1),
+                "named_pid" => policy.guardrails.never_kill_pid.push(900),
+                "service" => {
+                    policy.guardrails.builtin_protection = true;
+                    parent.comm = "sshd".to_string();
+                    parent.cmd = "sshd -D".to_string();
+                }
+                "user" => policy.guardrails.protected_users.push("u".to_string()),
+                "young" => parent.elapsed = std::time::Duration::ZERO,
+                "memory" => {
+                    policy.robot_mode.max_blast_radius_mb = 1.0;
+                    parent.rss_bytes = 2 * 1024 * 1024;
+                }
+                _ => {}
+            }
+            let filter = super::ProtectedFilter::from_guardrails(&policy.guardrails).unwrap();
+            let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+            let refusal = super::planned_zombie_parent_refusal(
+                &parent,
+                &filter,
+                &enforcer,
+                &policy,
+                &signatures,
+                &posterior,
+                true,
+            );
+            if case == "eligible" {
+                assert!(refusal.is_none(), "{refusal:?}");
+            } else {
+                assert!(refusal.is_some(), "{case}");
+                let reason = refusal.unwrap();
+                let expected = match case {
+                    "init" => "init/kernel",
+                    "named_pid" => "never_kill_pid",
+                    "service" => "protected",
+                    "user" => "protected",
+                    "young" => "min_process_age_seconds",
+                    "memory" => "max_blast_radius_mb",
+                    _ => unreachable!(),
+                };
+                assert!(reason.contains(expected), "{case}: {reason}");
+            }
+        }
     }
 
     #[test]
@@ -12523,6 +12925,14 @@ mod process_tree_safety_tests {
         .expect("decode saved kill budget");
         let saved_outcomes = std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl"))
             .expect("saved TUI outcomes");
+        let typed_outcomes = pt_core::verify::parse_action_outcomes(&saved_outcomes).unwrap();
+        assert_eq!(typed_outcomes[0].status, "success");
+        assert_eq!(typed_outcomes[0].action, Some(Action::Kill));
+        assert!(typed_outcomes[0]
+            .target
+            .as_ref()
+            .unwrap()
+            .matches(&plan.actions[0].target));
         writeln!(
             evidence,
             "{}",
@@ -13984,7 +14394,7 @@ fn generate_narrative_summary(
             age_human, memory_mb
         ));
         output.push_str(&format!(
-            "   Confidence: {}%, Recommendation: {}\n",
+            "   Suspicion: {}%, Recommendation: {}\n",
             score, recommendation
         ));
 
@@ -14514,6 +14924,102 @@ fn build_agent_action_plan(
         candidates,
         generated_at: Some(generated_at),
     })
+}
+
+/// Reconcile displayed decisions with the eligible actions of this exact plan.
+/// A routed zombie action belongs to its original incarnation, not to every
+/// candidate sharing the parent's PID. Staged actions retain their final remedy.
+fn reconcile_agent_action_candidates(
+    candidates: &mut [serde_json::Value],
+    action_inputs: &HashMap<u32, DecisionCandidate>,
+    plan: &Plan,
+) {
+    let mut actions_by_identity: HashMap<ProcessIdentity, Vec<&pt_core::plan::PlanAction>> =
+        HashMap::new();
+    for action in &plan.actions {
+        if !action.blocked && action.action != Action::Keep {
+            let identity = action
+                .original_zombie_target
+                .as_ref()
+                .unwrap_or(&action.target);
+            actions_by_identity
+                .entry(identity.clone())
+                .or_default()
+                .push(action);
+        }
+    }
+    for candidate in candidates {
+        let Some(pid) = candidate["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            continue;
+        };
+        let input = action_inputs.get(&pid);
+        let actions = input
+            .and_then(|input| actions_by_identity.get(&input.identity))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let Some(final_action) = actions.iter().max_by_key(|action| action.stage) else {
+            if !matches!(
+                candidate["recommended_action"].as_str(),
+                Some("keep" | "review")
+            ) {
+                let reason = if let Some(input) =
+                    input.filter(|input| !input.blocked_reasons.is_empty())
+                {
+                    input.blocked_reasons.join("; ")
+                } else if input
+                    .is_some_and(|input| input.process_state == Some(ProcessState::Zombie))
+                {
+                    "Zombie remedy requires a usable parent identity and a supported parent action"
+                        .to_string()
+                } else if input
+                    .is_some_and(|input| input.decision.optimal_action == Action::Restart)
+                {
+                    "Restart requires a supported supervisor adapter".to_string()
+                } else {
+                    "No eligible executable action remains after planning".to_string()
+                };
+                let previous = candidate["action_rationale"].as_str().unwrap_or("");
+                candidate["action_rationale"] = serde_json::json!(format!("{previous}; {reason}"));
+                candidate["recommended_action"] = serde_json::json!("review");
+                candidate["recommendation"] = serde_json::json!("REVIEW");
+                candidate["execution_plan"] = serde_json::json!({"reason": reason});
+            }
+            continue;
+        };
+        candidate["recommended_action"] = serde_json::to_value(final_action.action).unwrap();
+        candidate["recommendation"] = serde_json::json!(candidate["recommended_action"]
+            .as_str()
+            .unwrap()
+            .to_ascii_uppercase());
+        candidate["action_target"] = serde_json::to_value(&final_action.target).unwrap();
+        candidate["plan_action_ids"] = serde_json::json!(actions
+            .iter()
+            .map(|action| &action.action_id)
+            .collect::<Vec<_>>());
+        if final_action.original_zombie_target.is_some() {
+            candidate["zombie_routing"]["planned_action"] =
+                serde_json::to_value(final_action.action).unwrap();
+            candidate["zombie_routing"]["target"] =
+                serde_json::to_value(&final_action.target).unwrap();
+        }
+    }
+}
+
+fn agent_recommended_actions(plan: &Plan) -> Vec<serde_json::Value> {
+    plan.actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "pid": action.target.pid.0,
+                "action": action.action,
+                "stage": action.stage,
+                "action_id": action.action_id,
+            })
+        })
+        .collect()
 }
 
 fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
@@ -15137,6 +15643,33 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             None
         };
 
+        let parent = scan_result
+            .processes
+            .iter()
+            .find(|parent| parent.pid == proc.ppid);
+        let source_supervisor =
+            supervisor_info_for_plan_identity(&process_identity_from_record(proc));
+        let routed_supervision =
+            proc.state.is_zombie() && matches!(recommended_action, "kill" | "restart");
+        let mut supervisor = if routed_supervision {
+            match parent {
+                Some(parent) => {
+                    supervisor_info_for_plan_identity(&process_identity_from_record(parent))
+                }
+                None => unknown_supervision_for_plan(
+                    proc.ppid.0,
+                    "routed parent identity is unavailable in the full process snapshot",
+                ),
+            }
+        } else {
+            source_supervisor.clone()
+        };
+        supervisor["subject_kind"] = serde_json::json!(if routed_supervision {
+            "zombie_parent"
+        } else {
+            "process"
+        });
+
         // A zombie is already dead: only its parent can reap it, so the remedy
         // targets the parent (nudge with SIGCHLD, then restart/stop it).
         let zombie_routing = proc.state.is_zombie().then(|| {
@@ -15218,7 +15751,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 Action::Resume | Action::Unfreeze | Action::Unquarantine => "reversal",
                 Action::Keep | Action::Renice => "no_action",
             },
-            "supervisor": supervisor_info_for_plan(proc.pid.0),
+            "supervisor": supervisor,
+            "source_supervisor": routed_supervision.then_some(source_supervisor),
             "uncertainty": {
                 // Shannon entropy (bits) of the 4-class posterior: 0 = certain, 2 = uniform.
                 "posterior_entropy_bits": posterior.entropy_bits(),
@@ -15238,6 +15772,25 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "policy_blocked": policy_blocked,
             "policy": policy_value,
         });
+
+        let supervision_refusal = (candidate["supervisor"]["status"] == "unknown")
+            .then(|| {
+                candidate["supervisor"]["reason"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .flatten();
+        if let Some(reason) = &supervision_refusal {
+            if !matches!(
+                candidate["recommended_action"].as_str(),
+                Some("keep" | "review")
+            ) {
+                candidate["recommended_action"] = serde_json::json!("review");
+                candidate["recommendation"] = serde_json::json!("REVIEW");
+                let rationale = candidate["action_rationale"].as_str().unwrap_or("");
+                candidate["action_rationale"] = serde_json::json!(format!("{rationale}; {reason}"));
+            }
+        }
 
         if let Some(predictions) = predictions {
             if let Some(obj) = candidate.as_object_mut() {
@@ -15320,6 +15873,44 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             provenance_log_odds_shift: None,
         };
 
+        let parent_refusal = if proc.state.is_zombie()
+            && matches!(
+                candidate["recommended_action"].as_str(),
+                Some("kill" | "restart")
+            ) {
+            parent.and_then(|parent| {
+                planned_zombie_parent_refusal(
+                    parent,
+                    &protected_filter,
+                    &enforcer,
+                    &decision_policy,
+                    &scorer.signatures,
+                    posterior,
+                    global.robot,
+                )
+            })
+        } else {
+            None
+        };
+        let mut blocked_reasons: Vec<String> = policy_result
+            .violation
+            .as_ref()
+            .filter(|_| policy_blocked)
+            .map(|violation| format!("Policy blocked: {} ({})", violation.message, violation.rule))
+            .into_iter()
+            .collect();
+        if let Some(reason) = supervision_refusal {
+            blocked_reasons.push(reason);
+        }
+        if let Some(reason) = &parent_refusal {
+            blocked_reasons.push(reason.clone());
+            candidate["zombie_routing"]["refusal"] = serde_json::json!(reason);
+            candidate["policy_blocked"] = serde_json::json!(true);
+            if !policy_blocked {
+                policy_blocked_count += 1;
+            }
+        }
+
         // Store candidate with its ranking key (no early break!)
         action_inputs.insert(
             proc.pid.0,
@@ -15327,14 +15918,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 identity: process_identity_from_record(proc),
                 ppid: Some(proc.ppid.0),
                 decision: decision_outcome,
-                blocked_reasons: Vec::new(),
+                blocked_reasons,
                 stage_pause_before_kill: false,
                 process_state: Some(proc.state),
-                parent_identity: scan_result
-                    .processes
-                    .iter()
-                    .find(|parent| parent.pid == proc.ppid)
-                    .map(process_identity_from_record),
+                parent_identity: parent.map(process_identity_from_record),
                 d_state_diagnostics: None,
             },
         );
@@ -15506,8 +16093,41 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
     }
 
-    // Rebuild kill/review/spare candidate lists from the final sorted candidates
-    let mut kill_candidates: Vec<u32> = Vec::new();
+    let generated_at = chrono::Utc::now().to_rfc3339();
+    let action_plan = build_agent_action_plan(
+        &session_id,
+        &decision_policy,
+        &candidates,
+        &action_inputs,
+        generated_at.clone(),
+    );
+    reconcile_agent_action_candidates(&mut candidates, &action_inputs, &action_plan);
+    let final_recommendations: HashMap<_, _> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            Some((
+                (
+                    u32::try_from(candidate["pid"].as_u64()?).ok()?,
+                    candidate["start_id"].as_str()?,
+                ),
+                candidate["recommended_action"].as_str()?,
+            ))
+        })
+        .collect();
+    for recorded in &mut persisted_inference_records {
+        if let Some(action) = final_recommendations.get(&(recorded.pid, recorded.start_id.as_str()))
+        {
+            recorded.recommended_action = (*action).to_string();
+        }
+    }
+
+    // Executable targets and displayed remedies come from the same final plan.
+    let kill_candidates: Vec<u32> = action_plan
+        .actions
+        .iter()
+        .filter(|action| action.action == Action::Kill)
+        .map(|action| action.target.pid.0)
+        .collect();
     let mut review_candidates: Vec<u32> = Vec::new();
     let mut spare_candidates: Vec<u32> = Vec::new();
     let mut expected_memory_freed_bytes: u64 = 0;
@@ -15524,15 +16144,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .map(|selected| selected.contains(&pid))
             .unwrap_or(false);
         if action == "kill" {
-            kill_candidates.push(pid);
             expected_memory_freed_bytes += memory_mb * 1024 * 1024;
-        } else if selected_by_goal {
-            goal_selected_needing_review.push(pid);
+        } else if action == "review" {
             review_candidates.push(pid);
         } else if action == "keep" {
             spare_candidates.push(pid);
-        } else {
-            review_candidates.push(pid);
+        }
+        if selected_by_goal && action != "kill" {
+            goal_selected_needing_review.push(pid);
         }
     }
     let expected_memory_freed_gb = (expected_memory_freed_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
@@ -15619,7 +16238,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         recommendations["goal"] = goal.clone();
     }
 
-    // Build recommended section (legacy format for backward compatibility)
+    // Expose every executable action with its actual target, stage and stable ID.
     let empty_pids: Vec<u32> = Vec::new();
     let preselected_pids = if args.yes {
         &kill_candidates
@@ -15628,11 +16247,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     };
     let recommended = serde_json::json!({
         "preselected_pids": preselected_pids,
-        "actions": kill_candidates.iter().map(|pid| serde_json::json!({
-            "pid": pid,
-            "action": "kill",
-            "stage": 1,
-        })).collect::<Vec<_>>(),
+        "actions": agent_recommended_actions(&action_plan),
     });
 
     // Check for stub flags usage (future features parsed but not yet functional)
@@ -15677,7 +16292,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "session_id": session_id.0,
         "label": args.label,
-        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "generated_at": generated_at,
         "host_id": pt_core::logging::get_host_id(),
         "host": host_info,
         "system_state": system_state,
@@ -15713,7 +16328,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "goal_summary": goal_summary,
         "candidates": candidates,
         "recommendations": recommendations,
-        "recommended": recommended,  // Legacy format for backward compatibility
+        "recommended": recommended,
         "session_created": created,
     });
 
@@ -15724,13 +16339,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
     // The persisted and full stdout document carries the executable Plan fields
     // alongside its recorded candidate evidence. Apply consumes this same contract.
-    let action_plan = build_agent_action_plan(
-        &session_id,
-        &decision_policy,
-        &candidates,
-        &action_inputs,
-        plan_output["generated_at"].as_str().unwrap().to_string(),
-    );
     if let serde_json::Value::Object(fields) = serde_json::to_value(action_plan).unwrap() {
         plan_output.as_object_mut().unwrap().extend(fields);
     }
@@ -16398,8 +17006,37 @@ fn build_process_explanation(
     explanation
 }
 
+fn supervisor_info_for_plan_identity(identity: &ProcessIdentity) -> serde_json::Value {
+    let pid = identity.pid.0;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let provider = LiveIdentityProvider::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut info = if matches!(provider.revalidate(identity), Ok(true)) {
+        let observed = supervisor_info_for_plan(pid);
+        if matches!(provider.revalidate(identity), Ok(true)) {
+            observed
+        } else {
+            unknown_supervision_for_plan(pid, "supervision subject identity changed during probing")
+        }
+    } else {
+        unknown_supervision_for_plan(
+            pid,
+            "supervision subject identity changed or is unavailable",
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let mut info = supervisor_info_for_plan(pid);
+    info["subject_identity"] = serde_json::json!(identity);
+    info["subject_kind"] = serde_json::json!("process");
+    info
+}
+
 #[cfg(target_os = "linux")]
 fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
+    let human_supervision = match detect_supervision(pid) {
+        Ok(result) => result,
+        Err(error) => return unknown_supervision_for_plan(pid, &error.to_string()),
+    };
     let mut detected = false;
     let mut supervisor_type: Option<String> = None;
     let mut unit: Option<String> = None;
@@ -16503,19 +17140,16 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
     }
 
     // Human supervision (agents/IDEs/CI) for warning-only
-    if !detected {
-        if let Ok(result) = detect_supervision(pid) {
-            if is_human_supervised(&result) {
-                detected = true;
-                supervisor_type = result.supervisor_type.map(|t| t.to_string());
-                unit = result.supervisor_name;
-                recommended_action = "review".to_string();
-            }
-        }
+    if !detected && is_human_supervised(&human_supervision) {
+        detected = true;
+        supervisor_type = human_supervision.supervisor_type.map(|t| t.to_string());
+        unit = human_supervision.supervisor_name;
+        recommended_action = "review".to_string();
     }
 
     serde_json::json!({
         "detected": detected,
+        "status": "observed",
         "type": supervisor_type,
         "unit": unit,
         "manager": manager,
@@ -16525,33 +17159,44 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn supervisor_info_for_plan(_pid: u32) -> serde_json::Value {
+fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
+    unknown_supervision_for_plan(
+        pid,
+        "complete supervisor probes are unavailable on this platform",
+    )
+}
+
+fn unknown_supervision_for_plan(pid: u32, error: &str) -> serde_json::Value {
     serde_json::json!({
-        "detected": false,
+        "subject_identity": serde_json::Value::Null,
+        "detected": serde_json::Value::Null,
+        "status": "unknown",
+        "reason": format!("Mandatory supervision evidence unavailable for PID {pid}: {error}"),
         "type": serde_json::Value::Null,
         "unit": serde_json::Value::Null,
         "manager": serde_json::Value::Null,
-        "recommended_action": "kill",
+        "recommended_action": "review",
         "supervisor_command": serde_json::Value::Null,
     })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-/// Robot-mode supervision gate. Fails CLOSED: if supervision cannot be determined
-/// (detection error, or the process environment is unreadable, e.g. another user's
-/// process without privileges), the process is treated as supervised, so robot
-/// mode requires a human instead of assuming "nobody is attached".
-fn is_supervised_for_robot(pid: u32) -> bool {
-    match detect_supervision(pid) {
-        Ok(result) => is_human_supervised(&result) || result.environ.is_none(),
-        Err(_) => true,
-    }
+/// Preserve unavailable required evidence separately from observed supervision.
+/// Confirmation policy cannot turn a failed mandatory probe into permission.
+fn supervision_for_robot(pid: u32) -> Result<bool, String> {
+    detect_supervision(pid)
+        .map(|result| is_human_supervised(&result))
+        .map_err(|error| {
+            format!("Mandatory supervision evidence unavailable for PID {pid}: {error}")
+        })
 }
 
-/// No supervision evidence on this platform: fail closed (a human must confirm).
+/// No supervision evidence on this platform: preserve Unknown as a refusal.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn is_supervised_for_robot(_pid: u32) -> bool {
-    true
+fn supervision_for_robot(pid: u32) -> Result<bool, String> {
+    Err(format!(
+        "Mandatory supervision evidence unavailable for PID {pid}: unsupported platform"
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -16809,7 +17454,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             return ExitCode::IoError;
         }
     };
-    let plan: Plan = match serde_json::from_str(&plan_content) {
+    let plan = match parse_agent_plan(&plan_content) {
         Ok(p) => p,
         Err(e) => {
             eprintln!(
@@ -16819,27 +17464,44 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }
     };
 
-    // Load completed action IDs for --resume mode
+    if plan.session_id != sid.0 {
+        eprintln!(
+            "agent apply: plan session {} does not match requested session {}",
+            plan.session_id, sid
+        );
+        return ExitCode::InternalError;
+    }
+
+    // Resume only executions bound to this canonical action and target identity.
     let completed_action_ids: std::collections::HashSet<String> = if args.resume {
         let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
-        if outcomes_path.exists() {
-            std::fs::read_to_string(&outcomes_path)
-                .ok()
-                .map(|content| {
-                    content
-                        .lines()
-                        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                        .filter(|v| v.get("status").and_then(|s| s.as_str()) == Some("success"))
-                        .filter_map(|v| {
-                            v.get("action_id")
-                                .and_then(|a| a.as_str())
-                                .map(String::from)
-                        })
+        match std::fs::read_to_string(&outcomes_path) {
+            Ok(content) => match parse_action_outcomes(&content).and_then(|saved| {
+                executed_plan_actions(&plan, &saved).map(|executed| {
+                    executed
+                        .into_iter()
+                        .map(|(action, _)| action.action_id.clone())
                         .collect()
                 })
-                .unwrap_or_default()
-        } else {
-            std::collections::HashSet::new()
+            }) {
+                Ok(completed) => completed,
+                Err(error) => {
+                    eprintln!(
+                        "agent apply: saved execution evidence is invalid for this Plan; refusing --resume: {error}"
+                    );
+                    return ExitCode::PolicyBlocked;
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::collections::HashSet::new()
+            }
+            Err(error) => {
+                eprintln!(
+                    "agent apply: cannot read saved execution evidence {}: {error}",
+                    outcomes_path.display()
+                );
+                return ExitCode::IoError;
+            }
         }
     } else {
         std::collections::HashSet::new()
@@ -17330,6 +17992,31 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 continue;
             }
 
+            let supervised = match supervision_for_robot(action.target.pid.0) {
+                Ok(supervised) => supervised,
+                Err(reason) => {
+                    blocked_by_prechecks += 1;
+                    outcomes.push(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "precheck_blocked",
+                        "check": "check_agent_supervision",
+                        "reason": reason,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        None,
+                        action,
+                        "precheck_blocked",
+                        &[("check", serde_json::json!("check_agent_supervision"))],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+            };
             let candidate = RobotCandidate {
                 posterior: action
                     .rationale
@@ -17341,7 +18028,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 category: action.rationale.category.clone(),
                 is_kill_action: action.action == Action::Kill,
                 has_policy_snapshot,
-                is_supervised: is_supervised_for_robot(action.target.pid.0),
+                is_supervised: supervised,
             };
             let mut check = checker.check_candidate(&candidate);
             if check.allowed {
@@ -17351,7 +18038,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
             if !check.allowed {
                 blocked_by_constraints += 1;
-                outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "blocked_by_constraints"}));
+                outcomes.push(serde_json::json!({
+                    "action_id": action.action_id,
+                    "pid": action.target.pid.0,
+                    "status": "blocked_by_constraints",
+                    "violations": check.violations,
+                }));
                 emit_action_event(
                     pt_core::events::event_names::ACTION_COMPLETE,
                     action_index,
@@ -17656,6 +18348,33 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
 
                 let current_rss_bytes = current_process.rss_bytes;
+                let supervised = match supervision_for_robot(action.target.pid.0) {
+                    Ok(supervised) => supervised,
+                    Err(reason) => {
+                        blocked_by_prechecks += 1;
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        outcomes.push(serde_json::json!({
+                            "action_id": action.action_id,
+                            "pid": action.target.pid.0,
+                            "status": "precheck_blocked",
+                            "check": "check_agent_supervision",
+                            "reason": reason,
+                            "time_ms": elapsed_ms,
+                        }));
+                        emit_action_event(
+                            pt_core::events::event_names::ACTION_COMPLETE,
+                            action_index,
+                            Some(elapsed_ms),
+                            action,
+                            "precheck_blocked",
+                            &[("check", serde_json::json!("check_agent_supervision"))],
+                        );
+                        if args.abort_on_unknown {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 let candidate = RobotCandidate {
                     posterior: action
                         .rationale
@@ -17667,7 +18386,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     category: action.rationale.category.clone(),
                     is_kill_action: action.action == Action::Kill,
                     has_policy_snapshot,
-                    is_supervised: is_supervised_for_robot(action.target.pid.0),
+                    is_supervised: supervised,
                 };
                 let mut check = checker.check_candidate(&candidate);
                 if check.allowed {
@@ -20761,11 +21480,7 @@ fn evaluate_watch_candidate(
     }
     .to_string();
 
-    let confidence = posterior_result
-        .posterior
-        .abandoned
-        .max(posterior_result.posterior.zombie)
-        .clamp(0.0, 1.0);
+    let confidence = posterior_result.posterior.abandonment_probability();
 
     Some(WatchEval {
         confidence,
@@ -21131,11 +21846,7 @@ fn generate_report_from_session(
         started_at: chrono::DateTime::parse_from_rfc3339(&manifest.timing.created_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .map_err(|error| pt_report::ReportError::MissingData(format!("created_at: {error}")))?,
-        ended_at: manifest.timing.updated_at.as_ref().and_then(|ts| {
-            chrono::DateTime::parse_from_rfc3339(ts)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .ok()
-        }),
+        ended_at: pt_report::generator::recorded_session_end(&serde_json::to_value(&manifest)?),
         duration_ms: None,
         state: format!("{:?}", manifest.state).to_lowercase(),
         mode: serde_json::to_value(manifest.mode)?
@@ -21155,7 +21866,7 @@ fn generate_report_from_session(
         cores: None,
         memory_bytes: None,
         pt_version: None,
-        export_profile: "safe".to_string(),
+        export_profile: generator.config().redaction_profile.clone(),
     };
 
     // A session report needs its recorded plan. Missing or corrupt data is an
@@ -21176,9 +21887,9 @@ mod report_generation_tests {
     use super::*;
     use pt_report::{ReportConfig, ReportGenerator, ReportTheme};
 
-    fn make_report_handle(session_id: &SessionId) -> (tempfile::TempDir, SessionHandle) {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(&session_id.0);
+    fn make_report_handle(session_id: &SessionId) -> (PathBuf, SessionHandle) {
+        let tmp = tempfile::tempdir().unwrap().keep();
+        let dir = tmp.join(&session_id.0);
         fs::create_dir_all(&dir).unwrap();
         (
             tmp,
@@ -21193,7 +21904,10 @@ mod report_generation_tests {
     fn generate_report_from_session_uses_context_host_metadata() {
         let session_id = SessionId("pt-20260115-120000-rpt".to_string());
         let (_tmp, handle) = make_report_handle(&session_id);
-        let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+        let mut manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+        manifest.timing.created_at = "2026-01-15T12:00:00Z".to_string();
+        manifest.state_history[0].ts = manifest.timing.created_at.clone();
+        manifest.record_state(SessionState::Planned);
         handle.write_manifest(&manifest).unwrap();
         handle
             .write_context(&SessionContext {
@@ -21233,6 +21947,9 @@ mod report_generation_tests {
             serde_json::from_str(data).expect("recorded session JSON")
         };
         let recorded = recorded_data(&html);
+        assert_eq!(recorded["overview"]["state"], "planned");
+        assert!(recorded["overview"]["ended_at"].is_null());
+        assert_eq!(recorded["overview"]["export_profile"], "safe");
         // Each export has its own random key. Equal host inputs in the same
         // export must correlate; a separately constructed engine cannot predict
         // its token. The plan sentinel independently identifies the context host.
@@ -21271,6 +21988,48 @@ mod report_generation_tests {
         assert!(!changed_html.contains("host-from-context"));
         assert!(!changed_html.contains("different-context-host"));
         assert!(!changed_html.contains(&wrong_host_row));
+
+        let mut forensic_config = ReportConfig::new().with_embed_assets(true);
+        forensic_config.redaction_profile = "Forensic".to_string();
+        let forensic = ReportGenerator::new(forensic_config);
+        for (state, timestamp, expected_end) in [
+            (
+                SessionState::Completed,
+                "2026-01-15T12:02:00Z",
+                Some("2026-01-15T12:02:00Z"),
+            ),
+            (
+                SessionState::Archived,
+                "2026-01-15T12:05:00Z",
+                Some("2026-01-15T12:02:00Z"),
+            ),
+            (SessionState::Planned, "2026-01-15T12:06:00Z", None),
+            (
+                SessionState::Failed,
+                "2026-01-15T12:07:00Z",
+                Some("2026-01-15T12:07:00Z"),
+            ),
+            (
+                SessionState::Cancelled,
+                "2026-01-15T12:08:00Z",
+                Some("2026-01-15T12:08:00Z"),
+            ),
+        ] {
+            manifest.record_state(state);
+            manifest.state_history.last_mut().unwrap().ts = timestamp.to_string();
+            // A later update is deliberately not the terminal transition.
+            manifest.timing.updated_at = Some("2026-01-15T13:00:00Z".to_string());
+            handle.write_manifest(&manifest).unwrap();
+            let html = generate_report_from_session(&forensic, &handle).unwrap();
+            let recorded = recorded_data(&html);
+            assert_eq!(
+                recorded["overview"]["ended_at"],
+                serde_json::json!(expected_end),
+                "{state:?}"
+            );
+            assert_eq!(recorded["overview"]["export_profile"], "forensic");
+            assert!(html.contains(">forensic</span>"));
+        }
     }
 
     #[test]

@@ -541,6 +541,8 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate pt-core: {e}"))?;
     let output = std::process::Command::new(&exe)
+        .arg("--config")
+        .arg(config_dir())
         .args(plan_command_args(params))
         .stdin(std::process::Stdio::null())
         .output()

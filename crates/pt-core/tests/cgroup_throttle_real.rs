@@ -2,9 +2,10 @@
 //!
 //! These tests require:
 //! - Linux with cgroup v2 support
-//! - Write access to cgroup hierarchy (root or appropriate permissions)
+//! - PT_TEST_CGROUP_PARENT: a preexisting writable delegated parent whose CPU
+//!   controller is already enabled; only new owned leaves are mutated.
 //!
-//! Tests are automatically skipped if requirements are not met.
+//! Without that prerequisite the live capability is explicitly unavailable.
 
 #![cfg(all(feature = "test-utils", target_os = "linux"))]
 
@@ -17,7 +18,7 @@ use pt_core::action::{
 use pt_core::collect::cgroup::{collect_cgroup_details, CgroupVersion};
 use pt_core::decision::Action as PlanActionType;
 use pt_core::plan::{ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, PlanAction};
-use pt_core::test_utils::ProcessHarness;
+use pt_core::test_utils::OwnedCgroupFixture;
 use std::fs;
 use std::time::Duration;
 
@@ -33,20 +34,6 @@ fn empty_rationale() -> ActionRationale {
         has_known_signature: None,
         category: None,
     }
-}
-
-fn has_cgroup_v2_write_access() -> bool {
-    if let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup") {
-        for line in cgroup.lines() {
-            if let Some(path) = line.strip_prefix("0::") {
-                let cpu_max_path = format!("/sys/fs/cgroup{}/cpu.max", path);
-                if let Ok(metadata) = fs::metadata(&cpu_max_path) {
-                    return !metadata.permissions().readonly();
-                }
-            }
-        }
-    }
-    false
 }
 
 // ============================================================================
@@ -174,52 +161,37 @@ fn test_reversal_metadata_capture() {
 
 #[test]
 fn test_throttle_spawned_process() {
-    if !ProcessHarness::is_available() {
-        pt_core::test_log!(INFO, "Skipping: ProcessHarness not available");
+    let Some(fixture) = OwnedCgroupFixture::new().expect("safe delegated cgroup setup") else {
         return;
-    }
-
-    // First check if we have cgroup access for our own process
-    // (spawned processes inherit our cgroup)
-    if !has_cgroup_v2_write_access() {
-        pt_core::test_log!(INFO, "Skipping: no cgroup v2 write access");
-        return;
-    }
-
-    let harness = ProcessHarness;
-    let proc = harness.spawn_sleep(60).expect("spawn sleep process");
-    let pid = proc.pid();
+    };
+    let pid = fixture.target.pid();
 
     pt_core::test_log!(INFO, "throttle test starting", pid = pid);
 
-    // Check if we can throttle this process
-    if !can_throttle_process(pid) {
-        pt_core::test_log!(INFO, "Skipping: cannot throttle spawned process", pid = pid);
-        return;
-    }
+    assert!(
+        can_throttle_process(pid),
+        "owned exclusive leaf must be throttleable"
+    );
+    let before = OwnedCgroupFixture::controls(&fixture.leaf);
+    let sibling_before = OwnedCgroupFixture::controls(&fixture.sibling_leaf);
 
     // Capture original state
     let runner = CpuThrottleActionRunner::with_defaults();
-    let reversal = runner.capture_reversal_metadata(pid);
+    let reversal = runner
+        .capture_reversal_metadata(pid)
+        .expect("actual reversal metadata");
     pt_core::test_log!(
         INFO,
         "captured reversal metadata",
         pid = pid,
-        has_reversal = reversal.is_some()
+        has_reversal = true
     );
 
     // Create throttle action
     let action = PlanAction {
         action_id: "test-throttle".to_string(),
         action: PlanActionType::Throttle,
-        target: ProcessIdentity {
-            pid: ProcessId(pid),
-            start_id: StartId("mock".to_string()),
-            uid: 1000,
-            pgid: None,
-            sid: None,
-            quality: IdentityQuality::Full,
-        },
+        target: fixture.identity.clone(),
         order: 0,
         stage: 0,
         timeouts: ActionTimeouts::default(),
@@ -236,26 +208,6 @@ fn test_throttle_spawned_process() {
 
     // Execute throttle
     let result = runner.execute(&action);
-    if let Err(ref e) = result {
-        pt_core::test_log!(
-            INFO,
-            "throttle execution result",
-            pid = pid,
-            error = format!("{:?}", e).as_str()
-        );
-        // Permission errors and cgroup access failures are expected in non-privileged environments
-        let error_msg = format!("{:?}", e);
-        if matches!(e, pt_core::action::ActionError::PermissionDenied)
-            || error_msg.contains("no writable cgroup")
-            || error_msg.contains("permission")
-        {
-            pt_core::test_log!(
-                INFO,
-                "Skipping verification: cgroup write access unavailable"
-            );
-            return;
-        }
-    }
     assert!(result.is_ok(), "throttle failed: {:?}", result);
     pt_core::test_log!(INFO, "throttle executed successfully", pid = pid);
 
@@ -267,52 +219,167 @@ fn test_throttle_spawned_process() {
 
     // Verify CPU limits were changed
     let details = collect_cgroup_details(pid).expect("collect cgroup details");
-    if let Some(ref limits) = details.cpu_limits {
-        pt_core::test_log!(
-            INFO,
-            "post-throttle CPU limits",
-            pid = pid,
-            quota_us = format!("{:?}", limits.quota_us).as_str(),
-            period_us = format!("{:?}", limits.period_us).as_str(),
-            effective_cores = format!("{:?}", limits.effective_cores).as_str()
-        );
-    }
+    let limits = details.cpu_limits.expect("actual CPU limits");
+    assert_eq!(limits.quota_us, Some(25_000));
+    assert_eq!(limits.period_us, Some(100_000));
+    let quota = fs::read_to_string(fixture.leaf.join("cpu.max")).unwrap();
+    assert_eq!(quota.trim(), "25000 100000");
+    fixture.assert_isolated();
+    fixture.record("throttled");
+    assert_eq!(
+        OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+        sibling_before
+    );
 
     // Test reversal
-    if let Some(ref metadata) = reversal {
-        let restore_result = runner.restore_from_metadata(metadata);
-        assert!(
-            restore_result.is_ok(),
-            "reversal failed: {:?}",
-            restore_result
-        );
-        pt_core::test_log!(INFO, "reversal successful", pid = pid);
-    }
+    let restore_result = runner.restore_from_metadata(&reversal);
+    assert!(
+        restore_result.is_ok(),
+        "reversal failed: {:?}",
+        restore_result
+    );
+    fixture.record("restored");
+    assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), before);
+    assert_eq!(
+        OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+        sibling_before
+    );
+    fixture.assert_isolated();
+    pt_core::test_log!(INFO, "reversal successful", pid = pid);
+    let mut stale_reversal = reversal.clone();
+    stale_reversal.identity.start_id =
+        StartId(format!("{}-stale", stale_reversal.identity.start_id.0));
+    let result = runner.restore_from_metadata(&stale_reversal);
+    assert!(
+        matches!(result, Err(pt_core::action::ActionError::IdentityMismatch)),
+        "stale reversal admitted: {result:?}"
+    );
+    fixture.record("stale-reversal-refused");
+    assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), before);
+    assert_eq!(
+        OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+        sibling_before
+    );
+    fixture.assert_isolated();
+
+    // Actual stale identity and shared membership must leave both owned tasks
+    // and both controllers unchanged, rather than becoming successful writes.
+    let mut stale = action.clone();
+    stale.target.start_id = StartId(format!("{}-stale", stale.target.start_id.0));
+    let result = runner.execute(&stale);
+    assert!(
+        matches!(result, Err(pt_core::action::ActionError::IdentityMismatch)),
+        "stale identity admitted: {result:?}"
+    );
+    fixture.record("stale-refused");
+    assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), before);
+    assert_eq!(
+        OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+        sibling_before
+    );
+    fixture.assert_isolated();
+    let descendant = fixture
+        .leaf
+        .join(format!("empty-owned-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&descendant).expect("create retained empty owned descendant");
+    assert!(fs::read_to_string(descendant.join("cgroup.procs"))
+        .unwrap()
+        .trim()
+        .is_empty());
+    let result = runner.execute(&action);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("descendants")),
+        "nonleaf cgroup admitted: {result:?}"
+    );
+    assert!(!can_throttle_process(pid));
+    fixture.record("descendant-refused");
+    assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), before);
+    assert_eq!(
+        OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+        sibling_before
+    );
+    fixture.assert_alive();
+    fs::write(
+        fixture.leaf.join("cgroup.procs"),
+        fixture.sibling.pid().to_string(),
+    )
+    .expect("move only owned sibling into owned leaf");
+    let mut members: Vec<u32> = fs::read_to_string(fixture.leaf.join("cgroup.procs"))
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    members.sort_unstable();
+    let mut expected = vec![pid, fixture.sibling.pid()];
+    expected.sort_unstable();
+    assert_eq!(members, expected);
+    let result = runner.execute(&action);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("shared")),
+        "shared cgroup admitted: {result:?}"
+    );
+    assert!(!can_throttle_process(pid));
+    fixture.record("shared-refused");
+    assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), before);
+    assert_eq!(
+        OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+        sibling_before
+    );
+    fixture.assert_alive();
 }
 
 #[test]
 fn test_throttle_permission_denied() {
-    if !ProcessHarness::is_available() {
-        pt_core::test_log!(INFO, "Skipping: ProcessHarness not available");
-        return;
-    }
-
-    // Try to throttle PID 1 (init) which should fail with permission denied
+    // Root privileges cannot override the PID1 guard. Observe its existing
+    // controls before and after; this test must never restore an unknown quota.
     let init_pid = 1u32;
 
     let runner = CpuThrottleActionRunner::with_defaults();
+    let path = collect_cgroup_details(init_pid)
+        .expect("actual init cgroup")
+        .unified_path
+        .expect("actual init unified path");
+    let directory = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+    let controls = || {
+        ["cpu.max", "cgroup.freeze"]
+            .into_iter()
+            .map(|name| {
+                let bytes = match fs::read(directory.join(name)) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("cannot observe existing init {name}: {error}"),
+                };
+                (name.to_string(), bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = controls();
+    let artifacts =
+        std::env::temp_dir().join(format!("pt-cgroup-init-refusal-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&artifacts).expect("retain init refusal observations");
+    eprintln!(
+        "Retained protected init observations: {}",
+        artifacts.display()
+    );
+    for (name, bytes) in &before {
+        if let Some(bytes) = bytes {
+            fs::write(artifacts.join(format!("before-{name}")), bytes).unwrap();
+        }
+    }
+    fs::write(
+        artifacts.join("before-observation.json"),
+        serde_json::to_vec_pretty(&before).unwrap(),
+    )
+    .unwrap();
 
     let action = PlanAction {
         action_id: "test-throttle-init".to_string(),
         action: PlanActionType::Throttle,
-        target: ProcessIdentity {
-            pid: ProcessId(init_pid),
-            start_id: StartId("mock".to_string()),
-            uid: 0,
-            pgid: None,
-            sid: None,
-            quality: IdentityQuality::Full,
-        },
+        target: OwnedCgroupFixture::read_identity(init_pid).expect("actual init identity"),
         order: 0,
         stage: 0,
         timeouts: ActionTimeouts::default(),
@@ -337,6 +404,37 @@ fn test_throttle_permission_denied() {
 
     // We expect this to fail - either permission denied or process not found
     assert!(result.is_err(), "throttling init should fail");
+    assert!(result.unwrap_err().to_string().contains("protected PID 1"));
+    assert!(!can_throttle_process(init_pid));
+    assert_eq!(controls(), before);
+    let mut freeze = action.clone();
+    let freezer = pt_core::action::FreezeActionRunner::with_defaults();
+    for action_type in [PlanActionType::Freeze, PlanActionType::Unfreeze] {
+        freeze.action = action_type;
+        let result = freezer.execute(&freeze);
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("protected PID 1")),
+            "protected freezer mutation admitted: {result:?}"
+        );
+        assert_eq!(controls(), before);
+    }
+    for (name, bytes) in controls() {
+        if let Some(bytes) = bytes {
+            fs::write(artifacts.join(format!("after-{name}")), bytes).unwrap();
+        }
+    }
+    fs::write(
+        artifacts.join("after-observation.json"),
+        serde_json::to_vec_pretty(&controls()).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        artifacts.join("identity.json"),
+        serde_json::to_vec_pretty(&action.target).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
