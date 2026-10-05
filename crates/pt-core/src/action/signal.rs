@@ -1021,19 +1021,39 @@ mod tests {
             let pid = child.id();
             let runner = SignalActionRunner::with_defaults();
 
-            // Wait for it to become a zombie
-            let start = Instant::now();
+            // Observe this owned child's actual exit without reaping it. Fixture
+            // startup is not a signal-runner latency measurement; the original
+            // 500 ms effect-verification deadline below remains unchanged.
+            // SAFETY: siginfo_t is a C integer/union record with a valid zero
+            // representation. waitid fills its child-status fields on success.
+            let mut exit_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             loop {
-                if start.elapsed() > Duration::from_secs(2) {
-                    // Fallback cleanup if it never becomes Z (unlikely)
-                    let _ = child.wait();
-                    panic!("Process did not become zombie in time");
-                }
-                if let Some('Z') = runner.get_process_state(pid) {
+                // SAFETY: pid is our still-unreaped direct child. WNOWAIT leaves
+                // the exited child available for the real /proc and runner checks.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid,
+                        &mut exit_info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if result == 0 {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    let _ = child.wait();
+                    panic!("observe owned child exit without reaping: {error}");
+                }
             }
+            // SAFETY: successful WEXITED waitid initialized child-status fields.
+            assert_eq!(unsafe { exit_info.si_pid() }, pid as libc::pid_t);
+            assert_eq!(exit_info.si_code, libc::CLD_EXITED);
+            // SAFETY: CLD_EXITED makes si_status the child's actual exit status.
+            assert_eq!(unsafe { exit_info.si_status() }, 0);
+            assert_eq!(runner.get_process_state(pid), Some('Z'));
+            assert!(runner.process_exists(pid), "owned zombie still exists");
 
             // Verify wait_for_state_change considers it exited
             // Without the fix, this would timeout because process_exists() is true for zombies
@@ -1047,7 +1067,7 @@ mod tests {
             assert!(result.is_ok(), "Zombie should be considered exited");
 
             // Cleanup
-            let _ = child.wait();
+            assert!(child.wait().expect("reap the owned zombie").success());
         }
     }
 }
