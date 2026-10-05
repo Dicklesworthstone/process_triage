@@ -2,14 +2,14 @@
 
 ## Current work and validation — 2026-10-05 19:17 UTC
 
-The core product is materially better, but the project is not finished. Eleven
-original product items have independently accepted closures during this session;
+The core product is materially better, but the project is not finished. Twelve
+product items have independently accepted closures during this session;
 the original fleet-normalization and CPU-throttle positive tasks were reopened
 when their evidence proved insufficient. The graph now contains 960 issues:
-823 closed, 124 open and thirteen in progress (**137 remaining**). Active cycles
-remain zero. A newly discovered production watchdog race is `bd-u7gc.8`; the
-original root/nonroot workspace task `bd-ufqb.9` blocks on it, without changing
-either task's acceptance criteria.
+824 closed, 124 open and twelve in progress (**136 remaining**). Active cycles
+remain zero. The newly discovered production watchdog race `bd-u7gc.8` is now
+independently accepted and closed on its original criteria. The original root/nonroot
+workspace task `bd-ufqb.9` remains open without changing its acceptance criteria.
 
 The earlier ROOT run actually changed PID 1's CPU quota. Read-only observation
 found `/sys/fs/cgroup/init.scope/cpu.max` at `25000 100000`. Its previous value
@@ -29,7 +29,10 @@ no existing controller setting or process membership changed during provisioning
 The complete existing cgroup and action-tray binaries then passed 15 and 18 tests
 as ROOT, including all four actual quota/freeze/restore positives. The parent,
 global controller settings and PID 1 quota stayed unchanged; phase artifacts and
-cleanup observations are retained. Independent artifact review is underway.
+cleanup observations are retained. Independent artifact review accepted the actual
+17 phases and all eight owned cleanup exits. The original before/after source checks
+were quiet with no separate transcript; current full source and binary hashes were
+independently recomputed without inventing historical check records.
 These sleepers do not measure CPU relief. Snapshot checks are not atomic isolation;
 automatic leaf management and durable CLI undo remain incomplete.
 
@@ -101,8 +104,9 @@ live owned-child tests require actual SIGKILL/timeout and cancellation survival,
 with separate same-birth/UID survivors. Independent source review accepted these
 changes. Both watchdog cases and the live session neighbor passed in the complete
 ROOT core library run: 4,048 passed, zero failed, seven original ignored, zero
-filtered. Independent bounded runtime acceptance is pending; this is not a complete
-workspace pass. No forced PID-reuse reproduction or macOS execution is claimed.
+filtered. Independent bounded runtime acceptance closed `bd-u7gc.8` at 19:21 UTC;
+this is not a complete workspace pass. No forced PID-reuse reproduction or macOS
+execution is claimed.
 
 Superseded owned check/full-test jobs are cancelled only through RCH's normal
 owner-bound API. The first pair recovered with terminal acknowledgment, source
@@ -136,15 +140,16 @@ by elapsed time, selected passing tests or an independently reviewed scanner row
   cases plus existing collector/session/group neighbors on frozen c0f2 source.
 - [x] Complete c0f2 workspace all-targets check, warnings-denying Clippy, formatting
   and the lean no-default-features check, all actual exit zero.
-- [ ] Independently accept the bounded watchdog runtime against its original criteria.
+- [x] Independently accept the bounded watchdog runtime against its original criteria
+  and close `bd-u7gc.8` with exact source, actual effects and gate citations.
 - [ ] Check and rerun the two observed test-only corrections without cancelling the
   ongoing older full suites or crediting their failures as corrected passes.
 - [ ] Complete the entire nonroot and ROOT workspace suites on that same source;
   report all original ignores/unavailable prerequisites separately. No selected
   run can close the full-workspace requirement.
-- [ ] Independently verify the eligible delegated cgroup runtime artifacts; then
-  measure actual CPU relief and deliver the original automatic isolation/CLI undo
-  requirements. Keep `bd-qr40.4` and `process_triage-sj6.6` open until those pass.
+- [x] Independently verify the eligible delegated cgroup runtime artifacts.
+- [ ] Measure actual CPU relief and deliver the original automatic isolation/CLI
+  undo requirements. Keep `bd-qr40.4` and `process_triage-sj6.6` open until those pass.
 - [ ] Restore the incident quota only after the intended prior value is supplied
   and the applicable overwrite authorization is satisfied.
 - [ ] Obtain actual hosted main CI evidence, the unavailable macOS endpoint and
@@ -152,12 +157,13 @@ by elapsed time, selected passing tests or an independently reviewed scanner row
 - [ ] Resume dependency updates only after the circuit-breaker response, preserving
   MSRV and separately resolving the known vulnerable transitive dependency families.
 
-### Bounded work and honesty audit — 2026-10-05 18:55 UTC
+### Bounded work and honesty audit — 2026-10-05 19:21 UTC
 
-Window: 15:54–18:55 UTC. Inputs: actual source edits and frozen-source differences,
+Window: 15:54–19:21 UTC. Inputs: actual source edits and frozen-source differences,
 the independently retained f19 runtime archive and original `.17` criteria, current
 tracker records, recent log/stat/reflog, four owned cancellation/recovery records,
-compiler/scanner streams and the original ROOT incident. External commits and merges
+compiler/scanner streams, the exact archived formatting rerun, independent watchdog
+and cgroup runtime reviews, and the original ROOT incident. External commits and merges
 preserved earlier authored bytes; their count is not a feature count. The recent
 reflog shows those commits/merges, not a root reset. No root commit, push, deletion,
 golden regeneration or release occurred. Whole external history has not received
@@ -165,12 +171,13 @@ another exhaustive per-commit audit; receipt checks establish current source ide
 That limitation is explicit rather than a clean-history assertion.
 
 Real-work inventory: canonical action-kind binding USER (independently accepted);
-direct cgroup/reversal safety, truthful fleet merge behavior and watchdog lifetime
-correction USER source changes (new runtime acceptance pending); root-compatible
+direct cgroup/reversal safety and truthful fleet merge behavior USER source changes
+(direct cgroup effects accepted, original positive tasks remain incomplete);
+watchdog lifetime correction USER (independently accepted); root-compatible
 permission fixtures and owned cgroup/group fixtures ENABLER; source-bound validation
 and necessary integrity recovery ENABLER; tracker/TODO updates PROCESS. Tally:
-USER 4, ENABLER 3, PROCESS 1, UNKNOWN 0. Only the first USER item has new complete
-positive acceptance in this window. Refusal-only changes do not become normalization,
+USER 4, ENABLER 3, PROCESS 1, UNKNOWN 0. Two USER items have new complete original
+acceptance in this window. Refusal-only changes do not become normalization,
 resource relief or cgroup isolation capability.
 
 1. Most visible accepted change: a genuine saved Pause execution cannot be reused
@@ -179,17 +186,19 @@ resource relief or cgroup isolation capability.
 2. The tracker/report changes no product behavior. Minimal archives did preserve
    source after observed evidence loss; additional certificate layers would add nothing.
 3. Real consumers exercised the accepted action-kind path and the older 4,208
-   selected repairs. The latest fixtures/watchdog have only source/Clippy acceptance
-   so far, which cannot be called positive runtime delivery.
+   selected repairs. Current watchdog and four direct cgroup effects have independently
+   reviewed actual runtime. The primary ROOT permission fixture still failed at its
+   later descriptor bootstrap; source correction is not a passing invocation.
 4. Oldest user-relevant open item remains `bd-l3s5`, measured fleet false-positive
    calibration. Actual privileged safety defects took precedence; calibration is
    still a central missing product outcome. `bd-toa2.10` is another concrete gap:
    terminal-pane workloads inherit a service classification and disappear from plans.
-5. Root closed `.17` after independent exact-source/evidence acceptance; reviewers
+5. Root closed `.17` and `.8` after independent exact-source/evidence acceptance; reviewers
    made no closures. Source review and research receive no capability credit.
 6. No original positive criterion was moved to a follow-up to close its parent.
    `hc7.3` and `sj6.6` were reopened; `.9/.11` stay open. New `.8` records a genuinely
-   newly observed watchdog defect and blocks the existing workspace requirement.
+   newly observed watchdog defect and was closed only on its full original criteria;
+   the workspace requirement stays open despite its satisfied dependency.
 
 Verdict: DRIFTING. Repeated builds, evidence recovery and failed prerequisite
 sequences consumed substantial time. Correction: freeze the now-reviewed source,
@@ -210,6 +219,10 @@ Honesty inventory, defending none of the author's decisions:
 3. No (checked: changed paths and executed commands). No baselines were regenerated.
 4. Yes: fixture/verifier changes accompany safety fixes. Their source diffs were
    separately reviewed, original windows retained and support/refusal losses published.
+   Observed loader-FD readiness now retries only complete mismatches or ENOENT within
+   the same original five seconds, admitting only the original exact three null FDs.
+   The typo exit oracle admits required ArgsError10 and rejects ActionsOk2; no command
+   window, malformed input or unchanged-byte assertion was removed.
    The new two-second watchdog observation deadline is a new test's declared budget,
    not a widened old gate. Invocation-only 10,800-second build limits remain separate.
 5. Yes: prior fleet normalization relied on invented local statistics. Those bytes
@@ -233,7 +246,7 @@ Honesty inventory, defending none of the author's decisions:
 10. No (checked: cited current Cargo/UBS/cancellation logs). Both streams are retained;
     the subsequent observed target-directory loss is disclosed, not a claim of retention.
 11. Yes: older `hc7.3` and `sj6.6` closures lacked original positive evidence. Their
-    criteria are unchanged and tasks reopened. `.17` alone closed in this window on
+    criteria are unchanged and tasks reopened. `.17` and `.8` closed in this window on
     independently rehashed actual source/runtime evidence.
 12. No (checked: original reopened descriptions and current README support split).
     Truthful limits did not replace the original positive requirements.
@@ -255,8 +268,9 @@ Honesty inventory, defending none of the author's decisions:
     full-suite acceptance before any optimistic progress summary.
 20. Strongest accepted proof remains the re-executable actual f19 Pause/resume and
     kind-tampering test, with independently bound 55 runtime files/seven commands.
-    The current strongest new-source result is Clippy exit 0 on receipt `c0f2ac12`;
-    its live watchdog/cgroup/permission acceptance remains pending.
+    Current `c0f2ac12` also has independently accepted actual watchdog timeout/cancel
+    and direct cgroup quota/freeze/restoration effects. Primary permission/whole-suite
+    acceptance and the later two test-only deltas remain unproven.
 
 Disposition: the false positive-capability closures are reopened and the original
 requirements retained (RH-9/RH-12); fabricated normalization is removed and disclosed
