@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -70,6 +70,38 @@ pub enum QuickScanError {
     UnsupportedPlatform(String),
 }
 
+/// Cancellation and signalling share this lock. The caller must cancel before
+/// reaping its owned child, so a delayed timeout can never signal a recycled PID.
+struct PsTimeoutGuard(Arc<Mutex<bool>>);
+
+impl Drop for PsTimeoutGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = true;
+    }
+}
+
+fn start_ps_watchdog(pid: u32, timeout: Duration, timed_out: Arc<AtomicBool>) -> PsTimeoutGuard {
+    let finished = Arc::new(Mutex::new(false));
+    let watchdog_finished = finished.clone();
+    thread::spawn(move || {
+        thread::sleep(timeout);
+        let finished = watchdog_finished
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !*finished {
+            timed_out.store(true, Ordering::Relaxed);
+            debug!("Quick scan timed out, killing ps process {}", pid);
+            #[cfg(unix)]
+            // SAFETY: cancellation must take this same lock before the caller
+            // can reap its owned child; the PID is still pinned while signalling.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    });
+    PsTimeoutGuard(finished)
+}
+
 /// Perform a quick scan of running processes.
 ///
 /// Uses the ps command with a custom format string to collect process
@@ -114,34 +146,8 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
     // matters on CPU-starved hosts (the ones most in need of triage), where 10 s
     // made the whole plan fail (ts2 under load, pt at nice 19).
     let timeout = options.timeout.unwrap_or(Duration::from_secs(30));
-    let finished = Arc::new(AtomicBool::new(false));
-    let finished_clone = finished.clone();
     let timed_out = Arc::new(AtomicBool::new(false));
-    let timed_out_clone = timed_out.clone();
-
-    // Guard to ensure `finished` is always set to true on exit.
-    // This prevents the watchdog thread from waking up later and killing
-    // whatever process recycled this PID if we return early (e.g. via `?`).
-    struct FinishGuard(Arc<AtomicBool>);
-    impl Drop for FinishGuard {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
-    let _guard = FinishGuard(finished);
-
-    // Spawn watchdog thread
-    thread::spawn(move || {
-        thread::sleep(timeout);
-        if !finished_clone.load(Ordering::Relaxed) {
-            timed_out_clone.store(true, Ordering::Relaxed);
-            debug!("Quick scan timed out, killing ps process {}", pid);
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
-        }
-    });
+    let guard = start_ps_watchdog(pid, timeout, timed_out.clone());
 
     let stdout = child
         .stdout
@@ -239,8 +245,8 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         }
     }
 
-    // Drop the guard to mark as finished before waiting, so we don't race with PID reuse
-    drop(_guard);
+    // Cancellation waits for any in-progress check/signal before allowing reap.
+    drop(guard);
 
     // Wait for child process to avoid leaving zombies
     let exit_status = child.wait()?;
@@ -1119,6 +1125,84 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_watchdog_timeout_kills_only_the_owned_child() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut target = OwnedScanChild::spawn();
+        let mut survivor = OwnedScanChild::spawn();
+        let options = QuickScanOptions {
+            pids: vec![survivor.pid()],
+            ..Default::default()
+        };
+        let before = quick_scan(&options).expect("live survivor before timeout");
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let guard = start_ps_watchdog(target.pid(), Duration::from_millis(100), timed_out.clone());
+        let start = Instant::now();
+        while !timed_out.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Join the signal's critical section before reaping the owned target.
+        drop(guard);
+        assert!(timed_out.load(Ordering::Relaxed), "watchdog must fire");
+        let status = target.0.wait().expect("reap timed-out owned child");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(survivor.0.try_wait().expect("survivor status").is_none());
+        let after = quick_scan(&options).expect("live survivor after timeout");
+        assert_eq!(before.processes.len(), 1);
+        assert_eq!(after.processes.len(), 1);
+        assert_eq!(before.processes[0].start_id, after.processes[0].start_id);
+        assert_eq!(before.processes[0].uid, after.processes[0].uid);
+        crate::test_log!(
+            INFO,
+            "actual owned watchdog timeout",
+            target_pid = target.pid(),
+            signal = status.signal().unwrap(),
+            survivor_pid = survivor.pid(),
+            survivor_start_id = after.processes[0].start_id.0.as_str(),
+            survivor_uid = after.processes[0].uid
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_cancelled_watchdog_leaves_owned_children_alive() {
+        let mut target = OwnedScanChild::spawn();
+        let mut survivor = OwnedScanChild::spawn();
+        let options = QuickScanOptions {
+            pids: vec![target.pid(), survivor.pid()],
+            ..Default::default()
+        };
+        let before = quick_scan(&options).expect("live children before cancellation");
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let guard = start_ps_watchdog(target.pid(), Duration::from_millis(100), timed_out.clone());
+        drop(guard);
+        thread::sleep(Duration::from_millis(200));
+        assert!(!timed_out.load(Ordering::Relaxed));
+        assert!(target.0.try_wait().expect("target status").is_none());
+        assert!(survivor.0.try_wait().expect("survivor status").is_none());
+        let after = quick_scan(&options).expect("live children after cancellation");
+        assert_eq!(before.processes.len(), 2);
+        assert_eq!(after.processes.len(), 2);
+        for record in &before.processes {
+            let current = after
+                .processes
+                .iter()
+                .find(|candidate| candidate.pid == record.pid)
+                .expect("same owned child remains present");
+            assert_eq!(current.start_id, record.start_id);
+            assert_eq!(current.uid, record.uid);
+        }
+        crate::test_log!(
+            INFO,
+            "actual owned watchdog cancellation",
+            target_pid = target.pid(),
+            survivor_pid = survivor.pid(),
+            survivor_uid = after.processes[0].uid
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
