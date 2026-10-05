@@ -31,10 +31,16 @@ pub struct ExecutionOutcome {
 pub enum Msg {
     // Input messages
     KeyPressed(KeyEvent),
-    Resized { width: u16, height: u16 },
+    Resized {
+        width: u16,
+        height: u16,
+    },
     Tick,
     FocusChanged(bool),
-    PasteReceived { text: String, bracketed: bool },
+    PasteReceived {
+        text: String,
+        bracketed: bool,
+    },
     ClipboardReceived(String),
     Noop,
 
@@ -71,7 +77,9 @@ pub enum Msg {
     ToggleHelp,
 
     // Action messages
-    RequestExecute,
+    RequestExecute {
+        ticket: u64,
+    },
     ConfirmExecute,
     CancelExecute,
     RequestRefresh,
@@ -79,8 +87,14 @@ pub enum Msg {
 
     // Async result messages
     ProcessesScanned(Vec<ProcessRow>),
-    ExecutionComplete(Result<ExecutionOutcome, String>),
-    RefreshComplete(Result<Vec<ProcessRow>, String>),
+    ExecutionComplete {
+        ticket: u64,
+        result: Result<ExecutionOutcome, String>,
+    },
+    RefreshComplete {
+        ticket: u64,
+        result: Result<Vec<ProcessRow>, String>,
+    },
     LedgerExported(Result<PathBuf, String>),
 
     // Theme messages

@@ -8,7 +8,7 @@
 //! 1. Pause → observe → resume workflow
 //! 2. Staged kill escalation (SIGTERM → SIGKILL)
 //! 3. Safety gates in robot mode (protected patterns, data-loss gates, identity validation)
-//! 4. Placeholder tests for renice and throttle (pending implementation)
+//! 4. Renice priority adjustment and verification; optional cgroup actions
 //!
 //! All tests capture structured logs including:
 //! - Generated plan (JSON)
@@ -28,9 +28,10 @@ use pt_core::action::prechecks::NoopPreCheckProvider;
 use pt_core::action::prechecks::{
     LivePreCheckConfig, LivePreCheckProvider, PreCheckProvider, PreCheckResult,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use pt_core::action::ReniceConfig;
 use pt_core::action::{ReniceActionRunner, SignalActionRunner, SignalConfig};
+use pt_core::collect::{quick_scan, QuickScanOptions};
 use pt_core::decision::Action;
 use pt_core::plan::{
     ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, GatesSummary, Plan,
@@ -38,6 +39,7 @@ use pt_core::plan::{
 };
 use pt_core::test_utils::ProcessHarness;
 use serde_json::json;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -194,6 +196,150 @@ fn make_test_identity(pid: u32, uid: u32) -> ProcessIdentity {
         pgid: None,
         sid: Some(pid),
         quality: IdentityQuality::Full,
+    }
+}
+
+fn live_identity(pid: u32) -> ProcessIdentity {
+    let scan = quick_scan(&QuickScanOptions {
+        pids: vec![pid],
+        timeout: Some(Duration::from_secs(30)),
+        ..QuickScanOptions::default()
+    })
+    .expect("collect actual action target");
+    assert!(
+        scan.metadata.warnings.is_empty(),
+        "target scan warnings: {:?}",
+        scan.metadata.warnings
+    );
+    assert_eq!(scan.processes.len(), 1, "expected the owned target only");
+    let record = scan.processes.into_iter().next().expect("target record");
+    assert_eq!(record.pid.0, pid);
+    assert!(!record.start_id.0.is_empty());
+    assert!(!record.start_id.0.starts_with("unknown"));
+    assert!(record.pgid.is_some());
+    assert!(record.sid.is_some());
+    #[cfg(target_os = "linux")]
+    {
+        let stat = pt_core::collect::parse_proc_stat(pid).expect("read owned target birth ticks");
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .expect("read current boot ID");
+        assert_eq!(
+            record.start_id,
+            StartId::from_linux(boot.trim(), stat.starttime, pid)
+        );
+        // SAFETY: this observes the test's owner without changing credentials.
+        assert_eq!(record.uid, unsafe { libc::geteuid() });
+    }
+    ProcessIdentity {
+        pid: record.pid,
+        start_id: record.start_id,
+        uid: record.uid,
+        pgid: record.pgid,
+        sid: record.sid,
+        quality: IdentityQuality::Full,
+    }
+}
+
+// Keep the direct child unreaped until its actual termination signal is observed.
+// Drop can kill only this owned incarnation, including after a failed assertion.
+struct OwnedActionChild {
+    child: Child,
+}
+
+impl OwnedActionChild {
+    fn sleep() -> Self {
+        Self {
+            child: Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn owned cooperative sleep"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn term_ignoring() -> Self {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        let mut target = Self {
+            child: Command::new("sh")
+                .args(["-c", "trap '' TERM; printf 'ready\\n'; while :; do :; done"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn owned TERM-ignoring shell"),
+        };
+        let mut stdout = target.child.stdout.take().expect("readiness stdout");
+        // SAFETY: change only the owned pipe's file status flags so readiness
+        // cannot block the test before its five-second timeout is checked.
+        let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "get pipe flags: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            -1,
+            "set nonblocking readiness: {}",
+            std::io::Error::last_os_error()
+        );
+        let started = Instant::now();
+        let mut ready = Vec::new();
+        loop {
+            let mut bytes = [0; 64];
+            let observed = stdout.read(&mut bytes);
+            assert!(
+                started.elapsed() < Duration::from_millis(5000),
+                "TERM-ignore readiness timed out: {ready:?}"
+            );
+            match observed {
+                Ok(0) => panic!("TERM-ignoring shell exited before readiness: {ready:?}"),
+                Ok(count) => {
+                    ready.extend_from_slice(&bytes[..count]);
+                    if ready.ends_with(b"\n") {
+                        assert_eq!(ready, b"ready\n");
+                        return target;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("read TERM-ignore readiness: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn observed_exit(&mut self) -> ExitStatus {
+        let started = Instant::now();
+        loop {
+            let observed = self.child.try_wait().expect("observe owned child exit");
+            assert!(
+                started.elapsed() < Duration::from_millis(5000),
+                "owned child did not exit within verification bound"
+            );
+            if let Some(status) = observed {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for OwnedActionChild {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -357,7 +503,9 @@ mod pause_observe_resume {
         let runner = SignalActionRunner::with_defaults();
 
         // Phase 1: Pause
-        let pause_action = make_pause_action(pid, None, "e2e-pause-1");
+        let mut pause_action = make_pause_action(pid, None, "e2e-pause-1");
+        pause_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": pause_action.target }));
         ctx.log_action_attempt(&pause_action, "execute_pause");
 
         let pause_result = runner.execute(&pause_action);
@@ -391,7 +539,9 @@ mod pause_observe_resume {
         assert!(verify_result.is_ok(), "Pause verification should succeed");
 
         // Phase 3: Resume
-        let resume_action = make_resume_action(pid, None, "e2e-resume-1");
+        let mut resume_action = make_resume_action(pid, None, "e2e-resume-1");
+        resume_action.target = pause_action.target.clone();
+        assert_eq!(live_identity(pid), resume_action.target);
         ctx.log_action_attempt(&resume_action, "execute_resume");
 
         let resume_result = runner.execute(&resume_action);
@@ -466,7 +616,10 @@ mod pause_observe_resume {
         });
 
         // Phase 1: Pause entire group
-        let pause_action = make_pause_action(pid, Some(pgid), "e2e-group-pause");
+        let mut pause_action = make_pause_action(pid, Some(pgid), "e2e-group-pause");
+        pause_action.target = live_identity(pid);
+        assert_eq!(pause_action.target.pgid, Some(pgid));
+        ctx.log("live_target", json!({ "identity": pause_action.target }));
         ctx.log_action_attempt(&pause_action, "execute_group_pause");
 
         let pause_result = runner.execute(&pause_action);
@@ -490,7 +643,9 @@ mod pause_observe_resume {
         assert!(all_stopped, "All processes in group should be stopped");
 
         // Phase 3: Resume entire group
-        let resume_action = make_resume_action(pid, Some(pgid), "e2e-group-resume");
+        let mut resume_action = make_resume_action(pid, Some(pgid), "e2e-group-resume");
+        resume_action.target = pause_action.target.clone();
+        assert_eq!(live_identity(pid), resume_action.target);
         ctx.log_action_attempt(&resume_action, "execute_group_resume");
 
         let resume_result = runner.execute(&resume_action);
@@ -527,7 +682,9 @@ mod staged_kill_escalation {
 
     /// Test that graceful kill (SIGTERM) works on cooperative processes
     #[test]
+    #[cfg(unix)]
     fn test_graceful_kill_sigterm_only() {
+        use std::os::unix::process::ExitStatusExt;
         if !ProcessHarness::is_available() {
             return;
         }
@@ -538,8 +695,7 @@ mod staged_kill_escalation {
             json!({ "test": "graceful_kill_sigterm_only" }),
         );
 
-        let harness = ProcessHarness;
-        let proc = harness.spawn_sleep(60).expect("spawn sleep");
+        let mut proc = OwnedActionChild::sleep();
         let pid = proc.pid();
 
         ctx.log("process_spawned", json!({ "pid": pid }));
@@ -552,7 +708,9 @@ mod staged_kill_escalation {
             use_process_groups: false,
         });
 
-        let kill_action = make_kill_action(pid, "e2e-graceful-kill", vec![]);
+        let mut kill_action = make_kill_action(pid, "e2e-graceful-kill", vec![]);
+        kill_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": kill_action.target }));
         ctx.log_action_attempt(&kill_action, "execute_kill");
 
         let start = Instant::now();
@@ -584,12 +742,20 @@ mod staged_kill_escalation {
             verify.is_ok(),
             "Verification should confirm process is dead"
         );
+        let status = proc.observed_exit();
+        ctx.log(
+            "owned_exit_observed",
+            json!({ "pid": pid, "signal": status.signal(), "code": status.code() }),
+        );
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
 
     /// Test that staged kill escalates to SIGKILL for unresponsive processes
     #[test]
+    #[cfg(unix)]
     fn test_kill_escalates_to_sigkill() {
+        use std::os::unix::process::ExitStatusExt;
         if !ProcessHarness::is_available() {
             return;
         }
@@ -597,14 +763,28 @@ mod staged_kill_escalation {
         let mut ctx = TestContext::new();
         ctx.log("test_start", json!({ "test": "kill_escalates_to_sigkill" }));
 
-        let harness = ProcessHarness;
-        // spawn_busy creates a CPU-bound process that ignores SIGTERM
-        let proc = harness.spawn_busy().expect("spawn busy");
+        // Readiness is emitted only after this owned shell ignores SIGTERM.
+        let mut proc = OwnedActionChild::term_ignoring();
         let pid = proc.pid();
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .expect("read owned shell's signal dispositions");
+            let ignored = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigIgn:"))
+                .expect("SigIgn field");
+            let ignored = u64::from_str_radix(ignored.trim(), 16).expect("SigIgn mask");
+            assert_ne!(ignored & (1_u64 << (libc::SIGTERM - 1)), 0);
+            ctx.log(
+                "TERM_ignore_observed",
+                json!({ "pid": pid, "SigIgn": ignored }),
+            );
+        }
 
         ctx.log(
             "process_spawned",
-            json!({ "pid": pid, "type": "busy_loop" }),
+            json!({ "pid": pid, "type": "TERM_ignoring_busy_loop", "ready": true }),
         );
 
         // Very short grace period to trigger escalation
@@ -615,7 +795,9 @@ mod staged_kill_escalation {
             use_process_groups: false,
         });
 
-        let kill_action = make_kill_action(pid, "e2e-force-kill", vec![]);
+        let mut kill_action = make_kill_action(pid, "e2e-force-kill", vec![]);
+        kill_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": kill_action.target }));
         ctx.log_action_attempt(&kill_action, "execute_escalating_kill");
 
         let start = Instant::now();
@@ -643,6 +825,13 @@ mod staged_kill_escalation {
         );
 
         assert!(verify.is_ok(), "Process should be dead after SIGKILL");
+        let status = proc.observed_exit();
+        ctx.log(
+            "owned_exit_observed",
+            json!({ "pid": pid, "signal": status.signal(), "code": status.code() }),
+        );
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(elapsed >= Duration::from_millis(500));
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
 
@@ -689,8 +878,11 @@ mod staged_kill_escalation {
             std::thread::sleep(Duration::from_millis(50));
         }
 
+        assert!(is_zombie, "owned child must actually be an unreaped zombie");
         let runner = SignalActionRunner::with_defaults();
-        let kill_action = make_kill_action(pid, "e2e-kill-zombie", vec![]);
+        let mut kill_action = make_kill_action(pid, "e2e-kill-zombie", vec![]);
+        kill_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": kill_action.target }));
 
         ctx.log_action_attempt(&kill_action, "execute_kill_on_zombie");
 
@@ -734,8 +926,8 @@ mod safety_gates_robot_mode {
             json!({ "test": "identity_mismatch_blocks_action" }),
         );
 
-        let dir = tempdir().expect("tempdir");
-        let lock_path = dir.path().join("test.lock");
+        let dir = tempdir().expect("tempdir").keep();
+        let lock_path = dir.join("test.lock");
 
         // Create a plan targeting PID 99999 (doesn't exist)
         let kill_action =
@@ -786,8 +978,8 @@ mod safety_gates_robot_mode {
             json!({ "test": "lock_contention_blocks_execution" }),
         );
 
-        let dir = tempdir().expect("tempdir");
-        let lock_path = dir.path().join("test.lock");
+        let dir = tempdir().expect("tempdir").keep();
+        let lock_path = dir.join("test.lock");
 
         // Hold the lock using direct flock
         let held_file = OpenOptions::new()
@@ -852,8 +1044,8 @@ mod safety_gates_robot_mode {
             json!({ "test": "precheck_blocks_action_in_executor" }),
         );
 
-        let dir = tempdir().expect("tempdir");
-        let lock_path = dir.path().join("test.lock");
+        let dir = tempdir().expect("tempdir").keep();
+        let lock_path = dir.join("test.lock");
 
         // Create action with pre-checks
         let kill_action = make_kill_action(
@@ -953,7 +1145,7 @@ mod safety_gates_robot_mode {
 }
 
 // ============================================================================
-// SCENARIO 4: Renice Action (Placeholder - pending sj6.4)
+// SCENARIO 4: Renice Action
 // ============================================================================
 
 mod renice_action {
@@ -961,17 +1153,44 @@ mod renice_action {
     use pt_core::action::executor::ActionRunner;
 
     #[cfg(target_os = "linux")]
-    fn read_nice_value(pid: u32) -> Option<i32> {
+    fn read_nice_value(pid: u32) -> Result<i32, String> {
         let stat_path = format!("/proc/{pid}/stat");
-        let content = std::fs::read_to_string(stat_path).ok()?;
-        let comm_end = content.rfind(')')?;
-        let after_comm = content.get(comm_end + 2..)?;
+        let content = std::fs::read_to_string(&stat_path)
+            .map_err(|error| format!("read {stat_path}: {error}"))?;
+        let comm_end = content
+            .rfind(')')
+            .ok_or_else(|| format!("missing comm boundary in {stat_path}: {content:?}"))?;
+        let after_comm = content
+            .get(comm_end + 2..)
+            .ok_or_else(|| format!("missing stat fields in {stat_path}: {content:?}"))?;
         let fields: Vec<&str> = after_comm.split_whitespace().collect();
-        fields.get(16)?.parse::<i32>().ok()
+        fields
+            .get(16)
+            .ok_or_else(|| format!("missing nice field in {stat_path}: {content:?}"))?
+            .parse::<i32>()
+            .map_err(|error| format!("invalid nice field in {stat_path}: {error}; {content:?}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_nice_value(pid: u32) -> Result<i32, String> {
+        // SAFETY: getpriority only observes the owned child's priority. A real
+        // -1 priority is distinguished from failure through thread-local errno.
+        unsafe {
+            *libc::__error() = 0;
+            let value = libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t);
+            if value == -1 && *libc::__error() != 0 {
+                Err(format!(
+                    "getpriority({pid}): {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                Ok(value)
+            }
+        }
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_renice_priority_adjustment() {
         if !ProcessHarness::is_available() {
             eprintln!("Skipping test: ProcessHarness not available");
@@ -990,64 +1209,68 @@ mod renice_action {
 
         ctx.log("process_spawned", json!({ "pid": pid, "type": "sleep" }));
 
-        #[cfg(target_os = "linux")]
-        let before = read_nice_value(pid);
-        #[cfg(target_os = "linux")]
-        ctx.log("nice_before", json!({ "pid": pid, "nice": before }));
+        let before = read_nice_value(pid).expect("observe owned target's initial priority");
+        let expected = before.max(pt_core::action::DEFAULT_NICE_VALUE);
+        ctx.log(
+            "nice_before",
+            json!({
+                "pid": pid,
+                "nice": before,
+                "expected": expected,
+                "scope": if before >= pt_core::action::DEFAULT_NICE_VALUE {
+                    "already_lower_priority_noop"
+                } else {
+                    "priority_adjustment"
+                }
+            }),
+        );
 
         let runner = ReniceActionRunner::with_defaults();
-        let action = make_renice_action(pid, "e2e-renice-1");
+        let mut action = make_renice_action(pid, "e2e-renice-1");
+        action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": action.target }));
 
         ctx.log_action_attempt(&action, "execute_renice");
 
         let execute_result = runner.execute(&action);
-        match execute_result {
-            Ok(()) => {
-                let verify_result = runner.verify(&action);
-                if let Err(ref e) = verify_result {
-                    ctx.on_failure(
-                        "renice_priority_adjustment",
-                        &format!("Verify failed: {:?}", e),
-                    );
-                }
-                assert!(verify_result.is_ok(), "Renice verification should succeed");
-
-                #[cfg(target_os = "linux")]
-                if let Some(after) = read_nice_value(pid) {
-                    ctx.log(
-                        "nice_after",
-                        json!({ "pid": pid, "nice": after, "expected": pt_core::action::DEFAULT_NICE_VALUE }),
-                    );
-                    assert_eq!(
-                        after,
-                        pt_core::action::DEFAULT_NICE_VALUE,
-                        "expected nice value to change"
-                    );
-                } else {
-                    ctx.log("nice_after_unavailable", json!({ "pid": pid }));
-                }
-            }
-            Err(pt_core::action::ActionError::PermissionDenied) => {
-                ctx.log(
-                    "renice_permission_denied",
-                    json!({ "pid": pid, "note": "insufficient permissions; skipping assertions" }),
-                );
-                return;
-            }
-            Err(e) => {
-                ctx.on_failure(
-                    "renice_priority_adjustment",
-                    &format!("Execute failed: {:?}", e),
-                );
-                panic!("renice execute failed: {:?}", e);
-            }
-        }
+        ctx.log(
+            "renice_executed",
+            json!({ "result": format!("{execute_result:?}") }),
+        );
+        assert!(
+            execute_result.is_ok(),
+            "Renice execute failed: {execute_result:?}"
+        );
+        let verify_result = runner.verify(&action);
+        ctx.log_verification(
+            "e2e-renice-1",
+            if verify_result.is_ok() {
+                "passed"
+            } else {
+                "failed"
+            },
+            json!({ "verify_result": format!("{verify_result:?}") }),
+        );
+        assert!(
+            verify_result.is_ok(),
+            "Renice verification failed: {verify_result:?}"
+        );
+        let after = read_nice_value(pid).expect("observe owned target's resulting priority");
+        ctx.log(
+            "nice_after",
+            json!({ "pid": pid, "nice": after, "expected": expected }),
+        );
+        assert_eq!(
+            after, expected,
+            "renice must lower or preserve priority exactly"
+        );
+        assert_eq!(live_identity(pid), action.target);
 
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_renice_verification() {
         if !ProcessHarness::is_available() {
             eprintln!("Skipping test: ProcessHarness not available");
@@ -1061,67 +1284,67 @@ mod renice_action {
         let proc = harness.spawn_sleep(60).expect("spawn sleep");
         let pid = proc.pid();
 
+        let before = read_nice_value(pid).expect("observe owned target's initial priority");
+        let expected = before.max(pt_core::action::DEFAULT_NICE_VALUE);
+        ctx.log(
+            "nice_before",
+            json!({ "pid": pid, "nice": before, "expected": expected, "noop": before >= 10 }),
+        );
         let runner = ReniceActionRunner::with_defaults();
-        let action = make_renice_action(pid, "e2e-renice-verify");
+        let mut action = make_renice_action(pid, "e2e-renice-verify");
+        action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": action.target }));
 
         let execute_result = runner.execute(&action);
-        if let Err(pt_core::action::ActionError::PermissionDenied) = execute_result {
-            ctx.log(
-                "renice_permission_denied",
-                json!({ "pid": pid, "note": "insufficient permissions; skipping verification" }),
-            );
-            return;
-        }
-        assert!(execute_result.is_ok(), "Renice execute should succeed");
+        ctx.log(
+            "renice_executed",
+            json!({ "result": format!("{execute_result:?}") }),
+        );
+        assert!(
+            execute_result.is_ok(),
+            "Renice execute failed: {execute_result:?}"
+        );
 
         let verify_ok = runner.verify(&action);
         if let Err(ref e) = verify_ok {
             ctx.on_failure("renice_verification", &format!("Verify failed: {:?}", e));
         }
-        assert!(verify_ok.is_ok(), "Renice verify should succeed");
+        assert!(verify_ok.is_ok(), "Renice verify failed: {verify_ok:?}");
+        let actual = read_nice_value(pid).expect("observe priority for mismatch negative");
+        ctx.log(
+            "nice_after",
+            json!({ "pid": pid, "nice": actual, "expected": expected }),
+        );
+        assert_eq!(actual, expected);
 
-        // Intentionally verify with a mismatched expectation to ensure failure path works.
-        #[cfg(target_os = "linux")]
-        {
-            if read_nice_value(pid).is_none() {
-                ctx.log(
-                    "nice_unavailable",
-                    json!({ "pid": pid, "note": "skipping mismatch check" }),
+        // Verify only: asking for actual+1 remains a mismatch even at nice 19.
+        // No setpriority syscall or out-of-range priority mutation is attempted.
+        let mismatch_expected = actual + 1;
+        let mismatch_runner = ReniceActionRunner::new(ReniceConfig {
+            nice_value: mismatch_expected,
+            clamp_to_range: false,
+            capture_reversal: false,
+        });
+        let mismatch = mismatch_runner.verify(&action);
+        ctx.log(
+            "mismatch_verify_result",
+            json!({ "pid": pid, "actual": actual, "expected": mismatch_expected,
+                "result": format!("{mismatch:?}") }),
+        );
+        match mismatch {
+            Err(pt_core::action::ActionError::Failed(message)) => {
+                assert_eq!(
+                    message,
+                    format!("nice value mismatch: expected {mismatch_expected}, got {actual}")
                 );
-                return;
             }
-            let mismatch_runner = ReniceActionRunner::new(ReniceConfig {
-                nice_value: pt_core::action::DEFAULT_NICE_VALUE + 5,
-                clamp_to_range: true,
-                capture_reversal: false,
-            });
-            let mismatch = mismatch_runner.verify(&action);
-            match mismatch {
-                Err(pt_core::action::ActionError::Failed(_)) => {
-                    ctx.log("mismatch_verify_failed", json!({ "pid": pid }));
-                }
-                Err(pt_core::action::ActionError::PermissionDenied) => {
-                    ctx.log(
-                        "renice_permission_denied",
-                        json!({ "pid": pid, "note": "verification denied; skipping mismatch check" }),
-                    );
-                }
-                Ok(()) => {
-                    ctx.on_failure(
-                        "renice_verification",
-                        "mismatch verification unexpectedly succeeded",
-                    );
-                    panic!("mismatch verification unexpectedly succeeded");
-                }
-                Err(e) => {
-                    ctx.on_failure(
-                        "renice_verification",
-                        &format!("unexpected verify error: {:?}", e),
-                    );
-                    panic!("unexpected verify error: {:?}", e);
-                }
-            }
+            other => panic!("expected a specific priority mismatch failure, got {other:?}"),
         }
+        assert_eq!(
+            read_nice_value(pid).expect("observe untouched priority"),
+            actual
+        );
+        assert_eq!(live_identity(pid), action.target);
 
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
@@ -1644,7 +1867,9 @@ mod full_workflow {
 
         // Step 1: Observe (pause)
         ctx.log("workflow_step", json!({ "step": 1, "action": "pause" }));
-        let pause_action = make_pause_action(pid, None, "workflow-pause");
+        let mut pause_action = make_pause_action(pid, None, "workflow-pause");
+        pause_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": pause_action.target }));
         let pause_result = runner.execute(&pause_action);
         assert!(pause_result.is_ok(), "Pause should succeed");
 
@@ -1675,7 +1900,9 @@ mod full_workflow {
 
         // Step 3: Kill (the process is already stopped, kill anyway)
         ctx.log("workflow_step", json!({ "step": 3, "action": "kill" }));
-        let kill_action = make_kill_action(pid, "workflow-kill", vec![]);
+        let mut kill_action = make_kill_action(pid, "workflow-kill", vec![]);
+        kill_action.target = pause_action.target.clone();
+        assert_eq!(live_identity(pid), kill_action.target);
         let kill_result = runner.execute(&kill_action);
         assert!(kill_result.is_ok(), "Kill should succeed");
 
