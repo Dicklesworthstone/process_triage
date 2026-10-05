@@ -1,6 +1,6 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Current work and validation — 2026-10-05 18:48 UTC
+## Current work and validation — 2026-10-05 19:17 UTC
 
 The core product is materially better, but the project is not finished. Eleven
 original product items have independently accepted closures during this session;
@@ -23,14 +23,28 @@ guards to the direct cgroup runners and metadata reversal paths. Unknown prior
 settings are refused; bare Unquarantine cannot claim to restore an unknown CPUset.
 The four existing positive fixtures now require an explicitly supplied eligible
 CPU-enabled delegated parent and use only newly owned leaves, with exact controller
-readback, captured reversal and an unchanged owned sibling. None has received that
-prerequisite or delivered positive kernel proof yet. Snapshot checks are not atomic
-isolation; automatic leaf management and durable CLI undo remain incomplete.
+readback, captured reversal and an unchanged owned sibling. On hz2 a freshly created
+empty, root-owned test parent received CPU delegation only inside that new parent;
+no existing controller setting or process membership changed during provisioning.
+The complete existing cgroup and action-tray binaries then passed 15 and 18 tests
+as ROOT, including all four actual quota/freeze/restore positives. The parent,
+global controller settings and PID 1 quota stayed unchanged; phase artifacts and
+cleanup observations are retained. Independent artifact review is underway.
+These sleepers do not measure CPU relief. Snapshot checks are not atomic isolation;
+automatic leaf management and durable CLI undo remain incomplete.
 
 ROOT permission fixtures share a child-only privilege-drop helper. Actual credentials,
 capabilities, exact-one-test execution and retained root-created log handles are
-required; source review corrected the original artifact-path race. Runtime acceptance
-is still required. Ordinary fleet import now rejects unknown merge strategies before
+required; source review corrected the original artifact-path race. The two core
+permission cases passed in the ROOT suite; the complete live-apply case failed at a
+later owned fixture bootstrap. Its retained traceback shows a transient loader FD
+closing between enumeration and readlink after `comm=sleep`. The correction reuses
+the original five-second deadline and 10 ms interval, logs complete/partial actual
+snapshots and requires exact `[0,1,2]` pointing to `/dev/null` before readiness.
+Only FileNotFoundError snapshot races are retried; all independent Rust descriptor,
+identity and plan/apply assertions remain. Independent source review accepted this
+bounded delta; fresh runtime is required and the old invocation remains failed.
+Ordinary fleet import now rejects unknown merge strategies before
 writing and previews the actual merged values of its nine existing reported numeric
 fields. Signature comparison checks the whole matcher/lifecycle in deterministic name
 order. Complete parameter/signature merge previews and measured normalization remain
@@ -46,14 +60,32 @@ That frozen source remains archived at
 `/data/tmp/pt-source-recovery-20261005-group.mc47v49r/frozen-source.tar.gz`, SHA-256
 `e96f03a2627800dbb2cd38b582e252758457613f023f4fdbf27bf71b0048f743`.
 Formatting passed on it; compiler/runtime acceptance did not. Its logs remain in
-the same directory. Later source corrections require a fresh receipt and checks.
+the same directory. The subsequent frozen 503-file receipt
+`c0f2ac121be6304223a9665b0548859a457574caa53615645d2d7bf8bcd9710e`
+passed all four mandatory compiler gates, including extended-feature strict Clippy.
+Source archive SHA-256 is
+`351ba7db1eded690b2f81368db3f67ee0c037ce249503a27ea6dcce08312a238`;
+receipt, archive and both-stream logs live at
+`/data/tmp/pt-source-recovery-20261005-watchdog.wg1cfjxj/`.
+Both complete workspace suites continue on that source; the unrelated fixture
+bootstrap failure already prevents a ROOT pass. Current source differs in two test
+files only: that descriptor-readiness correction and an unknown-strategy expected
+exit correction from 2 (ActionsOk) to the original `.16` contract's 10 (ArgsError).
+The malformed argument, refusal reason, unchanged input/config bytes and original
+command windows are preserved. These deltas need fresh checks/runtime.
 
 The UBS scan on the prior immutable `dc5b4222` receipt exited **1**, with 53 critical,
 3,458 warnings and 2,380 informational findings across fifteen files. Independent
 review inspected every critical row without suppression: 22 test/assertion panics,
 eighteen public comparisons, eight bounded executable sites, two fixed test shell
 literals, two zero-valid C structs and one successful-return-guarded initialization.
-Warnings remain unreviewed; this is not a scanner pass or general security claim.
+The fresh c0f2 eighteen-file scan also exited **1**: 57 critical, 3,767 warnings and
+2,480 informational findings. All four added critical rows were source-reviewed;
+none was suppressed. Warnings remain unreviewed; this is not a scanner pass or
+general security claim. Fresh `cargo audit` exited **1** on the unchanged lockfile:
+590 dependencies, the rkyv RUSTSEC-2026-0235 vulnerability, the lru
+RUSTSEC-2026-0253 unsoundness warning and the paste RUSTSEC-2024-0436 maintenance
+warning. No advisory waiver or security-green claim was made.
 The review found an adjacent helper defect: ignored `setsid()` failure. It now
 propagates the OS error. The original live group fixture additionally requires
 actual child/caller group separation and new-session leadership before signalling,
@@ -66,8 +98,11 @@ it never signals a potentially reaped/reused grandchild PID. The production ps
 watchdog now serializes its entire check/signal with cancellation before reaping,
 instead of relying on an atomic flag that permits a delayed stale signal. Two new
 live owned-child tests require actual SIGKILL/timeout and cancellation survival,
-with separate same-birth/UID survivors. Source review/runtime validation are pending;
-no forced PID-reuse reproduction or macOS execution is claimed.
+with separate same-birth/UID survivors. Independent source review accepted these
+changes. Both watchdog cases and the live session neighbor passed in the complete
+ROOT core library run: 4,048 passed, zero failed, seven original ignored, zero
+filtered. Independent bounded runtime acceptance is pending; this is not a complete
+workspace pass. No forced PID-reuse reproduction or macOS execution is claimed.
 
 Superseded owned check/full-test jobs are cancelled only through RCH's normal
 owner-bound API. The first pair recovered with terminal acknowledgment, source
@@ -97,15 +132,19 @@ by elapsed time, selected passing tests or an independently reviewed scanner row
   group identity/isolation/resume assertions; source review accepted this delta.
 - [x] Record the discovered watchdog race in `bd-u7gc.8`, claim it and retain the
   blocking edge into the original full-workspace task.
-- [ ] Independently accept the session-cleanup/watchdog source corrections and
-  run both new real-child cases plus existing collector/session/group neighbors.
-- [ ] Freeze the corrected source once, then complete workspace all-targets check,
-  warnings-denying Clippy, formatting and the lean no-default-features check.
+- [x] Independently review session-cleanup/watchdog source and run both new real-child
+  cases plus existing collector/session/group neighbors on frozen c0f2 source.
+- [x] Complete c0f2 workspace all-targets check, warnings-denying Clippy, formatting
+  and the lean no-default-features check, all actual exit zero.
+- [ ] Independently accept the bounded watchdog runtime against its original criteria.
+- [ ] Check and rerun the two observed test-only corrections without cancelling the
+  ongoing older full suites or crediting their failures as corrected passes.
 - [ ] Complete the entire nonroot and ROOT workspace suites on that same source;
   report all original ignores/unavailable prerequisites separately. No selected
   run can close the full-workspace requirement.
-- [ ] Run eligible delegated cgroup positives and actual CPU-relief measurement;
-  keep `bd-qr40.4` and `process_triage-sj6.6` open until their original positives pass.
+- [ ] Independently verify the eligible delegated cgroup runtime artifacts; then
+  measure actual CPU relief and deliver the original automatic isolation/CLI undo
+  requirements. Keep `bd-qr40.4` and `process_triage-sj6.6` open until those pass.
 - [ ] Restore the incident quota only after the intended prior value is supplied
   and the applicable overwrite authorization is satisfied.
 - [ ] Obtain actual hosted main CI evidence, the unavailable macOS endpoint and
