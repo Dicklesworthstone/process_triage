@@ -71,7 +71,71 @@ impl Default for CompositeActionRunner {
 /// pt moves the target into a dedicated leaf cgroup, it only acts when the cgroup
 /// holds the target alone.
 #[cfg(target_os = "linux")]
-pub(super) fn ensure_exclusive_cgroup(pid: u32) -> Result<(), ActionError> {
+pub(super) fn read_cgroup_identity(pid: u32) -> Option<pt_common::ProcessIdentity> {
+    let stat = crate::collect::proc_parsers::parse_proc_stat(pid)?;
+    if stat.pid != pid || stat.starttime == 0 {
+        return None;
+    }
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let uid = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    uuid::Uuid::parse_str(boot_id.trim()).ok()?;
+    Some(pt_common::ProcessIdentity {
+        pid: pt_common::ProcessId(pid),
+        start_id: pt_common::StartId::from_linux(boot_id.trim(), stat.starttime, pid),
+        uid,
+        pgid: u32::try_from(stat.pgrp).ok(),
+        sid: u32::try_from(stat.session).ok(),
+        quality: pt_common::IdentityQuality::Full,
+    })
+}
+
+/// Revalidate the planned incarnation and built-in protections for direct callers.
+#[cfg(target_os = "linux")]
+pub(super) fn ensure_cgroup_target(
+    target: &pt_common::ProcessIdentity,
+) -> Result<String, ActionError> {
+    let pid = target.pid.0;
+    if pid <= 1 || crate::collect::protected::live_invoker_chain_pids().contains(&pid) {
+        return Err(ActionError::Failed(format!(
+            "refusing cgroup mutation for protected PID {pid}"
+        )));
+    }
+    if target.quality != pt_common::IdentityQuality::Full {
+        return Err(ActionError::IdentityMismatch);
+    }
+    let current = read_cgroup_identity(pid).ok_or(ActionError::IdentityMismatch)?;
+    if !target.matches(&current) {
+        return Err(ActionError::IdentityMismatch);
+    }
+    // SAFETY: geteuid has no preconditions and only reads the caller's credentials.
+    if current.uid != unsafe { libc::geteuid() } {
+        return Err(ActionError::PermissionDenied);
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map_err(|error| ActionError::Failed(format!("cannot read target name: {error}")))?;
+    let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map_err(|error| ActionError::Failed(format!("cannot read target command: {error}")))?;
+    let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+    if crate::collect::protected::builtin_protection_match(comm.trim(), &cmd).is_some()
+        || crate::collect::protected::live_service_ancestor(pid).is_some()
+        || crate::collect::read_cgroup_role(pid).is_supervised_service()
+    {
+        return Err(ActionError::Failed(
+            "refusing cgroup mutation for protected infrastructure".to_string(),
+        ));
+    }
+    ensure_exclusive_cgroup(pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn ensure_exclusive_cgroup(pid: u32) -> Result<String, ActionError> {
     if pid <= 1 {
         return Err(ActionError::Failed(format!(
             "refusing cgroup mutation for protected PID {pid}"
@@ -80,9 +144,25 @@ pub(super) fn ensure_exclusive_cgroup(pid: u32) -> Result<(), ActionError> {
     let path = crate::collect::collect_cgroup_details(pid)
         .and_then(|d| d.unified_path)
         .ok_or_else(|| ActionError::Failed(format!("cannot resolve cgroup of pid {pid}")))?;
-    let procs_file = format!("/sys/fs/cgroup{path}/cgroup.procs");
+    ensure_exclusive_cgroup_path(pid, std::path::Path::new(&format!("/sys/fs/cgroup{path}")))?;
+    Ok(path)
+}
+
+/// Check the actual controller directory, including a hybrid v1 fallback.
+#[cfg(target_os = "linux")]
+pub(super) fn ensure_exclusive_cgroup_path(
+    pid: u32,
+    directory: &std::path::Path,
+) -> Result<(), ActionError> {
+    if pid <= 1 {
+        return Err(ActionError::Failed(format!(
+            "refusing cgroup mutation for protected PID {pid}"
+        )));
+    }
+    let path = directory.display();
+    let procs_file = directory.join("cgroup.procs");
     let content = std::fs::read_to_string(&procs_file)
-        .map_err(|e| ActionError::Failed(format!("cannot read {procs_file}: {e}")))?;
+        .map_err(|e| ActionError::Failed(format!("cannot read {}: {e}", procs_file.display())))?;
     let others = shared_cgroup_members(&content, pid)?;
     if others > 0 {
         return Err(ActionError::Failed(format!(
@@ -92,9 +172,6 @@ pub(super) fn ensure_exclusive_cgroup(pid: u32) -> Result<(), ActionError> {
     }
     // Resource limits and freeze state affect descendants too. Require a leaf
     // rather than inferring isolation from only this directory's process list.
-    let directory = std::path::Path::new(&procs_file)
-        .parent()
-        .ok_or_else(|| ActionError::Failed("cgroup directory is unavailable".to_string()))?;
     for entry in std::fs::read_dir(directory)
         .map_err(|error| ActionError::Failed(format!("cannot inspect cgroup {path}: {error}")))?
     {

@@ -4,7 +4,7 @@
 //! - Automatic cgroup path discovery for target process
 //! - Reversal metadata capture for undo operations
 //! - Verification via read-back of cpuset.cpus
-//! - Support for both cgroup v2 and v1 cpuset controllers
+//! - Cgroup v2 and isolated hybrid v1 cpuset controllers
 //! - Safety gates: protected denylist, min CPU count to prevent starvation
 //!
 //! # How Quarantine Works
@@ -21,7 +21,8 @@
 //! The quarantine action includes safety gates to prevent system instability:
 //! - Minimum CPU count policy prevents starvation (at least 1 CPU must be available)
 //! - Protected process denylist prevents quarantining critical system processes
-//! - Reversal metadata allows restoring previous cpuset configuration
+//! - Explicit reversal metadata restores the previous cpuset configuration;
+//!   a bare Unquarantine action cannot reconstruct it and is refused
 
 use super::executor::{ActionError, ActionRunner};
 use crate::collect::cgroup::{collect_cgroup_details, CgroupVersion};
@@ -118,6 +119,9 @@ pub struct QuarantineReversalMetadata {
     /// PID of the quarantined process.
     pub pid: u32,
 
+    /// Exact process incarnation whose previous CPU set was captured.
+    pub identity: pt_common::ProcessIdentity,
+
     /// Cgroup path where quarantine was applied.
     pub cgroup_path: String,
 
@@ -180,20 +184,29 @@ impl CpusetQuarantineActionRunner {
     #[cfg(target_os = "linux")]
     fn execute_quarantine(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
-        super::dispatch::ensure_exclusive_cgroup(pid)?;
+        let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
         debug!(
             pid,
             cpus = self.config.target_cpus,
             "executing cpuset quarantine"
         );
 
-        // Note: Protected process check requires reading /proc/<pid>/comm at runtime
-        // since ProcessIdentity doesn't include comm. The protected_names check
-        // would need to be done at plan creation time with process metadata.
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map_err(|error| ActionError::Failed(format!("cannot read target name: {error}")))?;
+        if self.is_protected(comm.trim()) {
+            return Err(ActionError::Failed(
+                "refusing quarantine for a configured protected process name".to_string(),
+            ));
+        }
 
         // Collect cgroup details for the target process
         let cgroup_details = collect_cgroup_details(pid)
             .ok_or_else(|| ActionError::Failed(format!("failed to read cgroup for pid {}", pid)))?;
+        if cgroup_details.unified_path.as_deref() != Some(checked_path.as_str()) {
+            return Err(ActionError::Failed(
+                "refusing quarantine after cgroup membership changed".to_string(),
+            ));
+        }
 
         // Try cgroup v2 first
         if cgroup_details.version == CgroupVersion::V2
@@ -228,6 +241,10 @@ impl CpusetQuarantineActionRunner {
     /// Apply cpuset quarantine using cgroup v2.
     #[cfg(target_os = "linux")]
     fn apply_quarantine_v2(&self, pid: u32, unified_path: &str) -> Result<(), ActionError> {
+        super::dispatch::ensure_exclusive_cgroup_path(
+            pid,
+            Path::new(&format!("/sys/fs/cgroup{unified_path}")),
+        )?;
         let cgroup_root = "/sys/fs/cgroup";
         let cpuset_path = format!("{}{}/cpuset.cpus", cgroup_root, unified_path);
 
@@ -272,6 +289,10 @@ impl CpusetQuarantineActionRunner {
     #[cfg(target_os = "linux")]
     fn apply_quarantine_v1(&self, pid: u32, cpuset_path: &str) -> Result<(), ActionError> {
         let cgroup_root = "/sys/fs/cgroup/cpuset";
+        super::dispatch::ensure_exclusive_cgroup_path(
+            pid,
+            Path::new(&format!("{cgroup_root}{cpuset_path}")),
+        )?;
         let cpus_path = format!("{}{}/cpuset.cpus", cgroup_root, cpuset_path);
 
         // Check if path exists
@@ -314,54 +335,18 @@ impl CpusetQuarantineActionRunner {
     /// Execute an unquarantine action (restore previous cpuset).
     #[cfg(target_os = "linux")]
     fn execute_unquarantine(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let pid = action.target.pid.0;
-        super::dispatch::ensure_exclusive_cgroup(pid)?;
-        debug!(pid, "executing cpuset unquarantine");
-
-        // For unquarantine, we need reversal metadata
-        // This would typically be passed via action metadata
-        // For now, restore to all available CPUs
-        let cgroup_details = collect_cgroup_details(pid)
-            .ok_or_else(|| ActionError::Failed(format!("failed to read cgroup for pid {}", pid)))?;
-
-        if let Some(ref unified_path) = cgroup_details.unified_path {
-            let cpuset_path = format!("/sys/fs/cgroup{}/cpuset.cpus", unified_path);
-            if Path::new(&cpuset_path).exists() {
-                // Try to read cpuset.cpus.effective to get all available CPUs
-                let effective_path =
-                    format!("/sys/fs/cgroup{}/cpuset.cpus.effective", unified_path);
-                let all_cpus = if Path::new(&effective_path).exists() {
-                    fs::read_to_string(&effective_path).ok()
-                } else {
-                    // Fall back to reading from parent or system
-                    get_system_cpuset()
-                };
-
-                if let Some(cpus) = all_cpus {
-                    let cpus = cpus.trim();
-                    fs::write(&cpuset_path, cpus).map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            ActionError::PermissionDenied
-                        } else {
-                            ActionError::Failed(format!("failed to restore cpuset.cpus: {}", e))
-                        }
-                    })?;
-                    info!(pid, cpuset = cpus, "cpuset restored via unquarantine");
-                    return Ok(());
-                }
-            }
-        }
-
-        Err(ActionError::Failed(format!(
-            "could not restore cpuset for pid {}",
-            pid
-        )))
+        super::dispatch::ensure_cgroup_target(&action.target)?;
+        Err(ActionError::Failed(
+            "unquarantine requires the recorded previous cpuset; restore from reversal metadata"
+                .to_string(),
+        ))
     }
 
     /// Verify quarantine was applied by reading back cpuset.cpus.
     #[cfg(target_os = "linux")]
     fn verify_quarantine(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        super::dispatch::ensure_cgroup_target(&action.target)?;
 
         let cgroup_details = collect_cgroup_details(pid).ok_or_else(|| {
             ActionError::Failed(format!(
@@ -421,6 +406,7 @@ impl CpusetQuarantineActionRunner {
     /// Capture reversal metadata before applying quarantine.
     #[cfg(target_os = "linux")]
     pub fn capture_reversal_metadata(&self, pid: u32) -> Option<QuarantineReversalMetadata> {
+        let identity = super::dispatch::read_cgroup_identity(pid)?;
         let cgroup_details = collect_cgroup_details(pid)?;
 
         // Try v2 first
@@ -432,6 +418,7 @@ impl CpusetQuarantineActionRunner {
                 let effective = fs::read_to_string(&effective_path).ok();
                 return Some(QuarantineReversalMetadata {
                     pid,
+                    identity,
                     cgroup_path: unified_path.clone(),
                     previous_cpuset: previous.trim().to_string(),
                     previous_effective: effective.map(|s| s.trim().to_string()),
@@ -447,6 +434,7 @@ impl CpusetQuarantineActionRunner {
             if let Ok(previous) = fs::read_to_string(&cpus_path) {
                 return Some(QuarantineReversalMetadata {
                     pid,
+                    identity,
                     cgroup_path: cpuset_path.clone(),
                     previous_cpuset: previous.trim().to_string(),
                     previous_effective: None,
@@ -465,6 +453,15 @@ impl CpusetQuarantineActionRunner {
         &self,
         metadata: &QuarantineReversalMetadata,
     ) -> Result<(), ActionError> {
+        if metadata.pid != metadata.identity.pid.0 {
+            return Err(ActionError::IdentityMismatch);
+        }
+        let checked_path = super::dispatch::ensure_cgroup_target(&metadata.identity)?;
+        if !metadata.is_v2 || checked_path != metadata.cgroup_path {
+            return Err(ActionError::Failed(
+                "refusing cpuset reversal without unchanged cgroup v2 membership".to_string(),
+            ));
+        }
         let cpuset_path = if metadata.is_v2 {
             format!("/sys/fs/cgroup{}/cpuset.cpus", metadata.cgroup_path)
         } else {
@@ -473,6 +470,13 @@ impl CpusetQuarantineActionRunner {
 
         fs::write(&cpuset_path, &metadata.previous_cpuset)
             .map_err(|e| ActionError::Failed(format!("failed to restore cpuset: {}", e)))?;
+        let restored = fs::read_to_string(&cpuset_path)
+            .map_err(|e| ActionError::Failed(format!("cannot verify restored cpuset: {e}")))?;
+        if restored.trim() != metadata.previous_cpuset.trim() {
+            return Err(ActionError::Failed(
+                "restored cpuset does not match reversal metadata".to_string(),
+            ));
+        }
 
         info!(
             path = %cpuset_path,
@@ -508,7 +512,9 @@ impl ActionRunner for CpusetQuarantineActionRunner {
     fn verify(&self, action: &PlanAction) -> Result<(), ActionError> {
         match action.action {
             Action::Quarantine => self.verify_quarantine(action),
-            Action::Unquarantine => Ok(()), // Unquarantine verification would check cpuset restored
+            Action::Unquarantine => Err(ActionError::Failed(
+                "cannot verify unquarantine without the recorded previous cpuset".to_string(),
+            )),
             Action::Keep => Ok(()),
             Action::Pause
             | Action::Resume
@@ -540,6 +546,12 @@ impl ActionRunner for CpusetQuarantineActionRunner {
 /// Check if cpuset quarantine is available for a process.
 #[cfg(target_os = "linux")]
 pub fn can_quarantine_cpuset(pid: u32) -> bool {
+    let Some(identity) = super::dispatch::read_cgroup_identity(pid) else {
+        return false;
+    };
+    if super::dispatch::ensure_cgroup_target(&identity).is_err() {
+        return false;
+    }
     if let Some(details) = collect_cgroup_details(pid) {
         // Check if we have a writable cpuset cgroup path
         if let Some(ref unified_path) = details.unified_path {
@@ -571,38 +583,6 @@ pub fn can_quarantine_cpuset(pid: u32) -> bool {
 #[cfg(not(target_os = "linux"))]
 pub fn can_quarantine_cpuset(_pid: u32) -> bool {
     false
-}
-
-/// Get the system's available CPUs.
-#[cfg(target_os = "linux")]
-fn get_system_cpuset() -> Option<String> {
-    // Try /sys/devices/system/cpu/online first
-    if let Ok(content) = fs::read_to_string("/sys/devices/system/cpu/online") {
-        return Some(content.trim().to_string());
-    }
-    // Fall back to counting CPU directories
-    let mut max_cpu = 0;
-    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if let Some(name) = name.to_str() {
-                if let Some(num) = name.strip_prefix("cpu") {
-                    if let Ok(n) = num.parse::<u32>() {
-                        max_cpu = max_cpu.max(n);
-                    }
-                }
-            }
-        }
-        if max_cpu > 0 {
-            return Some(format!("0-{}", max_cpu));
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn get_system_cpuset() -> Option<String> {
-    None
 }
 
 /// Count the number of CPUs in a cpuset string like "0-3" or "0,2,4".
