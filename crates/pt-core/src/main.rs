@@ -2320,7 +2320,12 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                                 record_confirmed_kills(store, &plan, &result, &commands);
                             }
                         }
-                        let final_state = if result.summary.actions_failed > 0 {
+                        let final_state = if result.summary.actions_failed > 0
+                            || result
+                                .outcomes
+                                .iter()
+                                .any(|outcome| outcome.details.is_some())
+                        {
                             SessionState::Failed
                         } else {
                             SessionState::Completed
@@ -2547,6 +2552,97 @@ fn write_plan_to_session(handle: &SessionHandle, plan: &Plan) -> Result<PathBuf,
     Ok(plan_path)
 }
 
+/// Serialize budget checks, real execution and persistent accounting across
+/// every local execution entry point, including runs which skip the UI lock.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn acquire_execution_policy(
+    policy: &pt_core::config::Policy,
+    handle: &SessionHandle,
+) -> Result<(GlobalLock, pt_core::decision::PolicyEnforcer), String> {
+    let data_dir = handle
+        .dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("cannot resolve session execution data directory")?;
+    let lock = GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock"))
+        .map_err(|error| format!("cannot lock execution policy: {error}"))?
+        .ok_or("another command is executing actions")?;
+    let enforcer =
+        pt_core::decision::PolicyEnforcer::new(policy, Some(&data_dir.join("rate_limit.json")))
+            .map_err(|error| format!("cannot load execution policy: {error}"))?;
+    Ok((lock, enforcer))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_execution_policy(
+    enforcer: &pt_core::decision::PolicyEnforcer,
+    policy: &pt_core::config::Policy,
+    action: &pt_core::plan::PlanAction,
+    robot: bool,
+) -> Result<pt_core::decision::PolicyCheckResult, String> {
+    let scan = quick_scan(&QuickScanOptions {
+        pids: vec![action.target.pid.0],
+        include_kernel_threads: false,
+        timeout: None,
+        progress: None,
+    })
+    .map_err(|error| format!("cannot collect current policy evidence: {error}"))?;
+    let proc = scan
+        .processes
+        .iter()
+        .find(|proc| proc.pid == action.target.pid)
+        .ok_or("target is absent from current policy evidence")?;
+    let group = if policy.guardrails.protected_groups.is_empty() {
+        None
+    } else {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "group=", "-p", &action.target.pid.0.to_string()])
+            .output()
+            .map_err(|error| format!("cannot collect protected-group evidence: {error}"))?;
+        if !output.status.success() {
+            return Err("cannot collect protected-group evidence".to_string());
+        }
+        let group = std::str::from_utf8(&output.stdout)
+            .map_err(|error| format!("invalid protected-group evidence: {error}"))?
+            .trim();
+        if group.is_empty() {
+            return Err("protected-group evidence is unavailable".to_string());
+        }
+        Some(group.to_string())
+    };
+    let candidate = pt_core::decision::ProcessCandidate {
+        pid: proc.pid.0 as i32,
+        ppid: proc.ppid.0 as i32,
+        cmdline: proc.cmd.clone(),
+        user: Some(proc.user.clone()),
+        group,
+        category: action.rationale.category.clone(),
+        age_seconds: proc.elapsed.as_secs(),
+        posterior: action.rationale.posterior.as_ref().map(|scores| {
+            pt_core::decision::robot_constraints::gate_posterior(scores, action.action)
+        }),
+        memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
+        has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
+        open_write_fds: pt_core::action::prechecks::open_write_fd_count(proc.pid.0),
+        has_locked_files: None,
+        has_active_tty: Some(proc.has_tty()),
+        seconds_since_io: None,
+        cwd_deleted: None,
+        process_state: Some(proc.state),
+        wchan: None,
+        critical_files: Vec::new(),
+        cgroup_role: policy
+            .guardrails
+            .builtin_protection
+            .then(|| pt_core::collect::read_cgroup_role(proc.pid.0)),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
+    };
+    Ok(enforcer.check_action(&candidate, action.action, robot))
+}
+
 #[cfg(feature = "ui")]
 fn execute_plan_actions(
     handle: &SessionHandle,
@@ -2564,15 +2660,84 @@ fn execute_plan_actions(
         let lock_path = action_dir.join("lock");
         let runner = CompositeActionRunner::with_defaults();
         let identity_provider = LiveIdentityProvider::new();
-        let pre_checks =
-            LivePreCheckProvider::new(Some(&policy.guardrails), LivePreCheckConfig::default())
-                .unwrap_or_else(|_| LivePreCheckProvider::with_defaults());
+        let (_execution_lock, enforcer) = acquire_execution_policy(policy, handle)?;
+        let pre_checks = LivePreCheckProvider::new(
+            Some(&policy.guardrails),
+            LivePreCheckConfig::from(&policy.data_loss_gates),
+        )
+        .map_err(|error| format!("cannot configure safety checks: {error}"))?;
+        pre_checks.prime_recent_io(
+            &plan
+                .actions
+                .iter()
+                .map(|action| action.target.pid.0)
+                .collect::<Vec<_>>(),
+        );
 
         let executor = ActionExecutor::new(&runner, &identity_provider, lock_path)
             .with_pre_check_provider(&pre_checks);
-        executor
-            .execute_plan(plan)
-            .map_err(|e| format!("execute plan: {}", e))
+        let mut outcomes = Vec::new();
+        for action in &plan.actions {
+            if !action.blocked && action.action != Action::Keep {
+                let check = match check_execution_policy(&enforcer, policy, action, false) {
+                    Ok(check) => check,
+                    Err(error) => {
+                        outcomes.push(pt_core::action::ActionResult {
+                            action_id: action.action_id.clone(),
+                            status: pt_core::action::ActionStatus::PreCheckBlocked {
+                                check: pt_core::plan::PreCheck::CheckNotProtected,
+                                reason: error,
+                            },
+                            time_ms: 0,
+                            details: None,
+                        });
+                        continue;
+                    }
+                };
+                if !check.allowed {
+                    outcomes.push(pt_core::action::ActionResult {
+                        action_id: action.action_id.clone(),
+                        status: pt_core::action::ActionStatus::PreCheckBlocked {
+                            check: pt_core::plan::PreCheck::CheckNotProtected,
+                            reason: serde_json::to_string(&check.violation)
+                                .map_err(|error| error.to_string())?,
+                        },
+                        time_ms: 0,
+                        details: None,
+                    });
+                    continue;
+                }
+            }
+            let mut single = plan.clone();
+            single.actions = vec![action.clone()];
+            let result = match executor.execute_plan(&single) {
+                Ok(result) => result,
+                Err(error) => {
+                    outcomes.push(pt_core::action::ActionResult {
+                        action_id: action.action_id.clone(),
+                        status: pt_core::action::ActionStatus::Failed,
+                        time_ms: 0,
+                        details: Some(format!("execute plan: {error}")),
+                    });
+                    break;
+                }
+            };
+            for mut outcome in result.outcomes {
+                if action.action == Action::Kill
+                    && outcome.status == pt_core::action::ActionStatus::Success
+                {
+                    if let Err(error) = enforcer.record_kill() {
+                        outcome.details = Some(format!(
+                            "kill completed, but its rate limit budget could not be persisted: {error}"
+                        ));
+                        outcomes.push(outcome);
+                        return Ok(execution_result(outcomes));
+                    }
+                }
+                outcomes.push(outcome);
+            }
+        }
+        Ok(execution_result(outcomes))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -2580,6 +2745,29 @@ fn execute_plan_actions(
         let _ = handle;
         let _ = plan;
         Err("execution not supported on this platform".to_string())
+    }
+}
+
+#[cfg(feature = "ui")]
+fn execution_result(
+    outcomes: Vec<pt_core::action::ActionResult>,
+) -> pt_core::action::ExecutionResult {
+    use pt_core::action::{ActionStatus, ExecutionResult, ExecutionSummary};
+    ExecutionResult {
+        summary: ExecutionSummary {
+            actions_attempted: outcomes.len(),
+            actions_succeeded: outcomes
+                .iter()
+                .filter(|result| result.status == ActionStatus::Success)
+                .count(),
+            actions_failed: outcomes
+                .iter()
+                .filter(|result| {
+                    !matches!(result.status, ActionStatus::Success | ActionStatus::Skipped)
+                })
+                .count(),
+        },
+        outcomes,
     }
 }
 
@@ -2641,6 +2829,7 @@ fn write_outcomes_from_execution(
             "pid": pid,
             "status": action_status_label(&outcome.status),
             "time_ms": outcome.time_ms,
+            "details": outcome.details,
         });
         if let ActionStatus::PreCheckBlocked { check, reason } = &outcome.status {
             if let Some(obj) = entry.as_object_mut() {
@@ -10643,6 +10832,276 @@ mod process_tree_safety_tests {
         assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
     }
 
+    /// Exercise the TUI's real execution helper, including its saved budget and
+    /// a later missing target. This proves execution/accounting, not rendering
+    /// or inference calibration.
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_execution_preserves_real_kill_and_budget_after_missing_target() {
+        use pt_core::action::ActionStatus;
+        use pt_core::collect::{quick_scan, QuickScanOptions};
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use pt_core::plan::DecisionCandidate;
+        use pt_core::session::{SessionManifest, SessionMode, SessionStore};
+        use std::io::{BufRead, Write};
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+
+        struct DetachedTarget {
+            leader: Child,
+            pid: u32,
+            pidfd: OwnedFd,
+        }
+
+        impl DetachedTarget {
+            fn spawn() -> Self {
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", "sleep 600 </dev/null >/dev/null 2>&1 & echo $!; wait"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .env_remove("SSH_CONNECTION")
+                    .env_remove("SSH_CLIENT")
+                    .env_remove("SSH_TTY");
+                // SAFETY: setsid is async-signal-safe and changes only the child.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut leader = command.spawn().expect("spawn detached reaper");
+                let mut line = String::new();
+                std::io::BufReader::new(leader.stdout.take().expect("reaper stdout"))
+                    .read_line(&mut line)
+                    .expect("read detached target PID");
+                let pid = line.trim().parse::<u32>().expect("detached target PID");
+                // SAFETY: the successful descriptor refers to the live test
+                // target and is transferred into sole OwnedFd ownership.
+                let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                assert!(
+                    descriptor >= 0,
+                    "pidfd_open: {}",
+                    std::io::Error::last_os_error()
+                );
+                let pidfd = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+                Self { leader, pid, pidfd }
+            }
+
+            fn stop_and_reap(&mut self) {
+                // SAFETY: pidfd pins the original target even if its PID is reused.
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                assert_eq!(
+                    result,
+                    0,
+                    "kill fixture: {}",
+                    std::io::Error::last_os_error()
+                );
+                self.leader.wait().expect("reap stopped fixture");
+            }
+        }
+
+        impl Drop for DetachedTarget {
+            fn drop(&mut self) {
+                // SAFETY: cleanup can signal only the original owned target.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                let _ = self.leader.wait();
+            }
+        }
+
+        let data_dir = tempfile::tempdir().expect("isolated execution data");
+        let session_id = pt_common::SessionId::new();
+        let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+        let handle = SessionStore::at_data_dir(data_dir.path())
+            .create(&manifest)
+            .expect("create real interactive session");
+        let mut first = DetachedTarget::spawn();
+        let mut missing = DetachedTarget::spawn();
+        let scan_options = QuickScanOptions {
+            pids: vec![first.pid, missing.pid],
+            include_kernel_threads: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
+            progress: None,
+        };
+        let records = quick_scan(&scan_options).expect("scan live fixture identities");
+        assert_eq!(records.processes.len(), 2, "both targets must start alive");
+        // SAFETY: getsid only observes the calling process's session identity.
+        let own_session = unsafe { libc::getsid(0) };
+        assert!(own_session >= 0, "resolve the test process's session");
+        for record in &records.processes {
+            assert_ne!(record.sid, Some(own_session as u32));
+            assert_ne!(
+                record.sid,
+                Some(record.pid.0),
+                "target is not the session leader"
+            );
+            assert!(!record.state.is_zombie(), "target starts live");
+        }
+
+        // Fresh, explicitly selected fixture targets use age zero. Other live
+        // protection and data-loss checks remain enabled.
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.min_process_age_seconds = 0;
+        policy.guardrails.protected_users.clear();
+        policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+        // A controlled decision selects Kill; no inference-quality claim follows.
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all())
+            .expect("fixture decision");
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let inputs = records
+            .processes
+            .iter()
+            .map(|record| {
+                (
+                    record.pid.0,
+                    DecisionCandidate {
+                        identity: process_identity_from_record(record),
+                        ppid: Some(record.ppid.0),
+                        decision: decision.clone(),
+                        blocked_reasons: Vec::new(),
+                        stage_pause_before_kill: false,
+                        process_state: Some(record.state),
+                        parent_identity: None,
+                        d_state_diagnostics: None,
+                    },
+                )
+            })
+            .collect();
+        let mut plan = build_agent_action_plan(
+            &session_id,
+            &policy,
+            &[cand(first.pid), cand(missing.pid)],
+            &inputs,
+            chrono::Utc::now().to_rfc3339(),
+        );
+        assert_eq!(plan.actions.len(), 2);
+        // This regression exercises a failure after a real success regardless
+        // of planner ordering or PID allocation order.
+        plan.actions
+            .sort_by_key(|action| action.target.pid.0 != first.pid);
+        for (index, action) in plan.actions.iter_mut().enumerate() {
+            action.order = index as u32;
+        }
+        super::write_plan_to_session(&handle, &plan).expect("save real action plan");
+        let log_dir = std::path::Path::new("target/test-logs/e2e/rate_limit").join(format!(
+            "tui-helper-{}-{}",
+            std::process::id(),
+            session_id.0
+        ));
+        std::fs::create_dir_all(&log_dir).expect("create evidence directory");
+        let mut evidence = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(log_dir.join("steps.jsonl"))
+            .expect("create execution evidence");
+        writeln!(
+            evidence,
+            "{}",
+            serde_json::json!({"step": "live_targets", "session_id": session_id.0, "processes": records.processes, "plan": plan})
+        )
+        .expect("write live-target evidence");
+
+        missing.stop_and_reap();
+        let before = quick_scan(&scan_options).expect("scan after planted target disappearance");
+        assert!(before
+            .processes
+            .iter()
+            .any(|record| record.pid.0 == first.pid));
+        assert!(!before
+            .processes
+            .iter()
+            .any(|record| record.pid.0 == missing.pid));
+        let result = super::execute_plan_actions(&handle, &policy, &plan)
+            .expect("TUI helper retains results after missing policy evidence");
+        super::write_outcomes_from_execution(&handle, &plan, &result)
+            .expect("save retained TUI outcomes");
+        writeln!(
+            evidence,
+            "{}",
+            serde_json::json!({"step": "helper_result", "result": result})
+        )
+        .expect("write helper result before checking real effect");
+        evidence.flush().expect("flush helper result");
+        assert_eq!(result.outcomes.len(), 2);
+        assert_eq!(result.outcomes[0].status, ActionStatus::Success);
+        first
+            .leader
+            .wait()
+            .expect("real target reaped after helper kill");
+        let after = quick_scan(&scan_options).expect("scan final live effects");
+        let budget: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(data_dir.path().join("rate_limit.json")).expect("saved kill budget"),
+        )
+        .expect("decode saved kill budget");
+        let saved_outcomes = std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl"))
+            .expect("saved TUI outcomes");
+        writeln!(
+            evidence,
+            "{}",
+            serde_json::json!({"step": "execute_and_account", "result": result, "budget": budget, "before": before.processes, "after": after.processes, "saved_outcomes": saved_outcomes})
+        )
+        .expect("write execution evidence");
+        evidence.flush().expect("flush execution evidence");
+
+        assert!(
+            after.processes.is_empty(),
+            "both original targets were reaped"
+        );
+        assert_eq!(result.summary.actions_attempted, 2);
+        assert_eq!(result.summary.actions_succeeded, 1);
+        assert_eq!(result.summary.actions_failed, 1);
+        assert_eq!(result.outcomes[0].action_id, plan.actions[0].action_id);
+        assert_eq!(result.outcomes[1].action_id, plan.actions[1].action_id);
+        assert!(
+            matches!(&result.outcomes[1].status, ActionStatus::PreCheckBlocked { reason, .. } if reason.contains("absent")),
+            "missing target needs an explicit evidence refusal: {:?}",
+            result.outcomes[1]
+        );
+        assert_eq!(
+            budget["kill_timestamps"]
+                .as_array()
+                .expect("kill timestamps")
+                .len(),
+            1
+        );
+        let persisted: Vec<serde_json::Value> = saved_outcomes
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("saved outcome JSON"))
+            .collect();
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[0]["action_id"], plan.actions[0].action_id);
+        assert_eq!(persisted[0]["status"], "success");
+        assert_eq!(persisted[1]["action_id"], plan.actions[1].action_id);
+        assert_eq!(persisted[1]["status"], "precheck_blocked");
+    }
+
     #[test]
     fn tree_safety_rules() {
         use ProcessState::{Sleeping as S, Zombie as Z};
@@ -14758,7 +15217,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             Some(&config.policy.guardrails),
             LivePreCheckConfig::from(&config.policy.data_loss_gates),
         )
-        .unwrap_or_else(|_| LivePreCheckProvider::with_defaults())
+        .map_err(|error| eprintln!("agent apply: cannot configure safety checks: {error}"))
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let precheck_provider = match precheck_provider {
+        Ok(provider) => provider,
+        Err(()) => return ExitCode::PolicyBlocked,
     };
     // One recent-I/O probe window for every target the data-loss gate will check,
     // instead of one full window per target.
@@ -14782,6 +15246,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut succeeded = 0usize;
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
     let mut failed = 0usize;
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
+    let mut accounting_error: Option<String> = None;
     let mut skipped = 0usize;
     let mut blocked_by_constraints = 0usize;
     let mut blocked_by_prechecks = 0usize;
@@ -14924,6 +15390,14 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     } else {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
+            let (_execution_lock, enforcer) =
+                match acquire_execution_policy(&config.policy, &handle) {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        eprintln!("agent apply: {error}");
+                        return ExitCode::PolicyBlocked;
+                    }
+                };
             let identity_provider = LiveIdentityProvider::new();
             // Composite runner: signals (kill/pause/resume), renice, and on Linux
             // freeze/throttle/quarantine (refused unless the target owns its cgroup).
@@ -15121,6 +15595,50 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     continue;
                 }
 
+                let policy_check =
+                    match check_execution_policy(&enforcer, &config.policy, action, true) {
+                        Ok(check) => check,
+                        Err(error) => {
+                            blocked_by_prechecks += 1;
+                            outcomes.push(serde_json::json!({
+                                "action_id": action.action_id,
+                                "pid": action.target.pid.0,
+                                "status": "blocked_by_policy",
+                                "reason": "policy_evidence_unavailable",
+                                "error": error,
+                            }));
+                            if args.abort_on_unknown {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                if !policy_check.allowed {
+                    blocked_by_prechecks += 1;
+                    let rate_limit = policy_check.violation.as_ref().is_some_and(|violation| {
+                        violation.kind == pt_core::decision::ViolationKind::RateLimitExceeded
+                    });
+                    outcomes.push(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "blocked_by_policy",
+                        "reason": if rate_limit { "rate_limit" } else { "policy" },
+                        "violation": policy_check.violation,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        None,
+                        action,
+                        "blocked_by_policy",
+                        &[],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+
                 // "success" means the effect was observed (stopped, reniced, exited,
                 // zombie reaped), not merely that the syscall returned.
                 let result = action_runner
@@ -15139,6 +15657,19 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                                 .map(|mb| (mb.max(0.0) * 1024.0 * 1024.0) as u64)
                                 .unwrap_or(0);
                             checker.record_action(bytes, true);
+                            if let Err(error) = enforcer.record_kill() {
+                                succeeded += 1;
+                                accounting_error = Some(error.to_string());
+                                outcomes.push(serde_json::json!({
+                                    "action_id": action.action_id,
+                                    "pid": action.target.pid.0,
+                                    "status": "success",
+                                    "signal_path": signal_path,
+                                    "rate_limit_recorded": false,
+                                    "error": format!("kill completed, but budget persistence failed: {error}"),
+                                }));
+                                break;
+                            }
                         }
                         succeeded += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -15396,7 +15927,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }
     }
 
-    let final_state = if failed > 0 {
+    let final_state = if failed > 0 || accounting_error.is_some() {
         SessionState::Failed
     } else {
         SessionState::Completed
@@ -15416,6 +15947,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             "resumed_skipped": resumed_skipped
         },
         "outcomes": outcomes,
+        "accounting_error": accounting_error,
         "goal_progress": goal_progress_payload,
         "constraints_summary": constraints_summary,
         "resumed": args.resume
@@ -15458,7 +15990,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
     if (blocked_by_constraints + blocked_by_prechecks) > 0 && succeeded == 0 && failed == 0 {
         ExitCode::PolicyBlocked
-    } else if failed > 0 {
+    } else if failed > 0 || accounting_error.is_some() {
         ExitCode::PartialFail
     } else {
         ExitCode::ActionsOk

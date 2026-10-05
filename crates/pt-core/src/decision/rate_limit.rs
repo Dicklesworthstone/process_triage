@@ -39,8 +39,8 @@
 use crate::config::policy::Guardrails;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -251,15 +251,10 @@ impl SlidingWindowRateLimiter {
     ) -> Result<Self, RateLimitError> {
         let state_path = state_path.map(|p| p.as_ref().to_path_buf());
 
-        // Try to load existing state
-        let persistent = if let Some(ref path) = state_path {
-            Self::load_state(path).unwrap_or_default()
-        } else {
-            PersistentState::default()
-        };
-
         let state = RateLimiterState {
-            persistent,
+            // Read shared state on each check/update. A corrupt budget blocks
+            // kills without preventing read-only commands from constructing us.
+            persistent: PersistentState::default(),
             kills_this_run: 0,
         };
 
@@ -280,14 +275,25 @@ impl SlidingWindowRateLimiter {
 
     /// Load state from disk.
     fn load_state(path: &Path) -> Result<PersistentState, RateLimitError> {
-        if !path.exists() {
-            return Ok(PersistentState::default());
-        }
-
-        let file = File::open(path).map_err(|e| RateLimitError::LoadState(e.to_string()))?;
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PersistentState::default());
+            }
+            Err(error) => {
+                return Err(RateLimitError::LoadState(format!(
+                    "{}: {error}; kills are refused until it is readable",
+                    path.display()
+                )));
+            }
+        };
         let reader = BufReader::new(file);
-        let mut state: PersistentState = serde_json::from_reader(reader)
-            .map_err(|e| RateLimitError::LoadState(e.to_string()))?;
+        let mut state: PersistentState = serde_json::from_reader(reader).map_err(|error| {
+            RateLimitError::LoadState(format!(
+                "{}: {error}; kills are refused until it is repaired",
+                path.display()
+            ))
+        })?;
 
         // Prune old entries on load
         let now = current_unix_timestamp();
@@ -297,23 +303,54 @@ impl SlidingWindowRateLimiter {
     }
 
     /// Save state to disk.
-    fn save_state(&self, state: &PersistentState) -> Result<(), RateLimitError> {
-        let Some(ref path) = self.state_path else {
-            return Ok(());
-        };
-
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Write atomically via temp file
-        let temp_path = path.with_extension("tmp");
-        let file = File::create(&temp_path)?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, state)?;
+    fn save_state(path: &Path, state: &PersistentState) -> Result<(), RateLimitError> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        let temp_path = sibling_with_suffix(path, &format!(".{}.{nanos}.tmp", std::process::id()));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, state)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
         fs::rename(&temp_path, path)?;
+        // On failure retain the temporary data for diagnosis; never discard it.
+        Ok(())
+    }
 
+    fn refresh(&self, state: &mut RateLimiterState) -> Result<(), RateLimitError> {
+        if let Some(path) = &self.state_path {
+            let _lock = StateLock::acquire(path, false)?;
+            state.persistent = Self::load_state(path)?;
+        }
+        Ok(())
+    }
+
+    fn lock_for_update(
+        &self,
+        state: &mut RateLimiterState,
+    ) -> Result<Option<StateLock>, RateLimitError> {
+        let Some(path) = &self.state_path else {
+            return Ok(None);
+        };
+        let lock = StateLock::acquire(path, true)?;
+        state.persistent = Self::load_state(path)?;
+        Ok(Some(lock))
+    }
+
+    fn append_kill(&self, state: &mut RateLimiterState) -> Result<(), RateLimitError> {
+        let now = current_unix_timestamp();
+        state.persistent.kill_timestamps.push_back(now);
+        state.persistent.last_updated = now;
+        state.persistent.prune_old(now);
+        if let Some(path) = &self.state_path {
+            Self::save_state(path, &state.persistent)?;
+        }
+        state.kills_this_run += 1;
         Ok(())
     }
 
@@ -322,12 +359,7 @@ impl SlidingWindowRateLimiter {
     /// If `force` is true, the kill is allowed regardless of limits (for emergency override),
     /// but warnings are still generated.
     pub fn check(&self, force: bool) -> Result<RateLimitResult, RateLimitError> {
-        let state = self
-            .state
-            .read()
-            .map_err(|e| RateLimitError::LoadState(format!("lock poisoned: {}", e)))?;
-
-        self.check_internal(&state, force, None)
+        self.check_with_override(force, None)
     }
 
     /// Check with an override limit (e.g., robot mode may have lower limits).
@@ -336,10 +368,11 @@ impl SlidingWindowRateLimiter {
         force: bool,
         override_per_run: Option<u32>,
     ) -> Result<RateLimitResult, RateLimitError> {
-        let state = self
+        let mut state = self
             .state
-            .read()
+            .write()
             .map_err(|e| RateLimitError::LoadState(format!("lock poisoned: {}", e)))?;
+        self.refresh(&mut state)?;
 
         self.check_internal(&state, force, override_per_run)
     }
@@ -427,20 +460,9 @@ impl SlidingWindowRateLimiter {
             .write()
             .map_err(|e| RateLimitError::SaveState(format!("lock poisoned: {}", e)))?;
 
-        let now = current_unix_timestamp();
-
-        // Update persistent state
-        state.persistent.kill_timestamps.push_back(now);
-        state.persistent.last_updated = now;
-        state.persistent.prune_old(now);
-
-        // Update run counter
-        state.kills_this_run += 1;
-
-        // Save to disk
-        self.save_state(&state.persistent)?;
-
-        Ok(self.get_counts_internal(&state, now))
+        let _lock = self.lock_for_update(&mut state)?;
+        self.append_kill(&mut state)?;
+        Ok(self.get_counts_internal(&state, current_unix_timestamp()))
     }
 
     /// Check and record in one atomic operation.
@@ -457,21 +479,10 @@ impl SlidingWindowRateLimiter {
             .write()
             .map_err(|e| RateLimitError::SaveState(format!("lock poisoned: {}", e)))?;
 
+        let _lock = self.lock_for_update(&mut state)?;
         let result = self.check_internal(&state, force, override_per_run)?;
-
         if result.allowed {
-            let now = current_unix_timestamp();
-
-            // Update persistent state
-            state.persistent.kill_timestamps.push_back(now);
-            state.persistent.last_updated = now;
-            state.persistent.prune_old(now);
-
-            // Update run counter
-            state.kills_this_run += 1;
-
-            // Save to disk
-            self.save_state(&state.persistent)?;
+            self.append_kill(&mut state)?;
         }
 
         Ok(result)
@@ -479,10 +490,11 @@ impl SlidingWindowRateLimiter {
 
     /// Get current counts without modifying state.
     pub fn get_counts(&self) -> Result<RateLimitCounts, RateLimitError> {
-        let state = self
+        let mut state = self
             .state
-            .read()
+            .write()
             .map_err(|e| RateLimitError::LoadState(format!("lock poisoned: {}", e)))?;
+        self.refresh(&mut state)?;
 
         let now = current_unix_timestamp();
         Ok(self.get_counts_internal(&state, now))
@@ -522,6 +534,45 @@ impl SlidingWindowRateLimiter {
     pub fn config(&self) -> &RateLimitConfig {
         &self.config
     }
+}
+
+/// Lock a stable sibling inode; renaming the state file never changes this lock.
+struct StateLock(#[allow(dead_code)] File);
+
+impl StateLock {
+    fn acquire(path: &Path, exclusive: bool) -> Result<Self, RateLimitError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(sibling_with_suffix(path, ".lock"))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let operation = if exclusive {
+                libc::LOCK_EX
+            } else {
+                libc::LOCK_SH
+            };
+            // SAFETY: flock operates only on the descriptor owned by this guard;
+            // closing it releases the lock, including error returns.
+            if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = exclusive;
+        Ok(Self(file))
+    }
+}
+
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 /// Get current Unix timestamp in seconds.
@@ -1145,20 +1196,125 @@ mod tests {
     // ── persistence with corrupt state file ─────────────────────────
 
     #[test]
-    fn test_persistence_corrupt_state_uses_default() {
+    fn corrupt_persistent_state_refuses_kills_without_resetting_the_budget() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("rate_limit.json");
 
         // Write corrupt JSON
         std::fs::write(&state_path, "not valid json").unwrap();
 
-        // Should fall back to default state
+        // Construction permits read-only consumers, but no kill may use a
+        // corrupt budget, including an emergency override.
         let config = test_config();
         let limiter = SlidingWindowRateLimiter::new(config, Some(&state_path)).unwrap();
 
         assert_eq!(limiter.current_run_count().unwrap(), 0);
-        let counts = limiter.get_counts().unwrap();
-        assert_eq!(counts.day, 0);
+        assert!(limiter.check(false).is_err());
+        assert!(limiter.check(true).is_err());
+        assert!(limiter.check_and_record(false, None).is_err());
+        assert!(limiter.record_kill().is_err());
+        assert!(limiter.get_counts().is_err());
+        assert_eq!(limiter.current_run_count().unwrap(), 0);
+        assert_eq!(fs::read_to_string(&state_path).unwrap(), "not valid json");
+    }
+
+    #[test]
+    fn unreadable_persistent_state_refuses_kills() {
+        // A directory produces a genuine read error even on root workers;
+        // permission-bit fixtures alone cannot establish this boundary there.
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("rate_limit.json");
+        fs::create_dir(&state_path).unwrap();
+        let limiter = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        assert!(limiter.check(false).is_err());
+        assert!(limiter.check_and_record(false, None).is_err());
+        assert!(limiter.record_kill().is_err());
+        assert!(state_path.is_dir());
+    }
+
+    #[test]
+    fn a_running_limiter_sees_another_runs_persisted_kills() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("rate_limit.json");
+        let config = RateLimitConfig {
+            max_per_run: 100,
+            max_per_minute: None,
+            max_per_hour: Some(3),
+            max_per_day: None,
+        };
+        let first = SlidingWindowRateLimiter::new(config.clone(), Some(&state_path)).unwrap();
+        let second = SlidingWindowRateLimiter::new(config, Some(&state_path)).unwrap();
+        assert!(second.check(false).unwrap().allowed);
+        for _ in 0..3 {
+            first.record_kill().unwrap();
+        }
+        let result = second.check(false).unwrap();
+        assert!(!result.allowed);
+        assert_eq!(result.block_reason.unwrap().window, RateLimitWindow::Hour);
+        assert_eq!(second.get_counts().unwrap().hour, 3);
+        assert_eq!(second.current_run_count().unwrap(), 0);
+        second.check_and_record(true, None).unwrap();
+        assert_eq!(first.get_counts().unwrap().hour, 4);
+    }
+
+    #[test]
+    fn independent_concurrent_writers_lose_no_kills() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("rate_limit.json");
+        let config = RateLimitConfig {
+            max_per_run: u32::MAX,
+            max_per_minute: None,
+            max_per_hour: None,
+            max_per_day: None,
+        };
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let state_path = state_path.clone();
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    let limiter = SlidingWindowRateLimiter::new(config, Some(&state_path)).unwrap();
+                    for _ in 0..10 {
+                        limiter.record_kill().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let fresh = SlidingWindowRateLimiter::new(config, Some(&state_path)).unwrap();
+        assert_eq!(fresh.get_counts().unwrap().day, 40);
+    }
+
+    #[test]
+    fn concurrent_atomic_checks_never_exceed_the_shared_budget() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("rate_limit.json");
+        let config = RateLimitConfig {
+            max_per_run: u32::MAX,
+            max_per_minute: None,
+            max_per_hour: Some(10),
+            max_per_day: None,
+        };
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let state_path = state_path.clone();
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    let limiter = SlidingWindowRateLimiter::new(config, Some(&state_path)).unwrap();
+                    (0..5)
+                        .filter(|_| limiter.check_and_record(false, None).unwrap().allowed)
+                        .count()
+                })
+            })
+            .collect();
+        let accepted: usize = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .sum();
+        assert_eq!(accepted, 10);
+        let fresh = SlidingWindowRateLimiter::new(config, Some(&state_path)).unwrap();
+        assert_eq!(fresh.get_counts().unwrap().hour, 10);
     }
 
     // ── SlidingWindowRateLimiter debug ──────────────────────────────

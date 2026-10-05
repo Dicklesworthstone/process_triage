@@ -311,6 +311,112 @@ fn apply_with_args(
     (status, json)
 }
 
+#[test]
+fn agent_apply_persists_the_kill_budget_across_runs() {
+    use std::io::Write;
+    let data_dir = TempDir::new().expect("data dir");
+    let config_dir = TempDir::new().expect("config dir");
+    write_test_policy(config_dir.path());
+    let policy_path = config_dir.path().join("policy.json");
+    let mut policy: Policy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy.guardrails.max_kills_per_minute = Some(2);
+    // A full one-second I/O window keeps this minute-budget probe inside its
+    // declared window. The separate writer regressions exercise the data gate.
+    policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+    fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let first = ForeignTarget::spawn("sleep 351");
+    let second = ForeignTarget::spawn("sleep 352");
+    let third = ForeignTarget::spawn("sleep 353");
+    let mut first_action = plan_action(Action::Kill, &live_identity(first.pid));
+    first_action.action_id = "first-kill".to_string();
+    let mut second_action = plan_action(Action::Kill, &live_identity(second.pid));
+    second_action.action_id = "second-kill".to_string();
+    let first_session = session_with_actions(data_dir.path(), vec![first_action, second_action]);
+    let third_session = session_with_plan(
+        data_dir.path(),
+        plan_action(Action::Kill, &live_identity(third.pid)),
+    );
+    let log_dir = Path::new("target/test-logs/e2e/rate_limit").join(format!(
+        "{}-{}",
+        std::process::id(),
+        SessionId::new().0
+    ));
+    fs::create_dir_all(&log_dir).unwrap();
+    let mut steps = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(log_dir.join("steps.jsonl"))
+        .unwrap();
+    let started = std::time::Instant::now();
+    for (index, session) in [&first_session, &third_session].into_iter().enumerate() {
+        let output = cargo_bin_cmd!("pt-core")
+            .timeout(Duration::from_secs(120))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", data_dir.path())
+            .env("PROCESS_TRIAGE_CONFIG", config_dir.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "apply",
+                "--session",
+                session,
+                "--recommended",
+                "--yes",
+            ])
+            .output()
+            .unwrap();
+        fs::write(log_dir.join(format!("{index}.stdout.json")), &output.stdout).unwrap();
+        fs::write(
+            log_dir.join(format!("{index}.stderr.jsonl")),
+            &output.stderr,
+        )
+        .unwrap();
+        writeln!(
+            steps,
+            "{}",
+            serde_json::json!({
+                "step": index, "session_id": session, "exit_code": output.status.code(),
+                "elapsed_ms": started.elapsed().as_millis(),
+                "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&output.stdout),
+                "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&output.stderr),
+            })
+        )
+        .unwrap();
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if index == 0 {
+            assert_eq!(output.status.code(), Some(2), "{result}");
+            let outcomes = result["outcomes"].as_array().unwrap();
+            assert_eq!(outcomes.len(), 2, "{result}");
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| outcome["status"] == "success"),
+                "{result}"
+            );
+            assert!(!first.alive());
+            assert!(!second.alive());
+        } else {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "minute-window probe ran too slowly"
+            );
+            assert_eq!(
+                result["outcomes"][0]["status"], "blocked_by_policy",
+                "{result}"
+            );
+            assert_eq!(result["outcomes"][0]["reason"], "rate_limit", "{result}");
+            assert_ne!(output.status.code(), Some(2), "{result}");
+            assert!(third.alive(), "rate-limited target was signaled");
+        }
+        let budget: Value =
+            serde_json::from_slice(&fs::read(data_dir.path().join("rate_limit.json")).unwrap())
+                .unwrap();
+        assert_eq!(budget["kill_timestamps"].as_array().unwrap().len(), 2);
+    }
+}
+
 /// Exercise the actual planner-to-apply contract, not a hand-authored action.
 /// The isolated policy selects kill to make routing deterministic; this tests
 /// execution and saved identities, not inference calibration or FDR quality.

@@ -739,6 +739,21 @@ impl PolicyEnforcer {
             });
         }
 
+        // Unknown evidence cannot satisfy a positive confidence floor. Explicit
+        // zero-floor policies still permit execution-only test/manual plans.
+        if candidate
+            .posterior
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            || (candidate.posterior.is_none() && self.robot_mode.min_posterior > 0.0)
+        {
+            return Some(PolicyViolation {
+                kind: ViolationKind::RobotModeGate,
+                message: "valid posterior evidence is required by the confidence floor".to_string(),
+                rule: "robot_mode.min_posterior".to_string(),
+                context: None,
+            });
+        }
+
         // Check minimum posterior
         if let Some(posterior) = candidate.posterior {
             if posterior < self.robot_mode.min_posterior {
@@ -1221,6 +1236,41 @@ mod tests {
             provenance_evidence_completeness: None,
             provenance_confidence_penalty: None,
         }
+    }
+
+    #[test]
+    fn robot_confidence_floor_refuses_missing_or_invalid_probability() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.require_human_for_supervised = false;
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        for posterior in [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(-0.1),
+            Some(1.1),
+        ] {
+            candidate.posterior = posterior;
+            let result = enforcer.check_action(&candidate, Action::Kill, true);
+            assert!(!result.allowed, "invalid probability {posterior:?}");
+            assert_eq!(result.violation.unwrap().rule, "robot_mode.min_posterior");
+        }
+        candidate.posterior = Some(1.0);
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        policy.robot_mode.min_posterior = 0.0;
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        candidate.posterior = None;
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
     }
 
     #[test]
