@@ -29,6 +29,7 @@ static HARNESS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// passes; ordinary nonroot callers execute their original body directly.
 #[cfg(target_os = "linux")]
 pub fn run_owned_unprivileged_case(test_name: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     use std::os::unix::process::CommandExt;
@@ -129,6 +130,26 @@ pub fn run_owned_unprivileged_case(test_name: &str) -> bool {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&artifacts)
         .expect("open only the new owned directory");
+    // Create and retain both log handles before granting the shared test UID
+    // control of the directory. Readback never reopens an unprivileged path.
+    let stdout_path = artifacts.join("stdout.log");
+    let stderr_path = artifacts.join("stderr.log");
+    let stdout = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&stdout_path)
+        .expect("create retained privilege-run stdout");
+    let stderr = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&stderr_path)
+        .expect("create retained privilege-run stderr");
+    let mut retained_stdout = stdout.try_clone().expect("retain original stdout handle");
+    let mut retained_stderr = stderr.try_clone().expect("retain original stderr handle");
     // SAFETY: the descriptor pins the freshly created directory, not an
     // existing repository path or a symlink supplied by another process.
     assert_eq!(
@@ -142,20 +163,6 @@ pub fn run_owned_unprivileged_case(test_name: &str) -> bool {
     assert_eq!(metadata.uid(), UID);
     assert_eq!(metadata.gid(), GID);
     assert_eq!(metadata.mode() & 0o777, 0o700);
-    let stdout_path = artifacts.join("stdout.log");
-    let stderr_path = artifacts.join("stderr.log");
-    let stdout = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&stdout_path)
-        .expect("create retained privilege-run stdout");
-    let stderr = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&stderr_path)
-        .expect("create retained privilege-run stderr");
     let mut command = Command::new(std::env::current_exe().expect("current libtest executable"));
     command
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
@@ -233,8 +240,20 @@ pub fn run_owned_unprivileged_case(test_name: &str) -> bool {
             .expect("spawn genuinely unprivileged exact test"),
     );
     let status = child.0.wait().expect("wait for complete unprivileged test");
-    let stdout = fs::read_to_string(&stdout_path).expect("read retained test stdout");
-    let stderr = fs::read_to_string(&stderr_path).expect("read retained test stderr");
+    retained_stdout
+        .seek(SeekFrom::Start(0))
+        .expect("rewind original stdout handle");
+    retained_stderr
+        .seek(SeekFrom::Start(0))
+        .expect("rewind original stderr handle");
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    retained_stdout
+        .read_to_string(&mut stdout)
+        .expect("read retained test stdout handle");
+    retained_stderr
+        .read_to_string(&mut stderr)
+        .expect("read retained test stderr handle");
     eprintln!("unprivileged case={test_name} status={status} stdout={stdout} stderr={stderr}");
     assert!(
         status.success(),
