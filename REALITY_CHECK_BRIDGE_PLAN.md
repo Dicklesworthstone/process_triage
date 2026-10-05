@@ -113,6 +113,123 @@ by elapsed time, selected passing tests or an independently reviewed scanner row
 - [ ] Resume dependency updates only after the circuit-breaker response, preserving
   MSRV and separately resolving the known vulnerable transitive dependency families.
 
+### Bounded work and honesty audit — 2026-10-05 18:55 UTC
+
+Window: 15:54–18:55 UTC. Inputs: actual source edits and frozen-source differences,
+the independently retained f19 runtime archive and original `.17` criteria, current
+tracker records, recent log/stat/reflog, four owned cancellation/recovery records,
+compiler/scanner streams and the original ROOT incident. External commits and merges
+preserved earlier authored bytes; their count is not a feature count. The recent
+reflog shows those commits/merges, not a root reset. No root commit, push, deletion,
+golden regeneration or release occurred. Whole external history has not received
+another exhaustive per-commit audit; receipt checks establish current source identity.
+That limitation is explicit rather than a clean-history assertion.
+
+Real-work inventory: canonical action-kind binding USER (independently accepted);
+direct cgroup/reversal safety, truthful fleet merge behavior and watchdog lifetime
+correction USER source changes (new runtime acceptance pending); root-compatible
+permission fixtures and owned cgroup/group fixtures ENABLER; source-bound validation
+and necessary integrity recovery ENABLER; tracker/TODO updates PROCESS. Tally:
+USER 4, ENABLER 3, PROCESS 1, UNKNOWN 0. Only the first USER item has new complete
+positive acceptance in this window. Refusal-only changes do not become normalization,
+resource relief or cgroup isolation capability.
+
+1. Most visible accepted change: a genuine saved Pause execution cannot be reused
+   as Kill evidence; real resume remains idempotent. The original actual Pause,
+   SIGCONT, budget and kind-tampering phases passed on independently bound f19 source.
+2. The tracker/report changes no product behavior. Minimal archives did preserve
+   source after observed evidence loss; additional certificate layers would add nothing.
+3. Real consumers exercised the accepted action-kind path and the older 4,208
+   selected repairs. The latest fixtures/watchdog have only source/Clippy acceptance
+   so far, which cannot be called positive runtime delivery.
+4. Oldest user-relevant open item remains `bd-l3s5`, measured fleet false-positive
+   calibration. Actual privileged safety defects took precedence; calibration is
+   still a central missing product outcome. `bd-toa2.10` is another concrete gap:
+   terminal-pane workloads inherit a service classification and disappear from plans.
+5. Root closed `.17` after independent exact-source/evidence acceptance; reviewers
+   made no closures. Source review and research receive no capability credit.
+6. No original positive criterion was moved to a follow-up to close its parent.
+   `hc7.3` and `sj6.6` were reopened; `.9/.11` stay open. New `.8` records a genuinely
+   newly observed watchdog defect and blocks the existing workspace requirement.
+
+Verdict: DRIFTING. Repeated builds, evidence recovery and failed prerequisite
+sequences consumed substantial time. Correction: freeze the now-reviewed source,
+finish its actual runtime checks, then work the next user-visible gap. Do not create
+more report layers, turn scanner review into a passing gate, or repeat a passed
+check without changed source or an unresolved concern.
+
+Honesty inventory, defending none of the author's decisions:
+
+1. Yes: four unsafe inherited-cgroup positive fixtures were replaced. The exact
+   defect was an observed successful PID1 quota write; the old test assumptions
+   were not safe under ROOT. Admitted coverage is now only newly owned delegated
+   leaves, captured reversal and unchanged siblings; unprovisioned positives are
+   unavailable proof. Original task positives remain open. No timing/ignore/assertion
+   relaxation is credited as progress; whole external history is not newly certified.
+2. No (checked: owned-leaf, group and watchdog fixture changes). Tests use actual
+   spawned processes and actual controllers; synthetic unit negatives are not live proof.
+3. No (checked: changed paths and executed commands). No baselines were regenerated.
+4. Yes: fixture/verifier changes accompany safety fixes. Their source diffs were
+   separately reviewed, original windows retained and support/refusal losses published.
+   The new two-second watchdog observation deadline is a new test's declared budget,
+   not a widened old gate. Invocation-only 10,800-second build limits remain separate.
+5. Yes: prior fleet normalization relied on invented local statistics. Those bytes
+   were removed, not legitimized by a live occupancy census; requested normalization
+   now refuses and its original positive task remains reopened. ROOT-only helper
+   dispatch deliberately executes each complete permission fixture unprivileged;
+   it proves credential dropping and the original permission case, not privileged
+   cross-user product actuation. This scope difference is explicit.
+6. No (checked: actual selected test denominators, helper exact-one-count assertion,
+   frozen full-suite commands and current gate terminals). Absent delegated cgroup
+   prerequisites can return without actuation and are never counted as positive proof.
+7. Yes: the missing-target recovery failed, UBS first failed to launch, and one
+   archive command continued after a failed formatting prerequisite. Their outcomes
+   are retained above; none is credited as accepted backup/scan/formatting evidence.
+8. No (checked: source-review statements and runtime receipt boundaries). Current
+   source agreement/Clippy is not live kernel, forced PID reuse or macOS proof.
+9. Yes: the prior normalization completion and cgroup safety confidence were too
+   strong. Both original tasks are reopened, the PID1 incident is prominent, and
+   scanner/audit/full-suite failures remain explicit. The 135 remainder arithmetic
+   was also corrected before adding the newly observed task.
+10. No (checked: cited current Cargo/UBS/cancellation logs). Both streams are retained;
+    the subsequent observed target-directory loss is disclosed, not a claim of retention.
+11. Yes: older `hc7.3` and `sj6.6` closures lacked original positive evidence. Their
+    criteria are unchanged and tasks reopened. `.17` alone closed in this window on
+    independently rehashed actual source/runtime evidence.
+12. No (checked: original reopened descriptions and current README support split).
+    Truthful limits did not replace the original positive requirements.
+13. No (checked: window closure records). Root performed normal closure only after
+    exact-revision independent acceptance; children did not close their own work.
+14. No (checked: review assignments). Each specifies actual effects, planted negative
+    obligations and no ROOT/Mac/kernel/scanner-pass claim from source-only evidence.
+15. No (checked: complete new handwritten deltas and cited actual command results).
+    Agent findings were inspected and source fixes reviewed; unexecuted child claims
+    are not accepted as runtime results. Existing raw archive binding counts once.
+16. No (checked: current original-task statuses). Refusal fixes leave their positive
+    tasks open; safe source guards alone earn no leaf, normalization or relief closure.
+17. No (checked: proof wording and exact artifact hashes). Agreement is source review;
+    common frozen artifacts are one evidence origin, not independent runtime samples.
+18. No (checked: predeclared full/selected target invocations). Overlapping runs are
+    not summed; no measured fleet quality, performance win or relief statistic is claimed.
+19. The owner should see the actual PID1 write, the invented baseline, lost local
+    logs, prerequisite mistakes, repeated cancellation/rebuild costs and missing
+    full-suite acceptance before any optimistic progress summary.
+20. Strongest accepted proof remains the re-executable actual f19 Pause/resume and
+    kind-tampering test, with independently bound 55 runtime files/seven commands.
+    The current strongest new-source result is Clippy exit 0 on receipt `c0f2ac12`;
+    its live watchdog/cgroup/permission acceptance remains pending.
+
+Disposition: the false positive-capability closures are reopened and the original
+requirements retained (RH-9/RH-12); fabricated normalization is removed and disclosed
+(RH-2/RH-7). The actual privileged incident and fixture support loss are recorded;
+future privileged runs receive explicit source review of mutation/cleanup lifetime
+(RH-1). Failed prerequisites stop dependent validation claims (RH-16). Source and
+runtime revisions, unavailable prerequisites and actual exits remain separate
+(RH-2/RH-7). Recovery data uses only the minimal integrity exception for observed
+evidence loss; no new process product or capability credit is manufactured. Older
+session coverage remains the earlier six Cass queries with no indexed project hits,
+which establishes neither absence of misconduct nor a clean project history.
+
 ## Previous validation — 2026-10-05 18:16 UTC
 
 The combined repaired source is archived at
