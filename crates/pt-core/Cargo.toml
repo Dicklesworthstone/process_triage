@@ -22,7 +22,7 @@ clap_complete = "4"
 serde.workspace = true
 serde_json.workspace = true
 yaml_serde = "0.10.7"
-schemars = { version = "1.2.0", features = ["chrono04"] }
+schemars = { version = "1.2.2", features = ["chrono04"] }
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-schemars = { version = "1.2.0", features = ["chrono04"] }
+schemars = { version = "1.2.2", features = ["chrono04"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror.workspace = true
