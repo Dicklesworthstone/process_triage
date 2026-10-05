@@ -277,6 +277,7 @@ fn apply_with_args(
     target: &str,
     extra: &[&str],
 ) -> (String, Value) {
+    let started = std::time::Instant::now();
     let out = cargo_bin_cmd!("pt-core")
         .timeout(Duration::from_secs(240))
         .env("PT_SKIP_GLOBAL_LOCK", "1")
@@ -297,6 +298,28 @@ fn apply_with_args(
         .args(extra)
         .output()
         .expect("run agent apply");
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-logs/e2e/agent_apply")
+        .join(session)
+        .join(SessionId::new().0);
+    fs::create_dir_all(&log_dir).expect("apply artifacts");
+    fs::write(log_dir.join("stdout.json"), &out.stdout).expect("save apply stdout");
+    fs::write(log_dir.join("stderr.jsonl"), &out.stderr).expect("save apply stderr");
+    fs::write(
+        log_dir.join("step.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "command": "pt-core", "session_id": session,
+                "args": ["--format", "json", "agent", "apply", "--session", session,
+                         "--targets", target, "--yes"], "extra_args": extra,
+                "exit_code": out.status.code(), "elapsed_ms": started.elapsed().as_millis(),
+                "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&out.stdout),
+                "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&out.stderr),
+            })
+        ),
+    )
+    .expect("save apply step");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let json: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
@@ -712,6 +735,47 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
     // Scope the real apply to our one exact identity, regardless of what the
     // planner observes on the worker. The normal runtime safety checks run.
     let target = format!("{pid}:{}", identity.start_id.0);
+    policy.robot_mode.require_policy_snapshot = Some(true);
+    fs::write(
+        config_dir.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    for (step, snapshot) in [
+        ("apply_missing_snapshot", None),
+        (
+            "apply_incomplete_snapshot",
+            Some(serde_json::json!({"min_process_age_seconds": 0})),
+        ),
+    ] {
+        let mut without_snapshot: Value = serde_json::from_slice(&persisted).unwrap();
+        if let Some(snapshot) = snapshot {
+            without_snapshot["policy_snapshot"] = snapshot;
+        } else {
+            without_snapshot.as_object_mut().unwrap().remove("policy_snapshot");
+        }
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            serde_json::to_vec(&without_snapshot).unwrap(),
+        )
+        .unwrap();
+        let refused = run_step(
+            &log_dir,
+            step,
+            &[
+                "--format", "json", "agent", "apply", "--session", session,
+                "--targets", &target, "--yes",
+            ],
+            &data_dir,
+            &config_dir,
+            30,
+        );
+        assert_eq!(refused.status.code(), Some(4));
+        assert!(String::from_utf8_lossy(&refused.stderr)
+            .contains("requires a valid recorded policy snapshot"));
+        assert!(state_of(pid).is_some_and(|state| state != 'Z'));
+        assert!(!handle.dir.join("action/outcomes.jsonl").exists());
+    }
     let mut tampered: Value = serde_json::from_slice(&persisted).unwrap();
     for saved_action in tampered["actions"].as_array_mut().unwrap() {
         saved_action["pre_checks"] = serde_json::json!([]);
@@ -1216,8 +1280,9 @@ fn agent_apply_data_loss_gate_blocks_kill_of_open_writer() {
 }
 
 /// --max-total-blast-radius accumulates the memory of each kill (bd-qr40.7): apply
-/// recorded 0 bytes per kill, so the run-wide budget never ran out. Three kills of
-/// 100 MB each (plan memory) against a 250 MB budget: two run, the third is refused.
+/// originally recorded 0 bytes, then trusted saved estimates. Allocate actual
+/// resident memory while recording zero estimates: two measured footprints fit
+/// the budget, while a third is refused and remains alive.
 #[cfg(target_os = "linux")]
 #[test]
 fn agent_apply_total_blast_radius_budget_refuses_kills_past_the_cap() {
@@ -1225,11 +1290,43 @@ fn agent_apply_total_blast_radius_budget_refuses_kills_past_the_cap() {
     let config_dir = TempDir::new().expect("config dir");
     write_test_policy(config_dir.path());
 
-    let victims = [
-        ForeignTarget::spawn("sleep 311"),
-        ForeignTarget::spawn("sleep 312"),
-        ForeignTarget::spawn("sleep 313"),
-    ];
+    let policy_path = config_dir.path().join("policy.json");
+    let mut policy: Policy = serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+    fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let victims = std::array::from_fn::<_, 3, _>(|_| {
+        ForeignTarget::spawn(
+            "python3 -c 'import time; memory=bytearray(b\"x\"*(16*1024*1024)); time.sleep(600)'",
+        )
+    });
+    let pids: Vec<u32> = victims.iter().map(|victim| victim.pid).collect();
+    let started = std::time::Instant::now();
+    let resident_bytes = loop {
+        let scan = quick_scan(&QuickScanOptions {
+            pids: pids.clone(),
+            ..QuickScanOptions::default()
+        })
+        .unwrap();
+        let resident: Vec<u64> = pids
+            .iter()
+            .map(|pid| {
+                scan.processes
+                    .iter()
+                    .find(|process| process.pid.0 == *pid)
+                    .map_or(0, |process| process.rss_bytes)
+            })
+            .collect();
+        if resident.iter().all(|bytes| *bytes >= 16 * 1024 * 1024) {
+            break resident;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "real resident memory: {resident:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let budget_mb =
+        (resident_bytes[0] + resident_bytes[1] + resident_bytes[2] / 2) as f64 / (1024.0 * 1024.0);
     let mut actions = Vec::new();
     let mut targets = Vec::new();
     for (i, victim) in victims.iter().enumerate() {
@@ -1238,7 +1335,7 @@ fn agent_apply_total_blast_radius_budget_refuses_kills_past_the_cap() {
         let mut action = plan_action(Action::Kill, &identity);
         action.action_id = format!("a-kill-{i}");
         action.order = i as u32;
-        action.rationale.memory_mb = Some(100.0);
+        action.rationale.memory_mb = Some(0.0);
         actions.push(action);
     }
     let s = session_with_actions(data_dir.path(), actions);
@@ -1248,7 +1345,7 @@ fn agent_apply_total_blast_radius_budget_refuses_kills_past_the_cap() {
         config_dir.path(),
         &s,
         &targets.join(","),
-        &["--max-total-blast-radius", "250"],
+        &["--max-total-blast-radius", &budget_mb.to_string()],
     );
     let outcomes = json["outcomes"].as_array().expect("outcomes");
     let statuses: Vec<(u64, &str)> = outcomes
@@ -1270,8 +1367,26 @@ fn agent_apply_total_blast_radius_budget_refuses_kills_past_the_cap() {
         .filter(|(_, st)| *st == "blocked_by_constraints")
         .map(|(pid, _)| *pid)
         .collect();
-    assert_eq!(succeeded.len(), 2, "two kills fit in 250 MB: {json}");
-    assert_eq!(refused.len(), 1, "the third would reach 300 MB: {json}");
+    assert_eq!(
+        succeeded.len(),
+        2,
+        "two measured kills fit in {budget_mb} MB: {json}"
+    );
+    assert_eq!(
+        refused.len(),
+        1,
+        "the third measured kill exceeds {budget_mb} MB: {json}"
+    );
+    let refused_outcome = outcomes
+        .iter()
+        .find(|outcome| outcome["status"] == "blocked_by_constraints")
+        .unwrap();
+    assert!(refused_outcome["current_rss_bytes"].as_u64().unwrap() >= 16 * 1024 * 1024);
+    assert!(refused_outcome["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|violation| { violation["constraint"] == "max_total_blast_radius" }));
     let survivor = victims
         .iter()
         .find(|v| u64::from(v.pid) == refused[0])

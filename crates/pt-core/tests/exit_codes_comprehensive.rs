@@ -15,6 +15,10 @@ fn cli_usage_errors_follow_the_agent_exit_contract() {
         vec!["nonexistent-command"],
         vec!["config", "export-preset"],
         vec!["agent", "apply", "--pids", "not-a-pid"],
+        vec!["agent", "apply", "--session", "fixture", "--max-total-blast-radius", "NaN"],
+        vec!["agent", "apply", "--session", "fixture", "--max-total-blast-radius", "inf"],
+        vec!["agent", "apply", "--session", "fixture", "--max-blast-radius=-1"],
+        vec!["agent", "apply", "--session", "fixture", "--min-posterior", "1.1"],
     ] {
         cargo_bin_cmd!("pt-core")
             .args(args)
