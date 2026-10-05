@@ -7632,6 +7632,111 @@ fn apply_process_tree_safety(
     downgraded
 }
 
+/// Cap the final planned kill set without spending the execution rate budget.
+/// Children are eligible before parents; unrelated eligible choices retain the
+/// planner's ranking. Recheck tree safety after any budget exclusions.
+fn apply_planned_kill_budget(
+    candidates: &mut [&mut serde_json::Value],
+    processes: &[ProcessRecord],
+    policy: &pt_core::config::Policy,
+    robot: bool,
+) -> usize {
+    let mut downgraded =
+        apply_process_tree_safety(candidates, processes, policy.guardrails.builtin_protection);
+    let limit = if robot {
+        policy
+            .guardrails
+            .max_kills_per_run
+            .min(policy.robot_mode.max_kills)
+    } else {
+        policy.guardrails.max_kills_per_run
+    };
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let kill_indices: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate["recommended_action"].as_str() == Some("kill"))
+        .map(|(index, _)| index)
+        .collect();
+
+    if kill_indices.len() > limit {
+        let kill_by_pid: HashMap<u32, usize> = kill_indices
+            .iter()
+            .filter_map(|&index| {
+                let pid = u32::try_from(candidates[index]["pid"].as_u64()?).ok()?;
+                Some((pid, index))
+            })
+            .collect();
+        let mut pending_children: HashMap<u32, usize> =
+            kill_by_pid.keys().map(|&pid| (pid, 0)).collect();
+        let mut parent_of: HashMap<u32, u32> = HashMap::new();
+        for process in processes {
+            if !process.state.is_zombie()
+                && kill_by_pid.contains_key(&process.pid.0)
+                && kill_by_pid.contains_key(&process.ppid.0)
+            {
+                *pending_children.entry(process.ppid.0).or_default() += 1;
+                parent_of.insert(process.pid.0, process.ppid.0);
+            }
+        }
+        let mut ready: std::collections::BTreeSet<usize> = pending_children
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .filter_map(|(pid, _)| kill_by_pid.get(pid).copied())
+            .collect();
+        let mut selected = HashSet::new();
+        while selected.len() < limit {
+            let Some(index) = ready.pop_first() else {
+                break;
+            };
+            selected.insert(index);
+            let pid = candidates[index]["pid"].as_u64().unwrap_or(0) as u32;
+            if let Some(parent) = parent_of.get(&pid) {
+                if let Some(count) = pending_children.get_mut(parent) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        if let Some(&parent_index) = kill_by_pid.get(parent) {
+                            ready.insert(parent_index);
+                        }
+                    }
+                }
+            }
+        }
+
+        for index in kill_indices {
+            if selected.contains(&index) {
+                continue;
+            }
+            if let Some(object) = candidates[index].as_object_mut() {
+                let previous_rationale = object
+                    .get("action_rationale")
+                    .and_then(|value| value.as_str())
+                    .map(|reason| format!("; previous rationale: {reason}"))
+                    .unwrap_or_default();
+                object.insert(
+                    "recommended_action".to_string(),
+                    serde_json::json!("review"),
+                );
+                object.insert("recommendation".to_string(), serde_json::json!("REVIEW"));
+                object.insert(
+                    "action_rationale".to_string(),
+                    serde_json::json!(format!(
+                        "Kill downgraded to review: final plan is limited to {limit} kills{previous_rationale}"
+                    )),
+                );
+                object.insert(
+                    "plan_budget".to_string(),
+                    serde_json::json!({ "rule": "max_planned_kills", "limit": limit }),
+                );
+                downgraded += 1;
+            }
+        }
+    }
+
+    downgraded
+        + apply_process_tree_safety(candidates, processes, policy.guardrails.builtin_protection)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigFileKind {
     Priors,
@@ -10750,7 +10855,10 @@ fn output_stub_with_session(
 
 #[cfg(test)]
 mod process_tree_safety_tests {
-    use super::{apply_process_tree_safety, build_agent_action_plan, process_identity_from_record};
+    use super::{
+        apply_planned_kill_budget, apply_process_tree_safety, build_agent_action_plan,
+        process_identity_from_record,
+    };
     use pt_common::{ProcessId, StartId};
     use pt_core::collect::{ProcessRecord, ProcessState};
 
@@ -10779,6 +10887,193 @@ mod process_tree_safety_tests {
 
     fn cand(pid: u32) -> serde_json::Value {
         serde_json::json!({"pid": pid, "recommended_action": "kill", "recommendation": "KILL"})
+    }
+
+    #[test]
+    fn planned_kill_budget_preserves_two_kills_and_canonical_evidence() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use pt_core::plan::DecisionCandidate;
+
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 2;
+        policy.robot_mode.max_kills = 1;
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let processes: Vec<_> = [100, 200, 300, 400, 500]
+            .into_iter()
+            .map(|pid| rec(pid, 1, "sleep 600", ProcessState::Sleeping))
+            .collect();
+        let inputs = processes
+            .iter()
+            .map(|process| {
+                (
+                    process.pid.0,
+                    DecisionCandidate {
+                        identity: process_identity_from_record(process),
+                        ppid: Some(1),
+                        decision: decision.clone(),
+                        blocked_reasons: Vec::new(),
+                        stage_pause_before_kill: false,
+                        process_state: Some(process.state),
+                        parent_identity: None,
+                        d_state_diagnostics: None,
+                    },
+                )
+            })
+            .collect();
+        let mut candidates = vec![
+            serde_json::json!({"pid": 400, "recommended_action": "keep", "reason": "useful"}),
+            serde_json::json!({"pid": 500, "recommended_action": "review", "reason": "uncertain"}),
+            cand(100),
+            cand(200),
+            cand(300),
+        ];
+        candidates[4]["posterior"] = serde_json::to_value(posterior).unwrap();
+        candidates[4]["action_rationale"] = serde_json::json!("abandonment evidence");
+        let original = candidates.clone();
+        let mut refs: Vec<_> = candidates.iter_mut().collect();
+        assert_eq!(
+            apply_planned_kill_budget(&mut refs, &processes, &policy, false),
+            1
+        );
+        assert_eq!(&candidates[..4], &original[..4]);
+        assert_eq!(candidates[4]["recommended_action"], "review");
+        assert_eq!(candidates[4]["posterior"], original[4]["posterior"]);
+        assert!(candidates[4]["action_rationale"]
+            .as_str()
+            .unwrap()
+            .contains("abandonment evidence"));
+        assert_eq!(candidates[4]["plan_budget"]["limit"], 2);
+
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-10-04T12:00:00Z".to_string(),
+        );
+        assert_eq!(
+            plan.actions
+                .iter()
+                .map(|action| action.target.pid.0)
+                .collect::<Vec<_>>(),
+            vec![100, 200]
+        );
+        for action in &plan.actions {
+            assert_eq!(action.action, Action::Kill);
+            assert_eq!(action.rationale.posterior, Some(posterior));
+            assert_eq!(
+                action.target.start_id.0,
+                format!("b:1:{}", action.target.pid.0)
+            );
+        }
+    }
+
+    #[test]
+    fn planned_kill_budget_refuses_zero_and_preserves_keep_review() {
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 0;
+        let processes: Vec<_> = [100, 200, 300, 400]
+            .into_iter()
+            .map(|pid| rec(pid, 1, "sleep 600", ProcessState::Sleeping))
+            .collect();
+        let mut candidates = vec![
+            cand(100),
+            serde_json::json!({"pid": 200, "recommended_action": "keep", "reason": "useful"}),
+            cand(300),
+            serde_json::json!({"pid": 400, "recommended_action": "review", "reason": "uncertain"}),
+        ];
+        let original = candidates.clone();
+        let mut refs: Vec<_> = candidates.iter_mut().collect();
+        assert_eq!(
+            apply_planned_kill_budget(&mut refs, &processes, &policy, true),
+            2
+        );
+        assert_eq!(candidates[1], original[1]);
+        assert_eq!(candidates[3], original[3]);
+        for index in [0, 2] {
+            assert_eq!(candidates[index]["recommended_action"], "review");
+            assert_eq!(candidates[index]["plan_budget"]["limit"], 0);
+        }
+    }
+
+    #[test]
+    fn planned_kill_budget_uses_stricter_robot_or_run_limit() {
+        let processes: Vec<_> = [100, 200, 300]
+            .into_iter()
+            .map(|pid| rec(pid, 1, "sleep 600", ProcessState::Sleeping))
+            .collect();
+        for (run_limit, robot_limit, expected) in [(3, 2, vec![100, 200]), (1, 3, vec![100])] {
+            let mut policy = pt_core::config::Policy::default();
+            policy.guardrails.max_kills_per_run = run_limit;
+            policy.robot_mode.max_kills = robot_limit;
+            let mut candidates = vec![cand(100), cand(200), cand(300)];
+            let mut refs: Vec<_> = candidates.iter_mut().collect();
+            apply_planned_kill_budget(&mut refs, &processes, &policy, true);
+            let remaining: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| candidate["recommended_action"] == "kill")
+                .map(|candidate| candidate["pid"].as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(remaining, expected);
+        }
+    }
+
+    #[test]
+    fn planned_kill_budget_selects_children_before_higher_ranked_parents() {
+        let processes = vec![
+            rec(100, 1, "sh", ProcessState::Sleeping),
+            rec(101, 100, "sh", ProcessState::Sleeping),
+            rec(102, 101, "sleep 600", ProcessState::Sleeping),
+        ];
+        for (limit, expected) in [(1, vec![102]), (2, vec![101, 102])] {
+            let mut policy = pt_core::config::Policy::default();
+            policy.guardrails.max_kills_per_run = limit;
+            let mut candidates = vec![cand(100), cand(101), cand(102)];
+            let mut refs: Vec<_> = candidates.iter_mut().collect();
+            apply_planned_kill_budget(&mut refs, &processes, &policy, false);
+            let remaining: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| candidate["recommended_action"] == "kill")
+                .map(|candidate| candidate["pid"].as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(remaining, expected);
+        }
+    }
+
+    #[test]
+    fn planned_kill_budget_preserves_unselected_live_child() {
+        let processes = vec![
+            rec(100, 1, "sh", ProcessState::Sleeping),
+            rec(101, 100, "sleep 600", ProcessState::Sleeping),
+            rec(200, 1, "sleep 600", ProcessState::Sleeping),
+        ];
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 1;
+        for child in [
+            None,
+            Some(serde_json::json!({"pid": 101, "recommended_action": "keep"})),
+        ] {
+            let mut candidates = vec![cand(100), cand(200)];
+            if let Some(child) = child {
+                candidates.push(child);
+            }
+            let mut refs: Vec<_> = candidates.iter_mut().collect();
+            apply_planned_kill_budget(&mut refs, &processes, &policy, false);
+            assert_eq!(candidates[0]["recommended_action"], "review");
+            assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+            assert_eq!(candidates[1]["recommended_action"], "kill");
+            if candidates.len() == 3 {
+                assert_eq!(candidates[2]["recommended_action"], "keep");
+            }
+        }
     }
 
     #[test]
@@ -13619,6 +13914,18 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     }
 
+    // Planning does not record executions, so enforce the final kill count after
+    // goal ranking and before both the displayed and executable plans are built.
+    {
+        let mut candidate_values: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
+        apply_planned_kill_budget(
+            &mut candidate_values,
+            &scan_result.processes,
+            &decision_policy,
+            global.robot,
+        );
+    }
+
     // Rebuild kill/review/spare candidate lists from the final sorted candidates
     let mut kill_candidates: Vec<u32> = Vec::new();
     let mut review_candidates: Vec<u32> = Vec::new();
@@ -14986,7 +15293,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .is_some_and(|snapshot| {
             serde_json::from_value::<pt_core::config::Policy>(snapshot.clone()).is_ok()
         });
-    if config.policy.robot_mode.require_policy_snapshot.unwrap_or(false) && !has_policy_snapshot {
+    if config
+        .policy
+        .robot_mode
+        .require_policy_snapshot
+        .unwrap_or(false)
+        && !has_policy_snapshot
+    {
         eprintln!("agent apply: current policy requires a valid recorded policy snapshot");
         return ExitCode::PolicyBlocked;
     }
