@@ -187,26 +187,47 @@ impl Drop for ForeignTarget {
     }
 }
 
-/// Nice value of a live process (from ps: portable across Linux and macOS).
+/// Read the kernel nice value. Linux ps displays '-' for scheduling classes
+/// where nice does not affect scheduling, even when a numeric value exists.
 fn nice_of(pid: u32) -> Result<i64, String> {
-    let out = ProcessCommand::new("ps")
-        .args(["-o", "nice=", "-p", &pid.to_string()])
-        .output()
-        .map_err(|error| format!("ps nice for {pid}: {error}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() {
-        return Err(format!(
-            "ps nice for {pid}: status={}, stdout={stdout:?}, stderr={stderr:?}",
-            out.status
-        ));
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: errno is thread-local. getpriority observes only this owned
+        // target, and clearing errno distinguishes a valid nice value of -1.
+        let (nice, error) = unsafe {
+            *libc::__errno_location() = 0;
+            let nice = libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t);
+            (nice, *libc::__errno_location())
+        };
+        if error != 0 {
+            return Err(format!(
+                "getpriority for {pid}: {}",
+                std::io::Error::from_raw_os_error(error)
+            ));
+        }
+        Ok(i64::from(nice))
     }
-    stdout.trim().parse().map_err(|error| {
-        format!(
-            "ps nice for {pid}: {error}, status={}, stdout={stdout:?}, stderr={stderr:?}",
-            out.status
-        )
-    })
+    #[cfg(target_os = "macos")]
+    {
+        let out = ProcessCommand::new("ps")
+            .args(["-o", "nice=", "-p", &pid.to_string()])
+            .output()
+            .map_err(|error| format!("ps nice for {pid}: {error}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            return Err(format!(
+                "ps nice for {pid}: status={}, stdout={stdout:?}, stderr={stderr:?}",
+                out.status
+            ));
+        }
+        stdout.trim().parse().map_err(|error| {
+            format!(
+                "ps nice for {pid}: {error}, status={}, stdout={stdout:?}, stderr={stderr:?}",
+                out.status
+            )
+        })
+    }
 }
 
 /// Live identity of `pid` exactly as a plan records it (via the real quick_scan).
@@ -545,15 +566,16 @@ fn agent_apply_persists_the_kill_budget_across_runs() {
     let first = ForeignTarget::spawn("sleep 351");
     let second = ForeignTarget::spawn("sleep 352");
     let third = ForeignTarget::spawn("sleep 353");
-    let mut first_action = plan_action(Action::Kill, &live_identity(first.pid));
+    let first_identity = live_identity(first.pid);
+    let second_identity = live_identity(second.pid);
+    let third_identity = live_identity(third.pid);
+    let mut first_action = plan_action(Action::Kill, &first_identity);
     first_action.action_id = "first-kill".to_string();
-    let mut second_action = plan_action(Action::Kill, &live_identity(second.pid));
+    let mut second_action = plan_action(Action::Kill, &second_identity);
     second_action.action_id = "second-kill".to_string();
     let first_session = session_with_actions(data_dir.path(), vec![first_action, second_action]);
-    let third_session = session_with_plan(
-        data_dir.path(),
-        plan_action(Action::Kill, &live_identity(third.pid)),
-    );
+    let third_session =
+        session_with_plan(data_dir.path(), plan_action(Action::Kill, &third_identity));
     let log_dir = Path::new("target/test-logs/e2e/rate_limit").join(format!(
         "{}-{}",
         std::process::id(),
@@ -566,6 +588,8 @@ fn agent_apply_persists_the_kill_budget_across_runs() {
         .open(log_dir.join("steps.jsonl"))
         .unwrap();
     let started = std::time::Instant::now();
+    let mut first_execution_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut first_budget_bytes = None;
     for (index, session) in [&first_session, &third_session].into_iter().enumerate() {
         let output = cargo_bin_cmd!("pt-core")
             .timeout(Duration::from_secs(120))
@@ -585,6 +609,9 @@ fn agent_apply_persists_the_kill_budget_across_runs() {
             ])
             .output()
             .unwrap();
+        let observed_at = chrono::Utc::now();
+        let budget_bytes = fs::read(data_dir.path().join("rate_limit.json")).unwrap();
+        fs::write(log_dir.join(format!("{index}.budget.json")), &budget_bytes).unwrap();
         fs::write(log_dir.join(format!("{index}.stdout.json")), &output.stdout).unwrap();
         fs::write(
             log_dir.join(format!("{index}.stderr.jsonl")),
@@ -597,41 +624,133 @@ fn agent_apply_persists_the_kill_budget_across_runs() {
             serde_json::json!({
                 "step": index, "session_id": session, "exit_code": output.status.code(),
                 "elapsed_ms": started.elapsed().as_millis(),
+                "observed_at": observed_at,
+                "first_pre_execution_at": first_execution_at,
                 "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&output.stdout),
                 "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&output.stderr),
+                "budget_sha256": pt_bundle::FileEntry::compute_checksum(&budget_bytes),
             })
         )
         .unwrap();
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let budget: Value = serde_json::from_slice(&budget_bytes).unwrap();
+        let charges = budget["kill_timestamps"].as_array().unwrap();
+        assert_eq!(charges.len(), 2, "{budget}");
+        assert_eq!(budget["pending_kill_intent"], false, "{budget}");
+        let charges: Vec<u64> = charges
+            .iter()
+            .map(|charge| charge.as_u64().unwrap())
+            .collect();
+        assert!(
+            charges.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{budget}"
+        );
+        assert!(
+            charges
+                .iter()
+                .all(|charge| *charge <= observed_at.timestamp().try_into().unwrap()),
+            "future kill charge: {budget}"
+        );
         if index == 0 {
             assert_eq!(output.status.code(), Some(2), "{result}");
             let outcomes = result["outcomes"].as_array().unwrap();
             assert_eq!(outcomes.len(), 2, "{result}");
-            assert!(
-                outcomes
-                    .iter()
-                    .all(|outcome| outcome["status"] == "success"),
-                "{result}"
-            );
+            for (outcome, (action_id, identity)) in outcomes.iter().zip([
+                ("first-kill", &first_identity),
+                ("second-kill", &second_identity),
+            ]) {
+                assert_eq!(outcome["action_id"], action_id, "{result}");
+                assert_eq!(outcome["pid"], identity.pid.0, "{result}");
+                assert_eq!(
+                    outcome["target"],
+                    serde_json::to_value(identity).unwrap(),
+                    "{result}"
+                );
+                assert_eq!(outcome["status"], "success", "{result}");
+                assert_eq!(outcome["kill_signal_delivered"], true, "{result}");
+                assert_eq!(outcome["signal_path"], SIGNAL_PATH, "{result}");
+                let executed_at =
+                    chrono::DateTime::parse_from_rfc3339(outcome["executed_at"].as_str().unwrap())
+                        .unwrap()
+                        .with_timezone(&chrono::Utc);
+                first_execution_at =
+                    Some(first_execution_at.map_or(executed_at, |first| first.min(executed_at)));
+            }
             assert!(!first.alive());
             assert!(!second.alive());
+            first_budget_bytes = Some(budget_bytes);
         } else {
-            assert!(
-                started.elapsed() < Duration::from_secs(60),
-                "minute-window probe ran too slowly"
+            // Bind the endpoint to the actual policy refusal, before reporting
+            // tail work. The start is captured before execution, not after slow
+            // verification when the durable charge is written. Total command
+            // latency remains recorded above and earns no performance credit.
+            let events: Vec<Value> = String::from_utf8(output.stderr.clone())
+                .unwrap()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|event| {
+                    event["event"] == "action_complete"
+                        && event["session_id"] == *session
+                        && event["phase"] == "apply"
+                        && event["details"]["action"] == "Kill"
+                        && event["details"]["action_id"] == "a-kill"
+                        && event["details"]["pid"] == third.pid
+                        && event["details"]["status"] == "blocked_by_policy"
+                })
+                .collect();
+            assert_eq!(
+                events.len(),
+                1,
+                "expected one exact third-action refusal event"
             );
+            let refused_at =
+                chrono::DateTime::parse_from_rfc3339(events[0]["timestamp"].as_str().unwrap())
+                    .unwrap()
+                    .with_timezone(&chrono::Utc);
+            assert!(refused_at <= observed_at, "refusal event is in the future");
+            let window = refused_at.signed_duration_since(first_execution_at.unwrap());
+            writeln!(
+                steps,
+                "{}",
+                serde_json::json!({
+                    "step": "minute_boundary", "first_pre_execution_at": first_execution_at,
+                    "refused_at": refused_at, "observed_at": observed_at,
+                    "window_ms": window.num_milliseconds(),
+                    "total_elapsed_ms": started.elapsed().as_millis(),
+                })
+            )
+            .unwrap();
+            assert!(
+                window >= chrono::Duration::zero() && window < chrono::Duration::seconds(60),
+                "third attempt is outside the original minute window: {window}"
+            );
+            assert_eq!(output.status.code(), Some(4), "{result}");
+            assert_eq!(result["outcomes"].as_array().unwrap().len(), 1, "{result}");
+            assert_eq!(result["outcomes"][0]["action_id"], "a-kill", "{result}");
+            assert_eq!(result["outcomes"][0]["pid"], third.pid, "{result}");
             assert_eq!(
                 result["outcomes"][0]["status"], "blocked_by_policy",
                 "{result}"
             );
             assert_eq!(result["outcomes"][0]["reason"], "rate_limit", "{result}");
-            assert_ne!(output.status.code(), Some(2), "{result}");
+            assert_eq!(
+                result["outcomes"][0]["violation"]["kind"], "rate_limit_exceeded",
+                "{result}"
+            );
+            assert_eq!(
+                result["outcomes"][0]["violation"]["message"],
+                "rate limit exceeded: 2 kills already performed this minute (max 2)",
+                "{result}"
+            );
             assert!(third.alive(), "rate-limited target was signaled");
+            assert_eq!(live_identity(third.pid), third_identity);
+            assert_eq!(
+                budget_bytes,
+                first_budget_bytes.as_ref().unwrap().as_slice(),
+                "refusal changed the durable budget"
+            );
         }
-        let budget: Value =
-            serde_json::from_slice(&fs::read(data_dir.path().join("rate_limit.json")).unwrap())
-                .unwrap();
-        assert_eq!(budget["kill_timestamps"].as_array().unwrap().len(), 2);
     }
 }
 
@@ -768,6 +887,50 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
 import ctypes, json, os, signal, sys, time
 from pathlib import Path
 assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+zombie_names = json.loads(sys.argv[2])
+supervision_ready = json.loads(sys.argv[3])
+zombie_parent_script = '''
+import ctypes, json, os, signal, sys, time
+from pathlib import Path
+libc = ctypes.CDLL(None, use_errno=True)
+# The exec'd Python runtime can retain its own read-only libffi descriptor.
+# Finish interpreter initialization, then establish the same exact descriptor
+# isolation as the sleep fixture before announcing the parent or forking.
+for fd in [int(name) for name in os.listdir('/proc/self/fd') if int(name) > 2]:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+supervision_ready = json.loads(sys.argv[2])
+if supervision_ready is not None:
+    assert libc.prctl(3, 0, 0, 0, 0) == 1
+    def make_nondumpable(signum, frame):
+        assert signum == signal.SIGUSR1
+        assert libc.prctl(4, 0, 0, 0, 0) == 0
+        evidence = {'status': 'READY', 'pid': os.getpid(), 'uid': os.getuid(),
+                    'dumpable': libc.prctl(3, 0, 0, 0, 0),
+                    'raw_stat': Path('/proc/self/stat').read_text()}
+        Path(supervision_ready).write_text(json.dumps(evidence))
+    signal.signal(signal.SIGUSR1, make_nondumpable)
+assert libc.prctl(15, ctypes.c_char_p(b'pt-zparent'), 0, 0, 0) == 0
+for name in json.loads(sys.argv[1]) or []:
+    child = os.fork()
+    if child == 0:
+        try:
+            assert libc.prctl(15, ctypes.c_char_p(name.encode()), 0, 0, 0) == 0
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+# Keep the two children unreaped until the owned subreaper ends this fixture.
+while True:
+    time.sleep(60)
+'''
+def reap_owned_children():
+    while True:
+        try:
+            os.waitpid(-1, 0)
+        except ChildProcessError:
+            return
 pid_read, pid_write = os.pipe()
 ack_read, ack_write = os.pipe()
 intermediate = os.fork()
@@ -785,7 +948,10 @@ if intermediate == 0:
                 os.close(fd)
             except OSError:
                 pass
-        os.execve('/usr/bin/sleep', ['sleep', sys.argv[1]], {'PATH': '/usr/bin:/bin'})
+        if zombie_names is None and supervision_ready is None:
+            os.execve('/usr/bin/sleep', ['sleep', sys.argv[1]], {'PATH': '/usr/bin:/bin'})
+        os.execve('/usr/bin/python3', ['python3', '-c', zombie_parent_script,
+                  json.dumps(zombie_names), json.dumps(supervision_ready)], {'PATH': '/usr/bin:/bin'})
     os.write(pid_write, str(target).encode() + b'\n')
     os.close(pid_write)
     if os.read(ack_read, 1) != b'1':
@@ -806,31 +972,75 @@ try:
 except BaseException:
     os.close(ack_write)
     assert os.waitpid(intermediate, 0) == (intermediate, 0)
+    reap_owned_children()
     raise
 try:
     os.write(ack_write, b'1')
     os.close(ack_write)
     assert os.waitpid(intermediate, 0) == (intermediate, 0)
     deadline = time.monotonic() + 5
-    while Path('/proc/' + str(target) + '/comm').read_text().strip() != 'sleep':
+    expected_comm = 'sleep' if zombie_names is None and supervision_ready is None else 'pt-zparent'
+    while Path('/proc/' + str(target) + '/comm').read_text().strip() != expected_comm:
         assert time.monotonic() < deadline
         time.sleep(0.01)
+    zombie_children = []
+    if zombie_names is not None:
+        while True:
+            children_file = Path('/proc/' + str(target) + '/task/' + str(target) + '/children')
+            zombie_children = [int(pid) for pid in children_file.read_text().split()]
+            observed = [(Path('/proc/' + str(pid) + '/comm').read_text().strip(),
+                         Path('/proc/' + str(pid) + '/stat').read_text().rsplit(') ', 1)[1].split()[0])
+                        for pid in zombie_children]
+            if len(observed) == 2 and sorted(name for name, state in observed) == sorted(zombie_names) \
+                    and all(state == 'Z' for name, state in observed):
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    descriptors = [{'fd': int(name),
+                    'destination': os.readlink('/proc/' + str(target) + '/fd/' + name),
+                    'raw_fdinfo': Path('/proc/' + str(target) + '/fdinfo/' + name).read_text()}
+                   for name in os.listdir('/proc/' + str(target) + '/fd')]
+    descriptors.sort(key=lambda descriptor: descriptor['fd'])
     print(json.dumps({'pid': target, 'former_parent': intermediate,
-                      'adoptive_parent': os.getpid()}), flush=True)
-    sys.stdin.readline()
+                      'adoptive_parent': os.getpid(), 'zombie_children': zombie_children,
+                      'descriptors': descriptors}), flush=True)
+    command = sys.stdin.readline()
+    if supervision_ready is not None and command:
+        assert command.strip() == 'nondumpable'
+        assert not Path(supervision_ready).exists()
+        signal.pidfd_send_signal(pidfd, signal.SIGUSR1, None, 0)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                ready = json.loads(Path(supervision_ready).read_text())
+                break
+            except (FileNotFoundError, json.JSONDecodeError):
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        assert ready['status'] == 'READY' and ready['pid'] == target and ready['dumpable'] == 0
+        print(json.dumps(ready), flush=True)
+        sys.stdin.readline()
 finally:
     try:
         signal.pidfd_send_signal(pidfd, signal.SIGKILL, None, 0)
     except ProcessLookupError:
         pass
     os.waitpid(target, 0)
+    reap_owned_children()
     os.close(pidfd)
     print('Owned pidfd target reaped; files retained', file=sys.stderr, flush=True)
 "#;
-    let spawn_owned_orphan = |target_log: &Path, seconds: &str, data: &Path, config: &Path| {
+    let spawn_owned_orphan = |target_log: &Path,
+                              seconds: &str,
+                              data: &Path,
+                              config: &Path,
+                              zombie_names: Option<&[String; 2]>,
+                              supervision_ready: Option<&Path>| {
         let mut reaper = OwnedSubreaper(
             ProcessCommand::new("python3")
                 .args(["-u", "-c", script, seconds])
+                .arg(serde_json::to_string(&zombie_names).unwrap())
+                .arg(serde_json::to_string(&supervision_ready).unwrap())
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .stdin(Stdio::piped())
@@ -840,7 +1050,7 @@ finally:
                 .expect("spawn owned subreaper"),
         );
         let mut line = String::new();
-        std::io::BufReader::new(reaper.0.stdout.take().expect("adoption evidence pipe"))
+        std::io::BufReader::new(reaper.0.stdout.as_mut().expect("adoption evidence pipe"))
             .read_line(&mut line)
             .expect("read adopted target evidence");
         let adoption: Value = serde_json::from_str(&line).expect("actual kernel adoption evidence");
@@ -879,20 +1089,14 @@ finally:
             let path = path.unwrap().path();
             let fd: u32 = path.file_name().unwrap().to_str().unwrap().parse().unwrap();
             let destination = fs::read_link(&path).unwrap();
-            assert_eq!(destination, Path::new("/dev/null"));
             let raw_fdinfo = fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).unwrap();
             descriptors.push(
                 serde_json::json!({"fd":fd, "destination":destination, "raw_fdinfo":raw_fdinfo}),
             );
         }
         descriptors.sort_by_key(|descriptor| descriptor["fd"].as_u64().unwrap());
-        assert_eq!(
-            descriptors
-                .iter()
-                .map(|descriptor| descriptor["fd"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
+        // Persist actual readiness and descriptor observations before asserting
+        // their shape so a failed owned fixture remains diagnosable.
         fs::write(
             target_log.join("owned-target-before.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -903,10 +1107,29 @@ finally:
             .unwrap(),
         )
         .unwrap();
+        for descriptor in &descriptors {
+            assert_eq!(
+                Path::new(descriptor["destination"].as_str().unwrap()),
+                Path::new("/dev/null")
+            );
+        }
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor["fd"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         (reaper, target, identity)
     };
-    let (mut reaper, _target, identity) =
-        spawn_owned_orphan(&log_dir, &unique_seconds, &data_dir, &config_dir);
+    let (mut reaper, _target, identity) = spawn_owned_orphan(
+        &log_dir,
+        &unique_seconds,
+        &data_dir,
+        &config_dir,
+        None,
+        None,
+    );
     let pid = identity.pid.0;
 
     // This intentionally strong typed prior is input to the real Bayesian path,
@@ -1279,6 +1502,236 @@ finally:
         .as_str()
         .unwrap()
         .contains(&unique_seconds));
+
+    // Resume consumes the actual saved execution, never a manufactured success
+    // record. The still-running owned subreaper supplies an independent live
+    // identity whose survival is checked across every evidence refusal.
+    let resume_survivor = live_identity(reaper.0.id());
+    assert!(state_of(resume_survivor.pid.0).is_some_and(|state| state != 'Z'));
+    let outcomes_path = handle.dir.join("action/outcomes.jsonl");
+    let original_outcomes = fs::read(&outcomes_path).unwrap();
+    let original_budget = fs::read(data_dir.join("rate_limit.json")).unwrap();
+    fs::write(
+        log_dir.join("resume-original-outcomes.jsonl"),
+        &original_outcomes,
+    )
+    .unwrap();
+    fs::write(
+        log_dir.join("resume-original-budget.json"),
+        &original_budget,
+    )
+    .unwrap();
+    let assert_resume_unchanged = |expected_plan: &[u8], expected_outcomes: &[u8]| {
+        assert_eq!(
+            fs::read(handle.dir.join("decision/plan.json")).unwrap(),
+            expected_plan
+        );
+        assert_eq!(fs::read(&outcomes_path).unwrap(), expected_outcomes);
+        assert_eq!(
+            fs::read(data_dir.join("rate_limit.json")).unwrap(),
+            original_budget
+        );
+        assert!(state_of(resume_survivor.pid.0).is_some_and(|state| state != 'Z'));
+        assert_eq!(live_identity(resume_survivor.pid.0), resume_survivor);
+        assert!(state_of(pid).is_none_or(|state| state == 'Z'));
+    };
+    let resume_args = [
+        "--format",
+        "json",
+        "agent",
+        "apply",
+        "--session",
+        session,
+        "--resume",
+        "--yes",
+        "--recommended",
+    ];
+    let resumed = run_step(
+        &log_dir,
+        "resume_actual_success",
+        &resume_args,
+        &data_dir,
+        &config_dir,
+        30,
+    );
+    assert_eq!(
+        resumed.status.code(),
+        Some(pt_core::exit_codes::ExitCode::Clean.as_i32()),
+        "{resumed:?}"
+    );
+    let resume_result: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(resume_result["session_id"], session);
+    assert_eq!(resume_result["note"], "nothing_to_do");
+    assert_eq!(resume_result["summary"]["attempted"], 0);
+    assert!(resume_result["outcomes"].as_array().unwrap().is_empty());
+    assert_resume_unchanged(&persisted, &original_outcomes);
+
+    let saved_outcomes: Vec<Value> = std::str::from_utf8(&original_outcomes)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let successful_index = saved_outcomes
+        .iter()
+        .position(|saved| saved["action_id"] == action.action_id && saved["status"] == "success")
+        .expect("actual producer action has its real successful outcome");
+    assert_eq!(
+        saved_outcomes[successful_index]["target"],
+        serde_json::to_value(&identity).unwrap()
+    );
+    let mut start_parts = identity.start_id.0.rsplitn(3, ':');
+    assert_eq!(start_parts.next().unwrap().parse::<u32>().unwrap(), pid);
+    let wrong_birth = start_parts
+        .next()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        .checked_add(1)
+        .unwrap();
+    let wrong_start_id = format!("{}:{wrong_birth}:{pid}", start_parts.next().unwrap());
+    for field in ["pid", "start_id", "uid", "executed_at"] {
+        let mut altered = saved_outcomes.clone();
+        let saved_success = &mut altered[successful_index];
+        match field {
+            "pid" => {
+                saved_success["pid"] = serde_json::json!(resume_survivor.pid.0);
+                saved_success["target"]["pid"] = serde_json::json!(resume_survivor.pid.0);
+            }
+            "start_id" => saved_success["target"]["start_id"] = serde_json::json!(wrong_start_id),
+            "uid" => {
+                saved_success["target"]["uid"] = serde_json::json!(identity.uid.wrapping_add(1));
+            }
+            "executed_at" => {
+                saved_success["executed_at"] =
+                    serde_json::json!(chrono::Utc::now() + chrono::Duration::days(1));
+            }
+            _ => unreachable!("fixed identity mutation cases"),
+        }
+        assert_eq!(saved_success["action_id"], action.action_id);
+        assert_eq!(saved_success["status"], "success");
+        let altered_bytes = altered
+            .iter()
+            .map(|saved| serde_json::to_string(saved).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&outcomes_path, altered_bytes.as_bytes()).unwrap();
+        fs::write(
+            log_dir.join(format!("resume-tampered-{field}-outcomes.jsonl")),
+            altered_bytes.as_bytes(),
+        )
+        .unwrap();
+        let refused = run_step(
+            &log_dir,
+            &format!("resume_tampered_{field}"),
+            &resume_args,
+            &data_dir,
+            &config_dir,
+            30,
+        );
+        assert_eq!(
+            refused.status.code(),
+            Some(pt_core::exit_codes::ExitCode::PolicyBlocked.as_i32()),
+            "{refused:?}"
+        );
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            error.contains("saved execution evidence is invalid for this Plan; refusing --resume")
+        );
+        if field == "executed_at" {
+            assert!(error.contains("invalid execution timestamp"));
+            assert!(error.contains(&format!(
+                "{} execution occurs after verification",
+                action.action_id
+            )));
+        } else {
+            assert!(error.contains(&format!(
+                "{} executed target does not match the plan",
+                action.action_id
+            )));
+        }
+        assert_resume_unchanged(&persisted, altered_bytes.as_bytes());
+        fs::write(&outcomes_path, &original_outcomes).unwrap();
+        assert_resume_unchanged(&persisted, &original_outcomes);
+    }
+
+    let mut malformed_outcomes = original_outcomes.clone();
+    malformed_outcomes.extend_from_slice(b"\n{malformed-outcome\n");
+    fs::write(&outcomes_path, &malformed_outcomes).unwrap();
+    fs::write(
+        log_dir.join("resume-malformed-outcomes.jsonl"),
+        &malformed_outcomes,
+    )
+    .unwrap();
+    let refused = run_step(
+        &log_dir,
+        "resume_malformed_outcomes",
+        &resume_args,
+        &data_dir,
+        &config_dir,
+        30,
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(pt_core::exit_codes::ExitCode::PolicyBlocked.as_i32()),
+        "{refused:?}"
+    );
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(error.contains("saved execution evidence is invalid for this Plan; refusing --resume"));
+    assert!(error.contains("invalid saved action outcomes: line "));
+    assert_resume_unchanged(&persisted, &malformed_outcomes);
+    fs::write(&outcomes_path, &original_outcomes).unwrap();
+    assert_resume_unchanged(&persisted, &original_outcomes);
+
+    for corruption in ["duplicate_id", "empty_id", "session_id"] {
+        let mut altered_plan: Value = serde_json::from_slice(&persisted).unwrap();
+        match corruption {
+            "duplicate_id" => {
+                let duplicate = altered_plan["actions"][0].clone();
+                altered_plan["actions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(duplicate);
+            }
+            "empty_id" => altered_plan["actions"][0]["action_id"] = serde_json::json!(""),
+            "session_id" => altered_plan["session_id"] = serde_json::json!(SessionId::new().0),
+            _ => unreachable!("fixed canonical Plan mutation cases"),
+        }
+        let altered_bytes = serde_json::to_vec(&altered_plan).unwrap();
+        fs::write(handle.dir.join("decision/plan.json"), &altered_bytes).unwrap();
+        fs::write(
+            log_dir.join(format!("resume-invalid-plan-{corruption}.json")),
+            &altered_bytes,
+        )
+        .unwrap();
+        let refused = run_step(
+            &log_dir,
+            &format!("resume_invalid_plan_{corruption}"),
+            &resume_args,
+            &data_dir,
+            &config_dir,
+            30,
+        );
+        assert_eq!(
+            refused.status.code(),
+            Some(pt_core::exit_codes::ExitCode::InternalError.as_i32()),
+            "{refused:?}"
+        );
+        let error = String::from_utf8_lossy(&refused.stderr);
+        if corruption == "session_id" {
+            assert!(error.contains("plan session "));
+            assert!(error.contains(" does not match requested session "));
+            assert!(error.contains(altered_plan["session_id"].as_str().unwrap()));
+            assert!(error.contains(session));
+        } else {
+            assert!(error.contains("invalid plan.json"));
+            assert!(error.contains("empty or duplicate action_id"));
+        }
+        assert_resume_unchanged(&altered_bytes, &original_outcomes);
+        fs::write(handle.dir.join("decision/plan.json"), &persisted).unwrap();
+        assert_resume_unchanged(&persisted, &original_outcomes);
+    }
     drop(reaper.0.stdin.take());
     assert!(reaper.0.wait().expect("reap owned subreaper").success());
     eprint!(
@@ -1342,10 +1795,22 @@ finally:
     let second_log = drift_log.join("second-target");
     fs::create_dir_all(&first_log).unwrap();
     fs::create_dir_all(&second_log).unwrap();
-    let (mut first_reaper, _first_target, first_identity) =
-        spawn_owned_orphan(&first_log, &durations[0], &drift_data, &drift_config);
-    let (mut second_reaper, _second_target, second_identity) =
-        spawn_owned_orphan(&second_log, &durations[1], &drift_data, &drift_config);
+    let (mut first_reaper, _first_target, first_identity) = spawn_owned_orphan(
+        &first_log,
+        &durations[0],
+        &drift_data,
+        &drift_config,
+        None,
+        None,
+    );
+    let (mut second_reaper, _second_target, second_identity) = spawn_owned_orphan(
+        &second_log,
+        &durations[1],
+        &drift_data,
+        &drift_config,
+        None,
+        None,
+    );
     let identities = [&first_identity, &second_identity];
     let mut sessions = Vec::new();
     let mut produced = Vec::new();
@@ -1531,6 +1996,880 @@ finally:
             fs::read_to_string(target_log.join("target-launch.stderr")).unwrap()
         );
     }
+
+    // Genuine producer-only zombie routing: one adopted parent holds two dead,
+    // unreaped children. This checks eligibility and stable contracts, not live
+    // reaping or inference calibration. The real SIGCHLD tests below stay separate;
+    // missing-parent coverage remains the generated-Plan unit's bounded scope.
+    let zombie_log = log_dir.join("two-zombie-routing");
+    fs::create_dir_all(&zombie_log).unwrap();
+    let zombie_data = TempDir::new().expect("zombie data dir").keep();
+    let zombie_config = TempDir::new().expect("zombie config dir").keep();
+    let mut zombie_policy: Policy = serde_json::from_value(configured.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&zombie_policy).unwrap(), configured);
+    fs::write(
+        zombie_config.join("policy.json"),
+        serde_json::to_vec_pretty(&zombie_policy).unwrap(),
+    )
+    .unwrap();
+    let zombie_names = [
+        format!("ptz{}a", std::process::id()),
+        format!("ptz{}b", std::process::id()),
+    ];
+    assert!(zombie_names.iter().all(|name| name.len() <= 15));
+    let parent_ready_path =
+        zombie_log.join(format!("nondumpable-parent-{}.json", uuid::Uuid::new_v4()));
+    assert!(!parent_ready_path.exists());
+    let (mut zombie_reaper, _zombie_parent, parent_identity) = spawn_owned_orphan(
+        &zombie_log,
+        "zombie-parent",
+        &zombie_data,
+        &zombie_config,
+        Some(&zombie_names),
+        Some(&parent_ready_path),
+    );
+    // SAFETY: geteuid only observes this test's caller. The permission-denial
+    // phase below requires the genuine unprivileged owner of this exact parent.
+    let zombie_owner_uid = unsafe { libc::geteuid() };
+    assert_ne!(zombie_owner_uid, 0);
+    assert_eq!(parent_identity.uid, zombie_owner_uid);
+    let ownership: Value =
+        serde_json::from_slice(&fs::read(zombie_log.join("owned-target-before.json")).unwrap())
+            .unwrap();
+    let child_pids: Vec<u32> = ownership["adoption"]["zombie_children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pid| pid.as_u64().unwrap().try_into().unwrap())
+        .collect();
+    assert_eq!(child_pids.len(), 2);
+    assert_ne!(child_pids[0], child_pids[1]);
+    let scan = quick_scan(&QuickScanOptions {
+        pids: child_pids
+            .iter()
+            .copied()
+            .chain(std::iter::once(parent_identity.pid.0))
+            .collect(),
+        include_kernel_threads: false,
+        timeout: Some(Duration::from_secs(30)),
+        progress: None,
+    })
+    .expect("observe actual owned parent and zombies");
+    let parent_record = scan
+        .processes
+        .iter()
+        .find(|record| record.pid == parent_identity.pid)
+        .expect("owned parent in actual scan");
+    assert!(!parent_record.state.is_zombie());
+    assert_eq!(parent_record.comm, "pt-zparent");
+    assert_eq!(parent_record.uid, parent_identity.uid);
+    assert_eq!(parent_record.start_id, parent_identity.start_id);
+    let mut zombies = Vec::new();
+    let mut zombie_signatures = SignatureSchema::new();
+    for pid in &child_pids {
+        let record = scan
+            .processes
+            .iter()
+            .find(|record| record.pid.0 == *pid)
+            .expect("actual owned zombie in scan")
+            .clone();
+        assert!(record.state.is_zombie(), "{record:?}");
+        assert_eq!(record.ppid, parent_identity.pid);
+        assert_eq!(record.uid, parent_identity.uid);
+        assert!(zombie_names.contains(&record.comm), "{record:?}");
+        assert!(!record.cmd.is_empty());
+        let identity = live_identity(*pid);
+        assert_eq!(identity.start_id, record.start_id);
+        assert_eq!(identity.uid, record.uid);
+        let pattern = format!("^{}$", regex::escape(&record.comm));
+        zombie_signatures.add(
+            SupervisorSignature::new(
+                format!("owned-zombie-{}", record.comm),
+                SupervisorCategory::Other,
+            )
+            .with_process_patterns(vec![&pattern])
+            .with_priors(SignaturePriors {
+                useful: Some(BetaParams::new(1.0, 999.0)),
+                useful_bad: Some(BetaParams::new(1.0, 999.0)),
+                abandoned: Some(BetaParams::new(1.0, 999.0)),
+                zombie: Some(BetaParams::new(999.0, 1.0)),
+            }),
+        );
+        fs::write(
+            zombie_log.join(format!("{pid}-actual-observation.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "identity":identity, "ppid":record.ppid, "comm":record.comm,
+                "command":record.cmd, "state":record.state.to_string(),
+                "raw_stat":fs::read_to_string(format!("/proc/{pid}/stat")).unwrap(),
+                "raw_status":fs::read_to_string(format!("/proc/{pid}/status")).unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        zombies.push((record, identity));
+    }
+    assert_ne!(zombies[0].0.comm, zombies[1].0.comm);
+    zombie_signatures.validate_for_activation().unwrap();
+    fs::write(
+        zombie_config.join("signatures.json"),
+        zombie_signatures.to_json().unwrap(),
+    )
+    .unwrap();
+    let validated = run_step(
+        &zombie_log,
+        "signature_validate",
+        &["--format", "json", "signature", "validate"],
+        &zombie_data,
+        &zombie_config,
+        30,
+    );
+    assert_eq!(validated.status.code(), Some(0), "{validated:?}");
+    let selected_pids = child_pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    for protected_parent in [false, true] {
+        if protected_parent {
+            zombie_policy
+                .guardrails
+                .never_kill_pid
+                .push(parent_identity.pid.0);
+            let mut restored = serde_json::to_value(&zombie_policy).unwrap();
+            restored["guardrails"]["never_kill_pid"] =
+                configured["guardrails"]["never_kill_pid"].clone();
+            assert_eq!(restored, configured);
+            fs::write(
+                zombie_config.join("policy.json"),
+                serde_json::to_vec_pretty(&zombie_policy).unwrap(),
+            )
+            .unwrap();
+        }
+        let planned = run_step(
+            &zombie_log,
+            if protected_parent {
+                "plan-protected-parent"
+            } else {
+                "plan-two-zombies"
+            },
+            &[
+                "--robot",
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--min-age",
+                "0",
+                "--max-candidates",
+                "20",
+                "--pids",
+                &selected_pids,
+            ],
+            &zombie_data,
+            &zombie_config,
+            180,
+        );
+        assert_eq!(planned.status.code(), Some(1), "{planned:?}");
+        let document: Value = serde_json::from_slice(&planned.stdout).unwrap();
+        let session = SessionId::parse(document["session_id"].as_str().unwrap()).unwrap();
+        let handle = SessionStore::at_data_dir(&zombie_data)
+            .open(&session)
+            .unwrap();
+        let recorded = fs::read(handle.dir.join("decision/plan.json")).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&recorded).unwrap(),
+            document
+        );
+        let canonical = pt_core::verify::parse_agent_plan(std::str::from_utf8(&recorded).unwrap())
+            .expect("real verification consumer accepts generated unique action IDs");
+        assert_eq!(document["candidates"].as_array().unwrap().len(), 2);
+        let advertised = document["recommended"]["actions"].as_array().unwrap();
+        assert_eq!(advertised.len(), canonical.actions.len());
+        assert!(document["recommendations"]["kill_set"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(document["recommendations"]["spare_set"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        if protected_parent {
+            assert!(canonical.actions.is_empty());
+            assert!(canonical.pre_toggled.is_empty());
+            assert_eq!(canonical.gates_summary.blocked_candidates, 2);
+            assert_eq!(canonical.gates_summary.pre_toggled_actions, 0);
+            let mut reviewed: Vec<u32> = document["recommendations"]["review_set"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pid| pid.as_u64().unwrap() as u32)
+                .collect();
+            reviewed.sort_unstable();
+            let mut expected = child_pids.clone();
+            expected.sort_unstable();
+            assert_eq!(reviewed, expected);
+        } else {
+            assert_eq!(canonical.actions.len(), 2);
+            assert_ne!(
+                canonical.actions[0].action_id,
+                canonical.actions[1].action_id
+            );
+            assert_eq!(canonical.pre_toggled.len(), 2);
+            assert_eq!(canonical.gates_summary.blocked_candidates, 0);
+            assert_eq!(canonical.gates_summary.pre_toggled_actions, 2);
+            assert!(document["recommendations"]["review_set"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            for (advertised, action) in advertised.iter().zip(&canonical.actions) {
+                assert_eq!(action.action, Action::Restart);
+                assert_eq!(action.routing, ActionRouting::ZombieToParent);
+                assert_eq!(action.target, parent_identity);
+                assert!(!action.blocked);
+                assert!(action
+                    .pre_checks
+                    .contains(&pt_core::plan::PreCheck::VerifyIdentity));
+                assert_eq!(advertised["pid"], action.target.pid.0);
+                assert_eq!(advertised["action"], "restart");
+                assert_eq!(advertised["action_id"], action.action_id);
+                assert_eq!(advertised["stage"], action.stage);
+                assert!(canonical.pre_toggled.contains(&action.action_id));
+            }
+        }
+        for (record, identity) in &zombies {
+            let candidate = document["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|candidate| candidate["pid"] == identity.pid.0)
+                .unwrap();
+            assert_eq!(candidate["start_id"], identity.start_id.0);
+            assert_eq!(candidate["uid"], identity.uid);
+            assert_eq!(candidate["ppid"], parent_identity.pid.0);
+            assert_eq!(candidate["state"], record.state.to_string());
+            assert_eq!(candidate["command_short"], record.comm);
+            assert_eq!(candidate["command"], record.cmd);
+            assert_eq!(candidate["supervisor"]["subject_kind"], "zombie_parent");
+            assert_eq!(
+                candidate["supervisor"]["subject_identity"],
+                serde_json::to_value(&parent_identity).unwrap()
+            );
+            assert_eq!(candidate["supervisor"]["status"], "observed");
+            assert_eq!(candidate["supervisor"]["detected"], false);
+            assert_eq!(candidate["source_supervisor"]["subject_kind"], "process");
+            assert_eq!(
+                candidate["source_supervisor"]["subject_identity"],
+                serde_json::to_value(identity).unwrap()
+            );
+            let child_supervision_error =
+                pt_core::supervision::detect_supervision(identity.pid.0).unwrap_err();
+            match &child_supervision_error {
+                pt_core::supervision::DetectionError::Environment(
+                    pt_core::supervision::EnvironError::IoError { pid, source },
+                ) => {
+                    assert_eq!(*pid, identity.pid.0);
+                    assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+                }
+                other => panic!("expected actual dead-child environment denial, got {other}"),
+            }
+            assert_eq!(candidate["source_supervisor"]["status"], "unknown");
+            assert!(candidate["source_supervisor"]["detected"].is_null());
+            assert_eq!(
+                candidate["source_supervisor"]["reason"],
+                format!(
+                    "Mandatory supervision evidence unavailable for PID {}: {child_supervision_error}",
+                    identity.pid.0
+                )
+            );
+            assert_eq!(candidate["inference"]["prior_source"], "signature");
+            assert_eq!(
+                candidate["signature"]["name"],
+                format!("owned-zombie-{}", record.comm)
+            );
+            if protected_parent {
+                assert_eq!(candidate["policy_blocked"], true);
+                assert_eq!(candidate["recommended_action"], "review");
+                assert_eq!(candidate["recommendation"], "REVIEW");
+                assert_eq!(
+                    candidate["zombie_routing"]["parent_protected_by"],
+                    format!("never_kill_pid[{}]", parent_identity.pid.0)
+                );
+                let refusal = format!(
+                    "parent is protected by never_kill_pid[{}]",
+                    parent_identity.pid.0
+                );
+                assert_eq!(candidate["zombie_routing"]["refusal"], refusal);
+                assert_eq!(candidate["execution_plan"]["reason"], refusal);
+            } else {
+                assert_eq!(candidate["policy_blocked"], false);
+                assert_eq!(candidate["recommended_action"], "restart");
+                assert_eq!(candidate["recommendation"], "RESTART");
+                let action = canonical
+                    .actions
+                    .iter()
+                    .find(|action| action.original_zombie_target.as_ref() == Some(identity))
+                    .unwrap();
+                assert_eq!(
+                    candidate["action_target"],
+                    serde_json::to_value(&parent_identity).unwrap()
+                );
+                assert_eq!(
+                    candidate["plan_action_ids"],
+                    serde_json::json!([action.action_id])
+                );
+            }
+            assert_eq!(state_of(identity.pid.0), Some('Z'));
+            assert_eq!(live_identity(identity.pid.0), *identity);
+        }
+        assert!(state_of(parent_identity.pid.0).is_some_and(|state| state != 'Z'));
+        assert_eq!(live_identity(parent_identity.pid.0), parent_identity);
+        assert!(!handle.dir.join("action/outcomes.jsonl").exists());
+        assert!(!zombie_data.join("rate_limit.json").exists());
+    }
+
+    // Keep the exact same two zombies and live parent, removing only the
+    // preceding declared parent-protection entry. Actual PR_SET_DUMPABLE denial
+    // must now block the routed parent's mandatory evidence, even though the
+    // original dead-child observations were already Unknown in the positive.
+    zombie_policy = serde_json::from_value(configured.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&zombie_policy).unwrap(), configured);
+    fs::write(
+        zombie_config.join("policy.json"),
+        serde_json::to_vec_pretty(&zombie_policy).unwrap(),
+    )
+    .unwrap();
+    zombie_reaper
+        .0
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"nondumpable\n")
+        .unwrap();
+    let mut parent_ready_line = String::new();
+    std::io::BufReader::new(zombie_reaper.0.stdout.as_mut().unwrap())
+        .read_line(&mut parent_ready_line)
+        .unwrap();
+    let parent_ready: Value = serde_json::from_str(&parent_ready_line).unwrap();
+    let parent_pid = parent_identity.pid.0;
+    assert_eq!(parent_ready["status"], "READY");
+    assert_eq!(parent_ready["pid"], parent_pid);
+    assert_eq!(parent_ready["uid"], zombie_owner_uid);
+    assert_eq!(parent_ready["dumpable"], 0);
+    assert_eq!(
+        fs::read(&parent_ready_path).unwrap(),
+        parent_ready_line.trim_end().as_bytes()
+    );
+    assert_eq!(live_identity(parent_pid), parent_identity);
+    let parent_raw_stat = fs::read_to_string(format!("/proc/{parent_pid}/stat")).unwrap();
+    let ready_stat_fields: Vec<_> = parent_ready["raw_stat"]
+        .as_str()
+        .unwrap()
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    let current_stat_fields: Vec<_> = parent_raw_stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    for field in [1, 3, 19] {
+        assert_eq!(ready_stat_fields[field], current_stat_fields[field]);
+    }
+    let parent_environment_error = fs::read(format!("/proc/{parent_pid}/environ")).unwrap_err();
+    let parent_descriptor_error = fs::read_dir(format!("/proc/{parent_pid}/fd")).unwrap_err();
+    assert_eq!(
+        parent_environment_error.kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        parent_descriptor_error.kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let parent_supervision_error =
+        pt_core::supervision::detect_supervision(parent_pid).unwrap_err();
+    match &parent_supervision_error {
+        pt_core::supervision::DetectionError::Environment(
+            pt_core::supervision::EnvironError::IoError { pid, source },
+        ) => {
+            assert_eq!(*pid, parent_pid);
+            assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        other => panic!("expected actual parent environment permission error, got {other}"),
+    }
+    let parent_mandatory_reason = format!(
+        "Mandatory supervision evidence unavailable for PID {parent_pid}: {parent_supervision_error}"
+    );
+    fs::write(
+        zombie_log.join("actual-parent-permission-denial.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "ready":parent_ready, "identity":parent_identity, "raw_stat":parent_raw_stat,
+            "environment_error":parent_environment_error.to_string(),
+            "descriptor_error":parent_descriptor_error.to_string(),
+            "supervision_error":parent_supervision_error.to_string(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let planned = run_step(
+        &zombie_log,
+        "plan-unreadable-parent",
+        &[
+            "--robot",
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--min-age",
+            "0",
+            "--max-candidates",
+            "20",
+            "--pids",
+            &selected_pids,
+        ],
+        &zombie_data,
+        &zombie_config,
+        180,
+    );
+    assert_eq!(planned.status.code(), Some(1), "{planned:?}");
+    let document: Value = serde_json::from_slice(&planned.stdout).unwrap();
+    let session = SessionId::parse(document["session_id"].as_str().unwrap()).unwrap();
+    let handle = SessionStore::at_data_dir(&zombie_data)
+        .open(&session)
+        .unwrap();
+    let recorded = fs::read(handle.dir.join("decision/plan.json")).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recorded).unwrap(),
+        document
+    );
+    let canonical = pt_core::verify::parse_agent_plan(std::str::from_utf8(&recorded).unwrap())
+        .expect("real consumer accepts the parent's Unknown review-only Plan");
+    assert!(canonical.actions.is_empty());
+    assert!(canonical.pre_toggled.is_empty());
+    assert_eq!(canonical.gates_summary.blocked_candidates, 2);
+    assert_eq!(canonical.gates_summary.pre_toggled_actions, 0);
+    assert!(document["recommended"]["actions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(document["recommendations"]["kill_set"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(document["recommendations"]["spare_set"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let mut reviewed: Vec<u32> = document["recommendations"]["review_set"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pid| pid.as_u64().unwrap() as u32)
+        .collect();
+    reviewed.sort_unstable();
+    let mut expected = child_pids.clone();
+    expected.sort_unstable();
+    assert_eq!(reviewed, expected);
+    assert_eq!(document["candidates"].as_array().unwrap().len(), 2);
+    for (record, identity) in &zombies {
+        let candidate = document["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["pid"] == identity.pid.0)
+            .unwrap();
+        assert_eq!(candidate["start_id"], identity.start_id.0);
+        assert_eq!(candidate["uid"], identity.uid);
+        assert_eq!(candidate["ppid"], parent_pid);
+        assert_eq!(candidate["state"], record.state.to_string());
+        assert_eq!(candidate["command"], record.cmd);
+        assert_eq!(candidate["inference"]["prior_source"], "signature");
+        assert_eq!(
+            candidate["signature"]["name"],
+            format!("owned-zombie-{}", record.comm)
+        );
+        assert_eq!(candidate["supervisor"]["subject_kind"], "zombie_parent");
+        assert_eq!(
+            candidate["supervisor"]["subject_identity"],
+            serde_json::to_value(&parent_identity).unwrap()
+        );
+        assert_eq!(candidate["supervisor"]["status"], "unknown");
+        assert!(candidate["supervisor"]["detected"].is_null());
+        assert_eq!(candidate["supervisor"]["recommended_action"], "review");
+        assert_eq!(candidate["supervisor"]["reason"], parent_mandatory_reason);
+        assert_eq!(candidate["source_supervisor"]["subject_kind"], "process");
+        assert_eq!(
+            candidate["source_supervisor"]["subject_identity"],
+            serde_json::to_value(identity).unwrap()
+        );
+        assert_eq!(candidate["source_supervisor"]["status"], "unknown");
+        assert!(candidate["source_supervisor"]["detected"].is_null());
+        assert_eq!(candidate["recommended_action"], "review");
+        assert_eq!(candidate["recommendation"], "REVIEW");
+        assert!(candidate["action_rationale"]
+            .as_str()
+            .unwrap()
+            .contains(&parent_mandatory_reason));
+        assert_eq!(state_of(identity.pid.0), Some('Z'));
+        assert_eq!(live_identity(identity.pid.0), *identity);
+    }
+    assert!(state_of(parent_pid).is_some_and(|state| state != 'Z'));
+    assert_eq!(live_identity(parent_pid), parent_identity);
+    assert!(!handle.dir.join("action/outcomes.jsonl").exists());
+    assert!(!zombie_data.join("rate_limit.json").exists());
+    drop(zombie_reaper.0.stdin.take());
+    assert!(zombie_reaper.0.wait().unwrap().success());
+    eprint!(
+        "{}",
+        fs::read_to_string(zombie_log.join("target-launch.stderr")).unwrap()
+    );
+
+    // Isolate mandatory-supervision availability from the recent-I/O window.
+    // This phase alone declares a zero I/O threshold; loss, FDR, confidence,
+    // builtin protection and the open-file gate remain their original defaults.
+    // A readable real producer plan is followed by a genuine same-UID procfs
+    // permission denial, not a synthetic Plan or simulated permission result.
+    // SAFETY: geteuid only observes the caller's effective user identity.
+    let caller_uid = unsafe { libc::geteuid() };
+    assert_ne!(caller_uid, 0, "requires an unprivileged fixture caller");
+    let supervision_log = log_dir.join("mandatory-supervision-unknown");
+    fs::create_dir_all(&supervision_log).unwrap();
+    let supervision_data = TempDir::new().expect("supervision data dir").keep();
+    let supervision_config = TempDir::new().expect("supervision config dir").keep();
+    let ready_path = supervision_log.join(format!("nondumpable-{}.json", uuid::Uuid::new_v4()));
+    assert!(!ready_path.exists());
+    let mut supervision_policy: Policy = serde_json::from_value(configured.clone()).unwrap();
+    supervision_policy
+        .data_loss_gates
+        .block_if_recent_io_seconds = Some(0);
+    let (mut supervision_reaper, _supervision_target, supervision_identity) = spawn_owned_orphan(
+        &supervision_log,
+        "supervision-probe",
+        &supervision_data,
+        &supervision_config,
+        None,
+        Some(&ready_path),
+    );
+    let supervision_pid = supervision_identity.pid.0;
+    assert_eq!(supervision_identity.uid, caller_uid);
+    assert_eq!(
+        fs::read(format!("/proc/{supervision_pid}/environ")).unwrap(),
+        b"PATH=/usr/bin:/bin\0"
+    );
+    assert_eq!(
+        pt_core::action::prechecks::open_write_fd_count(supervision_pid),
+        Some(0)
+    );
+    let mut supervision_signatures = SignatureSchema::new();
+    let ready_pattern = regex::escape(ready_path.to_str().unwrap());
+    supervision_signatures.add(
+        SupervisorSignature::new("owned-readable-supervision", SupervisorCategory::Other)
+            .with_process_patterns(vec!["^pt-zparent$"])
+            .with_arg_patterns(vec![&ready_pattern])
+            .with_priors(SignaturePriors {
+                useful: Some(BetaParams::new(1.0, 999.0)),
+                useful_bad: Some(BetaParams::new(1.0, 999.0)),
+                abandoned: Some(BetaParams::new(999.0, 1.0)),
+                zombie: Some(BetaParams::new(1.0, 999.0)),
+            }),
+    );
+    supervision_signatures.validate_for_activation().unwrap();
+    fs::write(
+        supervision_config.join("signatures.json"),
+        supervision_signatures.to_json().unwrap(),
+    )
+    .unwrap();
+    let validated = run_step(
+        &supervision_log,
+        "signature_validate",
+        &["--format", "json", "signature", "validate"],
+        &supervision_data,
+        &supervision_config,
+        30,
+    );
+    assert_eq!(validated.status.code(), Some(0), "{validated:?}");
+    let mut supervision_sessions = Vec::new();
+    for require_human in [false, true] {
+        supervision_policy.robot_mode.require_human_for_supervised = require_human;
+        let mut restored = serde_json::to_value(&supervision_policy).unwrap();
+        restored["data_loss_gates"]["block_if_recent_io_seconds"] =
+            configured["data_loss_gates"]["block_if_recent_io_seconds"].clone();
+        restored["robot_mode"]["require_human_for_supervised"] =
+            configured["robot_mode"]["require_human_for_supervised"].clone();
+        assert_eq!(restored, configured);
+        fs::write(
+            supervision_config.join("policy.json"),
+            serde_json::to_vec_pretty(&supervision_policy).unwrap(),
+        )
+        .unwrap();
+        let planned = run_step(
+            &supervision_log,
+            if require_human {
+                "plan-readable-human-required"
+            } else {
+                "plan-readable-human-optional"
+            },
+            &[
+                "--robot",
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--min-age",
+                "0",
+                "--max-candidates",
+                "20",
+                "--pids",
+                &supervision_pid.to_string(),
+            ],
+            &supervision_data,
+            &supervision_config,
+            180,
+        );
+        assert_eq!(planned.status.code(), Some(1), "{planned:?}");
+        let document: Value = serde_json::from_slice(&planned.stdout).unwrap();
+        let session = SessionId::parse(document["session_id"].as_str().unwrap()).unwrap();
+        let handle = SessionStore::at_data_dir(&supervision_data)
+            .open(&session)
+            .unwrap();
+        let recorded = fs::read(handle.dir.join("decision/plan.json")).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&recorded).unwrap(),
+            document
+        );
+        let canonical =
+            pt_core::verify::parse_agent_plan(std::str::from_utf8(&recorded).unwrap()).unwrap();
+        assert_eq!(canonical.actions.len(), 1);
+        assert_eq!(canonical.actions[0].target, supervision_identity);
+        assert_eq!(canonical.actions[0].action, Action::Kill);
+        assert!(!canonical.actions[0].blocked);
+        assert_eq!(
+            document["recommended"]["actions"][0]["action_id"],
+            canonical.actions[0].action_id
+        );
+        let candidate = document["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["pid"] == supervision_pid)
+            .unwrap();
+        assert_eq!(candidate["start_id"], supervision_identity.start_id.0);
+        assert_eq!(candidate["uid"], supervision_identity.uid);
+        assert_eq!(candidate["inference"]["prior_source"], "signature");
+        assert_eq!(candidate["signature"]["name"], "owned-readable-supervision");
+        assert_eq!(candidate["supervisor"]["status"], "observed");
+        assert_eq!(candidate["supervisor"]["detected"], false);
+        assert_eq!(candidate["recommended_action"], "kill");
+        assert_eq!(live_identity(supervision_pid), supervision_identity);
+        supervision_sessions.push((
+            require_human,
+            session,
+            canonical.actions[0].action_id.clone(),
+        ));
+    }
+    supervision_reaper
+        .0
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"nondumpable\n")
+        .unwrap();
+    let mut ready_line = String::new();
+    std::io::BufReader::new(supervision_reaper.0.stdout.as_mut().unwrap())
+        .read_line(&mut ready_line)
+        .unwrap();
+    let ready: Value = serde_json::from_str(&ready_line).unwrap();
+    assert_eq!(ready["status"], "READY");
+    assert_eq!(ready["pid"], supervision_pid);
+    assert_eq!(ready["uid"], supervision_identity.uid);
+    assert_eq!(ready["dumpable"], 0);
+    assert_eq!(
+        fs::read(&ready_path).unwrap(),
+        ready_line.trim_end().as_bytes()
+    );
+    assert_eq!(live_identity(supervision_pid), supervision_identity);
+    let raw_stat = fs::read_to_string(format!("/proc/{supervision_pid}/stat")).unwrap();
+    let ready_stat_fields: Vec<_> = ready["raw_stat"]
+        .as_str()
+        .unwrap()
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    let current_stat_fields: Vec<_> = raw_stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    // CPU/time counters can advance between real observations; the original
+    // parent, session and boot-relative birth remain exactly bound.
+    for field in [1, 3, 19] {
+        assert_eq!(ready_stat_fields[field], current_stat_fields[field]);
+    }
+    let environment_error = fs::read(format!("/proc/{supervision_pid}/environ")).unwrap_err();
+    let descriptor_error = fs::read_dir(format!("/proc/{supervision_pid}/fd")).unwrap_err();
+    assert_eq!(
+        environment_error.kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        descriptor_error.kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let supervision_error = pt_core::supervision::detect_supervision(supervision_pid).unwrap_err();
+    match &supervision_error {
+        pt_core::supervision::DetectionError::Environment(
+            pt_core::supervision::EnvironError::IoError { pid, source },
+        ) => {
+            assert_eq!(*pid, supervision_pid);
+            assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        other => panic!("expected actual environment permission error, got {other}"),
+    }
+    let mandatory_reason = format!(
+        "Mandatory supervision evidence unavailable for PID {supervision_pid}: {supervision_error}"
+    );
+    fs::write(
+        supervision_log.join("actual-permission-denial.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "ready":ready, "identity":supervision_identity, "raw_stat":raw_stat,
+            "environment_error":environment_error.to_string(),
+            "descriptor_error":descriptor_error.to_string(),
+            "supervision_error":supervision_error.to_string(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let target = format!("{}:{}", supervision_pid, supervision_identity.start_id.0);
+    for (require_human, session, action_id) in supervision_sessions {
+        supervision_policy.robot_mode.require_human_for_supervised = require_human;
+        fs::write(
+            supervision_config.join("policy.json"),
+            serde_json::to_vec_pretty(&supervision_policy).unwrap(),
+        )
+        .unwrap();
+        for dry_run in [true, false] {
+            let mut args = vec![
+                "--robot",
+                "--format",
+                "json",
+                "agent",
+                "apply",
+                "--session",
+                session.0.as_str(),
+                "--targets",
+                &target,
+                "--yes",
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let refused = run_step(
+                &supervision_log,
+                &format!("apply-nondumpable-human-{require_human}-dry-{dry_run}"),
+                &args,
+                &supervision_data,
+                &supervision_config,
+                180,
+            );
+            assert_eq!(
+                refused.status.code(),
+                Some(pt_core::exit_codes::ExitCode::PolicyBlocked.as_i32()),
+                "{refused:?}"
+            );
+            let document: Value = serde_json::from_slice(&refused.stdout).unwrap();
+            let outcomes = document["outcomes"].as_array().unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0]["pid"], supervision_pid);
+            assert_eq!(outcomes[0]["action_id"], action_id);
+            assert_eq!(outcomes[0]["status"], "precheck_blocked");
+            if dry_run {
+                assert_eq!(outcomes[0]["check"], "check_agent_supervision");
+                assert_eq!(outcomes[0]["reason"], mandatory_reason);
+            } else {
+                // The default live file gate runs before supervision detection.
+                assert_eq!(outcomes[0]["check"], "check_data_loss_gate");
+                assert_eq!(
+                    outcomes[0]["reason"],
+                    "cannot inspect open files; refusing without complete data-loss evidence"
+                );
+            }
+            assert!(state_of(supervision_pid).is_some_and(|state| state != 'Z'));
+            assert_eq!(live_identity(supervision_pid), supervision_identity);
+            assert!(!supervision_data.join("rate_limit.json").exists());
+        }
+        let planned = run_step(
+            &supervision_log,
+            &format!("plan-already-nondumpable-human-{require_human}"),
+            &[
+                "--robot",
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--min-age",
+                "0",
+                "--max-candidates",
+                "20",
+                "--pids",
+                &supervision_pid.to_string(),
+            ],
+            &supervision_data,
+            &supervision_config,
+            180,
+        );
+        assert_eq!(planned.status.code(), Some(1), "{planned:?}");
+        let document: Value = serde_json::from_slice(&planned.stdout).unwrap();
+        let session = SessionId::parse(document["session_id"].as_str().unwrap()).unwrap();
+        let handle = SessionStore::at_data_dir(&supervision_data)
+            .open(&session)
+            .unwrap();
+        let recorded = fs::read(handle.dir.join("decision/plan.json")).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&recorded).unwrap(),
+            document
+        );
+        let canonical =
+            pt_core::verify::parse_agent_plan(std::str::from_utf8(&recorded).unwrap()).unwrap();
+        assert!(canonical.actions.is_empty());
+        assert!(canonical.pre_toggled.is_empty());
+        assert!(document["recommended"]["actions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let candidate = document["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["pid"] == supervision_pid)
+            .expect("actual still-visible same-UID target must retain Unknown metadata");
+        assert_eq!(candidate["start_id"], supervision_identity.start_id.0);
+        assert_eq!(candidate["uid"], supervision_identity.uid);
+        assert_eq!(candidate["supervisor"]["status"], "unknown");
+        assert!(candidate["supervisor"]["detected"].is_null());
+        assert_eq!(candidate["supervisor"]["recommended_action"], "review");
+        assert_eq!(candidate["supervisor"]["reason"], mandatory_reason);
+        assert_eq!(candidate["recommended_action"], "review");
+        assert_eq!(candidate["recommendation"], "REVIEW");
+        assert_eq!(
+            document["recommendations"]["review_set"],
+            serde_json::json!([supervision_pid])
+        );
+        assert!(state_of(supervision_pid).is_some_and(|state| state != 'Z'));
+        assert_eq!(live_identity(supervision_pid), supervision_identity);
+        assert!(!handle.dir.join("action/outcomes.jsonl").exists());
+        assert!(!supervision_data.join("rate_limit.json").exists());
+    }
+    drop(supervision_reaper.0.stdin.take());
+    assert!(supervision_reaper.0.wait().unwrap().success());
+    eprint!(
+        "{}",
+        fs::read_to_string(supervision_log.join("target-launch.stderr")).unwrap()
+    );
 }
 
 #[test]
@@ -1665,9 +3004,9 @@ fn agent_apply_subset_and_failed_child_do_not_kill_a_live_parent() {
 
 #[test]
 fn agent_apply_executes_renice_then_kill_on_live_process() {
-    let data_dir = TempDir::new().expect("data dir");
-    let config_dir = TempDir::new().expect("config dir");
-    write_test_policy(config_dir.path());
+    let data_dir = TempDir::new().expect("data dir").keep();
+    let config_dir = TempDir::new().expect("config dir").keep();
+    write_test_policy(&config_dir);
 
     let mut victim = ForeignTarget::spawn("sleep 300");
     let pid = victim.pid;
@@ -1678,18 +3017,30 @@ fn agent_apply_executes_renice_then_kill_on_live_process() {
             victim.alive()
         )
     });
+    #[cfg(target_os = "linux")]
+    fs::write(
+        data_dir.join("renice-before.stat"),
+        fs::read(format!("/proc/{pid}/stat")).unwrap(),
+    )
+    .unwrap();
 
     // Real identity of the live child, exactly as a plan records it.
     let identity = live_identity(pid);
     let target = format!("{}:{}", pid, identity.start_id.0);
 
     // 1) Renice: previously failed in apply ("requires ... support").
-    let s1 = session_with_plan(data_dir.path(), plan_action(Action::Renice, &identity));
-    let (status, json) = apply(data_dir.path(), config_dir.path(), &s1, &target);
+    let s1 = session_with_plan(&data_dir, plan_action(Action::Renice, &identity));
+    let (status, json) = apply(&data_dir, &config_dir, &s1, &target);
     assert_eq!(status, "success", "renice outcome: {json}");
     // Renice only lowers priority: target nice is the default (10); a child that
     // already runs at nice >= 10 (the test was launched under `nice`) is left alone.
     let nice_after = nice_of(pid).expect("child alive after renice");
+    #[cfg(target_os = "linux")]
+    fs::write(
+        data_dir.join("renice-after.stat"),
+        fs::read(format!("/proc/{pid}/stat")).unwrap(),
+    )
+    .unwrap();
     let target_nice = i64::from(pt_core::action::renice::DEFAULT_NICE_VALUE);
     assert_eq!(
         nice_after,
@@ -1703,8 +3054,8 @@ fn agent_apply_executes_renice_then_kill_on_live_process() {
     );
 
     // 2) Kill.
-    let s2 = session_with_plan(data_dir.path(), plan_action(Action::Kill, &identity));
-    let (status, json) = apply(data_dir.path(), config_dir.path(), &s2, &target);
+    let s2 = session_with_plan(&data_dir, plan_action(Action::Kill, &identity));
+    let (status, json) = apply(&data_dir, &config_dir, &s2, &target);
     assert_eq!(status, "success", "kill outcome: {json}");
     assert_eq!(json["outcomes"][0]["signal_path"], SIGNAL_PATH, "{json}");
     let exited = (0..50).any(|_| {
@@ -1728,9 +3079,9 @@ fn state_of(pid: u32) -> Option<char> {
 
 #[test]
 fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
-    let data_dir = TempDir::new().expect("data dir");
-    let config_dir = TempDir::new().expect("config dir");
-    write_test_policy(config_dir.path());
+    let data_dir = TempDir::new().expect("data dir").keep();
+    let config_dir = TempDir::new().expect("config dir").keep();
+    write_test_policy(&config_dir);
 
     let victim = ForeignTarget::spawn("sleep 301");
     let pid = victim.pid;
@@ -1738,13 +3089,144 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
     let target = format!("{}:{}", pid, identity.start_id.0);
 
     // Pause (SIGSTOP) then resume (SIGCONT), each checked on the live process.
-    let s = session_with_plan(data_dir.path(), plan_action(Action::Pause, &identity));
-    let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &target);
+    let s = session_with_plan(&data_dir, plan_action(Action::Pause, &identity));
+    let (status, json) = apply(&data_dir, &config_dir, &s, &target);
     assert_eq!(status, "success", "pause outcome: {json}");
     assert_eq!(json["outcomes"][0]["signal_path"], SIGNAL_PATH, "{json}");
+    assert_eq!(json["outcomes"][0]["action"], "pause", "{json}");
     assert_eq!(state_of(pid), Some('T'), "child should be stopped");
-    let s = session_with_plan(data_dir.path(), plan_action(Action::Resume, &identity));
-    let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &target);
+
+    let handle = SessionStore::at_data_dir(&data_dir)
+        .open(&SessionId::parse(&s).unwrap())
+        .unwrap();
+    let plan_path = handle.dir.join("decision/plan.json");
+    let outcomes_path = handle.dir.join("action/outcomes.jsonl");
+    let budget_path = data_dir.join("rate_limit.json");
+    let original_plan = fs::read(&plan_path).unwrap();
+    let original_outcomes = fs::read(&outcomes_path).unwrap();
+    let original_budget = fs::read(&budget_path).ok();
+    let plan: Plan = serde_json::from_slice(&original_plan).unwrap();
+    let saved =
+        pt_core::verify::parse_action_outcomes(std::str::from_utf8(&original_outcomes).unwrap())
+            .unwrap();
+    let success = saved
+        .iter()
+        .find(|outcome| outcome.status == "success")
+        .expect("actual SIGSTOP saved its successful execution");
+    assert_eq!(success.action_id, plan.actions[0].action_id);
+    assert_eq!(success.action, Some(Action::Pause));
+    assert!(success.target.as_ref().unwrap().matches(&identity));
+
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-logs/e2e/agent_apply")
+        .join(&s)
+        .join("resume-action-kind");
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::write(log_dir.join("original-plan.json"), &original_plan).unwrap();
+    fs::write(log_dir.join("original-outcomes.jsonl"), &original_outcomes).unwrap();
+    fs::write(
+        log_dir.join("owned-identity.json"),
+        serde_json::to_vec_pretty(&identity).unwrap(),
+    )
+    .unwrap();
+    if let Some(budget) = &original_budget {
+        fs::write(log_dir.join("original-budget.json"), budget).unwrap();
+    }
+    let resume_args = [
+        "--format",
+        "json",
+        "agent",
+        "apply",
+        "--session",
+        &s,
+        "--resume",
+        "--yes",
+        "--recommended",
+    ];
+    let resume = |index: usize| {
+        let started = std::time::Instant::now();
+        let output = cargo_bin_cmd!("pt-core")
+            .timeout(Duration::from_secs(30))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env("PROCESS_TRIAGE_CONFIG", &config_dir)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args(resume_args)
+            .output()
+            .expect("run actual resume");
+        fs::write(log_dir.join(format!("{index}.stdout.json")), &output.stdout).unwrap();
+        fs::write(
+            log_dir.join(format!("{index}.stderr.jsonl")),
+            &output.stderr,
+        )
+        .unwrap();
+        let record = serde_json::json!({
+            "command": "pt-core", "args": resume_args, "exit_code": output.status.code(),
+            "elapsed_ms": started.elapsed().as_millis(), "session_id": s,
+            "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&output.stdout),
+            "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&output.stderr),
+            "plan_sha256": pt_bundle::FileEntry::compute_checksum(&fs::read(&plan_path).unwrap()),
+            "outcomes_sha256": pt_bundle::FileEntry::compute_checksum(&fs::read(&outcomes_path).unwrap()),
+            "budget_sha256": fs::read(&budget_path).ok().map(|bytes| pt_bundle::FileEntry::compute_checksum(&bytes)),
+        });
+        fs::write(
+            log_dir.join(format!("{index}.step.jsonl")),
+            format!("{record}\n"),
+        )
+        .unwrap();
+        eprintln!("{record}");
+        output
+    };
+    let unchanged = || {
+        assert_eq!(fs::read(&outcomes_path).unwrap(), original_outcomes);
+        assert_eq!(fs::read(&budget_path).ok(), original_budget);
+        assert!(victim.alive());
+        assert!(live_identity(pid).matches(&identity));
+        assert_eq!(
+            state_of(pid),
+            Some('T'),
+            "original owned child stays stopped"
+        );
+    };
+    let resumed = resume(0);
+    assert_eq!(
+        resumed.status.code(),
+        Some(pt_core::exit_codes::ExitCode::Clean.as_i32())
+    );
+    let result: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(result["note"], "nothing_to_do");
+    assert_eq!(result["summary"]["attempted"], 0);
+    assert!(result["outcomes"].as_array().unwrap().is_empty());
+    unchanged();
+
+    // Change only the action kind. ID, target, prechecks and all evidence stay identical.
+    let mut altered = plan.clone();
+    altered.actions[0].action = Action::Kill;
+    let altered_bytes = serde_json::to_vec_pretty(&altered).unwrap();
+    fs::write(log_dir.join("tampered-plan.json"), &altered_bytes).unwrap();
+    fs::write(&plan_path, &altered_bytes).unwrap();
+    let refused = resume(1);
+    assert_eq!(
+        refused.status.code(),
+        Some(pt_core::exit_codes::ExitCode::PolicyBlocked.as_i32())
+    );
+    let diagnostic = String::from_utf8_lossy(&refused.stderr);
+    assert!(diagnostic.contains("action kind"), "{refused:?}");
+    unchanged();
+
+    fs::write(&plan_path, &original_plan).unwrap();
+    assert_eq!(fs::read(&plan_path).unwrap(), original_plan);
+    let restored = resume(2);
+    assert_eq!(
+        restored.status.code(),
+        Some(pt_core::exit_codes::ExitCode::Clean.as_i32())
+    );
+    let restored_result: Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(restored_result["note"], "nothing_to_do");
+    unchanged();
+
+    let s = session_with_plan(&data_dir, plan_action(Action::Resume, &identity));
+    let (status, json) = apply(&data_dir, &config_dir, &s, &target);
     assert_eq!(status, "success", "resume outcome: {json}");
     assert_eq!(json["outcomes"][0]["signal_path"], SIGNAL_PATH, "{json}");
     assert_ne!(state_of(pid), Some('T'), "child should run again");
@@ -1757,8 +3239,8 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
     let start: u64 = start.parse().expect("numeric start");
     stale.start_id.0 = format!("{boot}:{}:{pid}", start + 7);
     let stale_target = format!("{}:{}", pid, stale.start_id.0);
-    let s = session_with_plan(data_dir.path(), plan_action(Action::Kill, &stale));
-    let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &stale_target);
+    let s = session_with_plan(&data_dir, plan_action(Action::Kill, &stale));
+    let (status, json) = apply(&data_dir, &config_dir, &s, &stale_target);
     assert_ne!(status, "success", "stale identity must be refused: {json}");
     assert!(victim.alive(), "target must survive a stale-identity kill");
 
@@ -1770,8 +3252,8 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
     std::thread::sleep(Duration::from_millis(300));
     let mux_identity = live_identity(mux_pid);
     let mux_target = format!("{}:{}", mux_pid, mux_identity.start_id.0);
-    let s = session_with_plan(data_dir.path(), plan_action(Action::Kill, &mux_identity));
-    let (status, json) = apply(data_dir.path(), config_dir.path(), &s, &mux_target);
+    let s = session_with_plan(&data_dir, plan_action(Action::Kill, &mux_identity));
+    let (status, json) = apply(&data_dir, &config_dir, &s, &mux_target);
     assert_eq!(status, "precheck_blocked", "protected target: {json}");
     assert!(mux.alive(), "protected process must survive");
 }

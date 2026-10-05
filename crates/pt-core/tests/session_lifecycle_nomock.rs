@@ -251,6 +251,7 @@ fn test_verify_plan_with_real_process_nomock() {
         action_id: plan.actions[0].action_id.clone(),
         pid,
         status: "success".to_string(),
+        action: Some(plan.actions[0].action),
         target: Some(plan.actions[0].target.clone()),
         command: Some(record.cmd.clone()),
         parent_pid: Some(record.ppid.0),
@@ -282,7 +283,15 @@ fn test_verify_plan_with_real_process_nomock() {
         .parse::<u64>()
         .unwrap();
     let boot = parts.next().expect("identity boot");
-    reused_record.start_id = StartId(format!("{boot}:{}:{identity_pid}", ticks.saturating_add(1)));
+    // A matching incarnation born after execution can legitimately be a
+    // respawn, and a same-tick birth is ambiguous. Use a distinct birth before
+    // the original target so this fault injection tests identity reuse only.
+    reused_record.start_id = StartId(format!(
+        "{boot}:{}:{identity_pid}",
+        ticks
+            .checked_sub(1)
+            .expect("target birth has a previous tick")
+    ));
     let report_mismatch = verify_plan(
         &plan,
         &[execution.clone()],
@@ -292,10 +301,14 @@ fn test_verify_plan_with_real_process_nomock() {
     )
     .expect("verify changed process identity");
     assert_eq!(report_mismatch.action_outcomes.len(), 1);
-    assert!(matches!(
-        report_mismatch.action_outcomes[0].outcome,
-        VerifyOutcome::PidReused
-    ));
+    assert!(
+        matches!(
+            report_mismatch.action_outcomes[0].outcome,
+            VerifyOutcome::PidReused
+        ),
+        "{}",
+        serde_json::to_string(&report_mismatch).unwrap()
+    );
 
     proc.trigger_exit();
     proc.wait_for_exit(Duration::from_secs(2));
