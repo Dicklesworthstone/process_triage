@@ -1,19 +1,64 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Current work and validation — 2026-10-05 20:45 UTC
+## Current work and validation — 2026-10-05 22:20 UTC
 
 The core product is materially better, but the project is not finished. Twelve
 product items have independently accepted closures during this session;
 the original fleet-normalization and CPU-throttle positive tasks were reopened
 when their evidence proved insufficient. The graph now contains 960 issues:
-824 closed, 123 open and thirteen in progress (**136 remaining**). Active cycles
+823 closed, 123 open and fourteen in progress (**137 remaining**). Active cycles
 remain zero. The newly discovered production watchdog race `bd-u7gc.8` is now
 independently accepted and closed on its original criteria. The original root/nonroot
 workspace task `bd-ufqb.9` remains open without changing its acceptance criteria.
+The original snapshot-persistence task `process_triage-9k8.1` was reopened for its
+discarded sync errors, preserving the historical closure in Git and the original
+requirements. No duplicate task or observed data-loss claim was introduced.
 
-The earlier ROOT run actually changed PID 1's CPU quota. Read-only observation
+A small partial snapshot fix is now in progress only in the temporary checkout:
+`crates/pt-core/src/session/mod.rs`, SHA-256
+`ccf5c74dea7bca41d0d43c06036703fe6632a7414dce5447c6128f63a908d5c8`.
+It propagates actual file-sync errors before rename and adds a retained Linux
+filesystem refusal test with exact prior-artifact bytes. Formatting passed after
+an initial formatting failure. The separate hz4 job has now passed formatting,
+the workspace all-targets check, strict Clippy and lean check. The scoped job then
+finished zero at 22:16:24 UTC: all four original and new writer tests passed, with
+zero failures/ignores and 4,052 filtered library tests. Source and lockfile checks
+passed before and after. Its complete writable log SHA-256 is
+`da47e68d9184ba0ab660d9e329d31f51e9cd258d73b43971d630f79ddb56bb21`;
+Independent review confirms the complete bounded log and actual retained prior
+bytes plus `/dev/null` symlink on hz4 at `/data/tmp/.tmpBAH6Zu`. That fixture is
+owned by UID 1000 but its directory mode is 0775; no private-mode guarantee is
+claimed. These two source/lock guards do not constitute a full 503-file guard.
+Earlier RCH attempts rejected incompatible
+options, the temporary project path, a full-disk lease write, unavailable hz2/hz3
+workers and an alias topology conflict. The successful invocation uses the documented
+state location on `/tmp` and the temporary checkout's actual `/tmp` canonical and
+alias root. No shared worker alias changed, force or local compilation was used.
+A normal hz3 probe returned connection_failed. The first UBS launch failed, then
+its cache write failed with ENOSPC; after relocating the cache, the actual scan
+still exited one with one critical, 277 warnings and 79 informational findings.
+Independent source review identifies the critical as the new test's failure-only
+panic; warnings/info remain unreviewed and this is not a scanner pass. Directory
+syncing, PID-only temporary-file names and symlink following remain unresolved.
+The original task stays in progress, and this source patch is neither published
+nor covered by the bdf3 results below. The private final retention location is
+hz4 `/data/tmp/pt-final-retention-20261005-5ndr5hq5/final-retention.tar.gz`,
+SHA-256 `8724b7fccb62bff888a49d80ba860167391465745b2c659969441d47e7eb443e`.
+Its 5,475,529 bytes were copied with exclusive creation, file/parent-directory sync
+and actual remote hash verification; directory/file modes are 0700/0600, UID 1000.
+It preserves the tested patch/logs and recovery backups, but cannot recover the
+lost NONROOT raw streams. Only report and tracker changes are selected for the
+final normal publication; an explicit exception request for the source's UBS
+nonzero gate is pending, and elapsed time supplies no approval.
+UBS returned three (`no-supported-languages`, zero scanned files) for those
+metadata files; this is an applicability limit, not a scanner pass. JSONL parsing,
+unique issue IDs, preserved original descriptions/dependencies, cycle checks and
+`git diff --check` pass. The source patch stays unstaged under its nonzero code gate.
+
+The earlier ROOT run I launched actually changed PID 1's CPU quota. Read-only observation
 found `/sys/fs/cgroup/init.scope/cpu.max` at `25000 100000`. Its previous value
-was not captured. Restoration remains pending the operator's intended value;
+was not captured. A fresh read at 21:03:31 UTC found the same quota and boot ID
+`fe7e016e-81c2-4582-83f9-f7acc87d7fb1`. Restoration remains pending the operator's intended value;
 the kernel's default is not proof of the prior configuration. No guessed write
 has been made. Normal recovery of that exact old RCH job again returned RCH-E504
 without durable completion acknowledgment or replay. It is not a ROOT pass.
@@ -48,7 +93,7 @@ Only FileNotFoundError snapshot races are retried; all independent Rust descript
 identity and plan/apply assertions remain. Independent source review accepted this
 bounded delta; the complete original forty-step case then passed in the bdf3 ROOT
 workspace, with actual dropped credentials and original effects. The old invocation
-remains failed; the same-source NONROOT workspace is still running.
+remains failed; the same-source NONROOT workspace also finished failed.
 Ordinary fleet import now rejects unknown merge strategies before
 writing and previews the actual merged values of its nine existing reported numeric
 fields. Signature comparison checks the whole matcher/lifecycle in deterministic name
@@ -76,8 +121,15 @@ The complete ROOT invocation on c0f2 exited 101: 7,180 passed, four failed and
 27 originally ignored across 139 unfiltered outer targets. Nested privilege-drop
 summaries are excluded from that total. The failures are the descriptor bootstrap,
 the unknown-strategy expected exit and two baseline bundle roundtrips whose fixture
-class fractions summed to 0.75. The older nonroot invocation continues; its observed
-unknown-strategy failure is retained, not credited as a corrected pass.
+class fractions summed to 0.75. The older NONROOT invocation completed at
+20:53:03 UTC with exit 101: 7,169 passed, fifteen failed and 27 original ignores
+across all 139 outer targets, with zero filtered. Independent review confirmed
+three old fixture/oracle failures and twelve actual command interruptions: one
+plan and four policy cases at their original 120-second windows, plus seven
+snapshot cases at 30 seconds. Their intended semantic checks were not reached.
+The original invocation has a quiet source preguard and no postguard after failure.
+Its complete log SHA-256 is
+`996774e6d2b427e575d4af70fcd633e01262c832ac36c401368a6320490fc988`.
 
 The bdf3 Rust validation source differs from c0f2 in exactly three test files. The descriptor-readiness
 correction and expected exit correction from 2 (ActionsOk) to the original `.16`
@@ -108,12 +160,22 @@ metadata. Its mixed Cargo/stdout/stderr stream is correctly described as text.
 
 Two final nonroot admission attempts exited 103 with no Cargo execution; strict
 remote-only behavior prevented local fallback. The third attempt was actually
-admitted on hz4 at 20:02 UTC, passed the three compiler checks and now compiles the
-complete workspace suite. Its latest completed outer targets have no failures,
-but the original fourteen-case live producer/apply target is still active. The older
-nonroot run has fifteen failures across 103 completed outer targets: the bad expected
-exit, two incomplete baseline fixtures and twelve whole-host command deadlines.
-These are prefix counts, not a complete run. The separate f679 first-two-correction
+admitted on hz4 at 20:02 UTC and passed the three compiler checks. Its complete
+workspace suite finished at 22:01:42.716651 UTC with remote exit 101: **7,174 passed,
+ten failed and 27 original ignores** across 139 unfiltered outer summaries. The
+five failed targets are `agent_apply_executes_actions`, `e2e_capabilities`,
+`e2e_daemon_dormant`, `e2e_plan` and `e2e_snapshot`. The original fourteen-case
+live action binary finished thirteen passing cases and one failure: recent-I/O apply
+took 123.356 seconds against its unchanged 110-second shared-window assertion.
+The entire original forty-step producer/apply case passed. The separate `bd-aq9x`
+five-target-under-five-seconds acceptance remains unmet. Additional failures are
+observed before retirement. The two snapshot failure details were not recovered;
+they must not be inferred from an older invocation. The capability case
+reports unavailable `ps`; the deep-plan case lacks the expected network ledger
+term. Five daemon cases exceeded their original phase windows; four retained phase
+snapshots show the actual child in D-state. These observations do not prove a
+single cause, establish an environmental waiver, or repair acceptance.
+The separate f679 first-two-correction
 invocation exited 101: 21 passed and one failed across the complete 14/8 binaries;
 the Pause/resume suite's cleanup Kill reached its unchanged 240-second deadline with
 empty stdout. It does not establish a hanging Pause syscall. Neither failure is
@@ -129,6 +191,34 @@ Evidence remains at hz3 `/data/tmp/pt-owned-plan-profile-3tk_197v/`.
 `session::write_json_pretty` also discards `sync_all` errors, a concrete persistence
 correctness gap. Removing durability or widening deadlines is not an accepted fix;
 no latency win is claimed.
+
+A subsequent owned no-goal apply diagnostic stopped at a readiness assertion
+before invoking plan or apply. Its initial failing identity was not retained, so
+the cause is unproven. The sole private-fixture policy delta was minimum age
+3600 to zero; all other defaults were preserved. Its owned shell naturally exited
+zero after 180.007 seconds, without signals. hz3 artifacts remain at
+`/data/tmp/pt-owned-apply-profile-bec4839f-7665-4fb2-b64a-6c59e7cac1be`.
+There is no apply trace or timing, timeout explanation or capability credit.
+
+Local `/data` exhausted unprivileged writable space at 21:03 UTC. The original
+NONROOT tee stopped mid-summary, so its local log is explicitly incomplete. I failed
+to retrieve the complete worker stdout/stderr before normal RCH retirement removed
+the spools. There is no complete raw-log hash or independent complete-transcript
+acceptance for this invocation. The final census was observed on the worker before
+retirement; authoritative terminal metadata is retained in
+`/tmp/pt-disk-pressure-preservation-20261005-2056/`.
+`rch-jobs-2203.json` records job `30050444235506662`, terminal acknowledgment,
+remote exit 101 and normal source/tree/pair retirement. The wrapper's local exit one
+is separate from the remote exit 101. Independent review confirms the terminal
+metadata, not a complete-log census. No replay, force or cancellation was used.
+Tracker comments 453–455 were saved before their local atomic export
+failed. The intact JSONL and a consistent database backup were preserved on `/tmp`.
+Export from that backup then succeeded in a temporary checkout as the workspace
+owner. A first import selected stale checkout data; verification caught it before
+publication. A fresh disposable cache imported the exact certified JSONL and
+preserves all pending comments; no force flag, issue deletion or gate change was used.
+The original workspace and failed caches remain retained. These are recovery steps,
+not new product capability. Further normal repository work needs disk space.
 
 The native 62-case agent contract finished zero on bdf3 as UID 1000, with all 62
 original TAP cases passing and no skips; exact binary SHA-256 is
@@ -249,9 +339,10 @@ by elapsed time, selected passing tests or an independently reviewed scanner row
   ongoing older full suites or crediting their failures as corrected passes.
 - [x] Complete and independently review the entire bdf3 ROOT workspace and validate
   its manifest using the existing schema/checksum validator.
-- [ ] Complete the entire nonroot workspace suite on that same source;
-  report all original ignores/unavailable prerequisites separately. No selected
-  run can close the full-workspace requirement.
+- [ ] Satisfy the original entire nonroot workspace acceptance on that same source;
+  the execution finished failed, and complete log retrieval was lost. Report all
+  original ignores/unavailable prerequisites separately. No selected run or ROOT
+  result can close the full-workspace requirement.
 - [x] Independently verify the eligible delegated cgroup runtime artifacts.
 - [ ] Measure actual CPU relief and finish original safe leaf isolation or shared-leaf
   refusal, CLI undo and fleet evidence. `bd-qr40.4` permits refusal where isolation is
@@ -269,7 +360,8 @@ by elapsed time, selected passing tests or an independently reviewed scanner row
 - [x] Repair actual helper loading, literal data, argument/status handling and strict
   prebuilt-core selection; preserve compiler/CLI prerequisites and verify seven cases.
 - [ ] Resolve the observed session-persistence stall and discarded sync errors on
-  concrete production evidence while retaining durability and original deadlines.
+  concrete production evidence while retaining durability and original deadlines;
+  the error-propagation gap is tracked by reopened `process_triage-9k8.1`.
 - [ ] Resolve `bd-toa2.10` through one shared live placement classifier and all
   independent supervision readers. A read-only census found 48 TTY pane processes
   and 22 terminal-less descendants with same-owner/same-cgroup TTY ancestry; the
@@ -277,31 +369,48 @@ by elapsed time, selected passing tests or an independently reviewed scanner row
   exempt helpers or unproven reparented processes. Recorded raw paths and stable
   birth/owner/ancestry observations, protected daemon controls and actual incumbent
   versus fixed read-only plans are required; census alone proves no repaired behavior.
+  Independent review rejected the broad v5 stack: its unit-only orphan exemption
+  lacks TTY/owner/birth proof, `CheckSupervisor` still reads raw placement, and its
+  descendant fixture signals an unpinned grandchild. The coherent production edit
+  surface is the existing cgroup/protected/prechecks/lineage/main/export modules;
+  retain protection on unreadable or changed chains and test owned child lifetimes.
+- [ ] Recover writable `/data` space before further ordinary builds or tracker
+  mutations there. Preserve the original workspace; after publication, import the
+  exact current JSONL through a healthy disposable cache. Do not delete files or
+  weaken database-owner/source checks to recover space.
 - [ ] Resume dependency updates only after the circuit-breaker response, preserving
   MSRV and separately resolving the known vulnerable transitive dependency families.
 
-### Bounded work and honesty audit — 2026-10-05 20:12 UTC
+### Bounded work and honesty audit — 2026-10-05 22:16 UTC
 
-Window: 15:54–20:12 UTC. Inputs: actual source edits and frozen-source differences,
+Window: 15:54–22:16 UTC. Inputs: actual source edits and frozen-source differences,
 the independently retained f19 runtime archive and original `.17` criteria, current
 tracker records, recent log/stat/reflog, four owned cancellation/recovery records,
 compiler/scanner streams, the exact archived formatting rerun, independent watchdog
 and cgroup runtime reviews, complete bdf3 ROOT and native BATS evidence, the
-actual counter correction, and the original ROOT incident. External commits and merges
+actual counter/helper corrections, complete failed c0f2 NONROOT, preserved original
+hz4 output after local disk exhaustion, authoritative terminal metadata, the loss
+of its complete spools before retrieval, the separate partial snapshot delta and
+its completed scoped checks, recovered tracker records, and the original ROOT incident. External commits and merges
 preserved earlier authored bytes; their count is not a feature count. The recent
-reflog shows those commits/merges, not a root reset. No root commit, push, deletion,
-golden regeneration or release occurred. Whole external history has not received
+reflog shows those commits/merges, not a root reset. Root's two normal Bash commits
+`de20368` and `b4a174b` were pushed to main and the required legacy mirror. Their
+count is not capability credit. No root deletion, golden regeneration or release
+occurred. Whole external history has not received
 another exhaustive per-commit audit; receipt checks establish current source identity.
 That limitation is explicit rather than a clean-history assertion.
 
 Real-work inventory: canonical action-kind binding USER (independently accepted);
 direct cgroup/reversal safety and truthful fleet merge behavior USER source changes
 (direct cgroup effects accepted, original positive tasks remain incomplete);
-watchdog lifetime correction USER (independently accepted); root-compatible
+watchdog lifetime correction USER (independently accepted); partial snapshot
+sync-error propagation USER (source reviewed and scoped runtime passed, not published);
+root-compatible
 permission fixtures and owned cgroup/group fixtures ENABLER; source-bound validation
-and necessary integrity recovery ENABLER; harness count repair ENABLER;
+and necessary integrity recovery ENABLER; harness counter, helper argument/literal
+and actual CI prebuilt-core repair ENABLER;
 tracker/TODO updates PROCESS. Tally:
-USER 4, ENABLER 4, PROCESS 1, UNKNOWN 0. Two USER items have new complete original
+USER 5, ENABLER 4, PROCESS 1, UNKNOWN 0. Two USER items have new complete original
 acceptance in this window. Refusal-only changes do not become normalization,
 resource relief or cgroup isolation capability.
 
@@ -315,7 +424,10 @@ resource relief or cgroup isolation capability.
    reviewed actual runtime. The old primary ROOT descriptor bootstrap remains a
    failed invocation; its bounded correction now passed as the entire original
    permission case in the independently reviewed bdf3 ROOT workspace. The separate
-   f679 Pause timeout and older NONROOT deadline failures remain failed.
+   f679 cleanup-Kill timeout, complete older NONROOT failure and current NONROOT
+   shared-window failure remain failed. The complete current NONROOT finished
+   failed; I lost its full raw streams before retrieval. The local disk error does
+   not erase failures or establish an environmental waiver.
 4. Oldest user-relevant open item remains `bd-l3s5`, measured fleet false-positive
    calibration. Actual privileged safety defects took precedence; calibration is
    still a central missing product outcome. `bd-toa2.10` is another concrete gap:
@@ -325,11 +437,15 @@ resource relief or cgroup isolation capability.
 6. No original positive criterion was moved to a follow-up to close its parent.
    `hc7.3` and `sj6.6` were reopened; `.9/.11` stay open. New `.8` records a genuinely
    newly observed watchdog defect and was closed only on its full original criteria;
-   the workspace requirement stays open despite its satisfied dependency.
+   the workspace requirement stays open despite its satisfied dependency. The
+   original snapshot task was reopened after independent review of discarded sync
+   errors; its acceptance was preserved and no duplicate closure opportunity added.
 
 Verdict: DRIFTING. Repeated builds, evidence recovery and failed prerequisite
-sequences consumed substantial time. Correction: freeze the now-reviewed source,
-finish its actual runtime checks, then work the next user-visible gap. Do not create
+sequences consumed substantial time. I also failed to preserve the complete
+NONROOT logs despite knowing the local tee had failed. Correction: retain the
+completed scoped snapshot checks, publish the
+factual report/tracker changes and leave unmet criteria open. Do not create
 more report layers, turn scanner review into a passing gate, or repeat a passed
 check without changed source or an unresolved concern.
 
@@ -377,8 +493,11 @@ Honesty inventory, defending none of the author's decisions:
    strong. Both original tasks are reopened, the PID1 incident is prominent, and
    scanner/audit/full-suite failures remain explicit. The 135 remainder arithmetic
    was also corrected before adding the newly observed task.
-10. No (checked: cited current Cargo/UBS/cancellation logs). Both streams are retained;
-    the subsequent observed target-directory loss is disclosed, not a claim of retention.
+10. Yes: the current NONROOT local tee is incomplete and its complete worker spools
+    were retired before I copied them. Its final census and terminal metadata are
+    retained, but two snapshot failure details and a full independent transcript
+    audit are unavailable. Earlier complete c0f2 and ROOT logs are distinct retained
+    artifacts. The new snapshot-check stream was completely saved to writable `/tmp`.
 11. Yes: older `hc7.3` and `sj6.6` closures lacked original positive evidence. Their
     criteria are unchanged and tasks reopened. `.17` and `.8` closed in this window on
     independently rehashed actual source/runtime evidence.
