@@ -1,6 +1,39 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
-## Publication and next work — 2026-10-06 08:32 UTC
+## Publication and next work — 2026-10-06 18:44 UTC
+
+The latest owner reply, "OK, so please do everything you think is advisable based
+on all of that," follows the explicit final question, "May I publish the three-file
+lean fix despite UBS exit 1 on unchanged baseline findings—17 critical, 882 warning
+and 1,626 informational?" Root treats this as the requested scoped publication
+approval for `bd-g7mg`: the eight field/initializer guards and explanatory comment
+in `main.rs`, its existing report and native tracker updates. It does not resume
+the separate dependency-update circuit breaker or authorize another source
+change, scanner suppression, deletion, general security clearance or gate-zero
+claim. Renewed file reservations have no conflicts. The 18:43 normal fetch still
+binds upstream main to `ed50b23`; no incoming code/graph merge is needed.
+
+- [x] Record the new scoped owner disposition and retain actual UBS exits.
+- [x] Recheck the unchanged accepted source receipt and all three-file diff.
+- [x] Run the required pre-commit scanner with retained output and actual exit.
+- [ ] Normally commit and push the three-file lean fix plus pane closure metadata.
+- [ ] Independently bind acceptance/closure to that exact published source.
+- [ ] Publish the native independently accepted lean closure metadata.
+- [ ] Continue with the highest-impact product gap; claim its existing Bead first.
+
+The 10:30 observations below are the retained pre-approval state. No runtime
+criterion or original test changed between acceptance and this approval.
+All 528 accepted inputs and the complete final gate-log hash still match.
+The fresh pre-commit UBS invocation at 18:44 returned actual one: unchanged
+17 critical, 882 warning and 1,626 informational records in one Rust file.
+Summary `/tmp/pt-lean-disk-preservation-20261006-e0jiszca/owner-approved-publication-ubs-1844.json`,
+SHA-256 `36f13ec145498e1b613ccf629638f3496c5dd660e5fbe048ae21bd9190f0b222`;
+raw findings `.../ubs/scratch/tmp.dj35sg2caI/rust.findings.json`, SHA-256
+`042c8ba393ae9b25e2d0ee4f6f12ee0fa04f93b1017c11d287386d0198b47788`.
+All 2,525 complete records match the published baseline after only the previously
+defined checkout-prefix normalization and line/column exclusion. All 961 issue
+IDs remain present; exactly the pane and lean issues differ from `ed50b23`.
+Normal publication proceeds under the new scoped owner exception; UBS is not green.
 
 The owner's reply, "OK, so please do everything you think is advisable based on
 all of that," follows the explicit publication question and is being treated as
@@ -31,12 +64,311 @@ credit; the merge error and failed recovery attempts remain disclosed (SM-11).
 
 - [x] Preserve and reconcile both graph histories without deleting evidence.
 - [x] Re-run the publication scanner and record its actual nonzero disposition.
-- [ ] Commit/publish the verified pane change on main without rewriting history.
-- [ ] Bind independent acceptance and closure to the actual published revision.
+- [x] Commit/publish the verified pane change on main without rewriting history:
+      `ed50b23b5a4a2e381030a6361c128554aee2c0af`, normal pushes at 08:40 UTC.
+- [x] Bind independent acceptance and closure to the actual published revision:
+      WhiteBeaver closed `bd-toa2.10` at 08:50:21 UTC using normal native
+      JSONL-only mode. Exactly its four closure fields changed; all 961 IDs,
+      471 comments and 1,941 dependencies were preserved. No scanner-zero claim.
+- [ ] Publish the independently accepted pane closure metadata through a normal
+      commit/push; its runtime source is already published at `ed50b23`.
 - [ ] Address `bd-g7mg`: lean all-target tests reference UI-only queue fields;
       preserve UI behavioral assertions and check both feature configurations.
 - [ ] Continue the existing ready product graph; do not substitute stale task
       comments for inspection of current production code.
+
+Root has reclaimed single graph ownership. The graph now has 824 closed,
+122 open and fifteen in-progress issues: **137 remaining**. The disposable cache
+passed its earlier read/status checks, but native writes subsequently failed WAL
+recovery. Normal `br --no-db` retains closure policy, JSONL authority and non-force
+data-loss checks and completed the independent closure. Only native JSONL mode
+is now authoritative; the stale cache must not be flushed. Whole `br doctor`
+was also not green because inherited warnings remained. Untracked recovery
+artifacts are preserved and were not included in the product commit.
+
+Next ready blocker, `bd-g7mg`, has an eight-guard fix available: include the four
+already-computed `QueueMetrics` fields and their initializers when either `ui`
+or `test` is enabled. This keeps the original queue tests and every assertion
+in both builds, without adding a fictitious production consumer or hiding tests.
+
+- [x] Claim the existing bug after the verifier releases graph ownership.
+- [x] Retain an exact-source baseline lean all-targets failure.
+- [x] Manually change the eight field/initializer guards; preserve both tests.
+- [x] Run the four mandatory gates plus lean all-targets check and strict Clippy.
+- [x] Execute both original queue tests in lean and default-feature builds.
+- [x] Independently review the unchanged assertions and exact source change.
+- [x] Independently assess the final gate logs and original acceptance criteria.
+- [x] Scan the actual changed file and compare all findings to the baseline.
+- [ ] Resolve its actual nonzero scanner publication disposition.
+- [ ] Publish and independently close only when its original criteria are met.
+
+Formatting passes for the new guard change. Both original queue tests are
+byte-for-byte unchanged. Hashing the module from its Linux/test cfg header
+through its closing brace, excluding trailing newlines, gives the same SHA-256
+in baseline and fixed source:
+`e0261b05813053583411c85a5d167d6d5a873dce4f9cafd9b280b97bc35e6797`.
+The fixed 528-file receipt is `/data/tmp/pt-lean-fixed-source-20261006.sha256`,
+SHA-256 `101220f00f1e9d6ce459475874db52bf639aa70346052757dc6c0b8f9d34616d`.
+Compiler/test verification and independent final assessment have now passed;
+publication remains pending. This is not a published or closed bug.
+Actual UBS scans of baseline and changed `main.rs` both exit one with 17 critical,
+882 warning and 1,626 informational matches. Full warning review is incomplete;
+the prior nine-file pane exception does not automatically authorize this change.
+All 2,525 finding records have identical multisets after excluding line/column
+positions, not merely equal totals. Baseline raw findings are
+`/tmp/pt-disk-pressure-preservation-20261005-2056/ubs/scratch/tmp.y7m1AUY8Jo/rust.findings.json`
+(SHA-256 `f9c4ae3e952e63c97052cf6db600b0c683d8af2f121e0bcc2317cbacb49afc53`);
+fixed findings are `.../scratch/tmp.xaSu9xzBHW/rust.findings.json`
+(SHA-256 `beb95de85a7db9ee77f63fd2dac9c2f162ec5ba58d0d73cf2463f14f2a12b5c3`).
+WhiteBeaver independently accepted the source-only change: exactly four field
+guards/four initializers and one comment; no arithmetic, consumer, test-body,
+ignore, allowance or assertion change. Its final review also accepts the bounded
+ROOT Linux runtime matrix, source guards and baseline reproduction; it does not
+authorize the new scanner exception or close the unpublished bug.
+
+The first new baseline RCH request duplicated its compressed receipt in the
+command and failed admission with an unconfirmed-selection lease. Its original
+command was not replayed; same-identity cancellation and recovery refused without
+acknowledgment. All three diagnostics are retained. A shorter request declares
+the same receipt once and verifies it twice. Attempts two and six were normally
+cancelled-before-start (actual native acknowledgments); neither ran a compiler.
+Attempt three ran on hz2 and exited 101 because a cached `toon` source directory
+was missing, **before reaching pt-core**. All 1,056 source guards passed, but
+this is not a reproduced queue-field failure. Its log is
+`/data/tmp/pt-lean-baseline-gate-attempt3-hz2-20261006.log`, SHA-256
+`4b5cc5def08332e8594fdc9a33ebdf76ca8639dee89a81dd8c544a082a48fc12`.
+Attempt four refused the incompatible job/clean-overlay flag combination; five
+refused insufficient hz2 slots. Those are failures, not compiler evidence.
+Attempt seven completed on vmi1152480 against an immutable archive of
+`ed50b23`, with a fresh Cargo cache and remote target on `/data/tmp`. It reproduced
+**eight E0609 errors**: the four UI-only fields read by each of the two original
+queue tests. The actual lean all-targets command exited 101 at 09:18:55 UTC;
+all 528 before and 528 after source guards passed. Retained log:
+`/data/tmp/pt-lean-baseline-gate-attempt7-vmi1152480-20261006.log`, SHA-256
+`9f79619d357bef3887100aae9396150c56410afa6577a0a3f852b744b0ece068`.
+This fresh-cache reproduction establishes the defect; the failed admissions and
+missing cached checkout above do not. The fixed-source eight-gate job now uses
+the same available worker/cache and a data-volume target; the first lean
+all-targets check passed. Its log is
+`/data/tmp/pt-lean-fixed-gates-vmi1152480-20261006.log`; remaining gates and both
+two-test executions are pending. Both jobs return logs only.
+No local compilation, shared daemon restart, forced cancellation, file cleanup
+or scanner waiver for this new bug occurred.
+
+At 09:33 UTC, local `/data` reached zero available bytes. The first fixed job's
+log stopped at 102,400 bytes in the workspace check; it retains only the lean
+all-targets check, strict lean Clippy and formatting PASS markers. The RCH client
+aborted (`rch_exit -6`, shell 250). Normal native recovery of the exact owned
+wrapper `rchw-bfd493c3-a459-40ff-9c97-a8d3fe952f8b` acknowledged its actual remote
+exit 137; recovery CLI zero means reconciliation, **not successful gates**.
+The missing tail and postguards remain a loss, with no final/test acceptance.
+Source, graph, report, receipt, complete baseline and the incomplete prefix were
+copied with hashes to `/tmp/pt-lean-disk-preservation-20261006-e0jiszca`.
+The available worker still had 137 GiB of disk and 46 GiB available RAM.
+
+The writable active checkout is now `/tmp/pt-lean-work-20261006.gEPiPFtk`:
+a non-destructive copy of this owned 70 MiB checkout, main at the same `ed50b23`.
+Every one of its 528 guarded inputs matches the fixed receipt, and the accepted
+961-record JSONL is byte-identical (SHA-256
+`ce824a73a96ee091b8eb3a2dca2d52d5b4b538488be24ffdec6d43ee2955c176`).
+Only native JSONL mode in this writable checkout is the graph writer now;
+neither copied disposable cache nor retained older cache may be flushed.
+No source edit, file deletion or shared-service restart was used for this move.
+The first native comment in the copied checkout also refused ENOSPC, with its
+JSONL hash unchanged: the shell still inherited `TMPDIR=/data/tmp`. Explicit
+per-invocation writable `TMPDIR`/`SQLITE_TMPDIR` succeeded and retained the
+failure/retry checkpoint as comment 473 on `bd-g7mg`. No global shell setting or
+SQLite status substitution was changed.
+
+The repeat keeps the original immutable `/data/tmp` compiler source and existing
+remote cache/target, verifies all 528 inputs before and after, and runs all eight
+gates again. Its client cache/output are on writable local `/tmp`; the worker
+also retains its full stdout/stderr in a separate owned data-volume directory.
+Local log:
+`/tmp/pt-lean-disk-preservation-20261006-e0jiszca/pt-lean-fixed-gates-attempt2-vmi1152480-20261006.log`.
+The interrupted job is not promoted to a pass.
+
+The repeat has completed all six static gates: literal workspace all-targets
+check, workspace Clippy with `-D warnings`, formatting, lean production check,
+and the original bead's lean all-targets check/strict Clippy. Both two-test runs
+are still pending, as are final source postguards and the final log hash.
+Fresh UBS on the writable exact source actually exited one at 09:54 UTC:
+`/tmp/pt-lean-disk-preservation-20261006-e0jiszca/final-writable-main-ubs.json`,
+SHA-256 `a0ec4d285dedd6f763c943b9ce5b202fd8b5ff0e16a418b481f614f731428635`.
+Counts remain 17 critical, 882 warning, 1,626 informational. Its 2,525 raw finding
+records (`.../ubs/scratch/tmp.shzC74r2E3/rust.findings.json`) are byte-identical
+to the earlier fixed scan, SHA-256
+`beb95de85a7db9ee77f63fd2dac9c2f162ec5ba58d0d73cf2463f14f2a12b5c3`,
+and the complete multiset equals baseline after excluding line/column positions.
+This is not a zero scan or a general warning/security clearance. Native graph
+checks retain all 961 IDs, 473 comments and 1,941 dependencies; active cycles are
+zero, with one pre-existing archived closed cycle. The 09:57 fetch still points
+upstream main at `ed50b23`.
+
+That second fixed run reached the six static passes and executed both lean
+queue tests (2 passed, zero failures/ignored, 30 filtered), then exceeded RCH's
+configured 30-minute deadline while building the default-feature binary. Its
+actual exit is 137; the default tests and final postguards did not complete.
+This time both outputs are retained, with no truncated/lost tail claimed:
+local full log SHA-256
+`309d371710277517c3aeddf46ddc71fb97e242902f5874a0135019c662a3a60a`;
+worker `/data/tmp/pt-lean-gate-evidence-20261006.f0G89SWV/gates.log`, downloaded
+as `.../pt-lean-disk-preservation-20261006-e0jiszca/attempt2-worker-f0G89SWV-gates.log`,
+SHA-256 `102ffb01fe6e63c69f03cc0278838a9d8099a3297a508b92abc40c82eea9b70a`.
+The third run repeats the same eight commands and 528 before/after guards using
+the populated cache; no timeout, lint or assertion threshold was changed.
+Its log is `.../pt-lean-disk-preservation-20261006-e0jiszca/pt-lean-fixed-gates-attempt3-vmi1152480-20261006.log`.
+The third run completed at 10:16:54 UTC with actual RCH zero, all eight gate
+passes, and `FINAL_GATES_EXIT=0 SOURCE_AFTER_EXIT=0`. Both original tests ran
+under each configuration: **2 passed, zero failed/ignored** in lean and default
+(30 and 41 filtered respectively), exactly four executions in this final run.
+All 528 before and 528 after guards passed; all 528 writable-checkout inputs
+still match the same receipt. Final local full log SHA-256:
+`009f45bf4961ea43174f46cb81fde6c4b2d145cc3ae7ed2340c9b2653cbdb50c`
+(127,446 bytes). Worker full log:
+`/data/tmp/pt-lean-gate-evidence-20261006.4lVzJ0wd/gates.log`.
+The complete worker log was downloaded to
+`/tmp/pt-lean-disk-preservation-20261006-e0jiszca/final-worker-4lVzJ0wd-gates.log`,
+SHA-256 `ec5b903049ec258b62d5f7d22409fae889bc8681eb5b8e91107fc6d32847db73`.
+No failure was removed, no deadline was raised, and repeated/cached runs count
+once as the final acceptance matrix, not as a performance win or extra feature.
+Root retained this checkpoint in native Beads comment 474. WhiteBeaver completed
+final non-author assessment: all eight sequential commands and their actual
+exits, four original-test executions, all 1,056 source guards, receipt and current
+source hashes match the unchanged acceptance criteria. Its first observer
+summary incorrectly expected the lean duration to be 0.00s rather than 0.01s;
+only the observer comparison was corrected, with no producer/test edit. It also
+verified all 2,525 baseline/fixed/fresh scanner records, including unchanged
+findings and actual UBS one. Source/runtime acceptance is complete; the separate
+nonzero UBS disposition, publication and exact-published-source closure remain
+pending. The scope is ROOT Linux, not a full workspace/non-root/Mac/live-feature
+or security/performance acceptance.
+
+The separate metadata-only pre-commit UBS invocation actually returned three,
+`no-supported-languages`, scanning zero Markdown/JSONL files. Retained output:
+`/tmp/pt-lean-disk-preservation-20261006-e0jiszca/pane-closure-metadata-ubs.json`,
+SHA-256 `1ad3abcee9cfc59e20eb6424269a68d8af440234ce61319f62bb41a21becba4a`.
+This is neither a green scan nor new source findings. The concrete pending
+publication is the eight guards/comment in `main.rs`, existing report updates
+and native graph updates (accepted pane closure and in-progress lean bug);
+untracked recovery artifacts are excluded. The earlier pane exception remains
+scoped to its published source. The new source has unchanged findings but still
+needs a separate owner disposition under the explicit AGENTS pre-commit rule.
+The owner has been asked for that exact three-file exception; no reply is yet
+recorded and elapsed time is not approval. The final three-file scanner actually
+returned one at 10:26 UTC, scanning one Rust file with the same 17 critical,
+882 warning and 1,626 informational records. Summary:
+`/tmp/pt-lean-disk-preservation-20261006-e0jiszca/final-three-file-publication-ubs.json`,
+SHA-256 `2f10cd41fe427f35f0a1ec7e1b5a41b9df89448339ac81cedb0bad6598ae127b`.
+Raw 2,525-record JSONL:
+`/tmp/pt-disk-pressure-preservation-20261005-2056/ubs/scratch/tmp.ndzHdQsgMn/rust.findings.json`,
+SHA-256 `042c8ba393ae9b25e2d0ee4f6f12ee0fa04f93b1017c11d287386d0198b47788`.
+These raw bytes differ from the prior fixed scan: 2,521 source records use the
+absolute current-checkout path rather than the relative source path; the four
+existing phase records retain empty paths. All complete records match the prior
+fixed multiset after normalizing only that exact checkout prefix, and baseline
+after additionally excluding line/column positions. Root's initial read-only
+comparisons incorrectly assumed JSON-array format, byte equality and nonempty
+paths; those observers refused and were corrected without changing any producer,
+scanner, severity, finding or gate. Independent confirmation was requested.
+WhiteBeaver independently confirmed this final scan comparison: exactly 2,521
+paths normalize by the named checkout prefix, four empty phase paths remain
+unchanged, all other fields match fixed source and baseline (the latter excluding
+only line/column shifts), and zero records are suppressed. The invocation scans
+one Rust file; its Markdown/JSONL arguments do not constitute scanned-code
+coverage. Actual UBS remains one, with no inferred exception or closure approval.
+`git diff --check` is clean; all 528 source hashes still match. Current graph has
+961 IDs, 476 comments, 1,941 dependencies, only the two intended changed issues,
+zero active cycles and one preserved archived closed cycle. No commit/push of
+these pending changes or source-closure claim has occurred. Native comment 476
+retains this final scanner comparison and the pending owner decision. Already
+published pane-file leases were released; the three pending edit surfaces remain
+reserved until their normal expiry.
+
+Next-product inspection while this decision is pending confirms that WS0 is
+not a completed-code wiring shortcut. Current `replay::replay_inference` calls
+its own evidence/posterior/myopic path (`replay/snapshot.rs:282`); no current
+`replay::triage` production module exists. GreenLotus's held lab patch (comments
+394/395) extends capture and scoring, but explicitly lacks shared action
+decisions, kill/review metrics, latency, labeled live corpus and a consumed CLI
+capture command. The original criteria require all of those relevant positive
+observables; synthetic candidate metrics do not establish product accuracy.
+The logical order remains `bd-uacs.8` shared decisions plus `bd-l3s5.1` faithful
+redacted capture, then live labels `.2/.3`, production-path metrics `.5`, and
+ratchets `.7`. Do not close `.5` from the separate replay pipeline or count
+merely landing the held patch as that acceptance. Also confirmed the existing
+pressure snapshot is already reached from `collect_system_state`; the window
+estimator is not called there, and remaining effective-capacity/daemon/fleet/macOS
+requirements keep `bd-p1o0.1` open. Neither inspection earns feature credit.
+
+### Publication-window work and honesty audit
+
+Bounded window: this continuation through the observations above. Record inspected:
+normal `ed50b23` commit/push, current three-file diff, exact native JSONL closure
+and graph comparison, RCH logs/refusals, two scanner summaries/raw findings, both
+unchanged queue-test bodies, and the independent source/closure reviews.
+
+Creation worksheet: this is the existing operator-requested TODO/report, not a
+new process artifact. Runtime does not branch on it. Consumer: owner reviewing
+the requested comprehensive progress; gate: this block's completion claims and
+scoped publication disposition; observed defect: earlier false closure, lost
+evidence and the current avoidable stale merge. Retire its active checklist when
+the corresponding work is independently accepted; preserve history under the
+no-deletion rule. Minimal compiler/graph snapshots prevent the specifically
+observed evidence loss and stale merge, are necessary at this scale, and reuse
+the existing report/harness rather than a new certificate system. Opportunity
+cost: `bd-g7mg` blocks real lean checks; finish it before more graph machinery.
+
+Real-work worksheet: one USER source publication (verified panes reach inference),
+one pending ENABLER (lean test build fix), one PROCESS activity (requested TODO
+and necessary graph recovery). This is not three delivered capabilities. Demo:
+the source-bound old/new native plans show the pane appears while six controls
+stay protected. Omitting process work would not change runtime; it would lose
+requested TODO/closure evidence. Existing paired BATS/native checks exercised
+the enabler for the published pane; the final four queue-test executions verify
+the lean build fix, which still awaits publication. They earn no new live-feature
+or performance credit.
+Older WS1 calibration/decision gaps still matter and stay open. Only the nonauthor
+verifier closed a positive capability; no refusal farming or follow-up laundering.
+Verdict **DRIFTING**: tracker recovery and repeated admission troubleshooting
+consumed excessive time. Correction: freeze recovery machinery, use native
+JSONL mode and the available worker, complete the bounded code/test change.
+
+Honesty inventory (all twenty prompts; no broader-session claim):
+
+| # | Answer and checked evidence |
+|---|---|
+| 1 | No: inspected published/current test and config diffs; no assertion, ignore, skip or golden changed. |
+| 2 | No: current code adds no mock, fixture or stub; the existing TCP/Unix unit inputs stay unchanged. |
+| 3 | No: no BLESS or snapshot regeneration in commands/diffs. |
+| 4 | Yes: eight guards admit existing lean-test fields; source-only independent review preserves all assertions. P0 publication used the explicitly recorded owner scanner exception, with actual UBS1 retained. |
+| 5 | No: reviewed full guard diff and scanner multiset; no hardcoded success, narrowed runtime path or synthetic consumer. |
+| 6 | No: final log records both unchanged tests actually executed in both configurations, four passes; six compiler/lint/format gates are separately static checks. |
+| 7 | No: actual compiler/refusal/scanner exits are recorded separately; failed admission is not a build. |
+| 8 | No: original live artifacts retain their timestamps; unit inputs and source review are not presented as new live/fleet proof. |
+| 9 | No concealed failure found in the checked records: stale-merge mistake, WAL failures, missing checkout, refused/cancelled admissions, full local disk and interrupted fixed job are disclosed above. |
+| 10 | Yes: the fixed job's output truncated at 102,400 bytes on the full local disk; only three static PASS markers survive. Native recovery reports actual remote137, not success. The loss is retained and earns no final/test acceptance. The repeat uses writable local output plus worker-side retention. Scanner raw findings and the completed baseline remain intact; older lost streams remain losses. |
+| 11 | No: only original fully accepted pane criteria closed, by WhiteBeaver; the lean bug is in progress and no criteria were split away. |
+| 12 | No: compared original Beads criteria and current source; no scope/spec relaxation. |
+| 13 | Yes: independent peer closure binds exact published ed50b23, real artifacts and the scoped UBS1 disposition; it is not author self-certification. |
+| 14 | No: review dispatch named positive observables, negatives and explicit no-claim boundaries; no make-tests-green instruction. |
+| 15 | No: root rechecked the native closed record, 961 IDs, intended four closure fields, comments/dependencies, source/test hashes and actual diffs. Final nonauthor review checked the entire bounded gate/test/source matrix; exact published-source closure is still pending. |
+| 16 | No: inspected sole new close and pending bug; no refusal-only item closed. |
+| 17 | No: repeated source/log agreement is counted once, with the earlier independent live execution separately identified. |
+| 18 | No: declared two existing tests in each of two configurations; the final run executed exactly two per configuration, zero failed/ignored, 30/41 filtered. Earlier repeated lean execution is not added to this final matrix. |
+| 19 | Yes: the avoidable stale-root merge and oversized/incompatible RCH invocations wasted time. The soft tombstone was corrected from preserved good JSONL; all IDs/comments survived. No rewrite or failure deletion hid those errors. |
+| 20 | Published pane evidence: the same-invocation native old/new comparison, real six protected controls, retained negatives and exact source/binary hashes. The guard fix has independently accepted baseline eight-E0609 reproduction, eight final gate passes, four original-test executions and all 1,056 source guards; its separate scanner disposition/publication remain pending. |
+
+Disposition: Q4 is independently reviewed strengthening, with no removed
+assertion or suppression; P0 UBS1 remains an owner-approved exception, not a
+green scan. Q10 is an actual output loss: preserve its prefix and native137,
+accept no missing result, and repeat with writable output plus remote retention.
+Q13 is the required independent close. Q19 is corrected, disclosed
+and named SM-11/RH-17: keep one JSONL writer, never flush stale caches, preserve
+every failed attempt, and never claim refused admission as execution. Earlier
+bounded history/CASS findings remain in the prior audits; no new historical
+evidence is inferred from an unindexed session. This report receives no feature
+credit, and publication plus the remaining 137 items stay pending.
 
 ## Current implementation and TODO — 2026-10-06 01:08 UTC
 

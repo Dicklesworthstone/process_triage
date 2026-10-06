@@ -3516,17 +3516,18 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
 }
 
 // Linux-only: built from /proc/net socket data (the only caller is Linux-gated too).
+// Keep detailed estimates in lean unit tests as well as the UI.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct QueueMetrics {
     saturated: bool,
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", test))]
     lambda: f64,
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", test))]
     mu: f64,
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", test))]
     stall_probability: f64,
-    #[cfg(feature = "ui")]
+    #[cfg(any(feature = "ui", test))]
     backlog_sockets: usize,
 }
 
@@ -3575,13 +3576,13 @@ fn estimate_queue_metrics(info: &pt_core::collect::NetworkInfo, io_active: bool)
 
     QueueMetrics {
         saturated,
-        #[cfg(feature = "ui")]
+        #[cfg(any(feature = "ui", test))]
         lambda,
-        #[cfg(feature = "ui")]
+        #[cfg(any(feature = "ui", test))]
         mu,
-        #[cfg(feature = "ui")]
+        #[cfg(any(feature = "ui", test))]
         stall_probability,
-        #[cfg(feature = "ui")]
+        #[cfg(any(feature = "ui", test))]
         backlog_sockets,
     }
 }
