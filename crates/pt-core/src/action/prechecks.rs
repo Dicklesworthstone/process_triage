@@ -1065,13 +1065,12 @@ impl LivePreCheckProvider {
             // blocked every action on processes started over SSH ("use systemctl stop
             // session-N.scope", which would end the whole login).
             let cgroup_path = self.read_supervision_cgroup_path(pid)?;
-            if cgroup_path
-                .as_deref()
-                .is_some_and(|path| crate::collect::classify_cgroup_path(path).is_user_workload())
-            {
+            if cgroup_path.as_deref().is_some_and(|path| {
+                crate::collect::classify_live_cgroup_path(pid, path).is_user_workload()
+            }) {
                 trace!(
                     pid,
-                    "login-session / transient-scope workload: not supervised"
+                    "login-session / terminal-pane / transient-scope workload: not supervised"
                 );
                 return Ok(None);
             }

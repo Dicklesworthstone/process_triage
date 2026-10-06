@@ -1,5 +1,306 @@
 # Reality Check & Bridge Plan — process_triage (`pt`)
 
+## Publication and next work — 2026-10-06 08:32 UTC
+
+The owner's reply, "OK, so please do everything you think is advisable based on
+all of that," follows the explicit publication question and is being treated as
+approval for its scoped `bd-toa2.10` scanner exception. This covers the verified
+nine-file pane change only; it is not a blanket scanner/security exception.
+The repeated publication scan actually exits one with the same 24 critical,
+1,450 warning and 2,120 informational matches. Its retained summary is
+`/data/tmp/pt-pane-publication-ubs-20261006.json`, SHA-256
+`2803ff2d489f3fb217afb8776f0d6f4be44eaa9f8085a97ace03d357ddfd71b6`.
+No suppression, hook bypass, test weakening or scanner-zero claim was added.
+
+Incoming main commits through `3c4149d` change only the graph. The first native
+merge preserved all IDs/comments and imported the new lean-test blocker. A second
+merge through the stale retained checkout incorrectly interpreted its absence
+as deletion and tombstoned `bd-g7mg`; this was my avoidable recovery mistake.
+The original record remained in fetched JSONL. Additive reconciliation refused
+that resurrection plus unrelated legacy graph conflicts, without mutation.
+I rebuilt a fresh disposable `.beads/beads.db` in this source checkout from the
+good 961-record JSONL, then reapplied the sole DB-only approval comment and the
+pane's in-progress status. Every prior/incoming comment and issue ID is now
+checked preserved; `bd-g7mg` is open. Only this checkout/cache is the active graph
+writer from now on; the old cache is retained and must not be flushed again.
+The pre-merge JSONL and SQLite backup remain under
+`/data/tmp/pt-pane-publication-preserved.ugysfwpf`. No file was deleted and no
+force/rebuild-overwrite flag was used. All 528 guarded code/test/README inputs
+still match the previously accepted r3 receipt. This correction earns no feature
+credit; the merge error and failed recovery attempts remain disclosed (SM-11).
+
+- [x] Preserve and reconcile both graph histories without deleting evidence.
+- [x] Re-run the publication scanner and record its actual nonzero disposition.
+- [ ] Commit/publish the verified pane change on main without rewriting history.
+- [ ] Bind independent acceptance and closure to the actual published revision.
+- [ ] Address `bd-g7mg`: lean all-target tests reference UI-only queue fields;
+      preserve UI behavioral assertions and check both feature configurations.
+- [ ] Continue the existing ready product graph; do not substitute stale task
+      comments for inspection of current production code.
+
+## Current implementation and TODO — 2026-10-06 01:08 UTC
+
+`bd-toa2.10` is now in progress in the isolated main checkout
+`/data/tmp/pt-pane-work-20261006.hkqx4iP8`. The production change lets ordinary
+terminal panes inside a mux's user-service cgroup reach the existing decision
+engine. It requires the same owner, exact cgroup, a TTY below a recognized live
+mux executable, and unchanged process/ancestor identities on re-read. Missing,
+moved, changed or adopted ancestry retains service protection. The mux itself,
+`am`, `rchd`, NTM's monitor and coordination-server children remain protected.
+Lineage, plan supervisor advice, scan protection and live apply protection share
+the classifier; a pane receives no mux-unit restart advice. This is an unpublished
+implementation, not a release, a calibration result or a performance win.
+
+The graph contains 960 issues: 823 closed, 122 open and fifteen in progress,
+**137 remaining**. No item has been closed during this resumed block. Its single
+writer uses `.beads/validation-recovery.db` in the retained temporary checkout;
+the stale default cache is not authoritative. The fetched `6625ee8` merge has
+the exact same tree as `5fe0a75`; it preserves the prior report and tracker parents.
+
+Granular acceptance TODO for the active P0:
+
+- [x] Trace every raw-service reader and refine the shared production classifier.
+- [x] Require a bounded, acyclic, same-owner chain and actual mux executable;
+      re-read PID, birth, owner, PPID, SID, TTY, command, executable and placement.
+- [x] Preserve system/user services, containers, muxes, coordination daemons and
+      their service children; test missing/changed/moved/adopted witnesses.
+- [x] Replay the recorded raw `/proc` pane layout through the production parser.
+- [x] Remove systemd supervisor evidence/advice for verified pane workloads.
+- [x] Expose actual per-PID protection rules in plan JSON so a young control's
+      absence cannot stand in for evidence that protection worked.
+- [x] Add the paired-native read-only test to the existing real BATS suite.
+- [x] Correct its initially malformed comparison JSONL to carry the existing
+      runner's run ID on every witness, summary and structured PASS event.
+- [x] Retain Python witness/comparison failure output before unchanged assertions;
+      reproduce the permission failure with an actual stored traceback and FAIL.
+- [x] Independently review the feature, planted negatives and logging correction;
+      fix the initially missing pane-launched `rchd` protection.
+- [x] Build and retain an unmodified incumbent binary from `5fe0a75`.
+- [x] Run formatting, workspace all-targets check, strict Clippy and lean check
+      against the final Rust source through strict remote compilation.
+- [x] Finish the final-source collection, precheck and enforcer test subsets.
+- [x] Build, retain and hash the changed native binary outside the RCH job roots.
+- [x] Execute the existing E2E runner with the actual old pane subject and six
+      live mux/coordination/service controls; require unchanged identity witnesses.
+- [x] Compare ordinary default-threshold plans as a separate countermetric.
+- [x] Validate the original E2E manifest schema, actual file hashes and JSONL IDs.
+- [x] Independently re-execute and assess every original acceptance condition.
+- [ ] Resolve the actual nonzero UBS commit gate without suppression or rewrites
+      of legitimate tests to placate scanner matches; publish and close only then.
+
+The earlier-source job finished zero with 403 collection tests passed/seven
+existing ignores, 75 prechecks passed and 87 enforcer tests passed. Its complete
+log is `/data/tmp/pt-pane-gates-20261006.log`, SHA-256
+`c41b49ab5283497ec1d2a9358490aa9afda786278f3deac53822047a504fb928`.
+These earlier 565 passes do not cover later source deltas. Final compilation uses receipt
+`0bf490e42f0d57ba62c7f2eca54537ee2abd20cadb7819c5c00fb193f50cdcc1`
+and `/data/tmp/pt-pane-final-gates-attempt5-hz2-20261006.log`, SHA-256
+`7f28c5f6d8f40f7ae6369cef3d581f8f500803d24d5e17ee050cee6399bec8ba`.
+That final job also passed all 565 focused tests, with zero failures and seven
+existing ignores, all four mandatory static gates and the lean native build.
+All 528 guarded inputs matched both before and after. The subsequent three
+logging-only BATS corrections leave all 526 compile inputs and README identical;
+the original paired live-test receipt is
+`4bc362f0b8eb9a6e75d8ae14101779e8b60cdd1f15170aa1be09c6c872055b4b`,
+and the final failure-output retention receipt is
+`e981cf447ebb1ae09f5b2d3d81e344055ee373501e7bbe3489b4e95f85505206`.
+No identical-final-528-file compilation claim is made across that test-only delta.
+The retained fixed binary is `/data/tmp/pt-pane-fixed-retrieval.VfeGlvsx/pt-core`,
+SHA-256 `27e3113df4003c249cca39595d5c29ab32295a16b122873e73c3869d87bc2f46`;
+the retained unmodified incumbent is `/data/tmp/pt-pane-baseline-native-20261006`,
+SHA-256 `b7e211216ff238648a25e218be63b34265ed34d689d96d296c749d32be2b292a`.
+
+The existing real BATS runner passed at 00:49:30–00:49:39 UTC, one test passed,
+zero failed/skipped, run ID `e2e-20261006004930-9wy8`. Native plans evaluated
+21 versus 34 candidates: thirteen added, zero removed, all thirteen recommended
+Keep, zero new Kill. Subject 205617 became visible without mux-unit advice;
+controls 1173, 349620, 440938, 3332649, 3922144 and 4110556 retained actual
+protection rules. All seven full identity/placement witnesses were unchanged.
+The separate ordinary-default plans returned 8 versus 12 rows, four added Keep,
+zero removed and zero Kill in either plan. Their actual native exits were both
+one (review results), not zero. Default threshold 0.7, min-age 3600 and cap 20
+were unchanged. Observed durations were 1495 and 2213 ms; this volatile-host
+sample supplies no speedup or calibration claim.
+
+Evidence is private under `/data/tmp/pt-pane-live-root.pPSVCqpD`; the original
+manifest validator and installed JSON Schema validator both passed. Manifest
+canonical SHA-256 is `5f167afb378b202f1b62c2905dda31ab7265c1fc2ec3d81a698a9ba5c2b08faf`.
+Its thirteen logs and sixteen artifacts bind binary/source/build hashes and
+actual native exit statuses; structured harness logs carry the actual run ID.
+Plan artifacts use only the existing six secret filters (custom profile), not
+the full Safe/Forensic export engine. Raw witnesses/countermetric stdout remain
+unredacted diagnostic evidence behind the 0700 parent and 0600 files.
+
+Two unprivileged runs failed before either native plan because root-service
+executable links were unreadable. The first exposed the existing unconditional
+PASS teardown label. The corrected second negative still exits one and now
+logs FAIL; no witness/gate was relaxed. Root was used only to read those controls.
+Independent first execution at 00:56:33–00:56:47 UTC also passed: 33 to 49
+rows, sixteen added, zero removed, fifteen new Keep and one new Review (a live
+`rch exec` job aged 3986 seconds), zero new Kill. It retained all six controls,
+including the original pane-launched `am`, and seven stable witnesses. Its
+first runner output used the default artifact route because the dispatch named
+the wrong environment variable; the verifier retained that original metadata
+before rerunning with `ARTIFACT_ROOT`. That second run failed before either
+plan: control `am` PID 3332649 had exited. Its loss is retained, not erased by
+the earlier pass. A new service-launched `am` is a different placement and is
+not substituted into the original pane-am proof. WhiteBeaver independently
+accepted the original functional criteria and validated all 29 manifest file
+hashes/lengths and JSONL run IDs against the unchanged 528-file live receipt.
+Its private evidence is `/data/tmp/pt-pane-independent-live.3b34ZgbM`.
+UBS publication disposition remains pending; independent functional acceptance
+is not a scanner exception or a graph closure.
+
+The initial witness traceback was not retained. That loss cannot be recovered.
+Four final BATS logging lines now save both Python steps' combined output before
+the original assertions and log their error text on failure. The new unprivileged
+negative at 01:05:24–25 UTC actually exits one with zero native plans and retains
+`PermissionError: [Errno 13] Permission denied: '/proc/1173/exe'` in its text log.
+Its manifest is `/data/tmp/pt-pane-negative-r3.dhe0v2kv/manifest.json`, canonical
+SHA-256 `f9c8bbfe11419a013720e8b2770e09d967a058c3e4de2b33434431dfc574b1b3`.
+The separate positive at 01:05:25–37 UTC actually exits zero: 36 to 49 candidates,
+thirteen new Keep, zero removed/new Kill, seven unchanged witnesses, six actual
+protected controls including the different service-launched `am` PID 3962602.
+Its manifest is `/data/tmp/pt-pane-positive-r3.v62mqucs/manifest.json`, canonical
+SHA-256 `8ef5cb27aa04238095b8092ed7d997c23595bc6e57d8532e0d1d321eb2f9d277`.
+Both original schema and manifest validators pass. WhiteBeaver independently
+reviewed the four-line source delta and both r3 manifests, all referenced hashes,
+actual failure trace, preserved assertions, positive identities/protection rules
+and unchanged 528-file receipt. Original functional acceptance stands on the
+unchanged Rust source. UBS publication disposition is the remaining boundary.
+
+UBS actually exits one: 24 critical, 1,450 warning and 2,120 informational matches
+across six Rust files. All 24 critical matches equal the independently reviewed
+baseline multiset; the full warning set is not reviewed. The raw findings remain
+at `/tmp/pt-disk-pressure-preservation-20261005-2056/ubs/scratch/tmp.hSAvzFypDX/rust.findings.json`,
+SHA-256 `839c82eb588c808f8e17ad7691ff0b3f7c19c677aa6022ad98d5af958a1d1606`.
+This is not a scanner pass or security clearance. Shellcheck passes for the BATS
+source, which this UBS invocation does not recognize as a Bash file. The source
+remains uncommitted under the repository's exit-zero requirement.
+
+The first final-job request was too long for RCH's pre-parse 65,536-byte request
+bound. Lossless compression of the same receipt retained every check. A later
+hz4 queue timeout and two incorrectly specified hz2 path-mapping invocations
+supplied no execution evidence. The accepted hz2 invocation explicitly uses
+`/data/tmp` for both canonical and alias roots; no shared alias changed and no
+heavy local compilation ran. These failed attempts remain failures.
+
+Next work is chosen from remaining implementation and proof gaps rather than
+stale comments: `bd-zi8p.5` already has production MCP age-floor wiring, but still
+needs exact four-surface default/override proof, the required fresh busy-process
+E2E and the original fleet artifacts. Its existing MCP test does not assert that
+the fresh child appears with the override. `bd-toa2.11` remains the real FUSE
+pause/kill safety gap. This host's current mount namespace has zero FUSE data
+mounts and one `fusectl` control mount; 258 of 495 observed process FD directories
+were unreadable, so that observation is not a fleet or complete server census.
+Dependency updates remain paused under the previously requested library-updater
+circuit-breaker decision. Prior NONROOT failures, lost raw streams, pending
+snapshot publication and the unresolved PID 1 quota restoration below remain
+unresolved; this new work does not replace their evidence or obligations.
+
+### Bounded work, process and honesty audit — resumed block
+
+Window: 2026-10-05 23:53 UTC through the assessment above. Mechanical source
+log/reflog review found no new commits or history rewriting; authoritative
+closed-issue review found no closes updated during this window. The purpose
+from README is to find abandoned processes and help remove them safely.
+
+Real-work inventory: one USER implementation (verified panes reach the existing
+decision engine; README explains the conservative boundary), one ENABLER block
+(focused/static/native tests and real paired acceptance), and one PROCESS block
+(the requested existing TODO/report/Beads evidence updates). This is an activity
+inventory, not three closures or shipped capabilities. Most visible outcome:
+demo the retained native old/new plans in two minutes, showing the pane appears
+and all six infrastructure controls stay protected. Nothing shipped in this
+window: source remains unpublished. Omitting the report would not change runtime
+behavior, but would lose the user's requested TODO and the exact acceptance
+limits. The ENABLER is exercised by the existing real BATS runner and verifier,
+not speculative infrastructure. The older root/nonroot workspace failure and
+WS1 calibrated scoring/age-floor work remain open; this ready P0 was chosen
+because mux placement made ordinary agent workloads completely invisible. No
+agent produced closes, no follow-up was minted to launder unmet criteria, and
+no plan-only commit stood in for implementation. Verdict: product work is real,
+publication is still pending; finish that boundary before expanding machinery.
+
+Process creation gate: this report update was explicitly requested as a complete
+TODO; its consumers are the project owner and WhiteBeaver assessing `bd-toa2.10`.
+The named shipping boundary is independently accepted pane classification with
+honest build/live/UBS evidence. Observed defects are the false PASS teardown,
+initial malformed JSONL, wrong artifact route and the prior loss of raw NONROOT
+streams. Stop updating this bounded session section at handoff; retain evidence
+until acceptance and any operator-authorized retirement. No file deletion is
+authorized. Retained native binaries outside RCH job roots are the minimum
+integrity control for a demonstrated worker-retirement evidence loss. Checks
+are needed for this native A/B, reused rather than a new dashboard or harness;
+there is no cheaper surviving binary binding. The current highest-priority
+ready capability is this claimed P0. Additional process work would displace it;
+only the existing-schema manifest and required acceptance inventory are added.
+
+Honesty inventory (all twenty questions; neither author's nor verifier's reports
+are presumed correct):
+
+1. No (checked: the entire current BATS diff, Rust test diffs, unchanged CI/Cargo
+   gate files and window log/reflog); no ignore, deletion or tolerance relaxation.
+2. No (checked: new table/re-read/raw-proc tests and actual native BATS path);
+   fixtures exercise the production parser, and live binaries receive real PIDs.
+3. No (checked: changed-path inventory); no golden/snapshot baseline regeneration.
+4. Yes: a feature test and shared teardown logger changed in the feature diff.
+   The logger correction has a retained still-failing negative and independent
+   review; it fixes false PASS labeling, with no assertion or tolerance weakened.
+5. No (checked: classifier and exact native argv); no fixture PID, environment
+   sniff, sampling shortcut or reduced age floor occurs in production behavior.
+6. No (checked: actual 403+75+87 test summaries and live TAP 1/0/0); filtered
+   library tests and seven existing ignores are outside the stated proof scope.
+7. No (checked: complete compiler log, native artifacts, manifest and counters);
+   failed admissions and actual native exit-one results remain explicit.
+8. No (checked: parser replay versus native proof descriptions); no WS0 capture,
+   full-suite, release, field, fleet, Mac or calibration proof is claimed.
+9. No (checked: retained UBS1, unprivileged failures, independent ENOENT loss and
+   prior failures stated above); the implementation remains unpublished.
+10. Yes: the first unprivileged Python witness failure's raw traceback was lost
+    at its assertion; its failed TAP/status survived. Four logging lines now
+    retain the combined output before the unchanged assertions. A new failed
+    run stores the actual permission traceback; it does not reconstruct the
+    original lost text. Prior lost NONROOT raw output also remains disclosed.
+11. No (checked: authoritative closed-issue window query); no resumed closure.
+12. No (checked: original `bd-toa2.10` description and current source scope);
+    raw parser replay is not promoted to the still-open WS0 capture work.
+13. No (checked: verifier dispatch and graph window); graph writes remain with
+    the root, and no implementer/verifier has closed this item yet.
+14. No (checked: dispatch); it names the actual positive pane, six negative
+    controls, stable witnesses and a No-Claim line, rather than "get green."
+15. No (checked: root's own native runs, static/log/source guards, touched gate
+    diffs and actual retained independent native/logging results); agreement
+    is not a substitute for the separately recorded execution and hashes.
+16. No (checked: work inventory and actual pane visibility); no refusal-only
+    leaf closure is counted while the positive capability remains open.
+17. No (checked: comparisons); independent agreement adds no live-count proof;
+    its actual 33-to-49 run differs from the root's 21-to-34 population.
+18. No (checked: predeclared subject, controls, default threshold and age floor);
+    counters are timestamp-scoped and not cherry-picked performance metrics.
+19. Yes: repeated RCH path-mapping requests wasted work before correct admission;
+    initial JSONL and false-PASS labels were wrong; the dispatch named the wrong
+    artifact variable, and two dynamic metadata commands were guard-blocked.
+    The initial BATS edit preceded its file reservation, with no observed
+    conflict; subsequent edits checked the active lease before writing.
+    Corrected before credit, with failed attempts retained and no guard override.
+    The old PID 1 quota/lost NONROOT stream incidents remain unresolved below.
+20. Strongest evidence: retained, executable baseline/fixed binaries through the
+    existing runner with unchanged witnesses and exact protection reasons, plus
+    the verifier's separately executed native pair. A skeptic can rerun it with
+    genuinely live, recorded subjects; exited controls must fail loudly.
+
+Disposition for Yes answers: corrections are in the current test/logger and
+literal metadata calls; failures are disclosed above and to the owner in updates.
+Lost original raw traces cannot be restored; replacement observations are
+separately timestamped and never promoted to the missing original stream.
+Countermeasures are RH-1 (gate diffs and still-failing logger negative), RH-2 /
+SM-4 (bound proof classes and exact source/native guards), SM-8 / SM-11 (retain
+first failures and varying population results), and RH-14 (no scanner/command
+guard bypass). A bounded Cass sweep of six workspace queries returned no indexed
+project history (five workspace-not-indexed, one genuine no-match); one broader
+hit was old RCH context. This cannot certify older sessions clean.
+
 ## Current work and validation — 2026-10-05 22:20 UTC
 
 The core product is materially better, but the project is not finished. Twelve

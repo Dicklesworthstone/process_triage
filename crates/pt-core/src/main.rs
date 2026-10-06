@@ -16174,6 +16174,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "total_processes_scanned": total_scanned,
         "protected_filtered": protected_filtered_count,
         "protected_by_rule": protected_by_rule,
+        // Per-PID reasons distinguish protection from age/threshold filtering;
+        // expose no command lines or other process metadata for protected rows.
+        "protected_by_pid": protected_rule_by_pid,
         "candidates_evaluated": candidates_evaluated,
         "deep_scan_ms": deep_scan_ms,
         "deep_evidence_pids": deep_signals.as_ref().map(|m| m.len()),
@@ -17128,6 +17131,9 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
     if !detected {
         if let Some((service, user_manager)) = pt_core::collect::read_systemd_cgroup_path(pid)
             .and_then(|path| {
+                if pt_core::collect::classify_live_cgroup_path(pid, &path).is_user_workload() {
+                    return None;
+                }
                 pt_core::collect::systemd_service_unit(&path)
                     .map(|(service, user)| (service.to_string(), user))
             })

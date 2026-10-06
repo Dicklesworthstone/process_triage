@@ -692,6 +692,12 @@ static BUILTIN_PROTECTED: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::Laz
             "terminal multiplexer: hosts every interactive/agent session on the machine",
         ),
         builtin_rule(
+            "builtin.agent_coordination",
+            Cmd,
+            r"^(\S*/)?am(\s+serve(-http)?(\s|$)|\s*$)|^(\S*/)?(mcp-agent-mail|rchd)(\s|$)|^(\S*/)?ntm\s+internal-monitor(\s|$)",
+            "shared agent-mail/compilation service or live agent-session monitor",
+        ),
+        builtin_rule(
             "builtin.ssh_control_master",
             Cmd,
             // Started with -M / ControlMaster=..., or (ControlMaster set in ssh_config)
@@ -972,9 +978,10 @@ pub const SERVICE_DAEMON_RULE: &str = "builtin.service_daemon";
 /// Maximum ancestor depth walked for parent-identity protection.
 const MAX_ANCESTOR_DEPTH: usize = 64;
 
-/// Whether a process is itself a database / web / message server.
+/// Whether a process is a service or shared agent-coordination daemon.
 pub fn is_service_daemon(comm: &str, cmd: &str) -> bool {
-    builtin_protection_match(comm, cmd).is_some_and(|(rule, _)| rule == SERVICE_DAEMON_RULE)
+    builtin_protection_match(comm, cmd)
+        .is_some_and(|(rule, _)| matches!(rule, SERVICE_DAEMON_RULE | "builtin.agent_coordination"))
 }
 
 /// Nearest ancestor of `pid` that is a service daemon (`(pid, comm)`), walking the
@@ -1287,6 +1294,51 @@ mod tests {
         for (comm, cmd) in not_daemons {
             assert!(!is_service_daemon(comm, cmd), "{comm} / {cmd}");
         }
+    }
+
+    #[test]
+    fn builtin_protects_coordination_servers_and_monitor_children() {
+        for cmd in [
+            "/home/ubuntu/mcp_agent_mail/am",
+            "am serve",
+            "/opt/am serve-http --port 8765",
+            "mcp-agent-mail serve",
+            "/home/ubuntu/.local/bin/rchd",
+            "rchd --foreground",
+            "ntm internal-monitor frankensim",
+        ] {
+            assert_eq!(
+                builtin_protection_match("daemon", cmd).map(|(rule, _)| rule),
+                Some("builtin.agent_coordination"),
+                "{cmd}"
+            );
+            assert_eq!(
+                service_ancestor_with(
+                    300,
+                    |pid| (pid == 300).then_some(200),
+                    |pid| (pid == 200).then(|| ("daemon".to_string(), cmd.to_string()))
+                ),
+                Some((200, "daemon".to_string())),
+                "child of {cmd}"
+            );
+        }
+        for cmd in [
+            "am send alice",
+            "am inbox",
+            "amp serve",
+            "am serve-other",
+            "ntm attach frankensim",
+            "ntm spawn frankensim",
+            "ntm internal-monitor-fake",
+            "bash -c 'am serve-http'",
+            "pytest test_mcp_agent_mail.py",
+            "rg rchd",
+            "rchdoc serve",
+        ] {
+            assert!(!is_service_daemon("am", cmd), "{cmd}");
+        }
+        // A mux hosts workloads; its children must not inherit daemon protection.
+        assert!(!is_service_daemon("tmux: server", "tmux new -d"));
     }
 
     /// Workers and plugins inherit protection from their server by parent identity,
