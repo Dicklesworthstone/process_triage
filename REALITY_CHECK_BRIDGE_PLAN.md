@@ -16,8 +16,8 @@ binds upstream main to `ed50b23`; no incoming code/graph merge is needed.
 - [x] Record the new scoped owner disposition and retain actual UBS exits.
 - [x] Recheck the unchanged accepted source receipt and all three-file diff.
 - [x] Run the required pre-commit scanner with retained output and actual exit.
-- [ ] Normally commit and push the three-file lean fix plus pane closure metadata.
-- [ ] Independently bind acceptance/closure to that exact published source.
+- [x] Normally commit and push the three-file lean fix plus pane closure metadata.
+- [x] Independently bind acceptance/closure to that exact published source.
 - [ ] Publish the native independently accepted lean closure metadata.
 - [ ] Continue with the highest-impact product gap; claim its existing Bead first.
 
@@ -34,6 +34,25 @@ All 2,525 complete records match the published baseline after only the previousl
 defined checkout-prefix normalization and line/column exclusion. All 961 issue
 IDs remain present; exactly the pane and lean issues differ from `ed50b23`.
 Normal publication proceeds under the new scoped owner exception; UBS is not green.
+Normal source commit `53aeed5b26441a43f8c3c7c53486e086540f0127` is now published
+on main and its required legacy mirror. WhiteBeaver independently verified both
+published refs and committed/working 528-file source receipt, retained gate log
+and fresh actual UBS one. It closed only `bd-g7mg` with normal native JSONL mode
+at 18:47:43 UTC, citing the original criteria and bounded ROOT Linux evidence.
+Exactly status, closed_at, close_reason and updated_at changed; all 961 IDs,
+477 comments and 1,941 dependencies remain preserved. Before JSONL is retained
+at `.../pt-lean-disk-preservation-20261006-e0jiszca/independent-g7mg-close-before-b11ze110/issues-before.jsonl`,
+SHA-256 `295410ef1d9e140258ff4647ac670ed79112c5fbaca1d3f827f0f6fb63c1a3b1`;
+after SHA-256 `608bac0460b2cb046816be6da29a5f9adf13f5a0c31916274b0830ca113070b6`.
+There are 825 closed, 122 open and fourteen in progress: **136 remaining**.
+Active cycles remain zero (one old archived closed cycle separately). Root has
+sole graph ownership again. This accepted closure's normal metadata publication
+is the remaining step for this bug; it earns no separate feature credit.
+Its required metadata-only scanner actually returned three (`no-supported-languages`,
+zero scanned Markdown/JSONL files) at 18:51 UTC. Retained output:
+`/tmp/pt-lean-disk-preservation-20261006-e0jiszca/accepted-closure-metadata-ubs-1854.json`.
+The existing scoped approval includes this normal report/tracker publication;
+neither unsupported metadata nor the accepted source scan is described as UBS zero.
 
 The owner's reply, "OK, so please do everything you think is advisable based on
 all of that," follows the explicit publication question and is being treated as
