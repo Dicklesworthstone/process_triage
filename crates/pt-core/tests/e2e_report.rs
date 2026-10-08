@@ -1619,39 +1619,50 @@ mod bundle_extraction {
         }
     }
 
+    /// The default destination is named by the bundle, so a symlink there refuses.
     #[test]
-    fn destination_and_ancestor_symlinks_refuse_without_outside_writes() {
-        for placement in ["default", "destination", "ancestor"] {
+    fn default_destination_symlink_refuses_without_outside_writes() {
+        let case = retained_case();
+        let outside = case.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("payload.bin"), b"outside bytes must survive").unwrap();
+        let (bundle, session) = genuine_bundle(&case, &[("payload.bin", PAYLOAD)]);
+        let link = case.join("working").join(&session);
+        symlink(&outside, &link).unwrap();
+        let (output, value) = extract(&case, &bundle, None, true);
+        assert!(!output.status.success());
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["error_code"], "UNSAFE_EXTRACTION_DESTINATION");
+        assert_eq!(
+            fs::read(outside.join("payload.bin")).unwrap(),
+            b"outside bytes must survive"
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        assert_eq!(fs::read_link(&link).unwrap(), outside);
+    }
+
+    /// `--output` is the user's choice, so links in it are followed (macOS /tmp
+    /// and /var are symlinks), as v2.2.1 did; refusing them broke
+    /// `--output /tmp/x` on every Mac.
+    #[test]
+    fn user_destination_and_ancestor_symlinks_are_followed() {
+        for (placement, relative) in [("destination", "jump"), ("ancestor", "jump/new/output")] {
             let case = retained_case();
             let outside = case.join("outside");
             fs::create_dir(&outside).unwrap();
-            fs::write(outside.join("payload.bin"), b"outside bytes must survive").unwrap();
-            let (bundle, session) = genuine_bundle(&case, &[("payload.bin", PAYLOAD)]);
-            let link = case.join("working").join(if placement == "default" {
-                &session
-            } else {
-                "jump"
-            });
+            let (bundle, _) = genuine_bundle(&case, &[("payload.bin", PAYLOAD)]);
+            let link = case.join("working/jump");
             symlink(&outside, &link).unwrap();
-            let destination = match placement {
-                "default" => None,
-                "ancestor" => Some(Path::new("jump/new/output")),
-                "destination" => Some(Path::new("jump")),
-                _ => unreachable!(),
-            };
-            let (output, value) = extract(&case, &bundle, destination, true);
-            assert!(!output.status.success());
-            assert_eq!(value["status"], "error");
-            assert_eq!(value["error_code"], "UNSAFE_EXTRACTION_DESTINATION");
-            assert_eq!(
-                fs::read(outside.join("payload.bin")).unwrap(),
-                b"outside bytes must survive"
+            let (output, value) = extract(&case, &bundle, Some(Path::new(relative)), true);
+            assert!(output.status.success(), "{placement}: {value}");
+            assert_eq!(value["status"], "ok", "{placement}: {value}");
+            let landed = outside.join(
+                relative
+                    .strip_prefix("jump")
+                    .unwrap()
+                    .trim_start_matches('/'),
             );
-            assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
-            assert!(fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink());
+            assert_verified_payloads(&bundle, &landed);
             assert_eq!(fs::read_link(&link).unwrap(), outside);
         }
     }

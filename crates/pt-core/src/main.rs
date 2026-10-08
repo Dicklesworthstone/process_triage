@@ -5422,7 +5422,7 @@ fn open_bundle_extract_child(
     parent: &std::fs::File,
     name: &std::ffi::CStr,
 ) -> std::io::Result<std::fs::File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
 
     // SAFETY: parent is a live directory descriptor and name is one validated,
     // NUL-terminated component. New directories are private to the effective UID.
@@ -5434,6 +5434,17 @@ fn open_bundle_extract_child(
     }
     // Do not trust an EEXIST check: open the child relative to the retained
     // parent, requiring a directory and refusing a symlink at the actual open.
+    open_existing_bundle_extract_child(parent, name)
+}
+
+/// Open an existing directory below `parent`, refusing a symlink at the open.
+#[cfg(unix)]
+fn open_existing_bundle_extract_child(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
     // SAFETY: the borrowed parent and component remain live during openat.
     let descriptor = unsafe {
         libc::openat(
@@ -5450,13 +5461,36 @@ fn open_bundle_extract_child(
 }
 
 #[cfg(unix)]
-fn open_bundle_extract_directory(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_bundle_extract_directory(path: &Path, user_given: bool) -> std::io::Result<std::fs::File> {
     use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
 
     // Validate all components before creating any directory. Explicit absolute
     // and relative destinations remain supported; parent traversal is refused.
-    let names = bundle_extract_path_components(path, true)?;
-    let anchor = if path.is_absolute() { c"/" } else { c"." };
+    let mut names = bundle_extract_path_components(path, true)?;
+    let mut existing = Vec::new();
+    let mut absolute = path.is_absolute();
+    if user_given {
+        // The user chose --output, so links in its existing part are theirs to
+        // follow (macOS /tmp and /var are symlinks; v2.2.1 followed them too).
+        // Resolve that part once and re-walk the result without following
+        // anything, so a swap after resolution fails closed; only the missing
+        // tail is created. Bundle-derived names never get this.
+        let mut prefix = PathBuf::from(if absolute { "/" } else { "." });
+        let mut present = 0;
+        for name in &names {
+            let candidate = prefix.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+            if std::fs::metadata(&candidate).is_err() {
+                break;
+            }
+            prefix = candidate;
+            present += 1;
+        }
+        existing = bundle_extract_path_components(&std::fs::canonicalize(&prefix)?, true)?;
+        names = names.split_off(present);
+        absolute = true;
+    }
+    let anchor = if absolute { c"/" } else { c"." };
     // SAFETY: the literal anchor is NUL terminated; AT_FDCWD is a valid anchor.
     let descriptor = unsafe {
         libc::openat(
@@ -5470,6 +5504,9 @@ fn open_bundle_extract_directory(path: &Path) -> std::io::Result<std::fs::File> 
     }
     // SAFETY: take sole ownership of the successful openat descriptor.
     let mut directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    for name in existing {
+        directory = open_existing_bundle_extract_child(&directory, &name)?;
+    }
     for name in names {
         directory = open_bundle_extract_child(&directory, &name)?;
     }
@@ -5514,7 +5551,10 @@ fn write_bundle_extracted_file(
 }
 
 #[cfg(not(unix))]
-fn open_bundle_extract_directory(_path: &Path) -> std::io::Result<std::fs::File> {
+fn open_bundle_extract_directory(
+    _path: &Path,
+    _user_given: bool,
+) -> std::io::Result<std::fs::File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "descriptor-relative bundle extraction is unsupported on this platform",
@@ -5642,7 +5682,7 @@ fn run_bundle_extract(
     };
 
     // Keep the opened destination as the authority for all later child opens.
-    let destination = match open_bundle_extract_directory(&output_dir) {
+    let destination = match open_bundle_extract_directory(&output_dir, output_arg.is_some()) {
         Ok(directory) => directory,
         Err(error) => {
             let code = if error.kind() == std::io::ErrorKind::Unsupported {
