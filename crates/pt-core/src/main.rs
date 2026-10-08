@@ -12309,6 +12309,22 @@ mod process_tree_safety_tests {
         }
     }
 
+    /// On macOS the plan reports no supervisor (as v2.2.1 did) instead of
+    /// "unknown", and robot supervision answers from the environment.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plan_and_robot_supervision_do_not_refuse_for_missing_linux_probes() {
+        let pid = std::process::id();
+        let observed = super::supervisor_info_for_plan(pid);
+        assert_eq!(observed["status"], "observed", "{observed}");
+        assert_eq!(observed["detected"], false, "{observed}");
+        assert_eq!(observed["recommended_action"], "kill", "{observed}");
+        assert!(
+            super::supervision_for_robot(pid).is_ok(),
+            "robot supervision must not fail for missing Linux-only probes"
+        );
+    }
+
     #[test]
     fn routed_parent_checks_use_its_own_protection_age_and_memory() {
         use pt_core::decision::PolicyEnforcer;
@@ -17168,12 +17184,20 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
     })
 }
 
+/// No systemd, container or cgroup supervisors to probe here (launchd is checked by
+/// the apply-time pre-check). As in v2.2.1 the plan reports none detected; an
+/// "unknown" status turned every macOS candidate into REVIEW.
 #[cfg(not(target_os = "linux"))]
-fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
-    unknown_supervision_for_plan(
-        pid,
-        "complete supervisor probes are unavailable on this platform",
-    )
+fn supervisor_info_for_plan(_pid: u32) -> serde_json::Value {
+    serde_json::json!({
+        "detected": false,
+        "status": "observed",
+        "type": serde_json::Value::Null,
+        "unit": serde_json::Value::Null,
+        "manager": serde_json::Value::Null,
+        "recommended_action": "kill",
+        "supervisor_command": serde_json::Value::Null,
+    })
 }
 
 fn unknown_supervision_for_plan(pid: u32, error: &str) -> serde_json::Value {
@@ -17194,11 +17218,17 @@ fn unknown_supervision_for_plan(pid: u32, error: &str) -> serde_json::Value {
 /// Preserve unavailable required evidence separately from observed supervision.
 /// Confirmation policy cannot turn a failed mandatory probe into permission.
 fn supervision_for_robot(pid: u32) -> Result<bool, String> {
-    detect_supervision(pid)
-        .map(|result| is_human_supervised(&result))
-        .map_err(|error| {
-            format!("Mandatory supervision evidence unavailable for PID {pid}: {error}")
-        })
+    let result = detect_supervision(pid).map_err(|error| {
+        format!("Mandatory supervision evidence unavailable for PID {pid}: {error}")
+    })?;
+    // Off Linux an unreadable environment is not an error from detection; robot
+    // mode still refuses it, as v2.2.1 did.
+    if result.environ.is_none() {
+        return Err(format!(
+            "Mandatory supervision evidence unavailable for PID {pid}: environment unreadable"
+        ));
+    }
+    Ok(is_human_supervised(&result))
 }
 
 /// No supervision evidence on this platform: preserve Unknown as a refusal.

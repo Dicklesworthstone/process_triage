@@ -471,6 +471,10 @@ enum RecentIoEvidence {
     Active,
     #[cfg(target_os = "linux")]
     Idle,
+    /// The platform has no per-process I/O counters (macOS). Not activity: as in
+    /// v2.2.1 the gate passes, since refusing here blocked every macOS action.
+    #[cfg(not(target_os = "linux"))]
+    Unsupported,
     Unknown(String),
 }
 
@@ -863,9 +867,7 @@ impl LivePreCheckProvider {
         {
             let _ = pid;
             let _ = window;
-            RecentIoEvidence::Unknown(
-                "per-process I/O observation is unsupported on macOS".to_string(),
-            )
+            RecentIoEvidence::Unsupported
         }
     }
 
@@ -1040,11 +1042,17 @@ impl LivePreCheckProvider {
             }
             Ok(Some(parent.comm))
         }
-        #[cfg(not(target_os = "linux"))]
+        // No /proc here: take the parent from `ps`, as v2.2.1 did, so the launchd
+        // check below still runs. Refusing instead blocked every macOS action.
+        #[cfg(target_os = "macos")]
         {
-            Err(format!(
-                "parent supervision evidence for PID {pid} is unsupported on this platform"
-            ))
+            Ok(crate::collect::read_process_snapshot(pid)
+                .and_then(|info| self.read_comm(info.ppid)))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            Ok(None)
         }
     }
 
@@ -1296,6 +1304,8 @@ impl PreCheckProvider for LivePreCheckProvider {
             match self.has_recent_io(pid, window) {
                 #[cfg(target_os = "linux")]
                 RecentIoEvidence::Idle => {}
+                #[cfg(not(target_os = "linux"))]
+                RecentIoEvidence::Unsupported => {}
                 RecentIoEvidence::Unknown(reason) => {
                     return PreCheckResult::Blocked {
                         check: PreCheck::CheckDataLossGate,
@@ -2189,9 +2199,11 @@ mod tests {
     mod macos_tests {
         use super::*;
 
+        /// macOS has no per-process I/O counters; as in v2.2.1, an enabled
+        /// recent-I/O gate does not refuse on that alone.
         #[test]
-        fn recent_io_unsupported_probe_cannot_clear_an_enabled_gate() {
-            let mut config = LivePreCheckConfig {
+        fn recent_io_gate_passes_without_io_counters_on_macos() {
+            let config = LivePreCheckConfig {
                 block_if_open_write_fds: false,
                 block_if_locked_files: false,
                 block_if_active_tty: false,
@@ -2200,13 +2212,32 @@ mod tests {
                 enhanced_session_safety: false,
                 ..LivePreCheckConfig::default()
             };
-            let provider = LivePreCheckProvider::new(None, config.clone()).expect("provider");
-            assert!(matches!(provider.check_data_loss(std::process::id()),
-                PreCheckResult::Blocked { check, reason }
-                    if check == PreCheck::CheckDataLossGate && reason.contains("unsupported on macOS")));
-            config.block_if_recent_io_seconds = 0;
-            let provider = LivePreCheckProvider::new(None, config).expect("disabled provider");
-            assert!(provider.check_data_loss(std::process::id()).is_passed());
+            let provider = LivePreCheckProvider::new(None, config).expect("provider");
+            let result = provider.check_data_loss(std::process::id());
+            assert!(result.is_passed(), "{result:?}");
+        }
+
+        /// The parent lookup and launchd check run on macOS, and missing Linux-only
+        /// ancestry evidence does not refuse an unsupervised process.
+        #[test]
+        fn supervisor_checks_pass_unsupervised_process_on_macos() {
+            let mut child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn child");
+            std::thread::sleep(Duration::from_millis(300));
+            let provider =
+                LivePreCheckProvider::new(None, LivePreCheckConfig::default()).expect("provider");
+            let supervisor = provider.check_supervisor(child.id());
+            let agent = provider.check_agent_supervision(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(supervisor.is_passed(), "{supervisor:?}");
+            assert!(agent.is_passed(), "{agent:?}");
         }
 
         /// The data-loss gate sees a regular file held open for writing (via lsof).

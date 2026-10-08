@@ -191,8 +191,10 @@ pub fn is_human_supervised(result: &CombinedResult) -> bool {
 
 /// Combined supervision detector using all available methods.
 pub struct SupervisionDetector {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ancestry: AncestryAnalyzer,
     environ: EnvironAnalyzer,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ipc: IpcAnalyzer,
 }
 
@@ -218,6 +220,7 @@ impl SupervisionDetector {
     }
 
     /// Detect supervision using all available methods.
+    #[cfg(target_os = "linux")]
     pub fn detect(&mut self, pid: u32) -> Result<CombinedResult, DetectionError> {
         let before = ancestry::read_stat(pid).map_err(|error| match error {
             AncestryError::ProcessNotFound(missing) if missing == pid => {
@@ -287,6 +290,27 @@ impl SupervisionDetector {
         result.supervisor_name = best_name;
         result.supervisor_type = best_type;
 
+        Ok(result)
+    }
+
+    /// Detect supervision where ancestry and IPC evidence (/proc) do not exist.
+    ///
+    /// As in v2.2.1, detection rests on the environment there and an unreadable
+    /// environment leaves `environ` as `None` for callers to judge. Treating the
+    /// missing Linux-only probes as an error refused every action on macOS.
+    #[cfg(not(target_os = "linux"))]
+    pub fn detect(&mut self, pid: u32) -> Result<CombinedResult, DetectionError> {
+        let mut result = CombinedResult::not_supervised();
+        if let Ok(environ_result) = self.environ.analyze(pid) {
+            if environ_result.is_supervised {
+                result.evidence.extend(environ_result.evidence.clone());
+                result.is_supervised = environ_result.confidence > 0.0;
+                result.confidence = environ_result.confidence;
+                result.supervisor_name = environ_result.supervisor_name.clone();
+                result.supervisor_type = environ_result.category;
+            }
+            result.environ = Some(environ_result);
+        }
         Ok(result)
     }
 }
@@ -364,6 +388,18 @@ mod tests {
         // Just check the structure is valid
         assert!(result.confidence >= 0.0);
         assert!(result.confidence <= 1.0);
+    }
+
+    /// Without /proc ancestry or IPC evidence, detection still answers from the
+    /// environment instead of failing (which refused every macOS action).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_detect_supervision_current_process_macos() {
+        let result = detect_supervision(std::process::id()).expect("detection on macOS");
+        assert!(result.ancestry.is_none());
+        assert!(result.ipc.is_none());
+        assert!(result.environ.is_some());
+        assert!(result.confidence >= 0.0 && result.confidence <= 1.0);
     }
 
     #[cfg(target_os = "linux")]
