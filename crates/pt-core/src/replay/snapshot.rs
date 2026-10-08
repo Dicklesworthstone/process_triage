@@ -224,6 +224,31 @@ pub fn load_snapshot(path: &Path) -> Result<ReplaySnapshot, ReplayError> {
 }
 
 impl ReplaySnapshot {
+    /// Save a new private capture without overwriting an existing file or symlink.
+    ///
+    /// Captures retain command lines and identities for faithful replay. They are
+    /// not redacted exports: callers must review/redact them before sharing.
+    /// Unix captures are created with at most owner read/write permissions.
+    pub fn save_new_private(&self, path: &Path) -> Result<(), ReplayError> {
+        use std::io::Write;
+
+        // Serialize before creating the destination so serialization errors do not
+        // leave an empty capture. An I/O failure retains any partial file as evidence.
+        let json = serde_json::to_vec_pretty(self)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        file.write_all(&json)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     /// Save the snapshot to a JSON file.
     pub fn save(&self, path: &Path) -> Result<(), ReplayError> {
         let json = serde_json::to_string_pretty(self)?;

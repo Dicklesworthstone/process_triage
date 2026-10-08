@@ -444,6 +444,11 @@ struct ScanArgs {
     /// Resource recovery goal (advisory only)
     #[arg(long)]
     goal: Option<String>,
+
+    /// Record this quick scan as a private ReplaySnapshot (contains raw command lines).
+    /// The destination must not exist. Redact and review before sharing.
+    #[arg(long, value_name = "PATH", conflicts_with = "deep")]
+    record_replay: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -3663,6 +3668,19 @@ fn run_scan(global: &GlobalOpts, args: &ScanArgs) -> ExitCode {
             } else {
                 None
             };
+
+            if let Some(path) = &args.record_replay {
+                let recording = pt_core::replay::record_snapshot(&result, None)
+                    .and_then(|snapshot| snapshot.save_new_private(path));
+                if let Err(err) = recording {
+                    eprintln!(
+                        "scan: replay recording failed at {}: {}",
+                        path.display(),
+                        err
+                    );
+                    return ExitCode::IoError;
+                }
+            }
 
             match global.format {
                 OutputFormat::Json | OutputFormat::Toon => {
@@ -12187,6 +12205,33 @@ fn fast_path_skip_reason_label(reason: FastPathSkipReason) -> &'static str {
 /// An agent CLI whose terminal had input/output within this window is live.
 const AGENT_LIVE_TTY_IDLE_SECS: u64 = 30 * 60;
 
+/// Seconds since the agent's terminal last saw I/O (agent CLIs with a tty only).
+fn agent_tty_idle_seconds(proc: &ProcessRecord) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        pt_core::collect::protected::agent_kind(&proc.cmd)
+            .and(proc.tty.as_deref())
+            .and_then(pt_core::collect::protected::tty_idle_seconds)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = proc;
+        None
+    }
+}
+
+/// `agent_liveness` block for plan/explain output (`None` for non-agents).
+fn agent_liveness_json(proc: &ProcessRecord) -> Option<serde_json::Value> {
+    pt_core::collect::protected::agent_kind(&proc.cmd)?;
+    let idle = agent_tty_idle_seconds(proc);
+    Some(serde_json::json!({
+        "tty": proc.tty,
+        "tty_idle_seconds": idle,
+        "live": idle.is_some_and(|s| s < AGENT_LIVE_TTY_IDLE_SECS),
+        "window_seconds": AGENT_LIVE_TTY_IDLE_SECS,
+    }))
+}
+
 fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let _lock = match acquire_global_lock(global, "agent plan") {
         Ok(lock) => lock,
@@ -12919,24 +12964,13 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         // review. Only the agent itself: its children are judged on their own
         // evidence (a hung test runner under a live agent stays a candidate).
         let agent_kind = pt_core::collect::protected::agent_kind(&proc.cmd);
-        #[cfg(unix)]
-        let agent_tty_idle = agent_kind
-            .and(proc.tty.as_deref())
-            .and_then(pt_core::collect::protected::tty_idle_seconds);
-        #[cfg(not(unix))]
-        let agent_tty_idle: Option<u64> = None;
-        let agent_live = agent_tty_idle.is_some_and(|idle| idle < AGENT_LIVE_TTY_IDLE_SECS);
+        let agent_liveness = agent_liveness_json(proc);
+        let agent_live = agent_liveness
+            .as_ref()
+            .is_some_and(|l| l["live"].as_bool() == Some(true));
         if agent_live && recommended_action == "review" {
             recommended_action = "keep";
         }
-        let agent_liveness = agent_kind.map(|_| {
-            serde_json::json!({
-                "tty": proc.tty,
-                "tty_idle_seconds": agent_tty_idle,
-                "live": agent_live,
-                "window_seconds": AGENT_LIVE_TTY_IDLE_SECS,
-            })
-        });
         let policy_value = serde_json::to_value(&policy_result)
             .unwrap_or_else(|_| serde_json::json!({ "allowed": policy_result.allowed }));
         let action_rationale = if policy_blocked {
@@ -14090,6 +14124,7 @@ fn build_process_explanation(
         "user": proc.user,
         "state": proc.state.to_string(),
         "agent_kind": pt_core::collect::protected::agent_kind(&proc.cmd),
+        "agent_liveness": agent_liveness_json(proc),
         "elapsed_seconds": proc.elapsed.as_secs(),
         "cpu_percent": proc.cpu_percent,
         "classification": ledger.classification.label(),

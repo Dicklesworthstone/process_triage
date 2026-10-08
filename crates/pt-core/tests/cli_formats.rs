@@ -12,6 +12,120 @@ fn pt_core() -> Command {
     cargo_bin_cmd!("pt-core")
 }
 
+mod replay_recording {
+    use super::*;
+
+    // Retain captures for inspection; these tests never delete capture evidence.
+    fn capture_dir() -> std::path::PathBuf {
+        tempfile::tempdir().expect("capture directory").keep()
+    }
+
+    #[test]
+    fn quick_scan_records_the_exact_live_inventory_for_native_replay() {
+        let path = capture_dir().join("scan.json");
+        let output = pt_core()
+            .args(["scan", "--format", "json", "--robot", "--record-replay"])
+            .arg(&path)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let displayed: serde_json::Value = serde_json::from_slice(&output).expect("scan JSON");
+        let snapshot = pt_core::replay::load_snapshot(&path).expect("native snapshot loader");
+        assert!(
+            !snapshot.processes.is_empty(),
+            "a live scan must contain processes"
+        );
+        assert_eq!(
+            serde_json::to_value(&snapshot.processes).expect("recorded inventory"),
+            displayed["scan"]["processes"]
+        );
+        assert_eq!(
+            snapshot.scan_metadata.process_count,
+            snapshot.processes.len()
+        );
+        assert_eq!(
+            Some(snapshot.context.platform.as_str()),
+            displayed["scan"]["metadata"]["platform"].as_str()
+        );
+        let restored = snapshot.to_scan_result();
+        assert_eq!(
+            serde_json::to_value(&restored.processes).expect("restored inventory"),
+            displayed["scan"]["processes"]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("capture metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "capture must not expose raw commands to other users"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_recording_preserves_an_existing_capture() {
+        let path = capture_dir().join("existing.json");
+        let original = b"useful earlier capture\n";
+        std::fs::write(&path, original).expect("existing capture");
+        pt_core()
+            .args(["scan", "--format", "json", "--robot", "--record-replay"])
+            .arg(&path)
+            .assert()
+            .code(21)
+            .stderr(predicate::str::contains("replay recording failed"));
+        assert_eq!(
+            std::fs::read(&path).expect("preserved capture"),
+            original.as_slice()
+        );
+    }
+
+    #[test]
+    fn deep_scan_cannot_silently_ignore_replay_recording() {
+        let path = capture_dir().join("unsupported.json");
+        pt_core()
+            .args(["scan", "--deep", "--record-replay"])
+            .arg(&path)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+        assert!(
+            !path.exists(),
+            "an unsupported recording must not create a file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_recording_never_follows_an_existing_symlink() {
+        let dir = capture_dir();
+        let target = dir.join("valuable.json");
+        let link = dir.join("capture.json");
+        let original = b"useful work behind a symlink\n";
+        std::fs::write(&target, original).expect("target capture");
+        std::os::unix::fs::symlink(&target, &link).expect("capture symlink");
+        pt_core()
+            .args(["scan", "--format", "json", "--robot", "--record-replay"])
+            .arg(&link)
+            .assert()
+            .code(21);
+        assert_eq!(
+            std::fs::read(&target).expect("preserved target"),
+            original.as_slice()
+        );
+        assert!(std::fs::symlink_metadata(&link)
+            .expect("preserved link")
+            .file_type()
+            .is_symlink());
+    }
+}
+
 // ============================================================================
 // Global Format Option Tests
 // ============================================================================
