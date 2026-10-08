@@ -17644,6 +17644,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     // Determine which actions to apply
     let use_recommended =
         args.recommended || (args.resume && args.pids.is_empty() && args.targets.is_empty());
+    // With --targets the selection is the exact (pid, start_id) identities: a merged
+    // plan can hold two actions for one recycled pid.
+    let mut selected_identities: Option<std::collections::HashSet<(u32, String)>> = None;
     let mut target_pids: Vec<u32> = if use_recommended {
         plan.actions
             .iter()
@@ -17676,6 +17679,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 return ExitCode::ArgsError;
             }
             selected.push(pid);
+            selected_identities
+                .get_or_insert_with(Default::default)
+                .insert((pid, start_id.to_string()));
         }
         selected
     } else {
@@ -17778,6 +17784,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .actions
         .iter()
         .filter(|a| target_pids.contains(&a.target.pid.0))
+        .filter(|a| {
+            selected_identities.as_ref().is_none_or(|identities| {
+                identities.contains(&(a.target.pid.0, a.target.start_id.0.clone()))
+            })
+        })
         .filter(|a| !completed_action_ids.contains(&a.action_id))
         .collect();
     if actions_to_apply.is_empty() {
