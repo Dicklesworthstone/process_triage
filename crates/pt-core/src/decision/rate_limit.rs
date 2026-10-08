@@ -199,6 +199,74 @@ struct PersistentState {
     /// An action was authorized but its delivery result has not been durably saved.
     #[serde(default)]
     pending_kill_intent: bool,
+    /// The process that wrote `pending_kill_intent`, so a later run can settle an
+    /// intent whose writer died (Ctrl-C, a timeout) instead of refusing forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_kill_owner: Option<IntentOwner>,
+}
+
+/// A process identity that survives pid reuse: pid plus birth (Linux start ticks,
+/// macOS start microseconds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IntentOwner {
+    pid: u32,
+    birth: u64,
+}
+
+impl IntentOwner {
+    fn current() -> Option<Self> {
+        let pid = std::process::id();
+        process_birth(pid)
+            .ok()
+            .flatten()
+            .map(|birth| Self { pid, birth })
+    }
+
+    /// Only a confirmed absence counts: no such pid, or the pid now belongs to a
+    /// process with a different birth. An unreadable identity is not "gone".
+    fn is_gone(&self) -> bool {
+        match process_birth(self.pid) {
+            Ok(Some(birth)) => birth != self.birth,
+            Ok(None) => true,
+            Err(()) => false,
+        }
+    }
+}
+
+/// Birth of `pid`: `Ok(None)` if no such process exists, `Err` if it exists (or
+/// may exist) but its identity cannot be read.
+fn process_birth(pid: u32) -> Result<Option<u64>, ()> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::collect::proc_parsers::{read_required_proc_stat, StatReadError};
+        match read_required_proc_stat(pid) {
+            Ok(stat) => Ok(Some(stat.starttime)),
+            Err(StatReadError::Read { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(_) => Err(()),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(info) = crate::collect::macos::read_bsd_info(pid) {
+            return Ok(Some(info.start_us));
+        }
+        // SAFETY: signal 0 only checks for existence; nothing is delivered.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else {
+            Err(())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        Err(())
+    }
 }
 
 impl PersistentState {
@@ -341,8 +409,15 @@ impl SlidingWindowRateLimiter {
 
     fn refresh(&self, state: &mut RateLimiterState) -> Result<(), RateLimitError> {
         if let Some(path) = &self.state_path {
-            let _lock = StateLock::acquire(path, false)?;
-            state.persistent = Self::load_state(path)?;
+            {
+                let _lock = StateLock::acquire(path, false)?;
+                state.persistent = Self::load_state(path)?;
+            }
+            if Self::holds_abandoned_intent(state) {
+                let _lock = StateLock::acquire(path, true)?;
+                state.persistent = Self::load_state(path)?;
+                Self::settle_abandoned_intent(state, path)?;
+            }
         }
         Ok(())
     }
@@ -356,7 +431,61 @@ impl SlidingWindowRateLimiter {
         };
         let lock = StateLock::acquire(path, true)?;
         state.persistent = Self::load_state(path)?;
+        Self::settle_abandoned_intent(state, path)?;
         Ok(Some(lock))
+    }
+
+    fn holds_abandoned_intent(state: &RateLimiterState) -> bool {
+        !state.owns_kill_intent
+            && state.persistent.pending_kill_intent
+            && state
+                .persistent
+                .pending_kill_owner
+                .as_ref()
+                .is_some_and(IntentOwner::is_gone)
+    }
+
+    /// Settle an intent whose writer is gone: it can never finish it, and its
+    /// signal may have been delivered, so charge one kill and clear the intent.
+    /// A live or unverifiable owner, or an intent without one, keeps refusing.
+    /// The caller holds the exclusive state lock and has just loaded the state.
+    fn settle_abandoned_intent(
+        state: &mut RateLimiterState,
+        path: &Path,
+    ) -> Result<(), RateLimitError> {
+        if !Self::holds_abandoned_intent(state) {
+            return Ok(());
+        }
+        let now = current_unix_timestamp();
+        state.persistent.kill_timestamps.push_back(now);
+        state.persistent.pending_kill_intent = false;
+        state.persistent.pending_kill_owner = None;
+        state.persistent.last_updated = now;
+        state.persistent.prune_old(now);
+        Self::save_state(path, &state.persistent)
+    }
+
+    /// Refusal while an intent is unresolved, naming the file that holds it.
+    fn pending_intent_refusal(&self, state: &RateLimiterState) -> RateLimitError {
+        let location = self
+            .state_path
+            .as_ref()
+            .map(|path| format!(" in {}", path.display()))
+            .unwrap_or_default();
+        let holder = match &state.persistent.pending_kill_owner {
+            Some(owner) => format!(
+                " (written by pt PID {}, which is still running or cannot be verified)",
+                owner.pid
+            ),
+            None if self.state_path.is_some() => {
+                " (it records no owner; if no pt is running, set pending_kill_intent to false there)"
+                    .to_string()
+            }
+            None => String::new(),
+        };
+        RateLimitError::KillAccounting(format!(
+            "an unresolved pending kill intent{location} must be reconciled before another kill{holder}"
+        ))
     }
 
     fn append_kill(&self, state: &mut RateLimiterState) -> Result<(), RateLimitError> {
@@ -373,6 +502,8 @@ impl SlidingWindowRateLimiter {
 
     /// Persist a pending intent before signaling. The caller must check policy
     /// first; an unresolved intent refuses another action even under force.
+    /// The intent records this process, so a run after it dies settles the intent
+    /// (see `settle_abandoned_intent`) rather than refusing forever.
     /// Without a configured state file, this guards only this shared instance.
     pub fn begin_kill_accounting(&self) -> Result<(), RateLimitError> {
         let mut state = self
@@ -381,12 +512,10 @@ impl SlidingWindowRateLimiter {
             .map_err(|error| RateLimitError::SaveState(format!("lock poisoned: {error}")))?;
         let _lock = self.lock_for_update(&mut state)?;
         if state.persistent.pending_kill_intent || state.owns_kill_intent {
-            return Err(RateLimitError::KillAccounting(
-                "an unresolved pending kill intent must be reconciled before another kill"
-                    .to_string(),
-            ));
+            return Err(self.pending_intent_refusal(&state));
         }
         state.persistent.pending_kill_intent = true;
+        state.persistent.pending_kill_owner = IntentOwner::current();
         state.persistent.last_updated = current_unix_timestamp();
         if let Some(path) = &self.state_path {
             Self::save_state(path, &state.persistent)?;
@@ -430,6 +559,7 @@ impl SlidingWindowRateLimiter {
             state.persistent.kill_timestamps.push_back(now);
         }
         state.persistent.pending_kill_intent = false;
+        state.persistent.pending_kill_owner = None;
         state.persistent.last_updated = now;
         state.persistent.prune_old(now);
         if let Some(path) = &self.state_path {
@@ -468,10 +598,7 @@ impl SlidingWindowRateLimiter {
         override_per_run: Option<u32>,
     ) -> Result<RateLimitResult, RateLimitError> {
         if state.persistent.pending_kill_intent {
-            return Err(RateLimitError::KillAccounting(
-                "an unresolved pending kill intent must be reconciled before another kill"
-                    .to_string(),
-            ));
+            return Err(self.pending_intent_refusal(state));
         }
         let now = current_unix_timestamp();
         let counts = self.get_counts_internal(state, now);
@@ -552,10 +679,7 @@ impl SlidingWindowRateLimiter {
 
         let _lock = self.lock_for_update(&mut state)?;
         if state.persistent.pending_kill_intent {
-            return Err(RateLimitError::KillAccounting(
-                "an unresolved pending kill intent must be reconciled before another kill"
-                    .to_string(),
-            ));
+            return Err(self.pending_intent_refusal(&state));
         }
         self.append_kill(&mut state)?;
         Ok(self.get_counts_internal(&state, current_unix_timestamp()))
@@ -813,6 +937,84 @@ mod tests {
         assert!(limiter.finish_kill_accounting(true).is_err());
         assert_eq!(limiter.current_run_count().unwrap(), 1);
         assert_eq!(fresh.get_counts().unwrap().day, 1);
+    }
+
+    /// A pending intent as a writer leaves it on disk, written as raw JSON.
+    fn write_pending_intent(path: &Path, owner: serde_json::Value) {
+        let state = serde_json::json!({
+            "kill_timestamps": [],
+            "last_updated": current_unix_timestamp(),
+            "pending_kill_intent": true,
+            "pending_kill_owner": owner,
+        });
+        fs::write(path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    }
+
+    fn saved_json(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    /// The writer died during the kill window (Ctrl-C, an agent's timeout): the
+    /// next run charges the possibly delivered kill and clears the intent instead
+    /// of refusing every kill from then on.
+    #[test]
+    fn abandoned_intent_of_a_dead_owner_is_charged_and_cleared() {
+        let dir = retained_accounting_dir("dead-owner");
+        let state_path = dir.join("rate_limit.json");
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = exited.id();
+        exited.wait().unwrap();
+        write_pending_intent(
+            &state_path,
+            serde_json::json!({ "pid": dead_pid, "birth": 1 }),
+        );
+
+        let limiter = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        assert!(limiter.check(false).unwrap().allowed);
+        let saved = saved_json(&state_path);
+        assert_eq!(saved["pending_kill_intent"], false);
+        assert!(saved.get("pending_kill_owner").is_none(), "{saved}");
+        assert_eq!(saved["kill_timestamps"].as_array().unwrap().len(), 1);
+        let counts = limiter.get_counts().unwrap();
+        assert_eq!((counts.run, counts.day), (0, 1));
+        limiter.begin_kill_accounting().unwrap();
+        limiter.finish_kill_accounting(false).unwrap();
+    }
+
+    /// A reused pid is not the owner: a different birth settles the intent too.
+    #[test]
+    fn intent_of_a_reused_pid_is_settled() {
+        let dir = retained_accounting_dir("reused-pid");
+        let state_path = dir.join("rate_limit.json");
+        let own = IntentOwner::current().expect("own identity");
+        write_pending_intent(
+            &state_path,
+            serde_json::json!({ "pid": own.pid, "birth": own.birth.wrapping_add(1) }),
+        );
+        let limiter = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        assert!(limiter.check_and_record(false, None).unwrap().allowed);
+        assert_eq!(limiter.get_counts().unwrap().day, 2);
+        assert_eq!(saved_json(&state_path)["pending_kill_intent"], false);
+    }
+
+    /// A live owner still blocks other runs, and the refusal names the file.
+    #[test]
+    fn live_owner_intent_keeps_refusing_and_names_the_file() {
+        let dir = retained_accounting_dir("live-owner");
+        let state_path = dir.join("rate_limit.json");
+        let owner = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        owner.begin_kill_accounting().unwrap();
+        let recorded = saved_json(&state_path);
+        assert_eq!(recorded["pending_kill_owner"]["pid"], std::process::id());
+        let pending_bytes = fs::read(&state_path).unwrap();
+
+        let other = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        let error = other.check(false).unwrap_err().to_string();
+        assert!(error.contains(&state_path.display().to_string()), "{error}");
+        assert!(error.contains("still running"), "{error}");
+        assert_eq!(fs::read(&state_path).unwrap(), pending_bytes);
+        owner.finish_kill_accounting(false).unwrap();
+        assert!(other.check(false).unwrap().allowed);
     }
 
     #[test]
