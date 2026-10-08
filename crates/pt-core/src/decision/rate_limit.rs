@@ -206,30 +206,65 @@ struct PersistentState {
 }
 
 /// A process identity that survives pid reuse: pid plus birth (Linux start ticks,
-/// macOS start microseconds).
+/// macOS start microseconds), and on Linux the pid namespace the pid belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct IntentOwner {
     pid: u32,
     birth: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid_namespace: Option<u64>,
 }
 
 impl IntentOwner {
     fn current() -> Option<Self> {
         let pid = std::process::id();
-        process_birth(pid)
-            .ok()
-            .flatten()
-            .map(|birth| Self { pid, birth })
+        process_birth(pid).ok().flatten().map(|birth| Self {
+            pid,
+            birth,
+            pid_namespace: current_pid_namespace(),
+        })
     }
 
     /// Only a confirmed absence counts: no such pid, or the pid now belongs to a
-    /// process with a different birth. An unreadable identity is not "gone".
+    /// process with a different birth. An unreadable identity, or an owner in
+    /// another pid namespace (its pid means a different process here), is not "gone".
     fn is_gone(&self) -> bool {
+        if self.pid_namespace.is_some() && self.pid_namespace != current_pid_namespace() {
+            return false;
+        }
         match process_birth(self.pid) {
             Ok(Some(birth)) => birth != self.birth,
             Ok(None) => true,
             Err(()) => false,
         }
+    }
+}
+
+/// Whether `pid` may exist: only ESRCH from kill(pid, 0) says it does not.
+#[cfg(unix)]
+fn pid_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // SAFETY: signal 0 performs only the existence and permission check.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Inode of this process's pid namespace (`/proc/self/ns/pid` -> `pid:[N]`).
+fn current_pid_namespace() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let link = std::fs::read_link("/proc/self/ns/pid").ok()?;
+        let link = link.to_str()?;
+        link.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
@@ -241,8 +276,10 @@ fn process_birth(pid: u32) -> Result<Option<u64>, ()> {
         use crate::collect::proc_parsers::{read_required_proc_stat, StatReadError};
         match read_required_proc_stat(pid) {
             Ok(stat) => Ok(Some(stat.starttime)),
+            // /proc can hide a live process (hidepid, no /proc mounted): only
+            // ESRCH from kill(pid, 0) proves it does not exist.
             Err(StatReadError::Read { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
+                if source.kind() == std::io::ErrorKind::NotFound && !pid_exists(pid) =>
             {
                 Ok(None)
             }
@@ -254,12 +291,10 @@ fn process_birth(pid: u32) -> Result<Option<u64>, ()> {
         if let Some(info) = crate::collect::macos::read_bsd_info(pid) {
             return Ok(Some(info.start_us));
         }
-        // SAFETY: signal 0 only checks for existence; nothing is delivered.
-        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            Ok(None)
-        } else {
+        if pid_exists(pid) {
             Err(())
+        } else {
+            Ok(None)
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -708,7 +743,8 @@ impl SlidingWindowRateLimiter {
         Ok(result)
     }
 
-    /// Get current counts without modifying state.
+    /// Get current counts. Like every read, this settles an intent whose writer
+    /// is gone (see `settle_abandoned_intent`), so it may update the state file.
     pub fn get_counts(&self) -> Result<RateLimitCounts, RateLimitError> {
         let mut state = self
             .state
@@ -995,6 +1031,26 @@ mod tests {
         assert!(limiter.check_and_record(false, None).unwrap().allowed);
         assert_eq!(limiter.get_counts().unwrap().day, 2);
         assert_eq!(saved_json(&state_path)["pending_kill_intent"], false);
+    }
+
+    /// A pid recorded in another pid namespace names a different process here, so
+    /// its absence proves nothing: the intent keeps refusing.
+    #[test]
+    fn intent_from_another_pid_namespace_is_not_settled() {
+        let dir = retained_accounting_dir("other-namespace");
+        let state_path = dir.join("rate_limit.json");
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = exited.id();
+        exited.wait().unwrap();
+        write_pending_intent(
+            &state_path,
+            serde_json::json!({ "pid": dead_pid, "birth": 1, "pid_namespace": 1 }),
+        );
+        let pending_bytes = fs::read(&state_path).unwrap();
+        let limiter = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
+        assert!(limiter.check(false).is_err());
+        assert!(limiter.begin_kill_accounting().is_err());
+        assert_eq!(fs::read(&state_path).unwrap(), pending_bytes);
     }
 
     /// A live owner still blocks other runs, and the refusal names the file.
