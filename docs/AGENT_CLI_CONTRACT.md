@@ -514,7 +514,8 @@ When supervised:
       "type": "object",
       "required": ["detected", "recommended_action"],
       "properties": {
-        "detected": {"type": "boolean"},
+        "detected": {"type": ["boolean", "null"]},
+        "status": {"type": "string", "enum": ["observed", "unknown"]},
         "type": {"type": ["string", "null"]},
         "unit": {"type": ["string", "null"]},
         "recommended_action": {"type": "string"},
