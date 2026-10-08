@@ -66,8 +66,9 @@ impl ForeignTarget {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                // null_mut: macOS declares these `*mut`, Linux `*const` (it coerces).
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         };
         assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());
@@ -116,7 +117,8 @@ impl ForeignTarget {
                     return Err(std::io::Error::last_os_error());
                 }
                 if let Some(slave) = tty_slave {
-                    if libc::ioctl(slave, libc::TIOCSCTTY, 0) == -1 {
+                    // The request is u32 on macOS and c_ulong (or c_int) elsewhere.
+                    if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
