@@ -256,7 +256,9 @@ impl SignalActionRunner {
                 return pidfd.send(libc::SIGSTOP);
             }
         }
-        #[cfg(target_os = "macos")]
+        // Without a pidfd (macOS, or a Linux kernel before 5.3), re-check the
+        // start identity right before the plain kill(2).
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if !use_group {
             self.check_identity_now(action)?;
         }
@@ -305,7 +307,7 @@ impl SignalActionRunner {
             }
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if !use_group {
             self.check_identity_now(action)?;
         }
@@ -348,7 +350,7 @@ impl SignalActionRunner {
         if let Some(pidfd) = self.pinned_pidfd(action)? {
             return pidfd.send(libc::SIGCHLD);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.check_identity_now(action)?;
         self.send_signal(action.target.pid.0, libc::SIGCHLD, false)
     }
@@ -425,7 +427,7 @@ impl SignalActionRunner {
                 return pidfd.send(libc::SIGCONT);
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if !use_group {
             self.check_identity_now(action)?;
         }
