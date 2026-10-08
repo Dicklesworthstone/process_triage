@@ -10174,6 +10174,15 @@ fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCod
 fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
     install_shadow_signal_handlers();
     let own_pid = std::process::id();
+    // Held while the observer runs: `shadow stop` signals the pid file's pid only
+    // while some observer holds it, so a stale file never names a target.
+    let _pid_lock = match GlobalLock::try_acquire(&shadow_pid_lock_path()) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("shadow run: failed to open the shadow pid lock: {}", err);
+            None
+        }
+    };
 
     let mut iterations = args.iterations;
     let mut run_count: u32 = 0;
@@ -10301,6 +10310,38 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
             return ExitCode::IoError;
         }
     };
+
+    // A running observer holds the shadow pid lock. If it is free, the pid file is
+    // stale (or was written by an observer from before v2.3.0, which held no lock)
+    // and its pid may belong to an unrelated process: do not signal it.
+    match GlobalLock::try_acquire(&shadow_pid_lock_path()) {
+        Ok(Some(_free)) => {
+            let response = serde_json::json!({
+                "command": "shadow stop",
+                "running": false,
+                "pid": pid,
+                "message": format!(
+                    "no shadow observer holds the shadow pid lock; not signalling pid {pid} from the pid file"
+                ),
+            });
+            match global.format {
+                OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+                    println!("{}", format_structured_output(global, response));
+                }
+                _ => {
+                    println!(
+                        "No running shadow observer holds the lock; pid {pid} in the pid file was not signalled."
+                    );
+                }
+            }
+            return ExitCode::Clean;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("shadow stop: failed to check the shadow pid lock: {}", err);
+            return ExitCode::IoError;
+        }
+    }
 
     if let Err(err) = terminate_process(pid) {
         eprintln!("shadow stop: failed to signal pid {}: {}", pid, err);
@@ -10631,6 +10672,10 @@ fn shadow_base_dir() -> PathBuf {
 
 fn shadow_pid_path() -> PathBuf {
     shadow_base_dir().join("shadow.pid")
+}
+
+fn shadow_pid_lock_path() -> PathBuf {
+    shadow_base_dir().join("shadow.pid.lock")
 }
 
 fn write_shadow_pid(pid: u32) -> std::io::Result<()> {

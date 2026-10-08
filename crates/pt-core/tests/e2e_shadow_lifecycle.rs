@@ -269,6 +269,38 @@ fn test_shadow_stop_not_running_json_schema() {
     );
 }
 
+/// A stale pid file (the observer died without cleanup) may name an unrelated
+/// live process by now; with no observer holding the lock, stop must not signal it.
+#[cfg(unix)]
+#[test]
+fn test_shadow_stop_does_not_signal_a_stale_pid_file() {
+    let dir = tempdir().expect("tempdir");
+    let shadow_dir = dir.path().join("shadow");
+    fs::create_dir_all(&shadow_dir).expect("create shadow dir");
+    let mut bystander = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn bystander");
+    fs::write(shadow_dir.join("shadow.pid"), bystander.id().to_string()).expect("write pid");
+
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", dir.path())
+        .args(["--format", "json", "shadow", "stop"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    std::thread::sleep(Duration::from_millis(300));
+    let still_running = bystander.try_wait().expect("poll bystander").is_none();
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+
+    let json: Value = serde_json::from_slice(&output).expect("parse JSON");
+    assert_eq!(json["running"], false, "{json}");
+    assert!(still_running, "stop signalled the stale pid: {json}");
+}
+
 // ============================================================================
 // Shadow Export
 // ============================================================================
