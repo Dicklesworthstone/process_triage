@@ -9625,6 +9625,32 @@ fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
         }
     };
 
+    // A running daemon holds its pid lock. If the lock is free, the pid file is
+    // stale and its pid may now belong to an unrelated process: do not signal it.
+    match try_acquire_daemon_pid_lock() {
+        Ok(Some(_free)) => {
+            let response = serde_json::json!({
+                "command": "daemon stop",
+                "running": false,
+                "message": format!("stale daemon pid file (pid {pid}); no daemon is running"),
+            });
+            match global.format {
+                OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+                    println!("{}", format_structured_output(global, response));
+                }
+                _ => {
+                    println!("Daemon not running (stale pid file for pid {pid}).");
+                }
+            }
+            return ExitCode::Clean;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("daemon stop: failed to check the daemon pid lock: {}", err);
+            return ExitCode::IoError;
+        }
+    }
+
     if let Err(err) = terminate_process(pid) {
         eprintln!("daemon stop: failed to terminate daemon: {}", err);
         return ExitCode::IoError;
@@ -11360,9 +11386,21 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
     (config, enabled)
 }
 
+/// SIGTERM a pid read from one of pt's own pid files. The pid must name one
+/// process: 0 would signal pt's process group, and values past i32::MAX would
+/// become negative (a process group, or every process for -1).
 #[cfg(unix)]
 fn terminate_process(pid: u32) -> std::io::Result<()> {
-    let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    let pid = match libc::pid_t::try_from(pid) {
+        Ok(pid) if pid > 1 => pid,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to signal pid {pid} from a pid file"),
+            ))
+        }
+    };
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
     if result == 0 {
         Ok(())
     } else {
@@ -13687,6 +13725,21 @@ mod config_file_kind_tests {
         assert!(detect_config_file_kind(&junk).is_err());
         let not_json = write(&dir, "priors.json", "nope");
         assert!(detect_config_file_kind(&not_json).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pid_file_signal_tests {
+    use super::terminate_process;
+
+    /// A pid file holding 0, 1 or a value that wraps negative must not become
+    /// kill(0) (pt's own process group), kill(1) or a process-group signal.
+    #[test]
+    fn terminate_process_refuses_non_process_pids_without_signalling() {
+        for pid in [0, 1, u32::MAX, i32::MAX as u32 + 1] {
+            let error = terminate_process(pid).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{pid}");
+        }
     }
 }
 
