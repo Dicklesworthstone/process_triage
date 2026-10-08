@@ -12350,7 +12350,8 @@ mod process_tree_safety_tests {
     }
 
     /// On macOS the plan reports no supervisor (as v2.2.1 did) instead of
-    /// "unknown", and robot supervision answers from the environment.
+    /// "unknown", and robot supervision answers "supervised" (no ancestry evidence)
+    /// instead of failing, so robot mode asks for a human as v2.2.1 did.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_plan_and_robot_supervision_do_not_refuse_for_missing_linux_probes() {
@@ -12359,9 +12360,10 @@ mod process_tree_safety_tests {
         assert_eq!(observed["status"], "observed", "{observed}");
         assert_eq!(observed["detected"], false, "{observed}");
         assert_eq!(observed["recommended_action"], "kill", "{observed}");
-        assert!(
-            super::supervision_for_robot(pid).is_ok(),
-            "robot supervision must not fail for missing Linux-only probes"
+        assert_eq!(
+            super::supervision_for_robot(pid),
+            Ok(true),
+            "without ancestry evidence the target counts as supervised"
         );
     }
 
@@ -17261,12 +17263,11 @@ fn supervision_for_robot(pid: u32) -> Result<bool, String> {
     let result = detect_supervision(pid).map_err(|error| {
         format!("Mandatory supervision evidence unavailable for PID {pid}: {error}")
     })?;
-    // Off Linux an unreadable environment is not an error from detection; robot
-    // mode still refuses it, as v2.2.1 did.
-    if result.environ.is_none() {
-        return Err(format!(
-            "Mandatory supervision evidence unavailable for PID {pid}: environment unreadable"
-        ));
+    // Off Linux there is no ancestry evidence, so an agent or IDE parent cannot be
+    // ruled out (sudo strips the environment markers): as in v2.2.1, count the
+    // target as supervised, so robot mode asks for a human.
+    if result.ancestry.is_none() {
+        return Ok(true);
     }
     Ok(is_human_supervised(&result))
 }
