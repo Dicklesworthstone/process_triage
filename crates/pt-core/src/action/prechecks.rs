@@ -383,12 +383,33 @@ fn proc_locks_mentions_pid(content: &str, pid: u32) -> bool {
 
 /// Whether an open-file target (a `/proc/<pid>/fd` link or an lsof NAME) is a file
 /// whose pending writes could be lost by killing the process.
+///
+/// memfds and unlinked files that had a name are excluded: nothing in them can
+/// outlive the process, and counting them refused every leaked Chromium or
+/// Electron process (they hold unlinked `/dev/shm` or `/tmp` segments and memfds
+/// open read-write). An `O_TMPFILE` file (`#<inode>`) is still being built and
+/// may be linked into place, so it stays protected, as do named `/dev/shm` files.
 fn is_persistent_file_target(target: &str) -> bool {
-    target.starts_with('/')
-        && (target.starts_with("/dev/shm/") || !target.starts_with("/dev/"))
+    if !target.starts_with('/') || target.starts_with("/memfd:") {
+        return false;
+    }
+    let path = match target.strip_suffix(" (deleted)") {
+        Some(path) if !is_unnamed_tmpfile(path) => return false,
+        Some(path) => path,
+        None => target,
+    };
+    (path.starts_with("/dev/shm/") || !path.starts_with("/dev/"))
         && !["/proc/", "/sys/"]
             .iter()
-            .any(|prefix| target.starts_with(prefix))
+            .any(|prefix| path.starts_with(prefix))
+}
+
+/// Linux names an `O_TMPFILE` descriptor `<dir>/#<inode>`.
+fn is_unnamed_tmpfile(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .and_then(|name| name.strip_prefix('#'))
+        .is_some_and(|inode| !inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Number of persistent regular files `pid` holds open for writing: the data-loss
@@ -406,8 +427,8 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
             let entry = entry.ok()?;
             let fd_name = entry.file_name();
             // Only writes to real, persistent files can lose data. stdout/stderr
-            // to a pty/pipe, sockets, /dev/null and anon inodes do not. Unlinked
-            // regular files can still hold pending data and must remain protected.
+            // to a pty/pipe, sockets, /dev/null, anon inodes, memfds and unlinked
+            // named files do not (see is_persistent_file_target).
             let target = match std::fs::read_link(entry.path()) {
                 Ok(target) => target,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1601,12 +1622,19 @@ mod tests {
             "/home/ubuntu/.cache/x.log",
             "/tmp/build.out",
             "/run/user/1000/work-in-progress.log",
-            "/tmp/old.log (deleted)",
             "/dev/shm/pending.data",
+            "/tmp/#5242881 (deleted)",
         ] {
             assert!(is_persistent_file_target(t), "{t}");
         }
+        // Chromium/Electron hold these read-write; none of it outlives the process.
         for t in [
+            "/tmp/old.log (deleted)",
+            "/dev/shm/.org.chromium.Chromium.XyZ123 (deleted)",
+            "/tmp/.org.chromium.Chromium.AbC456 (deleted)",
+            "/memfd:wayland-cursor (deleted)",
+            "/memfd:pulseaudio",
+            "/tmp/#notinode (deleted)",
             "/dev/pts/3",
             "/dev/null",
             "pipe:[123]",
