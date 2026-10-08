@@ -508,6 +508,16 @@ impl SlidingWindowRateLimiter {
             .map(|path| format!(" in {}", path.display()))
             .unwrap_or_default();
         let holder = match &state.persistent.pending_kill_owner {
+            Some(owner)
+                if owner.pid_namespace.is_some()
+                    && owner.pid_namespace != current_pid_namespace() =>
+            {
+                format!(
+                    " (written by pt PID {} in another pid namespace, which this run cannot \
+                     check; if no pt is running there, set pending_kill_intent to false there)",
+                    owner.pid
+                )
+            }
             Some(owner) => format!(
                 " (written by pt PID {}, which is still running or cannot be verified)",
                 owner.pid
@@ -1048,7 +1058,8 @@ mod tests {
         );
         let pending_bytes = fs::read(&state_path).unwrap();
         let limiter = SlidingWindowRateLimiter::new(test_config(), Some(&state_path)).unwrap();
-        assert!(limiter.check(false).is_err());
+        let error = limiter.check(false).unwrap_err().to_string();
+        assert!(error.contains("another pid namespace"), "{error}");
         assert!(limiter.begin_kill_accounting().is_err());
         assert_eq!(fs::read(&state_path).unwrap(), pending_bytes);
     }
