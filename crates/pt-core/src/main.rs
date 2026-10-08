@@ -9168,12 +9168,12 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
     let own_pid = std::process::id();
     let mut last_cpu_sample: Option<(f64, std::time::Instant)> = None;
 
-    match read_daemon_pid() {
-        Ok(Some(pid)) if pid != own_pid && is_process_running(pid) => {
+    match read_pid_file_record(&daemon_pid_path()) {
+        Ok(Some((pid, birth))) if pid != own_pid && pid_file_running(pid, birth) => {
             eprintln!("daemon start: existing daemon running (pid {})", pid);
             return ExitCode::LockError;
         }
-        Ok(Some(pid)) if pid != own_pid => {
+        Ok(Some((pid, _))) if pid != own_pid => {
             let _ = remove_daemon_pid();
         }
         Ok(_) => {}
@@ -9629,6 +9629,7 @@ fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
     // stale and its pid may now belong to an unrelated process: do not signal it.
     match try_acquire_daemon_pid_lock() {
         Ok(Some(_free)) => {
+            let _ = remove_daemon_pid();
             let response = serde_json::json!({
                 "command": "daemon stop",
                 "running": false,
@@ -9688,8 +9689,9 @@ fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
 
 #[cfg(feature = "daemon")]
 fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
-    let pid = read_daemon_pid().ok().flatten();
-    let running = pid.map(is_process_running).unwrap_or(false);
+    let record = read_pid_file_record(&daemon_pid_path()).ok().flatten();
+    let pid = record.map(|(pid, _)| pid);
+    let running = record.is_some_and(|(pid, birth)| pid_file_running(pid, birth));
     let state_path = daemon_state_path();
     let state = if state_path.exists() {
         std::fs::read_to_string(&state_path)
@@ -10122,12 +10124,7 @@ fn run_shadow_start(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
 
 fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
     if let Ok(Some((pid, birth))) = read_pid_file_record(&shadow_pid_path()) {
-        let running = match pid_file_target(pid, birth) {
-            PidFileTarget::Verified => true,
-            PidFileTarget::Stale => false,
-            PidFileTarget::Unverified => is_process_running(pid),
-        };
-        if running {
+        if pid_file_running(pid, birth) {
             eprintln!(
                 "shadow start: existing shadow observer running (pid {})",
                 pid
@@ -10152,13 +10149,19 @@ fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCod
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             eprintln!("shadow start: failed to spawn background worker: {}", err);
             return ExitCode::IoError;
         }
     };
+    // Its birth is recorded while it is still our unreaped child; one that has
+    // already exited would leave a pid file naming nothing.
+    if let Ok(Some(status)) = child.try_wait() {
+        eprintln!("shadow start: background worker exited at once ({status})");
+        return ExitCode::IoError;
+    }
 
     if let Err(err) = write_shadow_pid(child.id()) {
         eprintln!("shadow start: failed to write pid file: {}", err);
@@ -10321,11 +10324,14 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
     let refusal = match target {
         PidFileTarget::Verified => None,
         PidFileTarget::Stale => Some(format!(
-            "pid {pid} in the shadow pid file is no longer the observer; not signalled"
+            "pid {pid} in {} is no longer the observer; not signalled",
+            shadow_pid_path().display()
         )),
         PidFileTarget::Unverified => Some(format!(
-            "the shadow pid file records no start time (written before v2.3.0); if pid {pid} \
-             is a pt shadow observer, stop it with `kill {pid}`"
+            "pid {pid} in {} cannot be verified (no start time recorded before v2.3.0, or the \
+             process cannot be inspected); if it is a pt shadow observer, stop it with \
+             `kill {pid}` and remove that file",
+            shadow_pid_path().display()
         )),
     };
     if let Some(message) = refusal {
@@ -10376,8 +10382,9 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
 }
 
 fn run_shadow_status(global: &GlobalOpts) -> ExitCode {
-    let pid = read_shadow_pid().ok().flatten();
-    let running = pid.map(is_process_running).unwrap_or(false);
+    let record = read_pid_file_record(&shadow_pid_path()).ok().flatten();
+    let pid = record.map(|(pid, _)| pid);
+    let running = record.is_some_and(|(pid, birth)| pid_file_running(pid, birth));
     let stale = pid.is_some() && !running;
 
     let config = ShadowStorageConfig {
@@ -10709,52 +10716,86 @@ fn process_birth_for_pid_file(pid: u32) -> Option<u64> {
     }
 }
 
-/// Write `<pid> <birth>` (or just the pid when its birth cannot be read).
+/// `<pid file>.birth`: `<pid> <birth>` for the pid the pid file names. A sidecar
+/// keeps the pid file itself a bare pid, as scripts and older pt versions read it.
+fn pid_birth_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".birth");
+    PathBuf::from(name)
+}
+
+/// Write the pid file, recording the process's birth beside it when readable.
 fn write_pid_file_record(path: &Path, pid: u32) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let record = match process_birth_for_pid_file(pid) {
-        Some(birth) => format!("{pid} {birth}"),
-        None => pid.to_string(),
-    };
-    std::fs::write(path, record)
+    // The sidecar first: a reader binds it to the pid file's pid, so a sidecar
+    // left by an earlier run never applies to a new pid.
+    if let Some(birth) = process_birth_for_pid_file(pid) {
+        std::fs::write(pid_birth_path(path), format!("{pid} {birth}"))?;
+    }
+    std::fs::write(path, pid.to_string())
 }
 
-/// Read `<pid>` (pre-2.3.0 files) or `<pid> <birth>`.
+/// Read the pid file's pid and, when its sidecar names the same pid, its birth.
 fn read_pid_file_record(path: &Path) -> std::io::Result<Option<(u32, Option<u64>)>> {
     if !path.exists() {
         return Ok(None);
     }
     let content = std::fs::read_to_string(path)?;
-    let mut fields = content.split_whitespace();
-    let Some(Ok(pid)) = fields.next().map(str::parse::<u32>) else {
+    let Ok(pid) = content.trim().parse::<u32>() else {
         return Ok(None);
     };
-    Ok(Some((
-        pid,
-        fields.next().and_then(|birth| birth.parse().ok()),
-    )))
+    let birth = std::fs::read_to_string(pid_birth_path(path))
+        .ok()
+        .and_then(|record| {
+            let mut fields = record.split_whitespace();
+            let recorded_pid = fields.next()?.parse::<u32>().ok()?;
+            let birth = fields.next()?.parse::<u64>().ok()?;
+            (recorded_pid == pid).then_some(birth)
+        });
+    Ok(Some((pid, birth)))
 }
 
 /// Whether a pid file's pid still names the process that wrote its record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PidFileTarget {
+    /// The live process has the recorded birth.
     Verified,
+    /// The process is gone, or the pid now belongs to one with another birth.
     Stale,
+    /// No birth is recorded (pre-2.3.0 file), or the process exists but cannot
+    /// be inspected (another user's process, hidepid).
     Unverified,
 }
 
 fn pid_file_target(pid: u32, birth: Option<u64>) -> PidFileTarget {
-    match birth {
-        Some(birth) if process_birth_for_pid_file(pid) == Some(birth) => PidFileTarget::Verified,
+    let Some(birth) = birth else {
+        return PidFileTarget::Unverified;
+    };
+    match process_birth_for_pid_file(pid) {
+        Some(live) if live == birth => PidFileTarget::Verified,
         Some(_) => PidFileTarget::Stale,
-        None => PidFileTarget::Unverified,
+        None if is_process_running(pid) => PidFileTarget::Unverified,
+        None => PidFileTarget::Stale,
+    }
+}
+
+/// Whether the pid file's process runs: its recorded birth decides when there is one.
+fn pid_file_running(pid: u32, birth: Option<u64>) -> bool {
+    match pid_file_target(pid, birth) {
+        PidFileTarget::Verified => true,
+        PidFileTarget::Stale => false,
+        PidFileTarget::Unverified => is_process_running(pid),
     }
 }
 
 fn remove_shadow_pid() -> std::io::Result<()> {
     let path = shadow_pid_path();
+    let birth = pid_birth_path(&path);
+    if birth.exists() {
+        std::fs::remove_file(birth)?;
+    }
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -11043,6 +11084,10 @@ fn read_daemon_pid() -> std::io::Result<Option<u32>> {
 #[cfg(feature = "daemon")]
 fn remove_daemon_pid() -> std::io::Result<()> {
     let path = daemon_pid_path();
+    let birth = pid_birth_path(&path);
+    if birth.exists() {
+        std::fs::remove_file(birth)?;
+    }
     if path.exists() {
         std::fs::remove_file(path)?;
     }
