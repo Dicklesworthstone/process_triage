@@ -9645,7 +9645,20 @@ fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
             }
             return ExitCode::Clean;
         }
-        Ok(None) => {}
+        // The lock is held, but maybe by a starting daemon or another `stop`: the
+        // holder writes its pid into the lock file, and it must be the pid file's.
+        Ok(None) => {
+            let holder = std::fs::read_to_string(daemon_pid_lock_path())
+                .ok()
+                .and_then(|content| content.trim().parse::<u32>().ok());
+            if holder != Some(pid) {
+                eprintln!(
+                    "daemon stop: the daemon pid lock is not held by pid {pid} from the pid file; \
+                     not signalled (retry once the daemon has started or the other stop finished)"
+                );
+                return ExitCode::IoError;
+            }
+        }
         Err(err) => {
             eprintln!("daemon stop: failed to check the daemon pid lock: {}", err);
             return ExitCode::IoError;
@@ -10731,8 +10744,9 @@ fn write_pid_file_record(path: &Path, pid: u32) -> std::io::Result<()> {
     }
     // The sidecar first: a reader binds it to the pid file's pid, so a sidecar
     // left by an earlier run never applies to a new pid.
-    if let Some(birth) = process_birth_for_pid_file(pid) {
-        std::fs::write(pid_birth_path(path), format!("{pid} {birth}"))?;
+    match process_birth_for_pid_file(pid) {
+        Some(birth) => std::fs::write(pid_birth_path(path), format!("{pid} {birth}"))?,
+        None => remove_if_present(&pid_birth_path(path))?,
     }
     std::fs::write(path, pid.to_string())
 }
@@ -10771,7 +10785,11 @@ enum PidFileTarget {
 
 fn pid_file_target(pid: u32, birth: Option<u64>) -> PidFileTarget {
     let Some(birth) = birth else {
-        return PidFileTarget::Unverified;
+        return if is_process_running(pid) {
+            PidFileTarget::Unverified
+        } else {
+            PidFileTarget::Stale
+        };
     };
     match process_birth_for_pid_file(pid) {
         Some(live) if live == birth => PidFileTarget::Verified,
@@ -10791,15 +10809,21 @@ fn pid_file_running(pid: u32, birth: Option<u64>) -> bool {
 }
 
 fn remove_shadow_pid() -> std::io::Result<()> {
-    let path = shadow_pid_path();
-    let birth = pid_birth_path(&path);
-    if birth.exists() {
-        std::fs::remove_file(birth)?;
+    remove_pid_file_record(&shadow_pid_path())
+}
+
+/// Remove a pid file, then its birth sidecar; one already removed (by the
+/// exiting process's own cleanup) is fine.
+fn remove_pid_file_record(path: &Path) -> std::io::Result<()> {
+    remove_if_present(path)?;
+    remove_if_present(&pid_birth_path(path))
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
 }
 
 // ============================================================================
@@ -11083,15 +11107,7 @@ fn read_daemon_pid() -> std::io::Result<Option<u32>> {
 
 #[cfg(feature = "daemon")]
 fn remove_daemon_pid() -> std::io::Result<()> {
-    let path = daemon_pid_path();
-    let birth = pid_birth_path(&path);
-    if birth.exists() {
-        std::fs::remove_file(birth)?;
-    }
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
+    remove_pid_file_record(&daemon_pid_path())
 }
 
 #[cfg(feature = "daemon")]
