@@ -578,7 +578,8 @@ fn parse_ps_line_with_timing(
         (start_time_unix, elapsed, start_id)
     };
 
-    let tty = if parsed.tty_raw == "?" || parsed.tty_raw == "-" {
+    // No controlling terminal: procps prints `?`, BSD/macOS ps prints `??`.
+    let tty = if matches!(parsed.tty_raw, "?" | "??" | "-") {
         None
     } else {
         Some(parsed.tty_raw.to_string())
@@ -1476,6 +1477,24 @@ mod tests {
         assert_eq!(record.uid, 501);
         assert_eq!(record.user, "alice");
         assert_eq!(record.comm, "sleep");
+    }
+
+    #[test]
+    fn macos_ps_without_a_terminal_has_no_tty() {
+        // BSD/macOS ps prints `??` for a process without a controlling terminal.
+        // Reading it as a terminal made every macOS kill fail the active-TTY gate.
+        let boot_id: Option<String> = None;
+        let detached = "  501   1  501 alice  501  501 S  0.0  8192 40960 ??  Mon Feb 24 09:00:00 2026 1:23:45 sleep sleep";
+        let record = parse_ps_line_synthetic(detached, "macos", &boot_id, 1_800_000_000)
+            .expect("parse detached macOS line");
+        assert_eq!(record.tty, None);
+        assert!(!record.has_tty());
+
+        let interactive = "  502 501  501 alice  502  501 S  0.0  8192 40960 ttys003  Mon Feb 24 09:00:00 2026 1:23:45 zsh -zsh";
+        let record = parse_ps_line_synthetic(interactive, "macos", &boot_id, 1_800_000_000)
+            .expect("parse interactive macOS line");
+        assert_eq!(record.tty.as_deref(), Some("ttys003"));
+        assert!(record.has_tty());
     }
 
     #[test]
