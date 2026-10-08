@@ -9601,8 +9601,8 @@ fn daemon_notify_desktop(
 
 #[cfg(feature = "daemon")]
 fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
-    let pid = match read_daemon_pid() {
-        Ok(Some(pid)) => pid,
+    let (pid, birth) = match read_pid_file_record(&daemon_pid_path()) {
+        Ok(Some(record)) => record,
         Ok(None) => {
             let response = serde_json::json!({
                 "command": "daemon stop",
@@ -9649,6 +9649,14 @@ fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
             eprintln!("daemon stop: failed to check the daemon pid lock: {}", err);
             return ExitCode::IoError;
         }
+    }
+    // A daemon runs, but the file may still name another process (a daemon in a
+    // container sharing this data dir). Files from before v2.3.0 record no birth.
+    if pid_file_target(pid, birth) == PidFileTarget::Stale {
+        eprintln!(
+            "daemon stop: pid {pid} in the daemon pid file is not the running daemon; not signalled"
+        );
+        return ExitCode::IoError;
     }
 
     if let Err(err) = terminate_process(pid) {
@@ -10113,8 +10121,13 @@ fn run_shadow_start(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
 }
 
 fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
-    if let Ok(Some(pid)) = read_shadow_pid() {
-        if is_process_running(pid) {
+    if let Ok(Some((pid, birth))) = read_pid_file_record(&shadow_pid_path()) {
+        let running = match pid_file_target(pid, birth) {
+            PidFileTarget::Verified => true,
+            PidFileTarget::Stale => false,
+            PidFileTarget::Unverified => is_process_running(pid),
+        };
+        if running {
             eprintln!(
                 "shadow start: existing shadow observer running (pid {})",
                 pid
@@ -10174,15 +10187,6 @@ fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCod
 fn run_shadow_run(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
     install_shadow_signal_handlers();
     let own_pid = std::process::id();
-    // Held while the observer runs: `shadow stop` signals the pid file's pid only
-    // while some observer holds it, so a stale file never names a target.
-    let _pid_lock = match GlobalLock::try_acquire(&shadow_pid_lock_path()) {
-        Ok(lock) => lock,
-        Err(err) => {
-            eprintln!("shadow run: failed to open the shadow pid lock: {}", err);
-            None
-        }
-    };
 
     let mut iterations = args.iterations;
     let mut run_count: u32 = 0;
@@ -10287,8 +10291,8 @@ fn run_shadow_iteration(
 }
 
 fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
-    let pid = match read_shadow_pid() {
-        Ok(Some(pid)) => pid,
+    let (pid, birth) = match read_pid_file_record(&shadow_pid_path()) {
+        Ok(Some(record)) => record,
         Ok(None) => {
             let response = serde_json::json!({
                 "command": "shadow stop",
@@ -10311,36 +10315,38 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
         }
     };
 
-    // A running observer holds the shadow pid lock. If it is free, the pid file is
-    // stale (or was written by an observer from before v2.3.0, which held no lock)
-    // and its pid may belong to an unrelated process: do not signal it.
-    match GlobalLock::try_acquire(&shadow_pid_lock_path()) {
-        Ok(Some(_free)) => {
-            let response = serde_json::json!({
-                "command": "shadow stop",
-                "running": false,
-                "pid": pid,
-                "message": format!(
-                    "no shadow observer holds the shadow pid lock; not signalling pid {pid} from the pid file"
-                ),
-            });
-            match global.format {
-                OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
-                    println!("{}", format_structured_output(global, response));
-                }
-                _ => {
-                    println!(
-                        "No running shadow observer holds the lock; pid {pid} in the pid file was not signalled."
-                    );
-                }
+    // The pid file records the observer's birth: signal only that process, never
+    // whatever reused the pid after an unclean exit.
+    let target = pid_file_target(pid, birth);
+    let refusal = match target {
+        PidFileTarget::Verified => None,
+        PidFileTarget::Stale => Some(format!(
+            "pid {pid} in the shadow pid file is no longer the observer; not signalled"
+        )),
+        PidFileTarget::Unverified => Some(format!(
+            "the shadow pid file records no start time (written before v2.3.0); if pid {pid} \
+             is a pt shadow observer, stop it with `kill {pid}`"
+        )),
+    };
+    if let Some(message) = refusal {
+        if target == PidFileTarget::Stale {
+            let _ = remove_shadow_pid();
+        }
+        let response = serde_json::json!({
+            "command": "shadow stop",
+            "running": false,
+            "pid": pid,
+            "message": message,
+        });
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+                println!("{}", format_structured_output(global, response));
             }
-            return ExitCode::Clean;
+            _ => {
+                println!("Shadow observer not signalled: {message}.");
+            }
         }
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("shadow stop: failed to check the shadow pid lock: {}", err);
-            return ExitCode::IoError;
-        }
+        return ExitCode::Clean;
     }
 
     if let Err(err) = terminate_process(pid) {
@@ -10674,25 +10680,77 @@ fn shadow_pid_path() -> PathBuf {
     shadow_base_dir().join("shadow.pid")
 }
 
-fn shadow_pid_lock_path() -> PathBuf {
-    shadow_base_dir().join("shadow.pid.lock")
-}
-
 fn write_shadow_pid(pid: u32) -> std::io::Result<()> {
-    let path = shadow_pid_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, pid.to_string())
+    write_pid_file_record(&shadow_pid_path(), pid)
 }
 
 fn read_shadow_pid() -> std::io::Result<Option<u32>> {
-    let path = shadow_pid_path();
+    Ok(read_pid_file_record(&shadow_pid_path())?.map(|(pid, _)| pid))
+}
+
+/// Birth of a live process (Linux start ticks, macOS start microseconds): what a
+/// pid file records next to the pid so a later `stop` can tell that process from
+/// an unrelated one that reused the pid.
+fn process_birth_for_pid_file(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        pt_core::collect::proc_parsers::read_required_proc_stat(pid)
+            .ok()
+            .map(|stat| stat.starttime)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        pt_core::collect::read_bsd_info(pid).map(|info| info.start_us)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Write `<pid> <birth>` (or just the pid when its birth cannot be read).
+fn write_pid_file_record(path: &Path, pid: u32) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let record = match process_birth_for_pid_file(pid) {
+        Some(birth) => format!("{pid} {birth}"),
+        None => pid.to_string(),
+    };
+    std::fs::write(path, record)
+}
+
+/// Read `<pid>` (pre-2.3.0 files) or `<pid> <birth>`.
+fn read_pid_file_record(path: &Path) -> std::io::Result<Option<(u32, Option<u64>)>> {
     if !path.exists() {
         return Ok(None);
     }
     let content = std::fs::read_to_string(path)?;
-    Ok(content.trim().parse::<u32>().ok())
+    let mut fields = content.split_whitespace();
+    let Some(Ok(pid)) = fields.next().map(str::parse::<u32>) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        pid,
+        fields.next().and_then(|birth| birth.parse().ok()),
+    )))
+}
+
+/// Whether a pid file's pid still names the process that wrote its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidFileTarget {
+    Verified,
+    Stale,
+    Unverified,
+}
+
+fn pid_file_target(pid: u32, birth: Option<u64>) -> PidFileTarget {
+    match birth {
+        Some(birth) if process_birth_for_pid_file(pid) == Some(birth) => PidFileTarget::Verified,
+        Some(_) => PidFileTarget::Stale,
+        None => PidFileTarget::Unverified,
+    }
 }
 
 fn remove_shadow_pid() -> std::io::Result<()> {
@@ -10974,21 +11032,12 @@ fn daemon_lock_path() -> PathBuf {
 
 #[cfg(feature = "daemon")]
 fn write_daemon_pid(pid: u32) -> std::io::Result<()> {
-    let path = daemon_pid_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, pid.to_string())
+    write_pid_file_record(&daemon_pid_path(), pid)
 }
 
 #[cfg(feature = "daemon")]
 fn read_daemon_pid() -> std::io::Result<Option<u32>> {
-    let path = daemon_pid_path();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = std::fs::read_to_string(path)?;
-    Ok(content.trim().parse::<u32>().ok())
+    Ok(read_pid_file_record(&daemon_pid_path())?.map(|(pid, _)| pid))
 }
 
 #[cfg(feature = "daemon")]
