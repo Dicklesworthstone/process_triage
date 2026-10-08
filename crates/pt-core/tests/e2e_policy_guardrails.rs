@@ -13,7 +13,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use predicates::prelude::*;
-use pt_common::config::policy::Policy;
+use pt_core::config::Policy;
 use serde_json::Value;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -265,7 +265,7 @@ mod blast_radius {
 
 mod protected_patterns {
     use super::*;
-    use pt_common::config::policy::{PatternEntry, PatternKind};
+    use pt_core::config::policy::{PatternEntry, PatternKind};
 
     #[test]
     fn policy_protected_patterns_filter_candidates() {
@@ -500,62 +500,83 @@ mod robot_mode {
 mod min_age {
     use super::*;
 
+    /// Only the age floor in play: protection rules would hide the test's own child
+    /// on some runners (rch workers run tests as root, in a service cgroup).
+    fn age_only_policy(min_age: u64) -> Policy {
+        let mut policy = Policy::default();
+        policy.guardrails.min_process_age_seconds = min_age;
+        policy.guardrails.protected_users = Vec::new();
+        policy.guardrails.never_kill_ppid = Vec::new();
+        policy.guardrails.protected_patterns = Vec::new();
+        policy.guardrails.builtin_protection = false;
+        policy
+    }
+
+    fn candidate_pids(json: &Value) -> Vec<u64> {
+        json["candidates"]
+            .as_array()
+            .map(|c| c.iter().filter_map(|c| c["pid"].as_u64()).collect())
+            .unwrap_or_default()
+    }
+
+    /// A process started a moment ago is not evaluated under the policy's age floor,
+    /// and is once `--min-age 0` lowers it (`--threshold 0` makes every evaluated
+    /// process a candidate, so absence means "not evaluated").
     #[test]
     fn plan_min_age_filters_young_processes() {
         let config_dir = tempdir().expect("temp config dir");
-        let mut policy = Policy::default();
-        // Set very high minimum age so most processes are filtered
-        policy.guardrails.min_process_age_seconds = 999_999;
-        write_policy(config_dir.path(), &policy);
+        write_policy(config_dir.path(), &age_only_policy(3600));
+        let mut child = std::process::Command::new("sleep")
+            .arg("120")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().to_string();
 
-        let (json, _code) = plan_json_with_config(
+        let (floor, _) =
+            plan_json_with_config(config_dir.path(), &["--pids", &pid, "--threshold", "0"]);
+        let (no_floor, _) = plan_json_with_config(
             config_dir.path(),
-            &["--threshold", "0", "--max-candidates", "20"],
+            &["--pids", &pid, "--threshold", "0", "--min-age", "0"],
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            floor["args"]["effective_min_age"], 3600,
+            "{}",
+            floor["args"]
+        );
+        assert_eq!(floor["policy_snapshot"]["min_process_age_seconds"], 3600);
+        let pid: u64 = pid.parse().unwrap();
+        assert!(
+            !candidate_pids(&floor).contains(&pid),
+            "a seconds-old process passed the 1 h floor: {}",
+            floor["candidates"]
         );
 
-        let candidates = json
-            .get("candidates")
-            .and_then(|c| c.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        // With min_age=999999, most processes should be filtered
-        let actionable = candidates
-            .iter()
-            .filter(|c| {
-                !c.get("policy_blocked")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true)
-            })
-            .count();
-
-        eprintln!(
-            "[INFO] min_age=999999: {}/{} actionable (most should be blocked by age)",
-            actionable,
-            candidates.len()
+        assert_eq!(no_floor["args"]["effective_min_age"], 0);
+        assert!(
+            candidate_pids(&no_floor).contains(&pid),
+            "--min-age 0 must evaluate it: {}",
+            no_floor["candidates"]
         );
     }
 
+    /// `--min-age` overrides the policy floor, and every candidate respects it.
     #[test]
     fn plan_cli_min_age_override() {
         let config_dir = tempdir().expect("temp config dir");
-        write_policy(config_dir.path(), &Policy::default());
+        write_policy(config_dir.path(), &age_only_policy(3600));
 
-        // CLI --min-age should override policy
-        pt_core_fast()
-            .env("PT_CONFIG_DIR", config_dir.path().display().to_string())
-            .args([
-                "--format",
-                "json",
-                "agent",
-                "plan",
-                "--min-age",
-                "60",
-                "--sample-size",
-                TEST_SAMPLE_SIZE,
-            ])
-            .assert()
-            .code(predicate::in_iter([0, 1]));
+        let (json, _) =
+            plan_json_with_config(config_dir.path(), &["--min-age", "60", "--threshold", "0"]);
+
+        assert_eq!(json["args"]["min_age"], 60);
+        assert_eq!(json["args"]["effective_min_age"], 60);
+        assert_eq!(json["policy_snapshot"]["min_process_age_seconds"], 60);
+        for c in json["candidates"].as_array().cloned().unwrap_or_default() {
+            assert!(c["age_seconds"].as_u64().unwrap() >= 60, "{c}");
+        }
     }
 }
 
@@ -930,7 +951,7 @@ mod combined {
         // Configure multiple guardrails simultaneously
         policy.guardrails.max_kills_per_run = 3;
         policy.guardrails.min_process_age_seconds = 300;
-        policy.guardrails.require_confirmation = true;
+        policy.guardrails.require_confirmation = Some(true);
         policy.robot_mode.enabled = true;
         policy.robot_mode.min_posterior = 0.95;
         policy.robot_mode.max_blast_radius_mb = 1024.0;

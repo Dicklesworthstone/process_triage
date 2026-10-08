@@ -150,8 +150,8 @@ Most tools only know "kill" or "don't kill." `pt` evaluates 8 possible actions r
 | **Renice** | lower priority (`nice`), never raises it | Yes | Linux, macOS |
 | **Pause** | `SIGSTOP` (resume: `SIGCONT`) | Yes | Linux, macOS |
 | **Freeze** | cgroup v2 freezer | Yes | Linux, if the target owns its cgroup |
-| **Throttle** | cgroup CPU quota | Yes | Linux, if the target owns its cgroup |
-| **Quarantine** | cpuset controller | Yes | Linux, if the target owns its cgroup |
+| **Throttle** | cgroup CPU quota | Explicit prior metadata | Linux, in an exclusive leaf |
+| **Quarantine** | cpuset controller | Explicit prior metadata | Linux, in an exclusive leaf |
 | **Restart** | via the supervisor | Partial | not executable yet (planned, e.g. for a zombie's parent); apply reports it as failed |
 | **Kill** | SIGTERM → SIGKILL | No | Linux, macOS |
 
@@ -272,6 +272,8 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/process_triage/ma
 
 Releases up to v2.1.0 were published without signatures, so a verified install of them fails closed ("does not publish release-signing-public.pem") and installs nothing. `pt update` verifies by default and says so when it refuses; `pt update --no-verify` installs unverified on explicit request.
 
+The installer and the `pt` wrapper pin the release-signing key: a verified install or `pt update` accepts a release only if its `release-signing-public.pem` has one of the SHA-256 fingerprints (of the DER public key) listed in `TRUSTED_RELEASE_KEY_FINGERPRINTS`, currently `b5084da80f9652304307fa7c3f965ee7840d3815fd863c2b40f4524e00e2e4ee` (first used for v2.2.0). A release signed with any other key is refused even if its signatures are internally consistent. `PT_RELEASE_PUBLIC_KEY_FINGERPRINT` (comma- or space-separated) or `PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE` replaces the built-in list, for example to pin a fork's own key.
+
 **Platforms:** Linux x86_64 (primary), Linux aarch64, macOS x86_64, macOS aarch64, Windows x86_64 (via WSL2 only, using the Linux install)
 
 ---
@@ -302,6 +304,7 @@ pt agent explain --session <id> --pids 1234 # why one process scored the way it 
 ```bash
 pt agent plan --format json            # Structured JSON plan
 pt agent plan --format toon            # Token-optimized output
+pt agent plan --pids 1234,5678          # Score selected PIDs with full ancestry/protection checks
 pt agent apply --session <id> --yes    # Execute a plan (needs robot_mode.enabled=true in policy)
 pt agent verify --session <id>         # Confirm outcomes
 pt agent label --pid 1234 --kill       # Teach pt your verdict for this command pattern
@@ -338,6 +341,7 @@ pt shadow stop                    # Stop observer
 | `pt bundle create` | Export session bundle | `pt bundle create --session <id> --output out.ptb` |
 | `pt report` | HTML report from session | `pt report --session <id> --output report.html` |
 | `pt shadow start` | Start calibration observer | `pt shadow start` |
+| `pt doctor` | Read-only host hygiene audit (prints fixes, never runs them) | `pt doctor --format md` |
 | `pt config validate` | Validate config files | `pt-core config validate policy.json` |
 | `pt --version` | Show version | `pt --version` |
 | `pt --help` | Full help | `pt --help` |
@@ -399,13 +403,17 @@ Protection has two layers:
 
 - **Policy** (`policy.json` → `guardrails`): protected patterns (defaults `systemd`, `sshd`), protected users (default `root`), protected categories (`database`, `webserver`), PIDs, and children of PID 1.
 - **Built-in** (`guardrails.builtin_protection`, on by default):
-  - terminal multiplexers (tmux, zellij, screen, wezterm/frankenterm mux servers), SSH ControlMasters (e.g. rch's shared connections), session infrastructure (sshd sessions, `systemd --user`, dbus, pipewire, agents), interactive shells, and what is on someone's screen: terminal emulators, display servers/compositors (including kiosk `cage`) and live monitors such as `htop`/`btop` (headless `Xvfb` stays a candidate);
+  - terminal multiplexers (tmux, zellij, screen, wezterm/frankenterm mux servers), SSH ControlMasters (e.g. rch's shared connections), session infrastructure (sshd sessions, `systemd --user`, dbus, pipewire, agents), the display-manager / session-manager process that holds a graphical login (`sddm-helper`, `gdm-session-worker`, `lightdm --session-child`, `greetd`, `uwsm start`, `gnome-session-binary`, `ksmserver`, …), interactive shells, and what is on someone's screen: terminal emulators, display servers/compositors (including kiosk `cage`) and live monitors such as `htop`/`btop` (headless `Xvfb` stays a candidate);
   - `pt` itself and every process that invoked it;
   - database / web / message servers by name, even under rewritten titles (`postgres: … io worker`, `nginx: worker process`; also mysqld/mariadbd, redis/valkey, mongod, memcached, httpd/apache2, caddy, haproxy, traefik, php-fpm, clickhouse, etcd, rabbitmq, mattermost, minio, elasticsearch), **and every descendant of one** (workers, plugins), wherever they run: systemd, docker or a plain shell. `pt agent plan` reports the per-rule counts in `summary.protected_by_rule`;
   - on Linux, anything supervised by systemd (`system.slice/*.service`, user units) or a container runtime, which covers postgres/nginx/mysql workers, docker containers and the like;
   - AI agent CLIs (claude, codex, gemini/agy, …) are never pre-selected or robot-killed; they are shown for manual review.
 - On macOS (no cgroups), placement comes from owner and executable: `root` and system role accounts (`_windowserver`, …), Apple platform binaries (`/System`, `/usr/libexec`, `/usr/sbin`, `/sbin`, `/Library/Apple`) and anything inside a `.app` bundle (GUI apps and their helpers) are protected (`builtin.macos_system`). A real user's other processes are evaluated even after being reparented to launchd (PID 1), which is how a dev server orphaned by a closed terminal looks there.
 - On Linux, a workload started inside a login session (for example a build running as root over SSH on a build worker, or an orphan reparented to PID 1) is **not** covered by the root-user / PID-1 rules, because it is a candidate rather than a system service.
+- Where placement is unknown (Linux without systemd cgroups: cgroup v1 hosts, a container's own root namespace), the root-user and PID-1 rules apply unchanged: root's processes and children of PID 1 stay protected there, so such hosts see fewer candidates. The scan filter and the policy enforcer behind `agent plan` use this one placement rule, so a process the scan evaluates is not downgraded to review afterwards because of where it runs (before, every macOS orphan was).
+
+A terminal pane can inherit its multiplexer's user-service cgroup. On Linux, `pt` evaluates that pane's workloads like a transient scope when it can verify a same-owner ancestry chain with a controlling terminal below the live mux executable. Scan, plan and apply use this shared classification, so a pane workload is not given advice to restart the mux service. The mux itself, agent-mail and `rchd` servers, NTM session monitors and their service children stay protected. Missing or changed evidence retains service protection; a pane adopted by the user manager after losing its mux ancestry also retains protection.
+- Desktop applications are evaluated, not protected, but scored as what they are: a process without a terminal in an XDG application unit of the user's systemd manager (`app-*.scope` / `app-*.service`, which is how GNOME, KDE and uwsm launch apps) gets desktop-app ownership evidence toward useful, and its missing TTY is not counted against it. An idle app left open for days is not a candidate; a runaway one still can be. Commands typed into a terminal emulator share its unit but have a TTY, so they are judged on their own evidence. A process in such a unit whose matched signature expects it to be left behind (a jest or pytest that an editor extension started, say) gets no desktop-app credit; plan and explain report this as `desktop_app_credited: false`.
 
 ### Staged Kill Signals
 
@@ -430,7 +438,7 @@ All of these apply in `pt agent apply` (robot mode is off by default: `robot_mod
 | protection rules | on | Built-in + `guardrails.protected_*`, re-checked live before each action |
 | live pre-checks | always | Identity, protection, session safety, data-loss gate, supervisor; a plan cannot opt out |
 
-Fleet plans additionally pool kill decisions across hosts with e-value Benjamini-Yekutieli FDR control; single-host plans report the expected false-discovery rate of their kill set.
+Fleet plans additionally pool kill decisions across hosts, keeping the posterior expected false-discovery proportion of the pooled kill set within `--max-fdr`; single-host plans report the expected false-discovery rate of their kill set.
 
 ---
 
@@ -450,7 +458,7 @@ pt (Bash wrapper)
      ├─ Decide ─────── Expected-loss minimization, protection and policy
      │                  enforcement, process-tree safety, Value of
      │                  Information (deep-scan hint), goal optimizer,
-     │                  fleet e-BY FDR
+     │                  fleet expected-FDR pooling
      │
      ├─ Act ────────── identity-pinned signals (pidfd on Linux),
      │                  SIGTERM → SIGKILL, renice, pause/resume,
@@ -499,6 +507,7 @@ process_triage/
 ```
 ~/.config/process_triage/
 ├── decisions.json      # Learned kill/spare verdicts per command pattern
+├── signatures.json     # User signatures (`pt-core signature add/import`)
 ├── priors.json         # Bayesian hyperparameters (optional)
 └── policy.json         # Safety policy (optional)
 
@@ -507,13 +516,23 @@ process_triage/
     └── pt-20260115-143022-a7xq/
         ├── manifest.json            # Session metadata and state
         ├── context.json             # Host / run context
-        ├── scan/snapshot.json       # Process snapshot
-        ├── decision/plan.json       # Generated plan
+        ├── scan/inventory.json      # Process identities and commands
+        ├── inference/results.json   # Four-class posteriors
+        ├── decision/plan.json       # Executable plan and recorded evidence
         ├── action/outcomes.jsonl    # Action outcomes
         └── logs/session.jsonl       # Session event log
 ```
 
-On macOS the same layout lives under `~/Library/Application Support/` unless `XDG_*` or `PROCESS_TRIAGE_*` variables are set.
+The config directory is `$XDG_CONFIG_HOME/process_triage` (default `~/.config/process_triage`) on every platform; `--config` / `PT_CONFIG_DIR`, then `PROCESS_TRIAGE_CONFIG`, override it, and every file above (signatures included) follows the override. (Earlier releases kept `signatures.json`, `pattern_stats.json` and the `patterns/` files in `~/Library/Application Support/process_triage` on macOS; without an override pt still reads each one from there until the config directory has its own copy, and the next `signature` change or `agent fleet transfer import` saves the full contents to the config directory.) The data directory defaults to `~/.local/share/process_triage` on Linux and `~/Library/Application Support/process_triage` on macOS; `PROCESS_TRIAGE_DATA` or `XDG_DATA_HOME` override it.
+
+Fleet configuration transfer supports validated JSON and encrypted `.ptb` export,
+import and diff. An intact `.ptb` transfer requires explicit `--export-profile forensic`;
+Safe and Minimal are redacted sharing profiles and cannot activate configuration.
+Import refuses detected credentials and invalid priors or matchers. Import dry runs
+show the selected strategy's merged values for the reported prior fields. Baseline
+normalization remains unavailable: `--normalize-baseline` refuses until comparable
+measured learning observations are wired. A current process count cannot establish
+the evidence supporting transferred priors. Multi-file activation is not yet atomic.
 
 ### Environment Variables
 
@@ -616,11 +635,11 @@ pt report --session <id> --output report.html --include-ledger --embed-assets
 # Plan across hosts (inventory: TOML, YAML or JSON by extension)
 pt-core agent fleet plan --inventory hosts.toml --parallel 10
 
-# Or list hosts directly; pooled FDR across hosts (e-value Benjamini-Yekutieli)
+# Or list hosts directly; kills pooled across hosts within an expected FDR of 5%
 pt-core agent fleet plan --hosts trj,ts1,hz3 --max-fdr 0.05
 ```
 
-Current status: fleet **planning** works: each host runs its own `pt-core agent plan` over SSH (so protection, cgroup placement and the posterior are evaluated on that host), and the fleet aggregates those decisions with pooled e-BY FDR across hosts. Hosts need `pt-core` on their PATH. Fleet **apply** only reports planned actions; remote execution is not implemented yet. The Chandy-Lamport consistent-snapshot coordinator exists as a library but is not wired into fleet planning yet, so cross-host dependencies are not considered today.
+Current status: fleet **planning** works: each host runs its own `pt-core agent plan` over SSH (so protection, cgroup placement and the posterior are evaluated on that host), and the fleet pools those decisions across hosts by Bayesian expected FDR (the largest kill set, most probable first, whose posterior expected share of wrong kills stays within `--max-fdr`). Hosts need `pt-core` on their PATH. Fleet **apply** only reports planned actions; remote execution is not implemented yet. The Chandy-Lamport consistent-snapshot coordinator exists as a library but is not wired into fleet planning yet, so cross-host dependencies are not considered today.
 
 ---
 
@@ -695,16 +714,25 @@ If the daemon itself exceeds its budget, it backs off automatically.
 
 ```bash
 pt-core signature list              # Show all signatures
+pt-core signature add herdr-server \
+  --category terminal \
+  --pattern '^herdr$' \
+  --arg-pattern '^server$' \
+  --prior useful                    # "this is normal": matching processes score as useful
 pt-core signature add stuck-jest \
   --category other \
   --pattern jest \
-  --arg-pattern=--runInBand         # Add custom signature (categories: agent, ide, ci, orchestrator, terminal, other)
+  --arg-pattern=--runInBand \
+  --prior abandoned                 # "usually left behind"
+pt-core signature test herdr --cmdline 'herdr server'   # Which signature matches?
 
 pt-core signature export sigs.json  # Export for sharing
 pt-core signature import sigs.json  # Import from file
 ```
 
-Signatures are matched against the process name and command line (and, where collected, environment and sockets). A matched signature sets the Bayesian prior: test-runner signatures such as jest or pytest shift it toward "likely abandoned if old", dev-server signatures toward "likely useful".
+Categories: `agent`, `ide`, `ci`, `orchestrator`, `terminal`, `other`. `--pattern` matches the process name, `--arg-pattern` the command line (repeat either; all arg patterns must match). User signatures live in `signatures.json` in the config directory.
+
+Signatures are matched against the process name and command line. A matched signature with priors sets the class prior: `--prior useful` (about 90% useful) or `--prior abandoned` (about 80% abandoned). Built-in test-runner and build-tool signatures (jest, pytest, webpack, ...) lean toward "likely abandoned if old", dev-server signatures toward "likely useful"; their argument patterns match the tool as a command word (`node_modules/.bin/jest`, `python -m pytest`), not any path that contains the name. A signature added without `--prior` only labels its matches. Signature and learned priors apply the same way in `pt agent plan`, the TUI, `pt agent explain`, `snapshot`, `watch` and the MCP tools.
 
 ---
 
@@ -722,7 +750,7 @@ Signatures are matched against the process name and command line (and, where col
 | **GitHub Actions** | `GITHUB_ACTIONS`, `GITHUB_WORKFLOW` env | 0.95 |
 | **tmux/screen** | `TMUX` or `STY` env | 0.30 |
 
-Supervision is reported per candidate in the plan (`supervisor`). Processes placed in a systemd service or container cgroup are protected outright, and robot mode requires a human for anything supervised by an agent, IDE or CI job (failing closed when it cannot tell). A nohup/disown detector (SIGHUP in `SigIgn`, `nohup.out`) exists in the library but is not used in scoring yet.
+Supervision is reported per candidate in the plan (`supervisor`); for a process supervised by a systemd service it gives the unit, the manager (`system` or `user`) and the `systemctl [--user] restart <unit>` command. Processes classified as systemd services or container workloads are protected outright, and robot mode requires a human for anything supervised by an agent, IDE or CI job (failing closed when it cannot tell). Verified terminal-pane ancestry is treated as a user workload even inside the mux service's cgroup. A nohup/disown detector (SIGHUP in `SigIgn`, `nohup.out`) exists in the library but is not used in scoring yet.
 
 ---
 
@@ -806,6 +834,28 @@ The designed behavior: monitor system memory and escalate scan cadence when pres
 Transitions require 2 consecutive signals at the new level (prevents flapping on momentary spikes). De-escalation also requires 2 consecutive normal readings.
 
 On Linux, `pt` reads Pressure Stall Information (`/proc/pressure/memory`) when available, using `memory.some` as a more accurate signal than raw utilization. PSI thresholds: 20% for warning, 60% for emergency.
+
+---
+
+## Host Hygiene Audit (`pt doctor`)
+
+Many incidents come from host configuration, not from any one process. `pt doctor` (Linux) reads the machine's settings and reports findings as `ok` / `info` / `warn` / `crit`, each with the observed values, a recommendation, the reason it matters, and the exact commands a person could run. It is **read-only**: nothing is written and no command is executed (`--fix-script` prints them as a commented shell script for review).
+
+| Check | Flags |
+|-------|-------|
+| Current pressure regimes | the same PSI / load / memory / file-handle reading as `agent plan` |
+| `vm.vfs_cache_pressure` | below 100 (critical on large-RAM btrfs hosts, where it let caches grow to 388 GB and systemd-oomd killed every session); when caches are bloated now, says that dropping caches only treats the symptom |
+| `vm.min_free_kbytes` | below the reserve for the machine's RAM (≈256 MB at 16 GB, 512 MB at 32–64 GB, 1 GB at 256 GB, 2 GB at 512 GB) |
+| `vm.dirty_ratio` | percentage limits that allow tens of GB of dirty cache |
+| Swap | no swap; swap nearly full; zram active but not recreated at boot; swap paradox (swapped pages while available RAM is more than twice the swapped amount) |
+| systemd-oomd | whether it runs; a later `MemoryMax=infinity` (or reset) drop-in that negates an earlier `user-.slice` / `user@.service` limit |
+| journald | volatile storage or retention under a day (OOM post-mortems lost) |
+| File handles / inotify | system file table above 75% (with the largest descriptor holders); `max_user_watches` below 524288 |
+| Process table | zombies grouped by parent (a parent with 5+ unreaped children), D-state count |
+| Deleted but open files | disk space held by files deleted while a process still has them open (1 GiB or more), with the holder |
+| pt itself | PSI unavailable (regimes fall back to load and memory); session store past 1000 sessions or 1 GiB, or growing with retention switched off |
+
+Exit code: 0 when nothing needs attention, 1 when there is a warning or critical finding (the severity is in `worst`). Not yet covered: multiplexer hygiene, a policy section for thresholds, macOS.
 
 ---
 
@@ -975,7 +1025,7 @@ The `pt` script is a thin Bash wrapper that locates and execs `pt-core`:
 5. `/usr/local/bin/pt-core`
 6. PATH lookup via `which`
 
-**UI mode**: bare `pt` runs the TUI when it has a terminal; without one (or in robot mode) `pt run` exits 11 and points you to `pt agent plan`. The wrapper still accepts `--shell`/`--tui` and exports `PT_UI_MODE`, but pt-core currently ignores them.
+**UI mode**: bare `pt` runs the TUI when it has a terminal; without one (or in robot mode) `pt run` exits 11 and points you to `pt agent plan`. Use `pt scan` or `pt agent plan` for noninteractive output.
 
 **Built-in commands**:
 - `pt update` — Fetches the latest version and runs its installer with `--verify` (fails closed on unsigned releases; `--no-verify` overrides); `pt update rollback|list-backups|show-backup|verify-backup|prune-backups` manage pt-core backups
@@ -1089,7 +1139,19 @@ Example: 25% throttle = 25,000 µs quota per 100,000 µs period
 | **Write order** | Period must be set before quota | Single atomic write |
 | **Detection** | Hierarchy ID != 0 in `/proc/[pid]/cgroup` | Hierarchy ID = 0 |
 
-`pt` auto-detects cgroup version (v1, v2, or hybrid) and uses the appropriate interface. Previous settings are captured for reversal. Linux only, and refused unless the target is the only process in its cgroup: limiting a shared cgroup would throttle or freeze its neighbours too, and most shell-launched dev processes share one.
+`pt` detects cgroup v1, v2 and hybrid hierarchies. Mutation currently requires a
+readable unified v2 hierarchy, a full matching process identity, the caller's
+owner, and an exclusive leaf with no descendants. Direct runners also refuse
+PID 1, invoking processes and protected infrastructure. Hybrid v1 fallbacks check
+their own controller's leaf separately; pure v1 mutation is refused. Most
+shell-launched dev processes share a cgroup and cannot be changed safely here.
+These checks are snapshots; automatic creation of a dedicated target leaf is
+not implemented.
+
+The library can capture prior CPU limits and CPU sets for explicit reversal,
+bound to the original process identity and controller path. Unknown prior
+settings are refused. A bare Unquarantine action cannot restore a prior CPU set
+and is refused; durable reversal wiring into the CLI remains incomplete.
 
 ### cpuset Quarantine
 
@@ -1159,13 +1221,21 @@ A `.ptb` file is a ZIP archive (optionally encrypted) containing a manifest and 
 ```
 session.ptb (ZIP or encrypted envelope)
 ├── manifest.json       # Bundle metadata + file checksums
-├── snapshot.json       # Redacted process state
-├── inference.jsonl     # Per-process posteriors
-├── plan.json           # Generated action plan
-├── actions.json        # Executed actions + outcomes
-├── provenance.json     # Process provenance graph
-└── audit.jsonl         # Action audit trail
+├── session/manifest.json       # Session metadata
+├── session/context.json        # Host / run context
+├── scan/inventory.json         # Redacted process state
+├── inference/results.json      # Four-class posteriors
+├── plan.json                   # Executable plan and recorded evidence
+├── scan/provenance.json        # Process provenance graph, when recorded
+├── scan/provenance_audit.json  # Provenance export audit, when recorded
+├── logs/outcomes.jsonl         # Recorded action outcomes
+└── logs/session.jsonl          # Session event log
 ```
+
+Safe exports sanitize JSON and JSONL before checksums are computed. Minimal exports
+contain only available aggregate counts in `summary.json`. Opaque telemetry and
+process dumps require an explicit forensic export until a format-specific sanitizer
+is available; safe exports refuse them before creating the destination file.
 
 ### Encryption Envelope
 
@@ -1209,7 +1279,7 @@ The inference engine is backed by formal mathematical guarantees documented in [
 | Guarantee | Method | Invariant |
 |-----------|--------|-----------|
 | Posterior sums to 1 | Log-sum-exp normalization | `sum P(C\|x) = 1` |
-| FDR control (fleet plans) | e-value eBY | `E[FDP] <= alpha` |
+| FDR control (fleet plans) | Bayesian expected FDR | `E[FDP \| x] <= alpha` (as good as the posterior's calibration) |
 | Numerical stability | Log-domain arithmetic | No overflow/underflow |
 
 Library-only (not applied by any command yet): Mondrian conformal coverage, M/M/1 stall probabilities, Chandy-Lamport consistent cuts.
@@ -1252,12 +1322,7 @@ A probe is only worth taking if its expected information gain exceeds its cost: 
 
 ### FDR Control for Multiple Kill Decisions
 
-When triaging many processes at once, killing the top-N by score without correction inflates the false discovery rate. Single-host plans report the expected false-discovery rate of their kill set (`kill_set_fdr_estimate`); fleet plans pool kill decisions across hosts with e-value multiple testing:
-
-- **eBH** (e-value Benjamini-Hochberg): assumes positive regression dependency
-- **eBY** (e-value Benjamini-Yekutieli): conservative, handles arbitrary dependence
-
-The correction factor `c(m) = H_m = sum 1/j` for eBY means you can kill fewer processes per session, but each kill has a controlled false discovery rate.
+When triaging many processes at once, killing the top-N by score without correction inflates the false discovery rate. Single-host plans report the expected false-discovery rate of their kill set (`kill_set_fdr_estimate`, the mean of 1 − P(abandoned or zombie) over it); fleet plans pool kill decisions across hosts and keep the largest kill set, most probable first, whose posterior expected false-discovery proportion is at most `--max-fdr`. This bound is only as good as the posterior's calibration (see Limitations). e-value procedures (eBH, and eBY for arbitrary dependence) are applied when candidates carry genuine e-values; a posterior probability is not one.
 
 ### Contextual Bandits for Action Selection (library-only)
 
@@ -1387,7 +1452,7 @@ The evidence ledger's detailed view that shows every Bayes factor, every evidenc
 Simple heuristics work for obvious cases (zombie processes, 0% CPU for hours). The interesting cases are ambiguous: a process using 2% CPU might be doing useful background work or might be a stuck event loop. A posterior combines weak signals consistently, says how uncertain it is, and lets the action choice weigh the cost of being wrong. Richer models (change points, regime switching, queueing) exist in the library and will be wired in only where they measurably improve decisions.
 
 **Q: What happens if `pt` kills a supervised process?**
-It won't in normal use: processes placed in a systemd service or container cgroup are protected, and database/web servers and their workers are protected by name and ancestry. `pt agent verify --check-respawn` reports whether a killed process came back.
+It won't in normal use: processes classified as systemd services or container workloads are protected, and database/web servers and their workers are protected by name and ancestry. A verified terminal-pane workload inside a mux service is evaluated separately from its protected server. `pt agent verify --check-respawn` reports whether a killed process came back.
 
 **Q: How does provenance-aware blast radius differ from just counting child processes?**
 On Linux it also traces *shared resources*: two processes that share a lockfile, a TCP listener on the same port, or a pidfile are connected even without a parent-child relationship, and a large shared footprint lowers the abandonment posterior. Plans also report each candidate's direct child count.

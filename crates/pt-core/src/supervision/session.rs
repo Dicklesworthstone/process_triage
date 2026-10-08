@@ -896,9 +896,19 @@ mod tests {
         struct Reap(std::process::Child, Option<u32>);
         impl Drop for Reap {
             fn drop(&mut self) {
-                if let Some(pid) = self.1 {
-                    // SAFETY: kill(2) on a pid this test created.
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                if self.1.is_some() {
+                    let leader = self.0.id() as libc::pid_t;
+                    // SAFETY: this Child remains unreaped, pinning the leader PID.
+                    // Only its verified private session can receive the group signal;
+                    // a reaped/reused numeric grandchild PID is never signalled.
+                    unsafe {
+                        if libc::getpgid(leader) == leader
+                            && libc::getsid(leader) == leader
+                            && libc::getpgrp() != leader
+                        {
+                            libc::kill(-leader, libc::SIGKILL);
+                        }
+                    }
                 }
                 let _ = self.0.kill();
                 let _ = self.0.wait();
@@ -927,7 +937,17 @@ mod tests {
                 .read_line(&mut line)
                 .unwrap();
             let member = line.trim().parse().expect("member pid");
-            Reap(leader, Some(member))
+            let session = Reap(leader, Some(member));
+            let leader_pid = session.0.id() as libc::pid_t;
+            // SAFETY: these calls only inspect the owned session and caller.
+            unsafe {
+                assert_eq!(libc::getpgid(leader_pid), leader_pid);
+                assert_eq!(libc::getsid(leader_pid), leader_pid);
+                assert_ne!(libc::getpgrp(), leader_pid);
+                assert_eq!(libc::getpgid(member as libc::pid_t), leader_pid);
+                assert_eq!(libc::getsid(member as libc::pid_t), leader_pid);
+            }
+            session
         }
 
         fn types(target: u32) -> Vec<SessionProtectionType> {

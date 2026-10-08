@@ -4,7 +4,7 @@
 //! All interactions use ftui `Msg` types sent through `Model::update()`.
 
 use ftui::{
-    KeyCode as FtuiKeyCode, KeyEvent as FtuiKeyEvent, Model as FtuiModel,
+    Cmd as FtuiCmd, KeyCode as FtuiKeyCode, KeyEvent as FtuiKeyEvent, Model as FtuiModel,
     Modifiers as FtuiModifiers,
 };
 use pt_core::tui::widgets::{DetailView, ProcessRow};
@@ -17,6 +17,35 @@ use pt_core::tui::{App, AppState, Msg};
 /// Send a Msg through the ftui Model::update loop, discarding the Cmd.
 fn send_msg(app: &mut App, msg: Msg) {
     let _cmd = <App as FtuiModel>::update(app, msg);
+}
+
+fn deferred_task(command: FtuiCmd<Msg>) -> Box<dyn FnOnce() -> Msg + Send> {
+    let FtuiCmd::Sequence(commands) = command else {
+        panic!("expected a logged asynchronous task");
+    };
+    let mut task = None;
+    for command in commands {
+        match command {
+            FtuiCmd::Log(_) => {}
+            FtuiCmd::Task(_, run) => {
+                assert!(task.is_none(), "one request must schedule one task");
+                task = Some(run);
+            }
+            other => panic!("unexpected task command: {other:?}"),
+        }
+    }
+    task.expect("the production update must schedule a task")
+}
+
+fn confirmed_request(app: &mut App) -> Msg {
+    send_msg(app, ftui_char('e'));
+    assert_eq!(app.state, AppState::Confirming);
+    let FtuiCmd::Msg(request @ Msg::RequestExecute { .. }) =
+        <App as FtuiModel>::update(app, Msg::ConfirmExecute)
+    else {
+        panic!("a fresh confirmation must create a bound request");
+    };
+    request
 }
 
 /// Send multiple Msgs sequentially.
@@ -748,9 +777,8 @@ fn refresh_sets_status_message() {
     let mut app = app_with_rows();
 
     send_msg(&mut app, ftui_char('r'));
-    // In ftui path, 'r' dispatches Msg::RequestRefresh via FtuiCmd::msg
-    // The refresh_op is None (skeleton mode), so it returns a task Cmd
-    // but the status should still be set
+    // The key enters the guarded refresh transition before returning its task.
+    // This test observes the request without executing the skeleton task.
 }
 
 #[test]
@@ -787,8 +815,11 @@ fn refresh_complete_updates_rows() {
         "test-process",
         None,
     )];
-    send_msg(&mut app, Msg::RefreshComplete(Ok(new_rows)));
+    app.set_refresh_op(std::sync::Arc::new(move || Ok(new_rows.clone())));
+    let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+    send_msg(&mut app, refresh());
     assert_eq!(app.process_table.rows.len(), 1);
+    assert_eq!(app.process_table.rows[0].pid, 9999);
 }
 
 #[test]
@@ -796,27 +827,37 @@ fn execution_complete_ok() {
     use pt_core::tui::ExecutionOutcome;
     let mut app = app_with_rows();
 
-    send_msg(
-        &mut app,
-        Msg::ExecutionComplete(Ok(ExecutionOutcome {
+    send_msg(&mut app, Msg::SelectAll);
+    app.set_execute_op(std::sync::Arc::new(|pids| {
+        assert_eq!(pids.len(), 5);
+        Ok(ExecutionOutcome {
             mode: None,
             attempted: 3,
             succeeded: 2,
             failed: 1,
-        })),
-    );
-    // Should not crash; status is set
+        })
+    }));
+    let request = confirmed_request(&mut app);
+    let execute = deferred_task(<App as FtuiModel>::update(&mut app, request));
+    send_msg(&mut app, execute());
+    assert_eq!(app.state, AppState::Normal);
+    assert_eq!(app.process_table.selected_count(), 0);
 }
 
 #[test]
 fn execution_complete_err() {
     let mut app = app_with_rows();
 
-    send_msg(
-        &mut app,
-        Msg::ExecutionComplete(Err("test error".to_string())),
-    );
-    // Should not crash; error status is set
+    send_msg(&mut app, Msg::SelectAll);
+    app.set_execute_op(std::sync::Arc::new(|pids| {
+        assert_eq!(pids.len(), 5);
+        Err("test error".to_string())
+    }));
+    let request = confirmed_request(&mut app);
+    let execute = deferred_task(<App as FtuiModel>::update(&mut app, request));
+    send_msg(&mut app, execute());
+    assert_eq!(app.state, AppState::Normal);
+    assert_eq!(app.process_table.selected_count(), 0);
 }
 
 // ===========================================================================
@@ -1010,8 +1051,15 @@ fn ledger_exported_err() {
 #[test]
 fn confirm_execute_via_msg() {
     let mut app = app_with_rows();
-    send_msg(&mut app, Msg::ConfirmExecute);
-    // Directly triggers confirmation handling
+    assert!(matches!(
+        <App as FtuiModel>::update(&mut app, Msg::ConfirmExecute),
+        FtuiCmd::None
+    ));
+    send_msg(&mut app, Msg::SelectAll);
+    let request = confirmed_request(&mut app);
+    let execute = deferred_task(<App as FtuiModel>::update(&mut app, request));
+    send_msg(&mut app, execute());
+    assert_eq!(app.process_table.selected_count(), 0);
 }
 
 #[test]

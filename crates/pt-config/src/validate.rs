@@ -61,7 +61,7 @@ pub fn validate_priors(priors: &crate::priors::Priors) -> ValidationResult<()> {
         + priors.classes.abandoned.prior_prob
         + priors.classes.zombie.prior_prob;
 
-    if (prior_sum - 1.0).abs() > 0.01 {
+    if !prior_sum.is_finite() || (prior_sum - 1.0).abs() > 0.01 {
         return Err(ValidationError::SemanticError(format!(
             "Class priors must sum to 1.0, got {} (useful={}, useful_bad={}, abandoned={}, zombie={})",
             prior_sum,
@@ -92,10 +92,10 @@ pub fn validate_priors(priors: &crate::priors::Priors) -> ValidationResult<()> {
 /// Validate a single class's parameters.
 fn validate_class_params(name: &str, params: &crate::priors::ClassParams) -> ValidationResult<()> {
     // Prior probability must be in [0, 1]
-    if params.prior_prob < 0.0 || params.prior_prob > 1.0 {
+    if !params.prior_prob.is_finite() || params.prior_prob < 0.0 || params.prior_prob > 1.0 {
         return Err(ValidationError::InvalidValue {
             field: format!("classes.{}.prior_prob", name),
-            message: format!("Must be in [0, 1], got {}", params.prior_prob),
+            message: format!("Must be finite and in [0, 1], got {}", params.prior_prob),
         });
     }
 
@@ -126,17 +126,17 @@ fn validate_class_params(name: &str, params: &crate::priors::ClassParams) -> Val
 
 /// Validate Beta distribution parameters.
 fn validate_beta_params(field: &str, params: &crate::priors::BetaParams) -> ValidationResult<()> {
-    if params.alpha <= 0.0 {
+    if !params.alpha.is_finite() || params.alpha <= 0.0 {
         return Err(ValidationError::InvalidValue {
             field: format!("{}.alpha", field),
-            message: format!("Must be positive, got {}", params.alpha),
+            message: format!("Must be finite and positive, got {}", params.alpha),
         });
     }
 
-    if params.beta <= 0.0 {
+    if !params.beta.is_finite() || params.beta <= 0.0 {
         return Err(ValidationError::InvalidValue {
             field: format!("{}.beta", field),
-            message: format!("Must be positive, got {}", params.beta),
+            message: format!("Must be finite and positive, got {}", params.beta),
         });
     }
 
@@ -145,17 +145,17 @@ fn validate_beta_params(field: &str, params: &crate::priors::BetaParams) -> Vali
 
 /// Validate Gamma distribution parameters.
 fn validate_gamma_params(field: &str, params: &crate::priors::GammaParams) -> ValidationResult<()> {
-    if params.shape <= 0.0 {
+    if !params.shape.is_finite() || params.shape <= 0.0 {
         return Err(ValidationError::InvalidValue {
             field: format!("{}.shape", field),
-            message: format!("Must be positive, got {}", params.shape),
+            message: format!("Must be finite and positive, got {}", params.shape),
         });
     }
 
-    if params.rate <= 0.0 {
+    if !params.rate.is_finite() || params.rate <= 0.0 {
         return Err(ValidationError::InvalidValue {
             field: format!("{}.rate", field),
-            message: format!("Must be positive, got {}", params.rate),
+            message: format!("Must be finite and positive, got {}", params.rate),
         });
     }
 
@@ -195,6 +195,29 @@ pub fn validate_policy(policy: &crate::policy::Policy) -> ValidationResult<()> {
     // longer mandatory: PID 1 itself is hard-blocked in the enforcer, and on systemd
     // hosts services are protected by cgroup placement, so requiring [1] only hid
     // every PID-1 child (e.g. zombie parents) on hosts that opted out.
+
+    // An empty guardrail pattern matches every command line: it silently protects
+    // (or force-reviews) every process, which is always a typo.
+    for (field, patterns) in [
+        (
+            "guardrails.protected_patterns",
+            &policy.guardrails.protected_patterns,
+        ),
+        (
+            "guardrails.force_review_patterns",
+            &policy.guardrails.force_review_patterns,
+        ),
+    ] {
+        if let Some(index) = patterns
+            .iter()
+            .position(|entry| entry.pattern.trim().is_empty())
+        {
+            return Err(ValidationError::InvalidValue {
+                field: format!("{field}[{index}].pattern"),
+                message: "Must not be empty".to_string(),
+            });
+        }
+    }
 
     validate_load_aware(&policy.load_aware)?;
 
@@ -334,6 +357,59 @@ mod tests {
             comment: None,
         };
         assert!(validate_gamma_params("test", &invalid).is_err());
+    }
+
+    #[test]
+    fn distribution_parameters_reject_nonfinite_values() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for params in [
+                crate::priors::BetaParams {
+                    alpha: value,
+                    beta: 1.0,
+                    comment: None,
+                },
+                crate::priors::BetaParams {
+                    alpha: 1.0,
+                    beta: value,
+                    comment: None,
+                },
+            ] {
+                assert!(matches!(
+                    validate_beta_params("test", &params),
+                    Err(ValidationError::InvalidValue { .. })
+                ));
+            }
+            for params in [
+                crate::priors::GammaParams {
+                    shape: value,
+                    rate: 1.0,
+                    comment: None,
+                },
+                crate::priors::GammaParams {
+                    shape: 1.0,
+                    rate: value,
+                    comment: None,
+                },
+            ] {
+                assert!(matches!(
+                    validate_gamma_params("test", &params),
+                    Err(ValidationError::InvalidValue { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn finite_parameter_overflow_is_rejected_before_serialization() {
+        let mut priors = crate::priors::Priors::default();
+        priors.classes.useful.cpu_beta.alpha = 1e308;
+        assert!(validate_priors(&priors).is_ok());
+        priors.classes.useful.cpu_beta.alpha *= 10.0;
+        assert!(matches!(
+            validate_priors(&priors),
+            Err(ValidationError::InvalidValue { field, .. })
+                if field == "classes.useful.cpu_beta.alpha"
+        ));
     }
 
     // ── validate_beta_params ────────────────────────────────────
@@ -483,6 +559,23 @@ mod tests {
     }
 
     #[test]
+    fn priors_reject_nonfinite_probabilities() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut priors = crate::priors::Priors::default();
+            priors.classes.useful.prior_prob = value;
+            assert!(matches!(
+                validate_priors(&priors),
+                Err(ValidationError::SemanticError(_))
+            ));
+            assert!(matches!(
+                validate_class_params("useful", &priors.classes.useful),
+                Err(ValidationError::InvalidValue { field, .. })
+                    if field == "classes.useful.prior_prob"
+            ));
+        }
+    }
+
+    #[test]
     fn priors_bad_sum() {
         let mut priors = crate::priors::Priors::default();
         priors.classes.useful.prior_prob = 0.9;
@@ -607,6 +700,24 @@ mod tests {
         let mut policy = crate::policy::Policy::default();
         policy.guardrails.never_kill_ppid = vec![2, 3];
         assert!(validate_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn policy_guardrails_empty_pattern_rejected() {
+        for force_review in [false, true] {
+            let mut policy = crate::policy::Policy::default();
+            let entry = crate::policy::PatternEntry {
+                pattern: " ".to_string(),
+                ..policy.guardrails.protected_patterns[0].clone()
+            };
+            if force_review {
+                policy.guardrails.force_review_patterns.push(entry);
+            } else {
+                policy.guardrails.protected_patterns.push(entry);
+            }
+            let err = validate_policy(&policy).expect_err("empty pattern accepted");
+            assert!(err.to_string().contains("pattern"), "{err}");
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod collect;
 pub mod config;
 pub mod daemon;
 pub mod decision;
+pub mod doctor;
 pub mod events;
 pub mod exit_codes;
 pub mod fleet;
@@ -33,11 +34,16 @@ pub mod plan;
 pub mod plugin;
 pub mod replay;
 pub mod schema;
+pub mod scoring;
 pub mod session;
 pub mod shadow;
 pub mod signature_cli;
 pub mod supervision;
 pub mod verify;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/support/live_harness.rs"]
+mod live_test_harness;
 
 // TUI module (optional, behind "ui" feature)
 #[cfg(feature = "ui")]

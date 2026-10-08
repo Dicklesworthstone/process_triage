@@ -2,7 +2,7 @@ name: Performance Smoke
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +15,7 @@ env:
 
 jobs:
   bench-smoke:
-    name: Bench Smoke (ubuntu / stable)
+    name: Bench Smoke (ubuntu / nightly)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -24,7 +24,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: nightly-2026-08-31
 
       - name: Install OS deps
         run: |
@@ -34,8 +36,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "crates -> target"
-          key: perf-ubuntu-stable
+          workspaces: ". -> target"
+          key: perf-ubuntu-nightly
 
       - name: Run benchmark smoke + budgets
         run: |

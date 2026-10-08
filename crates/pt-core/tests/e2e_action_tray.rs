@@ -8,7 +8,7 @@
 //! 1. Pause → observe → resume workflow
 //! 2. Staged kill escalation (SIGTERM → SIGKILL)
 //! 3. Safety gates in robot mode (protected patterns, data-loss gates, identity validation)
-//! 4. Placeholder tests for renice and throttle (pending implementation)
+//! 4. Renice priority adjustment and verification; optional cgroup actions
 //!
 //! All tests capture structured logs including:
 //! - Generated plan (JSON)
@@ -28,9 +28,10 @@ use pt_core::action::prechecks::NoopPreCheckProvider;
 use pt_core::action::prechecks::{
     LivePreCheckConfig, LivePreCheckProvider, PreCheckProvider, PreCheckResult,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use pt_core::action::ReniceConfig;
 use pt_core::action::{ReniceActionRunner, SignalActionRunner, SignalConfig};
+use pt_core::collect::{quick_scan, QuickScanOptions};
 use pt_core::decision::Action;
 use pt_core::plan::{
     ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, GatesSummary, Plan,
@@ -38,6 +39,7 @@ use pt_core::plan::{
 };
 use pt_core::test_utils::ProcessHarness;
 use serde_json::json;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -194,6 +196,150 @@ fn make_test_identity(pid: u32, uid: u32) -> ProcessIdentity {
         pgid: None,
         sid: Some(pid),
         quality: IdentityQuality::Full,
+    }
+}
+
+fn live_identity(pid: u32) -> ProcessIdentity {
+    let scan = quick_scan(&QuickScanOptions {
+        pids: vec![pid],
+        timeout: Some(Duration::from_secs(30)),
+        ..QuickScanOptions::default()
+    })
+    .expect("collect actual action target");
+    assert!(
+        scan.metadata.warnings.is_empty(),
+        "target scan warnings: {:?}",
+        scan.metadata.warnings
+    );
+    assert_eq!(scan.processes.len(), 1, "expected the owned target only");
+    let record = scan.processes.into_iter().next().expect("target record");
+    assert_eq!(record.pid.0, pid);
+    assert!(!record.start_id.0.is_empty());
+    assert!(!record.start_id.0.starts_with("unknown"));
+    assert!(record.pgid.is_some());
+    assert!(record.sid.is_some());
+    #[cfg(target_os = "linux")]
+    {
+        let stat = pt_core::collect::parse_proc_stat(pid).expect("read owned target birth ticks");
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .expect("read current boot ID");
+        assert_eq!(
+            record.start_id,
+            StartId::from_linux(boot.trim(), stat.starttime, pid)
+        );
+        // SAFETY: this observes the test's owner without changing credentials.
+        assert_eq!(record.uid, unsafe { libc::geteuid() });
+    }
+    ProcessIdentity {
+        pid: record.pid,
+        start_id: record.start_id,
+        uid: record.uid,
+        pgid: record.pgid,
+        sid: record.sid,
+        quality: IdentityQuality::Full,
+    }
+}
+
+// Keep the direct child unreaped until its actual termination signal is observed.
+// Drop can kill only this owned incarnation, including after a failed assertion.
+struct OwnedActionChild {
+    child: Child,
+}
+
+impl OwnedActionChild {
+    fn sleep() -> Self {
+        Self {
+            child: Command::new("sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn owned cooperative sleep"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn term_ignoring() -> Self {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        let mut target = Self {
+            child: Command::new("sh")
+                .args(["-c", "trap '' TERM; printf 'ready\\n'; while :; do :; done"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn owned TERM-ignoring shell"),
+        };
+        let mut stdout = target.child.stdout.take().expect("readiness stdout");
+        // SAFETY: change only the owned pipe's file status flags so readiness
+        // cannot block the test before its five-second timeout is checked.
+        let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "get pipe flags: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            -1,
+            "set nonblocking readiness: {}",
+            std::io::Error::last_os_error()
+        );
+        let started = Instant::now();
+        let mut ready = Vec::new();
+        loop {
+            let mut bytes = [0; 64];
+            let observed = stdout.read(&mut bytes);
+            assert!(
+                started.elapsed() < Duration::from_millis(5000),
+                "TERM-ignore readiness timed out: {ready:?}"
+            );
+            match observed {
+                Ok(0) => panic!("TERM-ignoring shell exited before readiness: {ready:?}"),
+                Ok(count) => {
+                    ready.extend_from_slice(&bytes[..count]);
+                    if ready.ends_with(b"\n") {
+                        assert_eq!(ready, b"ready\n");
+                        return target;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("read TERM-ignore readiness: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn observed_exit(&mut self) -> ExitStatus {
+        let started = Instant::now();
+        loop {
+            let observed = self.child.try_wait().expect("observe owned child exit");
+            assert!(
+                started.elapsed() < Duration::from_millis(5000),
+                "owned child did not exit within verification bound"
+            );
+            if let Some(status) = observed {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for OwnedActionChild {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -357,7 +503,9 @@ mod pause_observe_resume {
         let runner = SignalActionRunner::with_defaults();
 
         // Phase 1: Pause
-        let pause_action = make_pause_action(pid, None, "e2e-pause-1");
+        let mut pause_action = make_pause_action(pid, None, "e2e-pause-1");
+        pause_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": pause_action.target }));
         ctx.log_action_attempt(&pause_action, "execute_pause");
 
         let pause_result = runner.execute(&pause_action);
@@ -391,7 +539,9 @@ mod pause_observe_resume {
         assert!(verify_result.is_ok(), "Pause verification should succeed");
 
         // Phase 3: Resume
-        let resume_action = make_resume_action(pid, None, "e2e-resume-1");
+        let mut resume_action = make_resume_action(pid, None, "e2e-resume-1");
+        resume_action.target = pause_action.target.clone();
+        assert_eq!(live_identity(pid), resume_action.target);
         ctx.log_action_attempt(&resume_action, "execute_resume");
 
         let resume_result = runner.execute(&resume_action);
@@ -441,6 +591,20 @@ mod pause_observe_resume {
         std::thread::sleep(Duration::from_millis(200));
 
         let pgid = proc.pgid().expect("should have pgid");
+        assert_eq!(
+            pgid, pid,
+            "owned child must lead its isolated process group"
+        );
+        // SAFETY: these calls only inspect the caller and the owned child's session.
+        let (caller_pgid, child_sid) = unsafe { (libc::getpgrp(), libc::getsid(pid as i32)) };
+        assert_ne!(
+            pgid as i32, caller_pgid,
+            "child must not share the test group"
+        );
+        assert_eq!(
+            child_sid, pid as i32,
+            "owned child must lead its new session"
+        );
         let group_pids = proc.group_pids();
 
         ctx.log(
@@ -458,6 +622,11 @@ mod pause_observe_resume {
             "Expected at least 2 processes in group, got {:?}",
             group_pids
         );
+        let group_identities: Vec<_> = group_pids.iter().map(|pid| live_identity(*pid)).collect();
+        ctx.log(
+            "live_group_members",
+            json!({ "identities": group_identities }),
+        );
 
         // Create runner with process group targeting
         let runner = SignalActionRunner::new(SignalConfig {
@@ -466,7 +635,10 @@ mod pause_observe_resume {
         });
 
         // Phase 1: Pause entire group
-        let pause_action = make_pause_action(pid, Some(pgid), "e2e-group-pause");
+        let mut pause_action = make_pause_action(pid, Some(pgid), "e2e-group-pause");
+        pause_action.target = live_identity(pid);
+        assert_eq!(pause_action.target.pgid, Some(pgid));
+        ctx.log("live_target", json!({ "identity": pause_action.target }));
         ctx.log_action_attempt(&pause_action, "execute_group_pause");
 
         let pause_result = runner.execute(&pause_action);
@@ -490,7 +662,9 @@ mod pause_observe_resume {
         assert!(all_stopped, "All processes in group should be stopped");
 
         // Phase 3: Resume entire group
-        let resume_action = make_resume_action(pid, Some(pgid), "e2e-group-resume");
+        let mut resume_action = make_resume_action(pid, Some(pgid), "e2e-group-resume");
+        resume_action.target = pause_action.target.clone();
+        assert_eq!(live_identity(pid), resume_action.target);
         ctx.log_action_attempt(&resume_action, "execute_group_resume");
 
         let resume_result = runner.execute(&resume_action);
@@ -500,15 +674,21 @@ mod pause_observe_resume {
         std::thread::sleep(Duration::from_millis(100));
 
         let mut all_running = true;
-        for gpid in &group_pids {
-            let running = !is_process_stopped(*gpid);
+        for (gpid, identity) in group_pids.iter().zip(&group_identities) {
+            assert_eq!(
+                live_identity(*gpid),
+                *identity,
+                "resumed member must survive"
+            );
+            let state = pt_core::test_utils::get_process_state(*gpid);
+            let running = !is_process_stopped(*gpid) && matches!(state, Some('S' | 'R'));
             if !running {
                 all_running = false;
             }
             ctx.log_verification(
                 "e2e-group-resume",
                 if running { "passed" } else { "failed" },
-                json!({ "member_pid": gpid, "is_running": running }),
+                json!({ "member_pid": gpid, "is_running": running, "state": state }),
             );
         }
         assert!(all_running, "All processes in group should be running");
@@ -527,7 +707,9 @@ mod staged_kill_escalation {
 
     /// Test that graceful kill (SIGTERM) works on cooperative processes
     #[test]
+    #[cfg(unix)]
     fn test_graceful_kill_sigterm_only() {
+        use std::os::unix::process::ExitStatusExt;
         if !ProcessHarness::is_available() {
             return;
         }
@@ -538,8 +720,7 @@ mod staged_kill_escalation {
             json!({ "test": "graceful_kill_sigterm_only" }),
         );
 
-        let harness = ProcessHarness;
-        let proc = harness.spawn_sleep(60).expect("spawn sleep");
+        let mut proc = OwnedActionChild::sleep();
         let pid = proc.pid();
 
         ctx.log("process_spawned", json!({ "pid": pid }));
@@ -552,7 +733,9 @@ mod staged_kill_escalation {
             use_process_groups: false,
         });
 
-        let kill_action = make_kill_action(pid, "e2e-graceful-kill", vec![]);
+        let mut kill_action = make_kill_action(pid, "e2e-graceful-kill", vec![]);
+        kill_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": kill_action.target }));
         ctx.log_action_attempt(&kill_action, "execute_kill");
 
         let start = Instant::now();
@@ -584,12 +767,20 @@ mod staged_kill_escalation {
             verify.is_ok(),
             "Verification should confirm process is dead"
         );
+        let status = proc.observed_exit();
+        ctx.log(
+            "owned_exit_observed",
+            json!({ "pid": pid, "signal": status.signal(), "code": status.code() }),
+        );
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
 
     /// Test that staged kill escalates to SIGKILL for unresponsive processes
     #[test]
+    #[cfg(unix)]
     fn test_kill_escalates_to_sigkill() {
+        use std::os::unix::process::ExitStatusExt;
         if !ProcessHarness::is_available() {
             return;
         }
@@ -597,14 +788,28 @@ mod staged_kill_escalation {
         let mut ctx = TestContext::new();
         ctx.log("test_start", json!({ "test": "kill_escalates_to_sigkill" }));
 
-        let harness = ProcessHarness;
-        // spawn_busy creates a CPU-bound process that ignores SIGTERM
-        let proc = harness.spawn_busy().expect("spawn busy");
+        // Readiness is emitted only after this owned shell ignores SIGTERM.
+        let mut proc = OwnedActionChild::term_ignoring();
         let pid = proc.pid();
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .expect("read owned shell's signal dispositions");
+            let ignored = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigIgn:"))
+                .expect("SigIgn field");
+            let ignored = u64::from_str_radix(ignored.trim(), 16).expect("SigIgn mask");
+            assert_ne!(ignored & (1_u64 << (libc::SIGTERM - 1)), 0);
+            ctx.log(
+                "TERM_ignore_observed",
+                json!({ "pid": pid, "SigIgn": ignored }),
+            );
+        }
 
         ctx.log(
             "process_spawned",
-            json!({ "pid": pid, "type": "busy_loop" }),
+            json!({ "pid": pid, "type": "TERM_ignoring_busy_loop", "ready": true }),
         );
 
         // Very short grace period to trigger escalation
@@ -615,7 +820,9 @@ mod staged_kill_escalation {
             use_process_groups: false,
         });
 
-        let kill_action = make_kill_action(pid, "e2e-force-kill", vec![]);
+        let mut kill_action = make_kill_action(pid, "e2e-force-kill", vec![]);
+        kill_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": kill_action.target }));
         ctx.log_action_attempt(&kill_action, "execute_escalating_kill");
 
         let start = Instant::now();
@@ -643,6 +850,13 @@ mod staged_kill_escalation {
         );
 
         assert!(verify.is_ok(), "Process should be dead after SIGKILL");
+        let status = proc.observed_exit();
+        ctx.log(
+            "owned_exit_observed",
+            json!({ "pid": pid, "signal": status.signal(), "code": status.code() }),
+        );
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(elapsed >= Duration::from_millis(500));
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
 
@@ -689,8 +903,11 @@ mod staged_kill_escalation {
             std::thread::sleep(Duration::from_millis(50));
         }
 
+        assert!(is_zombie, "owned child must actually be an unreaped zombie");
         let runner = SignalActionRunner::with_defaults();
-        let kill_action = make_kill_action(pid, "e2e-kill-zombie", vec![]);
+        let mut kill_action = make_kill_action(pid, "e2e-kill-zombie", vec![]);
+        kill_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": kill_action.target }));
 
         ctx.log_action_attempt(&kill_action, "execute_kill_on_zombie");
 
@@ -734,8 +951,8 @@ mod safety_gates_robot_mode {
             json!({ "test": "identity_mismatch_blocks_action" }),
         );
 
-        let dir = tempdir().expect("tempdir");
-        let lock_path = dir.path().join("test.lock");
+        let dir = tempdir().expect("tempdir").keep();
+        let lock_path = dir.join("test.lock");
 
         // Create a plan targeting PID 99999 (doesn't exist)
         let kill_action =
@@ -786,8 +1003,8 @@ mod safety_gates_robot_mode {
             json!({ "test": "lock_contention_blocks_execution" }),
         );
 
-        let dir = tempdir().expect("tempdir");
-        let lock_path = dir.path().join("test.lock");
+        let dir = tempdir().expect("tempdir").keep();
+        let lock_path = dir.join("test.lock");
 
         // Hold the lock using direct flock
         let held_file = OpenOptions::new()
@@ -852,8 +1069,8 @@ mod safety_gates_robot_mode {
             json!({ "test": "precheck_blocks_action_in_executor" }),
         );
 
-        let dir = tempdir().expect("tempdir");
-        let lock_path = dir.path().join("test.lock");
+        let dir = tempdir().expect("tempdir").keep();
+        let lock_path = dir.join("test.lock");
 
         // Create action with pre-checks
         let kill_action = make_kill_action(
@@ -953,7 +1170,7 @@ mod safety_gates_robot_mode {
 }
 
 // ============================================================================
-// SCENARIO 4: Renice Action (Placeholder - pending sj6.4)
+// SCENARIO 4: Renice Action
 // ============================================================================
 
 mod renice_action {
@@ -961,17 +1178,44 @@ mod renice_action {
     use pt_core::action::executor::ActionRunner;
 
     #[cfg(target_os = "linux")]
-    fn read_nice_value(pid: u32) -> Option<i32> {
+    fn read_nice_value(pid: u32) -> Result<i32, String> {
         let stat_path = format!("/proc/{pid}/stat");
-        let content = std::fs::read_to_string(stat_path).ok()?;
-        let comm_end = content.rfind(')')?;
-        let after_comm = content.get(comm_end + 2..)?;
+        let content = std::fs::read_to_string(&stat_path)
+            .map_err(|error| format!("read {stat_path}: {error}"))?;
+        let comm_end = content
+            .rfind(')')
+            .ok_or_else(|| format!("missing comm boundary in {stat_path}: {content:?}"))?;
+        let after_comm = content
+            .get(comm_end + 2..)
+            .ok_or_else(|| format!("missing stat fields in {stat_path}: {content:?}"))?;
         let fields: Vec<&str> = after_comm.split_whitespace().collect();
-        fields.get(16)?.parse::<i32>().ok()
+        fields
+            .get(16)
+            .ok_or_else(|| format!("missing nice field in {stat_path}: {content:?}"))?
+            .parse::<i32>()
+            .map_err(|error| format!("invalid nice field in {stat_path}: {error}; {content:?}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_nice_value(pid: u32) -> Result<i32, String> {
+        // SAFETY: getpriority only observes the owned child's priority. A real
+        // -1 priority is distinguished from failure through thread-local errno.
+        unsafe {
+            *libc::__error() = 0;
+            let value = libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t);
+            if value == -1 && *libc::__error() != 0 {
+                Err(format!(
+                    "getpriority({pid}): {}",
+                    std::io::Error::last_os_error()
+                ))
+            } else {
+                Ok(value)
+            }
+        }
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_renice_priority_adjustment() {
         if !ProcessHarness::is_available() {
             eprintln!("Skipping test: ProcessHarness not available");
@@ -990,64 +1234,68 @@ mod renice_action {
 
         ctx.log("process_spawned", json!({ "pid": pid, "type": "sleep" }));
 
-        #[cfg(target_os = "linux")]
-        let before = read_nice_value(pid);
-        #[cfg(target_os = "linux")]
-        ctx.log("nice_before", json!({ "pid": pid, "nice": before }));
+        let before = read_nice_value(pid).expect("observe owned target's initial priority");
+        let expected = before.max(pt_core::action::DEFAULT_NICE_VALUE);
+        ctx.log(
+            "nice_before",
+            json!({
+                "pid": pid,
+                "nice": before,
+                "expected": expected,
+                "scope": if before >= pt_core::action::DEFAULT_NICE_VALUE {
+                    "already_lower_priority_noop"
+                } else {
+                    "priority_adjustment"
+                }
+            }),
+        );
 
         let runner = ReniceActionRunner::with_defaults();
-        let action = make_renice_action(pid, "e2e-renice-1");
+        let mut action = make_renice_action(pid, "e2e-renice-1");
+        action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": action.target }));
 
         ctx.log_action_attempt(&action, "execute_renice");
 
         let execute_result = runner.execute(&action);
-        match execute_result {
-            Ok(()) => {
-                let verify_result = runner.verify(&action);
-                if let Err(ref e) = verify_result {
-                    ctx.on_failure(
-                        "renice_priority_adjustment",
-                        &format!("Verify failed: {:?}", e),
-                    );
-                }
-                assert!(verify_result.is_ok(), "Renice verification should succeed");
-
-                #[cfg(target_os = "linux")]
-                if let Some(after) = read_nice_value(pid) {
-                    ctx.log(
-                        "nice_after",
-                        json!({ "pid": pid, "nice": after, "expected": pt_core::action::DEFAULT_NICE_VALUE }),
-                    );
-                    assert_eq!(
-                        after,
-                        pt_core::action::DEFAULT_NICE_VALUE,
-                        "expected nice value to change"
-                    );
-                } else {
-                    ctx.log("nice_after_unavailable", json!({ "pid": pid }));
-                }
-            }
-            Err(pt_core::action::ActionError::PermissionDenied) => {
-                ctx.log(
-                    "renice_permission_denied",
-                    json!({ "pid": pid, "note": "insufficient permissions; skipping assertions" }),
-                );
-                return;
-            }
-            Err(e) => {
-                ctx.on_failure(
-                    "renice_priority_adjustment",
-                    &format!("Execute failed: {:?}", e),
-                );
-                panic!("renice execute failed: {:?}", e);
-            }
-        }
+        ctx.log(
+            "renice_executed",
+            json!({ "result": format!("{execute_result:?}") }),
+        );
+        assert!(
+            execute_result.is_ok(),
+            "Renice execute failed: {execute_result:?}"
+        );
+        let verify_result = runner.verify(&action);
+        ctx.log_verification(
+            "e2e-renice-1",
+            if verify_result.is_ok() {
+                "passed"
+            } else {
+                "failed"
+            },
+            json!({ "verify_result": format!("{verify_result:?}") }),
+        );
+        assert!(
+            verify_result.is_ok(),
+            "Renice verification failed: {verify_result:?}"
+        );
+        let after = read_nice_value(pid).expect("observe owned target's resulting priority");
+        ctx.log(
+            "nice_after",
+            json!({ "pid": pid, "nice": after, "expected": expected }),
+        );
+        assert_eq!(
+            after, expected,
+            "renice must lower or preserve priority exactly"
+        );
+        assert_eq!(live_identity(pid), action.target);
 
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_renice_verification() {
         if !ProcessHarness::is_available() {
             eprintln!("Skipping test: ProcessHarness not available");
@@ -1061,74 +1309,74 @@ mod renice_action {
         let proc = harness.spawn_sleep(60).expect("spawn sleep");
         let pid = proc.pid();
 
+        let before = read_nice_value(pid).expect("observe owned target's initial priority");
+        let expected = before.max(pt_core::action::DEFAULT_NICE_VALUE);
+        ctx.log(
+            "nice_before",
+            json!({ "pid": pid, "nice": before, "expected": expected, "noop": before >= 10 }),
+        );
         let runner = ReniceActionRunner::with_defaults();
-        let action = make_renice_action(pid, "e2e-renice-verify");
+        let mut action = make_renice_action(pid, "e2e-renice-verify");
+        action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": action.target }));
 
         let execute_result = runner.execute(&action);
-        if let Err(pt_core::action::ActionError::PermissionDenied) = execute_result {
-            ctx.log(
-                "renice_permission_denied",
-                json!({ "pid": pid, "note": "insufficient permissions; skipping verification" }),
-            );
-            return;
-        }
-        assert!(execute_result.is_ok(), "Renice execute should succeed");
+        ctx.log(
+            "renice_executed",
+            json!({ "result": format!("{execute_result:?}") }),
+        );
+        assert!(
+            execute_result.is_ok(),
+            "Renice execute failed: {execute_result:?}"
+        );
 
         let verify_ok = runner.verify(&action);
         if let Err(ref e) = verify_ok {
             ctx.on_failure("renice_verification", &format!("Verify failed: {:?}", e));
         }
-        assert!(verify_ok.is_ok(), "Renice verify should succeed");
+        assert!(verify_ok.is_ok(), "Renice verify failed: {verify_ok:?}");
+        let actual = read_nice_value(pid).expect("observe priority for mismatch negative");
+        ctx.log(
+            "nice_after",
+            json!({ "pid": pid, "nice": actual, "expected": expected }),
+        );
+        assert_eq!(actual, expected);
 
-        // Intentionally verify with a mismatched expectation to ensure failure path works.
-        #[cfg(target_os = "linux")]
-        {
-            if read_nice_value(pid).is_none() {
-                ctx.log(
-                    "nice_unavailable",
-                    json!({ "pid": pid, "note": "skipping mismatch check" }),
+        // Verify only: asking for actual+1 remains a mismatch even at nice 19.
+        // No setpriority syscall or out-of-range priority mutation is attempted.
+        let mismatch_expected = actual + 1;
+        let mismatch_runner = ReniceActionRunner::new(ReniceConfig {
+            nice_value: mismatch_expected,
+            clamp_to_range: false,
+            capture_reversal: false,
+        });
+        let mismatch = mismatch_runner.verify(&action);
+        ctx.log(
+            "mismatch_verify_result",
+            json!({ "pid": pid, "actual": actual, "expected": mismatch_expected,
+                "result": format!("{mismatch:?}") }),
+        );
+        match mismatch {
+            Err(pt_core::action::ActionError::Failed(message)) => {
+                assert_eq!(
+                    message,
+                    format!("nice value mismatch: expected {mismatch_expected}, got {actual}")
                 );
-                return;
             }
-            let mismatch_runner = ReniceActionRunner::new(ReniceConfig {
-                nice_value: pt_core::action::DEFAULT_NICE_VALUE + 5,
-                clamp_to_range: true,
-                capture_reversal: false,
-            });
-            let mismatch = mismatch_runner.verify(&action);
-            match mismatch {
-                Err(pt_core::action::ActionError::Failed(_)) => {
-                    ctx.log("mismatch_verify_failed", json!({ "pid": pid }));
-                }
-                Err(pt_core::action::ActionError::PermissionDenied) => {
-                    ctx.log(
-                        "renice_permission_denied",
-                        json!({ "pid": pid, "note": "verification denied; skipping mismatch check" }),
-                    );
-                }
-                Ok(()) => {
-                    ctx.on_failure(
-                        "renice_verification",
-                        "mismatch verification unexpectedly succeeded",
-                    );
-                    panic!("mismatch verification unexpectedly succeeded");
-                }
-                Err(e) => {
-                    ctx.on_failure(
-                        "renice_verification",
-                        &format!("unexpected verify error: {:?}", e),
-                    );
-                    panic!("unexpected verify error: {:?}", e);
-                }
-            }
+            other => panic!("expected a specific priority mismatch failure, got {other:?}"),
         }
+        assert_eq!(
+            read_nice_value(pid).expect("observe untouched priority"),
+            actual
+        );
+        assert_eq!(live_identity(pid), action.target);
 
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
 }
 
 // ============================================================================
-// SCENARIO 5: Cgroup Throttle Action (Placeholder - pending sj6.6)
+// SCENARIO 5: Cgroup Throttle Action (requires an owned delegated leaf)
 // ============================================================================
 
 // cgroup v2 throttling is Linux-only.
@@ -1141,34 +1389,13 @@ mod cgroup_throttle_action {
     #[cfg(target_os = "linux")]
     use pt_core::collect::cgroup::collect_cgroup_details;
     use pt_core::decision::Action as ActionType;
+    use pt_core::test_utils::OwnedCgroupFixture;
 
-    #[cfg(target_os = "linux")]
-    fn has_cgroup_v2_write_access() -> bool {
-        if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
-            for line in cgroup.lines() {
-                if let Some(path) = line.strip_prefix("0::") {
-                    let cpu_max_path = format!("/sys/fs/cgroup{}/cpu.max", path);
-                    if let Ok(metadata) = std::fs::metadata(&cpu_max_path) {
-                        return !metadata.permissions().readonly();
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    fn make_throttle_action(pid: u32, action_id: &str) -> PlanAction {
+    fn make_throttle_action(target: ProcessIdentity, action_id: &str) -> PlanAction {
         PlanAction {
             action_id: action_id.to_string(),
             action: ActionType::Throttle,
-            target: ProcessIdentity {
-                pid: ProcessId(pid),
-                start_id: StartId("mock".to_string()),
-                uid: 1000,
-                pgid: None,
-                sid: None,
-                quality: IdentityQuality::Full,
-            },
+            target,
             order: 0,
             stage: 0,
             timeouts: ActionTimeouts::default(),
@@ -1188,76 +1415,41 @@ mod cgroup_throttle_action {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_cgroup_cpu_throttle() {
-        if !ProcessHarness::is_available() {
-            eprintln!("Skipping test: ProcessHarness not available");
-            return;
-        }
-
         let mut ctx = TestContext::new();
         ctx.log("test_start", json!({ "test": "cgroup_cpu_throttle" }));
-
-        // Check if we have cgroup v2 write access
-        if !has_cgroup_v2_write_access() {
-            ctx.log(
-                "test_skipped",
-                json!({ "reason": "no cgroup v2 write access" }),
-            );
+        let Some(fixture) = OwnedCgroupFixture::new().expect("safe delegated cgroup setup") else {
+            ctx.log("capability_unavailable", json!({"reason": "PT_TEST_CGROUP_PARENT prerequisite absent", "positive_kernel_proof": false}));
             return;
-        }
-
-        let harness = ProcessHarness;
-        let proc = harness.spawn_sleep(60).expect("spawn sleep process");
-        let pid = proc.pid();
-
-        ctx.log("process_spawned", json!({ "pid": pid, "type": "sleep" }));
-
-        // Check if we can throttle this process
-        if !can_throttle_process(pid) {
-            ctx.log(
-                "test_skipped",
-                json!({ "reason": "cannot throttle spawned process", "pid": pid }),
-            );
-            return;
-        }
+        };
+        let pid = fixture.target.pid();
+        ctx.log("process_spawned", json!({ "identity": fixture.identity, "type": "sleep", "leaf": fixture.leaf, "artifacts": fixture.artifacts }));
+        assert!(
+            can_throttle_process(pid),
+            "owned exclusive leaf unavailable"
+        );
+        let before = OwnedCgroupFixture::controls(&fixture.leaf);
+        let sibling_before = OwnedCgroupFixture::controls(&fixture.sibling_leaf);
 
         // Capture original state for reversal
         let runner = CpuThrottleActionRunner::with_defaults();
-        let reversal = runner.capture_reversal_metadata(pid);
+        let reversal = runner
+            .capture_reversal_metadata(pid)
+            .expect("actual reversal metadata");
         ctx.log(
             "reversal_captured",
-            json!({ "pid": pid, "has_reversal": reversal.is_some() }),
+            json!({ "pid": pid, "metadata": reversal }),
         );
 
         // Create and execute throttle action
-        let action = make_throttle_action(pid, "e2e-throttle");
+        let action = make_throttle_action(fixture.identity.clone(), "e2e-throttle");
         ctx.log_action_attempt(&action, "execute_throttle");
 
         let result = runner.execute(&action);
-        match &result {
-            Ok(()) => {
-                ctx.log("throttle_executed", json!({ "pid": pid, "success": true }));
-            }
-            Err(pt_core::action::ActionError::PermissionDenied) => {
-                ctx.log(
-                    "test_skipped",
-                    json!({ "reason": "permission denied", "pid": pid }),
-                );
-                return;
-            }
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("no writable cgroup") || err_str.contains("permission") {
-                    ctx.log(
-                        "test_skipped",
-                        json!({ "reason": "cgroup write access unavailable", "pid": pid }),
-                    );
-                    return;
-                }
-                ctx.on_failure("cgroup_cpu_throttle", &err_str);
-                panic!("throttle execute failed: {}", err_str);
-            }
-        }
-        assert!(result.is_ok(), "throttle should succeed");
+        ctx.log(
+            "throttle_executed",
+            json!({ "pid": pid, "result": format!("{result:?}") }),
+        );
+        assert!(result.is_ok(), "throttle should succeed: {result:?}");
 
         // Verify throttle was applied
         std::thread::sleep(Duration::from_millis(50));
@@ -1270,28 +1462,34 @@ mod cgroup_throttle_action {
         assert!(verify.is_ok(), "throttle verification should succeed");
 
         // Verify CPU limits were changed
-        if let Some(details) = collect_cgroup_details(pid) {
-            if let Some(ref limits) = details.cpu_limits {
-                ctx.log(
-                    "post_throttle_limits",
-                    json!({
-                        "pid": pid,
-                        "quota_us": limits.quota_us,
-                        "period_us": limits.period_us,
-                        "effective_cores": limits.effective_cores
-                    }),
-                );
-            }
-        }
+        let details = collect_cgroup_details(pid).expect("actual target cgroup");
+        let limits = details.cpu_limits.expect("actual throttled limits");
+        assert_eq!(limits.quota_us, Some(25_000));
+        assert_eq!(limits.period_us, Some(100_000));
+        let quota = std::fs::read_to_string(fixture.leaf.join("cpu.max")).unwrap();
+        assert_eq!(quota.trim(), "25000 100000");
+        ctx.log("post_throttle_limits", json!({"pid": pid, "quota_us": limits.quota_us, "period_us": limits.period_us, "effective_cores": limits.effective_cores}));
+        fixture.record("throttled");
+        fixture.assert_isolated();
+        assert_eq!(
+            OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+            sibling_before
+        );
 
         // Restore original settings
-        if let Some(ref metadata) = reversal {
-            let restore = runner.restore_from_metadata(metadata);
-            ctx.log(
-                "reversal_applied",
-                json!({ "success": restore.is_ok(), "pid": pid }),
-            );
-        }
+        let restore = runner.restore_from_metadata(&reversal);
+        ctx.log(
+            "reversal_applied",
+            json!({ "result": format!("{restore:?}"), "pid": pid }),
+        );
+        assert!(restore.is_ok(), "reversal failed: {restore:?}");
+        fixture.record("restored");
+        assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), before);
+        assert_eq!(
+            OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+            sibling_before
+        );
+        fixture.assert_isolated();
 
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
@@ -1300,74 +1498,56 @@ mod cgroup_throttle_action {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_cgroup_throttle_with_custom_fraction() {
-        if !ProcessHarness::is_available() {
-            return;
-        }
-
         let mut ctx = TestContext::new();
         ctx.log(
             "test_start",
             json!({ "test": "cgroup_throttle_custom_fraction" }),
         );
 
-        if !has_cgroup_v2_write_access() {
-            ctx.log(
-                "test_skipped",
-                json!({ "reason": "no cgroup v2 write access" }),
-            );
+        let Some(fixture) = OwnedCgroupFixture::new().expect("safe delegated cgroup setup") else {
+            ctx.log("capability_unavailable", json!({"reason": "PT_TEST_CGROUP_PARENT prerequisite absent", "positive_kernel_proof": false}));
             return;
-        }
-
-        let harness = ProcessHarness;
-        let proc = harness.spawn_sleep(60).expect("spawn process");
-        let pid = proc.pid();
-
-        if !can_throttle_process(pid) {
-            ctx.log(
-                "test_skipped",
-                json!({ "reason": "cannot throttle process" }),
-            );
-            return;
-        }
+        };
+        let pid = fixture.target.pid();
+        assert!(
+            can_throttle_process(pid),
+            "owned exclusive leaf unavailable"
+        );
+        let before = OwnedCgroupFixture::controls(&fixture.leaf);
+        let sibling_before = OwnedCgroupFixture::controls(&fixture.sibling_leaf);
 
         // Use a custom throttle config with 10% CPU
         let config = CpuThrottleConfig::with_fraction(0.1);
         let runner = CpuThrottleActionRunner::new(config);
-        let reversal = runner.capture_reversal_metadata(pid);
+        let reversal = runner
+            .capture_reversal_metadata(pid)
+            .expect("actual reversal metadata");
 
-        let action = make_throttle_action(pid, "e2e-throttle-custom");
+        let action = make_throttle_action(fixture.identity.clone(), "e2e-throttle-custom");
         let result = runner.execute(&action);
 
-        match &result {
-            Ok(()) => {
-                ctx.log(
-                    "custom_throttle_applied",
-                    json!({ "fraction": 0.1, "pid": pid }),
-                );
+        ctx.log("custom_throttle_applied", json!({ "fraction": 0.1, "identity": fixture.identity, "result": format!("{result:?}") }));
+        assert!(result.is_ok(), "custom throttle failed: {result:?}");
+        let verify = runner.verify(&action);
+        assert!(verify.is_ok(), "custom throttle verification failed");
+        let quota = std::fs::read_to_string(fixture.leaf.join("cpu.max")).unwrap();
+        assert_eq!(quota.trim(), "10000 100000");
+        fixture.record("custom-throttled");
+        fixture.assert_isolated();
+        assert_eq!(
+            OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+            sibling_before
+        );
 
-                // Verify
-                let verify = runner.verify(&action);
-                assert!(verify.is_ok(), "custom throttle verification failed");
-            }
-            Err(pt_core::action::ActionError::PermissionDenied) => {
-                ctx.log("test_skipped", json!({ "reason": "permission denied" }));
-                return;
-            }
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("no writable cgroup") || err_str.contains("permission") {
-                    ctx.log("test_skipped", json!({ "reason": "cgroup unavailable" }));
-                    return;
-                }
-                // Don't fail - log and continue
-                ctx.log("throttle_error", json!({ "error": err_str }));
-            }
-        }
-
-        // Cleanup
-        if let Some(ref metadata) = reversal {
-            let _ = runner.restore_from_metadata(metadata);
-        }
+        let restore = runner.restore_from_metadata(&reversal);
+        assert!(restore.is_ok(), "custom reversal failed: {restore:?}");
+        fixture.record("restored");
+        assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), before);
+        assert_eq!(
+            OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+            sibling_before
+        );
+        fixture.assert_isolated();
 
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
@@ -1383,7 +1563,10 @@ mod cgroup_throttle_action {
         );
 
         let runner = CpuThrottleActionRunner::with_defaults();
-        let action = make_throttle_action(999_999_999, "e2e-throttle-nonexistent");
+        let action = make_throttle_action(
+            ProcessIdentity::new(999_999_999, StartId("absent".to_string()), 1000),
+            "e2e-throttle-nonexistent",
+        );
 
         let result = runner.execute(&action);
         assert!(
@@ -1411,19 +1594,13 @@ mod cgroup_freeze_action {
     #[cfg(target_os = "linux")]
     use pt_core::action::{is_freeze_available, FreezeActionRunner};
     use pt_core::decision::Action as ActionType;
+    use pt_core::test_utils::OwnedCgroupFixture;
 
-    fn make_freeze_action(pid: u32, action_id: &str) -> PlanAction {
+    fn make_freeze_action(target: ProcessIdentity, action_id: &str) -> PlanAction {
         PlanAction {
             action_id: action_id.to_string(),
             action: ActionType::Freeze,
-            target: ProcessIdentity {
-                pid: ProcessId(pid),
-                start_id: StartId("mock".to_string()),
-                uid: 1000,
-                pgid: None,
-                sid: None,
-                quality: IdentityQuality::Full,
-            },
+            target,
             order: 0,
             stage: 0,
             timeouts: ActionTimeouts::default(),
@@ -1439,18 +1616,11 @@ mod cgroup_freeze_action {
         }
     }
 
-    fn make_unfreeze_action(pid: u32, action_id: &str) -> PlanAction {
+    fn make_unfreeze_action(target: ProcessIdentity, action_id: &str) -> PlanAction {
         PlanAction {
             action_id: action_id.to_string(),
             action: ActionType::Unfreeze,
-            target: ProcessIdentity {
-                pid: ProcessId(pid),
-                start_id: StartId("mock".to_string()),
-                uid: 1000,
-                pgid: None,
-                sid: None,
-                quality: IdentityQuality::Full,
-            },
+            target,
             order: 1,
             stage: 1,
             timeouts: ActionTimeouts::default(),
@@ -1470,61 +1640,37 @@ mod cgroup_freeze_action {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_cgroup_freeze_thaw() {
-        if !ProcessHarness::is_available() {
-            eprintln!("Skipping test: ProcessHarness not available");
-            return;
-        }
-
         let mut ctx = TestContext::new();
         ctx.log("test_start", json!({ "test": "cgroup_freeze_thaw" }));
-
-        let harness = ProcessHarness;
-        let proc = harness.spawn_sleep(60).expect("spawn sleep process");
-        let pid = proc.pid();
-
-        ctx.log("process_spawned", json!({ "pid": pid, "type": "sleep" }));
-
-        // Check if freeze is available for this process
-        if !is_freeze_available(pid) {
-            ctx.log(
-                "test_skipped",
-                json!({ "reason": "cgroup v2 freeze not available", "pid": pid }),
-            );
+        let Some(fixture) = OwnedCgroupFixture::new().expect("safe delegated cgroup setup") else {
+            ctx.log("capability_unavailable", json!({"reason": "PT_TEST_CGROUP_PARENT prerequisite absent", "positive_kernel_proof": false}));
             return;
-        }
+        };
+        let pid = fixture.target.pid();
+        ctx.log("process_spawned", json!({ "identity": fixture.identity, "type": "sleep", "leaf": fixture.leaf, "artifacts": fixture.artifacts }));
+        assert!(is_freeze_available(pid), "owned leaf freezer unavailable");
+        let before = OwnedCgroupFixture::controls(&fixture.leaf);
+        let sibling_before = OwnedCgroupFixture::controls(&fixture.sibling_leaf);
+        let frozen = std::fs::read_to_string(fixture.leaf.join("cgroup.freeze")).unwrap();
+        assert_eq!(frozen.trim(), "0");
+        let events = std::fs::read_to_string(fixture.leaf.join("cgroup.events")).unwrap();
+        assert!(events.lines().any(|line| line == "frozen 0"));
 
         let runner = FreezeActionRunner::with_defaults();
 
         // Phase 1: Freeze
-        let freeze_action = make_freeze_action(pid, "e2e-freeze");
+        let freeze_action = make_freeze_action(fixture.identity.clone(), "e2e-freeze");
         ctx.log_action_attempt(&freeze_action, "execute_freeze");
 
         let freeze_result = runner.execute(&freeze_action);
-        match &freeze_result {
-            Ok(()) => {
-                ctx.log("freeze_executed", json!({ "pid": pid, "success": true }));
-            }
-            Err(pt_core::action::ActionError::PermissionDenied) => {
-                ctx.log(
-                    "test_skipped",
-                    json!({ "reason": "permission denied for freeze", "pid": pid }),
-                );
-                return;
-            }
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("permission") || err_str.contains("v2") {
-                    ctx.log(
-                        "test_skipped",
-                        json!({ "reason": "cgroup freeze unavailable", "error": err_str }),
-                    );
-                    return;
-                }
-                ctx.on_failure("cgroup_freeze_thaw", &err_str);
-                panic!("freeze execute failed: {}", err_str);
-            }
-        }
-        assert!(freeze_result.is_ok(), "freeze should succeed");
+        ctx.log(
+            "freeze_executed",
+            json!({ "pid": pid, "result": format!("{freeze_result:?}") }),
+        );
+        assert!(
+            freeze_result.is_ok(),
+            "freeze should succeed: {freeze_result:?}"
+        );
 
         // Verify freeze state
         let verify_freeze = runner.verify(&freeze_action);
@@ -1538,9 +1684,19 @@ mod cgroup_freeze_action {
             json!({ "verify_result": format!("{:?}", verify_freeze) }),
         );
         assert!(verify_freeze.is_ok(), "freeze verification should succeed");
+        let frozen = std::fs::read_to_string(fixture.leaf.join("cgroup.freeze")).unwrap();
+        assert_eq!(frozen.trim(), "1");
+        let events = std::fs::read_to_string(fixture.leaf.join("cgroup.events")).unwrap();
+        assert!(events.lines().any(|line| line == "frozen 1"));
+        fixture.record("frozen");
+        fixture.assert_isolated();
+        assert_eq!(
+            OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+            sibling_before
+        );
 
         // Phase 2: Unfreeze (thaw)
-        let unfreeze_action = make_unfreeze_action(pid, "e2e-unfreeze");
+        let unfreeze_action = make_unfreeze_action(fixture.identity.clone(), "e2e-unfreeze");
         ctx.log_action_attempt(&unfreeze_action, "execute_unfreeze");
 
         let unfreeze_result = runner.execute(&unfreeze_action);
@@ -1562,6 +1718,36 @@ mod cgroup_freeze_action {
             verify_unfreeze.is_ok(),
             "unfreeze verification should succeed"
         );
+        let frozen = std::fs::read_to_string(fixture.leaf.join("cgroup.freeze")).unwrap();
+        assert_eq!(frozen.trim(), "0");
+        let events = std::fs::read_to_string(fixture.leaf.join("cgroup.events")).unwrap();
+        assert!(events.lines().any(|line| line == "frozen 0"));
+        fixture.record("thawed");
+        assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), before);
+        assert_eq!(
+            OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+            sibling_before
+        );
+        fixture.assert_isolated();
+
+        let mut stale = freeze_action.clone();
+        stale.target.uid = stale
+            .target
+            .uid
+            .checked_add(1)
+            .expect("planted different UID");
+        let result = runner.execute(&stale);
+        assert!(
+            matches!(result, Err(pt_core::action::ActionError::IdentityMismatch)),
+            "stale owner admitted: {result:?}"
+        );
+        fixture.record("stale-refused");
+        assert_eq!(OwnedCgroupFixture::controls(&fixture.leaf), before);
+        assert_eq!(
+            OwnedCgroupFixture::controls(&fixture.sibling_leaf),
+            sibling_before
+        );
+        fixture.assert_isolated();
 
         ctx.log("test_complete", json!({ "result": "passed" }));
     }
@@ -1576,7 +1762,10 @@ mod cgroup_freeze_action {
         let runner = FreezeActionRunner::with_defaults();
 
         // Try to freeze a nonexistent process
-        let action = make_freeze_action(999_999_999, "e2e-freeze-nonexistent");
+        let action = make_freeze_action(
+            ProcessIdentity::new(999_999_999, StartId("absent".to_string()), 1000),
+            "e2e-freeze-nonexistent",
+        );
         let result = runner.execute(&action);
 
         assert!(result.is_err(), "freezing nonexistent process should fail");
@@ -1644,7 +1833,9 @@ mod full_workflow {
 
         // Step 1: Observe (pause)
         ctx.log("workflow_step", json!({ "step": 1, "action": "pause" }));
-        let pause_action = make_pause_action(pid, None, "workflow-pause");
+        let mut pause_action = make_pause_action(pid, None, "workflow-pause");
+        pause_action.target = live_identity(pid);
+        ctx.log("live_target", json!({ "identity": pause_action.target }));
         let pause_result = runner.execute(&pause_action);
         assert!(pause_result.is_ok(), "Pause should succeed");
 
@@ -1675,7 +1866,9 @@ mod full_workflow {
 
         // Step 3: Kill (the process is already stopped, kill anyway)
         ctx.log("workflow_step", json!({ "step": 3, "action": "kill" }));
-        let kill_action = make_kill_action(pid, "workflow-kill", vec![]);
+        let mut kill_action = make_kill_action(pid, "workflow-kill", vec![]);
+        kill_action.target = pause_action.target.clone();
+        assert_eq!(live_identity(pid), kill_action.target);
         let kill_result = runner.execute(&kill_action);
         assert!(kill_result.is_ok(), "Kill should succeed");
 

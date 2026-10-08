@@ -225,7 +225,7 @@ mod data_loss_gates {
 
         // Initialize git repo and hold a lock
         let setup_cmd = format!(
-            "cd {} && git init && touch .git/index.lock && sleep 60",
+            "cd {} && git init --initial-branch=main && touch .git/index.lock && sleep 60",
             dir.path().display()
         );
 
@@ -540,14 +540,29 @@ mod identity_coordination {
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_lock_contention_returns_error() {
+        use std::os::fd::AsRawFd;
         // Concurrent runs should be blocked by lock
         let plan = make_test_plan(123, 1000, vec![]);
-        let dir = tempdir().expect("tempdir");
-        let lock_path = dir.path().join("lock");
+        let dir = tempdir().expect("tempdir").keep();
+        let lock_path = dir.join("lock");
 
-        // Manually acquire lock
-        std::fs::write(&lock_path, format!("{}", std::process::id())).expect("write lock");
+        // Contents alone do not hold an advisory lock. Keep the real descriptor
+        // and LOCK_EX lease alive until after the executor has refused it.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .expect("create owned lock");
+        // SAFETY: flock operates only on our owned file descriptor.
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "acquire real lock: {}",
+            std::io::Error::last_os_error()
+        );
 
         let runner = NoopActionRunner;
         let identity_provider = StaticIdentityProvider::default();
@@ -559,6 +574,13 @@ mod identity_coordination {
             pt_core::action::executor::ExecutionError::LockUnavailable => {}
             _ => panic!("Expected LockUnavailable error, got {:?}", err),
         }
+        drop(held);
+        // An existing unlocked file must not create false contention.
+        let unlocked = executor
+            .execute_plan(&plan)
+            .expect("released lock permits execution");
+        assert_eq!(unlocked.summary.actions_attempted, 1);
+        assert_eq!(unlocked.outcomes[0].status, ActionStatus::IdentityMismatch);
     }
 
     #[test]

@@ -1,0 +1,572 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Plan",
+  "description": "Action plan output.",
+  "type": "object",
+  "properties": {
+    "plan_id": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "policy_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "policy_version": {
+      "type": "string"
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PlanAction"
+      }
+    },
+    "pre_toggled": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "gates_summary": {
+      "$ref": "#/$defs/GatesSummary"
+    }
+  },
+  "required": [
+    "plan_id",
+    "session_id",
+    "generated_at",
+    "policy_version",
+    "actions",
+    "pre_toggled",
+    "gates_summary"
+  ],
+  "$defs": {
+    "PlanAction": {
+      "description": "A single action in a plan.",
+      "type": "object",
+      "properties": {
+        "action_id": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/ProcessIdentity"
+        },
+        "action": {
+          "$ref": "#/$defs/Action"
+        },
+        "order": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "stage": {
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "timeouts": {
+          "$ref": "#/$defs/ActionTimeouts"
+        },
+        "pre_checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PreCheck"
+          }
+        },
+        "rationale": {
+          "$ref": "#/$defs/ActionRationale"
+        },
+        "on_success": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ActionHook"
+          }
+        },
+        "on_failure": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ActionHook"
+          }
+        },
+        "blocked": {
+          "type": "boolean"
+        },
+        "routing": {
+          "description": "How the action was routed (direct, zombie-to-parent, etc.).",
+          "$ref": "#/$defs/ActionRouting"
+        },
+        "confidence": {
+          "description": "Confidence level for this action.",
+          "$ref": "#/$defs/ActionConfidence"
+        },
+        "original_zombie_target": {
+          "description": "Original target if this action was rerouted from a zombie.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "d_state_diagnostics": {
+          "description": "D-state diagnostics if targeting a D-state process.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DStateDiagnostics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "action_id",
+        "target",
+        "action",
+        "order",
+        "stage",
+        "timeouts",
+        "pre_checks",
+        "rationale",
+        "on_success",
+        "on_failure",
+        "blocked"
+      ]
+    },
+    "ProcessIdentity": {
+      "description": "Complete process identity tuple for safe revalidation.\n\nThe tuple (pid, start_id, uid, boot_id) is sufficient to detect\nPID reuse across time and across session resumes.",
+      "type": "object",
+      "properties": {
+        "pid": {
+          "description": "Process ID.",
+          "$ref": "#/$defs/ProcessId"
+        },
+        "start_id": {
+          "description": "Start ID for PID-reuse detection.",
+          "$ref": "#/$defs/StartId"
+        },
+        "uid": {
+          "description": "User ID (owner of the process).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pgid": {
+          "description": "Process group ID (for group-aware actions).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "sid": {
+          "description": "Session ID (for session-aware safety gates).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "quality": {
+          "description": "Identity quality/provenance indicator.",
+          "$ref": "#/$defs/IdentityQuality"
+        }
+      },
+      "required": [
+        "pid",
+        "start_id",
+        "uid",
+        "quality"
+      ]
+    },
+    "ProcessId": {
+      "description": "Process ID wrapper with display formatting.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "StartId": {
+      "description": "Start ID - unique identifier for a specific process incarnation.\n\nFormat: `<boot_id>:<start_time_ticks>:<pid>` (Linux)\nor `<boot_id>:<start_time>:<pid>` (macOS)\n\nThis disambiguates PID reuse across reboots and within a boot.",
+      "type": "string"
+    },
+    "IdentityQuality": {
+      "description": "Quality/provenance indicator for process identity.\n\nIndicates how reliable the identity tuple is for TOCTOU protection.\nWhen identity quality is degraded, safety gates should be tightened.",
+      "oneOf": [
+        {
+          "description": "Full identity available: boot_id + start_time_ticks + pid.\nStrongest guarantee against PID reuse.",
+          "type": "string",
+          "const": "Full"
+        },
+        {
+          "description": "Boot ID unavailable but start_time available.\nSafe within a single boot but weaker across reboots.",
+          "type": "string",
+          "const": "NoBootId"
+        },
+        {
+          "description": "Start time unavailable (fallback to pid-only).\nWeakest identity - PID reuse cannot be detected.",
+          "type": "string",
+          "const": "PidOnly"
+        }
+      ]
+    },
+    "Action": {
+      "description": "Supported actions for early decisioning.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "keep",
+            "renice",
+            "pause",
+            "throttle",
+            "restart",
+            "kill"
+          ]
+        },
+        {
+          "description": "Resume a previously paused process (follow-up to Pause, not a decision action).",
+          "type": "string",
+          "const": "resume"
+        },
+        {
+          "description": "Freeze process via cgroup v2 freezer (more robust than SIGSTOP).",
+          "type": "string",
+          "const": "freeze"
+        },
+        {
+          "description": "Unfreeze a previously frozen process (follow-up to Freeze, not a decision action).",
+          "type": "string",
+          "const": "unfreeze"
+        },
+        {
+          "description": "Quarantine process by restricting it to a limited cpuset (cgroup cpuset controller).",
+          "type": "string",
+          "const": "quarantine"
+        },
+        {
+          "description": "Unquarantine a previously quarantined process (follow-up to Quarantine).",
+          "type": "string",
+          "const": "unquarantine"
+        }
+      ]
+    },
+    "ActionTimeouts": {
+      "description": "Action timeouts for staged execution.",
+      "type": "object",
+      "properties": {
+        "preflight_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "execute_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "verify_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "preflight_ms",
+        "execute_ms",
+        "verify_ms"
+      ]
+    },
+    "PreCheck": {
+      "description": "Preconditions that must be revalidated at apply time.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "verify_identity",
+            "check_not_protected",
+            "check_session_safety",
+            "check_data_loss_gate",
+            "check_supervisor",
+            "check_agent_supervision"
+          ]
+        },
+        {
+          "description": "Verify process is still in expected state (not zombie/D-state if expecting killable).",
+          "type": "string",
+          "const": "verify_process_state"
+        }
+      ]
+    },
+    "ActionRationale": {
+      "description": "Structured action rationale.",
+      "type": "object",
+      "properties": {
+        "expected_loss": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "expected_recovery": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "expected_recovery_stddev": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "posterior_odds_abandoned_vs_useful": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "sprt_boundary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SprtBoundary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "posterior": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClassScores"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "memory_mb": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "has_known_signature": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "category": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SprtBoundary": {
+      "description": "SPRT-style boundary information.",
+      "type": "object",
+      "properties": {
+        "log_odds_threshold": {
+          "type": "number",
+          "format": "double"
+        },
+        "numerator": {
+          "type": "number",
+          "format": "double"
+        },
+        "denominator": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "log_odds_threshold",
+        "numerator",
+        "denominator"
+      ]
+    },
+    "ClassScores": {
+      "description": "Per-class scores for the 4-state model.",
+      "type": "object",
+      "properties": {
+        "useful": {
+          "type": "number",
+          "format": "double"
+        },
+        "useful_bad": {
+          "type": "number",
+          "format": "double"
+        },
+        "abandoned": {
+          "type": "number",
+          "format": "double"
+        },
+        "zombie": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "useful",
+        "useful_bad",
+        "abandoned",
+        "zombie"
+      ]
+    },
+    "ActionHook": {
+      "description": "Simple action hook for success/failure paths.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "details": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "ActionRouting": {
+      "description": "Why an action was routed differently than the direct target.",
+      "oneOf": [
+        {
+          "description": "Direct action on the target process.",
+          "type": "string",
+          "const": "direct"
+        },
+        {
+          "description": "Zombie: routed to parent process.",
+          "type": "string",
+          "const": "zombie_to_parent"
+        },
+        {
+          "description": "Zombie: routed to supervisor (systemd, docker, etc.).",
+          "type": "string",
+          "const": "zombie_to_supervisor"
+        },
+        {
+          "description": "Zombie: investigate only (no viable parent/supervisor).",
+          "type": "string",
+          "const": "zombie_investigate_only"
+        },
+        {
+          "description": "D-state: low confidence, may not succeed.",
+          "type": "string",
+          "const": "d_state_low_confidence"
+        }
+      ]
+    },
+    "ActionConfidence": {
+      "description": "Confidence level for action success.",
+      "oneOf": [
+        {
+          "description": "Normal confidence - action should succeed.",
+          "type": "string",
+          "const": "normal"
+        },
+        {
+          "description": "Low confidence - action may fail due to process state (D-state).",
+          "type": "string",
+          "const": "low"
+        },
+        {
+          "description": "Very low - action is unlikely to succeed.",
+          "type": "string",
+          "const": "very_low"
+        }
+      ]
+    },
+    "DStateDiagnostics": {
+      "description": "Diagnostics for D-state (uninterruptible sleep) processes.",
+      "type": "object",
+      "properties": {
+        "wchan": {
+          "description": "Kernel function where process is blocked (from /proc/\\[pid\\]/wchan).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "io_read_bytes": {
+          "description": "I/O read bytes at time of detection.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "io_write_bytes": {
+          "description": "I/O write bytes at time of detection.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "d_state_duration_ms": {
+          "description": "Time spent in D-state (if known).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "GatesSummary": {
+      "description": "High-level gate summary for the plan.",
+      "type": "object",
+      "properties": {
+        "total_candidates": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "blocked_candidates": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "pre_toggled_actions": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "total_candidates",
+        "blocked_candidates",
+        "pre_toggled_actions"
+      ]
+    }
+  }
+}

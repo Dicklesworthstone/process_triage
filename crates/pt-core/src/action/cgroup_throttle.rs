@@ -4,8 +4,8 @@
 //! - Automatic cgroup path discovery for target process
 //! - Reversal metadata capture for undo operations
 //! - Verification via read-back of cpu.max
-//! - Fallback to cgroup v1 (cpu.cfs_quota_us/cpu.cfs_period_us)
-//! - Graceful degradation to renice if cgroup unavailable
+//! - Hybrid v1 fallback with separate controller isolation checks
+//! - Explicit refusal when safe cgroup mutation is unavailable
 
 use super::executor::{ActionError, ActionRunner};
 use crate::collect::cgroup::{collect_cgroup_details, CgroupVersion, CpuLimitSource};
@@ -75,6 +75,9 @@ pub struct ThrottleReversalMetadata {
     /// PID of the throttled process.
     pub pid: u32,
 
+    /// Exact process incarnation whose previous limits were captured.
+    pub identity: pt_common::ProcessIdentity,
+
     /// Cgroup path where throttle was applied.
     pub cgroup_path: String,
 
@@ -129,6 +132,7 @@ impl CpuThrottleActionRunner {
     #[cfg(target_os = "linux")]
     fn execute_throttle(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
         debug!(
             pid,
             fraction = self.config.target_fraction,
@@ -138,6 +142,11 @@ impl CpuThrottleActionRunner {
         // Collect cgroup details for the target process
         let cgroup_details = collect_cgroup_details(pid)
             .ok_or_else(|| ActionError::Failed(format!("failed to read cgroup for pid {}", pid)))?;
+        if cgroup_details.unified_path.as_deref() != Some(checked_path.as_str()) {
+            return Err(ActionError::Failed(
+                "refusing throttle after cgroup membership changed".to_string(),
+            ));
+        }
 
         // Try cgroup v2 first
         if cgroup_details.version == CgroupVersion::V2
@@ -173,6 +182,10 @@ impl CpuThrottleActionRunner {
     #[cfg(target_os = "linux")]
     fn apply_throttle_v2(&self, pid: u32, unified_path: &str) -> Result<(), ActionError> {
         let cgroup_root = "/sys/fs/cgroup";
+        super::dispatch::ensure_exclusive_cgroup_path(
+            pid,
+            Path::new(&format!("{cgroup_root}{unified_path}")),
+        )?;
         let cpu_max_path = format!("{}{}/cpu.max", cgroup_root, unified_path);
 
         // Check if cpu.max exists and is writable
@@ -219,6 +232,10 @@ impl CpuThrottleActionRunner {
     #[cfg(target_os = "linux")]
     fn apply_throttle_v1(&self, pid: u32, cpu_path: &str) -> Result<(), ActionError> {
         let cgroup_root = "/sys/fs/cgroup/cpu";
+        super::dispatch::ensure_exclusive_cgroup_path(
+            pid,
+            Path::new(&format!("{cgroup_root}{cpu_path}")),
+        )?;
         let quota_path = format!("{}{}/cpu.cfs_quota_us", cgroup_root, cpu_path);
         let period_path = format!("{}{}/cpu.cfs_period_us", cgroup_root, cpu_path);
 
@@ -274,6 +291,7 @@ impl CpuThrottleActionRunner {
     #[cfg(target_os = "linux")]
     fn verify_throttle(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        super::dispatch::ensure_cgroup_target(&action.target)?;
 
         // Re-collect cgroup details to verify
         let cgroup_details = collect_cgroup_details(pid).ok_or_else(|| {
@@ -345,14 +363,16 @@ impl CpuThrottleActionRunner {
     /// Capture reversal metadata before applying throttle.
     #[cfg(target_os = "linux")]
     pub fn capture_reversal_metadata(&self, pid: u32) -> Option<ThrottleReversalMetadata> {
+        let identity = super::dispatch::read_cgroup_identity(pid)?;
         let cgroup_details = collect_cgroup_details(pid)?;
 
         let (cgroup_path, previous_quota, previous_period, source) =
             if let Some(ref limits) = cgroup_details.cpu_limits {
-                let path = cgroup_details
-                    .unified_path
-                    .clone()
-                    .or_else(|| cgroup_details.v1_paths.get("cpu").cloned())?;
+                let path = match limits.source {
+                    CpuLimitSource::CgroupV2CpuMax => cgroup_details.unified_path.clone()?,
+                    CpuLimitSource::CgroupV1Cfs => cgroup_details.v1_paths.get("cpu").cloned()?,
+                    CpuLimitSource::None => cgroup_details.unified_path.clone()?,
+                };
                 (path, limits.quota_us, limits.period_us, limits.source)
             } else {
                 let path = cgroup_details
@@ -364,6 +384,7 @@ impl CpuThrottleActionRunner {
 
         Some(ThrottleReversalMetadata {
             pid,
+            identity,
             cgroup_path,
             previous_quota_us: previous_quota,
             previous_period_us: previous_period,
@@ -378,13 +399,27 @@ impl CpuThrottleActionRunner {
         &self,
         metadata: &ThrottleReversalMetadata,
     ) -> Result<(), ActionError> {
+        if metadata.pid != metadata.identity.pid.0 {
+            return Err(ActionError::IdentityMismatch);
+        }
+        let checked_path = super::dispatch::ensure_cgroup_target(&metadata.identity)?;
         match metadata.source {
             CpuLimitSource::CgroupV2CpuMax => {
+                if checked_path != metadata.cgroup_path {
+                    return Err(ActionError::Failed(
+                        "refusing throttle reversal after cgroup membership changed".to_string(),
+                    ));
+                }
                 let cpu_max_path = format!("/sys/fs/cgroup{}/cpu.max", metadata.cgroup_path);
                 let value = match (metadata.previous_quota_us, metadata.previous_period_us) {
-                    (Some(q), Some(p)) if q > 0 => format!("{} {}", q, p),
-                    (None, Some(p)) | (_, Some(p)) => format!("max {}", p),
-                    _ => "max 100000".to_string(), // Default unlimited
+                    (Some(q), Some(p)) if q > 0 && p > 0 => format!("{} {}", q, p),
+                    (None, Some(p)) if p > 0 => format!("max {}", p),
+                    _ => {
+                        return Err(ActionError::Failed(
+                            "refusing reversal without the recorded previous CPU limits"
+                                .to_string(),
+                        ));
+                    }
                 };
                 fs::write(&cpu_max_path, &value).map_err(|e| {
                     ActionError::Failed(format!("failed to restore cpu.max: {}", e))
@@ -397,6 +432,18 @@ impl CpuThrottleActionRunner {
                 Ok(())
             }
             CpuLimitSource::CgroupV1Cfs => {
+                let current_cpu_path = collect_cgroup_details(metadata.pid)
+                    .and_then(|details| details.v1_paths.get("cpu").cloned());
+                if current_cpu_path.as_deref() != Some(metadata.cgroup_path.as_str()) {
+                    return Err(ActionError::Failed(
+                        "refusing throttle reversal after CPU controller membership changed"
+                            .to_string(),
+                    ));
+                }
+                super::dispatch::ensure_exclusive_cgroup_path(
+                    metadata.pid,
+                    Path::new(&format!("/sys/fs/cgroup/cpu{}", metadata.cgroup_path)),
+                )?;
                 let quota_path = format!(
                     "/sys/fs/cgroup/cpu{}/cpu.cfs_quota_us",
                     metadata.cgroup_path
@@ -406,13 +453,24 @@ impl CpuThrottleActionRunner {
                     metadata.cgroup_path
                 );
 
-                if let Some(period) = metadata.previous_period_us {
-                    fs::write(&period_path, period.to_string()).map_err(|e| {
-                        ActionError::Failed(format!("failed to restore period: {}", e))
+                let period = metadata
+                    .previous_period_us
+                    .filter(|period| *period > 0)
+                    .ok_or_else(|| {
+                        ActionError::Failed(
+                            "refusing reversal without the recorded previous period".to_string(),
+                        )
                     })?;
-                }
-
+                // The v1 collector represents the kernel's unlimited sentinel
+                // (-1) as None, while retaining its controller source and period.
                 let quota_value = metadata.previous_quota_us.unwrap_or(-1);
+                if quota_value != -1 && quota_value <= 0 {
+                    return Err(ActionError::Failed(
+                        "invalid recorded previous quota".to_string(),
+                    ));
+                }
+                fs::write(&period_path, period.to_string())
+                    .map_err(|e| ActionError::Failed(format!("failed to restore period: {}", e)))?;
                 fs::write(&quota_path, quota_value.to_string())
                     .map_err(|e| ActionError::Failed(format!("failed to restore quota: {}", e)))?;
 
@@ -423,30 +481,9 @@ impl CpuThrottleActionRunner {
                 );
                 Ok(())
             }
-            CpuLimitSource::None => {
-                // No previous limits - set to unlimited
-                warn!("no previous limits in reversal metadata, setting to unlimited");
-                // Try v2 first
-                let cpu_max_path = format!("/sys/fs/cgroup{}/cpu.max", metadata.cgroup_path);
-                if Path::new(&cpu_max_path).exists() {
-                    fs::write(&cpu_max_path, "max 100000").map_err(|e| {
-                        ActionError::Failed(format!("failed to restore to unlimited (v2): {}", e))
-                    })?;
-                    return Ok(());
-                }
-
-                // Try v1 fallback
-                let quota_path = format!(
-                    "/sys/fs/cgroup/cpu{}/cpu.cfs_quota_us",
-                    metadata.cgroup_path
-                );
-                if Path::new(&quota_path).exists() {
-                    fs::write(&quota_path, "-1").map_err(|e| {
-                        ActionError::Failed(format!("failed to restore to unlimited (v1): {}", e))
-                    })?;
-                }
-                Ok(())
-            }
+            CpuLimitSource::None => Err(ActionError::Failed(
+                "refusing reversal without the recorded previous CPU limits".to_string(),
+            )),
         }
     }
 }
@@ -507,6 +544,12 @@ impl ActionRunner for CpuThrottleActionRunner {
 /// Check if cgroup CPU throttle is available for a process.
 #[cfg(target_os = "linux")]
 pub fn can_throttle_process(pid: u32) -> bool {
+    let Some(identity) = super::dispatch::read_cgroup_identity(pid) else {
+        return false;
+    };
+    if super::dispatch::ensure_cgroup_target(&identity).is_err() {
+        return false;
+    }
     if let Some(details) = collect_cgroup_details(pid) {
         // Check if we have a writable cgroup path
         if let Some(ref unified_path) = details.unified_path {

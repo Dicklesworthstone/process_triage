@@ -8,20 +8,28 @@
 //! - No raw secrets leak through encryption/decryption cycle
 
 use pt_bundle::{BundleError, BundleReader, BundleWriter, BUNDLE_SCHEMA_VERSION};
-use pt_redact::ExportProfile;
+use pt_redact::{ExportProfile, RedactionPolicy};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::io::{Cursor, Read, Write};
 use tempfile::TempDir;
+use zip::write::FileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-/// Build a realistic bundle with known content for verification testing.
-fn build_test_bundle(profile: ExportProfile) -> (Vec<u8>, pt_bundle::BundleManifest) {
-    let mut writer = BundleWriter::new("pt-20260205-enc-test", "host-enc-test", profile)
-        .with_pt_version("2.0.0-test")
-        .with_redaction_policy("1.0.0", "sha256-test-key")
-        .with_description("Encryption + verification E2E test");
+/// Build an archive fixture; opaque bytes require explicit Forensic export.
+fn build_test_bundle() -> (Vec<u8>, pt_bundle::BundleManifest) {
+    let mut writer = BundleWriter::new(
+        "pt-20260205-enc-test",
+        "host-enc-test",
+        ExportProfile::Forensic,
+    )
+    .with_pt_version("2.0.0-test")
+    .with_redaction_policy("1.0.0", "sha256-test-key")
+    .with_description("Encryption + verification E2E test");
 
     writer
         .add_summary(&json!({
@@ -74,10 +82,13 @@ fn test_encrypt_decrypt_roundtrip_preserves_all_content() {
     let bundle_path = temp_dir.path().join("session.ptb");
 
     // Write encrypted bundle directly via BundleWriter
-    let mut writer =
-        BundleWriter::new("pt-20260205-enc-test", "host-enc-test", ExportProfile::Safe)
-            .with_pt_version("2.0.0-test")
-            .with_redaction_policy("1.0.0", "sha256-test-key");
+    let mut writer = BundleWriter::new(
+        "pt-20260205-enc-test",
+        "host-enc-test",
+        ExportProfile::Forensic,
+    )
+    .with_pt_version("2.0.0-test")
+    .with_redaction_policy("1.0.0", "sha256-test-key");
 
     writer
         .add_summary(&json!({"total_processes": 100, "candidates": 4}))
@@ -96,7 +107,7 @@ fn test_encrypt_decrypt_roundtrip_preserves_all_content() {
     let mut reader =
         BundleReader::open_with_passphrase(&bundle_path, Some(passphrase)).expect("open");
     assert_eq!(reader.session_id(), "pt-20260205-enc-test");
-    assert_eq!(reader.export_profile(), ExportProfile::Safe);
+    assert_eq!(reader.export_profile(), ExportProfile::Forensic);
 
     // Verify all files intact
     let failures = reader.verify_all();
@@ -109,6 +120,13 @@ fn test_encrypt_decrypt_roundtrip_preserves_all_content() {
     // Read summary to confirm content preserved
     let summary: serde_json::Value = reader.read_summary().expect("read summary");
     assert_eq!(summary["total_processes"], 100);
+    assert_eq!(summary["candidates"], 4);
+    assert_eq!(
+        reader
+            .read_verified("telemetry/audit.parquet")
+            .expect("read opaque archive payload"),
+        vec![0x50, 0x41, 0x52, 0x31]
+    );
 
     eprintln!(
         "[INFO] Encrypted roundtrip: {} files, {} raw bytes",
@@ -132,7 +150,8 @@ fn test_encrypt_decrypt_with_various_passphrases() {
         let temp_dir = TempDir::new().expect("temp dir");
         let bundle_path = temp_dir.path().join("session.ptb");
 
-        let mut writer = BundleWriter::new("session-passphrase", "host-pp", ExportProfile::Safe);
+        let mut writer =
+            BundleWriter::new("pt-20261004-120100-abcd", "host-pp", ExportProfile::Safe);
         writer
             .add_summary(&json!({"test": "passphrase"}))
             .expect("add summary");
@@ -143,7 +162,7 @@ fn test_encrypt_decrypt_with_various_passphrases() {
 
         let mut reader =
             BundleReader::open_with_passphrase(&bundle_path, Some(passphrase)).expect("open");
-        assert_eq!(reader.session_id(), "session-passphrase");
+        assert_eq!(reader.session_id(), "pt-20261004-120100-abcd");
         let failures = reader.verify_all();
         assert!(
             failures.is_empty(),
@@ -168,11 +187,17 @@ fn test_encrypted_bundle_all_profiles() {
         let temp_dir = TempDir::new().expect("temp dir");
         let bundle_path = temp_dir.path().join("session.ptb");
 
-        let mut writer = BundleWriter::new("session-profile", "host-prof", profile);
+        let mut writer = BundleWriter::new("pt-20261004-120200-abcd", "host-prof", profile);
         writer
-            .add_summary(&json!({"profile": format!("{:?}", profile)}))
+            .add_summary(&json!({"total_processes": 8, "candidates": 2}))
             .expect("add summary");
-        writer.add_telemetry("audit", vec![1, 2, 3]);
+        writer
+            .add_plan(&json!({"recommendations": [{"pid": 5678, "action": "spare"}]}))
+            .expect("add plan");
+        writer.add_log(
+            "events",
+            b"{\"event\":\"profile_test\",\"exit_code\":0}\n".to_vec(),
+        );
 
         let manifest = writer
             .write_encrypted(&bundle_path, passphrase)
@@ -181,6 +206,19 @@ fn test_encrypted_bundle_all_profiles() {
         let mut reader =
             BundleReader::open_with_passphrase(&bundle_path, Some(passphrase)).expect("open");
         assert_eq!(reader.export_profile(), profile);
+        assert_eq!(reader.session_id(), "pt-20261004-120200-abcd");
+        let summary: serde_json::Value = reader.read_summary().expect("read summary");
+        assert_eq!(summary, json!({"total_processes": 8, "candidates": 2}));
+        if profile == ExportProfile::Minimal {
+            assert_eq!(manifest.file_count(), 1);
+            assert!(!reader.has_file("plan.json"));
+            assert!(!reader.has_file("logs/events.jsonl"));
+        } else {
+            assert_eq!(manifest.file_count(), 3);
+            let plan: serde_json::Value = reader.read_plan().expect("read plan").expect("plan");
+            assert_eq!(plan["recommendations"][0]["action"], "spare");
+            assert!(reader.has_file("logs/events.jsonl"));
+        }
 
         let failures = reader.verify_all();
         assert!(
@@ -274,7 +312,7 @@ fn test_none_passphrase_on_encrypted_bundle_fails() {
 
 #[test]
 fn test_corrupted_bundle_bytes_detected() {
-    let (mut bytes, _) = build_test_bundle(ExportProfile::Safe);
+    let (mut bytes, _) = build_test_bundle();
 
     // Corrupt the middle of the ZIP — this may corrupt file data inside
     // rather than the ZIP directory (which lives at the end).
@@ -305,7 +343,7 @@ fn test_corrupted_bundle_bytes_detected() {
 
 #[test]
 fn test_truncated_bundle_detected() {
-    let (bytes, _) = build_test_bundle(ExportProfile::Safe);
+    let (bytes, _) = build_test_bundle();
 
     // Truncate to just 100 bytes
     let truncated = bytes[..100].to_vec();
@@ -330,18 +368,17 @@ fn test_corrupted_encrypted_bundle_detected() {
     // Read and corrupt the encrypted bytes
     let mut raw = std::fs::read(&bundle_path).expect("read");
     let data_start = 8 + 4 + 16 + 12; // MAGIC + iterations + salt + nonce
-    if raw.len() > data_start + 10 {
-        raw[data_start + 5] ^= 0xFF;
-        raw[data_start + 6] ^= 0xFF;
-    }
+    assert!(
+        raw.len() > data_start + 10,
+        "encrypted payload must be present"
+    );
+    raw[data_start + 5] ^= 0xFF;
+    raw[data_start + 6] ^= 0xFF;
     std::fs::write(&bundle_path, &raw).expect("write corrupted");
 
     // Should fail with DecryptionFailed (AEAD authentication tag mismatch)
     let result = BundleReader::open_with_passphrase(&bundle_path, Some(passphrase));
-    assert!(
-        result.is_err(),
-        "Corrupted encrypted bundle should fail to open"
-    );
+    assert!(matches!(result, Err(BundleError::DecryptionFailed)));
 }
 
 #[test]
@@ -368,24 +405,14 @@ fn test_truncated_encrypted_header_detected() {
 
 #[test]
 fn test_checksum_verification_detects_tampered_content() {
-    // We'll use from_bytes directly — but we need to tamper with a file inside the ZIP.
-    // Since we can't easily modify ZIP internals, test via verify_all by manually
-    // constructing a scenario: create a bundle, modify a file's expected checksum
-    // in the manifest, then verify.
-
-    // Instead: use read_verified on a fresh bundle but with a wrong manifest checksum.
-    // The simplest approach: create a bundle, read it, verify works, then verify
-    // that if we had a corrupted file, read_verified would catch it.
-
-    // Build two bundles with same structure but different telemetry content
-    let mut writer1 = BundleWriter::new("session-chk1", "host-chk1", ExportProfile::Safe);
+    let mut writer1 = BundleWriter::new("session-chk1", "host-chk1", ExportProfile::Forensic);
     writer1
         .add_summary(&json!({"test": "checksum1"}))
         .expect("add summary");
     writer1.add_telemetry("audit", vec![1, 2, 3, 4, 5]);
 
     let (bytes1, manifest1) = writer1.write_to_vec().expect("write bundle1");
-    let mut reader1 = BundleReader::from_bytes(bytes1).expect("open bundle1");
+    let mut reader1 = BundleReader::from_bytes(bytes1.clone()).expect("open bundle1");
 
     // All files should verify
     let failures = reader1.verify_all();
@@ -405,6 +432,42 @@ fn test_checksum_verification_detects_tampered_content() {
         assert!(entry.bytes > 0, "bytes should be > 0 for {}", entry.path);
     }
 
+    // Rebuild a valid ZIP with changed telemetry and the original manifest.
+    // ZIP CRCs stay valid, so rejection must come from the bundle checksum gate.
+    let mut original_zip = ZipArchive::new(Cursor::new(bytes1)).expect("open original ZIP");
+    let mut tampered_zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+    let mut changed_payloads = 0;
+    for index in 0..original_zip.len() {
+        let mut entry = original_zip.by_index(index).expect("ZIP entry");
+        let path = entry.name().to_string();
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).expect("read ZIP entry");
+        if path == "telemetry/audit.parquet" {
+            assert_eq!(data, vec![1, 2, 3, 4, 5]);
+            data[0] ^= 0xFF;
+            changed_payloads += 1;
+        }
+        tampered_zip
+            .start_file(path, options)
+            .expect("start ZIP entry");
+        tampered_zip.write_all(&data).expect("write ZIP entry");
+    }
+    assert_eq!(changed_payloads, 1, "must tamper with the named payload");
+    let tampered_bytes = tampered_zip
+        .finish()
+        .expect("finish tampered ZIP")
+        .into_inner();
+    let mut tampered = BundleReader::from_bytes(tampered_bytes).expect("open valid tampered ZIP");
+    assert!(matches!(
+        tampered.read_verified("telemetry/audit.parquet"),
+        Err(BundleError::ChecksumMismatch { path, .. }) if path == "telemetry/audit.parquet"
+    ));
+    let failures = tampered.verify_all();
+    assert_eq!(failures.len(), 1, "only the changed payload should fail");
+    assert_eq!(failures[0], "telemetry/audit.parquet");
+
     eprintln!(
         "[INFO] Checksum verification: {} files validated",
         manifest1.file_count()
@@ -417,7 +480,7 @@ fn test_checksum_verification_detects_tampered_content() {
 
 #[test]
 fn test_manifest_checksums_match_file_content() {
-    let (bytes, manifest) = build_test_bundle(ExportProfile::Safe);
+    let (bytes, manifest) = build_test_bundle();
     let mut reader = BundleReader::from_bytes(bytes).expect("open bundle");
 
     for entry in manifest.files.iter() {
@@ -441,7 +504,7 @@ fn test_manifest_checksums_match_file_content() {
 
 #[test]
 fn test_manifest_version_present_and_valid() {
-    let (_, manifest) = build_test_bundle(ExportProfile::Safe);
+    let (_, manifest) = build_test_bundle();
 
     assert_eq!(manifest.bundle_version, BUNDLE_SCHEMA_VERSION);
     assert!(!manifest.bundle_version.is_empty());
@@ -468,6 +531,19 @@ fn test_manifest_redaction_metadata_preserved_through_encryption() {
         .write_encrypted(&bundle_path, passphrase)
         .expect("write encrypted");
 
+    let policy = RedactionPolicy::default();
+    let canonical_policy = serde_json::to_value(&policy).expect("policy value");
+    let policy_bytes = serde_json::to_vec(&canonical_policy).expect("policy bytes");
+    assert_eq!(
+        orig_manifest.redaction_policy_version,
+        policy.schema_version
+    );
+    assert_eq!(
+        orig_manifest.redaction_policy_hash,
+        format!("{:x}", Sha256::digest(&policy_bytes))
+    );
+    assert_ne!(orig_manifest.redaction_policy_hash, "sha256-abc123");
+
     let reader = BundleReader::open_with_passphrase(&bundle_path, Some(passphrase)).expect("open");
 
     assert_eq!(
@@ -490,7 +566,8 @@ fn test_passphrase_on_unencrypted_bundle_still_opens() {
     let temp_dir = TempDir::new().expect("temp dir");
     let bundle_path = temp_dir.path().join("session.ptb");
 
-    let mut writer = BundleWriter::new("session-plain", "host-plain", ExportProfile::Safe);
+    let mut writer =
+        BundleWriter::new("pt-20261004-120300-abcd", "host-plain", ExportProfile::Safe);
     writer
         .add_summary(&json!({"test": "plain"}))
         .expect("add summary");
@@ -500,7 +577,7 @@ fn test_passphrase_on_unencrypted_bundle_still_opens() {
     // (passphrase is just ignored since file isn't encrypted)
     let reader = BundleReader::open_with_passphrase(&bundle_path, Some("unnecessary-passphrase"))
         .expect("open plain with passphrase");
-    assert_eq!(reader.session_id(), "session-plain");
+    assert_eq!(reader.session_id(), "pt-20261004-120300-abcd");
 }
 
 // ============================================================================
@@ -559,12 +636,12 @@ fn test_encrypted_bundle_different_sessions_are_independent() {
     for i in 1..=2 {
         let path = temp_dir.path().join(format!("session-{}.ptb", i));
         let mut writer = BundleWriter::new(
-            format!("session-ind-{}", i),
+            format!("pt-20261004-12040{}-abcd", i),
             "host-ind",
             ExportProfile::Safe,
         );
         writer
-            .add_summary(&json!({"session_number": i}))
+            .add_summary(&json!({"total_processes": i}))
             .expect("add summary");
         writer.write_encrypted(&path, passphrase).expect("write");
     }
@@ -581,13 +658,13 @@ fn test_encrypted_bundle_different_sessions_are_independent() {
     )
     .expect("open 2");
 
-    assert_eq!(reader1.session_id(), "session-ind-1");
-    assert_eq!(reader2.session_id(), "session-ind-2");
+    assert_eq!(reader1.session_id(), "pt-20261004-120401-abcd");
+    assert_eq!(reader2.session_id(), "pt-20261004-120402-abcd");
 
     let sum1: serde_json::Value = reader1.read_summary().expect("read 1");
     let sum2: serde_json::Value = reader2.read_summary().expect("read 2");
-    assert_eq!(sum1["session_number"], 1);
-    assert_eq!(sum2["session_number"], 2);
+    assert_eq!(sum1["total_processes"], 1);
+    assert_eq!(sum2["total_processes"], 2);
 }
 
 // ============================================================================
@@ -600,7 +677,7 @@ fn test_encrypted_bundle_preserves_jsonl_log_schema() {
     let bundle_path = temp_dir.path().join("session.ptb");
     let passphrase = "log-schema-test";
 
-    let (plain_bytes, _) = build_test_bundle(ExportProfile::Safe);
+    let (plain_bytes, _) = build_test_bundle();
 
     // Manually encrypt the plain bytes
     let encrypted =
@@ -665,7 +742,7 @@ fn test_no_secrets_leak_through_encrypted_bundle_cycle() {
     let passphrase = "secret-leak-test";
     let canary_secret = "AKIAIOSFODNN7EXAMPLE";
 
-    // The summary uses a redacted version of the secret
+    // Check the redactor, then submit the raw secret to the writer itself.
     let policy = pt_redact::RedactionPolicy::default();
     let key = pt_redact::KeyMaterial::from_bytes([42u8; 32], "enc-leak-test");
     let engine = pt_redact::RedactionEngine::with_key(policy, key);
@@ -681,10 +758,12 @@ fn test_no_secrets_leak_through_encrypted_bundle_cycle() {
     );
 
     let bundle_path = temp_dir.path().join("session.ptb");
-    let mut writer = BundleWriter::new("session-leak", "host-leak", ExportProfile::Safe);
+    let mut writer = BundleWriter::new("session-leak", "host-leak", ExportProfile::Safe)
+        .with_redaction_engine(engine)
+        .with_description(canary_secret);
     writer
         .add_summary(&json!({
-            "note": redacted.output,
+            "note": canary_secret,
             "test": "secret-leak",
         }))
         .expect("add summary");
@@ -704,10 +783,34 @@ fn test_no_secrets_leak_through_encrypted_bundle_cycle() {
     // Decrypted content should not contain the secret
     let mut reader =
         BundleReader::open_with_passphrase(&bundle_path, Some(passphrase)).expect("open");
+    let manifest_text = reader.manifest().to_json().expect("manifest JSON");
+    assert!(
+        !manifest_text.contains(canary_secret),
+        "manifest leaked secret"
+    );
     let summary_bytes = reader.read_verified("summary.json").expect("read summary");
     let summary_text = String::from_utf8(summary_bytes).expect("utf8");
     assert!(
         !summary_text.contains(canary_secret),
         "Decrypted summary should not contain canary secret"
     );
+}
+
+#[test]
+fn test_safe_opaque_payload_refused_before_encrypted_destination_creation() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let bundle_path = temp_dir.path().join("refused-encrypted.ptb");
+    let mut writer = BundleWriter::new("session-refused", "host-refused", ExportProfile::Safe);
+    writer
+        .add_summary(&json!({"total_processes": 1}))
+        .expect("add summary");
+    writer.add_telemetry("audit", b"opaque private telemetry".to_vec());
+
+    let result = writer.write_encrypted(&bundle_path, "refusal-test-key");
+    assert!(matches!(
+        result,
+        Err(BundleError::UnsanitizedPayload { path, profile })
+            if path == "telemetry/audit.parquet" && profile == "safe"
+    ));
+    assert!(!bundle_path.exists(), "refusal must not create an output");
 }

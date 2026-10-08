@@ -203,10 +203,123 @@ fn label_rejects_missing_verdict_and_target() {
     pt_core(config_dir.path(), data_dir.path())
         .args(["agent", "label", "--cmd", "sleep 5"])
         .assert()
-        .code(2);
+        .code(10);
     pt_core(config_dir.path(), data_dir.path())
         .args(["agent", "label", "--kill"])
         .assert()
-        .code(2);
+        .code(10);
     assert!(!config_dir.path().join("decisions.json").exists());
+}
+
+/// GH #16/#18/#13: `signature add --prior useful` under a `PT_CONFIG_DIR` override
+/// writes the signature there, and both `agent plan` and `agent explain` score the
+/// matching live process with the signature's prior.
+#[test]
+fn signature_prior_from_config_override_reaches_plan_and_explain() {
+    let config_dir = TempDir::new().expect("config dir");
+    let other_config = TempDir::new().expect("other config dir");
+    let data_dir = TempDir::new().expect("data dir");
+    let child = ProcessCommand::new("sleep")
+        .arg("619")
+        .spawn()
+        .expect("spawn sleep");
+    let guard = ChildGuard(child);
+    let pid = guard.0.id();
+
+    // Runtime is evidence, and after clipping (TERM_CLIP_NATS) it is flat for the
+    // first ~80 s, pulls P(useful) down until ~7 min (abandoned gains) and pushes it
+    // back up afterwards: not monotonic. A full-host plan can take minutes on a
+    // loaded host, so plan and explain would see different ages and a different
+    // posterior. Default priors without the runtime term make the posterior
+    // age-independent, so plan and explain must agree.
+    let mut priors = pt_core::config::Priors::default();
+    for class in [
+        &mut priors.classes.useful,
+        &mut priors.classes.useful_bad,
+        &mut priors.classes.abandoned,
+        &mut priors.classes.zombie,
+    ] {
+        class.runtime_gamma = None;
+    }
+    std::fs::write(
+        config_dir.path().join("priors.json"),
+        serde_json::to_string_pretty(&priors).expect("serialize priors"),
+    )
+    .expect("write priors");
+
+    // PT_CONFIG_DIR (the --config flag's env) outranks PROCESS_TRIAGE_CONFIG.
+    let out = pt_core(other_config.path(), data_dir.path())
+        .env("PT_CONFIG_DIR", config_dir.path())
+        .args([
+            "--format",
+            "json",
+            "signature",
+            "add",
+            "sleep-619",
+            "--category",
+            "other",
+            "--pattern",
+            "^sleep$",
+            "--arg-pattern",
+            r"(^|\s)619$",
+            "--prior",
+            "useful",
+        ])
+        .output()
+        .expect("run signature add");
+    assert!(
+        out.status.success(),
+        "signature add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let added: Value = serde_json::from_slice(&out.stdout).expect("add output is JSON");
+    assert_eq!(added["prior"], "useful", "{added}");
+    assert!(config_dir.path().join("signatures.json").exists());
+    assert!(!other_config.path().join("signatures.json").exists());
+
+    let planned = plan_candidate(config_dir.path(), data_dir.path(), pid);
+    assert_eq!(planned["signature"]["name"], "sleep-619", "{planned}");
+    assert_eq!(
+        planned["inference"]["prior_source"], "signature",
+        "{planned}"
+    );
+
+    let explained = explain(config_dir.path(), data_dir.path(), pid);
+    assert_eq!(explained["signature"]["name"], "sleep-619", "{explained}");
+    assert_eq!(explained["prior_source"], "signature", "{explained}");
+    assert_eq!(
+        explained["classification"], planned["classification"],
+        "plan {planned}\nexplain {explained}"
+    );
+    let useful = |v: &Value| v["posterior"]["useful"].as_f64().expect("useful");
+    // Same scorer (the slack only absorbs CPU-sample jitter).
+    assert!(
+        (useful(&explained) - useful(&planned)).abs() < 0.01,
+        "plan and explain agree: plan {} explain {}",
+        useful(&planned),
+        useful(&explained)
+    );
+    // The "useful" prior dominates a seconds-old idle sleep.
+    assert!(useful(&planned) > 0.5, "{planned}");
+
+    // The MCP server reads the same config directory (it ignored PT_CONFIG_DIR and
+    // listed the signatures of PROCESS_TRIAGE_CONFIG instead).
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "pt_signatures", "arguments": {"user_only": true}},
+    });
+    let out = pt_core(other_config.path(), data_dir.path())
+        .env("PT_CONFIG_DIR", config_dir.path())
+        .arg("mcp")
+        .write_stdin(format!("{request}\n"))
+        .output()
+        .expect("run mcp");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "mcp failed: {stdout}");
+    assert!(
+        stdout.contains("sleep-619"),
+        "MCP lists the user signature from PT_CONFIG_DIR: {stdout}"
+    );
 }

@@ -280,11 +280,26 @@ impl CommandNormalizer {
             });
         }
 
-        // Generate standard pattern
+        // Generate standard pattern: key flags and subcommands, plus the argument that
+        // says WHICH program the interpreter runs (the first script, or the module after
+        // `-m`). Without it every flagless `node <script>` shared one pattern, so a
+        // verdict on `node x.js` spoke for `node y.js`.
+        let mut identity_taken = false;
         let std_args: Vec<String> = args_to_process
             .iter()
-            .filter(|a| self.is_key_arg(a))
-            .map(|a| self.normalize_arg_standard(a))
+            .enumerate()
+            .filter(|(i, a)| {
+                if self.is_key_arg(a) {
+                    return true;
+                }
+                let after_module_flag = *i > 0 && args_to_process[i - 1] == "-m";
+                if !identity_taken && (after_module_flag || Self::is_script_arg(a)) {
+                    identity_taken = true;
+                    return true;
+                }
+                false
+            })
+            .map(|(_, a)| self.normalize_arg_standard(a))
             .collect();
 
         candidates.push(PatternCandidate {
@@ -336,6 +351,16 @@ impl CommandNormalizer {
         }
 
         true
+    }
+
+    /// Whether an argument names a script an interpreter runs (`x.js`,
+    /// `node_modules/.bin/jest`, `manage.py`).
+    fn is_script_arg(arg: &str) -> bool {
+        const SCRIPT_EXTENSIONS: [&str; 10] = [
+            ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php", ".sh", ".jar",
+        ];
+        !arg.starts_with('-')
+            && (SCRIPT_EXTENSIONS.iter().any(|ext| arg.ends_with(ext)) || arg.contains("bin/"))
     }
 
     /// Check if an argument is a key flag (worth keeping at standard level).

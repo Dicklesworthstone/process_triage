@@ -476,11 +476,23 @@ mod e2e_scenarios {
 
     #[test]
     fn test_shadow_report_from_observations() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let shadow_dir = dir.path().join("shadow");
+        let dir = tempdir()?.keep();
+        eprintln!("Retained shadow report fixture: {}", dir.display());
+        let shadow_dir = dir.join("shadow");
         fs::create_dir_all(&shadow_dir)?;
+        // Keep report artifacts outside the directory consumed as observations.
+        let artifacts = dir.join("report-artifacts");
+        fs::create_dir_all(&artifacts)?;
 
         let now = Utc::now();
+        let belief = BeliefState {
+            p_abandoned: 0.75,
+            p_legitimate: 0.25,
+            p_zombie: 0.0,
+            p_useful_but_bad: 0.0,
+            recommendation: "kill".to_string(),
+            ..BeliefState::default()
+        };
         let observation = Observation {
             timestamp: now,
             pid: 4242,
@@ -497,39 +509,127 @@ mod e2e_scenarios {
                     .to_string(),
                 ),
             }],
-            belief: BeliefState {
-                p_abandoned: 0.75,
-                recommendation: "kill".to_string(),
-                ..BeliefState::default()
-            },
+            belief: belief.clone(),
         };
 
-        let payload = serde_json::to_string_pretty(&vec![observation])?;
         let path = shadow_dir.join("shadow_observations.json");
-        fs::write(&path, payload)?;
+        let report_for = |phase: &str,
+                          observations: &[Observation]|
+         -> Result<Value, Box<dyn std::error::Error>> {
+            let payload = serde_json::to_vec_pretty(observations)?;
+            fs::write(&path, &payload)?;
+            fs::write(artifacts.join(format!("{phase}.input.json")), &payload)?;
+            let mut command = pt_core();
+            command.env("PROCESS_TRIAGE_DATA", &dir).args([
+                "shadow",
+                "report",
+                "--threshold",
+                "0.5",
+            ]);
+            fs::write(
+                artifacts.join(format!("{phase}.command.txt")),
+                format!("{command:?}"),
+            )?;
+            let output = command.output()?;
+            fs::write(artifacts.join(format!("{phase}.stdout")), &output.stdout)?;
+            fs::write(artifacts.join(format!("{phase}.stderr")), &output.stderr)?;
+            fs::write(
+                artifacts.join(format!("{phase}.result.json")),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "exit_code": output.status.code(),
+                    "status": format!("{:?}", output.status),
+                    "input_sha256": pt_bundle::FileEntry::compute_checksum(&payload),
+                    "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&output.stdout),
+                    "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&output.stderr)
+                }))?,
+            )?;
+            assert!(
+                output.status.success(),
+                "shadow report {phase} failed: {:?}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(serde_json::from_slice(&output.stdout)?)
+        };
 
-        let output = pt_core()
-            .env("PROCESS_TRIAGE_DATA", dir.path())
-            .args(["shadow", "report", "--threshold", "0.5"])
-            .assert()
-            .success()
-            .get_output()
-            .stdout
-            .clone();
+        // A missing process has no observed exit status and cannot supply a label.
+        let mut observations = vec![observation];
+        let missing_report = report_for("missing", &observations)?;
+        for (field, expected) in [
+            ("total_predictions", 1),
+            ("resolved_predictions", 0),
+            ("pending_predictions", 0),
+            ("unlabeled_outcomes", 1),
+            ("positive_labels", 0),
+            ("negative_labels", 0),
+        ] {
+            assert_eq!(missing_report[field].as_u64(), Some(expected), "{field}");
+        }
+        assert_eq!(missing_report.get("metrics"), Some(&Value::Null));
+        assert_eq!(missing_report.get("quality"), Some(&Value::Null));
 
-        let report: Value = serde_json::from_slice(&output)?;
-        assert_eq!(
-            report.get("total_predictions").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        assert_eq!(
-            report.get("resolved_predictions").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        assert_eq!(
-            report.get("pending_predictions").and_then(|v| v.as_u64()),
-            Some(0)
-        );
+        // Supply a real owned child's wait result to the report consumer. This
+        // does not exercise the live shadow observer or establish calibration.
+        let predicted_at = Utc::now();
+        let mut child_command = std::process::Command::new("sleep");
+        child_command
+            .arg("0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        fs::write(
+            artifacts.join("waited-child.command.txt"),
+            format!("{child_command:?}"),
+        )?;
+        let mut child = child_command.spawn()?;
+        let child_pid = child.id();
+        let status = child.wait()?;
+        let exited_at = Utc::now();
+        fs::write(
+            artifacts.join("waited-child.result.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "pid": child_pid,
+                "predicted_at": predicted_at,
+                "waited_at": exited_at,
+                "exit_code": status.code(),
+                "status": format!("{status:?}")
+            }))?,
+        )?;
+        assert!(status.success(), "owned child failed: {status:?}");
+        let exit_code = status.code().ok_or("owned child exited without a code")?;
+        assert_eq!(exit_code, 0);
+        observations.push(Observation {
+            timestamp: predicted_at,
+            pid: child_pid,
+            identity_hash: format!("waited-child-{child_pid}-{predicted_at}"),
+            state: StateSnapshot::default(),
+            events: vec![ProcessEvent {
+                timestamp: exited_at,
+                event_type: EventType::ProcessExit,
+                details: Some(
+                    serde_json::json!({
+                        "reason": "exit_status",
+                        "comm": "sleep",
+                        "exit_code": exit_code
+                    })
+                    .to_string(),
+                ),
+            }],
+            belief,
+        });
+        let known_exit_report = report_for("known-exit", &observations)?;
+        for (field, expected) in [
+            ("total_predictions", 2),
+            ("resolved_predictions", 1),
+            ("pending_predictions", 0),
+            ("unlabeled_outcomes", 1),
+            ("positive_labels", 0),
+            ("negative_labels", 1),
+        ] {
+            assert_eq!(known_exit_report[field].as_u64(), Some(expected), "{field}");
+        }
+        assert_eq!(known_exit_report.get("metrics"), Some(&Value::Null));
+        assert_eq!(known_exit_report.get("quality"), Some(&Value::Null));
 
         Ok(())
     }

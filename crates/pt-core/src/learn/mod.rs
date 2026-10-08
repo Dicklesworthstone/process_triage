@@ -14,23 +14,89 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::exit_codes::ExitCode;
+
 pub const LEARN_SCHEMA_VERSION: &str = "1.0.0";
 pub const PROGRESS_FILE_NAME: &str = "learn_progress.json";
 
-static VERIFY_01: &[&[&str]] = &[
-    &["--version"],
-    &["scan", "--help"],
-    &["robot", "plan", "--help"],
+/// One verification step of a tutorial.
+#[derive(Debug, Clone, Copy)]
+pub enum VerifyStep {
+    /// Run the (read-only) command for real; it must succeed.
+    Run(&'static [&'static str]),
+    /// The command needs values the reader supplies (a session id, a PID). It is run
+    /// with placeholders, so it fails, but pt-core must accept its arguments: a
+    /// usage error means the tutorial documents a command that does not exist.
+    Accepts(&'static [&'static str]),
+}
+
+impl VerifyStep {
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::Run(args) | Self::Accepts(args) => args,
+        }
+    }
+}
+
+/// Session id no real session has, for `VerifyStep::Accepts`.
+const NO_SESSION: &str = "pt-20000101-000000-none";
+
+static VERIFY_01: &[VerifyStep] = &[
+    VerifyStep::Run(&["--version"]),
+    VerifyStep::Run(&["scan", "--format", "summary"]),
+    VerifyStep::Run(&["agent", "plan", "--format", "summary"]),
+    VerifyStep::Accepts(&["agent", "explain", "--session", NO_SESSION, "--pids", "1"]),
 ];
-static VERIFY_02: &[&[&str]] = &[&["robot", "explain", "--help"], &["scan", "--help"]];
-static VERIFY_03: &[&[&str]] = &[&["scan", "--help"], &["run", "--help"]];
-static VERIFY_04: &[&[&str]] = &[&["robot", "plan", "--help"], &["robot", "apply", "--help"]];
-static VERIFY_05: &[&[&str]] = &[
-    &["agent", "plan", "--help"],
-    &["agent", "explain", "--help"],
+static VERIFY_02: &[VerifyStep] = &[
+    VerifyStep::Run(&["agent", "plan", "--format", "summary", "--min-age", "3600"]),
+    VerifyStep::Accepts(&["agent", "explain", "--session", NO_SESSION, "--pids", "1"]),
+    VerifyStep::Accepts(&[
+        "agent",
+        "apply",
+        "--session",
+        NO_SESSION,
+        "--pids",
+        "1",
+        "--yes",
+    ]),
 ];
-static VERIFY_06: &[&[&str]] = &[&["shadow", "--help"], &["telemetry", "status", "--help"]];
-static VERIFY_07: &[&[&str]] = &[&["deep-scan", "--help"], &["scan", "--deep", "--help"]];
+static VERIFY_03: &[VerifyStep] = &[
+    VerifyStep::Run(&["agent", "plan", "--format", "summary", "--min-age", "3600"]),
+    VerifyStep::Accepts(&["agent", "explain", "--session", NO_SESSION, "--pids", "1"]),
+];
+static VERIFY_04: &[VerifyStep] = &[
+    VerifyStep::Run(&["agent", "plan", "--format", "summary"]),
+    VerifyStep::Accepts(&["agent", "explain", "--session", NO_SESSION, "--pids", "1"]),
+    VerifyStep::Accepts(&[
+        "agent",
+        "apply",
+        "--session",
+        NO_SESSION,
+        "--recommended",
+        "--yes",
+    ]),
+    VerifyStep::Accepts(&["agent", "verify", "--session", NO_SESSION]),
+    VerifyStep::Accepts(&[
+        "agent",
+        "diff",
+        "--base",
+        NO_SESSION,
+        "--compare",
+        NO_SESSION,
+    ]),
+];
+static VERIFY_05: &[VerifyStep] = &[
+    VerifyStep::Run(&["agent", "fleet", "plan", "--help"]),
+    VerifyStep::Accepts(&["agent", "fleet", "status", "--fleet-session", NO_SESSION]),
+];
+static VERIFY_06: &[VerifyStep] = &[
+    VerifyStep::Run(&["shadow", "status", "--format", "json"]),
+    VerifyStep::Run(&["shadow", "report", "--help"]),
+];
+static VERIFY_07: &[VerifyStep] = &[
+    VerifyStep::Run(&["deep-scan", "--format", "summary"]),
+    VerifyStep::Run(&["agent", "plan", "--deep", "--format", "summary"]),
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Tutorial {
@@ -42,7 +108,7 @@ pub struct Tutorial {
     pub commands: &'static [&'static str],
     pub hints: &'static [&'static str],
     #[serde(skip_serializing)]
-    pub verify_args: &'static [&'static [&'static str]],
+    pub verify_args: &'static [VerifyStep],
 }
 
 static TUTORIALS: &[Tutorial] = &[
@@ -52,10 +118,10 @@ static TUTORIALS: &[Tutorial] = &[
         title: "First Run",
         goal: "Understand safe scan/report behavior with no destructive actions.",
         doc_path: "docs/tutorials/01-first-run.md",
-        commands: &["pt --version", "pt scan", "pt robot plan --format json"],
+        commands: &["pt --version", "pt scan", "pt agent plan --format json"],
         hints: &[
             "Start with scan and plan-only commands before any apply step.",
-            "Use robot explain to understand evidence on a single PID.",
+            "Use `pt agent explain --session <session> --pids <pid>` to see one PID's evidence.",
         ],
         verify_args: VERIFY_01,
     },
@@ -65,7 +131,10 @@ static TUTORIALS: &[Tutorial] = &[
         title: "Stuck Test Runner",
         goal: "Triage long-running tests safely and inspect decision evidence.",
         doc_path: "docs/tutorials/02-stuck-test-runner.md",
-        commands: &["pt scan", "pt robot explain --pid <pid> --format json"],
+        commands: &[
+            "pt agent plan --format json --min-age 3600",
+            "pt agent explain --session <session> --pids <pid> --format json",
+        ],
         hints: &[
             "Prefer explain and plan before any apply command.",
             "Check command ancestry when deciding if a test process is abandoned.",
@@ -78,7 +147,10 @@ static TUTORIALS: &[Tutorial] = &[
         title: "Port Conflict",
         goal: "Resolve port collisions by ranking and reviewing suspicious processes.",
         doc_path: "docs/tutorials/03-port-conflict.md",
-        commands: &["pt scan", "pt run --inline"],
+        commands: &[
+            "pt agent plan --format json --min-age 3600",
+            "pt agent explain --session <session> --pids <pid> --format json",
+        ],
         hints: &[
             "Use summary and genealogy views to inspect port-holding process trees.",
             "Avoid force-killing unknown parent processes; inspect first.",
@@ -92,9 +164,10 @@ static TUTORIALS: &[Tutorial] = &[
         goal: "Run plan/explain/apply flows in automation-friendly stages.",
         doc_path: "docs/tutorials/04-agent-workflow.md",
         commands: &[
-            "pt robot plan --format json",
-            "pt robot explain --pid <pid> --format json",
-            "pt robot apply --pids <pid> --yes --format json",
+            "pt agent plan --format json",
+            "pt agent explain --session <session> --pids <pid> --format json",
+            "pt agent apply --session <session> --pids <pid> --yes --format json",
+            "pt agent verify --session <session>",
         ],
         hints: &[
             "Persist plan output before apply to keep a full audit trail.",
@@ -110,7 +183,7 @@ static TUTORIALS: &[Tutorial] = &[
         doc_path: "docs/tutorials/05-fleet-workflow.md",
         commands: &[
             "pt agent fleet plan --hosts <hosts> --format json",
-            "pt agent fleet apply --fleet-session <session> --format json",
+            "pt agent fleet status --fleet-session <fleet-session>",
         ],
         hints: &[
             "Use fleet report/status commands to inspect host-level outcomes.",
@@ -123,11 +196,16 @@ static TUTORIALS: &[Tutorial] = &[
         slug: "shadow-calibration",
         title: "Shadow Calibration",
         goal: "Use shadow mode to calibrate decisions without executing actions.",
-        doc_path: "docs/tutorials/README.md",
-        commands: &["pt --shadow run", "pt shadow status"],
+        doc_path: "docs/tutorials/06-shadow-calibration.md",
+        commands: &[
+            "pt shadow start",
+            "pt shadow status",
+            "pt shadow report -f md",
+            "pt shadow stop",
+        ],
         hints: &[
-            "Shadow mode should never execute destructive actions.",
-            "Compare shadow telemetry before changing thresholds.",
+            "Shadow mode records recommendations and never acts.",
+            "Read the report's label counts before trusting any calibration figure.",
         ],
         verify_args: VERIFY_06,
     },
@@ -136,11 +214,11 @@ static TUTORIALS: &[Tutorial] = &[
         slug: "deep-scan-evidence",
         title: "Deep Scan Evidence",
         goal: "Collect richer evidence using deep scan pathways with clear limits.",
-        doc_path: "docs/tutorials/README.md",
-        commands: &["pt deep-scan", "pt scan --deep"],
+        doc_path: "docs/tutorials/07-deep-scan-evidence.md",
+        commands: &["pt deep-scan", "pt agent plan --deep --format json"],
         hints: &[
-            "Use deep scan selectively because it is more expensive.",
-            "Fallback to quick scan when privileged probes are unavailable.",
+            "Deep scan reads more of /proc per process; use it when quick evidence is ambiguous.",
+            "Without permission to read another user's /proc entries, those processes get quick evidence only.",
         ],
         verify_args: VERIFY_07,
     },
@@ -300,13 +378,34 @@ fn command_label(args: &[&str]) -> String {
     parts.join(" ")
 }
 
-fn run_check_with_budget(binary: &Path, args: &[&str], budget: Duration) -> VerifyCheck {
+/// Whether pt-core's stderr is a command-line usage error (clap prints `error: ...`
+/// followed by a `Usage:` line), as opposed to the command running and failing.
+fn is_usage_error(stderr: &str) -> bool {
+    stderr.lines().any(|l| l.starts_with("error: ")) && stderr.contains("Usage:")
+}
+
+fn run_check_with_budget(
+    binary: &Path,
+    step: VerifyStep,
+    data_dir: &Path,
+    budget: Duration,
+) -> VerifyCheck {
     let started = Instant::now();
+    let args = step.args();
     let command = command_label(args);
+    let accepts_only = matches!(step, VerifyStep::Accepts(_));
+    // Checks never touch the user's session history.
     let mut child = match Command::new(binary)
         .args(args)
+        .env("PROCESS_TRIAGE_DATA", data_dir)
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(if accepts_only {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .spawn()
     {
         Ok(child) => child,
@@ -324,12 +423,34 @@ fn run_check_with_budget(binary: &Path, args: &[&str], budget: Duration) -> Veri
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let (ok, error) = if accepts_only {
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+                    }
+                    if is_usage_error(&stderr) {
+                        let first = stderr.lines().next().unwrap_or_default().to_string();
+                        (
+                            false,
+                            Some(format!("pt-core rejects the arguments: {first}")),
+                        )
+                    } else {
+                        (true, None)
+                    }
+                } else {
+                    // A completed plan may contain candidates. Other operational
+                    // outcomes (blocked, partial, interrupted) do not verify a tutorial.
+                    let plan_ready = args.starts_with(&["agent", "plan"])
+                        && !args.iter().any(|arg| matches!(*arg, "--help" | "-h"))
+                        && status.code() == Some(ExitCode::PlanReady.as_i32());
+                    (status.success() || plan_ready, None)
+                };
                 return VerifyCheck {
                     command,
-                    status: if status.success() { "ok" } else { "failed" }.to_string(),
+                    status: if ok { "ok" } else { "failed" }.to_string(),
                     exit_code: status.code(),
                     duration_ms: started.elapsed().as_millis() as u64,
-                    error: None,
+                    error,
                 };
             }
             Ok(None) => {
@@ -373,15 +494,22 @@ pub fn verify_tutorial(
     let mut fallback_active = false;
     let mut fallback_reason = None;
     let mut all_ok = true;
+    let data_dir = std::env::temp_dir().join(format!(
+        "pt-learn-verify-{}-{}-{}",
+        std::process::id(),
+        tutorial.id,
+        uuid::Uuid::new_v4()
+    ));
+    let _ = std::fs::create_dir_all(&data_dir);
 
-    for args in tutorial.verify_args {
+    for step in tutorial.verify_args {
         let elapsed = overall_started.elapsed();
         if elapsed >= total_budget {
             fallback_active = true;
             all_ok = false;
             fallback_reason = Some("total verification budget exhausted".to_string());
             checks.push(VerifyCheck {
-                command: command_label(args),
+                command: command_label(step.args()),
                 status: "budget_exhausted".to_string(),
                 exit_code: None,
                 duration_ms: elapsed.as_millis() as u64,
@@ -392,7 +520,7 @@ pub fn verify_tutorial(
 
         let remaining = total_budget.saturating_sub(elapsed);
         let budget = per_check_budget.min(remaining);
-        let check = run_check_with_budget(binary, args, budget);
+        let check = run_check_with_budget(binary, *step, &data_dir, budget);
         if check.status != "ok" {
             all_ok = false;
             if check.status == "timeout" {
@@ -402,6 +530,8 @@ pub fn verify_tutorial(
         }
         checks.push(check);
     }
+    // Retain real check artifacts, including failed or interrupted sessions.
+    // A unique directory avoids overwriting evidence from repeated checks.
 
     VerifyResult {
         tutorial_id: tutorial.id.to_string(),
@@ -465,5 +595,104 @@ mod tests {
         );
         assert_eq!(result.status, "degraded");
         assert!(result.fallback_active);
+    }
+
+    #[test]
+    fn usage_errors_are_told_apart_from_failing_commands() {
+        let clap = "error: unexpected argument '--pid' found\n\n  tip: a similar argument exists: '--pids'\n\nUsage: pt-core agent explain [OPTIONS]\n";
+        assert!(is_usage_error(clap));
+        assert!(!is_usage_error(
+            "agent explain: session pt-20000101-000000-none not found\n"
+        ));
+        assert!(!is_usage_error(""));
+    }
+
+    /// A tutorial command with a wrong flag fails verification; one whose arguments
+    /// are accepted passes even though it fails for lack of a real session.
+    #[cfg(unix)]
+    #[test]
+    fn accepts_step_fails_only_on_usage_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-pt-core");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"--pid\" ]; then\n    printf \"error: unexpected argument '--pid' found\\n\\nUsage: pt-core agent explain\\n\" >&2\n    exit 2\n  fi\ndone\necho \"session not found\" >&2\nexit 10\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = dir.path().join("data");
+        let budget = Duration::from_secs(5);
+
+        let bad = run_check_with_budget(
+            &fake,
+            VerifyStep::Accepts(&["agent", "explain", "--pid", "1"]),
+            &data,
+            budget,
+        );
+        assert_eq!(bad.status, "failed", "{bad:?}");
+        assert!(bad.error.unwrap().contains("unexpected argument"));
+
+        let good = run_check_with_budget(
+            &fake,
+            VerifyStep::Accepts(&["agent", "explain", "--session", NO_SESSION, "--pids", "1"]),
+            &data,
+            budget,
+        );
+        assert_eq!(good.status, "ok", "{good:?}");
+        assert_eq!(good.exit_code, Some(10));
+
+        // A Run step requires success.
+        let run = run_check_with_budget(&fake, VerifyStep::Run(&["scan"]), &data, budget);
+        assert_eq!(run.status, "failed");
+    }
+
+    /// A genuine completed plan with candidates verifies the tutorial, while
+    /// policy refusals, partial execution and unexpected codes remain failures.
+    #[cfg(unix)]
+    #[test]
+    fn run_step_accepts_only_the_commands_successful_outcomes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap().keep();
+        let data = dir.join("data");
+        let budget = Duration::from_secs(5);
+        for code in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20] {
+            let fake = dir.join(format!("fake-{code}"));
+            std::fs::write(&fake, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for (args, accepts_candidates) in [
+                (&["agent", "plan"][..], true),
+                (&["agent", "plan", "--deep"][..], true),
+                (&["agent", "plan", "--help"][..], false),
+                (&["scan"][..], false),
+                (&["deep-scan"][..], false),
+                (&["--version"][..], false),
+                (&["shadow", "status"][..], false),
+            ] {
+                let run = run_check_with_budget(&fake, VerifyStep::Run(args), &data, budget);
+                let want = if code == 0 || (code == 1 && accepts_candidates) {
+                    "ok"
+                } else {
+                    "failed"
+                };
+                assert_eq!(run.status, want, "{args:?}, exit {code}: {run:?}");
+                assert_eq!(run.exit_code, Some(code));
+            }
+        }
+    }
+
+    /// The catalog no longer documents forms pt-core rejects (`--pid`) or the legacy
+    /// `robot` alias the docs replaced with `agent`.
+    #[test]
+    fn tutorial_commands_use_no_removed_forms() {
+        for tutorial in tutorials() {
+            for command in tutorial.commands {
+                assert!(
+                    !command.contains("--pid ") && !command.contains("robot "),
+                    "tutorial {} documents a removed form: {command}",
+                    tutorial.id
+                );
+            }
+        }
     }
 }

@@ -49,6 +49,11 @@ impl CompositeActionRunner {
     pub fn take_signal_path(&self) -> Option<&'static str> {
         self.signal.take_signal_path()
     }
+
+    /// Whether a destructive signal actually reached a target since the last call.
+    pub fn take_kill_signal_delivered(&self) -> bool {
+        self.signal.take_kill_signal_delivered()
+    }
 }
 
 impl Default for CompositeActionRunner {
@@ -66,42 +71,162 @@ impl Default for CompositeActionRunner {
 /// pt moves the target into a dedicated leaf cgroup, it only acts when the cgroup
 /// holds the target alone.
 #[cfg(target_os = "linux")]
-fn ensure_exclusive_cgroup(pid: u32) -> Result<(), ActionError> {
+pub(super) fn read_cgroup_identity(pid: u32) -> Option<pt_common::ProcessIdentity> {
+    let stat = crate::collect::proc_parsers::parse_proc_stat(pid)?;
+    if stat.pid != pid || stat.starttime == 0 {
+        return None;
+    }
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let uid = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    uuid::Uuid::parse_str(boot_id.trim()).ok()?;
+    Some(pt_common::ProcessIdentity {
+        pid: pt_common::ProcessId(pid),
+        start_id: pt_common::StartId::from_linux(boot_id.trim(), stat.starttime, pid),
+        uid,
+        pgid: u32::try_from(stat.pgrp).ok(),
+        sid: u32::try_from(stat.session).ok(),
+        quality: pt_common::IdentityQuality::Full,
+    })
+}
+
+/// Revalidate the planned incarnation and built-in protections for direct callers.
+#[cfg(target_os = "linux")]
+pub(super) fn ensure_cgroup_target(
+    target: &pt_common::ProcessIdentity,
+) -> Result<String, ActionError> {
+    let pid = target.pid.0;
+    if pid <= 1 || crate::collect::protected::live_invoker_chain_pids().contains(&pid) {
+        return Err(ActionError::Failed(format!(
+            "refusing cgroup mutation for protected PID {pid}"
+        )));
+    }
+    if target.quality != pt_common::IdentityQuality::Full {
+        return Err(ActionError::IdentityMismatch);
+    }
+    let current = read_cgroup_identity(pid).ok_or(ActionError::IdentityMismatch)?;
+    if !target.matches(&current) {
+        return Err(ActionError::IdentityMismatch);
+    }
+    // SAFETY: geteuid has no preconditions and only reads the caller's credentials.
+    if current.uid != unsafe { libc::geteuid() } {
+        return Err(ActionError::PermissionDenied);
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map_err(|error| ActionError::Failed(format!("cannot read target name: {error}")))?;
+    let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map_err(|error| ActionError::Failed(format!("cannot read target command: {error}")))?;
+    let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+    if crate::collect::protected::builtin_protection_match(comm.trim(), &cmd).is_some()
+        || crate::collect::protected::live_service_ancestor(pid).is_some()
+        || crate::collect::read_cgroup_role(pid).is_supervised_service()
+    {
+        return Err(ActionError::Failed(
+            "refusing cgroup mutation for protected infrastructure".to_string(),
+        ));
+    }
+    ensure_exclusive_cgroup(pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn ensure_exclusive_cgroup(pid: u32) -> Result<String, ActionError> {
+    if pid <= 1 {
+        return Err(ActionError::Failed(format!(
+            "refusing cgroup mutation for protected PID {pid}"
+        )));
+    }
     let path = crate::collect::collect_cgroup_details(pid)
         .and_then(|d| d.unified_path)
         .ok_or_else(|| ActionError::Failed(format!("cannot resolve cgroup of pid {pid}")))?;
-    let procs_file = format!("/sys/fs/cgroup{path}/cgroup.procs");
+    ensure_exclusive_cgroup_path(pid, std::path::Path::new(&format!("/sys/fs/cgroup{path}")))?;
+    Ok(path)
+}
+
+/// Check the actual controller directory, including a hybrid v1 fallback.
+#[cfg(target_os = "linux")]
+pub(super) fn ensure_exclusive_cgroup_path(
+    pid: u32,
+    directory: &std::path::Path,
+) -> Result<(), ActionError> {
+    if pid <= 1 {
+        return Err(ActionError::Failed(format!(
+            "refusing cgroup mutation for protected PID {pid}"
+        )));
+    }
+    let path = directory.display();
+    let procs_file = directory.join("cgroup.procs");
     let content = std::fs::read_to_string(&procs_file)
-        .map_err(|e| ActionError::Failed(format!("cannot read {procs_file}: {e}")))?;
-    let others = shared_cgroup_members(&content, pid);
+        .map_err(|e| ActionError::Failed(format!("cannot read {}: {e}", procs_file.display())))?;
+    let others = shared_cgroup_members(&content, pid)?;
     if others > 0 {
         return Err(ActionError::Failed(format!(
             "refusing: cgroup {path} is shared with {others} other process(es) and would \
              affect them all (leaf-cgroup isolation not implemented)"
         )));
     }
+    // Resource limits and freeze state affect descendants too. Require a leaf
+    // rather than inferring isolation from only this directory's process list.
+    for entry in std::fs::read_dir(directory)
+        .map_err(|error| ActionError::Failed(format!("cannot inspect cgroup {path}: {error}")))?
+    {
+        let entry = entry.map_err(|error| {
+            ActionError::Failed(format!("cannot inspect cgroup entry in {path}: {error}"))
+        })?;
+        if entry
+            .file_type()
+            .map_err(|error| {
+                ActionError::Failed(format!("cannot inspect cgroup entry in {path}: {error}"))
+            })?
+            .is_dir()
+        {
+            return Err(ActionError::Failed(format!(
+                "refusing: cgroup {path} has descendants; an exclusive leaf is required"
+            )));
+        }
+    }
     Ok(())
 }
 
 /// Number of processes other than `pid` listed in `cgroup.procs` content.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn shared_cgroup_members(procs_content: &str, pid: u32) -> usize {
-    procs_content
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .filter(|p| *p != pid)
-        .count()
+fn shared_cgroup_members(procs_content: &str, pid: u32) -> Result<usize, ActionError> {
+    let mut target_present = false;
+    let mut others = 0;
+    for line in procs_content.lines() {
+        let member = line.trim().parse::<u32>().map_err(|_| {
+            ActionError::Failed(
+                "cannot establish cgroup isolation: invalid process list".to_string(),
+            )
+        })?;
+        if member == 0 {
+            return Err(ActionError::Failed(
+                "cannot establish cgroup isolation: invalid zero PID".to_string(),
+            ));
+        }
+        if member == pid {
+            target_present = true;
+        } else {
+            others += 1;
+        }
+    }
+    if !target_present {
+        return Err(ActionError::Failed(format!(
+            "cannot establish cgroup isolation: target PID {pid} is absent"
+        )));
+    }
+    Ok(others)
 }
 
 impl ActionRunner for CompositeActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
-        #[cfg(target_os = "linux")]
-        if matches!(
-            action.action,
-            Action::Freeze | Action::Throttle | Action::Quarantine
-        ) {
-            ensure_exclusive_cgroup(action.target.pid.0)?;
-        }
+        // Each specialized cgroup runner checks isolation at its own write entry,
+        // including callers that use the runner without this dispatcher.
         match action.action {
             Action::Keep => Ok(()),
             Action::Pause | Action::Resume | Action::Kill => self.signal.execute(action),
@@ -218,10 +343,12 @@ mod tests {
 
     #[test]
     fn shared_cgroup_members_counts_others() {
-        assert_eq!(shared_cgroup_members("123\n", 123), 0);
-        assert_eq!(shared_cgroup_members("123\n456\n789\n", 123), 2);
-        assert_eq!(shared_cgroup_members("", 123), 0);
-        assert_eq!(shared_cgroup_members("456\n", 123), 1);
+        assert_eq!(shared_cgroup_members("123\n", 123).unwrap(), 0);
+        assert_eq!(shared_cgroup_members("123\n456\n789\n", 123).unwrap(), 2);
+        assert_eq!(shared_cgroup_members("123\n123\n", 123).unwrap(), 0);
+        for invalid in ["", "456\n", "123\ninvalid\n", "123\n0\n"] {
+            assert!(shared_cgroup_members(invalid, 123).is_err());
+        }
     }
 
     #[test]

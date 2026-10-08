@@ -1,6 +1,6 @@
 [package]
 name = "pt-core"
-version = "2.1.0"
+version = "2.3.0"
 edition = "2021"
 description = "Process Triage core inference and decision engine"
 license = "MIT"
@@ -17,22 +17,22 @@ name = "pt-core"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive", "env", "string"] }
+clap = { version = "4.6.7", features = ["derive", "env", "string"] }
 clap_complete = "4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-schemars = { version = "1.2.0", features = ["chrono04"] }
+serde.workspace = true
+serde_json.workspace = true
+yaml_serde = "0.10.7"
+schemars = { version = "1.2.2", features = ["chrono04"] }
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror.workspace = true
 dirs = "5"
 libc = "0.2"
-regex = "1"
+regex = "1.13.1"
 sha2 = "0.10"
 hex = "0.4"
-rand = "0.9"
+rand = "0.9.5"
 toon = { workspace = true }
 tempfile = { version = "3", optional = true }
 
@@ -45,7 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Prometheus metrics (optional, behind "metrics" feature)
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14.0", optional = true }
 tiny_http = { version = "0.12", optional = true }
 
 # TUI dependencies (optional, behind "ui" feature)
@@ -80,7 +80,7 @@ assert_cmd = "2"
 criterion = "0.5"
 predicates = "3"
 tempfile = "3"
-regex = "1"
+regex = "1.13.1"
 proptest = "1"
 filetime = "0.2"
 ftui-harness = "0.2.0"

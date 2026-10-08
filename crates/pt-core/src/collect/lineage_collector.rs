@@ -278,28 +278,11 @@ fn detect_supervisor(
 
 /// Try to detect a systemd service unit from /proc/[pid]/cgroup.
 fn detect_systemd_unit(pid: u32) -> Option<String> {
-    let path = format!("/proc/{pid}/cgroup");
-    let content = fs::read_to_string(&path).ok()?;
-
-    for line in content.lines() {
-        // Format: hierarchy-ID:controller-list:cgroup-path
-        // e.g., "0::/system.slice/nginx.service"
-        // e.g., "0::/user.slice/user-1000.slice/session-1.scope"
-        let parts: Vec<&str> = line.splitn(3, ':').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let cgroup_path = parts[2];
-
-        // Look for .service suffix
-        if let Some(service_part) = cgroup_path.rsplit('/').next() {
-            if service_part.ends_with(".service") {
-                return Some(service_part.to_string());
-            }
-        }
+    let path = super::cgroup::read_systemd_cgroup_path(pid)?;
+    if super::cgroup::classify_live_cgroup_path(pid, &path).is_user_workload() {
+        return None;
     }
-
-    None
+    super::cgroup::systemd_service_unit(&path).map(|(unit, _)| unit.to_string())
 }
 
 /// Check if a process appears to be inside a container.

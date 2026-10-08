@@ -646,6 +646,10 @@ pub struct PatternLibrary {
     /// Base configuration directory.
     config_dir: PathBuf,
 
+    /// Directory to read a file from when `config_dir` lacks it (the pre-GH #18
+    /// location on macOS). Never written.
+    legacy_dir: Option<PathBuf>,
+
     /// Built-in patterns (read-only).
     built_in: PersistedSchema,
 
@@ -670,12 +674,34 @@ impl PatternLibrary {
     pub fn new(config_dir: impl Into<PathBuf>) -> Self {
         Self {
             config_dir: config_dir.into(),
+            legacy_dir: None,
             built_in: PersistedSchema::new(),
             learned: PersistedSchema::new(),
             custom: PersistedSchema::new(),
             disabled: DisabledPatterns::default(),
             stats: AllPatternStats::default(),
             dirty: false,
+        }
+    }
+
+    /// Read each file that `config_dir` lacks from `legacy_dir` instead (see
+    /// [`crate::signature_cli::legacy_read_dir`]). [`Self::save`] writes everything
+    /// loaded to `config_dir`, so a save migrates the legacy contents rather than
+    /// shadowing them with a file that holds only the new entries.
+    pub fn with_legacy_dir(mut self, legacy_dir: Option<PathBuf>) -> Self {
+        self.legacy_dir = legacy_dir;
+        self
+    }
+
+    /// `relative` under `config_dir`, or under the legacy dir when only that has it.
+    fn readable_path(&self, relative: &Path) -> PathBuf {
+        let path = self.config_dir.join(relative);
+        if path.exists() {
+            return path;
+        }
+        match &self.legacy_dir {
+            Some(legacy) if legacy.join(relative).exists() => legacy.join(relative),
+            _ => path,
         }
     }
 
@@ -715,34 +741,34 @@ impl PatternLibrary {
     pub fn load(&mut self) -> Result<(), PersistenceError> {
         self.ensure_directories()?;
 
-        let patterns_dir = self.patterns_dir();
+        let patterns_dir = Path::new(PATTERNS_DIR_NAME);
 
         // Load built-in patterns
-        let built_in_path = patterns_dir.join(BUILT_IN_FILE);
+        let built_in_path = self.readable_path(&patterns_dir.join(BUILT_IN_FILE));
         if built_in_path.exists() {
             self.built_in = PersistedSchema::from_file(&built_in_path)?;
         }
 
         // Load learned patterns
-        let learned_path = patterns_dir.join(LEARNED_FILE);
+        let learned_path = self.readable_path(&patterns_dir.join(LEARNED_FILE));
         if learned_path.exists() {
             self.learned = PersistedSchema::from_file(&learned_path)?;
         }
 
         // Load custom patterns
-        let custom_path = patterns_dir.join(CUSTOM_FILE);
+        let custom_path = self.readable_path(&patterns_dir.join(CUSTOM_FILE));
         if custom_path.exists() {
             self.custom = PersistedSchema::from_file(&custom_path)?;
         }
 
         // Load disabled patterns
-        let disabled_path = patterns_dir.join(DISABLED_FILE);
+        let disabled_path = self.readable_path(&patterns_dir.join(DISABLED_FILE));
         if disabled_path.exists() {
             self.disabled = DisabledPatterns::from_file(&disabled_path)?;
         }
 
         // Load statistics
-        let stats_path = self.config_dir.join(STATS_FILE);
+        let stats_path = self.readable_path(Path::new(STATS_FILE));
         if stats_path.exists() {
             self.stats = AllPatternStats::from_file(&stats_path)?;
         }
@@ -1218,6 +1244,53 @@ mod tests {
 
         lib.enable_pattern("test_pattern").expect("enable");
         assert!(!lib.disabled.is_disabled("test_pattern"));
+    }
+
+    /// Before GH #18, macOS kept patterns, disabled.json and pattern_stats.json in
+    /// `~/Library/Application Support/process_triage`. A fleet-transfer import into the
+    /// new config dir must carry them over, not write files holding only the imported
+    /// entries (which would then shadow the legacy ones for every reader).
+    #[test]
+    fn test_library_save_migrates_legacy_dir_contents() {
+        let root = tempdir().expect("tempdir");
+        let legacy = root.path().join("legacy");
+        let config = root.path().join("config");
+        {
+            let mut old = PatternLibrary::new(&legacy);
+            old.add_custom(make_test_signature("legacy_custom"))
+                .expect("add custom");
+            old.add_learned(make_test_signature("legacy_learned"))
+                .expect("add learned");
+            old.disable_pattern("legacy_custom", Some("noisy"))
+                .expect("disable");
+            old.record_match("legacy_learned", true);
+            old.save().expect("save legacy");
+        }
+
+        let mut lib = PatternLibrary::new(&config).with_legacy_dir(Some(legacy.clone()));
+        lib.load().expect("load");
+        assert!(lib.get_pattern("legacy_learned").is_some());
+        assert!(lib.disabled.is_disabled("legacy_custom"));
+        lib.add_custom(make_test_signature("new_custom"))
+            .expect("add new");
+        lib.save().expect("save");
+
+        // A fresh reader of the new dir alone sees legacy and new entries.
+        let mut reread = PatternLibrary::new(&config);
+        reread.load().expect("reload");
+        assert!(reread.get_pattern("legacy_learned").is_some());
+        assert!(reread.get_pattern("new_custom").is_some());
+        assert!(reread.disabled.is_disabled("legacy_custom"));
+        assert_eq!(
+            reread
+                .get_stats("legacy_learned")
+                .map(|stats| stats.accept_count),
+            Some(1)
+        );
+        // The legacy dir is only read.
+        let mut untouched = PatternLibrary::new(&legacy);
+        untouched.load().expect("load legacy");
+        assert!(untouched.get_pattern("new_custom").is_none());
     }
 
     #[test]

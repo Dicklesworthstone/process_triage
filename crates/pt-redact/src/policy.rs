@@ -5,7 +5,7 @@
 
 use crate::{Action, FieldClass};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Schema version for the policy file.
@@ -28,7 +28,7 @@ pub struct RedactionPolicy {
 
     /// Per-field-class rules.
     #[serde(default)]
-    pub field_rules: HashMap<String, FieldRule>,
+    pub field_rules: BTreeMap<String, FieldRule>,
 
     /// Whether secret detection is enabled.
     #[serde(default = "default_true")]
@@ -115,7 +115,7 @@ pub struct FieldRule {
 
     /// Override for specific profiles.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile_overrides: Option<HashMap<String, Action>>,
+    pub profile_overrides: Option<BTreeMap<String, Action>>,
 }
 
 impl FieldRule {
@@ -231,7 +231,7 @@ impl RedactionPolicy {
 
 impl Default for RedactionPolicy {
     fn default() -> Self {
-        let mut field_rules = HashMap::new();
+        let mut field_rules = BTreeMap::new();
 
         // Default rules from spec
         field_rules.insert("cmdline".to_string(), FieldRule::new(Action::NormalizeHash));
@@ -269,6 +269,30 @@ impl Default for RedactionPolicy {
             FieldRule::new(Action::DetectAction),
         );
 
+        // Explicit local-detail allowlist for forensic exports. Structured
+        // export still checks secret values and hard-redacts environment and
+        // credential fields before consulting these profile overrides.
+        // Full URLs retain their credential-removing action.
+        for class in [
+            FieldClass::Cmdline,
+            FieldClass::PathHome,
+            FieldClass::PathTmp,
+            FieldClass::PathProject,
+            FieldClass::Hostname,
+            FieldClass::IpAddress,
+            FieldClass::UrlHost,
+            FieldClass::UrlPath,
+            FieldClass::Username,
+            FieldClass::ContainerId,
+        ] {
+            if let Some(rule) = field_rules.get_mut(&class.to_string()) {
+                rule.profile_overrides = Some(BTreeMap::from([(
+                    ExportProfile::Forensic.to_string(),
+                    Action::Allow,
+                )]));
+            }
+        }
+
         Self {
             schema_version: POLICY_SCHEMA_VERSION.to_string(),
             default_profile: ExportProfile::Safe,
@@ -296,6 +320,44 @@ mod tests {
     }
 
     #[test]
+    fn independent_default_policies_serialize_identically() {
+        let serialized = |policy: &RedactionPolicy| {
+            serde_json::to_vec(&serde_json::to_value(policy).unwrap()).unwrap()
+        };
+        let expected = serialized(&RedactionPolicy::default());
+        for _ in 0..8 {
+            assert_eq!(serialized(&RedactionPolicy::default()), expected);
+        }
+    }
+
+    #[test]
+    fn equivalent_rule_and_profile_order_preserves_serialized_policy() {
+        let left: RedactionPolicy = serde_json::from_str(
+            r#"{"field_rules":{"hostname":{"action":"hash","profile_overrides":{"safe":"redact","forensic":"allow"}},"cmd":{"action":"allow"}}}"#,
+        )
+        .unwrap();
+        let mut right: RedactionPolicy = serde_json::from_str(
+            r#"{"field_rules":{"cmd":{"action":"allow"},"hostname":{"profile_overrides":{"forensic":"allow","safe":"redact"},"action":"hash"}}}"#,
+        )
+        .unwrap();
+        let serialized = |policy: &RedactionPolicy| {
+            serde_json::to_vec(&serde_json::to_value(policy).unwrap()).unwrap()
+        };
+        assert_eq!(serialized(&left), serialized(&right));
+        assert_eq!(
+            left.action_for_profile(FieldClass::Hostname, ExportProfile::Safe),
+            Action::Redact
+        );
+        assert_eq!(
+            right.action_for_profile(FieldClass::Hostname, ExportProfile::Forensic),
+            Action::Allow
+        );
+        right.set_action(FieldClass::Cmd, Action::Redact);
+        assert_ne!(serialized(&left), serialized(&right));
+        assert_eq!(right.action_for(FieldClass::Cmd), Action::Redact);
+    }
+
+    #[test]
     fn test_action_for_field_class() {
         let policy = RedactionPolicy::default();
 
@@ -306,6 +368,270 @@ mod tests {
             Action::NormalizeHash
         );
         assert_eq!(policy.action_for(FieldClass::Hostname), Action::Hash);
+    }
+
+    #[test]
+    fn default_forensic_allowlist_preserves_sharing_actions_and_credential_guards() {
+        let policy = RedactionPolicy::default();
+        for (class, sharing_action) in [
+            (FieldClass::Cmdline, Action::NormalizeHash),
+            (FieldClass::PathHome, Action::NormalizeHash),
+            (FieldClass::PathTmp, Action::Normalize),
+            (FieldClass::PathProject, Action::Hash),
+            (FieldClass::Hostname, Action::Hash),
+            (FieldClass::IpAddress, Action::Hash),
+            (FieldClass::UrlHost, Action::Hash),
+            (FieldClass::UrlPath, Action::Normalize),
+            (FieldClass::Username, Action::Hash),
+            (FieldClass::ContainerId, Action::Truncate),
+        ] {
+            assert_eq!(
+                policy.action_for_profile(class, ExportProfile::Forensic),
+                Action::Allow,
+                "forensic local detail {class}"
+            );
+            for profile in [ExportProfile::Safe, ExportProfile::Minimal] {
+                assert_eq!(
+                    policy.action_for_profile(class, profile),
+                    sharing_action,
+                    "sharing action for {class} in {profile}"
+                );
+            }
+        }
+        for profile in [
+            ExportProfile::Forensic,
+            ExportProfile::Safe,
+            ExportProfile::Minimal,
+        ] {
+            for class in [FieldClass::CmdlineArg, FieldClass::FreeText] {
+                assert_eq!(
+                    policy.action_for_profile(class, profile),
+                    Action::DetectAction
+                );
+            }
+            for class in [FieldClass::EnvValue, FieldClass::UrlCredentials] {
+                assert_eq!(policy.action_for_profile(class, profile), Action::Redact);
+            }
+            assert_eq!(
+                policy.action_for_profile(FieldClass::Url, profile),
+                Action::NormalizeHash
+            );
+        }
+        assert!(policy.detection_enabled);
+    }
+
+    #[test]
+    fn default_forensic_structured_export_preserves_matchers_but_redacts_secrets() {
+        let engine = crate::RedactionEngine::with_key(
+            RedactionPolicy::default(),
+            crate::KeyMaterial::from_bytes([0; 32], "test"),
+        );
+        let input = serde_json::json!({
+            "cmd": "python /home/local-user/work.py",
+            "cwd": "/home/local-user/project",
+            "hostname": "local-worker-host",
+            "username": "local-user",
+            "cmd_pattern": "^worker-(red|blue)$",
+            "patterns": {"process_names": ["^local-worker$"]},
+            "args": ["--verbose", "--token=local-secret", "AKIAIOSFODNN7EXAMPLE"],
+            "environment": {"HOME": "/home/local-user"},
+            "environment_vars": {"PRIVATE_TOKEN": "AKIAIOSFODNN7EXAMPLE"},
+            "env_value": "private-environment-value",
+            "password": "private-password-value"
+        });
+        let forensic = engine.redact_json_for_export(&input, ExportProfile::Forensic);
+        for field in ["cmd", "cwd", "hostname", "username", "cmd_pattern"] {
+            assert_eq!(forensic[field], input[field], "forensic field {field}");
+        }
+        assert_ne!(forensic["patterns"], input["patterns"]);
+        let signatures = serde_json::json!({
+            "schema_version": 2,
+            "signatures": [{
+                "name": "local-worker", "category": "other", "confidence_weight": 0.8,
+                "patterns": {
+                    "process_names": ["^local-worker$"],
+                    "arg_patterns": ["^--verbose$"],
+                    "working_dir_patterns": ["^/home/local-user/project$"],
+                    "parent_patterns": ["^local-parent$"],
+                    "socket_paths": ["/home/local-user/worker.sock"],
+                    "pid_files": ["/home/local-user/worker.pid"],
+                    "environment_vars": {"PRIVATE_TOKEN": "private-environment-value"}
+                },
+                "notes": "private note"
+            }],
+            "metadata": {"description": "private description"}
+        });
+        let exported = engine.redact_json_for_export(&signatures, ExportProfile::Forensic);
+        assert_eq!(
+            exported["signatures"][0]["name"],
+            signatures["signatures"][0]["name"]
+        );
+        for field in [
+            "process_names",
+            "arg_patterns",
+            "working_dir_patterns",
+            "parent_patterns",
+            "socket_paths",
+            "pid_files",
+        ] {
+            assert_eq!(
+                exported["signatures"][0]["patterns"][field],
+                signatures["signatures"][0]["patterns"][field]
+            );
+        }
+        assert_ne!(
+            exported["signatures"][0]["notes"],
+            signatures["signatures"][0]["notes"]
+        );
+        assert_ne!(
+            exported["metadata"]["description"],
+            signatures["metadata"]["description"]
+        );
+        assert!(!exported.to_string().contains("private-environment-value"));
+        let mut restrictive_policy = RedactionPolicy::default();
+        restrictive_policy.set_action(FieldClass::Cmdline, Action::Redact);
+        let restrictive = crate::RedactionEngine::with_key(
+            restrictive_policy,
+            crate::KeyMaterial::from_bytes([0; 32], "test"),
+        )
+        .redact_json_for_export(&signatures, ExportProfile::Forensic);
+        assert_eq!(restrictive["signatures"][0]["name"], "[REDACTED]");
+        assert_eq!(
+            restrictive["signatures"][0]["patterns"]["process_names"][0],
+            "[REDACTED]"
+        );
+        for matcher in [
+            serde_json::json!("opaque-matcher"),
+            serde_json::json!([["opaque-matcher"]]),
+            serde_json::json!(["opaque-matcher", 1]),
+        ] {
+            let mut malformed = signatures.clone();
+            malformed["signatures"][0]["patterns"]["process_names"] = matcher;
+            let exported = engine.redact_json_for_export(&malformed, ExportProfile::Forensic);
+            assert!(!exported.to_string().contains("opaque-matcher"));
+            assert_ne!(
+                exported["signatures"][0]["name"],
+                malformed["signatures"][0]["name"]
+            );
+        }
+        for malformed in [
+            serde_json::json!({"schema_version": "2", "signatures": signatures["signatures"]}),
+            serde_json::json!({"schema_version": 2, "signatures": signatures["signatures"], "extra": 1}),
+            serde_json::json!({"summary": signatures}),
+        ] {
+            let exported = engine.redact_json_for_export(&malformed, ExportProfile::Forensic);
+            assert!(!exported.to_string().contains("^local-worker$"));
+        }
+        let mut malformed = signatures.clone();
+        malformed["signatures"][0]["category"] = serde_json::json!("unknown-category");
+        let exported = engine.redact_json_for_export(&malformed, ExportProfile::Forensic);
+        assert!(!exported.to_string().contains("^local-worker$"));
+        assert_eq!(forensic["args"][0], "--verbose");
+        assert_eq!(forensic["args"][1], "[REDACTED]");
+        assert_eq!(forensic["args"][2], "[REDACTED]");
+        assert_eq!(forensic["environment"], "[REDACTED]");
+        let environment_vars = forensic["environment_vars"].as_object().unwrap();
+        assert_eq!(environment_vars.len(), 1);
+        assert!(!environment_vars.contains_key("PRIVATE_TOKEN"));
+        assert!(environment_vars.values().all(|value| value == "[REDACTED]"));
+        let encoded = forensic.to_string();
+        for secret in [
+            "AKIAIOSFODNN7EXAMPLE",
+            "local-secret",
+            "private-environment-value",
+            "private-password-value",
+        ] {
+            assert!(!encoded.contains(secret), "forensic secret {secret}");
+        }
+        let safe = engine.redact_json_for_export(&input, ExportProfile::Safe);
+        for field in ["cmd", "cwd", "hostname", "username", "cmd_pattern"] {
+            assert_ne!(safe[field], input[field], "safe field {field}");
+        }
+        assert_ne!(
+            safe["patterns"]["process_names"][0],
+            input["patterns"]["process_names"][0]
+        );
+    }
+
+    #[test]
+    fn default_forensic_value_apis_preserve_text_without_bypassing_secret_detection() {
+        let engine = crate::RedactionEngine::with_key(
+            RedactionPolicy::default(),
+            crate::KeyMaterial::from_bytes([0; 32], "test"),
+        );
+        for (value, class) in [
+            ("python /home/local-user/work.py", FieldClass::Cmdline),
+            ("--verbose", FieldClass::CmdlineArg),
+        ] {
+            assert_eq!(
+                engine
+                    .redact_with_profile(value, class, ExportProfile::Forensic)
+                    .output,
+                value
+            );
+        }
+        for (value, class) in [
+            ("private note", FieldClass::FreeText),
+            ("opaque-credential", FieldClass::CmdlineArg),
+        ] {
+            assert_ne!(
+                engine
+                    .redact_with_profile(value, class, ExportProfile::Forensic)
+                    .output,
+                value
+            );
+        }
+        let forensic_policy = RedactionPolicy {
+            default_profile: ExportProfile::Forensic,
+            ..RedactionPolicy::default()
+        };
+        let default_forensic = crate::RedactionEngine::with_key(
+            forensic_policy,
+            crate::KeyMaterial::from_bytes([0; 32], "test"),
+        );
+        for class in [
+            FieldClass::Cmdline,
+            FieldClass::CmdlineArg,
+            FieldClass::FreeText,
+        ] {
+            for secret in [
+                "AKIAIOSFODNN7EXAMPLE",
+                "--token=local-secret",
+                "--TOKEN=local-secret",
+                "--PASSWORD=local-secret",
+                "--API-KEY=local-secret",
+                "--SECRET=local-secret",
+            ] {
+                let explicit = engine.redact_with_profile(secret, class, ExportProfile::Forensic);
+                assert!(!explicit.output.contains(secret), "explicit {class} secret");
+                let implicit = default_forensic.redact(secret, class);
+                assert!(!implicit.output.contains(secret), "default {class} secret");
+            }
+        }
+        let disabled = crate::RedactionEngine::with_key(
+            RedactionPolicy {
+                detection_enabled: false,
+                ..RedactionPolicy::default()
+            },
+            crate::KeyMaterial::from_bytes([0; 32], "test"),
+        );
+        for secret in [
+            "AKIAIOSFODNN7EXAMPLE",
+            "--TOKEN=local-secret",
+            "--PASSWORD=local-secret",
+            "--API-KEY=local-secret",
+            "--SECRET=local-secret",
+        ] {
+            assert!(!disabled
+                .redact_with_profile(secret, FieldClass::Cmdline, ExportProfile::Forensic)
+                .output
+                .contains(secret));
+            let input = serde_json::json!({"command": format!("worker {secret}")});
+            assert!(!disabled
+                .redact_json_for_export(&input, ExportProfile::Forensic)
+                .to_string()
+                .contains(secret));
+        }
     }
 
     #[test]
@@ -337,7 +663,7 @@ mod tests {
         let mut policy = RedactionPolicy::default();
 
         // Create a rule with profile override
-        let mut overrides = HashMap::new();
+        let mut overrides = BTreeMap::new();
         overrides.insert("forensic".to_string(), Action::Allow);
 
         policy.field_rules.insert(

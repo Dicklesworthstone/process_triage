@@ -338,8 +338,12 @@ mod ancestry_tests {
         // PID 4000000000 should not exist
         let result = analyzer.analyze(4000000000);
 
-        // Should return ProcessNotFound
+        // Linux reads /proc and reports the absence; elsewhere ancestry evidence is
+        // unsupported (541e4a9), whatever the PID.
+        #[cfg(target_os = "linux")]
         assert!(matches!(result, Err(AncestryError::ProcessNotFound(_))));
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(result, Err(AncestryError::Unsupported(_))));
     }
 
     // =========================================================================

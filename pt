@@ -7,7 +7,7 @@
 #
 set -euo pipefail
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.3.0"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -16,13 +16,36 @@ readonly VERSION="2.1.0"
 readonly PT_CORE_BIN="pt-core"
 readonly INSTALL_BASE_URL="https://raw.githubusercontent.com/Dicklesworthstone/process_triage"
 readonly INSTALL_URL="${INSTALL_BASE_URL}/main/install.sh"
-# Populated in release artifacts to pin expected installer signing key.
-readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=""
+readonly RELEASE_API_URL="https://api.github.com/repos/Dicklesworthstone/process_triage/releases/latest"
+# Release-signing keys `pt update` accepts (SHA-256 of each key's DER
+# SubjectPublicKeyInfo; space separated). Handed to the release's installer as
+# PT_RELEASE_PUBLIC_KEY_FINGERPRINT, so an update is refused if the release is
+# signed by any other key, whatever that installer embeds (an explicit
+# PT_RELEASE_PUBLIC_KEY_FINGERPRINT or PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE in
+# the environment wins). Must match
+# TRUSTED_RELEASE_KEY_FINGERPRINTS in install.sh; see there for key rotation.
+readonly TRUSTED_RELEASE_KEY_FINGERPRINTS="b5084da80f9652304307fa7c3f965ee7840d3815fd863c2b40f4524e00e2e4ee"
+
+# Directory of this script with symlinks followed, so a from-source install
+# (`ln -s "$(pwd)/pt" ~/.local/bin/pt`) finds the repo's target/release/pt-core
+# instead of a stale ~/.local/bin/pt-core. Portable: BSD readlink has no -f.
+script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    local dir
+    while [[ -L "$src" ]]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" == /* ]] || src="${dir}/${src}"
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(script_dir)"
+readonly SCRIPT_DIR
 
 # Locations to search for pt-core
 readonly SEARCH_PATHS=(
-    "$(dirname "$0")/pt-core"
-    "$(dirname "$0")/target/release/pt-core"
+    "${SCRIPT_DIR}/pt-core"
+    "${SCRIPT_DIR}/target/release/pt-core"
     "$HOME/.local/bin/pt-core"
     "/usr/local/bin/pt-core"
     "/usr/bin/pt-core"
@@ -33,12 +56,14 @@ readonly SEARCH_PATHS=(
 # ══════════════════════════════════════════════════════════════════════════════
 
 find_pt_core() {
-    # Check explicit override
+    # Check explicit override (an unusable one is an error, not a silent fallback)
     if [[ -n "${PT_CORE_PATH:-}" ]]; then
-        if [[ -x "$PT_CORE_PATH" ]]; then
+        if [[ -f "$PT_CORE_PATH" && -x "$PT_CORE_PATH" ]]; then
             echo "$PT_CORE_PATH"
             return 0
         fi
+        echo "Error: PT_CORE_PATH=${PT_CORE_PATH} is not an executable file." >&2
+        return 2
     fi
 
     # Check search paths
@@ -58,70 +83,43 @@ find_pt_core() {
     return 1
 }
 
-fetch_latest_release_version() {
-    local version_url="${INSTALL_BASE_URL}/main/VERSION"
-    local version=""
+fetch_latest_release_tag() {
+    if ! command -v jq &>/dev/null; then
+        printf "Error: jq is required to read published release metadata for 'pt update'.\n" >&2
+        return 1
+    fi
 
+    local metadata tag
     if command -v curl &>/dev/null; then
-        version="$(curl -fsSL "$version_url" 2>/dev/null | tr -d '[:space:]')" || return 1
+        if ! metadata="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$RELEASE_API_URL")"; then
+            printf 'Error: could not fetch published release metadata from %s (network or HTTP error). Nothing was changed.\n' "$RELEASE_API_URL" >&2
+            return 1
+        fi
     elif command -v wget &>/dev/null; then
-        version="$(wget -qO- "$version_url" 2>/dev/null | tr -d '[:space:]')" || return 1
+        if ! metadata="$(wget -qO- --header='Accept: application/vnd.github+json' "$RELEASE_API_URL")"; then
+            printf 'Error: could not fetch published release metadata from %s (network or HTTP error). Nothing was changed.\n' "$RELEASE_API_URL" >&2
+            return 1
+        fi
     else
+        printf 'Error: neither curl nor wget is available to fetch published release metadata.\n' >&2
         return 1
     fi
 
-    # Accept semver-like release tags only (e.g., 2.0.3, 2.0.3-rc1, 2.0.3+build).
-    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*(\+[0-9A-Za-z.-]+)?$ ]]; then
+    # Only GitHub's published full release is an update target. Never fall back
+    # to main/VERSION, which can name a release that has not been published.
+    if ! tag="$(printf '%s' "$metadata" | jq -er '
+        if type == "object" and .draft == false and .prerelease == false
+            and (.published_at | type == "string" and length > 0)
+            and (.tag_name | type == "string")
+        then .tag_name else error("not a published full release") end')"; then
+        printf 'Error: invalid published release metadata from %s. Nothing was changed.\n' "$RELEASE_API_URL" >&2
         return 1
     fi
-
-    printf '%s\n' "$version"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# UI mode selection
-# ══════════════════════════════════════════════════════════════════════════════
-
-detect_auto_ui_mode() {
-    if [[ ! -t 0 || ! -t 1 ]]; then
-        printf 'shell\n'
-        return 0
+    if [[ ! "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*(\+[0-9A-Za-z.-]+)?$ ]]; then
+        printf 'Error: invalid published release tag. Nothing was changed.\n' >&2
+        return 1
     fi
-
-    if [[ "${CI:-}" == "true" || "${CI:-}" == "1" ]]; then
-        printf 'shell\n'
-        return 0
-    fi
-
-    if [[ "${TERM:-}" == "dumb" ]]; then
-        printf 'shell\n'
-        return 0
-    fi
-
-    printf 'tui\n'
-}
-
-resolve_ui_mode() {
-    local cli_mode="${1:-}"
-    local env_mode="${PT_UI_MODE:-auto}"
-
-    if [[ "$cli_mode" == "shell" || "$cli_mode" == "tui" ]]; then
-        printf '%s\n' "$cli_mode"
-        return 0
-    fi
-
-    case "$env_mode" in
-        shell|tui)
-            printf '%s\n' "$env_mode"
-            return 0
-            ;;
-        auto|"")
-            ;;
-        *)
-            ;;
-    esac
-
-    detect_auto_ui_mode
+    printf '%s\n' "$tag"
 }
 
 resolve_config_dir() {
@@ -143,23 +141,16 @@ resolve_config_dir() {
     printf '%s\n' "${HOME}/.config/process_triage"
 }
 
-ensure_decisions_file() {
-    local config_dir="$1"
-    local decisions_file="${config_dir}/decisions.json"
-
-    mkdir -p "$config_dir"
-
-    if [[ ! -e "$decisions_file" || ! -s "$decisions_file" ]]; then
-        printf '{}\n' > "$decisions_file"
-    fi
-
-    printf '%s\n' "$decisions_file"
-}
-
 show_history() {
     local config_dir decisions_file
     config_dir="$(resolve_config_dir)"
-    decisions_file="$(ensure_decisions_file "$config_dir")"
+    decisions_file="${config_dir}/decisions.json"
+
+    # Read-only: a missing or empty store is no history, not something to create.
+    if [[ ! -s "$decisions_file" ]]; then
+        printf 'No decision history.\n'
+        return 0
+    fi
 
     if ! command -v jq &>/dev/null; then
         echo "Error: jq is required for 'pt history'." >&2
@@ -203,7 +194,11 @@ clear_history() {
     local scope="${1:-}"
     local config_dir decisions_file
     config_dir="$(resolve_config_dir)"
-    decisions_file="$(ensure_decisions_file "$config_dir")"
+    decisions_file="${config_dir}/decisions.json"
+    if [[ ! -s "$decisions_file" ]]; then
+        printf 'Decision history already empty.\n'
+        return 0
+    fi
 
     if ! command -v jq &>/dev/null; then
         echo "Error: jq is required for 'pt clear'." >&2
@@ -215,8 +210,14 @@ clear_history() {
         exit 1
     fi
 
+    # Keys are "level|pattern|args"; TEXT matches the pattern and args, never the level
+    # prefix (`pt clear act` must not match every exact| key). Each verdict is stored
+    # at three levels; count patterns the way `pt history` lists them.
+    # shellcheck disable=SC2016  # $s is a jq variable
+    local match='(.key | ltrimstr("exact|") | ltrimstr("standard|") | ltrimstr("broad|") | contains($s))'
+    local listed='((.key | startswith("exact|") or startswith("broad|")) | not)'
     local total
-    total="$(jq --arg s "$scope" '[keys[] | select(contains($s))] | length' "$decisions_file")"
+    total="$(jq --arg s "$scope" "[to_entries[] | select($match) | select($listed)] | length" "$decisions_file")"
     if [[ "$total" == "0" ]]; then
         if [[ -n "$scope" ]]; then
             printf 'No decisions match "%s".\n' "$scope"
@@ -251,7 +252,7 @@ clear_history() {
         return 0
     fi
     local tmp="${decisions_file}.tmp.$$"
-    jq --arg s "$scope" 'with_entries(select(.key | contains($s) | not))' "$decisions_file" > "$tmp"
+    jq --arg s "$scope" "with_entries(select($match | not))" "$decisions_file" > "$tmp"
     mv "$tmp" "$decisions_file"
     printf 'Cleared %s decision%s matching "%s".\n' "$total" "$plural" "$scope"
 }
@@ -262,13 +263,11 @@ Process Triage wrapper for pt-core
 
 Usage: pt [WRAPPER-OPTIONS] [COMMAND]
 
-Wrapper options:
-      --shell     Force shell/non-TUI mode
-      --tui       Force TUI mode when interactive
+Wrapper options (before the command):
   -h, --help      Show this wrapper-aware help
-  -V, --version   Show wrapper version
+  -V, --version   Show wrapper and pt-core versions
 
-Wrapper commands:
+Wrapper commands (work even when pt-core is missing):
   help            Show wrapper-aware top-level help
   update          Run the verified installer update flow (fails closed on unsigned releases;
                   --no-verify to override); \`pt update rollback|list-backups|...\` go to pt-core
@@ -292,7 +291,7 @@ Core commands:
   shadow          Shadow mode observation management
   signature       Signature management
   schema          Generate JSON schemas
-  update          Update management
+  daemon          Background monitor (start/stop/status)
   mcp             MCP server
   completions     Generate shell completion scripts
   version         Print version information
@@ -307,127 +306,194 @@ EOF
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-main() {
-    local cli_mode=""
-    local -a forwarded_args=()
-    local arg
+fetch_to_file() {
+    local url="$1" out="$2"
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$url" > "$out"
+    elif command -v wget &>/dev/null; then
+        wget -qO- "$url" > "$out"
+    else
+        echo "Error: neither curl nor wget is available to download the installer." >&2
+        return 127
+    fi
+}
 
-    for arg in "$@"; do
-        case "$arg" in
-            --shell)
-                if [[ "$cli_mode" == "tui" ]]; then
-                    echo "Error: --shell and --tui cannot be used together." >&2
-                    exit 2
-                fi
-                cli_mode="shell"
+# Bare `pt update [--verify|--no-verify]`: run the published release's installer.
+run_update() {
+    local verify_arg="--verify"
+    if [[ $# -gt 1 ]]; then
+        echo "Error: unexpected arguments to 'pt update': $*" >&2
+        exit 2
+    fi
+    if [[ "${1:-}" == "--no-verify" ]]; then
+        verify_arg="--no-verify"
+        echo "Warning: --no-verify: installing WITHOUT signature/checksum verification." >&2
+    elif [[ -n "${1:-}" && "$1" != "--verify" ]]; then
+        echo "Error: unknown update option '$1' (use --verify or --no-verify, or a pt-core update subcommand such as rollback)." >&2
+        exit 2
+    fi
+    local target_tag target_version
+    target_tag="$(fetch_latest_release_tag)" || exit 1
+    target_version="${target_tag#v}"
+    local target_install_url="${INSTALL_BASE_URL}/${target_tag}/install.sh"
+
+    echo "Updating Process Triage to v${target_version}..."
+    # Verification is requested with the --verify ARGUMENT: installers up to and
+    # including v2.1.0 reset VERIFY=0 at startup, so the env var alone was ignored
+    # and every `pt update` installed unverified. The env var is kept for newer ones.
+    local verify_env=1
+    [[ "$verify_arg" == "--no-verify" ]] && verify_env=0
+    local -a installer_env=("VERIFY=${verify_env}")
+    # The user's own pin (either variable) is inherited as is; the installer
+    # prefers PT_RELEASE_PUBLIC_KEY_FINGERPRINT, so setting it here would
+    # silently discard a PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE.
+    if [[ -z "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" && -z "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE:-}" ]]; then
+        installer_env+=("PT_RELEASE_PUBLIC_KEY_FINGERPRINT=${TRUSTED_RELEASE_KEY_FINGERPRINTS}")
+    fi
+
+    # Download first, so a network failure or an unpublished tag is reported as
+    # such instead of as a verification failure.
+    local installer
+    installer="$(mktemp "${TMPDIR:-/tmp}/pt-install.XXXXXX")" || {
+        echo "Error: could not create a temporary file for the installer." >&2
+        exit 1
+    }
+    if ! fetch_to_file "$target_install_url" "$installer"; then
+        echo "Error: could not download the v${target_version} installer from ${target_install_url}" >&2
+        echo "(network problem, or that release is not published yet). Nothing was changed." >&2
+        exit 1
+    fi
+    # Fed through a pipe, exactly as `curl ... | bash -s` would run it (the installer
+    # behaves differently when its stdin is a pipe).
+    local status=0
+    # shellcheck disable=SC2002
+    cat "$installer" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "Update failed: the v${target_version} installer exited with status ${status}; its message is above." >&2
+        if [[ "$verify_arg" == "--verify" ]]; then
+            echo "If it refused an unsigned release or an unknown signing key, 'pt update --no-verify' installs it unverified." >&2
+        fi
+    fi
+    exit $status
+}
+
+# Recognize the wrapper version after known leading global options without
+# stealing an option's value or interpreting arguments after a subcommand.
+wrapper_version_requested() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version|-V)
+                return 0
                 ;;
-            --tui)
-                if [[ "$cli_mode" == "shell" ]]; then
-                    echo "Error: --shell and --tui cannot be used together." >&2
-                    exit 2
-                fi
-                cli_mode="tui"
+            --capabilities|--config|--format|-f|--timeout|--fields|--max-tokens)
+                [[ $# -ge 2 ]] || return 1
+                shift 2
+                ;;
+            --capabilities=*|--config=*|--format=*|--timeout=*|--fields=*|--max-tokens=*)
+                shift
+                ;;
+            --verbose|--quiet|--no-color|--robot|--shadow|--dry-run|--standalone|--compact|--estimate-tokens)
+                shift
+                ;;
+            -?*)
+                local short_options="${1#-}"
+                while [[ -n "$short_options" ]]; do
+                    case "${short_options:0:1}" in
+                        V)
+                            return 0
+                            ;;
+                        v|q)
+                            short_options="${short_options:1}"
+                            ;;
+                        f)
+                            # The remainder belongs to -f, even if it looks like
+                            # another flag. Without a remainder, consume its value.
+                            if [[ ${#short_options} -eq 1 ]]; then
+                                [[ $# -ge 2 ]] || return 1
+                                shift
+                            fi
+                            short_options=""
+                            ;;
+                        *)
+                            return 1
+                            ;;
+                    esac
+                done
+                shift
                 ;;
             *)
-                forwarded_args+=("$arg")
+                return 1
                 ;;
         esac
     done
+    return 1
+}
 
-    local selected_ui_mode
-    selected_ui_mode="$(resolve_ui_mode "$cli_mode")"
-    export PT_UI_MODE="$selected_ui_mode"
+main() {
+    local -a forwarded_args=()
+    if [[ $# -gt 0 ]]; then
+        forwarded_args=("$@")
+    fi
 
-    local pt_core
-    pt_core=$(find_pt_core) || {
-        echo "Error: 'pt-core' binary not found." >&2
+    # Wrapper commands that must work without pt-core (`pt update` is the repair path).
+    case "${forwarded_args[0]:-}" in
+        --help|-h)
+            show_wrapper_help
+            exit 0
+            ;;
+        help)
+            if [[ ${#forwarded_args[@]} -eq 1 ]]; then
+                show_wrapper_help
+                exit 0
+            fi
+            ;;
+        history)
+            show_history
+            exit 0
+            ;;
+        clear)
+            clear_history "${forwarded_args[1]:-}"
+            exit 0
+            ;;
+        update)
+            if [[ -z "${forwarded_args[1]:-}" || "${forwarded_args[1]}" == -* ]]; then
+                run_update "${forwarded_args[@]:1}"
+            fi
+            ;;
+    esac
+
+    local pt_core find_status=0
+    pt_core=$(find_pt_core) || find_status=$?
+
+    if wrapper_version_requested ${forwarded_args[@]+"${forwarded_args[@]}"}; then
+        # Report both halves: the wrapper and the engine can be updated independently
+        # (the fleet had wrapper/core skew that `pt --version` used to hide).
+        printf 'pt version %s\n' "$VERSION"
+        if [[ $find_status -eq 0 ]]; then
+            local core_version
+            core_version="$("$pt_core" --version 2>/dev/null | head -n 1)"
+            printf '%s (%s)\n' "${core_version:-pt-core unknown}" "$pt_core"
+        else
+            printf 'pt-core not found\n'
+        fi
+        exit 0
+    fi
+
+    if [[ $find_status -ne 0 ]]; then
+        if [[ $find_status -eq 1 ]]; then
+            echo "Error: 'pt-core' binary not found." >&2
+        fi
         echo "Please install it via:" >&2
         echo "  curl -fsSL $INSTALL_URL | bash" >&2
         echo "  # or" >&2
         echo "  wget -qO- $INSTALL_URL | bash" >&2
         exit 1
-    }
+    fi
 
     # `pt update <subcommand>` (rollback, list-backups, show-backup, verify-backup,
     # prune-backups, ...) is pt-core's backup management: pass it through.
-    if [[ "${forwarded_args[0]:-}" == "update" && -n "${forwarded_args[1]:-}" \
-        && "${forwarded_args[1]}" != -* ]]; then
-        exec "$pt_core" "${forwarded_args[@]}"
-    fi
-
-    # Bare `pt update [--no-verify]`: run the target release's signed installer.
     if [[ "${forwarded_args[0]:-}" == "update" ]]; then
-        local verify_arg="--verify"
-        if [[ "${forwarded_args[1]:-}" == "--no-verify" ]]; then
-            verify_arg="--no-verify"
-            echo "Warning: --no-verify: installing WITHOUT signature/checksum verification." >&2
-        elif [[ -n "${forwarded_args[1]:-}" ]]; then
-            echo "Error: unknown update option '${forwarded_args[1]}' (use --no-verify, or a pt-core update subcommand such as rollback)." >&2
-            exit 2
-        fi
-        local target_version
-        if target_version="$(fetch_latest_release_version)"; then
-            :
-        else
-            target_version="$VERSION"
-            echo "Warning: could not resolve latest VERSION; falling back to v${VERSION} installer." >&2
-        fi
-        local target_install_url="${INSTALL_BASE_URL}/v${target_version}/install.sh"
-
-        echo "Updating Process Triage to v${target_version}..."
-        # Verification is requested with the --verify ARGUMENT: installers up to and
-        # including v2.1.0 reset VERIFY=0 at startup, so the env var alone was ignored
-        # and every `pt update` installed unverified. The env var is kept for newer ones.
-        local verify_env=1
-        [[ "$verify_arg" == "--no-verify" ]] && verify_env=0
-        local -a installer_env=("VERIFY=${verify_env}")
-        if [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
-            installer_env+=("PT_RELEASE_PUBLIC_KEY_FINGERPRINT=${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}")
-        fi
-        local status=0
-        if command -v curl &>/dev/null; then
-            curl -fsSL "$target_install_url" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
-        elif command -v wget &>/dev/null; then
-            wget -qO- "$target_install_url" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
-        else
-            echo "Error: neither curl nor wget is available to run installer." >&2
-            exit 1
-        fi
-        if [[ $status -ne 0 && "$verify_arg" == "--verify" ]]; then
-            echo "Update aborted: the release could not be verified (unsigned release or key mismatch)." >&2
-            echo "Nothing was installed. To install it anyway, unverified: pt update --no-verify" >&2
-        fi
-        exit $status
-    fi
-
-    if [[ "${forwarded_args[0]:-}" == "--version" || "${forwarded_args[0]:-}" == "-V" ]]; then
-        # Report both halves: the wrapper and the engine can be updated independently
-        # (the fleet had wrapper/core skew that `pt --version` used to hide).
-        local core_version
-        core_version="$("$pt_core" --version 2>/dev/null | head -n 1)"
-        printf 'pt version %s\n' "$VERSION"
-        printf '%s (%s)\n' "${core_version:-pt-core unknown}" "$pt_core"
-        exit 0
-    fi
-
-    if [[ "${forwarded_args[0]:-}" == "--help" || "${forwarded_args[0]:-}" == "-h" ]]; then
-        show_wrapper_help
-        exit 0
-    fi
-
-    if [[ "${forwarded_args[0]:-}" == "help" && ${#forwarded_args[@]} -eq 1 ]]; then
-        show_wrapper_help
-        exit 0
-    fi
-
-    if [[ "${forwarded_args[0]:-}" == "history" ]]; then
-        show_history
-        exit 0
-    fi
-
-    if [[ "${forwarded_args[0]:-}" == "clear" ]]; then
-        clear_history "${forwarded_args[1]:-}"
-        exit 0
+        exec "$pt_core" "${forwarded_args[@]}"
     fi
 
     # Preserve the documented `pt deep` surface even though pt-core exposes

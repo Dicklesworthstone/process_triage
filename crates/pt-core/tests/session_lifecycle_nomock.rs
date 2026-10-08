@@ -18,7 +18,7 @@ use pt_core::session::resume::{
 };
 use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionState, SessionStore};
 use pt_core::test_utils::ProcessHarness;
-use pt_core::verify::{verify_plan, AgentPlan, BlastRadius, PlanCandidate, VerifyOutcome};
+use pt_core::verify::{capture_execution_clock, verify_plan, SavedActionOutcome, VerifyOutcome};
 use std::env;
 use std::fs;
 use std::sync::{Mutex, OnceLock};
@@ -218,61 +218,97 @@ fn test_verify_plan_with_real_process_nomock() {
     let proc = harness.spawn_sleep(10).expect("spawn sleep process");
     let pid = proc.pid();
 
-    let record = match wait_for_record(pid) {
-        Some(r) => r,
-        None => return,
-    };
+    let record = wait_for_record(pid).expect("live verification target must be observable");
     let records = vec![record.clone()];
-
-    let plan = AgentPlan {
-        session_id: "pt-test".to_string(),
+    let identity = ProcessIdentity {
+        pid: record.pid,
+        start_id: record.start_id.clone(),
+        uid: record.uid,
+        pgid: record.pgid,
+        sid: record.sid,
+        quality: IdentityQuality::Full,
+    };
+    let bundle = DecisionBundle {
+        session_id: SessionId::new(),
+        policy: Policy::default(),
         generated_at: Some(Utc::now().to_rfc3339()),
-        candidates: vec![PlanCandidate {
-            pid,
-            uid: record.uid,
-            cmd_short: record.comm.clone(),
-            cmd_full: record.cmd.clone(),
-            start_id: Some(record.start_id.0.clone()),
-            recommended_action: "kill".to_string(),
-            blast_radius: Some(BlastRadius {
-                memory_mb: 0.0,
-                cpu_pct: 0.0,
-            }),
+        candidates: vec![DecisionCandidate {
+            identity,
+            ppid: Some(record.ppid.0),
+            decision: make_decision(),
+            blocked_reasons: vec![],
+            stage_pause_before_kill: false,
+            process_state: Some(record.state),
+            parent_identity: None,
+            d_state_diagnostics: None,
         }],
     };
-
-    let report_running = verify_plan(&plan, &records, Utc::now(), Utc::now());
+    let plan = generate_plan(&bundle);
+    assert_eq!(plan.actions.len(), 1);
+    // Deliberately claim success while the real target remains alive. This is
+    // a verification fault-injection record, not evidence that apply executed.
+    let execution = SavedActionOutcome {
+        action_id: plan.actions[0].action_id.clone(),
+        pid,
+        status: "success".to_string(),
+        action: Some(plan.actions[0].action),
+        target: Some(plan.actions[0].target.clone()),
+        command: Some(record.cmd.clone()),
+        parent_pid: Some(record.ppid.0),
+        parent_identity: None,
+        executed_at: Some(Utc::now()),
+        execution_clock: capture_execution_clock(),
+        time_ms: None,
+    };
+    let report_running = verify_plan(
+        &plan,
+        std::slice::from_ref(&execution),
+        &records,
+        Utc::now(),
+        Utc::now(),
+    )
+    .expect("verify bound execution evidence");
     assert_eq!(report_running.action_outcomes.len(), 1);
     assert!(matches!(
         report_running.action_outcomes[0].outcome,
         VerifyOutcome::StillRunning
     ));
 
-    let wrong_start_time = (record.start_time_unix.max(0) as u64).saturating_add(1);
-    let legacy_start_id = format!("{}:{}", pid, wrong_start_time);
-    let plan_mismatch = AgentPlan {
-        session_id: "pt-test".to_string(),
-        generated_at: Some(Utc::now().to_rfc3339()),
-        candidates: vec![PlanCandidate {
-            pid,
-            uid: record.uid,
-            cmd_short: record.comm.clone(),
-            cmd_full: record.cmd.clone(),
-            start_id: Some(legacy_start_id),
-            recommended_action: "kill".to_string(),
-            blast_radius: Some(BlastRadius {
-                memory_mb: 0.0,
-                cpu_pct: 0.0,
-            }),
-        }],
-    };
-
-    let report_mismatch = verify_plan(&plan_mismatch, &records, Utc::now(), Utc::now());
-    assert_eq!(report_mismatch.action_outcomes.len(), 1);
-    assert!(matches!(
-        report_mismatch.action_outcomes[0].outcome,
-        VerifyOutcome::PidReused
+    let mut reused_record = record.clone();
+    let mut parts = record.start_id.0.rsplitn(3, ':');
+    let identity_pid = parts.next().expect("identity PID");
+    let ticks = parts
+        .next()
+        .expect("identity ticks")
+        .parse::<u64>()
+        .unwrap();
+    let boot = parts.next().expect("identity boot");
+    // A matching incarnation born after execution can legitimately be a
+    // respawn, and a same-tick birth is ambiguous. Use a distinct birth before
+    // the original target so this fault injection tests identity reuse only.
+    reused_record.start_id = StartId(format!(
+        "{boot}:{}:{identity_pid}",
+        ticks
+            .checked_sub(1)
+            .expect("target birth has a previous tick")
     ));
+    let report_mismatch = verify_plan(
+        &plan,
+        std::slice::from_ref(&execution),
+        &[reused_record],
+        Utc::now(),
+        Utc::now(),
+    )
+    .expect("verify changed process identity");
+    assert_eq!(report_mismatch.action_outcomes.len(), 1);
+    assert!(
+        matches!(
+            report_mismatch.action_outcomes[0].outcome,
+            VerifyOutcome::PidReused
+        ),
+        "{}",
+        serde_json::to_string(&report_mismatch).unwrap()
+    );
 
     proc.trigger_exit();
     proc.wait_for_exit(Duration::from_secs(2));
@@ -288,15 +324,13 @@ fn test_verify_plan_with_real_process_nomock() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    if !gone {
-        return;
-    }
-
-    let report_dead = verify_plan(&plan, &records_after, Utc::now(), Utc::now());
+    assert!(gone, "owned verification target must exit and disappear");
+    let report_dead = verify_plan(&plan, &[execution], &records_after, Utc::now(), Utc::now())
+        .expect("verify observed target disappearance");
     assert_eq!(report_dead.action_outcomes.len(), 1);
     assert!(matches!(
         report_dead.action_outcomes[0].outcome,
-        VerifyOutcome::ConfirmedDead | VerifyOutcome::PidReused | VerifyOutcome::Respawned
+        VerifyOutcome::ConfirmedDead
     ));
 }
 

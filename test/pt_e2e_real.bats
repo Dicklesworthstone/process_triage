@@ -40,7 +40,11 @@ setup() {
 
 teardown() {
     teardown_test_env
-    test_end "real e2e" "pass"
+    if [[ -n "${BATS_TEST_COMPLETED:-}" ]]; then
+        test_end "real e2e" "pass"
+    else
+        test_end "real e2e" "fail"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -184,4 +188,118 @@ run_cmd_with_artifacts() {
     if [[ "$status" -ne 0 && "$status" -ne 124 ]]; then
         fail "pt scan failed with status $status"
     fi
+}
+
+@test "mux-pane plan visibility and protected services (real, paired binaries)" {
+    # Explicit live-host acceptance: ordinary CI lacks both the mux layout and
+    # the independently built incumbent. A skip supplies no acceptance evidence.
+    [[ -n "${PT_PANE_BASELINE_BIN:-}" && -n "${PT_PANE_SUBJECT_PID:-}" && -n "${PT_PANE_CONTROL_PIDS:-}" ]] ||
+        skip "requires incumbent binary, live pane subject and protected controls"
+    [[ -x "$PT_PANE_BASELINE_BIN" ]]
+    command_exists python3
+    export PROCESS_TRIAGE_RETENTION=off
+    run python3 - "$ARTIFACT_SNAPSHOTS_DIR/pane_subjects.json" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+pids = [int(os.environ['PT_PANE_SUBJECT_PID'])]
+pids += [int(pid) for pid in os.environ['PT_PANE_CONTROL_PIDS'].split(',')]
+rows = {}
+uptime = float(Path('/proc/uptime').read_text().split()[0])
+ticks = os.sysconf('SC_CLK_TCK')
+for pid in pids:
+    proc = Path('/proc') / str(pid)
+    stat = (proc / 'stat').read_text()
+    fields = stat[stat.rfind(')') + 1:].split()
+    rows[str(pid)] = {
+        'birth_ticks': int(fields[19]), 'ppid': int(fields[1]),
+        'sid': int(fields[3]), 'tty': int(fields[4]),
+        'uids': next(line for line in (proc / 'status').read_text().splitlines()
+                     if line.startswith('Uid:')),
+        'exe': str((proc / 'exe').readlink()),
+        'argv': (proc / 'cmdline').read_bytes().decode().split('\0'),
+        'comm': (proc / 'comm').read_text().strip(),
+        'cgroup': (proc / 'cgroup').read_text().strip(),
+        'elapsed_seconds': uptime - int(fields[19]) / ticks,
+    }
+assert rows[str(pids[0])]['elapsed_seconds'] >= 3600, 'pane subject must exceed the age floor'
+Path(sys.argv[1]).write_text(json.dumps(rows))
+PY
+    printf '%s\n' "$output" > "$ARTIFACT_LOG_DIR/pane_witness_capture.txt"
+    [[ "$status" -eq 0 ]] || test_error "$output"
+    [[ "$status" -eq 0 ]]
+    local name binary command
+    for name in baseline fixed; do
+        binary="$PT_CORE_PATH"
+        [[ "$name" != baseline ]] || binary="$PT_PANE_BASELINE_BIN"
+        printf -v command 'PROCESS_TRIAGE_DATA=%q %q agent plan --format json --min-posterior 0 --max-candidates 1000' \
+            "$DATA_DIR/$name" "$binary"
+        run_cmd_with_artifacts "pane_$name" "$command"
+        [[ "$status" -eq 0 || "$status" -eq 1 ]]
+    done
+
+    run python3 - "$ARTIFACT_STDOUT_DIR/pane_baseline.stdout" "$ARTIFACT_STDOUT_DIR/pane_fixed.stdout" \
+        "$ARTIFACT_SNAPSHOTS_DIR/pane_subjects.json" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+baseline, fixed, recorded = [json.loads(Path(path).read_text()) for path in sys.argv[1:]]
+run_id = os.environ.get('E2E_RUN_ID', 'pane-manual')
+subject = int(os.environ['PT_PANE_SUBJECT_PID'])
+controls = {int(pid) for pid in os.environ['PT_PANE_CONTROL_PIDS'].split(',')}
+old = {int(row['pid']): row for row in baseline['candidates']}
+new = {int(row['pid']): row for row in fixed['candidates']}
+assert subject not in old, 'incumbent unexpectedly evaluates the pane subject'
+assert subject in new, 'fixed plan still hides the pane subject'
+assert not controls.intersection(new), 'fixed plan exposes protected service controls'
+protected = fixed['summary']['protected_by_pid']
+assert all(str(pid) in protected for pid in controls), 'control absence must be caused by protection'
+assert fixed['summary']['protected_by_rule']['builtin.agent_coordination'] > 0
+assert new[subject]['supervisor'].get('type') != 'systemd'
+assert new[subject]['supervisor'].get('supervisor_command') is None
+assert fixed['args']['effective_min_age'] == baseline['args']['effective_min_age'] == 3600
+
+# Bind the externally chosen live subjects to their raw placement. Nothing here
+# recreates the classifier or supplies synthetic process rows to the executable.
+for pid in [subject, *sorted(controls)]:
+    proc = Path('/proc') / str(pid)
+    stat = (proc / 'stat').read_text()
+    fields = stat[stat.rfind(')') + 1:].split()
+    current = {
+        'birth_ticks': int(fields[19]), 'ppid': int(fields[1]),
+        'sid': int(fields[3]), 'tty': int(fields[4]),
+        'uids': next(line for line in (proc / 'status').read_text().splitlines()
+                     if line.startswith('Uid:')),
+        'exe': str((proc / 'exe').readlink()),
+        'argv': (proc / 'cmdline').read_bytes().decode().split('\0'),
+        'comm': (proc / 'comm').read_text().strip(),
+        'cgroup': (proc / 'cgroup').read_text().strip(),
+    }
+    expected = {key: value for key, value in recorded[str(pid)].items()
+                if key != 'elapsed_seconds'}
+    assert current == expected, f'live identity or placement changed for {pid}'
+    print(json.dumps({'run_id': run_id, 'pid': pid, **recorded[str(pid)]}))
+control_names = {recorded[str(pid)]['comm'] for pid in controls}
+assert {'frankenterm-mux', 'rchd', 'dbus-daemon', 'am'}.issubset(control_names)
+for pid in controls:
+    if recorded[str(pid)]['comm'] == 'am':
+        assert protected[str(pid)] == 'builtin.agent_coordination', 'live am needs builtin protection'
+print(json.dumps({'run_id': run_id, 'baseline_summary': baseline['summary'], 'fixed_summary': fixed['summary'],
+                  'new_candidate_pids': sorted(new.keys() - old.keys()),
+                  'removed_candidate_pids': sorted(old.keys() - new.keys()),
+                  'protected_controls': len(controls), 'control_false_positives': 0,
+                  'new_kill_recommendations': sum(row['recommended_action'] == 'kill'
+                      for pid, row in new.items() if pid not in old)}))
+print(json.dumps({'run_id': run_id, 'event': 'pane_acceptance', 'status': 'PASS',
+                  'message': 'native read-only pane visibility and protected controls'}))
+PY
+    printf '%s\n' "$output" > "$ARTIFACT_LOG_DIR/pane_comparison_output.txt"
+    [[ "$status" -eq 0 ]] || test_error "$output"
+    [[ "$status" -eq 0 ]]
+    printf '%s\n' "$output" > "$ARTIFACT_LOG_DIR/pane_comparison.jsonl"
+    test_info "$output"
 }

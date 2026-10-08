@@ -127,6 +127,9 @@ pub enum DetectionError {
 
     #[error("Process {0} not found")]
     ProcessNotFound(u32),
+
+    #[error("Process {0} changed while reading supervision evidence")]
+    ProcessChanged(u32),
 }
 
 /// Combined supervision detection result.
@@ -188,8 +191,10 @@ pub fn is_human_supervised(result: &CombinedResult) -> bool {
 
 /// Combined supervision detector using all available methods.
 pub struct SupervisionDetector {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ancestry: AncestryAnalyzer,
     environ: EnvironAnalyzer,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ipc: IpcAnalyzer,
 }
 
@@ -203,7 +208,7 @@ impl SupervisionDetector {
         }
     }
 
-    /// Pre-populate the process tree cache for efficient batch analysis.
+    /// Pre-populate observed identities; detection refreshes required evidence.
     #[cfg(target_os = "linux")]
     pub fn populate_cache(&mut self) -> Result<(), AncestryError> {
         self.ancestry.populate_cache()
@@ -215,7 +220,14 @@ impl SupervisionDetector {
     }
 
     /// Detect supervision using all available methods.
+    #[cfg(target_os = "linux")]
     pub fn detect(&mut self, pid: u32) -> Result<CombinedResult, DetectionError> {
+        let before = ancestry::read_stat(pid).map_err(|error| match error {
+            AncestryError::ProcessNotFound(missing) if missing == pid => {
+                DetectionError::ProcessNotFound(pid)
+            }
+            other => DetectionError::Ancestry(other),
+        })?;
         let mut result = CombinedResult::not_supervised();
         let mut best_confidence = 0.0f64;
         let mut best_name: Option<String> = None;
@@ -234,54 +246,42 @@ impl SupervisionDetector {
                 }
                 result.ancestry = Some(ancestry_result);
             }
-            Err(AncestryError::ProcessNotFound(_)) => {
+            Err(AncestryError::ProcessNotFound(missing)) if missing == pid => {
                 return Err(DetectionError::ProcessNotFound(pid));
             }
-            Err(_) => {
-                // Other errors are non-fatal, continue with other methods
-            }
+            Err(error) => return Err(error.into()),
         }
 
         // Try environment analysis
-        match self.environ.analyze(pid) {
-            Ok(environ_result) => {
-                if environ_result.is_supervised {
-                    result.evidence.extend(environ_result.evidence.clone());
-                    if environ_result.confidence > best_confidence {
-                        best_confidence = environ_result.confidence;
-                        best_name = environ_result.supervisor_name.clone();
-                        best_type = environ_result.category;
-                    }
-                }
-                result.environ = Some(environ_result);
-            }
-            Err(EnvironError::ProcessNotFound(_)) => {
-                // Already checked in ancestry, skip
-            }
-            Err(_) => {
-                // Non-fatal, continue
+        let environ_result = self.environ.analyze(pid)?;
+        if environ_result.is_supervised {
+            result.evidence.extend(environ_result.evidence.clone());
+            if environ_result.confidence > best_confidence {
+                best_confidence = environ_result.confidence;
+                best_name = environ_result.supervisor_name.clone();
+                best_type = environ_result.category;
             }
         }
+        result.environ = Some(environ_result);
 
         // Try IPC analysis
-        match self.ipc.analyze(pid) {
-            Ok(ipc_result) => {
-                if ipc_result.is_supervised {
-                    result.evidence.extend(ipc_result.evidence.clone());
-                    if ipc_result.confidence > best_confidence {
-                        best_confidence = ipc_result.confidence;
-                        best_name = ipc_result.supervisor_name.clone();
-                        best_type = ipc_result.category;
-                    }
-                }
-                result.ipc = Some(ipc_result);
+        let ipc_result = self.ipc.analyze(pid)?;
+        if ipc_result.is_supervised {
+            result.evidence.extend(ipc_result.evidence.clone());
+            if ipc_result.confidence > best_confidence {
+                best_confidence = ipc_result.confidence;
+                best_name = ipc_result.supervisor_name.clone();
+                best_type = ipc_result.category;
             }
-            Err(IpcError::ProcessNotFound(_) | IpcError::PermissionDenied(_)) => {
-                // Expected for many processes, non-fatal
-            }
-            Err(_) => {
-                // Non-fatal, continue
-            }
+        }
+        result.ipc = Some(ipc_result);
+
+        let after = ancestry::read_stat(pid)?;
+        if after.starttime != before.starttime
+            || after.ppid != before.ppid
+            || after.comm != before.comm
+        {
+            return Err(DetectionError::ProcessChanged(pid));
         }
 
         // Combine results
@@ -290,6 +290,27 @@ impl SupervisionDetector {
         result.supervisor_name = best_name;
         result.supervisor_type = best_type;
 
+        Ok(result)
+    }
+
+    /// Detect supervision where ancestry and IPC evidence (/proc) do not exist.
+    ///
+    /// As in v2.2.1, detection rests on the environment there and an unreadable
+    /// environment leaves `environ` as `None` for callers to judge. Treating the
+    /// missing Linux-only probes as an error refused every action on macOS.
+    #[cfg(not(target_os = "linux"))]
+    pub fn detect(&mut self, pid: u32) -> Result<CombinedResult, DetectionError> {
+        let mut result = CombinedResult::not_supervised();
+        if let Ok(environ_result) = self.environ.analyze(pid) {
+            if environ_result.is_supervised {
+                result.evidence.extend(environ_result.evidence.clone());
+                result.is_supervised = environ_result.confidence > 0.0;
+                result.confidence = environ_result.confidence;
+                result.supervisor_name = environ_result.supervisor_name.clone();
+                result.supervisor_type = environ_result.category;
+            }
+            result.environ = Some(environ_result);
+        }
         Ok(result)
     }
 }
@@ -360,10 +381,25 @@ mod tests {
         assert!(result.is_ok());
 
         let result = result.unwrap();
+        assert!(result.ancestry.is_some());
+        assert!(result.environ.is_some());
+        assert!(result.ipc.is_some());
         // May or may not be supervised depending on environment
         // Just check the structure is valid
         assert!(result.confidence >= 0.0);
         assert!(result.confidence <= 1.0);
+    }
+
+    /// Without /proc ancestry or IPC evidence, detection still answers from the
+    /// environment instead of failing (which refused every macOS action).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_detect_supervision_current_process_macos() {
+        let result = detect_supervision(std::process::id()).expect("detection on macOS");
+        assert!(result.ancestry.is_none());
+        assert!(result.ipc.is_none());
+        assert!(result.environ.is_some());
+        assert!(result.confidence >= 0.0 && result.confidence <= 1.0);
     }
 
     #[cfg(target_os = "linux")]

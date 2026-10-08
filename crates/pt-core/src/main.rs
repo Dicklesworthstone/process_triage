@@ -10,20 +10,15 @@
 use clap::parser::ValueSource;
 use clap::FromArgMatches;
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use pt_common::{CandidateProvenanceOutput, OutputFormat, SessionId, SCHEMA_VERSION};
-// Provenance inference reads /proc lineage (Linux only).
-#[cfg(target_os = "linux")]
 use pt_common::{
-    normalize_lineage, OwnershipState, ProvenanceConfidence, ProvenanceFeatureInput,
-    ProvenanceRedactionState, RawLineageEvidence,
+    CandidateProvenanceOutput, IdentityQuality, OutputFormat, ProcessIdentity, SessionId,
+    SCHEMA_VERSION,
 };
-#[cfg(feature = "ui")]
-use pt_common::{IdentityQuality, ProcessIdentity};
 use pt_core::calibrate::{validation::ValidationEngine, CalibrationError};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::collect::protected::ProtectedFilter;
 #[cfg(target_os = "linux")]
-use pt_core::collect::{systemd::collect_systemd_unit, ContainerRuntime};
+use pt_core::collect::ContainerRuntime;
 use pt_core::config::{
     get_preset, list_presets, load_config, ConfigError, ConfigOptions, PresetName, Priors,
 };
@@ -51,7 +46,6 @@ use pt_core::output::predictions::{
     Predictions, TrajectoryAssessment, TrajectoryLabel,
 };
 use pt_core::output::{encode_toon_value, CompactConfig, FieldSelector, TokenEfficientOutput};
-#[cfg(feature = "ui")]
 use pt_core::plan::{generate_plan, DecisionBundle, DecisionCandidate};
 use pt_core::session::compare::generate_comparison_report;
 use pt_core::session::diff::{
@@ -79,7 +73,9 @@ use pt_core::supervision::{
 use pt_core::tui::widgets::ProcessRow;
 #[cfg(feature = "ui")]
 use pt_core::tui::{run_ftui, App, ExecutionOutcome};
-use pt_core::verify::{parse_agent_plan, verify_plan, VerifyError};
+use pt_core::verify::{
+    executed_plan_actions, parse_action_outcomes, parse_agent_plan, verify_plan, VerifyOutcome,
+};
 use pt_telemetry::retention::{RetentionConfig, RetentionEnforcer, RetentionError};
 use pt_telemetry::shadow::{Observation, ShadowStorage, ShadowStorageConfig};
 use pt_telemetry::writer::default_telemetry_dir;
@@ -331,6 +327,10 @@ enum Commands {
 
     /// Validate configuration and environment
     Check(CheckArgs),
+
+    /// Read-only host hygiene audit: VM tuning, swap/zram, oomd limits, journald,
+    /// file-handle/inotify limits, zombie parents (suggests commands, never runs them)
+    Doctor(DoctorArgs),
 
     /// Interactive tutorials and onboarding guidance
     Learn(LearnArgs),
@@ -607,6 +607,10 @@ struct ReportArgs {
     /// Include detailed math ledger
     #[arg(long)]
     include_ledger: bool,
+
+    /// Generate self-contained HTML with built-in styles and readable tables
+    #[arg(long)]
+    embed_assets: bool,
 }
 
 #[derive(Args, Debug)]
@@ -629,16 +633,23 @@ struct CheckArgs {
 }
 
 #[derive(Args, Debug)]
+struct DoctorArgs {
+    /// Print the suggested commands as a commented shell script (never executed)
+    #[arg(long)]
+    fix_script: bool,
+}
+
+#[derive(Args, Debug)]
 struct LearnArgs {
     #[command(subcommand)]
     command: Option<LearnCommands>,
 
     /// Per-check verification budget in milliseconds
-    #[arg(long, default_value_t = 750)]
+    #[arg(long, default_value_t = 45_000)]
     verify_budget_ms: u64,
 
     /// Total verification budget in milliseconds
-    #[arg(long, default_value_t = 5000)]
+    #[arg(long, default_value_t = 420_000)]
     total_budget_ms: u64,
 }
 
@@ -907,8 +918,8 @@ struct AgentFleetTransferExportArgs {
     #[arg(long, default_value = "true")]
     include_priors: bool,
 
-    /// Redaction profile (minimal|safe|forensic)
-    #[arg(long)]
+    /// Configuration-transfer profile (.ptb requires forensic; sharing profiles are refused)
+    #[arg(long, value_parser = ["minimal", "safe", "forensic"])]
     export_profile: Option<String>,
 
     /// Passphrase for .ptb encryption
@@ -923,8 +934,8 @@ struct AgentFleetTransferImportArgs {
     from: String,
 
     /// Merge strategy: weighted, replace, keep-local
-    #[arg(long)]
-    merge_strategy: Option<String>,
+    #[arg(long, default_value = "weighted")]
+    merge_strategy: pt_core::fleet::transfer::MergeStrategy,
 
     /// Show what would change without modifying
     #[arg(long)]
@@ -938,7 +949,7 @@ struct AgentFleetTransferImportArgs {
     #[arg(long)]
     passphrase: Option<String>,
 
-    /// Normalize incoming priors using baseline stats
+    /// Request normalization (refused until comparable measured learning baselines exist)
     #[arg(long)]
     normalize_baseline: bool,
 }
@@ -1036,6 +1047,11 @@ struct AgentPlanArgs {
     /// Maximum candidates to return
     #[arg(long, default_value = "20")]
     max_candidates: u32,
+
+    /// Restrict inference to selected PIDs (comma-separated); ancestry and safety
+    /// checks still use the full scan.
+    #[arg(long, value_delimiter = ',')]
+    pids: Vec<u32>,
 
     /// Minimum posterior probability threshold for candidate selection
     #[arg(
@@ -1170,11 +1186,11 @@ struct AgentApplyArgs {
     session: String,
 
     /// PIDs to act on (default: all recommended)
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', conflicts_with_all = ["targets", "recommended"])]
     pids: Vec<u32>,
 
     /// Specific targets with identity (pid:start_id)
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', conflicts_with = "recommended")]
     targets: Vec<String>,
 
     /// Skip safety gate confirmations
@@ -1190,15 +1206,15 @@ struct AgentApplyArgs {
     min_age: Option<u64>,
 
     /// Minimum posterior probability required (e.g. 0.99)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_probability)]
     min_posterior: Option<f64>,
 
     /// Max blast radius per action (MB)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_nonnegative_finite)]
     max_blast_radius: Option<f64>,
 
     /// Max total blast radius for the run (MB)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_nonnegative_finite)]
     max_total_blast_radius: Option<f64>,
 
     /// Max kills per run
@@ -1224,6 +1240,24 @@ struct AgentApplyArgs {
     /// Resume interrupted apply (skip already completed actions)
     #[arg(long)]
     resume: bool,
+}
+
+fn parse_nonnegative_finite(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|error| format!("invalid number: {error}"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err("must be finite and nonnegative".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_probability(value: &str) -> Result<f64, String> {
+    let parsed = parse_nonnegative_finite(value)?;
+    if parsed > 1.0 {
+        return Err("probability must be between 0 and 1".to_string());
+    }
+    Ok(parsed)
 }
 
 fn config_options(global: &GlobalOpts) -> ConfigOptions {
@@ -1829,8 +1863,22 @@ fn restore_default_sigpipe() {}
 fn main() {
     restore_default_sigpipe();
 
-    let matches = Cli::command().get_matches();
-    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let matches = Cli::command().try_get_matches().unwrap_or_else(|error| {
+        let code = if matches!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+        ) {
+            ExitCode::Clean
+        } else {
+            ExitCode::ArgsError
+        };
+        let _ = error.print();
+        std::process::exit(code.as_i32());
+    });
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| {
+        let _ = error.print();
+        std::process::exit(ExitCode::ArgsError.as_i32());
+    });
     let format_source = matches.value_source("format");
     cli.global.format = resolve_output_format(cli.global.format, format_source);
 
@@ -1894,6 +1942,7 @@ fn main() {
         Some(Commands::Bundle(args)) => run_bundle(&cli.global, &args),
         Some(Commands::Report(args)) => run_report(&cli.global, &args),
         Some(Commands::Check(args)) => run_check(&cli.global, &args),
+        Some(Commands::Doctor(args)) => run_doctor_cmd(&cli.global, &args),
         Some(Commands::Learn(args)) => run_learn(&cli.global, &args),
         Some(Commands::Agent(args)) => run_agent(&cli.global, &args),
         Some(Commands::Config(args)) => run_config(&cli.global, &args),
@@ -1901,11 +1950,13 @@ fn main() {
         Some(Commands::Daemon(args)) => run_daemon(&cli.global, &args),
         Some(Commands::Telemetry(args)) => run_telemetry(&cli.global, &args),
         Some(Commands::Shadow(args)) => run_shadow(&cli.global, &args),
-        Some(Commands::Signature(args)) => {
-            pt_core::signature_cli::run_signature(&cli.global.format, &args)
-        }
+        Some(Commands::Signature(args)) => pt_core::signature_cli::run_signature(
+            &cli.global.format,
+            &resolved_config_dir(&cli.global),
+            &args,
+        ),
         Some(Commands::Schema(args)) => run_schema(&cli.global, &args),
-        Some(Commands::Mcp(args)) => run_mcp(&args),
+        Some(Commands::Mcp(args)) => run_mcp(&cli.global, &args),
         Some(Commands::Update(args)) => run_update(&cli.global, &args),
         Some(Commands::Completions(args)) => {
             clap_complete::generate(
@@ -1957,12 +2008,36 @@ fn parse_output_format(value: &str) -> Option<OutputFormat> {
 
 #[cfg(test)]
 mod cli_definition_tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     /// clap's own consistency check over every subcommand.
     #[test]
     fn cli_definition_is_consistent() {
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn fleet_import_refuses_unknown_merge_strategy_during_parsing() {
+        let prefix = [
+            "pt-core",
+            "agent",
+            "fleet",
+            "transfer",
+            "import",
+            "--from",
+            "bundle.json",
+        ];
+        for strategy in ["weighted", "replace", "keep-local"] {
+            let args = prefix.into_iter().chain(["--merge-strategy", strategy]);
+            assert!(super::Cli::try_parse_from(args).is_ok());
+        }
+        let error = match super::Cli::try_parse_from(
+            prefix.into_iter().chain(["--merge-strategy", "replcae"]),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a typo must not silently select a different merge strategy"),
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     /// A subcommand arg with the id of a global arg but a different value type makes
@@ -2110,7 +2185,9 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         .write_context(&ctx)
         .map_err(|e| format!("failed to write context.json: {}", e))?;
 
-    let _ = handle.update_state(SessionState::Scanning);
+    handle
+        .update_state(SessionState::Scanning)
+        .map_err(|error| format!("persist interactive scanning state: {error}"))?;
 
     let config_options = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
@@ -2130,15 +2207,36 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         }
     };
 
+    // The same scorer as `agent plan`; each scan scores with the verdicts recorded so far.
+    let (signatures, signature_warnings) =
+        pt_core::scoring::load_signature_database(&config.config_dir);
+    for warning in signature_warnings {
+        eprintln!("pt: warning: {warning}");
+    }
+    let base_scorer = Scorer::new(
+        priors.clone(),
+        Default::default(),
+        signatures,
+        pt_core::scoring::fast_path_config(&policy),
+    );
+    let scorer_with = |decisions: Option<&pt_core::decision::decision_store::DecisionStore>| {
+        let mut scorer = base_scorer.clone();
+        scorer.decisions = decisions.cloned().unwrap_or_default();
+        scorer
+    };
+
     let TuiBuildOutput {
         rows,
         plan_candidates,
         goal_summary,
         goal_order,
-    } = build_tui_data_from_live_scan(global, args, &priors, &policy, decisions.as_ref())?;
+    } = build_tui_data_from_live_scan(global, args, scorer_with(decisions.as_ref()), &policy)?;
     let decisions = Arc::new(Mutex::new(decisions));
 
-    let _ = handle.update_state(SessionState::Planned);
+    handle
+        .update_state(SessionState::Planned)
+        .map_err(|error| format!("persist interactive planned state: {error}"))?;
+    let execution_state = Arc::new(Mutex::new(TuiExecutionState::default()));
 
     let mut app = App::new();
 
@@ -2192,7 +2290,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
 
         // Build refresh closure
         let plan_cache_r = Arc::clone(&plan_candidates);
-        let priors_r = priors.clone();
+        let scorer_r = base_scorer.clone();
         let policy_r = policy.clone();
         let timeout_r = global.timeout;
         let deep_r = args.deep;
@@ -2214,28 +2312,20 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                 let protected_filter = ProtectedFilter::from_guardrails(&policy_scan_r.guardrails)
                     .map_err(|e| format!("filter error: {}", e))?;
                 let filter_result = protected_filter.filter_scan_result(&scan_result);
-                let probe_advice =
-                    compute_probe_advice(&filter_result.passed, &priors_r, &policy_r);
-                let deep_signals = if deep_r {
-                    collect_deep_signals(&filter_result.passed)
-                } else {
-                    let targeted = deep_scan_target_pids(&filter_result.passed, &probe_advice);
-                    collect_deep_signals_for_pids(&targeted)
-                };
-                let decisions = decisions_r
+                let mut scorer = scorer_r.clone();
+                scorer.decisions = decisions_r
                     .lock()
-                    .map_err(|_| "decision store lock poisoned".to_string())?;
-                let output = build_tui_rows(
+                    .map_err(|_| "decision store lock poisoned".to_string())?
+                    .clone()
+                    .unwrap_or_default();
+                let output = score_tui_rows(
                     &filter_result.passed,
                     min_age_r,
-                    deep_signals.as_ref(),
-                    Some(&probe_advice),
-                    &priors_r,
+                    deep_r,
+                    scorer,
                     &policy_r,
                     goal_r.as_deref(),
-                    decisions.as_ref(),
                 );
-                drop(decisions);
                 let mut guard = plan_cache_r
                     .lock()
                     .map_err(|_| "plan cache lock poisoned".to_string())?;
@@ -2251,69 +2341,71 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let dry_run = global.dry_run;
         let shadow = global.shadow;
         let decisions_e = Arc::clone(&decisions);
+        let execution_state_e = Arc::clone(&execution_state);
 
         let execute_fn: Arc<dyn Fn(Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync> =
             Arc::new(move |selected: Vec<u32>| {
-                let candidates = plan_cache_e
+                let mut state = execution_state_e
                     .lock()
-                    .map_err(|_| "plan cache lock poisoned".to_string())?;
-                let plan =
-                    build_plan_from_selection(&session_id_e, &policy_e, &selected, &candidates)?;
-                let commands: HashMap<u32, (String, String)> = selected
-                    .iter()
-                    .filter_map(|pid| {
-                        let c = candidates.get(pid)?;
-                        Some((*pid, (c.comm.clone(), c.cmd.clone())))
-                    })
-                    .collect();
-                drop(candidates); // release lock before I/O
-
-                if plan.actions.is_empty() {
-                    return Err("no actions to apply for selected processes".to_string());
-                }
-
-                write_plan_to_session(&handle_e, &plan)?;
-
-                if dry_run || shadow {
-                    let mode = if dry_run { "dry_run" } else { "shadow" };
-                    write_outcomes_for_mode(&handle_e, &plan, mode)
-                        .map_err(|e| format!("write outcomes: {}", e))?;
-                    return Ok(ExecutionOutcome {
-                        mode: Some(mode.to_string()),
-                        attempted: plan.actions.len(),
-                        succeeded: 0,
-                        failed: 0,
-                    });
-                }
-
-                let _ = handle_e.update_state(SessionState::Executing);
-                match execute_plan_actions(&handle_e, &policy_e, &plan) {
-                    Ok(result) => {
-                        write_outcomes_from_execution(&handle_e, &plan, &result)
-                            .map_err(|e| format!("write outcomes: {}", e))?;
-                        if let Ok(mut guard) = decisions_e.lock() {
-                            if let Some(store) = guard.as_mut() {
-                                record_confirmed_kills(store, &plan, &result, &commands);
-                            }
-                        }
-                        let final_state = if result.summary.actions_failed > 0 {
-                            SessionState::Failed
-                        } else {
-                            SessionState::Completed
-                        };
-                        let _ = handle_e.update_state(final_state);
-                        Ok(ExecutionOutcome {
-                            mode: None,
-                            attempted: result.summary.actions_attempted,
-                            succeeded: result.summary.actions_succeeded,
-                            failed: result.summary.actions_failed,
+                    .map_err(|_| "interactive execution state lock poisoned".to_string())?;
+                let outcome = (|| {
+                    let candidates = plan_cache_e
+                        .lock()
+                        .map_err(|_| "plan cache lock poisoned".to_string())?;
+                    let plan = build_plan_from_selection(
+                        &session_id_e,
+                        &policy_e,
+                        &selected,
+                        &candidates,
+                    )?;
+                    let commands: HashMap<u32, (String, String)> = selected
+                        .iter()
+                        .filter_map(|pid| {
+                            let c = candidates.get(pid)?;
+                            Some((*pid, (c.comm.clone(), c.cmd.clone())))
                         })
+                        .collect();
+                    drop(candidates); // release lock before I/O
+
+                    if plan.actions.is_empty() {
+                        return Err("no actions to apply for selected processes".to_string());
                     }
-                    Err(e) => {
-                        let _ = handle_e.update_state(SessionState::Failed);
-                        Err(e)
+
+                    if dry_run || shadow {
+                        write_plan_to_session(&handle_e, &plan)?;
+                        let mode = if dry_run { "dry_run" } else { "shadow" };
+                        write_outcomes_for_mode(&handle_e, &plan, mode)
+                            .map_err(|e| format!("write outcomes: {}", e))?;
+                        return Ok(ExecutionOutcome {
+                            mode: Some(mode.to_string()),
+                            attempted: plan.actions.len(),
+                            succeeded: 0,
+                            failed: 0,
+                        });
                     }
-                }
+
+                    let (result, _) =
+                        execute_tui_plan_selection(&handle_e, &policy_e, &plan, &mut state)?;
+                    if let Ok(mut guard) = decisions_e.lock() {
+                        if let Some(store) = guard.as_mut() {
+                            record_confirmed_kills(store, &plan, &result, &commands);
+                        }
+                    }
+                    if let Some(error) = result.outcomes.iter().find_map(|outcome| {
+                        (outcome.status == pt_core::action::ActionStatus::Success)
+                            .then_some(outcome.details.as_ref())
+                            .flatten()
+                    }) {
+                        return Err(error.clone());
+                    }
+                    Ok(ExecutionOutcome {
+                        mode: None,
+                        attempted: result.summary.actions_attempted,
+                        succeeded: result.summary.actions_succeeded,
+                        failed: result.summary.actions_failed,
+                    })
+                })();
+                outcome.map_err(|error| record_tui_execution_failure(&handle_e, &mut state, error))
             });
 
         app.set_refresh_op(refresh_fn);
@@ -2327,14 +2419,10 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         run_ftui(app, program_config).map_err(|e| format!("tui error: {}", e))?;
     }
 
-    if let Ok(manifest) = handle.read_manifest() {
-        if manifest.state != SessionState::Failed {
-            let _ = handle.update_state(SessionState::Completed);
-        }
-    } else {
-        let _ = handle.update_state(SessionState::Completed);
-    }
-    Ok(())
+    let state = execution_state
+        .lock()
+        .map_err(|_| "interactive execution state lock poisoned".to_string())?;
+    finish_tui_session(&handle, &state)
 }
 
 #[cfg(feature = "ui")]
@@ -2413,9 +2501,8 @@ struct TuiBuildOutput {
 fn build_tui_data_from_live_scan(
     global: &GlobalOpts,
     args: &RunArgs,
-    priors: &Priors,
+    scorer: Scorer,
     policy: &pt_core::config::Policy,
-    decisions: Option<&pt_core::decision::decision_store::DecisionStore>,
 ) -> Result<TuiBuildOutput, String> {
     let scan_options = QuickScanOptions {
         pids: vec![],
@@ -2428,24 +2515,50 @@ fn build_tui_data_from_live_scan(
     let protected_filter = ProtectedFilter::from_guardrails(&policy.guardrails)
         .map_err(|e| format!("protected filter error: {}", e))?;
     let filter_result = protected_filter.filter_scan_result(&scan_result);
-    let probe_advice = compute_probe_advice(&filter_result.passed, priors, policy);
-    let deep_signals = if args.deep {
-        collect_deep_signals(&filter_result.passed)
-    } else {
-        let targeted = deep_scan_target_pids(&filter_result.passed, &probe_advice);
-        collect_deep_signals_for_pids(&targeted)
-    };
-
-    Ok(build_tui_rows(
+    Ok(score_tui_rows(
         &filter_result.passed,
         args.min_age,
-        deep_signals.as_ref(),
-        Some(&probe_advice),
-        priors,
+        args.deep,
+        scorer,
         policy,
         args.goal.as_deref(),
-        decisions,
     ))
+}
+
+/// Score a filtered scan for the TUI: provenance for the processes old enough to be
+/// candidates (as `agent plan` collects it), VOI probe advice, deep signals (all
+/// processes with `--deep`, else where the advice asks for them), then rows.
+#[cfg(feature = "ui")]
+fn score_tui_rows(
+    processes: &[ProcessRecord],
+    min_age: Option<u64>,
+    deep: bool,
+    mut scorer: Scorer,
+    policy: &pt_core::config::Policy,
+    goal_str: Option<&str>,
+) -> TuiBuildOutput {
+    let min_age = min_age.unwrap_or(policy.guardrails.min_process_age_seconds);
+    let eligible: Vec<&ProcessRecord> = processes
+        .iter()
+        .filter(|proc| proc.elapsed.as_secs() >= min_age)
+        .collect();
+    scorer.collect_provenance(&eligible);
+    let probe_advice = compute_probe_advice(processes, &scorer, policy);
+    let deep_signals = if deep {
+        collect_deep_signals(processes)
+    } else {
+        let targeted = deep_scan_target_pids(processes, &probe_advice);
+        collect_deep_signals_for_pids(&targeted)
+    };
+    build_tui_rows(
+        processes,
+        Some(min_age),
+        deep_signals.as_ref(),
+        Some(&probe_advice),
+        &scorer,
+        policy,
+        goal_str,
+    )
 }
 
 #[cfg(feature = "ui")]
@@ -2482,20 +2595,453 @@ fn build_plan_from_selection(
         candidates: plan_candidates,
         generated_at: Some(chrono::Utc::now().to_rfc3339()),
     };
-    Ok(generate_plan(&bundle))
+    let plan = generate_plan(&bundle);
+    let planned_kills = plan
+        .actions
+        .iter()
+        .filter(|action| action.action == Action::Kill && !action.blocked)
+        .count();
+    if planned_kills > policy.guardrails.max_kills_per_run as usize {
+        return Err(format!(
+            "selected {planned_kills} kills exceed the per-run policy limit {}; select fewer processes",
+            policy.guardrails.max_kills_per_run,
+        ));
+    }
+    Ok(plan)
 }
 
 #[cfg(feature = "ui")]
 fn write_plan_to_session(handle: &SessionHandle, plan: &Plan) -> Result<PathBuf, String> {
+    if plan.session_id != handle.id.0 {
+        return Err("interactive selection does not belong to this session".to_string());
+    }
     let decision_dir = handle.dir.join("decision");
     if let Err(e) = std::fs::create_dir_all(&decision_dir) {
         return Err(format!("create decision dir: {}", e));
     }
     let plan_path = decision_dir.join("plan.json");
+    let mut canonical = match std::fs::read_to_string(&plan_path) {
+        Ok(content) => parse_agent_plan(&content)
+            .map_err(|error| format!("read previous interactive plan: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => plan.clone(),
+        Err(error) => return Err(format!("read previous interactive plan: {error}")),
+    };
+    if canonical.session_id != plan.session_id
+        || canonical.policy_id != plan.policy_id
+        || canonical.policy_version != plan.policy_version
+    {
+        return Err("interactive selections do not share the saved session and policy".to_string());
+    }
+    for action in &plan.actions {
+        if let Some(previous) = canonical
+            .actions
+            .iter()
+            .find(|previous| previous.action_id == action.action_id)
+        {
+            if previous.target != action.target
+                || previous.action != action.action
+                || previous.blocked != action.blocked
+                || previous.routing != action.routing
+            {
+                return Err(format!(
+                    "interactive action {} conflicts with its saved binding",
+                    action.action_id
+                ));
+            }
+        } else {
+            let mut appended = action.clone();
+            appended.order = u32::try_from(canonical.actions.len())
+                .map_err(|error| format!("too many interactive actions: {error}"))?;
+            canonical.actions.push(appended);
+        }
+    }
+    for action_id in &plan.pre_toggled {
+        if !canonical.pre_toggled.contains(action_id) {
+            canonical.pre_toggled.push(action_id.clone());
+        }
+    }
+    let identities: HashSet<_> = canonical
+        .actions
+        .iter()
+        .map(|action| {
+            (
+                &action.target.start_id,
+                action.target.pid,
+                action.target.uid,
+            )
+        })
+        .collect();
+    let blocked: HashSet<_> = canonical
+        .actions
+        .iter()
+        .filter(|action| action.blocked)
+        .map(|action| {
+            (
+                &action.target.start_id,
+                action.target.pid,
+                action.target.uid,
+            )
+        })
+        .collect();
+    canonical.gates_summary.total_candidates = identities.len();
+    canonical.gates_summary.blocked_candidates = blocked.len();
+    canonical.gates_summary.pre_toggled_actions = canonical.pre_toggled.len();
     let content =
-        serde_json::to_string_pretty(plan).map_err(|e| format!("serialize plan: {}", e))?;
+        serde_json::to_string_pretty(&canonical).map_err(|e| format!("serialize plan: {}", e))?;
     std::fs::write(&plan_path, content).map_err(|e| format!("write plan: {}", e))?;
     Ok(plan_path)
+}
+
+/// Serialize budget checks, real execution and persistent accounting across
+/// every local execution entry point, including runs which skip the UI lock.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn acquire_execution_policy(
+    policy: &pt_core::config::Policy,
+    recorded_policy: Option<&pt_core::config::Policy>,
+    handle: &SessionHandle,
+) -> Result<(GlobalLock, pt_core::decision::PolicyEnforcer), String> {
+    let data_dir = handle
+        .dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("cannot resolve session execution data directory")?;
+    let lock = GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock"))
+        .map_err(|error| format!("cannot lock execution policy: {error}"))?
+        .ok_or("another command is executing actions")?;
+    let enforcer = pt_core::decision::PolicyEnforcer::new_with_recorded_policy(
+        policy,
+        recorded_policy,
+        Some(&data_dir.join("rate_limit.json")),
+    )
+    .map_err(|error| format!("cannot load execution policy: {error}"))?;
+    Ok((lock, enforcer))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_execution_policy(
+    enforcer: &pt_core::decision::PolicyEnforcer,
+    action: &pt_core::plan::PlanAction,
+    robot: bool,
+) -> Result<(pt_core::decision::PolicyCheckResult, ProcessRecord), String> {
+    let scan = quick_scan(&QuickScanOptions {
+        pids: vec![action.target.pid.0],
+        include_kernel_threads: false,
+        timeout: None,
+        progress: None,
+    })
+    .map_err(|error| format!("cannot collect current policy evidence: {error}"))?;
+    let proc = scan
+        .processes
+        .iter()
+        .find(|proc| proc.pid == action.target.pid)
+        .ok_or("target is absent from current policy evidence")?;
+    let mut candidate = process_policy_candidate(enforcer, proc)?;
+    candidate.category = action.rationale.category.clone();
+    candidate.posterior =
+        action.rationale.posterior.as_ref().map(|scores| {
+            pt_core::decision::robot_constraints::gate_posterior(scores, action.action)
+        });
+    candidate.has_known_signature = action.rationale.has_known_signature.unwrap_or(false);
+    Ok((
+        enforcer.check_action(&candidate, action.action, robot),
+        proc.clone(),
+    ))
+}
+
+/// Target facts shared by live execution and routed-parent planning. Decision
+/// evidence belongs to the remedy's source and is supplied separately.
+fn process_policy_candidate(
+    enforcer: &pt_core::decision::PolicyEnforcer,
+    proc: &ProcessRecord,
+) -> Result<pt_core::decision::ProcessCandidate, String> {
+    let group = if !enforcer.requires_group_evidence() {
+        None
+    } else {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "group=", "-p", &proc.pid.0.to_string()])
+            .output()
+            .map_err(|error| format!("cannot collect protected-group evidence: {error}"))?;
+        if !output.status.success() {
+            return Err("cannot collect protected-group evidence".to_string());
+        }
+        let group = std::str::from_utf8(&output.stdout)
+            .map_err(|error| format!("invalid protected-group evidence: {error}"))?
+            .trim();
+        if group.is_empty() {
+            return Err("protected-group evidence is unavailable".to_string());
+        }
+        Some(group.to_string())
+    };
+    Ok(pt_core::decision::ProcessCandidate {
+        pid: proc.pid.0 as i32,
+        ppid: proc.ppid.0 as i32,
+        cmdline: proc.cmd.clone(),
+        user: Some(proc.user.clone()),
+        group,
+        category: None,
+        age_seconds: proc.elapsed.as_secs(),
+        posterior: None,
+        memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
+        has_known_signature: false,
+        open_write_fds: pt_core::action::prechecks::open_write_fd_count(proc.pid.0),
+        has_locked_files: None,
+        has_active_tty: Some(proc.has_tty()),
+        seconds_since_io: None,
+        cwd_deleted: None,
+        process_state: Some(proc.state),
+        wchan: None,
+        critical_files: Vec::new(),
+        cgroup_role: enforcer
+            .requires_builtin_placement()
+            .then(|| pt_core::collect::read_cgroup_role(proc.pid.0)),
+        blast_radius_risk_level: None,
+        blast_radius_total_affected: None,
+        provenance_evidence_completeness: None,
+        provenance_confidence_penalty: None,
+    })
+}
+
+fn planned_zombie_parent_refusal(
+    parent: &ProcessRecord,
+    protected_filter: &ProtectedFilter,
+    enforcer: &pt_core::decision::PolicyEnforcer,
+    policy: &pt_core::config::Policy,
+    signatures: &pt_core::supervision::SignatureDatabase,
+    source_posterior: &pt_core::inference::ClassScores,
+    robot: bool,
+) -> Option<String> {
+    if parent.pid.0 <= 1 {
+        return Some("parent is init/kernel and is never acted on".to_string());
+    }
+    if let Some(protection) = protected_filter.is_protected(parent) {
+        return Some(format!("parent is protected by {}", protection.pattern));
+    }
+    let mut target = match process_policy_candidate(enforcer, parent) {
+        Ok(target) => target,
+        Err(error) => return Some(format!("parent policy evidence unavailable: {error}")),
+    };
+    if policy.data_loss_gates.block_if_open_write_fds && target.open_write_fds.is_none() {
+        return Some("parent writable-descriptor evidence is unavailable".to_string());
+    }
+    let context = pt_core::supervision::signature::ProcessMatchContext::with_comm(&parent.comm)
+        .cmdline(&parent.cmd);
+    let parent_signature = signatures.best_match(&context);
+    target.has_known_signature = parent_signature.is_some();
+    target.category = parent_signature
+        .as_ref()
+        .map(|matched| matched.signature.category.to_string());
+    // Confidence describes the zombie remedy, not abandonment of its parent.
+    // All target protection, age, memory and signature facts are the parent's.
+    target.posterior = Some(pt_core::decision::robot_constraints::gate_posterior(
+        source_posterior,
+        Action::Restart,
+    ));
+    #[cfg(target_os = "linux")]
+    {
+        target.critical_files = pt_core::collect::parse_fd(parent.pid.0)
+            .map(|fd| fd.critical_writes)
+            .unwrap_or_default();
+    }
+    enforcer
+        .check_action(&target, Action::Restart, robot)
+        .violation
+        .map(|violation| {
+            format!(
+                "parent policy blocked: {} ({})",
+                violation.message, violation.rule
+            )
+        })
+}
+
+/// Bind saved execution evidence to the current identity, before taking action.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn capture_action_execution_evidence(
+    action: &pt_core::plan::PlanAction,
+    process: &ProcessRecord,
+) -> Result<serde_json::Value, String> {
+    if process.pid != action.target.pid
+        || process.uid != action.target.uid
+        || process.start_id != action.target.start_id
+    {
+        return Err("execution evidence does not match the saved target identity".to_string());
+    }
+    if action.action == pt_core::decision::Action::Kill
+        && (process.cmd.trim().is_empty() || process.ppid.0 == 0)
+    {
+        return Err("kill command or parent evidence is unavailable".to_string());
+    }
+    let parent_identity = if action.action == pt_core::decision::Action::Kill {
+        let parents = quick_scan(&QuickScanOptions {
+            pids: vec![process.ppid.0],
+            include_kernel_threads: false,
+            timeout: Some(Duration::from_secs(5)),
+            progress: None,
+        })
+        .map_err(|error| format!("cannot collect execution parent identity: {error}"))?;
+        parents
+            .processes
+            .iter()
+            .find(|parent| parent.pid == process.ppid)
+            .map(process_identity_from_record)
+    } else {
+        None
+    };
+    let execution_clock = pt_core::verify::capture_execution_clock();
+    if cfg!(target_os = "linux")
+        && action.action == pt_core::decision::Action::Kill
+        && execution_clock.is_none()
+    {
+        return Err("kill execution clock is unavailable".to_string());
+    }
+    Ok(serde_json::json!({
+        "action": action.action,
+        "target": action.target,
+        "command": process.cmd,
+        "parent_pid": process.ppid.0,
+        "parent_identity": parent_identity,
+        "executed_at": chrono::Utc::now(),
+        "execution_clock": execution_clock,
+    }))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn capture_current_action_execution_evidence(
+    action: &pt_core::plan::PlanAction,
+) -> Result<serde_json::Value, String> {
+    let scan = quick_scan(&QuickScanOptions {
+        pids: vec![action.target.pid.0],
+        include_kernel_threads: false,
+        timeout: Some(Duration::from_secs(5)),
+        progress: None,
+    })
+    .map_err(|error| format!("cannot refresh execution identity: {error}"))?;
+    let process = scan
+        .processes
+        .iter()
+        .find(|process| process.pid == action.target.pid)
+        .ok_or("target disappeared before execution")?;
+    capture_action_execution_evidence(action, process)
+}
+
+/// Record the current context at runner entry, after the executor's safety checks.
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+struct RecordedActionRunner {
+    runner: pt_core::action::CompositeActionRunner,
+    evidence: std::cell::RefCell<Option<serde_json::Value>>,
+}
+
+#[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+impl pt_core::action::ActionRunner for RecordedActionRunner {
+    fn execute(&self, action: &PlanAction) -> Result<(), pt_core::action::ActionError> {
+        let evidence = capture_current_action_execution_evidence(action)
+            .map_err(pt_core::action::ActionError::Failed)?;
+        *self.evidence.borrow_mut() = Some(evidence);
+        self.runner.execute(action)
+    }
+
+    fn verify(&self, action: &PlanAction) -> Result<(), pt_core::action::ActionError> {
+        self.runner.verify(action)
+    }
+
+    fn revalidate(
+        &self,
+        action: &PlanAction,
+        provider: &dyn pt_core::action::IdentityProvider,
+    ) -> Result<bool, pt_core::action::ActionError> {
+        self.runner.revalidate(action, provider)
+    }
+}
+
+#[cfg(feature = "ui")]
+type RecordedExecution = (
+    pt_core::action::ExecutionResult,
+    HashMap<String, serde_json::Value>,
+);
+
+/// The same interactive process can apply several selections. Only delivered
+/// kills spend its run budget; saved attempts and failures survive later batches.
+#[cfg(feature = "ui")]
+#[derive(Default)]
+struct TuiExecutionState {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    enforcer: Option<pt_core::decision::PolicyEnforcer>,
+    failure: Option<String>,
+}
+
+#[cfg(feature = "ui")]
+fn record_tui_execution_failure(
+    handle: &SessionHandle,
+    state: &mut TuiExecutionState,
+    error: String,
+) -> String {
+    let error = match handle.update_state(SessionState::Failed) {
+        Ok(_) => error,
+        Err(state_error) => format!("{error}; persist interactive failure state: {state_error}"),
+    };
+    state.failure = Some(match state.failure.take() {
+        Some(previous) if previous != error => format!("{previous}; {error}"),
+        _ => error.clone(),
+    });
+    error
+}
+
+#[cfg(feature = "ui")]
+fn finish_tui_session(handle: &SessionHandle, state: &TuiExecutionState) -> Result<(), String> {
+    let manifest = handle
+        .read_manifest()
+        .map_err(|error| format!("read final interactive session state: {error}"))?;
+    if let Some(error) = &state.failure {
+        return Err(error.clone());
+    }
+    if manifest.state == SessionState::Failed {
+        return Err("interactive session contains failed action attempts".to_string());
+    }
+    handle
+        .update_state(SessionState::Completed)
+        .map_err(|error| format!("persist final interactive session state: {error}"))?;
+    Ok(())
+}
+
+#[cfg(feature = "ui")]
+fn execute_tui_plan_selection(
+    handle: &SessionHandle,
+    policy: &pt_core::config::Policy,
+    selection: &Plan,
+    state: &mut TuiExecutionState,
+) -> Result<RecordedExecution, String> {
+    let execution = (|| {
+        // Persist every earlier binding, but execute only this new selection.
+        write_plan_to_session(handle, selection)?;
+        handle
+            .update_state(SessionState::Executing)
+            .map_err(|error| format!("persist interactive execution state: {error}"))?;
+        let (result, evidence) = execute_plan_actions(handle, policy, selection, state)?;
+        write_outcomes_from_execution(handle, selection, &result, &evidence)?;
+        if result.summary.actions_failed > 0 || result.outcomes.iter().any(|o| o.details.is_some())
+        {
+            let error = result
+                .outcomes
+                .iter()
+                .find_map(|outcome| outcome.details.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} interactive action attempt(s) failed",
+                        result.summary.actions_failed
+                    )
+                });
+            state.failure.get_or_insert(error);
+        }
+        let final_state = if state.failure.is_some() {
+            SessionState::Failed
+        } else {
+            SessionState::Completed
+        };
+        handle
+            .update_state(final_state)
+            .map_err(|error| format!("persist interactive action result state: {error}"))?;
+        Ok((result, evidence))
+    })();
+    execution.map_err(|error| record_tui_execution_failure(handle, state, error))
 }
 
 #[cfg(feature = "ui")]
@@ -2503,7 +3049,8 @@ fn execute_plan_actions(
     handle: &SessionHandle,
     policy: &pt_core::config::Policy,
     plan: &Plan,
-) -> Result<pt_core::action::ExecutionResult, String> {
+    state: &mut TuiExecutionState,
+) -> Result<RecordedExecution, String> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use pt_core::action::{
@@ -2513,24 +3060,191 @@ fn execute_plan_actions(
         let action_dir = handle.dir.join("action");
         std::fs::create_dir_all(&action_dir).map_err(|e| format!("create action dir: {}", e))?;
         let lock_path = action_dir.join("lock");
-        let runner = CompositeActionRunner::with_defaults();
+        let runner = RecordedActionRunner {
+            runner: CompositeActionRunner::with_defaults(),
+            evidence: std::cell::RefCell::new(None),
+        };
         let identity_provider = LiveIdentityProvider::new();
-        let pre_checks =
-            LivePreCheckProvider::new(Some(&policy.guardrails), LivePreCheckConfig::default())
-                .unwrap_or_else(|_| LivePreCheckProvider::with_defaults());
+        let (_execution_lock, new_enforcer) = acquire_execution_policy(policy, None, handle)?;
+        let enforcer = state.enforcer.get_or_insert(new_enforcer);
+        let pre_checks = LivePreCheckProvider::new(
+            Some(&policy.guardrails),
+            LivePreCheckConfig::from(&policy.data_loss_gates),
+        )
+        .map_err(|error| format!("cannot configure safety checks: {error}"))?;
+        pre_checks.prime_recent_io(
+            &plan
+                .actions
+                .iter()
+                .map(|action| action.target.pid.0)
+                .collect::<Vec<_>>(),
+        );
 
         let executor = ActionExecutor::new(&runner, &identity_provider, lock_path)
             .with_pre_check_provider(&pre_checks);
-        executor
-            .execute_plan(plan)
-            .map_err(|e| format!("execute plan: {}", e))
+        let mut outcomes = Vec::new();
+        let mut execution_evidence = HashMap::new();
+        for action in &plan.actions {
+            if !action.blocked && action.action != Action::Keep {
+                let (check, _) = match check_execution_policy(enforcer, action, false) {
+                    Ok(check) => check,
+                    Err(error) => {
+                        outcomes.push(pt_core::action::ActionResult {
+                            action_id: action.action_id.clone(),
+                            status: pt_core::action::ActionStatus::PreCheckBlocked {
+                                check: pt_core::plan::PreCheck::CheckNotProtected,
+                                reason: error,
+                            },
+                            time_ms: 0,
+                            details: None,
+                        });
+                        continue;
+                    }
+                };
+                if !check.allowed {
+                    outcomes.push(pt_core::action::ActionResult {
+                        action_id: action.action_id.clone(),
+                        status: pt_core::action::ActionStatus::PreCheckBlocked {
+                            check: pt_core::plan::PreCheck::CheckNotProtected,
+                            reason: serde_json::to_string(&check.violation)
+                                .map_err(|error| error.to_string())?,
+                        },
+                        time_ms: 0,
+                        details: None,
+                    });
+                    continue;
+                }
+            }
+            let mut single = plan.clone();
+            single.actions = vec![action.clone()];
+            if action.action == Action::Kill && !action.blocked {
+                let tree_check = quick_scan(&QuickScanOptions {
+                    pids: vec![],
+                    include_kernel_threads: false,
+                    timeout: None,
+                    progress: None,
+                })
+                .map_err(|error| format!("cannot revalidate process tree: {error}"))
+                .and_then(|scan| {
+                    if !scan.metadata.warnings.is_empty() {
+                        return Err("incomplete process-tree snapshot".to_string());
+                    }
+                    Ok(execution_tree_refusal(
+                        action.target.pid.0,
+                        &scan.processes,
+                        policy.guardrails.builtin_protection,
+                    ))
+                });
+                let reason = match tree_check {
+                    Ok(None) => None,
+                    Ok(Some(reason)) | Err(reason) => Some(reason),
+                };
+                if let Some(reason) = reason {
+                    outcomes.push(pt_core::action::ActionResult {
+                        action_id: action.action_id.clone(),
+                        status: pt_core::action::ActionStatus::PreCheckBlocked {
+                            check: pt_core::plan::PreCheck::CheckNotProtected,
+                            reason,
+                        },
+                        time_ms: 0,
+                        details: None,
+                    });
+                    continue;
+                }
+            }
+            runner.evidence.borrow_mut().take();
+            runner.runner.take_kill_signal_delivered();
+            let accounting_started = action.action == Action::Kill && !action.blocked;
+            if accounting_started {
+                if let Err(error) = enforcer.begin_kill_accounting() {
+                    outcomes.push(pt_core::action::ActionResult {
+                        action_id: action.action_id.clone(),
+                        status: pt_core::action::ActionStatus::PreCheckBlocked {
+                            check: pt_core::plan::PreCheck::CheckNotProtected,
+                            reason: format!("cannot prepare durable kill accounting: {error}"),
+                        },
+                        time_ms: 0,
+                        details: Some(error.to_string()),
+                    });
+                    break;
+                }
+            }
+            let result = match executor.execute_plan(&single) {
+                Ok(result) => result,
+                Err(error) => {
+                    let accounting_error = accounting_started
+                        .then(|| enforcer.finish_kill_accounting(false).err())
+                        .flatten();
+                    outcomes.push(pt_core::action::ActionResult {
+                        action_id: action.action_id.clone(),
+                        status: pt_core::action::ActionStatus::Failed,
+                        time_ms: 0,
+                        details: Some(format!(
+                            "execute plan: {error}; accounting completion error: {accounting_error:?}"
+                        )),
+                    });
+                    break;
+                }
+            };
+            if let Some(evidence) = runner.evidence.borrow().as_ref() {
+                execution_evidence.insert(action.action_id.clone(), evidence.clone());
+            }
+            let kill_signal_delivered = runner.runner.take_kill_signal_delivered();
+            if let Some(fields) = execution_evidence
+                .get_mut(&action.action_id)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                fields.insert(
+                    "kill_signal_delivered".to_string(),
+                    serde_json::Value::Bool(kill_signal_delivered),
+                );
+            }
+            let accounting_error = accounting_started
+                .then(|| enforcer.finish_kill_accounting(kill_signal_delivered).err())
+                .flatten();
+            for mut outcome in result.outcomes {
+                if let Some(error) = &accounting_error {
+                    outcome.details = Some(format!(
+                        "kill delivery={kill_signal_delivered}, but its accounting completion could not be persisted: {error}"
+                    ));
+                    outcomes.push(outcome);
+                    return Ok((execution_result(outcomes), execution_evidence));
+                }
+                outcomes.push(outcome);
+            }
+        }
+        Ok((execution_result(outcomes), execution_evidence))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = policy;
         let _ = handle;
         let _ = plan;
+        let _ = state;
         Err("execution not supported on this platform".to_string())
+    }
+}
+
+#[cfg(feature = "ui")]
+fn execution_result(
+    outcomes: Vec<pt_core::action::ActionResult>,
+) -> pt_core::action::ExecutionResult {
+    use pt_core::action::{ActionStatus, ExecutionResult, ExecutionSummary};
+    ExecutionResult {
+        summary: ExecutionSummary {
+            actions_attempted: outcomes.len(),
+            actions_succeeded: outcomes
+                .iter()
+                .filter(|result| result.status == ActionStatus::Success)
+                .count(),
+            actions_failed: outcomes
+                .iter()
+                .filter(|result| {
+                    !matches!(result.status, ActionStatus::Success | ActionStatus::Skipped)
+                })
+                .count(),
+        },
+        outcomes,
     }
 }
 
@@ -2540,27 +3254,21 @@ fn write_outcomes_for_mode(
     plan: &Plan,
     status: &str,
 ) -> Result<(), String> {
-    use std::io::Write;
-
-    let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
-    let _ = std::fs::create_dir_all(handle.dir.join("action"));
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&outcomes_path)
-        .map_err(|e| format!("open outcomes: {}", e))?;
-
-    for action in &plan.actions {
-        let entry = serde_json::json!({
-            "action_id": action.action_id,
-            "pid": action.target.pid.0,
-            "status": status,
-        });
-        if let Err(e) = writeln!(file, "{}", entry) {
-            return Err(format!("write outcomes: {}", e));
-        }
-    }
-    Ok(())
+    let outcomes: Vec<_> = plan
+        .actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "action_id": action.action_id,
+                "pid": action.target.pid.0,
+                "status": status,
+            })
+        })
+        .collect();
+    append_action_outcomes(&handle.dir.join("action"), &outcomes).map_err(|error| {
+        let state_error = handle.update_state(SessionState::Failed).err();
+        format!("{error}; session failure state error: {state_error:?}")
+    })
 }
 
 #[cfg(feature = "ui")]
@@ -2568,23 +3276,16 @@ fn write_outcomes_from_execution(
     handle: &SessionHandle,
     plan: &Plan,
     result: &pt_core::action::ExecutionResult,
+    execution_evidence: &HashMap<String, serde_json::Value>,
 ) -> Result<(), String> {
     use pt_core::action::ActionStatus;
-    use std::io::Write;
 
     let mut by_id: HashMap<String, u32> = HashMap::new();
     for action in &plan.actions {
         by_id.insert(action.action_id.clone(), action.target.pid.0);
     }
 
-    let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
-    let _ = std::fs::create_dir_all(handle.dir.join("action"));
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&outcomes_path)
-        .map_err(|e| format!("open outcomes: {}", e))?;
-
+    let mut outcomes = Vec::with_capacity(result.outcomes.len());
     for outcome in &result.outcomes {
         let pid = by_id.get(&outcome.action_id).copied().unwrap_or_default();
         let mut entry = serde_json::json!({
@@ -2592,7 +3293,21 @@ fn write_outcomes_from_execution(
             "pid": pid,
             "status": action_status_label(&outcome.status),
             "time_ms": outcome.time_ms,
+            "details": outcome.details,
         });
+        if !matches!(
+            outcome.status,
+            ActionStatus::Skipped | ActionStatus::PreCheckBlocked { .. }
+        ) {
+            if let (Some(fields), Some(evidence)) = (
+                entry.as_object_mut(),
+                execution_evidence
+                    .get(&outcome.action_id)
+                    .and_then(|value| value.as_object()),
+            ) {
+                fields.extend(evidence.clone());
+            }
+        }
         if let ActionStatus::PreCheckBlocked { check, reason } = &outcome.status {
             if let Some(obj) = entry.as_object_mut() {
                 obj.insert(
@@ -2605,11 +3320,15 @@ fn write_outcomes_from_execution(
                 );
             }
         }
-        if let Err(e) = writeln!(file, "{}", entry) {
-            return Err(format!("write outcomes: {}", e));
-        }
+        outcomes.push(entry);
     }
-    Ok(())
+    append_action_outcomes(&handle.dir.join("action"), &outcomes).map_err(|error| {
+        let state_error = handle.update_state(SessionState::Failed).err();
+        let actual = serde_json::json!({"summary": result.summary, "outcomes": outcomes});
+        format!(
+            "{error}; actual execution results: {actual}; session failure state error: {state_error:?}"
+        )
+    })
 }
 
 #[cfg(feature = "ui")]
@@ -2648,9 +3367,13 @@ struct DeepSignals {
     net_active: Option<bool>,
     io_active: Option<bool>,
     queue_saturated: Option<bool>,
+    #[cfg(feature = "ui")]
     queue_lambda: Option<f64>,
+    #[cfg(feature = "ui")]
     queue_mu: Option<f64>,
+    #[cfg(feature = "ui")]
     queue_stall_probability: Option<f64>,
+    #[cfg(feature = "ui")]
     queue_backlog_sockets: Option<usize>,
 }
 
@@ -2665,7 +3388,7 @@ struct ProbeAdvice {
 #[cfg(feature = "ui")]
 fn compute_probe_advice(
     processes: &[ProcessRecord],
-    priors: &Priors,
+    scorer: &Scorer,
     policy: &pt_core::config::Policy,
 ) -> HashMap<u32, ProbeAdvice> {
     let mut advice = HashMap::new();
@@ -2673,13 +3396,11 @@ fn compute_probe_advice(
     let available_probes = [pt_core::decision::ProbeType::DeepScan];
 
     for proc in processes {
-        let evidence = Evidence::from_snapshot(proc);
-
-        let Ok(posterior) = compute_posterior(priors, &evidence) else {
+        let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
             continue;
         };
         let Ok((decision, _)) = pt_core::decision::decide_sequential(
-            &posterior.posterior,
+            &score.posterior.posterior,
             policy,
             &ActionFeasibility::allow_all(),
             &cost_model,
@@ -2772,9 +3493,13 @@ fn collect_deep_signals_for_pids(pids: &[u32]) -> Option<HashMap<u32, DeepSignal
                     net_active,
                     io_active,
                     queue_saturated: queue_metrics.map(|metrics| metrics.saturated),
+                    #[cfg(feature = "ui")]
                     queue_lambda: queue_metrics.map(|metrics| metrics.lambda),
+                    #[cfg(feature = "ui")]
                     queue_mu: queue_metrics.map(|metrics| metrics.mu),
+                    #[cfg(feature = "ui")]
                     queue_stall_probability: queue_metrics.map(|metrics| metrics.stall_probability),
+                    #[cfg(feature = "ui")]
                     queue_backlog_sockets: queue_metrics.map(|metrics| metrics.backlog_sockets),
                 },
             );
@@ -2796,13 +3521,18 @@ fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, Deep
 }
 
 // Linux-only: built from /proc/net socket data (the only caller is Linux-gated too).
+// Keep detailed estimates in lean unit tests as well as the UI.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct QueueMetrics {
     saturated: bool,
+    #[cfg(any(feature = "ui", test))]
     lambda: f64,
+    #[cfg(any(feature = "ui", test))]
     mu: f64,
+    #[cfg(any(feature = "ui", test))]
     stall_probability: f64,
+    #[cfg(any(feature = "ui", test))]
     backlog_sockets: usize,
 }
 
@@ -2851,9 +3581,13 @@ fn estimate_queue_metrics(info: &pt_core::collect::NetworkInfo, io_active: bool)
 
     QueueMetrics {
         saturated,
+        #[cfg(any(feature = "ui", test))]
         lambda,
+        #[cfg(any(feature = "ui", test))]
         mu,
+        #[cfg(any(feature = "ui", test))]
         stall_probability,
+        #[cfg(any(feature = "ui", test))]
         backlog_sockets,
     }
 }
@@ -2865,15 +3599,14 @@ fn build_tui_rows(
     min_age: Option<u64>,
     deep_signals: Option<&HashMap<u32, DeepSignals>>,
     probe_advice: Option<&HashMap<u32, ProbeAdvice>>,
-    priors: &Priors,
+    scorer: &Scorer,
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
-    decisions: Option<&pt_core::decision::decision_store::DecisionStore>,
 ) -> TuiBuildOutput {
     const MIN_POSTERIOR: f64 = 0.7;
     const MAX_CANDIDATES: usize = 50;
 
-    let system_state = collect_system_state();
+    let system_state = collect_system_state(Some(processes));
     let load_adjustment = if policy.load_aware.enabled {
         let signals = LoadSignals::from_system_state(&system_state, processes.len());
         compute_load_adjustment(&policy.load_aware, &signals)
@@ -2912,12 +3645,10 @@ fn build_tui_rows(
             ..Evidence::from_snapshot(proc)
         };
 
-        let learned_priors = decisions.and_then(|d| d.priors_for(&proc.comm, &proc.cmd, priors));
-        let posterior_result =
-            match compute_posterior(learned_priors.as_ref().unwrap_or(priors), &evidence) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+        let Some(score) = scorer.score(proc, evidence) else {
+            continue;
+        };
+        let posterior_result = score.posterior;
         let mut decision_outcome =
             match decide_action(&posterior_result.posterior, &decision_policy, &feasibility) {
                 Ok(d) => d,
@@ -2926,8 +3657,7 @@ fn build_tui_rows(
 
         // Populate rationale fields available in current context
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
-        let mut ledger =
-            EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
+        let mut ledger = score.ledger;
         if let Some(probe) = probe {
             if probe.should_probe
                 && probe.recommended_probe == Some(pt_core::decision::ProbeType::DeepScan)
@@ -3163,12 +3893,8 @@ fn build_tui_rows(
 }
 
 #[cfg(target_os = "linux")]
-use pt_core::collect::{
-    collect_fd_ipc_resources, collect_lineage_for_pid, collect_listener_resources_from,
-    collect_local_resource_evidence, detect_listener_conflicts, parse_fd, parse_proc_net_tcp,
-    parse_proc_net_udp, NetworkSnapshot, SharedResourceGraph,
-};
-use pt_core::collect::{quick_scan, ProcessRecord, QuickScanOptions, ScanResult};
+use pt_core::collect::{parse_fd, parse_proc_net_tcp, parse_proc_net_udp, NetworkSnapshot};
+use pt_core::collect::{quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanResult};
 use pt_core::decision::goal_progress::{
     self, ActionOutcome as GoalActionOutcome, GoalMetric, GoalProgressReport, MetricSnapshot,
     ProgressConfig,
@@ -3177,336 +3903,8 @@ use pt_core::decision::{
     apply_load_to_loss_matrix, compute_load_adjustment, decide_action, Action, ActionFeasibility,
     LoadSignals,
 };
-#[cfg(target_os = "linux")]
-use pt_core::decision::{
-    estimate_blast_radius, BlastRadiusEstimate, BlastRadiusEstimatorConfig, RiskLevel,
-};
-#[cfg(target_os = "linux")]
-use pt_core::inference::{apply_evidence_terms, ClassScores, Confidence, EvidenceTerm};
-use pt_core::inference::{
-    compute_posterior, compute_posterior_with_overrides, try_signature_fast_path, Evidence,
-    EvidenceLedger, FastPathConfig, FastPathSkipReason, PriorContext,
-};
-use pt_core::supervision::signature::{MatchLevel, ProcessMatchContext, SignatureDatabase};
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
-struct ProvenanceInferenceBundle {
-    resource_graph: SharedResourceGraph,
-    lineages: HashMap<u32, RawLineageEvidence>,
-    children: HashMap<u32, Vec<u32>>,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
-struct ProvenanceScoreAdjustment {
-    evidence_terms: Vec<EvidenceTerm>,
-    evidence_completeness: f64,
-    confidence_penalty_steps: usize,
-    confidence_notes: Vec<String>,
-    blast_radius: BlastRadiusEstimate,
-}
-
-#[cfg(target_os = "linux")]
-impl ProvenanceScoreAdjustment {
-    /// Convert to the stable output contract type for JSON/TOON/agent consumers.
-    ///
-    /// Delegates to `CandidateProvenanceOutput::from_parts` so the contract
-    /// logic (direction thresholds, score-impact construction) lives in one
-    /// place in pt-common rather than being duplicated here.
-    fn to_candidate_output(&self) -> CandidateProvenanceOutput {
-        let feature_inputs: Vec<ProvenanceFeatureInput> = self
-            .evidence_terms
-            .iter()
-            .map(|term| ProvenanceFeatureInput {
-                feature: term.feature.clone(),
-                abandoned_ll: term.log_likelihood.abandoned,
-                useful_ll: term.log_likelihood.useful,
-            })
-            .collect();
-
-        CandidateProvenanceOutput::from_parts(
-            self.evidence_completeness,
-            self.confidence_penalty_steps,
-            self.confidence_notes.clone(),
-            &feature_inputs,
-            self.blast_radius.risk_score,
-            &format!("{:?}", self.blast_radius.risk_level).to_lowercase(),
-            self.blast_radius.confidence,
-            &self.blast_radius.summary,
-            self.blast_radius.total_affected,
-            ProvenanceRedactionState::None,
-        )
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn build_provenance_inference_bundle(processes: &[&ProcessRecord]) -> ProvenanceInferenceBundle {
-    let mut lineages = HashMap::new();
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut per_process_resources: Vec<(u32, Vec<pt_common::RawResourceEvidence>)> = Vec::new();
-    let mut all_resources = Vec::new();
-    // One socket-table snapshot for the whole scan (was re-parsed per process).
-    let network_snapshot = NetworkSnapshot::collect();
-
-    for proc in processes {
-        let pid = proc.pid.0;
-        children.entry(proc.ppid.0).or_default().push(pid);
-        lineages.insert(pid, collect_lineage_for_pid(pid));
-
-        let fd_info = parse_fd(pid);
-        let mut resources = collect_local_resource_evidence(pid, fd_info.as_ref());
-        resources.extend(collect_listener_resources_from(pid, &network_snapshot));
-        resources.extend(collect_fd_ipc_resources(pid));
-        all_resources.extend(resources.iter().cloned());
-        per_process_resources.push((pid, resources));
-    }
-
-    let index_of_pid: HashMap<u32, usize> = per_process_resources
-        .iter()
-        .enumerate()
-        .map(|(i, (pid, _))| (*pid, i))
-        .collect();
-    for conflict in detect_listener_conflicts(&all_resources) {
-        if let Some((_, resources)) = index_of_pid
-            .get(&conflict.owner_pid)
-            .map(|&i| &mut per_process_resources[i])
-        {
-            if let Some(existing) = resources
-                .iter_mut()
-                .find(|resource| resource.key == conflict.key && resource.kind == conflict.kind)
-            {
-                existing.state = conflict.state;
-                existing.observed_at = conflict.observed_at.clone();
-            } else {
-                resources.push(conflict);
-            }
-        }
-    }
-
-    let resource_graph = SharedResourceGraph::from_evidence(&per_process_resources);
-
-    ProvenanceInferenceBundle {
-        resource_graph,
-        lineages,
-        children,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn provenance_confidence_score(confidence: ProvenanceConfidence) -> f64 {
-    match confidence {
-        ProvenanceConfidence::High => 1.0,
-        ProvenanceConfidence::Medium => 0.75,
-        ProvenanceConfidence::Low => 0.45,
-        ProvenanceConfidence::Unknown => 0.2,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn downgrade_confidence(confidence: Confidence, steps: usize) -> Confidence {
-    let mut downgraded = confidence;
-    for _ in 0..steps {
-        downgraded = match downgraded {
-            Confidence::VeryHigh => Confidence::High,
-            Confidence::High => Confidence::Medium,
-            Confidence::Medium | Confidence::Low => Confidence::Low,
-        };
-    }
-    downgraded
-}
-
-#[cfg(target_os = "linux")]
-fn provenance_term(
-    feature: &str,
-    useful: f64,
-    useful_bad: f64,
-    abandoned: f64,
-    zombie: f64,
-) -> EvidenceTerm {
-    EvidenceTerm {
-        feature: feature.to_string(),
-        log_likelihood: ClassScores {
-            useful,
-            useful_bad,
-            abandoned,
-            zombie,
-        },
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn derive_provenance_adjustment(
-    pid: u32,
-    bundle: &ProvenanceInferenceBundle,
-) -> ProvenanceScoreAdjustment {
-    let lineage = bundle.lineages.get(&pid);
-    let normalized_lineage = lineage.map(normalize_lineage);
-    let child_pids = bundle
-        .children
-        .get(&pid)
-        .map(|children| children.as_slice())
-        .unwrap_or(&[]);
-
-    let mut resolved_resources = 0usize;
-    let mut unresolved_resources = 0usize;
-    let mut conflict_resources = 0usize;
-
-    if let Some(keys) = bundle.resource_graph.process_resources.get(&pid) {
-        for key in keys {
-            let Some(resource) = bundle.resource_graph.resources.get(key) else {
-                continue;
-            };
-            let Some(holder_state) = resource.holder_states.iter().find(|state| state.pid == pid)
-            else {
-                continue;
-            };
-            match holder_state.state {
-                pt_common::ResourceState::Active | pt_common::ResourceState::Stale => {
-                    resolved_resources += 1;
-                }
-                pt_common::ResourceState::Partial | pt_common::ResourceState::Missing => {
-                    unresolved_resources += 1;
-                }
-                pt_common::ResourceState::Conflicted => {
-                    unresolved_resources += 1;
-                    conflict_resources += 1;
-                }
-            }
-        }
-    }
-
-    let lineage_confidence = normalized_lineage
-        .as_ref()
-        .map(|lineage| lineage.confidence)
-        .unwrap_or(ProvenanceConfidence::Unknown);
-    let lineage_score = provenance_confidence_score(lineage_confidence);
-    let resource_score = if resolved_resources + unresolved_resources == 0 {
-        0.7
-    } else {
-        resolved_resources as f64 / (resolved_resources + unresolved_resources) as f64
-    };
-    let mut evidence_completeness = ((lineage_score + resource_score) / 2.0).clamp(0.0, 1.0);
-
-    let mut confidence_notes = Vec::new();
-    let mut confidence_penalty_steps = 0usize;
-
-    if lineage.is_none() {
-        confidence_notes.push("missing lineage provenance".to_string());
-        confidence_penalty_steps += 1;
-    }
-    if unresolved_resources > 0 {
-        confidence_notes.push(format!(
-            "resource provenance has {unresolved_resources} unresolved edge(s)"
-        ));
-        confidence_penalty_steps += 1;
-    }
-    if let Some(normalized_lineage) = normalized_lineage.as_ref() {
-        if !normalized_lineage.downgrade_reasons.is_empty() {
-            confidence_notes.extend(normalized_lineage.downgrade_reasons.iter().cloned());
-            confidence_penalty_steps += 1;
-        }
-    }
-    if conflict_resources > 0 {
-        confidence_notes.push(format!(
-            "resource provenance has {conflict_resources} conflicting edge(s)"
-        ));
-    }
-
-    if !confidence_notes.is_empty() {
-        evidence_completeness = (evidence_completeness - 0.1).clamp(0.0, 1.0);
-    }
-
-    let blast_radius = estimate_blast_radius(
-        pid,
-        &bundle.resource_graph,
-        lineage,
-        child_pids,
-        evidence_completeness,
-        &BlastRadiusEstimatorConfig::default(),
-    );
-
-    if blast_radius.confidence < 0.5 {
-        confidence_notes.push("blast-radius estimate is low-confidence".to_string());
-        confidence_penalty_steps += 1;
-    }
-
-    let mut evidence_terms = Vec::new();
-    if let Some(normalized_lineage) = normalized_lineage.as_ref() {
-        match &normalized_lineage.ownership {
-            OwnershipState::Orphaned => {
-                evidence_terms.push(provenance_term(
-                    "provenance_ownership_orphaned",
-                    -0.55,
-                    -0.10,
-                    0.70,
-                    0.20,
-                ));
-            }
-            OwnershipState::Supervised { .. }
-            | OwnershipState::InitChild
-            | OwnershipState::AgentOwned { .. } => {
-                evidence_terms.push(provenance_term(
-                    "provenance_ownership_supervised",
-                    0.60,
-                    0.20,
-                    -0.70,
-                    -0.20,
-                ));
-            }
-            OwnershipState::ShellOwned { .. } => {
-                evidence_terms.push(provenance_term(
-                    "provenance_ownership_shell",
-                    0.35,
-                    0.15,
-                    -0.35,
-                    -0.10,
-                ));
-            }
-            OwnershipState::Unknown => {}
-        }
-    }
-
-    if blast_radius.direct.components.listener_count > 0 {
-        evidence_terms.push(provenance_term(
-            "provenance_active_listener",
-            0.55,
-            0.20,
-            -0.60,
-            -0.15,
-        ));
-    }
-
-    match blast_radius.risk_level {
-        RiskLevel::High | RiskLevel::Critical => {
-            evidence_terms.push(provenance_term(
-                "provenance_blast_radius_high",
-                0.65,
-                0.30,
-                -0.75,
-                -0.20,
-            ));
-        }
-        RiskLevel::Low if blast_radius.total_affected == 0 => {
-            evidence_terms.push(provenance_term(
-                "provenance_blast_radius_low",
-                -0.25,
-                -0.05,
-                0.35,
-                0.10,
-            ));
-        }
-        RiskLevel::Medium | RiskLevel::Low => {}
-    }
-
-    ProvenanceScoreAdjustment {
-        evidence_terms,
-        evidence_completeness,
-        confidence_penalty_steps: confidence_penalty_steps.min(3),
-        confidence_notes,
-        blast_radius,
-    }
-}
+use pt_core::inference::Evidence;
+use pt_core::scoring::{match_level_label, Scorer};
 
 fn progress_emitter(global: &GlobalOpts) -> Option<Arc<dyn ProgressEmitter>> {
     match global.format {
@@ -4386,7 +4784,6 @@ fn run_bundle_create(
     use pt_redact::ExportProfile;
 
     let session_id = SessionId::new();
-    let host_id = pt_core::logging::get_host_id();
     let passphrase = resolve_bundle_passphrase(passphrase_arg);
 
     if encrypt && passphrase.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
@@ -4483,52 +4880,85 @@ fn run_bundle_create(
         }
     };
 
+    // Preserve the source session's host, including imported sessions; the
+    // machine creating the archive is not necessarily the machine scanned.
+    let source_host_id = match handle.read_context() {
+        Ok(context) => context.host_id,
+        Err(pt_core::session::SessionError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            "unknown".to_string()
+        }
+        Err(error) => {
+            eprintln!("bundle create: cannot read session context: {error}");
+            return ExitCode::IoError;
+        }
+    };
     // Create bundle writer
-    let mut writer = BundleWriter::new(&target_session.0, &host_id, export_profile)
+    let mut writer = BundleWriter::new(&target_session.0, &source_host_id, export_profile)
         .with_pt_version(env!("CARGO_PKG_VERSION"))
         .with_description(format!("Export of session {}", target_session.0));
 
-    // Add manifest.json from session
-    let manifest_path = handle.manifest_path();
-    if let Ok(content) = std::fs::read(&manifest_path) {
-        writer.add_file("session/manifest.json", content, Some(FileType::Json));
-    }
-
-    // Add context.json from session
-    let context_path = handle.context_path();
-    if let Ok(content) = std::fs::read(&context_path) {
-        writer.add_file("session/context.json", content, Some(FileType::Json));
-    }
-
-    // Add plan.json if present
-    let plan_path = handle.dir.join("decision/plan.json");
-    if plan_path.exists() {
-        if let Ok(content) = std::fs::read(&plan_path) {
-            writer.add_file("plan.json", content, Some(FileType::Json));
-        }
-    }
-
-    // Add snapshot.json if present
-    let snapshot_path = handle.dir.join("scan/snapshot.json");
-    if snapshot_path.exists() {
-        if let Ok(content) = std::fs::read(&snapshot_path) {
-            writer.add_file("snapshot.json", content, Some(FileType::Json));
-        }
-    }
-
-    // Add inference results if present
-    let posteriors_path = handle.dir.join("inference/posteriors.json");
-    if posteriors_path.exists() {
-        if let Ok(content) = std::fs::read(&posteriors_path) {
-            writer.add_file("inference/posteriors.json", content, Some(FileType::Json));
-        }
-    }
-
-    // Add audit trail if present
-    let audit_path = handle.dir.join("action/outcomes.jsonl");
-    if audit_path.exists() {
-        if let Ok(content) = std::fs::read(&audit_path) {
-            writer.add_file("logs/outcomes.jsonl", content, Some(FileType::Log));
+    // Optional artifacts may be absent; existing unreadable artifacts must not
+    // silently disappear from a successful export. The session manifest is required.
+    for (source, destination, file_type, required) in [
+        (
+            "manifest.json",
+            "session/manifest.json",
+            FileType::Json,
+            true,
+        ),
+        (
+            "context.json",
+            "session/context.json",
+            FileType::Json,
+            false,
+        ),
+        ("decision/plan.json", "plan.json", FileType::Json, false),
+        (
+            "scan/inventory.json",
+            "scan/inventory.json",
+            FileType::Json,
+            false,
+        ),
+        (
+            "inference/results.json",
+            "inference/results.json",
+            FileType::Json,
+            false,
+        ),
+        (
+            "action/outcomes.jsonl",
+            "logs/outcomes.jsonl",
+            FileType::Log,
+            false,
+        ),
+        (
+            "logs/session.jsonl",
+            "logs/session.jsonl",
+            FileType::Log,
+            false,
+        ),
+        (
+            "scan/provenance.json",
+            "scan/provenance.json",
+            FileType::Json,
+            false,
+        ),
+        (
+            "scan/provenance_audit.json",
+            "scan/provenance_audit.json",
+            FileType::Json,
+            false,
+        ),
+    ] {
+        match std::fs::read(handle.dir.join(source)) {
+            Ok(content) => writer.add_file(destination, content, Some(file_type)),
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("bundle create: cannot read {source}: {error}");
+                return ExitCode::IoError;
+            }
         }
     }
 
@@ -4536,10 +4966,6 @@ fn run_bundle_create(
     let provenance_snapshot_path = handle.dir.join("scan/provenance.json");
     let provenance_audit_path = handle.dir.join("scan/provenance_audit.json");
     if provenance_snapshot_path.exists() {
-        if let Ok(content) = std::fs::read(&provenance_snapshot_path) {
-            writer.add_file("scan/provenance.json", content, Some(FileType::Json));
-        }
-
         let mut provenance_summary = BundleProvenanceSummary {
             snapshot_path: "scan/provenance.json".to_string(),
             audit_path: None,
@@ -4559,20 +4985,18 @@ fn run_bundle_create(
         };
 
         if provenance_audit_path.exists() {
-            match std::fs::read_to_string(&provenance_audit_path).ok().and_then(|raw| {
-                serde_json::from_str::<
-                    pt_core::session::snapshot_persist::ProvenancePersistenceAudit,
-                >(&raw)
-                .ok()
-            }) {
-                Some(audit) => {
-                    if let Ok(content) = std::fs::read(&provenance_audit_path) {
-                        writer.add_file(
-                            "scan/provenance_audit.json",
-                            content,
-                            Some(FileType::Json),
-                        );
-                    }
+            let raw = match std::fs::read(&provenance_audit_path) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    eprintln!("bundle create: cannot read provenance audit: {error}");
+                    return ExitCode::IoError;
+                }
+            };
+            match serde_json::from_slice::<
+                pt_core::session::snapshot_persist::ProvenancePersistenceAudit,
+            >(&raw)
+            {
+                Ok(audit) => {
                     provenance_summary.audit_path = Some("scan/provenance_audit.json".to_string());
                     provenance_summary.provenance_schema_version =
                         Some(audit.provenance_schema_version);
@@ -4591,9 +5015,10 @@ fn run_bundle_create(
                     provenance_summary.omitted_sections = audit.omitted_sections;
                     provenance_summary.compatibility_notes = audit.migration_notes;
                 }
-                None => provenance_summary.compatibility_notes.push(
-                    "provenance audit sidecar was present but unreadable; bundle consumers should treat provenance compatibility details as partial".to_string(),
-                ),
+                Err(error) => {
+                    eprintln!("bundle create: invalid provenance audit: {error}");
+                    return ExitCode::IoError;
+                }
             }
         } else {
             provenance_summary.compatibility_notes.push(
@@ -4607,45 +5032,104 @@ fn run_bundle_create(
     // Optionally include telemetry data
     if include_telemetry {
         let telemetry_dir = handle.dir.join("telemetry");
-        if telemetry_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&telemetry_dir) {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    if entry_path.is_file() {
-                        if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
-                            if let Ok(content) = std::fs::read(&entry_path) {
-                                let file_type = if name.ends_with(".parquet") {
-                                    FileType::Parquet
-                                } else if name.ends_with(".jsonl") {
-                                    FileType::Log
-                                } else if name.ends_with(".json") {
-                                    FileType::Json
-                                } else {
-                                    FileType::Binary
-                                };
-                                writer.add_file(
-                                    format!("telemetry/{}", name),
-                                    content,
-                                    Some(file_type),
-                                );
-                            }
-                        }
+        let entries = match std::fs::read_dir(&telemetry_dir) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                eprintln!("bundle create: cannot read requested telemetry: {error}");
+                return ExitCode::IoError;
+            }
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        eprintln!("bundle create: cannot enumerate telemetry: {error}");
+                        return ExitCode::IoError;
                     }
+                };
+                let metadata = match std::fs::metadata(entry.path()) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        eprintln!("bundle create: cannot inspect telemetry: {error}");
+                        return ExitCode::IoError;
+                    }
+                };
+                if !metadata.is_file() {
+                    continue;
                 }
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
+                    eprintln!("bundle create: telemetry filename is not valid UTF-8");
+                    return ExitCode::IoError;
+                };
+                let content = match std::fs::read(entry.path()) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        eprintln!("bundle create: cannot read telemetry file: {error}");
+                        return ExitCode::IoError;
+                    }
+                };
+                let file_type = if name.ends_with(".parquet") {
+                    FileType::Parquet
+                } else if name.ends_with(".jsonl") {
+                    FileType::Log
+                } else if name.ends_with(".json") {
+                    FileType::Json
+                } else {
+                    FileType::Binary
+                };
+                writer.add_file(format!("telemetry/{name}"), content, Some(file_type));
             }
         }
     }
 
-    // Include user signatures if available
-    if let Some(user_schema) = pt_core::signature_cli::load_user_signatures() {
-        if !user_schema.signatures.is_empty() {
-            if let Ok(json) = serde_json::to_string_pretty(&user_schema) {
-                writer.add_file(
-                    pt_core::signature_cli::BUNDLE_SIGNATURES_PATH,
-                    json.into_bytes(),
-                    Some(FileType::Json),
-                );
+    // A missing optional signature file is acceptable; a present unreadable or
+    // invalid one must not silently disappear from an otherwise successful export.
+    let config_dir = resolved_config_dir(global);
+    let signature_path = pt_core::signature_cli::user_signatures_path(&config_dir);
+    let signature_bytes = match std::fs::read(&signature_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match pt_core::signature_cli::legacy_read_dir(&config_dir) {
+                Some(legacy_dir) => {
+                    match std::fs::read(pt_core::signature_cli::user_signatures_path(&legacy_dir)) {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => {
+                            eprintln!("bundle create: cannot read user signatures: {error}");
+                            return ExitCode::IoError;
+                        }
+                    }
+                }
+                None => None,
             }
+        }
+        Err(error) => {
+            eprintln!("bundle create: cannot read user signatures: {error}");
+            return ExitCode::IoError;
+        }
+    };
+    if let Some(signature_bytes) = signature_bytes {
+        let user_schema: pt_core::supervision::signature::SignatureSchema =
+            match serde_json::from_slice(&signature_bytes) {
+                Ok(schema) => schema,
+                Err(error) => {
+                    eprintln!("bundle create: invalid user signatures: {error}");
+                    return ExitCode::IoError;
+                }
+            };
+        if let Err(error) = user_schema.validate() {
+            eprintln!("bundle create: invalid user signatures: {error}");
+            return ExitCode::IoError;
+        }
+        if !user_schema.signatures.is_empty() {
+            writer.add_file(
+                pt_core::signature_cli::BUNDLE_SIGNATURES_PATH,
+                signature_bytes,
+                Some(FileType::Json),
+            );
         }
     }
 
@@ -4918,6 +5402,219 @@ fn run_bundle_inspect(
     ExitCode::Clean
 }
 
+#[cfg(unix)]
+fn bundle_extract_path_components(
+    path: &Path,
+    destination: bool,
+) -> std::io::Result<Vec<std::ffi::CString>> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    if path.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "extraction path is empty",
+        ));
+    }
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => {
+                Some(std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "extraction path contains a NUL byte",
+                    )
+                }))
+            }
+            Component::RootDir | Component::CurDir if destination => None,
+            _ => Some(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "extraction paths must use normal directory components",
+            ))),
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn open_bundle_extract_child(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: parent is a live directory descriptor and name is one validated,
+    // NUL-terminated component. New directories are private to the effective UID.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error);
+        }
+    }
+    // Do not trust an EEXIST check: open the child relative to the retained
+    // parent, requiring a directory and refusing a symlink at the actual open.
+    open_existing_bundle_extract_child(parent, name)
+}
+
+/// Open an existing directory below `parent`, refusing a symlink at the open.
+#[cfg(unix)]
+fn open_existing_bundle_extract_child(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // SAFETY: the borrowed parent and component remain live during openat.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful openat returns a new descriptor with sole ownership.
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn open_bundle_extract_directory(path: &Path, user_given: bool) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Validate all components before creating any directory. Explicit absolute
+    // and relative destinations remain supported; parent traversal is refused.
+    let mut names = bundle_extract_path_components(path, true)?;
+    let mut existing = Vec::new();
+    let mut absolute = path.is_absolute();
+    if user_given {
+        // The user chose --output, so links in its existing part are theirs to
+        // follow (macOS /tmp and /var are symlinks; v2.2.1 followed them too).
+        // Resolve that part once and re-walk the result without following
+        // anything, so a swap after resolution fails closed; only the missing
+        // tail is created. Bundle-derived names never get this.
+        let mut prefix = PathBuf::from(if absolute { "/" } else { "." });
+        let mut present = 0;
+        for name in &names {
+            let candidate = prefix.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+            if std::fs::metadata(&candidate).is_err() {
+                break;
+            }
+            prefix = candidate;
+            present += 1;
+        }
+        existing = bundle_extract_path_components(&std::fs::canonicalize(&prefix)?, true)?;
+        names = names.split_off(present);
+        absolute = true;
+    }
+    let anchor = if absolute { c"/" } else { c"." };
+    // SAFETY: the literal anchor is NUL terminated; AT_FDCWD is a valid anchor.
+    let descriptor = unsafe {
+        libc::openat(
+            libc::AT_FDCWD,
+            anchor.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: take sole ownership of the successful openat descriptor.
+    let mut directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    for name in existing {
+        directory = open_existing_bundle_extract_child(&directory, &name)?;
+    }
+    for name in names {
+        directory = open_bundle_extract_child(&directory, &name)?;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn write_bundle_extracted_file(
+    directory: &std::fs::File,
+    path: &str,
+    content: &[u8],
+) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let names = bundle_extract_path_components(Path::new(path), false)?;
+    let (name, parents) = names.split_last().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "artifact has no filename")
+    })?;
+    let mut parent = directory.try_clone()?;
+    for component in parents {
+        parent = open_bundle_extract_child(&parent, component)?;
+    }
+    // SAFETY: the live parent descriptor and single NUL-terminated filename
+    // stay borrowed throughout openat. O_EXCL makes creation atomic and refuses
+    // every existing final entry, including regular files, hardlinks and symlinks.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the new descriptor is uniquely owned by this File, which closes it
+    // on every return path. A write failure leaves its new partial file in place.
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    file.write_all(content)?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn open_bundle_extract_directory(
+    _path: &Path,
+    _user_given: bool,
+) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative bundle extraction is unsupported on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+fn write_bundle_extracted_file(
+    _directory: &std::fs::File,
+    _path: &str,
+    _content: &[u8],
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative bundle extraction is unsupported on this platform",
+    ))
+}
+
+fn output_bundle_extract_error(
+    global: &GlobalOpts,
+    session_id: &SessionId,
+    code: &str,
+    message: &str,
+    exit: ExitCode,
+) -> ExitCode {
+    let output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "session_id": session_id.0,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "bundle extract",
+        "status": "error",
+        "error_code": code,
+        "error": message,
+    });
+    match global.format {
+        OutputFormat::Md => eprintln!("Error: {}", message),
+        OutputFormat::Jsonl => println!("{}", serde_json::to_string(&output).unwrap()),
+        _ => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
+    }
+    exit
+}
+
 fn run_bundle_extract(
     global: &GlobalOpts,
     path: &str,
@@ -4985,37 +5682,41 @@ fn run_bundle_extract(
         }
     };
 
-    // Determine output directory
+    // An untrusted manifest identifier must never become a default filesystem path.
     let output_dir = match output_arg {
         Some(p) => PathBuf::from(p),
-        None => {
-            // Default: use session ID from manifest
-            PathBuf::from(reader.session_id())
-        }
+        None => match SessionId::parse(reader.session_id()) {
+            Some(id) => PathBuf::from(id.0),
+            None => {
+                return output_bundle_extract_error(
+                    global,
+                    &session_id,
+                    "INVALID_SESSION_ID",
+                    "Bundle session ID is invalid for the default extraction destination",
+                    ExitCode::ArgsError,
+                );
+            }
+        },
     };
 
-    // Create output directory
-    if let Err(e) = std::fs::create_dir_all(&output_dir) {
-        let error_output = serde_json::json!({
-            "schema_version": SCHEMA_VERSION,
-            "session_id": session_id.0,
-            "generated_at": chrono::Utc::now().to_rfc3339(),
-            "command": "bundle extract",
-            "status": "error",
-            "error": format!("Failed to create output directory: {}", e),
-        });
-        match global.format {
-            OutputFormat::Md => eprintln!("Error: Failed to create output directory: {}", e),
-            OutputFormat::Jsonl => {
-                println!(
-                    "{}",
-                    serde_json::to_string(&error_output).unwrap_or_else(|_| "{}".to_string())
-                )
-            }
-            _ => println!("{}", serde_json::to_string_pretty(&error_output).unwrap()),
+    // Keep the opened destination as the authority for all later child opens.
+    let destination = match open_bundle_extract_directory(&output_dir, output_arg.is_some()) {
+        Ok(directory) => directory,
+        Err(error) => {
+            let code = if error.kind() == std::io::ErrorKind::Unsupported {
+                "EXTRACTION_UNSUPPORTED_PLATFORM"
+            } else {
+                "UNSAFE_EXTRACTION_DESTINATION"
+            };
+            return output_bundle_extract_error(
+                global,
+                &session_id,
+                code,
+                &format!("Cannot safely open extraction destination: {}", error),
+                ExitCode::InternalError,
+            );
         }
-        return ExitCode::InternalError;
-    }
+    };
 
     // Get list of files to extract
     let file_paths: Vec<String> = reader.files().iter().map(|f| f.path.clone()).collect();
@@ -5032,16 +5733,7 @@ fn run_bundle_extract(
 
         match data {
             Ok(content) => {
-                let dest_path = output_dir.join(file_path);
-                // Create parent directories
-                if let Some(parent) = dest_path.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        errors.push(format!("{}: {}", file_path, e));
-                        continue;
-                    }
-                }
-                // Write file
-                if let Err(e) = std::fs::write(&dest_path, content) {
+                if let Err(e) = write_bundle_extracted_file(&destination, file_path, &content) {
                     errors.push(format!("{}: {}", file_path, e));
                 } else {
                     extracted += 1;
@@ -5127,7 +5819,7 @@ fn run_report(global: &GlobalOpts, args: &ReportArgs) -> ExitCode {
         out: args.output.clone(),
         profile: "safe".to_string(),
         galaxy_brain: args.include_ledger,
-        embed_assets: false,
+        embed_assets: args.embed_assets,
         report_format: "html".to_string(),
         prose_style: "conversational".to_string(),
         title: None,
@@ -5144,6 +5836,58 @@ fn run_report(global: &GlobalOpts, _args: &ReportArgs) -> ExitCode {
         "report",
         "Report generation requires building with the `report` feature",
     )
+}
+
+/// `pt-core doctor`: the read-only host audit. Exits Clean when nothing needs
+/// attention and PlanReady when a warning or critical finding does (the severity is in
+/// `worst`; 2 would read as ActionsOk in pt's exit-code contract).
+fn run_doctor_cmd(global: &GlobalOpts, args: &DoctorArgs) -> ExitCode {
+    use pt_core::doctor::{fix_script, run_doctor, Level};
+    let report = run_doctor();
+    if args.fix_script {
+        print!("{}", fix_script(&report));
+    } else {
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon => {
+                let value = serde_json::to_value(&report).unwrap_or_default();
+                println!("{}", format_structured_output(global, value));
+            }
+            OutputFormat::Summary => {
+                let count = |l: Level| report.findings.iter().filter(|f| f.level == l).count();
+                println!(
+                    "doctor: {:?} ({} crit, {} warn, {} info)",
+                    report.worst,
+                    count(Level::Crit),
+                    count(Level::Warn),
+                    count(Level::Info)
+                );
+            }
+            _ => {
+                println!("# pt doctor\n");
+                for f in report.findings.iter().filter(|f| f.level > Level::Ok) {
+                    println!("- [{:?}] {}: {}", f.level, f.id, f.summary);
+                    if let Some(rec) = &f.recommended {
+                        println!("  recommended: {rec}");
+                    }
+                    println!("  why: {}", f.rationale);
+                    for c in &f.commands {
+                        println!("  $ {c}");
+                    }
+                }
+                let ok = report
+                    .findings
+                    .iter()
+                    .filter(|f| f.level == Level::Ok)
+                    .count();
+                println!("\n{ok} checks ok. Suggested commands are never run by pt.");
+            }
+        }
+    }
+    if report.worst >= Level::Warn {
+        ExitCode::PlanReady
+    } else {
+        ExitCode::Clean
+    }
 }
 
 fn run_check(global: &GlobalOpts, args: &CheckArgs) -> ExitCode {
@@ -6728,9 +7472,19 @@ fn run_agent_fleet_transfer_export(
     args: &AgentFleetTransferExportArgs,
 ) -> ExitCode {
     use pt_core::fleet::transfer::export_bundle;
-    use pt_core::supervision::pattern_persistence::{
-        PatternLibrary, PatternSource, PersistedSchema,
-    };
+    use pt_core::supervision::pattern_persistence::PersistedSchema;
+
+    let out_path = PathBuf::from(&args.out);
+    let is_ptb = out_path.extension().map(|e| e == "ptb").unwrap_or(false);
+    if matches!(args.export_profile.as_deref(), Some("minimal" | "safe"))
+        || (is_ptb && args.export_profile.as_deref() != Some("forensic"))
+    {
+        return output_agent_error(
+            global,
+            "fleet transfer export",
+            "intact configuration transfer requires forensic profile for .ptb; safe/minimal are sharing profiles, not activatable configuration",
+        );
+    }
 
     let host_id = pt_core::logging::get_host_id();
 
@@ -6751,22 +7505,11 @@ fn run_agent_fleet_transfer_export(
         None
     };
 
+    // An unreadable pattern library is an error, not a bundle without signatures.
     let signatures_opt: Option<PersistedSchema> = if args.include_signatures {
-        let config_dir = global
-            .config
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| dirs::config_dir().map(|d| d.join("process_triage")))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let mut lib = PatternLibrary::new(&config_dir);
-        if lib.load().is_ok() {
-            Some(lib.export(&[
-                PatternSource::Learned,
-                PatternSource::Custom,
-                PatternSource::Imported,
-            ]))
-        } else {
-            None
+        match load_transfer_signatures(global) {
+            Ok(signatures) => Some(signatures),
+            Err(e) => return output_agent_error(global, "fleet transfer export", &e),
         }
     } else {
         None
@@ -6785,7 +7528,6 @@ fn run_agent_fleet_transfer_export(
         }
     };
 
-    let out_path = PathBuf::from(&args.out);
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(err) = std::fs::create_dir_all(parent) {
@@ -6799,8 +7541,6 @@ fn run_agent_fleet_transfer_export(
         }
     }
 
-    let is_ptb = out_path.extension().map(|e| e == "ptb").unwrap_or(false);
-
     if is_ptb {
         use pt_bundle::{BundleWriter, FileType};
         use pt_redact::ExportProfile;
@@ -6811,14 +7551,12 @@ fn run_agent_fleet_transfer_export(
                 return output_agent_error(global, "fleet transfer export", &e.to_string());
             }
         };
-        let export_profile = match args.export_profile.as_deref() {
-            Some("minimal") => ExportProfile::Minimal,
-            Some("forensic") => ExportProfile::Forensic,
-            _ => ExportProfile::Safe,
-        };
-        let mut writer = BundleWriter::new("transfer", &host_id, export_profile)
-            .with_description("Fleet transfer bundle");
-        writer.add_file("transfer_bundle.json", json_bytes, Some(FileType::Json));
+        let mut writer = BundleWriter::new("transfer", &host_id, ExportProfile::Forensic)
+            .with_description("Intact fleet configuration transfer");
+        // export_bundle has validated all typed fields, executable matchers and
+        // detected-secret content. Generic session redaction would invalidate
+        // this operational schema and its checksum, so retain those exact bytes.
+        writer.add_file("transfer_bundle.json", json_bytes, Some(FileType::Binary));
 
         let passphrase = args
             .passphrase
@@ -6883,8 +7621,7 @@ fn run_agent_fleet_transfer_import(
     args: &AgentFleetTransferImportArgs,
 ) -> ExitCode {
     use pt_core::fleet::transfer::{
-        compute_diff, merge_priors, normalize_baseline, validate_bundle, MergeStrategy,
-        TransferBundle,
+        compute_diff, merge_priors, validate_bundle, MergeStrategy, TransferBundle,
     };
     use pt_core::supervision::pattern_persistence::{ConflictResolution, PatternLibrary};
 
@@ -6907,6 +7644,13 @@ fn run_agent_fleet_transfer_import(
                 }
             };
 
+        if reader.manifest().export_profile != pt_redact::ExportProfile::Forensic {
+            return output_agent_error(
+                global,
+                "fleet transfer import",
+                "redacted sharing bundle cannot be activated as fleet configuration",
+            );
+        }
         let data = match reader.read_verified("transfer_bundle.json") {
             Ok(d) => d,
             Err(e) => {
@@ -6915,8 +7659,12 @@ fn run_agent_fleet_transfer_import(
         };
         match serde_json::from_slice(&data) {
             Ok(b) => b,
-            Err(e) => {
-                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            Err(_) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer import",
+                    "invalid fleet transfer configuration",
+                );
             }
         }
     } else {
@@ -6928,8 +7676,12 @@ fn run_agent_fleet_transfer_import(
         };
         match serde_json::from_str(&data) {
             Ok(b) => b,
-            Err(e) => {
-                return output_agent_error(global, "fleet transfer import", &e.to_string());
+            Err(_) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer import",
+                    "invalid fleet transfer configuration",
+                );
             }
         }
     };
@@ -6941,12 +7693,18 @@ fn run_agent_fleet_transfer_import(
         }
     };
 
-    let strategy: MergeStrategy = args
-        .merge_strategy
-        .as_deref()
-        .unwrap_or("weighted")
-        .parse()
-        .unwrap_or(MergeStrategy::Weighted);
+    // Neither the exported configuration nor the local session inventory tracks
+    // the comparable learning observations behind these Beta parameters. A PID
+    // census is occupancy, not evidence for increasing their concentration.
+    if args.normalize_baseline {
+        return output_agent_error(
+            global,
+            "fleet transfer import",
+            "baseline normalization requires comparable measured learning observations; local baseline evidence is unavailable",
+        );
+    }
+
+    let strategy: MergeStrategy = args.merge_strategy;
 
     let options = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
@@ -6959,20 +7717,7 @@ fn run_agent_fleet_transfer_import(
     };
 
     let merged_priors = if let Some(ref incoming_priors) = bundle.priors {
-        let mut incoming = incoming_priors.clone();
-        if args.normalize_baseline {
-            if let Some(ref source_stats) = bundle.baseline_stats {
-                let target_stats = pt_core::fleet::transfer::BaselineStats {
-                    total_processes_seen: 5000,
-                    observation_window_hours: 72.0,
-                    class_distribution: std::collections::BTreeMap::new(),
-                    mean_cpu_utilization: 50.0,
-                    host_type: None,
-                };
-                normalize_baseline(&mut incoming, source_stats, &target_stats);
-            }
-        }
-        match merge_priors(&config.priors, &incoming, strategy) {
+        match merge_priors(&config.priors, incoming_priors, strategy) {
             Ok(m) => Some(m),
             Err(e) => {
                 return output_agent_error(global, "fleet transfer import", &e.to_string());
@@ -6982,7 +7727,21 @@ fn run_agent_fleet_transfer_import(
         None
     };
 
-    let diff = compute_diff(Some(&config.priors), None, &bundle);
+    let local_signatures = match local_transfer_signatures(global, &bundle) {
+        Ok(local) => local,
+        Err(e) => return output_agent_error(global, "fleet transfer import", &e),
+    };
+    if let Some(priors) = &merged_priors {
+        if let Err(error) = pt_config::validate::validate_priors(priors) {
+            return output_agent_error(global, "fleet transfer import", &error.to_string());
+        }
+    }
+    let diff = compute_diff(
+        Some(&config.priors),
+        local_signatures.as_ref(),
+        &bundle,
+        merged_priors.as_ref(),
+    );
 
     if args.dry_run {
         let response = serde_json::json!({
@@ -7024,19 +7783,43 @@ fn run_agent_fleet_transfer_import(
         return ExitCode::Clean;
     }
 
+    // Load the local pattern library and merge the bundle's signatures in memory
+    // before writing anything: a failure here must leave both the priors and the
+    // pattern files untouched, not merge the priors and then report success with
+    // the signatures silently skipped. save() rewrites every pattern file,
+    // disabled.json and pattern_stats.json from memory, so it must never follow a
+    // failed load.
+    let pending_signatures = if let Some(ref incoming_sigs) = bundle.signatures {
+        let config_dir = resolved_config_dir(global);
+        let mut lib = PatternLibrary::new(&config_dir)
+            .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
+        let resolution = match strategy {
+            MergeStrategy::Replace => ConflictResolution::ReplaceWithImported,
+            MergeStrategy::KeepLocal => ConflictResolution::KeepExisting,
+            MergeStrategy::Weighted => ConflictResolution::KeepHigherConfidence,
+        };
+        match lib
+            .load()
+            .and_then(|()| lib.import(incoming_sigs.clone(), resolution))
+        {
+            Ok(result) => Some((lib, result)),
+            Err(e) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer import",
+                    &format!("signature import failed, nothing was written: {e}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     if let Some(ref final_priors) = merged_priors {
-        let priors_path = config.snapshot().priors_path.unwrap_or_else(|| {
-            global
-                .config
-                .as_ref()
-                .map(|c| PathBuf::from(c).join("priors.json"))
-                .unwrap_or_else(|| {
-                    dirs::config_dir()
-                        .unwrap_or_else(|| PathBuf::from("."))
-                        .join("pt")
-                        .join("priors.json")
-                })
-        });
+        let priors_path = config
+            .snapshot()
+            .priors_path
+            .unwrap_or_else(|| resolved_config_dir(global).join("priors.json"));
 
         if !args.no_backup && priors_path.exists() {
             let backup = priors_path.with_extension("json.bak");
@@ -7067,39 +7850,28 @@ fn run_agent_fleet_transfer_import(
         }
     }
 
-    let sig_result = if let Some(ref incoming_sigs) = bundle.signatures {
-        let config_dir = global
-            .config
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| dirs::config_dir().map(|d| d.join("process_triage")))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let mut lib = PatternLibrary::new(&config_dir);
-        let _ = lib.load();
-
-        let resolution = match strategy {
-            MergeStrategy::Replace => ConflictResolution::ReplaceWithImported,
-            MergeStrategy::KeepLocal => ConflictResolution::KeepExisting,
-            MergeStrategy::Weighted => ConflictResolution::KeepHigherConfidence,
-        };
-
-        match lib.import(incoming_sigs.clone(), resolution) {
-            Ok(result) => {
-                let _ = lib.save();
-                Some(serde_json::json!({
-                    "imported": result.imported,
-                    "updated": result.updated,
-                    "skipped": result.skipped,
-                    "conflicts": result.conflicts.len(),
-                }))
+    let sig_result = match pending_signatures {
+        Some((mut lib, result)) => {
+            if let Err(e) = lib.save() {
+                eprintln!(
+                    "fleet transfer import: saving signatures failed{}: {}",
+                    if merged_priors.is_some() {
+                        " (priors were already merged)"
+                    } else {
+                        ""
+                    },
+                    e
+                );
+                return ExitCode::IoError;
             }
-            Err(e) => {
-                eprintln!("warning: signature import failed: {}", e);
-                None
-            }
+            Some(serde_json::json!({
+                "imported": result.imported,
+                "updated": result.updated,
+                "skipped": result.skipped,
+                "conflicts": result.conflicts.len(),
+            }))
         }
-    } else {
-        None
+        None => None,
     };
 
     let response = serde_json::json!({
@@ -7138,6 +7910,38 @@ fn run_agent_fleet_transfer_import(
     ExitCode::Clean
 }
 
+/// The signatures `fleet transfer` moves between hosts: the learned, custom and
+/// imported patterns of the local pattern library, read from the config directory
+/// (and, without an override, from the pre-GH #18 macOS location for files it
+/// lacks).
+fn load_transfer_signatures(
+    global: &GlobalOpts,
+) -> Result<pt_core::supervision::pattern_persistence::PersistedSchema, String> {
+    use pt_core::supervision::pattern_persistence::{PatternLibrary, PatternSource};
+    let config_dir = resolved_config_dir(global);
+    let mut lib = PatternLibrary::new(&config_dir)
+        .with_legacy_dir(pt_core::signature_cli::legacy_read_dir(&config_dir));
+    lib.load()
+        .map_err(|e| format!("could not load the local pattern library: {e}"))?;
+    Ok(lib.export(&[
+        PatternSource::Learned,
+        PatternSource::Custom,
+        PatternSource::Imported,
+    ]))
+}
+
+/// The local side of a signature diff against `bundle`: `None` when the bundle
+/// carries no signatures (nothing to compare).
+fn local_transfer_signatures(
+    global: &GlobalOpts,
+    bundle: &pt_core::fleet::transfer::TransferBundle,
+) -> Result<Option<pt_core::supervision::pattern_persistence::PersistedSchema>, String> {
+    if bundle.signatures.is_none() {
+        return Ok(None);
+    }
+    load_transfer_signatures(global).map(Some)
+}
+
 fn run_agent_fleet_transfer_diff(
     global: &GlobalOpts,
     args: &AgentFleetTransferDiffArgs,
@@ -7163,6 +7967,13 @@ fn run_agent_fleet_transfer_diff(
                 }
             };
 
+        if reader.manifest().export_profile != pt_redact::ExportProfile::Forensic {
+            return output_agent_error(
+                global,
+                "fleet transfer diff",
+                "redacted sharing bundle cannot be used as intact fleet configuration",
+            );
+        }
         let data = match reader.read_verified("transfer_bundle.json") {
             Ok(d) => d,
             Err(e) => {
@@ -7171,8 +7982,12 @@ fn run_agent_fleet_transfer_diff(
         };
         match serde_json::from_slice(&data) {
             Ok(b) => b,
-            Err(e) => {
-                return output_agent_error(global, "fleet transfer diff", &e.to_string());
+            Err(_) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer diff",
+                    "invalid fleet transfer configuration",
+                );
             }
         }
     } else {
@@ -7184,8 +7999,12 @@ fn run_agent_fleet_transfer_diff(
         };
         match serde_json::from_str(&data) {
             Ok(b) => b,
-            Err(e) => {
-                return output_agent_error(global, "fleet transfer diff", &e.to_string());
+            Err(_) => {
+                return output_agent_error(
+                    global,
+                    "fleet transfer diff",
+                    "invalid fleet transfer configuration",
+                );
             }
         }
     };
@@ -7207,7 +8026,16 @@ fn run_agent_fleet_transfer_diff(
         Err(e) => return output_config_error(global, &e),
     };
 
-    let diff = compute_diff(Some(&config.priors), None, &bundle);
+    let local_signatures = match local_transfer_signatures(global, &bundle) {
+        Ok(local) => local,
+        Err(e) => return output_agent_error(global, "fleet transfer diff", &e),
+    };
+    let diff = compute_diff(
+        Some(&config.priors),
+        local_signatures.as_ref(),
+        &bundle,
+        None,
+    );
 
     let response = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -7471,6 +8299,19 @@ fn run_config_schema(global: &GlobalOpts, file: &str) -> ExitCode {
 ///    monitors started by live Claude sessions).
 ///
 /// Returns the number of downgraded candidates.
+fn execution_tree_refusal(
+    pid: u32,
+    processes: &[ProcessRecord],
+    agent_rule: bool,
+) -> Option<String> {
+    let mut candidate = serde_json::json!({
+        "pid": pid,
+        "recommended_action": "kill",
+    });
+    apply_process_tree_safety(&mut [&mut candidate], processes, agent_rule);
+    candidate["action_rationale"].as_str().map(String::from)
+}
+
 fn apply_process_tree_safety(
     candidates: &mut [&mut serde_json::Value],
     processes: &[ProcessRecord],
@@ -7589,6 +8430,111 @@ fn apply_process_tree_safety(
         }
     }
     downgraded
+}
+
+/// Cap the final planned kill set without spending the execution rate budget.
+/// Children are eligible before parents; unrelated eligible choices retain the
+/// planner's ranking. Recheck tree safety after any budget exclusions.
+fn apply_planned_kill_budget(
+    candidates: &mut [&mut serde_json::Value],
+    processes: &[ProcessRecord],
+    policy: &pt_core::config::Policy,
+    robot: bool,
+) -> usize {
+    let mut downgraded =
+        apply_process_tree_safety(candidates, processes, policy.guardrails.builtin_protection);
+    let limit = if robot {
+        policy
+            .guardrails
+            .max_kills_per_run
+            .min(policy.robot_mode.max_kills)
+    } else {
+        policy.guardrails.max_kills_per_run
+    };
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let kill_indices: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate["recommended_action"].as_str() == Some("kill"))
+        .map(|(index, _)| index)
+        .collect();
+
+    if kill_indices.len() > limit {
+        let kill_by_pid: HashMap<u32, usize> = kill_indices
+            .iter()
+            .filter_map(|&index| {
+                let pid = u32::try_from(candidates[index]["pid"].as_u64()?).ok()?;
+                Some((pid, index))
+            })
+            .collect();
+        let mut pending_children: HashMap<u32, usize> =
+            kill_by_pid.keys().map(|&pid| (pid, 0)).collect();
+        let mut parent_of: HashMap<u32, u32> = HashMap::new();
+        for process in processes {
+            if !process.state.is_zombie()
+                && kill_by_pid.contains_key(&process.pid.0)
+                && kill_by_pid.contains_key(&process.ppid.0)
+            {
+                *pending_children.entry(process.ppid.0).or_default() += 1;
+                parent_of.insert(process.pid.0, process.ppid.0);
+            }
+        }
+        let mut ready: std::collections::BTreeSet<usize> = pending_children
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .filter_map(|(pid, _)| kill_by_pid.get(pid).copied())
+            .collect();
+        let mut selected = HashSet::new();
+        while selected.len() < limit {
+            let Some(index) = ready.pop_first() else {
+                break;
+            };
+            selected.insert(index);
+            let pid = candidates[index]["pid"].as_u64().unwrap_or(0) as u32;
+            if let Some(parent) = parent_of.get(&pid) {
+                if let Some(count) = pending_children.get_mut(parent) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        if let Some(&parent_index) = kill_by_pid.get(parent) {
+                            ready.insert(parent_index);
+                        }
+                    }
+                }
+            }
+        }
+
+        for index in kill_indices {
+            if selected.contains(&index) {
+                continue;
+            }
+            if let Some(object) = candidates[index].as_object_mut() {
+                let previous_rationale = object
+                    .get("action_rationale")
+                    .and_then(|value| value.as_str())
+                    .map(|reason| format!("; previous rationale: {reason}"))
+                    .unwrap_or_default();
+                object.insert(
+                    "recommended_action".to_string(),
+                    serde_json::json!("review"),
+                );
+                object.insert("recommendation".to_string(), serde_json::json!("REVIEW"));
+                object.insert(
+                    "action_rationale".to_string(),
+                    serde_json::json!(format!(
+                        "Kill downgraded to review: final plan is limited to {limit} kills{previous_rationale}"
+                    )),
+                );
+                object.insert(
+                    "plan_budget".to_string(),
+                    serde_json::json!({ "rule": "max_planned_kills", "limit": limit }),
+                );
+                downgraded += 1;
+            }
+        }
+    }
+
+    downgraded
+        + apply_process_tree_safety(candidates, processes, policy.guardrails.builtin_protection)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8240,12 +9186,12 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
     let own_pid = std::process::id();
     let mut last_cpu_sample: Option<(f64, std::time::Instant)> = None;
 
-    match read_daemon_pid() {
-        Ok(Some(pid)) if pid != own_pid && is_process_running(pid) => {
+    match read_pid_file_record(&daemon_pid_path()) {
+        Ok(Some((pid, birth))) if pid != own_pid && pid_file_running(pid, birth) => {
             eprintln!("daemon start: existing daemon running (pid {})", pid);
             return ExitCode::LockError;
         }
-        Ok(Some(pid)) if pid != own_pid => {
+        Ok(Some((pid, _))) if pid != own_pid => {
             let _ = remove_daemon_pid();
         }
         Ok(_) => {}
@@ -8673,8 +9619,8 @@ fn daemon_notify_desktop(
 
 #[cfg(feature = "daemon")]
 fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
-    let pid = match read_daemon_pid() {
-        Ok(Some(pid)) => pid,
+    let (pid, birth) = match read_pid_file_record(&daemon_pid_path()) {
+        Ok(Some(record)) => record,
         Ok(None) => {
             let response = serde_json::json!({
                 "command": "daemon stop",
@@ -8696,6 +9642,54 @@ fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
             return ExitCode::IoError;
         }
     };
+
+    // A running daemon holds its pid lock. If the lock is free, the pid file is
+    // stale and its pid may now belong to an unrelated process: do not signal it.
+    match try_acquire_daemon_pid_lock() {
+        Ok(Some(_free)) => {
+            let _ = remove_daemon_pid();
+            let response = serde_json::json!({
+                "command": "daemon stop",
+                "running": false,
+                "message": format!("stale daemon pid file (pid {pid}); no daemon is running"),
+            });
+            match global.format {
+                OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+                    println!("{}", format_structured_output(global, response));
+                }
+                _ => {
+                    println!("Daemon not running (stale pid file for pid {pid}).");
+                }
+            }
+            return ExitCode::Clean;
+        }
+        // The lock is held, but maybe by a starting daemon or another `stop`: the
+        // holder writes its pid into the lock file, and it must be the pid file's.
+        Ok(None) => {
+            let holder = std::fs::read_to_string(daemon_pid_lock_path())
+                .ok()
+                .and_then(|content| content.trim().parse::<u32>().ok());
+            if holder != Some(pid) {
+                eprintln!(
+                    "daemon stop: the daemon pid lock is not held by pid {pid} from the pid file; \
+                     not signalled (retry once the daemon has started or the other stop finished)"
+                );
+                return ExitCode::IoError;
+            }
+        }
+        Err(err) => {
+            eprintln!("daemon stop: failed to check the daemon pid lock: {}", err);
+            return ExitCode::IoError;
+        }
+    }
+    // A daemon runs, but the file may still name another process (a daemon in a
+    // container sharing this data dir). Files from before v2.3.0 record no birth.
+    if pid_file_target(pid, birth) == PidFileTarget::Stale {
+        eprintln!(
+            "daemon stop: pid {pid} in the daemon pid file is not the running daemon; not signalled"
+        );
+        return ExitCode::IoError;
+    }
 
     if let Err(err) = terminate_process(pid) {
         eprintln!("daemon stop: failed to terminate daemon: {}", err);
@@ -8726,8 +9720,9 @@ fn run_daemon_stop(global: &GlobalOpts) -> ExitCode {
 
 #[cfg(feature = "daemon")]
 fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
-    let pid = read_daemon_pid().ok().flatten();
-    let running = pid.map(is_process_running).unwrap_or(false);
+    let record = read_pid_file_record(&daemon_pid_path()).ok().flatten();
+    let pid = record.map(|(pid, _)| pid);
+    let running = record.is_some_and(|(pid, birth)| pid_file_running(pid, birth));
     let state_path = daemon_state_path();
     let state = if state_path.exists() {
         std::fs::read_to_string(&state_path)
@@ -9159,8 +10154,8 @@ fn run_shadow_start(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
 }
 
 fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCode {
-    if let Ok(Some(pid)) = read_shadow_pid() {
-        if is_process_running(pid) {
+    if let Ok(Some((pid, birth))) = read_pid_file_record(&shadow_pid_path()) {
+        if pid_file_running(pid, birth) {
             eprintln!(
                 "shadow start: existing shadow observer running (pid {})",
                 pid
@@ -9185,13 +10180,19 @@ fn run_shadow_background(global: &GlobalOpts, args: &ShadowStartArgs) -> ExitCod
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             eprintln!("shadow start: failed to spawn background worker: {}", err);
             return ExitCode::IoError;
         }
     };
+    // Its birth is recorded while it is still our unreaped child; one that has
+    // already exited would leave a pid file naming nothing.
+    if let Ok(Some(status)) = child.try_wait() {
+        eprintln!("shadow start: background worker exited at once ({status})");
+        return ExitCode::IoError;
+    }
 
     if let Err(err) = write_shadow_pid(child.id()) {
         eprintln!("shadow start: failed to write pid file: {}", err);
@@ -9324,8 +10325,8 @@ fn run_shadow_iteration(
 }
 
 fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
-    let pid = match read_shadow_pid() {
-        Ok(Some(pid)) => pid,
+    let (pid, birth) = match read_pid_file_record(&shadow_pid_path()) {
+        Ok(Some(record)) => record,
         Ok(None) => {
             let response = serde_json::json!({
                 "command": "shadow stop",
@@ -9347,6 +10348,43 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
             return ExitCode::IoError;
         }
     };
+
+    // The pid file records the observer's birth: signal only that process, never
+    // whatever reused the pid after an unclean exit.
+    let target = pid_file_target(pid, birth);
+    let refusal = match target {
+        PidFileTarget::Verified => None,
+        PidFileTarget::Stale => Some(format!(
+            "pid {pid} in {} is no longer the observer; not signalled",
+            shadow_pid_path().display()
+        )),
+        PidFileTarget::Unverified => Some(format!(
+            "pid {pid} in {} cannot be verified (no start time recorded before v2.3.0, or the \
+             process cannot be inspected); if it is a pt shadow observer, stop it with \
+             `kill {pid}` and remove that file",
+            shadow_pid_path().display()
+        )),
+    };
+    if let Some(message) = refusal {
+        if target == PidFileTarget::Stale {
+            let _ = remove_shadow_pid();
+        }
+        let response = serde_json::json!({
+            "command": "shadow stop",
+            "running": false,
+            "pid": pid,
+            "message": message,
+        });
+        match global.format {
+            OutputFormat::Json | OutputFormat::Toon | OutputFormat::Jsonl => {
+                println!("{}", format_structured_output(global, response));
+            }
+            _ => {
+                println!("Shadow observer not signalled: {message}.");
+            }
+        }
+        return ExitCode::Clean;
+    }
 
     if let Err(err) = terminate_process(pid) {
         eprintln!("shadow stop: failed to signal pid {}: {}", pid, err);
@@ -9375,8 +10413,9 @@ fn run_shadow_stop(global: &GlobalOpts) -> ExitCode {
 }
 
 fn run_shadow_status(global: &GlobalOpts) -> ExitCode {
-    let pid = read_shadow_pid().ok().flatten();
-    let running = pid.map(is_process_running).unwrap_or(false);
+    let record = read_pid_file_record(&shadow_pid_path()).ok().flatten();
+    let pid = record.map(|(pid, _)| pid);
+    let running = record.is_some_and(|(pid, birth)| pid_file_running(pid, birth));
     let stale = pid.is_some() && !running;
 
     let config = ShadowStorageConfig {
@@ -9680,28 +10719,129 @@ fn shadow_pid_path() -> PathBuf {
 }
 
 fn write_shadow_pid(pid: u32) -> std::io::Result<()> {
-    let path = shadow_pid_path();
+    write_pid_file_record(&shadow_pid_path(), pid)
+}
+
+fn read_shadow_pid() -> std::io::Result<Option<u32>> {
+    Ok(read_pid_file_record(&shadow_pid_path())?.map(|(pid, _)| pid))
+}
+
+/// Birth of a live process (Linux start ticks, macOS start microseconds): what a
+/// pid file records next to the pid so a later `stop` can tell that process from
+/// an unrelated one that reused the pid.
+fn process_birth_for_pid_file(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        pt_core::collect::proc_parsers::read_required_proc_stat(pid)
+            .ok()
+            .map(|stat| stat.starttime)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        pt_core::collect::read_bsd_info(pid).map(|info| info.start_us)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// `<pid file>.birth`: `<pid> <birth>` for the pid the pid file names. A sidecar
+/// keeps the pid file itself a bare pid, as scripts and older pt versions read it.
+fn pid_birth_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".birth");
+    PathBuf::from(name)
+}
+
+/// Write the pid file, recording the process's birth beside it when readable.
+fn write_pid_file_record(path: &Path, pid: u32) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    // The sidecar first: a reader binds it to the pid file's pid, so a sidecar
+    // left by an earlier run never applies to a new pid.
+    match process_birth_for_pid_file(pid) {
+        Some(birth) => std::fs::write(pid_birth_path(path), format!("{pid} {birth}"))?,
+        None => remove_if_present(&pid_birth_path(path))?,
     }
     std::fs::write(path, pid.to_string())
 }
 
-fn read_shadow_pid() -> std::io::Result<Option<u32>> {
-    let path = shadow_pid_path();
+/// Read the pid file's pid and, when its sidecar names the same pid, its birth.
+fn read_pid_file_record(path: &Path) -> std::io::Result<Option<(u32, Option<u64>)>> {
     if !path.exists() {
         return Ok(None);
     }
     let content = std::fs::read_to_string(path)?;
-    Ok(content.trim().parse::<u32>().ok())
+    let Ok(pid) = content.trim().parse::<u32>() else {
+        return Ok(None);
+    };
+    let birth = std::fs::read_to_string(pid_birth_path(path))
+        .ok()
+        .and_then(|record| {
+            let mut fields = record.split_whitespace();
+            let recorded_pid = fields.next()?.parse::<u32>().ok()?;
+            let birth = fields.next()?.parse::<u64>().ok()?;
+            (recorded_pid == pid).then_some(birth)
+        });
+    Ok(Some((pid, birth)))
+}
+
+/// Whether a pid file's pid still names the process that wrote its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidFileTarget {
+    /// The live process has the recorded birth.
+    Verified,
+    /// The process is gone, or the pid now belongs to one with another birth.
+    Stale,
+    /// No birth is recorded (pre-2.3.0 file), or the process exists but cannot
+    /// be inspected (another user's process, hidepid).
+    Unverified,
+}
+
+fn pid_file_target(pid: u32, birth: Option<u64>) -> PidFileTarget {
+    let Some(birth) = birth else {
+        return if is_process_running(pid) {
+            PidFileTarget::Unverified
+        } else {
+            PidFileTarget::Stale
+        };
+    };
+    match process_birth_for_pid_file(pid) {
+        Some(live) if live == birth => PidFileTarget::Verified,
+        Some(_) => PidFileTarget::Stale,
+        None if is_process_running(pid) => PidFileTarget::Unverified,
+        None => PidFileTarget::Stale,
+    }
+}
+
+/// Whether the pid file's process runs: its recorded birth decides when there is one.
+fn pid_file_running(pid: u32, birth: Option<u64>) -> bool {
+    match pid_file_target(pid, birth) {
+        PidFileTarget::Verified => true,
+        PidFileTarget::Stale => false,
+        PidFileTarget::Unverified => is_process_running(pid),
+    }
 }
 
 fn remove_shadow_pid() -> std::io::Result<()> {
-    let path = shadow_pid_path();
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    remove_pid_file_record(&shadow_pid_path())
+}
+
+/// Remove a pid file, then its birth sidecar; one already removed (by the
+/// exiting process's own cleanup) is fine.
+fn remove_pid_file_record(path: &Path) -> std::io::Result<()> {
+    remove_if_present(path)?;
+    remove_if_present(&pid_birth_path(path))
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
-    Ok(())
 }
 
 // ============================================================================
@@ -9975,30 +11115,17 @@ fn daemon_lock_path() -> PathBuf {
 
 #[cfg(feature = "daemon")]
 fn write_daemon_pid(pid: u32) -> std::io::Result<()> {
-    let path = daemon_pid_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, pid.to_string())
+    write_pid_file_record(&daemon_pid_path(), pid)
 }
 
 #[cfg(feature = "daemon")]
 fn read_daemon_pid() -> std::io::Result<Option<u32>> {
-    let path = daemon_pid_path();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = std::fs::read_to_string(path)?;
-    Ok(content.trim().parse::<u32>().ok())
+    Ok(read_pid_file_record(&daemon_pid_path())?.map(|(pid, _)| pid))
 }
 
 #[cfg(feature = "daemon")]
 fn remove_daemon_pid() -> std::io::Result<()> {
-    let path = daemon_pid_path();
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
+    remove_pid_file_record(&daemon_pid_path())
 }
 
 #[cfg(feature = "daemon")]
@@ -10432,9 +11559,21 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
     (config, enabled)
 }
 
+/// SIGTERM a pid read from one of pt's own pid files. The pid must name one
+/// process: 0 would signal pt's process group, and values past i32::MAX would
+/// become negative (a process group, or every process for -1).
 #[cfg(unix)]
 fn terminate_process(pid: u32) -> std::io::Result<()> {
-    let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    let pid = match libc::pid_t::try_from(pid) {
+        Ok(pid) if pid > 1 => pid,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to signal pid {pid} from a pid file"),
+            ))
+        }
+    };
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
     if result == 0 {
         Ok(())
     } else {
@@ -10535,10 +11674,15 @@ fn collect_shadow_files(dir: &PathBuf, files: &mut Vec<PathBuf>) -> std::io::Res
     Ok(())
 }
 
-fn run_mcp(args: &McpArgs) -> ExitCode {
+fn run_mcp(global: &GlobalOpts, args: &McpArgs) -> ExitCode {
     if args.transport != "stdio" {
         eprintln!("Only 'stdio' transport is currently supported");
         return ExitCode::ArgsError;
+    }
+    // The tools read priors, policy, learned verdicts and signatures from the same
+    // config directory as every CLI command (GH #18).
+    if let Some(dir) = global.config.as_ref() {
+        pt_core::mcp::set_config_dir(PathBuf::from(dir));
     }
 
     let mut server = pt_core::mcp::McpServer::new();
@@ -10704,7 +11848,10 @@ fn output_stub_with_session(
 
 #[cfg(test)]
 mod process_tree_safety_tests {
-    use super::apply_process_tree_safety;
+    use super::{
+        apply_planned_kill_budget, apply_process_tree_safety, build_agent_action_plan,
+        process_identity_from_record, reconcile_agent_action_candidates,
+    };
     use pt_common::{ProcessId, StartId};
     use pt_core::collect::{ProcessRecord, ProcessState};
 
@@ -10733,6 +11880,1812 @@ mod process_tree_safety_tests {
 
     fn cand(pid: u32) -> serde_json::Value {
         serde_json::json!({"pid": pid, "recommended_action": "kill", "recommendation": "KILL"})
+    }
+
+    /// Payload-level reporting test: no live signal or kill is claimed here.
+    #[test]
+    fn goal_progress_uses_executed_identity_parent_clock_and_actual_success() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use pt_core::plan::DecisionCandidate;
+        use pt_core::verify::{ExecutionClock, SavedActionOutcome};
+
+        let policy = pt_core::config::Policy::default();
+        let process = rec(100, 10, "sleep 600", ProcessState::Sleeping);
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let inputs = [(
+            100,
+            DecisionCandidate {
+                identity: process_identity_from_record(&process),
+                ppid: Some(10),
+                decision,
+                blocked_reasons: Vec::new(),
+                stage_pause_before_kill: false,
+                process_state: Some(process.state),
+                parent_identity: None,
+                d_state_diagnostics: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &[cand(100)],
+            &inputs,
+            "1970-01-01T00:00:01Z".to_string(),
+        );
+        assert_eq!(plan.actions.len(), 1);
+        let action = &plan.actions[0];
+        let parent = rec(10, 1, "sh respawner.sh", ProcessState::Sleeping);
+        let saved = SavedActionOutcome {
+            action_id: action.action_id.clone(),
+            pid: 100,
+            status: "success".to_string(),
+            action: Some(action.action),
+            target: Some(action.target.clone()),
+            command: Some(process.cmd.clone()),
+            parent_pid: Some(10),
+            parent_identity: Some(process_identity_from_record(&parent)),
+            executed_at: Some(chrono::DateTime::from_timestamp(10, 0).unwrap()),
+            execution_clock: Some(ExecutionClock {
+                boot_id: "b".to_string(),
+                ticks: 1000,
+            }),
+            time_ms: Some(1),
+        };
+        let mut replacement = rec(200, 10, "sleep 600", ProcessState::Sleeping);
+        replacement.start_id = StartId::from_linux("b", 1001, 200);
+        replacement.start_time_unix = 10;
+        let payload = serde_json::to_value(&saved).unwrap();
+        let successful =
+            super::successful_goal_action_outcomes(&plan, std::slice::from_ref(&payload)).unwrap();
+        assert_eq!(successful.len(), 1);
+        assert!(super::detect_respawn_for_goal_progress(
+            action,
+            &successful[0],
+            &[replacement.clone(), parent.clone()]
+        ));
+        for variant in ["parent", "uid", "substring", "preexisting"] {
+            let mut unrelated = replacement.clone();
+            match variant {
+                "parent" => unrelated.ppid = ProcessId(11),
+                "uid" => unrelated.uid = 1001,
+                "substring" => unrelated.cmd = "sleep 6000".to_string(),
+                "preexisting" => unrelated.start_id = StartId::from_linux("b", 999, 200),
+                _ => unreachable!(),
+            }
+            assert!(
+                !super::detect_respawn_for_goal_progress(
+                    action,
+                    &successful[0],
+                    &[unrelated, parent.clone()]
+                ),
+                "{variant}"
+            );
+        }
+        for status in ["dry_run", "shadow", "failed", "precheck_blocked"] {
+            let mut planned_only = payload.clone();
+            planned_only["status"] = serde_json::json!(status);
+            assert!(
+                super::successful_goal_action_outcomes(&plan, &[planned_only])
+                    .unwrap()
+                    .is_empty(),
+                "{status}"
+            );
+        }
+        let mut invalid = payload;
+        invalid["target"]["uid"] = serde_json::json!(1001);
+        assert!(super::successful_goal_action_outcomes(&plan, &[invalid]).is_err());
+    }
+
+    fn retained_outcome_fixture(label: &str) -> std::path::PathBuf {
+        // Retain filesystem probes for inspection; no automatic deletion.
+        std::env::temp_dir().join(format!("pt-outcome-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn goal_progress_planning_retains_expectation_without_observed_effect_claim() {
+        let before = super::MetricSnapshot {
+            available_memory_bytes: 100,
+            total_cpu_frac: 0.0,
+            occupied_ports: Vec::new(),
+            total_fds: 0,
+            timestamp: 1.0,
+        };
+        let after = super::MetricSnapshot {
+            available_memory_bytes: 200,
+            timestamp: 2.0,
+            ..before.clone()
+        };
+        let report = super::goal_progress::measure_progress(
+            super::GoalMetric::Memory,
+            None,
+            &before,
+            &after,
+            vec![super::GoalActionOutcome {
+                pid: 100,
+                label: "sleep 600".to_string(),
+                success: false,
+                respawn_detected: false,
+                expected_contribution: 50.0,
+            }],
+            &super::ProgressConfig::default(),
+            None,
+        );
+        let actual = super::goal_report_json(&report, false);
+        assert_eq!(actual["expected_progress"], 50.0);
+        assert_eq!(actual["observed_progress"], 100.0);
+        assert!(!actual["suspected_causes"].as_array().unwrap().is_empty());
+        let planned = super::goal_report_json(&report, true);
+        assert_eq!(planned["expected_progress"], 50.0);
+        assert!(planned["observed_progress"].is_null());
+        assert!(planned["discrepancy"].is_null());
+        assert_eq!(planned["classification"], "not_executed");
+        assert!(planned["suspected_causes"].as_array().unwrap().is_empty());
+        let brief = super::goal_report_brief_json(&report, true);
+        assert_eq!(brief["expected"], 50.0);
+        assert!(brief["observed"].is_null());
+        assert_eq!(brief["planning_only"], true);
+    }
+
+    #[test]
+    fn action_outcome_log_appends_complete_original_payloads() {
+        let directory = retained_outcome_fixture("append");
+        let success = serde_json::json!({"action_id":"a1", "pid":100, "status":"success", "target":{"start_id":"b:1:100"}});
+        let refusal = serde_json::json!({"action_id":"a2", "pid":200, "status":"precheck_blocked", "reason":"rate_limit"});
+        super::append_action_outcomes(&directory, std::slice::from_ref(&success)).unwrap();
+        super::append_action_outcomes(&directory, std::slice::from_ref(&refusal)).unwrap();
+        let saved = std::fs::read_to_string(directory.join("outcomes.jsonl")).unwrap();
+        let records: Vec<serde_json::Value> = saved
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records, vec![success, refusal]);
+        assert!(saved.ends_with('\n'));
+    }
+
+    #[test]
+    fn action_outcome_log_reports_creation_and_open_failures() {
+        let root = retained_outcome_fixture("refusal");
+        std::fs::create_dir_all(&root).unwrap();
+        let not_directory = root.join("parent-is-a-file");
+        std::fs::write(&not_directory, "retained sentinel").unwrap();
+        let records = vec![serde_json::json!({"action_id":"a1", "pid":100, "status":"success"})];
+        let creation = super::append_action_outcomes(&not_directory, &records).unwrap_err();
+        assert!(creation.contains("create action outcome directory"));
+        assert_eq!(
+            std::fs::read_to_string(&not_directory).unwrap(),
+            "retained sentinel"
+        );
+        let action_dir = root.join("action");
+        std::fs::create_dir_all(action_dir.join("outcomes.jsonl")).unwrap();
+        let open = super::append_action_outcomes(&action_dir, &records).unwrap_err();
+        assert!(open.contains("open action outcomes"));
+        assert_eq!(records[0]["status"], "success");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn action_outcome_log_reports_real_flush_failure() {
+        use std::os::unix::fs::symlink;
+        let directory = retained_outcome_fixture("flush");
+        std::fs::create_dir_all(&directory).unwrap();
+        symlink("/dev/full", directory.join("outcomes.jsonl")).unwrap();
+        let records = vec![serde_json::json!({"action_id":"a1", "pid":100, "status":"success"})];
+        let error = super::append_action_outcomes(&directory, &records).unwrap_err();
+        assert!(error.contains("flush action outcomes"), "{error}");
+        assert_eq!(records[0]["status"], "success");
+    }
+
+    #[test]
+    fn planned_kill_budget_preserves_two_kills_and_canonical_evidence() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use pt_core::plan::DecisionCandidate;
+
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 2;
+        policy.robot_mode.max_kills = 1;
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let processes: Vec<_> = [100, 200, 300, 400, 500]
+            .into_iter()
+            .map(|pid| rec(pid, 1, "sleep 600", ProcessState::Sleeping))
+            .collect();
+        let inputs = processes
+            .iter()
+            .map(|process| {
+                (
+                    process.pid.0,
+                    DecisionCandidate {
+                        identity: process_identity_from_record(process),
+                        ppid: Some(1),
+                        decision: decision.clone(),
+                        blocked_reasons: Vec::new(),
+                        stage_pause_before_kill: false,
+                        process_state: Some(process.state),
+                        parent_identity: None,
+                        d_state_diagnostics: None,
+                    },
+                )
+            })
+            .collect();
+        let mut candidates = vec![
+            serde_json::json!({"pid": 400, "recommended_action": "keep", "reason": "useful"}),
+            serde_json::json!({"pid": 500, "recommended_action": "review", "reason": "uncertain"}),
+            cand(100),
+            cand(200),
+            cand(300),
+        ];
+        candidates[4]["posterior"] = serde_json::to_value(posterior).unwrap();
+        candidates[4]["action_rationale"] = serde_json::json!("abandonment evidence");
+        let original = candidates.clone();
+        let mut refs: Vec<_> = candidates.iter_mut().collect();
+        assert_eq!(
+            apply_planned_kill_budget(&mut refs, &processes, &policy, false),
+            1
+        );
+        assert_eq!(&candidates[..4], &original[..4]);
+        assert_eq!(candidates[4]["recommended_action"], "review");
+        assert_eq!(candidates[4]["posterior"], original[4]["posterior"]);
+        assert!(candidates[4]["action_rationale"]
+            .as_str()
+            .unwrap()
+            .contains("abandonment evidence"));
+        assert_eq!(candidates[4]["plan_budget"]["limit"], 2);
+
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-10-04T12:00:00Z".to_string(),
+        );
+        assert_eq!(
+            plan.actions
+                .iter()
+                .map(|action| action.target.pid.0)
+                .collect::<Vec<_>>(),
+            vec![100, 200]
+        );
+        for action in &plan.actions {
+            assert_eq!(action.action, Action::Kill);
+            assert_eq!(action.rationale.posterior, Some(posterior));
+            assert_eq!(
+                action.target.start_id.0,
+                format!("b:1:{}", action.target.pid.0)
+            );
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn tui_selection_refuses_a_plan_above_the_run_cap_and_accepts_the_boundary() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use std::collections::HashMap;
+
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 2;
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let candidates: HashMap<_, _> = [100, 200, 300]
+            .into_iter()
+            .map(|pid| {
+                let process = rec(pid, 1, "sleep 600", ProcessState::Sleeping);
+                (
+                    pid,
+                    super::PlanCandidateInput {
+                        identity: super::process_identity_from_record(&process),
+                        ppid: Some(1),
+                        decision: decision.clone(),
+                        process_state: process.state,
+                        comm: process.comm,
+                        cmd: process.cmd,
+                    },
+                )
+            })
+            .collect();
+        let session = pt_common::SessionId::new();
+        let permitted =
+            super::build_plan_from_selection(&session, &policy, &[100, 200], &candidates).unwrap();
+        assert_eq!(permitted.actions.len(), 2);
+        assert!(permitted.actions.iter().all(|action| !action.blocked));
+        let error =
+            super::build_plan_from_selection(&session, &policy, &[100, 200, 300], &candidates)
+                .unwrap_err();
+        assert!(error.contains("selected 3 kills exceed the per-run policy limit 2"));
+        policy.guardrails.max_kills_per_run = 0;
+        assert!(super::build_plan_from_selection(&session, &policy, &[100], &candidates).is_err());
+    }
+
+    #[test]
+    fn planned_kill_budget_refuses_zero_and_preserves_keep_review() {
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 0;
+        let processes: Vec<_> = [100, 200, 300, 400]
+            .into_iter()
+            .map(|pid| rec(pid, 1, "sleep 600", ProcessState::Sleeping))
+            .collect();
+        let mut candidates = vec![
+            cand(100),
+            serde_json::json!({"pid": 200, "recommended_action": "keep", "reason": "useful"}),
+            cand(300),
+            serde_json::json!({"pid": 400, "recommended_action": "review", "reason": "uncertain"}),
+        ];
+        let original = candidates.clone();
+        let mut refs: Vec<_> = candidates.iter_mut().collect();
+        assert_eq!(
+            apply_planned_kill_budget(&mut refs, &processes, &policy, true),
+            2
+        );
+        assert_eq!(candidates[1], original[1]);
+        assert_eq!(candidates[3], original[3]);
+        for index in [0, 2] {
+            assert_eq!(candidates[index]["recommended_action"], "review");
+            assert_eq!(candidates[index]["plan_budget"]["limit"], 0);
+        }
+    }
+
+    #[test]
+    fn planned_kill_budget_uses_stricter_robot_or_run_limit() {
+        let processes: Vec<_> = [100, 200, 300]
+            .into_iter()
+            .map(|pid| rec(pid, 1, "sleep 600", ProcessState::Sleeping))
+            .collect();
+        for (run_limit, robot_limit, expected) in [(3, 2, vec![100, 200]), (1, 3, vec![100])] {
+            let mut policy = pt_core::config::Policy::default();
+            policy.guardrails.max_kills_per_run = run_limit;
+            policy.robot_mode.max_kills = robot_limit;
+            let mut candidates = [cand(100), cand(200), cand(300)];
+            let mut refs: Vec<_> = candidates.iter_mut().collect();
+            apply_planned_kill_budget(&mut refs, &processes, &policy, true);
+            let remaining: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| candidate["recommended_action"] == "kill")
+                .map(|candidate| candidate["pid"].as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(remaining, expected);
+        }
+    }
+
+    #[test]
+    fn planned_kill_budget_selects_children_before_higher_ranked_parents() {
+        let processes = vec![
+            rec(100, 1, "sh", ProcessState::Sleeping),
+            rec(101, 100, "sh", ProcessState::Sleeping),
+            rec(102, 101, "sleep 600", ProcessState::Sleeping),
+        ];
+        for (limit, expected) in [(1, vec![102]), (2, vec![101, 102])] {
+            let mut policy = pt_core::config::Policy::default();
+            policy.guardrails.max_kills_per_run = limit;
+            let mut candidates = [cand(100), cand(101), cand(102)];
+            let mut refs: Vec<_> = candidates.iter_mut().collect();
+            apply_planned_kill_budget(&mut refs, &processes, &policy, false);
+            let remaining: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| candidate["recommended_action"] == "kill")
+                .map(|candidate| candidate["pid"].as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(remaining, expected);
+        }
+    }
+
+    #[test]
+    fn planned_kill_budget_preserves_unselected_live_child() {
+        let processes = vec![
+            rec(100, 1, "sh", ProcessState::Sleeping),
+            rec(101, 100, "sleep 600", ProcessState::Sleeping),
+            rec(200, 1, "sleep 600", ProcessState::Sleeping),
+        ];
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.max_kills_per_run = 1;
+        for child in [
+            None,
+            Some(serde_json::json!({"pid": 101, "recommended_action": "keep"})),
+        ] {
+            let mut candidates = vec![cand(100), cand(200)];
+            if let Some(child) = child {
+                candidates.push(child);
+            }
+            let mut refs: Vec<_> = candidates.iter_mut().collect();
+            apply_planned_kill_budget(&mut refs, &processes, &policy, false);
+            assert_eq!(candidates[0]["recommended_action"], "review");
+            assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+            assert_eq!(candidates[1]["recommended_action"], "kill");
+            if candidates.len() == 3 {
+                assert_eq!(candidates[2]["recommended_action"], "keep");
+            }
+        }
+    }
+
+    #[test]
+    fn executable_plan_preserves_final_safety_downgrades_and_canonical_identity() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use pt_core::plan::{DecisionCandidate, PreCheck};
+        let policy = pt_core::config::Policy::default();
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let inputs = [100, 200, 300]
+            .into_iter()
+            .map(|pid| {
+                let process = rec(pid, 1, "sleep 600", ProcessState::Sleeping);
+                (
+                    pid,
+                    DecisionCandidate {
+                        identity: process_identity_from_record(&process),
+                        ppid: Some(1),
+                        decision: decision.clone(),
+                        blocked_reasons: Vec::new(),
+                        stage_pause_before_kill: false,
+                        process_state: Some(process.state),
+                        parent_identity: None,
+                        d_state_diagnostics: None,
+                    },
+                )
+            })
+            .collect();
+        let candidates = vec![
+            cand(100),
+            serde_json::json!({"pid": 200, "recommended_action": "review"}),
+            serde_json::json!({"pid": 300, "recommended_action": "keep"}),
+        ];
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-10-04T12:00:00Z".to_string(),
+        );
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target.pid.0, 100);
+        assert_eq!(plan.actions[0].target.start_id.0, "b:1:100");
+        assert!(plan.actions[0]
+            .pre_checks
+            .contains(&PreCheck::VerifyIdentity));
+        assert!(plan.actions[0]
+            .pre_checks
+            .contains(&PreCheck::CheckDataLossGate));
+        assert_eq!(plan.actions[0].rationale.posterior, Some(posterior));
+        let mut document = serde_json::to_value(&plan).unwrap();
+        document["candidates"] = serde_json::to_value(candidates).unwrap();
+        let applied: pt_core::plan::Plan = serde_json::from_value(document).unwrap();
+        assert_eq!(applied.plan_id, plan.plan_id);
+        assert_eq!(applied.actions[0].action_id, plan.actions[0].action_id);
+    }
+
+    #[test]
+    fn displayed_actions_match_stages_routed_targets_and_full_incarnations() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use pt_core::plan::DecisionCandidate;
+
+        let policy = pt_core::config::Policy::default();
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        let parent = rec(900, 1, "parent", ProcessState::Sleeping);
+        let inputs: std::collections::HashMap<_, _> = [100, 200, 300, 400, 500, 600, 700, 800]
+            .into_iter()
+            .map(|pid| {
+                let state = if matches!(pid, 300 | 400) {
+                    ProcessState::Zombie
+                } else {
+                    ProcessState::Sleeping
+                };
+                let process = rec(pid, 900, "sleep 600", state);
+                let mut chosen = decision.clone();
+                chosen.optimal_action = match pid {
+                    200 => Action::Pause,
+                    400 | 800 => Action::Restart,
+                    600 => Action::Keep,
+                    _ => Action::Kill,
+                };
+                (
+                    pid,
+                    DecisionCandidate {
+                        identity: process_identity_from_record(&process),
+                        ppid: Some(900),
+                        decision: chosen,
+                        blocked_reasons: if pid == 500 {
+                            vec!["protected".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                        stage_pause_before_kill: pid == 100,
+                        process_state: Some(state),
+                        parent_identity: (pid == 300)
+                            .then(|| process_identity_from_record(&parent)),
+                        d_state_diagnostics: None,
+                    },
+                )
+            })
+            .collect();
+        let mut candidates: Vec<_> = [100, 200, 300, 400, 500, 600, 700, 800]
+            .into_iter()
+            .map(|pid| serde_json::json!({
+                "pid": pid, "posterior": posterior,
+                "recommended_action": match pid {
+                    200 => "pause", 400 | 800 => "restart", 600 => "keep", 700 => "review", _ => "kill"
+                },
+                "action_rationale": "original evidence", "zombie_routing": {}
+            }))
+            .collect();
+        let plan = build_agent_action_plan(
+            &pt_common::SessionId::new(),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-10-05T12:00:00Z".to_string(),
+        );
+        reconcile_agent_action_candidates(&mut candidates, &inputs, &plan);
+        assert_eq!(plan.actions.len(), 4);
+        assert!(plan
+            .actions
+            .iter()
+            .all(|action| !action.blocked && action.action != Action::Keep));
+        assert_eq!(candidates[0]["recommended_action"], "kill");
+        assert_eq!(
+            candidates[0]["plan_action_ids"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(candidates[1]["recommended_action"], "pause");
+        assert_eq!(candidates[2]["recommended_action"], "restart");
+        assert_eq!(
+            candidates[2]["action_target"],
+            serde_json::to_value(process_identity_from_record(&parent)).unwrap()
+        );
+        for index in [3, 4, 6, 7] {
+            assert_eq!(
+                candidates[index]["recommended_action"], "review",
+                "index {index}"
+            );
+            assert_eq!(
+                candidates[index]["posterior"],
+                serde_json::to_value(posterior).unwrap()
+            );
+        }
+        assert_eq!(candidates[5]["recommended_action"], "keep");
+        let recommended = super::agent_recommended_actions(&plan);
+        assert_eq!(recommended.len(), plan.actions.len());
+        for (recorded, action) in recommended.iter().zip(&plan.actions) {
+            assert_eq!(recorded["pid"], action.target.pid.0);
+            assert_eq!(
+                recorded["action"],
+                serde_json::to_value(action.action).unwrap()
+            );
+            assert_eq!(recorded["stage"], action.stage);
+            assert_eq!(recorded["action_id"], action.action_id);
+        }
+        // Same PID with a different birth, owner or group cannot claim the old
+        // executable action. The plan and its original evidence remain intact.
+        for changed in ["birth", "owner", "group"] {
+            let mut changed_inputs = inputs.clone();
+            let identity = &mut changed_inputs.get_mut(&100).unwrap().identity;
+            match changed {
+                "birth" => identity.start_id = StartId::from_linux("b", 2, 100),
+                "owner" => identity.uid = 1001,
+                "group" => identity.pgid = Some(101),
+                _ => unreachable!(),
+            }
+            let mut reused = vec![cand(100)];
+            reconcile_agent_action_candidates(&mut reused, &changed_inputs, &plan);
+            assert_eq!(reused[0]["recommended_action"], "review", "{changed}");
+            assert_eq!(plan.actions.len(), 4);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervision_subject_is_bound_to_the_observed_birth_and_owner() {
+        let pid = std::process::id();
+        let scan = super::quick_scan(&super::QuickScanOptions {
+            pids: vec![pid],
+            include_kernel_threads: false,
+            timeout: Some(std::time::Duration::from_secs(5)),
+            progress: None,
+        })
+        .expect("observe this test process without signalling it");
+        let process = scan
+            .processes
+            .iter()
+            .find(|process| process.pid.0 == pid)
+            .expect("current process remains observable");
+        let identity = process_identity_from_record(process);
+        let observed = super::supervisor_info_for_plan_identity(&identity);
+        assert_eq!(observed["status"], "observed", "{observed}");
+        assert_eq!(
+            observed["subject_identity"],
+            serde_json::to_value(&identity).unwrap()
+        );
+        let (prefix, recorded_pid) = identity.start_id.0.rsplit_once(':').unwrap();
+        assert_eq!(recorded_pid.parse::<u32>().unwrap(), pid);
+        let (boot, ticks) = prefix.rsplit_once(':').unwrap();
+        for changed in ["birth", "owner"] {
+            let mut stale = identity.clone();
+            if changed == "birth" {
+                stale.start_id = StartId::from_linux(
+                    boot,
+                    ticks.parse::<u64>().unwrap().checked_add(1).unwrap(),
+                    pid,
+                );
+            } else {
+                stale.uid = identity.uid.checked_add(1).unwrap();
+            }
+            let refused = super::supervisor_info_for_plan_identity(&stale);
+            assert_eq!(refused["status"], "unknown", "{changed}: {refused}");
+            assert!(refused["detected"].is_null(), "{changed}: {refused}");
+            assert!(
+                refused["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("identity changed"),
+                "{changed}: {refused}"
+            );
+            assert_eq!(
+                refused["subject_identity"],
+                serde_json::to_value(&stale).unwrap()
+            );
+        }
+    }
+
+    /// On macOS the plan reports no supervisor (as v2.2.1 did) instead of
+    /// "unknown", and robot supervision answers "supervised" (no ancestry evidence)
+    /// instead of failing, so robot mode asks for a human as v2.2.1 did.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plan_and_robot_supervision_do_not_refuse_for_missing_linux_probes() {
+        let pid = std::process::id();
+        let observed = super::supervisor_info_for_plan(pid);
+        assert_eq!(observed["status"], "observed", "{observed}");
+        assert_eq!(observed["detected"], false, "{observed}");
+        assert_eq!(observed["recommended_action"], "kill", "{observed}");
+        assert_eq!(
+            super::supervision_for_robot(pid),
+            Ok(true),
+            "without ancestry evidence the target counts as supervised"
+        );
+    }
+
+    #[test]
+    fn routed_parent_checks_use_its_own_protection_age_and_memory() {
+        use pt_core::decision::PolicyEnforcer;
+        use pt_core::inference::ClassScores;
+        use pt_core::supervision::SignatureDatabase;
+
+        let mut base_policy = pt_core::config::Policy::default();
+        base_policy.guardrails.builtin_protection = false;
+        base_policy.data_loss_gates.block_if_open_write_fds = false;
+        base_policy.robot_mode.enabled = true;
+        let base_parent = rec(900, 50, "worker", ProcessState::Sleeping);
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.0,
+            zombie: 0.999,
+        };
+        let signatures = SignatureDatabase::new();
+        for case in [
+            "eligible",
+            "init",
+            "named_pid",
+            "service",
+            "user",
+            "young",
+            "memory",
+        ] {
+            let mut policy = base_policy.clone();
+            let mut parent = base_parent.clone();
+            match case {
+                "init" => parent.pid = ProcessId(1),
+                "named_pid" => policy.guardrails.never_kill_pid.push(900),
+                "service" => {
+                    policy.guardrails.builtin_protection = true;
+                    parent.comm = "sshd".to_string();
+                    parent.cmd = "sshd -D".to_string();
+                }
+                "user" => policy.guardrails.protected_users.push("u".to_string()),
+                "young" => parent.elapsed = std::time::Duration::ZERO,
+                "memory" => {
+                    policy.robot_mode.max_blast_radius_mb = 1.0;
+                    parent.rss_bytes = 2 * 1024 * 1024;
+                }
+                _ => {}
+            }
+            let filter = super::ProtectedFilter::from_guardrails(&policy.guardrails).unwrap();
+            let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+            let refusal = super::planned_zombie_parent_refusal(
+                &parent,
+                &filter,
+                &enforcer,
+                &policy,
+                &signatures,
+                &posterior,
+                true,
+            );
+            if case == "eligible" {
+                assert!(refusal.is_none(), "{refusal:?}");
+            } else {
+                assert!(refusal.is_some(), "{case}");
+                let reason = refusal.unwrap();
+                let expected = match case {
+                    "init" => "init/kernel",
+                    "named_pid" => "never_kill_pid",
+                    "service" => "protected",
+                    "user" => "protected",
+                    "young" => "min_process_age_seconds",
+                    "memory" => "max_blast_radius_mb",
+                    _ => unreachable!(),
+                };
+                assert!(reason.contains(expected), "{case}: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_kill_set_preserves_omitted_live_child() {
+        use ProcessState::Sleeping;
+        let procs = vec![
+            rec(200, 1, "sh -c sleep 99999", Sleeping),
+            rec(201, 200, "sleep 99999", Sleeping),
+        ];
+        let mut candidates = vec![cand(200), cand(201)];
+        let mut refs: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
+        assert_eq!(apply_process_tree_safety(&mut refs, &procs, true), 0);
+        candidates.truncate(1);
+        let mut refs: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
+        assert_eq!(apply_process_tree_safety(&mut refs, &procs, true), 1);
+        assert_eq!(candidates[0]["recommended_action"], "review");
+        assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    mod tui_live_fixtures {
+        use std::io::BufRead;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+
+        pub(super) struct DetachedTarget {
+            pub(super) leader: Child,
+            pub(super) pid: u32,
+            pidfd: OwnedFd,
+        }
+
+        impl DetachedTarget {
+            pub(super) fn spawn() -> Self {
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", "sleep 600 </dev/null >/dev/null 2>&1 & echo $!; wait"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .env_remove("SSH_CONNECTION")
+                    .env_remove("SSH_CLIENT")
+                    .env_remove("SSH_TTY");
+                // SAFETY: setsid is async-signal-safe and changes only the child.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut leader = command.spawn().expect("spawn detached reaper");
+                let mut line = String::new();
+                std::io::BufReader::new(leader.stdout.take().expect("reaper stdout"))
+                    .read_line(&mut line)
+                    .expect("read detached target PID");
+                let pid = line.trim().parse::<u32>().expect("detached target PID");
+                // SAFETY: the successful descriptor refers to the live test
+                // target and is transferred into sole OwnedFd ownership.
+                let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                assert!(
+                    descriptor >= 0,
+                    "pidfd_open: {}",
+                    std::io::Error::last_os_error()
+                );
+                let pidfd = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+                Self { leader, pid, pidfd }
+            }
+
+            pub(super) fn stop_and_reap(&mut self) {
+                // SAFETY: pidfd pins the original target even if its PID is reused.
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                assert_eq!(
+                    result,
+                    0,
+                    "kill fixture: {}",
+                    std::io::Error::last_os_error()
+                );
+                self.leader.wait().expect("reap stopped fixture");
+            }
+        }
+
+        impl Drop for DetachedTarget {
+            fn drop(&mut self) {
+                // SAFETY: cleanup can signal only the original owned target.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                let _ = self.leader.wait();
+            }
+        }
+
+        pub(super) struct DetachedWrapper {
+            pub(super) parent: DetachedTarget,
+            pub(super) child_pid: u32,
+            child_pidfd: OwnedFd,
+        }
+
+        struct WrapperSetup(Option<Child>);
+
+        impl Drop for WrapperSetup {
+            fn drop(&mut self) {
+                if let Some(leader) = &mut self.0 {
+                    // SAFETY: successful setsid made this unreaped owned Child
+                    // the leader of a new session and process group. Its PID
+                    // cannot be reused before wait, and foreign sessions cannot
+                    // join this group. This only unwinds setup before both
+                    // pidfds exist; normal cleanup pins child and parent below.
+                    unsafe { libc::kill(-(leader.id() as i32), libc::SIGKILL) };
+                    let _ = leader.wait();
+                }
+            }
+        }
+
+        impl DetachedWrapper {
+            pub(super) fn spawn() -> Self {
+                let mut command = Command::new("sh");
+                command
+                    .args([
+                        "-c",
+                        "sh -c 'sleep 600 </dev/null >/dev/null 2>&1 & printf \"%s %s\\n\" \"$$\" \"$!\"; wait' & wait",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .env_remove("SSH_CONNECTION")
+                    .env_remove("SSH_CLIENT")
+                    .env_remove("SSH_TTY");
+                // SAFETY: only the owned child enters a new session.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut setup = WrapperSetup(Some(
+                    command.spawn().expect("spawn detached wrapper reaper"),
+                ));
+                let leader = setup.0.as_mut().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(leader.stdout.take().expect("wrapper stdout"))
+                    .read_line(&mut line)
+                    .expect("read owned wrapper and child PIDs");
+                let mut pids = line.split_whitespace();
+                let parent_pid = pids.next().unwrap().parse::<u32>().unwrap();
+                let child_pid = pids.next().unwrap().parse::<u32>().unwrap();
+                // SAFETY: these descriptors bind the two processes emitted by
+                // this owned launcher; later cleanup never signals by bare PID.
+                let child_descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) };
+                assert!(
+                    child_descriptor >= 0,
+                    "bind owned wrapper child: {}",
+                    std::io::Error::last_os_error()
+                );
+                let child_pidfd = unsafe { OwnedFd::from_raw_fd(child_descriptor as i32) };
+                let parent_descriptor =
+                    unsafe { libc::syscall(libc::SYS_pidfd_open, parent_pid, 0) };
+                assert!(
+                    parent_descriptor >= 0,
+                    "bind owned wrapper parent: {}",
+                    std::io::Error::last_os_error()
+                );
+                let parent = DetachedTarget {
+                    leader: setup.0.take().unwrap(),
+                    pid: parent_pid,
+                    // SAFETY: the successful descriptor is transferred once.
+                    pidfd: unsafe { OwnedFd::from_raw_fd(parent_descriptor as i32) },
+                };
+                let wrapper = Self {
+                    parent,
+                    child_pid,
+                    child_pidfd,
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::fs::read_to_string(format!("/proc/{child_pid}/comm"))
+                    .map(|comm| comm.trim() != "sleep")
+                    .unwrap_or(true)
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned child did not finish sleep exec"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                wrapper
+            }
+        }
+
+        impl Drop for DetachedWrapper {
+            fn drop(&mut self) {
+                // SAFETY: stop the pinned child first, letting its wrapper reap
+                // it and exit before the session reaper is waited on. The later
+                // DetachedTarget drop can only signal the pinned original parent.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.child_pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                let _ = self.parent.leader.wait();
+            }
+        }
+
+        pub(super) fn case(label: &str) -> (pt_core::session::SessionHandle, std::path::PathBuf) {
+            use pt_core::session::{SessionManifest, SessionMode, SessionStore};
+
+            let session_id = pt_common::SessionId::new();
+            let log_dir = std::path::Path::new("target/test-logs/e2e/rate_limit").join(format!(
+                "{label}-{}-{}",
+                std::process::id(),
+                session_id.0
+            ));
+            std::fs::create_dir_all(&log_dir).expect("create retained interactive evidence");
+            let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+            let handle = SessionStore::at_data_dir(&log_dir.join("data"))
+                .create(&manifest)
+                .expect("create actual interactive session");
+            (handle, log_dir)
+        }
+
+        pub(super) fn policy(max_kills_per_run: u32) -> pt_core::config::Policy {
+            let mut policy = pt_core::config::Policy::default();
+            // Execution-plumbing fixtures own fresh detached targets; keep the
+            // real built-in, identity, session and data-loss checks enabled.
+            policy.guardrails.min_process_age_seconds = 0;
+            policy.guardrails.protected_users.clear();
+            policy.guardrails.max_kills_per_run = max_kills_per_run;
+            policy.guardrails.max_kills_per_minute = Some(2);
+            policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+            policy
+        }
+
+        pub(super) fn selection(
+            handle: &pt_core::session::SessionHandle,
+            policy: &pt_core::config::Policy,
+            target: &DetachedTarget,
+        ) -> pt_core::plan::Plan {
+            selection_for_pid(handle, policy, target.pid, "sleep")
+        }
+
+        pub(super) fn wrapper_selection(
+            handle: &pt_core::session::SessionHandle,
+            policy: &pt_core::config::Policy,
+            target: &DetachedWrapper,
+        ) -> pt_core::plan::Plan {
+            selection_for_pid(handle, policy, target.parent.pid, "sh")
+        }
+
+        fn selection_for_pid(
+            handle: &pt_core::session::SessionHandle,
+            policy: &pt_core::config::Policy,
+            pid: u32,
+            expected_comm: &str,
+        ) -> pt_core::plan::Plan {
+            use pt_core::collect::{quick_scan, QuickScanOptions};
+            use pt_core::decision::{decide_action, Action, ActionFeasibility};
+            use pt_core::inference::ClassScores;
+
+            let scan = quick_scan(&QuickScanOptions {
+                pids: vec![pid],
+                include_kernel_threads: false,
+                timeout: Some(std::time::Duration::from_secs(30)),
+                progress: None,
+            })
+            .expect("collect actual selected target");
+            let selected: Vec<_> = scan
+                .processes
+                .iter()
+                .filter(|process| process.pid.0 == pid)
+                .collect();
+            assert_eq!(selected.len(), 1);
+            let process = selected[0];
+            assert_eq!(process.pid.0, pid);
+            assert_eq!(
+                process.comm, expected_comm,
+                "fixture must finish exec before selection"
+            );
+            assert!(!process.state.is_zombie());
+            assert_ne!(
+                process.sid,
+                Some(process.pid.0),
+                "target is not a session leader"
+            );
+            // SAFETY: getsid observes only the test caller's own session.
+            let own_session = unsafe { libc::getsid(0) };
+            assert!(own_session >= 0);
+            assert_ne!(process.sid, Some(own_session as u32));
+            // A controlled decision tests execution plumbing, not inference quality.
+            let posterior = ClassScores {
+                useful: 0.001,
+                useful_bad: 0.0,
+                abandoned: 0.999,
+                zombie: 0.0,
+            };
+            let decision = decide_action(&posterior, policy, &ActionFeasibility::allow_all())
+                .expect("controlled fixture decision");
+            assert_eq!(decision.optimal_action, Action::Kill);
+            let candidates = std::collections::HashMap::from([(
+                process.pid.0,
+                super::super::PlanCandidateInput {
+                    identity: super::process_identity_from_record(process),
+                    ppid: Some(process.ppid.0),
+                    decision,
+                    process_state: process.state,
+                    comm: process.comm.clone(),
+                    cmd: process.cmd.clone(),
+                },
+            )]);
+            let plan =
+                super::super::build_plan_from_selection(&handle.id, policy, &[pid], &candidates)
+                    .expect("produce canonical selected action");
+            assert_eq!(plan.actions.len(), 1);
+            assert_eq!(plan.actions[0].action, Action::Kill);
+            assert_eq!(
+                plan.actions[0].target,
+                super::process_identity_from_record(process)
+            );
+            plan
+        }
+
+        pub(super) fn record(log_dir: &std::path::Path, evidence: serde_json::Value) {
+            use std::io::Write;
+
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("steps.jsonl"))
+                .expect("open retained actual interactive steps");
+            writeln!(file, "{evidence}").expect("retain actual interactive evidence");
+            file.flush().expect("flush actual interactive evidence");
+        }
+
+        pub(super) fn fd_evidence(pid: u32) -> Vec<serde_json::Value> {
+            use std::os::unix::fs::FileTypeExt;
+
+            let mut descriptors = Vec::new();
+            for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .expect("observe actual owned fixture descriptors")
+            {
+                let entry = entry.unwrap();
+                let fd = entry.file_name().to_str().unwrap().parse::<u32>().unwrap();
+                let destination = std::fs::read_link(entry.path()).unwrap();
+                let file_type = std::fs::metadata(entry.path()).unwrap().file_type();
+                let kind = if file_type.is_file() {
+                    "regular"
+                } else if file_type.is_char_device() {
+                    "character"
+                } else if file_type.is_fifo() {
+                    "pipe"
+                } else if file_type.is_socket() {
+                    "socket"
+                } else {
+                    "other"
+                };
+                let fdinfo = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}"))
+                    .expect("retain actual fixture descriptor flags");
+                let flags = fdinfo
+                    .lines()
+                    .find_map(|line| line.strip_prefix("flags:"))
+                    .expect("descriptor must report access flags")
+                    .trim();
+                let access_mode = u64::from_str_radix(flags, 8).unwrap() & libc::O_ACCMODE as u64;
+                let writable_regular = file_type.is_file()
+                    && (access_mode == libc::O_WRONLY as u64 || access_mode == libc::O_RDWR as u64);
+                descriptors.push(serde_json::json!({
+                    "pid": pid, "fd": fd, "destination": destination,
+                    "kind": kind, "fdinfo": fdinfo, "access_mode": access_mode,
+                    "writable_regular": writable_regular,
+                }));
+            }
+            descriptors.sort_by_key(|descriptor| descriptor["fd"].as_u64().unwrap());
+            descriptors
+        }
+    }
+
+    /// Exercise the TUI's real execution helper, including its saved budget and
+    /// a later missing target. This proves execution/accounting, not rendering
+    /// or inference calibration.
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_execution_preserves_real_kill_and_budget_after_missing_target() {
+        use pt_core::action::ActionStatus;
+        use pt_core::collect::{quick_scan, QuickScanOptions};
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use pt_core::plan::DecisionCandidate;
+        use pt_core::session::{SessionManifest, SessionMode, SessionStore};
+        use std::io::Write;
+        use tui_live_fixtures::DetachedTarget;
+
+        let data_dir = tempfile::tempdir().expect("isolated execution data");
+        let session_id = pt_common::SessionId::new();
+        let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+        let handle = SessionStore::at_data_dir(data_dir.path())
+            .create(&manifest)
+            .expect("create real interactive session");
+        let mut first = DetachedTarget::spawn();
+        let mut missing = DetachedTarget::spawn();
+        let scan_options = QuickScanOptions {
+            pids: vec![first.pid, missing.pid],
+            include_kernel_threads: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
+            progress: None,
+        };
+        let mut records = quick_scan(&scan_options).expect("scan live fixture identities");
+        records
+            .processes
+            .retain(|record| scan_options.pids.contains(&record.pid.0));
+        assert_eq!(records.processes.len(), 2, "both targets must start alive");
+        // SAFETY: getsid only observes the calling process's session identity.
+        let own_session = unsafe { libc::getsid(0) };
+        assert!(own_session >= 0, "resolve the test process's session");
+        for record in &records.processes {
+            assert_ne!(record.sid, Some(own_session as u32));
+            assert_ne!(
+                record.sid,
+                Some(record.pid.0),
+                "target is not the session leader"
+            );
+            assert!(!record.state.is_zombie(), "target starts live");
+        }
+
+        // Fresh, explicitly selected fixture targets use age zero. Other live
+        // protection and data-loss checks remain enabled.
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.min_process_age_seconds = 0;
+        policy.guardrails.protected_users.clear();
+        policy.data_loss_gates.block_if_recent_io_seconds = Some(1);
+        // A controlled decision selects Kill; no inference-quality claim follows.
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all())
+            .expect("fixture decision");
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let inputs = records
+            .processes
+            .iter()
+            .map(|record| {
+                (
+                    record.pid.0,
+                    DecisionCandidate {
+                        identity: process_identity_from_record(record),
+                        ppid: Some(record.ppid.0),
+                        decision: decision.clone(),
+                        blocked_reasons: Vec::new(),
+                        stage_pause_before_kill: false,
+                        process_state: Some(record.state),
+                        parent_identity: None,
+                        d_state_diagnostics: None,
+                    },
+                )
+            })
+            .collect();
+        let mut plan = build_agent_action_plan(
+            &session_id,
+            &policy,
+            &[cand(first.pid), cand(missing.pid)],
+            &inputs,
+            chrono::Utc::now().to_rfc3339(),
+        );
+        assert_eq!(plan.actions.len(), 2);
+        // This regression exercises a failure after a real success regardless
+        // of planner ordering or PID allocation order.
+        plan.actions
+            .sort_by_key(|action| action.target.pid.0 != first.pid);
+        for (index, action) in plan.actions.iter_mut().enumerate() {
+            action.order = index as u32;
+        }
+        super::write_plan_to_session(&handle, &plan).expect("save real action plan");
+        let log_dir = std::path::Path::new("target/test-logs/e2e/rate_limit").join(format!(
+            "tui-helper-{}-{}",
+            std::process::id(),
+            session_id.0
+        ));
+        std::fs::create_dir_all(&log_dir).expect("create evidence directory");
+        let mut evidence = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(log_dir.join("steps.jsonl"))
+            .expect("create execution evidence");
+        writeln!(
+            evidence,
+            "{}",
+            serde_json::json!({"step": "live_targets", "session_id": session_id.0, "processes": records.processes, "plan": plan})
+        )
+        .expect("write live-target evidence");
+
+        missing.stop_and_reap();
+        let before = quick_scan(&scan_options).expect("scan after planted target disappearance");
+        assert!(before
+            .processes
+            .iter()
+            .any(|record| record.pid.0 == first.pid));
+        assert!(!before
+            .processes
+            .iter()
+            .any(|record| record.pid.0 == missing.pid));
+        let mut execution_state = super::TuiExecutionState::default();
+        let (result, execution_evidence) =
+            super::execute_plan_actions(&handle, &policy, &plan, &mut execution_state)
+                .expect("TUI helper retains results after missing policy evidence");
+        super::write_outcomes_from_execution(&handle, &plan, &result, &execution_evidence)
+            .expect("save retained TUI outcomes");
+        writeln!(
+            evidence,
+            "{}",
+            serde_json::json!({"step": "helper_result", "result": result})
+        )
+        .expect("write helper result before checking real effect");
+        evidence.flush().expect("flush helper result");
+        assert_eq!(result.outcomes.len(), 2);
+        assert_eq!(result.outcomes[0].status, ActionStatus::Success);
+        first
+            .leader
+            .wait()
+            .expect("real target reaped after helper kill");
+        let after = quick_scan(&scan_options).expect("scan final live effects");
+        let budget: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(data_dir.path().join("rate_limit.json")).expect("saved kill budget"),
+        )
+        .expect("decode saved kill budget");
+        let saved_outcomes = std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl"))
+            .expect("saved TUI outcomes");
+        let typed_outcomes = pt_core::verify::parse_action_outcomes(&saved_outcomes).unwrap();
+        assert_eq!(typed_outcomes[0].status, "success");
+        assert_eq!(typed_outcomes[0].action, Some(Action::Kill));
+        assert!(typed_outcomes[0]
+            .target
+            .as_ref()
+            .unwrap()
+            .matches(&plan.actions[0].target));
+        writeln!(
+            evidence,
+            "{}",
+            serde_json::json!({"step": "execute_and_account", "result": result, "budget": budget, "before": before.processes, "after": after.processes, "saved_outcomes": saved_outcomes})
+        )
+        .expect("write execution evidence");
+        evidence.flush().expect("flush execution evidence");
+
+        assert!(
+            after
+                .processes
+                .iter()
+                .all(|record| !scan_options.pids.contains(&record.pid.0)),
+            "both original targets were reaped"
+        );
+        assert_eq!(result.summary.actions_attempted, 2);
+        assert_eq!(result.summary.actions_succeeded, 1);
+        assert_eq!(result.summary.actions_failed, 1);
+        assert_eq!(result.outcomes[0].action_id, plan.actions[0].action_id);
+        assert_eq!(result.outcomes[1].action_id, plan.actions[1].action_id);
+        assert!(
+            matches!(&result.outcomes[1].status, ActionStatus::PreCheckBlocked { reason, .. } if reason.contains("absent")),
+            "missing target needs an explicit evidence refusal: {:?}",
+            result.outcomes[1]
+        );
+        assert_eq!(
+            budget["kill_timestamps"]
+                .as_array()
+                .expect("kill timestamps")
+                .len(),
+            1
+        );
+        let persisted: Vec<serde_json::Value> = saved_outcomes
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("saved outcome JSON"))
+            .collect();
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[0]["action_id"], plan.actions[0].action_id);
+        assert_eq!(persisted[0]["status"], "success");
+        assert_eq!(persisted[1]["action_id"], plan.actions[1].action_id);
+        assert_eq!(persisted[1]["status"], "precheck_blocked");
+    }
+
+    /// An actual wrapper selection must preserve its unselected live child.
+    /// This is headless execution plumbing, not rendered-TUI or calibration proof.
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_selected_wrapper_refuses_its_unselected_live_child() {
+        use pt_core::action::ActionStatus;
+        use pt_core::collect::{quick_scan, QuickScanOptions};
+        use pt_core::session::SessionState;
+        use pt_core::verify::{executed_plan_actions, parse_action_outcomes, parse_agent_plan};
+        use tui_live_fixtures::{
+            case, fd_evidence, policy, record, wrapper_selection, DetachedWrapper,
+        };
+
+        let (handle, log_dir) = case("tui-live-child");
+        let policy = policy(1);
+        assert!(policy.guardrails.builtin_protection);
+        let target = DetachedWrapper::spawn();
+        let selection = wrapper_selection(&handle, &policy, &target);
+        let options = QuickScanOptions {
+            pids: vec![target.parent.pid, target.child_pid],
+            include_kernel_threads: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
+            progress: None,
+        };
+        let before = quick_scan(&options).expect("collect actual wrapper and child identities");
+        assert!(before.metadata.warnings.is_empty());
+        let parent = before
+            .processes
+            .iter()
+            .find(|process| process.pid.0 == target.parent.pid)
+            .unwrap();
+        let child = before
+            .processes
+            .iter()
+            .find(|process| process.pid.0 == target.child_pid)
+            .unwrap();
+        assert_eq!(parent.comm, "sh");
+        assert_eq!(child.comm, "sleep");
+        assert_eq!(parent.ppid.0, target.parent.leader.id());
+        assert_eq!(child.ppid.0, parent.pid.0);
+        assert_eq!(child.sid, parent.sid);
+        assert_eq!(parent.sid, Some(target.parent.leader.id()));
+        assert_ne!(parent.sid, Some(parent.pid.0));
+        // SAFETY: only observe the test caller's own UID and session ID.
+        let uid = unsafe { libc::geteuid() };
+        let own_session = unsafe { libc::getsid(0) };
+        assert!(own_session >= 0);
+        assert_ne!(parent.sid, Some(own_session as u32));
+        let parent_identity = super::process_identity_from_record(parent);
+        let child_identity = super::process_identity_from_record(child);
+        assert_eq!(parent_identity.uid, uid);
+        assert_eq!(child_identity.uid, uid);
+        assert_eq!(selection.actions[0].target, parent_identity);
+        assert_eq!(selection.actions.len(), 1);
+        assert_ne!(selection.actions[0].target.pid.0, target.child_pid);
+        let parent_fds = fd_evidence(target.parent.pid);
+        let child_fds = fd_evidence(target.child_pid);
+        record(
+            &log_dir,
+            serde_json::json!({"step": "owned_wrapper_descriptors", "parent_identity": parent_identity, "parent_fds": parent_fds, "child_identity": child_identity, "child_fds": child_fds}),
+        );
+        // A harness log is real data-loss evidence. Prove this disposable
+        // fixture has no regular-file writer before requiring the tree refusal;
+        // preserve all production data-loss gates and their execution order.
+        for descriptors in [&parent_fds, &child_fds] {
+            for stdio in 0..=2 {
+                assert!(descriptors
+                    .iter()
+                    .any(|descriptor| descriptor["fd"] == stdio));
+            }
+            assert!(
+                descriptors
+                    .iter()
+                    .all(|descriptor| descriptor["writable_regular"] == false),
+                "owned fixture inherited a regular-file writer: {descriptors:?}"
+            );
+        }
+        record(
+            &log_dir,
+            serde_json::json!({"step": "owned_wrapper_selection", "selected_plan": selection, "before": before.processes}),
+        );
+
+        let mut state = super::TuiExecutionState::default();
+        let (result, evidence) =
+            super::execute_tui_plan_selection(&handle, &policy, &selection, &mut state)
+                .expect("retain actual live-child refusal through the callback helper");
+        record(
+            &log_dir,
+            serde_json::json!({"step": "callback_live_child_result", "result": result, "evidence": evidence}),
+        );
+        assert_eq!(result.outcomes.len(), 1);
+        assert_eq!(result.summary.actions_succeeded, 0);
+        assert_eq!(result.summary.actions_failed, 1);
+        assert!(
+            matches!(&result.outcomes[0].status, ActionStatus::PreCheckBlocked { reason, .. } if reason.contains(&format!("has live child {} (sleep)", target.child_pid))),
+            "{:?}",
+            result.outcomes[0]
+        );
+        assert!(
+            evidence.is_empty(),
+            "refusal must occur before runner signal delivery"
+        );
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 0);
+        let after = quick_scan(&options).expect("observe both actually spared processes");
+        assert!(after.metadata.warnings.is_empty());
+        for identity in [&parent_identity, &child_identity] {
+            let live = after
+                .processes
+                .iter()
+                .find(|process| process.pid.0 == identity.pid.0)
+                .expect("original owned identity must remain alive");
+            assert!(!live.state.is_zombie());
+            assert_eq!(super::process_identity_from_record(live), *identity);
+        }
+        let budget_path = log_dir.join("data/rate_limit.json");
+        assert!(
+            !budget_path.exists(),
+            "tree refusal cannot prepare or spend durable kill budget"
+        );
+        let canonical = parse_agent_plan(
+            &std::fs::read_to_string(handle.dir.join("decision/plan.json")).unwrap(),
+        )
+        .unwrap();
+        let saved = parse_action_outcomes(
+            &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(canonical.actions.len(), 1);
+        assert_eq!(canonical.actions[0].target, parent_identity);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].status, "precheck_blocked");
+        assert!(executed_plan_actions(&canonical, &saved)
+            .unwrap()
+            .is_empty());
+        assert_eq!(handle.read_manifest().unwrap().state, SessionState::Failed);
+        assert!(super::finish_tui_session(&handle, &state).is_err());
+        record(
+            &log_dir,
+            serde_json::json!({"step": "wrapper_live_child_refusal", "selected_plan": selection, "before": before.processes, "result": result, "evidence": evidence, "after": after.processes, "saved_plan": canonical, "saved_outcomes": saved}),
+        );
+    }
+
+    /// Real headless callback plumbing: three selections retain a refused
+    /// identity and two actual kills. This is not rendered-TUI/calibration proof.
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_repeated_selections_preserve_canonical_bindings_and_failed_attempts() {
+        use pt_core::action::ActionStatus;
+        use pt_core::collect::{quick_scan, QuickScanOptions};
+        use pt_core::session::SessionState;
+        use pt_core::verify::{
+            executed_plan_actions, parse_action_outcomes, parse_agent_plan, verify_plan,
+            VerifyOutcome,
+        };
+        use tui_live_fixtures::{case, policy, record, selection, DetachedTarget};
+
+        let (handle, log_dir) = case("tui-cumulative");
+        let policy = policy(3);
+        let mut first = DetachedTarget::spawn();
+        let mut second = DetachedTarget::spawn();
+        let refused = DetachedTarget::spawn();
+        let first_selection = selection(&handle, &policy, &first);
+        let second_selection = selection(&handle, &policy, &second);
+        let mut refused_selection = selection(&handle, &policy, &refused);
+        // Planted corruption of an actual produced Plan, never a successful
+        // execution fixture: the wrong owner must refuse signaling this target.
+        refused_selection.actions[0].target.uid ^= 1;
+        let mut state = super::TuiExecutionState::default();
+        let (refusal, refusal_evidence) =
+            super::execute_tui_plan_selection(&handle, &policy, &refused_selection, &mut state)
+                .expect("retain actual runtime identity refusal");
+        record(
+            &log_dir,
+            serde_json::json!({"step": "wrong_uid_refusal", "plan": refused_selection, "result": refusal, "evidence": refusal_evidence}),
+        );
+        assert_eq!(refusal.outcomes.len(), 1);
+        assert_eq!(refusal.outcomes[0].status, ActionStatus::IdentityMismatch);
+        assert!(refusal_evidence.is_empty());
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 0);
+        let first_saved = std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl"))
+            .expect("read original failed attempt bytes");
+
+        for (selected, target) in [
+            (&first_selection, &mut first),
+            (&second_selection, &mut second),
+        ] {
+            let (result, evidence) =
+                super::execute_tui_plan_selection(&handle, &policy, selected, &mut state)
+                    .expect("execute only the current selection");
+            record(
+                &log_dir,
+                serde_json::json!({"step": "selected_real_kill", "selection": selected, "result": result, "evidence": evidence}),
+            );
+            assert_eq!(result.outcomes.len(), 1);
+            assert_eq!(result.summary.actions_succeeded, 1);
+            assert_eq!(result.outcomes[0].status, ActionStatus::Success);
+            assert_eq!(result.outcomes[0].action_id, selected.actions[0].action_id);
+            assert_eq!(
+                evidence[&selected.actions[0].action_id]["kill_signal_delivered"],
+                true
+            );
+            assert_eq!(
+                evidence[&selected.actions[0].action_id]["target"],
+                serde_json::to_value(&selected.actions[0].target).unwrap()
+            );
+            let exit = target.leader.wait().expect("reap real selected kill");
+            assert!(exit.success(), "reaper should observe its killed child");
+        }
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 2);
+        let raw_outcomes = std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl"))
+            .expect("read append-only attempts");
+        assert!(
+            raw_outcomes.starts_with(&first_saved),
+            "later success must preserve the original failed attempt bytes"
+        );
+        let saved = parse_action_outcomes(&raw_outcomes).expect("decode all actual attempts");
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved[0].status, "identity_mismatch");
+        let raw_plan = std::fs::read_to_string(handle.dir.join("decision/plan.json"))
+            .expect("read cumulative canonical plan");
+        let canonical = parse_agent_plan(&raw_plan).expect("decode cumulative action bindings");
+        assert_eq!(canonical.actions.len(), 3);
+        for selected in [&refused_selection, &first_selection, &second_selection] {
+            let bound = canonical
+                .actions
+                .iter()
+                .find(|action| action.action_id == selected.actions[0].action_id)
+                .expect("retain every original action binding");
+            assert_eq!(bound.target, selected.actions[0].target);
+            assert_eq!(bound.action, selected.actions[0].action);
+        }
+        let executions = executed_plan_actions(&canonical, &saved)
+            .expect("both successful outcomes bind to the saved canonical plan");
+        assert_eq!(executions.len(), 2);
+        let current = quick_scan(&QuickScanOptions {
+            pids: vec![first.pid, second.pid, refused.pid],
+            include_kernel_threads: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
+            progress: None,
+        })
+        .expect("observe actual final process states");
+        let owned: Vec<_> = current
+            .processes
+            .iter()
+            .filter(|record| [first.pid, second.pid, refused.pid].contains(&record.pid.0))
+            .collect();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(
+            owned[0].pid.0, refused.pid,
+            "negative target must remain alive"
+        );
+        let now = chrono::Utc::now();
+        let verification = verify_plan(&canonical, &saved, &current.processes, now, now)
+            .expect("verify retained execution bindings and failed attempt");
+        record(
+            &log_dir,
+            serde_json::json!({"step": "saved_verification", "canonical_plan": canonical, "saved_outcomes": saved, "current": current.processes, "verification": verification}),
+        );
+        assert_eq!(verification.verification.overall_status, "partial_success");
+        assert_eq!(verification.action_outcomes.len(), 3);
+        assert_eq!(
+            verification
+                .action_outcomes
+                .iter()
+                .filter(|outcome| outcome.outcome == VerifyOutcome::ConfirmedDead
+                    && outcome.verified == Some(true))
+                .count(),
+            2
+        );
+        let failed = verification
+            .action_outcomes
+            .iter()
+            .find(|outcome| outcome.action_id == refused_selection.actions[0].action_id)
+            .unwrap();
+        assert_eq!(failed.outcome, VerifyOutcome::Unsupported);
+        assert_eq!(failed.actual.as_deref(), Some("failed_attempt"));
+        assert_eq!(failed.verified, Some(false));
+        assert_eq!(handle.read_manifest().unwrap().state, SessionState::Failed);
+        assert!(
+            super::finish_tui_session(&handle, &state).is_err(),
+            "outer TUI exit must retain an earlier failed batch"
+        );
+        let budget: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(log_dir.join("data/rate_limit.json")).unwrap())
+                .unwrap();
+        assert_eq!(budget["kill_timestamps"].as_array().unwrap().len(), 2);
+        record(
+            &log_dir,
+            serde_json::json!({"step": "final_run_budget", "budget": budget, "failure": state.failure}),
+        );
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_run_budget_refuses_second_selection_without_charging_untouched_plan() {
+        use pt_core::action::ActionStatus;
+        use pt_core::collect::{quick_scan, QuickScanOptions};
+        use pt_core::verify::{executed_plan_actions, parse_action_outcomes, parse_agent_plan};
+        use tui_live_fixtures::{case, policy, record, selection, DetachedTarget};
+
+        let (handle, log_dir) = case("tui-run-cap");
+        let policy = policy(1);
+        let mut first = DetachedTarget::spawn();
+        let second = DetachedTarget::spawn();
+        let first_selection = selection(&handle, &policy, &first);
+        let second_selection = selection(&handle, &policy, &second);
+        // Merely saved targets do not spend execution budget.
+        super::write_plan_to_session(&handle, &first_selection).unwrap();
+        super::write_plan_to_session(&handle, &second_selection).unwrap();
+        let mut state = super::TuiExecutionState::default();
+        let (first_result, first_evidence) =
+            super::execute_tui_plan_selection(&handle, &policy, &first_selection, &mut state)
+                .expect("first real delivered kill fits the run budget");
+        record(
+            &log_dir,
+            serde_json::json!({"step": "first_real_kill", "selection": first_selection, "result": first_result, "evidence": first_evidence}),
+        );
+        assert_eq!(first_result.outcomes.len(), 1);
+        assert_eq!(first_result.outcomes[0].status, ActionStatus::Success);
+        assert_eq!(
+            first_evidence[&first_selection.actions[0].action_id]["kill_signal_delivered"],
+            true
+        );
+        first
+            .leader
+            .wait()
+            .expect("reap first actually killed target");
+        let (second_result, second_evidence) =
+            super::execute_tui_plan_selection(&handle, &policy, &second_selection, &mut state)
+                .expect("record refusal of the second real selection");
+        record(
+            &log_dir,
+            serde_json::json!({"step": "second_run_cap_refusal", "selection": second_selection, "result": second_result, "evidence": second_evidence}),
+        );
+        assert_eq!(second_result.outcomes.len(), 1);
+        assert_eq!(second_result.summary.actions_succeeded, 0);
+        assert!(
+            matches!(&second_result.outcomes[0].status, ActionStatus::PreCheckBlocked { reason, .. } if reason.contains("rate_limit") && reason.contains("this run"))
+        );
+        assert!(second_evidence.is_empty());
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 1);
+        let current = quick_scan(&QuickScanOptions {
+            pids: vec![first.pid, second.pid],
+            include_kernel_threads: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
+            progress: None,
+        })
+        .expect("observe actual spared second target");
+        let owned: Vec<_> = current
+            .processes
+            .iter()
+            .filter(|record| [first.pid, second.pid].contains(&record.pid.0))
+            .collect();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].pid.0, second.pid);
+        assert_eq!(
+            super::process_identity_from_record(owned[0]),
+            second_selection.actions[0].target
+        );
+        let canonical = parse_agent_plan(
+            &std::fs::read_to_string(handle.dir.join("decision/plan.json")).unwrap(),
+        )
+        .unwrap();
+        let saved = parse_action_outcomes(
+            &std::fs::read_to_string(handle.dir.join("action/outcomes.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(canonical.actions.len(), 2);
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].status, "success");
+        assert_eq!(saved[1].status, "precheck_blocked");
+        assert_eq!(executed_plan_actions(&canonical, &saved).unwrap().len(), 1);
+        let budget: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(log_dir.join("data/rate_limit.json")).unwrap())
+                .unwrap();
+        assert_eq!(budget["kill_timestamps"].as_array().unwrap().len(), 1);
+        assert!(super::finish_tui_session(&handle, &state).is_err());
+        record(
+            &log_dir,
+            serde_json::json!({"step": "retained_bound_refusal", "plan": canonical, "outcomes": saved, "current": current.processes, "budget": budget}),
+        );
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn tui_actual_kill_persistence_failure_and_state_io_failure_reach_outer_exit() {
+        use tui_live_fixtures::{case, policy, record, selection, DetachedTarget};
+
+        let (handle, log_dir) = case("tui-persistence-failure");
+        let policy = policy(1);
+        let mut target = DetachedTarget::spawn();
+        let selected = selection(&handle, &policy, &target);
+        // A real filesystem refusal at the append destination must retain the
+        // delivered kill in the error response, never report a clean session.
+        std::fs::create_dir_all(handle.dir.join("action/outcomes.jsonl")).unwrap();
+        let mut state = super::TuiExecutionState::default();
+        let error = super::execute_tui_plan_selection(&handle, &policy, &selected, &mut state)
+            .expect_err("directory cannot accept append-only outcome records");
+        target
+            .leader
+            .wait()
+            .expect("reap the actually delivered kill");
+        assert!(error.contains("actual execution results"));
+        assert!(error.contains("\"status\":\"success\""));
+        assert!(error.contains("\"kill_signal_delivered\":true"));
+        assert_eq!(state.enforcer.as_ref().unwrap().current_run_kill_count(), 1);
+        assert_eq!(
+            handle.read_manifest().unwrap().state,
+            pt_core::session::SessionState::Failed
+        );
+        assert!(super::finish_tui_session(&handle, &state).is_err());
+        record(
+            &log_dir,
+            serde_json::json!({"step": "actual_kill_append_refusal", "selection": selected, "error": error, "failure": state.failure}),
+        );
+
+        let (unreadable, unreadable_log) = case("tui-state-io-failure");
+        std::fs::write(unreadable.manifest_path(), b"{ invalid saved manifest").unwrap();
+        let mut state = super::TuiExecutionState::default();
+        let error = super::record_tui_execution_failure(
+            &unreadable,
+            &mut state,
+            "actual callback failure".to_string(),
+        );
+        assert!(error.contains("actual callback failure"));
+        assert!(error.contains("persist interactive failure state"));
+        assert_eq!(state.failure.as_deref(), Some(error.as_str()));
+        let exit_error = super::finish_tui_session(&unreadable, &state).unwrap_err();
+        assert!(exit_error.contains("read final interactive session state"));
+        assert_eq!(
+            std::fs::read(unreadable.manifest_path()).unwrap(),
+            b"{ invalid saved manifest"
+        );
+        record(
+            &unreadable_log,
+            serde_json::json!({"step": "state_io_refusal", "callback_error": error, "outer_error": exit_error}),
+        );
     }
 
     #[test]
@@ -10945,6 +13898,21 @@ mod config_file_kind_tests {
         assert!(detect_config_file_kind(&junk).is_err());
         let not_json = write(&dir, "priors.json", "nope");
         assert!(detect_config_file_kind(&not_json).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pid_file_signal_tests {
+    use super::terminate_process;
+
+    /// A pid file holding 0, 1 or a value that wraps negative must not become
+    /// kill(0) (pt's own process group), kill(1) or a process-group signal.
+    #[test]
+    fn terminate_process_refuses_non_process_pids_without_signalling() {
+        for pid in [0, 1, u32::MAX, i32::MAX as u32 + 1] {
+            let error = terminate_process(pid).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{pid}");
+        }
     }
 }
 
@@ -11288,19 +14256,53 @@ fn output_capabilities(global: &GlobalOpts) {
 // ============================================================================
 
 /// Collect system state for snapshot output.
-fn collect_system_state() -> serde_json::Value {
-    let load = collect_load_averages();
-    let cores = collect_cpu_count();
-    let memory = collect_memory_info();
+fn collect_system_state(processes: Option<&[ProcessRecord]>) -> serde_json::Value {
+    use pt_core::collect::pressure::read_pressure_snapshot;
+    use pt_core::decision::pressure_regime::{assess, PressureThresholds, ProcessCensus};
+
+    let snapshot = read_pressure_snapshot();
+    let census = processes.map(|processes| ProcessCensus {
+        zombies: processes
+            .iter()
+            .filter(|process| process.state == ProcessState::Zombie)
+            .count() as u32,
+        dstate: processes
+            .iter()
+            .filter(|process| process.state == ProcessState::DiskSleep)
+            .count() as u32,
+    });
+    let assessment = assess(
+        &snapshot,
+        None,
+        census.as_ref(),
+        &PressureThresholds::default(),
+    );
+    let load = snapshot
+        .load
+        .map(|load| vec![load.one, load.five, load.fifteen]);
+    let total = snapshot.meminfo.and_then(|memory| memory.total);
+    let available = snapshot.meminfo.and_then(|memory| memory.available);
+    let gib = |bytes: u64| bytes as f64 / 1_073_741_824.0;
+    let memory = serde_json::json!({
+        "total_gb": total.map(gib),
+        "available_gb": available.map(gib),
+        "used_gb": total.zip(available).map(|(total, available)| gib(total.saturating_sub(available))),
+    });
     let process_count = collect_process_count();
-    let psi = collect_psi();
+    let psi = serde_json::json!({
+        "cpu": snapshot.cpu.and_then(|resource| resource.some).map(|line| line.avg10),
+        "memory": snapshot.memory.and_then(|resource| resource.some).map(|line| line.avg10),
+        "io": snapshot.io.and_then(|resource| resource.some).map(|line| line.avg10),
+    });
 
     serde_json::json!({
         "load": load,
-        "cores": cores,
+        "cores": snapshot.cpus,
         "memory": memory,
         "process_count": process_count,
         "psi": psi,
+        "pressure": snapshot,
+        "assessment": assessment,
     })
 }
 
@@ -11398,33 +14400,6 @@ fn collect_process_count() -> u32 {
                 .count() as u32
         })
         .unwrap_or(0)
-}
-
-/// Read PSI (Pressure Stall Information) from /proc/pressure/.
-fn collect_psi() -> serde_json::Value {
-    fn read_psi_file(resource: &str) -> Option<f64> {
-        let path = format!("/proc/pressure/{}", resource);
-        std::fs::read_to_string(&path).ok().and_then(|content| {
-            // Parse "some avg10=X.XX avg60=Y.YY avg300=Z.ZZ total=N"
-            // We want avg10 for recent pressure
-            for line in content.lines() {
-                if line.starts_with("some") {
-                    for part in line.split_whitespace() {
-                        if let Some(val) = part.strip_prefix("avg10=") {
-                            return val.parse().ok();
-                        }
-                    }
-                }
-            }
-            None
-        })
-    }
-
-    serde_json::json!({
-        "cpu": read_psi_file("cpu").unwrap_or(0.0),
-        "memory": read_psi_file("memory").unwrap_or(0.0),
-        "io": read_psi_file("io").unwrap_or(0.0),
-    })
 }
 
 /// Get the system hostname.
@@ -11707,7 +14682,7 @@ fn generate_narrative_summary(
             age_human, memory_mb
         ));
         output.push_str(&format!(
-            "   Confidence: {}%, Recommendation: {}\n",
+            "   Suspicion: {}%, Recommendation: {}\n",
             score, recommendation
         ));
 
@@ -11806,7 +14781,6 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     }
 
     // Collect system state and capabilities
-    let system_state = collect_system_state();
     let caps = get_capabilities();
     let host_id = pt_core::logging::get_host_id();
     let timestamp = chrono::Utc::now();
@@ -11828,6 +14802,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         }
     };
 
+    let system_state =
+        collect_system_state(scan_result.as_ref().map(|scan| scan.processes.as_slice()));
+
     // Persist compact artifacts when we have a scan result.
     if let Some(ref scan_result) = scan_result {
         // Load config for protected filter + action policy.
@@ -11836,11 +14813,23 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             ..Default::default()
         };
         if let Ok(config) = load_config(&config_options) {
-            let priors = config.priors.clone();
+            let (mut scorer, scorer_warnings) = Scorer::from_config(&config);
+            for warning in scorer_warnings {
+                eprintln!("agent snapshot: warning: {warning}");
+            }
             let policy = config.policy;
 
             if let Ok(protected_filter) = ProtectedFilter::from_guardrails(&policy.guardrails) {
                 let filter_result = protected_filter.filter_scan_result(scan_result);
+                // Provenance over the processes `agent plan` would evaluate, so their
+                // inference matches the plan's.
+                let min_age = policy.guardrails.min_process_age_seconds;
+                let plan_eligible: Vec<&ProcessRecord> = filter_result
+                    .passed
+                    .iter()
+                    .filter(|proc| proc.elapsed.as_secs() >= min_age)
+                    .collect();
+                scorer.collect_provenance(&plan_eligible);
 
                 let mut persisted_inventory_records: Vec<PersistedProcess> = Vec::new();
                 let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
@@ -11849,24 +14838,17 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
 
                 let feasibility = ActionFeasibility::allow_all();
                 for proc in &filter_result.passed {
-                    let evidence = Evidence::from_snapshot(proc);
-
-                    let posterior_result = match compute_posterior(&priors, &evidence) {
-                        Ok(r) => r,
-                        Err(_) => continue,
+                    let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
+                        continue;
                     };
+                    let posterior_result = score.posterior;
+                    let ledger = score.ledger;
 
                     let decision_outcome =
                         match decide_action(&posterior_result.posterior, &policy, &feasibility) {
                             Ok(d) => d,
                             Err(_) => continue,
                         };
-
-                    let ledger = EvidenceLedger::from_posterior_result(
-                        &posterior_result,
-                        Some(proc.pid.0),
-                        None,
-                    );
 
                     let posterior = &posterior_result.posterior;
                     let score = posterior.suspicion_score();
@@ -12182,26 +15164,6 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     ExitCode::Clean
 }
 
-fn match_level_label(level: MatchLevel) -> &'static str {
-    match level {
-        MatchLevel::None => "none",
-        MatchLevel::GenericCategory => "generic_category",
-        MatchLevel::CommandOnly => "command_only",
-        MatchLevel::CommandPlusArgs => "command_plus_args",
-        MatchLevel::ExactCommand => "exact_command",
-        MatchLevel::MultiPattern => "multi_pattern",
-    }
-}
-
-fn fast_path_skip_reason_label(reason: FastPathSkipReason) -> &'static str {
-    match reason {
-        FastPathSkipReason::Disabled => "disabled",
-        FastPathSkipReason::NoMatch => "no_match",
-        FastPathSkipReason::ScoreBelowThreshold => "score_below_threshold",
-        FastPathSkipReason::NoPriors => "no_priors",
-    }
-}
-
 /// An agent CLI whose terminal had input/output within this window is live.
 const AGENT_LIVE_TTY_IDLE_SECS: u64 = 30 * 60;
 
@@ -12230,6 +15192,150 @@ fn agent_liveness_json(proc: &ProcessRecord) -> Option<serde_json::Value> {
         "live": idle.is_some_and(|s| s < AGENT_LIVE_TTY_IDLE_SECS),
         "window_seconds": AGENT_LIVE_TTY_IDLE_SECS,
     }))
+}
+
+fn process_identity_from_record(proc: &ProcessRecord) -> ProcessIdentity {
+    let quality =
+        if proc.start_id.0.starts_with("unknown:") || proc.start_id.0.starts_with("synthetic:") {
+            IdentityQuality::NoBootId
+        } else {
+            IdentityQuality::Full
+        };
+    ProcessIdentity::full(
+        proc.pid.0,
+        proc.start_id.clone(),
+        proc.uid,
+        proc.pgid,
+        proc.sid,
+        quality,
+    )
+}
+
+fn build_agent_action_plan(
+    session_id: &SessionId,
+    policy: &pt_core::config::Policy,
+    candidates: &[serde_json::Value],
+    action_inputs: &HashMap<u32, DecisionCandidate>,
+    generated_at: String,
+) -> Plan {
+    let candidates = candidates
+        .iter()
+        .filter_map(|recorded| {
+            let pid = u32::try_from(recorded["pid"].as_u64()?).ok()?;
+            let mut input = action_inputs.get(&pid)?.clone();
+            let final_action = recorded["recommended_action"].as_str()?;
+            let chosen_action = serde_json::to_value(input.decision.optimal_action).ok()?;
+            // Tree safety, policy, agent supervision and human review have the
+            // final word. Never revive a decision that one of them downgraded.
+            if chosen_action.as_str() != Some(final_action) {
+                input.decision.optimal_action = Action::Keep;
+            }
+            Some(input)
+        })
+        .collect();
+    generate_plan(&DecisionBundle {
+        session_id: session_id.clone(),
+        policy: policy.clone(),
+        candidates,
+        generated_at: Some(generated_at),
+    })
+}
+
+/// Reconcile displayed decisions with the eligible actions of this exact plan.
+/// A routed zombie action belongs to its original incarnation, not to every
+/// candidate sharing the parent's PID. Staged actions retain their final remedy.
+fn reconcile_agent_action_candidates(
+    candidates: &mut [serde_json::Value],
+    action_inputs: &HashMap<u32, DecisionCandidate>,
+    plan: &Plan,
+) {
+    let mut actions_by_identity: HashMap<ProcessIdentity, Vec<&pt_core::plan::PlanAction>> =
+        HashMap::new();
+    for action in &plan.actions {
+        if !action.blocked && action.action != Action::Keep {
+            let identity = action
+                .original_zombie_target
+                .as_ref()
+                .unwrap_or(&action.target);
+            actions_by_identity
+                .entry(identity.clone())
+                .or_default()
+                .push(action);
+        }
+    }
+    for candidate in candidates {
+        let Some(pid) = candidate["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            continue;
+        };
+        let input = action_inputs.get(&pid);
+        let actions = input
+            .and_then(|input| actions_by_identity.get(&input.identity))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let Some(final_action) = actions.iter().max_by_key(|action| action.stage) else {
+            if !matches!(
+                candidate["recommended_action"].as_str(),
+                Some("keep" | "review")
+            ) {
+                let reason = if let Some(input) =
+                    input.filter(|input| !input.blocked_reasons.is_empty())
+                {
+                    input.blocked_reasons.join("; ")
+                } else if input
+                    .is_some_and(|input| input.process_state == Some(ProcessState::Zombie))
+                {
+                    "Zombie remedy requires a usable parent identity and a supported parent action"
+                        .to_string()
+                } else if input
+                    .is_some_and(|input| input.decision.optimal_action == Action::Restart)
+                {
+                    "Restart requires a supported supervisor adapter".to_string()
+                } else {
+                    "No eligible executable action remains after planning".to_string()
+                };
+                let previous = candidate["action_rationale"].as_str().unwrap_or("");
+                candidate["action_rationale"] = serde_json::json!(format!("{previous}; {reason}"));
+                candidate["recommended_action"] = serde_json::json!("review");
+                candidate["recommendation"] = serde_json::json!("REVIEW");
+                candidate["execution_plan"] = serde_json::json!({"reason": reason});
+            }
+            continue;
+        };
+        candidate["recommended_action"] = serde_json::to_value(final_action.action).unwrap();
+        candidate["recommendation"] = serde_json::json!(candidate["recommended_action"]
+            .as_str()
+            .unwrap()
+            .to_ascii_uppercase());
+        candidate["action_target"] = serde_json::to_value(&final_action.target).unwrap();
+        candidate["plan_action_ids"] = serde_json::json!(actions
+            .iter()
+            .map(|action| &action.action_id)
+            .collect::<Vec<_>>());
+        if final_action.original_zombie_target.is_some() {
+            candidate["zombie_routing"]["planned_action"] =
+                serde_json::to_value(final_action.action).unwrap();
+            candidate["zombie_routing"]["target"] =
+                serde_json::to_value(&final_action.target).unwrap();
+        }
+    }
+}
+
+fn agent_recommended_actions(plan: &Plan) -> Vec<serde_json::Value> {
+    plan.actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "pid": action.target.pid.0,
+                "action": action.action,
+                "stage": action.stage,
+                "action_id": action.action_id,
+            })
+        })
+        .collect()
+
 }
 
 fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
@@ -12300,34 +15406,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
-    let priors = config.priors.clone();
-    // Human kill/spare verdicts per command pattern become learned priors below.
-    let decision_store =
-        match pt_core::decision::decision_store::DecisionStore::load(&config.config_dir) {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("agent plan: ignoring unreadable decision store: {}", e);
-                Default::default()
-            }
-        };
-    let policy = config.policy;
-    let fast_path_config = FastPathConfig {
-        enabled: policy.signature_fast_path.enabled,
-        min_confidence_threshold: policy.signature_fast_path.min_confidence_threshold,
-        require_explicit_priors: policy.signature_fast_path.require_explicit_priors,
-    };
-
-    let mut signature_db = SignatureDatabase::with_defaults();
-    if let Some(user_schema) = pt_core::signature_cli::load_user_signatures() {
-        for signature in user_schema.signatures {
-            if let Err(err) = signature_db.add(signature) {
-                eprintln!(
-                    "agent plan: warning: skipping invalid user signature during load: {}",
-                    err
-                );
-            }
-        }
+    // Priors, human kill/spare verdicts, built-in + user signatures and the fast-path
+    // policy: the same scorer every other surface uses.
+    let (mut scorer, scorer_warnings) = pt_core::scoring::Scorer::from_config(&config);
+    for warning in scorer_warnings {
+        eprintln!("agent plan: warning: {warning}");
     }
+    let fast_path_config = scorer.fast_path.clone();
+    let policy = config.policy;
 
     let rate_limit_path = resolve_data_dir_for_lock().map(|dir| dir.join("rate_limit.json"));
     let enforcer = match pt_core::decision::PolicyEnforcer::new(&policy, rate_limit_path.as_deref())
@@ -12429,7 +15515,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "Protected filter applied"
     );
 
-    let system_state = collect_system_state();
+    let system_state = collect_system_state(Some(&scan_result.processes));
     let load_adjustment = if policy.load_aware.enabled {
         let signals = LoadSignals::from_system_state(&system_state, filter_result.passed.len());
         compute_load_adjustment(&policy.load_aware, &signals)
@@ -12457,6 +15543,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         PersistedProcess,
         PersistedInference,
     )> = Vec::new();
+    let mut action_inputs: HashMap<u32, DecisionCandidate> = HashMap::new();
     let mut policy_blocked_count = 0usize;
     let mut signature_match_count = 0usize;
     let mut signature_fast_path_used_count = 0usize;
@@ -12483,6 +15570,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let eligible_processes: Vec<_> = filter_result
         .passed
         .iter()
+        .filter(|proc| args.pids.is_empty() || args.pids.contains(&proc.pid.0))
         .filter(|proc| proc.elapsed.as_secs() >= effective_min_age)
         .collect();
 
@@ -12501,8 +15589,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let _current_cpu_pct: f64 = processes_to_infer.iter().map(|p| p.cpu_percent).sum();
     let probe_cost_model = pt_core::decision::ProbeCostModel::default();
     let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
-    #[cfg(target_os = "linux")]
-    let provenance_bundle = build_provenance_inference_bundle(&processes_to_infer);
+    scorer.collect_provenance(&processes_to_infer);
 
     // --deep: one batched deep scan (sockets, I/O, queue backlog) over the
     // candidates, overlaid onto the quick-scan evidence below.
@@ -12557,200 +15644,29 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             ..Evidence::from_snapshot(proc)
         };
 
-        let mut match_ctx = ProcessMatchContext::with_comm(&proc.comm);
-        if !proc.cmd.is_empty() {
-            match_ctx = match_ctx.cmdline(&proc.cmd);
-        }
-        let signature_match = signature_db.best_match(&match_ctx);
+        // One scoring path for every surface: learned verdicts, signatures (and their
+        // fast path), desktop-application ownership and provenance.
+        let Some(score) = scorer.score(proc, evidence) else {
+            continue;
+        };
+        let posterior_result = score.posterior;
+        let ledger = score.ledger;
+        let prior_source_label = score.prior_source;
+        let signature_age_weight = score.signature_age_weight;
+        let signature_match = score.signature;
+        let learned_prior = score.learned_prior;
+        let fast_path_used = score.fast_path_used;
+        let fast_path_skip_reason = score.fast_path_skip_reason;
+        let desktop_app = score.desktop_app;
+        let desktop_app_credited = score.desktop_app_credited;
+        #[cfg(target_os = "linux")]
+        let provenance_adjustment = score.provenance;
         if signature_match.is_some() {
             signature_match_count = signature_match_count.saturating_add(1);
         }
-
-        let mut fast_path_used = false;
-        let mut fast_path_skip_reason: Option<&'static str> = None;
-        let prior_source_label: String;
-        let learned_prior = decision_store.learned_prior(&proc.comm, &proc.cmd, &priors);
-        let learned_overrides = learned_prior.as_ref().map(|learned| {
-            pt_core::decision::decision_store::DecisionStore::overrides_for(learned, &priors)
-        });
-        let prior_context = PriorContext {
-            global_priors: &priors,
-            signature_match: signature_match.as_ref(),
-            category_defaults: None,
-            user_overrides: learned_overrides.as_ref(),
-        };
-
-        // A human verdict on this pattern outranks the signature fast path.
-        let fast_path_signature = signature_match.as_ref().filter(|_| learned_prior.is_none());
-        // Adjusted below by Linux-only provenance evidence.
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-        let (mut posterior_result, mut ledger) = if let Some(sig_match) = fast_path_signature {
-            match try_signature_fast_path(&fast_path_config, Some(sig_match), proc.pid.0) {
-                Ok(Some(fast_path)) => {
-                    fast_path_used = true;
-                    signature_fast_path_used_count =
-                        signature_fast_path_used_count.saturating_add(1);
-                    prior_source_label = "signature_fast_path".to_string();
-                    (fast_path.posterior, fast_path.ledger)
-                }
-                Ok(None) => match compute_posterior_with_overrides(&prior_context, &evidence) {
-                    Ok((result, source_info)) => {
-                        prior_source_label = source_info.source.to_string();
-                        let ledger =
-                            EvidenceLedger::from_posterior_result(&result, Some(proc.pid.0), None);
-                        (result, ledger)
-                    }
-                    Err(_) => continue,
-                },
-                Err(reason) => {
-                    fast_path_skip_reason = Some(fast_path_skip_reason_label(reason));
-                    match compute_posterior_with_overrides(&prior_context, &evidence) {
-                        Ok((result, source_info)) => {
-                            prior_source_label = source_info.source.to_string();
-                            let ledger = EvidenceLedger::from_posterior_result(
-                                &result,
-                                Some(proc.pid.0),
-                                None,
-                            );
-                            (result, ledger)
-                        }
-                        Err(_) => continue,
-                    }
-                }
-            }
-        } else {
-            match compute_posterior_with_overrides(&prior_context, &evidence) {
-                Ok((result, source_info)) => {
-                    prior_source_label = source_info.source.to_string();
-                    let ledger =
-                        EvidenceLedger::from_posterior_result(&result, Some(proc.pid.0), None);
-                    (result, ledger)
-                }
-                Err(_) => continue,
-            }
-        };
-
-        #[cfg(target_os = "linux")]
-        let provenance_adjustment = {
-            let mut adjustment = derive_provenance_adjustment(proc.pid.0, &provenance_bundle);
-            // The base `orphan` term already carries "reparented to init"; counting the
-            // lineage's orphaned verdict again double-counts one fact under naive Bayes.
-            // Keep it only when it adds information (lineage sees an orphan that the
-            // base check does not, e.g. reparented to a user subreaper).
-            if proc.is_orphan() {
-                adjustment
-                    .evidence_terms
-                    .retain(|t| t.feature != "provenance_ownership_orphaned");
-            }
-            if !adjustment.evidence_terms.is_empty() {
-                match apply_evidence_terms(&posterior_result, adjustment.evidence_terms.clone()) {
-                    Ok(adjusted) => {
-                        posterior_result = adjusted;
-                        ledger = EvidenceLedger::from_posterior_result(
-                            &posterior_result,
-                            Some(proc.pid.0),
-                            None,
-                        );
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            pid = proc.pid.0,
-                            error = %err,
-                            "Failed to apply provenance-derived evidence terms"
-                        );
-                    }
-                }
-            }
-
-            if adjustment.confidence_penalty_steps > 0 {
-                let downgraded =
-                    downgrade_confidence(ledger.confidence, adjustment.confidence_penalty_steps);
-                if downgraded != ledger.confidence {
-                    ledger.confidence = downgraded;
-                }
-                if !adjustment.confidence_notes.is_empty() {
-                    let joined = adjustment.confidence_notes.join("; ");
-                    ledger
-                        .top_evidence
-                        .push(format!("Provenance confidence downgrade: {joined}"));
-                    ledger.why_summary =
-                        format!("{} Provenance caveats: {}.", ledger.why_summary, joined);
-                }
-            }
-
-            for term in &adjustment.evidence_terms {
-                let glyph = if term.feature.contains("blast_radius") {
-                    "🛡"
-                } else {
-                    "🔗"
-                };
-                ledger
-                    .evidence_glyphs
-                    .insert(term.feature.clone(), glyph.to_string());
-            }
-
-            tracing::debug!(
-                pid = proc.pid.0,
-                evidence_completeness = adjustment.evidence_completeness,
-                blast_radius_risk = adjustment.blast_radius.risk_score,
-                blast_radius_confidence = adjustment.blast_radius.confidence,
-                blast_radius_level = ?adjustment.blast_radius.risk_level,
-                confidence_penalty_steps = adjustment.confidence_penalty_steps,
-                score_terms = ?adjustment
-                    .evidence_terms
-                    .iter()
-                    .map(|term| term.feature.clone())
-                    .collect::<Vec<_>>(),
-                notes = ?adjustment.confidence_notes,
-                "Applied provenance-derived scoring adjustments"
-            );
-
-            // Explanation-trace diagnostics: emit per-feature evidence selection
-            // events so provenance decisions can be diagnosed from the trace log.
-            for term in &adjustment.evidence_terms {
-                let net_shift = term.log_likelihood.abandoned - term.log_likelihood.useful;
-                let direction = if net_shift > 0.1 {
-                    "toward_abandon"
-                } else if net_shift < -0.1 {
-                    "toward_useful"
-                } else {
-                    "neutral"
-                };
-                tracing::trace!(
-                    pid = proc.pid.0,
-                    feature = %term.feature,
-                    abandoned_ll = term.log_likelihood.abandoned,
-                    useful_ll = term.log_likelihood.useful,
-                    net_shift = net_shift,
-                    direction = direction,
-                    "provenance_evidence_selected"
-                );
-            }
-
-            if adjustment.confidence_penalty_steps > 0 {
-                tracing::trace!(
-                    pid = proc.pid.0,
-                    steps = adjustment.confidence_penalty_steps,
-                    reasons = ?adjustment.confidence_notes,
-                    evidence_completeness = adjustment.evidence_completeness,
-                    "provenance_confidence_downgraded"
-                );
-            }
-
-            if adjustment.blast_radius.total_affected > 0 {
-                tracing::trace!(
-                    pid = proc.pid.0,
-                    risk_score = adjustment.blast_radius.risk_score,
-                    risk_level = ?adjustment.blast_radius.risk_level,
-                    total_affected = adjustment.blast_radius.total_affected,
-                    confidence = adjustment.blast_radius.confidence,
-                    summary = %adjustment.blast_radius.summary,
-                    "provenance_blast_radius_computed"
-                );
-            }
-
-            adjustment
-        };
+        if fast_path_used {
+            signature_fast_path_used_count = signature_fast_path_used_count.saturating_add(1);
+        }
 
         let signature_name = signature_match.as_ref().map(|m| m.signature.name.clone());
         let signature_level = signature_match
@@ -12760,28 +15676,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let signature_category = signature_match
             .as_ref()
             .map(|m| format!("{:?}", m.signature.category));
-
-        if let Some(sig_match) = signature_match.as_ref() {
-            if !fast_path_used {
-                ledger.top_evidence.insert(
-                    0,
-                    format!(
-                        "Signature match: {} (score={:.2}, level={})",
-                        sig_match.signature.name,
-                        sig_match.score,
-                        match_level_label(sig_match.level)
-                    ),
-                );
-                ledger.why_summary = format!(
-                    "Matched signature '{}' (score {:.2}, level {}, prior source {}). {}",
-                    sig_match.signature.name,
-                    sig_match.score,
-                    match_level_label(sig_match.level),
-                    prior_source_label,
-                    ledger.why_summary
-                );
-            }
-        }
 
         // Apply state-based feasibility constraints so decisioning does not
         // recommend fundamentally invalid actions (e.g., kill for zombie/D-state).
@@ -12921,21 +15815,27 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 .builtin_protection
                 .then(|| pt_core::collect::read_cgroup_role(proc.pid.0)),
             #[cfg(target_os = "linux")]
-            blast_radius_risk_level: Some(
-                format!("{:?}", provenance_adjustment.blast_radius.risk_level).to_lowercase(),
-            ),
+            blast_radius_risk_level: provenance_adjustment
+                .as_ref()
+                .map(|p| format!("{:?}", p.blast_radius.risk_level).to_lowercase()),
             #[cfg(not(target_os = "linux"))]
             blast_radius_risk_level: None,
             #[cfg(target_os = "linux")]
-            blast_radius_total_affected: Some(provenance_adjustment.blast_radius.total_affected),
+            blast_radius_total_affected: provenance_adjustment
+                .as_ref()
+                .map(|p| p.blast_radius.total_affected),
             #[cfg(not(target_os = "linux"))]
             blast_radius_total_affected: None,
             #[cfg(target_os = "linux")]
-            provenance_evidence_completeness: Some(provenance_adjustment.evidence_completeness),
+            provenance_evidence_completeness: provenance_adjustment
+                .as_ref()
+                .map(|p| p.evidence_completeness),
             #[cfg(not(target_os = "linux"))]
             provenance_evidence_completeness: None,
             #[cfg(target_os = "linux")]
-            provenance_confidence_penalty: Some(provenance_adjustment.confidence_penalty_steps),
+            provenance_confidence_penalty: provenance_adjustment
+                .as_ref()
+                .map(|p| p.confidence_penalty_steps),
             #[cfg(not(target_os = "linux"))]
             provenance_confidence_penalty: None,
         };
@@ -13029,8 +15929,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             })
         });
         #[cfg(target_os = "linux")]
-        let provenance_summary = serde_json::to_value(provenance_adjustment.to_candidate_output())
-            .unwrap_or_else(|_| serde_json::json!({"enabled": false}));
+        let provenance_summary = provenance_adjustment
+            .as_ref()
+            .and_then(|p| serde_json::to_value(p.to_candidate_output()).ok())
+            .unwrap_or_else(|| serde_json::json!({"enabled": false}));
 
         let predictions = if args.include_predictions {
             let mut predictions = build_stub_predictions();
@@ -13045,6 +15947,33 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         } else {
             None
         };
+
+        let parent = scan_result
+            .processes
+            .iter()
+            .find(|parent| parent.pid == proc.ppid);
+        let source_supervisor =
+            supervisor_info_for_plan_identity(&process_identity_from_record(proc));
+        let routed_supervision =
+            proc.state.is_zombie() && matches!(recommended_action, "kill" | "restart");
+        let mut supervisor = if routed_supervision {
+            match parent {
+                Some(parent) => {
+                    supervisor_info_for_plan_identity(&process_identity_from_record(parent))
+                }
+                None => unknown_supervision_for_plan(
+                    proc.ppid.0,
+                    "routed parent identity is unavailable in the full process snapshot",
+                ),
+            }
+        } else {
+            source_supervisor.clone()
+        };
+        supervisor["subject_kind"] = serde_json::json!(if routed_supervision {
+            "zombie_parent"
+        } else {
+            "process"
+        });
 
         // A zombie is already dead: only its parent can reap it, so the remedy
         // targets the parent (nudge with SIGCHLD, then restart/stop it).
@@ -13070,7 +15999,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "agent_kind": agent_kind,
             "agent_liveness": agent_liveness,
             "zombie_routing": zombie_routing,
-            "start_id": format!("{}:{}", proc.pid.0, proc.start_time_unix),
+            "start_id": proc.start_id.to_string(),
             "uid": proc.uid,
             "user": &proc.user,
             "command": &proc.cmd,
@@ -13098,7 +16027,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "inference": {
                 "mode": if fast_path_used { "signature_fast_path" } else { "bayesian" },
                 "prior_source": prior_source_label,
+                "signature_age_weight": signature_age_weight,
                 "learned_prior": learned_prior,
+                "desktop_app": desktop_app,
+                "desktop_app_credited": desktop_app_credited,
                 "fast_path": {
                     "enabled": fast_path_config.enabled,
                     "used": fast_path_used,
@@ -13109,6 +16041,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             },
             "confidence": ledger.confidence.label(),
             "evidence": evidence_contributions,
+            "evidence_ledger": ledger,
             "provenance_inference": serde_json::to_value(CandidateProvenanceOutput::disabled())
                 .unwrap_or_else(|_| serde_json::json!({"enabled": false})),
             "blast_radius": {
@@ -13123,7 +16056,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 Action::Resume | Action::Unfreeze | Action::Unquarantine => "reversal",
                 Action::Keep | Action::Renice => "no_action",
             },
-            "supervisor": supervisor_info_for_plan(proc.pid.0),
+            "supervisor": supervisor,
+            "source_supervisor": routed_supervision.then_some(source_supervisor),
             "uncertainty": {
                 // Shannon entropy (bits) of the 4-class posterior: 0 = certain, 2 = uniform.
                 "posterior_entropy_bits": posterior.entropy_bits(),
@@ -13143,6 +16077,25 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "policy_blocked": policy_blocked,
             "policy": policy_value,
         });
+
+        let supervision_refusal = (candidate["supervisor"]["status"] == "unknown")
+            .then(|| {
+                candidate["supervisor"]["reason"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .flatten();
+        if let Some(reason) = &supervision_refusal {
+            if !matches!(
+                candidate["recommended_action"].as_str(),
+                Some("keep" | "review")
+            ) {
+                candidate["recommended_action"] = serde_json::json!("review");
+                candidate["recommendation"] = serde_json::json!("REVIEW");
+                let rationale = candidate["action_rationale"].as_str().unwrap_or("");
+                candidate["action_rationale"] = serde_json::json!(format!("{rationale}; {reason}"));
+            }
+        }
 
         if let Some(predictions) = predictions {
             if let Some(obj) = candidate.as_object_mut() {
@@ -13183,23 +16136,27 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             recommended_action: recommended_action.to_string(),
             score,
             #[cfg(target_os = "linux")]
-            blast_radius_risk_level: Some(
-                format!("{:?}", provenance_adjustment.blast_radius.risk_level).to_lowercase(),
-            ),
+            blast_radius_risk_level: provenance_adjustment
+                .as_ref()
+                .map(|p| format!("{:?}", p.blast_radius.risk_level).to_lowercase()),
             #[cfg(not(target_os = "linux"))]
             blast_radius_risk_level: None,
             #[cfg(target_os = "linux")]
-            blast_radius_total_affected: Some(provenance_adjustment.blast_radius.total_affected),
+            blast_radius_total_affected: provenance_adjustment
+                .as_ref()
+                .map(|p| p.blast_radius.total_affected),
             #[cfg(not(target_os = "linux"))]
             blast_radius_total_affected: None,
             #[cfg(target_os = "linux")]
-            provenance_evidence_completeness: Some(provenance_adjustment.evidence_completeness),
+            provenance_evidence_completeness: provenance_adjustment
+                .as_ref()
+                .map(|p| p.evidence_completeness),
             #[cfg(not(target_os = "linux"))]
             provenance_evidence_completeness: None,
             #[cfg(target_os = "linux")]
             provenance_score_terms: provenance_adjustment
-                .evidence_terms
                 .iter()
+                .flat_map(|p| &p.evidence_terms)
                 .map(|t| t.feature.clone())
                 .collect(),
             #[cfg(not(target_os = "linux"))]
@@ -13207,8 +16164,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             #[cfg(target_os = "linux")]
             provenance_log_odds_shift: {
                 let shift: f64 = provenance_adjustment
-                    .evidence_terms
                     .iter()
+                    .flat_map(|p| &p.evidence_terms)
                     .map(|t| t.log_likelihood.abandoned - t.log_likelihood.useful)
                     .sum();
                 if shift.abs() > f64::EPSILON {
@@ -13221,7 +16178,58 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             provenance_log_odds_shift: None,
         };
 
+        let parent_refusal = if proc.state.is_zombie()
+            && matches!(
+                candidate["recommended_action"].as_str(),
+                Some("kill" | "restart")
+            ) {
+            parent.and_then(|parent| {
+                planned_zombie_parent_refusal(
+                    parent,
+                    &protected_filter,
+                    &enforcer,
+                    &decision_policy,
+                    &scorer.signatures,
+                    posterior,
+                    global.robot,
+                )
+            })
+        } else {
+            None
+        };
+        let mut blocked_reasons: Vec<String> = policy_result
+            .violation
+            .as_ref()
+            .filter(|_| policy_blocked)
+            .map(|violation| format!("Policy blocked: {} ({})", violation.message, violation.rule))
+            .into_iter()
+            .collect();
+        if let Some(reason) = supervision_refusal {
+            blocked_reasons.push(reason);
+        }
+        if let Some(reason) = &parent_refusal {
+            blocked_reasons.push(reason.clone());
+            candidate["zombie_routing"]["refusal"] = serde_json::json!(reason);
+            candidate["policy_blocked"] = serde_json::json!(true);
+            if !policy_blocked {
+                policy_blocked_count += 1;
+            }
+        }
+
         // Store candidate with its ranking key (no early break!)
+        action_inputs.insert(
+            proc.pid.0,
+            DecisionCandidate {
+                identity: process_identity_from_record(proc),
+                ppid: Some(proc.ppid.0),
+                decision: decision_outcome,
+                blocked_reasons,
+                stage_pause_before_kill: false,
+                process_state: Some(proc.state),
+                parent_identity: parent.map(process_identity_from_record),
+                d_state_diagnostics: None,
+            },
+        );
         all_candidates.push((
             (abandonment_probability, intervention_probability),
             candidate,
@@ -13275,7 +16283,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     // Capture count before truncation for summary stats
     let above_threshold_count = all_candidates.len();
 
-    // Take top N candidates (sorted by max posterior, not scan order!)
+    // Take top N candidates in suspicion order.
     let mut candidates: Vec<serde_json::Value> = Vec::new();
     let mut persisted_inventory_records: Vec<PersistedProcess> = Vec::new();
     let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
@@ -13286,6 +16294,17 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         candidates.push(candidate_json);
         persisted_inventory_records.push(proc_rec);
         persisted_inference_records.push(inf_rec);
+    }
+
+    // Truncation can remove a child that made its parent's kill safe in the
+    // earlier full candidate set. Re-evaluate the actual final action set.
+    {
+        let mut candidate_values: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
+        apply_process_tree_safety(
+            &mut candidate_values,
+            &scan_result.processes,
+            decision_policy.guardrails.builtin_protection,
+        );
     }
 
     let mut goal_summary: Option<serde_json::Value> = None;
@@ -13367,8 +16386,53 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     }
 
-    // Rebuild kill/review/spare candidate lists from the final sorted candidates
-    let mut kill_candidates: Vec<u32> = Vec::new();
+    // Planning does not record executions, so enforce the final kill count after
+    // goal ranking and before both the displayed and executable plans are built.
+    {
+        let mut candidate_values: Vec<&mut serde_json::Value> = candidates.iter_mut().collect();
+        apply_planned_kill_budget(
+            &mut candidate_values,
+            &scan_result.processes,
+            &decision_policy,
+            global.robot,
+        );
+    }
+
+    let generated_at = chrono::Utc::now().to_rfc3339();
+    let action_plan = build_agent_action_plan(
+        &session_id,
+        &decision_policy,
+        &candidates,
+        &action_inputs,
+        generated_at.clone(),
+    );
+    reconcile_agent_action_candidates(&mut candidates, &action_inputs, &action_plan);
+    let final_recommendations: HashMap<_, _> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            Some((
+                (
+                    u32::try_from(candidate["pid"].as_u64()?).ok()?,
+                    candidate["start_id"].as_str()?,
+                ),
+                candidate["recommended_action"].as_str()?,
+            ))
+        })
+        .collect();
+    for recorded in &mut persisted_inference_records {
+        if let Some(action) = final_recommendations.get(&(recorded.pid, recorded.start_id.as_str()))
+        {
+            recorded.recommended_action = (*action).to_string();
+        }
+    }
+
+    // Executable targets and displayed remedies come from the same final plan.
+    let kill_candidates: Vec<u32> = action_plan
+        .actions
+        .iter()
+        .filter(|action| action.action == Action::Kill)
+        .map(|action| action.target.pid.0)
+        .collect();
     let mut review_candidates: Vec<u32> = Vec::new();
     let mut spare_candidates: Vec<u32> = Vec::new();
     let mut expected_memory_freed_bytes: u64 = 0;
@@ -13385,15 +16449,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .map(|selected| selected.contains(&pid))
             .unwrap_or(false);
         if action == "kill" {
-            kill_candidates.push(pid);
             expected_memory_freed_bytes += memory_mb * 1024 * 1024;
-        } else if selected_by_goal {
-            goal_selected_needing_review.push(pid);
+        } else if action == "review" {
             review_candidates.push(pid);
         } else if action == "keep" {
             spare_candidates.push(pid);
-        } else {
-            review_candidates.push(pid);
+        }
+        if selected_by_goal && action != "kill" {
+            goal_selected_needing_review.push(pid);
         }
     }
     let expected_memory_freed_gb = (expected_memory_freed_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
@@ -13413,6 +16476,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "total_processes_scanned": total_scanned,
         "protected_filtered": protected_filtered_count,
         "protected_by_rule": protected_by_rule,
+        // Per-PID reasons distinguish protection from age/threshold filtering;
+        // expose no command lines or other process metadata for protected rows.
+        "protected_by_pid": protected_rule_by_pid,
         "candidates_evaluated": candidates_evaluated,
         "deep_scan_ms": deep_scan_ms,
         "deep_evidence_pids": deep_signals.as_ref().map(|m| m.len()),
@@ -13480,7 +16546,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         recommendations["goal"] = goal.clone();
     }
 
-    // Build recommended section (legacy format for backward compatibility)
+    // Expose every executable action with its actual target, stage and stable ID.
     let empty_pids: Vec<u32> = Vec::new();
     let preselected_pids = if args.yes {
         &kill_candidates
@@ -13489,11 +16555,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     };
     let recommended = serde_json::json!({
         "preselected_pids": preselected_pids,
-        "actions": kill_candidates.iter().map(|pid| serde_json::json!({
-            "pid": pid,
-            "action": "kill",
-            "stage": 1,
-        })).collect::<Vec<_>>(),
+        "actions": agent_recommended_actions(&action_plan),
     });
 
     // Check for stub flags usage (future features parsed but not yet functional)
@@ -13538,13 +16600,15 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "session_id": session_id.0,
         "label": args.label,
-        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "generated_at": generated_at,
         "host_id": pt_core::logging::get_host_id(),
         "host": host_info,
+        "system_state": system_state,
         "scan": scan_info,
         "command": "agent plan",
         "args": {
             "max_candidates": args.max_candidates,
+            "pids": args.pids,
             "min_posterior": args.min_posterior,
             "only": args.only,
             "yes": args.yes,
@@ -13572,7 +16636,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "goal_summary": goal_summary,
         "candidates": candidates,
         "recommendations": recommendations,
-        "recommended": recommended,  // Legacy format for backward compatibility
+        "recommended": recommended,
         "session_created": created,
     });
 
@@ -13580,6 +16644,17 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     if let Some(stub_flags) = stub_flags_section {
         plan_output["stub_flags"] = stub_flags;
     }
+
+    // The persisted and full stdout document carries the executable Plan fields
+    // alongside its recorded candidate evidence. Apply consumes this same contract.
+    if let serde_json::Value::Object(fields) = serde_json::to_value(action_plan).unwrap() {
+        plan_output.as_object_mut().unwrap().extend(fields);
+    }
+    plan_output["policy_snapshot"] = serde_json::to_value(&decision_policy).unwrap();
+    plan_output["policy_snapshot"]["min_process_age_seconds"] =
+        serde_json::json!(effective_min_age);
+    plan_output["policy_snapshot"]["guardrails"]["min_process_age_seconds"] =
+        serde_json::json!(effective_min_age);
 
     // Write plan to session
     let decision_dir = handle.dir.join("decision");
@@ -13847,11 +16922,11 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         }
     };
 
-    // Load priors from config or use defaults
+    // Load the plan's scorer from config or use defaults
     let ExplainContext {
-        priors,
-        decisions,
+        mut scorer,
         protected,
+        min_age_seconds,
     } = match load_priors_for_explain(global) {
         Ok(p) => p,
         Err(e) => {
@@ -13893,6 +16968,14 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         }
     };
 
+    collect_explain_provenance(
+        global,
+        &mut scorer,
+        protected.as_ref(),
+        min_age_seconds,
+        &scan_result.processes,
+    );
+
     // Build explanations for each process
     let mut explanations: Vec<serde_json::Value> = Vec::new();
 
@@ -13900,8 +16983,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         let record = scan_result.processes.iter().find(|p| p.pid.0 == *pid);
         match record {
             Some(proc) => {
-                let mut explanation =
-                    build_process_explanation(proc, &priors, decisions.as_ref(), args);
+                let mut explanation = build_process_explanation(proc, &scorer, args);
                 if let Some(ref filter) = protected {
                     // agent plan skips protected processes; say so and why.
                     explanation["protection"] = explain_protection(filter, proc);
@@ -14032,33 +17114,93 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
     ExitCode::Clean
 }
 
-/// Load priors (and learned decisions, if readable) from config with fallback to defaults.
+/// The config directory pt reads and writes (`--config`/`PT_CONFIG_DIR`, then
+/// `PROCESS_TRIAGE_CONFIG`, then the XDG default), as every config file resolves it.
+fn resolved_config_dir(global: &GlobalOpts) -> PathBuf {
+    pt_core::config::resolve_config_dir(&config_options(global))
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// The scorer `agent plan` would use (priors, learned verdicts, signatures), with
+/// fallback to defaults when the config cannot be loaded.
 fn load_priors_for_explain(global: &GlobalOpts) -> Result<ExplainContext, ConfigError> {
-    let opts = ConfigOptions {
-        config_dir: global.config.as_ref().map(PathBuf::from),
-        priors_path: None,
-        policy_path: None,
-    };
-    let (priors, decisions, guardrails) = match load_config(&opts) {
+    let (scorer, guardrails) = match load_config(&config_options(global)) {
         Ok(resolved) => {
-            let decisions =
-                pt_core::decision::decision_store::DecisionStore::load(&resolved.config_dir).ok();
-            (resolved.priors, decisions, resolved.policy.guardrails)
+            let (scorer, warnings) = Scorer::from_config(&resolved);
+            for warning in warnings {
+                eprintln!("agent explain: warning: {warning}");
+            }
+            (scorer, resolved.policy.guardrails)
         }
-        Err(_) => (Priors::default(), None, Default::default()),
+        Err(_) => {
+            let policy = pt_core::config::Policy::default();
+            let (signatures, _) =
+                pt_core::scoring::load_signature_database(&resolved_config_dir(global));
+            let scorer = Scorer::new(
+                Priors::default(),
+                Default::default(),
+                signatures,
+                pt_core::scoring::fast_path_config(&policy),
+            );
+            (scorer, policy.guardrails)
+        }
     };
     Ok(ExplainContext {
-        priors,
-        decisions,
+        scorer,
         protected: ProtectedFilter::from_guardrails(&guardrails).ok(),
+        min_age_seconds: guardrails.min_process_age_seconds,
     })
 }
 
 /// What `agent explain` evaluates a process against.
 struct ExplainContext {
-    priors: Priors,
-    decisions: Option<pt_core::decision::decision_store::DecisionStore>,
+    scorer: Scorer,
     protected: Option<ProtectedFilter>,
+    /// `agent plan`'s default age floor for candidates.
+    min_age_seconds: u64,
+}
+
+/// Collect provenance the way `agent plan` does: over the processes plan would
+/// evaluate (unprotected and old enough) plus the ones being explained, so the
+/// explanation carries the same lineage, listener and blast-radius terms.
+fn collect_explain_provenance(
+    global: &GlobalOpts,
+    scorer: &mut Scorer,
+    protected: Option<&ProtectedFilter>,
+    min_age_seconds: u64,
+    targets: &[ProcessRecord],
+) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let scan_options = QuickScanOptions {
+        pids: vec![],
+        include_kernel_threads: false,
+        timeout: global.timeout.map(std::time::Duration::from_secs),
+        progress: None,
+    };
+    let population = match quick_scan(&scan_options) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("agent explain: warning: provenance scan failed: {e}");
+            scorer.collect_provenance(&targets.iter().collect::<Vec<_>>());
+            return;
+        }
+    };
+    let passed = match protected {
+        Some(filter) => filter.filter_scan_result(&population).passed,
+        None => population.processes,
+    };
+    let mut set: Vec<&ProcessRecord> = passed
+        .iter()
+        .filter(|proc| proc.elapsed.as_secs() >= min_age_seconds)
+        .collect();
+    for target in targets {
+        if !set.iter().any(|proc| proc.pid == target.pid) {
+            set.push(target);
+        }
+    }
+    scorer.collect_provenance(&set);
 }
 
 /// Why a process would be skipped by `agent plan` (not evaluated), if it would be.
@@ -14089,32 +17231,21 @@ fn explain_protection(filter: &ProtectedFilter, proc: &ProcessRecord) -> serde_j
 /// Build a JSON explanation for a single process.
 fn build_process_explanation(
     proc: &ProcessRecord,
-    global_priors: &Priors,
-    decisions: Option<&pt_core::decision::decision_store::DecisionStore>,
+    scorer: &Scorer,
     args: &AgentExplainArgs,
 ) -> serde_json::Value {
-    // Human kill/spare verdicts for this command pattern replace the class prior.
-    let learned_prior =
-        decisions.and_then(|d| d.learned_prior(&proc.comm, &proc.cmd, global_priors));
-    let learned_priors = decisions.and_then(|d| d.priors_for(&proc.comm, &proc.cmd, global_priors));
-    let priors = learned_priors.as_ref().unwrap_or(global_priors);
-    // Convert ProcessRecord to Evidence (same snapshot features as agent plan)
-    let evidence = Evidence::from_snapshot(proc);
-
-    // Compute posterior
-    let posterior_result = match compute_posterior(priors, &evidence) {
-        Ok(r) => r,
-        Err(e) => {
-            return serde_json::json!({
-                "pid": proc.pid.0,
-                "comm": proc.comm,
-                "error": format!("posterior computation failed: {}", e),
-            });
-        }
+    // Scored exactly as `agent plan` scores it (learned verdicts, signatures,
+    // desktop-app ownership, provenance), from the same snapshot evidence.
+    let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
+        return serde_json::json!({
+            "pid": proc.pid.0,
+            "comm": proc.comm,
+            "error": "posterior computation failed",
+        });
     };
-
-    // Build evidence ledger
-    let ledger = EvidenceLedger::from_posterior_result(&posterior_result, Some(proc.pid.0), None);
+    let posterior_result = &score.posterior;
+    let ledger = &score.ledger;
+    let learned_prior = &score.learned_prior;
 
     // Build base explanation
     let mut explanation = serde_json::json!({
@@ -14136,7 +17267,18 @@ fn build_process_explanation(
             "abandoned": posterior_result.posterior.abandoned,
             "zombie": posterior_result.posterior.zombie,
         },
+        "score": posterior_result.posterior.suspicion_score(),
+        "prior_source": score.prior_source,
+        "signature_age_weight": score.signature_age_weight,
         "learned_prior": learned_prior,
+        "signature": score.signature.as_ref().map(|m| serde_json::json!({
+            "name": m.signature.name,
+            "category": format!("{:?}", m.signature.category),
+            "score": m.score,
+            "match_level": match_level_label(m.level),
+        })),
+        "desktop_app": score.desktop_app,
+        "desktop_app_credited": score.desktop_app_credited,
     });
 
     // Add Bayes factors if galaxy_brain mode or requested
@@ -14173,13 +17315,44 @@ fn build_process_explanation(
     explanation
 }
 
+fn supervisor_info_for_plan_identity(identity: &ProcessIdentity) -> serde_json::Value {
+    let pid = identity.pid.0;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let provider = LiveIdentityProvider::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut info = if matches!(provider.revalidate(identity), Ok(true)) {
+        let observed = supervisor_info_for_plan(pid);
+        if matches!(provider.revalidate(identity), Ok(true)) {
+            observed
+        } else {
+            unknown_supervision_for_plan(pid, "supervision subject identity changed during probing")
+        }
+    } else {
+        unknown_supervision_for_plan(
+            pid,
+            "supervision subject identity changed or is unavailable",
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let mut info = supervisor_info_for_plan(pid);
+    info["subject_identity"] = serde_json::json!(identity);
+    info["subject_kind"] = serde_json::json!("process");
+    info
+}
+
 #[cfg(target_os = "linux")]
 fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
+    let human_supervision = match detect_supervision(pid) {
+        Ok(result) => result,
+        Err(error) => return unknown_supervision_for_plan(pid, &error.to_string()),
+    };
     let mut detected = false;
     let mut supervisor_type: Option<String> = None;
     let mut unit: Option<String> = None;
     let mut recommended_action = "kill".to_string();
     let mut supervisor_command: Option<String> = None;
+    // Which systemd manager owns the unit ("system" or "user"), for systemd.
+    let mut manager: Option<&str> = None;
 
     // Prefer container supervision if present
     if let Ok(result) = ContainerSupervisionAnalyzer::new()
@@ -14255,75 +17428,100 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
         }
     }
 
-    // systemd supervision
+    // systemd supervision: the service unit the process's cgroup places it in, for the
+    // system manager or a user's manager (GH #19: the unit was never looked up, so
+    // this never fired).
     if !detected {
-        if let Some(unit_info) = collect_systemd_unit(pid, None) {
+        if let Some((service, user_manager)) = pt_core::collect::read_systemd_cgroup_path(pid)
+            .and_then(|path| {
+                if pt_core::collect::classify_live_cgroup_path(pid, &path).is_user_workload() {
+                    return None;
+                }
+                pt_core::collect::systemd_service_unit(&path)
+                    .map(|(service, user)| (service.to_string(), user))
+            })
+        {
             detected = true;
             supervisor_type = Some("systemd".to_string());
-            unit = Some(unit_info.name.clone());
-            let (action_label, command) = match unit_info.unit_type {
-                pt_core::collect::systemd::SystemdUnitType::Scope => (
-                    "systemctl_stop",
-                    format!("systemctl stop {}", unit_info.name),
-                ),
-                _ => (
-                    "systemctl_restart",
-                    format!("systemctl restart {}", unit_info.name),
-                ),
-            };
-            recommended_action = action_label.to_string();
-            supervisor_command = Some(command);
+            manager = Some(if user_manager { "user" } else { "system" });
+            let scope = if user_manager { "--user " } else { "" };
+            recommended_action = "systemctl_restart".to_string();
+            supervisor_command = Some(format!("systemctl {scope}restart {service}"));
+            unit = Some(service);
         }
     }
 
     // Human supervision (agents/IDEs/CI) for warning-only
-    if !detected {
-        if let Ok(result) = detect_supervision(pid) {
-            if is_human_supervised(&result) {
-                detected = true;
-                supervisor_type = result.supervisor_type.map(|t| t.to_string());
-                unit = result.supervisor_name;
-                recommended_action = "review".to_string();
-            }
-        }
+    if !detected && is_human_supervised(&human_supervision) {
+        detected = true;
+        supervisor_type = human_supervision.supervisor_type.map(|t| t.to_string());
+        unit = human_supervision.supervisor_name;
+        recommended_action = "review".to_string();
     }
 
     serde_json::json!({
         "detected": detected,
+        "status": "observed",
         "type": supervisor_type,
         "unit": unit,
+        "manager": manager,
         "recommended_action": recommended_action,
         "supervisor_command": supervisor_command,
     })
 }
 
+/// No systemd, container or cgroup supervisors to probe here (launchd is checked by
+/// the apply-time pre-check). As in v2.2.1 the plan reports none detected; an
+/// "unknown" status turned every macOS candidate into REVIEW.
 #[cfg(not(target_os = "linux"))]
 fn supervisor_info_for_plan(_pid: u32) -> serde_json::Value {
     serde_json::json!({
         "detected": false,
+        "status": "observed",
         "type": serde_json::Value::Null,
         "unit": serde_json::Value::Null,
+        "manager": serde_json::Value::Null,
         "recommended_action": "kill",
         "supervisor_command": serde_json::Value::Null,
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-/// Robot-mode supervision gate. Fails CLOSED: if supervision cannot be determined
-/// (detection error, or the process environment is unreadable, e.g. another user's
-/// process without privileges), the process is treated as supervised, so robot
-/// mode requires a human instead of assuming "nobody is attached".
-fn is_supervised_for_robot(pid: u32) -> bool {
-    match detect_supervision(pid) {
-        Ok(result) => is_human_supervised(&result) || result.environ.is_none(),
-        Err(_) => true,
-    }
+fn unknown_supervision_for_plan(pid: u32, error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "subject_identity": serde_json::Value::Null,
+        "detected": serde_json::Value::Null,
+        "status": "unknown",
+        "reason": format!("Mandatory supervision evidence unavailable for PID {pid}: {error}"),
+        "type": serde_json::Value::Null,
+        "unit": serde_json::Value::Null,
+        "manager": serde_json::Value::Null,
+        "recommended_action": "review",
+        "supervisor_command": serde_json::Value::Null,
+    })
 }
 
-/// No supervision evidence on this platform: fail closed (a human must confirm).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Preserve unavailable required evidence separately from observed supervision.
+/// Confirmation policy cannot turn a failed mandatory probe into permission.
+fn supervision_for_robot(pid: u32) -> Result<bool, String> {
+    let result = detect_supervision(pid).map_err(|error| {
+        format!("Mandatory supervision evidence unavailable for PID {pid}: {error}")
+    })?;
+    // Off Linux there is no ancestry evidence, so an agent or IDE parent cannot be
+    // ruled out (sudo strips the environment markers): as in v2.2.1, count the
+    // target as supervised, so robot mode asks for a human.
+    if result.ancestry.is_none() {
+        return Ok(true);
+    }
+    Ok(is_human_supervised(&result))
+}
+
+/// No supervision evidence on this platform: preserve Unknown as a refusal.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn is_supervised_for_robot(_pid: u32) -> bool {
-    true
+fn supervision_for_robot(pid: u32) -> Result<bool, String> {
+    Err(format!(
+        "Mandatory supervision evidence unavailable for PID {pid}: unsupported platform"
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -14448,47 +17646,83 @@ fn capture_metric_snapshot_for_goal_progress(processes: &[ProcessRecord]) -> Met
     }
 }
 
-fn normalize_command_signature_for_goal_progress(cmd: &str) -> String {
-    cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+fn successful_goal_action_outcomes(
+    plan: &Plan,
+    outcomes: &[serde_json::Value],
+) -> Result<Vec<pt_core::verify::SavedActionOutcome>, String> {
+    let saved: Vec<pt_core::verify::SavedActionOutcome> = outcomes
+        .iter()
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("cannot parse goal execution evidence: {error}"))?;
+    executed_plan_actions(plan, &saved)
+        .map(|actions| {
+            actions
+                .into_iter()
+                .map(|(_, outcome)| outcome.clone())
+                .collect()
+        })
+        .map_err(|error| format!("cannot bind goal execution evidence: {error}"))
 }
 
 fn detect_respawn_for_goal_progress(
     action: &PlanAction,
-    action_success: bool,
-    before_by_pid: &HashMap<u32, &ProcessRecord>,
-    after_by_pid: &HashMap<u32, &ProcessRecord>,
+    execution: &pt_core::verify::SavedActionOutcome,
     after_processes: &[ProcessRecord],
 ) -> bool {
-    if !action_success {
-        return false;
-    }
-
-    let pid = action.target.pid.0;
-    let Some(before_proc) = before_by_pid.get(&pid).copied() else {
-        return false;
-    };
-
-    if let Some(after_proc) = after_by_pid.get(&pid).copied() {
-        return after_proc.start_id.0 != before_proc.start_id.0;
-    }
-
-    let before_cmd = normalize_command_signature_for_goal_progress(&before_proc.cmd);
-    after_processes.iter().any(|proc| {
-        proc.uid == before_proc.uid
-            && proc.pid.0 != pid
-            && proc.start_time_unix >= before_proc.start_time_unix
-            && normalize_command_signature_for_goal_progress(&proc.cmd) == before_cmd
-    })
+    pt_core::verify::detect_respawn(action, execution, after_processes).is_some()
 }
 
-fn goal_report_brief_json(report: &GoalProgressReport) -> serde_json::Value {
+/// Persist the actual results, including refusals, without replacing a previous
+/// execution log. A returned error must not turn a completed kill into a failure.
+fn append_action_outcomes(action_dir: &Path, outcomes: &[serde_json::Value]) -> Result<(), String> {
+    std::fs::create_dir_all(action_dir).map_err(|error| {
+        format!(
+            "create action outcome directory {}: {error}",
+            action_dir.display()
+        )
+    })?;
+    let path = action_dir.join("outcomes.jsonl");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("open action outcomes {}: {error}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    for outcome in outcomes {
+        writeln!(writer, "{outcome}")
+            .map_err(|error| format!("write action outcomes {}: {error}", path.display()))?;
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("flush action outcomes {}: {error}", path.display()))
+}
+
+fn goal_report_json(report: &GoalProgressReport, planning_only: bool) -> serde_json::Value {
+    let mut payload = serde_json::json!(report);
+    payload["planning_only"] = serde_json::json!(planning_only);
+    if planning_only {
+        // Retain the planned contribution without attributing ambient host
+        // changes or an execution-failure diagnosis to a dry-run/shadow action.
+        payload["observed_progress"] = serde_json::Value::Null;
+        payload["discrepancy"] = serde_json::Value::Null;
+        payload["discrepancy_fraction"] = serde_json::Value::Null;
+        payload["classification"] = serde_json::json!("not_executed");
+        payload["suspected_causes"] = serde_json::json!([]);
+    }
+    payload
+}
+
+fn goal_report_brief_json(report: &GoalProgressReport, planning_only: bool) -> serde_json::Value {
     serde_json::json!({
         "expected": report.expected_progress,
-        "observed": report.observed_progress,
-        "discrepancy": report.discrepancy,
-        "discrepancy_fraction": report.discrepancy_fraction,
-        "classification": report.classification.to_string(),
-        "suspected_causes": report.suspected_causes.iter().map(|cause| cause.cause.clone()).collect::<Vec<_>>(),
+        "observed": (!planning_only).then_some(report.observed_progress),
+        "discrepancy": (!planning_only).then_some(report.discrepancy),
+        "discrepancy_fraction": (!planning_only).then_some(report.discrepancy_fraction),
+        "classification": if planning_only { "not_executed".to_string() } else { report.classification.to_string() },
+        "suspected_causes": if planning_only { Vec::new() } else { report.suspected_causes.iter().map(|cause| cause.cause.clone()).collect::<Vec<_>>() },
+        "planning_only": planning_only,
     })
 }
 
@@ -14545,35 +17779,54 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             return ExitCode::IoError;
         }
     };
-    let plan: Plan = match serde_json::from_str(&plan_content) {
+    let plan = match parse_agent_plan(&plan_content) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("agent apply: invalid plan.json: {}", e);
+            eprintln!(
+                "agent apply: invalid plan.json (expected Plan schema {SCHEMA_VERSION}; inspect with `pt schema Plan`): {e}"
+            );
             return ExitCode::InternalError;
         }
     };
 
-    // Load completed action IDs for --resume mode
+    if plan.session_id != sid.0 {
+        eprintln!(
+            "agent apply: plan session {} does not match requested session {}",
+            plan.session_id, sid
+        );
+        return ExitCode::InternalError;
+    }
+
+    // Resume only executions bound to this canonical action and target identity.
     let completed_action_ids: std::collections::HashSet<String> = if args.resume {
         let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
-        if outcomes_path.exists() {
-            std::fs::read_to_string(&outcomes_path)
-                .ok()
-                .map(|content| {
-                    content
-                        .lines()
-                        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                        .filter(|v| v.get("status").and_then(|s| s.as_str()) == Some("success"))
-                        .filter_map(|v| {
-                            v.get("action_id")
-                                .and_then(|a| a.as_str())
-                                .map(String::from)
-                        })
+        match std::fs::read_to_string(&outcomes_path) {
+            Ok(content) => match parse_action_outcomes(&content).and_then(|saved| {
+                executed_plan_actions(&plan, &saved).map(|executed| {
+                    executed
+                        .into_iter()
+                        .map(|(action, _)| action.action_id.clone())
                         .collect()
                 })
-                .unwrap_or_default()
-        } else {
-            std::collections::HashSet::new()
+            }) {
+                Ok(completed) => completed,
+                Err(error) => {
+                    eprintln!(
+                        "agent apply: saved execution evidence is invalid for this Plan; refusing --resume: {error}"
+                    );
+                    return ExitCode::PolicyBlocked;
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::collections::HashSet::new()
+            }
+            Err(error) => {
+                eprintln!(
+                    "agent apply: cannot read saved execution evidence {}: {error}",
+                    outcomes_path.display()
+                );
+                return ExitCode::IoError;
+            }
         }
     } else {
         std::collections::HashSet::new()
@@ -14582,6 +17835,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     // Determine which actions to apply
     let use_recommended =
         args.recommended || (args.resume && args.pids.is_empty() && args.targets.is_empty());
+    // With --targets the selection is the exact (pid, start_id) identities: a merged
+    // plan can hold two actions for one recycled pid.
+    let mut selected_identities: Option<std::collections::HashSet<(u32, String)>> = None;
     let mut target_pids: Vec<u32> = if use_recommended {
         plan.actions
             .iter()
@@ -14591,38 +17847,122 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     } else if !args.pids.is_empty() {
         args.pids.clone()
     } else if !args.targets.is_empty() {
-        args.targets
-            .iter()
-            .filter_map(|t| t.split(':').next().and_then(|p| p.parse().ok()))
-            .collect()
+        let mut selected = Vec::with_capacity(args.targets.len());
+        for target in &args.targets {
+            let Some((pid, start_id)) = target.split_once(':') else {
+                eprintln!("agent apply: invalid target {target:?}; expected pid:start_id");
+                return ExitCode::ArgsError;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                eprintln!("agent apply: invalid target PID in {target:?}");
+                return ExitCode::ArgsError;
+            };
+            if pid == 0 || start_id.is_empty() {
+                eprintln!("agent apply: invalid target {target:?}; expected pid:start_id");
+                return ExitCode::ArgsError;
+            }
+            if !plan
+                .actions
+                .iter()
+                .any(|action| action.target.pid.0 == pid && action.target.start_id.0 == start_id)
+            {
+                eprintln!("agent apply: target identity {target:?} does not match a saved action");
+                return ExitCode::ArgsError;
+            }
+            selected.push(pid);
+            selected_identities
+                .get_or_insert_with(Default::default)
+                .insert((pid, start_id.to_string()));
+        }
+        selected
     } else {
         eprintln!("agent apply: must specify --recommended, --pids, or --targets");
         return ExitCode::ArgsError;
     };
 
-    if let Some(min_age) = args.min_age {
-        if !target_pids.is_empty() {
-            let scan_options = QuickScanOptions {
-                pids: target_pids.clone(),
-                include_kernel_threads: false,
-                timeout: global.timeout.map(std::time::Duration::from_secs),
-                progress: None,
-            };
-            let scan_result = match quick_scan(&scan_options) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("agent apply: min-age scan failed: {}", e);
-                    return ExitCode::InternalError;
-                }
-            };
-            let eligible: HashSet<u32> = scan_result
-                .processes
-                .iter()
-                .filter(|proc| proc.elapsed.as_secs() >= min_age)
-                .map(|proc| proc.pid.0)
-                .collect();
-            target_pids.retain(|pid| eligible.contains(pid));
+    let saved_document: serde_json::Value = match serde_json::from_str(&plan_content) {
+        Ok(document) => document,
+        Err(error) => {
+            eprintln!("agent apply: invalid recorded plan policy: {}", error);
+            return ExitCode::InternalError;
         }
+    };
+    let invalid_policy_snapshot = |reason: String| {
+        eprintln!("agent apply: requires a valid recorded policy snapshot: {reason}");
+        println!(
+            "{}",
+            format_structured_output(
+                global,
+                serde_json::json!({"session_id": sid.0, "error": "invalid_policy_snapshot"}),
+            )
+        );
+        ExitCode::PolicyBlocked
+    };
+    let recorded_policy = match saved_document.get("policy_snapshot") {
+        Some(snapshot) => match serde_json::from_value::<pt_core::config::Policy>(snapshot.clone())
+        {
+            Ok(policy) => Some(policy),
+            Err(error) => {
+                return invalid_policy_snapshot(error.to_string());
+            }
+        },
+        None => None,
+    };
+    let saved_min_age = match saved_document.pointer("/policy_snapshot/min_process_age_seconds") {
+        Some(value) => match value.as_u64() {
+            Some(age) => age,
+            None => {
+                return invalid_policy_snapshot("invalid recorded minimum process age".to_string());
+            }
+        },
+        None => config.policy.guardrails.min_process_age_seconds,
+    };
+    let has_policy_snapshot = recorded_policy.is_some();
+    if config
+        .policy
+        .robot_mode
+        .require_policy_snapshot
+        .unwrap_or(false)
+        && !has_policy_snapshot
+    {
+        eprintln!("agent apply: current policy requires a valid recorded policy snapshot");
+        return ExitCode::PolicyBlocked;
+    }
+    let min_age = args
+        .min_age
+        .unwrap_or(saved_min_age)
+        .max(saved_min_age)
+        .max(config.policy.guardrails.min_process_age_seconds)
+        .max(
+            recorded_policy
+                .as_ref()
+                .map_or(0, |policy| policy.guardrails.min_process_age_seconds),
+        );
+    let builtin_protection = config.policy.guardrails.builtin_protection
+        || recorded_policy
+            .as_ref()
+            .is_some_and(|policy| policy.guardrails.builtin_protection);
+    if min_age > 0 && !target_pids.is_empty() {
+        let scan_options = QuickScanOptions {
+            pids: target_pids.clone(),
+            include_kernel_threads: false,
+            timeout: global.timeout.map(std::time::Duration::from_secs),
+            progress: None,
+        };
+        let scan_result = match quick_scan(&scan_options) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("agent apply: min-age scan failed: {}", e);
+                return ExitCode::InternalError;
+            }
+        };
+        let eligible: HashSet<u32> = scan_result
+            .processes
+            .iter()
+            .filter(|proc| proc.elapsed.as_secs() >= min_age)
+            .map(|proc| proc.pid.0)
+            .collect();
+        target_pids.retain(|pid| eligible.contains(pid));
     }
 
     if target_pids.is_empty() {
@@ -14631,10 +17971,15 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     // Filter out completed actions using earlier declaration for --resume mode
-    let actions_to_apply: Vec<_> = plan
+    let mut actions_to_apply: Vec<_> = plan
         .actions
         .iter()
         .filter(|a| target_pids.contains(&a.target.pid.0))
+        .filter(|a| {
+            selected_identities.as_ref().is_none_or(|identities| {
+                identities.contains(&(a.target.pid.0, a.target.start_id.0.clone()))
+            })
+        })
         .filter(|a| !completed_action_ids.contains(&a.action_id))
         .collect();
     if actions_to_apply.is_empty() {
@@ -14649,14 +17994,56 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         progress: None,
     };
 
-    let before_scan_processes = quick_scan(&goal_progress_scan_options)
-        .map(|scan| scan.processes)
-        .unwrap_or_else(|_| Vec::new());
+    let before_scan_processes = match quick_scan(&goal_progress_scan_options) {
+        Ok(scan) => scan.processes,
+        Err(error) => {
+            eprintln!("agent apply: cannot revalidate selected process tree: {error}");
+            return ExitCode::InternalError;
+        }
+    };
+    let mut selected_candidates: Vec<serde_json::Value> = actions_to_apply
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "pid": action.target.pid.0,
+                "recommended_action": action.action,
+            })
+        })
+        .collect();
+    let mut selected_refs: Vec<&mut serde_json::Value> = selected_candidates.iter_mut().collect();
+    apply_process_tree_safety(
+        &mut selected_refs,
+        &before_scan_processes,
+        builtin_protection,
+    );
+    let tree_refusals: HashMap<u32, String> = selected_candidates
+        .iter()
+        .filter(|candidate| candidate["tree_safety"].is_object())
+        .map(|candidate| {
+            (
+                candidate["pid"].as_u64().unwrap() as u32,
+                candidate["action_rationale"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
     let before_snapshot = capture_metric_snapshot_for_goal_progress(&before_scan_processes);
     let before_by_pid: HashMap<u32, &ProcessRecord> = before_scan_processes
         .iter()
         .map(|proc| (proc.pid.0, proc))
         .collect();
+    // Complete descendants before their parents. Stable sorting retains stages
+    // and ordering for multiple actions targeting the same process.
+    actions_to_apply.sort_by_cached_key(|action| {
+        let mut current = action.target.pid.0;
+        let mut ancestors = HashSet::new();
+        while ancestors.len() < 64 && ancestors.insert(current) {
+            let Some(process) = before_by_pid.get(&current) else {
+                break;
+            };
+            current = process.ppid.0;
+        }
+        std::cmp::Reverse(ancestors.len())
+    });
 
     #[cfg(target_os = "linux")]
     let before_network_snapshot = NetworkSnapshot::collect();
@@ -14780,7 +18167,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     // Check if robot mode is enabled in policy (required for agent apply)
-    if !config.policy.robot_mode.enabled && !global.dry_run && !global.shadow {
+    if (!config.policy.robot_mode.enabled
+        || recorded_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.robot_mode.enabled))
+        && !global.dry_run
+        && !global.shadow
+    {
         let err = serde_json::json!({
             "session_id": sid.0,
             "error": "robot_mode_disabled",
@@ -14791,35 +18184,59 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     // Build robot constraints from policy + CLI overrides
-    let constraints = RuntimeRobotConstraints::from_policy(&config.policy.robot_mode)
-        .with_min_posterior(args.min_posterior)
-        .with_max_blast_radius_mb(args.max_blast_radius)
-        .with_max_total_blast_radius_mb(args.max_total_blast_radius)
-        .with_max_kills(args.max_kills)
-        .with_require_known_signature(if args.require_known_signature {
-            Some(true)
-        } else {
-            None
-        })
-        .with_allow_categories(if args.only_categories.is_empty() {
-            None
-        } else {
-            Some(args.only_categories.clone())
-        })
-        .with_exclude_categories(args.exclude_categories.clone());
+    let build_constraints = |policy: &pt_core::config::Policy| {
+        RuntimeRobotConstraints::from_policy(&policy.robot_mode)
+            .with_min_posterior(args.min_posterior)
+            .with_max_blast_radius_mb(args.max_blast_radius)
+            .with_max_total_blast_radius_mb(args.max_total_blast_radius)
+            .with_max_kills(args.max_kills)
+            .with_require_known_signature(if args.require_known_signature {
+                Some(true)
+            } else {
+                None
+            })
+            .with_allow_categories(if args.only_categories.is_empty() {
+                None
+            } else {
+                Some(args.only_categories.clone())
+            })
+            .with_exclude_categories(args.exclude_categories.clone())
+    };
 
+    let constraints = build_constraints(&config.policy);
     let checker = ConstraintChecker::new(constraints.clone());
-    let constraints_summary = constraints.active_constraints_summary();
+    let recorded_checker = recorded_policy
+        .as_ref()
+        .map(|policy| ConstraintChecker::new(build_constraints(policy)));
+    let mut constraints_summary = constraints.active_constraints_summary();
+    if let Some(policy) = &recorded_policy {
+        constraints_summary.extend(
+            build_constraints(policy)
+                .active_constraints_summary()
+                .into_iter()
+                .map(|constraint| format!("recorded {constraint}")),
+        );
+    }
     let _ = handle.update_state(SessionState::Executing);
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let precheck_provider = {
+    let precheck_providers = {
         use pt_core::action::{LivePreCheckConfig, LivePreCheckProvider};
-        LivePreCheckProvider::new(
-            Some(&config.policy.guardrails),
-            LivePreCheckConfig::from(&config.policy.data_loss_gates),
-        )
-        .unwrap_or_else(|_| LivePreCheckProvider::with_defaults())
+        std::iter::once(&config.policy)
+            .chain(recorded_policy.iter())
+            .map(|policy| {
+                LivePreCheckProvider::new(
+                    Some(&policy.guardrails),
+                    LivePreCheckConfig::from(&policy.data_loss_gates),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| eprintln!("agent apply: cannot configure safety checks: {error}"))
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let precheck_providers = match precheck_providers {
+        Ok(providers) => providers,
+        Err(()) => return ExitCode::PolicyBlocked,
     };
     // One recent-I/O probe window for every target the data-loss gate will check,
     // instead of one full window per target.
@@ -14834,7 +18251,14 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             })
             .map(|a| a.target.pid.0)
             .collect();
-        precheck_provider.prime_recent_io(&gated);
+        // Observe both policies' I/O windows concurrently. Each retains its
+        // own threshold and cache; neither policy can disable the other's gate.
+        std::thread::scope(|scope| {
+            let gated = gated.as_slice();
+            for provider in &precheck_providers {
+                scope.spawn(move || provider.prime_recent_io(gated));
+            }
+        });
     }
 
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
@@ -14843,6 +18267,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut succeeded = 0usize;
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
     let mut failed = 0usize;
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
+    let mut accounting_error: Option<String> = None;
     let mut skipped = 0usize;
     let mut blocked_by_constraints = 0usize;
     let mut blocked_by_prechecks = 0usize;
@@ -14902,6 +18328,31 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 continue;
             }
 
+            let supervised = match supervision_for_robot(action.target.pid.0) {
+                Ok(supervised) => supervised,
+                Err(reason) => {
+                    blocked_by_prechecks += 1;
+                    outcomes.push(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "precheck_blocked",
+                        "check": "check_agent_supervision",
+                        "reason": reason,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        None,
+                        action,
+                        "precheck_blocked",
+                        &[("check", serde_json::json!("check_agent_supervision"))],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+            };
             let candidate = RobotCandidate {
                 posterior: action
                     .rationale
@@ -14912,13 +18363,23 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
                 category: action.rationale.category.clone(),
                 is_kill_action: action.action == Action::Kill,
-                has_policy_snapshot: true,
-                is_supervised: is_supervised_for_robot(action.target.pid.0),
+                has_policy_snapshot,
+                is_supervised: supervised,
             };
-            let check = checker.check_candidate(&candidate);
+            let mut check = checker.check_candidate(&candidate);
+            if check.allowed {
+                if let Some(recorded) = &recorded_checker {
+                    check = recorded.check_candidate(&candidate);
+                }
+            }
             if !check.allowed {
                 blocked_by_constraints += 1;
-                outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "blocked_by_constraints"}));
+                outcomes.push(serde_json::json!({
+                    "action_id": action.action_id,
+                    "pid": action.target.pid.0,
+                    "status": "blocked_by_constraints",
+                    "violations": check.violations,
+                }));
                 emit_action_event(
                     pt_core::events::event_names::ACTION_COMPLETE,
                     action_index,
@@ -14931,7 +18392,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
 
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if let Some((check, reason)) = first_precheck_block(&precheck_provider, action) {
+            if let Some((check, reason)) = precheck_providers
+                .iter()
+                .find_map(|provider| first_precheck_block(provider, action))
+            {
                 blocked_by_prechecks += 1;
                 outcomes.push(serde_json::json!({
                     "action_id": action.action_id,
@@ -14951,6 +18415,26 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 continue;
             }
 
+            if let Some(reason) = tree_refusals.get(&action.target.pid.0) {
+                blocked_by_prechecks += 1;
+                outcomes.push(serde_json::json!({
+                    "action_id": action.action_id,
+                    "pid": action.target.pid.0,
+                    "status": "precheck_blocked",
+                    "check": "process_tree",
+                    "reason": reason,
+                }));
+                emit_action_event(
+                    pt_core::events::event_names::ACTION_COMPLETE,
+                    action_index,
+                    None,
+                    action,
+                    "precheck_blocked",
+                    &[("check", serde_json::json!("process_tree"))],
+                );
+                continue;
+            }
+
             skipped += 1;
             outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": if global.dry_run { "dry_run" } else { "shadow" }}));
             emit_action_event(
@@ -14965,6 +18449,14 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     } else {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
+            let (_execution_lock, enforcer) =
+                match acquire_execution_policy(&config.policy, recorded_policy.as_ref(), &handle) {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        eprintln!("agent apply: {error}");
+                        return ExitCode::PolicyBlocked;
+                    }
+                };
             let identity_provider = LiveIdentityProvider::new();
             // Composite runner: signals (kill/pause/resume), renice, and on Linux
             // freeze/throttle/quarantine (refused unless the target owns its cgroup).
@@ -15024,37 +18516,6 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
 
                 let start = std::time::Instant::now();
-                let candidate = RobotCandidate {
-                    posterior: action
-                        .rationale
-                        .posterior
-                        .as_ref()
-                        .map(|scores| candidate_posterior(scores, action.action)),
-                    memory_mb: action.rationale.memory_mb,
-                    has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
-                    category: action.rationale.category.clone(),
-                    is_kill_action: action.action == Action::Kill,
-                    has_policy_snapshot: true,
-                    is_supervised: is_supervised_for_robot(action.target.pid.0),
-                };
-                let check = checker.check_candidate(&candidate);
-                if !check.allowed {
-                    blocked_by_constraints += 1;
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "blocked_by_constraints", "time_ms": elapsed_ms}));
-                    emit_action_event(
-                        pt_core::events::event_names::ACTION_COMPLETE,
-                        action_index,
-                        Some(elapsed_ms),
-                        action,
-                        "blocked_by_constraints",
-                        &[],
-                    );
-                    if args.abort_on_unknown {
-                        break;
-                    }
-                    continue;
-                }
                 match identity_provider.revalidate(&action.target) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -15092,7 +18553,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         continue;
                     }
                 }
-                if let Some((check, reason)) = first_precheck_block(&precheck_provider, action) {
+                if let Some((check, reason)) = precheck_providers
+                    .iter()
+                    .find_map(|provider| first_precheck_block(provider, action))
+                {
                     blocked_by_prechecks += 1;
                     let elapsed_ms = start.elapsed().as_millis() as u64;
                     outcomes.push(serde_json::json!({
@@ -15116,6 +18580,218 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                     continue;
                 }
+                let mut tree_reason = tree_refusals.get(&action.target.pid.0).cloned();
+                if action.action == Action::Kill && tree_reason.is_none() {
+                    // A selected child's action may have failed, or a new child
+                    // may have appeared. Refuse the parent while any live child
+                    // remains, even if that child was in the original kill set.
+                    let current_tree = match quick_scan(&goal_progress_scan_options) {
+                        Ok(scan) if scan.metadata.warnings.is_empty() => scan.processes,
+                        Ok(scan) => {
+                            failed += 1;
+                            outcomes.push(serde_json::json!({
+                                "action_id": action.action_id,
+                                "pid": action.target.pid.0,
+                                "status": "identity_check_failed",
+                                "error": "incomplete process-tree snapshot",
+                                "warnings": scan.metadata.warnings,
+                            }));
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("agent apply: cannot revalidate process tree: {error}");
+                            failed += 1;
+                            outcomes.push(serde_json::json!({
+                                "action_id": action.action_id,
+                                "pid": action.target.pid.0,
+                                "status": "identity_check_failed",
+                                "error": format!("cannot revalidate process tree: {error}"),
+                            }));
+                            break;
+                        }
+                    };
+                    tree_reason = execution_tree_refusal(
+                        action.target.pid.0,
+                        &current_tree,
+                        builtin_protection,
+                    );
+                }
+                if let Some(reason) = tree_reason {
+                    blocked_by_prechecks += 1;
+                    outcomes.push(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "precheck_blocked",
+                        "check": "process_tree",
+                        "reason": reason,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        None,
+                        action,
+                        "precheck_blocked",
+                        &[("check", serde_json::json!("process_tree"))],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+
+                let (policy_check, current_process) =
+                    match check_execution_policy(&enforcer, action, true) {
+                        Ok(check) => check,
+                        Err(error) => {
+                            blocked_by_prechecks += 1;
+                            outcomes.push(serde_json::json!({
+                                "action_id": action.action_id,
+                                "pid": action.target.pid.0,
+                                "status": "blocked_by_policy",
+                                "reason": "policy_evidence_unavailable",
+                                "error": error,
+                            }));
+                            if args.abort_on_unknown {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                if !policy_check.allowed {
+                    blocked_by_prechecks += 1;
+                    let rate_limit = policy_check.violation.as_ref().is_some_and(|violation| {
+                        violation.kind == pt_core::decision::ViolationKind::RateLimitExceeded
+                    });
+                    outcomes.push(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "blocked_by_policy",
+                        "reason": if rate_limit { "rate_limit" } else { "policy" },
+                        "violation": policy_check.violation,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        None,
+                        action,
+                        "blocked_by_policy",
+                        &[],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+
+                let current_rss_bytes = current_process.rss_bytes;
+                let supervised = match supervision_for_robot(action.target.pid.0) {
+                    Ok(supervised) => supervised,
+                    Err(reason) => {
+                        blocked_by_prechecks += 1;
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        outcomes.push(serde_json::json!({
+                            "action_id": action.action_id,
+                            "pid": action.target.pid.0,
+                            "status": "precheck_blocked",
+                            "check": "check_agent_supervision",
+                            "reason": reason,
+                            "time_ms": elapsed_ms,
+                        }));
+                        emit_action_event(
+                            pt_core::events::event_names::ACTION_COMPLETE,
+                            action_index,
+                            Some(elapsed_ms),
+                            action,
+                            "precheck_blocked",
+                            &[("check", serde_json::json!("check_agent_supervision"))],
+                        );
+                        if args.abort_on_unknown {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let candidate = RobotCandidate {
+                    posterior: action
+                        .rationale
+                        .posterior
+                        .as_ref()
+                        .map(|scores| candidate_posterior(scores, action.action)),
+                    memory_mb: Some(current_rss_bytes as f64 / (1024.0 * 1024.0)),
+                    has_known_signature: action.rationale.has_known_signature.unwrap_or(false),
+                    category: action.rationale.category.clone(),
+                    is_kill_action: action.action == Action::Kill,
+                    has_policy_snapshot,
+                    is_supervised: supervised,
+                };
+                let mut check = checker.check_candidate(&candidate);
+                if check.allowed {
+                    if let Some(recorded) = &recorded_checker {
+                        check = recorded.check_candidate(&candidate);
+                    }
+                }
+                if !check.allowed {
+                    blocked_by_constraints += 1;
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    outcomes.push(serde_json::json!({
+                        "action_id": action.action_id,
+                        "pid": action.target.pid.0,
+                        "status": "blocked_by_constraints",
+                        "violations": check.violations,
+                        "current_rss_bytes": current_rss_bytes,
+                        "time_ms": elapsed_ms,
+                    }));
+                    emit_action_event(
+                        pt_core::events::event_names::ACTION_COMPLETE,
+                        action_index,
+                        Some(elapsed_ms),
+                        action,
+                        "blocked_by_constraints",
+                        &[],
+                    );
+                    if args.abort_on_unknown {
+                        break;
+                    }
+                    continue;
+                }
+
+                if action.action == Action::Kill {
+                    if let Err(error) = enforcer.begin_kill_accounting() {
+                        accounting_error = Some(error.to_string());
+                        blocked_by_prechecks += 1;
+                        outcomes.push(serde_json::json!({
+                            "action_id": action.action_id,
+                            "pid": action.target.pid.0,
+                            "status": "precheck_blocked",
+                            "check": "durable_kill_accounting",
+                            "reason": format!("cannot prepare durable kill accounting: {error}"),
+                        }));
+                        break;
+                    }
+                }
+                let execution_evidence = match capture_current_action_execution_evidence(action) {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        if action.action == Action::Kill {
+                            if let Err(error) = enforcer.finish_kill_accounting(false) {
+                                accounting_error = Some(error.to_string());
+                            }
+                        }
+                        blocked_by_prechecks += 1;
+                        outcomes.push(serde_json::json!({
+                            "action_id": action.action_id,
+                            "pid": action.target.pid.0,
+                            "status": "precheck_blocked",
+                            "check": "verify_identity",
+                            "reason": error,
+                            "accounting_error": accounting_error,
+                        }));
+                        if args.abort_on_unknown || accounting_error.is_some() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 // "success" means the effect was observed (stopped, reniced, exited,
                 // zombie reaped), not merely that the syscall returned.
                 let result = action_runner
@@ -15123,21 +18799,48 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     .and_then(|()| action_runner.verify(action));
                 // pidfd (bound to the verified process) or kill(2) with re-verify.
                 let signal_path = action_runner.take_signal_path();
+                let kill_signal_delivered = action_runner.take_kill_signal_delivered();
+                if action.action == Action::Kill && kill_signal_delivered {
+                    checker.record_action(current_rss_bytes, true);
+                    if let Some(recorded) = &recorded_checker {
+                        recorded.record_action(current_rss_bytes, true);
+                    }
+                }
+                if action.action == Action::Kill {
+                    if let Err(error) = enforcer.finish_kill_accounting(kill_signal_delivered) {
+                        accounting_error = Some(error.to_string());
+                    }
+                }
                 match result {
                     Ok(()) => {
-                        if action.action == Action::Kill {
-                            // Accumulate the real memory footprint so
-                            // --max-total-blast-radius is enforced (was always 0).
-                            let bytes = action
-                                .rationale
-                                .memory_mb
-                                .map(|mb| (mb.max(0.0) * 1024.0 * 1024.0) as u64)
-                                .unwrap_or(0);
-                            checker.record_action(bytes, true);
+                        if let Some(error) = &accounting_error {
+                            succeeded += 1;
+                            let mut outcome = serde_json::json!({
+                                "action_id": action.action_id,
+                                "pid": action.target.pid.0,
+                                "status": "success",
+                                "signal_path": signal_path,
+                                "rate_limit_recorded": false,
+                                "kill_signal_delivered": kill_signal_delivered,
+                                "error": format!("kill signal delivered, but budget persistence failed: {error}"),
+                            });
+                            if let (Some(fields), Some(evidence)) =
+                                (outcome.as_object_mut(), execution_evidence.as_object())
+                            {
+                                fields.extend(evidence.clone());
+                            }
+                            outcomes.push(outcome);
+                            break;
                         }
                         succeeded += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "success", "time_ms": elapsed_ms, "signal_path": signal_path}));
+                        let mut outcome = serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "success", "time_ms": elapsed_ms, "signal_path": signal_path, "kill_signal_delivered": kill_signal_delivered});
+                        if let (Some(fields), Some(evidence)) =
+                            (outcome.as_object_mut(), execution_evidence.as_object())
+                        {
+                            fields.extend(evidence.clone());
+                        }
+                        outcomes.push(outcome);
                         emit_action_event(
                             pt_core::events::event_names::ACTION_COMPLETE,
                             action_index,
@@ -15150,7 +18853,13 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     Err(e) => {
                         failed += 1;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        outcomes.push(serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "failed", "error": format!("{:?}", e), "time_ms": elapsed_ms, "signal_path": signal_path}));
+                        let mut outcome = serde_json::json!({"action_id": action.action_id, "pid": action.target.pid.0, "status": "failed", "error": format!("{:?}", e), "time_ms": elapsed_ms, "signal_path": signal_path, "kill_signal_delivered": kill_signal_delivered, "accounting_error": accounting_error});
+                        if let (Some(fields), Some(evidence)) =
+                            (outcome.as_object_mut(), execution_evidence.as_object())
+                        {
+                            fields.extend(evidence.clone());
+                        }
+                        outcomes.push(outcome);
                         emit_action_event(
                             pt_core::events::event_names::ACTION_FAILED,
                             action_index,
@@ -15159,7 +18868,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                             "failed",
                             &[("error", serde_json::json!(format!("{:?}", e)))],
                         );
-                        if args.abort_on_unknown {
+                        if args.abort_on_unknown || accounting_error.is_some() {
                             break;
                         }
                     }
@@ -15216,22 +18925,17 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .map(|scan| scan.processes)
         .unwrap_or_else(|_| Vec::new());
     let after_snapshot = capture_metric_snapshot_for_goal_progress(&after_scan_processes);
-    let after_by_pid: HashMap<u32, &ProcessRecord> = after_scan_processes
+    let (goal_executions, goal_evidence_error) =
+        match successful_goal_action_outcomes(&plan, &outcomes) {
+            Ok(executions) => (executions, None),
+            Err(error) => {
+                eprintln!("agent apply: {error}");
+                (Vec::new(), Some(error))
+            }
+        };
+    let execution_by_action: HashMap<&str, &pt_core::verify::SavedActionOutcome> = goal_executions
         .iter()
-        .map(|proc| (proc.pid.0, proc))
-        .collect();
-
-    let status_by_action: HashMap<String, String> = outcomes
-        .iter()
-        .filter_map(|outcome| {
-            let action_id = outcome.get("action_id")?.as_str()?.to_string();
-            let status = outcome
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            Some((action_id, status))
-        })
+        .map(|execution| (execution.action_id.as_str(), execution))
         .collect();
 
     let mut respawn_by_action: HashMap<String, bool> = HashMap::new();
@@ -15240,18 +18944,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     let mut port_action_outcomes = Vec::new();
     let mut fd_action_outcomes = Vec::new();
     for action in &actions_to_apply {
-        let status = status_by_action
-            .get(&action.action_id)
-            .map(|value| value.as_str())
-            .unwrap_or("unknown");
-        let success = matches!(status, "success" | "dry_run" | "shadow");
-        let respawn_detected = detect_respawn_for_goal_progress(
-            action,
-            success,
-            &before_by_pid,
-            &after_by_pid,
-            &after_scan_processes,
-        );
+        let execution = execution_by_action.get(action.action_id.as_str()).copied();
+        let success = execution.is_some();
+        let respawn_detected = execution.is_some_and(|execution| {
+            detect_respawn_for_goal_progress(action, execution, &after_scan_processes)
+        });
         respawn_by_action.insert(action.action_id.clone(), respawn_detected);
 
         let (memory_expected, cpu_expected, port_expected, fd_expected, label) = expected_by_action
@@ -15328,22 +19025,25 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         Some(sid.0.clone()),
     );
 
+    let planning_only = global.dry_run || global.shadow;
     let goal_progress_payload = serde_json::json!({
         "session_id": sid.0,
         "before": before_snapshot,
         "after": after_snapshot,
+        "planning_only": planning_only,
+        "execution_evidence_error": goal_evidence_error,
         "metrics": {
-            "memory": memory_report,
-            "cpu": cpu_report,
-            "ports": port_report,
-            "file_descriptors": fd_report
+            "memory": goal_report_json(&memory_report, planning_only),
+            "cpu": goal_report_json(&cpu_report, planning_only),
+            "ports": goal_report_json(&port_report, planning_only),
+            "file_descriptors": goal_report_json(&fd_report, planning_only)
         }
     });
     let goal_progress_discrepancy = serde_json::json!({
-        "memory": goal_report_brief_json(&memory_report),
-        "cpu": goal_report_brief_json(&cpu_report),
-        "ports": goal_report_brief_json(&port_report),
-        "file_descriptors": goal_report_brief_json(&fd_report),
+        "memory": goal_report_brief_json(&memory_report, planning_only),
+        "cpu": goal_report_brief_json(&cpu_report, planning_only),
+        "ports": goal_report_brief_json(&port_report, planning_only),
+        "file_descriptors": goal_report_brief_json(&fd_report, planning_only),
         "respawn_loop_suspected": respawn_by_action.values().any(|detected| *detected),
     });
 
@@ -15365,38 +19065,44 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }
     }
 
-    let memory_summary_suffix = format!(
-        ", mem_obs={:.1}MB mem_exp={:.1}MB ({})",
-        memory_report.observed_progress / 1_048_576.0,
-        memory_report.expected_progress / 1_048_576.0,
-        memory_report.classification
-    );
+    let memory_summary_suffix = if planning_only {
+        format!(
+            ", mem_obs=unobserved mem_exp={:.1}MB (not_executed)",
+            memory_report.expected_progress / 1_048_576.0
+        )
+    } else {
+        format!(
+            ", mem_obs={:.1}MB mem_exp={:.1}MB ({})",
+            memory_report.observed_progress / 1_048_576.0,
+            memory_report.expected_progress / 1_048_576.0,
+            memory_report.classification
+        )
+    };
 
     // Write outcomes
     let action_dir = handle.dir.join("action");
-    let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
-    let _ = std::fs::create_dir_all(&action_dir);
+    let persistence_error = append_action_outcomes(&action_dir, &outcomes).err();
+    if let Some(error) = &persistence_error {
+        eprintln!("agent apply: {error}; actual action outcomes remain in this response");
+    }
     let goal_progress_path = action_dir.join("goal_progress.json");
     if let Ok(payload) = serde_json::to_string_pretty(&goal_progress_payload) {
         let _ = std::fs::write(&goal_progress_path, payload);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&outcomes_path)
+    let final_state = if failed > 0
+        || accounting_error.is_some()
+        || goal_evidence_error.is_some()
+        || persistence_error.is_some()
     {
-        use std::io::Write;
-        for o in &outcomes {
-            let _ = writeln!(file, "{}", o);
-        }
-    }
-
-    let final_state = if failed > 0 {
         SessionState::Failed
     } else {
         SessionState::Completed
     };
-    let _ = handle.update_state(final_state);
+    let session_state_error = handle.update_state(final_state).err().map(|error| {
+        let error = format!("persist final session state: {error}");
+        eprintln!("agent apply: {error}; actual action outcomes remain in this response");
+        error
+    });
 
     let result = serde_json::json!({
         "session_id": sid.0,
@@ -15411,6 +19117,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             "resumed_skipped": resumed_skipped
         },
         "outcomes": outcomes,
+        "accounting_error": accounting_error,
+        "persistence_error": persistence_error,
+        "session_state_error": session_state_error,
+        "goal_evidence_error": goal_evidence_error,
         "goal_progress": goal_progress_payload,
         "constraints_summary": constraints_summary,
         "resumed": args.resume
@@ -15451,9 +19161,11 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         ),
     }
 
-    if (blocked_by_constraints + blocked_by_prechecks) > 0 && succeeded == 0 && failed == 0 {
+    if persistence_error.is_some() || session_state_error.is_some() {
+        ExitCode::IoError
+    } else if (blocked_by_constraints + blocked_by_prechecks) > 0 && succeeded == 0 && failed == 0 {
         ExitCode::PolicyBlocked
-    } else if failed > 0 {
+    } else if failed > 0 || accounting_error.is_some() || goal_evidence_error.is_some() {
         ExitCode::PartialFail
     } else {
         ExitCode::ActionsOk
@@ -15461,7 +19173,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 }
 
 fn output_apply_nothing(global: &GlobalOpts, sid: &SessionId) {
-    let result = serde_json::json!({"session_id": sid.0, "mode": "robot_apply", "note": "nothing_to_do", "summary": {"attempted": 0}});
+    let result = serde_json::json!({"session_id": sid.0, "mode": "robot_apply", "note": "nothing_to_do", "summary": {"attempted": 0}, "outcomes": []});
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, result));
@@ -15515,13 +19227,42 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     };
     let plan = match parse_agent_plan(&plan_content) {
         Ok(p) => p,
-        Err(VerifyError::InvalidPlan(msg)) => {
-            eprintln!("agent verify: invalid plan.json: {}", msg);
+        Err(error) => {
+            eprintln!("agent verify: invalid plan.json: {error}");
             return ExitCode::InternalError;
         }
-        Err(VerifyError::InvalidTimestamp(msg)) => {
-            eprintln!("agent verify: invalid timestamp: {}", msg);
-            return ExitCode::ArgsError;
+    };
+    if plan.session_id != sid.0 {
+        eprintln!(
+            "agent verify: plan session {} does not match requested session {}",
+            plan.session_id, sid
+        );
+        return ExitCode::InternalError;
+    }
+    let outcomes_path = handle.dir.join("action/outcomes.jsonl");
+    let outcomes_content = match std::fs::read_to_string(&outcomes_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            eprintln!(
+                "agent verify: cannot read {}: {error}",
+                outcomes_path.display()
+            );
+            return ExitCode::IoError;
+        }
+    };
+    let saved_outcomes = match parse_action_outcomes(&outcomes_content) {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            eprintln!("agent verify: invalid execution outcomes: {error}");
+            return ExitCode::InternalError;
+        }
+    };
+    let executed_actions = match executed_plan_actions(&plan, &saved_outcomes) {
+        Ok(actions) => actions,
+        Err(error) => {
+            eprintln!("agent verify: cannot bind execution outcomes to plan: {error}");
+            return ExitCode::InternalError;
         }
     };
 
@@ -15531,22 +19272,45 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     if args.wait > 0 {
         let wait_duration = std::time::Duration::from_secs(args.wait);
         let start = std::time::Instant::now();
-        let target_pids: Vec<u32> = plan
-            .candidates
+        let target_identities: Vec<&ProcessIdentity> = executed_actions
             .iter()
-            .filter(|c| c.recommended_action == "terminate" || c.recommended_action == "kill")
-            .map(|c| c.pid)
+            .filter(|(action, _)| action.action == pt_core::decision::Action::Kill)
+            .map(|(action, _)| &action.target)
             .collect();
 
-        while start.elapsed() < wait_duration {
-            // Check if all target processes have terminated
-            let still_running: Vec<u32> = target_pids
-                .iter()
-                .filter(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
-                .copied()
-                .collect();
+        while !target_identities.is_empty() && start.elapsed() < wait_duration {
+            let current = match quick_scan(&QuickScanOptions {
+                pids: target_identities
+                    .iter()
+                    .map(|identity| identity.pid.0)
+                    .collect(),
+                include_kernel_threads: false,
+                timeout: Some(Duration::from_secs(5)),
+                progress: None,
+            }) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    eprintln!("agent verify: cannot inspect targets while waiting: {error}");
+                    return ExitCode::InternalError;
+                }
+            };
+            if !current.metadata.warnings.is_empty() {
+                eprintln!(
+                    "agent verify: incomplete target snapshot while waiting: {}",
+                    current.metadata.warnings.join("; ")
+                );
+                return ExitCode::InternalError;
+            }
+            let still_running = target_identities.iter().any(|identity| {
+                current.processes.iter().any(|process| {
+                    process.pid == identity.pid
+                        && process.start_id == identity.start_id
+                        && process.uid == identity.uid
+                        && !process.state.is_zombie()
+                })
+            });
 
-            if still_running.is_empty() {
+            if !still_running {
                 break;
             }
 
@@ -15567,9 +19331,28 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
+    if !scan_result.metadata.warnings.is_empty() {
+        eprintln!(
+            "agent verify: incomplete process snapshot: {}",
+            scan_result.metadata.warnings.join("; ")
+        );
+        return ExitCode::InternalError;
+    }
 
     let completed_at = chrono::Utc::now();
-    let report = verify_plan(&plan, &scan_result.processes, requested_at, completed_at);
+    let report = match verify_plan(
+        &plan,
+        &saved_outcomes,
+        &scan_result.processes,
+        requested_at,
+        completed_at,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("agent verify: cannot verify recorded execution: {error}");
+            return ExitCode::InternalError;
+        }
+    };
 
     let verify_dir = handle.dir.join("action");
     if let Err(e) = std::fs::create_dir_all(&verify_dir) {
@@ -15590,12 +19373,6 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         return ExitCode::IoError;
     }
 
-    if let Ok(manifest) = handle.read_manifest() {
-        if manifest.state != SessionState::Completed {
-            let _ = handle.update_state(SessionState::Completed);
-        }
-    }
-
     let total = report.action_outcomes.len();
     let verified_count = report
         .action_outcomes
@@ -15603,30 +19380,28 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         .filter(|o| o.verified.unwrap_or(false))
         .count();
     let failed_count = total.saturating_sub(verified_count);
+    if failed_count > 0 {
+        if let Err(error) = handle.update_state(SessionState::Failed) {
+            eprintln!("agent verify: cannot save failed verification state: {error}");
+            return ExitCode::IoError;
+        }
+    }
 
-    // Check for respawned processes if --check-respawn is set
+    // Use the same identity/parent/time matcher as per-action verification.
     let respawned_count = if args.check_respawn {
-        // Get command signatures of killed processes
-        let killed_commands: Vec<&str> = plan
-            .candidates
+        report
+            .action_outcomes
             .iter()
-            .filter(|c| c.recommended_action == "terminate" || c.recommended_action == "kill")
-            .map(|c| {
-                // Prefer cmd_full, fall back to cmd_short
-                if !c.cmd_full.is_empty() {
-                    c.cmd_full.as_str()
-                } else {
-                    c.cmd_short.as_str()
-                }
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        // Count current processes that match killed command patterns
-        scan_result
-            .processes
+            .filter(|outcome| outcome.outcome == VerifyOutcome::Respawned)
+            .count()
+    } else {
+        0
+    };
+    let unknown_respawn_count = if args.check_respawn {
+        report
+            .action_outcomes
             .iter()
-            .filter(|p| killed_commands.iter().any(|kc| p.cmd.contains(kc)))
+            .filter(|outcome| outcome.actual.as_deref() == Some("ambiguous_respawn"))
             .count()
     } else {
         0
@@ -15650,8 +19425,11 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                         serde_json::json!({
                             "enabled": true,
                             "respawned_count": respawned_count,
+                            "unknown_count": unknown_respawn_count,
                             "warning": if respawned_count > 0 {
                                 Some(format!("{} processes may have respawned", respawned_count))
+                            } else if unknown_respawn_count > 0 {
+                                Some(format!("{} targets have ambiguous respawn timing", unknown_respawn_count))
                             } else {
                                 None
                             }
@@ -15665,15 +19443,17 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
             let freed = report
                 .resource_summary
                 .as_ref()
-                .map(|s| s.memory_freed_mb)
+                .map(|s| s.expected_freed_mb)
                 .unwrap_or(0.0);
             let respawn_info = if args.check_respawn && respawned_count > 0 {
                 format!(", {} respawned!", respawned_count)
+            } else if unknown_respawn_count > 0 {
+                format!(", {} ambiguous respawns", unknown_respawn_count)
             } else {
                 String::new()
             };
             println!(
-                "[{}] agent verify: {} verified, {} failed (freed {} MB){}",
+                "[{}] agent verify: {} verified, {} failed (expected freed {} MB){}",
                 sid, verified_count, failed_count, freed, respawn_info
             );
         }
@@ -15696,12 +19476,18 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
             );
             if let Some(summary) = &report.resource_summary {
                 println!(
-                    "- Memory freed: {} MB (expected {})",
-                    summary.memory_freed_mb, summary.expected_mb
+                    "- Expected memory freed: {} MB (plan estimate {})",
+                    summary.expected_freed_mb, summary.expected_mb
                 );
             }
             if args.check_respawn {
                 println!("- Respawn check: {} processes detected", respawned_count);
+                if unknown_respawn_count > 0 {
+                    println!(
+                        "- Respawn timing ambiguous for {} targets",
+                        unknown_respawn_count
+                    );
+                }
                 if respawned_count > 0 {
                     println!("  ⚠ Warning: Some killed processes may have respawned");
                 }
@@ -17062,18 +20848,10 @@ fn run_agent_import_priors(global: &GlobalOpts, args: &AgentImportPriorsArgs) ->
     };
 
     // Determine priors output path
-    let priors_path = config.snapshot().priors_path.unwrap_or_else(|| {
-        global
-            .config
-            .as_ref()
-            .map(|c| PathBuf::from(c).join("priors.json"))
-            .unwrap_or_else(|| {
-                dirs::config_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("pt")
-                    .join("priors.json")
-            })
-    });
+    let priors_path = config
+        .snapshot()
+        .priors_path
+        .unwrap_or_else(|| resolved_config_dir(global).join("priors.json"));
 
     // Check host profile compatibility
     if let Some(ref filter_profile) = args.host_profile {
@@ -17857,7 +21635,12 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
-    let priors = config.priors;
+    // The same scorer as `agent plan`.
+    let (mut scorer, scorer_warnings) = Scorer::from_config(&config);
+    for warning in scorer_warnings {
+        eprintln!("agent watch: warning: {warning}");
+    }
+    let config_dir = config.config_dir.clone();
     let policy = config.policy;
 
     let scan_options = QuickScanOptions {
@@ -17879,7 +21662,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
     }
 
     loop {
-        let system_state = collect_system_state();
+        let system_state = collect_system_state(None);
         if baseline.is_none() {
             baseline = Some(WatchBaseline::from_state(&system_state));
         }
@@ -17924,18 +21707,22 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
 
         let mut current: HashMap<u32, WatchCandidate> = HashMap::new();
 
-        for proc in &filtered.passed {
-            if proc.pid.0 == 0 || proc.pid.0 == 1 {
-                continue;
-            }
-            let min_age = args
-                .min_age
-                .unwrap_or(policy.guardrails.min_process_age_seconds);
-            if proc.elapsed.as_secs() < min_age {
-                continue;
-            }
+        // Verdicts recorded since the last pass count on this one.
+        if let Ok(decisions) = pt_core::decision::decision_store::DecisionStore::load(&config_dir) {
+            scorer.decisions = decisions;
+        }
+        let min_age = args
+            .min_age
+            .unwrap_or(policy.guardrails.min_process_age_seconds);
+        let eligible: Vec<&ProcessRecord> = filtered
+            .passed
+            .iter()
+            .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
+            .collect();
+        scorer.collect_provenance(&eligible);
 
-            let Some(eval) = evaluate_watch_candidate(proc, &priors, &decision_policy) else {
+        for proc in eligible {
+            let Some(eval) = evaluate_watch_candidate(proc, &scorer, &decision_policy) else {
                 continue;
             };
             if eval.confidence < threshold.min_prob {
@@ -18011,12 +21798,10 @@ struct WatchEval {
 
 fn evaluate_watch_candidate(
     proc: &ProcessRecord,
-    priors: &Priors,
+    scorer: &Scorer,
     policy: &pt_core::config::Policy,
 ) -> Option<WatchEval> {
-    let evidence = Evidence::from_snapshot(proc);
-
-    let posterior_result = compute_posterior(priors, &evidence).ok()?;
+    let posterior_result = scorer.score(proc, Evidence::from_snapshot(proc))?.posterior;
     let decision_outcome = decide_action(
         &posterior_result.posterior,
         policy,
@@ -18031,11 +21816,7 @@ fn evaluate_watch_candidate(
     }
     .to_string();
 
-    let confidence = posterior_result
-        .posterior
-        .abandoned
-        .max(posterior_result.posterior.zombie)
-        .clamp(0.0, 1.0);
+    let confidence = posterior_result.posterior.abandonment_probability();
 
     Some(WatchEval {
         confidence,
@@ -18297,154 +22078,6 @@ mod watch_tests {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod provenance_scoring_tests {
-    use super::*;
-    use pt_common::{
-        AncestorEntry, LineageCollectionMethod, LockMechanism, RawResourceEvidence,
-        ResourceCollectionMethod, ResourceDetails, ResourceKind, ResourceState, SupervisorEvidence,
-        SupervisorKind,
-    };
-
-    fn lock_ev(pid: u32, path: &str, state: ResourceState) -> RawResourceEvidence {
-        RawResourceEvidence {
-            kind: ResourceKind::Lockfile,
-            key: path.to_string(),
-            owner_pid: pid,
-            collection_method: ResourceCollectionMethod::ProcFd,
-            state,
-            details: ResourceDetails::Lockfile {
-                path: path.to_string(),
-                mechanism: LockMechanism::Existence,
-            },
-            observed_at: "2026-03-17T00:00:00Z".to_string(),
-        }
-    }
-
-    fn listener_ev(pid: u32, port: u16) -> RawResourceEvidence {
-        RawResourceEvidence {
-            kind: ResourceKind::Listener,
-            key: format!("tcp:0.0.0.0:{port}"),
-            owner_pid: pid,
-            collection_method: ResourceCollectionMethod::ProcNet,
-            state: ResourceState::Active,
-            details: ResourceDetails::Listener {
-                protocol: "tcp".to_string(),
-                port,
-                bind_address: "0.0.0.0".to_string(),
-            },
-            observed_at: "2026-03-17T00:00:00Z".to_string(),
-        }
-    }
-
-    fn lineage(pid: u32, ppid: u32, supervisor: Option<SupervisorEvidence>) -> RawLineageEvidence {
-        RawLineageEvidence {
-            pid,
-            ppid,
-            pgid: pid,
-            sid: pid,
-            uid: 1000,
-            user: Some("ubuntu".to_string()),
-            tty: None,
-            supervisor,
-            ancestors: if ppid > 1 {
-                vec![AncestorEntry {
-                    pid: ppid,
-                    comm: "bash".to_string(),
-                    uid: 1000,
-                }]
-            } else {
-                Vec::new()
-            },
-            collection_method: LineageCollectionMethod::Synthetic,
-            observed_at: "2026-03-17T00:00:00Z".to_string(),
-        }
-    }
-
-    fn feature_names(adjustment: &ProvenanceScoreAdjustment) -> Vec<&str> {
-        adjustment
-            .evidence_terms
-            .iter()
-            .map(|term| term.feature.as_str())
-            .collect()
-    }
-
-    #[test]
-    fn orphaned_low_blast_radius_elevates_abandonment_features() {
-        let bundle = ProvenanceInferenceBundle {
-            resource_graph: SharedResourceGraph::from_evidence(&[]),
-            lineages: HashMap::from([(100, lineage(100, 1, None))]),
-            children: HashMap::new(),
-        };
-
-        let adjustment = derive_provenance_adjustment(100, &bundle);
-        let features = feature_names(&adjustment);
-
-        assert!(features.contains(&"provenance_ownership_orphaned"));
-        assert!(features.contains(&"provenance_blast_radius_low"));
-        assert!(adjustment.confidence_penalty_steps >= 1);
-        assert!(adjustment
-            .confidence_notes
-            .iter()
-            .any(|note| note.contains("PPID=1") || note.contains("ancestor chain")));
-    }
-
-    #[test]
-    fn supervised_listener_suppresses_false_positive_path() {
-        let bundle = ProvenanceInferenceBundle {
-            resource_graph: SharedResourceGraph::from_evidence(&[(
-                200,
-                vec![listener_ev(200, 8080)],
-            )]),
-            lineages: HashMap::from([(
-                200,
-                lineage(
-                    200,
-                    2,
-                    Some(SupervisorEvidence {
-                        kind: SupervisorKind::Systemd,
-                        unit_name: Some("api.service".to_string()),
-                        auto_restart: Some(true),
-                        confidence: ProvenanceConfidence::High,
-                    }),
-                ),
-            )]),
-            children: HashMap::new(),
-        };
-
-        let adjustment = derive_provenance_adjustment(200, &bundle);
-        let features = feature_names(&adjustment);
-
-        assert!(features.contains(&"provenance_ownership_supervised"));
-        assert!(features.contains(&"provenance_active_listener"));
-        assert!(adjustment.evidence_completeness >= 0.8);
-    }
-
-    #[test]
-    fn missing_and_conflicted_provenance_downgrades_confidence() {
-        let bundle = ProvenanceInferenceBundle {
-            resource_graph: SharedResourceGraph::from_evidence(&[(
-                300,
-                vec![lock_ev(300, "/tmp/shared.lock", ResourceState::Conflicted)],
-            )]),
-            lineages: HashMap::new(),
-            children: HashMap::new(),
-        };
-
-        let adjustment = derive_provenance_adjustment(300, &bundle);
-
-        assert!(adjustment.confidence_penalty_steps >= 2);
-        assert!(adjustment
-            .confidence_notes
-            .iter()
-            .any(|note| note.contains("missing lineage provenance")));
-        assert!(adjustment
-            .confidence_notes
-            .iter()
-            .any(|note| note.contains("unresolved edge")));
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
 mod queue_metrics_tests {
     use super::*;
     use pt_core::collect::{
@@ -18518,7 +22151,6 @@ fn generate_report_from_session(
     handle: &pt_core::session::SessionHandle,
 ) -> pt_report::Result<String> {
     use pt_report::sections::*;
-    use pt_report::ReportData;
 
     // Read manifest for session metadata
     let manifest = handle
@@ -18549,15 +22181,14 @@ fn generate_report_from_session(
         hostname: None,
         started_at: chrono::DateTime::parse_from_rfc3339(&manifest.timing.created_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or_else(|_| chrono::Utc::now()),
-        ended_at: manifest.timing.updated_at.as_ref().and_then(|ts| {
-            chrono::DateTime::parse_from_rfc3339(ts)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .ok()
-        }),
+            .map_err(|error| pt_report::ReportError::MissingData(format!("created_at: {error}")))?,
+        ended_at: pt_report::generator::recorded_session_end(&serde_json::to_value(&manifest)?),
         duration_ms: None,
         state: format!("{:?}", manifest.state).to_lowercase(),
-        mode: format!("{:?}", manifest.mode).to_lowercase(),
+        mode: serde_json::to_value(manifest.mode)?
+            .as_str()
+            .expect("SessionMode serializes as a string")
+            .to_string(),
         deep_scan: false,
         processes_scanned: 0,
         candidates_found: 0,
@@ -18571,58 +22202,20 @@ fn generate_report_from_session(
         cores: None,
         memory_bytes: None,
         pt_version: None,
-        export_profile: "safe".to_string(),
+        export_profile: generator.config().redaction_profile.clone(),
     };
 
-    // Try to read plan.json for candidate count
+    // A session report needs its recorded plan. Missing or corrupt data is an
+    // error, not a successful report with invented empty candidate counts.
     let plan_path = handle.dir.join("decision").join("plan.json");
-    let candidates_count = if plan_path.exists() {
-        std::fs::read_to_string(&plan_path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-            .and_then(|v| {
-                v.get("candidates")
-                    .and_then(|c| c.as_array())
-                    .map(|a| a.len())
-                    .or_else(|| {
-                        v.get("summary")
-                            .and_then(|s| s.get("candidates_returned"))
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
-                    })
-                    .or_else(|| {
-                        v.get("gates_summary")
-                            .and_then(|g| g.get("total_candidates"))
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
-                    })
-                    .or_else(|| v.get("actions").and_then(|a| a.as_array()).map(|a| a.len()))
-            })
-            .unwrap_or(0)
-    } else {
-        0
+    let plan: serde_json::Value = serde_json::from_slice(&std::fs::read(&plan_path)?)?;
+    let outcomes_path = handle.dir.join("action/outcomes.jsonl");
+    let outcomes = match std::fs::read(&outcomes_path) {
+        Ok(bytes) => pt_report::generator::parse_outcomes(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
     };
-
-    // Build report data
-    let data = ReportData {
-        config: generator.config().clone(),
-        generated_at: chrono::Utc::now(),
-        generator_version: env!("CARGO_PKG_VERSION").to_string(),
-        overview: Some(OverviewSection {
-            candidates_found: candidates_count,
-            ..overview
-        }),
-        candidates: None, // Would be populated from plan.json
-        evidence: None,
-        actions: None,
-        galaxy_brain: if generator.config().galaxy_brain {
-            Some(GalaxyBrainSection::default())
-        } else {
-            None
-        },
-    };
-
-    generator.generate(data)
+    generator.generate_from_session_artifacts(overview, &plan, &outcomes)
 }
 
 #[cfg(all(test, feature = "report"))]
@@ -18630,9 +22223,9 @@ mod report_generation_tests {
     use super::*;
     use pt_report::{ReportConfig, ReportGenerator, ReportTheme};
 
-    fn make_report_handle(session_id: &SessionId) -> (tempfile::TempDir, SessionHandle) {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(&session_id.0);
+    fn make_report_handle(session_id: &SessionId) -> (PathBuf, SessionHandle) {
+        let tmp = tempfile::tempdir().unwrap().keep();
+        let dir = tmp.join(&session_id.0);
         fs::create_dir_all(&dir).unwrap();
         (
             tmp,
@@ -18647,7 +22240,10 @@ mod report_generation_tests {
     fn generate_report_from_session_uses_context_host_metadata() {
         let session_id = SessionId("pt-20260115-120000-rpt".to_string());
         let (_tmp, handle) = make_report_handle(&session_id);
-        let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+        let mut manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
+        manifest.timing.created_at = "2026-01-15T12:00:00Z".to_string();
+        manifest.state_history[0].ts = manifest.timing.created_at.clone();
+        manifest.record_state(SessionState::Planned);
         handle.write_manifest(&manifest).unwrap();
         handle
             .write_context(&SessionContext {
@@ -18658,11 +22254,17 @@ mod report_generation_tests {
                 run_id: "run-123".to_string(),
                 label: None,
                 os: pt_core::session::SessionOs {
-                    family: "test-os".to_string(),
-                    arch: "test-arch".to_string(),
+                    family: "linux".to_string(),
+                    arch: "x86_64".to_string(),
                 },
             })
             .unwrap();
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            r#"{"candidates":[],"host_id":"host-from-context"}"#,
+        )
+        .unwrap();
 
         let generator = ReportGenerator::new(
             ReportConfig::new()
@@ -18670,17 +22272,100 @@ mod report_generation_tests {
                 .with_title("Session Report Test".to_string()),
         );
         let html = generate_report_from_session(&generator, &handle).unwrap();
-        let host_row =
-            "Host ID</dt>\n                <dd class=\"font-mono\">host-from-context</dd>";
+        let recorded_data = |html: &str| -> serde_json::Value {
+            let data = html
+                .split("id=\"recorded-session-data\">")
+                .nth(1)
+                .expect("actual recorded session data")
+                .split("</script>")
+                .next()
+                .unwrap();
+            serde_json::from_str(data).expect("recorded session JSON")
+        };
+        let recorded = recorded_data(&html);
+        assert_eq!(recorded["overview"]["state"], "planned");
+        assert!(recorded["overview"]["ended_at"].is_null());
+        assert_eq!(recorded["overview"]["export_profile"], "safe");
+        // Each export has its own random key. Equal host inputs in the same
+        // export must correlate; a separately constructed engine cannot predict
+        // its token. The plan sentinel independently identifies the context host.
+        assert_eq!(recorded["overview"]["host_id"], recorded["plan"]["host_id"]);
+        let host_row = format!(
+            "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
+            recorded["plan"]["host_id"].as_str().unwrap(),
+        );
         let wrong_host_row = format!(
             "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
             session_id.0
         );
 
-        assert!(html.contains(host_row));
+        assert!(html.contains(&host_row));
+        assert!(!html.contains("host-from-context"));
         assert!(!html.contains(&wrong_host_row));
-        assert!(html.contains("test-os"));
-        assert!(html.contains("test-arch"));
+        assert!(html.contains("linux"));
+        assert!(html.contains("x86_64"));
+
+        // Change only the real saved context. The unchanged plan sentinel must
+        // now differ from the overview, ruling out an overview copied from the
+        // plan or a fabricated constant while retaining Safe host redaction.
+        let mut context = handle.read_context().unwrap();
+        context.host_id = "different-context-host".to_string();
+        handle.write_context(&context).unwrap();
+        let changed_html = generate_report_from_session(&generator, &handle).unwrap();
+        let changed = recorded_data(&changed_html);
+        let changed_overview_host = changed["overview"]["host_id"].as_str().unwrap();
+        let unchanged_plan_host = changed["plan"]["host_id"].as_str().unwrap();
+        assert_ne!(changed_overview_host, unchanged_plan_host);
+        let changed_host_row = format!(
+            "Host ID</dt>\n                <dd class=\"font-mono\">{}</dd>",
+            changed_overview_host,
+        );
+        assert!(changed_html.contains(&changed_host_row));
+        assert!(!changed_html.contains("host-from-context"));
+        assert!(!changed_html.contains("different-context-host"));
+        assert!(!changed_html.contains(&wrong_host_row));
+
+        let mut forensic_config = ReportConfig::new().with_embed_assets(true);
+        forensic_config.redaction_profile = "Forensic".to_string();
+        let forensic = ReportGenerator::new(forensic_config);
+        for (state, timestamp, expected_end) in [
+            (
+                SessionState::Completed,
+                "2026-01-15T12:02:00Z",
+                Some("2026-01-15T12:02:00Z"),
+            ),
+            (
+                SessionState::Archived,
+                "2026-01-15T12:05:00Z",
+                Some("2026-01-15T12:02:00Z"),
+            ),
+            (SessionState::Planned, "2026-01-15T12:06:00Z", None),
+            (
+                SessionState::Failed,
+                "2026-01-15T12:07:00Z",
+                Some("2026-01-15T12:07:00Z"),
+            ),
+            (
+                SessionState::Cancelled,
+                "2026-01-15T12:08:00Z",
+                Some("2026-01-15T12:08:00Z"),
+            ),
+        ] {
+            manifest.record_state(state);
+            manifest.state_history.last_mut().unwrap().ts = timestamp.to_string();
+            // A later update is deliberately not the terminal transition.
+            manifest.timing.updated_at = Some("2026-01-15T13:00:00Z".to_string());
+            handle.write_manifest(&manifest).unwrap();
+            let html = generate_report_from_session(&forensic, &handle).unwrap();
+            let recorded = recorded_data(&html);
+            assert_eq!(
+                recorded["overview"]["ended_at"],
+                serde_json::json!(expected_end),
+                "{state:?}"
+            );
+            assert_eq!(recorded["overview"]["export_profile"], "forensic");
+            assert!(html.contains(">forensic</span>"));
+        }
     }
 
     #[test]
@@ -18689,6 +22374,13 @@ mod report_generation_tests {
         let (_tmp, handle) = make_report_handle(&session_id);
         let manifest = SessionManifest::new(&session_id, None, SessionMode::Interactive, None);
         handle.write_manifest(&manifest).unwrap();
+
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            r#"{"candidates":[]}"#,
+        )
+        .unwrap();
 
         let generator = ReportGenerator::new(
             ReportConfig::new()
@@ -18723,33 +22415,54 @@ mod report_generation_tests {
 
         assert!(err.to_string().contains("missing required data: context:"));
     }
+
+    #[test]
+    fn generate_report_from_session_rejects_missing_and_corrupt_plan() {
+        let session_id = SessionId::new();
+        let (_tmp, handle) = make_report_handle(&session_id);
+        handle
+            .write_manifest(&SessionManifest::new(
+                &session_id,
+                None,
+                SessionMode::RobotPlan,
+                None,
+            ))
+            .unwrap();
+        let generator = ReportGenerator::default_config();
+        assert!(matches!(
+            generate_report_from_session(&generator, &handle),
+            Err(pt_report::ReportError::IoError(error)) if error.kind() == std::io::ErrorKind::NotFound,
+        ));
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        fs::write(handle.dir.join("decision/plan.json"), b"not-json").unwrap();
+        assert!(matches!(
+            generate_report_from_session(&generator, &handle),
+            Err(pt_report::ReportError::JsonError(_)),
+        ));
+    }
 }
 
 /// Generate Slack-friendly summary.
 #[cfg(feature = "report")]
 fn generate_slack_summary(prose_style: &str) -> String {
     match prose_style {
-        "terse" => {
-            "*Process Triage Summary*\n• Session completed\n• No critical issues found".to_string()
-        }
-        "formal" => "*Process Triage Report*\n\nThe session has been completed successfully. \
-             All processes have been analyzed according to the configured policy.\n\n\
+        "terse" => "*Process Triage Summary*\n• Report generated\n• Review the recorded evidence and outcomes".to_string(),
+        "formal" => "*Process Triage Report*\n\nA report has been generated from the saved session artifacts. \
+             Consult the HTML report for recorded recommendations and action outcomes.\n\n\
              _Report generated by pt-core_"
             .to_string(),
         "technical" => "*Process Triage Technical Summary*\n\n\
              ```\n\
-             Session: completed\n\
-             Candidates: analyzed\n\
-             Actions: pending review\n\
+             Source: saved session artifacts\n\
+             Missing measurements: explicitly marked\n\
              ```\n\n\
-             See full HTML report for detailed evidence ledger and posterior computations."
+             See the HTML report for recorded evidence, posteriors, and outcomes."
             .to_string(),
         _ => {
             // conversational (default)
-            "*Process Triage Complete* 🎯\n\n\
-             I've finished analyzing your processes. The session has been saved \
-             and you can review the detailed findings in the HTML report.\n\n\
-             Let me know if you'd like me to explain any of the recommendations!"
+            "*Process Triage Report*\n\n\
+             Your report is ready. Review the saved recommendations and action outcomes \
+             in the HTML report. Missing measurements are marked explicitly."
                 .to_string()
         }
     }
@@ -18759,24 +22472,20 @@ fn generate_slack_summary(prose_style: &str) -> String {
 #[cfg(feature = "report")]
 fn generate_prose_summary(prose_style: &str) -> String {
     match prose_style {
-        "terse" => "Session complete. Candidates analyzed. Report ready.".to_string(),
-        "formal" => "The process triage session has concluded. All candidate processes have been \
-             evaluated using Bayesian inference, and recommendations have been generated \
-             based on the configured policy parameters. The full report is available for \
-             your review."
+        "terse" => "Report ready. Review the recorded evidence and outcomes.".to_string(),
+        "formal" => "A process triage report has been generated from the saved session artifacts. \
+             The HTML report presents recorded recommendations and action outcomes, with \
+             missing measurements marked explicitly."
             .to_string(),
-        "technical" => "Process triage session completed. The inference engine computed posterior \
-             probabilities for each candidate across the four-class model (useful, useful_bad, \
-             abandoned, zombie). Expected loss calculations and FDR control were applied \
-             to generate action recommendations. See the galaxy-brain tab in the HTML report \
-             for full mathematical derivations."
+        "technical" => "The report reads saved plan evidence and action outcomes. Four-class \
+             posteriors and exact evidence ledgers are shown when recorded; missing ledgers \
+             and measurements are marked explicitly. Review the HTML report for details."
             .to_string(),
         _ => {
             // conversational (default)
-            "All done! I've analyzed your running processes and identified any that might \
-             be abandoned or stuck. You can check out the full report to see the details \
-             and decide what to do with each one. The report shows my reasoning for each \
-             recommendation, so you'll know exactly why I flagged something."
+            "Your report is ready. You can review the saved recommendations, evidence, \
+             and action outcomes in the HTML report. It marks missing information so \
+             you can see which details were actually recorded."
                 .to_string()
         }
     }

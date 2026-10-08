@@ -4,7 +4,7 @@
 //! into child processes.
 
 use super::types::{EvidenceType, SupervisionEvidence, SupervisorCategory};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 use crate::collect::parse_environ_content;
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
@@ -23,6 +23,12 @@ pub enum EnvironError {
 
     #[error("Process {0} not found")]
     ProcessNotFound(u32),
+
+    #[error("Invalid environment evidence for PID {pid}: {reason}")]
+    Parse { pid: u32, reason: String },
+
+    #[error("Environment evidence for PID {0} is unsupported or unavailable on this platform")]
+    Unsupported(u32),
 }
 
 /// A pattern for detecting supervisor environment variables.
@@ -363,17 +369,46 @@ pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
         }
     })?;
 
-    Ok(parse_environ_content(&content).unwrap_or_default())
+    parse_required_environ(pid, &content)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_required_environ(
+    pid: u32,
+    content: &[u8],
+) -> Result<HashMap<String, String>, EnvironError> {
+    let invalid = |reason: &str| EnvironError::Parse {
+        pid,
+        reason: reason.to_string(),
+    };
+    let mut env = HashMap::new();
+    for entry in content
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let entry = std::str::from_utf8(entry).map_err(|_| invalid("invalid UTF-8"))?;
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| invalid("entry has no separator"))?;
+        if key.is_empty() {
+            return Err(invalid("entry has an empty variable name"));
+        }
+        if env.get(key).is_some_and(|previous| previous != value) {
+            return Err(invalid("conflicting duplicate variable"));
+        }
+        env.insert(key.to_string(), value.to_string());
+    }
+    Ok(env)
 }
 
 #[cfg(target_os = "macos")]
 pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
-    crate::collect::macos::collect_environ(pid).ok_or(EnvironError::ProcessNotFound(pid))
+    crate::collect::macos::collect_environ(pid).ok_or(EnvironError::Unsupported(pid))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn read_environ(_pid: u32) -> Result<HashMap<String, String>, EnvironError> {
-    Ok(HashMap::new())
+pub fn read_environ(pid: u32) -> Result<HashMap<String, String>, EnvironError> {
+    Err(EnvironError::Unsupported(pid))
 }
 
 /// Analyzer for environment-based supervision detection.
@@ -555,6 +590,28 @@ mod tests {
 
         assert!(!result.is_supervised);
         assert!(result.evidence.is_empty());
+    }
+
+    #[test]
+    fn required_environment_distinguishes_empty_from_ambiguous() {
+        assert!(parse_required_environ(42, b"").unwrap().is_empty());
+        assert_eq!(
+            parse_required_environ(42, b"TMUX=owned\0TMUX=owned\0").unwrap()["TMUX"],
+            "owned"
+        );
+        for bytes in [
+            b"TMUX=owned\0TMUX=\0".as_slice(),
+            b"missing-separator\0".as_slice(),
+            b"=invalid\0".as_slice(),
+            b"TMUX=\xff\0".as_slice(),
+        ] {
+            let error = parse_required_environ(42, bytes).unwrap_err();
+            assert!(matches!(error, EnvironError::Parse { pid: 42, .. }));
+        }
+        let error =
+            parse_required_environ(42, b"PASSWORD=secret-one\0PASSWORD=secret-two\0").unwrap_err();
+        assert!(!error.to_string().contains("secret-one"));
+        assert!(!error.to_string().contains("secret-two"));
     }
 
     #[test]

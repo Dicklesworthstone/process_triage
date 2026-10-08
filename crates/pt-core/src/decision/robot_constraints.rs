@@ -71,6 +71,10 @@ pub struct RuntimeRobotConstraints {
     /// Categories to allow (if non-empty, only these are allowed).
     pub allow_categories: Vec<String>,
 
+    /// An empty intersection of policy and CLI allowlists permits no category.
+    #[serde(default)]
+    pub deny_all_categories: bool,
+
     /// Categories to exclude (these are never allowed).
     pub exclude_categories: Vec<String>,
 
@@ -123,6 +127,7 @@ impl RuntimeRobotConstraints {
             require_known_signature: robot_mode.require_known_signature,
             require_policy_snapshot: robot_mode.require_policy_snapshot.unwrap_or(false),
             allow_categories: robot_mode.allow_categories.clone(),
+            deny_all_categories: false,
             exclude_categories: robot_mode.exclude_categories.clone(),
             require_human_for_supervised: robot_mode.require_human_for_supervised,
             sources: Some(ConstraintSources::default()),
@@ -140,18 +145,22 @@ impl RuntimeRobotConstraints {
             require_known_signature: false,
             require_policy_snapshot: false,
             allow_categories: Vec::new(),
+            deny_all_categories: false,
             exclude_categories: Vec::new(),
             require_human_for_supervised: false,
             sources: None,
         }
     }
 
-    /// Override minimum posterior from CLI.
+    /// Override minimum posterior from CLI. Like every other CLI override this can only
+    /// tighten the policy: a lower value than the policy's is ignored.
     pub fn with_min_posterior(mut self, value: Option<f64>) -> Self {
         if let Some(v) = value {
-            self.min_posterior = v;
-            if let Some(ref mut sources) = self.sources {
-                sources.min_posterior = ConstraintSource::CliOverride;
+            if v > self.min_posterior {
+                self.min_posterior = v;
+                if let Some(ref mut sources) = self.sources {
+                    sources.min_posterior = ConstraintSource::CliOverride;
+                }
             }
         }
         self
@@ -171,8 +180,12 @@ impl RuntimeRobotConstraints {
 
     /// Set max total blast radius (accumulated) from CLI.
     pub fn with_max_total_blast_radius_mb(mut self, value: Option<f64>) -> Self {
-        if value.is_some() {
-            self.max_total_blast_radius_mb = value;
+        if let Some(value) = value {
+            self.max_total_blast_radius_mb = Some(
+                self.max_total_blast_radius_mb
+                    .map(|current| current.min(value))
+                    .unwrap_or(value),
+            );
             if let Some(ref mut sources) = self.sources {
                 sources.max_total_blast_radius_mb = ConstraintSource::CliOverride;
             }
@@ -234,10 +247,18 @@ impl RuntimeRobotConstraints {
         self
     }
 
-    /// Set allow categories from CLI (replaces policy if specified).
+    /// Restrict allowed categories to the intersection of policy and CLI.
     pub fn with_allow_categories(mut self, categories: Option<Vec<String>>) -> Self {
         if let Some(cats) = categories {
-            self.allow_categories = cats;
+            if !self.deny_all_categories && !self.allow_categories.is_empty() {
+                self.allow_categories.retain(|category| {
+                    cats.iter()
+                        .any(|value| value.eq_ignore_ascii_case(category))
+                });
+                self.deny_all_categories = self.allow_categories.is_empty();
+            } else if !self.deny_all_categories {
+                self.allow_categories = cats;
+            }
             if let Some(ref mut sources) = self.sources {
                 sources.allow_categories = ConstraintSource::CliOverride;
             }
@@ -279,6 +300,9 @@ impl RuntimeRobotConstraints {
                 "allow_categories: [{}]",
                 self.allow_categories.join(", ")
             ));
+        }
+        if self.deny_all_categories {
+            summary.push("no categories permitted by policy and CLI".to_string());
         }
 
         if !self.exclude_categories.is_empty() {
@@ -472,6 +496,26 @@ impl ConstraintChecker {
             });
         }
 
+        if candidate
+            .posterior
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            || (candidate.posterior.is_none() && self.constraints.min_posterior > 0.0)
+        {
+            violations.push(ConstraintViolation {
+                constraint: ConstraintKind::MinPosterior,
+                message: "valid posterior evidence is required by the confidence floor".to_string(),
+                threshold: self.constraints.min_posterior.to_string(),
+                actual: "missing or invalid".to_string(),
+                source: self
+                    .constraints
+                    .sources
+                    .as_ref()
+                    .map(|sources| sources.min_posterior)
+                    .unwrap_or_default(),
+                remediation: Some("collect valid posterior evidence before applying".to_string()),
+            });
+        }
+
         // Check minimum posterior
         if let Some(posterior) = candidate.posterior {
             if posterior < self.constraints.min_posterior {
@@ -648,35 +692,35 @@ impl ConstraintChecker {
                     )),
                 });
             }
+        }
 
-            // Check allow list (if non-empty)
-            if !self.constraints.allow_categories.is_empty()
-                && !self
+        if self.constraints.deny_all_categories
+            || (!self.constraints.allow_categories.is_empty()
+                && !candidate.category.as_ref().is_some_and(|category| {
+                    self.constraints
+                        .allow_categories
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(category))
+                }))
+        {
+            violations.push(ConstraintViolation {
+                constraint: ConstraintKind::CategoryNotAllowed,
+                message: "candidate category is not permitted by the policy and CLI".to_string(),
+                threshold: format!("allow_categories: {:?}", self.constraints.allow_categories),
+                actual: candidate
+                    .category
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                source: self
                     .constraints
-                    .allow_categories
-                    .iter()
-                    .any(|c| c.to_lowercase() == cat_lower)
-            {
-                violations.push(ConstraintViolation {
-                    constraint: ConstraintKind::CategoryNotAllowed,
-                    message: format!("Category '{}' is not in the allow list", category),
-                    threshold: format!(
-                        "allow_categories: [{}]",
-                        self.constraints.allow_categories.join(", ")
-                    ),
-                    actual: format!("category: {}", category),
-                    source: self
-                        .constraints
-                        .sources
-                        .as_ref()
-                        .map(|s| s.allow_categories)
-                        .unwrap_or_default(),
-                    remediation: Some(format!(
-                        "Add '{}' to allow_categories or handle this process manually",
-                        category
-                    )),
-                });
-            }
+                    .sources
+                    .as_ref()
+                    .map(|sources| sources.allow_categories)
+                    .unwrap_or_default(),
+                remediation: Some(
+                    "handle this process manually or collect its category".to_string(),
+                ),
+            });
         }
 
         let metrics = self.current_metrics();
@@ -918,6 +962,19 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_min_posterior_cannot_loosen_policy() {
+        let robot_mode = test_robot_mode(); // min_posterior = 0.95
+        let constraints =
+            RuntimeRobotConstraints::from_policy(&robot_mode).with_min_posterior(Some(0.5));
+
+        assert_eq!(constraints.min_posterior, 0.95);
+        assert_ne!(
+            constraints.sources.as_ref().unwrap().min_posterior,
+            ConstraintSource::CliOverride
+        );
+    }
+
+    #[test]
     fn test_cli_override_max_kills_uses_minimum() {
         let robot_mode = test_robot_mode(); // max_kills = 5
 
@@ -929,6 +986,173 @@ mod tests {
         let constraints2 =
             RuntimeRobotConstraints::from_policy(&robot_mode).with_max_kills(Some(10));
         assert_eq!(constraints2.max_kills, 5);
+    }
+
+    #[test]
+    fn confidence_floor_refuses_unknown_and_nonfinite_probability() {
+        let checker =
+            ConstraintChecker::new(RuntimeRobotConstraints::from_policy(&test_robot_mode()));
+        for posterior in [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(-0.1),
+            Some(1.1),
+        ] {
+            let mut candidate = RobotCandidate::new()
+                .with_memory_mb(1.0)
+                .with_kill_action(true);
+            candidate.posterior = posterior;
+            let result = checker.check_candidate(&candidate);
+            assert!(!result.allowed, "{posterior:?}");
+            assert!(result
+                .violations
+                .iter()
+                .any(|violation| violation.constraint == ConstraintKind::MinPosterior));
+        }
+        assert!(
+            checker
+                .check_candidate(&RobotCandidate::new().with_posterior(1.0))
+                .allowed
+        );
+        let mut policy = test_robot_mode();
+        policy.min_posterior = 0.0;
+        let checker = ConstraintChecker::new(RuntimeRobotConstraints::from_policy(&policy));
+        assert!(checker.check_candidate(&RobotCandidate::new()).allowed);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn cli_overrides_never_admit_a_policy_refused_candidate(
+            policy_floor in 0.0f64..1.0,
+            cli_floor in 0.0f64..1.0,
+            probability in 0.0f64..1.0,
+            policy_memory in 1.0f64..2048.0,
+            cli_memory in 1.0f64..2048.0,
+            memory in 0.0f64..4096.0,
+            policy_kills in 0u32..20,
+            cli_kills in 0u32..20,
+            policy_mask in 0u8..8,
+            cli_mask in 0u8..8,
+            policy_excluded_mask in 0u8..8,
+            cli_excluded_mask in 0u8..8,
+            policy_total in proptest::option::of(1.0f64..8192.0),
+            cli_total_first in 1.0f64..8192.0,
+            cli_total_second in 1.0f64..8192.0,
+            prior_kill_bytes in proptest::collection::vec(0u64..268_435_456, 0..24),
+            category_index in 0usize..4,
+            policy_known in proptest::bool::ANY,
+            cli_known in proptest::bool::ANY,
+            has_signature in proptest::bool::ANY,
+            policy_snapshot in proptest::bool::ANY,
+            cli_snapshot in proptest::bool::ANY,
+            has_snapshot in proptest::bool::ANY,
+        ) {
+            let categories = ["daemon", "test", "shell"];
+            let select = |mask: u8| categories.iter().enumerate()
+                .filter(|(index, _)| mask & (1u8 << *index) != 0)
+                .map(|(_, category)| (*category).to_string()).collect::<Vec<_>>();
+            let mut policy = test_robot_mode();
+            policy.min_posterior = policy_floor;
+            policy.max_blast_radius_mb = policy_memory;
+            policy.max_kills = policy_kills;
+            policy.allow_categories = select(policy_mask);
+            policy.exclude_categories = select(policy_excluded_mask);
+            policy.require_known_signature = policy_known;
+            policy.require_policy_snapshot = Some(policy_snapshot);
+            // The base policy has no total cap. Include an existing run cap so
+            // repeated overrides must preserve whichever limit is tightest.
+            let baseline = RuntimeRobotConstraints::from_policy(&policy)
+                .with_max_total_blast_radius_mb(policy_total);
+            let constrained = baseline.clone()
+                .with_min_posterior(Some(cli_floor))
+                .with_max_blast_radius_mb(Some(cli_memory))
+                .with_max_kills(Some(cli_kills))
+                .with_require_known_signature(Some(cli_known))
+                .with_require_policy_snapshot(Some(cli_snapshot))
+                .with_allow_categories(Some(select(cli_mask)))
+                .with_exclude_categories(select(cli_excluded_mask))
+                .with_max_total_blast_radius_mb(Some(cli_total_first))
+                .with_max_total_blast_radius_mb(Some(cli_total_second));
+            let mut candidate = RobotCandidate::new().with_posterior(probability)
+                .with_memory_mb(memory).with_kill_action(true)
+                .with_policy_snapshot(has_snapshot);
+            candidate.has_known_signature = has_signature;
+            candidate.category = categories.get(category_index).map(|value| (*value).to_string());
+            let before = ConstraintChecker::new(baseline);
+            let after = ConstraintChecker::new(constrained);
+            for bytes in prior_kill_bytes {
+                before.record_action(bytes, true);
+                after.record_action(bytes, true);
+            }
+            let permitted_before = before.check_candidate(&candidate);
+            let permitted_after = after.check_candidate(&candidate);
+            proptest::prop_assert!(
+                !permitted_after.allowed || permitted_before.allowed,
+                "CLI admitted {:?}, policy refused {:?}",
+                permitted_after, permitted_before
+            );
+        }
+
+        #[test]
+        fn cli_tightening_keeps_boundary_admission_with_prior_actions(
+            policy_floor in 0.0f64..0.95,
+            memory_mb in 1u64..513,
+            prior_kill_bytes in proptest::collection::vec(1u64..67_108_864, 1..16),
+        ) {
+            let prior_kills = prior_kill_bytes.len() as u32;
+            let prior_bytes = prior_kill_bytes.iter().sum::<u64>();
+            let prior_mb = prior_bytes as f64 / (1024.0 * 1024.0);
+            let memory = memory_mb as f64;
+            let cli_floor = (policy_floor + 1.0) / 2.0;
+            let mut policy = test_robot_mode();
+            policy.min_posterior = policy_floor;
+            policy.max_blast_radius_mb = memory * 2.0;
+            policy.max_kills = prior_kills + 2;
+            policy.allow_categories = vec!["daemon".into(), "test".into()];
+            policy.exclude_categories = vec!["shell".into()];
+            let baseline = RuntimeRobotConstraints::from_policy(&policy)
+                .with_max_total_blast_radius_mb(Some(prior_mb + memory * 2.0));
+            let constrained = baseline.clone()
+                .with_min_posterior(Some(cli_floor))
+                .with_max_blast_radius_mb(Some(memory))
+                .with_max_kills(Some(prior_kills + 1))
+                .with_require_known_signature(Some(true))
+                .with_require_policy_snapshot(Some(true))
+                .with_allow_categories(Some(vec!["DAEMON".into()]))
+                .with_exclude_categories(vec!["TEST".into()])
+                .with_max_total_blast_radius_mb(Some(prior_mb + memory * 1.5))
+                .with_max_total_blast_radius_mb(Some(prior_mb + memory))
+                .with_max_total_blast_radius_mb(Some(prior_mb + memory * 3.0));
+            let before = ConstraintChecker::new(baseline);
+            let after = ConstraintChecker::new(constrained);
+            for bytes in prior_kill_bytes {
+                before.record_action(bytes, true);
+                after.record_action(bytes, true);
+            }
+            let candidate = RobotCandidate::new()
+                .with_posterior(cli_floor)
+                .with_memory_mb(memory)
+                .with_known_signature(true)
+                .with_policy_snapshot(true)
+                .with_category("daemon")
+                .with_kill_action(true);
+
+            // Equality at every tightened numeric boundary must still permit
+            // the last kill; this positive prevents a refusal-only property.
+            proptest::prop_assert!(before.check_candidate(&candidate).allowed);
+            proptest::prop_assert!(after.check_candidate(&candidate).allowed);
+            let bytes = memory_mb * 1024 * 1024;
+            before.record_action(bytes, true);
+            after.record_action(bytes, true);
+            proptest::prop_assert!(before.check_candidate(&candidate).allowed);
+            let refused = after.check_candidate(&candidate);
+            proptest::prop_assert!(!refused.allowed);
+            proptest::prop_assert!(refused.violations.iter().any(|violation|
+                violation.constraint == ConstraintKind::MaxKills));
+            proptest::prop_assert!(refused.violations.iter().any(|violation|
+                violation.constraint == ConstraintKind::MaxTotalBlastRadius));
+        }
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub fn read_resource(uri: &str) -> Result<Vec<ResourceContent>, String> {
 }
 
 fn resource_priors(uri: &str) -> Result<Vec<ResourceContent>, String> {
-    let options = crate::config::ConfigOptions::default();
+    let options = crate::mcp::config_options();
     let config =
         crate::config::load_config(&options).map_err(|e| format!("Config load error: {}", e))?;
 
@@ -66,7 +66,7 @@ fn resource_priors(uri: &str) -> Result<Vec<ResourceContent>, String> {
 }
 
 fn resource_policy(uri: &str) -> Result<Vec<ResourceContent>, String> {
-    let options = crate::config::ConfigOptions::default();
+    let options = crate::mcp::config_options();
     let config =
         crate::config::load_config(&options).map_err(|e| format!("Config load error: {}", e))?;
 

@@ -388,6 +388,60 @@ pub fn parse_proc_stat(pid: u32) -> Option<ProcessStat> {
     parse_proc_stat_content(&content)
 }
 
+/// Failure to obtain the identity fields required by a safety probe.
+#[derive(Debug, thiserror::Error)]
+pub enum StatReadError {
+    #[error("cannot read /proc/{pid}/stat: {source}")]
+    Read {
+        pid: u32,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid /proc/{pid}/stat: {reason}")]
+    Parse { pid: u32, reason: String },
+}
+
+/// Read PID, parent, command and birth ticks without manufacturing defaults.
+pub fn read_required_proc_stat(pid: u32) -> Result<ProcessStat, StatReadError> {
+    let bytes = fs::read(format!("/proc/{pid}/stat"))
+        .map_err(|source| StatReadError::Read { pid, source })?;
+    let content = std::str::from_utf8(&bytes).map_err(|_| StatReadError::Parse {
+        pid,
+        reason: "invalid UTF-8".to_string(),
+    })?;
+    parse_required_proc_stat_content(pid, content)
+}
+
+fn parse_required_proc_stat_content(pid: u32, content: &str) -> Result<ProcessStat, StatReadError> {
+    let invalid = |reason: &str| StatReadError::Parse {
+        pid,
+        reason: reason.to_string(),
+    };
+    let close = content.rfind(')').ok_or_else(|| invalid("missing comm"))?;
+    let fields: Vec<_> = content[close + 1..].split_whitespace().collect();
+    if fields.first().is_none_or(|state| {
+        !matches!(
+            *state,
+            "R" | "S" | "D" | "Z" | "T" | "t" | "X" | "x" | "K" | "W" | "P" | "I"
+        )
+    }) {
+        return Err(invalid("missing or invalid process state"));
+    }
+    fields
+        .get(1)
+        .and_then(|ppid| ppid.parse::<u32>().ok())
+        .ok_or_else(|| invalid("missing or invalid parent PID"))?;
+    fields
+        .get(19)
+        .and_then(|birth| birth.parse::<u64>().ok())
+        .ok_or_else(|| invalid("missing or invalid birth ticks"))?;
+    let stat = parse_proc_stat_content(content).ok_or_else(|| invalid("invalid stat fields"))?;
+    if stat.pid != pid {
+        return Err(invalid("PID differs from requested process"));
+    }
+    Ok(stat)
+}
+
 /// Parse stat file content (for testing).
 ///
 /// The stat file format is tricky because the comm field (process name)
@@ -441,45 +495,76 @@ pub fn parse_proc_stat_content(content: &str) -> Option<ProcessStat> {
 /// Parse /proc/\[pid\]/io file.
 ///
 /// # Errors
-/// Returns None if the file cannot be read (permission denied, process exited).
+/// Returns None if the file cannot be read or its counters are invalid.
 pub fn parse_io(pid: u32) -> Option<IoStats> {
-    let path = format!("/proc/{}/io", pid);
-    let bytes = fs::read(&path).ok()?;
-    let content = String::from_utf8_lossy(&bytes);
-    parse_io_content(&content)
+    read_io(pid).ok()
 }
 
-/// Parse io file content (for testing).
+/// A read or counter-validation failure in process I/O evidence.
+#[derive(Debug, thiserror::Error)]
+pub enum IoReadError {
+    #[error("cannot read /proc/{pid}/io: {source}")]
+    Read {
+        pid: u32,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid /proc/{pid}/io counters: {reason}")]
+    Parse { pid: u32, reason: String },
+}
+
+/// Read validated I/O counters without discarding the failure cause.
+pub fn read_io(pid: u32) -> Result<IoStats, IoReadError> {
+    let bytes =
+        fs::read(format!("/proc/{pid}/io")).map_err(|source| IoReadError::Read { pid, source })?;
+    parse_io_counters(&String::from_utf8_lossy(&bytes))
+        .map_err(|reason| IoReadError::Parse { pid, reason })
+}
+
+/// Parse validated io file content for optional collection callers.
 pub fn parse_io_content(content: &str) -> Option<IoStats> {
+    parse_io_counters(content).ok()
+}
+
+fn parse_io_counters(content: &str) -> Result<IoStats, String> {
     let mut stats = IoStats::default();
+    let mut seen = [false; 7];
 
     for line in content.lines() {
-        // Skip empty lines or lines without colons
-        let Some(colon_pos) = line.find(':') else {
+        if line.trim().is_empty() {
             continue;
+        }
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| "counter line is missing ':'".to_string())?;
+        let key = key.trim();
+        let (index, destination) = match key {
+            "rchar" => (0, &mut stats.rchar),
+            "wchar" => (1, &mut stats.wchar),
+            "syscr" => (2, &mut stats.syscr),
+            "syscw" => (3, &mut stats.syscw),
+            "read_bytes" => (4, &mut stats.read_bytes),
+            "write_bytes" => (5, &mut stats.write_bytes),
+            "cancelled_write_bytes" => (6, &mut stats.cancelled_write_bytes),
+            _ => continue,
         };
+        if seen[index] {
+            return Err(format!("duplicate {key} counter"));
+        }
+        *destination = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid {key} counter"))?;
+        seen[index] = true;
+    }
 
-        let key = line[..colon_pos].trim();
-        let value_str = line[colon_pos + 1..].trim();
-
-        // Skip lines where value can't be parsed as u64
-        let Ok(value) = value_str.parse::<u64>() else {
-            continue;
-        };
-
-        match key {
-            "rchar" => stats.rchar = value,
-            "wchar" => stats.wchar = value,
-            "syscr" => stats.syscr = value,
-            "syscw" => stats.syscw = value,
-            "read_bytes" => stats.read_bytes = value,
-            "write_bytes" => stats.write_bytes = value,
-            "cancelled_write_bytes" => stats.cancelled_write_bytes = value,
-            _ => {}
+    for (index, key) in [(1, "wchar"), (5, "write_bytes")] {
+        if !seen[index] {
+            return Err(format!("missing {key} counter"));
         }
     }
 
-    Some(stats)
+    Ok(stats)
 }
 
 /// Parse /proc/\[pid\]/schedstat file.
@@ -1024,6 +1109,27 @@ mod tests {
     }
 
     #[test]
+    fn required_stat_rejects_unknown_parent_and_birth() {
+        let valid = "42 (owned fixture) S 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 123 0 0";
+        let stat = parse_required_proc_stat_content(42, valid).unwrap();
+        assert_eq!(stat.ppid, 1);
+        assert_eq!(stat.starttime, 123);
+        for content in [
+            "42 (fixture) S invalid",
+            "42 (fixture) S 1",
+            "42 (fixture) S 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 invalid 0 0",
+            "43 (fixture) S 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 123 0 0",
+        ] {
+            assert!(matches!(
+                parse_required_proc_stat_content(42, content),
+                Err(StatReadError::Parse { pid: 42, .. })
+            ));
+        }
+        let root = valid.replacen("S 1 ", "S 0 ", 1);
+        assert_eq!(parse_required_proc_stat_content(42, &root).unwrap().ppid, 0);
+    }
+
+    #[test]
     fn test_parse_io_content() {
         let content = r#"rchar: 12345678
 wchar: 87654321
@@ -1042,6 +1148,42 @@ cancelled_write_bytes: 0
         assert_eq!(stats.read_bytes, 4096000);
         assert_eq!(stats.write_bytes, 2048000);
         assert_eq!(stats.cancelled_write_bytes, 0);
+    }
+
+    #[test]
+    fn io_counters_accept_zero_writes_and_future_fields() {
+        let stats = parse_io_counters("wchar: 0\nwrite_bytes: 0\nfuture_counter: unknown\n")
+            .expect("complete zero write counters");
+        assert_eq!(stats.wchar, 0);
+        assert_eq!(stats.write_bytes, 0);
+        assert!(parse_io_content("wchar: 0\nwrite_bytes: 0\n").is_some());
+    }
+
+    #[test]
+    fn io_counters_refuse_missing_invalid_and_duplicate_evidence() {
+        let cases = [
+            ("", "missing wchar"),
+            ("wchar: 0\n", "missing write_bytes"),
+            ("write_bytes: 0\n", "missing wchar"),
+            ("wchar: invalid\nwrite_bytes: 0\n", "invalid wchar"),
+            ("wchar: 0\nwrite_bytes: -1\n", "invalid write_bytes"),
+            (
+                "wchar: 0\nwrite_bytes: 18446744073709551616\n",
+                "invalid write_bytes",
+            ),
+            ("wchar: 0\nwchar: 0\nwrite_bytes: 0\n", "duplicate wchar"),
+            (
+                "wchar: 0\nwrite_bytes: 0\nwrite_bytes: 1\n",
+                "duplicate write_bytes",
+            ),
+            ("wchar 0\nwrite_bytes: 0\n", "missing ':'"),
+            ("wchar: 0\nwrite_bytes: 0\nsyscw: bad\n", "invalid syscw"),
+        ];
+        for (content, reason) in cases {
+            let error = parse_io_counters(content).expect_err("incomplete evidence must fail");
+            assert!(error.contains(reason), "expected {reason}, got {error}");
+            assert!(parse_io_content(content).is_none(), "{reason}");
+        }
     }
 
     #[test]

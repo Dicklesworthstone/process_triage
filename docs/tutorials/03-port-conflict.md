@@ -13,31 +13,32 @@ If you see a PID, you can use it in the steps below.
 ## 2) Generate a plan (safe)
 
 ```bash
-pt agent plan --format json --min-age 3600
+pt agent plan --format json --min-age 3600 > /tmp/pt-plan.json
+SESSION=$(jq -r .session_id /tmp/pt-plan.json)
 ```
 
 ## 3) Filter for dev servers
 
 ```bash
-pt agent plan --format json --min-age 3600 \
-  | jq '.candidates[] | select(.cmd_short | test("next dev|vite|webpack|node .*dev"; "i")) \
-  | {pid, cmd_short, runtime_seconds, recommendation, posterior_abandoned}'
+jq '.candidates[]
+    | select(.command_short | test("next|vite|webpack|node"; "i"))
+    | {pid, command_short, age_seconds, score, recommended_action}' \
+  /tmp/pt-plan.json
 ```
 
 ## 4) Explain a candidate
 
 ```bash
-pt agent explain --pid <pid> --format json
+pt agent explain --session "$SESSION" --pids <pid> --format json
 ```
 
 Verify it is yours (same UID) and not protected. If it is supervised by a tool
-(systemd, docker, pm2), prefer the supervisor action.
+(systemd, docker, pm2), the plan's `supervisor` field gives the command to stop it
+through its supervisor instead; killing it would only make it restart.
 
 ## 5) Optional: stop the server (manual decision)
 
 ```bash
 # Example only. Review evidence before applying.
-pt agent apply --pids <pid> --yes --format json
+pt agent apply --session "$SESSION" --pids <pid> --yes --format json
 ```
-
-If you see a supervisor recommendation in the plan, follow that instead of killing directly.

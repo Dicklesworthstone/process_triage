@@ -473,8 +473,10 @@ mod persistence {
         assert_eq!(counts.day, 0);
     }
 
+    /// A damaged kill log is not an empty one: starting fresh would hand out a new
+    /// day's budget. The limiter builds (no panic), refuses kills, and leaves the file.
     #[test]
-    fn corrupted_state_file_recovers_gracefully() {
+    fn corrupted_state_file_refuses_kills() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("corrupted_state.json");
 
@@ -487,15 +489,19 @@ mod persistence {
             max_per_hour: None,
             max_per_day: None,
         };
-        // Should not panic; falls back to default state
         let limiter = SlidingWindowRateLimiter::new(config, Some(&state_path)).unwrap();
-        let counts = limiter.get_counts().unwrap();
-        assert_eq!(counts.run, 0, "Should start fresh on corruption");
-        assert_eq!(counts.minute, 0);
+        assert!(limiter.get_counts().is_err());
+        assert!(limiter.check(false).is_err());
+        assert!(limiter.check_and_record(false, None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            "{ this is not valid json }}}"
+        );
     }
 
+    /// A truncated (empty) log is damaged too.
     #[test]
-    fn empty_state_file_recovers_gracefully() {
+    fn empty_state_file_refuses_kills() {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("empty_state.json");
 
@@ -508,8 +514,30 @@ mod persistence {
             max_per_day: None,
         };
         let limiter = SlidingWindowRateLimiter::new(config, Some(&state_path)).unwrap();
-        let counts = limiter.get_counts().unwrap();
-        assert_eq!(counts.run, 0);
+        assert!(limiter.get_counts().is_err());
+        assert!(limiter.record_kill().is_err());
+        assert_eq!(std::fs::read_to_string(&state_path).unwrap(), "");
+    }
+
+    /// Through the enforcer: a damaged log blocks kills with the rate-limit rule
+    /// instead of granting a fresh budget.
+    #[test]
+    fn enforcer_blocks_kills_when_the_kill_log_is_damaged() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("enforcer_state.json");
+        std::fs::write(&state_path, "garbage").unwrap();
+
+        let policy = policy_with_rate_limits(100, None, None, None);
+        let enforcer = PolicyEnforcer::new(&policy, Some(state_path.as_path())).unwrap();
+        let result = enforcer.check_action(&killable_candidate(), Action::Kill, false);
+        assert!(!result.allowed);
+        let violation = result.violation.unwrap();
+        assert_eq!(violation.rule, "guardrails.rate_limit_error");
+        assert!(
+            violation.message.contains("enforcer_state.json"),
+            "{}",
+            violation.message
+        );
     }
 
     #[test]

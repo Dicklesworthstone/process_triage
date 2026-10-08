@@ -283,39 +283,68 @@ fn test_runner_outside_workspace_flags_contradiction() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario: live workspace resolution on this repo
+// Scenario: live workspace resolution on an owned Git repository
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 #[test]
-fn live_workspace_resolution_on_process_triage_repo() {
-    use pt_core::collect::{find_repo_root, read_head_state};
-    use std::path::PathBuf;
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let (root, _worktree) = find_repo_root(&manifest_dir);
-    let root = root.expect("should find process_triage repo root");
-
-    let head = read_head_state(std::path::Path::new(root.effective_path()));
-    let head = head.expect("should read HEAD state");
-
-    // Build workspace evidence from live data
-    let raw = RawWorkspaceEvidence {
-        pid: std::process::id(),
-        cwd: Some(RawPathEvidence::resolved(
-            manifest_dir.to_string_lossy(),
-            manifest_dir.to_string_lossy(),
-        )),
-        repo_root: Some(root),
-        worktree: None,
-        head_state: Some(head),
-        collection_method: WorkspaceCollectionMethod::ProcfsCwdWalk,
-        observed_at: chrono::Utc::now().to_rfc3339(),
-    };
+fn live_workspace_resolution_on_owned_git_repo() {
+    use pt_core::collect::resolve_workspace_for_pid;
+    use std::process::{Child, Command, Stdio};
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let fixture = tempfile::tempdir()
+        .expect("owned repository fixture")
+        .keep();
+    let repository = fixture.join("process_triage");
+    let manifest_dir = repository.join("crates/pt-core");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .arg(&repository)
+        .output()
+        .expect("initialize owned Git repository");
+    assert!(
+        initialized.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let child = OwnedChild(
+        Command::new("sleep")
+            .arg("900")
+            .current_dir(&manifest_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn owned process in real repository"),
+    );
+    let raw = resolve_workspace_for_pid(child.0.id());
+    assert_eq!(raw.pid, child.0.id());
+    assert_eq!(
+        raw.collection_method,
+        WorkspaceCollectionMethod::ProcfsCwdWalk
+    );
+    assert_eq!(
+        raw.head_state,
+        Some(HeadState::Branch {
+            name: "main".to_string()
+        })
+    );
+    std::fs::write(
+        fixture.join("workspace.json"),
+        serde_json::to_vec_pretty(&raw).unwrap(),
+    )
+    .unwrap();
 
     let ws = normalize_workspace(&raw);
 
-    // Should resolve cleanly for the repo we're building in
+    // This real repository is available even when offload omits the caller's .git.
     match &ws {
         WorkspaceNormalizationResult::Resolved { workspace } => {
             assert!(
@@ -323,16 +352,12 @@ fn live_workspace_resolution_on_process_triage_repo() {
                 "root should be process_triage: {}",
                 workspace.canonical_root
             );
+            assert_eq!(
+                workspace.canonical_root,
+                repository.canonicalize().unwrap().to_string_lossy()
+            );
             assert_eq!(workspace.confidence, ProvenanceConfidence::High);
         }
-        other => {
-            // Degraded is also acceptable if symlinks are involved
-            match other {
-                WorkspaceNormalizationResult::Degraded { partial, .. } => {
-                    assert!(partial.canonical_root.contains("process_triage"));
-                }
-                _ => panic!("unexpected: {other:?}"),
-            }
-        }
+        other => panic!("owned repository must resolve with complete evidence: {other:?}"),
     }
 }

@@ -423,6 +423,7 @@ impl ProtectedFilter {
             notes,
         };
 
+        let mut session_workload = false;
         if self.builtin {
             if let Some((name, notes)) = builtin_protection_match(&record.comm, &record.cmd) {
                 return Some(make(
@@ -431,30 +432,23 @@ impl ProtectedFilter {
                     Some(notes.to_string()),
                 ));
             }
-            if role.is_supervised_service() {
-                return Some(make(
-                    MatchedField::SupervisedService,
-                    format!("cgroup:{role:?}"),
-                    Some(
-                        "supervised by systemd or a container runtime; stop the unit instead"
-                            .to_string(),
-                    ),
-                ));
-            }
-        }
-        let mut session_workload = self.builtin && role.is_user_workload();
-        // macOS has no cgroups (the role is always Unknown there): classify by owner
-        // and executable instead.
-        if self.builtin && cfg!(target_os = "macos") && role == super::cgroup::CgroupRole::Unknown {
-            match macos_placement(&record.user, &record.comm, &record.cmd) {
-                MacPlacement::System(notes) => {
+            match builtin_placement(role, &record.user, &record.comm, &record.cmd) {
+                BuiltinPlacement::SupervisedService => {
+                    return Some(make(
+                        MatchedField::SupervisedService,
+                        format!("cgroup:{role:?}"),
+                        Some(SUPERVISED_SERVICE_NOTES.to_string()),
+                    ));
+                }
+                BuiltinPlacement::MacSystem(notes) => {
                     return Some(make(
                         MatchedField::Builtin,
-                        "builtin.macos_system".to_string(),
+                        MACOS_SYSTEM_RULE.to_string(),
                         Some(notes.to_string()),
                     ));
                 }
-                MacPlacement::UserWorkload => session_workload = true,
+                BuiltinPlacement::UserWorkload => session_workload = true,
+                BuiltinPlacement::Unplaced => {}
             }
         }
 
@@ -698,9 +692,17 @@ static BUILTIN_PROTECTED: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::Laz
             "terminal multiplexer: hosts every interactive/agent session on the machine",
         ),
         builtin_rule(
+            "builtin.agent_coordination",
+            Cmd,
+            r"^(\S*/)?am(\s+serve(-http)?(\s|$)|\s*$)|^(\S*/)?(mcp-agent-mail|rchd)(\s|$)|^(\S*/)?ntm\s+internal-monitor(\s|$)",
+            "shared agent-mail/compilation service or live agent-session monitor",
+        ),
+        builtin_rule(
             "builtin.ssh_control_master",
             Cmd,
-            r"^(\S*/)?ssh\s(.*\s)?(-[1246AaCfGgKkMNnqsTtVvXxYy]*M[1246AaCfGgKkMNnqsTtVvXxYy]*|-oControlMaster=\S+|ControlMaster=(yes|auto|autoask|ask))(\s|$)",
+            // Started with -M / ControlMaster=..., or (ControlMaster set in ssh_config)
+            // seen by the title OpenSSH gives the master: `ssh: <ControlPath> [mux]`.
+            r"^(\S*/)?ssh\s(.*\s)?(-[1246AaCfGgKkMNnqsTtVvXxYy]*M[1246AaCfGgKkMNnqsTtVvXxYy]*|-oControlMaster=\S+|ControlMaster=(yes|auto|autoask|ask))(\s|$)|^ssh: \S.* \[mux\]\s*$",
             "SSH ControlMaster: shared connection used by rch and other remote tools",
         ),
         builtin_rule(
@@ -716,6 +718,17 @@ static BUILTIN_PROTECTED: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::Laz
             CommOrCmd,
             r"^(\S*/)?(sshd(-session)?|login|agetty|getty|mingetty|\(sd-pam\)|systemd|dbus-daemon|dbus-broker(-launch)?|pipewire(-pulse)?|wireplumber|pulseaudio|gpg-agent|ssh-agent|gnome-keyring-daemon|at-spi2-registryd|at-spi-bus-launcher|xdg-desktop-portal\S*|xdg-document-portal|xdg-permission-store|launchd|loginwindow|WindowServer)(:|\s|$)",
             "login/desktop session infrastructure",
+        ),
+        builtin_rule(
+            "builtin.display_manager_session",
+            CommOrCmd,
+            // The process a display manager or session manager keeps alive for the
+            // whole graphical login: when it exits, the desktop session ends. They
+            // run in the login session's scope (often as root), so neither the
+            // service-cgroup nor the root rule covers them (GH #14: sddm-helper
+            // was offered for PAUSE). `uwsm start` is the uwsm session launcher.
+            r"^(\S*/)?(sddm-helper|sddm-helper-start-wayland|sddm-helper-start-x11user|gdm-session-worker|gdm-wayland-session|gdm-x-session|lightdm|greetd|gnome-session-binary|gnome-session-service|gnome-session-ctl|ksmserver|startplasma-wayland|startplasma-x11|plasma_session|xfce4-session|lxqt-session|lxsession|mate-session|cinnamon-session)(:|\s|$)|(^|/)uwsm(\.py)?\s+start(\s|$)",
+            "display-manager / session-manager process that holds the graphical login: killing it ends the desktop session",
         ),
         builtin_rule(
             "builtin.session_host",
@@ -897,15 +910,78 @@ pub fn macos_placement(user: &str, comm: &str, cmd: &str) -> MacPlacement {
     MacPlacement::UserWorkload
 }
 
+/// Rule name for macOS system-domain, Apple and app-bundle processes.
+pub const MACOS_SYSTEM_RULE: &str = "builtin.macos_system";
+
+/// Why a supervised service is protected.
+pub const SUPERVISED_SERVICE_NOTES: &str =
+    "supervised by systemd or a container runtime; stop the unit instead";
+
+/// Where built-in protection places a process. The scan-time filter and the
+/// plan-time policy enforcer both decide through [`builtin_placement`], so a process
+/// the scan evaluates is not blocked later for its placement (the enforcer used to
+/// know only cgroup roles, which macOS never has, and blocked every macOS orphan
+/// through `never_kill_ppid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinPlacement {
+    /// Supervised by systemd or a container runtime: protected (stop the unit instead).
+    SupervisedService,
+    /// macOS system domain, Apple platform binary or app bundle: protected.
+    MacSystem(&'static str),
+    /// Started by a person or agent (login session, transient scope, or a macOS
+    /// user's own process): exempt from `never_kill_ppid`, and from `protected_users`
+    /// for root, because an orphan reparented to PID 1 is a candidate.
+    UserWorkload,
+    /// No placement known (Linux without systemd cgroups: cgroup v1, a container's
+    /// root namespace; a macOS process whose owner is unknown). The configured
+    /// guardrails apply unchanged: children of PID 1 stay protected by
+    /// `never_kill_ppid` and root by `protected_users`.
+    Unplaced,
+}
+
+/// Place a process from its cgroup role and, on macOS (no cgroups), its owner and
+/// executable. See [`BuiltinPlacement`].
+pub fn builtin_placement(
+    role: super::cgroup::CgroupRole,
+    user: &str,
+    comm: &str,
+    cmd: &str,
+) -> BuiltinPlacement {
+    placement_on(cfg!(target_os = "macos"), role, user, comm, cmd)
+}
+
+fn placement_on(
+    macos: bool,
+    role: super::cgroup::CgroupRole,
+    user: &str,
+    comm: &str,
+    cmd: &str,
+) -> BuiltinPlacement {
+    if role.is_supervised_service() {
+        return BuiltinPlacement::SupervisedService;
+    }
+    if role.is_user_workload() {
+        return BuiltinPlacement::UserWorkload;
+    }
+    if macos && role == super::cgroup::CgroupRole::Unknown && !user.is_empty() {
+        return match macos_placement(user, comm, cmd) {
+            MacPlacement::System(notes) => BuiltinPlacement::MacSystem(notes),
+            MacPlacement::UserWorkload => BuiltinPlacement::UserWorkload,
+        };
+    }
+    BuiltinPlacement::Unplaced
+}
+
 /// Name of the built-in rule for database / web / message servers.
 pub const SERVICE_DAEMON_RULE: &str = "builtin.service_daemon";
 
 /// Maximum ancestor depth walked for parent-identity protection.
 const MAX_ANCESTOR_DEPTH: usize = 64;
 
-/// Whether a process is itself a database / web / message server.
+/// Whether a process is a service or shared agent-coordination daemon.
 pub fn is_service_daemon(comm: &str, cmd: &str) -> bool {
-    builtin_protection_match(comm, cmd).is_some_and(|(rule, _)| rule == SERVICE_DAEMON_RULE)
+    builtin_protection_match(comm, cmd)
+        .is_some_and(|(rule, _)| matches!(rule, SERVICE_DAEMON_RULE | "builtin.agent_coordination"))
 }
 
 /// Nearest ancestor of `pid` that is a service daemon (`(pid, comm)`), walking the
@@ -1053,6 +1129,63 @@ mod tests {
         ProtectedFilter::from_guardrails(&crate::config::policy::Guardrails::default()).unwrap()
     }
 
+    /// One placement rule for the scan filter and the enforcer, with the platform
+    /// explicit so the macOS branch is tested on Linux too.
+    #[test]
+    fn builtin_placement_by_platform_and_role() {
+        use BuiltinPlacement::*;
+        use CgroupRole::*;
+        let server = ("alice", "python3", "python3 -m http.server 8000");
+        let place = |macos, role, (user, comm, cmd): (&str, &str, &str)| {
+            placement_on(macos, role, user, comm, cmd)
+        };
+        for macos in [false, true] {
+            for role in [SystemService, UserService, Container] {
+                assert_eq!(place(macos, role, server), SupervisedService, "{role:?}");
+            }
+            for role in [LoginSession, TransientScope] {
+                assert_eq!(place(macos, role, server), UserWorkload, "{role:?}");
+            }
+        }
+        // Linux without systemd placement: guardrails apply unchanged.
+        assert_eq!(place(false, Unknown, server), Unplaced);
+        assert_eq!(
+            place(false, Unknown, ("root", "make", "make -j8")),
+            Unplaced
+        );
+        // macOS: owner and executable decide.
+        assert_eq!(place(true, Unknown, server), UserWorkload);
+        assert!(matches!(
+            place(true, Unknown, ("root", "make", "make -j8")),
+            MacSystem(_)
+        ));
+        assert!(matches!(
+            place(
+                true,
+                Unknown,
+                ("alice", "Zed", "/Applications/Zed.app/Contents/MacOS/zed")
+            ),
+            MacSystem(_)
+        ));
+        assert!(matches!(
+            place(
+                true,
+                Unknown,
+                (
+                    "alice",
+                    "/usr/libexec/trustd",
+                    "/usr/libexec/trustd --agent"
+                )
+            ),
+            MacSystem(_)
+        ));
+        // Owner unknown: nothing vouches for it as a user workload.
+        assert_eq!(
+            place(true, Unknown, ("", "python3", "python3 x.py")),
+            Unplaced
+        );
+    }
+
     #[test]
     fn macos_placement_protects_system_and_apps_but_not_user_workloads() {
         use MacPlacement::*;
@@ -1163,6 +1296,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn builtin_protects_coordination_servers_and_monitor_children() {
+        for cmd in [
+            "/home/ubuntu/mcp_agent_mail/am",
+            "am serve",
+            "/opt/am serve-http --port 8765",
+            "mcp-agent-mail serve",
+            "/home/ubuntu/.local/bin/rchd",
+            "rchd --foreground",
+            "ntm internal-monitor frankensim",
+        ] {
+            assert_eq!(
+                builtin_protection_match("daemon", cmd).map(|(rule, _)| rule),
+                Some("builtin.agent_coordination"),
+                "{cmd}"
+            );
+            assert_eq!(
+                service_ancestor_with(
+                    300,
+                    |pid| (pid == 300).then_some(200),
+                    |pid| (pid == 200).then(|| ("daemon".to_string(), cmd.to_string()))
+                ),
+                Some((200, "daemon".to_string())),
+                "child of {cmd}"
+            );
+        }
+        for cmd in [
+            "am send alice",
+            "am inbox",
+            "amp serve",
+            "am serve-other",
+            "ntm attach frankensim",
+            "ntm spawn frankensim",
+            "ntm internal-monitor-fake",
+            "bash -c 'am serve-http'",
+            "pytest test_mcp_agent_mail.py",
+            "rg rchd",
+            "rchdoc serve",
+        ] {
+            assert!(!is_service_daemon("am", cmd), "{cmd}");
+        }
+        // A mux hosts workloads; its children must not inherit daemon protection.
+        assert!(!is_service_daemon("tmux: server", "tmux new -d"));
+    }
+
     /// Workers and plugins inherit protection from their server by parent identity,
     /// whatever they call themselves; unrelated processes do not.
     #[test]
@@ -1232,6 +1410,8 @@ mod tests {
             ("tmux: client", "tmux attach -t main"),
             ("ssh", "ssh -E /home/ubuntu/.ssh/rch/.ssh-connectionUXind1/log -S /home/ubuntu/.ssh/rch/.ssh-connectionUXind1/master -M -f -N vmi1149989"),
             ("ssh", "ssh -o ControlMaster=auto -o ControlPath=/tmp/cm-%r@%h ts2"),
+            // ControlMaster from ssh_config: argv carries no flag, only OpenSSH's title.
+            ("ssh", "ssh: /home/ubuntu/.ssh/sockets/ubuntu@ts2-22 [mux]"),
             ("sshd-session", "sshd-session: ubuntu@notty"),
             ("(sd-pam)", "(sd-pam)"),
             ("systemd", "/usr/lib/systemd/systemd --user"),
@@ -1276,6 +1456,57 @@ mod tests {
         }
     }
 
+    /// Display-manager session helpers live in the login session's scope (sddm-helper
+    /// runs as root in session-1.scope) and end the desktop when killed (GH #14).
+    #[test]
+    fn builtin_protects_display_manager_session_helpers() {
+        let filter = default_filter();
+        for (comm, cmd, user) in [
+            (
+                "sddm-helper",
+                "/usr/lib/sddm/sddm-helper --socket /tmp/sddm-auth-1 --id 1 --start uwsm start -- hyprland.desktop --user alice --autologin",
+                "root",
+            ),
+            (
+                "gdm-session-wor",
+                "gdm-session-worker [pam/gdm-password]",
+                "root",
+            ),
+            (
+                "gdm-wayland-ses",
+                "/usr/libexec/gdm-wayland-session env GNOME_SHELL_SESSION_MODE=ubuntu /usr/bin/gnome-session --session=ubuntu",
+                "alice",
+            ),
+            ("lightdm", "lightdm --session-child 13 20", "root"),
+            (
+                "gnome-session-b",
+                "/usr/libexec/gnome-session-binary --session=ubuntu",
+                "alice",
+            ),
+            ("python3", "/usr/bin/python3 /usr/bin/uwsm start -- hyprland.desktop", "alice"),
+            ("ksmserver", "/usr/bin/ksmserver", "alice"),
+        ] {
+            let rec = make_test_record(4242, 3000, comm, cmd, user);
+            let m = filter
+                .is_protected_with_role(&rec, CgroupRole::LoginSession)
+                .unwrap_or_else(|| panic!("{cmd:?} must be protected"));
+            assert_eq!(m.pattern, "builtin.display_manager_session", "{cmd:?}");
+        }
+        // Mentioning a session tool is not being one.
+        for (comm, cmd) in [
+            ("uwsm", "uwsm app -- slack"),
+            ("rg", "rg sddm-helper /var/log"),
+        ] {
+            let rec = make_test_record(4243, 3000, comm, cmd, "alice");
+            assert!(
+                filter
+                    .is_protected_with_role(&rec, CgroupRole::TransientScope)
+                    .is_none(),
+                "{cmd:?} must stay a candidate"
+            );
+        }
+    }
+
     #[test]
     fn builtin_does_not_protect_real_candidates() {
         let cases = [
@@ -1287,6 +1518,7 @@ mod tests {
             ("ssh", "ssh ts2 uptime"),
             ("ssh", "ssh ts2 tmux ls"),
             ("ssh", "ssh ts2 nc -z db 5432"),
+            ("ssh", "ssh ts2 echo [mux]"),
             ("node", "node /data/projects/app/node_modules/.bin/next dev"),
             ("bun", "bun test"),
             ("Xvfb", "Xvfb :99 -screen 0 1280x1024x24"),

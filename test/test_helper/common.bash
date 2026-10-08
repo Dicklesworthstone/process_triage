@@ -162,7 +162,7 @@ test_end() {
 # TEST ENVIRONMENT SETUP
 #==============================================================================
 
-setup_test_env() {
+setup_test_dirs() {
     # Create isolated directories
     # Use a unique per-test directory to avoid needing cleanup (no deletions).
     local test_suffix="${BATS_TEST_NAME:-unknown}"
@@ -192,38 +192,33 @@ setup_test_env() {
     # pt-core resolves these via PROCESS_TRIAGE_DATA and XDG_DATA_HOME.
     export PROCESS_TRIAGE_DATA="$DATA_DIR"
 
-    # Make the bash `pt` wrapper usable in tests by pointing it at a real pt-core binary.
-    # Prefer debug for fast build times; release builds in this repo use fat LTO and are
-    # too slow for per-test setup.
+    test_debug "TEST_DIR=$TEST_DIR"
+    test_debug "CONFIG_DIR=$CONFIG_DIR"
+    test_debug "DATA_DIR=$DATA_DIR"
+}
+
+setup_test_env() {
+    setup_test_dirs
+
+    # Supply a prebuilt core explicitly or use a normal debug/release artifact.
+    # Compile through RCH before BATS, never implicitly in per-test setup.
     if [[ -z "${PROJECT_ROOT:-}" ]]; then
-        PROJECT_ROOT="$(cd "$(dirname "${BATS_TEST_FILENAME:-.}")/.." && pwd)"
+        PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
         export PROJECT_ROOT
     fi
-    local pt_core_debug="${PROJECT_ROOT}/target/debug/pt-core"
-    if [[ -x "$pt_core_debug" ]]; then
-        export PT_CORE_PATH="$pt_core_debug"
-    else
-        test_info "Building pt-core (debug) for tests..."
-        (cd "$PROJECT_ROOT" && cargo build -p pt-core >/dev/null 2>&1) || {
-            test_error "ERROR: Failed to build pt-core for tests"
-            return 1
-        }
-        if [[ -x "$pt_core_debug" ]]; then
-            export PT_CORE_PATH="$pt_core_debug"
+    local pt_core_binary="${PT_CORE_PATH:-${PT_CORE:-}}"
+    if [[ -z "$pt_core_binary" ]]; then
+        pt_core_binary="${PROJECT_ROOT}/target/debug/pt-core"
+        if [[ ! -f "$pt_core_binary" || ! -x "$pt_core_binary" ]]; then
+            pt_core_binary="${PROJECT_ROOT}/target/release/pt-core"
         fi
     fi
-
-    # Many BATS tests historically pin to target/release/pt-core. Building a full
-    # release binary is expensive in this repo (fat LTO); to keep the suite fast,
-    # create a lightweight shim if the release binary doesn't exist yet.
-    local pt_core_release="${PROJECT_ROOT}/target/release/pt-core"
-    if [[ -x "$pt_core_debug" && ! -x "$pt_core_release" ]]; then
-        mkdir -p "${PROJECT_ROOT}/target/release"
-        cat > "$pt_core_release" <<EOF
-#!/usr/bin/env bash
-exec "${pt_core_debug}" "\$@"
-EOF
-        chmod +x "$pt_core_release"
+    if [[ -f "$pt_core_binary" && -x "$pt_core_binary" ]]; then
+        export PT_CORE_PATH="$pt_core_binary"
+    else
+        test_error "Required pt-core binary is not an executable file: $pt_core_binary"
+        test_error "Build through RCH before BATS, then set PT_CORE_PATH to the retained binary."
+        return 1
     fi
 
     test_debug "TEST_DIR=$TEST_DIR"
@@ -276,15 +271,13 @@ create_mock_command() {
     test_debug "Creating mock command: $name (exit=$exit_code)"
     test_debug "Mock output: ${output:0:100}..."
 
-    cat > "${MOCK_BIN}/${name}" << 'MOCK_CMD'
-#!/usr/bin/env bash
-cat << 'MOCK_OUTPUT'
-__MOCK_OUTPUT__
-MOCK_OUTPUT
-exit __MOCK_EXIT__
-MOCK_CMD
-    sed -i "s|__MOCK_OUTPUT__|${output//|/\\|}|g" "${MOCK_BIN}/${name}"
-    sed -i "s|__MOCK_EXIT__|${exit_code}|g" "${MOCK_BIN}/${name}"
+    # Quote fixture data as a Bash literal; no platform-specific sed or
+    # replacement interpretation of newlines, ampersands or shell syntax.
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf 'printf '\''%%s\\n'\'' %q\n' "$output"
+        printf 'exit %q\n' "$exit_code"
+    } > "${MOCK_BIN}/${name}"
     chmod +x "${MOCK_BIN}/${name}"
 
     test_info "Mock '$name' created at ${MOCK_BIN}/${name}"
@@ -310,18 +303,12 @@ create_mock_curl_redirect() {
     local final_url="$1"
     test_info "Creating mock curl redirect to: $final_url"
 
-    cat > "${MOCK_BIN}/curl" << 'MOCK_CURL'
-#!/usr/bin/env bash
-# Mock curl that handles -w '%{url_effective}'
-if [[ "$*" == *"url_effective"* ]]; then
-    echo "__REDIRECT_URL__"
-else
-    # Default behavior
-    cat /dev/null
-fi
-exit 0
-MOCK_CURL
-    sed -i "s|__REDIRECT_URL__|${final_url//|/\\|}|g" "${MOCK_BIN}/curl"
+    {
+        printf '%s\n' '#!/usr/bin/env bash' \
+            'if [[ "$*" == *"url_effective"* ]]; then'
+        printf '    printf '\''%%s\\n'\'' %q\n' "$final_url"
+        printf '%s\n' 'else' '    cat /dev/null' 'fi' 'exit 0'
+    } > "${MOCK_BIN}/curl"
     chmod +x "${MOCK_BIN}/curl"
 }
 
@@ -489,20 +476,27 @@ assert_not_equals() {
     return 0
 }
 
-# Assert command succeeds
+# Assert command succeeds. Usage: assert_success "context" command args...
 assert_success() {
-    local cmd="$1"
-    local context="${2:-}"
+    if [[ $# -lt 2 ]]; then
+        printf 'assert_success requires a context and command\n' >&2
+        return 2
+    fi
+    local context="$1"
+    shift
 
-    test_debug "assert_success: running '$cmd'"
+    test_debug "assert_success: running '$*'"
 
     local output exit_code
-    output="$(eval "$cmd" 2>&1)"
-    exit_code=$?
+    if output="$("$@" 2>&1)"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
 
     if [[ $exit_code -ne 0 ]]; then
         test_error "Command failed (expected success)"
-        test_error "  Command:   $cmd"
+        test_error "  Command:   $*"
         test_error "  Exit code: $exit_code"
         test_error "  Output:    $output"
         [[ -n "$context" ]] && test_error "  Context:   $context"
@@ -510,25 +504,39 @@ assert_success() {
     fi
 
     test_debug "Command succeeded (exit=0) ✓"
-    echo "$output"
+    printf '%s\n' "$output"
     return 0
 }
 
-# Assert command fails
+# Assert command fails. Usage: assert_fails expected_exit "context" command args...
 assert_fails() {
-    local cmd="$1"
-    local expected_exit="${2:-}"
-    local context="${3:-}"
+    if [[ $# -lt 3 ]]; then
+        printf 'assert_fails requires an expected exit, context and command\n' >&2
+        return 2
+    fi
+    local expected_exit="$1"
+    local context="$2"
+    shift 2
+    if [[ -n "$expected_exit" ]]; then
+        if [[ ! "$expected_exit" =~ ^[0-9]{1,3}$ ]] || ((10#$expected_exit > 255)); then
+            printf 'assert_fails expected exit must be empty or 0..255\n' >&2
+            return 2
+        fi
+        expected_exit=$((10#$expected_exit))
+    fi
 
-    test_debug "assert_fails: running '$cmd'"
+    test_debug "assert_fails: running '$*'"
 
     local output exit_code
-    output="$(eval "$cmd" 2>&1)"
-    exit_code=$?
+    if output="$("$@" 2>&1)"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
 
     if [[ $exit_code -eq 0 ]]; then
         test_error "Command succeeded (expected failure)"
-        test_error "  Command: $cmd"
+        test_error "  Command: $*"
         test_error "  Output:  $output"
         [[ -n "$context" ]] && test_error "  Context: $context"
         return 1
@@ -542,7 +550,7 @@ assert_fails() {
     fi
 
     test_debug "Command failed as expected (exit=$exit_code) ✓"
-    echo "$output"
+    printf '%s\n' "$output"
     return 0
 }
 
@@ -645,16 +653,23 @@ compare_with_snapshot() {
 
 # Time a command and report duration
 # Usage: time_command "description" command...
+# Requires Python 3.7+ for a monotonic millisecond clock on GNU and BSD hosts.
 time_command() {
+    if [[ $# -lt 2 ]]; then
+        printf 'time_command requires a description and command\n' >&2
+        return 2
+    fi
     local description="$1"
     shift
-    local cmd="$*"
 
-    local start end duration
-    start=$(date +%s%3N)
-    eval "$cmd"
-    local exit_code=$?
-    end=$(date +%s%3N)
+    local start end duration exit_code
+    start=$(python3 -c 'import time; print(time.monotonic_ns() // 1000000)') || return
+    if "$@"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+    end=$(python3 -c 'import time; print(time.monotonic_ns() // 1000000)') || return
     duration=$((end - start))
 
     test_info "$description completed in ${duration}ms (exit=$exit_code)"

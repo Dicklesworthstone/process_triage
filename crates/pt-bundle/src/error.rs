@@ -17,6 +17,14 @@ pub enum BundleError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Redaction could not be initialized.
+    #[error("redaction error: {0}")]
+    Redaction(#[from] pt_redact::RedactionError),
+
+    /// Sharing an opaque payload requires a format-specific sanitizer.
+    #[error("cannot safely export '{path}' with profile {profile}: no payload sanitizer")]
+    UnsanitizedPayload { path: String, profile: String },
+
     /// Checksum verification failed
     #[error("checksum mismatch for '{path}': expected {expected}, got {actual}")]
     ChecksumMismatch {
