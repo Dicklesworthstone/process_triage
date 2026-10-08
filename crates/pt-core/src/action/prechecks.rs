@@ -389,12 +389,14 @@ fn proc_locks_mentions_pid(content: &str, pid: u32) -> bool {
 /// Electron process (they hold unlinked `/dev/shm` or `/tmp` segments and memfds
 /// open read-write). An `O_TMPFILE` file (`#<inode>`) is still being built and
 /// may be linked into place, so it stays protected, as do named `/dev/shm` files.
-fn is_persistent_file_target(target: &str) -> bool {
+/// `still_linked` is the file's own link count being nonzero: a " (deleted)" link
+/// only says the name it was opened by is gone, not that the file is.
+fn is_persistent_file_target(target: &str, still_linked: bool) -> bool {
     if !target.starts_with('/') || target.starts_with("/memfd:") {
         return false;
     }
     let path = match target.strip_suffix(" (deleted)") {
-        Some(path) if !is_unnamed_tmpfile(path) => return false,
+        Some(path) if !still_linked && !is_unnamed_tmpfile(path) => return false,
         Some(path) => path,
         None => target,
     };
@@ -434,7 +436,18 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => return None,
             };
-            if !is_persistent_file_target(&target.to_string_lossy()) {
+            let target = target.to_string_lossy();
+            let still_linked = if target.ends_with(" (deleted)") {
+                use std::os::unix::fs::MetadataExt;
+                match std::fs::metadata(entry.path()) {
+                    Ok(metadata) => metadata.nlink() > 0,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return None,
+                }
+            } else {
+                false
+            };
+            if !is_persistent_file_target(&target, still_linked) {
                 continue;
             }
             let metadata = match std::fs::metadata(entry.path()) {
@@ -469,7 +482,7 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
             crate::collect::macos::collect_lsof_info(pid, Duration::from_secs(5)).ok()?;
         let write_count = files
             .iter()
-            .filter(|f| f.file_type == "REG" && is_persistent_file_target(&f.name))
+            .filter(|f| f.file_type == "REG" && is_persistent_file_target(&f.name, false))
             .filter(|f| {
                 f.mode
                     .as_ref()
@@ -1625,8 +1638,11 @@ mod tests {
             "/dev/shm/pending.data",
             "/tmp/#5242881 (deleted)",
         ] {
-            assert!(is_persistent_file_target(t), "{t}");
+            assert!(is_persistent_file_target(t, false), "{t}");
         }
+        // The opened name is gone but another hard link keeps the file (or the real
+        // name ends in " (deleted)"): its writes still land on disk.
+        assert!(is_persistent_file_target("/data/app/a.log (deleted)", true));
         // Chromium/Electron hold these read-write; none of it outlives the process.
         for t in [
             "/tmp/old.log (deleted)",
@@ -1642,7 +1658,7 @@ mod tests {
             "anon_inode:[eventfd]",
             "/proc/1/status",
         ] {
-            assert!(!is_persistent_file_target(t), "{t}");
+            assert!(!is_persistent_file_target(t, false), "{t}");
         }
     }
 
