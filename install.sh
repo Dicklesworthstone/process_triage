@@ -149,7 +149,7 @@ draw_box() {
     local max_width=0
     local line stripped len pad
 
-    for line in "${lines[@]}"; do
+    for line in ${lines[@]+"${lines[@]}"}; do
         stripped=$(printf '%b' "$line" | strip_ansi)
         len=${#stripped}
         [[ "$len" -gt "$max_width" ]] && max_width="$len"
@@ -163,7 +163,7 @@ draw_box() {
     done
 
     printf "\033[%sm╔%s╗\033[0m\n" "$color" "$border"
-    for line in "${lines[@]}"; do
+    for line in ${lines[@]+"${lines[@]}"}; do
         stripped=$(printf '%b' "$line" | strip_ansi)
         len=${#stripped}
         pad=$((max_width - len))
@@ -342,7 +342,7 @@ setup_proxy() {
 fetch_stdout() {
     local url="$1"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 120 "$url"
+        curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 10 --max-time 120 "$url"
     elif command -v wget >/dev/null 2>&1; then
         wget -q -O - "$url"
     else
@@ -355,7 +355,7 @@ download() {
     local url="$1"
     local output="$2"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 120 "$url" -o "$output"
+        curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 10 --max-time 120 "$url" -o "$output"
     elif command -v wget >/dev/null 2>&1; then
         wget -q -O "$output" "$url"
     else
@@ -569,7 +569,7 @@ resolve_version() {
     latest="${latest#v}"
     if [[ -z "$latest" ]]; then
         latest="$(
-            curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -o /dev/null -w '%{url_effective}' \
+            curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 10 --max-time 20 -o /dev/null -w '%{url_effective}' \
                 "${RELEASES_URL}/latest" 2>/dev/null \
                 | sed -nE 's|.*/tag/v?([0-9]+\.[0-9]+\.[0-9]+)$|\1|p' \
                 || true
@@ -668,7 +668,7 @@ check_network() {
     fi
     local url
     url="${RELEASES_URL}/download/v${VERSION}/pt"
-    if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 3 --max-time 5 -o /dev/null "$url"; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 3 --max-time 5 -o /dev/null "$url"; then
         warn "Network preflight failed for $url"
     fi
 }
@@ -783,7 +783,7 @@ resolve_expected_key_fingerprints() {
         err "No release key fingerprints in ${origin}"
         return 1
     fi
-    for entry in "${entries[@]}"; do
+    for entry in ${entries[@]+"${entries[@]}"}; do
         normalized="$(normalize_fingerprint "$entry")" || {
             err "Invalid release key fingerprint in ${origin}: ${entry}"
             return 1
@@ -1218,9 +1218,10 @@ prepare_offline_verification() {
 
 download_wrapper() {
     local output="$1"
-    local urls=()
-    mapfile -t urls < <(wrapper_urls)
-    download_first_available "$output" "${urls[@]}" || {
+    local urls=() url
+    # Not mapfile: it is bash 4+, and stock macOS runs this under /bin/bash 3.2.
+    while IFS= read -r url; do urls+=("$url"); done < <(wrapper_urls)
+    download_first_available "$output" ${urls[@]+"${urls[@]}"} || {
         err "Failed to download pt wrapper"
         exit 1
     }
@@ -1228,9 +1229,10 @@ download_wrapper() {
 
 download_core_archive() {
     local output="$1"
-    local urls=()
-    mapfile -t urls < <(core_urls)
-    download_first_available "$output" "${urls[@]}" || return 1
+    local urls=() url
+    # Not mapfile: it is bash 4+, and stock macOS runs this under /bin/bash 3.2.
+    while IFS= read -r url; do urls+=("$url"); done < <(core_urls)
+    download_first_available "$output" ${urls[@]+"${urls[@]}"} || return 1
     return 0
 }
 
@@ -1269,8 +1271,8 @@ show_final_summary() {
     [[ "$CLAUDE_SKILL_STATUS" != "skipped" ]] && AGENT_LINES+=("Claude skill: ${CLAUDE_SKILL_STATUS}")
     [[ "$CODEX_SKILL_STATUS" != "skipped" ]] && AGENT_LINES+=("Codex skill: ${CODEX_SKILL_STATUS}")
 
-    lines+=("${AGENT_LINES[@]}")
-    lines+=("${BACKUP_LINES[@]}")
+    lines+=(${AGENT_LINES[@]+"${AGENT_LINES[@]}"})
+    lines+=(${BACKUP_LINES[@]+"${BACKUP_LINES[@]}"})
     lines+=("Run: pt --help")
     lines+=("Managed paths:")
     lines+=("  wrapper: $(status_path "${DEST}/pt")")
@@ -1279,9 +1281,9 @@ show_final_summary() {
 
     echo ""
     if [[ "$HAS_GUM" -eq 1 && "$QUIET" -eq 0 ]]; then
-        gum style --border double --border-foreground 42 --padding "1 2" "${lines[@]}"
+        gum style --border double --border-foreground 42 --padding "1 2" ${lines[@]+"${lines[@]}"}
     else
-        draw_box "0;32" "${lines[@]}"
+        draw_box "0;32" ${lines[@]+"${lines[@]}"}
     fi
 }
 
