@@ -718,17 +718,6 @@ static BUILTIN_PROTECTED: std::sync::LazyLock<Vec<BuiltinRule>> = std::sync::Laz
             "login/desktop session infrastructure",
         ),
         builtin_rule(
-            "builtin.display_manager_session",
-            CommOrCmd,
-            // The process a display manager or session manager keeps alive for the
-            // whole graphical login: when it exits, the desktop session ends. They
-            // run in the login session's scope (often as root), so neither the
-            // service-cgroup nor the root rule covers them (GH #14: sddm-helper
-            // was offered for PAUSE). `uwsm start` is the uwsm session launcher.
-            r"^(\S*/)?(sddm-helper|sddm-helper-start-wayland|sddm-helper-start-x11user|gdm-session-worker|gdm-wayland-session|gdm-x-session|lightdm|greetd|gnome-session-binary|gnome-session-service|gnome-session-ctl|ksmserver|startplasma-wayland|startplasma-x11|plasma_session|xfce4-session|lxqt-session|lxsession|mate-session|cinnamon-session)(:|\s|$)|(^|/)uwsm(\.py)?\s+start(\s|$)",
-            "display-manager / session-manager process that holds the graphical login: killing it ends the desktop session",
-        ),
-        builtin_rule(
             "builtin.session_host",
             CommOrCmd,
             // Things a person is looking at or that host a session: terminal
@@ -821,26 +810,6 @@ pub fn agent_kind(cmd: &str) -> Option<&'static str> {
         "qwen" => "qwen",
         _ => "droid",
     })
-}
-
-/// Seconds since the terminal `tty` (as `ps` reports it: `pts/3`, `ttys003`) last
-/// saw input or output: the device's atime/mtime, which is what `w` shows as IDLE.
-/// `None` when the device cannot be stat'ed.
-#[cfg(unix)]
-pub fn tty_idle_seconds(tty: &str) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    let path = if tty.starts_with('/') {
-        std::path::PathBuf::from(tty)
-    } else {
-        std::path::Path::new("/dev").join(tty)
-    };
-    let md = std::fs::metadata(path).ok()?;
-    let last_io = md.atime().max(md.mtime());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
-    Some(now.saturating_sub(last_io).max(0) as u64)
 }
 
 /// PIDs of this pt process and all of its ancestors (the invoking shell, agent CLI,
@@ -1287,57 +1256,6 @@ mod tests {
         }
     }
 
-    /// Display-manager session helpers live in the login session's scope (sddm-helper
-    /// runs as root in session-1.scope) and end the desktop when killed (GH #14).
-    #[test]
-    fn builtin_protects_display_manager_session_helpers() {
-        let filter = default_filter();
-        for (comm, cmd, user) in [
-            (
-                "sddm-helper",
-                "/usr/lib/sddm/sddm-helper --socket /tmp/sddm-auth-1 --id 1 --start uwsm start -- hyprland.desktop --user alice --autologin",
-                "root",
-            ),
-            (
-                "gdm-session-wor",
-                "gdm-session-worker [pam/gdm-password]",
-                "root",
-            ),
-            (
-                "gdm-wayland-ses",
-                "/usr/libexec/gdm-wayland-session env GNOME_SHELL_SESSION_MODE=ubuntu /usr/bin/gnome-session --session=ubuntu",
-                "alice",
-            ),
-            ("lightdm", "lightdm --session-child 13 20", "root"),
-            (
-                "gnome-session-b",
-                "/usr/libexec/gnome-session-binary --session=ubuntu",
-                "alice",
-            ),
-            ("python3", "/usr/bin/python3 /usr/bin/uwsm start -- hyprland.desktop", "alice"),
-            ("ksmserver", "/usr/bin/ksmserver", "alice"),
-        ] {
-            let rec = make_test_record(4242, 3000, comm, cmd, user);
-            let m = filter
-                .is_protected_with_role(&rec, CgroupRole::LoginSession)
-                .unwrap_or_else(|| panic!("{cmd:?} must be protected"));
-            assert_eq!(m.pattern, "builtin.display_manager_session", "{cmd:?}");
-        }
-        // Mentioning a session tool is not being one.
-        for (comm, cmd) in [
-            ("uwsm", "uwsm app -- slack"),
-            ("rg", "rg sddm-helper /var/log"),
-        ] {
-            let rec = make_test_record(4243, 3000, comm, cmd, "alice");
-            assert!(
-                filter
-                    .is_protected_with_role(&rec, CgroupRole::TransientScope)
-                    .is_none(),
-                "{cmd:?} must stay a candidate"
-            );
-        }
-    }
-
     #[test]
     fn builtin_does_not_protect_real_candidates() {
         let cases = [
@@ -1364,24 +1282,6 @@ mod tests {
                 "{cmd:?} must stay a candidate"
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tty_idle_seconds_reads_last_io_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let dev = dir.path().join("pts-test");
-        let f = std::fs::File::create(&dev).unwrap();
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
-        f.set_times(
-            std::fs::FileTimes::new()
-                .set_accessed(past)
-                .set_modified(past),
-        )
-        .unwrap();
-        let idle = tty_idle_seconds(dev.to_str().unwrap()).expect("stat");
-        assert!((595..=660).contains(&idle), "idle {idle}");
-        assert_eq!(tty_idle_seconds("/nonexistent/pts/999"), None);
     }
 
     #[test]
