@@ -1726,4 +1726,71 @@ fn plan_identifies_agent_cli_kind() {
     assert_eq!(c["agent_kind"], "claude", "{c}");
     let rec = c["recommendation"].as_str().unwrap_or("");
     assert!(matches!(rec, "KEEP" | "REVIEW"), "agent got {rec}: {c}");
+    // No controlling terminal: no liveness evidence.
+    assert_eq!(c["agent_liveness"]["live"], false, "{c}");
+}
+
+/// An agent CLI on a terminal with recent I/O is live: kept, not surfaced for review.
+#[cfg(target_os = "linux")]
+#[test]
+fn plan_keeps_agent_with_active_terminal() {
+    // `script` gives the lookalike a real pty (just created, so recently active).
+    // Its stdin stays an open pipe: at EOF `script` would end the pty session and
+    // the lookalike would lose its terminal.
+    let mut agent = std::process::Command::new("script")
+        // 137: distinct from plan_identifies_agent_cli_kind's lookalike (runs in parallel)
+        .args(["-qc", "exec -a claude sleep 137", "/dev/null"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn script");
+    let _stdin = agent.stdin.take();
+    std::thread::sleep(Duration::from_millis(800));
+    let data_dir = tempdir().expect("data dir");
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", data_dir.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "plan",
+            "--min-age",
+            "0",
+            "--min-posterior",
+            "0",
+            "--max-candidates",
+            "100000",
+        ])
+        .output()
+        .expect("run plan");
+    let _ = std::process::Command::new("pkill")
+        .args(["-P", &agent.id().to_string()])
+        .status();
+    let _ = agent.kill();
+    let _ = agent.wait();
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("plan JSON");
+    let c = json["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .find(|c| {
+            c["agent_kind"] == "claude"
+                && c["command"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("claude 137")
+        })
+        .unwrap_or_else(|| panic!("agent lookalike not in plan"))
+        .clone();
+    assert_eq!(c["agent_liveness"]["live"], true, "{c}");
+    assert!(
+        c["agent_liveness"]["tty"]
+            .as_str()
+            .unwrap_or("")
+            .contains("pts"),
+        "{c}"
+    );
+    assert_eq!(c["recommendation"], "KEEP", "{c}");
 }

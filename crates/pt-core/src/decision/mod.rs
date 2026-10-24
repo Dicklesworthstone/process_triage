@@ -30,6 +30,7 @@ pub mod martingale_gates;
 pub mod mem_pressure;
 pub mod myopic_policy;
 pub mod ope;
+pub mod pressure_regime;
 pub mod provenance_explanation;
 pub mod provenance_scoring;
 pub mod rate_limit;

@@ -124,12 +124,13 @@ fn systemd_service_fixture() -> RawLineageEvidence {
     }
 }
 
+/// Reparented to init, still in the session of the shell job that started it.
 fn orphaned_fixture() -> RawLineageEvidence {
     RawLineageEvidence {
         pid: 45678,
         ppid: 1,
         pgid: 45678,
-        sid: 45678,
+        sid: 45000,
         uid: 1000,
         user: Some("developer".to_string()),
         tty: None,
@@ -137,6 +138,14 @@ fn orphaned_fixture() -> RawLineageEvidence {
         ancestors: vec![],
         collection_method: LineageCollectionMethod::Procfs,
         observed_at: "2026-03-16T00:00:00Z".to_string(),
+    }
+}
+
+/// Its own session leader under init, with the ancestor chain unreadable.
+fn unreadable_chain_session_leader_fixture() -> RawLineageEvidence {
+    RawLineageEvidence {
+        sid: 45678,
+        ..orphaned_fixture()
     }
 }
 
@@ -245,15 +254,24 @@ fn systemd_service_is_supervised_not_orphaned() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn orphaned_process_has_degraded_confidence() {
+fn orphaned_process_is_recognized_from_its_session() {
     let evidence = orphaned_fixture();
     let result = normalize_lineage(&evidence);
 
     assert_eq!(result.ownership, OwnershipState::Orphaned);
     assert!(result.is_orphaned);
     assert!(!result.session.has_tty);
-    // Degraded because we can't determine if this is a genuine orphan
-    // or just a process we can't read ancestors for
+}
+
+#[test]
+fn session_leader_with_unreadable_chain_is_unknown_with_degraded_confidence() {
+    let evidence = unreadable_chain_session_leader_fixture();
+    let result = normalize_lineage(&evidence);
+
+    // We can't tell an init-started daemon from a self-daemonized process without
+    // the chain, so it is not claimed as an orphan.
+    assert_eq!(result.ownership, OwnershipState::Unknown);
+    assert!(!result.is_orphaned);
     assert!(result.confidence > ProvenanceConfidence::High);
     assert!(!result.downgrade_reasons.is_empty());
 }
@@ -343,6 +361,7 @@ fn ownership_classification_survives_json_round_trip() {
         agent_owned_fixture(),
         systemd_service_fixture(),
         orphaned_fixture(),
+        unreadable_chain_session_leader_fixture(),
         detached_no_tty_fixture(),
     ];
 

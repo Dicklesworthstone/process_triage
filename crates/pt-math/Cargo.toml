@@ -10,7 +10,7 @@ name = "pt_math"
 path = "src/lib.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"

@@ -349,7 +349,8 @@ mod tests {
     use pt_redact::ExportProfile;
 
     fn create_test_bundle() -> Vec<u8> {
-        let mut writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Safe);
+        // Raw opaque bytes exercise archive mechanics through the local profile.
+        let mut writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Forensic);
         writer
             .add_summary(&serde_json::json!({"total": 42}))
             .unwrap();
@@ -376,7 +377,7 @@ mod tests {
         let manifest = reader.manifest();
         assert_eq!(manifest.session_id, "session-123");
         assert_eq!(manifest.host_id, "host-abc");
-        assert_eq!(manifest.export_profile, ExportProfile::Safe);
+        assert_eq!(manifest.export_profile, ExportProfile::Forensic);
     }
 
     #[test]
@@ -428,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_bundle_reader_telemetry_files() {
-        let mut writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Safe);
+        let mut writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Forensic);
         writer.add_telemetry("proc_samples", vec![1, 2, 3]);
         writer.add_telemetry("audit", vec![4, 5, 6]);
         writer
@@ -530,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_bundle_reader_read_report() {
-        let mut writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Safe);
+        let mut writer = BundleWriter::new("session-123", "host-abc", ExportProfile::Forensic);
         writer
             .add_summary(&serde_json::json!({"total": 42}))
             .unwrap();

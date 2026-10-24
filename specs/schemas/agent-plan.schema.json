@@ -181,7 +181,8 @@
       "type": "object",
       "required": ["detected", "recommended_action"],
       "properties": {
-        "detected": { "type": "boolean" },
+        "detected": { "type": ["boolean", "null"], "description": "null when supervision evidence is unavailable (status: unknown)" },
+        "status": { "type": "string", "enum": ["observed", "unknown"] },
         "type": { "type": ["string", "null"] },
         "unit": { "type": ["string", "null"] },
         "recommended_action": { "type": "string" },

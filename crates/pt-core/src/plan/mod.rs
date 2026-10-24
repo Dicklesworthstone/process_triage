@@ -223,18 +223,24 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
         let blocked = !candidate.blocked_reasons.is_empty();
         if blocked {
             blocked_candidates += 1;
+            continue;
         }
 
         // Check for zombie state - route to parent/supervisor instead
         if candidate.process_state == Some(ProcessState::Zombie) {
-            if let Some(zombie_actions) = plan_zombie_actions(candidate, blocked) {
+            if let Some(zombie_actions) = plan_zombie_actions(candidate, &bundle.policy) {
                 for plan_action in zombie_actions {
-                    if !blocked && !plan_action.blocked {
-                        pre_toggled.push(plan_action.action_id.clone());
-                    }
+                    pre_toggled.push(plan_action.action_id.clone());
                     actions.push(plan_action);
                 }
             }
+            continue;
+        }
+
+        // The runner supports Restart only for ZombieToParent routing. An
+        // unsupported direct restart is not an explicit gate refusal; those
+        // candidates were counted above before any executable action is built.
+        if candidate.decision.optimal_action == Action::Restart {
             continue;
         }
 
@@ -253,9 +259,7 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
 
         for (action, stage) in action_sequence {
             let action_id = action_id_for(action, &candidate.identity, stage);
-            if !blocked {
-                pre_toggled.push(action_id.clone());
-            }
+            pre_toggled.push(action_id.clone());
 
             let expected_loss = loss_for_action(&candidate.decision, action);
             let (expected_recovery, expected_recovery_stddev) =
@@ -314,7 +318,7 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
                         None
                     },
                 }],
-                blocked,
+                blocked: false,
                 routing,
                 confidence,
                 original_zombie_target: None,
@@ -357,22 +361,30 @@ pub fn generate_plan(bundle: &DecisionBundle) -> Plan {
 
 /// Plan actions for a zombie process.
 ///
-/// Zombies cannot be killed directly - they are already dead. Instead, we must:
-/// 1. If parent identity is known, signal/restart the parent to reap the zombie
-/// 2. If process is supervised, use supervisor to restart the service
-/// 3. If neither is available, emit an "investigate only" action
+/// Zombies cannot be killed directly - they are already dead. Route destructive
+/// requests to a known parent identity; leave other requests or unknown parents
+/// to the candidate report.
 ///
-/// Returns None if no action is appropriate (e.g., decision was Keep).
-fn plan_zombie_actions(candidate: &DecisionCandidate, blocked: bool) -> Option<Vec<PlanAction>> {
+/// Returns None when no executable action is appropriate. Keep, pause and
+/// other direct interventions cannot change a process that is already dead.
+fn plan_zombie_actions(candidate: &DecisionCandidate, policy: &Policy) -> Option<Vec<PlanAction>> {
     let original_action = candidate.decision.optimal_action;
 
-    // If decision is Keep, no action needed
-    if original_action == Action::Keep {
+    if !matches!(original_action, Action::Kill | Action::Restart) {
         return None;
     }
-
-    // For zombies, we cannot perform direct kill/restart - route to parent or supervisor
-    let is_destructive = matches!(original_action, Action::Kill | Action::Restart);
+    let parent_identity = candidate.parent_identity.as_ref()?;
+    // PID 0/1 is never an eligible parent target, even with an empty policy
+    // list. Other explicitly protected parent PIDs are also non-executable;
+    // the summary still counts only candidates carrying blocked_reasons.
+    if parent_identity.pid.0 <= 1
+        || policy
+            .guardrails
+            .never_kill_pid
+            .contains(&parent_identity.pid.0)
+    {
+        return None;
+    }
 
     let expected_loss = loss_for_action(&candidate.decision, original_action);
     let (expected_recovery, expected_recovery_stddev) =
@@ -389,102 +401,37 @@ fn plan_zombie_actions(candidate: &DecisionCandidate, blocked: bool) -> Option<V
         category: candidate.decision.rationale.category.clone(),
     };
 
-    let mut actions = Vec::new();
+    // Preserve parent routing for both Kill and Restart requests. No direct
+    // action can make the zombie reap itself.
+    let parent_action = Action::Restart;
+    let action_id = zombie_parent_action_id_for(&candidate.identity, parent_identity);
 
-    if is_destructive {
-        // Try to route to parent
-        if let Some(ref parent_identity) = candidate.parent_identity {
-            // Signal the parent to reap the zombie
-            // For Kill -> signal parent with SIGCHLD or restart it
-            // For Restart -> restart the parent
-            // Regardless of original action, restart parent to force zombie reap
-            let parent_action = Action::Restart;
-
-            let action_id = action_id_for(parent_action, parent_identity, 0);
-
-            actions.push(PlanAction {
-                action_id,
-                target: parent_identity.clone(),
-                action: parent_action,
-                order: 0,
-                stage: 0,
-                timeouts: ActionTimeouts::default(),
-                pre_checks: vec![
-                    PreCheck::VerifyIdentity,
-                    PreCheck::CheckNotProtected,
-                    PreCheck::CheckSessionSafety,
-                    PreCheck::CheckDataLossGate,
-                    PreCheck::CheckSupervisor,
-                    PreCheck::CheckAgentSupervision,
-                ],
-                rationale: base_rationale,
-                on_success: vec![ActionHook {
-                    action: "zombie_reaped".to_string(),
-                    details: Some(format!(
-                        "parent restart should reap zombie PID {}",
-                        candidate.identity.pid.0
-                    )),
-                }],
-                on_failure: vec![ActionHook {
-                    action: "report_failure".to_string(),
-                    details: Some("failed to restart parent of zombie".to_string()),
-                }],
-                blocked,
-                routing: ActionRouting::ZombieToParent,
-                confidence: ActionConfidence::Normal,
-                original_zombie_target: Some(candidate.identity.clone()),
-                d_state_diagnostics: None,
-            });
-        } else {
-            // No parent identity available - emit investigate-only action
-            // This is an informational action that doesn't execute anything
-            // but makes it clear we can't help without more info
-            let action_id = action_id_for(Action::Keep, &candidate.identity, 0);
-
-            actions.push(PlanAction {
-                action_id,
-                target: candidate.identity.clone(),
-                action: Action::Keep, // Keep (investigate) - we cannot act on this
-                order: 0,
-                stage: 0,
-                timeouts: ActionTimeouts::default(),
-                pre_checks: vec![PreCheck::VerifyIdentity],
-                rationale: base_rationale,
-                on_success: vec![],
-                on_failure: vec![],
-                blocked: true, // Always blocked - investigation only
-                routing: ActionRouting::ZombieInvestigateOnly,
-                confidence: ActionConfidence::VeryLow,
-                original_zombie_target: None,
-                d_state_diagnostics: None,
-            });
-        }
-    } else {
-        // Non-destructive actions (Pause, Renice, Throttle) don't make sense for zombies
-        // Zombies are already dead - they consume no resources except a process table entry
-        // Emit a Keep action to indicate we're doing nothing
-        let action_id = action_id_for(Action::Keep, &candidate.identity, 0);
-
-        actions.push(PlanAction {
-            action_id,
-            target: candidate.identity.clone(),
-            action: Action::Keep,
-            order: 0,
-            stage: 0,
-            timeouts: ActionTimeouts::default(),
-            pre_checks: vec![PreCheck::VerifyIdentity],
-            rationale: base_rationale,
-            on_success: vec![],
-            on_failure: vec![],
-            blocked: true,
-            routing: ActionRouting::ZombieInvestigateOnly,
-            confidence: ActionConfidence::VeryLow,
-            original_zombie_target: None,
-            d_state_diagnostics: None,
-        });
-    }
-
-    Some(actions)
+    Some(vec![PlanAction {
+        action_id,
+        target: parent_identity.clone(),
+        action: parent_action,
+        order: 0,
+        stage: 0,
+        timeouts: ActionTimeouts::default(),
+        pre_checks: pre_checks_for(parent_action),
+        rationale: base_rationale,
+        on_success: vec![ActionHook {
+            action: "zombie_reaped".to_string(),
+            details: Some(format!(
+                "parent restart should reap zombie PID {}",
+                candidate.identity.pid.0
+            )),
+        }],
+        on_failure: vec![ActionHook {
+            action: "report_failure".to_string(),
+            details: Some("failed to restart parent of zombie".to_string()),
+        }],
+        blocked: false,
+        routing: ActionRouting::ZombieToParent,
+        confidence: ActionConfidence::Normal,
+        original_zombie_target: Some(candidate.identity.clone()),
+        d_state_diagnostics: None,
+    }])
 }
 
 /// Pre-checks to run for `action` at apply time: the ones the plan lists plus every
@@ -573,6 +520,30 @@ fn action_id_for(action: Action, identity: &ProcessIdentity, stage: u8) -> Strin
     );
     let hash = fnv1a64(key.as_bytes());
     format!("act-{hash:016x}")
+}
+
+fn zombie_parent_action_id_for(zombie: &ProcessIdentity, parent: &ProcessIdentity) -> String {
+    // Bind the route to both complete identities. The requested Kill/Restart
+    // choice does not change this canonical Restart action. Length-prefixed
+    // start IDs prevent their delimiters from obscuring identity boundaries.
+    let key = format!(
+        "zombie_to_parent:restart:0:zombie(pid={},uid={},pgid={:?},sid={:?},quality={},start={}:{}):parent(pid={},uid={},pgid={:?},sid={:?},quality={},start={}:{})",
+        zombie.pid.0,
+        zombie.uid,
+        zombie.pgid,
+        zombie.sid,
+        zombie.quality,
+        zombie.start_id.0.len(),
+        zombie.start_id.0,
+        parent.pid.0,
+        parent.uid,
+        parent.pgid,
+        parent.sid,
+        parent.quality,
+        parent.start_id.0.len(),
+        parent.start_id.0
+    );
+    format!("act-{:016x}", fnv1a64(key.as_bytes()))
 }
 
 fn action_str(action: Action) -> &'static str {
@@ -722,19 +693,78 @@ mod tests {
     }
 
     #[test]
-    fn pre_toggled_excludes_blocked() {
+    fn blocked_candidates_are_counted_but_have_no_executable_actions() {
         let bundle = DecisionBundle {
             session_id: SessionId("pt-20260115-120000-abcd".to_string()),
             policy: Policy::default(),
             generated_at: Some("2026-01-15T12:00:00Z".to_string()),
-            candidates: vec![candidate(10, Action::Pause, 10.0, 1.0), {
-                let mut c = candidate(20, Action::Pause, 10.0, 1.0);
-                c.blocked_reasons = vec!["policy blocked".to_string()];
-                c
-            }],
+            candidates: vec![
+                candidate(10, Action::Pause, 10.0, 1.0),
+                {
+                    let mut c = candidate(20, Action::Kill, 10.0, 1.0);
+                    c.blocked_reasons = vec!["policy blocked".to_string()];
+                    c.stage_pause_before_kill = true;
+                    c
+                },
+                candidate(30, Action::Keep, 1.0, 1.0),
+                {
+                    let mut c = candidate(40, Action::Kill, 10.0, 1.0);
+                    c.blocked_reasons = vec!["protected zombie parent".to_string()];
+                    c.process_state = Some(ProcessState::Zombie);
+                    c.parent_identity = Some(identity(100));
+                    c
+                },
+            ],
         };
         let plan = generate_plan(&bundle);
-        assert_eq!(plan.pre_toggled.len(), 1);
+        assert_eq!(plan.gates_summary.total_candidates, 4);
+        assert_eq!(plan.gates_summary.blocked_candidates, 2);
+        assert_eq!(plan.gates_summary.pre_toggled_actions, 1);
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target, identity(10));
+        assert_eq!(plan.actions[0].action, Action::Pause);
+        assert!(!plan.actions[0].blocked);
+        assert_eq!(plan.pre_toggled, vec![plan.actions[0].action_id.clone()]);
+    }
+
+    #[test]
+    fn unsupported_direct_restart_is_omitted_without_losing_eligible_actions() {
+        for state in [
+            None,
+            Some(ProcessState::Running),
+            Some(ProcessState::DiskSleep),
+        ] {
+            let bundle = DecisionBundle {
+                session_id: SessionId("pt-20260115-120000-abcd".to_string()),
+                policy: Policy::default(),
+                generated_at: Some("2026-01-15T12:00:00Z".to_string()),
+                candidates: vec![
+                    candidate(10, Action::Pause, 10.0, 1.0),
+                    {
+                        let mut c = candidate(42, Action::Restart, 100.0, 1.0);
+                        c.process_state = state;
+                        c.parent_identity = Some(identity(100));
+                        c
+                    },
+                    {
+                        let mut c = candidate(43, Action::Restart, 100.0, 1.0);
+                        c.blocked_reasons = vec!["protected target".to_string()];
+                        c
+                    },
+                ],
+            };
+            let plan = generate_plan(&bundle);
+
+            assert_eq!(plan.actions.len(), 1);
+            assert_eq!(plan.actions[0].target, identity(10));
+            assert_eq!(plan.actions[0].action, Action::Pause);
+            assert_eq!(plan.actions[0].routing, ActionRouting::Direct);
+            assert!(!plan.actions[0].blocked);
+            assert_eq!(plan.pre_toggled, vec![plan.actions[0].action_id.clone()]);
+            assert_eq!(plan.gates_summary.total_candidates, 3);
+            assert_eq!(plan.gates_summary.blocked_candidates, 1);
+            assert_eq!(plan.gates_summary.pre_toggled_actions, 1);
+        }
     }
 
     #[test]
@@ -779,8 +809,137 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn zombie_kill_routes_to_parent() {
-        let parent_id = identity(100);
+    fn zombie_kill_and_restart_route_to_parent_with_execution_contract() {
+        let parent_id = identity(900);
+        let mut parent_action_id = None;
+        for requested_action in [Action::Kill, Action::Restart] {
+            let bundle = DecisionBundle {
+                session_id: SessionId("pt-20260115-120000-abcd".to_string()),
+                policy: Policy::default(),
+                generated_at: Some("2026-01-15T12:00:00Z".to_string()),
+                candidates: vec![{
+                    let mut c = candidate(42, requested_action, 100.0, 1.0);
+                    c.process_state = Some(ProcessState::Zombie);
+                    c.parent_identity = Some(parent_id.clone());
+                    c
+                }],
+            };
+            let plan = generate_plan(&bundle);
+
+            assert_eq!(plan.actions.len(), 1);
+            let action = &plan.actions[0];
+            assert_eq!(action.target, parent_id);
+            if let Some(previous_id) = &parent_action_id {
+                assert_eq!(&action.action_id, previous_id);
+            } else {
+                parent_action_id = Some(action.action_id.clone());
+            }
+            assert_eq!(action.action, Action::Restart);
+            assert_eq!(action.routing, ActionRouting::ZombieToParent);
+            assert_eq!(action.original_zombie_target, Some(identity(42)));
+            assert!(!action.blocked);
+            assert_eq!(action.confidence, ActionConfidence::Normal);
+            assert_eq!(action.order, 0);
+            assert_eq!(action.stage, 0);
+            assert_eq!(action.timeouts.preflight_ms, 2_000);
+            assert_eq!(action.timeouts.execute_ms, 10_000);
+            assert_eq!(action.timeouts.verify_ms, 5_000);
+            assert_eq!(
+                action.pre_checks,
+                vec![
+                    PreCheck::VerifyIdentity,
+                    PreCheck::CheckNotProtected,
+                    PreCheck::CheckSessionSafety,
+                    PreCheck::CheckDataLossGate,
+                    PreCheck::CheckSupervisor,
+                    PreCheck::CheckAgentSupervision,
+                ]
+            );
+            assert_eq!(action.rationale.expected_loss, Some(1.0));
+            assert_eq!(action.on_success[0].action, "zombie_reaped");
+            assert_eq!(action.on_failure[0].action, "report_failure");
+            assert_eq!(plan.pre_toggled, vec![action.action_id.clone()]);
+            assert_eq!(plan.gates_summary.total_candidates, 1);
+            assert_eq!(plan.gates_summary.blocked_candidates, 0);
+        }
+    }
+
+    #[test]
+    fn zombies_sharing_a_parent_have_distinct_verifiable_actions() {
+        let parent = identity(900);
+        let mut bundle = DecisionBundle {
+            session_id: SessionId("pt-20260115-120000-abcd".to_string()),
+            policy: Policy::default(),
+            generated_at: Some("2026-01-15T12:00:00Z".to_string()),
+            candidates: [42, 43]
+                .into_iter()
+                .map(|pid| {
+                    let mut c = candidate(pid, Action::Kill, 100.0, 1.0);
+                    c.process_state = Some(ProcessState::Zombie);
+                    c.ppid = Some(parent.pid.0);
+                    c.parent_identity = Some(parent.clone());
+                    c
+                })
+                .collect(),
+        };
+        let mut plan = generate_plan(&bundle);
+        assert_eq!(plan.actions.len(), 2);
+        assert_eq!(plan.gates_summary.total_candidates, 2);
+        assert_eq!(plan.gates_summary.blocked_candidates, 0);
+        assert_eq!(plan.gates_summary.pre_toggled_actions, 2);
+        assert_eq!(plan.pre_toggled.len(), 2);
+        assert_ne!(plan.actions[0].action_id, plan.actions[1].action_id);
+        for zombie_pid in [42, 43] {
+            let action = plan
+                .actions
+                .iter()
+                .find(|action| action.original_zombie_target == Some(identity(zombie_pid)))
+                .unwrap();
+            assert_eq!(action.target, parent);
+            assert_eq!(action.action, Action::Restart);
+            assert_eq!(action.routing, ActionRouting::ZombieToParent);
+            assert_eq!(action.rationale.expected_loss, Some(1.0));
+            assert!(action.pre_checks.contains(&PreCheck::VerifyIdentity));
+            assert!(action.pre_checks.contains(&PreCheck::CheckNotProtected));
+            assert!(plan.pre_toggled.contains(&action.action_id));
+        }
+        let parsed =
+            crate::verify::parse_agent_plan(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(parsed.actions.len(), 2);
+        for (actual, expected) in parsed.actions.iter().zip(&plan.actions) {
+            assert_eq!(actual.action_id, expected.action_id);
+            assert_eq!(actual.target, expected.target);
+            assert_eq!(
+                actual.original_zombie_target,
+                expected.original_zombie_target
+            );
+        }
+
+        bundle.candidates.reverse();
+        let reversed = generate_plan(&bundle);
+        assert_eq!(
+            reversed
+                .actions
+                .iter()
+                .map(|action| &action.action_id)
+                .collect::<Vec<_>>(),
+            plan.actions
+                .iter()
+                .map(|action| &action.action_id)
+                .collect::<Vec<_>>()
+        );
+
+        // The real verification parser must still refuse the prior collision.
+        plan.actions[1].action_id = plan.actions[0].action_id.clone();
+        assert!(matches!(
+            crate::verify::parse_agent_plan(&serde_json::to_string(&plan).unwrap()),
+            Err(crate::verify::VerifyError::InvalidPlan(reason))
+                if reason == "empty or duplicate action_id"
+        ));
+    }
+
+    #[test]
+    fn routed_action_ids_bind_each_field_of_both_process_identities() {
         let bundle = DecisionBundle {
             session_id: SessionId("pt-20260115-120000-abcd".to_string()),
             policy: Policy::default(),
@@ -788,49 +947,111 @@ mod tests {
             candidates: vec![{
                 let mut c = candidate(42, Action::Kill, 100.0, 1.0);
                 c.process_state = Some(ProcessState::Zombie);
-                c.parent_identity = Some(parent_id.clone());
+                c.ppid = Some(900);
+                c.parent_identity = Some(identity(900));
                 c
             }],
         };
-        let plan = generate_plan(&bundle);
-
-        // Should have one action targeting the parent, not the zombie
-        assert_eq!(plan.actions.len(), 1);
-        let action = &plan.actions[0];
-        assert_eq!(action.target.pid, parent_id.pid);
-        assert_eq!(action.action, Action::Restart);
-        assert_eq!(action.routing, ActionRouting::ZombieToParent);
-        assert!(action.original_zombie_target.is_some());
-        assert_eq!(action.original_zombie_target.as_ref().unwrap().pid.0, 42);
-        assert!(action.pre_checks.contains(&PreCheck::CheckAgentSupervision));
+        let baseline = generate_plan(&bundle);
+        assert_eq!(baseline.actions.len(), 1);
+        for original_zombie in [true, false] {
+            for field in ["pid", "boot", "birth", "uid", "pgid", "sid", "quality"] {
+                let mut changed = bundle.clone();
+                let c = &mut changed.candidates[0];
+                let id = if original_zombie {
+                    &mut c.identity
+                } else {
+                    c.parent_identity.as_mut().unwrap()
+                };
+                match field {
+                    "pid" => id.pid.0 += 1,
+                    "boot" => id.start_id.0 = format!("other-boot:{}:{}", id.pid.0, id.pid.0),
+                    "birth" => id.start_id.0 = format!("boot:{}:{}", id.pid.0, id.pid.0 + 1),
+                    "uid" => id.uid += 1,
+                    "pgid" => id.pgid = None,
+                    "sid" => id.sid = Some(777),
+                    "quality" => id.quality = pt_common::IdentityQuality::NoBootId,
+                    _ => unreachable!(),
+                }
+                c.ppid = Some(c.parent_identity.as_ref().unwrap().pid.0);
+                let expected_parent = c.parent_identity.clone().unwrap();
+                let expected_zombie = c.identity.clone();
+                let actual = generate_plan(&changed);
+                assert_eq!(actual.actions.len(), 1);
+                assert_ne!(
+                    actual.actions[0].action_id, baseline.actions[0].action_id,
+                    "identity field {field}, original zombie={original_zombie}"
+                );
+                assert_eq!(actual.actions[0].target, expected_parent);
+                assert_eq!(
+                    actual.actions[0].original_zombie_target,
+                    Some(expected_zombie)
+                );
+                assert_eq!(actual.actions[0].rationale.expected_loss, Some(1.0));
+            }
+        }
     }
 
     #[test]
-    fn zombie_without_parent_emits_investigate_only() {
-        let bundle = DecisionBundle {
-            session_id: SessionId("pt-20260115-120000-abcd".to_string()),
-            policy: Policy::default(),
-            generated_at: Some("2026-01-15T12:00:00Z".to_string()),
-            candidates: vec![{
-                let mut c = candidate(42, Action::Kill, 100.0, 1.0);
-                c.process_state = Some(ProcessState::Zombie);
-                c.parent_identity = None; // No parent available
-                c
-            }],
-        };
-        let plan = generate_plan(&bundle);
-
-        assert_eq!(plan.actions.len(), 1);
-        let action = &plan.actions[0];
-        assert_eq!(action.target.pid.0, 42);
-        assert_eq!(action.action, Action::Keep); // Investigation only
-        assert_eq!(action.routing, ActionRouting::ZombieInvestigateOnly);
-        assert!(action.blocked); // Always blocked for investigate-only
-        assert_eq!(action.confidence, ActionConfidence::VeryLow);
+    fn protected_zombie_parents_are_omitted_without_losing_eligible_actions() {
+        for requested_action in [Action::Kill, Action::Restart] {
+            for parent_pid in [0, 1, 900] {
+                let mut policy = Policy::default();
+                // PID 0/1 must stay protected even if no PID is configured.
+                policy.guardrails.never_kill_pid =
+                    if parent_pid == 900 { vec![900] } else { vec![] };
+                let bundle = DecisionBundle {
+                    session_id: SessionId("pt-20260115-120000-abcd".to_string()),
+                    policy,
+                    generated_at: Some("2026-01-15T12:00:00Z".to_string()),
+                    candidates: vec![candidate(10, Action::Pause, 10.0, 1.0), {
+                        let mut c = candidate(42, requested_action, 100.0, 1.0);
+                        c.process_state = Some(ProcessState::Zombie);
+                        c.ppid = Some(parent_pid);
+                        c.parent_identity = Some(identity(parent_pid));
+                        c
+                    }],
+                };
+                let plan = generate_plan(&bundle);
+                assert_eq!(plan.actions.len(), 1);
+                assert_eq!(plan.actions[0].target, identity(10));
+                assert_eq!(plan.actions[0].action, Action::Pause);
+                assert_eq!(plan.actions[0].routing, ActionRouting::Direct);
+                assert_eq!(plan.pre_toggled, vec![plan.actions[0].action_id.clone()]);
+                assert_eq!(plan.gates_summary.total_candidates, 2);
+                // Only an explicit source blocked_reason spends this count.
+                assert_eq!(plan.gates_summary.blocked_candidates, 0);
+                assert_eq!(plan.gates_summary.pre_toggled_actions, 1);
+            }
+        }
     }
 
     #[test]
-    fn zombie_pause_converted_to_keep() {
+    fn zombie_without_parent_has_no_executable_kill_or_restart() {
+        for requested_action in [Action::Kill, Action::Restart] {
+            let bundle = DecisionBundle {
+                session_id: SessionId("pt-20260115-120000-abcd".to_string()),
+                policy: Policy::default(),
+                generated_at: Some("2026-01-15T12:00:00Z".to_string()),
+                candidates: vec![{
+                    let mut c = candidate(42, requested_action, 100.0, 1.0);
+                    c.process_state = Some(ProcessState::Zombie);
+                    c.parent_identity = None;
+                    c
+                }],
+            };
+            let plan = generate_plan(&bundle);
+
+            assert!(plan.actions.is_empty());
+            assert!(plan.pre_toggled.is_empty());
+            assert_eq!(plan.gates_summary.total_candidates, 1);
+            assert_eq!(plan.gates_summary.blocked_candidates, 0);
+            assert_eq!(plan.gates_summary.pre_toggled_actions, 0);
+        }
+    }
+
+    #[test]
+    fn zombie_pause_has_no_executable_action() {
         // Pause on a zombie doesn't make sense - it's already dead
         let bundle = DecisionBundle {
             session_id: SessionId("pt-20260115-120000-abcd".to_string()),
@@ -839,16 +1060,17 @@ mod tests {
             candidates: vec![{
                 let mut c = candidate(42, Action::Pause, 10.0, 1.0);
                 c.process_state = Some(ProcessState::Zombie);
+                c.parent_identity = Some(identity(100));
                 c
             }],
         };
         let plan = generate_plan(&bundle);
 
-        assert_eq!(plan.actions.len(), 1);
-        let action = &plan.actions[0];
-        assert_eq!(action.action, Action::Keep);
-        assert_eq!(action.routing, ActionRouting::ZombieInvestigateOnly);
-        assert!(action.blocked);
+        assert!(plan.actions.is_empty());
+        assert!(plan.pre_toggled.is_empty());
+        assert_eq!(plan.gates_summary.total_candidates, 1);
+        assert_eq!(plan.gates_summary.blocked_candidates, 0);
+        assert_eq!(plan.gates_summary.pre_toggled_actions, 0);
     }
 
     #[test]

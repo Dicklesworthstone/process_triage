@@ -203,11 +203,11 @@ fn label_rejects_missing_verdict_and_target() {
     pt_core(config_dir.path(), data_dir.path())
         .args(["agent", "label", "--cmd", "sleep 5"])
         .assert()
-        .code(2);
+        .code(10);
     pt_core(config_dir.path(), data_dir.path())
         .args(["agent", "label", "--kill"])
         .assert()
-        .code(2);
+        .code(10);
     assert!(!config_dir.path().join("decisions.json").exists());
 }
 

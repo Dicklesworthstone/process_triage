@@ -11,13 +11,13 @@ name: Notify ACFS of Installer Change
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
     paths:
       - 'install.sh'
       - 'scripts/install.sh'
       - '**/install.sh'
   pull_request:
-    branches: [main, master]
+    branches: [main]
     paths:
       - 'install.sh'
       - 'scripts/install.sh'
@@ -51,7 +51,7 @@ jobs:
           fi
 
           SHA256=$(sha256sum "$INSTALLER_PATH" | cut -d' ' -f1)
-          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           echo "Computed SHA256: $SHA256"
 
       - name: Notify ACFS

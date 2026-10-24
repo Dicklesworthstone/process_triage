@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+#
+# pt - Process Triage Wrapper
+#
+# This script wraps the 'pt-core' Alien Technology Artifact.
+# It ensures the environment is set up correctly and forwards all arguments.
+#
+set -euo pipefail
+
+readonly VERSION="2.2.0"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+
+readonly PT_CORE_BIN="pt-core"
+readonly INSTALL_BASE_URL="https://raw.githubusercontent.com/Dicklesworthstone/process_triage"
+readonly INSTALL_URL="${INSTALL_BASE_URL}/main/install.sh"
+# Populated in release artifacts to pin expected installer signing key.
+readonly DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=""
+
+# Locations to search for pt-core
+readonly SEARCH_PATHS=(
+    "$(dirname "$0")/pt-core"
+    "$(dirname "$0")/target/release/pt-core"
+    "$HOME/.local/bin/pt-core"
+    "/usr/local/bin/pt-core"
+    "/usr/bin/pt-core"
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Discovery
+# ══════════════════════════════════════════════════════════════════════════════
+
+find_pt_core() {
+    # Check explicit override
+    if [[ -n "${PT_CORE_PATH:-}" ]]; then
+        if [[ -x "$PT_CORE_PATH" ]]; then
+            echo "$PT_CORE_PATH"
+            return 0
+        fi
+    fi
+
+    # Check search paths
+    for path in "${SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+
+    # Check PATH
+    if command -v "$PT_CORE_BIN" &>/dev/null; then
+        command -v "$PT_CORE_BIN"
+        return 0
+    fi
+
+    return 1
+}
+
+fetch_latest_release_version() {
+    local version_url="${INSTALL_BASE_URL}/main/VERSION"
+    local version=""
+
+    if command -v curl &>/dev/null; then
+        version="$(curl -fsSL "$version_url" 2>/dev/null | tr -d '[:space:]')" || return 1
+    elif command -v wget &>/dev/null; then
+        version="$(wget -qO- "$version_url" 2>/dev/null | tr -d '[:space:]')" || return 1
+    else
+        return 1
+    fi
+
+    # Accept semver-like release tags only (e.g., 2.0.3, 2.0.3-rc1, 2.0.3+build).
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*(\+[0-9A-Za-z.-]+)?$ ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$version"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI mode selection
+# ══════════════════════════════════════════════════════════════════════════════
+
+detect_auto_ui_mode() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        printf 'shell\n'
+        return 0
+    fi
+
+    if [[ "${CI:-}" == "true" || "${CI:-}" == "1" ]]; then
+        printf 'shell\n'
+        return 0
+    fi
+
+    if [[ "${TERM:-}" == "dumb" ]]; then
+        printf 'shell\n'
+        return 0
+    fi
+
+    printf 'tui\n'
+}
+
+resolve_ui_mode() {
+    local cli_mode="${1:-}"
+    local env_mode="${PT_UI_MODE:-auto}"
+
+    if [[ "$cli_mode" == "shell" || "$cli_mode" == "tui" ]]; then
+        printf '%s\n' "$cli_mode"
+        return 0
+    fi
+
+    case "$env_mode" in
+        shell|tui)
+            printf '%s\n' "$env_mode"
+            return 0
+            ;;
+        auto|"")
+            ;;
+        *)
+            ;;
+    esac
+
+    detect_auto_ui_mode
+}
+
+resolve_config_dir() {
+    if [[ -n "${PT_CONFIG_DIR:-}" ]]; then
+        printf '%s\n' "$PT_CONFIG_DIR"
+        return 0
+    fi
+
+    if [[ -n "${PROCESS_TRIAGE_CONFIG:-}" ]]; then
+        printf '%s\n' "$PROCESS_TRIAGE_CONFIG"
+        return 0
+    fi
+
+    if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+        printf '%s\n' "${XDG_CONFIG_HOME}/process_triage"
+        return 0
+    fi
+
+    printf '%s\n' "${HOME}/.config/process_triage"
+}
+
+ensure_decisions_file() {
+    local config_dir="$1"
+    local decisions_file="${config_dir}/decisions.json"
+
+    mkdir -p "$config_dir"
+
+    if [[ ! -e "$decisions_file" || ! -s "$decisions_file" ]]; then
+        printf '{}\n' > "$decisions_file"
+    fi
+
+    printf '%s\n' "$decisions_file"
+}
+
+show_history() {
+    local config_dir decisions_file
+    config_dir="$(resolve_config_dir)"
+    decisions_file="$(ensure_decisions_file "$config_dir")"
+
+    if ! command -v jq &>/dev/null; then
+        echo "Error: jq is required for 'pt history'." >&2
+        exit 1
+    fi
+
+    if ! jq -e 'type == "object"' "$decisions_file" >/dev/null 2>&1; then
+        echo "Error: decision history is not valid JSON object: $decisions_file" >&2
+        exit 1
+    fi
+
+    # Entries are {"kill": N, "spare": M, ...} per "level|pattern|args" key (written by
+    # `pt-core agent label`), or legacy "kill"/"spare" strings. Each verdict is stored at
+    # exact/standard/broad levels; list the standard level to count it once.
+    local rows='def counts: if type == "string"
+            then {kill: (if . == "kill" then 1 else 0 end), spare: (if . == "spare" then 1 else 0 end)}
+            else {kill: (.kill // 0), spare: (.spare // 0)} end;
+        [to_entries[]
+         | select((.key | startswith("exact|") or startswith("broad|")) | not)
+         | {pattern: (.key | ltrimstr("standard|") | rtrimstr("|")), c: (.value | counts)}]'
+
+    local total
+    total="$(jq "$rows | length" "$decisions_file")"
+    if [[ "$total" == "0" ]]; then
+        printf 'No decision history.\n'
+        return 0
+    fi
+
+    local kill_count spare_count
+    kill_count="$(jq "$rows | map(.c.kill) | add" "$decisions_file")"
+    spare_count="$(jq "$rows | map(.c.spare) | add" "$decisions_file")"
+
+    printf 'Decision history (%s patterns)\n' "$total"
+    printf 'kill: %s\n' "$kill_count"
+    printf 'spare: %s\n' "$spare_count"
+    jq -r "$rows | .[] | \"kill=\\(.c.kill) spare=\\(.c.spare)\\t\\(.pattern)\"" "$decisions_file"
+}
+
+clear_history() {
+    # Optional scope: only forget patterns containing this text (e.g. `pt clear jest`).
+    local scope="${1:-}"
+    local config_dir decisions_file
+    config_dir="$(resolve_config_dir)"
+    decisions_file="$(ensure_decisions_file "$config_dir")"
+
+    if ! command -v jq &>/dev/null; then
+        echo "Error: jq is required for 'pt clear'." >&2
+        exit 1
+    fi
+
+    if ! jq -e 'type == "object"' "$decisions_file" >/dev/null 2>&1; then
+        echo "Error: decision history is not valid JSON object: $decisions_file" >&2
+        exit 1
+    fi
+
+    local total
+    total="$(jq --arg s "$scope" '[keys[] | select(contains($s))] | length' "$decisions_file")"
+    if [[ "$total" == "0" ]]; then
+        if [[ -n "$scope" ]]; then
+            printf 'No decisions match "%s".\n' "$scope"
+        else
+            printf 'Decision history already empty.\n'
+        fi
+        return 0
+    fi
+
+    local reply=""
+    if [[ -t 0 && -z "${CI:-}" && -z "${TEST_MODE:-}" ]]; then
+        if [[ -n "$scope" ]]; then
+            printf 'Clear %s decision entries matching "%s"? [y/N] ' "$total" "$scope" >&2
+        else
+            printf 'Clear all decision history? [y/N] ' >&2
+        fi
+        read -r reply || true
+    else
+        read -r reply || true
+    fi
+
+    if [[ ! "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+        printf 'Aborted.\n' >&2
+        exit 1
+    fi
+
+    local plural
+    plural="$([[ "$total" == "1" ]] && printf '' || printf 's')"
+    if [[ -z "$scope" ]]; then
+        printf '{}\n' > "$decisions_file"
+        printf 'Cleared %s decision%s.\n' "$total" "$plural"
+        return 0
+    fi
+    local tmp="${decisions_file}.tmp.$$"
+    jq --arg s "$scope" 'with_entries(select(.key | contains($s) | not))' "$decisions_file" > "$tmp"
+    mv "$tmp" "$decisions_file"
+    printf 'Cleared %s decision%s matching "%s".\n' "$total" "$plural" "$scope"
+}
+
+show_wrapper_help() {
+    cat <<EOF
+Process Triage wrapper for pt-core
+
+Usage: pt [WRAPPER-OPTIONS] [COMMAND]
+
+Wrapper options:
+      --shell     Force shell/non-TUI mode
+      --tui       Force TUI mode when interactive
+  -h, --help      Show this wrapper-aware help
+  -V, --version   Show wrapper version
+
+Wrapper commands:
+  help            Show wrapper-aware top-level help
+  update          Run the verified installer update flow (fails closed on unsigned releases;
+                  --no-verify to override); \`pt update rollback|list-backups|...\` go to pt-core
+  history         Show learned decision memory from decisions.json
+  clear [TEXT]    Clear learned decisions (only patterns containing TEXT) after confirmation
+  deep            Alias for \`deep-scan\`
+
+Core commands:
+  run             Interactive golden path
+  scan            Quick scan only
+  deep-scan       Full deep scan with all available probes
+  diff            Compare two sessions
+  query           Query telemetry and history
+  bundle          Create or inspect diagnostic bundles
+  report          Generate HTML reports
+  check           Validate configuration and environment
+  learn           Interactive tutorials and onboarding
+  agent           Agent/robot subcommands
+  config          Configuration management
+  telemetry       Telemetry management
+  shadow          Shadow mode observation management
+  signature       Signature management
+  schema          Generate JSON schemas
+  update          Update management
+  mcp             MCP server
+  completions     Generate shell completion scripts
+  version         Print version information
+
+Notes:
+  - \`pt scan deep\` is accepted as a wrapper alias for \`pt deep-scan\`.
+  - Use \`pt help <subcommand>\` or \`pt <subcommand> --help\` for pt-core help.
+EOF
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
+
+main() {
+    local cli_mode=""
+    local -a forwarded_args=()
+    local arg
+
+    for arg in "$@"; do
+        case "$arg" in
+            --shell)
+                if [[ "$cli_mode" == "tui" ]]; then
+                    echo "Error: --shell and --tui cannot be used together." >&2
+                    exit 2
+                fi
+                cli_mode="shell"
+                ;;
+            --tui)
+                if [[ "$cli_mode" == "shell" ]]; then
+                    echo "Error: --shell and --tui cannot be used together." >&2
+                    exit 2
+                fi
+                cli_mode="tui"
+                ;;
+            *)
+                forwarded_args+=("$arg")
+                ;;
+        esac
+    done
+
+    local selected_ui_mode
+    selected_ui_mode="$(resolve_ui_mode "$cli_mode")"
+    export PT_UI_MODE="$selected_ui_mode"
+
+    local pt_core
+    pt_core=$(find_pt_core) || {
+        echo "Error: 'pt-core' binary not found." >&2
+        echo "Please install it via:" >&2
+        echo "  curl -fsSL $INSTALL_URL | bash" >&2
+        echo "  # or" >&2
+        echo "  wget -qO- $INSTALL_URL | bash" >&2
+        exit 1
+    }
+
+    # `pt update <subcommand>` (rollback, list-backups, show-backup, verify-backup,
+    # prune-backups, ...) is pt-core's backup management: pass it through.
+    if [[ "${forwarded_args[0]:-}" == "update" && -n "${forwarded_args[1]:-}" \
+        && "${forwarded_args[1]}" != -* ]]; then
+        exec "$pt_core" "${forwarded_args[@]}"
+    fi
+
+    # Bare `pt update [--no-verify]`: run the target release's signed installer.
+    if [[ "${forwarded_args[0]:-}" == "update" ]]; then
+        local verify_arg="--verify"
+        if [[ "${forwarded_args[1]:-}" == "--no-verify" ]]; then
+            verify_arg="--no-verify"
+            echo "Warning: --no-verify: installing WITHOUT signature/checksum verification." >&2
+        elif [[ -n "${forwarded_args[1]:-}" ]]; then
+            echo "Error: unknown update option '${forwarded_args[1]}' (use --no-verify, or a pt-core update subcommand such as rollback)." >&2
+            exit 2
+        fi
+        local target_version
+        if target_version="$(fetch_latest_release_version)"; then
+            :
+        else
+            target_version="$VERSION"
+            echo "Warning: could not resolve latest VERSION; falling back to v${VERSION} installer." >&2
+        fi
+        local target_install_url="${INSTALL_BASE_URL}/v${target_version}/install.sh"
+
+        echo "Updating Process Triage to v${target_version}..."
+        # Verification is requested with the --verify ARGUMENT: installers up to and
+        # including v2.1.0 reset VERIFY=0 at startup, so the env var alone was ignored
+        # and every `pt update` installed unverified. The env var is kept for newer ones.
+        local verify_env=1
+        [[ "$verify_arg" == "--no-verify" ]] && verify_env=0
+        local -a installer_env=("VERIFY=${verify_env}")
+        if [[ -n "${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
+            installer_env+=("PT_RELEASE_PUBLIC_KEY_FINGERPRINT=${DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT}")
+        fi
+        local status=0
+        if command -v curl &>/dev/null; then
+            curl -fsSL "$target_install_url" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
+        elif command -v wget &>/dev/null; then
+            wget -qO- "$target_install_url" | env "${installer_env[@]}" bash -s -- "$verify_arg" || status=$?
+        else
+            echo "Error: neither curl nor wget is available to run installer." >&2
+            exit 1
+        fi
+        if [[ $status -ne 0 && "$verify_arg" == "--verify" ]]; then
+            echo "Update aborted: the release could not be verified (unsigned release or key mismatch)." >&2
+            echo "Nothing was installed. To install it anyway, unverified: pt update --no-verify" >&2
+        fi
+        exit $status
+    fi
+
+    if [[ "${forwarded_args[0]:-}" == "--version" || "${forwarded_args[0]:-}" == "-V" ]]; then
+        # Report both halves: the wrapper and the engine can be updated independently
+        # (the fleet had wrapper/core skew that `pt --version` used to hide).
+        local core_version
+        core_version="$("$pt_core" --version 2>/dev/null | head -n 1)"
+        printf 'pt version %s\n' "$VERSION"
+        printf '%s (%s)\n' "${core_version:-pt-core unknown}" "$pt_core"
+        exit 0
+    fi
+
+    if [[ "${forwarded_args[0]:-}" == "--help" || "${forwarded_args[0]:-}" == "-h" ]]; then
+        show_wrapper_help
+        exit 0
+    fi
+
+    if [[ "${forwarded_args[0]:-}" == "help" && ${#forwarded_args[@]} -eq 1 ]]; then
+        show_wrapper_help
+        exit 0
+    fi
+
+    if [[ "${forwarded_args[0]:-}" == "history" ]]; then
+        show_history
+        exit 0
+    fi
+
+    if [[ "${forwarded_args[0]:-}" == "clear" ]]; then
+        clear_history "${forwarded_args[1]:-}"
+        exit 0
+    fi
+
+    # Preserve the documented `pt deep` surface even though pt-core exposes
+    # the clap-generated `deep-scan` subcommand name.
+    if [[ "${forwarded_args[0]:-}" == "deep" ]]; then
+        forwarded_args[0]="deep-scan"
+    fi
+
+    # Preserve the older wrapper-level `pt scan deep` shortcut by routing it
+    # to the explicit deep-scan subcommand exposed by pt-core.
+    if [[ "${forwarded_args[0]:-}" == "scan" && "${forwarded_args[1]:-}" == "deep" ]]; then
+        forwarded_args=("deep-scan" "${forwarded_args[@]:2}")
+    fi
+
+    # pt-core reads --config (env PT_CONFIG_DIR) first, then PROCESS_TRIAGE_CONFIG;
+    # export the latter too so every pt-core code path and `pt history` agree on the
+    # config dir (and decisions.json).
+    if [[ -n "${PT_CONFIG_DIR:-}" && -z "${PROCESS_TRIAGE_CONFIG:-}" ]]; then
+        export PROCESS_TRIAGE_CONFIG="$PT_CONFIG_DIR"
+    fi
+
+    # Forward to pt-core
+    # We use 'exec' to replace the shell process.
+    # The ${arr[@]+"${arr[@]}"} form is required: macOS ships bash 3.2, where
+    # "${arr[@]}" on an empty array is an "unbound variable" error under `set -u`
+    # (bare `pt` crashed there before reaching pt-core).
+    exec "$pt_core" ${forwarded_args[@]+"${forwarded_args[@]}"}
+}
+
+main "$@"

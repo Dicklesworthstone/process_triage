@@ -7,7 +7,8 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
-use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, SessionId, StartId};
+use pt_common::{IdentityQuality, ProcessIdentity, SessionId};
+use pt_core::collect::{quick_scan, QuickScanOptions};
 use pt_core::config::policy::{PatternEntry, PatternKind};
 use pt_core::config::Policy;
 use pt_core::decision::Action;
@@ -18,14 +19,11 @@ use pt_core::plan::{
 };
 use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionStore};
 use serde_json::Value;
-use std::env;
 use std::fs;
-use std::process::{Child, Command as ProcessCommand};
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
-
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct ChildGuard {
     child: Child,
@@ -38,33 +36,10 @@ impl Drop for ChildGuard {
     }
 }
 
-fn with_temp_dirs<T>(f: impl FnOnce(&TempDir, &TempDir) -> T) -> T {
-    let _guard = ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("env lock poisoned");
-
-    let old_data = env::var("PROCESS_TRIAGE_DATA").ok();
-    let old_config = env::var("PROCESS_TRIAGE_CONFIG").ok();
-
-    let data_dir = TempDir::new().expect("create temp data dir");
-    let config_dir = TempDir::new().expect("create temp config dir");
-
-    env::set_var("PROCESS_TRIAGE_DATA", data_dir.path());
-    env::set_var("PROCESS_TRIAGE_CONFIG", config_dir.path());
-
-    let result = f(&data_dir, &config_dir);
-
-    match old_data {
-        Some(val) => env::set_var("PROCESS_TRIAGE_DATA", val),
-        None => env::remove_var("PROCESS_TRIAGE_DATA"),
-    }
-    match old_config {
-        Some(val) => env::set_var("PROCESS_TRIAGE_CONFIG", val),
-        None => env::remove_var("PROCESS_TRIAGE_CONFIG"),
-    }
-
-    result
+fn with_temp_dirs<T>(f: impl FnOnce(&Path, &Path) -> T) -> T {
+    let data_dir = TempDir::new().expect("create temp data dir").keep();
+    let config_dir = TempDir::new().expect("create temp config dir").keep();
+    f(&data_dir, &config_dir)
 }
 
 fn pt_core_fast() -> Command {
@@ -83,6 +58,7 @@ fn agent_apply_returns_policy_blocked_for_precheck_block() {
         policy.robot_mode.enabled = true;
         policy.robot_mode.min_posterior = 0.0;
         policy.robot_mode.require_human_for_supervised = false;
+        policy.guardrails.min_process_age_seconds = 0;
         policy.guardrails.protected_patterns.push(PatternEntry {
             pattern: "^sleep$".to_string(),
             kind: PatternKind::Regex,
@@ -91,12 +67,12 @@ fn agent_apply_returns_policy_blocked_for_precheck_block() {
         });
 
         fs::write(
-            config_dir.path().join("policy.json"),
+            config_dir.join("policy.json"),
             serde_json::to_string_pretty(&policy).expect("serialize policy"),
         )
         .expect("write policy.json");
 
-        let store = SessionStore::from_env().expect("session store from env");
+        let store = SessionStore::at_data_dir(data_dir);
         let session_id = SessionId::new();
         let manifest = SessionManifest::new(&session_id, None, SessionMode::RobotPlan, None);
         let handle = store.create(&manifest).expect("create session");
@@ -109,20 +85,34 @@ fn agent_apply_returns_policy_blocked_for_precheck_block() {
         handle.write_context(&ctx).expect("write context");
 
         let child = ProcessCommand::new("sleep")
-            .arg("30")
+            .arg("900")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("spawn sleep process");
-        let guard = ChildGuard { child };
+        let mut guard = ChildGuard { child };
         let pid = guard.child.id();
 
-        let identity = ProcessIdentity {
-            pid: ProcessId(pid),
-            start_id: StartId("boot:1:424242".to_string()),
-            uid: 1000,
-            pgid: None,
-            sid: None,
-            quality: IdentityQuality::Full,
-        };
+        let scan = quick_scan(&QuickScanOptions {
+            pids: vec![pid],
+            ..QuickScanOptions::default()
+        })
+        .expect("scan owned target");
+        let target = scan.processes.iter().find(|p| p.pid.0 == pid).unwrap();
+        assert_eq!(
+            target.comm, "sleep",
+            "protected fixture must really be sleep"
+        );
+        let identity = ProcessIdentity::full(
+            pid,
+            target.start_id.clone(),
+            target.uid,
+            target.pgid,
+            target.sid,
+            IdentityQuality::Full,
+        );
 
         let plan = Plan {
             plan_id: "plan-test".to_string(),
@@ -132,7 +122,7 @@ fn agent_apply_returns_policy_blocked_for_precheck_block() {
             policy_version: "1.0.0".to_string(),
             actions: vec![PlanAction {
                 action_id: "action-1".to_string(),
-                target: identity,
+                target: identity.clone(),
                 action: Action::Kill,
                 order: 0,
                 stage: 0,
@@ -174,9 +164,9 @@ fn agent_apply_returns_policy_blocked_for_precheck_block() {
         )
         .expect("write plan");
 
-        let output = pt_core_fast()
-            .env("PROCESS_TRIAGE_DATA", data_dir.path())
-            .env("PROCESS_TRIAGE_CONFIG", config_dir.path())
+        let result = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", data_dir)
+            .env("PROCESS_TRIAGE_CONFIG", config_dir)
             .args([
                 "--format",
                 "json",
@@ -191,8 +181,19 @@ fn agent_apply_returns_policy_blocked_for_precheck_block() {
             .assert()
             .code(ExitCode::PolicyBlocked.as_i32())
             .get_output()
-            .stdout
             .clone();
+        let logs = Path::new("target/test-logs/e2e/agent_apply")
+            .join(&session_id.0)
+            .join("protected-precheck");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("stdout.json"), &result.stdout).unwrap();
+        fs::write(logs.join("stderr.log"), &result.stderr).unwrap();
+        fs::write(
+            logs.join("identity.json"),
+            serde_json::to_vec_pretty(&identity).unwrap(),
+        )
+        .unwrap();
+        let output = result.stdout;
 
         let json: Value = serde_json::from_slice(&output).expect("Output should be valid JSON");
         let summary = json
@@ -219,5 +220,17 @@ fn agent_apply_returns_policy_blocked_for_precheck_block() {
             Some("check_not_protected"),
             "Expected check_not_protected in outcome"
         );
+        assert!(
+            guard.child.try_wait().unwrap().is_none(),
+            "protected target died"
+        );
+        let current = quick_scan(&QuickScanOptions {
+            pids: vec![pid],
+            ..QuickScanOptions::default()
+        })
+        .unwrap();
+        let survivor = current.processes.iter().find(|p| p.pid.0 == pid).unwrap();
+        assert_eq!(survivor.start_id, identity.start_id);
+        assert_eq!(survivor.uid, identity.uid);
     });
 }

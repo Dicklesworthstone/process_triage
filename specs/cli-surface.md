@@ -557,9 +557,15 @@ Every JSON output includes:
 | 13 | `ERR_VERSION` | Version mismatch (wrapper/core) |
 | 14 | `ERR_LOCK` | Lock contention (another pt running) |
 | 15 | `ERR_SESSION` | Session not found or invalid |
+| 16 | `ERR_IDENTITY` | Process identity mismatch |
 | 20 | `ERR_INTERNAL` | Internal error (bug) |
 | 21 | `ERR_IO` | I/O error |
 | 22 | `ERR_TIMEOUT` | Operation timed out |
+
+Command-line usage errors, including unknown flags, conflicting selectors and
+missing required arguments, exit with `ArgsError` (10) and retain the usage
+diagnostic. Explicit `--help` and `--version` requests exit 0. Exit 2 is reserved
+for successfully executed actions.
 
 ### 6.2 Exit Code Escape Hatches
 

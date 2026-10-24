@@ -51,7 +51,7 @@ jobs:
           else
             version="${{ github.event.inputs.version }}"
           fi
-          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Using version: $version"
 
       - name: Download checksums from release
@@ -101,19 +101,33 @@ jobs:
   # ==========================================================================
   update-homebrew:
     name: Update Homebrew Tap
-    needs: generate-packages
+    needs: [generate-packages, test-packages]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: github.event.inputs.dry_run != 'true'
 
     steps:
+      - name: Check Homebrew token
+        id: token
+        env:
+          PACKAGE_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [[ -n "$PACKAGE_TOKEN" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::HOMEBREW_TAP_TOKEN is not configured; skipping Homebrew update"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download package files
+        if: steps.token.outputs.available == 'true'
         uses: actions/download-artifact@v4
         with:
           name: package-files
           path: packages
 
       - name: Checkout Homebrew tap
+        if: steps.token.outputs.available == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.HOMEBREW_TAP_REPO }}
@@ -121,6 +135,7 @@ jobs:
           path: tap
 
       - name: Update formula
+        if: steps.token.outputs.available == 'true'
         run: |
           version="${{ needs.generate-packages.outputs.version }}"
 
@@ -144,10 +159,10 @@ jobs:
           git add Formula/pt.rb
           git commit -m "Update pt to ${version}"
 
-          echo "branch=$branch" >> $GITHUB_ENV
+          echo "branch=$branch" >> "$GITHUB_ENV"
 
       - name: Create PR to Homebrew tap
-        if: env.branch != ''
+        if: steps.token.outputs.available == 'true' && env.branch != ''
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -171,19 +186,33 @@ jobs:
   # ==========================================================================
   update-scoop:
     name: Update Scoop Bucket
-    needs: generate-packages
+    needs: [generate-packages, test-packages]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: github.event.inputs.dry_run != 'true'
 
     steps:
+      - name: Check Scoop token
+        id: token
+        env:
+          PACKAGE_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: |
+          if [[ -n "$PACKAGE_TOKEN" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SCOOP_BUCKET_TOKEN is not configured; skipping Scoop update"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download package files
+        if: steps.token.outputs.available == 'true'
         uses: actions/download-artifact@v4
         with:
           name: package-files
           path: packages
 
       - name: Checkout Scoop bucket
+        if: steps.token.outputs.available == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SCOOP_BUCKET_REPO }}
@@ -191,6 +220,7 @@ jobs:
           path: bucket
 
       - name: Update manifest
+        if: steps.token.outputs.available == 'true'
         run: |
           version="${{ needs.generate-packages.outputs.version }}"
 
@@ -214,10 +244,10 @@ jobs:
           git add bucket/pt.json
           git commit -m "Update pt to ${version}"
 
-          echo "branch=$branch" >> $GITHUB_ENV
+          echo "branch=$branch" >> "$GITHUB_ENV"
 
       - name: Create PR to Scoop bucket
-        if: env.branch != ''
+        if: steps.token.outputs.available == 'true' && env.branch != ''
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
@@ -244,16 +274,30 @@ jobs:
     needs: [generate-packages, test-packages]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: github.event.inputs.dry_run != 'true' && needs.generate-packages.outputs.winget_generated == 'true' && secrets.WINGET_PKGS_TOKEN != ''
+    if: github.event.inputs.dry_run != 'true' && needs.generate-packages.outputs.winget_generated == 'true'
 
     steps:
+      - name: Check Winget token
+        id: token
+        env:
+          PACKAGE_TOKEN: ${{ secrets.WINGET_PKGS_TOKEN }}
+        run: |
+          if [[ -n "$PACKAGE_TOKEN" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::WINGET_PKGS_TOKEN is not configured; skipping Winget update"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download package files
+        if: steps.token.outputs.available == 'true'
         uses: actions/download-artifact@v4
         with:
           name: package-files
           path: packages
 
       - name: Checkout Winget repo
+        if: steps.token.outputs.available == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.WINGET_PKGS_REPO }}
@@ -261,6 +305,7 @@ jobs:
           path: winget
 
       - name: Update Winget manifests
+        if: steps.token.outputs.available == 'true'
         run: |
           version="${{ needs.generate-packages.outputs.version }}"
           manifest_dir="winget/manifests/p/ProcessTriage/pt/${version}"
@@ -294,7 +339,7 @@ jobs:
           echo "branch=$branch" >> "$GITHUB_ENV"
 
       - name: Create PR to Winget repo
-        if: env.branch != ''
+        if: steps.token.outputs.available == 'true' && env.branch != ''
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.WINGET_PKGS_TOKEN }}

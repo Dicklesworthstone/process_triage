@@ -105,7 +105,7 @@ impl NetworkSnapshot {
         }
 
         // Unix
-        if let Some(entries) = parse_proc_net_unix("/proc/net/unix") {
+        if let Ok(entries) = parse_proc_net_unix("/proc/net/unix") {
             for e in entries {
                 snapshot.unix_by_inode.insert(e.inode, e);
             }
@@ -519,39 +519,72 @@ pub fn parse_proc_net_udp_content(content: &str, is_ipv6: bool) -> Vec<UdpSocket
 }
 
 /// Parse /proc/net/unix file.
-pub fn parse_proc_net_unix(path: &str) -> Option<Vec<UnixSocket>> {
-    let file = fs::File::open(path).ok()?;
+pub fn parse_proc_net_unix(path: &str) -> std::io::Result<Vec<UnixSocket>> {
+    let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
-    Some(parse_proc_net_unix_reader(reader))
+    parse_proc_net_unix_reader(reader)
 }
 
 /// Parse Unix socket content from a reader.
-pub fn parse_proc_net_unix_reader<R: BufRead>(reader: R) -> Vec<UnixSocket> {
+pub fn parse_proc_net_unix_reader<R: BufRead>(reader: R) -> std::io::Result<Vec<UnixSocket>> {
     let mut sockets = Vec::new();
-
-    for line in reader.lines().skip(1).flatten() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 7 {
+    let invalid = |reason: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, reason);
+    let mut lines = reader.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| invalid("missing UNIX socket table header"))??;
+    if !header.split_whitespace().eq([
+        "Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",
+    ]) {
+        return Err(invalid("invalid UNIX socket table header"));
+    }
+    let mut inodes = HashSet::new();
+    for line in lines {
+        let line = line?;
+        if line.trim().is_empty() {
             continue;
+        }
+        let mut remaining = line.as_str();
+        let mut parts = Vec::with_capacity(7);
+        for _ in 0..7 {
+            remaining = remaining.trim_start();
+            if remaining.is_empty() {
+                return Err(invalid("truncated UNIX socket table row"));
+            }
+            let end = remaining
+                .find(char::is_whitespace)
+                .unwrap_or(remaining.len());
+            parts.push(&remaining[..end]);
+            remaining = &remaining[end..];
         }
 
         // Format: Num RefCount Protocol Flags Type St Inode Path
-        let ref_count = u32::from_str_radix(parts[1], 16).unwrap_or(0);
-        let socket_type = parts[4]
+        let slot = parts[0]
+            .strip_suffix(':')
+            .ok_or_else(|| invalid("invalid UNIX socket slot"))?;
+        u64::from_str_radix(slot, 16).map_err(|_| invalid("invalid UNIX socket slot"))?;
+        let ref_count =
+            u32::from_str_radix(parts[1], 16).map_err(|_| invalid("invalid UNIX refcount"))?;
+        for field in &parts[2..4] {
+            u32::from_str_radix(field, 16)
+                .map_err(|_| invalid("invalid UNIX protocol or flags"))?;
+        }
+        let socket_type = UnixSocketType::from_type(
+            u16::from_str_radix(parts[4], 16).map_err(|_| invalid("invalid UNIX socket type"))?,
+        );
+        let state = UnixSocketState::from_state(
+            u8::from_str_radix(parts[5], 16).map_err(|_| invalid("invalid UNIX socket state"))?,
+        );
+        let inode = parts[6]
             .parse()
-            .ok()
-            .map(UnixSocketType::from_type)
-            .unwrap_or(UnixSocketType::Unknown);
-        let state = parts[5]
-            .parse()
-            .ok()
-            .map(UnixSocketState::from_state)
-            .unwrap_or(UnixSocketState::Unknown);
-        let inode = parts[6].parse().unwrap_or(0);
-        let path = if parts.len() > 7 {
-            Some(parts[7..].join(" "))
-        } else {
+            .map_err(|_| invalid("invalid UNIX socket inode"))?;
+        if !inodes.insert(inode) {
+            return Err(invalid("duplicate UNIX socket inode"));
+        }
+        let path = if remaining.trim_start().is_empty() {
             None
+        } else {
+            Some(remaining.trim_start().to_string())
         };
 
         sockets.push(UnixSocket {
@@ -563,13 +596,95 @@ pub fn parse_proc_net_unix_reader<R: BufRead>(reader: R) -> Vec<UnixSocket> {
         });
     }
 
-    sockets
+    Ok(sockets)
 }
 
 /// Parse Unix socket content (for testing).
 #[cfg(test)]
-pub fn parse_proc_net_unix_content(content: &str) -> Vec<UnixSocket> {
+pub fn parse_proc_net_unix_content(content: &str) -> std::io::Result<Vec<UnixSocket>> {
     parse_proc_net_unix_reader(content.as_bytes())
+}
+
+/// Prove that an otherwise unclassified descriptor inode belongs to TCP/UDP.
+/// A missing or malformed table never establishes absence.
+#[cfg(target_os = "linux")]
+pub(crate) fn has_inet_socket_inode(pid: u32, inode: u64) -> std::io::Result<bool> {
+    for protocol in ["tcp", "udp", "tcp6", "udp6"] {
+        let path = format!("/proc/{pid}/net/{protocol}");
+        let contextual = |source: std::io::Error| {
+            std::io::Error::new(source.kind(), format!("{path}: {source}"))
+        };
+        let file = fs::File::open(&path).map_err(contextual)?;
+        if inet_table_has_inode(BufReader::new(file), inode).map_err(contextual)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn inet_table_has_inode<R: BufRead>(reader: R, inode: u64) -> std::io::Result<bool> {
+    let invalid = |reason: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, reason);
+    let mut lines = reader.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| invalid("missing TCP/UDP table header"))??;
+    let fields: Vec<_> = header.split_whitespace().collect();
+    if fields.first() != Some(&"sl")
+        || !fields.contains(&"local_address")
+        || !(fields.contains(&"rem_address") || fields.contains(&"remote_address"))
+        || !fields.contains(&"inode")
+    {
+        return Err(invalid("invalid TCP/UDP table header"));
+    }
+    for line in lines {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 10 {
+            return Err(invalid("truncated TCP/UDP socket row"));
+        }
+        let address = |value: &str| {
+            value.split_once(':').is_some_and(|(host, port)| {
+                matches!(host.len(), 8 | 32)
+                    && port.len() == 4
+                    && host
+                        .bytes()
+                        .chain(port.bytes())
+                        .all(|byte| byte.is_ascii_hexdigit())
+            })
+        };
+        let hex_pair = |value: &str| {
+            value.split_once(':').is_some_and(|(left, right)| {
+                u64::from_str_radix(left, 16).is_ok() && u64::from_str_radix(right, 16).is_ok()
+            })
+        };
+        if fields[0]
+            .strip_suffix(':')
+            .and_then(|slot| slot.parse::<u64>().ok())
+            .is_none()
+            || !address(fields[1])
+            || !address(fields[2])
+            || u8::from_str_radix(fields[3], 16).is_err()
+            || !hex_pair(fields[4])
+            || !hex_pair(fields[5])
+            || u64::from_str_radix(fields[6], 16).is_err()
+            || fields[7].parse::<u64>().is_err()
+            || fields[8].parse::<u64>().is_err()
+        {
+            return Err(invalid("invalid TCP/UDP socket row"));
+        }
+        let observed: u64 = fields
+            .get(9)
+            .and_then(|inode| inode.parse().ok())
+            .ok_or_else(|| invalid("invalid TCP/UDP socket inode row"))?;
+        if observed == inode {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Parse tx_queue:rx_queue field from /proc/net/tcp format (hex encoded).
@@ -763,7 +878,7 @@ mod tests {
 0000000000000000: 00000002 00000000 00010000 0002 01 33333
 "#;
 
-        let sockets = parse_proc_net_unix_content(content);
+        let sockets = parse_proc_net_unix_content(content).unwrap();
         assert_eq!(sockets.len(), 2);
 
         assert_eq!(sockets[0].socket_type, UnixSocketType::Stream);
@@ -786,6 +901,66 @@ mod tests {
         assert_eq!(UnixSocketType::from_type(2), UnixSocketType::Dgram);
         assert_eq!(UnixSocketType::from_type(5), UnixSocketType::SeqPacket);
         assert_eq!(UnixSocketType::from_type(99), UnixSocketType::Unknown);
+    }
+
+    #[test]
+    fn unix_table_failure_is_not_an_empty_observation() {
+        const HEADER: &str = "Num RefCount Protocol Flags Type St Inode Path\n";
+        assert!(parse_proc_net_unix_content(HEADER).unwrap().is_empty());
+        for content in [
+            "".to_string(),
+            format!("{HEADER}truncated\n"),
+            format!("{HEADER}0: 2 0 0 1 1 invalid /owned\n"),
+            format!("{HEADER}0: invalid 0 0 1 1 42 /owned\n"),
+            format!("{HEADER}0: 2 0 0 1 1 42 /owned\n1: 2 0 0 1 1 42 /other\n"),
+        ] {
+            assert_eq!(
+                parse_proc_net_unix_content(&content).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        struct FailedRead;
+        impl std::io::Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "planted reader refusal",
+                ))
+            }
+        }
+        assert_eq!(
+            parse_proc_net_unix_reader(BufReader::new(FailedRead))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let sockets =
+            parse_proc_net_unix_content(&format!("{HEADER}0: 2 0 0 1 1 42 /owned  path\n"))
+                .unwrap();
+        assert_eq!(sockets[0].path.as_deref(), Some("/owned  path"));
+    }
+
+    #[test]
+    fn inet_protocol_proof_requires_a_readable_valid_inode_row() {
+        const HEADER: &str = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
+        let row =
+            "0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 42\n";
+        assert!(inet_table_has_inode(format!("{HEADER}{row}").as_bytes(), 42).unwrap());
+        assert!(!inet_table_has_inode(format!("{HEADER}{row}").as_bytes(), 43).unwrap());
+        assert!(!inet_table_has_inode(HEADER.as_bytes(), 42).unwrap());
+        for content in [
+            "".to_string(),
+            format!("{HEADER}truncated\n"),
+            format!("{HEADER}{}", row.replace("0 42", "0 invalid")),
+            format!("{HEADER}{}", row.replace("0A", "invalid")),
+        ] {
+            assert_eq!(
+                inet_table_has_inode(content.as_bytes(), 42)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]

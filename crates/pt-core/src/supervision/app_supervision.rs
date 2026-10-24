@@ -24,7 +24,6 @@
 
 use super::ancestry::AncestryAnalyzer;
 use super::environ::read_environ;
-use super::signature::SignatureDatabase;
 use super::types::{EvidenceType, SupervisionEvidence};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -203,10 +202,6 @@ fn shell_escape(s: &str) -> String {
 pub struct AppSupervisionAnalyzer {
     /// Whether to include action recommendations.
     include_action_recommendations: bool,
-
-    /// Signature database for detection (reserved for future use).
-    #[allow(dead_code)]
-    signature_db: SignatureDatabase,
 }
 
 impl AppSupervisionAnalyzer {
@@ -214,7 +209,6 @@ impl AppSupervisionAnalyzer {
     pub fn new() -> Self {
         Self {
             include_action_recommendations: true,
-            signature_db: SignatureDatabase::with_defaults(),
         }
     }
 

@@ -198,6 +198,16 @@ impl ProcessExpectations {
         }
     }
 
+    /// A task that normally finishes in about `typical` seconds and almost never
+    /// takes longer than `max` (its 99th percentile).
+    pub fn task_lasting(typical: u64, max: u64) -> Self {
+        Self {
+            typical_lifetime_seconds: Some(typical),
+            max_normal_lifetime_seconds: Some(max),
+            ..Default::default()
+        }
+    }
+
     /// Create expectations for a long-running daemon.
     pub fn daemon() -> Self {
         Self {
@@ -539,6 +549,45 @@ impl SupervisorSignature {
         Ok(())
     }
 
+    /// Validate executable matcher data while preserving structural inspection
+    /// of signatures whose matching fields were redacted during export.
+    pub fn validate_for_activation(&self) -> Result<(), SignatureError> {
+        self.validate()?;
+        self.validate_activation_matchers()
+    }
+
+    fn validate_activation_matchers(&self) -> Result<(), SignatureError> {
+        let check_marker = |field: &str, value: &str| {
+            if value.contains("[HASH:") || value.contains("[REDACTED]") {
+                return Err(SignatureError::Invalid(format!(
+                    "redacted matcher in {field} cannot be activated; use an intact local signature"
+                )));
+            }
+            Ok(())
+        };
+
+        for (field, values) in [
+            ("process_names", self.patterns.process_names.as_slice()),
+            ("arg_patterns", self.patterns.arg_patterns.as_slice()),
+            (
+                "working_dir_patterns",
+                self.patterns.working_dir_patterns.as_slice(),
+            ),
+            ("parent_patterns", self.patterns.parent_patterns.as_slice()),
+            ("socket_paths", self.patterns.socket_paths.as_slice()),
+            ("pid_files", self.patterns.pid_files.as_slice()),
+        ] {
+            for value in values {
+                check_marker(field, value)?;
+            }
+        }
+        for (name, value) in &self.patterns.environment_vars {
+            check_marker("environment_vars.key", name)?;
+            check_marker("environment_vars.value", value)?;
+        }
+        Ok(())
+    }
+
     /// Convert to a SupervisorPattern (process name only).
     pub fn to_supervisor_pattern(&self) -> SupervisorPattern {
         SupervisorPattern::new(
@@ -638,6 +687,16 @@ impl SignatureSchema {
             sig.validate()?;
         }
 
+        Ok(())
+    }
+
+    /// Validate all signatures before activating their matcher data.
+    pub fn validate_for_activation(&self) -> Result<(), SignatureError> {
+        self.validate()?;
+        for signature in &self.signatures {
+            // Structural validation above already checked every regex once.
+            signature.validate_activation_matchers()?;
+        }
         Ok(())
     }
 
@@ -934,7 +993,7 @@ impl SignatureDatabase {
 
     /// Add a signature and compile its patterns.
     pub fn add(&mut self, signature: SupervisorSignature) -> Result<(), SignatureError> {
-        signature.validate()?;
+        signature.validate_for_activation()?;
 
         // Pre-compile all regexes to ensure success before updating state
         let mut proc_res = Vec::with_capacity(signature.patterns.process_names.len());
@@ -1700,7 +1759,17 @@ impl SignatureDatabase {
             SupervisorSignature::new("junit", SupervisorCategory::Other)
                 .with_confidence(0.75)
                 .with_notes("JUnit Java test runner")
-                .with_arg_patterns(vec![r"(junit|org\.junit)"])
+                // A JUnit launcher as the main class (JUnit 4 core, the JUnit 5 console
+                // launcher, IntelliJ, Eclipse), the console launcher jar or Maven's
+                // surefire booter run with -jar, or a Gradle test executor. The former
+                // bare `junit` matched any JVM with a junit jar on its classpath, e.g. a
+                // language server or a Gradle daemon.
+                .with_arg_patterns(vec![concat!(
+                    r"(^|\s)(org\.junit\.runner\.JUnitCore|org\.junit\.platform\.console\.ConsoleLauncher",
+                    r"|com\.intellij\.rt\.junit\.JUnitStarter|org\.eclipse\.jdt\.internal\.junit\.runner\.RemoteTestRunner)(\s|$)",
+                    r"|-jar\s+(\S*/)?(junit-platform-console-standalone|surefire/surefirebooter)[^\s/:]*\.jar(\s|$)",
+                    r"|(^|\s)worker\.org\.gradle\.process\.internal\.worker\.GradleWorkerMain\s+'?Gradle Test Executor\b",
+                )])
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
                 .as_builtin(),
@@ -1794,7 +1863,13 @@ impl SignatureDatabase {
             SupervisorSignature::new("django", SupervisorCategory::Other)
                 .with_confidence(0.80)
                 .with_notes("Django Python web server")
-                .with_arg_patterns(vec![r"(manage\.py\s+runserver|django)"])
+                // The development server (`manage.py runserver`, `django-admin runserver`,
+                // `python -m django runserver`). The former bare `django` matched any
+                // command line with the word in a path (a celery worker in
+                // ~/django-app/venv, `rg django`) and gave it dev-server priors.
+                .with_arg_patterns(vec![
+                    r"((^|[\s/])(manage\.py|django-admin(\.py)?)|-m\s+django)\s+runserver(_plus)?(\s|$)",
+                ])
                 .with_env_patterns(HashMap::from([(
                     "DJANGO_SETTINGS_MODULE".into(),
                     ".*".into(),
@@ -1870,6 +1945,139 @@ impl SignatureDatabase {
                 .as_builtin(),
         );
 
+        // Agent-swarm toolchain: the process kinds the operator playbook
+        // (system-performance-remediation) triages by age. Every one states how long a
+        // normal run lasts, so its "left behind" prior only applies once a process has
+        // outlived that (see scoring's age gate): young ones are judged on evidence.
+
+        // `rch exec -- <cargo ...>` waits for a build that runs on a remote worker: its
+        // own CPU is ~0 by design. Remote test suites can run for hours.
+        let _ = self.add(
+            SupervisorSignature::new("rch-exec", SupervisorCategory::Other)
+                .with_confidence(0.90)
+                .with_notes("Remote compilation helper client; the work runs on a worker")
+                .with_process_patterns(vec![r"^rch$"])
+                .with_arg_patterns(vec![r"(^|\s)exec(\s|$)"])
+                // Both: `rch status` is not a client waiting on a build.
+                .with_min_matches(2)
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations {
+                    idle_cpu_normal: true,
+                    ..ProcessExpectations::task_lasting(600, 4 * 3600)
+                })
+                .as_builtin(),
+        );
+
+        // `bun test` (playbook: ignores SIGTERM; stuck runs found after 12+ hours).
+        let _ = self.add(
+            SupervisorSignature::new("bun-test", SupervisorCategory::Other)
+                .with_confidence(0.90)
+                .with_notes("Bun test runner (known to ignore SIGTERM)")
+                .with_process_patterns(vec![r"^bun$"])
+                .with_arg_patterns(vec![r"(^|\s)test(\s|$)"])
+                // Both: `cargo test` must not read as `bun test`.
+                .with_min_matches(2)
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::short_lived_task())
+                .as_builtin(),
+        );
+
+        // Compilers and linkers run by a build tool: normally seconds to minutes per
+        // unit; a fat-LTO link can take tens of minutes.
+        let _ = self.add(
+            SupervisorSignature::new("compiler", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Compiler or linker process started by a build")
+                .with_process_patterns(vec![
+                    r"^rustc$",
+                    r"^clippy-driver$",
+                    r"^cc1$",
+                    r"^cc1plus$",
+                    r"^ld$",
+                    r"^ld\.lld$",
+                    r"^lld$",
+                    r"^mold$",
+                ])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations {
+                    cpu_during_run: Some(0.9),
+                    ..ProcessExpectations::task_lasting(60, 3600)
+                })
+                .as_builtin(),
+        );
+
+        // Short git operations (playbook: a `git add` running minutes is stuck).
+        // Network operations (fetch, push, clone) are deliberately not included.
+        let _ = self.add(
+            SupervisorSignature::new("git-local-op", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Local git operation that normally completes in seconds")
+                .with_process_patterns(vec![r"^git$"])
+                .with_arg_patterns(vec![
+                    r"^(\S*/)?git\s+(add|status|commit|stash|rev-parse)(\s|$)",
+                ])
+                .with_min_matches(2)
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::task_lasting(5, 300))
+                .as_builtin(),
+        );
+
+        // Vercel CLI queries (not `vercel dev`, which is a dev server).
+        let _ = self.add(
+            SupervisorSignature::new("vercel-cli", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Vercel CLI query/deploy command")
+                .with_arg_patterns(vec![
+                    &command_word_pattern("vercel"),
+                    r"(^|\s)(inspect|env|logs|ls|list|pull|whoami|deploy|build)(\s|$)",
+                ])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::task_lasting(60, 1800))
+                .as_builtin(),
+        );
+
+        // Dependency installs.
+        let _ = self.add(
+            SupervisorSignature::new("package-install", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Package manager install")
+                .with_arg_patterns(vec![
+                    r"(^|[\s/])(npm|pnpm|yarn|bun)(\.[cm]?js)?\s+(install|ci|i|add)(\s|$)",
+                ])
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::task_lasting(120, 1800))
+                .as_builtin(),
+        );
+
+        // Shells polling for a condition: `while ! test -f X; do sleep 1; done`
+        // (playbook: orphaned poll loops waiting for files that never appear).
+        let _ = self.add(
+            SupervisorSignature::new("poll-loop-shell", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Shell loop that sleeps until a condition holds")
+                .with_process_patterns(vec![r"^(ba|z|da|k)?sh$"])
+                .with_arg_patterns(vec![r"\b(while|until)\b.*;\s*do\b.*\bsleep\b.*\bdone\b"])
+                // Both: any other shell is not a poll loop.
+                .with_min_matches(2)
+                .with_priors(SignaturePriors::likely_abandoned())
+                .with_expectations(ProcessExpectations::task_lasting(300, 4 * 3600))
+                .as_builtin(),
+        );
+
+        // MCP servers an agent spawns over stdio: they live as long as their agent,
+        // idling is normal. Labels only (no prior): whether one is left behind comes
+        // from its parent and orphan evidence.
+        let _ = self.add(
+            SupervisorSignature::new("mcp-server", SupervisorCategory::Other)
+                .with_confidence(0.80)
+                .with_notes("Model Context Protocol server started by an agent")
+                .with_arg_patterns(vec![
+                    r"(@playwright/mcp|(^|[\s/])playwright-mcp(\s|$)|@morphllm/morphmcp|@modelcontextprotocol/server-)",
+                ])
+                .with_expectations(ProcessExpectations::daemon())
+                .as_builtin(),
+        );
+
         let _ = self.add(
             SupervisorSignature::new("go-build", SupervisorCategory::Other)
                 .with_confidence(0.85)
@@ -1905,7 +2113,16 @@ impl SignatureDatabase {
                 .with_confidence(0.80)
                 .with_notes("Apache Maven")
                 .with_process_patterns(vec![r"^mvn$"])
-                .with_arg_patterns(vec![r"mvn", r"maven"])
+                // The mvn/mvnw launcher script as an argument of its own (not a
+                // `-Dmaven.home=.../mvn` value), or the JVM it starts (Maven's
+                // classworlds launcher or the wrapper main class). The former `mvn` +
+                // `maven` substrings matched the long-running Maven daemon (mvnd, whose
+                // distribution has a `mvn/` directory) and any JVM whose paths mention
+                // both, and rated them likely abandoned.
+                .with_arg_patterns(vec![concat!(
+                    r"(^|\s)([^\s=]*/)?mvnw?(\s|$)",
+                    r"|(^|\s)(org\.codehaus\.plexus\.classworlds\.launcher\.Launcher|org\.apache\.maven\.wrapper\.MavenWrapperMain)(\s|$)",
+                )])
                 .with_env_patterns(HashMap::from([("MAVEN_HOME".into(), ".*".into())]))
                 .with_priors(SignaturePriors::likely_abandoned())
                 .with_expectations(ProcessExpectations::short_lived_task())
@@ -2218,6 +2435,89 @@ mod tests {
             sig.validate(),
             Err(SignatureError::InvalidRegex { .. })
         ));
+    }
+
+    #[test]
+    fn activation_rejects_redacted_matchers_and_preserves_intact_matching() {
+        let intact = SupervisorSignature::new("activation-worker", SupervisorCategory::Other)
+            .with_process_patterns(vec![r"^activation-worker$"])
+            .with_arg_patterns(vec![r"(^|\s)--owned-task(\s|$)"])
+            .with_min_matches(2);
+        intact.validate_for_activation().unwrap();
+        let mut schema = SignatureSchema::new();
+        schema.add(intact.clone());
+        schema.validate_for_activation().unwrap();
+        let mut db = SignatureDatabase::new();
+        db.add(intact.clone()).unwrap();
+
+        for marker in ["prefix[HASH:abcd]suffix", "prefix[REDACTED]suffix"] {
+            for field in [
+                "process_names",
+                "arg_patterns",
+                "working_dir_patterns",
+                "parent_patterns",
+                "environment_vars.key",
+                "environment_vars.value",
+                "socket_paths",
+                "pid_files",
+            ] {
+                let mut redacted = intact.clone();
+                match field {
+                    "process_names" => redacted.patterns.process_names.push(marker.to_string()),
+                    "arg_patterns" => redacted.patterns.arg_patterns.push(marker.to_string()),
+                    "working_dir_patterns" => redacted
+                        .patterns
+                        .working_dir_patterns
+                        .push(marker.to_string()),
+                    "parent_patterns" => redacted.patterns.parent_patterns.push(marker.to_string()),
+                    "environment_vars.key" => {
+                        redacted
+                            .patterns
+                            .environment_vars
+                            .insert(marker.to_string(), "^true$".to_string());
+                    }
+                    "environment_vars.value" => {
+                        redacted
+                            .patterns
+                            .environment_vars
+                            .insert("PT_OWNED_TASK".to_string(), marker.to_string());
+                    }
+                    "socket_paths" => redacted.patterns.socket_paths.push(marker.to_string()),
+                    "pid_files" => redacted.patterns.pid_files.push(marker.to_string()),
+                    _ => unreachable!("all matcher fields are covered"),
+                }
+
+                // Both markers are valid regex character classes; structural
+                // inspection must stay possible without allowing activation.
+                redacted.validate().unwrap();
+                assert!(matches!(
+                    redacted.validate_for_activation(),
+                    Err(SignatureError::Invalid(message)) if message.contains(field)
+                ));
+                let mut schema = SignatureSchema::new();
+                schema.add(redacted.clone());
+                schema.validate().unwrap();
+                assert!(matches!(
+                    schema.validate_for_activation(),
+                    Err(SignatureError::Invalid(message)) if message.contains(field)
+                ));
+                assert!(matches!(
+                    db.add(redacted),
+                    Err(SignatureError::Invalid(message)) if message.contains(field)
+                ));
+                assert_eq!(db.signatures(), std::slice::from_ref(&intact));
+            }
+        }
+
+        let matching = ProcessMatchContext::with_comm("activation-worker")
+            .cmdline("activation-worker --owned-task");
+        let actual = db.best_match(&matching).unwrap();
+        assert_eq!(actual.signature.name, "activation-worker");
+        assert!(actual.details.process_name_matched);
+        assert!(actual.details.args_matched);
+        let unrelated = ProcessMatchContext::with_comm("unrelated-worker")
+            .cmdline("unrelated-worker --owned-task");
+        assert!(db.best_match(&unrelated).is_none());
     }
 
     #[test]
@@ -2856,6 +3156,114 @@ mod tests {
         }
     }
 
+    /// junit, maven and django matched bare substrings; they now match the tool's
+    /// launcher, main class or subcommand (the GH #15 treatment of ef8c729).
+    #[test]
+    fn junit_maven_django_match_the_tool_not_substrings() {
+        let db = SignatureDatabase::with_defaults();
+        let matched = |comm: &str, cmd: &str| -> Vec<String> {
+            let ctx = ProcessMatchContext::with_comm(comm).cmdline(cmd);
+            db.match_process(&ctx)
+                .into_iter()
+                .map(|m| m.signature.name.clone())
+                .collect()
+        };
+        for (comm, cmd, expected) in [
+            (
+                "java",
+                "java -cp target/classes:/home/u/.m2/repository/junit/junit/4.13.2/junit-4.13.2.jar org.junit.runner.JUnitCore com.acme.FooTest",
+                "junit",
+            ),
+            (
+                "java",
+                "java -jar /opt/junit/junit-platform-console-standalone-1.10.2.jar --scan-classpath",
+                "junit",
+            ),
+            (
+                "java",
+                "/usr/lib/jvm/java-17/bin/java -ea -Didea.test.cyclic.buffer.size=1048576 -cp /opt/idea/lib/idea_rt.jar:/opt/idea/plugins/junit/lib/junit5-rt.jar com.intellij.rt.junit.JUnitStarter -ideVersion5 -junit5 com.acme.FooTest",
+                "junit",
+            ),
+            (
+                "java",
+                "/usr/lib/jvm/java-17/bin/java -jar /home/u/app/target/surefire/surefirebooter-20260930101500_3.jar /home/u/app/target/surefire 2026-09-30T10-15-00_123-jvmRun1 surefire123.tmp",
+                "junit",
+            ),
+            (
+                "java",
+                "/usr/lib/jvm/java-17/bin/java -Dorg.gradle.internal.worker.tmpdir=/home/u/app/build/tmp/test/work -cp /home/u/.gradle/caches/8.5/workerMain/gradle-worker.jar worker.org.gradle.process.internal.worker.GradleWorkerMain Gradle Test Executor 3",
+                "junit",
+            ),
+            ("mvn", "/bin/sh /usr/bin/mvn clean install", "maven"),
+            ("mvnw", "/bin/sh ./mvnw -q verify", "maven"),
+            (
+                "java",
+                "/usr/lib/jvm/java-17/bin/java -classpath /usr/share/maven/boot/plexus-classworlds-2.7.0.jar -Dclassworlds.conf=/usr/share/maven/bin/m2.conf -Dmaven.home=/usr/share/maven -Dmaven.multiModuleProjectDirectory=/home/u/app org.codehaus.plexus.classworlds.launcher.Launcher clean install",
+                "maven",
+            ),
+            (
+                "java",
+                "java -classpath /home/u/app/.mvn/wrapper/maven-wrapper.jar -Dmaven.multiModuleProjectDirectory=/home/u/app org.apache.maven.wrapper.MavenWrapperMain test",
+                "maven",
+            ),
+            ("python3", "python3 manage.py runserver 0.0.0.0:8000", "django"),
+            ("python", "python ./manage.py runserver_plus", "django"),
+            (
+                "python3",
+                "/home/u/app/venv/bin/python3 /home/u/app/venv/bin/django-admin runserver",
+                "django",
+            ),
+            ("python3", "python3 -m django runserver --settings=app.settings", "django"),
+        ] {
+            let names = matched(comm, cmd);
+            assert!(names.iter().any(|n| n == expected), "{cmd:?}: {names:?}");
+        }
+        for (comm, cmd, unexpected) in [
+            // A language server and a Gradle daemon with junit jars on the classpath.
+            (
+                "java",
+                "java -Declipse.application=org.eclipse.jdt.ls.core.id1 -jar /opt/jdtls/plugins/org.eclipse.equinox.launcher_1.6.jar -data /home/u/.cache/jdtls/ws -cp /home/u/.m2/repository/junit/junit/4.13.2/junit-4.13.2.jar",
+                "junit",
+            ),
+            (
+                "java",
+                "java -Xmx2g -cp /home/u/.gradle/caches/junit-platform-console-standalone-1.10.2.jar:/home/u/.gradle/wrapper/dists/gradle-8.5/lib/gradle-launcher-8.5.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.5",
+                "junit",
+            ),
+            ("vim", "vim src/test/java/org/junit/MyJunitTest.java", "junit"),
+            (
+                "java",
+                "java -cp /home/u/.gradle/caches/8.5/workerMain/gradle-worker.jar worker.org.gradle.process.internal.worker.GradleWorkerMain Gradle Worker Daemon 2",
+                "junit",
+            ),
+            // The Maven daemon is long-running; neither its paths nor maven.* properties
+            // make it a Maven build.
+            (
+                "java",
+                "java -classpath /opt/maven-mvnd/mvn/boot/plexus-classworlds-2.8.0.jar:/opt/maven-mvnd/lib/mvnd-daemon.jar -Dmvnd.home=/opt/maven-mvnd -Dmaven.home=/opt/maven-mvnd/mvn org.mvndaemon.mvnd.daemon.Server",
+                "maven",
+            ),
+            ("mvnd", "/opt/maven-mvnd/bin/mvnd clean install", "maven"),
+            ("less", "less /home/u/.mvn/maven.config", "maven"),
+            // django in a path or a search, not the dev server.
+            (
+                "celery",
+                "/home/u/django-app/venv/bin/python /home/u/django-app/venv/bin/celery -A proj worker",
+                "django",
+            ),
+            ("rg", "rg django src/", "django"),
+            ("python3", "python3 manage.py migrate", "django"),
+            (
+                "gunicorn",
+                "/home/u/app/venv/bin/python /home/u/app/venv/bin/gunicorn app.wsgi --workers 4",
+                "django",
+            ),
+        ] {
+            let names = matched(comm, cmd);
+            assert!(!names.iter().any(|n| n == unexpected), "{cmd:?}: {names:?}");
+        }
+    }
+
     #[test]
     fn test_working_dir_patterns_matching() {
         let mut db = SignatureDatabase::new();
@@ -2950,5 +3358,128 @@ mod tests {
         );
 
         assert!(multi.score > command_only.score);
+    }
+
+    fn best_name(db: &SignatureDatabase, comm: &str, cmdline: &str) -> Option<String> {
+        db.best_match(&ProcessMatchContext::with_comm(comm).cmdline(cmdline))
+            .map(|m| m.signature.name.clone())
+    }
+
+    /// The agent-swarm toolchain signatures match what they name and nothing nearby.
+    #[test]
+    fn agent_swarm_toolchain_signatures() {
+        let db = SignatureDatabase::with_defaults();
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            // The rch client wins over the generic cargo-build match on its arguments.
+            ("rch", "rch exec -- cargo build -p x", Some("rch-exec")),
+            ("rch", "rch status", None),
+            ("bun", "bun test --watch", Some("bun-test")),
+            (
+                "rustc",
+                "rustc --crate-name foo src/lib.rs",
+                Some("compiler"),
+            ),
+            (
+                "cc1plus",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/cc1plus -quiet",
+                Some("compiler"),
+            ),
+            ("rustup", "rustup update", None),
+            ("git", "git add .", Some("git-local-op")),
+            (
+                "git",
+                "/usr/bin/git status --porcelain",
+                Some("git-local-op"),
+            ),
+            ("git", "git push origin main", None),
+            (
+                "node",
+                "node /home/u/.bun/bin/vercel inspect abc",
+                Some("vercel-cli"),
+            ),
+            ("node", "node /home/u/.bun/bin/vercel dev", None),
+            // The dedicated npm signature (name + args, also age-gated) outranks the
+            // generic one; package-install covers pnpm/yarn/bun and node-launched forms.
+            ("npm", "npm install", Some("npm")),
+            (
+                "node",
+                "node /usr/bin/pnpm.cjs install --frozen-lockfile",
+                Some("package-install"),
+            ),
+            ("npm", "npm run install-hooks", None),
+            (
+                "bash",
+                "bash -c while ! test -f /tmp/done; do sleep 1; done",
+                Some("poll-loop-shell"),
+            ),
+            ("bash", "bash -c make && sleep 1", None),
+            (
+                "node",
+                "node /home/u/.npm/_npx/x/node_modules/.bin/playwright-mcp",
+                Some("mcp-server"),
+            ),
+            (
+                "node",
+                "node /home/u/.npm/_npx/9f/node_modules/@morphllm/morphmcp/dist/index.js",
+                Some("mcp-server"),
+            ),
+        ];
+        for (comm, cmdline, expected) in cases {
+            let got = best_name(&db, comm, cmdline);
+            match expected {
+                Some(name) => assert_eq!(got.as_deref(), Some(*name), "{comm} | {cmdline}"),
+                // None: no new toolchain signature claims it (another may).
+                None => assert!(
+                    !matches!(
+                        got.as_deref(),
+                        Some(
+                            "rch-exec"
+                                | "bun-test"
+                                | "compiler"
+                                | "git-local-op"
+                                | "vercel-cli"
+                                | "package-install"
+                                | "poll-loop-shell"
+                                | "mcp-server"
+                        )
+                    ),
+                    "{comm} | {cmdline} matched {got:?}"
+                ),
+            }
+        }
+    }
+
+    /// Each one states a normal lifetime (so the scoring age gate applies), except the
+    /// MCP servers, which only label.
+    #[test]
+    fn agent_swarm_toolchain_signatures_state_lifetimes() {
+        let db = SignatureDatabase::with_defaults();
+        for name in [
+            "rch-exec",
+            "bun-test",
+            "compiler",
+            "git-local-op",
+            "vercel-cli",
+            "package-install",
+            "poll-loop-shell",
+        ] {
+            let sig = db
+                .signatures()
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let e = &sig.expectations;
+            assert!(
+                e.typical_lifetime_seconds.unwrap() < e.max_normal_lifetime_seconds.unwrap(),
+                "{name}"
+            );
+            assert!(!sig.priors.is_empty(), "{name}");
+        }
+        let mcp = db
+            .signatures()
+            .iter()
+            .find(|s| s.name == "mcp-server")
+            .unwrap();
+        assert!(mcp.priors.is_empty());
     }
 }

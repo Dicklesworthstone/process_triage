@@ -114,10 +114,14 @@ fn test_agent_plan_candidates_have_supervisor_field() {
             "candidate[{}].supervisor should have 'detected'",
             i
         );
+        // Unavailable supervision evidence is reported as unknown (detected: null,
+        // status: "unknown") and sends the candidate to review; otherwise boolean.
+        let unknown = supervisor["status"] == "unknown";
         assert!(
-            supervisor["detected"].is_boolean(),
-            "candidate[{}].supervisor.detected should be boolean",
-            i
+            supervisor["detected"].is_boolean() || (unknown && supervisor["detected"].is_null()),
+            "candidate[{}].supervisor.detected should be boolean, or null with status unknown: {}",
+            i,
+            supervisor
         );
     }
 }

@@ -100,13 +100,16 @@ static RE_AI_API_KEY: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"sk-(?:ant-)?[A-Za-z0-9_-]{20,}").expect("valid regex"));
 
 static RE_PASSWORD_ARG: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"--password[=\s]+[^\s]+").expect("valid regex"));
+    Lazy::new(|| Regex::new(r"(?i)--password[=\s]+[^\s]+").expect("valid regex"));
 
 static RE_TOKEN_ARG: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"--token[=\s]+[^\s]+").expect("valid regex"));
+    Lazy::new(|| Regex::new(r"(?i)--token[=\s]+[^\s]+").expect("valid regex"));
 
 static RE_API_KEY_ARG: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"--api[-_]?key[=\s]+[^\s]+").expect("valid regex"));
+    Lazy::new(|| Regex::new(r"(?i)--api[-_]?key[=\s]+[^\s]+").expect("valid regex"));
+
+static RE_SECRET_ARG: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)--secret[=\s]+[^\s]+").expect("valid regex"));
 
 static RE_CONNECTION_STRING: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(postgres|mysql|mongodb|redis|amqp)://[^@]+@").expect("valid regex")
@@ -181,6 +184,9 @@ impl SecretDetector {
         }
         if RE_API_KEY_ARG.is_match(value) {
             return Some(SecretType::ApiKeyArg);
+        }
+        if RE_SECRET_ARG.is_match(value) {
+            return Some(SecretType::SensitiveArg);
         }
 
         // Check connection strings
@@ -341,6 +347,7 @@ pub fn find_all_secrets(value: &str) -> Vec<Detection> {
         (&RE_PASSWORD_ARG, SecretType::PasswordArg),
         (&RE_TOKEN_ARG, SecretType::TokenArg),
         (&RE_API_KEY_ARG, SecretType::ApiKeyArg),
+        (&RE_SECRET_ARG, SecretType::SensitiveArg),
         (&RE_CONNECTION_STRING, SecretType::ConnectionString),
     ];
 
@@ -406,6 +413,40 @@ mod tests {
         let detector = SecretDetector::new();
         let result = detector.detect("--token abc123xyz");
         assert_eq!(result, Some(SecretType::TokenArg));
+    }
+
+    #[test]
+    fn sensitive_arguments_are_detected_in_whole_commands_and_positioned_matches() {
+        let detector = SecretDetector::new();
+        for (argument, secret_type) in [
+            ("--secret=short-value", SecretType::SensitiveArg),
+            ("--secret short-value", SecretType::SensitiveArg),
+            ("--SECRET=short-value", SecretType::SensitiveArg),
+            ("--TOKEN=short-value", SecretType::TokenArg),
+            ("--Token short-value", SecretType::TokenArg),
+            ("--PASSWORD=short-value", SecretType::PasswordArg),
+            ("--Password short-value", SecretType::PasswordArg),
+            ("--API-KEY=short-value", SecretType::ApiKeyArg),
+            ("--Api_Key short-value", SecretType::ApiKeyArg),
+        ] {
+            let command = format!("worker {argument} --verbose");
+            assert_eq!(detector.detect(&command), Some(secret_type));
+            let matches = find_all_secrets(&command);
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].secret_type, secret_type);
+            assert_eq!(&command[matches[0].start..matches[0].end], argument);
+        }
+        for command in [
+            "worker --secret",
+            "worker --secret-mode enabled",
+            "worker --token-mode enabled",
+            "worker --password-policy enabled",
+            "worker --api-key-file config",
+            "worker --verbose",
+        ] {
+            assert_eq!(detector.detect(command), None);
+            assert!(find_all_secrets(command).is_empty());
+        }
     }
 
     #[test]

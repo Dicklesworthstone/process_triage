@@ -119,9 +119,10 @@ impl FreezeActionRunner {
     #[cfg(target_os = "linux")]
     fn execute_freeze(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
         debug!(pid = pid, "executing freeze");
 
-        let freeze_path = self.get_freeze_path(pid)?;
+        let freeze_path = format!("/sys/fs/cgroup{checked_path}/cgroup.freeze");
         self.write_freeze_state(&freeze_path, true)
     }
 
@@ -129,9 +130,10 @@ impl FreezeActionRunner {
     #[cfg(target_os = "linux")]
     fn execute_unfreeze(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
         debug!(pid = pid, "executing unfreeze");
 
-        let freeze_path = self.get_freeze_path(pid)?;
+        let freeze_path = format!("/sys/fs/cgroup{checked_path}/cgroup.freeze");
         self.write_freeze_state(&freeze_path, false)
     }
 
@@ -139,6 +141,7 @@ impl FreezeActionRunner {
     #[cfg(target_os = "linux")]
     fn verify_freeze(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        super::dispatch::ensure_cgroup_target(&action.target)?;
 
         // Give it a moment for the freeze state to propagate
         std::thread::sleep(std::time::Duration::from_millis(
@@ -163,6 +166,7 @@ impl FreezeActionRunner {
     #[cfg(target_os = "linux")]
     fn verify_unfreeze(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
+        super::dispatch::ensure_cgroup_target(&action.target)?;
 
         // Give it a moment for the unfreeze state to propagate
         std::thread::sleep(std::time::Duration::from_millis(
@@ -239,9 +243,16 @@ impl ActionRunner for FreezeActionRunner {
 
 /// Check if cgroup v2 freeze is available for a process.
 ///
-/// Returns `true` if the process's cgroup supports the freezer.
+/// Returns `true` when the target passes the direct runner's safety checks and
+/// its cgroup supports the freezer. Write permission is checked at execution.
 #[cfg(target_os = "linux")]
 pub fn is_freeze_available(pid: u32) -> bool {
+    let Some(identity) = super::dispatch::read_cgroup_identity(pid) else {
+        return false;
+    };
+    if super::dispatch::ensure_cgroup_target(&identity).is_err() {
+        return false;
+    }
     let details = match collect_cgroup_details(pid) {
         Some(d) => d,
         None => return false,

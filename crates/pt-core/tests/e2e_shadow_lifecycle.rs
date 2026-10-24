@@ -269,6 +269,95 @@ fn test_shadow_stop_not_running_json_schema() {
     );
 }
 
+/// Birth as pid files record it (Linux start ticks, macOS start microseconds).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn birth_of(pid: u32) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        pt_core::collect::proc_parsers::read_required_proc_stat(pid)
+            .expect("read bystander stat")
+            .starttime
+    }
+    #[cfg(target_os = "macos")]
+    {
+        pt_core::collect::read_bsd_info(pid)
+            .expect("read bystander bsd info")
+            .start_us
+    }
+}
+
+/// Run `shadow stop` against a pid file naming a live bystander, with the birth
+/// sidecar `birth(pid)` returns (none for a pre-2.3.0 file); report whether the
+/// bystander survived, the JSON response and whether the pid file is left.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_with_pid_file(birth: impl Fn(u32) -> Option<u64>) -> (bool, Value, bool) {
+    let dir = tempdir().expect("tempdir");
+    let shadow_dir = dir.path().join("shadow");
+    fs::create_dir_all(&shadow_dir).expect("create shadow dir");
+    let mut bystander = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn bystander");
+    let pid_path = shadow_dir.join("shadow.pid");
+    if let Some(birth) = birth(bystander.id()) {
+        fs::write(
+            shadow_dir.join("shadow.pid.birth"),
+            format!("{} {birth}", bystander.id()),
+        )
+        .expect("write birth sidecar");
+    }
+    fs::write(&pid_path, bystander.id().to_string()).expect("write pid file");
+
+    let output = pt_core()
+        .env("PROCESS_TRIAGE_DATA", dir.path())
+        .args(["--format", "json", "shadow", "stop"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    std::thread::sleep(Duration::from_millis(300));
+    let survived = bystander.try_wait().expect("poll bystander").is_none();
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    let json: Value = serde_json::from_slice(&output).expect("parse JSON");
+    (survived, json, pid_path.exists())
+}
+
+/// A pid file from before v2.3.0 records no birth: stop cannot tell the observer
+/// from an unrelated process that reused the pid, so it does not signal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_shadow_stop_does_not_signal_an_unverified_pid_file() {
+    let (survived, json, pid_file_left) = stop_with_pid_file(|_| None);
+    assert!(survived, "stop signalled an unverified pid: {json}");
+    assert_eq!(json["running"], false, "{json}");
+    assert!(pid_file_left, "an unverified pid file must be kept: {json}");
+}
+
+/// The observer died without cleanup and its pid now belongs to another process
+/// (different birth): not signalled, and the stale file is cleared.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_shadow_stop_does_not_signal_a_reused_pid() {
+    let (survived, json, pid_file_left) =
+        stop_with_pid_file(|pid| Some(birth_of(pid).wrapping_add(1)));
+    assert!(survived, "stop signalled a reused pid: {json}");
+    assert_eq!(json["running"], false, "{json}");
+    assert!(!pid_file_left, "stale pid file kept: {json}");
+}
+
+/// The recorded birth matches the live process: stop signals it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn test_shadow_stop_signals_the_recorded_observer() {
+    let (survived, json, _) = stop_with_pid_file(|pid| Some(birth_of(pid)));
+    assert!(
+        !survived,
+        "stop did not signal the recorded process: {json}"
+    );
+}
+
 // ============================================================================
 // Shadow Export
 // ============================================================================

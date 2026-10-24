@@ -42,6 +42,8 @@ pub struct SignalActionRunner {
     config: SignalConfig,
     /// How the last signal was delivered: "pidfd", "kill" or "kill_group".
     last_path: std::sync::Mutex<Option<&'static str>>,
+    /// A successful SIGTERM/SIGKILL delivery, even if later verification fails.
+    kill_signal_delivered: std::sync::atomic::AtomicBool,
 }
 
 impl SignalActionRunner {
@@ -49,6 +51,7 @@ impl SignalActionRunner {
         Self {
             config,
             last_path: std::sync::Mutex::new(None),
+            kill_signal_delivered: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -63,6 +66,20 @@ impl SignalActionRunner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// Consume actual destructive-signal delivery evidence for budget accounting.
+    pub fn take_kill_signal_delivered(&self) -> bool {
+        self.kill_signal_delivered
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(unix)]
+    fn note_delivered_signal(&self, signal: i32) {
+        if matches!(signal, libc::SIGTERM | libc::SIGKILL) {
+            self.kill_signal_delivered
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub fn with_defaults() -> Self {
@@ -98,6 +115,7 @@ impl SignalActionRunner {
 
         let result = unsafe { libc::kill(target_pid, signal) };
         if result == 0 {
+            self.note_delivered_signal(signal);
             return Ok(());
         }
 
@@ -238,7 +256,9 @@ impl SignalActionRunner {
                 return pidfd.send(libc::SIGSTOP);
             }
         }
-        #[cfg(target_os = "macos")]
+        // Without a pidfd (macOS, or a Linux kernel before 5.3), re-check the
+        // start identity right before the plain kill(2).
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if !use_group {
             self.check_identity_now(action)?;
         }
@@ -246,9 +266,9 @@ impl SignalActionRunner {
         Ok(())
     }
 
-    /// macOS has no pidfd: re-check the exact identity immediately before signaling,
-    /// keeping the PID-reuse window as small as the platform allows.
-    #[cfg(target_os = "macos")]
+    /// Re-check start identity immediately before fallback signaling, including
+    /// escalation when a Linux pidfd is unavailable.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn check_identity_now(&self, action: &PlanAction) -> Result<(), ActionError> {
         match self.read_starttime(action.target.pid.0) {
             Some(current) if ids_match_starttime(&action.target.start_id.0, current) => Ok(()),
@@ -269,10 +289,15 @@ impl SignalActionRunner {
         if !use_group {
             if let Some(pidfd) = self.pinned_pidfd(action)? {
                 pidfd.send(libc::SIGTERM)?;
+                self.note_delivered_signal(libc::SIGTERM);
                 let grace = Duration::from_millis(self.config.term_grace_ms);
                 return match self.wait_for_state_change(pid, true, None, grace) {
                     Ok(()) => Ok(()),
                     Err(ActionError::Timeout) => match pidfd.send(libc::SIGKILL) {
+                        Ok(()) => {
+                            self.note_delivered_signal(libc::SIGKILL);
+                            Ok(())
+                        }
                         // Exited between the grace timeout and SIGKILL: done.
                         Err(ActionError::ProcessNotFound) => Ok(()),
                         other => other,
@@ -282,7 +307,7 @@ impl SignalActionRunner {
             }
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if !use_group {
             self.check_identity_now(action)?;
         }
@@ -306,14 +331,7 @@ impl SignalActionRunner {
         // Re-validate the starttime to guard against killing a replacement process.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self.process_exists(pid) {
-            if let Some(current_starttime) = self.read_starttime(pid) {
-                let start_id = &action.target.start_id.0;
-                if !ids_match_starttime(start_id, current_starttime) {
-                    return Err(ActionError::IdentityMismatch);
-                }
-            }
-            // If we can't read starttime, the process is likely gone — SIGKILL
-            // will harmlessly fail with ESRCH.
+            self.check_identity_now(action)?;
         }
 
         if self.process_exists(pid) {
@@ -332,7 +350,7 @@ impl SignalActionRunner {
         if let Some(pidfd) = self.pinned_pidfd(action)? {
             return pidfd.send(libc::SIGCHLD);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.check_identity_now(action)?;
         self.send_signal(action.target.pid.0, libc::SIGCHLD, false)
     }
@@ -409,7 +427,7 @@ impl SignalActionRunner {
                 return pidfd.send(libc::SIGCONT);
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if !use_group {
             self.check_identity_now(action)?;
         }
@@ -903,6 +921,30 @@ mod tests {
             let status = child.wait().expect("wait failed");
             assert!(!status.success() || status.code().is_none());
         }
+
+        #[test]
+        fn delivered_kill_is_retained_after_verification_timeout() {
+            let mut child = Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn owned sleep");
+            let pid = child.id();
+            let runner = SignalActionRunner::new(SignalConfig {
+                verify_timeout_ms: 0,
+                ..SignalConfig::default()
+            });
+            assert!(!runner.take_kill_signal_delivered());
+            runner.send_signal(pid, libc::SIGTERM, false).unwrap();
+            // A zero observation window deliberately cannot certify the effect.
+            let observation = runner.wait_for_state_change(pid, true, None, Duration::ZERO);
+            assert!(matches!(observation, Err(ActionError::Timeout)));
+            child.wait().expect("reap signaled child");
+            assert!(runner.take_kill_signal_delivered());
+            assert!(!runner.take_kill_signal_delivered());
+            // No delivery is credited when the syscall itself refuses a target.
+            assert!(runner.send_signal(u32::MAX, libc::SIGTERM, false).is_err());
+            assert!(!runner.take_kill_signal_delivered());
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -974,26 +1016,52 @@ mod tests {
         fn test_zombie_detection() {
             use std::process::Command;
 
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.wait();
+                }
+            }
             // Spawn a process that exits immediately
             // It will become a zombie because we hold the handle and don't wait() yet
-            let mut child = Command::new("true").spawn().expect("failed to spawn true");
+            let mut child = OwnedChild(Command::new("true").spawn().expect("failed to spawn true"));
 
-            let pid = child.id();
+            let pid = child.0.id();
             let runner = SignalActionRunner::with_defaults();
 
-            // Wait for it to become a zombie
-            let start = Instant::now();
+            // Observe this owned child's actual exit without reaping it. Fixture
+            // startup is not a signal-runner latency measurement; the original
+            // 500 ms effect-verification deadline below remains unchanged.
+            // SAFETY: siginfo_t is a C integer/union record with a valid zero
+            // representation. waitid fills its child-status fields on success.
+            let mut exit_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             loop {
-                if start.elapsed() > Duration::from_secs(2) {
-                    // Fallback cleanup if it never becomes Z (unlikely)
-                    let _ = child.wait();
-                    panic!("Process did not become zombie in time");
-                }
-                if let Some('Z') = runner.get_process_state(pid) {
+                // SAFETY: pid is our still-unreaped direct child. WNOWAIT leaves
+                // the exited child available for the real /proc and runner checks.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid,
+                        &mut exit_info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if result == 0 {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    let _ = child.0.wait();
+                    panic!("observe owned child exit without reaping: {error}");
+                }
             }
+            // SAFETY: successful WEXITED waitid initialized child-status fields.
+            assert_eq!(unsafe { exit_info.si_pid() }, pid as libc::pid_t);
+            assert_eq!(exit_info.si_code, libc::CLD_EXITED);
+            // SAFETY: CLD_EXITED makes si_status the child's actual exit status.
+            assert_eq!(unsafe { exit_info.si_status() }, 0);
+            assert_eq!(runner.get_process_state(pid), Some('Z'));
+            assert!(runner.process_exists(pid), "owned zombie still exists");
 
             // Verify wait_for_state_change considers it exited
             // Without the fix, this would timeout because process_exists() is true for zombies
@@ -1007,7 +1075,7 @@ mod tests {
             assert!(result.is_ok(), "Zombie should be considered exited");
 
             // Cleanup
-            let _ = child.wait();
+            assert!(child.0.wait().expect("reap the owned zombie").success());
         }
     }
 }

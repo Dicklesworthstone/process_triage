@@ -95,9 +95,9 @@ tap_total=0
 tap_failed=0
 tap_skipped=0
 if [[ -f "$tap_path" ]]; then
-    tap_total=$(grep -Ec '^(ok|not ok) ' "$tap_path" || echo "0")
-    tap_failed=$(grep -Ec '^not ok ' "$tap_path" || echo "0")
-    tap_skipped=$(grep -Ec '^ok .*# SKIP' "$tap_path" || echo "0")
+    tap_total=$(awk '/^(ok|not ok) / { count++ } END { print count + 0 }' "$tap_path")
+    tap_failed=$(awk '/^not ok / { count++ } END { print count + 0 }' "$tap_path")
+    tap_skipped=$(awk '/^ok / && tolower($0) ~ /#[[:space:]]+skip([[:space:]]|$)/ { count++ } END { print count + 0 }' "$tap_path")
 fi
 
 printf '{"ts":"%s","event":"bats_complete","run_id":"%s","status":%s,"duration_s":%s,"start_ts":"%s","tap":"%s","stderr":"%s","tap_bytes":%s,"stderr_bytes":%s,"tap_total":%s,"tap_failed":%s,"tap_skipped":%s}\n' \

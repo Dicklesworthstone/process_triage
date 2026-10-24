@@ -642,7 +642,7 @@ fn test_exit_code_args_error_for_unknown_subcommand() {
         .args(["nonexistent-command"])
         .assert()
         .failure()
-        .code(2); // clap produces exit code 2 for unknown subcommands
+        .code(10); // usage errors must not alias ActionsOk (2)
 }
 
 #[test]
@@ -652,7 +652,7 @@ fn test_exit_code_args_error_for_missing_required_arg() {
         .args(["config", "export-preset"])
         .assert()
         .failure()
-        .code(2); // clap exit code for missing required args
+        .code(10); // missing arguments follow the agent ArgsError contract
 }
 
 #[test]

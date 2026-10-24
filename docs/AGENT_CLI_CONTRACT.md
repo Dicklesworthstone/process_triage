@@ -62,11 +62,13 @@ snapshot → plan → explain → apply → verify → diff → export/report
 ```
 ~/.local/share/process_triage/sessions/<session_id>/
 ├── manifest.json          # Session metadata
-├── snapshot.json          # Initial system state
-├── plan.json              # Generated plan
-├── telemetry/             # Collected evidence
-├── outcomes.json          # Action outcomes
-└── audit.jsonl            # Audit log
+├── context.json           # Source host and OS context
+├── scan/inventory.json    # Process inventory in a checksum envelope
+├── inference/results.json # Inference results in a checksum envelope
+├── decision/plan.json     # Executable Plan plus rich candidates and recorded evidence
+├── action/outcomes.jsonl  # Recorded action results
+├── logs/session.jsonl     # Session events
+└── telemetry/             # Collected evidence
 ```
 
 ### Session States
@@ -92,10 +94,30 @@ Example: `pt-20260115-143022-a7xq`
 ### Session Context Passing
 
 Commands accept `--session <id>` to reuse context:
-- `plan --session <id>`: Reuses snapshot (skip re-scanning)
+- `plan --session <id>`: Updates the session using a fresh process scan
 - `explain --session <id>`: Retrieves cached inference
 - `apply --session <id>`: Validates against saved plan
 - `verify --session <id>`: Compares against pre-action state
+
+The planner writes the same executable `Plan` contract consumed by apply to
+`decision/plan.json` and includes its fields in structured stdout. Required fields include
+`plan_id`, `session_id`, `generated_at`, `policy_version`, `actions`, `pre_toggled`, and
+`gates_summary`. The rich candidate records remain alongside those fields for review and reports.
+Use `pt schema Plan` to obtain the schema generated from the actual Rust type.
+
+Each executable action records a canonical process identity, required safety checks, timeouts,
+and decision rationale. Final review/keep candidates do not become executable actions. Apply
+rechecks live identities and safety checks, and enforces the saved minimum-age floor from
+`policy_snapshot.min_process_age_seconds`; the current policy or `--min-age` can raise that floor.
+A plan without that snapshot uses the current policy's floor.
+
+`pt agent plan --pids 1234,5678` restricts inference to selected PIDs. It retains the full scan
+for ancestry, protected-process filtering, and parent routing, and records the selection in
+`args.pids`. Applying a plan still requires an explicit action selection and the usual safety checks.
+
+CLI usage errors, including unknown flags, conflicting selectors and missing required arguments,
+exit with `ArgsError` (10). Explicit `--help` and `--version` requests exit 0. Exit 2 is reserved
+for `ActionsOk`; an invalid invocation cannot report that actions succeeded.
 
 ---
 
@@ -492,7 +514,8 @@ When supervised:
       "type": "object",
       "required": ["detected", "recommended_action"],
       "properties": {
-        "detected": {"type": "boolean"},
+        "detected": {"type": ["boolean", "null"]},
+        "status": {"type": "string", "enum": ["observed", "unknown"]},
         "type": {"type": ["string", "null"]},
         "unit": {"type": ["string", "null"]},
         "recommended_action": {"type": "string"},
@@ -535,34 +558,40 @@ When supervised:
 ```json
 {
   "type": "object",
-  "required": ["schema_version", "session_id", "results"],
+  "required": ["session_id", "mode", "summary", "outcomes"],
   "properties": {
-    "schema_version": {"type": "string"},
     "session_id": {"type": "string"},
-    "results": {
+    "mode": {"const": "robot_apply"},
+    "outcomes": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["target", "action", "outcome"],
+        "required": ["action_id", "pid", "status"],
         "properties": {
+          "action_id": {"type": "string"},
+          "pid": {"type": "integer"},
           "target": {"type": "object"},
-          "action": {"type": "string"},
-          "outcome": {
-            "enum": ["success", "skipped", "failed", "blocked"]
-          },
+          "status": {"type": "string"},
           "reason": {"type": "string"},
-          "duration_ms": {"type": "integer"}
+          "time_ms": {"type": "integer"},
+          "command": {"type": "string"},
+          "parent_pid": {"type": "integer"},
+          "parent_identity": {"type": ["object", "null"]},
+          "executed_at": {"type": "string", "format": "date-time"},
+          "execution_clock": {"type": ["object", "null"]}
         }
       }
     },
     "summary": {
       "type": "object",
       "properties": {
-        "total": {"type": "integer"},
-        "successful": {"type": "integer"},
+        "attempted": {"type": "integer"},
+        "succeeded": {"type": "integer"},
         "skipped": {"type": "integer"},
         "failed": {"type": "integer"},
-        "memory_freed_mb": {"type": "number"}
+        "blocked_by_constraints": {"type": "integer"},
+        "blocked_by_prechecks": {"type": "integer"},
+        "resumed_skipped": {"type": "integer"}
       }
     }
   }
@@ -592,30 +621,55 @@ When supervised:
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["target", "action", "outcome"],
+        "required": ["action_id", "target", "action", "outcome"],
         "properties": {
+          "action_id": {"type": "string"},
           "target": {"type": "object"},
           "action": {"type": "string"},
           "outcome": {
-            "enum": ["confirmed_dead", "confirmed_stopped", "still_running", "respawned", "pid_reused", "cascaded", "timeout"]
+            "enum": ["confirmed_dead", "confirmed_stopped", "still_running", "respawned", "pid_reused", "unsupported"]
           },
           "time_to_death_ms": {"type": "integer"},
-          "resources_freed": {"type": "object"},
-          "respawn_detected": {"type": "object"}
+          "expected_resources_freed": {"type": "object"},
+          "respawn_detected": {"type": "object"},
+          "actual": {"type": "string"},
+          "verified": {"type": "boolean"},
+          "note": {"type": "string"}
         }
       }
     },
     "resource_summary": {
       "type": "object",
       "properties": {
-        "memory_freed_mb": {"type": "number"},
+        "expected_freed_mb": {"type": "number"},
         "expected_mb": {"type": "number"},
         "shortfall_reason": {"type": "string"}
+      }
+    },
+    "respawn_check": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "respawned_count": {"type": "integer"},
+        "unknown_count": {"type": "integer"},
+        "warning": {"type": ["string", "null"]}
       }
     }
   }
 }
 ```
+
+Successful saved executions bound to the canonical plan's exact identity are verified. Recorded failed attempts
+remain visible as `unsupported` with `actual: "failed_attempt"`, `verified: false` and follow-up required; they
+make the report `failure` or `partial_success`. A later successful retry resolves only that action's failure.
+Recommendations and dry runs are excluded. Resource fields are expected plan estimates, not measured relief. Exact respawn matches
+require UID, full normalized command, original parent and a later birth; same-tick or same-second ambiguity is
+`unsupported` with `actual: "ambiguous_respawn"`, `verified: false` and a nonzero `unknown_count` when requested.
+
+Apply counts a successfully delivered destructive signal against its kill and memory budgets even if effect
+verification later fails. Mandatory outcome-log or session-state persistence failures return `IoError` while
+preserving actual results in the response. Dry-run/shadow goal reports retain planned expectations and mark
+observed effects as unobserved.
 
 ---
 

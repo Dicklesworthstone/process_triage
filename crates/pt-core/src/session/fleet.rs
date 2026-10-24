@@ -117,7 +117,8 @@ pub struct PooledFdrStatus {
     pub selected_kills: usize,
     /// Number of kill recommendations rejected by pooled FDR.
     pub rejected_kills: usize,
-    /// Selection threshold in e-value space at the decision boundary.
+    /// Selection threshold at the decision boundary: an e-value for `eby`, the lowest
+    /// selected P(abandoned or zombie) for `bayes_expected_fdr`.
     pub selection_threshold: Option<f64>,
     /// BY correction factor when applicable.
     pub correction_factor: Option<f64>,
@@ -383,18 +384,59 @@ fn effective_action(
     }
 }
 
-fn score_to_default_evalue(score: f64) -> f64 {
-    let clamped = score.clamp(0.0, 1.0 - 1e-12);
-    if clamped <= 0.0 {
-        0.0
-    } else {
-        // Convert posterior confidence into a monotonic e-value proxy.
-        let odds = clamped / (1.0 - clamped);
-        odds.powf(3.0)
+/// Bayesian FDR selection: the largest set of kill candidates, most probable first,
+/// whose posterior expected false discovery proportion (the mean of 1 - P(abandoned
+/// or zombie) over the set) is at most `alpha`. If the posteriors are calibrated, the
+/// expected FDP of the selected set is at most `alpha`; it claims nothing more.
+///
+/// Used when candidates carry posteriors but no e-values: a posterior is not an
+/// e-value, and turning one into an "e-value" (as odds^3 once did) voids the eBY
+/// guarantee instead of providing it.
+fn select_bayes_expected_fdr(scores: &[(usize, f64)], alpha: f64) -> (Vec<usize>, Option<f64>) {
+    let mut ranked: Vec<(usize, f64)> = scores
+        .iter()
+        .map(|&(i, p)| {
+            (
+                i,
+                if p.is_finite() {
+                    p.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+            )
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut false_mass = 0.0;
+    let mut selected = 0;
+    for (k, &(_, p)) in ranked.iter().enumerate() {
+        false_mass += 1.0 - p;
+        if false_mass / (k + 1) as f64 <= alpha {
+            selected = k + 1;
+        }
     }
+    let threshold = selected
+        .checked_sub(1)
+        .and_then(|last| ranked.get(last))
+        .map(|&(_, p)| p);
+    (
+        ranked[..selected].iter().map(|&(i, _)| i).collect(),
+        threshold,
+    )
 }
 
 fn compute_pooled_fdr(host_inputs: &[HostInput], alpha: f64) -> (HashSet<String>, PooledFdrStatus) {
+    // Real e-values (when every kill candidate brings one) go through e-BY; otherwise
+    // the posteriors are pooled with Bayesian expected-FDR selection.
+    let all_have_evalues = host_inputs
+        .iter()
+        .flat_map(|input| &input.candidates)
+        .filter(|cand| cand.recommended_action.eq_ignore_ascii_case("kill"))
+        .all(|cand| cand.e_value.is_some());
+    if !all_have_evalues {
+        return compute_pooled_bayes_fdr(host_inputs, alpha);
+    }
+
     let mut pool: Vec<(String, String, FdrCandidate)> = Vec::new();
     for input in host_inputs {
         for cand in &input.candidates {
@@ -402,10 +444,7 @@ fn compute_pooled_fdr(host_inputs: &[HostInput], alpha: f64) -> (HashSet<String>
                 continue;
             }
             let key = candidate_key(&input.host_id, cand.pid);
-            let e_value = cand
-                .e_value
-                .unwrap_or_else(|| score_to_default_evalue(cand.score))
-                .max(0.0);
+            let e_value = cand.e_value.unwrap_or(0.0).max(0.0);
             let fdr_candidate = FdrCandidate {
                 target: TargetIdentity {
                     pid: cand.pid as i32,
@@ -487,6 +526,55 @@ fn compute_pooled_fdr(host_inputs: &[HostInput], alpha: f64) -> (HashSet<String>
         rejected_by_host,
     };
 
+    (selected_keys, status)
+}
+
+fn compute_pooled_bayes_fdr(
+    host_inputs: &[HostInput],
+    alpha: f64,
+) -> (HashSet<String>, PooledFdrStatus) {
+    let pool: Vec<(String, String, f64)> = host_inputs
+        .iter()
+        .flat_map(|input| {
+            input
+                .candidates
+                .iter()
+                .filter(|cand| cand.recommended_action.eq_ignore_ascii_case("kill"))
+                .map(move |cand| {
+                    (
+                        candidate_key(&input.host_id, cand.pid),
+                        input.host_id.clone(),
+                        cand.score,
+                    )
+                })
+        })
+        .collect();
+    let scores: Vec<(usize, f64)> = pool.iter().enumerate().map(|(i, c)| (i, c.2)).collect();
+    let (chosen, threshold) = select_bayes_expected_fdr(&scores, alpha);
+    let chosen: HashSet<usize> = chosen.into_iter().collect();
+
+    let mut selected_keys = HashSet::new();
+    let mut selected_by_host: HashMap<String, u32> = HashMap::new();
+    let mut rejected_by_host: HashMap<String, u32> = HashMap::new();
+    for (i, (key, host_id, _)) in pool.iter().enumerate() {
+        if chosen.contains(&i) {
+            selected_keys.insert(key.clone());
+            *selected_by_host.entry(host_id.clone()).or_default() += 1;
+        } else {
+            *rejected_by_host.entry(host_id.clone()).or_default() += 1;
+        }
+    }
+    let status = PooledFdrStatus {
+        method: "bayes_expected_fdr".to_string(),
+        alpha,
+        total_kill_candidates: pool.len(),
+        selected_kills: chosen.len(),
+        rejected_kills: pool.len() - chosen.len(),
+        selection_threshold: threshold,
+        correction_factor: None,
+        selected_by_host,
+        rejected_by_host,
+    };
     (selected_keys, status)
 }
 
@@ -594,24 +682,26 @@ mod tests {
 
     #[test]
     fn test_recurring_patterns() {
+        // Kill posteriors high enough that the 5% fleet FDR budget admits all three
+        // (expected FDP 0.0117); at ~0.88 they would be held for review.
         let inputs = vec![
             host(
                 "host1",
                 vec![
                     cand(1, "nginx", "useful", "spare", 0.1),
-                    cand(2, "old_worker", "abandoned", "kill", 0.9),
+                    cand(2, "old_worker", "abandoned", "kill", 0.99),
                 ],
             ),
             host(
                 "host2",
                 vec![
                     cand(3, "nginx", "useful", "spare", 0.15),
-                    cand(4, "old_worker", "abandoned", "kill", 0.85),
+                    cand(4, "old_worker", "abandoned", "kill", 0.985),
                 ],
             ),
             host(
                 "host3",
-                vec![cand(5, "old_worker", "abandoned", "kill", 0.88)],
+                vec![cand(5, "old_worker", "abandoned", "kill", 0.99)],
             ),
         ];
         let fleet = create_fleet_session("f3", None, &inputs, 0.05);
@@ -639,7 +729,8 @@ mod tests {
         assert!((fleet.safety_budget.max_fdr - 0.10).abs() < f64::EPSILON);
         assert!((fleet.safety_budget.alpha_remaining - 0.10).abs() < f64::EPSILON);
         assert!((fleet.safety_budget.alpha_spent - 0.0).abs() < f64::EPSILON);
-        assert_eq!(fleet.safety_budget.pooled_fdr.method, "eby");
+        // Posteriors without e-values: Bayesian expected-FDR selection, not e-BY.
+        assert_eq!(fleet.safety_budget.pooled_fdr.method, "bayes_expected_fdr");
         assert_eq!(fleet.safety_budget.pooled_fdr.total_kill_candidates, 2);
         // Each host gets 0.05 allocation.
         assert!(
@@ -675,6 +766,74 @@ mod tests {
         assert_eq!(
             *fleet.aggregate.action_counts.get("review").unwrap_or(&0),
             1
+        );
+    }
+
+    #[test]
+    fn bayes_fdr_selects_the_largest_set_within_alpha() {
+        // Sorted: 0.99, 0.97, 0.80. Expected FDP: 0.01, 0.02, then 0.08 > 0.05.
+        let inputs = vec![
+            host(
+                "h1",
+                vec![
+                    cand(1, "a", "abandoned", "kill", 0.99),
+                    cand(2, "b", "abandoned", "kill", 0.80),
+                    cand(9, "c", "useful", "keep", 0.10),
+                ],
+            ),
+            host("h2", vec![cand(3, "c", "zombie", "kill", 0.97)]),
+        ];
+        let fleet = create_fleet_session("bayes", None, &inputs, 0.05);
+        let fdr = &fleet.safety_budget.pooled_fdr;
+        assert_eq!(fdr.method, "bayes_expected_fdr");
+        assert_eq!((fdr.total_kill_candidates, fdr.selected_kills), (3, 2));
+        assert_eq!(fdr.selection_threshold, Some(0.97));
+        assert_eq!(*fleet.aggregate.action_counts.get("kill").unwrap_or(&0), 2);
+
+        let (none, threshold) = select_bayes_expected_fdr(&[(0, 0.5), (1, 0.6)], 0.05);
+        assert!(none.is_empty() && threshold.is_none());
+    }
+
+    /// The guarantee, checked by simulation: when the truth is drawn from the
+    /// posteriors (a calibrated model), the realized false discovery proportion of the
+    /// selected set averages at most alpha.
+    #[test]
+    fn bayes_fdr_controls_expected_fdp_under_calibrated_posteriors() {
+        // Deterministic xorshift so the test needs no RNG crate.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut uniform = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let alpha = 0.05;
+        let trials = 4000;
+        let mut fdp_sum = 0.0;
+        let mut selections = 0;
+        for _ in 0..trials {
+            let scores: Vec<(usize, f64)> = (0..12)
+                .map(|i| (i, 0.5 + 0.5 * uniform().powf(0.3)))
+                .collect();
+            let (chosen, _) = select_bayes_expected_fdr(&scores, alpha);
+            if chosen.is_empty() {
+                continue;
+            }
+            selections += 1;
+            let false_discoveries = chosen
+                .iter()
+                .filter(|&&i| uniform() >= scores[i].1) // truth: abandoned with prob p
+                .count();
+            fdp_sum += false_discoveries as f64 / chosen.len() as f64;
+        }
+        assert!(
+            selections > trials / 2,
+            "selection should usually pick something"
+        );
+        let mean_fdp = fdp_sum / trials as f64;
+        assert!(
+            mean_fdp <= alpha + 0.01,
+            "mean FDP {mean_fdp} exceeds {alpha}"
         );
     }
 

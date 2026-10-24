@@ -24,6 +24,253 @@ use std::os::unix::net::{UnixListener, UnixStream};
 static HARNESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static HARNESS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Run an exact permission-sensitive test under an owned unprivileged process
+/// when its caller is root. Returns true only after the complete child test
+/// passes; ordinary nonroot callers execute their original body directly.
+#[cfg(target_os = "linux")]
+pub fn run_owned_unprivileged_case(test_name: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    const MARKER: &str = "PT_TEST_UNPRIVILEGED_PRECHECK_CASE";
+    const UID: libc::uid_t = 65534;
+    const GID: libc::gid_t = 65534;
+    if let Some(marker) = std::env::var_os(MARKER) {
+        assert_eq!(marker, test_name, "exact dropped-privilege test selector");
+        let status = fs::read_to_string("/proc/thread-self/status")
+            .expect("read actual dropped test thread credentials");
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .unwrap_or_else(|| panic!("missing credential field {name}: {status}"))
+                .trim()
+        };
+        for (name, expected) in [("Uid:", UID), ("Gid:", GID)] {
+            let ids: Vec<u32> = field(name)
+                .split_whitespace()
+                .map(|id| id.parse().expect("numeric actual credential"))
+                .collect();
+            assert_eq!(
+                ids,
+                vec![expected; 4],
+                "real/effective/saved/filesystem {name}"
+            );
+        }
+        assert!(
+            field("Groups:").is_empty(),
+            "supplementary groups must be cleared: {status}"
+        );
+        for name in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
+            assert_eq!(
+                u64::from_str_radix(field(name), 16).expect("actual capability mask"),
+                0,
+                "retained privilege in {name}: {status}"
+            );
+        }
+        assert_eq!(field("NoNewPrivs:"), "1", "exec must not regain privileges");
+        // SAFETY: these calls only observe this test thread's credentials.
+        assert_eq!(unsafe { libc::getuid() }, UID);
+        assert_eq!(unsafe { libc::geteuid() }, UID);
+        assert_eq!(unsafe { libc::getgid() }, GID);
+        assert_eq!(unsafe { libc::getegid() }, GID);
+        eprintln!("owned unprivileged case={test_name} credentials={status}");
+        println!("PT_UNPRIVILEGED_PRECHECKS_READY {test_name}");
+        return false;
+    }
+    // SAFETY: observing the caller cannot change the multithreaded runner.
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    struct OwnedRunner(Child);
+    impl Drop for OwnedRunner {
+        fn drop(&mut self) {
+            match self.0.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Err(error) = self.0.kill() {
+                        eprintln!("owned privilege runner cleanup kill: {error}");
+                    }
+                    if let Err(error) = self.0.wait() {
+                        eprintln!("owned privilege runner cleanup wait: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("owned privilege runner status unknown; no signal sent: {error}")
+                }
+            }
+        }
+    }
+
+    // Only this newly created, retained directory changes ownership. Existing
+    // checkout paths and permissions are never changed for the dropped caller.
+    let artifacts =
+        std::env::temp_dir().join(format!("pt-unprivileged-case-{}", uuid::Uuid::new_v4()));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&artifacts)
+        .expect("create a fresh retained unprivileged work directory");
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&artifacts)
+        .expect("open only the new owned directory");
+    // Create and retain both log handles before granting the shared test UID
+    // control of the directory. Readback never reopens an unprivileged path.
+    let stdout_path = artifacts.join("stdout.log");
+    let stderr_path = artifacts.join("stderr.log");
+    let stdout = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&stdout_path)
+        .expect("create retained privilege-run stdout");
+    let stderr = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&stderr_path)
+        .expect("create retained privilege-run stderr");
+    let mut retained_stdout = stdout.try_clone().expect("retain original stdout handle");
+    let mut retained_stderr = stderr.try_clone().expect("retain original stderr handle");
+    // SAFETY: the descriptor pins the freshly created directory, not an
+    // existing repository path or a symlink supplied by another process.
+    assert_eq!(
+        unsafe { libc::fchown(directory.as_raw_fd(), UID, GID) },
+        0,
+        "set new work directory owner: {}",
+        io::Error::last_os_error()
+    );
+    let metadata = directory.metadata().expect("actual new directory metadata");
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.uid(), UID);
+    assert_eq!(metadata.gid(), GID);
+    assert_eq!(metadata.mode() & 0o777, 0o700);
+    let mut command = Command::new(std::env::current_exe().expect("current libtest executable"));
+    command
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env(MARKER, test_name)
+        .env("PT_TEST_UNPRIVILEGED_ARTIFACT_DIR", &artifacts)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+    // SAFETY: only the newly forked, owned child changes credentials. Before
+    // exec this closure uses kernel interfaces and stack storage, and returns
+    // OS errors without allocating, logging or touching environment/mutexes.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setgroups(0, std::ptr::null()) != 0
+                || libc::prctl(
+                    libc::PR_SET_KEEPCAPS,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                || libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                || libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                || libc::setresgid(GID, GID, GID) != 0
+                || libc::setresuid(UID, UID, UID) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // Linux UAPI v3 is one header plus two 32-bit capability records.
+            let header = CapHeader {
+                version: 0x2008_0522,
+                pid: 0,
+            };
+            let data = [
+                CapData {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                },
+                CapData {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                },
+            ];
+            if libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    eprintln!(
+        "root-owned unprivileged case={test_name} executable={:?} argv={:?} artifacts={}",
+        command.get_program(),
+        command.get_args().collect::<Vec<_>>(),
+        artifacts.display()
+    );
+    let mut child = OwnedRunner(
+        command
+            .spawn()
+            .expect("spawn genuinely unprivileged exact test"),
+    );
+    let status = child.0.wait().expect("wait for complete unprivileged test");
+    retained_stdout
+        .seek(SeekFrom::Start(0))
+        .expect("rewind original stdout handle");
+    retained_stderr
+        .seek(SeekFrom::Start(0))
+        .expect("rewind original stderr handle");
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    retained_stdout
+        .read_to_string(&mut stdout)
+        .expect("read retained test stdout handle");
+    retained_stderr
+        .read_to_string(&mut stderr)
+        .expect("read retained test stderr handle");
+    eprintln!("unprivileged case={test_name} status={status} stdout={stdout} stderr={stderr}");
+    assert!(
+        status.success(),
+        "exact unprivileged case failed; artifacts={}",
+        artifacts.display()
+    );
+    assert!(
+        stdout.contains(&format!("PT_UNPRIVILEGED_PRECHECKS_READY {test_name}")),
+        "actual privilege validation must execute"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed; 0 failed;"),
+        "the selected test must run and pass exactly once: {stdout}"
+    );
+    true
+}
+
 /// Live resource harness scoped to a test.
 ///
 /// The harness holds open files and sockets in the current process so that

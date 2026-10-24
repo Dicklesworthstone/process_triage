@@ -73,6 +73,19 @@ pub enum AppState {
 type RefreshOp = Arc<dyn Fn() -> Result<Vec<ProcessRow>, String> + Send + Sync>;
 type ExecuteOp = Arc<dyn Fn(Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PendingOperation {
+    #[default]
+    Idle,
+    Refreshing(u64),
+    Executing(u64),
+}
+
+struct ConfirmedSelection {
+    ticket: u64,
+    pids: Vec<u32>,
+}
+
 /// Main TUI application.
 pub struct App {
     /// Current application state.
@@ -93,10 +106,10 @@ pub struct App {
     status_message: Option<String>,
     /// Whether a redraw is needed.
     needs_redraw: bool,
-    /// Whether a refresh has been requested.
-    refresh_requested: bool,
-    /// Whether an execute action has been requested.
-    execute_requested: bool,
+    operation: PendingOperation,
+    last_operation_ticket: u64,
+    confirmation_selection: Option<Vec<u32>>,
+    confirmed_selection: Option<ConfirmedSelection>,
     /// Responsive layout state for tracking breakpoint changes.
     layout_state: LayoutState,
     /// Whether the detail pane is visible.
@@ -155,8 +168,10 @@ impl App {
             confirm_dialog: ConfirmDialogState::new(),
             status_message: None,
             needs_redraw: true,
-            refresh_requested: false,
-            execute_requested: false,
+            operation: PendingOperation::Idle,
+            last_operation_ticket: 0,
+            confirmation_selection: None,
+            confirmed_selection: None,
             // Initialize with reasonable defaults; will be updated on first render
             layout_state: LayoutState::new(80, 24),
             detail_visible: true,
@@ -366,30 +381,48 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Request a refresh of the process list.
-    pub fn request_refresh(&mut self) {
-        self.refresh_requested = true;
-        self.needs_redraw = true;
+    fn issue_operation_ticket(&mut self) -> Option<u64> {
+        let Some(ticket) = self.last_operation_ticket.checked_add(1) else {
+            self.set_status("Operation ticket limit reached; restart the TUI");
+            return None;
+        };
+        self.last_operation_ticket = ticket;
+        Some(ticket)
     }
 
-    /// Check and clear refresh request.
-    pub fn take_refresh(&mut self) -> bool {
-        let requested = self.refresh_requested;
-        self.refresh_requested = false;
-        requested
+    fn operation_is_idle(&mut self) -> bool {
+        match self.operation {
+            PendingOperation::Idle => true,
+            PendingOperation::Refreshing(_) => {
+                self.set_status("Refresh in progress; wait before selecting or executing");
+                false
+            }
+            PendingOperation::Executing(_) => {
+                self.set_status("Execution in progress; wait before refreshing or executing");
+                false
+            }
+        }
     }
 
-    /// Request execution of selected actions.
-    pub fn request_execute(&mut self) {
-        self.execute_requested = true;
-        self.needs_redraw = true;
+    fn selection_is_available(&mut self) -> bool {
+        if !self.operation_is_idle() {
+            return false;
+        }
+        if self.state == AppState::Confirming {
+            self.set_status("Finish or cancel the current confirmation before changing selection");
+            return false;
+        }
+        true
     }
 
-    /// Check and clear execute request.
-    pub fn take_execute(&mut self) -> bool {
-        let requested = self.execute_requested;
-        self.execute_requested = false;
-        requested
+    fn invalidate_selection(&mut self) {
+        self.confirmation_selection = None;
+        self.confirmed_selection = None;
+        self.confirm_dialog.cancel();
+        self.process_table.deselect_all();
+        if self.state == AppState::Confirming {
+            self.state = AppState::Normal;
+        }
     }
 
     /// Check if redraw is needed and clear the flag.
@@ -471,7 +504,7 @@ impl App {
         ));
         match action_id {
             "action.execute" => self.show_execute_confirmation(),
-            "action.refresh" => return FtuiCmd::msg(Msg::RequestRefresh),
+            "action.refresh" => return self.handle_msg(Msg::RequestRefresh),
 
             "navigation.first" => self.process_table.cursor_home(),
             "navigation.last" => self.process_table.cursor_end(),
@@ -487,10 +520,10 @@ impl App {
                 self.update_focus();
             }
 
-            "selection.recommended" => self.process_table.select_recommended(),
-            "selection.all" => self.process_table.select_all(),
-            "selection.none" => self.process_table.deselect_all(),
-            "selection.invert" => self.process_table.invert_selection(),
+            "selection.recommended" => return self.handle_msg(Msg::SelectRecommended),
+            "selection.all" => return self.handle_msg(Msg::SelectAll),
+            "selection.none" => return self.handle_msg(Msg::DeselectAll),
+            "selection.invert" => return self.handle_msg(Msg::InvertSelection),
 
             "view.toggle_detail" => self.toggle_detail_visibility(),
             "view.summary" => self.set_detail_view(DetailView::Summary),
@@ -596,29 +629,56 @@ impl App {
 
     /// Show confirmation dialog for executing actions.
     fn show_execute_confirmation(&mut self) {
-        let selected_count = self.process_table.selected_count();
+        if !self.operation_is_idle() {
+            return;
+        }
+        self.confirmed_selection = None;
+        let selected_pids = self.process_table.get_selected();
+        let selected_count = selected_pids.len();
         if selected_count > 0 {
+            self.confirmation_selection = Some(selected_pids);
             self.confirm_dialog.show();
             self.state = AppState::Confirming;
             self.set_status(format!("Confirm action on {} process(es)?", selected_count));
         } else {
+            self.confirmation_selection = None;
             self.set_status("No processes selected");
         }
     }
 
     /// Handle confirmation dialog result.
-    fn handle_confirmation(&mut self, choice: ConfirmChoice) {
+    fn handle_confirmation(&mut self, choice: ConfirmChoice) -> FtuiCmd<Msg> {
+        if !self.operation_is_idle() {
+            return FtuiCmd::none();
+        }
+        if choice == ConfirmChoice::Yes && self.state != AppState::Confirming {
+            self.confirmation_selection = None;
+            self.set_status("Confirmation expired; select processes and confirm again");
+            return FtuiCmd::none();
+        }
+        let selection = self.confirmation_selection.take();
+        self.confirm_dialog.hide();
+        self.state = AppState::Normal;
         match choice {
             ConfirmChoice::Yes => {
-                let count = self.process_table.selected_count();
+                let Some(pids) = selection.filter(|pids| !pids.is_empty()) else {
+                    self.set_status("Confirmation expired; select processes and confirm again");
+                    return FtuiCmd::none();
+                };
+                let Some(ticket) = self.issue_operation_ticket() else {
+                    return FtuiCmd::none();
+                };
+                let count = pids.len();
+                self.confirmed_selection = Some(ConfirmedSelection { ticket, pids });
                 self.set_status(format!("Preparing actions for {} process(es)...", count));
-                self.request_execute();
+                FtuiCmd::msg(Msg::RequestExecute { ticket })
             }
             ConfirmChoice::No => {
+                self.confirmed_selection = None;
                 self.set_status("Action cancelled");
+                FtuiCmd::none()
             }
         }
-        self.state = AppState::Normal;
     }
 
     /// Check if the application should quit.
@@ -700,23 +760,33 @@ impl App {
             }
 
             Msg::ToggleSelection => {
-                self.process_table.toggle_selection();
+                if self.selection_is_available() {
+                    self.process_table.toggle_selection();
+                }
                 FtuiCmd::none()
             }
             Msg::SelectRecommended => {
-                self.process_table.select_recommended();
+                if self.selection_is_available() {
+                    self.process_table.select_recommended();
+                }
                 FtuiCmd::none()
             }
             Msg::SelectAll => {
-                self.process_table.select_all();
+                if self.selection_is_available() {
+                    self.process_table.select_all();
+                }
                 FtuiCmd::none()
             }
             Msg::DeselectAll => {
-                self.process_table.deselect_all();
+                if self.selection_is_available() {
+                    self.process_table.deselect_all();
+                }
                 FtuiCmd::none()
             }
             Msg::InvertSelection => {
-                self.process_table.invert_selection();
+                if self.selection_is_available() {
+                    self.process_table.invert_selection();
+                }
                 FtuiCmd::none()
             }
 
@@ -786,9 +856,26 @@ impl App {
                 FtuiCmd::none()
             }
 
-            Msg::RequestExecute => {
-                let selected_pids = self.process_table.get_selected();
+            Msg::RequestExecute { ticket } => {
+                if !self.operation_is_idle() {
+                    return FtuiCmd::none();
+                }
+                if !self
+                    .confirmed_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.ticket == ticket)
+                {
+                    self.set_status(
+                        "Stale execution request rejected; confirm the current selection",
+                    );
+                    return FtuiCmd::none();
+                }
+                let Some(selection) = self.confirmed_selection.take() else {
+                    return FtuiCmd::none();
+                };
+                let selected_pids = selection.pids;
                 let selected_count = selected_pids.len();
+                self.operation = PendingOperation::Executing(ticket);
                 tracing::info!(
                     target: "tui.user_input",
                     action = "execute_requested",
@@ -805,8 +892,9 @@ impl App {
                             "execute: starting (selected_count={})",
                             selected_count
                         )),
-                        FtuiCmd::task_named("execute-selected", move || {
-                            Msg::ExecutionComplete(execute(selected_pids))
+                        FtuiCmd::task_named("execute-selected", move || Msg::ExecutionComplete {
+                            ticket,
+                            result: execute(selected_pids),
                         }),
                     ])
                 } else {
@@ -819,33 +907,37 @@ impl App {
                             "execute: skeleton mode (selected_count={})",
                             selected_count
                         )),
-                        FtuiCmd::task_named("execute-selected", move || {
-                            Msg::ExecutionComplete(Ok(ExecutionOutcome {
+                        FtuiCmd::task_named("execute-selected", move || Msg::ExecutionComplete {
+                            ticket,
+                            result: Ok(ExecutionOutcome {
                                 mode: Some("skeleton".to_string()),
                                 attempted: selected_count,
                                 succeeded: 0,
                                 failed: 0,
-                            }))
+                            }),
                         }),
                     ])
                 }
             }
-            Msg::ConfirmExecute => {
-                self.handle_confirmation(ConfirmChoice::Yes);
-                FtuiCmd::none()
-            }
-            Msg::CancelExecute => {
-                self.handle_confirmation(ConfirmChoice::No);
-                FtuiCmd::none()
-            }
+            Msg::ConfirmExecute => self.handle_confirmation(ConfirmChoice::Yes),
+            Msg::CancelExecute => self.handle_confirmation(ConfirmChoice::No),
             Msg::RequestRefresh => {
+                if !self.operation_is_idle() {
+                    return FtuiCmd::none();
+                }
+                self.invalidate_selection();
+                let Some(ticket) = self.issue_operation_ticket() else {
+                    return FtuiCmd::none();
+                };
+                self.operation = PendingOperation::Refreshing(ticket);
                 tracing::info!(target: "tui.user_input", action = "refresh_requested", "Refresh requested");
                 if let Some(refresh) = self.refresh_op.clone() {
                     self.set_status("Refreshing process list...");
                     FtuiCmd::sequence(vec![
                         FtuiCmd::log("refresh: starting"),
-                        FtuiCmd::task_named("refresh-processes", move || {
-                            Msg::RefreshComplete(refresh())
+                        FtuiCmd::task_named("refresh-processes", move || Msg::RefreshComplete {
+                            ticket,
+                            result: refresh(),
                         }),
                     ])
                 } else {
@@ -853,8 +945,9 @@ impl App {
                     let prior_rows = self.process_table.rows.clone();
                     FtuiCmd::sequence(vec![
                         FtuiCmd::log("refresh: skeleton mode"),
-                        FtuiCmd::task_named("refresh-processes", move || {
-                            Msg::RefreshComplete(Ok(prior_rows))
+                        FtuiCmd::task_named("refresh-processes", move || Msg::RefreshComplete {
+                            ticket,
+                            result: Ok(prior_rows),
                         }),
                     ])
                 }
@@ -865,11 +958,23 @@ impl App {
             }
 
             Msg::ProcessesScanned(rows) => {
+                if !self.operation_is_idle() {
+                    return FtuiCmd::none();
+                }
+                self.invalidate_selection();
                 self.process_table.set_rows(rows);
                 self.set_status("Process list refreshed");
                 FtuiCmd::none()
             }
-            Msg::RefreshComplete(Ok(rows)) => {
+            Msg::RefreshComplete {
+                ticket,
+                result: Ok(rows),
+            } => {
+                if self.operation != PendingOperation::Refreshing(ticket) {
+                    return FtuiCmd::none();
+                }
+                self.operation = PendingOperation::Idle;
+                self.invalidate_selection();
                 let count = rows.len();
                 self.process_table.set_rows(rows);
                 self.set_status(format!("Process list refreshed ({})", count));
@@ -880,7 +985,15 @@ impl App {
                 );
                 FtuiCmd::log(format!("refresh: complete (rows={})", count))
             }
-            Msg::RefreshComplete(Err(error)) => {
+            Msg::RefreshComplete {
+                ticket,
+                result: Err(error),
+            } => {
+                if self.operation != PendingOperation::Refreshing(ticket) {
+                    return FtuiCmd::none();
+                }
+                self.operation = PendingOperation::Idle;
+                self.invalidate_selection();
                 tracing::error!(target: "tui.async_complete", error = %error, "Refresh failed");
                 self.set_status(format!("Refresh failed: {}", error));
                 self.push_toast(
@@ -890,7 +1003,15 @@ impl App {
                 );
                 FtuiCmd::log(format!("refresh: failed ({})", error))
             }
-            Msg::ExecutionComplete(Ok(outcome)) => {
+            Msg::ExecutionComplete {
+                ticket,
+                result: Ok(outcome),
+            } => {
+                if self.operation != PendingOperation::Executing(ticket) {
+                    return FtuiCmd::none();
+                }
+                self.operation = PendingOperation::Idle;
+                self.invalidate_selection();
                 let status = if let Some(mode) = outcome.mode.as_deref() {
                     match mode {
                         "dry_run" => format!(
@@ -919,7 +1040,15 @@ impl App {
                 self.push_toast(status.clone(), icon, style);
                 FtuiCmd::log(format!("execute: {}", status))
             }
-            Msg::ExecutionComplete(Err(error)) => {
+            Msg::ExecutionComplete {
+                ticket,
+                result: Err(error),
+            } => {
+                if self.operation != PendingOperation::Executing(ticket) {
+                    return FtuiCmd::none();
+                }
+                self.operation = PendingOperation::Idle;
+                self.invalidate_selection();
                 tracing::error!(target: "tui.async_complete", error = %error, "Execution failed");
                 self.set_status(format!("Execution failed: {}", error));
                 self.push_toast(
@@ -1027,8 +1156,7 @@ impl App {
         }
         if self.key_bindings.is_toggle(&key) {
             tracing::trace!(target: "tui.user_input", action = "toggle_selection");
-            self.process_table.toggle_selection();
-            return FtuiCmd::none();
+            return self.handle_msg(Msg::ToggleSelection);
         }
         if self.key_bindings.is_execute(&key) {
             tracing::info!(target: "tui.user_input", action = "request_execute", selected = self.process_table.selected_count(), "Execute requested");
@@ -1055,12 +1183,12 @@ impl App {
             FtuiKeyCode::Char('u') if key.modifiers.contains(FtuiModifiers::CTRL) => self
                 .process_table
                 .page_up(self.process_table.last_visible_height),
-            FtuiKeyCode::Char('a') => self.process_table.select_recommended(),
-            FtuiKeyCode::Char('A') => self.process_table.select_all(),
-            FtuiKeyCode::Char('u') => self.process_table.deselect_all(),
-            FtuiKeyCode::Char('x') => self.process_table.invert_selection(),
+            FtuiKeyCode::Char('a') => return self.handle_msg(Msg::SelectRecommended),
+            FtuiKeyCode::Char('A') => return self.handle_msg(Msg::SelectAll),
+            FtuiKeyCode::Char('u') => return self.handle_msg(Msg::DeselectAll),
+            FtuiKeyCode::Char('x') => return self.handle_msg(Msg::InvertSelection),
             FtuiKeyCode::Enter => self.toggle_detail_visibility(),
-            FtuiKeyCode::Char('r') => return FtuiCmd::msg(Msg::RequestRefresh),
+            FtuiKeyCode::Char('r') => return self.handle_msg(Msg::RequestRefresh),
             FtuiKeyCode::Char('s') => self.set_detail_view(DetailView::Summary),
             FtuiKeyCode::Char('t') => self.set_detail_view(DetailView::Genealogy),
             FtuiKeyCode::Char('g') => {
@@ -1116,14 +1244,10 @@ impl App {
             FtuiKeyCode::Tab => self.confirm_dialog.toggle(),
             FtuiKeyCode::Enter => {
                 let choice = self.confirm_dialog.confirm();
-                self.handle_confirmation(choice);
-                if self.take_execute() {
-                    return FtuiCmd::msg(Msg::RequestExecute);
-                }
+                return self.handle_confirmation(choice);
             }
             FtuiKeyCode::Escape => {
-                self.confirm_dialog.cancel();
-                self.state = AppState::Normal;
+                return self.handle_confirmation(ConfirmChoice::No);
             }
             _ => {}
         }
@@ -1567,6 +1691,52 @@ mod tests {
         }
     }
 
+    fn deferred_task(cmd: FtuiCmd<Msg>) -> Box<dyn FnOnce() -> Msg + Send> {
+        let FtuiCmd::Sequence(commands) = cmd else {
+            panic!("expected a logged asynchronous command");
+        };
+        let mut task = None;
+        for command in commands {
+            match command {
+                FtuiCmd::Log(_) => {}
+                FtuiCmd::Task(_, run) => {
+                    assert!(task.is_none(), "one request must schedule exactly one task");
+                    task = Some(run);
+                }
+                other => panic!("unexpected asynchronous command: {other:?}"),
+            }
+        }
+        task.expect("the production update must schedule a task")
+    }
+
+    fn confirmed_request(app: &mut App) -> Msg {
+        let command = <App as FtuiModel>::update(
+            app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char('e'))),
+        );
+        assert!(matches!(command, FtuiCmd::None));
+        assert_eq!(app.state, AppState::Confirming);
+        <App as FtuiModel>::update(app, Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Left)));
+        let command =
+            <App as FtuiModel>::update(app, Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Enter)));
+        let FtuiCmd::Msg(request @ Msg::RequestExecute { .. }) = command else {
+            panic!("confirmation must bind an execution request");
+        };
+        request
+    }
+
+    fn complete_execution_fixture(app: &mut App, result: Result<ExecutionOutcome, String>) {
+        app.process_table.set_rows(vec![make_row(42)]);
+        app.process_table.select_all();
+        app.set_execute_op(Arc::new(move |pids| {
+            assert_eq!(pids, vec![42]);
+            result.clone()
+        }));
+        let request = confirmed_request(app);
+        let run = deferred_task(<App as FtuiModel>::update(app, request));
+        <App as FtuiModel>::update(app, run());
+    }
+
     #[test]
     fn test_processes_scanned_updates_table() {
         let mut app = App::new();
@@ -1579,8 +1749,9 @@ mod tests {
     #[test]
     fn test_refresh_complete_ok() {
         let mut app = App::new();
-        let rows = vec![make_row(99)];
-        <App as FtuiModel>::update(&mut app, Msg::RefreshComplete(Ok(rows)));
+        app.set_refresh_op(Arc::new(|| Ok(vec![make_row(99)])));
+        let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+        <App as FtuiModel>::update(&mut app, refresh());
         assert_eq!(app.process_table.rows.len(), 1);
         assert!(app.status_message.as_deref().unwrap().contains("refreshed"));
     }
@@ -1588,10 +1759,9 @@ mod tests {
     #[test]
     fn test_refresh_complete_err() {
         let mut app = App::new();
-        <App as FtuiModel>::update(
-            &mut app,
-            Msg::RefreshComplete(Err("network error".to_string())),
-        );
+        app.set_refresh_op(Arc::new(|| Err("network error".to_string())));
+        let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+        <App as FtuiModel>::update(&mut app, refresh());
         assert!(app.status_message.as_deref().unwrap().contains("failed"));
     }
 
@@ -1604,7 +1774,7 @@ mod tests {
             succeeded: 2,
             failed: 1,
         };
-        <App as FtuiModel>::update(&mut app, Msg::ExecutionComplete(Ok(outcome)));
+        complete_execution_fixture(&mut app, Ok(outcome));
         let status = app.status_message.as_deref().unwrap();
         assert!(status.contains("2 succeeded"));
         assert!(status.contains("1 failed"));
@@ -1619,17 +1789,14 @@ mod tests {
             succeeded: 0,
             failed: 0,
         };
-        <App as FtuiModel>::update(&mut app, Msg::ExecutionComplete(Ok(outcome)));
+        complete_execution_fixture(&mut app, Ok(outcome));
         assert!(app.status_message.as_deref().unwrap().contains("dry_run"));
     }
 
     #[test]
     fn test_execution_complete_err() {
         let mut app = App::new();
-        <App as FtuiModel>::update(
-            &mut app,
-            Msg::ExecutionComplete(Err("permission denied".to_string())),
-        );
+        complete_execution_fixture(&mut app, Err("permission denied".to_string()));
         assert!(app.status_message.as_deref().unwrap().contains("failed"));
     }
 
@@ -1651,23 +1818,299 @@ mod tests {
     }
 
     #[test]
-    fn test_request_refresh_take_refresh() {
+    fn refresh_invalidates_pending_confirmation_before_the_task_runs() {
         let mut app = App::new();
-        assert!(!app.take_refresh());
-
-        app.request_refresh();
-        assert!(app.take_refresh());
-        assert!(!app.take_refresh()); // consumed
+        app.process_table.set_rows(vec![make_row(42)]);
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char('e'))),
+        );
+        assert!(app.confirm_dialog.visible);
+        let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+        assert_eq!(app.process_table.selected_count(), 0);
+        assert_eq!(app.state, AppState::Normal);
+        assert!(!app.confirm_dialog.visible);
+        assert!(app.confirmation_selection.is_none());
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, Msg::ConfirmExecute),
+            FtuiCmd::None
+        ));
+        <App as FtuiModel>::update(&mut app, refresh());
+        assert_eq!(app.operation, PendingOperation::Idle);
+        assert_eq!(app.process_table.selected_count(), 0);
     }
 
     #[test]
-    fn test_request_execute_take_execute() {
-        let mut app = App::new();
-        assert!(!app.take_execute());
+    fn refresh_cache_before_display_refuses_old_ticket_and_all_selection_entrypoints() {
+        use pt_common::{IdentityQuality, ProcessIdentity, StartId};
+        use std::sync::Mutex;
 
-        app.request_execute();
-        assert!(app.take_execute());
-        assert!(!app.take_execute()); // consumed
+        let mut app = App::new();
+        let before = ProcessIdentity::full(
+            42,
+            StartId("boot:100:42".to_string()),
+            1000,
+            Some(40),
+            Some(40),
+            IdentityQuality::Full,
+        );
+        let mut after = before.clone();
+        after.start_id = StartId("boot:200:42".to_string());
+        let cache = Arc::new(Mutex::new(before.clone()));
+        let executions = Arc::new(Mutex::new(Vec::<ProcessIdentity>::new()));
+        app.process_table.set_rows(vec![make_row(42)]);
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        let stale_request = confirmed_request(&mut app);
+
+        let cache_r = Arc::clone(&cache);
+        let after_r = after.clone();
+        app.set_refresh_op(Arc::new(move || {
+            *cache_r.lock().unwrap() = after_r.clone();
+            let mut row = make_row(42);
+            row.command = "replacement incarnation".to_string();
+            Ok(vec![row])
+        }));
+        let cache_e = Arc::clone(&cache);
+        let executions_e = Arc::clone(&executions);
+        app.set_execute_op(Arc::new(move |pids| {
+            assert_eq!(pids, vec![42]);
+            executions_e
+                .lock()
+                .unwrap()
+                .push(cache_e.lock().unwrap().clone());
+            Ok(ExecutionOutcome {
+                mode: Some("dry_run".to_string()),
+                attempted: 1,
+                succeeded: 0,
+                failed: 0,
+            })
+        }));
+        let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+        let completed = refresh();
+        assert_eq!(*cache.lock().unwrap(), after);
+        assert_eq!(app.process_table.rows[0].command, "proc_42");
+        assert_ne!(*cache.lock().unwrap(), before);
+        for message in [
+            stale_request.clone(),
+            Msg::SelectAll,
+            Msg::SelectRecommended,
+            Msg::InvertSelection,
+            Msg::ToggleSelection,
+            Msg::ConfirmExecute,
+            Msg::ProcessesScanned(vec![make_row(99)]),
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char('A'))),
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char(' '))),
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char('e'))),
+        ] {
+            assert!(matches!(
+                <App as FtuiModel>::update(&mut app, message),
+                FtuiCmd::None
+            ));
+            assert_eq!(app.process_table.selected_count(), 0);
+            assert_eq!(app.process_table.rows[0].pid, 42);
+        }
+        for action in ["selection.all", "selection.recommended", "action.execute"] {
+            assert!(matches!(app.execute_palette_action(action), FtuiCmd::None));
+            assert_eq!(app.process_table.selected_count(), 0);
+        }
+        <App as FtuiModel>::update(&mut app, completed);
+        assert_eq!(app.operation, PendingOperation::Idle);
+        assert_eq!(app.process_table.rows[0].command, "replacement incarnation");
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        let fresh_request = confirmed_request(&mut app);
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, stale_request),
+            FtuiCmd::None
+        ));
+        assert!(executions.lock().unwrap().is_empty());
+        let execute = deferred_task(<App as FtuiModel>::update(&mut app, fresh_request.clone()));
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, fresh_request.clone()),
+            FtuiCmd::None
+        ));
+        <App as FtuiModel>::update(&mut app, execute());
+        assert_eq!(*executions.lock().unwrap(), vec![after]);
+        assert_eq!(app.operation, PendingOperation::Idle);
+        assert_eq!(app.process_table.selected_count(), 0);
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        let later_request = confirmed_request(&mut app);
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, fresh_request),
+            FtuiCmd::None
+        ));
+        let later = deferred_task(<App as FtuiModel>::update(&mut app, later_request));
+        <App as FtuiModel>::update(&mut app, later());
+        assert_eq!(executions.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn execution_serializes_refresh_and_recovers_after_an_actual_task_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut app = App::new();
+        app.process_table.set_rows(vec![make_row(42)]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_e = Arc::clone(&calls);
+        app.set_execute_op(Arc::new(move |pids| {
+            assert_eq!(pids, vec![42]);
+            if calls_e.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("dispatch callback failure".to_string())
+            } else {
+                Ok(ExecutionOutcome {
+                    mode: Some("dry_run".to_string()),
+                    attempted: 1,
+                    succeeded: 0,
+                    failed: 0,
+                })
+            }
+        }));
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        let request = confirmed_request(&mut app);
+        let execute = deferred_task(<App as FtuiModel>::update(&mut app, request.clone()));
+        for message in [
+            Msg::RequestRefresh,
+            request.clone(),
+            Msg::ProcessesScanned(vec![make_row(99)]),
+            Msg::ConfirmExecute,
+            Msg::RefreshComplete {
+                ticket: 0,
+                result: Ok(vec![make_row(99)]),
+            },
+            Msg::ExecutionComplete {
+                ticket: 0,
+                result: Ok(ExecutionOutcome::default()),
+            },
+        ] {
+            assert!(matches!(
+                <App as FtuiModel>::update(&mut app, message),
+                FtuiCmd::None
+            ));
+        }
+        assert!(matches!(
+            app.execute_palette_action("action.refresh"),
+            FtuiCmd::None
+        ));
+        assert!(matches!(
+            <App as FtuiModel>::update(
+                &mut app,
+                Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char('r'))),
+            ),
+            FtuiCmd::None
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(app.process_table.rows[0].pid, 42);
+        <App as FtuiModel>::update(&mut app, execute());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.operation, PendingOperation::Idle);
+        assert_eq!(app.process_table.selected_count(), 0);
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap()
+            .contains("dispatch callback failure"));
+        let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+        <App as FtuiModel>::update(&mut app, refresh());
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        let fresh_request = confirmed_request(&mut app);
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, request),
+            FtuiCmd::None
+        ));
+        let execute = deferred_task(<App as FtuiModel>::update(&mut app, fresh_request));
+        <App as FtuiModel>::update(&mut app, execute());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(app.operation, PendingOperation::Idle);
+        assert!(app.status_message.as_deref().unwrap().contains("dry_run"));
+    }
+
+    #[test]
+    fn refresh_error_and_unrelated_completion_do_not_revive_an_old_confirmation() {
+        let mut app = App::new();
+        app.process_table.set_rows(vec![make_row(42)]);
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        let stale_request = confirmed_request(&mut app);
+        app.set_refresh_op(Arc::new(|| Err("scan evidence unavailable".to_string())));
+        let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+        let active = app.operation;
+        assert!(matches!(
+            <App as FtuiModel>::update(
+                &mut app,
+                Msg::ExecutionComplete {
+                    ticket: 0,
+                    result: Err("stale error".to_string())
+                },
+            ),
+            FtuiCmd::None
+        ));
+        assert_eq!(app.operation, active);
+        <App as FtuiModel>::update(&mut app, refresh());
+        assert_eq!(app.operation, PendingOperation::Idle);
+        assert_eq!(app.process_table.rows[0].pid, 42);
+        assert_eq!(app.process_table.selected_count(), 0);
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap()
+            .contains("scan evidence unavailable"));
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, stale_request),
+            FtuiCmd::None
+        ));
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        let fresh_request = confirmed_request(&mut app);
+        let execute = deferred_task(<App as FtuiModel>::update(&mut app, fresh_request));
+        <App as FtuiModel>::update(&mut app, execute());
+        assert_eq!(app.operation, PendingOperation::Idle);
+    }
+
+    #[test]
+    fn confirmed_dispatch_keeps_its_selection_and_row_replacement_expires_queued_tickets() {
+        use std::sync::Mutex;
+
+        let mut app = App::new();
+        app.process_table.set_rows(vec![make_row(42), make_row(99)]);
+        let received = Arc::new(Mutex::new(Vec::<Vec<u32>>::new()));
+        let received_e = Arc::clone(&received);
+        app.set_execute_op(Arc::new(move |pids| {
+            received_e.lock().unwrap().push(pids);
+            Ok(ExecutionOutcome {
+                mode: Some("dry_run".to_string()),
+                attempted: 1,
+                succeeded: 0,
+                failed: 0,
+            })
+        }));
+        <App as FtuiModel>::update(&mut app, Msg::ToggleSelection);
+        let confirmed = app.process_table.get_selected();
+        assert_eq!(confirmed.len(), 1);
+        let request = confirmed_request(&mut app);
+        <App as FtuiModel>::update(&mut app, Msg::DeselectAll);
+        <App as FtuiModel>::update(&mut app, Msg::CursorDown);
+        <App as FtuiModel>::update(&mut app, Msg::ToggleSelection);
+        assert_ne!(app.process_table.get_selected(), confirmed);
+        let execute = deferred_task(<App as FtuiModel>::update(&mut app, request));
+        <App as FtuiModel>::update(&mut app, execute());
+        assert_eq!(*received.lock().unwrap(), vec![confirmed]);
+
+        <App as FtuiModel>::update(&mut app, Msg::ProcessesScanned(vec![make_row(42)]));
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        let stale = confirmed_request(&mut app);
+        let mut replacement = make_row(42);
+        replacement.command = "changed snapshot".to_string();
+        <App as FtuiModel>::update(&mut app, Msg::ProcessesScanned(vec![replacement]));
+        assert_eq!(app.process_table.selected_count(), 0);
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        let fresh = confirmed_request(&mut app);
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, stale),
+            FtuiCmd::None
+        ));
+        assert_eq!(received.lock().unwrap().len(), 1);
+        let execute = deferred_task(<App as FtuiModel>::update(&mut app, fresh));
+        <App as FtuiModel>::update(&mut app, execute());
+        assert_eq!(received.lock().unwrap()[1], vec![42]);
+        assert_eq!(app.operation, PendingOperation::Idle);
     }
 
     #[test]

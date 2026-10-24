@@ -4,7 +4,9 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
-use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, SessionId, StartId};
+use pt_common::{IdentityQuality, ProcessIdentity, SessionId};
+use pt_core::collect::{quick_scan, QuickScanOptions};
+use pt_core::config::Policy;
 use pt_core::decision::Action;
 use pt_core::exit_codes::ExitCode;
 use pt_core::plan::{
@@ -13,32 +15,33 @@ use pt_core::plan::{
 };
 use pt_core::session::{SessionContext, SessionManifest, SessionMode, SessionStore};
 use serde_json::Value;
-use std::env;
 use std::fs;
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+struct ChildGuard(Child);
 
-fn with_temp_data_dir<T>(f: impl FnOnce(&TempDir) -> T) -> T {
-    let _guard = ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("env lock poisoned");
-
-    let old = env::var("PROCESS_TRIAGE_DATA").ok();
-    let dir = TempDir::new().expect("create temp data dir");
-    env::set_var("PROCESS_TRIAGE_DATA", dir.path());
-
-    let result = f(&dir);
-
-    match old {
-        Some(val) => env::set_var("PROCESS_TRIAGE_DATA", val),
-        None => env::remove_var("PROCESS_TRIAGE_DATA"),
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
+}
 
-    result
+fn with_temp_data_dir<T>(f: impl FnOnce(&Path, &Path) -> T) -> T {
+    let data = TempDir::new().expect("create temp data dir").keep();
+    let config = TempDir::new().expect("create temp config dir").keep();
+    let mut policy = Policy::default();
+    // Eligibility is isolated to this fresh target; confirmation remains mandatory.
+    policy.guardrails.min_process_age_seconds = 0;
+    fs::write(
+        config.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).expect("serialize policy"),
+    )
+    .expect("write isolated policy");
+    f(&data, &config)
 }
 
 fn pt_core_fast() -> Command {
@@ -51,8 +54,8 @@ fn pt_core_fast() -> Command {
 
 #[test]
 fn agent_apply_requires_yes_flag() {
-    with_temp_data_dir(|dir| {
-        let store = SessionStore::from_env().expect("session store from env");
+    with_temp_data_dir(|dir, config| {
+        let store = SessionStore::at_data_dir(dir);
         let session_id = SessionId::new();
         let manifest = SessionManifest::new(&session_id, None, SessionMode::RobotPlan, None);
         let handle = store.create(&manifest).expect("create session");
@@ -64,15 +67,31 @@ fn agent_apply_requires_yes_flag() {
         );
         handle.write_context(&ctx).expect("write context");
 
-        let pid = 424_245u32;
-        let identity = ProcessIdentity {
-            pid: ProcessId(pid),
-            start_id: StartId("boot:1:424245".to_string()),
-            uid: 1000,
-            pgid: None,
-            sid: None,
-            quality: IdentityQuality::Full,
-        };
+        let mut child = ChildGuard(
+            ProcessCommand::new("sleep")
+                .arg("900")
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn owned target"),
+        );
+        let pid = child.0.id();
+        let scan = quick_scan(&QuickScanOptions {
+            pids: vec![pid],
+            ..QuickScanOptions::default()
+        })
+        .expect("scan owned target");
+        let target = scan.processes.iter().find(|p| p.pid.0 == pid).unwrap();
+        let identity = ProcessIdentity::full(
+            pid,
+            target.start_id.clone(),
+            target.uid,
+            target.pgid,
+            target.sid,
+            IdentityQuality::Full,
+        );
 
         let plan = Plan {
             plan_id: "plan-test".to_string(),
@@ -82,7 +101,7 @@ fn agent_apply_requires_yes_flag() {
             policy_version: "1.0.0".to_string(),
             actions: vec![PlanAction {
                 action_id: "action-1".to_string(),
-                target: identity,
+                target: identity.clone(),
                 action: Action::Kill,
                 order: 0,
                 stage: 0,
@@ -124,8 +143,9 @@ fn agent_apply_requires_yes_flag() {
         )
         .expect("write plan");
 
-        let output = pt_core_fast()
-            .env("PROCESS_TRIAGE_DATA", dir.path())
+        let result = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir)
+            .env("PROCESS_TRIAGE_CONFIG", config)
             .args([
                 "--format",
                 "json",
@@ -139,14 +159,51 @@ fn agent_apply_requires_yes_flag() {
             .assert()
             .code(ExitCode::PolicyBlocked.as_i32())
             .get_output()
-            .stdout
             .clone();
+        let logs = Path::new("target/test-logs/e2e/agent_apply")
+            .join(&session_id.0)
+            .join("requires-yes");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("stdout.json"), &result.stdout).unwrap();
+        fs::write(logs.join("stderr.log"), &result.stderr).unwrap();
+        fs::write(
+            logs.join("identity.json"),
+            serde_json::to_vec_pretty(&identity).unwrap(),
+        )
+        .unwrap();
+        let output = result.stdout;
 
         let json: Value = serde_json::from_slice(&output).expect("Output should be valid JSON");
         assert_eq!(
             json.get("error").and_then(|v| v.as_str()),
             Some("confirmation_required"),
             "Expected confirmation_required error"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "unconfirmed target died"
+        );
+        let current = quick_scan(&QuickScanOptions {
+            pids: vec![pid],
+            ..QuickScanOptions::default()
+        })
+        .unwrap();
+        let survivor = current.processes.iter().find(|p| p.pid.0 == pid).unwrap();
+        assert_eq!(survivor.start_id, identity.start_id);
+        assert_eq!(survivor.uid, identity.uid);
+        assert!(
+            matches!(
+                fs::read(handle.dir.join("action/outcomes.jsonl")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "confirmation refusal must leave outcomes genuinely absent"
+        );
+        assert!(
+            matches!(
+                fs::read(dir.join("rate_limit.json")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
+            "confirmation refusal must leave budget genuinely absent"
         );
     });
 }

@@ -9,17 +9,21 @@
 //! - Bundle schema version presence
 
 use chrono::Utc;
-use pt_bundle::{BundleReader, BundleWriter, BUNDLE_SCHEMA_VERSION};
-use pt_redact::ExportProfile;
+use pt_bundle::{BundleError, BundleReader, BundleWriter, BUNDLE_SCHEMA_VERSION};
+use pt_redact::{ExportProfile, RedactionPolicy};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-/// Build a realistic bundle with summary, plan, telemetry, and log.
-fn build_full_bundle(profile: ExportProfile) -> (Vec<u8>, pt_bundle::BundleManifest) {
+/// Build structured content, with opaque archive payloads only under Forensic.
+fn build_full_bundle(
+    profile: ExportProfile,
+    include_opaque_telemetry: bool,
+) -> (Vec<u8>, pt_bundle::BundleManifest) {
     let mut writer = BundleWriter::new("pt-20260115-143022-abcd", "host-test", profile)
         .with_pt_version("2.0.0-test")
         .with_redaction_policy("1.0.0", "sha256-test-hash")
@@ -44,9 +48,21 @@ fn build_full_bundle(profile: ExportProfile) -> (Vec<u8>, pt_bundle::BundleManif
         }))
         .expect("add plan");
 
-    // Fake telemetry parquet bytes (just for bundling; content doesn't matter for bundle tests)
-    writer.add_telemetry("audit", vec![0x50, 0x41, 0x52, 0x31]); // PAR1 magic
-    writer.add_telemetry("proc_samples", vec![0x50, 0x41, 0x52, 0x31, 0x00, 0x01]);
+    // Opaque bytes exercise ZIP packaging, not Parquet validity or sanitization.
+    let artifacts = if include_opaque_telemetry {
+        assert_eq!(profile, ExportProfile::Forensic);
+        writer.add_telemetry("audit", vec![0x50, 0x41, 0x52, 0x31]);
+        writer.add_telemetry("proc_samples", vec![0x50, 0x41, 0x52, 0x31, 0x00, 0x01]);
+        json!([
+            {"path": "telemetry/audit.parquet", "kind": "parquet"},
+            {"path": "telemetry/proc_samples.parquet", "kind": "parquet"}
+        ])
+    } else {
+        json!([
+            {"path": "summary.json", "kind": "json"},
+            {"path": "plan.json", "kind": "json"}
+        ])
+    };
 
     let log_entry = json!({
         "event": "bundle_test",
@@ -56,10 +72,7 @@ fn build_full_bundle(profile: ExportProfile) -> (Vec<u8>, pt_bundle::BundleManif
         "command": "pt bundle create",
         "exit_code": 0,
         "duration_ms": 42,
-        "artifacts": [
-            {"path": "telemetry/audit.parquet", "kind": "parquet"},
-            {"path": "telemetry/proc_samples.parquet", "kind": "parquet"}
-        ]
+        "artifacts": artifacts
     });
     let log_jsonl = format!("{}\n", log_entry);
     writer.add_log("events", log_jsonl.into_bytes());
@@ -123,7 +136,7 @@ fn test_bundle_all_profiles_create_and_verify() {
     ];
 
     for profile in profiles {
-        let (bytes, manifest) = build_full_bundle(profile);
+        let (bytes, manifest) = build_full_bundle(profile, false);
 
         // Verify bundle is a valid ZIP
         assert_eq!(&bytes[0..2], b"PK", "Profile {:?}: not a ZIP", profile);
@@ -131,17 +144,44 @@ fn test_bundle_all_profiles_create_and_verify() {
         // Verify manifest metadata
         assert_eq!(manifest.export_profile, profile);
         assert_eq!(manifest.session_id, "pt-20260115-143022-abcd");
-        assert_eq!(manifest.host_id, "host-test");
+        if profile == ExportProfile::Forensic {
+            assert_eq!(manifest.host_id, "host-test");
+            assert_eq!(
+                manifest.description,
+                Some("No-mock integration test bundle".to_string())
+            );
+        } else {
+            assert_ne!(manifest.host_id, "host-test");
+            assert!(!manifest.host_id.is_empty());
+            let description = manifest.description.as_deref().expect("description");
+            assert!(!description.is_empty());
+            assert!(!description.contains("No-mock integration test bundle"));
+        }
         assert_eq!(manifest.bundle_version, BUNDLE_SCHEMA_VERSION);
         assert_eq!(manifest.pt_version, Some("2.0.0-test".to_string()));
-        assert_eq!(
-            manifest.description,
-            Some("No-mock integration test bundle".to_string())
-        );
 
         // Read back and verify all files
         let mut reader = BundleReader::from_bytes(bytes).expect("open bundle");
         assert_eq!(reader.export_profile(), profile);
+        let summary: serde_json::Value = reader.read_summary().expect("read summary");
+        assert_eq!(summary["total_processes"], 200);
+        assert_eq!(summary["candidates"], 8);
+        if profile == ExportProfile::Minimal {
+            assert_eq!(manifest.file_count(), 1);
+            assert_eq!(
+                summary,
+                json!({"total_processes": 200, "candidates": 8, "kills": 3, "spares": 5})
+            );
+            assert!(!reader.has_file("plan.json"));
+            assert!(!reader.has_file("logs/events.jsonl"));
+        } else {
+            assert_eq!(manifest.file_count(), 3);
+            assert_eq!(summary["schema_version"], "1.0.0");
+            let plan: serde_json::Value = reader.read_plan().expect("read plan").expect("plan");
+            assert_eq!(plan["recommendations"][0]["pid"], 1234);
+            assert_eq!(plan["recommendations"][0]["action"], "kill");
+            assert!(reader.has_file("logs/events.jsonl"));
+        }
 
         let failures = reader.verify_all();
         assert!(
@@ -161,7 +201,7 @@ fn test_bundle_all_profiles_create_and_verify() {
 
 #[test]
 fn test_bundle_manifest_checksums_match() {
-    let (bytes, manifest) = build_full_bundle(ExportProfile::Safe);
+    let (bytes, manifest) = build_full_bundle(ExportProfile::Forensic, true);
     let mut reader = BundleReader::from_bytes(bytes).expect("open bundle");
 
     // Verify each file individually
@@ -188,7 +228,7 @@ fn test_bundle_manifest_checksums_match() {
 
 #[test]
 fn test_bundle_schema_version_present() {
-    let (bytes, manifest) = build_full_bundle(ExportProfile::Safe);
+    let (bytes, manifest) = build_full_bundle(ExportProfile::Safe, false);
 
     // Bundle version must be present and match constant
     assert_eq!(manifest.bundle_version, BUNDLE_SCHEMA_VERSION);
@@ -210,7 +250,7 @@ fn test_bundle_schema_version_present() {
 
 #[test]
 fn test_bundle_multi_file_content_types() {
-    let (bytes, manifest) = build_full_bundle(ExportProfile::Safe);
+    let (bytes, manifest) = build_full_bundle(ExportProfile::Forensic, true);
     let mut reader = BundleReader::from_bytes(bytes).expect("open bundle");
 
     // Verify expected files are present
@@ -251,7 +291,7 @@ fn test_bundle_multi_file_content_types() {
 
 #[test]
 fn test_bundle_jsonl_log_schema_valid() {
-    let (bytes, _) = build_full_bundle(ExportProfile::Safe);
+    let (bytes, _) = build_full_bundle(ExportProfile::Safe, false);
     let mut reader = BundleReader::from_bytes(bytes).expect("open bundle");
 
     let log_bytes = reader.read_verified("logs/events.jsonl").expect("read log");
@@ -289,12 +329,18 @@ fn test_bundle_encrypted_roundtrip_all_profiles() {
         let passphrase = "test-passphrase-for-nomock";
 
         // Build and encrypt
-        let mut writer =
-            BundleWriter::new("session-enc", "host-enc", profile).with_pt_version("2.0.0");
+        let mut writer = BundleWriter::new("pt-20261004-120000-abcd", "host-enc", profile)
+            .with_pt_version("2.0.0");
         writer
-            .add_summary(&json!({"encrypted": true, "profile": format!("{:?}", profile)}))
+            .add_summary(&json!({"total_processes": 12, "candidates": 2}))
             .expect("add summary");
-        writer.add_telemetry("audit", vec![1, 2, 3]);
+        writer
+            .add_plan(&json!({"recommendations": [{"pid": 1234, "action": "spare"}]}))
+            .expect("add plan");
+        writer.add_log(
+            "events",
+            b"{\"event\":\"encryption_test\",\"exit_code\":0}\n".to_vec(),
+        );
 
         let manifest = writer
             .write_encrypted(&bundle_path, passphrase)
@@ -311,8 +357,20 @@ fn test_bundle_encrypted_roundtrip_all_profiles() {
         // Open with passphrase
         let mut reader =
             BundleReader::open_with_passphrase(&bundle_path, Some(passphrase)).expect("open");
-        assert_eq!(reader.session_id(), "session-enc");
+        assert_eq!(reader.session_id(), "pt-20261004-120000-abcd");
         assert_eq!(reader.export_profile(), profile);
+        let summary: serde_json::Value = reader.read_summary().expect("read summary");
+        assert_eq!(summary, json!({"total_processes": 12, "candidates": 2}));
+        if profile == ExportProfile::Minimal {
+            assert_eq!(manifest.file_count(), 1);
+            assert!(!reader.has_file("plan.json"));
+            assert!(!reader.has_file("logs/events.jsonl"));
+        } else {
+            assert_eq!(manifest.file_count(), 3);
+            let plan: serde_json::Value = reader.read_plan().expect("read plan").expect("plan");
+            assert_eq!(plan["recommendations"][0]["action"], "spare");
+            assert!(reader.has_file("logs/events.jsonl"));
+        }
 
         let failures = reader.verify_all();
         assert!(
@@ -348,7 +406,7 @@ fn test_bundle_encrypted_roundtrip_all_profiles() {
 
 #[test]
 fn test_bundle_artifact_manifest_completeness() {
-    let (_, manifest) = build_full_bundle(ExportProfile::Safe);
+    let (_, manifest) = build_full_bundle(ExportProfile::Forensic, true);
 
     // Every file must have non-empty sha256, non-zero bytes, and valid path
     for entry in manifest.files.iter() {
@@ -378,9 +436,16 @@ fn test_bundle_artifact_manifest_completeness() {
         );
     }
 
-    // Redaction policy metadata should be present
-    assert_eq!(manifest.redaction_policy_version, "1.0.0");
-    assert_eq!(manifest.redaction_policy_hash, "sha256-test-hash");
+    // Metadata describes the policy actually applied, overriding caller claims.
+    let policy = RedactionPolicy::default();
+    let canonical_policy = serde_json::to_value(&policy).expect("policy value");
+    let policy_bytes = serde_json::to_vec(&canonical_policy).expect("policy bytes");
+    assert_eq!(manifest.redaction_policy_version, policy.schema_version);
+    assert_eq!(
+        manifest.redaction_policy_hash,
+        format!("{:x}", Sha256::digest(&policy_bytes))
+    );
+    assert_ne!(manifest.redaction_policy_hash, "sha256-test-hash");
 
     eprintln!(
         "[INFO] Artifact manifest: {} entries, all valid",
@@ -394,7 +459,7 @@ fn test_bundle_file_on_disk_verify_all() {
     let bundle_path = temp_dir.path().join("on-disk.ptb");
 
     // Write to disk
-    let mut writer = BundleWriter::new("session-disk", "host-disk", ExportProfile::Safe)
+    let mut writer = BundleWriter::new("session-disk", "host-disk", ExportProfile::Forensic)
         .with_pt_version("2.0.0");
     writer
         .add_summary(&json!({"disk_test": true}))
@@ -438,8 +503,20 @@ fn test_bundle_empty_bundle_rejected() {
 fn test_bundle_single_file_minimal() {
     let mut writer = BundleWriter::new("session-min", "host-min", ExportProfile::Minimal);
     writer
-        .add_summary(&json!({"minimal": true}))
+        .add_summary(&json!({
+            "total_processes": 5,
+            "candidates": 1,
+            "kills": "private nonnumeric count",
+            "pid": 1234,
+            "command": "private-worker --token=canary",
+            "records": [{"pid": 1234}]
+        }))
         .expect("add summary");
+    writer
+        .add_plan(&json!({"recommendations": [{"pid": 1234, "action": "kill"}]}))
+        .expect("add plan");
+    writer.add_telemetry("audit", b"opaque private telemetry".to_vec());
+    writer.add_log("events", b"private unstructured log".to_vec());
 
     let (bytes, manifest) = writer.write_to_vec().expect("write");
 
@@ -448,12 +525,16 @@ fn test_bundle_single_file_minimal() {
 
     let mut reader = BundleReader::from_bytes(bytes).expect("open");
     let summary: serde_json::Value = reader.read_summary().expect("read summary");
-    assert_eq!(summary["minimal"], true);
+    assert_eq!(summary, json!({"total_processes": 5, "candidates": 1}));
+    assert!(!reader.has_file("plan.json"));
+    assert!(reader.telemetry_files().is_empty());
+    assert!(reader.log_files().is_empty());
+    assert!(reader.verify_all().is_empty());
 }
 
 #[test]
 fn test_bundle_large_telemetry_data() {
-    let mut writer = BundleWriter::new("session-large", "host-large", ExportProfile::Safe);
+    let mut writer = BundleWriter::new("session-large", "host-large", ExportProfile::Forensic);
 
     // 1MB of telemetry data
     let large_data = vec![0xABu8; 1024 * 1024];
@@ -478,4 +559,23 @@ fn test_bundle_large_telemetry_data() {
         .read_verified("telemetry/proc_samples.parquet")
         .expect("read telemetry");
     assert_eq!(read_data, large_data);
+}
+
+#[test]
+fn test_safe_opaque_payload_refused_before_destination_creation() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let bundle_path = temp_dir.path().join("refused.ptb");
+    let mut writer = BundleWriter::new("session-refused", "host-refused", ExportProfile::Safe);
+    writer
+        .add_summary(&json!({"total_processes": 1}))
+        .expect("add summary");
+    writer.add_telemetry("audit", b"opaque private telemetry".to_vec());
+
+    let result = writer.write(&bundle_path);
+    assert!(matches!(
+        result,
+        Err(BundleError::UnsanitizedPayload { path, profile })
+            if path == "telemetry/audit.parquet" && profile == "safe"
+    ));
+    assert!(!bundle_path.exists(), "refusal must not create an output");
 }

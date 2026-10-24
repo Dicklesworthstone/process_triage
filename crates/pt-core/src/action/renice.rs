@@ -277,23 +277,20 @@ impl ReniceActionRunner {
         // Give it a moment for the change to take effect
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        match self.get_nice_value(pid) {
+        Self::verify_observed_priority(self.get_nice_value(pid), expected)
+    }
+
+    #[cfg(unix)]
+    fn verify_observed_priority(actual: Option<i32>, expected: i32) -> Result<(), ActionError> {
+        match actual {
             // At or below the target priority (never raised by execute_renice).
             Some(actual) if actual >= expected => Ok(()),
             Some(actual) => Err(ActionError::Failed(format!(
                 "nice value mismatch: expected {expected}, got {actual}"
             ))),
-            None => {
-                // Process may have exited or /proc not available
-                // Check if process still exists
-                let stat_path = format!("/proc/{pid}/stat");
-                if !std::path::Path::new(&stat_path).exists() {
-                    Err(ActionError::Failed("process no longer exists".to_string()))
-                } else {
-                    // Can't verify but process exists - assume success
-                    Ok(())
-                }
-            }
+            None => Err(ActionError::Failed(
+                "unable to observe process priority; renice is unverified".to_string(),
+            )),
         }
     }
 }
@@ -418,6 +415,21 @@ mod tests {
         fn runner_can_be_created() {
             let runner = ReniceActionRunner::with_defaults();
             assert_eq!(runner.config.nice_value, DEFAULT_NICE_VALUE);
+        }
+
+        #[test]
+        fn verification_requires_observed_priority_at_or_below_target() {
+            // Higher nice means lower priority. Equality and a pre-existing
+            // lower priority are valid; missing evidence and higher priority are not.
+            for (observed, target) in [(Some(10), 10), (Some(19), 10), (Some(-20), -20)] {
+                assert!(ReniceActionRunner::verify_observed_priority(observed, target).is_ok());
+            }
+            for (observed, target) in [(Some(9), 10), (Some(-20), -19), (None, 10)] {
+                assert!(matches!(
+                    ReniceActionRunner::verify_observed_priority(observed, target),
+                    Err(ActionError::Failed(_))
+                ));
+            }
         }
 
         #[test]

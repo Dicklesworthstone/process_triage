@@ -6,8 +6,9 @@
 use super::types::{
     AncestryEntry, EvidenceType, SupervisionEvidence, SupervisionResult, SupervisorDatabase,
 };
+use crate::collect::proc_parsers::ProcessStat;
 #[cfg(target_os = "linux")]
-use crate::collect::proc_parsers::{parse_proc_cmdline, parse_proc_stat};
+use crate::collect::proc_parsers::{read_required_proc_stat, StatReadError};
 use pt_common::ProcessId;
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
@@ -22,21 +23,35 @@ const MAX_ANCESTRY_DEPTH: u32 = 20;
 /// Errors that can occur during ancestry analysis.
 #[derive(Debug, Error)]
 pub enum AncestryError {
-    #[error("I/O error reading /proc/{pid}: {source}")]
+    #[error("I/O error reading {path} for PID {pid}: {source}")]
     IoError {
         pid: u32,
+        path: String,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("Parse error for /proc/{pid}/stat: {message}")]
-    ParseError { pid: u32, message: String },
+    #[error("Parse error at {path} for PID {pid}: {message}")]
+    ParseError {
+        pid: u32,
+        path: String,
+        message: String,
+    },
 
     #[error("Process {0} not found")]
     ProcessNotFound(u32),
 
     #[error("Ancestry loop detected at PID {0}")]
     LoopDetected(u32),
+
+    #[error("Ancestry for PID {pid} is incomplete at depth {depth}")]
+    DepthLimit { pid: u32, depth: u32 },
+
+    #[error("Process {0} changed while reading ancestry evidence")]
+    ProcessChanged(u32),
+
+    #[error("Ancestry evidence for PID {0} is unsupported on this platform")]
+    Unsupported(u32),
 }
 
 /// Configuration for ancestry analysis.
@@ -60,15 +75,15 @@ impl Default for AncestryConfig {
     }
 }
 
-/// Process tree cache for efficient batch analysis.
+/// Last observed process identities, refreshed before each safety decision.
 #[derive(Debug, Default)]
 pub struct ProcessTreeCache {
     /// Cached (pid -> ppid) mappings.
     ppid_map: HashMap<u32, u32>,
     /// Cached (pid -> comm) mappings.
     comm_map: HashMap<u32, String>,
-    /// Cached (pid -> cmdline) mappings.
-    cmdline_map: HashMap<u32, String>,
+    /// Birth ticks of the observed process incarnation.
+    birth_map: HashMap<u32, u64>,
 }
 
 impl ProcessTreeCache {
@@ -79,32 +94,32 @@ impl ProcessTreeCache {
 
     /// Pre-populate the cache by scanning /proc.
     ///
-    /// This is more efficient for batch analysis than reading on-demand.
+    /// These initial observations never authorize absence without a fresh read.
     #[cfg(target_os = "linux")]
     pub fn populate(&mut self) -> Result<(), AncestryError> {
         let proc = Path::new("/proc");
-        if !proc.exists() {
-            return Ok(());
-        }
+        let entries = fs::read_dir(proc).map_err(|e| AncestryError::IoError {
+            pid: 0,
+            path: "/proc".to_string(),
+            source: e,
+        })?;
 
-        let entries =
-            fs::read_dir(proc).map_err(|e| AncestryError::IoError { pid: 0, source: e })?;
-
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(|source| AncestryError::IoError {
+                pid: 0,
+                path: "/proc".to_string(),
+                source,
+            })?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
 
             // Only process numeric directories (PIDs)
             if let Ok(pid) = name_str.parse::<u32>() {
                 // Read stat for PPID and comm
-                if let Ok((ppid, comm)) = read_stat(pid) {
-                    self.ppid_map.insert(pid, ppid);
-                    self.comm_map.insert(pid, comm);
-                }
-
-                // Read cmdline
-                if let Ok(cmdline) = read_cmdline(pid) {
-                    self.cmdline_map.insert(pid, cmdline);
+                if let Ok(stat) = read_stat(pid) {
+                    self.ppid_map.insert(pid, stat.ppid);
+                    self.comm_map.insert(pid, stat.comm);
+                    self.birth_map.insert(pid, stat.starttime);
                 }
             }
         }
@@ -112,66 +127,69 @@ impl ProcessTreeCache {
         Ok(())
     }
 
-    /// Get PPID from cache or read from /proc.
+    /// Refresh before a safety decision: a cached absence is not live evidence.
+    fn get_stat(&mut self, pid: u32) -> Result<ProcessStat, AncestryError> {
+        let stat = read_stat(pid)?;
+        self.ppid_map.insert(pid, stat.ppid);
+        self.comm_map.insert(pid, stat.comm.clone());
+        self.birth_map.insert(pid, stat.starttime);
+        Ok(stat)
+    }
+
     fn get_ppid(&mut self, pid: u32) -> Result<u32, AncestryError> {
-        if let Some(&ppid) = self.ppid_map.get(&pid) {
-            return Ok(ppid);
-        }
-
-        let (ppid, comm) = read_stat(pid)?;
-        self.ppid_map.insert(pid, ppid);
-        self.comm_map.insert(pid, comm);
-        Ok(ppid)
-    }
-
-    /// Get comm from cache or read from /proc.
-    fn get_comm(&mut self, pid: u32) -> Result<String, AncestryError> {
-        if let Some(comm) = self.comm_map.get(&pid) {
-            return Ok(comm.clone());
-        }
-
-        let (ppid, comm) = read_stat(pid)?;
-        self.ppid_map.insert(pid, ppid);
-        self.comm_map.insert(pid, comm.clone());
-        Ok(comm)
-    }
-
-    /// Get cmdline from cache or read from /proc.
-    fn get_cmdline(&mut self, pid: u32) -> Option<String> {
-        if let Some(cmdline) = self.cmdline_map.get(&pid) {
-            return Some(cmdline.clone());
-        }
-
-        if let Ok(cmdline) = read_cmdline(pid) {
-            self.cmdline_map.insert(pid, cmdline.clone());
-            return Some(cmdline);
-        }
-
-        None
+        Ok(self.get_stat(pid)?.ppid)
     }
 }
 
 /// Read PPID and comm from /proc/<pid>/stat.
 #[cfg(target_os = "linux")]
-fn read_stat(pid: u32) -> Result<(u32, String), AncestryError> {
-    let stat = parse_proc_stat(pid).ok_or(AncestryError::ProcessNotFound(pid))?;
-    Ok((stat.ppid, stat.comm))
+pub(super) fn read_stat(pid: u32) -> Result<ProcessStat, AncestryError> {
+    read_required_proc_stat(pid).map_err(|error| match error {
+        StatReadError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            AncestryError::ProcessNotFound(pid)
+        }
+        StatReadError::Read { source, .. } => AncestryError::IoError {
+            pid,
+            path: format!("/proc/{pid}/stat"),
+            source,
+        },
+        StatReadError::Parse { reason, .. } => AncestryError::ParseError {
+            pid,
+            path: format!("/proc/{pid}/stat"),
+            message: reason,
+        },
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_stat(pid: u32) -> Result<(u32, String), AncestryError> {
-    Err(AncestryError::ProcessNotFound(pid))
+pub(super) fn read_stat(pid: u32) -> Result<ProcessStat, AncestryError> {
+    Err(AncestryError::Unsupported(pid))
 }
 
 /// Read cmdline from /proc/<pid>/cmdline.
 #[cfg(target_os = "linux")]
 fn read_cmdline(pid: u32) -> Result<String, AncestryError> {
-    parse_proc_cmdline(pid).ok_or(AncestryError::ProcessNotFound(pid))
+    let path = format!("/proc/{pid}/cmdline");
+    let bytes = fs::read(&path).map_err(|source| AncestryError::IoError {
+        pid,
+        path: path.clone(),
+        source,
+    })?;
+    let content = std::str::from_utf8(&bytes).map_err(|_| AncestryError::ParseError {
+        pid,
+        path,
+        message: "invalid command-line UTF-8".to_string(),
+    })?;
+    Ok(content
+        .split('\0')
+        .filter(|arg| !arg.is_empty())
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_cmdline(_pid: u32) -> Result<String, AncestryError> {
-    Ok(String::new())
+fn read_cmdline(pid: u32) -> Result<String, AncestryError> {
+    Err(AncestryError::Unsupported(pid))
 }
 
 /// Analyzer for process ancestry and supervision detection.
@@ -210,6 +228,9 @@ impl AncestryAnalyzer {
 
     /// Analyze a process for supervision by walking its ancestry.
     pub fn analyze(&mut self, pid: u32) -> Result<SupervisionResult, AncestryError> {
+        if pid == 0 {
+            return Err(AncestryError::ProcessNotFound(pid));
+        }
         let mut ancestry_chain = Vec::new();
         let mut current_pid = pid;
         let mut visited = std::collections::HashSet::new();
@@ -223,17 +244,19 @@ impl AncestryAnalyzer {
             }
 
             // Get process info
-            let comm = match self.cache.get_comm(current_pid) {
-                Ok(c) => c,
-                Err(AncestryError::ProcessNotFound(_)) if current_pid == 1 => {
-                    // PID 1 may not be readable, that's OK
-                    break;
-                }
-                Err(e) => return Err(e),
-            };
+            let stat = self.cache.get_stat(current_pid)?;
+            let comm = stat.comm.clone();
 
             let cmdline = if self.config.include_cmdline {
-                self.cache.get_cmdline(current_pid)
+                let command = read_cmdline(current_pid)?;
+                let after = read_stat(current_pid)?;
+                if after.starttime != stat.starttime
+                    || after.ppid != stat.ppid
+                    || after.comm != stat.comm
+                {
+                    return Err(AncestryError::ProcessChanged(current_pid));
+                }
+                Some(command)
             } else {
                 None
             };
@@ -272,22 +295,19 @@ impl AncestryAnalyzer {
             }
 
             // Move to parent
-            let ppid = match self.cache.get_ppid(current_pid) {
-                Ok(p) => p,
-                Err(AncestryError::ProcessNotFound(_)) => break,
-                Err(e) => return Err(e),
-            };
-
-            if ppid == current_pid || ppid == 0 {
-                break; // Reached init or self-parented
+            let ppid = stat.ppid;
+            if ppid == 0 {
+                return Ok(SupervisionResult::not_supervised(ancestry_chain));
+            }
+            if ppid == current_pid {
+                return Err(AncestryError::LoopDetected(current_pid));
             }
 
             current_pid = ppid;
             depth += 1;
         }
 
-        // No supervisor found
-        Ok(SupervisionResult::not_supervised(ancestry_chain))
+        Err(AncestryError::DepthLimit { pid, depth })
     }
 
     /// Check if a process is orphaned (parent is init).
@@ -329,7 +349,7 @@ pub fn analyze_supervision_batch(
     for &pid in pids {
         match analyzer.analyze(pid) {
             Ok(result) => results.push((pid, result)),
-            Err(AncestryError::ProcessNotFound(_)) => {
+            Err(AncestryError::ProcessNotFound(missing)) if missing == pid => {
                 // Process may have exited, skip it
                 continue;
             }
@@ -392,6 +412,55 @@ mod tests {
         let cache = ProcessTreeCache::new();
         assert!(cache.ppid_map.is_empty());
         assert!(cache.comm_map.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cached_ancestry_cannot_supply_missing_or_stale_evidence() {
+        let mut cache = ProcessTreeCache::new();
+        cache.ppid_map.insert(u32::MAX, 0);
+        cache
+            .comm_map
+            .insert(u32::MAX, "cached absence".to_string());
+        cache.birth_map.insert(u32::MAX, 1);
+        assert!(
+            matches!(cache.get_stat(u32::MAX), Err(AncestryError::ProcessNotFound(pid)) if pid == u32::MAX)
+        );
+        let pid = std::process::id();
+        let live = read_stat(pid).unwrap();
+        cache.ppid_map.insert(pid, 0);
+        cache.comm_map.insert(pid, "stale command".to_string());
+        cache.birth_map.insert(pid, u64::MAX);
+        let refreshed = cache.get_stat(pid).unwrap();
+        assert_eq!(refreshed.ppid, live.ppid);
+        assert_eq!(refreshed.starttime, live.starttime);
+        assert_eq!(cache.birth_map[&pid], live.starttime);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestry_requires_an_observed_root_before_returning_absence() {
+        let mut truncated = AncestryAnalyzer::with_config(AncestryConfig {
+            max_depth: 1,
+            include_cmdline: false,
+            database: SupervisorDatabase::new(),
+        });
+        let pid = std::process::id();
+        assert_ne!(read_stat(pid).unwrap().ppid, 0);
+        assert!(
+            matches!(truncated.analyze(pid), Err(AncestryError::DepthLimit { pid: failed, depth: 1 }) if failed == pid)
+        );
+        let mut root = AncestryAnalyzer::with_config(AncestryConfig {
+            include_cmdline: false,
+            database: SupervisorDatabase::new(),
+            ..AncestryConfig::default()
+        });
+        let observed = read_stat(1).unwrap();
+        assert_eq!(observed.ppid, 0);
+        let result = root.analyze(1).unwrap();
+        assert!(!result.is_supervised);
+        assert_eq!(result.ancestry_chain.len(), 1);
+        assert_eq!(result.ancestry_chain[0].pid.0, 1);
     }
 
     #[cfg(target_os = "linux")]

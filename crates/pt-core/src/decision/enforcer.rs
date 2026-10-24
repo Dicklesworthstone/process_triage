@@ -369,6 +369,9 @@ pub struct PolicyEnforcer {
     data_loss_gates: DataLossGates,
     /// `guardrails.builtin_protection`.
     builtin_protection: bool,
+    /// The recorded policy independently restricts the current policy. Both
+    /// predicates share one durable limiter and one per-run count.
+    recorded_policy: Option<Box<PolicyEnforcer>>,
     /// Policy snapshot timestamp for hot-reload detection.
     loaded_at: Instant,
 }
@@ -455,8 +458,69 @@ impl PolicyEnforcer {
             robot_mode: policy.robot_mode.clone(),
             data_loss_gates: policy.data_loss_gates.clone(),
             builtin_protection: policy.guardrails.builtin_protection,
+            recorded_policy: None,
             loaded_at: Instant::now(),
         })
+    }
+
+    /// Enforce both policies without merging their protection exceptions or
+    /// charging one delivered kill twice. Only the four numeric budget caps
+    /// are intersected, with an absent window cap meaning no limit.
+    pub fn new_with_recorded_policy(
+        current: &Policy,
+        recorded: Option<&Policy>,
+        state_path: Option<&std::path::Path>,
+    ) -> Result<Self, EnforcerError> {
+        let mut enforcer = Self::new(current, state_path)?;
+        if let Some(recorded) = recorded {
+            let stricter_cap = |left: Option<u32>, right: Option<u32>| match (left, right) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(cap), None) | (None, Some(cap)) => Some(cap),
+                (None, None) => None,
+            };
+            let mut budgets = current.guardrails.clone();
+            budgets.max_kills_per_run = budgets
+                .max_kills_per_run
+                .min(recorded.guardrails.max_kills_per_run);
+            budgets.max_kills_per_minute = stricter_cap(
+                budgets.max_kills_per_minute,
+                recorded.guardrails.max_kills_per_minute,
+            );
+            budgets.max_kills_per_hour = stricter_cap(
+                budgets.max_kills_per_hour,
+                recorded.guardrails.max_kills_per_hour,
+            );
+            budgets.max_kills_per_day = stricter_cap(
+                budgets.max_kills_per_day,
+                recorded.guardrails.max_kills_per_day,
+            );
+            enforcer.rate_limiter = Arc::new(
+                SlidingWindowRateLimiter::from_guardrails(&budgets, state_path)
+                    .map_err(|error| EnforcerError::PolicyInvalid(error.to_string()))?,
+            );
+            let mut recorded_enforcer = Self::new(recorded, None)?;
+            recorded_enforcer.rate_limiter = Arc::clone(&enforcer.rate_limiter);
+            enforcer.recorded_policy = Some(Box::new(recorded_enforcer));
+        }
+        Ok(enforcer)
+    }
+
+    /// Collect evidence needed by either policy, even if the current policy
+    /// removed every protected group or disabled built-in protection.
+    pub fn requires_group_evidence(&self) -> bool {
+        !self.protected_groups.is_empty()
+            || self
+                .recorded_policy
+                .as_ref()
+                .is_some_and(|policy| policy.requires_group_evidence())
+    }
+
+    pub fn requires_builtin_placement(&self) -> bool {
+        self.builtin_protection
+            || self
+                .recorded_policy
+                .as_ref()
+                .is_some_and(|policy| policy.requires_builtin_placement())
     }
 
     /// Check if an action is allowed for a candidate.
@@ -469,7 +533,21 @@ impl PolicyEnforcer {
         action: Action,
         robot_mode: bool,
     ) -> PolicyCheckResult {
+        // Keep does nothing, so no gate can block it. Blocking it turned a plain "leave
+        // it alone" into a "review" item (every candidate of a `--robot` plan under the
+        // default policy, every macOS orphan through never_kill_ppid).
+        if action == Action::Keep {
+            return PolicyCheckResult::allowed();
+        }
+
         let mut warnings = Vec::new();
+        if let Some(recorded) = &self.recorded_policy {
+            let check = recorded.check_action(candidate, action, robot_mode);
+            if !check.allowed {
+                return check;
+            }
+            warnings.extend(check.warnings);
+        }
         // Only enforce most rules for destructive actions
         let is_destructive = matches!(action, Action::Kill | Action::Restart);
 
@@ -508,18 +586,33 @@ impl PolicyEnforcer {
                     context: None,
                 });
             }
+            // Same placement as the scan-time filter (cgroup role on Linux, owner and
+            // executable on macOS), so the scan's candidates are not blocked here for it.
             if let Some(role) = candidate.cgroup_role {
-                if role.is_supervised_service() {
-                    return PolicyCheckResult::blocked(PolicyViolation {
-                        kind: ViolationKind::ProtectedPattern,
-                        message: format!(
-                            "supervised service (cgroup {role:?}); stop the unit instead"
-                        ),
-                        rule: "builtin.supervised_service".to_string(),
-                        context: None,
-                    });
+                use crate::collect::protected::{builtin_placement, BuiltinPlacement};
+                let user = candidate.user.as_deref().unwrap_or("");
+                match builtin_placement(role, user, argv0, &candidate.cmdline) {
+                    BuiltinPlacement::SupervisedService => {
+                        return PolicyCheckResult::blocked(PolicyViolation {
+                            kind: ViolationKind::ProtectedPattern,
+                            message: format!(
+                                "supervised service (cgroup {role:?}); stop the unit instead"
+                            ),
+                            rule: "builtin.supervised_service".to_string(),
+                            context: None,
+                        });
+                    }
+                    BuiltinPlacement::MacSystem(notes) => {
+                        return PolicyCheckResult::blocked(PolicyViolation {
+                            kind: ViolationKind::ProtectedPattern,
+                            message: format!("built-in protection: {notes}"),
+                            rule: crate::collect::protected::MACOS_SYSTEM_RULE.to_string(),
+                            context: None,
+                        });
+                    }
+                    BuiltinPlacement::UserWorkload => session_workload = true,
+                    BuiltinPlacement::Unplaced => {}
                 }
-                session_workload = role.is_user_workload();
             }
             if let Some((rule, notes)) =
                 crate::collect::protected::builtin_force_review_match(&candidate.cmdline)
@@ -728,6 +821,21 @@ impl PolicyEnforcer {
                 kind: ViolationKind::RobotModeGate,
                 message: "robot_mode.enabled is false".to_string(),
                 rule: "robot_mode.enabled".to_string(),
+                context: None,
+            });
+        }
+
+        // Unknown evidence cannot satisfy a positive confidence floor. Explicit
+        // zero-floor policies still permit execution-only test/manual plans.
+        if candidate
+            .posterior
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            || (candidate.posterior.is_none() && self.robot_mode.min_posterior > 0.0)
+        {
+            return Some(PolicyViolation {
+                kind: ViolationKind::RobotModeGate,
+                message: "valid posterior evidence is required by the confidence floor".to_string(),
+                rule: "robot_mode.min_posterior".to_string(),
                 context: None,
             });
         }
@@ -1163,9 +1271,30 @@ impl PolicyEnforcer {
         self.rate_limiter.record_kill()
     }
 
+    /// Durably prepare kill accounting before any destructive signal is sent.
+    pub fn begin_kill_accounting(&self) -> Result<(), crate::decision::rate_limit::RateLimitError> {
+        self.rate_limiter.begin_kill_accounting()
+    }
+
+    /// Resolve the prepared intent using actual delivery, including actions
+    /// whose later effect verification failed.
+    pub fn finish_kill_accounting(
+        &self,
+        delivered: bool,
+    ) -> Result<
+        crate::decision::rate_limit::RateLimitCounts,
+        crate::decision::rate_limit::RateLimitError,
+    > {
+        self.rate_limiter.finish_kill_accounting(delivered)
+    }
+
     /// Check if the enforcer requires confirmation for actions.
     pub fn requires_confirmation(&self) -> bool {
         self.require_confirmation
+            || self
+                .recorded_policy
+                .as_ref()
+                .is_some_and(|policy| policy.requires_confirmation())
     }
 
     /// Get time since policy was loaded.
@@ -1214,6 +1343,216 @@ mod tests {
             provenance_evidence_completeness: None,
             provenance_confidence_penalty: None,
         }
+    }
+
+    #[test]
+    fn recorded_policy_requests_removed_group_and_builtin_evidence() {
+        let mut current = test_policy();
+        current.guardrails.builtin_protection = false;
+        current.robot_mode.enabled = true;
+        let mut recorded = current.clone();
+        recorded.guardrails.builtin_protection = true;
+        recorded.guardrails.protected_groups = vec!["testgroup".to_string()];
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
+        assert!(enforcer.requires_group_evidence());
+        assert!(enforcer.requires_builtin_placement());
+        let candidate = test_candidate();
+        assert!(
+            PolicyEnforcer::new(&current, None)
+                .unwrap()
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        let check = enforcer.check_action(&candidate, Action::Kill, true);
+        assert_eq!(check.violation.unwrap().kind, ViolationKind::ProtectedGroup);
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Keep, true)
+                .allowed
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorded_policy_does_not_merge_builtin_protection_exceptions() {
+        let mut current = test_policy();
+        current.guardrails.builtin_protection = true;
+        current.robot_mode.enabled = true;
+        let mut recorded = current.clone();
+        recorded.guardrails.builtin_protection = false;
+        let mut candidate = test_candidate();
+        candidate.user = Some("root".to_string());
+        candidate.cgroup_role = Some(crate::collect::CgroupRole::LoginSession);
+        assert!(
+            PolicyEnforcer::new(&current, None)
+                .unwrap()
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
+        assert!(
+            !enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn recorded_data_loss_gates_preserve_enabled_positive_boundaries() {
+        let mut current = test_policy();
+        current.robot_mode.enabled = true;
+        current.data_loss_gates.block_if_open_write_fds = true;
+        current.data_loss_gates.max_open_write_fds = Some(5);
+        let mut recorded = current.clone();
+        recorded.data_loss_gates.block_if_open_write_fds = false;
+        recorded.data_loss_gates.max_open_write_fds = None;
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.open_write_fds = Some(5);
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        candidate.open_write_fds = Some(6);
+        assert!(
+            !enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        let reversed =
+            PolicyEnforcer::new_with_recorded_policy(&recorded, Some(&current), None).unwrap();
+        assert!(
+            !reversed
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        candidate.open_write_fds = Some(5);
+        assert!(
+            reversed
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn recorded_robot_floor_survives_a_looser_current_policy() {
+        let mut current = test_policy();
+        current.robot_mode.enabled = true;
+        current.robot_mode.min_posterior = 0.90;
+        let mut recorded = current.clone();
+        recorded.robot_mode.min_posterior = 0.99;
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), None).unwrap();
+        let mut candidate = test_candidate();
+        assert!(
+            PolicyEnforcer::new(&current, None)
+                .unwrap()
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        let refusal = enforcer.check_action(&candidate, Action::Kill, true);
+        assert_eq!(refusal.violation.unwrap().rule, "robot_mode.min_posterior");
+        candidate.posterior = Some(0.99);
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        candidate.posterior = None;
+        assert!(
+            !enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn recorded_budget_shares_one_intent_and_charges_each_delivery_once() {
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state_path = data_dir.join("recorded-budget.json");
+        let mut current = test_policy();
+        current.robot_mode.enabled = true;
+        current.robot_mode.max_kills = 10;
+        current.guardrails.max_kills_per_run = 10;
+        current.guardrails.max_kills_per_minute = Some(10);
+        current.guardrails.max_kills_per_hour = None;
+        current.guardrails.max_kills_per_day = None;
+        let mut recorded = current.clone();
+        recorded.guardrails.max_kills_per_run = 2;
+        recorded.guardrails.max_kills_per_minute = Some(2);
+        recorded.guardrails.max_kills_per_hour = Some(2);
+        recorded.guardrails.max_kills_per_day = Some(2);
+        let enforcer =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), Some(&state_path))
+                .unwrap();
+        let candidate = test_candidate();
+        for delivered in 0..2 {
+            assert!(
+                enforcer
+                    .check_action(&candidate, Action::Kill, true)
+                    .allowed
+            );
+            assert_eq!(enforcer.current_run_kill_count(), delivered);
+            enforcer.begin_kill_accounting().unwrap();
+            enforcer.finish_kill_accounting(true).unwrap();
+        }
+        assert_eq!(enforcer.current_run_kill_count(), 2);
+        assert_eq!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .violation
+                .unwrap()
+                .kind,
+            ViolationKind::RateLimitExceeded
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(saved["kill_timestamps"].as_array().unwrap().len(), 2);
+        assert_eq!(saved["pending_kill_intent"], false);
+        let fresh =
+            PolicyEnforcer::new_with_recorded_policy(&current, Some(&recorded), Some(&state_path))
+                .unwrap();
+        assert_eq!(fresh.current_run_kill_count(), 0);
+        assert!(!fresh.check_action(&candidate, Action::Kill, true).allowed);
+    }
+
+    #[test]
+    fn robot_confidence_floor_refuses_missing_or_invalid_probability() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.robot_mode.require_human_for_supervised = false;
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        for posterior in [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(-0.1),
+            Some(1.1),
+        ] {
+            candidate.posterior = posterior;
+            let result = enforcer.check_action(&candidate, Action::Kill, true);
+            assert!(!result.allowed, "invalid probability {posterior:?}");
+            assert_eq!(result.violation.unwrap().rule, "robot_mode.min_posterior");
+        }
+        candidate.posterior = Some(1.0);
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
+        policy.robot_mode.min_posterior = 0.0;
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        candidate.posterior = None;
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Kill, true)
+                .allowed
+        );
     }
 
     #[test]
@@ -1394,6 +1733,121 @@ mod tests {
             result.violation.as_ref().unwrap().kind,
             ViolationKind::RobotModeGate
         );
+    }
+
+    /// Keep is a no-op: robot gates, never_kill_ppid and protection rules must not turn
+    /// "leave it alone" into a review item (a `--robot` plan under the default policy
+    /// used to report every candidate, keeps included, as review).
+    #[test]
+    fn keep_is_never_blocked() {
+        let mut policy = test_policy(); // robot_mode.enabled = false
+        policy.guardrails.never_kill_ppid = vec![1];
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+
+        let mut orphan = test_candidate();
+        orphan.ppid = 1;
+        orphan.posterior = Some(0.10);
+        for robot_mode in [false, true] {
+            let result = enforcer.check_action(&orphan, Action::Keep, robot_mode);
+            assert!(
+                result.allowed,
+                "robot_mode={robot_mode}: {:?}",
+                result.violation
+            );
+        }
+
+        // The same candidate is still gated for anything that acts on it.
+        let result = enforcer.check_action(&orphan, Action::Pause, true);
+        assert!(!result.allowed);
+    }
+
+    /// The scan filter and the enforcer place processes alike: under the default
+    /// guardrails (never_kill_ppid [1], protected_users [root]) a process the scan
+    /// evaluates is never blocked by the enforcer for protection, and a protected one
+    /// is never let through. On macOS this runs the owner/executable placement (the
+    /// enforcer used to block every macOS orphan through never_kill_ppid).
+    #[test]
+    fn enforcer_and_scan_filter_agree_on_protection() {
+        use crate::collect::protected::ProtectedFilter;
+        use crate::collect::{CgroupRole, ProcessRecord, ProcessState};
+        use pt_common::{ProcessId, StartId};
+
+        let policy = Policy::default();
+        let filter = ProtectedFilter::from_guardrails(&policy.guardrails).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let roles = [
+            CgroupRole::SystemService,
+            CgroupRole::UserService,
+            CgroupRole::Container,
+            CgroupRole::LoginSession,
+            CgroupRole::TransientScope,
+            CgroupRole::Unknown,
+        ];
+        let commands = [
+            ("python3", "python3 -m http.server 8000"),
+            ("node", "node /home/alice/app/server.js"),
+            ("zed", "/Applications/Zed.app/Contents/MacOS/zed"),
+        ];
+        let mut evaluated = 0;
+        for role in roles {
+            for user in ["alice", "root"] {
+                for ppid in [1u32, 4242] {
+                    for (comm, cmd) in commands {
+                        let record = ProcessRecord {
+                            pid: ProcessId(5000),
+                            ppid: ProcessId(ppid),
+                            uid: if user == "root" { 0 } else { 1000 },
+                            user: user.to_string(),
+                            pgid: Some(4999),
+                            sid: Some(4999),
+                            start_id: StartId::from_linux("test-boot-id", 1, 5000),
+                            comm: comm.to_string(),
+                            cmd: cmd.to_string(),
+                            state: ProcessState::Sleeping,
+                            cpu_percent: 0.0,
+                            rss_bytes: 1 << 20,
+                            vsz_bytes: 2 << 20,
+                            tty: None,
+                            start_time_unix: 1,
+                            elapsed: std::time::Duration::from_secs(7200),
+                            source: "test".to_string(),
+                            container_info: None,
+                        };
+                        let scan_protected = filter.is_protected_with_role(&record, role);
+
+                        let mut candidate = test_candidate();
+                        candidate.pid = 5000;
+                        candidate.ppid = ppid as i32;
+                        candidate.cmdline = cmd.to_string();
+                        candidate.user = Some(user.to_string());
+                        candidate.group = None;
+                        candidate.category = None;
+                        candidate.cgroup_role = Some(role);
+                        let result = enforcer.check_action(&candidate, Action::Kill, false);
+
+                        let case = format!("{role:?} {user} ppid={ppid} {cmd}");
+                        match scan_protected {
+                            Some(m) => assert!(
+                                !result.allowed,
+                                "{case}: scan protects it ({}), enforcer allows it",
+                                m.pattern
+                            ),
+                            None => {
+                                evaluated += 1;
+                                assert!(
+                                    result.allowed,
+                                    "{case}: scan evaluates it, enforcer blocks it: {:?}",
+                                    result.violation
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Session workloads (and on macOS, users' own processes) are evaluated even as
+        // root or as children of PID 1.
+        assert!(evaluated >= 12, "only {evaluated} cases evaluated");
     }
 
     #[test]
@@ -2365,6 +2819,53 @@ mod tests {
         assert_eq!(enforcer.current_run_kill_count(), 1);
         enforcer.record_kill().unwrap();
         assert_eq!(enforcer.current_run_kill_count(), 2);
+    }
+
+    #[test]
+    fn durable_accounting_wrappers_preserve_pending_refusal_and_non_delivery() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::path::PathBuf::from("target/test-logs/e2e/rate_limit")
+            .join(format!("enforcer-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("rate_limit.json");
+        let policy = test_policy();
+        let owner = PolicyEnforcer::new(&policy, Some(&state_path)).unwrap();
+        let fresh = PolicyEnforcer::new(&policy, Some(&state_path)).unwrap();
+        let candidate = test_candidate();
+        assert!(owner.check_action(&candidate, Action::Kill, false).allowed);
+
+        owner.begin_kill_accounting().unwrap();
+        let pending = std::fs::read(&state_path).unwrap();
+        for enforcer in [&owner, &fresh] {
+            let result = enforcer.check_action(&candidate, Action::Kill, false);
+            assert!(!result.allowed);
+            let violation = result.violation.unwrap();
+            assert_eq!(violation.kind, ViolationKind::RateLimitExceeded);
+            assert!(violation.message.contains("unresolved pending kill intent"));
+            assert_eq!(enforcer.current_run_kill_count(), 0);
+        }
+        assert!(fresh.finish_kill_accounting(false).is_err());
+        assert!(fresh.begin_kill_accounting().is_err());
+        assert_eq!(std::fs::read(&state_path).unwrap(), pending);
+
+        let counts = owner.finish_kill_accounting(false).unwrap();
+        assert_eq!(
+            (counts.run, counts.minute, counts.hour, counts.day),
+            (0, 0, 0, 0)
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(saved["pending_kill_intent"], false);
+        assert_eq!(saved["kill_timestamps"], serde_json::json!([]));
+        assert!(fresh.check_action(&candidate, Action::Kill, false).allowed);
+        fresh.begin_kill_accounting().unwrap();
+        fresh.finish_kill_accounting(false).unwrap();
+        assert!(owner.check_action(&candidate, Action::Kill, false).allowed);
+        assert_eq!(owner.current_run_kill_count(), 0);
+        assert_eq!(fresh.current_run_kill_count(), 0);
     }
 
     // ── Robot mode hard critical files gate ──────────────────────────

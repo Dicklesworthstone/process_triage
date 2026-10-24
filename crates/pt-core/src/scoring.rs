@@ -28,7 +28,8 @@ use crate::inference::{
     PriorContext,
 };
 use crate::supervision::signature::{
-    MatchLevel, ProcessMatchContext, SignatureDatabase, SignatureMatch,
+    BetaParams, MatchLevel, ProcessExpectations, ProcessMatchContext, SignatureDatabase,
+    SignatureMatch, SupervisorSignature,
 };
 
 #[cfg(target_os = "linux")]
@@ -115,6 +116,71 @@ fn desktop_app_term() -> EvidenceTerm {
     }
 }
 
+/// Whether the signature that set a process's class prior expects it to be left
+/// behind (e.g. the built-in test runners: `likely_abandoned`). A desktop
+/// application unit then only says who started the process, not that someone is
+/// using it: a jest that an editor extension spawned inside the editor's `app-*`
+/// unit and that has been stuck for hours is still a stuck jest.
+fn signature_expects_abandoned(sig_match: &SignatureMatch<'_>, priors: &Priors) -> bool {
+    let sig_priors = &sig_match.signature.priors;
+    let Some(abandoned) = sig_priors.abandoned.as_ref() else {
+        return false;
+    };
+    let useful = sig_priors
+        .useful
+        .as_ref()
+        .map_or(priors.classes.useful.prior_prob, |useful| useful.mean());
+    abandoned.mean() > useful
+}
+
+/// z-score of the 99th percentile of the standard normal distribution.
+const Z_99: f64 = 2.326_347_874_040_841;
+
+/// Probability that a normal run of a signature's process would have finished by
+/// `age_secs`, under a log-normal lifetime with median `typical_lifetime_seconds` and
+/// 99th percentile `max_normal_lifetime_seconds`. `None` unless both are set and the
+/// maximum exceeds the typical lifetime.
+fn normal_run_finished_by(expectations: &ProcessExpectations, age_secs: f64) -> Option<f64> {
+    let typical = expectations.typical_lifetime_seconds? as f64;
+    let max = expectations.max_normal_lifetime_seconds? as f64;
+    if typical <= 0.0 || max <= typical {
+        return None;
+    }
+    if age_secs <= 0.0 {
+        return Some(0.0);
+    }
+    let mu = typical.ln();
+    let sigma = (max.ln() - mu) / Z_99;
+    Some(pt_math::normal_cdf((age_secs.ln() - mu) / sigma))
+}
+
+/// A signature whose processes are usually left behind (a test runner, a build) sets
+/// that prior for a process that has outlived a normal run, not for one still inside
+/// it: a four-minute-old `cargo build` is not "likely abandoned". Blend each class
+/// prior the signature sets with the global one, weighting the signature by the
+/// probability that a normal run would have finished by now; past the 99th
+/// percentile this is the signature's own prior. Concentrations are kept.
+fn age_gated_signature(
+    signature: &SupervisorSignature,
+    global: &Priors,
+    weight: f64,
+) -> SupervisorSignature {
+    let blend = |sig: &Option<BetaParams>, global_prob: f64| {
+        sig.as_ref().map(|beta| {
+            let concentration = beta.alpha + beta.beta;
+            let mean = (1.0 - weight) * global_prob + weight * beta.mean();
+            BetaParams::new(mean * concentration, (1.0 - mean) * concentration)
+        })
+    };
+    let mut gated = signature.clone();
+    let classes = &global.classes;
+    gated.priors.useful = blend(&signature.priors.useful, classes.useful.prior_prob);
+    gated.priors.useful_bad = blend(&signature.priors.useful_bad, classes.useful_bad.prior_prob);
+    gated.priors.abandoned = blend(&signature.priors.abandoned, classes.abandoned.prior_prob);
+    gated.priors.zombie = blend(&signature.priors.zombie, classes.zombie.prior_prob);
+    gated
+}
+
 /// A process's score, with everything that went into it.
 #[derive(Debug, Clone)]
 pub struct ProcessScore<'a> {
@@ -124,11 +190,18 @@ pub struct ProcessScore<'a> {
     /// verdict, or `signature_fast_path`).
     pub prior_source: String,
     pub signature: Option<SignatureMatch<'a>>,
+    /// When the matched signature expects its processes to be left behind and states
+    /// a normal lifetime: the weight its prior got for this process's age (the
+    /// probability a normal run would have finished by now). `None` otherwise.
+    pub signature_age_weight: Option<f64>,
     pub learned_prior: Option<LearnedPrior>,
     pub fast_path_used: bool,
     pub fast_path_skip_reason: Option<&'static str>,
     /// The desktop application unit, when the process is a desktop application.
     pub desktop_app: Option<String>,
+    /// Whether the desktop-application ownership term was applied. It is withheld
+    /// when the signature that set the prior expects the process to be abandoned.
+    pub desktop_app_credited: bool,
     /// Provenance adjustment, when the scorer collected provenance.
     #[cfg(target_os = "linux")]
     pub provenance: Option<ProvenanceScoreAdjustment>,
@@ -225,6 +298,33 @@ impl Scorer {
             match_ctx = match_ctx.cmdline(&proc.cmd);
         }
         let signature = self.signatures.best_match(&match_ctx);
+        let signature_age_weight = signature
+            .as_ref()
+            .filter(|sig_match| signature_expects_abandoned(sig_match, &self.priors))
+            .and_then(|sig_match| {
+                normal_run_finished_by(
+                    &sig_match.signature.expectations,
+                    proc.elapsed.as_secs_f64(),
+                )
+            });
+        let gated_signature =
+            signature
+                .as_ref()
+                .zip(signature_age_weight)
+                .map(|(sig_match, weight)| {
+                    age_gated_signature(sig_match.signature, &self.priors, weight)
+                });
+        let gated_match =
+            signature
+                .as_ref()
+                .zip(gated_signature.as_ref())
+                .map(|(sig_match, gated)| SignatureMatch {
+                    signature: gated,
+                    level: sig_match.level,
+                    score: sig_match.score,
+                    details: sig_match.details.clone(),
+                });
+        let prior_signature = gated_match.as_ref().or(signature.as_ref());
 
         let learned_prior = self
             .decisions
@@ -234,14 +334,14 @@ impl Scorer {
             .map(|learned| DecisionStore::overrides_for(learned, &self.priors));
         let prior_context = PriorContext {
             global_priors: &self.priors,
-            signature_match: signature.as_ref(),
+            signature_match: prior_signature,
             category_defaults: None,
             user_overrides: learned_overrides.as_ref(),
         };
 
         // A human verdict on this pattern outranks the signature fast path.
         let mut fast_path_skip_reason = None;
-        let fast_path = match signature.as_ref().filter(|_| learned_prior.is_none()) {
+        let fast_path = match prior_signature.filter(|_| learned_prior.is_none()) {
             Some(sig_match) => match try_signature_fast_path(&self.fast_path, Some(sig_match), pid)
             {
                 Ok(result) => result,
@@ -267,10 +367,22 @@ impl Scorer {
             }
         };
 
-        if desktop_app.is_some() {
+        // Only when the signature actually set the prior (not a learned verdict, and
+        // not a match too weak for its priors to apply).
+        let signature_set_prior =
+            matches!(prior_source.as_str(), "signature" | "signature_fast_path");
+        let abandon_signature = signature
+            .as_ref()
+            .filter(|sig_match| {
+                signature_set_prior && signature_expects_abandoned(sig_match, &self.priors)
+            })
+            .map(|sig_match| sig_match.signature.name.clone());
+        let mut desktop_app_credited = false;
+        if desktop_app.is_some() && abandon_signature.is_none() {
             if let Ok(adjusted) = apply_evidence_terms(&posterior, [desktop_app_term()]) {
                 posterior = adjusted;
                 ledger = EvidenceLedger::from_posterior_result(&posterior, Some(pid), None);
+                desktop_app_credited = true;
             }
         }
 
@@ -303,10 +415,13 @@ impl Scorer {
             });
 
         if let Some(unit) = desktop_app.as_deref() {
-            ledger.top_evidence.insert(
-                0,
-                format!("Desktop application ({unit}) started by the graphical session"),
-            );
+            let line = match abandon_signature.as_deref() {
+                Some(name) => format!(
+                    "Desktop application unit ({unit}), no desktop-app credit: signature '{name}' expects it to be abandoned"
+                ),
+                None => format!("Desktop application ({unit}) started by the graphical session"),
+            };
+            ledger.top_evidence.insert(0, line);
             ledger
                 .evidence_glyphs
                 .insert(DESKTOP_APP_FEATURE.to_string(), "🖥".to_string());
@@ -334,15 +449,27 @@ impl Scorer {
             }
         }
 
+        // The age weight only shaped the prior when the signature set it.
+        let signature_age_weight = signature_age_weight.filter(|_| signature_set_prior);
+        if let Some(weight) = signature_age_weight {
+            ledger.top_evidence.push(format!(
+                "Signature prior weighted {:.2} by age: {:.0}% of normal runs have finished by now",
+                weight,
+                weight * 100.0
+            ));
+        }
+
         Some(ProcessScore {
             posterior,
             ledger,
             prior_source,
             signature,
+            signature_age_weight,
             learned_prior,
             fast_path_used,
             fast_path_skip_reason,
             desktop_app,
+            desktop_app_credited,
             #[cfg(target_os = "linux")]
             provenance,
         })
@@ -428,7 +555,11 @@ mod provenance {
         let mut per_process_resources: Vec<(u32, Vec<pt_common::RawResourceEvidence>)> = Vec::new();
         let mut all_resources = Vec::new();
         // One socket-table snapshot for the whole scan (was re-parsed per process).
-        let network_snapshot = NetworkSnapshot::collect();
+        let network_snapshot = if processes.is_empty() {
+            NetworkSnapshot::default()
+        } else {
+            NetworkSnapshot::collect()
+        };
 
         for proc in processes {
             let pid = proc.pid.0;
@@ -846,6 +977,129 @@ mod tests {
 
     const FOUR_DAYS: Duration = Duration::from_secs(4 * 24 * 3600);
 
+    #[test]
+    fn normal_run_lifetime_is_lognormal_between_typical_and_max() {
+        let build = ProcessExpectations::short_lived_task(); // typical 300 s, max 3600 s
+        let at = |secs: f64| normal_run_finished_by(&build, secs).expect("lifetime model");
+        assert!((at(300.0) - 0.5).abs() < 1e-9, "median");
+        assert!((at(3600.0) - 0.99).abs() < 1e-6, "99th percentile");
+        assert_eq!(at(0.0), 0.0);
+        assert!(at(10.0) < 0.01);
+        assert!(at(30.0) < at(300.0) && at(300.0) < at(3600.0) && at(3600.0) < at(86_400.0));
+
+        assert_eq!(
+            normal_run_finished_by(&ProcessExpectations::default(), 1000.0),
+            None
+        );
+        let daemon = ProcessExpectations::daemon();
+        assert_eq!(normal_run_finished_by(&daemon, 1000.0), None);
+    }
+
+    /// Young and stuck instances of the same command: the young one must stay below the
+    /// plan's 0.7 candidate threshold, the stuck one must keep the signature's prior.
+    fn assert_age_gated(comm: &str, cmd: &str, signature: &str, young_secs: u64, stuck_secs: u64) {
+        let scorer = scorer(SignatureDatabase::with_defaults());
+        let young = record(5200, comm, cmd, Duration::from_secs(young_secs));
+        let stuck = record(5201, comm, cmd, Duration::from_secs(stuck_secs));
+        let young_score = scorer
+            .score_with_desktop(&young, Evidence::from_snapshot(&young), None)
+            .expect("score");
+        let stuck_score = scorer
+            .score_with_desktop(&stuck, Evidence::from_snapshot(&stuck), None)
+            .expect("score");
+
+        assert_eq!(
+            young_score
+                .signature
+                .as_ref()
+                .map(|m| m.signature.name.as_str()),
+            Some(signature)
+        );
+        let young_weight = young_score.signature_age_weight.expect("age weight");
+        let stuck_weight = stuck_score.signature_age_weight.expect("age weight");
+        assert!(young_weight < 0.5, "{signature}: {young_weight}");
+        assert!(stuck_weight > 0.99, "{signature}: {stuck_weight}");
+
+        let young_p = young_score.posterior.posterior.abandonment_probability();
+        let stuck_p = stuck_score.posterior.posterior.abandonment_probability();
+        assert!(
+            young_p < 0.7,
+            "{signature}: a young run is a plan candidate: {:?}",
+            young_score.posterior.posterior
+        );
+        assert!(
+            stuck_p >= 0.7,
+            "{signature}: a stuck run lost its prior: {:?}",
+            stuck_score.posterior.posterior
+        );
+    }
+
+    /// hetzner1, 2026-10-04: a 265 s old `rch exec -- cargo build` (the build runs on a
+    /// remote worker, so the local process idles without a TTY) scored P(abandoned or
+    /// zombie) 0.85, carried by the cargo-build signature's "likely abandoned" prior
+    /// (+2.0 bits). It is now an rch client (remote runs can last hours) whose prior
+    /// only applies once it has outlived a normal run.
+    #[test]
+    fn young_remote_build_does_not_inherit_the_stuck_build_prior() {
+        assert_age_gated(
+            "rch",
+            "rch exec -- cargo build -p fs-cli --bin frankensim",
+            "rch-exec",
+            265,
+            6 * 3600,
+        );
+    }
+
+    #[test]
+    fn young_local_build_does_not_inherit_the_stuck_build_prior() {
+        assert_age_gated(
+            "cargo",
+            "cargo build --release",
+            "cargo-build",
+            265,
+            3 * 3600,
+        );
+    }
+
+    /// The age gate never touches a signature whose processes are expected to keep
+    /// running, nor one that states no lifetime.
+    #[test]
+    fn age_gate_only_applies_to_left_behind_signatures_with_lifetimes() {
+        let mut db = SignatureDatabase::new();
+        let no_lifetime = SupervisorSignature::new("stuck-thing", SupervisorCategory::Other)
+            .with_process_patterns(vec!["^stuckthing$"])
+            .with_priors(SignaturePriors::likely_abandoned());
+        db.add(no_lifetime).expect("add");
+        let scorer = scorer(db);
+        let proc = record(
+            5300,
+            "stuckthing",
+            "stuckthing --serve",
+            Duration::from_secs(60),
+        );
+        let score = scorer
+            .score_with_desktop(&proc, Evidence::from_snapshot(&proc), None)
+            .expect("score");
+        assert_eq!(score.prior_source, "signature");
+        assert_eq!(score.signature_age_weight, None);
+
+        let defaults = scorer_for_defaults();
+        let vite = record(
+            5301,
+            "node",
+            "node /app/node_modules/.bin/vite",
+            Duration::from_secs(60),
+        );
+        let score = defaults
+            .score_with_desktop(&vite, Evidence::from_snapshot(&vite), None)
+            .expect("score");
+        assert_eq!(score.signature_age_weight, None);
+    }
+
+    fn scorer_for_defaults() -> Scorer {
+        scorer(SignatureDatabase::with_defaults())
+    }
+
     /// GH #12: an idle desktop app open for days (slack in its uwsm app scope) was
     /// rated abandoned (0.61) from runtime and "no TTY". As a desktop application it
     /// no longer clears the plan's 0.7 intervention threshold.
@@ -888,6 +1142,104 @@ mod tests {
             desktop.desktop_app.as_deref(),
             Some("app-Hyprland-slack-4821.scope")
         );
+        assert!(desktop.desktop_app_credited);
+    }
+
+    fn has_desktop_term(score: &ProcessScore<'_>) -> bool {
+        score
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|t| t.feature == DESKTOP_APP_FEATURE)
+    }
+
+    /// A stuck jest that an editor extension spawned inside the editor's `app-*` unit
+    /// is still a stuck jest: the built-in jest signature expects it to be abandoned,
+    /// so the unit earns it no "someone is using this" credit.
+    #[test]
+    fn desktop_unit_gives_no_credit_when_signature_expects_abandoned() {
+        let scorer = scorer(SignatureDatabase::with_defaults());
+        let jest = record(
+            5150,
+            "node",
+            "node /home/alice/app/node_modules/.bin/jest --runInBand",
+            FOUR_DAYS,
+        );
+        let unit = "app-code-4821.scope".to_string();
+
+        let plain = scorer
+            .score_with_desktop(&jest, Evidence::from_snapshot(&jest), None)
+            .expect("score");
+        let desktop = scorer
+            .score_with_desktop(&jest, Evidence::from_snapshot(&jest), Some(unit.clone()))
+            .expect("score");
+
+        assert_eq!(desktop.prior_source, "signature");
+        assert!(!desktop.desktop_app_credited);
+        assert!(!has_desktop_term(&desktop));
+        assert_eq!(desktop.desktop_app.as_deref(), Some(unit.as_str()));
+        assert!(
+            desktop
+                .ledger
+                .top_evidence
+                .iter()
+                .any(|line| line.contains("no desktop-app credit")
+                    && line.contains("signature 'jest'")),
+            "{:?}",
+            desktop.ledger.top_evidence
+        );
+        assert!(
+            desktop.posterior.posterior.intervention_probability() >= 0.7,
+            "stuck jest in an app unit fell below the plan threshold: {:?}",
+            desktop.posterior.posterior
+        );
+        // Only "no TTY" is neutralized; the unit does not pull it toward useful.
+        assert!(
+            desktop.posterior.posterior.useful <= plain.posterior.posterior.useful + 0.05,
+            "desktop {:?} vs plain {:?}",
+            desktop.posterior.posterior,
+            plain.posterior.posterior
+        );
+    }
+
+    /// Signatures that expect the process to be in use keep the credit, and a
+    /// learned verdict (which replaces the signature prior) restores it.
+    #[test]
+    fn desktop_credit_kept_for_useful_signatures_and_learned_verdicts() {
+        let mut db = SignatureDatabase::with_defaults();
+        db.add(
+            SupervisorSignature::new("editor-helper", SupervisorCategory::Ide)
+                .with_process_patterns(vec!["^edhelper$"])
+                .with_priors(SignaturePriors::likely_useful()),
+        )
+        .expect("valid signature");
+        let mut scorer = scorer(db);
+        let unit = Some("app-code-4821.scope".to_string());
+
+        let helper = record(5160, "edhelper", "edhelper --stdio", FOUR_DAYS);
+        let score = scorer
+            .score_with_desktop(&helper, Evidence::from_snapshot(&helper), unit.clone())
+            .expect("score");
+        assert_eq!(score.prior_source, "signature");
+        assert!(score.desktop_app_credited && has_desktop_term(&score));
+        drop(score);
+
+        let jest = record(
+            5170,
+            "node",
+            "node /home/alice/app/node_modules/.bin/jest --watch",
+            FOUR_DAYS,
+        );
+        for _ in 0..3 {
+            scorer
+                .decisions
+                .record(&jest.comm, &jest.cmd, Verdict::Spare);
+        }
+        let score = scorer
+            .score_with_desktop(&jest, Evidence::from_snapshot(&jest), unit)
+            .expect("score");
+        assert_eq!(score.prior_source, "user");
+        assert!(score.desktop_app_credited && has_desktop_term(&score));
     }
 
     /// A signature's priors reach every surface through the scorer (GH #13/#16): a
@@ -1055,6 +1407,27 @@ mod provenance_tests {
 
     #[test]
     fn orphaned_low_blast_radius_elevates_abandonment_features() {
+        // Reparented to init, still in its spawner's session: an orphan even without
+        // a readable ancestor chain.
+        let mut orphan = lineage(100, 1, None);
+        orphan.sid = 90;
+        let bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[]),
+            lineages: HashMap::from([(100, orphan)]),
+            children: HashMap::new(),
+        };
+
+        let adjustment = derive_provenance_adjustment(100, &bundle);
+        let features = feature_names(&adjustment);
+
+        assert!(features.contains(&"provenance_ownership_orphaned"));
+        assert!(features.contains(&"provenance_blast_radius_low"));
+    }
+
+    /// Its own session leader under PID 1 with no readable chain (hidepid): as likely
+    /// an init-started daemon as an orphan, so no orphan term, and lowered confidence.
+    #[test]
+    fn chainless_session_leader_under_init_is_not_scored_orphaned() {
         let bundle = ProvenanceInferenceBundle {
             resource_graph: SharedResourceGraph::from_evidence(&[]),
             lineages: HashMap::from([(100, lineage(100, 1, None))]),
@@ -1064,13 +1437,72 @@ mod provenance_tests {
         let adjustment = derive_provenance_adjustment(100, &bundle);
         let features = feature_names(&adjustment);
 
-        assert!(features.contains(&"provenance_ownership_orphaned"));
-        assert!(features.contains(&"provenance_blast_radius_low"));
+        assert!(!features.contains(&"provenance_ownership_orphaned"));
         assert!(adjustment.confidence_penalty_steps >= 1);
         assert!(adjustment
             .confidence_notes
             .iter()
-            .any(|note| note.contains("PPID=1") || note.contains("ancestor chain")));
+            .any(|note| note.contains("ancestor chain")));
+    }
+
+    #[test]
+    fn reparented_orphan_with_init_ancestor_is_not_scored_supervised() {
+        // The collector walks ancestors up to and including PID 1, so a real orphan
+        // always has a non-empty chain. It used to be classified InitChild and earn
+        // the "supervised" term (+useful), cancelling the base orphan evidence.
+        let mut orphan = lineage(400, 1, None);
+        orphan.sid = 350; // kept the session of the shell that spawned it
+        orphan.ancestors = vec![AncestorEntry {
+            pid: 1,
+            comm: "systemd".to_string(),
+            uid: 0,
+        }];
+        let bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[]),
+            lineages: HashMap::from([(400, orphan)]),
+            children: HashMap::new(),
+        };
+
+        let features = feature_names(&derive_provenance_adjustment(400, &bundle)).join(",");
+        assert!(
+            features.contains("provenance_ownership_orphaned"),
+            "{features}"
+        );
+        assert!(
+            !features.contains("provenance_ownership_supervised"),
+            "{features}"
+        );
+    }
+
+    /// A job orphaned under `systemd --user` (a child subreaper) has ppid != 1, so the
+    /// base orphan check misses it; the lineage's orphan term is what carries it.
+    #[test]
+    fn job_reparented_to_user_subreaper_gets_the_orphan_term() {
+        let mut orphan = lineage(500, 2000, None);
+        orphan.sid = 450;
+        orphan.ancestors = vec![
+            AncestorEntry {
+                pid: 2000,
+                comm: "systemd".to_string(),
+                uid: 1000,
+            },
+            AncestorEntry {
+                pid: 1,
+                comm: "systemd".to_string(),
+                uid: 0,
+            },
+        ];
+        let bundle = ProvenanceInferenceBundle {
+            resource_graph: SharedResourceGraph::from_evidence(&[]),
+            lineages: HashMap::from([(500, orphan)]),
+            children: HashMap::new(),
+        };
+
+        let features = feature_names(&derive_provenance_adjustment(500, &bundle)).join(",");
+        assert!(
+            features.contains("provenance_ownership_orphaned"),
+            "{features}"
+        );
     }
 
     #[test]

@@ -649,9 +649,25 @@ fn probe_tool(
 
     let path = match which_result {
         Ok(output) if output.success() => output.stdout_str().trim().to_string(),
-        _ => {
-            trace!(tool = name, "not found");
-            return ToolCapability::unavailable();
+        Ok(output) => {
+            let error = format!(
+                "which probe failed: exit={:?}, stdout={:?}, stderr={:?}",
+                output.exit_code,
+                output.stdout_str(),
+                output.stderr_str()
+            );
+            trace!(tool = name, error, "tool path could not be established");
+            return ToolCapability {
+                error: Some(error),
+                ..ToolCapability::unavailable()
+            };
+        }
+        Err(error) => {
+            trace!(tool = name, error = %error, "tool path probe failed");
+            return ToolCapability {
+                error: Some(format!("which probe failed: {error}")),
+                ..ToolCapability::unavailable()
+            };
         }
     };
 
@@ -1037,7 +1053,11 @@ mod tests {
 
         // ps should generally be available
         #[cfg(unix)]
-        assert!(caps.tools.ps.available);
+        assert!(
+            caps.tools.ps.available,
+            "ps capability: {:?}",
+            caps.tools.ps
+        );
     }
 
     #[test]

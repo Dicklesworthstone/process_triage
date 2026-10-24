@@ -474,7 +474,7 @@ fn canonical_payload_bytes<T: Serialize>(
     })
 }
 
-fn canonicalize_json(value: &mut serde_json::Value) {
+pub(crate) fn canonicalize_json(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             // Rebuild object with sorted keys, recursively canonicalizing children.

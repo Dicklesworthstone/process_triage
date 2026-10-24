@@ -174,7 +174,7 @@ pub fn parse_inventory_str(
             message: e.to_string(),
         })?,
         InventoryFormat::Yaml => {
-            serde_yaml::from_str(content).map_err(|e| InventoryError::Parse {
+            yaml_serde::from_str(content).map_err(|e| InventoryError::Parse {
                 format: format.as_str().to_string(),
                 message: e.to_string(),
             })?
@@ -260,6 +260,55 @@ hosts:
         let inventory = parse_inventory_str(input, InventoryFormat::Yaml).unwrap();
         assert_eq!(inventory.hosts.len(), 2);
         assert_eq!(inventory.hosts[1].hostname, "host-b");
+    }
+
+    #[test]
+    fn parse_yaml_detailed_hosts() {
+        let input = r#"
+schema_version: "1.0.0"
+generated_at: "2026-10-04T12:00:00Z"
+hosts:
+  - host: db-1
+    access_method: ssh
+    credentials_ref: fleet-key
+    status: active
+    tags:
+      role: database
+"#;
+        let inventory = parse_inventory_str(input, InventoryFormat::Yaml).unwrap();
+        assert_eq!(inventory.generated_at, "2026-10-04T12:00:00Z");
+        assert_eq!(inventory.hosts.len(), 1);
+        let host = &inventory.hosts[0];
+        assert_eq!(host.hostname, "db-1");
+        assert_eq!(host.access_method, Some(AccessMethod::Ssh));
+        assert_eq!(host.credentials_ref.as_deref(), Some("fleet-key"));
+        assert_eq!(host.status, Some(InventoryStatus::Active));
+        assert_eq!(host.tags.get("role").map(String::as_str), Some("database"));
+    }
+
+    #[test]
+    fn parse_yaml_malformed_is_parse_error() {
+        let error = parse_inventory_str("hosts: [host-a", InventoryFormat::Yaml).unwrap_err();
+        match error {
+            InventoryError::Parse { format, message } => {
+                assert_eq!(format, "yaml");
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected YAML parse error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn parse_yaml_invalid_access_method_is_parse_error() {
+        let input = "hosts:\n  - hostname: db-1\n    access_method: unknown\n";
+        let error = parse_inventory_str(input, InventoryFormat::Yaml).unwrap_err();
+        assert!(matches!(error, InventoryError::Parse { format, .. } if format == "yaml"));
+    }
+
+    #[test]
+    fn parse_yaml_empty_hosts_is_error() {
+        let error = parse_inventory_str("hosts: []", InventoryFormat::Yaml).unwrap_err();
+        assert!(matches!(error, InventoryError::EmptyHosts));
     }
 
     #[test]

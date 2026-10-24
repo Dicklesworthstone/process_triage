@@ -75,7 +75,16 @@ GEMINI_STATUS="skipped"
 CLAUDE_SKILL_STATUS="skipped"
 CODEX_SKILL_STATUS="skipped"
 
-DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT=""
+# Release-signing keys this installer trusts: SHA-256 of each key's DER
+# SubjectPublicKeyInfo, i.e.
+#   openssl pkey -pubin -in release-signing-public.pem -outform der | sha256sum
+# A --verify install rejects a release whose release-signing-public.pem is not
+# one of these, even if every signature checks out against it. Rotating keys:
+# add the new fingerprint in a release still signed by the current key, sign
+# later releases with the new key, then drop the old entry. Keep the list in
+# pt (the wrapper) identical.
+#   b5084da8... ECDSA P-256, first used for v2.2.0
+TRUSTED_RELEASE_KEY_FINGERPRINTS="b5084da80f9652304307fa7c3f965ee7840d3815fd863c2b40f4524e00e2e4ee"
 
 strip_ansi() {
     sed $'s/\033\\[[0-9;]*m//g'
@@ -140,7 +149,7 @@ draw_box() {
     local max_width=0
     local line stripped len pad
 
-    for line in "${lines[@]}"; do
+    for line in ${lines[@]+"${lines[@]}"}; do
         stripped=$(printf '%b' "$line" | strip_ansi)
         len=${#stripped}
         [[ "$len" -gt "$max_width" ]] && max_width="$len"
@@ -154,7 +163,7 @@ draw_box() {
     done
 
     printf "\033[%sm╔%s╗\033[0m\n" "$color" "$border"
-    for line in "${lines[@]}"; do
+    for line in ${lines[@]+"${lines[@]}"}; do
         stripped=$(printf '%b' "$line" | strip_ansi)
         len=${#stripped}
         pad=$((max_width - len))
@@ -226,8 +235,10 @@ Environment:
   VERIFY=1                                Require verification
   PT_RELEASE_PUBLIC_KEY_FILE              PEM file for release verification
   PT_RELEASE_PUBLIC_KEY_PEM               PEM contents for release verification
-  PT_RELEASE_PUBLIC_KEY_FINGERPRINT       Expected SHA-256 fingerprint
-  PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE  File containing expected fingerprint
+  PT_RELEASE_PUBLIC_KEY_FINGERPRINT       Accepted key fingerprint(s), comma/space
+                                          separated; replaces the built-in pin list
+  PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE  File of accepted fingerprints (first field
+                                          of each line); replaces the built-in list
   HTTP_PROXY / HTTPS_PROXY / NO_PROXY     Proxy support
 EOF
 }
@@ -331,7 +342,7 @@ setup_proxy() {
 fetch_stdout() {
     local url="$1"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 120 "$url"
+        curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 10 --max-time 120 "$url"
     elif command -v wget >/dev/null 2>&1; then
         wget -q -O - "$url"
     else
@@ -344,7 +355,7 @@ download() {
     local url="$1"
     local output="$2"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 120 "$url" -o "$output"
+        curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 10 --max-time 120 "$url" -o "$output"
     elif command -v wget >/dev/null 2>&1; then
         wget -q -O "$output" "$url"
     else
@@ -430,19 +441,7 @@ prepare_offline_release_public_key() {
         return 1
     }
 
-    local expected actual
-    expected="$(resolve_expected_key_fingerprint || true)"
-    if [[ -n "$expected" ]]; then
-        actual="$(openssl pkey -pubin -in "$output" -outform der 2>/dev/null | sha256_stdin)"
-        actual="$(normalize_fingerprint "$actual")"
-        if [[ "$actual" != "$expected" ]]; then
-            err "Release public key fingerprint mismatch"
-            return 1
-        fi
-        ok "Release public key fingerprint verified: ${actual:0:16}..."
-    else
-        warn "No release public key fingerprint pin configured"
-    fi
+    check_release_key_pin "$output"
 }
 
 prepare_offline_checksums() {
@@ -570,7 +569,7 @@ resolve_version() {
     latest="${latest#v}"
     if [[ -z "$latest" ]]; then
         latest="$(
-            curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -o /dev/null -w '%{url_effective}' \
+            curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 10 --max-time 20 -o /dev/null -w '%{url_effective}' \
                 "${RELEASES_URL}/latest" 2>/dev/null \
                 | sed -nE 's|.*/tag/v?([0-9]+\.[0-9]+\.[0-9]+)$|\1|p' \
                 || true
@@ -669,7 +668,7 @@ check_network() {
     fi
     local url
     url="${RELEASES_URL}/download/v${VERSION}/pt"
-    if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 3 --max-time 5 -o /dev/null "$url"; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 3 --max-time 5 -o /dev/null "$url"; then
         warn "Network preflight failed for $url"
     fi
 }
@@ -757,18 +756,64 @@ normalize_fingerprint() {
     printf '%s\n' "$value"
 }
 
-resolve_expected_key_fingerprint() {
-    local expected=""
+# Print the accepted release-key fingerprints, one per line. An explicit
+# PT_RELEASE_PUBLIC_KEY_FINGERPRINT(_FILE) replaces the built-in list (that is
+# how `pt update` hands over the wrapper's pins, and how a fork pins its own
+# key). Fails if any entry is not a SHA-256 hex digest, so a typo can never
+# turn into "no pin".
+resolve_expected_key_fingerprints() {
+    local origin="built-in pin list"
+    local raw="$TRUSTED_RELEASE_KEY_FINGERPRINTS"
     if [[ -n "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT:-}" ]]; then
-        expected="$PT_RELEASE_PUBLIC_KEY_FINGERPRINT"
-    elif [[ -n "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE:-}" && -f "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}" ]]; then
-        expected="$(head -n1 "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}" | awk '{print $1}')"
-    elif [[ -n "$DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT" ]]; then
-        expected="$DEFAULT_RELEASE_PUBLIC_KEY_FINGERPRINT"
+        origin="PT_RELEASE_PUBLIC_KEY_FINGERPRINT"
+        raw="$PT_RELEASE_PUBLIC_KEY_FINGERPRINT"
+    elif [[ -n "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE:-}" ]]; then
+        origin="PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE"
+        if [[ ! -f "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}" ]]; then
+            err "Fingerprint file not found: ${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}"
+            return 1
+        fi
+        raw="$(awk '$1 !~ /^#/ { print $1 }' "${PT_RELEASE_PUBLIC_KEY_FINGERPRINT_FILE}")"
     fi
 
-    [[ -z "$expected" ]] && return 0
-    normalize_fingerprint "$expected"
+    local -a entries=()
+    local entry normalized
+    IFS=$', \t\n' read -r -d '' -a entries <<<"$raw" || true
+    if [[ "${#entries[@]}" -eq 0 ]]; then
+        err "No release key fingerprints in ${origin}"
+        return 1
+    fi
+    for entry in ${entries[@]+"${entries[@]}"}; do
+        normalized="$(normalize_fingerprint "$entry")" || {
+            err "Invalid release key fingerprint in ${origin}: ${entry}"
+            return 1
+        }
+        printf '%s\n' "$normalized"
+    done
+}
+
+# Fail unless the release public key in $1 is one of the pinned keys.
+check_release_key_pin() {
+    local pubkey_file="$1"
+    local expected actual
+    expected="$(resolve_expected_key_fingerprints)" || return 1
+    actual="$(openssl pkey -pubin -in "$pubkey_file" -outform der 2>/dev/null | sha256_stdin)"
+    actual="$(normalize_fingerprint "$actual")" || {
+        err "Could not compute the release public key fingerprint"
+        return 1
+    }
+    local fp pinned=0
+    while IFS= read -r fp; do
+        [[ "$fp" == "$actual" ]] && pinned=1
+    done <<<"$expected"
+    if [[ "$pinned" -ne 1 ]]; then
+        err "Release public key fingerprint mismatch"
+        err "Release key: ${actual}"
+        err "Trusted:     $(printf '%s' "$expected" | tr '\n' ' ')"
+        err "Refusing a release signed by a key this installer does not pin"
+        return 1
+    fi
+    ok "Release public key fingerprint verified: ${actual:0:16}..."
 }
 
 resolve_release_public_key() {
@@ -790,19 +835,7 @@ resolve_release_public_key() {
         return 1
     }
 
-    local expected actual
-    expected="$(resolve_expected_key_fingerprint || true)"
-    if [[ -n "$expected" ]]; then
-        actual="$(openssl pkey -pubin -in "$output" -outform der 2>/dev/null | sha256_stdin)"
-        actual="$(normalize_fingerprint "$actual")"
-        if [[ "$actual" != "$expected" ]]; then
-            err "Release public key fingerprint mismatch"
-            return 1
-        fi
-        ok "Release public key fingerprint verified: ${actual:0:16}..."
-    else
-        warn "No release public key fingerprint pin configured"
-    fi
+    check_release_key_pin "$output"
 }
 
 download_checksums() {
@@ -1185,9 +1218,10 @@ prepare_offline_verification() {
 
 download_wrapper() {
     local output="$1"
-    local urls=()
-    mapfile -t urls < <(wrapper_urls)
-    download_first_available "$output" "${urls[@]}" || {
+    local urls=() url
+    # Not mapfile: it is bash 4+, and stock macOS runs this under /bin/bash 3.2.
+    while IFS= read -r url; do urls+=("$url"); done < <(wrapper_urls)
+    download_first_available "$output" ${urls[@]+"${urls[@]}"} || {
         err "Failed to download pt wrapper"
         exit 1
     }
@@ -1195,9 +1229,10 @@ download_wrapper() {
 
 download_core_archive() {
     local output="$1"
-    local urls=()
-    mapfile -t urls < <(core_urls)
-    download_first_available "$output" "${urls[@]}" || return 1
+    local urls=() url
+    # Not mapfile: it is bash 4+, and stock macOS runs this under /bin/bash 3.2.
+    while IFS= read -r url; do urls+=("$url"); done < <(core_urls)
+    download_first_available "$output" ${urls[@]+"${urls[@]}"} || return 1
     return 0
 }
 
@@ -1236,8 +1271,8 @@ show_final_summary() {
     [[ "$CLAUDE_SKILL_STATUS" != "skipped" ]] && AGENT_LINES+=("Claude skill: ${CLAUDE_SKILL_STATUS}")
     [[ "$CODEX_SKILL_STATUS" != "skipped" ]] && AGENT_LINES+=("Codex skill: ${CODEX_SKILL_STATUS}")
 
-    lines+=("${AGENT_LINES[@]}")
-    lines+=("${BACKUP_LINES[@]}")
+    lines+=(${AGENT_LINES[@]+"${AGENT_LINES[@]}"})
+    lines+=(${BACKUP_LINES[@]+"${BACKUP_LINES[@]}"})
     lines+=("Run: pt --help")
     lines+=("Managed paths:")
     lines+=("  wrapper: $(status_path "${DEST}/pt")")
@@ -1246,9 +1281,9 @@ show_final_summary() {
 
     echo ""
     if [[ "$HAS_GUM" -eq 1 && "$QUIET" -eq 0 ]]; then
-        gum style --border double --border-foreground 42 --padding "1 2" "${lines[@]}"
+        gum style --border double --border-foreground 42 --padding "1 2" ${lines[@]+"${lines[@]}"}
     else
-        draw_box "0;32" "${lines[@]}"
+        draw_box "0;32" ${lines[@]+"${lines[@]}"}
     fi
 }
 
