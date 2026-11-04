@@ -289,3 +289,148 @@ fn watch_once_with_min_age() {
         let _: Value = serde_json::from_str(line).expect("valid JSON line");
     }
 }
+
+#[test]
+fn watch_rejects_invalid_force_review_rule() {
+    let config = TempDir::new().expect("config directory");
+    let data = TempDir::new().expect("data directory");
+    let mut policy = pt_core::config::Policy::default();
+    let mut pattern = policy.guardrails.protected_patterns[0].clone();
+    pattern.pattern = "[".to_string();
+    policy.guardrails.force_review_patterns.push(pattern);
+    fs::write(
+        config.path().join("policy.json"),
+        serde_json::to_vec(&policy).expect("serialize policy"),
+    )
+    .expect("write policy");
+
+    pt_core_fast()
+        .env("PROCESS_TRIAGE_DATA", data.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(config.path())
+        .args(["--format", "jsonl", "agent", "watch", "--once"])
+        .assert()
+        .code(ExitCode::InternalError.as_i32())
+        .stderr(predicates::str::contains(
+            "agent watch: policy enforcer error",
+        ))
+        .stderr(predicates::str::contains(
+            "guardrails.force_review_patterns",
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn watch_reports_policy_review_instead_of_raw_kill_decision() {
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let child = OwnedChild(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn owned process"),
+    );
+    let config = TempDir::new().expect("config directory");
+    let data = TempDir::new().expect("data directory");
+    let mut policy = pt_core::config::Policy::default();
+    // Test the operator's explicit review rule independently of host placement,
+    // user identity, or the test runner's own agent ancestry.
+    policy.guardrails.builtin_protection = false;
+    policy.guardrails.protected_users.clear();
+    policy.guardrails.protected_categories.clear();
+    policy.guardrails.never_kill_ppid.clear();
+    policy.guardrails.min_process_age_seconds = 0;
+    policy.robot_mode.enabled = true;
+    let mut pattern = policy.guardrails.protected_patterns[0].clone();
+    pattern.pattern = r"\bsleep\b".to_string();
+    policy.guardrails.force_review_patterns.push(pattern);
+    for row in [
+        &mut policy.loss_matrix.useful,
+        &mut policy.loss_matrix.useful_bad,
+        &mut policy.loss_matrix.abandoned,
+        &mut policy.loss_matrix.zombie,
+    ] {
+        row.keep = 10.0;
+        row.kill = 0.0;
+        row.pause = Some(10.0);
+        row.throttle = Some(10.0);
+        row.restart = Some(10.0);
+        row.renice = Some(10.0);
+    }
+    fs::write(
+        config.path().join("policy.json"),
+        serde_json::to_vec(&policy).expect("serialize policy"),
+    )
+    .expect("write policy");
+
+    // Equal likelihoods make the owned process cross the watch threshold without
+    // relying on its sampled CPU, runtime, or the host's process population.
+    let mut priors = pt_core::config::Priors::default();
+    let mut class = priors.classes.abandoned.clone();
+    class.prior_prob = 1e-12;
+    class.runtime_gamma = None;
+    priors.classes.useful = class.clone();
+    priors.classes.useful_bad = class.clone();
+    priors.classes.zombie = class.clone();
+    class.prior_prob = 1.0 - 3e-12;
+    priors.classes.abandoned = class;
+    priors.state_flags = None;
+    priors.command_categories = None;
+    fs::write(
+        config.path().join("priors.json"),
+        serde_json::to_vec(&priors).expect("serialize priors"),
+    )
+    .expect("write priors");
+
+    let output = pt_core_fast()
+        .env("PROCESS_TRIAGE_DATA", data.path())
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .arg("--config")
+        .arg(config.path())
+        .args([
+            "--robot",
+            "--format",
+            "jsonl",
+            "agent",
+            "watch",
+            "--once",
+            "--threshold",
+            "low",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events: Vec<Value> = String::from_utf8_lossy(&output)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("watch event JSON"))
+        .collect();
+    let event = events
+        .iter()
+        .find(|event| {
+            event["event"] == "candidate_detected"
+                && event["pid"].as_u64() == Some(u64::from(child.0.id()))
+        })
+        .unwrap_or_else(|| panic!("owned process must produce a watch event: {events:?}"));
+    assert_eq!(event["classification"], "review", "{event}");
+    assert!(
+        event["action_rationale"]
+            .as_str()
+            .expect("policy rationale")
+            .contains("force_review pattern"),
+        "{event}"
+    );
+    assert!(event["confidence"].as_f64().expect("confidence") >= 0.5);
+}

@@ -2320,12 +2320,13 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     .unwrap_or_default();
                 let output = score_tui_rows(
                     &filter_result.passed,
+                    &scan_result.processes,
                     min_age_r,
                     deep_r,
                     scorer,
                     &policy_r,
                     goal_r.as_deref(),
-                );
+                )?;
                 let mut guard = plan_cache_r
                     .lock()
                     .map_err(|_| "plan cache lock poisoned".to_string())?;
@@ -2448,6 +2449,8 @@ struct PlanCandidateInput {
     process_state: pt_core::collect::ProcessState,
     comm: String,
     cmd: String,
+    blocked_reasons: Vec<String>,
+    parent_identity: Option<ProcessIdentity>,
 }
 
 /// Record a "kill" verdict for every kill the human confirmed in the TUI that
@@ -2515,14 +2518,15 @@ fn build_tui_data_from_live_scan(
     let protected_filter = ProtectedFilter::from_guardrails(&policy.guardrails)
         .map_err(|e| format!("protected filter error: {}", e))?;
     let filter_result = protected_filter.filter_scan_result(&scan_result);
-    Ok(score_tui_rows(
+    score_tui_rows(
         &filter_result.passed,
+        &scan_result.processes,
         args.min_age,
         args.deep,
         scorer,
         policy,
         args.goal.as_deref(),
-    ))
+    )
 }
 
 /// Score a filtered scan for the TUI: provenance for the processes old enough to be
@@ -2531,12 +2535,13 @@ fn build_tui_data_from_live_scan(
 #[cfg(feature = "ui")]
 fn score_tui_rows(
     processes: &[ProcessRecord],
+    population: &[ProcessRecord],
     min_age: Option<u64>,
     deep: bool,
     mut scorer: Scorer,
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
-) -> TuiBuildOutput {
+) -> Result<TuiBuildOutput, String> {
     let min_age = min_age.unwrap_or(policy.guardrails.min_process_age_seconds);
     let eligible: Vec<&ProcessRecord> = processes
         .iter()
@@ -2552,6 +2557,7 @@ fn score_tui_rows(
     };
     build_tui_rows(
         processes,
+        population,
         Some(min_age),
         deep_signals.as_ref(),
         Some(&probe_advice),
@@ -2577,10 +2583,10 @@ fn build_plan_from_selection(
             identity: candidate.identity.clone(),
             ppid: candidate.ppid,
             decision: candidate.decision.clone(),
-            blocked_reasons: Vec::new(),
+            blocked_reasons: candidate.blocked_reasons.clone(),
             stage_pause_before_kill: false,
             process_state: Some(candidate.process_state),
-            parent_identity: None,
+            parent_identity: candidate.parent_identity.clone(),
             d_state_diagnostics: None,
         });
     }
@@ -2735,7 +2741,7 @@ fn check_execution_policy(
         .iter()
         .find(|proc| proc.pid == action.target.pid)
         .ok_or("target is absent from current policy evidence")?;
-    let mut candidate = process_policy_candidate(enforcer, proc)?;
+    let mut candidate = process_policy_candidate(enforcer, proc, action.action)?;
     candidate.category = action.rationale.category.clone();
     candidate.posterior =
         action.rationale.posterior.as_ref().map(|scores| {
@@ -2753,7 +2759,21 @@ fn check_execution_policy(
 fn process_policy_candidate(
     enforcer: &pt_core::decision::PolicyEnforcer,
     proc: &ProcessRecord,
+    action: Action,
 ) -> Result<pt_core::decision::ProcessCandidate, String> {
+    // Live policy revalidation precedes the executor's checks in the TUI. It
+    // must apply the infrastructure gate before following any writable FD.
+    #[cfg(target_os = "linux")]
+    if enforcer.requires_builtin_placement() {
+        if let pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } =
+            pt_core::action::prechecks::fuse_action_precheck(
+                pt_core::collect::protected::holds_fuse_device(proc.pid.0),
+                action,
+            )
+        {
+            return Err(reason);
+        }
+    }
     let group = if !enforcer.requires_group_evidence() {
         None
     } else {
@@ -2783,7 +2803,9 @@ fn process_policy_candidate(
         posterior: None,
         memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
         has_known_signature: false,
-        open_write_fds: pt_core::action::prechecks::open_write_fd_count(proc.pid.0),
+        open_write_fds: matches!(action, Action::Kill | Action::Restart)
+            .then(|| pt_core::action::prechecks::open_write_fd_count(proc.pid.0))
+            .flatten(),
         has_locked_files: None,
         has_active_tty: Some(proc.has_tty()),
         seconds_since_io: None,
@@ -2801,9 +2823,14 @@ fn process_policy_candidate(
     })
 }
 
+struct PlanningProtection<'a> {
+    filter: &'a ProtectedFilter,
+    population: &'a [ProcessRecord],
+}
+
 fn planned_zombie_parent_refusal(
     parent: &ProcessRecord,
-    protected_filter: &ProtectedFilter,
+    protection: &PlanningProtection<'_>,
     enforcer: &pt_core::decision::PolicyEnforcer,
     policy: &pt_core::config::Policy,
     signatures: &pt_core::supervision::SignatureDatabase,
@@ -2813,10 +2840,40 @@ fn planned_zombie_parent_refusal(
     if parent.pid.0 <= 1 {
         return Some("parent is init/kernel and is never acted on".to_string());
     }
-    if let Some(protection) = protected_filter.is_protected(parent) {
+    if let Some(protection) = protection.filter.is_protected(parent) {
         return Some(format!("parent is protected by {}", protection.pattern));
     }
-    let mut target = match process_policy_candidate(enforcer, parent) {
+    if protection.filter.builtin_enabled() {
+        if pt_core::collect::protected::invoker_chain_pids(protection.population)
+            .contains(&parent.pid.0)
+        {
+            return Some("parent is protected by builtin.invoker_chain".to_string());
+        }
+        let by_pid = protection
+            .population
+            .iter()
+            .map(|process| (process.pid.0, process))
+            .collect();
+        if let Some((pid, comm)) =
+            pt_core::collect::protected::service_ancestor(parent.pid.0, &by_pid)
+        {
+            return Some(format!(
+                "parent is protected by builtin.service_child (ancestor {pid}: {comm})"
+            ));
+        }
+        // Restart acts on the parent, not the zombie. Refuse before collecting
+        // writable-file evidence that could itself block on the parent's mount.
+        #[cfg(target_os = "linux")]
+        if let pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } =
+            pt_core::action::prechecks::fuse_action_precheck(
+                pt_core::collect::protected::holds_fuse_device(parent.pid.0),
+                Action::Restart,
+            )
+        {
+            return Some(format!("parent infrastructure protected: {reason}"));
+        }
+    }
+    let mut target = match process_policy_candidate(enforcer, parent, Action::Restart) {
         Ok(target) => target,
         Err(error) => return Some(format!("parent policy evidence unavailable: {error}")),
     };
@@ -3402,7 +3459,7 @@ fn compute_probe_advice(
         let Ok((decision, _)) = pt_core::decision::decide_sequential(
             &score.posterior.posterior,
             policy,
-            &ActionFeasibility::allow_all(),
+            &candidate_feasibility(proc),
             &cost_model,
             Some(&available_probes),
         ) else {
@@ -3593,20 +3650,79 @@ fn estimate_queue_metrics(info: &pt_core::collect::NetworkInfo, io_active: bool)
 }
 
 #[cfg(feature = "ui")]
+fn finalize_tui_recommendations(
+    rows: &mut [ProcessRow],
+    goal_candidates: &mut HashMap<u32, serde_json::Value>,
+    plan_candidates: &mut HashMap<u32, PlanCandidateInput>,
+    population: &[ProcessRecord],
+    policy: &pt_core::config::Policy,
+) {
+    // Retain the full population for safety while applying the budget to the
+    // actual visible set. A hidden child can still make its parent unsafe.
+    let visible: HashSet<u32> = rows.iter().map(|row| row.pid).collect();
+    goal_candidates.retain(|pid, _| visible.contains(pid));
+    plan_candidates.retain(|pid, _| visible.contains(pid));
+    let mut final_candidates: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|row| goal_candidates.remove(&row.pid))
+        .collect();
+    let mut candidates: Vec<&mut serde_json::Value> = final_candidates.iter_mut().collect();
+    apply_planned_kill_budget(&mut candidates, population, policy, false);
+    for candidate in final_candidates {
+        if let Some(pid) = candidate["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        {
+            goal_candidates.insert(pid, candidate);
+        }
+    }
+    for row in rows {
+        let Some(candidate) = goal_candidates.get(&row.pid) else {
+            continue;
+        };
+        let action = candidate["recommended_action"].as_str().unwrap_or("review");
+        row.classification = match action {
+            "kill" => "KILL",
+            "keep" => "SPARE",
+            _ => "REVIEW",
+        }
+        .to_string();
+        row.selected = action == "kill";
+        if action == "review" {
+            let reason = candidate["action_rationale"]
+                .as_str()
+                .unwrap_or("requires review")
+                .to_string();
+            row.top_evidence.insert(0, reason.clone());
+            row.why_summary = Some(format!(
+                "{} {reason}",
+                row.why_summary.as_deref().unwrap_or("")
+            ));
+            if let Some(input) = plan_candidates.get_mut(&row.pid) {
+                if !input.blocked_reasons.contains(&reason) {
+                    input.blocked_reasons.push(reason);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ui")]
 #[allow(clippy::too_many_arguments)]
 fn build_tui_rows(
     processes: &[ProcessRecord],
+    population: &[ProcessRecord],
     min_age: Option<u64>,
     deep_signals: Option<&HashMap<u32, DeepSignals>>,
     probe_advice: Option<&HashMap<u32, ProbeAdvice>>,
     scorer: &Scorer,
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
-) -> TuiBuildOutput {
+) -> Result<TuiBuildOutput, String> {
     const MIN_POSTERIOR: f64 = 0.7;
     const MAX_CANDIDATES: usize = 50;
 
-    let system_state = collect_system_state(Some(processes));
+    let system_state = collect_system_state(Some(population));
     let load_adjustment = if policy.load_aware.enabled {
         let signals = LoadSignals::from_system_state(&system_state, processes.len());
         compute_load_adjustment(&policy.load_aware, &signals)
@@ -3622,7 +3738,11 @@ fn build_tui_rows(
         policy.clone()
     };
 
-    let feasibility = ActionFeasibility::allow_all();
+    let rate_limit_path = resolve_data_dir_for_lock().map(|dir| dir.join("rate_limit.json"));
+    let enforcer = pt_core::decision::PolicyEnforcer::new(policy, rate_limit_path.as_deref())
+        .map_err(|error| format!("policy enforcer: {error}"))?;
+    let protected_filter = ProtectedFilter::from_guardrails(&policy.guardrails)
+        .map_err(|error| format!("protected filter: {error}"))?;
     let mut rows = Vec::new();
     let mut plan_candidates = HashMap::new();
     let mut goal_candidates: HashMap<u32, serde_json::Value> = HashMap::new();
@@ -3648,7 +3768,8 @@ fn build_tui_rows(
         let Some(score) = scorer.score(proc, evidence) else {
             continue;
         };
-        let posterior_result = score.posterior;
+        let posterior_result = &score.posterior;
+        let feasibility = candidate_feasibility(proc);
         let mut decision_outcome =
             match decide_action(&posterior_result.posterior, &decision_policy, &feasibility) {
                 Ok(d) => d,
@@ -3657,7 +3778,20 @@ fn build_tui_rows(
 
         // Populate rationale fields available in current context
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
-        let mut ledger = score.ledger;
+        decision_outcome.rationale.has_known_signature = Some(score.signature.is_some());
+        decision_outcome.rationale.category = score
+            .signature
+            .as_ref()
+            .map(|matched| format!("{:?}", matched.signature.category));
+        let advice = candidate_recommendation(
+            proc,
+            &score,
+            &decision_outcome,
+            &decision_policy,
+            &enforcer,
+            false,
+        );
+        let mut ledger = score.ledger.clone();
         if let Some(probe) = probe {
             if probe.should_probe
                 && probe.recommended_probe == Some(pt_core::decision::ProbeType::DeepScan)
@@ -3695,9 +3829,9 @@ fn build_tui_rows(
             continue;
         }
 
-        let classification = match decision_outcome.optimal_action {
-            Action::Kill => "KILL",
-            Action::Keep => "SPARE",
+        let classification = match advice.action {
+            "kill" => "KILL",
+            "keep" => "SPARE",
             _ => "REVIEW",
         };
 
@@ -3705,7 +3839,7 @@ fn build_tui_rows(
         let runtime = format_duration_human(proc.elapsed.as_secs());
         let memory = format_memory_human(proc.rss_bytes);
         let galaxy_brain = render_galaxy_brain(
-            &posterior_result,
+            posterior_result,
             &ledger,
             &GalaxyBrainConfig {
                 verbosity: Verbosity::Detail,
@@ -3714,14 +3848,68 @@ fn build_tui_rows(
             },
         );
 
-        let identity = ProcessIdentity::full(
-            proc.pid.0,
-            proc.start_id.clone(),
-            proc.uid,
-            proc.pgid,
-            proc.sid,
-            IdentityQuality::Full,
-        );
+        let identity = process_identity_from_record(proc);
+        let parent = population.iter().find(|parent| parent.pid == proc.ppid);
+        let mut blocked_reasons = Vec::new();
+        let mut recommendation = advice.action;
+        let mut rationale = advice.rationale;
+        if proc.state.is_zombie() {
+            if let Some(reason) = parent
+                .filter(|_| matches!(recommendation, "kill" | "restart"))
+                .and_then(|parent| {
+                    planned_zombie_parent_refusal(
+                        parent,
+                        &PlanningProtection {
+                            filter: &protected_filter,
+                            population,
+                        },
+                        &enforcer,
+                        &decision_policy,
+                        &scorer.signatures,
+                        &posterior_result.posterior,
+                        false,
+                    )
+                })
+            {
+                recommendation = "review";
+                rationale = reason;
+            }
+            ledger.top_evidence.insert(
+                0,
+                format!(
+                    "Zombie: route to parent {} for reaping; never signal the zombie",
+                    proc.ppid.0
+                ),
+            );
+        }
+        if !matches!(recommendation, "keep" | "review") {
+            let subject = if proc.state.is_zombie() {
+                parent
+            } else {
+                Some(proc)
+            };
+            let supervisor = match subject {
+                Some(subject) => {
+                    supervisor_info_for_plan_identity(&process_identity_from_record(subject))
+                }
+                None => unknown_supervision_for_plan(
+                    proc.ppid.0,
+                    "routed parent identity is unavailable in the full process snapshot",
+                ),
+            };
+            if supervisor["status"] == "unknown" {
+                recommendation = "review";
+                rationale = supervisor["reason"]
+                    .as_str()
+                    .unwrap_or("supervision evidence unavailable")
+                    .to_string();
+            }
+        }
+        if recommendation == "review" {
+            blocked_reasons.push(rationale.clone());
+        } else if recommendation == "keep" {
+            decision_outcome.optimal_action = Action::Keep;
+        }
         plan_candidates.insert(
             proc.pid.0,
             PlanCandidateInput {
@@ -3731,6 +3919,8 @@ fn build_tui_rows(
                 process_state: proc.state,
                 comm: proc.comm.clone(),
                 cmd: proc.cmd.clone(),
+                blocked_reasons,
+                parent_identity: parent.map(process_identity_from_record),
             },
         );
 
@@ -3766,18 +3956,13 @@ fn build_tui_rows(
             })
             .collect();
 
-        let recommended_action = match decision_outcome.optimal_action {
-            Action::Kill => "kill",
-            Action::Keep => "keep",
-            _ => "review",
-        };
-
         let memory_mb = proc.rss_bytes / (1024 * 1024);
         goal_candidates.insert(
             proc.pid.0,
             serde_json::json!({
                 "pid": proc.pid.0,
-                "recommended_action": recommended_action,
+                "recommended_action": recommendation,
+                "action_rationale": rationale,
                 "memory_mb": memory_mb,
                 "cpu_percent": proc.cpu_percent,
                 "expected_loss": expected_loss_entries,
@@ -3787,6 +3972,14 @@ fn build_tui_rows(
 
     rows.sort_by_key(|r| std::cmp::Reverse(r.score));
     rows.truncate(MAX_CANDIDATES);
+
+    finalize_tui_recommendations(
+        &mut rows,
+        &mut goal_candidates,
+        &mut plan_candidates,
+        population,
+        &decision_policy,
+    );
 
     let mut goal_summary: Option<Vec<String>> = None;
     let mut goal_order: Option<HashMap<u32, usize>> = None;
@@ -3884,12 +4077,12 @@ fn build_tui_rows(
         }
     }
 
-    TuiBuildOutput {
+    Ok(TuiBuildOutput {
         rows,
         plan_candidates,
         goal_summary,
         goal_order,
-    }
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -12202,6 +12395,8 @@ mod process_tree_safety_tests {
                         process_state: process.state,
                         comm: process.comm,
                         cmd: process.cmd,
+                        blocked_reasons: Vec::new(),
+                        parent_identity: None,
                     },
                 )
             })
@@ -12217,6 +12412,115 @@ mod process_tree_safety_tests {
         assert!(error.contains("selected 3 kills exceed the per-run policy limit 2"));
         policy.guardrails.max_kills_per_run = 0;
         assert!(super::build_plan_from_selection(&session, &policy, &[100], &candidates).is_err());
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn tui_final_rows_and_selection_preserve_tree_agent_and_budget_refusals() {
+        use pt_core::decision::{decide_action, Action, ActionFeasibility};
+        use pt_core::inference::ClassScores;
+        use std::collections::HashMap;
+
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.builtin_protection = true;
+        policy.guardrails.max_kills_per_run = 1;
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.999,
+            zombie: 0.0,
+        };
+        let decision = decide_action(&posterior, &policy, &ActionFeasibility::allow_all()).unwrap();
+        assert_eq!(decision.optimal_action, Action::Kill);
+        let population = vec![
+            rec(100, 1, "wrapper", ProcessState::Sleeping),
+            rec(101, 100, "hidden young child", ProcessState::Sleeping),
+            rec(200, 900, "worker", ProcessState::Sleeping),
+            rec(900, 1, "claude --resume", ProcessState::Sleeping),
+            rec(300, 1, "sleep 600", ProcessState::Sleeping),
+            rec(400, 1, "sleep 600", ProcessState::Sleeping),
+            rec(500, 1, "omitted row", ProcessState::Sleeping),
+        ];
+        let mut inputs: HashMap<_, _> = [100, 200, 300, 400, 500]
+            .into_iter()
+            .map(|pid| {
+                let process = population
+                    .iter()
+                    .find(|process| process.pid.0 == pid)
+                    .unwrap();
+                (
+                    pid,
+                    super::PlanCandidateInput {
+                        identity: process_identity_from_record(process),
+                        ppid: Some(process.ppid.0),
+                        decision: decision.clone(),
+                        process_state: process.state,
+                        comm: process.comm.clone(),
+                        cmd: process.cmd.clone(),
+                        blocked_reasons: Vec::new(),
+                        parent_identity: None,
+                    },
+                )
+            })
+            .collect();
+        let mut candidates: HashMap<_, _> = [100, 200, 300, 400, 500]
+            .into_iter()
+            .map(|pid| (pid, cand(pid)))
+            .collect();
+        let mut rows: Vec<_> = [100, 200, 300, 400]
+            .into_iter()
+            .map(|pid| super::ProcessRow {
+                pid,
+                score: 99,
+                classification: "KILL".to_string(),
+                runtime: "2h".to_string(),
+                memory: "0 B".to_string(),
+                command: "worker".to_string(),
+                selected: true,
+                galaxy_brain: None,
+                why_summary: Some("original score".to_string()),
+                top_evidence: Vec::new(),
+                confidence: None,
+                plan_preview: Vec::new(),
+                provenance_headline: None,
+                provenance_sections: Vec::new(),
+                provenance_caveats: Vec::new(),
+                blast_radius_risk: None,
+            })
+            .collect();
+        super::finalize_tui_recommendations(
+            &mut rows,
+            &mut candidates,
+            &mut inputs,
+            &population,
+            &policy,
+        );
+        assert!(!inputs.contains_key(&500));
+        assert!(!candidates.contains_key(&500));
+        assert_eq!(candidates[&100]["tree_safety"]["rule"], "live_child");
+        assert_eq!(candidates[&200]["tree_safety"]["rule"], "agent_descendant");
+        for row in &rows {
+            if row.pid == 300 {
+                assert_eq!(row.classification, "KILL");
+                assert!(row.selected);
+                assert!(inputs[&row.pid].blocked_reasons.is_empty());
+            } else {
+                assert_eq!(row.classification, "REVIEW");
+                assert!(!row.selected);
+                assert!(!row.top_evidence.is_empty());
+                assert!(!inputs[&row.pid].blocked_reasons.is_empty());
+            }
+        }
+        // Even explicitly selecting every row cannot revive a refused action.
+        let plan = super::build_plan_from_selection(
+            &pt_common::SessionId::new(),
+            &policy,
+            &[100, 200, 300, 400],
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target.pid.0, 300);
     }
 
     #[test]
@@ -12477,6 +12781,37 @@ mod process_tree_safety_tests {
             );
         }
         assert_eq!(candidates[5]["recommended_action"], "keep");
+        // Rebuilding after final output filtering preserves zombie Kill-to-
+        // Restart routing, including the original zombie's incarnation.
+        let rebuilt = build_agent_action_plan(
+            &pt_common::SessionId(plan.session_id.clone()),
+            &policy,
+            &candidates,
+            &inputs,
+            "2026-10-05T12:00:00Z".to_string(),
+        );
+        assert_eq!(rebuilt.actions.len(), plan.actions.len());
+        assert!(rebuilt.actions.iter().any(|action| {
+            action.action == Action::Restart
+                && action.target == process_identity_from_record(&parent)
+                && action.original_zombie_target.as_ref() == Some(&inputs[&300].identity)
+        }));
+        let mut kill_only = candidates.clone();
+        kill_only.retain(|candidate| super::candidate_matches_filter(candidate, "kill"));
+        assert_eq!(kill_only.len(), 1);
+        assert_eq!(kill_only[0]["pid"], 100);
+        let filtered_plan = build_agent_action_plan(
+            &pt_common::SessionId(plan.session_id.clone()),
+            &policy,
+            &kill_only,
+            &inputs,
+            "2026-10-05T12:00:00Z".to_string(),
+        );
+        assert_eq!(filtered_plan.actions.len(), 2);
+        assert!(filtered_plan
+            .actions
+            .iter()
+            .all(|action| action.target.pid.0 == 100));
         let recommended = super::agent_recommended_actions(&plan);
         assert_eq!(recommended.len(), plan.actions.len());
         for (recorded, action) in recommended.iter().zip(&plan.actions) {
@@ -12627,7 +12962,10 @@ mod process_tree_safety_tests {
             let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
             let refusal = super::planned_zombie_parent_refusal(
                 &parent,
-                &filter,
+                &super::PlanningProtection {
+                    filter: &filter,
+                    population: std::slice::from_ref(&parent),
+                },
                 &enforcer,
                 &policy,
                 &signatures,
@@ -12650,6 +12988,85 @@ mod process_tree_safety_tests {
                 };
                 assert!(reason.contains(expected), "{case}: {reason}");
             }
+        }
+    }
+
+    #[test]
+    fn routed_parent_checks_preserve_full_snapshot_invoker_and_service_protection() {
+        use pt_core::decision::PolicyEnforcer;
+        use pt_core::inference::ClassScores;
+        use pt_core::supervision::SignatureDatabase;
+
+        let mut policy = pt_core::config::Policy::default();
+        policy.guardrails.builtin_protection = true;
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.never_kill_ppid.clear();
+        let filter = super::ProtectedFilter::from_guardrails(&policy.guardrails).unwrap();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let signatures = SignatureDatabase::new();
+        let posterior = ClassScores {
+            useful: 0.001,
+            useful_bad: 0.0,
+            abandoned: 0.0,
+            zombie: 0.999,
+        };
+        for expected in ["builtin.invoker_chain", "builtin.service_child"] {
+            let parent = rec(u32::MAX - 1, u32::MAX - 2, "worker", ProcessState::Sleeping);
+            let population = if expected == "builtin.invoker_chain" {
+                vec![
+                    parent.clone(),
+                    rec(
+                        std::process::id(),
+                        parent.pid.0,
+                        "pt-core",
+                        ProcessState::Running,
+                    ),
+                ]
+            } else {
+                vec![
+                    parent.clone(),
+                    rec(u32::MAX - 2, 1, "postgres -D /tmp/test", ProcessState::Sleeping),
+                ]
+            };
+            let refusal = super::planned_zombie_parent_refusal(
+                &parent,
+                &super::PlanningProtection {
+                    filter: &filter,
+                    population: &population,
+                },
+                &enforcer,
+                &policy,
+                &signatures,
+                &posterior,
+                false,
+            )
+            .expect("snapshot protection precedes live descriptor collection");
+            assert!(refusal.contains(expected), "{expected}: {refusal}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_policy_evidence_refuses_unknown_fuse_before_probes_but_allows_recovery() {
+        use pt_core::decision::{Action, PolicyEnforcer};
+        let policy = pt_core::config::Policy::default();
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        // An impossible PID exercises actual unavailable procfs evidence.
+        let missing = rec(u32::MAX, 50, "unavailable", ProcessState::Sleeping);
+        for action in [Action::Kill, Action::Restart, Action::Pause, Action::Freeze] {
+            let refusal = super::process_policy_candidate(&enforcer, &missing, action)
+                .expect_err("disruptive actions require complete FUSE evidence");
+            assert!(refusal.contains("FUSE"), "{refusal}");
+        }
+        for action in [
+            Action::Keep,
+            Action::Resume,
+            Action::Unfreeze,
+            Action::Unquarantine,
+        ] {
+            let evidence = super::process_policy_candidate(&enforcer, &missing, action)
+                .expect("recovery skips the disruptive-action FUSE and writable-FD probes");
+            assert!(evidence.open_write_fds.is_none());
         }
     }
 
@@ -12977,6 +13394,8 @@ mod process_tree_safety_tests {
                     process_state: process.state,
                     comm: process.comm.clone(),
                     cmd: process.cmd.clone(),
+                    blocked_reasons: Vec::new(),
+                    parent_identity: None,
                 },
             )]);
             let plan =
@@ -14727,6 +15146,38 @@ fn generate_narrative_summary(
 }
 
 fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode {
+    let config_options = ConfigOptions {
+        config_dir: global.config.as_ref().map(PathBuf::from),
+        ..Default::default()
+    };
+    let config = match load_config(&config_options) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("agent snapshot: config error: {error}");
+            return ExitCode::InternalError;
+        }
+    };
+    let (mut scorer, scorer_warnings) = Scorer::from_config(&config);
+    for warning in scorer_warnings {
+        eprintln!("agent snapshot: warning: {warning}");
+    }
+    let policy = config.policy;
+    let protected_filter = match ProtectedFilter::from_guardrails(&policy.guardrails) {
+        Ok(filter) => filter,
+        Err(error) => {
+            eprintln!("agent snapshot: protected filter error: {error}");
+            return ExitCode::InternalError;
+        }
+    };
+    let rate_limit_path = resolve_data_dir_for_lock().map(|dir| dir.join("rate_limit.json"));
+    let enforcer = match pt_core::decision::PolicyEnforcer::new(&policy, rate_limit_path.as_deref())
+    {
+        Ok(enforcer) => enforcer,
+        Err(error) => {
+            eprintln!("agent snapshot: policy enforcer error: {error}");
+            return ExitCode::InternalError;
+        }
+    };
     let session_id = SessionId::new();
 
     let store = match SessionStore::from_env() {
@@ -14807,123 +15258,155 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
 
     // Persist compact artifacts when we have a scan result.
     if let Some(ref scan_result) = scan_result {
-        // Load config for protected filter + action policy.
-        let config_options = ConfigOptions {
-            config_dir: global.config.as_ref().map(PathBuf::from),
-            ..Default::default()
+        let filter_result = protected_filter.filter_scan_result(scan_result);
+        let min_age = policy.guardrails.min_process_age_seconds;
+        let plan_eligible: Vec<&ProcessRecord> = filter_result
+            .passed
+            .iter()
+            .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
+            .collect();
+        scorer.collect_provenance(&plan_eligible);
+        let load_adjustment = if policy.load_aware.enabled {
+            let signals = LoadSignals::from_system_state(&system_state, filter_result.passed.len());
+            compute_load_adjustment(&policy.load_aware, &signals)
+        } else {
+            None
         };
-        if let Ok(config) = load_config(&config_options) {
-            let (mut scorer, scorer_warnings) = Scorer::from_config(&config);
-            for warning in scorer_warnings {
-                eprintln!("agent snapshot: warning: {warning}");
-            }
-            let policy = config.policy;
+        let decision_policy = if let Some(adjustment) = &load_adjustment {
+            let mut adjusted = policy.clone();
+            adjusted.loss_matrix = apply_load_to_loss_matrix(&policy.loss_matrix, adjustment);
+            adjusted
+        } else {
+            policy.clone()
+        };
 
-            if let Ok(protected_filter) = ProtectedFilter::from_guardrails(&policy.guardrails) {
-                let filter_result = protected_filter.filter_scan_result(scan_result);
-                // Provenance over the processes `agent plan` would evaluate, so their
-                // inference matches the plan's.
-                let min_age = policy.guardrails.min_process_age_seconds;
-                let plan_eligible: Vec<&ProcessRecord> = filter_result
-                    .passed
+        // Inventory remains useful for diffs even when a process is too young
+        // for triage. Only age-eligible processes receive inference/action advice.
+        let persisted_inventory_records: Vec<PersistedProcess> = filter_result
+            .passed
+            .iter()
+            .map(|proc| PersistedProcess {
+                pid: proc.pid.0,
+                ppid: proc.ppid.0,
+                uid: proc.uid,
+                start_id: proc.start_id.to_string(),
+                comm: proc.comm.clone(),
+                cmd: proc.cmd.clone(),
+                state: proc.state.to_string(),
+                start_time_unix: proc.start_time_unix,
+                elapsed_secs: proc.elapsed.as_secs(),
+                identity_quality: "QuickScan".to_string(),
+            })
+            .collect();
+        let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
+        let mut recommendations = Vec::new();
+        for proc in plan_eligible {
+            let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
+                continue;
+            };
+            let posterior = &score.posterior.posterior;
+            let decision_outcome =
+                match decide_action(posterior, &decision_policy, &candidate_feasibility(proc)) {
+                    Ok(decision) => decision,
+                    Err(_) => continue,
+                };
+            let mut advice = candidate_recommendation(
+                proc,
+                &score,
+                &decision_outcome,
+                &decision_policy,
+                &enforcer,
+                global.robot,
+            );
+            if proc.state.is_zombie() && matches!(advice.action, "kill" | "restart") {
+                let refusal = match scan_result
+                    .processes
                     .iter()
-                    .filter(|proc| proc.elapsed.as_secs() >= min_age)
-                    .collect();
-                scorer.collect_provenance(&plan_eligible);
-
-                let mut persisted_inventory_records: Vec<PersistedProcess> = Vec::new();
-                let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
-                persisted_inventory_records.reserve(filter_result.passed.len());
-                persisted_inference_records.reserve(filter_result.passed.len());
-
-                let feasibility = ActionFeasibility::allow_all();
-                for proc in &filter_result.passed {
-                    let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
-                        continue;
-                    };
-                    let posterior_result = score.posterior;
-                    let ledger = score.ledger;
-
-                    let decision_outcome =
-                        match decide_action(&posterior_result.posterior, &policy, &feasibility) {
-                            Ok(d) => d,
-                            Err(_) => continue,
-                        };
-
-                    let posterior = &posterior_result.posterior;
-                    let score = posterior.suspicion_score();
-
-                    let recommended_action = match decision_outcome.optimal_action {
-                        Action::Keep => "keep",
-                        Action::Renice => "renice",
-                        Action::Pause => "pause",
-                        Action::Resume => "resume",
-                        Action::Freeze => "freeze",
-                        Action::Unfreeze => "unfreeze",
-                        Action::Throttle => "throttle",
-                        Action::Quarantine => "quarantine",
-                        Action::Unquarantine => "unquarantine",
-                        Action::Restart => "restart",
-                        Action::Kill => "kill",
-                    };
-
-                    persisted_inventory_records.push(PersistedProcess {
-                        pid: proc.pid.0,
-                        ppid: proc.ppid.0,
-                        uid: proc.uid,
-                        start_id: proc.start_id.to_string(),
-                        comm: proc.comm.clone(),
-                        cmd: proc.cmd.clone(),
-                        state: proc.state.to_string(),
-                        start_time_unix: proc.start_time_unix,
-                        elapsed_secs: proc.elapsed.as_secs(),
-                        identity_quality: "QuickScan".to_string(),
-                    });
-
-                    persisted_inference_records.push(PersistedInference {
-                        pid: proc.pid.0,
-                        start_id: proc.start_id.to_string(),
-                        classification: ledger.classification.label().to_string(),
-                        posterior_useful: posterior.useful,
-                        posterior_useful_bad: posterior.useful_bad,
-                        posterior_abandoned: posterior.abandoned,
-                        posterior_zombie: posterior.zombie,
-                        confidence: ledger.confidence.label().to_string(),
-                        recommended_action: recommended_action.to_string(),
-                        score,
-                        blast_radius_risk_level: None,
-                        blast_radius_total_affected: None,
-                        provenance_evidence_completeness: None,
-                        provenance_score_terms: Vec::new(),
-                        provenance_log_odds_shift: None,
-                    });
-                }
-
-                let host_id = pt_core::logging::get_host_id();
-                let inv_artifact = InventoryArtifact {
-                    total_system_processes: filter_result.total_before as u64,
-                    protected_filtered: filter_result.filtered.len() as u64,
-                    record_count: persisted_inventory_records.len(),
-                    records: persisted_inventory_records,
+                    .find(|parent| parent.pid == proc.ppid)
+                {
+                    Some(parent) => planned_zombie_parent_refusal(
+                        parent,
+                        &PlanningProtection {
+                            filter: &protected_filter,
+                            population: &scan_result.processes,
+                        },
+                        &enforcer,
+                        &decision_policy,
+                        &scorer.signatures,
+                        posterior,
+                        global.robot,
+                    ),
+                    None => Some(
+                        "zombie parent is absent from the scan; manual review required".to_string(),
+                    ),
                 };
-                if let Err(e) = persist_inventory(&handle, &session_id.0, &host_id, inv_artifact) {
-                    eprintln!(
-                        "agent snapshot: warning: failed to persist inventory artifact: {}",
-                        e
-                    );
-                }
-
-                let inf_artifact = InferenceArtifact {
-                    candidate_count: persisted_inference_records.len(),
-                    candidates: persisted_inference_records,
-                };
-                if let Err(e) = persist_inference(&handle, &session_id.0, &host_id, inf_artifact) {
-                    eprintln!(
-                        "agent snapshot: warning: failed to persist inference artifact: {}",
-                        e
-                    );
+                if let Some(reason) = refusal {
+                    advice.action = "review";
+                    advice.rationale = reason;
                 }
             }
+            recommendations.push(serde_json::json!({
+                "pid": proc.pid.0,
+                "recommended_action": advice.action,
+                "action_rationale": advice.rationale,
+            }));
+            persisted_inference_records.push(PersistedInference {
+                pid: proc.pid.0,
+                start_id: proc.start_id.to_string(),
+                classification: score.ledger.classification.label().to_string(),
+                posterior_useful: posterior.useful,
+                posterior_useful_bad: posterior.useful_bad,
+                posterior_abandoned: posterior.abandoned,
+                posterior_zombie: posterior.zombie,
+                confidence: score.ledger.confidence.label().to_string(),
+                recommended_action: advice.action.to_string(),
+                score: posterior.suspicion_score(),
+                blast_radius_risk_level: None,
+                blast_radius_total_affected: None,
+                provenance_evidence_completeness: None,
+                provenance_score_terms: Vec::new(),
+                provenance_log_odds_shift: None,
+            });
+        }
+        {
+            let mut candidates: Vec<&mut serde_json::Value> = recommendations.iter_mut().collect();
+            apply_planned_kill_budget(
+                &mut candidates,
+                &scan_result.processes,
+                &decision_policy,
+                global.robot,
+            );
+        }
+        let final_actions: HashMap<u32, &str> = recommendations
+            .iter()
+            .filter_map(|candidate| {
+                Some((
+                    u32::try_from(candidate["pid"].as_u64()?).ok()?,
+                    candidate["recommended_action"].as_str()?,
+                ))
+            })
+            .collect();
+        for record in &mut persisted_inference_records {
+            if let Some(action) = final_actions.get(&record.pid) {
+                record.recommended_action = (*action).to_string();
+            }
+        }
+
+        let inv_artifact = InventoryArtifact {
+            total_system_processes: filter_result.total_before as u64,
+            protected_filtered: filter_result.filtered.len() as u64,
+            record_count: persisted_inventory_records.len(),
+            records: persisted_inventory_records,
+        };
+        if let Err(error) = persist_inventory(&handle, &session_id.0, &host_id, inv_artifact) {
+            eprintln!("agent snapshot: warning: failed to persist inventory artifact: {error}");
+        }
+        let inf_artifact = InferenceArtifact {
+            candidate_count: persisted_inference_records.len(),
+            candidates: persisted_inference_records,
+        };
+        if let Err(error) = persist_inference(&handle, &session_id.0, &host_id, inf_artifact) {
+            eprintln!("agent snapshot: warning: failed to persist inference artifact: {error}");
         }
     }
 
@@ -15194,6 +15677,190 @@ fn agent_liveness_json(proc: &ProcessRecord) -> Option<serde_json::Value> {
     }))
 }
 
+/// The policy and live-infrastructure verdict for a scored process. Every
+/// presentation surface must apply this before turning an expected-loss action
+/// into a recommendation. Execution still revalidates the live evidence.
+struct CandidateRecommendation {
+    action: &'static str,
+    rationale: String,
+    policy: pt_core::decision::PolicyCheckResult,
+    agent_liveness: Option<serde_json::Value>,
+    fuse_server: Option<bool>,
+    fuse_mounts: Vec<String>,
+}
+
+fn candidate_feasibility(proc: &ProcessRecord) -> ActionFeasibility {
+    ActionFeasibility::from_process_state(proc.state.is_zombie(), proc.state.is_disksleep(), None)
+}
+
+fn candidate_recommendation(
+    proc: &ProcessRecord,
+    score: &pt_core::scoring::ProcessScore<'_>,
+    decision: &pt_core::decision::DecisionOutcome,
+    policy: &pt_core::config::Policy,
+    enforcer: &pt_core::decision::PolicyEnforcer,
+    robot: bool,
+) -> CandidateRecommendation {
+    // Only read descriptor links to recognize a FUSE server. Following files
+    // under its mounts for a writable-file probe can itself block on a stalled
+    // server, so do not probe them once the infrastructure gate has refused.
+    let fuse_server = policy
+        .guardrails
+        .builtin_protection
+        .then(|| pt_core::collect::protected::holds_fuse_device(proc.pid.0))
+        .flatten();
+    let fuse_mounts = if fuse_server == Some(true) {
+        pt_core::collect::protected::fuse_mountpoints(proc.pid.0)
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let fuse_refusal = if policy.guardrails.builtin_protection {
+        match pt_core::action::prechecks::fuse_action_precheck(fuse_server, decision.optimal_action)
+        {
+            pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } => Some(reason),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let fuse_refusal: Option<String> = None;
+    let destructive =
+        fuse_refusal.is_none() && matches!(decision.optimal_action, Action::Kill | Action::Restart);
+    let open_write_fds = destructive
+        .then(|| pt_core::action::prechecks::open_write_fd_count(proc.pid.0))
+        .flatten();
+    #[cfg(target_os = "linux")]
+    let critical_files = if destructive {
+        pt_core::collect::parse_fd(proc.pid.0)
+            .map(|fd| fd.critical_writes)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let critical_files = Vec::new();
+    #[cfg(target_os = "linux")]
+    let provenance = score.provenance.as_ref();
+
+    let candidate = pt_core::decision::ProcessCandidate {
+        pid: proc.pid.0 as i32,
+        ppid: proc.ppid.0 as i32,
+        cmdline: proc.cmd.clone(),
+        user: Some(proc.user.clone()),
+        group: None,
+        category: score
+            .signature
+            .as_ref()
+            .map(|matched| format!("{:?}", matched.signature.category)),
+        age_seconds: proc.elapsed.as_secs(),
+        posterior: Some(pt_core::decision::robot_constraints::gate_posterior(
+            &score.posterior.posterior,
+            decision.optimal_action,
+        )),
+        memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
+        has_known_signature: score.signature.is_some(),
+        open_write_fds,
+        has_locked_files: None,
+        has_active_tty: Some(proc.has_tty()),
+        seconds_since_io: None,
+        cwd_deleted: None,
+        process_state: Some(proc.state),
+        wchan: None,
+        critical_files,
+        cgroup_role: policy
+            .guardrails
+            .builtin_protection
+            .then(|| pt_core::collect::read_cgroup_role(proc.pid.0)),
+        #[cfg(target_os = "linux")]
+        blast_radius_risk_level: provenance
+            .map(|p| format!("{:?}", p.blast_radius.risk_level).to_lowercase()),
+        #[cfg(not(target_os = "linux"))]
+        blast_radius_risk_level: None,
+        #[cfg(target_os = "linux")]
+        blast_radius_total_affected: provenance.map(|p| p.blast_radius.total_affected),
+        #[cfg(not(target_os = "linux"))]
+        blast_radius_total_affected: None,
+        #[cfg(target_os = "linux")]
+        provenance_evidence_completeness: provenance.map(|p| p.evidence_completeness),
+        #[cfg(not(target_os = "linux"))]
+        provenance_evidence_completeness: None,
+        #[cfg(target_os = "linux")]
+        provenance_confidence_penalty: provenance.map(|p| p.confidence_penalty_steps),
+        #[cfg(not(target_os = "linux"))]
+        provenance_confidence_penalty: None,
+    };
+    let policy_result = enforcer.check_action(&candidate, decision.optimal_action, robot);
+    let mut action = match decision.optimal_action {
+        Action::Keep => "keep",
+        Action::Renice => "renice",
+        Action::Pause => "pause",
+        Action::Resume => "resume",
+        Action::Freeze => "freeze",
+        Action::Unfreeze => "unfreeze",
+        Action::Throttle => "throttle",
+        Action::Quarantine => "quarantine",
+        Action::Unquarantine => "unquarantine",
+        Action::Restart => "restart",
+        Action::Kill => "kill",
+    };
+    let mut rationale = format!(
+        "Action {:?} selected{}",
+        decision.rationale.chosen_action,
+        if decision.rationale.tie_break {
+            " (tie-break)"
+        } else {
+            ""
+        }
+    );
+    if !policy_result.allowed {
+        action = "review";
+        rationale = policy_result
+            .violation
+            .as_ref()
+            .map(|v| format!("Policy blocked: {}", v.message))
+            .unwrap_or_else(|| "Policy blocked".to_string());
+    } else if policy.guardrails.builtin_protection
+        && action != "keep"
+        && pt_core::collect::protected::builtin_force_review_match(&proc.cmd).is_some()
+    {
+        action = "review";
+        rationale = "Downgraded to review: AI agent CLI session (may be mid-task); \
+                     act only after manual review"
+            .to_string();
+    }
+    let agent_liveness = agent_liveness_json(proc);
+    if action == "review"
+        && agent_liveness
+            .as_ref()
+            .is_some_and(|liveness| liveness["live"].as_bool() == Some(true))
+    {
+        action = "keep";
+        rationale = "Keep: AI agent CLI terminal has recent activity".to_string();
+    }
+    if let Some(reason) = fuse_refusal {
+        // Keep is already safe. Preserve an earlier, independently sufficient
+        // review reason while still exposing the FUSE evidence in the result.
+        if action != "keep" {
+            action = "review";
+            rationale = format!("Downgraded to review: {reason}; {rationale}");
+        }
+    }
+    if action == "restart" && !proc.state.is_zombie() {
+        action = "review";
+        rationale = "Restart requires a supported supervisor adapter".to_string();
+    }
+    CandidateRecommendation {
+        action,
+        rationale,
+        policy: policy_result,
+        agent_liveness,
+        fuse_server,
+        fuse_mounts,
+    }
+}
+
 fn process_identity_from_record(proc: &ProcessRecord) -> ProcessIdentity {
     let quality =
         if proc.start_id.0.starts_with("unknown:") || proc.start_id.0.starts_with("synthetic:") {
@@ -15209,6 +15876,16 @@ fn process_identity_from_record(proc: &ProcessRecord) -> ProcessIdentity {
         proc.sid,
         quality,
     )
+}
+
+fn candidate_matches_filter(candidate: &serde_json::Value, only: &str) -> bool {
+    match only {
+        "kill" => candidate["recommended_action"].as_str() == Some("kill"),
+        "review" => candidate["recommended_action"]
+            .as_str()
+            .is_some_and(|action| action != "keep"),
+        _ => true,
+    }
 }
 
 fn build_agent_action_plan(
@@ -15227,7 +15904,10 @@ fn build_agent_action_plan(
             let chosen_action = serde_json::to_value(input.decision.optimal_action).ok()?;
             // Tree safety, policy, agent supervision and human review have the
             // final word. Never revive a decision that one of them downgraded.
-            if chosen_action.as_str() != Some(final_action) {
+            let routed_zombie_restart = input.process_state == Some(ProcessState::Zombie)
+                && input.decision.optimal_action == Action::Kill
+                && final_action == "restart";
+            if chosen_action.as_str() != Some(final_action) && !routed_zombie_restart {
                 input.decision.optimal_action = Action::Keep;
             }
             Some(input)
@@ -15335,7 +16015,6 @@ fn agent_recommended_actions(plan: &Plan) -> Vec<serde_json::Value> {
             })
         })
         .collect()
-
 }
 
 fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
@@ -15548,7 +16227,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut signature_match_count = 0usize;
     let mut signature_fast_path_used_count = 0usize;
 
-    let base_feasibility = ActionFeasibility::allow_all();
     let mut shadow_recorder = if global.shadow {
         match ShadowRecorder::new() {
             Ok(recorder) => Some(recorder),
@@ -15649,18 +16327,18 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let Some(score) = scorer.score(proc, evidence) else {
             continue;
         };
-        let posterior_result = score.posterior;
-        let ledger = score.ledger;
-        let prior_source_label = score.prior_source;
+        let posterior_result = &score.posterior;
+        let ledger = &score.ledger;
+        let prior_source_label = &score.prior_source;
         let signature_age_weight = score.signature_age_weight;
-        let signature_match = score.signature;
-        let learned_prior = score.learned_prior;
+        let signature_match = &score.signature;
+        let learned_prior = &score.learned_prior;
         let fast_path_used = score.fast_path_used;
         let fast_path_skip_reason = score.fast_path_skip_reason;
-        let desktop_app = score.desktop_app;
+        let desktop_app = &score.desktop_app;
         let desktop_app_credited = score.desktop_app_credited;
         #[cfg(target_os = "linux")]
-        let provenance_adjustment = score.provenance;
+        let provenance_adjustment = score.provenance.as_ref();
         if signature_match.is_some() {
             signature_match_count = signature_match_count.saturating_add(1);
         }
@@ -15679,12 +16357,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         // Apply state-based feasibility constraints so decisioning does not
         // recommend fundamentally invalid actions (e.g., kill for zombie/D-state).
-        let state_feasibility = ActionFeasibility::from_process_state(
-            proc.state.is_zombie(),
-            proc.state.is_disksleep(),
-            None,
-        );
-        let feasibility = base_feasibility.merge(&state_feasibility);
+        let feasibility = candidate_feasibility(proc);
 
         // Compute decision (optimal action based on expected loss)
         let mut decision_outcome =
@@ -15711,23 +16384,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let intervention_probability = posterior.intervention_probability();
         let abandonment_probability = posterior.abandonment_probability();
 
-        // Determine recommended action string (used for shadow recording and plan output)
-        let mut recommended_action = match decision_outcome.optimal_action {
-            Action::Keep => "keep",
-            Action::Renice => "renice",
-            Action::Pause => "pause",
-            Action::Resume => "resume",
-            Action::Freeze => "freeze",
-            Action::Unfreeze => "unfreeze",
-            Action::Throttle => "throttle",
-            Action::Quarantine => "quarantine",
-            Action::Unquarantine => "unquarantine",
-            Action::Restart => "restart",
-            Action::Kill => "kill",
-        };
-
         if let Some(ref mut recorder) = shadow_recorder {
-            match recorder.record_candidate(proc, posterior, &ledger, &decision_outcome) {
+            match recorder.record_candidate(proc, posterior, ledger, &decision_outcome) {
                 Ok(()) => shadow_recorded = shadow_recorded.saturating_add(1),
                 Err(err) => {
                     eprintln!(
@@ -15755,145 +16413,27 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             continue;
         }
 
-        // Apply --only filter
-        let include = match args.only.as_str() {
-            "kill" => decision_outcome.optimal_action == Action::Kill,
-            "review" => decision_outcome.optimal_action != Action::Keep,
-            _ => true, // "all"
-        };
-        if !include {
-            continue;
-        }
-
-        // Data-loss evidence for destructive recommendations: the same open-writer
-        // count apply's pre-check uses, so the plan says up front what apply refuses.
-        let destructive = matches!(
-            decision_outcome.optimal_action,
-            Action::Kill | Action::Restart
-        );
-        let open_write_fds = destructive
-            .then(|| pt_core::action::prechecks::open_write_fd_count(proc.pid.0))
-            .flatten();
-        #[cfg(target_os = "linux")]
-        let critical_files = if destructive {
-            pt_core::collect::parse_fd(proc.pid.0)
-                .map(|fd| fd.critical_writes)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        #[cfg(not(target_os = "linux"))]
-        let critical_files = Vec::new();
-
-        let process_candidate = pt_core::decision::ProcessCandidate {
-            pid: proc.pid.0 as i32,
-            ppid: proc.ppid.0 as i32,
-            cmdline: proc.cmd.clone(),
-            user: Some(proc.user.clone()),
-            group: None,
-            category: decision_outcome.rationale.category.clone(),
-            age_seconds: proc.elapsed.as_secs(),
-            posterior: Some(match decision_outcome.optimal_action {
-                Action::Kill | Action::Restart => abandonment_probability,
-                _ => intervention_probability,
-            }),
-            memory_mb: Some(proc.rss_bytes as f64 / (1024.0 * 1024.0)),
-            has_known_signature: decision_outcome
-                .rationale
-                .has_known_signature
-                .unwrap_or(false),
-            open_write_fds,
-            has_locked_files: None,
-            has_active_tty: Some(proc.has_tty()),
-            seconds_since_io: None,
-            cwd_deleted: None,
-            process_state: Some(proc.state),
-            wchan: None,
-            critical_files,
-            cgroup_role: decision_policy
-                .guardrails
-                .builtin_protection
-                .then(|| pt_core::collect::read_cgroup_role(proc.pid.0)),
-            #[cfg(target_os = "linux")]
-            blast_radius_risk_level: provenance_adjustment
-                .as_ref()
-                .map(|p| format!("{:?}", p.blast_radius.risk_level).to_lowercase()),
-            #[cfg(not(target_os = "linux"))]
-            blast_radius_risk_level: None,
-            #[cfg(target_os = "linux")]
-            blast_radius_total_affected: provenance_adjustment
-                .as_ref()
-                .map(|p| p.blast_radius.total_affected),
-            #[cfg(not(target_os = "linux"))]
-            blast_radius_total_affected: None,
-            #[cfg(target_os = "linux")]
-            provenance_evidence_completeness: provenance_adjustment
-                .as_ref()
-                .map(|p| p.evidence_completeness),
-            #[cfg(not(target_os = "linux"))]
-            provenance_evidence_completeness: None,
-            #[cfg(target_os = "linux")]
-            provenance_confidence_penalty: provenance_adjustment
-                .as_ref()
-                .map(|p| p.confidence_penalty_steps),
-            #[cfg(not(target_os = "linux"))]
-            provenance_confidence_penalty: None,
-        };
-        let policy_result = enforcer.check_action(
-            &process_candidate,
-            decision_outcome.optimal_action,
+        let advice = candidate_recommendation(
+            proc,
+            &score,
+            &decision_outcome,
+            &decision_policy,
+            &enforcer,
             global.robot,
         );
+        let recommended_action = advice.action;
+        let policy_result = advice.policy;
         let policy_blocked = !policy_result.allowed;
         if policy_blocked {
             policy_blocked_count += 1;
-            recommended_action = "review";
         }
-        // Agent CLI sessions (claude/codex/agy/...) never get an automatic action
-        // (kill, pause/SIGSTOP, renice, ...): they may be mid-task. Surface them for
-        // manual review instead. (The fleet reality e2e caught `pause` recommended
-        // for 8 live codex sessions when only `kill` was downgraded.)
-        let agent_force_review = decision_policy.guardrails.builtin_protection
-            && !matches!(recommended_action, "keep" | "review")
-            && pt_core::collect::protected::builtin_force_review_match(&proc.cmd).is_some();
-        if agent_force_review {
-            recommended_action = "review";
-        }
-        // Agent liveness: an agent CLI whose terminal saw input/output recently is
-        // in use (possibly waiting for its human), so it is kept, not surfaced for
-        // review. Only the agent itself: its children are judged on their own
-        // evidence (a hung test runner under a live agent stays a candidate).
         let agent_kind = pt_core::collect::protected::agent_kind(&proc.cmd);
-        let agent_liveness = agent_liveness_json(proc);
-        let agent_live = agent_liveness
-            .as_ref()
-            .is_some_and(|l| l["live"].as_bool() == Some(true));
-        if agent_live && recommended_action == "review" {
-            recommended_action = "keep";
-        }
+        let agent_liveness = advice.agent_liveness;
+        let fuse_server = advice.fuse_server;
+        let fuse_mounts = advice.fuse_mounts;
         let policy_value = serde_json::to_value(&policy_result)
             .unwrap_or_else(|_| serde_json::json!({ "allowed": policy_result.allowed }));
-        let action_rationale = if policy_blocked {
-            policy_result
-                .violation
-                .as_ref()
-                .map(|v| format!("Policy blocked: {}", v.message))
-                .unwrap_or_else(|| "Policy blocked".to_string())
-        } else if agent_force_review {
-            "Downgraded to review: AI agent CLI session (may be mid-task); \
-             act only after manual review"
-                .to_string()
-        } else {
-            format!(
-                "Action {:?} selected{}",
-                decision_outcome.rationale.chosen_action,
-                if decision_outcome.rationale.tie_break {
-                    " (tie-break)"
-                } else {
-                    ""
-                }
-            )
-        };
+        let action_rationale = advice.rationale;
 
         // Build evidence contributions from Bayes factors
         let evidence_contributions: Vec<serde_json::Value> = ledger
@@ -15998,6 +16538,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "state": proc.state.to_string(),
             "agent_kind": agent_kind,
             "agent_liveness": agent_liveness,
+            "fuse_server": fuse_server,
+            "fuse_mounts": fuse_mounts,
             "zombie_routing": zombie_routing,
             "start_id": proc.start_id.to_string(),
             "uid": proc.uid,
@@ -16186,7 +16728,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             parent.and_then(|parent| {
                 planned_zombie_parent_refusal(
                     parent,
-                    &protected_filter,
+                    &PlanningProtection {
+                        filter: &protected_filter,
+                        population: &scan_result.processes,
+                    },
                     &enforcer,
                     &decision_policy,
                     &scorer.signatures,
@@ -16282,6 +16827,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
     // Capture count before truncation for summary stats
     let above_threshold_count = all_candidates.len();
+
+    // Filter the policy/tree-adjusted recommendations, not the raw loss argmin.
+    // Later truncation, budgets and plan routing can still tighten this verdict;
+    // reapply the filter to that final contract below.
+    all_candidates.retain(|candidate| candidate_matches_filter(&candidate.1, &args.only));
 
     // Take top N candidates in suspicion order.
     let mut candidates: Vec<serde_json::Value> = Vec::new();
@@ -16399,7 +16949,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     }
 
     let generated_at = chrono::Utc::now().to_rfc3339();
-    let action_plan = build_agent_action_plan(
+    let mut action_plan = build_agent_action_plan(
         &session_id,
         &decision_policy,
         &candidates,
@@ -16407,6 +16957,24 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         generated_at.clone(),
     );
     reconcile_agent_action_candidates(&mut candidates, &action_inputs, &action_plan);
+    candidates.retain(|candidate| candidate_matches_filter(candidate, &args.only));
+    action_plan = build_agent_action_plan(
+        &session_id,
+        &decision_policy,
+        &candidates,
+        &action_inputs,
+        generated_at.clone(),
+    );
+    let returned_pids: HashSet<u32> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            candidate["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+        })
+        .collect();
+    persisted_inventory_records.retain(|record| returned_pids.contains(&record.pid));
+    persisted_inference_records.retain(|record| returned_pids.contains(&record.pid));
     let final_recommendations: HashMap<_, _> = candidates
         .iter()
         .filter_map(|candidate| {
@@ -17531,10 +18099,11 @@ fn first_precheck_block(
 ) -> Option<(pt_core::plan::PreCheck, String)> {
     // The plan's pre-checks plus the ones pt requires for this action type: a plan
     // cannot opt out of protection or session-safety checks.
-    let results = provider.run_checks(
+    let results = provider.run_checks_for_action(
         &pt_core::plan::effective_pre_checks(action),
         action.target.pid.0,
         action.target.sid,
+        action.action,
     );
     for result in results {
         if let pt_core::action::prechecks::PreCheckResult::Blocked { check, reason } = result {
@@ -21705,6 +22274,17 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             policy.clone()
         };
 
+        let rate_limit_path = resolve_data_dir_for_lock().map(|dir| dir.join("rate_limit.json"));
+        let enforcer = match pt_core::decision::PolicyEnforcer::new(
+            &decision_policy,
+            rate_limit_path.as_deref(),
+        ) {
+            Ok(enforcer) => enforcer,
+            Err(error) => {
+                eprintln!("agent watch: policy enforcer error: {error}");
+                return ExitCode::InternalError;
+            }
+        };
         let mut current: HashMap<u32, WatchCandidate> = HashMap::new();
 
         // Verdicts recorded since the last pass count on this one.
@@ -21721,8 +22301,19 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             .collect();
         scorer.collect_provenance(&eligible);
 
+        let mut evaluated = Vec::new();
         for proc in eligible {
-            let Some(eval) = evaluate_watch_candidate(proc, &scorer, &decision_policy) else {
+            let Some(eval) = evaluate_watch_candidate(
+                proc,
+                &scorer,
+                &decision_policy,
+                &enforcer,
+                &PlanningProtection {
+                    filter: &protected_filter,
+                    population: &scan_result.processes,
+                },
+                global.robot,
+            ) else {
                 continue;
             };
             if eval.confidence < threshold.min_prob {
@@ -21732,12 +22323,37 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             if severity < threshold.level {
                 continue;
             }
+            evaluated.push((proc, eval));
+        }
+
+        // A child omitted by the watch threshold is not being recommended for
+        // action. Resolve tree safety and the shared kill budget on this final
+        // event set, while retaining all protected/young ancestors and children.
+        {
+            let mut recommendations: Vec<&mut serde_json::Value> = evaluated
+                .iter_mut()
+                .map(|(_, eval)| &mut eval.recommendation)
+                .collect();
+            apply_planned_kill_budget(
+                &mut recommendations,
+                &scan_result.processes,
+                &decision_policy,
+                global.robot,
+            );
+        }
+        for (proc, eval) in evaluated {
+            let classification = match eval.recommendation["recommended_action"].as_str() {
+                Some("keep") => continue,
+                Some("kill") => "kill",
+                _ => "review",
+            };
+            let severity = severity_from_confidence(eval.confidence);
 
             let candidate = WatchCandidate {
                 start_id: proc.start_id.0.clone(),
                 severity,
                 confidence: eval.confidence,
-                classification: eval.classification.clone(),
+                classification: classification.to_string(),
                 command: proc.cmd.clone(),
             };
 
@@ -21754,6 +22370,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                             "prior_severity": severity_label(prev.severity),
                             "current_severity": severity_label(candidate.severity),
                             "command": candidate.command,
+                            "action_rationale": eval.recommendation["action_rationale"],
                         });
                         emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
                     }
@@ -21771,6 +22388,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                     "confidence": candidate.confidence,
                     "severity": severity_label(candidate.severity),
                     "command": candidate.command,
+                    "action_rationale": eval.recommendation["action_rationale"],
                 });
                 emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
             }
@@ -21793,34 +22411,59 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
 
 struct WatchEval {
     confidence: f64,
-    classification: String,
+    recommendation: serde_json::Value,
 }
 
 fn evaluate_watch_candidate(
     proc: &ProcessRecord,
     scorer: &Scorer,
     policy: &pt_core::config::Policy,
+    enforcer: &pt_core::decision::PolicyEnforcer,
+    protection: &PlanningProtection<'_>,
+    robot: bool,
 ) -> Option<WatchEval> {
-    let posterior_result = scorer.score(proc, Evidence::from_snapshot(proc))?.posterior;
+    let score = scorer.score(proc, Evidence::from_snapshot(proc))?;
     let decision_outcome = decide_action(
-        &posterior_result.posterior,
+        &score.posterior.posterior,
         policy,
-        &ActionFeasibility::allow_all(),
+        &candidate_feasibility(proc),
     )
     .ok()?;
-
-    let classification = match decision_outcome.optimal_action {
-        Action::Kill => "kill",
-        Action::Keep => "spare",
-        _ => "review",
+    let mut advice =
+        candidate_recommendation(proc, &score, &decision_outcome, policy, enforcer, robot);
+    if proc.state.is_zombie() && matches!(advice.action, "kill" | "restart") {
+        let refusal = match protection
+            .population
+            .iter()
+            .find(|parent| parent.pid == proc.ppid)
+        {
+            Some(parent) => planned_zombie_parent_refusal(
+                parent,
+                protection,
+                enforcer,
+                policy,
+                &scorer.signatures,
+                &score.posterior.posterior,
+                robot,
+            ),
+            None => {
+                Some("zombie parent is absent from the scan; manual review required".to_string())
+            }
+        };
+        if let Some(reason) = refusal {
+            advice.action = "review";
+            advice.rationale = reason;
+        }
     }
-    .to_string();
-
-    let confidence = posterior_result.posterior.abandonment_probability();
+    let confidence = score.posterior.posterior.abandonment_probability();
 
     Some(WatchEval {
         confidence,
-        classification,
+        recommendation: serde_json::json!({
+            "pid": proc.pid.0,
+            "recommended_action": advice.action,
+            "action_rationale": advice.rationale,
+        }),
     })
 }
 

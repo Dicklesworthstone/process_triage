@@ -1682,6 +1682,275 @@ fn plan_blocks_kill_of_open_writer() {
     );
 }
 
+/// `--only kill` must describe the executable plan after data-loss refusals and
+/// the per-run kill budget, including the artifacts consumed by session diff.
+#[cfg(target_os = "linux")]
+#[test]
+fn plan_only_kill_filters_final_policy_and_budget_decisions() {
+    use std::collections::BTreeSet;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    // Clean up only children owned by this test, including on assertion failure.
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("pt-plan-only-final-{}", uuid::Uuid::new_v4()));
+    let config_dir = root.join("config");
+    std::fs::create_dir_all(&config_dir).expect("create retained plan config");
+    eprintln!("retained final plan filter evidence: {}", root.display());
+
+    let mut policy = pt_core::config::Policy::default();
+    for row in [
+        &mut policy.loss_matrix.useful,
+        &mut policy.loss_matrix.useful_bad,
+        &mut policy.loss_matrix.abandoned,
+        &mut policy.loss_matrix.zombie,
+    ] {
+        row.keep = 10.0;
+        row.kill = 0.0;
+    }
+    // Restrict inference to our children below. Disable host-specific protection
+    // only in this fixture policy so root-owned/containerized CI is deterministic;
+    // the real data-loss gate and kill budget remain enabled.
+    policy.guardrails.builtin_protection = false;
+    policy.guardrails.protected_patterns.clear();
+    policy.guardrails.force_review_patterns.clear();
+    policy.guardrails.protected_users.clear();
+    policy.guardrails.protected_groups.clear();
+    policy.guardrails.protected_categories.clear();
+    policy.guardrails.never_kill_pid.clear();
+    policy.guardrails.never_kill_ppid.clear();
+    policy.guardrails.min_process_age_seconds = 0;
+    policy.guardrails.max_kills_per_run = 1;
+    policy.load_aware.enabled = false;
+    std::fs::write(
+        config_dir.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).expect("serialize fixture policy"),
+    )
+    .expect("write fixture policy");
+
+    let spawn = |stdout: Stdio| {
+        let mut command = std::process::Command::new("sleep");
+        command
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::null());
+        // SAFETY: setsid is async-signal-safe and this callback touches no shared
+        // state. A new session gives the fixture no inherited controlling TTY.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        OwnedChild(command.spawn().expect("spawn owned sleep fixture"))
+    };
+    let mut writer = spawn(Stdio::from(
+        std::fs::File::create(root.join("writer-output.txt")).expect("open writer output"),
+    ));
+    let mut first_control = spawn(Stdio::null());
+    let mut second_control = spawn(Stdio::null());
+    let writer_pid = u64::from(writer.0.id());
+    let control_pids = [
+        u64::from(first_control.0.id()),
+        u64::from(second_control.0.id()),
+    ];
+    let fixture_pids = BTreeSet::from([writer_pid, control_pids[0], control_pids[1]]);
+    let selected_pids = fixture_pids
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let pid_set = |rows: &[Value]| -> BTreeSet<u64> {
+        rows.iter()
+            .map(|row| row["pid"].as_u64().expect("record PID"))
+            .collect()
+    };
+
+    for only in ["all", "kill"] {
+        let data_dir = root.join(format!("data-{only}"));
+        let output = pt_core()
+            .timeout(Duration::from_secs(120))
+            .env_remove("PT_SKIP_GLOBAL_LOCK")
+            .env_remove("PT_CONFIG_DIR")
+            .env("PROCESS_TRIAGE_CONFIG", &config_dir)
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(&config_dir)
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--pretty",
+                "--pids",
+                &selected_pids,
+                "--min-age",
+                "0",
+                "--min-posterior",
+                "0",
+                "--max-candidates",
+                "3",
+                "--only",
+                only,
+            ])
+            .output()
+            .expect("run actual agent plan");
+        std::fs::write(root.join(format!("{only}.stdout")), &output.stdout)
+            .expect("retain plan stdout");
+        std::fs::write(root.join(format!("{only}.stderr")), &output.stderr)
+            .expect("retain plan stderr");
+        assert_eq!(output.status.code(), Some(1), "{only}: {output:?}");
+        let plan: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{only}: invalid plan JSON ({error}): {output:?}"));
+        let candidates = plan["candidates"].as_array().expect("plan candidates");
+        assert_eq!(plan["summary"]["candidates_returned"], candidates.len());
+        assert_eq!(plan["summary"]["kill_recommendations"], 1, "{only}: {plan}");
+
+        let kills: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate["recommended_action"] == "kill")
+            .collect();
+        assert_eq!(kills.len(), 1, "{only}: {plan}");
+        let kill = kills[0];
+        let kill_pid = kill["pid"].as_u64().expect("kill PID");
+        assert!(control_pids.contains(&kill_pid), "{only}: {kill}");
+        assert_eq!(kill["policy"]["allowed"], true, "{only}: {kill}");
+
+        if only == "all" {
+            assert_eq!(candidates.len(), 3, "{plan}");
+            assert_eq!(pid_set(candidates), fixture_pids, "{plan}");
+            let writer = candidates
+                .iter()
+                .find(|candidate| candidate["pid"].as_u64() == Some(writer_pid))
+                .expect("writer remains visible for review");
+            assert_eq!(writer["recommended_action"], "review", "{writer}");
+            assert_eq!(writer["policy"]["allowed"], false, "{writer}");
+            assert_eq!(
+                writer["policy"]["violation"]["rule"], "data_loss_gates.block_if_open_write_fds",
+                "{writer}"
+            );
+            let budget_review = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate["pid"].as_u64() != Some(writer_pid)
+                        && candidate["pid"].as_u64() != Some(kill_pid)
+                })
+                .expect("second control remains visible for budget review");
+            assert_eq!(
+                budget_review["recommended_action"], "review",
+                "{budget_review}"
+            );
+            assert_eq!(budget_review["policy"]["allowed"], true, "{budget_review}");
+            assert_eq!(budget_review["plan_budget"]["rule"], "max_planned_kills");
+            assert_eq!(budget_review["plan_budget"]["limit"], 1);
+            assert_eq!(plan["summary"]["review_recommendations"], 2);
+        } else {
+            assert_eq!(
+                candidates.len(),
+                1,
+                "--only kill leaked a review row: {plan}"
+            );
+            assert_eq!(plan["summary"]["review_recommendations"], 0);
+        }
+
+        // Both output modes expose exactly one executable action. A fresh scan
+        // may rank either control first, so compare identities within each plan.
+        let actions = plan["actions"].as_array().expect("executable actions");
+        assert_eq!(actions.len(), 1, "{only}: {plan}");
+        let action = &actions[0];
+        assert_eq!(action["action"], "kill", "{only}: {action}");
+        assert_eq!(action["blocked"], false, "{only}: {action}");
+        assert_eq!(action["target"]["pid"], kill_pid);
+        assert_eq!(action["target"]["start_id"], kill["start_id"]);
+        assert_eq!(kill["action_target"], action["target"]);
+        assert_eq!(
+            kill["plan_action_ids"],
+            serde_json::json!([action["action_id"]])
+        );
+        assert_eq!(
+            plan["recommendations"]["kill_set"],
+            serde_json::json!([kill_pid])
+        );
+        let review_pids: BTreeSet<u64> = plan["recommendations"]["review_set"]
+            .as_array()
+            .expect("review set")
+            .iter()
+            .map(|pid| pid.as_u64().expect("review PID"))
+            .collect();
+        assert_eq!(
+            review_pids,
+            pid_set(candidates)
+                .difference(&BTreeSet::from([kill_pid]))
+                .copied()
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(plan["recommendations"]["spare_set"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            plan["recommended"]["actions"],
+            serde_json::json!([{
+                "pid": kill_pid,
+                "action": "kill",
+                "stage": action["stage"],
+                "action_id": action["action_id"],
+            }])
+        );
+
+        let session_dir = data_dir
+            .join("sessions")
+            .join(plan["session_id"].as_str().expect("session ID"));
+        let read_artifact = |path: &str| -> Value {
+            let bytes = std::fs::read(session_dir.join(path))
+                .unwrap_or_else(|error| panic!("{only}: missing {path}: {error}"));
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|error| panic!("{only}: invalid {path}: {error}"))
+        };
+        assert_eq!(read_artifact("decision/plan.json"), plan);
+        let inventory = read_artifact("scan/inventory.json");
+        let inference = read_artifact("inference/results.json");
+        assert_eq!(inventory["payload"]["record_count"], candidates.len());
+        assert_eq!(inference["payload"]["candidate_count"], candidates.len());
+        assert_eq!(
+            pid_set(inventory["payload"]["records"].as_array().unwrap()),
+            pid_set(candidates)
+        );
+        let inferred = inference["payload"]["candidates"].as_array().unwrap();
+        assert_eq!(pid_set(inferred), pid_set(candidates));
+        for record in inferred {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate["pid"] == record["pid"])
+                .expect("persisted inference refers to returned candidate");
+            assert_eq!(record["start_id"], candidate["start_id"]);
+            assert_eq!(
+                record["recommended_action"],
+                candidate["recommended_action"]
+            );
+        }
+    }
+
+    for child in [&mut writer, &mut first_control, &mut second_control] {
+        assert!(
+            child.0.try_wait().expect("check owned child").is_none(),
+            "planning executed an action"
+        );
+    }
+}
+
 /// An agent CLI is identified in the plan (`agent_kind`) and never gets an
 /// automatic action.
 #[cfg(unix)]
