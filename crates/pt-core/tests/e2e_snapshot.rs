@@ -429,3 +429,53 @@ mod snapshot_policy_safety {
             .stdout(predicate::str::is_empty());
     }
 }
+
+#[test]
+fn snapshot_exposes_sampled_activity_and_explicit_single_snapshot_mode() {
+    let data = tempfile::tempdir().expect("snapshot data directory");
+    for window in ["25", "0"] {
+        let output = pt_core()
+            .env("PROCESS_TRIAGE_DATA", data.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "snapshot",
+                "--top",
+                "5",
+                "--window-ms",
+                window,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).expect("snapshot JSON");
+        let expected_window: u64 = window.parse().unwrap();
+        assert_eq!(result["activity_window_ms"], expected_window);
+        let snapshot = &result["process_snapshot"];
+        assert_eq!(snapshot["window_ms"], expected_window);
+        let processes = snapshot["processes"].as_array().expect("top processes");
+        assert!(!processes.is_empty(), "snapshot must exercise process output");
+        for process in processes {
+            assert!(process["cpu_lifetime_percent"].is_number());
+            if expected_window == 0 {
+                assert!(process["activity"].is_null());
+                assert_eq!(process["cpu_percent"], process["cpu_lifetime_percent"]);
+            } else {
+                let activity = &process["activity"];
+                assert_eq!(activity["pid"], process["pid"]);
+                assert_eq!(activity["requested_window_ms"], expected_window);
+                assert_eq!(process["cpu_percent"], activity["cpu_percent"]);
+                if process["cpu_percent"].is_null() {
+                    assert!(
+                        activity["cpu_error"].is_string(),
+                        "unknown activity must explain why: {activity}"
+                    );
+                }
+            }
+        }
+    }
+}

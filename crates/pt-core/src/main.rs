@@ -381,6 +381,10 @@ struct RunArgs {
     #[arg(long)]
     deep: bool,
 
+    /// Activity sampling window in milliseconds (0 uses lifetime CPU averages)
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    window_ms: u64,
+
     /// Render the TUI inline (preserves scrollback) instead of using the alternate screen.
     ///
     /// In inline mode, the UI is anchored at the bottom of the terminal and logs/progress
@@ -1021,6 +1025,10 @@ struct AgentWatchArgs {
     #[arg(long)]
     min_age: Option<u64>,
 
+    /// Activity sampling window in milliseconds (0 uses lifetime CPU averages)
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    window_ms: u64,
+
     /// Run a single iteration and exit
     #[arg(long)]
     once: bool,
@@ -1076,6 +1084,10 @@ struct AgentPlanArgs {
     /// Force deep scan with all available probes
     #[arg(long)]
     deep: bool,
+
+    /// Activity sampling window in milliseconds (0 uses lifetime CPU averages)
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    window_ms: u64,
 
     /// Only consider processes older than threshold (seconds)
     #[arg(long)]
@@ -1142,6 +1154,10 @@ struct AgentExplainArgs {
     /// Target process with stable identity (format: pid:start_id)
     #[arg(long)]
     target: Option<String>,
+
+    /// Activity sampling window in milliseconds (0 uses lifetime CPU averages)
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    window_ms: u64,
 
     /// Include evidence breakdown
     #[arg(long = "include", value_name = "TYPE")]
@@ -1342,6 +1358,10 @@ struct AgentSnapshotArgs {
     /// Limit to top N processes by resource usage (CPU+memory)
     #[arg(long)]
     top: Option<usize>,
+
+    /// Activity sampling window in milliseconds (0 uses lifetime CPU averages)
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    window_ms: u64,
 
     /// Include environment variables in snapshot (redacted by default)
     #[arg(long)]
@@ -1922,6 +1942,7 @@ fn main() {
                 &cli.global,
                 &RunArgs {
                     deep: false,
+                    window_ms: 500,
                     inline: false,
                     signatures: None,
                     community_signatures: false,
@@ -2014,6 +2035,37 @@ mod cli_definition_tests {
     #[test]
     fn cli_definition_is_consistent() {
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn activity_windows_have_consistent_defaults_bounds_and_zero_opt_out() {
+        for prefix in [
+            vec!["pt-core", "run"],
+            vec!["pt-core", "agent", "plan"],
+            vec!["pt-core", "agent", "snapshot"],
+            vec!["pt-core", "agent", "watch"],
+            vec![
+                "pt-core", "agent", "explain", "--session", "test-session", "--pids", "1234",
+            ],
+        ] {
+            for (value, expected) in [(None, 500), (Some("0"), 0), (Some("60000"), 60000)] {
+                let mut args = prefix.clone();
+                if let Some(value) = value {
+                    args.extend(["--window-ms", value]);
+                }
+                let matches = super::Cli::command().try_get_matches_from(args).unwrap();
+                let mut command = &matches;
+                while let Some((_, subcommand)) = command.subcommand() {
+                    command = subcommand;
+                }
+                assert_eq!(command.get_one::<u64>("window_ms"), Some(&expected));
+            }
+            for invalid in ["-1", "60001", "not-a-duration"] {
+                let mut args = prefix.clone();
+                args.extend(["--window-ms", invalid]);
+                assert!(super::Cli::try_parse_from(args).is_err());
+            }
+        }
     }
 
     #[test]
@@ -2294,6 +2346,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let policy_r = policy.clone();
         let timeout_r = global.timeout;
         let deep_r = args.deep;
+        let window_ms_r = args.window_ms;
         let min_age_r = args.min_age;
         let goal_r = args.goal.clone();
         let policy_scan_r = policy.clone();
@@ -2323,6 +2376,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     &scan_result.processes,
                     min_age_r,
                     deep_r,
+                    window_ms_r,
                     scorer,
                     &policy_r,
                     goal_r.as_deref(),
@@ -2523,6 +2577,7 @@ fn build_tui_data_from_live_scan(
         &scan_result.processes,
         args.min_age,
         args.deep,
+        args.window_ms,
         scorer,
         policy,
         args.goal.as_deref(),
@@ -2533,11 +2588,13 @@ fn build_tui_data_from_live_scan(
 /// candidates (as `agent plan` collects it), VOI probe advice, deep signals (all
 /// processes with `--deep`, else where the advice asks for them), then rows.
 #[cfg(feature = "ui")]
+#[allow(clippy::too_many_arguments)]
 fn score_tui_rows(
     processes: &[ProcessRecord],
     population: &[ProcessRecord],
     min_age: Option<u64>,
     deep: bool,
+    window_ms: u64,
     mut scorer: Scorer,
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
@@ -2548,12 +2605,18 @@ fn score_tui_rows(
         .filter(|proc| proc.elapsed.as_secs() >= min_age)
         .collect();
     scorer.collect_provenance(&eligible);
+    collect_planning_activity(&mut scorer, &eligible, population, goal_str, window_ms);
     let probe_advice = compute_probe_advice(processes, &scorer, policy);
     let deep_signals = if deep {
-        collect_deep_signals(processes)
+        collect_deep_signals_for_processes(&eligible, &scorer)
     } else {
         let targeted = deep_scan_target_pids(processes, &probe_advice);
-        collect_deep_signals_for_pids(&targeted)
+        let targeted: Vec<_> = eligible
+            .iter()
+            .copied()
+            .filter(|process| targeted.contains(&process.pid.0))
+            .collect();
+        collect_deep_signals_for_processes(&targeted, &scorer)
     };
     build_tui_rows(
         processes,
@@ -3425,11 +3488,9 @@ struct DeepSignals {
     io_active: Option<bool>,
     queue_saturated: Option<bool>,
     #[cfg(feature = "ui")]
-    queue_lambda: Option<f64>,
+    queue_rx_bytes: Option<u64>,
     #[cfg(feature = "ui")]
-    queue_mu: Option<f64>,
-    #[cfg(feature = "ui")]
-    queue_stall_probability: Option<f64>,
+    queue_tx_bytes: Option<u64>,
     #[cfg(feature = "ui")]
     queue_backlog_sockets: Option<usize>,
 }
@@ -3499,63 +3560,88 @@ fn deep_scan_target_pids(
         .collect()
 }
 
-fn collect_deep_signals_for_pids(pids: &[u32]) -> Option<HashMap<u32, DeepSignals>> {
+fn collect_deep_signals_for_processes(
+    processes: &[&ProcessRecord],
+    scorer: &Scorer,
+) -> Option<HashMap<u32, DeepSignals>> {
     #[cfg(target_os = "linux")]
     {
+        use pt_core::action::{IdentityProvider, LiveIdentityProvider};
         use pt_core::collect::{deep_scan, DeepScanOptions};
 
-        if pids.is_empty() {
+        if processes.is_empty() {
             return None;
         }
 
         let options = DeepScanOptions {
-            pids: pids.to_vec(),
+            pids: processes.iter().map(|process| process.pid.0).collect(),
             skip_inaccessible: true,
             include_environ: false,
             use_wait_free: true,
             progress: None,
         };
         let result = match deep_scan(&options) {
-            Ok(r) => r,
-            Err(err) => {
-                eprintln!("run: deep scan failed: {}", err);
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("deep scan failed: {}", error);
                 return None;
             }
         };
 
+        let by_pid: HashMap<u32, &ProcessRecord> = processes
+            .iter()
+            .map(|process| (process.pid.0, *process))
+            .collect();
+        let identity_provider = LiveIdentityProvider::new();
         let mut map = HashMap::new();
         for record in result.processes {
-            let io_active = record
-                .io
-                .as_ref()
-                .map(|io| io.read_bytes > 0 || io.write_bytes > 0);
-            let net_active = record.network.as_ref().map(|info| {
-                let counts = &info.socket_counts;
-                let total =
-                    counts.tcp + counts.tcp6 + counts.udp + counts.udp6 + counts.unix + counts.raw;
-                total > 0
-                    || !info.listen_ports.is_empty()
-                    || !info.tcp_connections.is_empty()
-                    || !info.udp_sockets.is_empty()
-                    || !info.unix_sockets.is_empty()
-            });
-            let queue_metrics = record
-                .network
-                .as_ref()
-                .map(|info| estimate_queue_metrics(info, io_active.unwrap_or(false)));
+            let Some(process) = by_pid.get(&record.pid.0) else {
+                continue;
+            };
+            let identity = process_identity_from_record(process);
+            // Deep probes address numeric PIDs and read stat before optional
+            // evidence. Join to the original scan, then revalidate after probes.
+            if !record.can_automate()
+                || !identity.matches(&record.to_identity())
+                || !matches!(identity_provider.revalidate(&identity), Ok(true))
+            {
+                continue;
+            }
+            let io_active = scorer
+                .activity_for(process)
+                .and_then(|activity| activity.io_active);
+            let has_network = record.fd.as_ref().is_some_and(|fd| fd.sockets > 0)
+                || record.network.as_ref().is_some_and(|info| {
+                    let counts = &info.socket_counts;
+                    [
+                        counts.tcp,
+                        counts.tcp6,
+                        counts.udp,
+                        counts.udp6,
+                        counts.unix,
+                        counts.raw,
+                    ]
+                    .iter()
+                    .any(|count| *count > 0)
+                        || !info.listen_ports.is_empty()
+                        || !info.tcp_connections.is_empty()
+                        || !info.udp_sockets.is_empty()
+                        || !info.unix_sockets.is_empty()
+                });
+            // Missing or empty namespace socket tables do not prove absence.
+            let net_active = has_network.then_some(true);
+            let queue_metrics = record.network.as_ref().map(observed_queue_metrics);
 
             map.insert(
                 record.pid.0,
                 DeepSignals {
                     net_active,
                     io_active,
-                    queue_saturated: queue_metrics.map(|metrics| metrics.saturated),
+                    queue_saturated: queue_metrics.and_then(|metrics| metrics.saturated),
                     #[cfg(feature = "ui")]
-                    queue_lambda: queue_metrics.map(|metrics| metrics.lambda),
+                    queue_rx_bytes: queue_metrics.map(|metrics| metrics.rx_bytes),
                     #[cfg(feature = "ui")]
-                    queue_mu: queue_metrics.map(|metrics| metrics.mu),
-                    #[cfg(feature = "ui")]
-                    queue_stall_probability: queue_metrics.map(|metrics| metrics.stall_probability),
+                    queue_tx_bytes: queue_metrics.map(|metrics| metrics.tx_bytes),
                     #[cfg(feature = "ui")]
                     queue_backlog_sockets: queue_metrics.map(|metrics| metrics.backlog_sockets),
                 },
@@ -3565,85 +3651,53 @@ fn collect_deep_signals_for_pids(pids: &[u32]) -> Option<HashMap<u32, DeepSignal
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pids;
+        let _ = (processes, scorer);
         eprintln!("deep scan not supported on this platform; using quick-scan evidence only");
         None
     }
 }
 
-#[cfg(feature = "ui")]
-fn collect_deep_signals(processes: &[ProcessRecord]) -> Option<HashMap<u32, DeepSignals>> {
-    let pids = processes.iter().map(|p| p.pid.0).collect::<Vec<_>>();
-    collect_deep_signals_for_pids(&pids)
-}
-
 // Linux-only: built from /proc/net socket data (the only caller is Linux-gated too).
-// Keep detailed estimates in lean unit tests as well as the UI.
+// Keep observed queue facts in lean unit tests as well as the UI.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct QueueMetrics {
-    saturated: bool,
+    saturated: Option<bool>,
     #[cfg(any(feature = "ui", test))]
-    lambda: f64,
+    rx_bytes: u64,
     #[cfg(any(feature = "ui", test))]
-    mu: f64,
-    #[cfg(any(feature = "ui", test))]
-    stall_probability: f64,
+    tx_bytes: u64,
     #[cfg(any(feature = "ui", test))]
     backlog_sockets: usize,
 }
 
 #[cfg(target_os = "linux")]
-fn estimate_queue_metrics(info: &pt_core::collect::NetworkInfo, io_active: bool) -> QueueMetrics {
+fn observed_queue_metrics(info: &pt_core::collect::NetworkInfo) -> QueueMetrics {
     const QUEUE_SATURATION_THRESHOLD: u32 = 4096;
 
+    #[cfg(any(feature = "ui", test))]
     let total_rx = info.total_rx_queue();
+    #[cfg(any(feature = "ui", test))]
     let total_tx = info.total_tx_queue();
-    let tcp_backlog = info
+    #[cfg(any(feature = "ui", test))]
+    let backlog_sockets = info
         .tcp_connections
         .iter()
         .filter(|conn| conn.rx_queue > 0 || conn.tx_queue > 0)
         .count();
-    let unix_pressure = info
-        .unix_sockets
-        .iter()
-        .filter(|sock| {
-            sock.state == pt_core::collect::UnixSocketState::Connected && sock.ref_count > 1
-        })
-        .count();
-    let backlog_sockets = tcp_backlog + unix_pressure;
 
-    let lambda = total_rx as f64 + unix_pressure as f64;
-    let mu = if io_active {
-        total_tx.max(1) as f64 + 1.0
-    } else {
-        total_tx as f64 * 0.25
-    };
-    let rho = if mu <= f64::EPSILON {
-        f64::INFINITY
-    } else {
-        lambda / mu
-    };
-    let stall_probability = if backlog_sockets == 0 {
-        0.0
-    } else if !rho.is_finite() || rho >= 1.0 {
-        1.0
-    } else {
-        rho.powf(backlog_sockets.max(1) as f64).clamp(0.0, 1.0)
-    };
-    let saturated = backlog_sockets > 0
-        && (stall_probability >= 0.5
-            || info.has_saturated_queue(QUEUE_SATURATION_THRESHOLD)
-            || !io_active);
+    // A single queue length cannot establish arrival/service rates or a stall
+    // probability. Storage I/O activity and UNIX socket reference counts do not
+    // measure socket throughput either. Retain only positive observed pressure;
+    // absent or small queues are not proof that the process is clear or idle.
+    let saturated = info.has_saturated_queue(QUEUE_SATURATION_THRESHOLD).then_some(true);
 
     QueueMetrics {
         saturated,
         #[cfg(any(feature = "ui", test))]
-        lambda,
+        rx_bytes: total_rx,
         #[cfg(any(feature = "ui", test))]
-        mu,
-        #[cfg(any(feature = "ui", test))]
-        stall_probability,
+        tx_bytes: total_tx,
         #[cfg(any(feature = "ui", test))]
         backlog_sockets,
     }
@@ -3746,7 +3800,7 @@ fn build_tui_rows(
     let mut rows = Vec::new();
     let mut plan_candidates = HashMap::new();
     let mut goal_candidates: HashMap<u32, serde_json::Value> = HashMap::new();
-    let mut cpu_total = 0.0;
+    let cpu_total = process_cpu_total(population, scorer).unwrap_or(f64::NAN);
     let mut supervision = pt_core::supervision::SupervisionDetector::new();
 
     for proc in processes {
@@ -3770,6 +3824,7 @@ fn build_tui_rows(
             continue;
         };
         let posterior_result = &score.posterior;
+        let cpu_percent = process_cpu_percent(proc, score.activity.as_ref());
         let feasibility = candidate_feasibility(proc);
         let mut decision_outcome =
             match decide_action(&posterior_result.posterior, &decision_policy, &feasibility) {
@@ -3804,21 +3859,20 @@ fn build_tui_rows(
             }
         }
         if let Some(queue) = deep {
-            if let (Some(lambda), Some(mu), Some(stall_probability), Some(backlog_sockets)) = (
-                queue.queue_lambda,
-                queue.queue_mu,
-                queue.queue_stall_probability,
+            if let (Some(rx_bytes), Some(tx_bytes), Some(backlog_sockets)) = (
+                queue.queue_rx_bytes,
+                queue.queue_tx_bytes,
                 queue.queue_backlog_sockets,
             ) {
                 if backlog_sockets > 0 {
                     ledger.top_evidence.insert(
                         0,
                         format!(
-                            "queue stall λ≈{lambda:.1}, μ≈{mu:.1}, P(queue>L)≈{stall_probability:.2} across {backlog_sockets} socket(s)"
+                            "observed socket queues: {rx_bytes} receive bytes, {tx_bytes} send bytes across {backlog_sockets} socket(s)"
                         ),
                     );
                     ledger.why_summary = format!(
-                        "{} Queueing view: λ≈{lambda:.1}, μ≈{mu:.1}, stall≈{stall_probability:.2}.",
+                        "{} Socket backlog was observed; throughput and stall probability were not measured.",
                         ledger.why_summary
                     );
                 }
@@ -3928,8 +3982,6 @@ fn build_tui_rows(
             blast_radius_risk: None,
         });
 
-        cpu_total += proc.cpu_percent;
-
         let expected_loss_entries: Vec<serde_json::Value> = decision_outcome
             .expected_loss
             .iter()
@@ -3949,7 +4001,7 @@ fn build_tui_rows(
                 "recommended_action": recommendation,
                 "action_rationale": rationale,
                 "memory_mb": memory_mb,
-                "cpu_percent": proc.cpu_percent,
+                "cpu_percent": cpu_percent,
                 "expected_loss": expected_loss_entries,
             }),
         );
@@ -4362,6 +4414,9 @@ fn resource_goal_from_target(
     target: &ResourceTarget,
     current_cpu_pct: f64,
 ) -> Result<(ResourceGoal, Vec<String>), String> {
+    if !target.value.is_finite() || target.value < 0.0 {
+        return Err("goal target must be finite and non-negative".to_string());
+    }
     let mut warnings = Vec::new();
     let goal = match target.metric {
         Metric::Memory => ResourceGoal {
@@ -4371,8 +4426,16 @@ fn resource_goal_from_target(
         },
         Metric::Cpu => {
             let target_pct = target.value * 100.0;
+            if !target_pct.is_finite() {
+                return Err("CPU goal percentage must be finite".to_string());
+            }
             let desired = match target.comparator {
                 Comparator::ReduceBelow => {
+                    if !current_cpu_pct.is_finite() || current_cpu_pct < 0.0 {
+                        return Err(
+                            "CPU reduce-below goal requires complete CPU measurements for the full observed process population".to_string(),
+                        );
+                    }
                     let required = (current_cpu_pct - target_pct).max(0.0);
                     if required <= 0.0 {
                         warnings.push("cpu_target_already_met".to_string());
@@ -4515,7 +4578,20 @@ fn build_goal_plan_from_candidates(
                 let Goal::Target(t) = sub else {
                     continue;
                 };
-                let (g, mut w) = resource_goal_from_target(t, current_cpu_pct)?;
+                let (g, mut w) = match resource_goal_from_target(t, current_cpu_pct) {
+                    Ok(value) => value,
+                    Err(error)
+                        if goal_requires_cpu_baseline(sub)
+                            && (!current_cpu_pct.is_finite() || current_cpu_pct < 0.0)
+                            && t.value.is_finite()
+                            && t.value >= 0.0
+                            && (t.value * 100.0).is_finite() =>
+                    {
+                        warnings.push(format!("cpu_reduce_below_baseline_unavailable: {error}"));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 warnings.append(&mut w);
                 let goals = vec![g.clone()];
                 let opt_candidates = build_opt_candidates_for_goals(candidates, &goals);
@@ -4838,6 +4914,47 @@ mod executable_goal_tests {
             assert_eq!(output.result.total_contributions, vec![0.0], "case={case}");
             assert_eq!(candidates[0]["goal_selected"], false, "case={case}");
             assert!(candidates[0].get("goal_rank").is_none(), "case={case}");
+        }
+    }
+
+    #[test]
+    fn cpu_goal_requires_full_current_baseline_without_affecting_memory_goals() {
+        let goal = parse_goal("reduce CPU below 50%").unwrap();
+        assert!(goal_requires_cpu_baseline(&goal));
+        assert!(goal_requires_cpu_baseline(&Goal::And(vec![goal.clone()])));
+        assert!(goal_requires_cpu_baseline(&Goal::Or(vec![goal.clone()])));
+        for missing in [f64::NAN, f64::INFINITY, -1.0] {
+            let error = build_resource_goals(&goal, missing).unwrap_err();
+            assert!(error.contains("full observed process population"), "{error}");
+        }
+        let (goals, _) = build_resource_goals(&goal, 100.0).unwrap();
+        assert_eq!(goals[0].target, 50.0);
+
+        let memory = parse_goal("free 100MB RAM").unwrap();
+        assert!(!goal_requires_cpu_baseline(&memory));
+        assert!(build_resource_goals(&memory, f64::NAN).is_ok());
+
+        let (candidates, _) = fixture(&[(100, 1000, 0.0)]);
+        let alternative = Goal::Or(vec![goal.clone(), memory.clone()]);
+        let output =
+            build_goal_plan_from_candidates("CPU or memory", &alternative, f64::NAN, &candidates)
+                .unwrap();
+        assert!(output.result.feasible);
+        assert_eq!(output.goals[0].resource, "memory_mb");
+        assert!(output
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("cpu_reduce_below_baseline_unavailable")));
+        let required = Goal::And(vec![goal.clone(), memory]);
+        assert!(build_resource_goals(&required, f64::NAN).is_err());
+
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, f64::MAX] {
+            let mut invalid_goal = goal.clone();
+            let Goal::Target(target) = &mut invalid_goal else {
+                unreachable!();
+            };
+            target.value = invalid;
+            assert!(build_resource_goals(&invalid_goal, 100.0).is_err());
         }
     }
 
@@ -15737,6 +15854,10 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
             .collect();
         scorer.collect_provenance(&plan_eligible);
+        scorer.collect_activity(
+            &scan_result.processes.iter().collect::<Vec<_>>(),
+            Duration::from_millis(args.window_ms),
+        );
         let load_adjustment = if policy.load_aware.enabled {
             let signals = LoadSignals::from_system_state(&system_state, filter_result.passed.len());
             compute_load_adjustment(&policy.load_aware, &signals)
@@ -15892,12 +16013,21 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     // Collect process list if --top, --include-env, or --include-network is specified.
     let process_snapshot = if args.top.is_some() || args.include_env || args.include_network {
         if let Some(ref scan_result) = scan_result {
-            let mut processes: Vec<_> = scan_result.processes.iter().collect();
+            let mut processes: Vec<_> = scan_result
+                .processes
+                .iter()
+                .map(|process| {
+                    let activity = scorer.activity_for(process);
+                    let cpu_percent = process_cpu_percent(process, activity.as_ref());
+                    (process, activity, cpu_percent)
+                })
+                .collect();
 
-            // Sort by resource usage (CPU + normalized memory)
+            // Rank current CPU measurements with resident memory. An unavailable
+            // window contributes no claimed CPU relief; lifetime CPU is separate.
             processes.sort_by(|a, b| {
-                let a_score = a.cpu_percent + (a.rss_bytes as f64 / 1_073_741_824.0); // GB
-                let b_score = b.cpu_percent + (b.rss_bytes as f64 / 1_073_741_824.0);
+                let a_score = a.2.unwrap_or(0.0) + (a.0.rss_bytes as f64 / 1_073_741_824.0);
+                let b_score = b.2.unwrap_or(0.0) + (b.0.rss_bytes as f64 / 1_073_741_824.0);
                 b_score
                     .partial_cmp(&a_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -15911,14 +16041,16 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             // Build process summaries for output
             let summaries: Vec<serde_json::Value> = processes
                 .iter()
-                .map(|p| {
+                .map(|(p, activity, cpu_percent)| {
                     let mut obj = serde_json::json!({
                         "pid": p.pid.0,
                         "ppid": p.ppid.0,
                         "user": &p.user,
                         "comm": &p.comm,
                         "cmd": &p.cmd,
-                        "cpu_percent": p.cpu_percent,
+                        "cpu_percent": cpu_percent,
+                        "cpu_lifetime_percent": p.cpu_percent,
+                        "activity": activity,
                         "rss_mb": p.rss_bytes / 1_048_576,
                         "vsz_mb": p.vsz_bytes / 1_048_576,
                         "state": format!("{:?}", p.state),
@@ -15980,6 +16112,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             Some(serde_json::json!({
                 "count": summaries.len(),
                 "top_n": args.top,
+                "window_ms": args.window_ms,
                 "include_env": args.include_env,
                 "include_network": args.include_network,
                 "processes": summaries,
@@ -16021,6 +16154,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "context_path": handle.context_path().display().to_string(),
                 "system_state": system_state,
                 "capabilities": capabilities_summary,
+                "activity_window_ms": args.window_ms,
             });
             if let Some(procs) = &process_snapshot {
                 if let Some(out_mut) = output.as_object_mut() {
@@ -16108,9 +16242,11 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                     for p in procs.iter().take(10) {
                         let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
                         let comm = p.get("comm").and_then(|v| v.as_str()).unwrap_or("?");
-                        let cpu = p.get("cpu_percent").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let cpu = p.get("cpu_percent").and_then(|v| v.as_f64())
+                            .map(|cpu| format!("{cpu:.1}%"))
+                            .unwrap_or_else(|| "unknown".to_string());
                         let rss = p.get("rss_mb").and_then(|v| v.as_u64()).unwrap_or(0);
-                        println!("    {:>7} {:<20} {:>5.1}% CPU {:>6}MB", pid, comm, cpu, rss);
+                        println!("    {:>7} {:<20} {:>7} CPU {:>6}MB", pid, comm, cpu, rss);
                     }
                     if procs.len() > 10 {
                         println!(
@@ -16166,6 +16302,58 @@ struct CandidateRecommendation {
     agent_liveness: Option<serde_json::Value>,
     fuse_server: Option<bool>,
     fuse_mounts: Vec<String>,
+}
+
+fn process_cpu_percent(
+    proc: &ProcessRecord,
+    activity: Option<&pt_core::collect::ProcessActivity>,
+) -> Option<f64> {
+    // No activity record means an explicit single snapshot. An unavailable
+    // requested window remains unknown rather than reverting to lifetime CPU.
+    activity.map_or(Some(proc.cpu_percent), |activity| activity.cpu_percent)
+}
+
+fn goal_requires_cpu_baseline(goal: &Goal) -> bool {
+    match goal {
+        Goal::Target(target) => {
+            matches!(target.metric, Metric::Cpu)
+                && matches!(target.comparator, Comparator::ReduceBelow)
+        }
+        Goal::And(parts) | Goal::Or(parts) => parts.iter().any(goal_requires_cpu_baseline),
+    }
+}
+
+fn collect_planning_activity(
+    scorer: &mut Scorer,
+    candidates: &[&ProcessRecord],
+    population: &[ProcessRecord],
+    goal_str: Option<&str>,
+    window_ms: u64,
+) {
+    let full_population = goal_str
+        .and_then(|goal| parse_goal(goal).ok())
+        .is_some_and(|goal| goal_requires_cpu_baseline(&goal));
+    if full_population {
+        // Excluded and protected workloads still count toward host CPU goals.
+        // Only procfs counters are sampled; this does not make them actionable.
+        scorer.collect_activity(
+            &population.iter().collect::<Vec<_>>(),
+            Duration::from_millis(window_ms),
+        );
+    } else {
+        scorer.collect_activity(candidates, Duration::from_millis(window_ms));
+    }
+}
+
+fn process_cpu_total(population: &[ProcessRecord], scorer: &Scorer) -> Option<f64> {
+    if population.is_empty() {
+        return None;
+    }
+    population.iter().try_fold(0.0, |total, process| {
+        let percent = process_cpu_percent(process, scorer.activity_for(process).as_ref())?;
+        let sum = total + percent;
+        (percent.is_finite() && percent >= 0.0 && sum.is_finite()).then_some(sum)
+    })
 }
 
 fn candidate_feasibility(proc: &ProcessRecord) -> ActionFeasibility {
@@ -16833,13 +17021,19 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let probe_cost_model = pt_core::decision::ProbeCostModel::default();
     let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
     scorer.collect_provenance(&processes_to_infer);
+    collect_planning_activity(
+        &mut scorer,
+        &processes_to_infer,
+        &scan_result.processes,
+        args.goal.as_deref(),
+        args.window_ms,
+    );
 
     // --deep: one batched deep scan (sockets, I/O, queue backlog) over the
     // candidates, overlaid onto the quick-scan evidence below.
     let deep_scan_start = std::time::Instant::now();
     let deep_signals: Option<HashMap<u32, DeepSignals>> = if args.deep {
-        let pids: Vec<u32> = processes_to_infer.iter().map(|p| p.pid.0).collect();
-        collect_deep_signals_for_pids(&pids)
+        collect_deep_signals_for_processes(&processes_to_infer, &scorer)
     } else {
         None
     };
@@ -16894,6 +17088,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         };
         let posterior_result = &score.posterior;
         let ledger = &score.ledger;
+        let activity = &score.activity;
+        let cpu_percent = process_cpu_percent(proc, activity.as_ref());
         let prior_source_label = &score.prior_source;
         let signature_age_weight = score.signature_age_weight;
         let signature_match = &score.signature;
@@ -16904,6 +17100,11 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         let desktop_app_credited = score.desktop_app_credited;
         #[cfg(target_os = "linux")]
         let provenance_adjustment = score.provenance.as_ref();
+        #[cfg(target_os = "linux")]
+        let blast_radius_risk_level = provenance_adjustment
+            .map(|provenance| format!("{:?}", provenance.blast_radius.risk_level).to_lowercase());
+        #[cfg(not(target_os = "linux"))]
+        let blast_radius_risk_level: Option<String> = None;
         if signature_match.is_some() {
             signature_match_count = signature_match_count.saturating_add(1);
         }
@@ -17115,7 +17316,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "age_seconds": age_seconds,
             "age_human": age_human,
             "memory_mb": proc.rss_bytes / (1024 * 1024),
-            "cpu_percent": proc.cpu_percent,
+            "cpu_percent": cpu_percent,
+            "cpu_lifetime_percent": proc.cpu_percent,
+            "activity": activity,
             "score": score,
             "classification": ledger.classification.label(),
             "posterior": {
@@ -17153,9 +17356,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 .unwrap_or_else(|_| serde_json::json!({"enabled": false})),
             "blast_radius": {
                 "memory_mb": proc.rss_bytes / (1024 * 1024),
-                "cpu_pct": proc.cpu_percent,
+                "cpu_pct": cpu_percent,
                 "child_count": child_counts.get(&proc.pid.0).copied().unwrap_or(0),
-                "risk_level": if proc.rss_bytes > 1024 * 1024 * 1024 { "medium" } else { "low" },
+                "risk_level": blast_radius_risk_level,
             },
             "reversibility": match decision_outcome.optimal_action {
                 Action::Kill | Action::Restart => "irreversible",
@@ -17242,12 +17445,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             confidence: ledger.confidence.label().to_string(),
             recommended_action: recommended_action.to_string(),
             score,
-            #[cfg(target_os = "linux")]
-            blast_radius_risk_level: provenance_adjustment
-                .as_ref()
-                .map(|p| format!("{:?}", p.blast_radius.risk_level).to_lowercase()),
-            #[cfg(not(target_os = "linux"))]
-            blast_radius_risk_level: None,
+            blast_radius_risk_level,
             #[cfg(target_os = "linux")]
             blast_radius_total_affected: provenance_adjustment
                 .as_ref()
@@ -17428,11 +17626,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     // Reduce-below goals use the full observed host snapshot. Protection,
     // --pids, sampling, --only and candidate caps constrain actions; they do
     // not remove the excluded processes' CPU usage from the recovery target.
-    let total_cpu_pct_for_goal: f64 = scan_result
-        .processes
-        .iter()
-        .map(|process| process.cpu_percent)
-        .sum();
+    // NaN is an internal unknown marker; CPU reduce-below conversion rejects
+    // it before arithmetic, while goals that need no CPU baseline still work.
+    let total_cpu_pct_for_goal =
+        process_cpu_total(&scan_result.processes, &scorer).unwrap_or(f64::NAN);
     if let Some(goal_str) = args.goal.as_deref() {
         match parse_goal(goal_str) {
             Ok(goal) => {
@@ -17757,6 +17954,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "since_time": args.since_time,
             "goal": args.goal,
             "include_predictions": args.include_predictions,
+            "window_ms": args.window_ms,
             "prediction_fields": args.prediction_fields,
             "minimal": args.minimal,
             "pretty": args.pretty,
@@ -18108,6 +18306,12 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         min_age_seconds,
         &scan_result.processes,
     );
+    // Explanations include explicitly requested young/protected subjects; their
+    // activity is safe to observe even when policy forbids acting on them.
+    scorer.collect_activity(
+        &scan_result.processes.iter().collect::<Vec<_>>(),
+        Duration::from_millis(args.window_ms),
+    );
 
     // Build explanations for each process
     let mut explanations: Vec<serde_json::Value> = Vec::new();
@@ -18140,6 +18344,7 @@ fn run_agent_explain(global: &GlobalOpts, args: &AgentExplainArgs) -> ExitCode {
         "session_id": sid.0,
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "command": "agent explain",
+        "activity_window_ms": args.window_ms,
         "explanations": explanations,
     });
 
@@ -18367,8 +18572,8 @@ fn build_process_explanation(
     scorer: &Scorer,
     args: &AgentExplainArgs,
 ) -> serde_json::Value {
-    // Scored exactly as `agent plan` scores it (learned verdicts, signatures,
-    // desktop-app ownership, provenance), from the same snapshot evidence.
+    // Scored through the same path as `agent plan`: learned verdicts,
+    // signatures, desktop-app ownership, provenance, and sampled activity.
     let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
         return serde_json::json!({
             "pid": proc.pid.0,
@@ -18379,6 +18584,9 @@ fn build_process_explanation(
     let posterior_result = &score.posterior;
     let ledger = &score.ledger;
     let learned_prior = &score.learned_prior;
+    let activity = score.activity.as_ref();
+    let cpu_percent = process_cpu_percent(proc, activity);
+    let io_active = activity.and_then(|sample| sample.io_active);
 
     // Build base explanation
     let mut explanation = serde_json::json!({
@@ -18390,7 +18598,11 @@ fn build_process_explanation(
         "agent_kind": pt_core::collect::protected::agent_kind(&proc.cmd),
         "agent_liveness": agent_liveness_json(proc),
         "elapsed_seconds": proc.elapsed.as_secs(),
-        "cpu_percent": proc.cpu_percent,
+        "start_id": proc.start_id,
+        "uid": proc.uid,
+        "cpu_percent": cpu_percent,
+        "cpu_lifetime_percent": proc.cpu_percent,
+        "activity": activity,
         "classification": ledger.classification.label(),
         "confidence": ledger.confidence.label(),
         "why_summary": ledger.why_summary,
@@ -18437,7 +18649,8 @@ fn build_process_explanation(
     // Add input evidence if requested
     if args.include.contains(&"evidence".to_string()) {
         explanation["evidence"] = serde_json::json!({
-            "cpu_occupancy": proc.cpu_percent / 100.0,
+            "cpu_occupancy": cpu_percent.map(|percent| (percent / 100.0).clamp(0.0, 1.0)),
+            "io_active": io_active,
             "runtime_seconds": proc.elapsed.as_secs_f64(),
             "is_orphan": proc.is_orphan(),
             "has_tty": proc.has_tty(),
@@ -22982,6 +23195,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
             .collect();
         scorer.collect_provenance(&eligible);
+        scorer.collect_activity(&eligible, Duration::from_millis(args.window_ms));
 
         let mut evaluated = Vec::new();
         let mut supervision = pt_core::supervision::SupervisionDetector::new();
@@ -23122,6 +23336,9 @@ fn evaluate_watch_candidate(
             "recommended_action": advice.action,
             "action_rationale": advice.rationale,
             "action_target": action_target,
+            "activity": score.activity,
+            "cpu_percent": process_cpu_percent(proc, score.activity.as_ref()),
+            "cpu_lifetime_percent": proc.cpu_percent,
         }),
     })
 }
@@ -23538,6 +23755,7 @@ mod watch_tests {
             threshold: "medium".to_string(),
             interval: 60,
             min_age: None,
+            window_ms: 500,
             once: true,
             goal_memory_available_gb: Some(2.0),
             goal_load_max: None,
@@ -23578,7 +23796,7 @@ mod queue_metrics_tests {
     };
 
     #[test]
-    fn estimate_queue_metrics_marks_idle_backlog_as_saturated() {
+    fn observed_queue_metrics_retains_real_queue_pressure() {
         let info = NetworkInfo {
             socket_counts: SocketCounts {
                 tcp: 1,
@@ -23600,16 +23818,21 @@ mod queue_metrics_tests {
             unix_sockets: Vec::new(),
         };
 
-        let metrics = estimate_queue_metrics(&info, false);
-        assert!(metrics.saturated);
+        let metrics = observed_queue_metrics(&info);
+        assert_eq!(metrics.saturated, Some(true));
         assert_eq!(metrics.backlog_sockets, 1);
-        assert_eq!(metrics.lambda, 8192.0);
-        assert_eq!(metrics.mu, 4.0);
-        assert_eq!(metrics.stall_probability, 1.0);
+        assert_eq!(metrics.rx_bytes, 8192);
+        assert_eq!(metrics.tx_bytes, 16);
+
+        let mut small_queue = info;
+        small_queue.tcp_connections[0].rx_queue = 8;
+        let metrics = observed_queue_metrics(&small_queue);
+        assert_eq!(metrics.saturated, None);
+        assert_eq!(metrics.backlog_sockets, 1);
     }
 
     #[test]
-    fn estimate_queue_metrics_counts_connected_unix_pressure() {
+    fn shared_unix_sockets_do_not_manufacture_queue_pressure() {
         let info = NetworkInfo {
             socket_counts: SocketCounts {
                 unix: 1,
@@ -23627,12 +23850,11 @@ mod queue_metrics_tests {
             }],
         };
 
-        let metrics = estimate_queue_metrics(&info, true);
-        assert_eq!(metrics.backlog_sockets, 1);
-        assert_eq!(metrics.lambda, 1.0);
-        assert_eq!(metrics.mu, 2.0);
-        assert_eq!(metrics.stall_probability, 0.5);
-        assert!(metrics.saturated);
+        let metrics = observed_queue_metrics(&info);
+        assert_eq!(metrics.backlog_sockets, 0);
+        assert_eq!(metrics.rx_bytes, 0);
+        assert_eq!(metrics.tx_bytes, 0);
+        assert_eq!(metrics.saturated, None);
     }
 }
 

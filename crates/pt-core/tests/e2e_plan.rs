@@ -1491,7 +1491,8 @@ fn plan_deep_adds_network_evidence() {
     std::thread::sleep(Duration::from_millis(500));
     let data_dir = tempdir().expect("data dir");
 
-    let plan = |deep: bool| -> Value {
+    let pid_arg = pid.to_string();
+    let plan = |deep: bool, window_ms: &str| -> Value {
         let mut args = vec![
             "--format",
             "json",
@@ -1503,6 +1504,10 @@ fn plan_deep_adds_network_evidence() {
             "0",
             "--max-candidates",
             "100000",
+            "--pids",
+            pid_arg.as_str(),
+            "--window-ms",
+            window_ms,
         ];
         if deep {
             args.push("--deep");
@@ -1529,8 +1534,9 @@ fn plan_deep_adds_network_evidence() {
             .collect()
     };
 
-    let quick = plan(false);
-    let deep = plan(true);
+    let quick = plan(false, "25");
+    let deep = plan(true, "25");
+    let legacy = plan(true, "0");
     let _ = child.kill();
     let _ = child.wait();
 
@@ -1543,6 +1549,45 @@ fn plan_deep_adds_network_evidence() {
         factors(&deep).contains(&"net".to_string()),
         "deep plan should carry a net term: {:?}",
         factors(&deep)
+    );
+    for output in [&quick, &deep] {
+        assert_eq!(output["args"]["window_ms"], 25);
+        let candidate = output["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["pid"].as_u64() == Some(u64::from(pid)))
+            .expect("owned process remains a candidate");
+        let activity = &candidate["activity"];
+        assert_eq!(activity["source"], "procfs_window", "{candidate}");
+        assert_eq!(activity["pid"], pid);
+        assert_eq!(activity["start_id"], candidate["start_id"]);
+        assert_eq!(activity["uid"], candidate["uid"]);
+        assert_eq!(activity["requested_window_ms"], 25);
+        assert!(
+            activity["cpu_window_seconds"].as_f64().unwrap() >= 0.025,
+            "{activity}"
+        );
+        assert!(activity["cpu_percent"].as_f64().unwrap() >= 0.0);
+        assert_eq!(candidate["cpu_percent"], activity["cpu_percent"]);
+        assert!(candidate["cpu_lifetime_percent"].is_number());
+        assert_eq!(candidate["blast_radius"]["cpu_pct"], candidate["cpu_percent"]);
+    }
+    let legacy_candidate = legacy["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["pid"].as_u64() == Some(u64::from(pid)))
+        .expect("single-snapshot candidate");
+    assert_eq!(legacy["args"]["window_ms"], 0);
+    assert!(legacy_candidate["activity"].is_null());
+    assert_eq!(
+        legacy_candidate["cpu_percent"],
+        legacy_candidate["cpu_lifetime_percent"]
+    );
+    assert!(
+        !factors(&legacy).contains(&"io_active".to_string()),
+        "single deep counters must not become current I/O evidence"
     );
     assert!(quick["summary"]["deep_scan_ms"].is_null());
     assert!(

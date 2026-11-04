@@ -102,6 +102,50 @@ fn start_ps_watchdog(pid: u32, timeout: Duration, timed_out: Arc<AtomicBool>) ->
     PsTimeoutGuard(finished)
 }
 
+/// A procfs mount from an ancestor PID namespace can assign unrelated processes
+/// the same numeric PIDs as our child handles. A single NSpid entry proves this
+/// mount uses our current namespace; even equal numbers in a nested chain do not.
+fn procfs_namespace_matches_self(status: &str, local_pid: u32) -> bool {
+    if local_pid == 0 {
+        return false;
+    }
+    let mut entries = status.lines().filter_map(|line| line.strip_prefix("NSpid:"));
+    let Some(entry) = entries.next() else {
+        return false;
+    };
+    if entries.next().is_some() {
+        return false;
+    }
+    let mut pids = entry.split_whitespace();
+    pids.next().and_then(|pid| pid.parse::<u32>().ok()) == Some(local_pid)
+        && pids.next().is_none()
+}
+
+fn collector_pid_for_scan(platform: &str, child_pid: u32) -> Option<u32> {
+    match platform {
+        "linux" => {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            procfs_namespace_matches_self(&status, std::process::id()).then_some(child_pid)
+        }
+        // Native macOS ps and child handles use the same process namespace.
+        "macos" => Some(child_pid),
+        _ => None,
+    }
+}
+
+/// Only full scans omit their owned collector. Keep targeted results and every
+/// row when namespace identity is uncertain; arbitrary missing activity remains
+/// unknown. The caller must still own the unreaped child when this is called.
+fn omit_owned_collector(
+    processes: &mut Vec<ProcessRecord>,
+    collector_pid: Option<u32>,
+    targeted: bool,
+) {
+    if let (false, Some(pid)) = (targeted, collector_pid) {
+        processes.retain(|process| process.pid.0 != pid);
+    }
+}
+
 /// Perform a quick scan of running processes.
 ///
 /// Uses the ps command with a custom format string to collect process
@@ -142,6 +186,7 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
         .map_err(|e| QuickScanError::CommandFailed(e.to_string()))?;
 
     let pid = child.id();
+    let collector_pid = collector_pid_for_scan(&platform, pid);
     // `ps` takes well under a second on a healthy host; the generous default only
     // matters on CPU-starved hosts (the ones most in need of triage), where 10 s
     // made the whole plan fail (ts2 under load, pt at nice 19).
@@ -244,6 +289,12 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr
             }
         }
     }
+
+    // ps exits before the snapshot can be sampled. Leaving its own row in the
+    // inventory would make every complete CPU baseline unavailable. Its PID is
+    // still pinned by our unreaped Child, and only a proven shared namespace may
+    // bind that handle to a row. Preserve all uncertain or explicitly requested rows.
+    omit_owned_collector(&mut processes, collector_pid, !options.pids.is_empty());
 
     // Cancellation waits for any in-progress check/signal before allowing reap.
     drop(guard);
@@ -1017,6 +1068,78 @@ mod tests {
         assert!(is_header_line("pid ppid uid user"));
         assert!(!is_header_line("123 1 0 root"));
         assert!(!is_header_line("999 42 1000 alice"));
+    }
+
+    #[test]
+    fn collector_namespace_proof_rejects_nested_and_ambiguous_pid_mappings() {
+        assert!(procfs_namespace_matches_self("Name: pt-core\nNSpid:\t42\n", 42));
+        for status in [
+            "",
+            "Pid:\t42\n",
+            "NSpid:\t\n",
+            "NSpid:\t43\n",
+            "NSpid:\t4200\t42\n",
+            // Numeric coincidence does not make two namespace levels identical.
+            "NSpid:\t42\t42\n",
+            "NSpid:\t42 junk\n",
+            "NSpid:\t-42\n",
+            "NSpid:\t42\nNSpid:\t42\n",
+        ] {
+            assert!(!procfs_namespace_matches_self(status, 42), "{status:?}");
+        }
+        assert!(!procfs_namespace_matches_self("NSpid:\t0\n", 0));
+    }
+
+    #[test]
+    fn collector_omission_preserves_unrelated_and_explicitly_requested_processes() {
+        let record = |pid, comm: &str| ProcessRecord {
+            pid: ProcessId(pid),
+            ppid: ProcessId(42),
+            uid: 1000,
+            user: "test-user".to_string(),
+            pgid: Some(42),
+            sid: Some(42),
+            start_id: StartId::from_linux("collector-test", 123, pid),
+            comm: comm.to_string(),
+            cmd: comm.to_string(),
+            state: ProcessState::Sleeping,
+            cpu_percent: 2.0,
+            rss_bytes: 1024,
+            vsz_bytes: 2048,
+            tty: None,
+            start_time_unix: 123,
+            elapsed: Duration::from_secs(7200),
+            source: "test".to_string(),
+            container_info: None,
+        };
+        // A different ps process is real inventory; command-name filtering would
+        // incorrectly discard it. The owned collector alone has a pinned PID.
+        let original = vec![record(500, "ps"), record(501, "ps"), record(777, "worker")];
+        let mut full = original.clone();
+        omit_owned_collector(&mut full, Some(500), false);
+        assert_eq!(
+            full.iter().map(|process| process.pid.0).collect::<Vec<_>>(),
+            [501, 777]
+        );
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::to_value(&original[1..]).unwrap()
+        );
+
+        let before = serde_json::to_value(&original).unwrap();
+        for (collector_pid, targeted) in [(None, false), (Some(500), true)] {
+            let mut preserved = original.clone();
+            omit_owned_collector(&mut preserved, collector_pid, targeted);
+            assert_eq!(serde_json::to_value(&preserved).unwrap(), before);
+        }
+
+        // An ancestor procfs mount may show an unrelated process at the child
+        // handle's numeric PID. Failed namespace proof must retain that row.
+        let collector_pid =
+            procfs_namespace_matches_self("NSpid:\t42\t42\n", 42).then_some(500);
+        let mut mismatched = original;
+        omit_owned_collector(&mut mismatched, collector_pid, false);
+        assert_eq!(serde_json::to_value(&mismatched).unwrap(), before);
     }
 
     #[test]
