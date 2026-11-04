@@ -1204,3 +1204,119 @@ fn actual_mcp_plan_child_uses_the_servers_explicit_config() {
         }
     }
 }
+
+#[test]
+fn actual_mcp_scan_and_explain_preserve_config_and_invoker_protection() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let root = std::env::temp_dir().join(format!("pt-mcp-evaluator-{}", uuid::Uuid::new_v4()));
+    let valid = root.join("valid config");
+    let invalid = root.join("invalid config");
+    let invalid_pattern = root.join("invalid protection");
+    let invalid_priors = root.join("invalid priors");
+    for dir in [&valid, &invalid, &invalid_pattern, &invalid_priors] {
+        std::fs::create_dir_all(dir).expect("create retained MCP config");
+    }
+    let mut policy = pt_core::config::Policy::default();
+    // The scan must use this explicit policy, not defaults. No processes need to
+    // be scored; explain still evaluates the requested caller below this floor.
+    policy.guardrails.min_process_age_seconds = u64::MAX;
+    std::fs::write(
+        valid.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).expect("serialize valid policy"),
+    )
+    .expect("write valid policy");
+    std::fs::write(invalid.join("policy.json"), b"{").expect("write malformed policy");
+    policy.guardrails.protected_patterns[0].pattern = "[".to_string();
+    std::fs::write(
+        invalid_pattern.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).expect("serialize malformed protection rule"),
+    )
+    .expect("write invalid protection");
+    std::fs::write(invalid_priors.join("priors.json"), b"{").expect("write malformed priors");
+
+    let caller_pid = std::process::id();
+    let requests = [
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "pt_scan", "arguments": {}}
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "pt_explain", "arguments": {"pid": caller_pid}}
+        }),
+    ];
+    let input = format!("{}\n{}\n", requests[0], requests[1]);
+    std::fs::write(root.join("requests.jsonl"), &input).expect("retain MCP requests");
+    eprintln!("retained MCP evaluator evidence: {}", root.display());
+
+    for (label, explicit, fallback, expected_error) in [
+        ("explicit_valid", Some(&valid), &invalid, false),
+        ("fallback_valid", None, &valid, false),
+        ("fallback_invalid", None, &invalid, true),
+        ("explicit_invalid", Some(&invalid), &valid, true),
+        ("invalid_protection", Some(&invalid_pattern), &valid, true),
+        ("invalid_priors", Some(&invalid_priors), &valid, true),
+    ] {
+        let mut command = cargo_bin_cmd!("pt-core");
+        command
+            .timeout(std::time::Duration::from_secs(120))
+            .env_remove("PT_CONFIG_DIR")
+            .env_remove("PT_SKIP_GLOBAL_LOCK")
+            .env("PROCESS_TRIAGE_CONFIG", fallback)
+            .env("PROCESS_TRIAGE_DATA", root.join(format!("data-{label}")))
+            .env("PROCESS_TRIAGE_RETENTION", "off");
+        if let Some(dir) = explicit {
+            command.arg("--config").arg(dir);
+        }
+        let output = command
+            .arg("mcp")
+            .write_stdin(input.clone())
+            .output()
+            .expect("execute actual MCP scan and explain");
+        std::fs::write(root.join(format!("{label}.stdout")), &output.stdout)
+            .expect("retain MCP stdout");
+        std::fs::write(root.join(format!("{label}.stderr")), &output.stderr)
+            .expect("retain MCP stderr");
+        assert!(output.status.success(), "{label}: {output:?}");
+        let responses: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+            .expect("MCP stdout is UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("actual JSON-RPC response"))
+            .collect();
+        assert_eq!(responses.len(), 2, "{label}: {responses:?}");
+        for (index, response) in responses.iter().enumerate() {
+            assert_eq!(response["id"], index + 1, "{label}: {response}");
+            assert!(response["error"].is_null(), "{label}: {response}");
+            assert_eq!(
+                response["result"]["isError"], expected_error,
+                "{label}: {response}"
+            );
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("tool response text");
+            if expected_error {
+                assert!(
+                    text.starts_with("failed to load config:")
+                        || text.starts_with("failed to load protection rules:"),
+                    "{label}: {text}"
+                );
+                continue;
+            }
+            let result: serde_json::Value = serde_json::from_str(text).expect("tool result JSON");
+            if index == 0 {
+                assert_eq!(result["min_age_seconds"], u64::MAX, "{label}: {result}");
+                assert!(result["total_processes"].as_u64().unwrap() > 0);
+                assert_eq!(result["returned"], 0);
+                assert!(result["processes"].as_array().unwrap().is_empty());
+            } else {
+                assert_eq!(result["pid"], caller_pid, "{label}: {result}");
+                assert_eq!(
+                    result["protected"]["rule"], "builtin.invoker_chain",
+                    "{label}: the actual MCP server must protect its caller: {result}"
+                );
+                assert!(result["posterior"].is_object(), "{label}: {result}");
+            }
+        }
+    }
+}

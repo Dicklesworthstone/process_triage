@@ -2,6 +2,7 @@
 //!
 //! Each tool maps to a pt operation: scan, explain, history, signatures, capabilities.
 
+use crate::collect::protected::{ProtectedFilter, ProtectedMatch};
 #[cfg(target_os = "linux")]
 use crate::collect::ScanMetadata;
 #[cfg(target_os = "linux")]
@@ -12,6 +13,7 @@ use crate::scoring::{load_signature_database, ProcessScore, Scorer};
 use crate::signature_cli::load_user_signatures;
 use crate::supervision::signature::ProcessMatchContext;
 use crate::supervision::{SignatureDatabase, SupervisorCategory};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// The config directory `agent plan` uses (`--config` / `PT_CONFIG_DIR`, then
@@ -83,47 +85,47 @@ fn load_signature_db_with_user_entries() -> SignatureDatabase {
 /// uses (priors, learned verdicts, signatures, desktop-app ownership, provenance).
 struct Evaluator {
     scorer: Scorer,
-    protected: Option<crate::collect::protected::ProtectedFilter>,
+    protected_filter: ProtectedFilter,
+    /// Protection resolved against the complete scan, including ancestors.
+    protected: HashMap<u32, ProtectedMatch>,
     /// `agent plan`'s default age floor for candidates.
     min_age_seconds: u64,
 }
 
 impl Evaluator {
-    fn load() -> Self {
-        match crate::config::load_config(&crate::mcp::config_options()) {
-            Ok(config) => Self {
-                protected: crate::collect::protected::ProtectedFilter::from_guardrails(
-                    &config.policy.guardrails,
-                )
-                .ok(),
-                min_age_seconds: config.policy.guardrails.min_process_age_seconds,
-                scorer: Scorer::from_config(&config).0,
-            },
-            Err(_) => {
-                let policy = crate::config::Policy::default();
-                Self {
-                    protected: crate::collect::protected::ProtectedFilter::from_guardrails(
-                        &policy.guardrails,
-                    )
-                    .ok(),
-                    min_age_seconds: policy.guardrails.min_process_age_seconds,
-                    scorer: Scorer::new(
-                        crate::config::Priors::default(),
-                        Default::default(),
-                        load_signature_db_with_user_entries(),
-                        crate::scoring::fast_path_config(&policy),
-                    ),
-                }
-            }
-        }
+    fn load() -> Result<Self, String> {
+        let config = crate::config::load_config(&crate::mcp::config_options())
+            .map_err(|error| format!("failed to load config: {error}"))?;
+        let protected_filter = ProtectedFilter::from_guardrails(&config.policy.guardrails)
+            .map_err(|error| format!("failed to load protection rules: {error}"))?;
+        Ok(Self {
+            protected_filter,
+            protected: HashMap::new(),
+            min_age_seconds: config.policy.guardrails.min_process_age_seconds,
+            scorer: Scorer::from_config(&config).0,
+        })
     }
 
     /// Collect provenance as `agent plan` does: for the unprotected processes old
     /// enough to be candidates, plus `extra` (processes asked about explicitly).
-    fn collect_provenance(&mut self, processes: &[ProcessRecord], extra: &[&ProcessRecord]) {
-        let mut set: Vec<&ProcessRecord> = processes
+    fn collect_provenance(&mut self, scan: &ScanResult, extra: &[&ProcessRecord]) {
+        // A per-process check misses the calling shell/agent and workers whose
+        // service ownership is only visible through their ancestors. Use the same
+        // full-scan filter as `agent plan`, before age/score filtering hides parents.
+        self.protected = self
+            .protected_filter
+            .filter_scan_result(scan)
+            .filtered
+            .into_iter()
+            .map(|protection| (protection.pid, protection))
+            .collect();
+        let mut set: Vec<&ProcessRecord> = scan
+            .processes
             .iter()
-            .filter(|p| p.elapsed.as_secs() >= self.min_age_seconds && self.protection(p).is_null())
+            .filter(|p| {
+                p.elapsed.as_secs() >= self.min_age_seconds
+                    && !self.protected.contains_key(&p.pid.0)
+            })
             .collect();
         for process in extra {
             if !set.iter().any(|p| p.pid == process.pid) {
@@ -147,11 +149,7 @@ impl Evaluator {
 
     /// `{rule, notes}` if `agent plan` would skip this process as protected.
     fn protection(&self, process: &ProcessRecord) -> serde_json::Value {
-        match self
-            .protected
-            .as_ref()
-            .and_then(|f| f.is_protected(process))
-        {
+        match self.protected.get(&process.pid.0) {
             Some(m) => serde_json::json!({ "rule": m.pattern, "notes": m.notes }),
             None => serde_json::Value::Null,
         }
@@ -350,15 +348,14 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         .get("min_score")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
+    let mut evaluator = Evaluator::load()?;
     let scan_result = collect_scan_result(deep)?;
-    let db = load_signature_db_with_user_entries();
-    let mut evaluator = Evaluator::load();
     // `agent plan`'s age floor: a process younger than this is never a candidate, so
     // scoring it would only invite acting on a busy new process.
     if let Some(min_age) = params.get("min_age").and_then(|v| v.as_u64()) {
         evaluator.min_age_seconds = min_age;
     }
-    evaluator.collect_provenance(&scan_result.processes, &[]);
+    evaluator.collect_provenance(&scan_result, &[]);
 
     // Score = P(abandoned or zombie) from the same posterior `agent plan` uses (it was
     // a signature-match score plus a state bonus, not a probability).
@@ -375,7 +372,13 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         let score = posterior.abandonment_probability();
         if score >= min_score {
             let protected = evaluator.protection(p);
-            candidates.push((p, score, posterior, protected, top_signature(p, &db)));
+            candidates.push((
+                p,
+                score,
+                posterior,
+                protected,
+                top_signature(p, &evaluator.scorer.signatures),
+            ));
         }
     }
 
@@ -433,6 +436,7 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
         return Err("Either 'pid' or 'comm' must be provided".to_string());
     }
 
+    let mut evaluator = Evaluator::load()?;
     // Run a quick scan to find the process
     let options = QuickScanOptions::default();
     let scan = quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))?;
@@ -459,12 +463,9 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 parent_comm: None,
             };
 
-            let db = load_signature_db_with_user_entries();
-            let matches = db.match_process(&ctx);
-
             // The same score and protection rules `agent plan` uses.
-            let mut evaluator = Evaluator::load();
-            evaluator.collect_provenance(&scan.processes, &[p]);
+            evaluator.collect_provenance(&scan, &[p]);
+            let matches = evaluator.scorer.signatures.match_process(&ctx);
             let score = evaluator.score(p);
             let evidence_terms: Vec<serde_json::Value> = score
                 .as_ref()
@@ -704,6 +705,116 @@ fn tool_capabilities(_params: &serde_json::Value) -> Result<Vec<ToolContent>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn protection_test_scan() -> ScanResult {
+        const BASE: u32 = 1 << 22;
+        let processes: Vec<ProcessRecord> = [
+            (std::process::id(), BASE + 1, "pt-core"),
+            (BASE + 1, BASE + 2, "bash"),
+            (BASE + 2, 1, "cargo"),
+            (BASE + 10, 1, "mattermost"),
+            (BASE + 11, BASE + 10, "plugin-worker"),
+            (BASE + 12, BASE + 11, "worker-child"),
+            (BASE + 20, BASE + 21, "unrelated-worker"),
+        ]
+        .into_iter()
+        .map(|(pid, ppid, comm)| ProcessRecord {
+            pid: pt_common::ProcessId(pid),
+            ppid: pt_common::ProcessId(ppid),
+            uid: 1000,
+            user: "test-user".to_string(),
+            pgid: Some(pid),
+            sid: Some(pid),
+            start_id: pt_common::StartId::from_linux("test-boot", 1234567890, pid),
+            comm: comm.to_string(),
+            cmd: comm.to_string(),
+            state: crate::collect::ProcessState::Sleeping,
+            cpu_percent: 0.0,
+            rss_bytes: 1024,
+            vsz_bytes: 2048,
+            tty: None,
+            start_time_unix: 1234567890,
+            elapsed: std::time::Duration::ZERO,
+            source: "test".to_string(),
+            container_info: None,
+        })
+        .collect();
+        ScanResult {
+            metadata: crate::collect::ScanMetadata {
+                scan_type: "quick".to_string(),
+                platform: std::env::consts::OS.to_string(),
+                boot_id: None,
+                started_at: "2026-10-06T12:00:00Z".to_string(),
+                duration_ms: 0,
+                process_count: processes.len(),
+                warnings: Vec::new(),
+            },
+            processes,
+        }
+    }
+
+    fn protection_test_evaluator(protected_filter: ProtectedFilter) -> Evaluator {
+        Evaluator {
+            scorer: Scorer::new(
+                crate::config::Priors::default(),
+                Default::default(),
+                SignatureDatabase::new(),
+                crate::scoring::fast_path_config(&crate::config::Policy::default()),
+            ),
+            protected_filter,
+            protected: HashMap::new(),
+            // Every record is below the age floor: ancestors must still protect
+            // their descendants, without probing synthetic PIDs for provenance.
+            min_age_seconds: 3600,
+        }
+    }
+
+    #[test]
+    fn evaluator_resolves_invoker_and_service_ancestors_before_age_filtering() {
+        let mut scan = protection_test_scan();
+        let filter = ProtectedFilter::new(&[], &[], &[], &[])
+            .unwrap()
+            .with_builtin_protection(true);
+        let mut evaluator = protection_test_evaluator(filter);
+        evaluator.collect_provenance(&scan, &[]);
+
+        for process in &scan.processes[..3] {
+            assert_eq!(
+                evaluator.protection(process)["rule"],
+                "builtin.invoker_chain",
+                "caller {} lost its protection",
+                process.pid.0
+            );
+        }
+        for process in &scan.processes[4..6] {
+            let protection = evaluator.protection(process);
+            assert_eq!(protection["rule"], "builtin.service_child");
+            assert!(protection["notes"].as_str().unwrap().contains("mattermost"));
+        }
+        assert!(evaluator.protection(&scan.processes[6]).is_null());
+
+        // Protection belongs to this snapshot, not a previous occupant of a PID.
+        scan.processes[4].ppid = scan.processes[6].ppid;
+        evaluator.collect_provenance(&scan, &[]);
+        assert!(evaluator.protection(&scan.processes[4]).is_null());
+        assert!(evaluator.protection(&scan.processes[5]).is_null());
+    }
+
+    #[test]
+    fn evaluator_honors_explicit_protection_when_builtin_rules_are_disabled() {
+        let scan = protection_test_scan();
+        let protected_pid = scan.processes[4].pid.0;
+        let filter = ProtectedFilter::new(&[], &[], &[protected_pid], &[]).unwrap();
+        let mut evaluator = protection_test_evaluator(filter);
+        evaluator.collect_provenance(&scan, &[]);
+
+        assert!(evaluator.protection(&scan.processes[0]).is_null());
+        assert_eq!(
+            evaluator.protection(&scan.processes[4])["rule"],
+            format!("never_kill_pid[{protected_pid}]")
+        );
+        assert!(evaluator.protection(&scan.processes[5]).is_null());
+    }
 
     #[test]
     fn tool_definitions_not_empty() {
