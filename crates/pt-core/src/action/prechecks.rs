@@ -16,6 +16,7 @@ use crate::collect::systemd::collect_systemd_unit;
 use crate::collect::systemd::{SystemdUnit, SystemdUnitType};
 use crate::collect::ProcessState;
 use crate::config::policy::{DataLossGates, Guardrails};
+use crate::decision::Action;
 use crate::plan::PreCheck;
 use crate::supervision::session::{SessionAnalyzer, SessionConfig, SessionProtectionType};
 use crate::supervision::{detect_supervision, is_human_supervised, SupervisorCategory};
@@ -251,6 +252,12 @@ pub trait PreCheckProvider {
     /// Reads comm, cmd, user from /proc to validate current state.
     fn check_not_protected(&self, pid: u32) -> PreCheckResult;
 
+    /// Action-aware protection, so restorative actions can release a FUSE
+    /// server that was stopped before it was recognized as infrastructure.
+    fn check_not_protected_for_action(&self, pid: u32, _action: Action) -> PreCheckResult {
+        self.check_not_protected(pid)
+    }
+
     /// Check for data loss risk (open write handles, etc.).
     fn check_data_loss(&self, pid: u32) -> PreCheckResult;
 
@@ -296,6 +303,76 @@ pub trait PreCheckProvider {
                 PreCheck::VerifyProcessState => Some(self.check_process_state(pid)),
             })
             .collect()
+    }
+
+    /// Run protection first with the intended action, then the remaining gates
+    /// in their listed order. Stop at the first refusal: later probes may follow
+    /// paths on a mount whose server the infrastructure gate identifies as unsafe.
+    /// Identity verification remains the caller's responsibility.
+    fn run_checks_for_action(
+        &self,
+        checks: &[PreCheck],
+        pid: u32,
+        sid: Option<u32>,
+        action: Action,
+    ) -> Vec<PreCheckResult> {
+        let mut results = Vec::new();
+        // A stale or edited plan can list data-loss probes ahead of protection.
+        // Do not touch their filesystem targets until infrastructure is checked.
+        if checks.contains(&PreCheck::CheckNotProtected) {
+            let result = self.check_not_protected_for_action(pid, action);
+            let blocked = !result.is_passed();
+            results.push(result);
+            if blocked {
+                return results;
+            }
+        }
+        for check in checks {
+            let result = match check {
+                // Identity is handled by IdentityProvider; protection ran above.
+                PreCheck::VerifyIdentity | PreCheck::CheckNotProtected => continue,
+                PreCheck::CheckDataLossGate => self.check_data_loss(pid),
+                PreCheck::CheckSupervisor => self.check_supervisor(pid),
+                PreCheck::CheckAgentSupervision => self.check_agent_supervision(pid),
+                PreCheck::CheckSessionSafety => self.check_session_safety(pid, sid),
+                PreCheck::VerifyProcessState => self.check_process_state(pid),
+            };
+            let blocked = !result.is_passed();
+            results.push(result);
+            if blocked {
+                break;
+            }
+        }
+        results
+    }
+}
+
+/// Refuse disruptive actions when a Linux FUSE server is present or its device
+/// descriptors cannot be inspected. Recovery actions remain available so an
+/// already stopped or restricted server can resume serving its mounts.
+#[cfg(target_os = "linux")]
+pub fn fuse_action_precheck(evidence: Option<bool>, action: Action) -> PreCheckResult {
+    if matches!(
+        action,
+        Action::Keep | Action::Resume | Action::Unfreeze | Action::Unquarantine
+    ) {
+        return PreCheckResult::Passed;
+    }
+    match evidence {
+        Some(false) => PreCheckResult::Passed,
+        Some(true) => PreCheckResult::Blocked {
+            check: PreCheck::CheckNotProtected,
+            reason: format!(
+                "{}: {}",
+                crate::collect::protected::FUSE_SERVER_RULE,
+                crate::collect::protected::FUSE_SERVER_NOTES
+            ),
+        },
+        None => PreCheckResult::Blocked {
+            check: PreCheck::CheckNotProtected,
+            reason: "cannot inspect FUSE device descriptors; refusing without complete infrastructure evidence"
+                .to_string(),
+        },
     }
 }
 
@@ -1184,6 +1261,10 @@ impl LivePreCheckProvider {
 
 impl PreCheckProvider for LivePreCheckProvider {
     fn check_not_protected(&self, pid: u32) -> PreCheckResult {
+        self.check_not_protected_for_action(pid, Action::Kill)
+    }
+
+    fn check_not_protected_for_action(&self, pid: u32, _action: Action) -> PreCheckResult {
         trace!(pid, "checking protection status");
 
         // Read current process state from /proc for TOCTOU safety
@@ -1219,6 +1300,18 @@ impl PreCheckProvider for LivePreCheckProvider {
                         check: PreCheck::CheckNotProtected,
                         reason: format!("{rule}: {notes}"),
                     };
+                }
+                // Prefer direct descriptor evidence to ancestry heuristics so
+                // a FUSE server always gets mount-specific remediation.
+                #[cfg(target_os = "linux")]
+                {
+                    let result = fuse_action_precheck(
+                        crate::collect::protected::holds_fuse_device(pid),
+                        _action,
+                    );
+                    if !result.is_passed() {
+                        return result;
+                    }
                 }
                 if let Some((daemon_pid, daemon)) =
                     crate::collect::protected::live_service_ancestor(pid)
@@ -1610,6 +1703,118 @@ impl PreCheckProvider for NoopPreCheckProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_prechecks_block_disruption_and_unknown_descriptors() {
+        for action in [
+            Action::Pause,
+            Action::Freeze,
+            Action::Throttle,
+            Action::Quarantine,
+            Action::Renice,
+            Action::Restart,
+            Action::Kill,
+        ] {
+            assert!(matches!(
+                fuse_action_precheck(Some(true), action),
+                PreCheckResult::Blocked { check: PreCheck::CheckNotProtected, reason }
+                    if reason.contains("builtin.fuse_server") && reason.contains("fusermount -u")
+            ));
+            assert!(matches!(
+                fuse_action_precheck(None, action),
+                PreCheckResult::Blocked { reason, .. }
+                    if reason.contains("complete infrastructure evidence")
+            ));
+            assert!(fuse_action_precheck(Some(false), action).is_passed());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_prechecks_allow_actions_that_restore_mount_access() {
+        for action in [
+            Action::Keep,
+            Action::Resume,
+            Action::Unfreeze,
+            Action::Unquarantine,
+        ] {
+            for evidence in [Some(true), Some(false), None] {
+                assert!(fuse_action_precheck(evidence, action).is_passed());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn action_prechecks_stop_after_refusal_and_preserve_recovery() {
+        // This provider makes unsafe probe ordering observable without ever
+        // hanging a real mount. It uses the production FUSE refusal logic.
+        #[derive(Default)]
+        struct FuseHolderProvider {
+            calls: std::cell::RefCell<Vec<&'static str>>,
+            refused: std::cell::Cell<bool>,
+        }
+
+        impl PreCheckProvider for FuseHolderProvider {
+            fn check_not_protected(&self, _pid: u32) -> PreCheckResult {
+                panic!("action-aware dispatch must supply the intended action");
+            }
+
+            fn check_not_protected_for_action(&self, _pid: u32, action: Action) -> PreCheckResult {
+                self.calls.borrow_mut().push("protection");
+                let result = fuse_action_precheck(Some(true), action);
+                self.refused.set(!result.is_passed());
+                result
+            }
+
+            fn check_data_loss(&self, _pid: u32) -> PreCheckResult {
+                assert!(!self.refused.get(), "must not probe a refused FUSE server");
+                self.calls.borrow_mut().push("data_loss");
+                PreCheckResult::Passed
+            }
+
+            fn check_supervisor(&self, _pid: u32) -> PreCheckResult {
+                self.calls.borrow_mut().push("supervisor");
+                PreCheckResult::Passed
+            }
+
+            fn check_session_safety(&self, _pid: u32, _sid: Option<u32>) -> PreCheckResult {
+                self.calls.borrow_mut().push("session");
+                PreCheckResult::Passed
+            }
+        }
+
+        let checks = [
+            PreCheck::VerifyIdentity,
+            // Even an edited plan with data-loss first must refuse before any
+            // path-following probe; duplicate protection is evaluated once.
+            PreCheck::CheckDataLossGate,
+            PreCheck::CheckSessionSafety,
+            PreCheck::CheckNotProtected,
+            PreCheck::CheckSupervisor,
+            PreCheck::CheckNotProtected,
+        ];
+        for action in [Action::Pause, Action::Freeze, Action::Kill] {
+            let provider = FuseHolderProvider::default();
+            let results = provider.run_checks_for_action(&checks, 123, None, action);
+            assert!(matches!(
+                results.as_slice(),
+                [PreCheckResult::Blocked { .. }]
+            ));
+            assert_eq!(*provider.calls.borrow(), vec!["protection"]);
+        }
+        for action in [Action::Resume, Action::Unfreeze, Action::Unquarantine] {
+            let provider = FuseHolderProvider::default();
+            let results = provider.run_checks_for_action(&checks, 123, None, action);
+            assert_eq!(results.len(), 4);
+            assert!(results.iter().all(PreCheckResult::is_passed));
+            assert_eq!(
+                *provider.calls.borrow(),
+                vec!["protection", "data_loss", "session", "supervisor"]
+            );
+        }
+    }
 
     #[test]
     fn proc_locks_parses_holders_and_waiters() {
@@ -3091,6 +3296,67 @@ while True:
                 matches!(provider.check_data_loss(u32::MAX), PreCheckResult::Blocked { reason, .. }
                 if reason.contains("complete data-loss evidence"))
             );
+        }
+
+        #[test]
+        fn infrastructure_gate_refuses_unreadable_fuse_descriptors() {
+            let provider = LivePreCheckProvider::with_defaults();
+            assert!(matches!(
+                provider.check_not_protected(u32::MAX),
+                PreCheckResult::Blocked { reason, .. }
+                    if reason.contains("cannot inspect FUSE device descriptors")
+            ));
+        }
+
+        #[test]
+        fn live_provider_refuses_inherited_fuse_device() {
+            use std::process::{Command, Stdio};
+
+            let device = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/fuse")
+            {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("SKIP live FUSE descriptor test: /dev/fuse unavailable: {error}");
+                    return;
+                }
+            };
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let child = OwnedChild(
+                Command::new("sleep")
+                    .arg("300")
+                    .stdin(Stdio::from(device))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn disposable FUSE holder"),
+            );
+            let provider = LivePreCheckProvider::with_defaults();
+            assert_eq!(
+                crate::collect::protected::holds_fuse_device(child.0.id()),
+                Some(true)
+            );
+            for action in [Action::Pause, Action::Freeze, Action::Kill] {
+                let results = provider.run_checks_for_action(
+                    &[PreCheck::CheckNotProtected],
+                    child.0.id(),
+                    None,
+                    action,
+                );
+                assert!(matches!(
+                    results.as_slice(),
+                    [PreCheckResult::Blocked { reason, .. }]
+                        if reason.contains("builtin.fuse_server") && reason.contains("fusermount -u")
+                ));
+            }
         }
 
         #[test]

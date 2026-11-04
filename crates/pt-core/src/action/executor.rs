@@ -225,7 +225,7 @@ impl<'a> ActionExecutor<'a> {
         if let Some(provider) = self.pre_check_provider {
             let pid = action.target.pid.0;
             let sid = action.target.sid;
-            let results = provider.run_checks(&pre_checks, pid, sid);
+            let results = provider.run_checks_for_action(&pre_checks, pid, sid, action.action);
 
             // If any pre-check fails, block the action
             for result in results {

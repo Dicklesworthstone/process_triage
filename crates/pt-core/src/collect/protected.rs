@@ -798,6 +798,138 @@ pub fn builtin_force_review_match(cmd: &str) -> Option<(&'static str, &'static s
     builtin_match(&BUILTIN_FORCE_REVIEW, "", cmd)
 }
 
+/// Live FUSE servers are infrastructure for every process accessing their mounts.
+pub const FUSE_SERVER_RULE: &str = "builtin.fuse_server";
+
+/// Remediation guidance shared by recommendations and execution pre-checks.
+pub const FUSE_SERVER_NOTES: &str =
+    "holds /dev/fuse: stopping the server can hang every mount accessor, and killing it can strand the mount; review its mounts and unmount with fusermount -u <mountpoint> first";
+
+/// Whether a process holds the Linux FUSE device open.
+///
+/// Only read procfs descriptor symlinks; following them or stat'ing a mount can
+/// itself hang on an unhealthy FUSE server. An open device is sufficient for a
+/// conservative refusal even when the mount cannot be attributed to this PID.
+/// `None` means inspection was incomplete, or the platform is unsupported.
+pub fn holds_fuse_device(pid: u32) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        fuse_device_in_fd_table(std::path::Path::new(&format!("/proc/{pid}/fd")))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_device_in_fd_table(directory: &std::path::Path) -> Option<bool> {
+    let entries = std::fs::read_dir(directory).ok()?;
+    let mut complete = true;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        match std::fs::read_link(entry.path()) {
+            Ok(target) if target == std::path::Path::new("/dev/fuse") => return Some(true),
+            Ok(_) => {}
+            // Descriptors may close while the directory is being enumerated.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => complete = false,
+        }
+    }
+    complete.then_some(false)
+}
+
+/// Best-effort mount attribution for display, never evidence that a server is safe.
+///
+/// A mount is attributed only when a FUSE entry in the target's mount namespace
+/// has a mountpoint exactly present in that process's argv (including an option
+/// value). This deliberately omits mounts when a daemon drops its mount argument.
+/// No mount path is opened, canonicalized or stat'ed.
+pub fn fuse_mountpoints(pid: u32) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return Vec::new();
+        };
+        let Ok(mountinfo) = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")) else {
+            return Vec::new();
+        };
+        fuse_mountpoints_from_inputs(&mountinfo, &cmdline)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_mountpoints_from_inputs(mountinfo: &str, cmdline: &[u8]) -> Vec<String> {
+    let arguments: Vec<&[u8]> = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect();
+    let mut mounts = std::collections::BTreeSet::new();
+    for line in mountinfo.lines() {
+        let Some((mount, filesystem)) = line.split_once(" - ") else {
+            continue;
+        };
+        let Some(kind) = filesystem.split_whitespace().next() else {
+            continue;
+        };
+        if kind != "fuse" && kind != "fuseblk" && !kind.starts_with("fuse.") {
+            continue;
+        }
+        let Some(encoded) = mount.split_whitespace().nth(4) else {
+            continue;
+        };
+        let Some(mountpoint) = decode_mountinfo_path(encoded.as_bytes()) else {
+            continue;
+        };
+        if arguments.iter().any(|argument| {
+            *argument == mountpoint.as_slice()
+                || (argument.starts_with(b"-")
+                    && argument
+                        .splitn(2, |byte| *byte == b'=')
+                        .nth(1)
+                        .is_some_and(|value| value == mountpoint.as_slice()))
+        }) {
+            mounts.insert(String::from_utf8_lossy(&mountpoint).into_owned());
+        }
+    }
+    mounts.into_iter().collect()
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo_path(encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut cursor = 0;
+    while cursor < encoded.len() {
+        if encoded[cursor] != b'\\' {
+            decoded.push(encoded[cursor]);
+            cursor += 1;
+            continue;
+        }
+        let escaped = encoded.get(cursor + 1..cursor + 4)?;
+        decoded.push(match escaped {
+            b"040" => b' ',
+            b"011" => b'\t',
+            b"012" => b'\n',
+            b"134" => b'\\',
+            _ => return None,
+        });
+        cursor += 4;
+    }
+    Some(decoded)
+}
+
 /// Which AI agent CLI a command line runs (`claude`, `codex`, `gemini`, `cursor`,
 /// `aider`, ...), for processes the agent-CLI rule matches; `None` otherwise.
 pub fn agent_kind(cmd: &str) -> Option<&'static str> {
@@ -1099,6 +1231,72 @@ mod tests {
     use super::*;
     use pt_common::{ProcessId, StartId};
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_device_detection_reads_descriptor_links_without_following_them() {
+        let table = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/null", table.path().join("0")).unwrap();
+        std::os::unix::fs::symlink("socket:[123]", table.path().join("1")).unwrap();
+        std::os::unix::fs::symlink("/unavailable/mount/file", table.path().join("2")).unwrap();
+        assert_eq!(fuse_device_in_fd_table(table.path()), Some(false));
+
+        // The device need not exist in the test namespace: only procfs link
+        // text is read, never the potentially blocked descriptor target.
+        std::os::unix::fs::symlink("/dev/fuse", table.path().join("3")).unwrap();
+        assert_eq!(fuse_device_in_fd_table(table.path()), Some(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_device_detection_preserves_incomplete_evidence() {
+        let table = tempfile::tempdir().unwrap();
+        assert_eq!(fuse_device_in_fd_table(&table.path().join("missing")), None);
+        std::fs::write(table.path().join("0"), b"not a procfs descriptor link").unwrap();
+        assert_eq!(fuse_device_in_fd_table(table.path()), None);
+        // A positively identified device remains sufficient to refuse an
+        // action, even if another descriptor could not be read.
+        std::os::unix::fs::symlink("/dev/fuse", table.path().join("1")).unwrap();
+        assert_eq!(fuse_device_in_fd_table(table.path()), Some(true));
+        assert_eq!(holds_fuse_device(u32::MAX), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_mount_attribution_requires_exact_arguments_and_fuse_filesystem() {
+        let mountinfo = concat!(
+            "10 1 0:21 / /mnt/other rw - fuse.sshfs remote rw\n",
+            "11 1 0:22 / /mnt/fs rw - ext4 /dev/sda rw\n",
+            "12 1 0:23 / /mnt/fs-more rw - fuse.ffs frankenfs rw\n",
+            "13 1 0:24 / /mnt/fuse\\040space rw - fuse.ffs frankenfs rw\n",
+            "14 1 0:25 / /mnt/block rw - fuseblk disk rw\n",
+            "15 1 0:26 / /mnt/option rw - fuse generic rw\n",
+            "16 1 0:24 / /mnt/fuse\\040space rw - fuse.ffs frankenfs rw\n",
+        );
+        let mounts = fuse_mountpoints_from_inputs(
+            mountinfo,
+            b"ffs-cli\0mount\0/mnt/fs\0/mnt/fuse space\0/mnt/block\0--mountpoint=/mnt/option\0",
+        );
+        assert_eq!(mounts, vec!["/mnt/block", "/mnt/fuse space", "/mnt/option"]);
+        assert!(fuse_mountpoints_from_inputs(mountinfo, b"ffs-cli\0mount\0").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fuse_mount_attribution_decodes_procfs_escapes_and_ignores_malformed_rows() {
+        assert_eq!(
+            decode_mountinfo_path(br"/mnt/space\040tab\011line\012slash\134"),
+            Some(b"/mnt/space tab\tline\nslash\\".to_vec())
+        );
+        for invalid in [br"/mnt/\".as_slice(), br"/mnt/\04", br"/mnt/\999"] {
+            assert_eq!(decode_mountinfo_path(invalid), None);
+        }
+        assert!(fuse_mountpoints_from_inputs(
+            "broken row\n1 2 3 - fuse foo rw\n1 2 3 / /mnt/\\999 rw - fuse foo rw\n",
+            b"server\0/mnt/\\999\0"
+        )
+        .is_empty());
+    }
 
     fn make_test_record(pid: u32, ppid: u32, comm: &str, cmd: &str, user: &str) -> ProcessRecord {
         ProcessRecord {
