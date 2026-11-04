@@ -328,6 +328,38 @@ pub fn compute_posterior(
     });
 
     if let Some(cpu) = &evidence.cpu {
+        // Keep validating every configured CPU prior, including the zombie
+        // parameters that no longer contribute a separate likelihood below.
+        for (field, beta) in [
+            ("classes.useful.cpu_beta", &priors.classes.useful.cpu_beta),
+            (
+                "classes.useful_bad.cpu_beta",
+                &priors.classes.useful_bad.cpu_beta,
+            ),
+            (
+                "classes.abandoned.cpu_beta",
+                &priors.classes.abandoned.cpu_beta,
+            ),
+            ("classes.zombie.cpu_beta", &priors.classes.zombie.cpu_beta),
+        ] {
+            if !beta.alpha.is_finite()
+                || !beta.beta.is_finite()
+                || beta.alpha <= 0.0
+                || beta.beta <= 0.0
+            {
+                return Err(PosteriorError::InvalidPriors {
+                    field,
+                    message: "CPU beta parameters must be finite and > 0".to_string(),
+                });
+            }
+        }
+
+        let idle_likelihood = log_lik_cpu(
+            cpu,
+            &priors.classes.abandoned,
+            priors,
+            cache.abandoned.cpu_beta.as_ref(),
+        )?;
         let term = ClassScores {
             useful: log_lik_cpu(
                 cpu,
@@ -341,18 +373,13 @@ pub fn compute_posterior(
                 priors,
                 cache.useful_bad.cpu_beta.as_ref(),
             )?,
-            abandoned: log_lik_cpu(
-                cpu,
-                &priors.classes.abandoned,
-                priors,
-                cache.abandoned.cpu_beta.as_ref(),
-            )?,
-            zombie: log_lik_cpu(
-                cpu,
-                &priors.classes.zombie,
-                priors,
-                cache.zombie.cpu_beta.as_ref(),
-            )?,
+            abandoned: idle_likelihood,
+            // CPU activity cannot distinguish an idle process from a zombie;
+            // the observed kernel state supplies that distinction. A separate
+            // zombie Beta(1,100) dominated the robust clipping reference near
+            // zero CPU, making 0% CPU weaker abandonment evidence than 3%.
+            // Share the idle likelihood before clipping for both CPU formats.
+            zombie: idle_likelihood,
         };
         evidence_terms.push(EvidenceTerm {
             feature: "cpu".to_string(),
@@ -1066,6 +1093,243 @@ mod tests {
         };
         let result = compute_posterior(&priors, &evidence).expect("posterior");
         assert!(approx_eq(result.posterior.useful, 0.25, 1e-12));
+    }
+
+    fn cpu_term(result: &PosteriorResult) -> ClassScores {
+        result
+            .evidence_terms
+            .iter()
+            .find(|term| term.feature == "cpu")
+            .expect("CPU evidence in the production ledger")
+            .log_likelihood
+    }
+
+    /// bd-sbcb: the independent zombie CPU likelihood previously set the clip
+    /// reference near zero and made a busier process look more abandoned.
+    #[test]
+    fn cpu_fraction_idle_evidence_is_monotone() {
+        let priors = Priors::default();
+        let mut previous_term_odds = f64::INFINITY;
+        let mut previous_posterior_odds = f64::INFINITY;
+        for step in 0..=1000 {
+            let occupancy = f64::from(step) / 10_000.0;
+            let result = compute_posterior(
+                &priors,
+                &Evidence {
+                    cpu: Some(CpuEvidence::Fraction { occupancy }),
+                    ..Evidence::default()
+                },
+            )
+            .expect("posterior");
+            let term = cpu_term(&result);
+            let term_odds = term.abandoned - term.useful;
+            assert!(
+                term_odds <= previous_term_odds + 1e-12,
+                "CPU {occupancy}: abandonment evidence increased from {previous_term_odds} to {term_odds}"
+            );
+            assert!(result.log_odds_abandoned_useful <= previous_posterior_odds + 1e-12);
+            assert!(term_odds.abs() <= TERM_CLIP_NATS * EVIDENCE_TEMPERING + 1e-12);
+            previous_term_odds = term_odds;
+            previous_posterior_odds = result.log_odds_abandoned_useful;
+        }
+    }
+
+    #[test]
+    fn cpu_binomial_idle_evidence_is_monotone() {
+        let priors = Priors::default();
+        for eta in [None, Some(0.5)] {
+            let mut previous_term_odds = f64::INFINITY;
+            for k in 0..=1000 {
+                let result = compute_posterior(
+                    &priors,
+                    &Evidence {
+                        cpu: Some(CpuEvidence::Binomial {
+                            k: f64::from(k),
+                            n: 10_000.0,
+                            eta,
+                        }),
+                        ..Evidence::default()
+                    },
+                )
+                .expect("posterior");
+                let term = cpu_term(&result);
+                let term_odds = term.abandoned - term.useful;
+                assert!(
+                    term_odds <= previous_term_odds + 1e-9,
+                    "CPU {k}/10000, eta {eta:?}: abandonment evidence increased from {previous_term_odds} to {term_odds}"
+                );
+                previous_term_odds = term_odds;
+            }
+        }
+    }
+
+    #[test]
+    fn zero_cpu_does_not_look_more_useful_than_three_percent() {
+        let priors = Priors::default();
+        let score = |occupancy| {
+            compute_posterior(
+                &priors,
+                &Evidence {
+                    cpu: Some(CpuEvidence::Fraction { occupancy }),
+                    state_flag: Some(1), // Sleeping, not a kernel-reported zombie.
+                    ..Evidence::default()
+                },
+            )
+            .expect("posterior")
+        };
+        let idle = score(0.0);
+        let busy = score(0.03);
+        assert!(idle.posterior.useful <= busy.posterior.useful + 1e-12);
+        assert!(idle.posterior.abandoned + 1e-12 >= busy.posterior.abandoned);
+        assert!(
+            idle.posterior.abandonment_probability() + 1e-12
+                >= busy.posterior.abandonment_probability()
+        );
+    }
+
+    #[test]
+    fn cpu_evidence_does_not_distinguish_zombies_from_abandoned_processes() {
+        let priors = Priors::default();
+        let expected_odds =
+            (priors.classes.zombie.prior_prob / priors.classes.abandoned.prior_prob).ln();
+        let mut other_zombie_cpu = priors.clone();
+        other_zombie_cpu.classes.zombie.cpu_beta = BetaParams::new(20.0, 0.2);
+        for cpu in [
+            CpuEvidence::Fraction { occupancy: 0.0 },
+            CpuEvidence::Fraction { occupancy: 0.03 },
+            CpuEvidence::Fraction { occupancy: 0.5 },
+            CpuEvidence::Fraction { occupancy: 1.0 },
+            CpuEvidence::Binomial {
+                k: 0.0,
+                n: 100.0,
+                eta: None,
+            },
+            CpuEvidence::Binomial {
+                k: 3.0,
+                n: 100.0,
+                eta: Some(0.5),
+            },
+        ] {
+            let evidence = Evidence {
+                cpu: Some(cpu),
+                ..Evidence::default()
+            };
+            let result = compute_posterior(&priors, &evidence).expect("posterior");
+            let term = cpu_term(&result);
+            assert_eq!(term.zombie, term.abandoned);
+            assert!(approx_eq(
+                result.log_posterior.zombie - result.log_posterior.abandoned,
+                expected_odds,
+                1e-12,
+            ));
+            assert_eq!(
+                result,
+                compute_posterior(&other_zombie_cpu, &evidence).expect("posterior"),
+                "CPU evidence must not infer zombie-ness from another idle prior"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_terminal_state_still_identifies_zombies_with_cpu_evidence() {
+        let priors = Priors::default();
+        let flags = priors.state_flags.as_ref().expect("default kernel states");
+        for state_name in ["Zombie", "Dead"] {
+            let state_flag = flags
+                .flag_names
+                .iter()
+                .position(|name| name == state_name)
+                .expect("terminal state");
+            let state_only = compute_posterior(
+                &priors,
+                &Evidence {
+                    state_flag: Some(state_flag),
+                    ..Evidence::default()
+                },
+            )
+            .expect("posterior");
+            for cpu in [
+                CpuEvidence::Fraction { occupancy: 0.0 },
+                CpuEvidence::Fraction { occupancy: 0.03 },
+                CpuEvidence::Binomial {
+                    k: 0.0,
+                    n: 100.0,
+                    eta: None,
+                },
+            ] {
+                let result = compute_posterior(
+                    &priors,
+                    &Evidence {
+                        cpu: Some(cpu),
+                        state_flag: Some(state_flag),
+                        ..Evidence::default()
+                    },
+                )
+                .expect("posterior");
+                assert!(result.posterior.zombie > 0.8, "{state_name}: {result:?}");
+                assert!(approx_eq(
+                    result.log_posterior.zombie - result.log_posterior.abandoned,
+                    state_only.log_posterior.zombie - state_only.log_posterior.abandoned,
+                    1e-12,
+                ));
+                let total = result
+                    .evidence_terms
+                    .iter()
+                    .fold(ClassScores::default(), |sum, term| {
+                        add_scores(sum, term.log_likelihood)
+                    });
+                assert!(approx_eq(
+                    result.log_odds_abandoned_useful,
+                    total.abandoned - total.useful,
+                    1e-12,
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn posterior_cpu_rejects_invalid_beta_priors_for_every_class() {
+        for class_name in ["useful", "useful_bad", "abandoned", "zombie"] {
+            for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                for invalid_alpha in [true, false] {
+                    let mut priors = Priors::default();
+                    let class = match class_name {
+                        "useful" => &mut priors.classes.useful,
+                        "useful_bad" => &mut priors.classes.useful_bad,
+                        "abandoned" => &mut priors.classes.abandoned,
+                        "zombie" => &mut priors.classes.zombie,
+                        _ => unreachable!(),
+                    };
+                    if invalid_alpha {
+                        class.cpu_beta.alpha = invalid;
+                    } else {
+                        class.cpu_beta.beta = invalid;
+                    }
+                    for cpu in [
+                        CpuEvidence::Fraction { occupancy: 0.0 },
+                        CpuEvidence::Binomial {
+                            k: 0.0,
+                            n: 100.0,
+                            eta: None,
+                        },
+                    ] {
+                        let error = compute_posterior(
+                            &priors,
+                            &Evidence {
+                                cpu: Some(cpu),
+                                ..Evidence::default()
+                            },
+                        )
+                        .expect_err("invalid CPU priors must not be ignored");
+                        assert!(matches!(
+                            error,
+                            PosteriorError::InvalidPriors { field, .. }
+                                if field == format!("classes.{class_name}.cpu_beta")
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
