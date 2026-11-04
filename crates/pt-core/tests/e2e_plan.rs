@@ -1951,6 +1951,142 @@ fn plan_only_kill_filters_final_policy_and_budget_decisions() {
     }
 }
 
+/// Holding /dev/fuse is sufficient to make a disruptive recommendation unsafe:
+/// pausing the server can hang all mount users, and killing it strands the mount.
+/// This exercises the real CLI and descriptor collector, without mounting a
+/// filesystem or acting on any process. A real mounted-filesystem test remains a
+/// separate platform integration check.
+#[cfg(target_os = "linux")]
+#[test]
+fn plan_reviews_fuse_device_holders_before_disruptive_actions() {
+    use std::fs::OpenOptions;
+    use std::process::{Child, Command as ProcessCommand, Stdio};
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let device = match OpenOptions::new().read(true).write(true).open("/dev/fuse") {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("SKIP real FUSE descriptor integration: cannot open /dev/fuse: {error}");
+            return;
+        }
+    };
+    let server = OwnedChild(
+        ProcessCommand::new("sleep")
+            .arg("307")
+            .stdin(Stdio::from(device))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test-owned FUSE descriptor holder"),
+    );
+    let control = OwnedChild(
+        ProcessCommand::new("sleep")
+            .arg("308")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test-owned control"),
+    );
+    let pids = format!("{},{}", server.0.id(), control.0.id());
+    let config_dir = tempdir().expect("config dir");
+    let data_dir = tempdir().expect("data dir");
+
+    for proposed_action in ["kill", "pause"] {
+        let mut policy = pt_core::config::Policy::default();
+        for row in [
+            &mut policy.loss_matrix.useful,
+            &mut policy.loss_matrix.useful_bad,
+            &mut policy.loss_matrix.abandoned,
+            &mut policy.loss_matrix.zombie,
+        ] {
+            row.keep = 10.0;
+            if proposed_action == "kill" {
+                row.kill = 0.0;
+            } else {
+                row.pause = Some(0.0);
+            }
+        }
+        policy.guardrails.min_process_age_seconds = 0;
+        policy.guardrails.protected_users.clear();
+        std::fs::write(
+            config_dir.path().join("policy.json"),
+            serde_json::to_vec_pretty(&policy).expect("serialize policy"),
+        )
+        .expect("write policy");
+
+        let output = pt_core()
+            .env("PROCESS_TRIAGE_DATA", data_dir.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .arg("--config")
+            .arg(config_dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--min-age",
+                "0",
+                "--min-posterior",
+                "0",
+                "--pids",
+                &pids,
+            ])
+            .output()
+            .expect("run FUSE safety plan");
+        assert!(
+            matches!(output.status.code(), Some(0 | 1)),
+            "{proposed_action}: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{proposed_action} plan JSON ({error}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        let candidates = document["candidates"].as_array().expect("candidates");
+        let holder = candidates
+            .iter()
+            .find(|candidate| candidate["pid"].as_u64() == Some(u64::from(server.0.id())))
+            .unwrap_or_else(|| panic!("FUSE holder absent: {document}"));
+        let ordinary = candidates
+            .iter()
+            .find(|candidate| candidate["pid"].as_u64() == Some(u64::from(control.0.id())))
+            .unwrap_or_else(|| panic!("control absent: {document}"));
+        assert_eq!(holder["fuse_server"], true, "{holder}");
+        assert_eq!(ordinary["fuse_server"], false, "{ordinary}");
+        assert_eq!(holder["recommended_action"], "review", "{holder}");
+        assert!(
+            holder["fuse_mounts"].is_array() || holder["fuse_mounts"].is_null(),
+            "{holder}"
+        );
+        assert!(
+            holder.to_string().contains("fusermount"),
+            "missing unmount advice: {holder}"
+        );
+        assert!(
+            document["actions"]
+                .as_array()
+                .expect("executable actions")
+                .iter()
+                .all(|action| {
+                    action["target"]["pid"].as_u64() != Some(u64::from(server.0.id()))
+                        || action["blocked"].as_bool() == Some(true)
+                        || action["action"].as_str() == Some("keep")
+                }),
+            "FUSE holder acquired an executable action: {document}",
+        );
+    }
+}
+
 /// An agent CLI is identified in the plan (`agent_kind`) and never gets an
 /// automatic action.
 #[cfg(unix)]

@@ -826,20 +826,27 @@ pub fn holds_fuse_device(pid: u32) -> Option<bool> {
 #[cfg(target_os = "linux")]
 fn fuse_device_in_fd_table(directory: &std::path::Path) -> Option<bool> {
     let entries = std::fs::read_dir(directory).ok()?;
+    fuse_device_from_link_targets(
+        entries.map(|entry| entry.and_then(|entry| std::fs::read_link(entry.path()))),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_device_from_link_targets(
+    targets: impl IntoIterator<Item = std::io::Result<std::path::PathBuf>>,
+) -> Option<bool> {
     let mut complete = true;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                complete = false;
-                continue;
+    for target in targets {
+        match target {
+            // Unlinking the device node does not close an existing connection.
+            Ok(target)
+                if target == std::path::Path::new("/dev/fuse")
+                    || target == std::path::Path::new("/dev/fuse (deleted)") =>
+            {
+                return Some(true);
             }
-        };
-        match std::fs::read_link(entry.path()) {
-            Ok(target) if target == std::path::Path::new("/dev/fuse") => return Some(true),
             Ok(_) => {}
-            // Descriptors may close while the directory is being enumerated.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A vanished descriptor is incomplete evidence, not proof of absence.
             Err(_) => complete = false,
         }
     }
@@ -1245,6 +1252,10 @@ mod tests {
         // text is read, never the potentially blocked descriptor target.
         std::os::unix::fs::symlink("/dev/fuse", table.path().join("3")).unwrap();
         assert_eq!(fuse_device_in_fd_table(table.path()), Some(true));
+
+        let unlinked = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/fuse (deleted)", unlinked.path().join("0")).unwrap();
+        assert_eq!(fuse_device_in_fd_table(unlinked.path()), Some(true));
     }
 
     #[cfg(target_os = "linux")]
@@ -1259,6 +1270,29 @@ mod tests {
         std::os::unix::fs::symlink("/dev/fuse", table.path().join("1")).unwrap();
         assert_eq!(fuse_device_in_fd_table(table.path()), Some(true));
         assert_eq!(holds_fuse_device(u32::MAX), None);
+
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert_eq!(
+                fuse_device_from_link_targets([
+                    Err(std::io::Error::from(kind)),
+                    Ok(std::path::PathBuf::from("/dev/null")),
+                ]),
+                None
+            );
+            for positive_first in [false, true] {
+                let mut targets = vec![
+                    Err(std::io::Error::from(kind)),
+                    Ok(std::path::PathBuf::from("/dev/fuse")),
+                ];
+                if positive_first {
+                    targets.reverse();
+                }
+                assert_eq!(fuse_device_from_link_targets(targets), Some(true));
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

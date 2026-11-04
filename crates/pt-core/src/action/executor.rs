@@ -672,6 +672,113 @@ mod tests {
         assert_eq!(result.summary.actions_failed, 0);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executor_passes_action_context_to_live_protection_without_bypassing_other_protections() {
+        use crate::action::prechecks::{LivePreCheckConfig, LivePreCheckProvider, PreCheckResult};
+        use crate::config::policy::Guardrails;
+
+        // Exercise real live protection through executor dispatch. Isolate
+        // unrelated probes, and use a no-op runner: no process is signalled.
+        struct ProtectionOnly(LivePreCheckProvider);
+        impl PreCheckProvider for ProtectionOnly {
+            fn check_not_protected(&self, pid: u32) -> PreCheckResult {
+                self.0.check_not_protected(pid)
+            }
+
+            fn check_not_protected_for_action(&self, pid: u32, action: Action) -> PreCheckResult {
+                self.0.check_not_protected_for_action(pid, action)
+            }
+
+            fn check_data_loss(&self, _pid: u32) -> PreCheckResult {
+                PreCheckResult::Passed
+            }
+
+            fn check_supervisor(&self, _pid: u32) -> PreCheckResult {
+                PreCheckResult::Passed
+            }
+
+            fn check_session_safety(&self, _pid: u32, _sid: Option<u32>) -> PreCheckResult {
+                PreCheckResult::Passed
+            }
+        }
+
+        let mut guardrails = Guardrails {
+            protected_patterns: Vec::new(),
+            protected_users: Vec::new(),
+            never_kill_pid: Vec::new(),
+            never_kill_ppid: Vec::new(),
+            ..Guardrails::default()
+        };
+        let provider = ProtectionOnly(
+            LivePreCheckProvider::new(Some(&guardrails), LivePreCheckConfig::default()).unwrap(),
+        );
+        let mut plan = make_plan();
+        plan.actions[0].target.pid = ProcessId(u32::MAX);
+        // An edited saved plan must not opt out of mandatory apply-time safety.
+        plan.actions[0].pre_checks.clear();
+        let identity_provider =
+            StaticIdentityProvider::default().with_identity(plan.actions[0].target.clone());
+        let runner = NoopActionRunner;
+        let dir = tempdir().unwrap().keep();
+
+        for action in [
+            Action::Kill,
+            Action::Restart,
+            Action::Pause,
+            Action::Freeze,
+            Action::Throttle,
+            Action::Renice,
+            Action::Quarantine,
+        ] {
+            plan.actions[0].action = action;
+            let executor = ActionExecutor::new(&runner, &identity_provider, dir.join("lock"))
+                .with_pre_check_provider(&provider);
+            let result = executor.execute_plan(&plan).unwrap();
+            assert!(
+                matches!(&result.outcomes[0].status, ActionStatus::PreCheckBlocked {
+                    check: PreCheck::CheckNotProtected, reason
+                } if reason.contains("complete infrastructure evidence")),
+                "{action:?}: {:?}",
+                result.outcomes[0].status
+            );
+        }
+        for action in [
+            Action::Keep,
+            Action::Resume,
+            Action::Unfreeze,
+            Action::Unquarantine,
+        ] {
+            plan.actions[0].action = action;
+            let executor = ActionExecutor::new(&runner, &identity_provider, dir.join("lock"))
+                .with_pre_check_provider(&provider);
+            let result = executor.execute_plan(&plan).unwrap();
+            assert_eq!(
+                result.outcomes[0].status,
+                ActionStatus::Success,
+                "{action:?}"
+            );
+        }
+
+        guardrails.never_kill_pid.push(u32::MAX);
+        let provider = ProtectionOnly(
+            LivePreCheckProvider::new(Some(&guardrails), LivePreCheckConfig::default()).unwrap(),
+        );
+        for action in [Action::Resume, Action::Unfreeze, Action::Unquarantine] {
+            plan.actions[0].action = action;
+            let executor = ActionExecutor::new(&runner, &identity_provider, dir.join("lock"))
+                .with_pre_check_provider(&provider);
+            let result = executor.execute_plan(&plan).unwrap();
+            assert!(
+                matches!(&result.outcomes[0].status, ActionStatus::PreCheckBlocked {
+                    check: PreCheck::CheckNotProtected, reason
+                } if reason.contains("protected PID")),
+                "{action:?}: {:?}",
+                result.outcomes[0].status
+            );
+        }
+    }
+
     #[test]
     fn executor_blocked_action_skipped() {
         let mut plan = make_plan();
