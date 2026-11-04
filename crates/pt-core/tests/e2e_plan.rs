@@ -288,9 +288,8 @@ mod plan_options {
         }
     }
 
-    /// A goal must never bypass per-candidate safety: every pid in the kill set is a
-    /// candidate whose own recommendation is `kill`; goal picks that are not
-    /// kill-recommended are listed for review instead.
+    /// Goal selection and projected recovery must agree with the final
+    /// executable kill plan, including each target's process incarnation.
     #[test]
     fn plan_goal_never_puts_non_kill_candidates_in_kill_set() {
         let output = pt_core_fast()
@@ -338,6 +337,53 @@ mod plan_options {
                 assert_ne!(action_of(pid).as_deref(), Some("kill"));
             }
         }
+
+        let selected = json["goal_summary"]["selected_pids"]
+            .as_array()
+            .expect("goal-selected PIDs");
+        let actions = json["actions"].as_array().expect("executable actions");
+        let mut projected_memory_mb = 0.0;
+        for pid in selected {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate["pid"] == *pid)
+                .unwrap_or_else(|| panic!("selected PID {pid} is not a returned candidate"));
+            assert_eq!(candidate["recommended_action"], "kill", "{candidate}");
+            assert_eq!(candidate["goal_selected"], true, "{candidate}");
+            assert!(
+                actions.iter().any(|action| {
+                    action["action"] == "kill"
+                        && action["blocked"] == false
+                        && matches!(action["routing"].as_str(), None | Some("direct"))
+                        && action["original_zombie_target"].is_null()
+                        && action["target"] == candidate["action_target"]
+                        && action["target"]["pid"] == candidate["pid"]
+                        && action["target"]["start_id"] == candidate["start_id"]
+                        && action["target"]["uid"] == candidate["uid"]
+                }),
+                "goal recovery has no matching executable kill: {candidate}"
+            );
+            projected_memory_mb += candidate["memory_mb"].as_u64().expect("memory MB") as f64;
+        }
+        for candidate in &candidates {
+            let selected_for_goal = selected.contains(&candidate["pid"]);
+            assert_eq!(
+                candidate["goal_selected"].as_bool(),
+                Some(selected_for_goal),
+                "{candidate}"
+            );
+            if !selected_for_goal {
+                assert!(candidate.get("goal_rank").is_none(), "{candidate}");
+            }
+        }
+        assert_eq!(json["summary"]["goal_selected_count"], selected.len());
+        let reported_recovery = json["goal_summary"]["projected_recovery"][0]
+            .as_f64()
+            .expect("projected memory recovery");
+        assert!(
+            (reported_recovery - projected_memory_mb).abs() < 1e-6,
+            "reported {reported_recovery} MB from {projected_memory_mb} executable MB"
+        );
     }
 
     #[test]
