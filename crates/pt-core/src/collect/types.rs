@@ -203,6 +203,66 @@ impl ProcessRecord {
     }
 }
 
+/// Recent CPU and storage-I/O activity for one observed process incarnation.
+///
+/// Missing measurements remain null, with a reason; they never mean that the
+/// process was idle. CPU percentages use the same one-core = 100% convention as
+/// `ps`, so a multithreaded process may exceed 100%.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProcessActivity {
+    pub pid: u32,
+    pub start_id: StartId,
+    pub uid: u32,
+    /// `procfs_window`, or an explicitly identified native-ps fallback.
+    pub source: String,
+    pub requested_window_ms: u64,
+    pub cpu_percent: Option<f64>,
+    pub cpu_ticks: Option<u64>,
+    pub cpu_window_seconds: Option<f64>,
+    pub io_window_seconds: Option<f64>,
+    pub read_bytes_per_second: Option<f64>,
+    pub write_bytes_per_second: Option<f64>,
+    /// Whether storage bytes moved during this window, not during the lifetime.
+    pub io_active: Option<bool>,
+    pub cpu_error: Option<String>,
+    pub io_error: Option<String>,
+}
+
+impl ProcessActivity {
+    pub(crate) fn unavailable(
+        process: &ProcessRecord,
+        window: Duration,
+        reason: impl Into<String>,
+    ) -> Self {
+        let reason = reason.into();
+        Self {
+            pid: process.pid.0,
+            start_id: process.start_id.clone(),
+            uid: process.uid,
+            source: if cfg!(target_os = "linux") {
+                "procfs_window"
+            } else {
+                "ps_lifetime_fallback"
+            }
+            .to_string(),
+            requested_window_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+            cpu_percent: None,
+            cpu_ticks: None,
+            cpu_window_seconds: None,
+            io_window_seconds: None,
+            read_bytes_per_second: None,
+            write_bytes_per_second: None,
+            io_active: None,
+            cpu_error: Some(reason.clone()),
+            io_error: Some(reason),
+        }
+    }
+
+    pub(crate) fn matches_record(&self, process: &ProcessRecord) -> bool {
+        self.pid == process.pid.0 && self.start_id == process.start_id && self.uid == process.uid
+    }
+}
+
 /// Result of a scan operation.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ScanResult {

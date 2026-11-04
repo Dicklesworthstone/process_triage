@@ -17,15 +17,17 @@
 //! 4. on Linux, provenance evidence (lineage ownership, listeners, blast radius) when
 //!    the caller collected it with [`Scorer::collect_provenance`].
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
-use crate::collect::ProcessRecord;
+use crate::collect::{ProcessActivity, ProcessRecord};
 use crate::config::{Policy, Priors, ResolvedConfig};
 use crate::decision::decision_store::{DecisionStore, LearnedPrior};
 use crate::inference::{
     apply_evidence_terms, compute_posterior_with_overrides, try_signature_fast_path, ClassScores,
-    Evidence, EvidenceLedger, EvidenceTerm, FastPathConfig, FastPathSkipReason, PosteriorResult,
-    PriorContext,
+    CpuEvidence, Evidence, EvidenceLedger, EvidenceTerm, FastPathConfig, FastPathSkipReason,
+    PosteriorResult, PriorContext,
 };
 use crate::supervision::signature::{
     BetaParams, MatchLevel, ProcessExpectations, ProcessMatchContext, SignatureDatabase,
@@ -186,6 +188,9 @@ fn age_gated_signature(
 pub struct ProcessScore<'a> {
     pub posterior: PosteriorResult,
     pub ledger: EvidenceLedger,
+    /// Identity-bound windowed activity, including reasons for missing signals.
+    /// None when no window was requested; then snapshot CPU remains the input.
+    pub activity: Option<ProcessActivity>,
     /// Where the class prior came from (`global`, `signature`, `user` for a learned
     /// verdict, or `signature_fast_path`).
     pub prior_source: String,
@@ -214,6 +219,8 @@ pub struct Scorer {
     pub decisions: DecisionStore,
     pub signatures: SignatureDatabase,
     pub fast_path: FastPathConfig,
+    activity_window: Option<Duration>,
+    activity: BTreeMap<u32, ProcessActivity>,
     #[cfg(target_os = "linux")]
     provenance: Option<ProvenanceInferenceBundle>,
 }
@@ -230,6 +237,8 @@ impl Scorer {
             decisions,
             signatures,
             fast_path,
+            activity_window: None,
+            activity: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             provenance: None,
         }
@@ -274,6 +283,64 @@ impl Scorer {
         }
     }
 
+    /// Collect recent CPU and storage-I/O evidence once for the entire batch.
+    ///
+    /// Linux uses one shared wait, with PID/start ID/UID checked around each
+    /// counter sample. A missing Linux sample suppresses the corresponding
+    /// evidence instead of reusing a lifetime average or claiming inactivity.
+    /// Other platforms retain explicitly labelled native-ps CPU evidence.
+    /// A zero window clears previous measurements and selects snapshot behavior.
+    pub fn collect_activity(&mut self, processes: &[&ProcessRecord], window: Duration) {
+        self.activity.clear();
+        self.activity_window = (!window.is_zero()).then_some(window);
+        if window.is_zero() || processes.is_empty() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.activity = crate::collect::tick_delta::sample_process_activity(processes, window);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.activity = processes
+                .iter()
+                .map(|process| {
+                    let mut activity = ProcessActivity::unavailable(
+                        process,
+                        window,
+                        "windowed activity collection is unsupported on this platform",
+                    );
+                    activity.cpu_percent = (process.cpu_percent.is_finite()
+                        && process.cpu_percent >= 0.0)
+                        .then_some(process.cpu_percent);
+                    activity.cpu_error = Some(
+                        "windowed CPU collection is unsupported; using native ps CPU".to_string(),
+                    );
+                    (process.pid.0, activity)
+                })
+                .collect();
+        }
+    }
+
+    /// Return activity only for this incarnation. An enabled window with a
+    /// missing or replaced PID yields explicit unknown measurements.
+    pub fn activity_for(&self, process: &ProcessRecord) -> Option<ProcessActivity> {
+        let window = self.activity_window?;
+        Some(match self.activity.get(&process.pid.0) {
+            Some(activity) if activity.matches_record(process) => activity.clone(),
+            Some(_) => ProcessActivity::unavailable(
+                process,
+                window,
+                "sampled activity belongs to a different process incarnation",
+            ),
+            None => ProcessActivity::unavailable(
+                process,
+                window,
+                "process was not included in the activity sampling window",
+            ),
+        })
+    }
+
     /// Score one process from its evidence (usually `Evidence::from_snapshot`, plus
     /// any deep-scan signals). `None` if the posterior cannot be computed.
     pub fn score(&self, proc: &ProcessRecord, evidence: Evidence) -> Option<ProcessScore<'_>> {
@@ -287,6 +354,13 @@ impl Scorer {
         desktop_app: Option<String>,
     ) -> Option<ProcessScore<'_>> {
         let pid = proc.pid.0;
+        let activity = self.activity_for(proc);
+        if let Some(activity) = &activity {
+            evidence.cpu = activity.cpu_percent.map(|percent| CpuEvidence::Fraction {
+                occupancy: (percent / 100.0).clamp(0.0, 1.0),
+            });
+            evidence.io_active = activity.io_active;
+        }
         if desktop_app.is_some() {
             // A desktop application never has a controlling terminal, so its absence
             // says nothing about abandonment.
@@ -459,9 +533,45 @@ impl Scorer {
             ));
         }
 
+        if let Some(activity) = &activity {
+            let cpu = match (activity.cpu_percent, activity.cpu_window_seconds) {
+                (Some(percent), Some(seconds)) => {
+                    format!("CPU {percent:.2}% over {seconds:.3}s")
+                }
+                (Some(percent), None) => format!("native ps CPU {percent:.2}% (not windowed)"),
+                _ => format!(
+                    "CPU unavailable: {}",
+                    activity.cpu_error.as_deref().unwrap_or("no usable sample")
+                ),
+            };
+            let io = match (
+                activity.read_bytes_per_second,
+                activity.write_bytes_per_second,
+                activity.io_window_seconds,
+            ) {
+                (Some(read), Some(written), Some(seconds)) => format!(
+                    "storage I/O {read:.0} read B/s, {written:.0} write B/s over {seconds:.3}s"
+                ),
+                _ => format!(
+                    "storage I/O unavailable: {}",
+                    activity.io_error.as_deref().unwrap_or("no usable sample")
+                ),
+            };
+            let usage = if fast_path_used {
+                "; signature fast path did not use these likelihoods"
+            } else {
+                ""
+            };
+            ledger.top_evidence.push(format!(
+                "Activity ({}; requested {}ms): {cpu}; {io}{usage}",
+                activity.source, activity.requested_window_ms
+            ));
+        }
+
         Some(ProcessScore {
             posterior,
             ledger,
+            activity,
             prior_source,
             signature,
             signature_age_weight,
@@ -976,6 +1086,142 @@ mod tests {
     }
 
     const FOUR_DAYS: Duration = Duration::from_secs(4 * 24 * 3600);
+
+    fn sampled_idle(process: &ProcessRecord) -> ProcessActivity {
+        let mut activity =
+            ProcessActivity::unavailable(process, Duration::from_millis(500), "fixture");
+        activity.source = "procfs_window".to_string();
+        activity.cpu_percent = Some(0.0);
+        activity.cpu_ticks = Some(0);
+        activity.cpu_window_seconds = Some(0.5);
+        activity.io_window_seconds = Some(0.5);
+        activity.read_bytes_per_second = Some(0.0);
+        activity.write_bytes_per_second = Some(0.0);
+        activity.io_active = Some(false);
+        activity.cpu_error = None;
+        activity.io_error = None;
+        activity
+    }
+
+    #[test]
+    fn windowed_activity_overrides_lifetime_cpu_and_cumulative_io_evidence() {
+        let mut process = record(1234, "worker", "worker", FOUR_DAYS);
+        process.cpu_percent = 90.0;
+        let incoming = Evidence {
+            io_active: Some(true),
+            ..Evidence::from_snapshot(&process)
+        };
+        let reference = scorer(SignatureDatabase::new());
+        let expected = reference
+            .score_with_desktop(
+                &process,
+                Evidence {
+                    cpu: Some(CpuEvidence::Fraction { occupancy: 0.0 }),
+                    io_active: Some(false),
+                    ..incoming.clone()
+                },
+                None,
+            )
+            .unwrap();
+        let stale = reference
+            .score_with_desktop(&process, incoming.clone(), None)
+            .unwrap();
+        let mut measured = scorer(SignatureDatabase::new());
+        measured.activity_window = Some(Duration::from_millis(500));
+        measured.activity.insert(process.pid.0, sampled_idle(&process));
+        let actual = measured
+            .score_with_desktop(&process, incoming, None)
+            .unwrap();
+        assert_eq!(actual.posterior.posterior, expected.posterior.posterior);
+        assert_ne!(actual.posterior.posterior, stale.posterior.posterior);
+        let activity = actual.activity.as_ref().unwrap();
+        assert_eq!(activity.cpu_percent, Some(0.0));
+        assert_eq!(activity.io_active, Some(false));
+        assert!(actual
+            .ledger
+            .top_evidence
+            .iter()
+            .any(|line| line.contains("procfs_window") && line.contains("over 0.500s")));
+    }
+
+    #[test]
+    fn missing_activity_suppresses_terms_instead_of_claiming_idle_or_using_lifetime() {
+        let mut process = record(1234, "worker", "worker", FOUR_DAYS);
+        process.cpu_percent = 90.0;
+        let incoming = Evidence {
+            io_active: Some(true),
+            ..Evidence::from_snapshot(&process)
+        };
+        let reference = scorer(SignatureDatabase::new());
+        let expected = reference
+            .score_with_desktop(
+                &process,
+                Evidence {
+                    cpu: None,
+                    io_active: None,
+                    ..incoming.clone()
+                },
+                None,
+            )
+            .unwrap();
+        let mut measured = scorer(SignatureDatabase::new());
+        // An enabled but empty batch must not lend old evidence to a later PID.
+        measured.collect_activity(&[], Duration::from_millis(500));
+        let actual = measured
+            .score_with_desktop(&process, incoming, None)
+            .unwrap();
+        assert_eq!(actual.posterior.posterior, expected.posterior.posterior);
+        let activity = actual.activity.unwrap();
+        assert!(activity.cpu_percent.is_none());
+        assert!(activity.io_active.is_none());
+        assert!(activity.cpu_error.unwrap().contains("not included"));
+        assert!(actual
+            .ledger
+            .top_evidence
+            .iter()
+            .any(|line| line.contains("CPU unavailable") && line.contains("I/O unavailable")));
+    }
+
+    #[test]
+    fn activity_cache_refuses_reused_pid_and_changed_owner() {
+        let process = record(1234, "worker", "worker", FOUR_DAYS);
+        let mut measured = scorer(SignatureDatabase::new());
+        measured.activity_window = Some(Duration::from_millis(500));
+        measured.activity.insert(process.pid.0, sampled_idle(&process));
+        assert_eq!(measured.activity_for(&process).unwrap().cpu_percent, Some(0.0));
+        for changed in ["start", "owner"] {
+            let mut replacement = process.clone();
+            if changed == "start" {
+                replacement.start_id = StartId::from_linux("test-boot-id", 98765, process.pid.0);
+            } else {
+                replacement.uid += 1;
+            }
+            let activity = measured.activity_for(&replacement).unwrap();
+            assert!(activity.cpu_percent.is_none());
+            assert!(activity.io_active.is_none());
+            assert!(activity.cpu_error.unwrap().contains("different process incarnation"));
+        }
+    }
+
+    #[test]
+    fn zero_window_clears_old_samples_and_restores_snapshot_scoring() {
+        let mut process = record(1234, "worker", "worker", FOUR_DAYS);
+        process.cpu_percent = 90.0;
+        let reference = scorer(SignatureDatabase::new());
+        let expected = reference
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+            .unwrap();
+        let mut measured = scorer(SignatureDatabase::new());
+        measured.activity_window = Some(Duration::from_millis(500));
+        measured.activity.insert(process.pid.0, sampled_idle(&process));
+        measured.collect_activity(&[&process], Duration::ZERO);
+        assert!(measured.activity.is_empty());
+        let actual = measured
+            .score_with_desktop(&process, Evidence::from_snapshot(&process), None)
+            .unwrap();
+        assert!(actual.activity.is_none());
+        assert_eq!(actual.posterior.posterior, expected.posterior.posterior);
+    }
 
     #[test]
     fn normal_run_lifetime_is_lognormal_between_typical_and_max() {

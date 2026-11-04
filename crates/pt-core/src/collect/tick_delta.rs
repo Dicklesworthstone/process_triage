@@ -15,10 +15,13 @@
 
 use super::cgroup::collect_cgroup_details;
 use super::cpu_capacity::{compute_cpu_capacity, CpuCapacity};
+use super::proc_parsers::{parse_io_content, IoStats};
+use super::{ProcessActivity, ProcessRecord};
 use pt_common::{IdentityQuality, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// System clock ticks per second.
 /// On Linux, typically 100 (USER_HZ).
@@ -279,6 +282,10 @@ pub fn parse_tick_snapshot(
     timestamp: std::time::SystemTime,
 ) -> Option<TickSnapshot> {
     // Find comm field (surrounded by parentheses)
+    let comm_start = content.find('(')?;
+    if content[..comm_start].trim().parse::<u32>().ok()? != pid {
+        return None;
+    }
     let comm_end = content.rfind(')')?;
     let after_comm = content.get(comm_end + 2..)?;
 
@@ -300,12 +307,56 @@ pub fn parse_tick_snapshot(
         identity,
         utime,
         stime,
-        total_ticks: utime + stime,
+        total_ticks: utime.checked_add(stime)?,
         num_threads,
         timestamp,
         monotonic: None,
         starttime,
     })
+}
+
+/// A counter reset or invalid window is unavailable evidence, never zero activity.
+/// Kept independent of OS reads so replay fixtures exercise the production math.
+fn counter_rate(before: u64, after: u64, seconds: f64) -> Result<(u64, f64), &'static str> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("sampling duration is not positive and finite");
+    }
+    let delta = after.checked_sub(before).ok_or("counter moved backwards")?;
+    let rate = delta as f64 / seconds;
+    if !rate.is_finite() {
+        return Err("counter rate is not finite");
+    }
+    Ok((delta, rate))
+}
+
+fn tick_window(before: &TickSnapshot, after: &TickSnapshot) -> Result<(u64, f64), &'static str> {
+    if before.pid != after.pid
+        || before.pid != before.identity.pid.0
+        || after.pid != after.identity.pid.0
+        || before.starttime != after.starttime
+        || !before.identity.matches(&after.identity)
+    {
+        return Err("process identity changed between CPU samples");
+    }
+    let seconds = match (before.monotonic, after.monotonic) {
+        (Some(start), Some(end)) => end
+            .checked_duration_since(start)
+            .ok_or("monotonic sample clock moved backwards")?
+            .as_secs_f64(),
+        (None, None) => after
+            .timestamp
+            .duration_since(before.timestamp)
+            .map_err(|_| "sample clock moved backwards")?
+            .as_secs_f64(),
+        _ => return Err("CPU samples use different clocks"),
+    };
+    // Checking both components prevents an increase in one from concealing a
+    // reset/wrap in the other. Totals are checked when the stat file is parsed.
+    if after.utime < before.utime || after.stime < before.stime {
+        return Err("CPU tick counter moved backwards");
+    }
+    let (ticks, _) = counter_rate(before.total_ticks, after.total_ticks, seconds)?;
+    Ok((ticks, seconds))
 }
 
 /// Compute tick-delta features from two snapshots.
@@ -322,43 +373,7 @@ pub fn compute_tick_delta(
     after: &TickSnapshot,
     config: &TickDeltaConfig,
 ) -> Option<TickDeltaFeatures> {
-    // Validate same process identity (PID reuse protection)
-    if before.identity != after.identity {
-        return None;
-    }
-
-    // Compute delta_t using monotonic time if available, otherwise SystemTime
-    let delta_t_secs = match (before.monotonic, after.monotonic) {
-        (Some(start), Some(end)) => {
-            if end <= start {
-                return None;
-            }
-            end.duration_since(start).as_secs_f64()
-        }
-        _ => {
-            // Fallback to SystemTime
-            if after.timestamp <= before.timestamp {
-                return None;
-            }
-            after
-                .timestamp
-                .duration_since(before.timestamp)
-                .ok()?
-                .as_secs_f64()
-        }
-    };
-
-    if delta_t_secs <= 0.0 {
-        return None;
-    }
-
-    // Guard against tick counter going backwards (e.g. PID reuse, counter wrap).
-    if after.total_ticks < before.total_ticks {
-        return None;
-    }
-
-    // Compute k_ticks
-    let k_ticks = after.total_ticks.saturating_sub(before.total_ticks);
+    let (k_ticks, delta_t_secs) = tick_window(before, after).ok()?;
 
     // Get CPU capacity
     let cgroup = collect_cgroup_details(after.pid);
@@ -472,6 +487,170 @@ pub fn sample_tick_delta(
     compute_tick_delta(&before, &after, config)
 }
 
+#[derive(Debug, Clone)]
+struct ActivitySnapshot {
+    ticks: TickSnapshot,
+    io: Result<IoStats, String>,
+    io_observed_at: Instant,
+}
+
+fn parse_activity_io(content: &str) -> Result<IoStats, String> {
+    let stats = parse_io_content(content)
+        .ok_or_else(|| "invalid or incomplete I/O counters".to_string())?;
+    // The shared write-safety parser requires wchar/write_bytes, but permits a
+    // missing read counter. Activity sampling must not turn that absence into 0.
+    if !content.lines().any(|line| {
+        line.split_once(':')
+            .is_some_and(|(key, _)| key.trim() == "read_bytes")
+    }) {
+        return Err("missing read_bytes counter".to_string());
+    }
+    Ok(stats)
+}
+
+fn ticks_match_process(ticks: &TickSnapshot, process: &ProcessRecord) -> bool {
+    ticks.pid == process.pid.0
+        && ticks.identity.pid == process.pid
+        && ticks.identity.start_id == process.start_id
+        && ticks.identity.uid == process.uid
+        && ticks.identity.quality.is_automatable()
+}
+
+fn collect_activity_snapshot(process: &ProcessRecord) -> Result<ActivitySnapshot, String> {
+    let pid = process.pid.0;
+    let before = collect_tick_snapshot(pid)
+        .ok_or_else(|| "CPU stat/identity is unreadable or invalid".to_string())?;
+    if !ticks_match_process(&before, process) {
+        return Err("process identity does not match the scanned incarnation".to_string());
+    }
+
+    let io = fs::read(format!("/proc/{pid}/io"))
+        .map_err(|error| format!("cannot read /proc/{pid}/io: {error}"))
+        .and_then(|bytes| parse_activity_io(&String::from_utf8_lossy(&bytes)));
+    let io_observed_at = Instant::now();
+
+    // The I/O file is addressed by numeric PID. Bracket it with identity reads
+    // so a replacement process cannot donate its counters to the old record.
+    let after = collect_tick_snapshot(pid)
+        .ok_or_else(|| "CPU stat/identity became unreadable while collecting I/O".to_string())?;
+    if !ticks_match_process(&after, process) || !before.identity.matches(&after.identity) {
+        return Err("process identity changed while collecting I/O".to_string());
+    }
+    Ok(ActivitySnapshot {
+        ticks: after,
+        io,
+        io_observed_at,
+    })
+}
+
+fn activity_from_snapshots(
+    process: &ProcessRecord,
+    before: &ActivitySnapshot,
+    after: &ActivitySnapshot,
+    window: Duration,
+    clock_ticks_per_second: u64,
+) -> ProcessActivity {
+    let mut activity = ProcessActivity::unavailable(process, window, "no usable samples");
+    if !ticks_match_process(&before.ticks, process)
+        || !ticks_match_process(&after.ticks, process)
+    {
+        return ProcessActivity::unavailable(
+            process,
+            window,
+            "activity samples do not match the scanned process incarnation",
+        );
+    }
+
+    match tick_window(&before.ticks, &after.ticks) {
+        Ok((ticks, seconds)) if clock_ticks_per_second > 0 => {
+            activity.cpu_ticks = Some(ticks);
+            activity.cpu_window_seconds = Some(seconds);
+            activity.cpu_percent =
+                Some(ticks as f64 / clock_ticks_per_second as f64 / seconds * 100.0);
+            activity.cpu_error = None;
+        }
+        Ok(_) => activity.cpu_error = Some("clock ticks per second is zero".to_string()),
+        Err(error) => activity.cpu_error = Some(error.to_string()),
+    }
+
+    let io_rates = || -> Result<(f64, f64, f64, bool), String> {
+        let first = before
+            .io
+            .as_ref()
+            .map_err(|error| format!("first I/O sample: {error}"))?;
+        let second = after
+            .io
+            .as_ref()
+            .map_err(|error| format!("second I/O sample: {error}"))?;
+        let seconds = after
+            .io_observed_at
+            .checked_duration_since(before.io_observed_at)
+            .ok_or_else(|| "I/O sample clock moved backwards".to_string())?
+            .as_secs_f64();
+        let (read, read_rate) = counter_rate(first.read_bytes, second.read_bytes, seconds)
+            .map_err(|error| format!("read_bytes: {error}"))?;
+        let (written, write_rate) = counter_rate(first.write_bytes, second.write_bytes, seconds)
+            .map_err(|error| format!("write_bytes: {error}"))?;
+        Ok((seconds, read_rate, write_rate, read > 0 || written > 0))
+    };
+    match io_rates() {
+        Ok((seconds, read_rate, write_rate, active)) => {
+            activity.io_window_seconds = Some(seconds);
+            activity.read_bytes_per_second = Some(read_rate);
+            activity.write_bytes_per_second = Some(write_rate);
+            activity.io_active = Some(active);
+            activity.io_error = None;
+        }
+        Err(error) => activity.io_error = Some(error),
+    }
+    activity
+}
+
+/// Measure recent CPU and storage-I/O rates using one shared sampling window.
+///
+/// Every sample is bound to the quick-scan PID/start ID/UID. The actual elapsed
+/// time is recorded per signal and process; batch collection overhead is never
+/// mistaken for the requested sleep duration. Empty batches and wholly
+/// unavailable first samples return without sleeping. Only procfs is read.
+pub fn sample_process_activity(
+    processes: &[&ProcessRecord],
+    window: Duration,
+) -> BTreeMap<u32, ProcessActivity> {
+    if window.is_zero() {
+        return BTreeMap::new();
+    }
+    let first: Vec<_> = processes
+        .iter()
+        .copied()
+        .map(|process| (process, collect_activity_snapshot(process)))
+        .collect();
+    if first.iter().any(|(_, snapshot)| snapshot.is_ok()) {
+        std::thread::sleep(window);
+    }
+    let tck = clk_tck();
+    first
+        .into_iter()
+        .map(|(process, before)| {
+            let activity = match before {
+                Err(error) => ProcessActivity::unavailable(
+                    process,
+                    window,
+                    format!("first sample: {error}"),
+                ),
+                Ok(before) => match collect_activity_snapshot(process) {
+                    Ok(after) => activity_from_snapshots(process, &before, &after, window, tck),
+                    Err(error) => ProcessActivity::unavailable(
+                        process,
+                        window,
+                        format!("second sample: {error}"),
+                    ),
+                },
+            };
+            (process.pid.0, activity)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +660,264 @@ mod tests {
             ProcessIdentity::new(pid, StartId::from_linux("test-boot", starttime, pid), 1000);
         identity.quality = IdentityQuality::Full;
         identity
+    }
+
+    fn activity_fixture() -> (ProcessRecord, ActivitySnapshot, ActivitySnapshot) {
+        let identity = test_identity(1234, 12345);
+        let process = ProcessRecord {
+            pid: identity.pid,
+            ppid: pt_common::ProcessId(1),
+            uid: identity.uid,
+            user: "fixture".to_string(),
+            pgid: Some(1234),
+            sid: Some(1234),
+            start_id: identity.start_id.clone(),
+            comm: "worker".to_string(),
+            cmd: "worker".to_string(),
+            state: super::super::ProcessState::Sleeping,
+            cpu_percent: 75.0,
+            rss_bytes: 0,
+            vsz_bytes: 0,
+            tty: None,
+            start_time_unix: 0,
+            elapsed: Duration::from_secs(3600),
+            source: "test".to_string(),
+            container_info: None,
+        };
+        let instant = Instant::now();
+        let first = ActivitySnapshot {
+            ticks: TickSnapshot {
+                pid: 1234,
+                identity,
+                utime: 10_000,
+                stime: 5_000,
+                total_ticks: 15_000,
+                num_threads: 1,
+                timestamp: UNIX_EPOCH + Duration::from_secs(1000),
+                monotonic: Some(instant),
+                starttime: 12345,
+            },
+            io: Ok(IoStats {
+                read_bytes: 8_000_000_000,
+                write_bytes: 4_000_000_000,
+                ..IoStats::default()
+            }),
+            io_observed_at: instant,
+        };
+        let mut second = first.clone();
+        second.ticks.timestamp += Duration::from_millis(500);
+        second.ticks.monotonic = Some(instant + Duration::from_millis(500));
+        second.io_observed_at += Duration::from_millis(500);
+        (process, first, second)
+    }
+
+    #[test]
+    fn activity_rates_use_actual_window_and_preserve_multicore_units() {
+        let (process, first, mut second) = activity_fixture();
+        second.ticks.utime += 50;
+        second.ticks.total_ticks += 50;
+        second.io.as_mut().unwrap().read_bytes += 8192;
+        second.io.as_mut().unwrap().write_bytes += 4096;
+        // A scheduling delay makes the actual window differ from the request.
+        let activity = activity_from_snapshots(
+            &process,
+            &first,
+            &second,
+            Duration::from_millis(250),
+            100,
+        );
+        assert_eq!(activity.requested_window_ms, 250);
+        assert_eq!(activity.cpu_ticks, Some(50));
+        assert_eq!(activity.cpu_window_seconds, Some(0.5));
+        assert_eq!(activity.cpu_percent, Some(100.0));
+        assert_eq!(activity.io_window_seconds, Some(0.5));
+        assert_eq!(activity.read_bytes_per_second, Some(16384.0));
+        assert_eq!(activity.write_bytes_per_second, Some(8192.0));
+        assert_eq!(activity.io_active, Some(true));
+        assert!(activity.cpu_error.is_none());
+        assert!(activity.io_error.is_none());
+
+        second.ticks.utime += 50;
+        second.ticks.total_ticks += 50;
+        let two_cores = activity_from_snapshots(
+            &process,
+            &first,
+            &second,
+            Duration::from_millis(500),
+            100,
+        );
+        assert_eq!(two_cores.cpu_percent, Some(200.0));
+    }
+
+    #[test]
+    fn historical_cpu_and_io_totals_do_not_mean_current_activity() {
+        let (process, first, second) = activity_fixture();
+        let activity = activity_from_snapshots(
+            &process,
+            &first,
+            &second,
+            Duration::from_millis(500),
+            100,
+        );
+        assert_eq!(activity.cpu_percent, Some(0.0));
+        assert_eq!(activity.cpu_ticks, Some(0));
+        assert_eq!(activity.read_bytes_per_second, Some(0.0));
+        assert_eq!(activity.write_bytes_per_second, Some(0.0));
+        assert_eq!(activity.io_active, Some(false));
+    }
+
+    #[test]
+    fn unavailable_and_regressing_io_remain_unknown_without_losing_cpu() {
+        for failure in ["unreadable", "read_reset", "write_reset"] {
+            let (process, first, mut second) = activity_fixture();
+            second.ticks.utime += 50;
+            second.ticks.total_ticks += 50;
+            match failure {
+                "unreadable" => second.io = Err("permission denied".to_string()),
+                "read_reset" => second.io.as_mut().unwrap().read_bytes = 0,
+                "write_reset" => second.io.as_mut().unwrap().write_bytes = 0,
+                _ => unreachable!(),
+            }
+            let activity = activity_from_snapshots(
+                &process,
+                &first,
+                &second,
+                Duration::from_millis(500),
+                100,
+            );
+            assert_eq!(activity.cpu_percent, Some(100.0), "{failure}");
+            assert!(activity.io_active.is_none(), "{failure}");
+            assert!(activity.read_bytes_per_second.is_none(), "{failure}");
+            assert!(activity.write_bytes_per_second.is_none(), "{failure}");
+            let reason = activity.io_error.unwrap();
+            assert!(
+                reason.contains("permission denied") || reason.contains("moved backwards"),
+                "{failure}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn activity_rejects_reused_pid_changed_owner_and_unknown_identity() {
+        for changed in ["start", "owner", "unknown"] {
+            let (process, first, mut second) = activity_fixture();
+            match changed {
+                "start" => second.ticks.identity.start_id = StartId::from_linux("b", 999, 1234),
+                "owner" => second.ticks.identity.uid += 1,
+                "unknown" => second.ticks.identity.quality = IdentityQuality::PidOnly,
+                _ => unreachable!(),
+            }
+            let activity = activity_from_snapshots(
+                &process,
+                &first,
+                &second,
+                Duration::from_millis(500),
+                100,
+            );
+            assert!(activity.cpu_percent.is_none(), "{changed}");
+            assert!(activity.io_active.is_none(), "{changed}");
+            assert!(activity.cpu_error.unwrap().contains("incarnation"));
+            assert!(activity.io_error.unwrap().contains("incarnation"));
+        }
+    }
+
+    #[test]
+    fn counter_and_tick_windows_reject_resets_invalid_time_and_clock_mixing() {
+        assert_eq!(counter_rate(100, 150, 0.5), Ok((50, 100.0)));
+        assert_eq!(counter_rate(u64::MAX, u64::MAX, 0.5), Ok((0, 0.0)));
+        assert!(counter_rate(u64::MAX, 0, 1.0).is_err());
+        for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(counter_rate(0, 1, seconds).is_err());
+        }
+        let (_, first, mut second) = activity_fixture();
+        second.ticks.utime -= 1;
+        second.ticks.stime += 2;
+        second.ticks.total_ticks += 1;
+        assert!(tick_window(&first.ticks, &second.ticks).is_err());
+        let (_, first, mut second) = activity_fixture();
+        second.ticks.monotonic = first.ticks.monotonic;
+        assert!(tick_window(&first.ticks, &second.ticks).is_err());
+        second.ticks.monotonic = None;
+        assert!(tick_window(&first.ticks, &second.ticks).is_err());
+    }
+
+    #[test]
+    fn activity_io_requires_read_counters_and_valid_complete_values() {
+        assert!(parse_activity_io("wchar: 0\nwrite_bytes: 0\n")
+            .unwrap_err()
+            .contains("read_bytes"));
+        assert!(parse_activity_io("wchar: 0\nwrite_bytes: 1\nread_bytes: bad\n").is_err());
+        assert!(parse_activity_io("wchar: 0\nread_bytes: 0\n").is_err());
+        assert!(parse_activity_io("wchar: 0\nwrite_bytes: 0\nread_bytes: 0\nread_bytes: 1\n")
+            .is_err());
+        let zero = parse_activity_io("wchar: 0\nwrite_bytes: 0\nread_bytes: 0\n").unwrap();
+        assert_eq!(zero.read_bytes, 0);
+        assert_eq!(zero.write_bytes, 0);
+    }
+
+    #[test]
+    fn unavailable_process_and_empty_batch_never_reuse_lifetime_cpu() {
+        let (mut process, _, _) = activity_fixture();
+        process.pid = pt_common::ProcessId(u32::MAX);
+        process.start_id = StartId::from_linux("unavailable", 1, u32::MAX);
+        let window = Duration::from_millis(500);
+        assert!(sample_process_activity(&[], window).is_empty());
+        let measured = sample_process_activity(&[&process], window);
+        let activity = &measured[&u32::MAX];
+        assert!(activity.cpu_percent.is_none());
+        assert!(activity.io_active.is_none());
+        assert!(activity.cpu_error.as_ref().unwrap().contains("first sample"));
+        assert_eq!(activity.start_id, process.start_id);
+        assert!(sample_process_activity(&[&process], Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn owned_busy_and_sleeping_processes_are_sampled_together() {
+        use std::process::{Command, Stdio};
+
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let spawn = |program: &str, args: &[&str]| {
+            OwnedChild(
+                Command::new(program)
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn owned CPU fixture"),
+            )
+        };
+        let busy = spawn("sh", &["-c", "while :; do :; done"]);
+        let idle = spawn("sleep", &["300"]);
+        let scan = super::super::quick_scan(&super::super::QuickScanOptions {
+            pids: vec![busy.0.id(), idle.0.id()],
+            timeout: Some(Duration::from_secs(10)),
+            ..Default::default()
+        })
+        .expect("scan actual owned fixtures");
+        assert_eq!(scan.processes.len(), 2);
+        let processes: Vec<_> = scan.processes.iter().collect();
+        let activity = sample_process_activity(&processes, Duration::from_millis(500));
+        let busy = &activity[&busy.0.id()];
+        let idle = &activity[&idle.0.id()];
+        let busy_cpu = busy.cpu_percent.expect("busy CPU sample is available");
+        let idle_cpu = idle.cpu_percent.expect("sleeping CPU sample is available");
+        // Shared/limited CI hosts may grant much less than a whole core; the
+        // collector must still distinguish actual progress from an idle sleeper.
+        assert!(busy_cpu > idle_cpu, "busy={busy:?}, idle={idle:?}");
+        assert!(idle_cpu < 10.0, "idle={idle:?}");
+        for sample in [busy, idle] {
+            assert_eq!(sample.source, "procfs_window");
+            assert!(sample.cpu_window_seconds.unwrap() >= 0.5);
+            assert!(sample.io_window_seconds.unwrap() >= 0.5);
+        }
     }
 
     #[test]
@@ -529,6 +966,18 @@ mod tests {
         let timestamp = std::time::SystemTime::now();
         let result = parse_tick_snapshot(content, 1234, timestamp);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn tick_parser_rejects_wrong_pid_and_overflowing_totals() {
+        let content = format!(
+            "1234 (worker) S 1 1234 1234 0 -1 4194304 100 0 0 0 {} 1 0 0 20 0 1 0 12345",
+            u64::MAX
+        );
+        assert!(parse_tick_snapshot(&content, 1234, UNIX_EPOCH).is_none());
+        let valid = "1234 (worker) S 1 1234 1234 0 -1 4194304 100 0 0 0 100 1 0 0 20 0 1 0 12345";
+        assert!(parse_tick_snapshot(valid, 5678, UNIX_EPOCH).is_none());
+        assert!(parse_tick_snapshot(valid, 1234, UNIX_EPOCH).is_some());
     }
 
     #[test]
