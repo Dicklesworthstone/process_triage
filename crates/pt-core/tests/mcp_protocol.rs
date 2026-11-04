@@ -396,8 +396,21 @@ fn tools_call_scan_scores_are_posterior_probabilities() {
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
     let procs = parsed["processes"].as_array().expect("processes");
     assert!(!procs.is_empty());
+    assert_eq!(parsed["window_ms"], 500);
     let mut seen_protected = false;
     for p in procs {
+        let activity = &p["activity"];
+        assert!(activity.is_object(), "{p}");
+        assert_eq!(activity["requested_window_ms"], 500, "{p}");
+        assert_eq!(activity["pid"], p["pid"], "{p}");
+        assert_eq!(activity["start_id"], p["start_id"], "{p}");
+        assert_eq!(activity["uid"], p["uid"], "{p}");
+        assert_eq!(p["cpu_pct"], activity["cpu_percent"], "{p}");
+        assert_eq!(p["io_activity"], activity["io_active"], "{p}");
+        assert!(p["cpu_lifetime_pct"].as_f64().is_some(), "{p}");
+        if p["cpu_pct"].is_null() {
+            assert!(activity["cpu_error"].is_string(), "{p}");
+        }
         let score = p["score"].as_f64().expect("score");
         assert!((0.0..=1.0).contains(&score), "{p}");
         let post = &p["posterior"];
@@ -499,6 +512,19 @@ fn tools_call_explain_reports_posterior_and_protection() {
         "{parsed}"
     );
     assert!(parsed.get("protected").is_some(), "{parsed}");
+    assert_eq!(parsed["window_ms"], 500);
+    let activity = &parsed["activity"];
+    assert!(activity.is_object(), "{parsed}");
+    assert_eq!(activity["pid"], parsed["pid"], "{parsed}");
+    assert_eq!(activity["start_id"], parsed["start_id"], "{parsed}");
+    assert_eq!(activity["uid"], parsed["uid"], "{parsed}");
+    assert_eq!(activity["requested_window_ms"], 500, "{parsed}");
+    assert_eq!(parsed["cpu_pct"], activity["cpu_percent"], "{parsed}");
+    assert_eq!(parsed["io_activity"], activity["io_active"], "{parsed}");
+    assert!(parsed["cpu_lifetime_pct"].as_f64().is_some(), "{parsed}");
+    if parsed["cpu_pct"].is_null() {
+        assert!(activity["cpu_error"].is_string(), "{parsed}");
+    }
     assert!(
         parsed["evidence"].as_array().is_some_and(|e| !e.is_empty()),
         "{parsed}"
@@ -1103,6 +1129,76 @@ fn interleaved_tool_and_resource_calls() {
 }
 
 #[test]
+fn actual_mcp_sampling_windows_are_advertised_and_rejected_before_process_work() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+
+    let config = tempfile::tempdir().expect("config directory");
+    std::fs::write(config.path().join("policy.json"), b"{")
+        .expect("write deliberately invalid config");
+    let mut requests = vec![serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {},
+    })];
+    for name in ["pt_scan", "pt_explain", "pt_plan"] {
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(60_001),
+            serde_json::json!(0.5),
+            serde_json::json!("500"),
+            serde_json::Value::Null,
+        ] {
+            requests.push(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": requests.len() + 1,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": {"pid": 1, "window_ms": invalid},
+                },
+            }));
+        }
+    }
+    let input = requests.iter().map(|request| format!("{request}\n")).collect::<String>();
+    let output = cargo_bin_cmd!("pt-core")
+        .arg("--config")
+        .arg(config.path())
+        .arg("mcp")
+        .write_stdin(input)
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .expect("run actual MCP window validation");
+    assert!(output.status.success(), "{output:?}");
+    let responses: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+        .expect("MCP stdout")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON-RPC response"))
+        .collect();
+    assert_eq!(responses.len(), requests.len(), "{responses:?}");
+    let definitions = responses[0]["result"]["tools"].as_array().expect("tool definitions");
+    for name in ["pt_scan", "pt_explain", "pt_plan"] {
+        let definition = definitions.iter().find(|tool| tool["name"] == name).unwrap();
+        let window = &definition["inputSchema"]["properties"]["window_ms"];
+        assert_eq!(window["type"], "integer", "{name}");
+        assert_eq!(window["default"], 500, "{name}");
+        assert_eq!(window["minimum"], 0, "{name}");
+        assert_eq!(window["maximum"], 60_000, "{name}");
+    }
+    for (index, response) in responses.iter().enumerate().skip(1) {
+        assert_eq!(response["id"], index + 1, "{response}");
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let error = response["result"]["content"][0]["text"].as_str().unwrap();
+        // This must reject the interval before loading the deliberately broken
+        // policy, scanning /proc, waiting, or spawning the planner child.
+        assert!(error.contains("window_ms"), "{error}");
+        assert!(error.contains("60000"), "{error}");
+        assert!(!error.contains("config"), "{error}");
+    }
+}
+
+#[test]
 fn actual_mcp_plan_child_uses_the_servers_explicit_config() {
     use assert_cmd::cargo::cargo_bin_cmd;
     use sha2::{Digest, Sha256};
@@ -1316,6 +1412,18 @@ fn actual_mcp_scan_and_explain_preserve_config_and_invoker_protection() {
                     "{label}: the actual MCP server must protect its caller: {result}"
                 );
                 assert!(result["posterior"].is_object(), "{label}: {result}");
+                assert_eq!(result["window_ms"], 500, "{label}: {result}");
+                let activity = &result["activity"];
+                assert_eq!(activity["pid"], caller_pid, "{label}: {result}");
+                assert_eq!(activity["start_id"], result["start_id"], "{label}: {result}");
+                assert_eq!(activity["uid"], result["uid"], "{label}: {result}");
+                assert_eq!(activity["requested_window_ms"], 500, "{label}: {result}");
+                assert_eq!(result["cpu_pct"], activity["cpu_percent"], "{label}: {result}");
+                assert_eq!(result["io_activity"], activity["io_active"], "{label}: {result}");
+                assert!(result["cpu_lifetime_pct"].as_f64().is_some(), "{label}: {result}");
+                if result["cpu_pct"].is_null() {
+                    assert!(activity["cpu_error"].is_string(), "{label}: {result}");
+                }
             }
         }
     }
@@ -1446,10 +1554,12 @@ fn actual_mcp_deep_scan_preserves_live_snapshot_and_default_age_candidates() {
     )
     .expect("retain observed baseline");
 
+    // This regression isolates preservation of quick-snapshot facts. Sampled
+    // activity has separate protocol coverage and must not replace this baseline.
     let requests = [
-        serde_json::json!({}),
-        serde_json::json!({"deep": true}),
-        serde_json::json!({"deep": true, "min_age": u64::MAX}),
+        serde_json::json!({"window_ms": 0}),
+        serde_json::json!({"deep": true, "window_ms": 0}),
+        serde_json::json!({"deep": true, "min_age": u64::MAX, "window_ms": 0}),
     ]
     .into_iter()
     .enumerate()
@@ -1495,6 +1605,7 @@ fn actual_mcp_deep_scan_preserves_live_snapshot_and_default_age_candidates() {
         .expect("scan JSON");
         let processes = result["processes"].as_array().expect("processes");
         assert_eq!(result["returned"], processes.len(), "{result}");
+        assert_eq!(result["window_ms"], 0, "{result}");
         if index == 2 {
             assert_eq!(result["min_age_seconds"], u64::MAX);
             assert!(processes.is_empty());
@@ -1511,6 +1622,9 @@ fn actual_mcp_deep_scan_preserves_live_snapshot_and_default_age_candidates() {
             });
         assert!(process["elapsed_sec"].as_u64().unwrap() >= 1, "{process}");
         assert!(process["cpu_pct"].as_f64().unwrap() > 0.0, "{process}");
+        assert_eq!(process["cpu_pct"], process["cpu_lifetime_pct"], "{process}");
+        assert!(process["activity"].is_null(), "{process}");
+        assert!(process["io_activity"].is_null(), "{process}");
         assert!(process["rss_bytes"].as_u64().unwrap() > 0, "{process}");
         assert_eq!(process["start_id"], baseline.start_id.0);
         assert_eq!(process["start_time_unix"], baseline.start_time_unix);

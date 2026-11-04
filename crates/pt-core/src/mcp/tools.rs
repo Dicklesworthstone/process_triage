@@ -5,7 +5,7 @@
 use crate::collect::protected::{ProtectedFilter, ProtectedMatch};
 #[cfg(target_os = "linux")]
 use crate::collect::{deep_scan, DeepScanOptions, DeepScanRecord};
-use crate::collect::{quick_scan, ProcessRecord, QuickScanOptions, ScanResult};
+use crate::collect::{quick_scan, ProcessActivity, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
 use crate::scoring::{load_signature_database, ProcessScore, Scorer};
 use crate::signature_cli::load_user_signatures;
@@ -13,6 +13,46 @@ use crate::supervision::signature::ProcessMatchContext;
 use crate::supervision::{SignatureDatabase, SupervisorCategory};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
+
+const DEFAULT_ACTIVITY_WINDOW_MS: u64 = 500;
+const MAX_ACTIVITY_WINDOW_MS: u64 = 60_000;
+
+fn activity_window_ms(params: &serde_json::Value) -> Result<u64, String> {
+    match params.get("window_ms") {
+        None => Ok(DEFAULT_ACTIVITY_WINDOW_MS),
+        Some(value) => value
+            .as_u64()
+            .filter(|window| *window <= MAX_ACTIVITY_WINDOW_MS)
+            .ok_or_else(|| {
+                format!(
+                    "window_ms must be an integer between 0 and {MAX_ACTIVITY_WINDOW_MS}"
+                )
+            }),
+    }
+}
+
+fn activity_window_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "integer",
+        "description": "CPU and storage I/O sampling window in milliseconds; 0 uses lifetime CPU from the quick snapshot and leaves I/O activity unknown",
+        "default": DEFAULT_ACTIVITY_WINDOW_MS,
+        "minimum": 0,
+        "maximum": MAX_ACTIVITY_WINDOW_MS,
+    })
+}
+
+/// An unavailable sample is unknown, not a substitute for lifetime CPU. Only
+/// explicit snapshot mode (window_ms = 0) retains the legacy CPU observation.
+fn reported_cpu_percent(
+    process: &ProcessRecord,
+    activity: Option<&ProcessActivity>,
+) -> Option<f64> {
+    match activity {
+        Some(activity) => activity.cpu_percent,
+        None => Some(process.cpu_percent),
+    }
+}
 
 /// The config directory `agent plan` uses (`--config` / `PT_CONFIG_DIR`, then
 /// `PROCESS_TRIAGE_CONFIG`, then the XDG default).
@@ -70,14 +110,7 @@ impl Evaluator {
             .into_iter()
             .map(|protection| (protection.pid, protection))
             .collect();
-        let mut set: Vec<&ProcessRecord> = scan
-            .processes
-            .iter()
-            .filter(|p| {
-                p.elapsed.as_secs() >= self.min_age_seconds
-                    && !self.protected.contains_key(&p.pid.0)
-            })
-            .collect();
+        let mut set = self.eligible_processes(scan);
         for process in extra {
             if !set.iter().any(|p| p.pid == process.pid) {
                 set.push(process);
@@ -86,18 +119,21 @@ impl Evaluator {
         self.scorer.collect_provenance(&set);
     }
 
+    fn eligible_processes<'a>(&self, scan: &'a ScanResult) -> Vec<&'a ProcessRecord> {
+        scan.processes
+            .iter()
+            .filter(|process| {
+                process.elapsed.as_secs() >= self.min_age_seconds
+                    && !self.protected.contains_key(&process.pid.0)
+            })
+            .collect()
+    }
+
     fn collect_deep_evidence(&mut self, scan: &ScanResult) -> serde_json::Value {
         #[cfg(target_os = "linux")]
         {
             self.deep_records.clear();
-            let eligible: Vec<&ProcessRecord> = scan
-                .processes
-                .iter()
-                .filter(|process| {
-                    process.elapsed.as_secs() >= self.min_age_seconds
-                        && !self.protected.contains_key(&process.pid.0)
-                })
-                .collect();
+            let eligible = self.eligible_processes(scan);
             // An empty PID selection means "all processes" to deep_scan.
             if eligible.is_empty() {
                 return serde_json::json!({
@@ -197,7 +233,10 @@ impl Evaluator {
                             "tx_queue_bytes": network.total_tx_queue(),
                         })),
                         "io_counters": record.io,
-                        "io_activity": serde_json::Value::Null,
+                        "io_activity": self
+                            .scorer
+                            .activity_for(process)
+                            .and_then(|activity| activity.io_active),
                         "fd_count": record.fd.as_ref().map(|fd| fd.count),
                         "fd_inspection_truncated": record.fd.as_ref().map(|fd| fd.truncated),
                         "wchan": record.wchan,
@@ -309,12 +348,15 @@ fn top_signature(process: &ProcessRecord, db: &SignatureDatabase) -> Option<Stri
 }
 
 /// Arguments for `pt-core agent plan` derived from `pt_plan` tool params.
-fn plan_command_args(params: &serde_json::Value) -> Vec<String> {
+fn plan_command_args(params: &serde_json::Value) -> Result<Vec<String>, String> {
+    let window_ms = activity_window_ms(params)?;
     let mut args = vec![
         "agent".to_string(),
         "plan".to_string(),
         "--format".to_string(),
         "json".to_string(),
+        "--window-ms".to_string(),
+        window_ms.to_string(),
     ];
     if params
         .get("deep")
@@ -331,7 +373,7 @@ fn plan_command_args(params: &serde_json::Value) -> Vec<String> {
         args.push("--min-age".to_string());
         args.push(min_age.to_string());
     }
-    args
+    Ok(args)
 }
 
 /// Build the list of available MCP tool definitions.
@@ -361,7 +403,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "description": "Minimum process age in seconds (default: policy guardrail, 1 hour, as for pt_plan; 0 returns every process)",
                         "minimum": 0
-                    }
+                    },
+                    "window_ms": activity_window_schema()
                 },
                 "required": [],
                 "additionalProperties": false
@@ -381,7 +424,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "comm": {
                         "type": "string",
                         "description": "Process name (comm) to explain (alternative to pid)"
-                    }
+                    },
+                    "window_ms": activity_window_schema()
                 },
                 "required": [],
                 "additionalProperties": false
@@ -423,7 +467,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "min_age": {
                         "type": "integer",
                         "description": "Minimum process age in seconds (default: policy guardrail, 1 hour)"
-                    }
+                    },
+                    "window_ms": activity_window_schema()
                 },
                 "required": [],
                 "additionalProperties": false
@@ -478,6 +523,7 @@ pub fn call_tool(name: &str, params: &serde_json::Value) -> Result<Vec<ToolConte
 }
 
 fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    let window_ms = activity_window_ms(params)?;
     let deep = params
         .get("deep")
         .and_then(|v| v.as_bool())
@@ -501,6 +547,10 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
     } else {
         serde_json::json!({"requested": false, "status": "not_requested"})
     };
+    let eligible = evaluator.eligible_processes(&scan_result);
+    evaluator
+        .scorer
+        .collect_activity(&eligible, Duration::from_millis(window_ms));
 
     // Score = P(abandoned or zombie) from the same posterior `agent plan` uses (it was
     // a signature-match score plus a state bonus, not a probability).
@@ -544,6 +594,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         "platform": scan_result.metadata.platform,
         "warnings": scan_result.metadata.warnings,
         "deep_scan": deep_scan,
+        "window_ms": window_ms,
         "total_processes": scan_result.processes.len(),
         "min_age_seconds": evaluator.min_age_seconds,
         "younger_than_min_age": younger_than_min_age,
@@ -552,6 +603,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         "truncated": matching_processes > candidates.len(),
         "score_definition": "P(abandoned or zombie) from pt's posterior (0-1); suspicion_score = 100 x score",
         "processes": candidates.iter().map(|(p, score, posterior, protected, top_signature)| {
+            let activity = evaluator.scorer.activity_for(p);
             serde_json::json!({
                 "pid": p.pid.0,
                 "ppid": p.ppid.0,
@@ -562,7 +614,10 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
                 "user": p.user,
                 "start_id": p.start_id,
                 "start_time_unix": p.start_time_unix,
-                "cpu_pct": p.cpu_percent,
+                "cpu_pct": reported_cpu_percent(p, activity.as_ref()),
+                "cpu_lifetime_pct": p.cpu_percent,
+                "io_activity": activity.as_ref().and_then(|sample| sample.io_active),
+                "activity": activity,
                 "rss_bytes": p.rss_bytes,
                 "vsz_bytes": p.vsz_bytes,
                 "elapsed_sec": p.elapsed.as_secs(),
@@ -585,6 +640,7 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
 }
 
 fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    let window_ms = activity_window_ms(params)?;
     let pid = params.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
     let comm = params.get("comm").and_then(|v| v.as_str());
 
@@ -621,6 +677,10 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 
             // The same score and protection rules `agent plan` uses.
             evaluator.collect_provenance(&scan, &[p]);
+            evaluator
+                .scorer
+                .collect_activity(&[p], Duration::from_millis(window_ms));
+            let activity = evaluator.scorer.activity_for(p);
             let matches = evaluator.scorer.signatures.match_process(&ctx);
             let score = evaluator.score(p);
             let evidence_terms: Vec<serde_json::Value> = score
@@ -651,7 +711,13 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
                 "state": format!("{}", p.state),
                 "uid": p.uid,
                 "user": p.user,
-                "cpu_pct": p.cpu_percent,
+                "start_id": p.start_id,
+                "start_time_unix": p.start_time_unix,
+                "window_ms": window_ms,
+                "cpu_pct": reported_cpu_percent(p, activity.as_ref()),
+                "cpu_lifetime_pct": p.cpu_percent,
+                "io_activity": activity.as_ref().and_then(|sample| sample.io_active),
+                "activity": activity,
                 "rss_bytes": p.rss_bytes,
                 "vsz_bytes": p.vsz_bytes,
                 "elapsed_sec": p.elapsed.as_secs(),
@@ -696,11 +762,12 @@ fn tool_explain(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> 
 /// heuristic. The previous MCP-only scorer ignored protection, the posterior and the
 /// loss matrix, and recommended `kill` for zombies (which a signal cannot reap).
 fn tool_plan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
+    let args = plan_command_args(params)?;
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate pt-core: {e}"))?;
     let output = std::process::Command::new(&exe)
         .arg("--config")
         .arg(config_dir())
-        .args(plan_command_args(params))
+        .args(args)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("failed to run `{} agent plan`: {e}", exe.display()))?;
@@ -1203,16 +1270,24 @@ mod tests {
     #[test]
     fn plan_tool_maps_params_to_agent_plan_args() {
         assert_eq!(
-            plan_command_args(&serde_json::json!({})),
-            ["agent", "plan", "--format", "json"]
+            plan_command_args(&serde_json::json!({})).unwrap(),
+            ["agent", "plan", "--format", "json", "--window-ms", "500"]
         );
         assert_eq!(
-            plan_command_args(&serde_json::json!({"deep": true, "min_score": 0.9, "min_age": 60})),
+            plan_command_args(&serde_json::json!({
+                "deep": true,
+                "min_score": 0.9,
+                "min_age": 60,
+                "window_ms": 250,
+            }))
+            .unwrap(),
             [
                 "agent",
                 "plan",
                 "--format",
                 "json",
+                "--window-ms",
+                "250",
                 "--deep",
                 "--min-posterior",
                 "0.9",
@@ -1220,9 +1295,96 @@ mod tests {
                 "60"
             ]
         );
+        for window_ms in [0, MAX_ACTIVITY_WINDOW_MS] {
+            let args = plan_command_args(&serde_json::json!({"window_ms": window_ms})).unwrap();
+            assert_eq!(args[4], "--window-ms");
+            assert_eq!(args[5], window_ms.to_string());
+        }
         // Out-of-range scores are clamped into a valid posterior.
-        let args = plan_command_args(&serde_json::json!({"min_score": 7.0}));
+        let args = plan_command_args(&serde_json::json!({"min_score": 7.0})).unwrap();
         assert_eq!(args[args.len() - 1], "1");
+    }
+
+    #[test]
+    fn activity_window_schema_matches_runtime_bounds_for_every_scoring_tool() {
+        let definitions = tool_definitions();
+        for name in ["pt_scan", "pt_explain", "pt_plan"] {
+            let tool = definitions.iter().find(|tool| tool.name == name).unwrap();
+            let window = &tool.input_schema["properties"]["window_ms"];
+            assert_eq!(window["type"], "integer", "{name}");
+            assert_eq!(window["default"], DEFAULT_ACTIVITY_WINDOW_MS, "{name}");
+            assert_eq!(window["minimum"], 0, "{name}");
+            assert_eq!(window["maximum"], MAX_ACTIVITY_WINDOW_MS, "{name}");
+        }
+        assert_eq!(
+            activity_window_ms(&serde_json::json!({})).unwrap(),
+            DEFAULT_ACTIVITY_WINDOW_MS
+        );
+        for window_ms in [0, 1, DEFAULT_ACTIVITY_WINDOW_MS, MAX_ACTIVITY_WINDOW_MS] {
+            assert_eq!(
+                activity_window_ms(&serde_json::json!({"window_ms": window_ms})).unwrap(),
+                window_ms
+            );
+        }
+    }
+
+    #[test]
+    fn scoring_tools_reject_invalid_sampling_windows_before_work() {
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(60_001),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(0.5),
+            serde_json::json!("500"),
+            serde_json::Value::Null,
+        ] {
+            for name in ["pt_scan", "pt_explain", "pt_plan"] {
+                let error = call_tool(
+                    name,
+                    &serde_json::json!({"pid": 1, "window_ms": invalid}),
+                )
+                .unwrap_err();
+                assert!(error.contains("window_ms"), "{name}: {error}");
+                assert!(error.contains("60000"), "{name}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_activity_never_relabels_lifetime_cpu_as_current() {
+        let mut process = protection_test_scan().processes.pop().unwrap();
+        process.cpu_percent = 81.0;
+        let filter = ProtectedFilter::new(&[], &[], &[], &[]).unwrap();
+        let mut evaluator = protection_test_evaluator(filter);
+        assert_eq!(reported_cpu_percent(&process, None), Some(81.0));
+
+        // No procfs reads or sleep are needed: a subject outside the measured
+        // set must carry unknown activity, including protected scan rows.
+        evaluator
+            .scorer
+            .collect_activity(&[], Duration::from_millis(500));
+        let mut activity = evaluator.scorer.activity_for(&process).unwrap();
+        assert!(activity.cpu_percent.is_none());
+        assert!(activity.io_active.is_none());
+        assert!(activity.cpu_error.is_some());
+        assert_eq!(reported_cpu_percent(&process, Some(&activity)), None);
+        let score = evaluator.score(&process).expect("unknown activity still scores");
+        assert!(score.activity.as_ref().unwrap().cpu_percent.is_none());
+        assert!(!score
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|term| term.feature == "cpu" || term.feature == "io_active"));
+
+        activity.cpu_percent = Some(0.0);
+        assert_eq!(reported_cpu_percent(&process, Some(&activity)), Some(0.0));
+        activity.cpu_percent = Some(12.5);
+        assert_eq!(reported_cpu_percent(&process, Some(&activity)), Some(12.5));
+        assert_eq!(process.cpu_percent, 81.0, "lifetime observation is retained");
+
+        evaluator.scorer.collect_activity(&[], Duration::ZERO);
+        assert!(evaluator.scorer.activity_for(&process).is_none());
+        assert_eq!(reported_cpu_percent(&process, None), Some(81.0));
     }
 
     #[test]
