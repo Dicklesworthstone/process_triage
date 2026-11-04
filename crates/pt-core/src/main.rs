@@ -22733,11 +22733,128 @@ struct WatchThreshold {
 }
 
 struct WatchCandidate {
-    start_id: String,
+    identity: ProcessIdentity,
     severity: WatchSeverity,
     confidence: f64,
     classification: String,
     command: String,
+    recommendation: serde_json::Value,
+}
+
+impl WatchCandidate {
+    fn new(
+        identity: ProcessIdentity,
+        command: String,
+        confidence: f64,
+        mut recommendation: serde_json::Value,
+    ) -> Option<Self> {
+        let classification = match recommendation["recommended_action"].as_str() {
+            Some("keep") => return None,
+            Some("kill") => "kill",
+            _ => "review",
+        };
+        if recommendation["recommended_action"] == "review" {
+            recommendation["action_target"] = serde_json::Value::Null;
+        }
+        Some(Self {
+            identity,
+            severity: severity_from_confidence(confidence),
+            confidence,
+            classification: classification.to_string(),
+            command,
+            recommendation,
+        })
+    }
+
+    fn event(&self, event_type: &str, timestamp: &str) -> serde_json::Value {
+        // Keep the finalized recommendation's evidence, including activity
+        // measurements, together with the action it actually supports.
+        let mut event = self.recommendation.clone();
+        event["event"] = serde_json::json!(event_type);
+        event["timestamp"] = serde_json::json!(timestamp);
+        event["pid"] = serde_json::json!(self.identity.pid.0);
+        event["source_identity"] = serde_json::json!(self.identity);
+        event["classification"] = serde_json::json!(self.classification);
+        event["confidence"] = serde_json::json!(self.confidence);
+        event["severity"] = serde_json::json!(severity_label(self.severity));
+        event["command"] = serde_json::json!(self.command);
+        event
+    }
+}
+
+/// Retire stale advice before publishing replacements. Compare actionable
+/// semantics, not changing measurements or prose, so unchanged ticks stay quiet.
+fn watch_candidate_events(
+    previous: &HashMap<u32, WatchCandidate>,
+    current: &HashMap<u32, WatchCandidate>,
+    observed: &HashMap<u32, ProcessIdentity>,
+    timestamp: &str,
+) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    let mut previous_pids: Vec<_> = previous.keys().copied().collect();
+    previous_pids.sort_unstable();
+    for pid in previous_pids {
+        let prior = &previous[&pid];
+        if current
+            .get(&pid)
+            .is_some_and(|candidate| candidate.identity == prior.identity)
+        {
+            continue;
+        }
+        let reason = match observed.get(&pid) {
+            None => "not_observed",
+            Some(identity) if identity != &prior.identity => "identity_changed",
+            Some(_) => "no_longer_candidate",
+        };
+        events.push(serde_json::json!({
+            "event": "candidate_cleared",
+            "timestamp": timestamp,
+            "pid": pid,
+            "source_identity": prior.identity,
+            "classification": "cleared",
+            "recommended_action": null,
+            "action_target": null,
+            "prior_classification": prior.classification,
+            "prior_recommended_action": prior.recommendation["recommended_action"],
+            "prior_confidence": prior.confidence,
+            "prior_severity": severity_label(prior.severity),
+            "command": prior.command,
+            "reason": reason,
+        }));
+    }
+
+    let mut current_pids: Vec<_> = current.keys().copied().collect();
+    current_pids.sort_unstable();
+    for pid in current_pids {
+        let candidate = &current[&pid];
+        let prior = previous
+            .get(&pid)
+            .filter(|prior| prior.identity == candidate.identity);
+        let Some(prior) = prior else {
+            events.push(candidate.event("candidate_detected", timestamp));
+            continue;
+        };
+
+        if candidate.recommendation["recommended_action"]
+            != prior.recommendation["recommended_action"]
+            || candidate.recommendation["action_target"] != prior.recommendation["action_target"]
+        {
+            let mut event = candidate.event("recommendation_changed", timestamp);
+            event["prior_recommended_action"] =
+                prior.recommendation["recommended_action"].clone();
+            event["prior_action_target"] = prior.recommendation["action_target"].clone();
+            events.push(event);
+        }
+        if candidate.severity > prior.severity {
+            let mut event = candidate.event("severity_escalated", timestamp);
+            event["prior_confidence"] = serde_json::json!(prior.confidence);
+            event["current_confidence"] = serde_json::json!(candidate.confidence);
+            event["prior_severity"] = serde_json::json!(severity_label(prior.severity));
+            event["current_severity"] = serde_json::json!(severity_label(candidate.severity));
+            events.push(event);
+        }
+    }
+    events
 }
 
 fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
@@ -22908,69 +23025,25 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                 global.robot,
             );
         }
-        for (proc, mut eval) in evaluated {
-            if matches!(
-                eval.recommendation["recommended_action"].as_str(),
-                Some("keep" | "review")
+        for (proc, eval) in evaluated {
+            if let Some(candidate) = WatchCandidate::new(
+                process_identity_from_record(proc),
+                proc.cmd.clone(),
+                eval.confidence,
+                eval.recommendation,
             ) {
-                eval.recommendation["action_target"] = serde_json::Value::Null;
+                current.insert(proc.pid.0, candidate);
             }
-            let classification = match eval.recommendation["recommended_action"].as_str() {
-                Some("keep") => continue,
-                Some("kill") => "kill",
-                _ => "review",
-            };
-            let severity = severity_from_confidence(eval.confidence);
+        }
 
-            let candidate = WatchCandidate {
-                start_id: proc.start_id.0.clone(),
-                severity,
-                confidence: eval.confidence,
-                classification: classification.to_string(),
-                command: proc.cmd.clone(),
-            };
-
-            let emit_new = match previous.get(&proc.pid.0) {
-                Some(prev) if prev.start_id == candidate.start_id => {
-                    if candidate.severity > prev.severity {
-                        let event = serde_json::json!({
-                            "event": "severity_escalated",
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                            "pid": proc.pid.0,
-                            "classification": candidate.classification,
-                            "prior_confidence": prev.confidence,
-                            "current_confidence": candidate.confidence,
-                            "prior_severity": severity_label(prev.severity),
-                            "current_severity": severity_label(candidate.severity),
-                            "command": candidate.command,
-                            "action_rationale": eval.recommendation["action_rationale"],
-                            "recommended_action": eval.recommendation["recommended_action"],
-                            "action_target": eval.recommendation["action_target"],
-                        });
-                        emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
-                    }
-                    false
-                }
-                _ => true,
-            };
-
-            if emit_new {
-                let event = serde_json::json!({
-                    "event": "candidate_detected",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "pid": proc.pid.0,
-                    "classification": candidate.classification,
-                    "confidence": candidate.confidence,
-                    "severity": severity_label(candidate.severity),
-                    "command": candidate.command,
-                    "action_rationale": eval.recommendation["action_rationale"],
-                    "recommended_action": eval.recommendation["recommended_action"],
-                    "action_target": eval.recommendation["action_target"],
-                });
-                emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
-            }
-
-            current.insert(proc.pid.0, candidate);
+        let observed = scan_result
+            .processes
+            .iter()
+            .map(|process| (process.pid.0, process_identity_from_record(process)))
+            .collect();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        for event in watch_candidate_events(&previous, &current, &observed, &timestamp) {
+            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
         }
 
         previous = current;
@@ -23243,6 +23316,196 @@ fn emit_watch_event(
 #[cfg(test)]
 mod watch_tests {
     use super::*;
+    use pt_common::StartId;
+
+    fn identity(pid: u32, birth: u64) -> ProcessIdentity {
+        ProcessIdentity::full(
+            pid,
+            StartId::from_linux("watch-test-boot", birth, pid),
+            1000,
+            Some(pid),
+            Some(pid),
+            IdentityQuality::Full,
+        )
+    }
+
+    fn candidate(
+        source: ProcessIdentity,
+        action: &str,
+        target: Option<ProcessIdentity>,
+        confidence: f64,
+    ) -> WatchCandidate {
+        WatchCandidate::new(
+            source,
+            "owned workload".to_string(),
+            confidence,
+            serde_json::json!({
+                "recommended_action": action,
+                "action_target": target,
+                "action_rationale": "test recommendation",
+                "activity": {"source": "procfs_window", "cpu_percent": 0.0},
+            }),
+        )
+        .expect("non-keep candidate")
+    }
+
+    #[test]
+    fn watch_emits_policy_downgrade_and_recovery_at_stable_severity() {
+        let source = identity(10, 100);
+        let observed = HashMap::from([(10, source.clone())]);
+        let previous = HashMap::from([(
+            10,
+            candidate(source.clone(), "kill", Some(source.clone()), 0.9),
+        )]);
+        // A final policy/tree downgrade may leave a formerly selected target in
+        // intermediate JSON. The published review event must revoke it.
+        let current = HashMap::from([(
+            10,
+            candidate(source.clone(), "review", Some(source.clone()), 0.9),
+        )]);
+        let events = watch_candidate_events(&previous, &current, &observed, "tick-2");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "recommendation_changed");
+        assert_eq!(events[0]["source_identity"], serde_json::json!(source));
+        assert_eq!(events[0]["recommended_action"], "review");
+        assert!(events[0]["action_target"].is_null());
+        assert_eq!(events[0]["prior_recommended_action"], "kill");
+        assert_eq!(events[0]["prior_action_target"], serde_json::json!(source));
+        assert!(watch_candidate_events(&current, &current, &observed, "tick-3").is_empty());
+
+        let events = watch_candidate_events(&current, &previous, &observed, "tick-4");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "recommendation_changed");
+        assert_eq!(events[0]["prior_recommended_action"], "review");
+        assert!(events[0]["prior_action_target"].is_null());
+        assert_eq!(events[0]["recommended_action"], "kill");
+        assert_eq!(events[0]["action_target"], serde_json::json!(source));
+    }
+
+    #[test]
+    fn watch_reports_changed_parent_incarnation_without_new_source() {
+        let source = identity(10, 100);
+        let prior_parent = identity(20, 200);
+        let replacement_parent = identity(20, 300);
+        let observed = HashMap::from([(10, source.clone())]);
+        let previous = HashMap::from([(
+            10,
+            candidate(source.clone(), "restart", Some(prior_parent.clone()), 0.9),
+        )]);
+        let current = HashMap::from([(
+            10,
+            candidate(source.clone(), "restart", Some(replacement_parent.clone()), 0.9),
+        )]);
+        let events = watch_candidate_events(&previous, &current, &observed, "tick-2");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "recommendation_changed");
+        assert_eq!(events[0]["source_identity"], serde_json::json!(source));
+        assert_eq!(events[0]["prior_action_target"], serde_json::json!(prior_parent));
+        assert_eq!(events[0]["action_target"], serde_json::json!(replacement_parent));
+    }
+
+    #[test]
+    fn watch_retires_every_changed_source_identity_before_redetection() {
+        let source = identity(10, 100);
+        for field in ["birth", "uid", "pgid", "sid", "quality"] {
+            let mut replacement = source.clone();
+            match field {
+                "birth" => replacement.start_id = identity(10, 200).start_id,
+                "uid" => replacement.uid = 1001,
+                "pgid" => replacement.pgid = Some(20),
+                "sid" => replacement.sid = Some(20),
+                "quality" => replacement.quality = IdentityQuality::NoBootId,
+                _ => unreachable!(),
+            }
+            let observed = HashMap::from([(10, replacement.clone())]);
+            let previous = HashMap::from([(
+                10,
+                candidate(source.clone(), "kill", Some(source.clone()), 0.9),
+            )]);
+            let current = HashMap::from([(
+                10,
+                candidate(replacement.clone(), "kill", Some(replacement.clone()), 0.98),
+            )]);
+            let events = watch_candidate_events(&previous, &current, &observed, "tick-2");
+            assert_eq!(events.len(), 2, "{field}: {events:?}");
+            assert_eq!(events[0]["event"], "candidate_cleared", "{field}");
+            assert_eq!(events[0]["reason"], "identity_changed", "{field}");
+            assert_eq!(events[0]["source_identity"], serde_json::json!(source));
+            assert!(events[0]["recommended_action"].is_null());
+            assert!(events[0]["action_target"].is_null());
+            assert_eq!(events[1]["event"], "candidate_detected", "{field}");
+            assert_eq!(events[1]["source_identity"], serde_json::json!(replacement));
+        }
+    }
+
+    #[test]
+    fn watch_clears_deterministically_without_claiming_exit_or_repeating() {
+        let first = identity(10, 100);
+        let absent = identity(30, 300);
+        let newcomer = identity(20, 200);
+        let previous = HashMap::from([
+            (30, candidate(absent, "review", None, 0.9)),
+            (10, candidate(first.clone(), "kill", Some(first.clone()), 0.9)),
+        ]);
+        let observed = HashMap::from([(10, first.clone()), (20, newcomer.clone())]);
+        // Keep is no longer a watch candidate, just like a protected process or
+        // one below threshold. Its previous recommendation still needs clearing.
+        assert!(WatchCandidate::new(
+            first,
+            "recovered workload".to_string(),
+            0.9,
+            serde_json::json!({"recommended_action": "keep"}),
+        )
+        .is_none());
+        let current = HashMap::from([(20, candidate(newcomer, "review", None, 0.9))]);
+        let events = watch_candidate_events(&previous, &current, &observed, "tick-2");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["event"], "candidate_cleared");
+        assert_eq!(events[0]["pid"], 10);
+        assert_eq!(events[0]["reason"], "no_longer_candidate");
+        assert_eq!(events[1]["event"], "candidate_cleared");
+        assert_eq!(events[1]["pid"], 30);
+        assert_eq!(events[1]["reason"], "not_observed");
+        assert_eq!(events[2]["event"], "candidate_detected");
+        assert_eq!(events[2]["pid"], 20);
+        for event in &events[..2] {
+            assert!(event["recommended_action"].is_null());
+            assert!(event["action_target"].is_null());
+        }
+        assert!(watch_candidate_events(&current, &current, &observed, "tick-3").is_empty());
+    }
+
+    #[test]
+    fn watch_ignores_measurement_churn_but_preserves_severity_escalation() {
+        let source = identity(10, 100);
+        let observed = HashMap::from([(10, source.clone())]);
+        let previous = HashMap::from([(
+            10,
+            candidate(source.clone(), "kill", Some(source.clone()), 0.9),
+        )]);
+        let mut unchanged = candidate(source.clone(), "kill", Some(source.clone()), 0.91);
+        unchanged.recommendation["activity"]["cpu_percent"] = serde_json::json!(12.5);
+        unchanged.recommendation["action_rationale"] = serde_json::json!("updated measurements");
+        let current = HashMap::from([(10, unchanged)]);
+        assert!(watch_candidate_events(&previous, &current, &observed, "tick-2").is_empty());
+
+        let mut escalated = candidate(source, "review", None, 0.98);
+        escalated.recommendation["activity"]["cpu_percent"] = serde_json::json!(50.0);
+        let current = HashMap::from([(10, escalated)]);
+        let events = watch_candidate_events(&previous, &current, &observed, "tick-3");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "recommendation_changed");
+        assert_eq!(events[1]["event"], "severity_escalated");
+        assert_eq!(events[1]["prior_severity"], "high");
+        assert_eq!(events[1]["current_severity"], "critical");
+        assert_eq!(events[1]["prior_confidence"], 0.9);
+        assert_eq!(events[1]["current_confidence"], 0.98);
+        for event in &events {
+            assert_eq!(event["activity"]["cpu_percent"], 50.0);
+            assert_eq!(event["recommended_action"], "review");
+            assert!(event["action_target"].is_null());
+        }
+    }
 
     #[test]
     fn test_parse_watch_threshold() {

@@ -177,6 +177,70 @@ fn tail_stops_on_session_ended_event() {
 // agent watch tests
 // ============================================================================
 
+#[cfg(unix)]
+struct OwnedWatchChild(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for OwnedWatchChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+fn write_watch_review_config(config: &TempDir) {
+    let mut policy = pt_core::config::Policy::default();
+    // Test explicit review independently of host placement, user identity, or
+    // the test runner's own agent ancestry. Watch never executes these actions.
+    policy.guardrails.builtin_protection = false;
+    policy.guardrails.protected_users.clear();
+    policy.guardrails.protected_categories.clear();
+    policy.guardrails.never_kill_ppid.clear();
+    policy.guardrails.min_process_age_seconds = 0;
+    policy.robot_mode.enabled = true;
+    let mut pattern = policy.guardrails.protected_patterns[0].clone();
+    pattern.pattern = r"\bsleep\b".to_string();
+    policy.guardrails.force_review_patterns.push(pattern);
+    for row in [
+        &mut policy.loss_matrix.useful,
+        &mut policy.loss_matrix.useful_bad,
+        &mut policy.loss_matrix.abandoned,
+        &mut policy.loss_matrix.zombie,
+    ] {
+        row.keep = 10.0;
+        row.kill = 0.0;
+        row.pause = Some(10.0);
+        row.throttle = Some(10.0);
+        row.restart = Some(10.0);
+        row.renice = Some(10.0);
+    }
+    fs::write(
+        config.path().join("policy.json"),
+        serde_json::to_vec(&policy).expect("serialize policy"),
+    )
+    .expect("write policy");
+
+    // Equal likelihoods make the owned process cross the watch threshold without
+    // relying on sampled CPU, runtime, or the host's process population.
+    let mut priors = pt_core::config::Priors::default();
+    let mut class = priors.classes.abandoned.clone();
+    class.prior_prob = 1e-12;
+    class.runtime_gamma = None;
+    priors.classes.useful = class.clone();
+    priors.classes.useful_bad = class.clone();
+    priors.classes.zombie = class.clone();
+    class.prior_prob = 1.0 - 3e-12;
+    priors.classes.abandoned = class;
+    priors.state_flags = None;
+    priors.command_categories = None;
+    fs::write(
+        config.path().join("priors.json"),
+        serde_json::to_vec(&priors).expect("serialize priors"),
+    )
+    .expect("write priors");
+}
+
 #[test]
 fn watch_requires_jsonl_format() {
     // watch without --format jsonl should fail
@@ -323,15 +387,7 @@ fn watch_rejects_invalid_force_review_rule() {
 #[cfg(unix)]
 #[test]
 fn watch_reports_policy_review_instead_of_raw_kill_decision() {
-    struct OwnedChild(std::process::Child);
-    impl Drop for OwnedChild {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    let child = OwnedChild(
+    let child = OwnedWatchChild(
         std::process::Command::new("sleep")
             .arg("300")
             .stdin(std::process::Stdio::null())
@@ -342,55 +398,7 @@ fn watch_reports_policy_review_instead_of_raw_kill_decision() {
     );
     let config = TempDir::new().expect("config directory");
     let data = TempDir::new().expect("data directory");
-    let mut policy = pt_core::config::Policy::default();
-    // Test the operator's explicit review rule independently of host placement,
-    // user identity, or the test runner's own agent ancestry.
-    policy.guardrails.builtin_protection = false;
-    policy.guardrails.protected_users.clear();
-    policy.guardrails.protected_categories.clear();
-    policy.guardrails.never_kill_ppid.clear();
-    policy.guardrails.min_process_age_seconds = 0;
-    policy.robot_mode.enabled = true;
-    let mut pattern = policy.guardrails.protected_patterns[0].clone();
-    pattern.pattern = r"\bsleep\b".to_string();
-    policy.guardrails.force_review_patterns.push(pattern);
-    for row in [
-        &mut policy.loss_matrix.useful,
-        &mut policy.loss_matrix.useful_bad,
-        &mut policy.loss_matrix.abandoned,
-        &mut policy.loss_matrix.zombie,
-    ] {
-        row.keep = 10.0;
-        row.kill = 0.0;
-        row.pause = Some(10.0);
-        row.throttle = Some(10.0);
-        row.restart = Some(10.0);
-        row.renice = Some(10.0);
-    }
-    fs::write(
-        config.path().join("policy.json"),
-        serde_json::to_vec(&policy).expect("serialize policy"),
-    )
-    .expect("write policy");
-
-    // Equal likelihoods make the owned process cross the watch threshold without
-    // relying on its sampled CPU, runtime, or the host's process population.
-    let mut priors = pt_core::config::Priors::default();
-    let mut class = priors.classes.abandoned.clone();
-    class.prior_prob = 1e-12;
-    class.runtime_gamma = None;
-    priors.classes.useful = class.clone();
-    priors.classes.useful_bad = class.clone();
-    priors.classes.zombie = class.clone();
-    class.prior_prob = 1.0 - 3e-12;
-    priors.classes.abandoned = class;
-    priors.state_flags = None;
-    priors.command_categories = None;
-    fs::write(
-        config.path().join("priors.json"),
-        serde_json::to_vec(&priors).expect("serialize priors"),
-    )
-    .expect("write priors");
+    write_watch_review_config(&config);
 
     let output = pt_core_fast()
         .env("PROCESS_TRIAGE_DATA", data.path())
@@ -433,4 +441,110 @@ fn watch_reports_policy_review_instead_of_raw_kill_decision() {
         "{event}"
     );
     assert!(event["confidence"].as_f64().expect("confidence") >= 0.5);
+}
+
+#[cfg(unix)]
+#[test]
+fn watch_clears_owned_process_after_exit_with_the_original_identity() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let config = TempDir::new().expect("config directory");
+    let data = TempDir::new().expect("data directory");
+    write_watch_review_config(&config);
+    let mut workload = OwnedWatchChild(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn owned workload"),
+    );
+    let workload_pid = workload.0.id();
+    let stderr_path = data.path().join("watch.stderr");
+    let mut watch = OwnedWatchChild(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin!("pt-core"))
+            .env("PROCESS_TRIAGE_DATA", data.path())
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .arg("--config")
+            .arg(config.path())
+            .args([
+                "--robot",
+                "--format",
+                "jsonl",
+                "agent",
+                "watch",
+                "--threshold",
+                "low",
+                "--interval",
+                "1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(
+                fs::File::create(&stderr_path).expect("watch stderr"),
+            ))
+            .spawn()
+            .expect("start real watch CLI"),
+    );
+    let output = watch.0.stdout.take().expect("watch stdout");
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut detected_identity = None;
+    let cleared = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = receiver
+            .recv_timeout(remaining)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "watch did not complete lifecycle: {error}; stderr: {}",
+                    fs::read_to_string(&stderr_path).unwrap_or_default()
+                )
+            })
+            .expect("read watch JSONL");
+        let event: Value = serde_json::from_str(&line).expect("watch event JSON");
+        if event["pid"].as_u64() != Some(u64::from(workload_pid)) {
+            continue;
+        }
+        match event["event"].as_str() {
+            Some("candidate_detected") => {
+                assert!(detected_identity.is_none(), "duplicate detection: {event}");
+                assert_eq!(event["recommended_action"], "review");
+                assert!(event["action_target"].is_null());
+                let identity: pt_common::ProcessIdentity =
+                    serde_json::from_value(event["source_identity"].clone())
+                        .expect("complete source identity");
+                assert_eq!(identity.pid.0, workload_pid);
+                detected_identity = Some(identity);
+                // Only the child created by this test is terminated. Watch is
+                // read-only and must publish a later clear without executing it.
+                workload.0.kill().expect("stop owned workload");
+                workload.0.wait().expect("reap owned workload");
+            }
+            Some("candidate_cleared") => break event,
+            _ => {}
+        }
+    };
+    assert_eq!(
+        cleared["source_identity"],
+        serde_json::to_value(detected_identity.expect("detection must precede clearing")).unwrap()
+    );
+    assert_eq!(cleared["reason"], "not_observed");
+    assert!(cleared["recommended_action"].is_null());
+    assert!(cleared["action_target"].is_null());
+    assert_eq!(cleared["prior_recommended_action"], "review");
+    watch.0.kill().expect("stop owned watcher");
+    watch.0.wait().expect("reap owned watcher");
+    reader.join().expect("watch output reader");
 }
