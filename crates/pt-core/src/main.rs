@@ -10026,35 +10026,134 @@ fn daemon_notify_cmd(
 fn daemon_notify_desktop(
     notif: &pt_core::decision::escalation::Notification,
 ) -> std::io::Result<()> {
+    if let Some(mut command) = desktop_notification_command(std::env::consts::OS, notif) {
+        let _ = command.status();
+    }
+    Ok(())
+}
+
+#[cfg(feature = "daemon")]
+fn desktop_notification_command(
+    target_os: &str,
+    notif: &pt_core::decision::escalation::Notification,
+) -> Option<std::process::Command> {
     use std::process::Command;
 
-    #[cfg(target_os = "linux")]
-    {
-        let urgency = match notif.severity {
-            pt_core::decision::escalation::Severity::Critical => "critical",
-            pt_core::decision::escalation::Severity::Warning => "normal",
-            pt_core::decision::escalation::Severity::Info => "low",
-        };
-        let _ = Command::new("notify-send")
-            .args(["-u", urgency, "-a", "pt", &notif.title, &notif.body])
-            .status();
-        Ok(())
+    let mut command = match target_os {
+        "linux" => {
+            let urgency = match notif.severity {
+                pt_core::decision::escalation::Severity::Critical => "critical",
+                pt_core::decision::escalation::Severity::Warning => "normal",
+                pt_core::decision::escalation::Severity::Info => "low",
+            };
+            let mut command = Command::new("notify-send");
+            command.args(["-u", urgency, "-a", "pt", "--"]);
+            command
+        }
+        "macos" => {
+            // Notification text is argv data, never AppleScript source. Escaping
+            // only quotes would leave backslash/newline combinations executable.
+            let mut command = Command::new("osascript");
+            command.args([
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 2 of argv) with title (item 1 of argv)",
+                "-e",
+                "end run",
+                "--",
+            ]);
+            command
+        }
+        _ => return None,
+    };
+    command.arg(&notif.title).arg(&notif.body);
+    Some(command)
+}
+
+#[cfg(all(test, feature = "daemon"))]
+mod desktop_notification_tests {
+    use super::desktop_notification_command;
+    use pt_core::decision::escalation::{
+        EscalationLevel, Notification, NotificationChannel, Severity,
+    };
+
+    fn notification(title: &str, body: &str, severity: Severity) -> Notification {
+        Notification {
+            severity,
+            level: EscalationLevel::L1,
+            channels: vec![NotificationChannel::Desktop],
+            title: title.to_string(),
+            body: body.to_string(),
+            human_review_cmd: None,
+            agent_review_cmd: None,
+            session_id: None,
+            created_at: 0.0,
+            bundled: false,
+            trigger_count: 1,
+            dedupe_key: "desktop-notification-test".to_string(),
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        // Best-effort: avoid shell by passing a single osascript program string.
-        let body = notif.body.replace('"', "\\\"");
-        let title = notif.title.replace('"', "\\\"");
-        let script = format!("display notification \"{}\" with title \"{}\"", body, title);
-        let _ = Command::new("osascript").args(["-e", &script]).status();
-        Ok(())
+    #[test]
+    fn macos_notification_keeps_untrusted_text_out_of_applescript() {
+        for (title, body) in [
+            ("Process triage", "Review 3 candidates"),
+            (
+                "--title \\\"quoted\\\"\nsecond line",
+                "\\\" & do shell script \"touch /tmp/pt-notify-canary\" & \"\nλ",
+            ),
+            ("", ""),
+        ] {
+            let notif = notification(title, body, Severity::Warning);
+            let command = desktop_notification_command("macos", &notif).unwrap();
+            assert_eq!(command.get_program(), "osascript");
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                args,
+                [
+                    "-e",
+                    "on run argv",
+                    "-e",
+                    "display notification (item 2 of argv) with title (item 1 of argv)",
+                    "-e",
+                    "end run",
+                    "--",
+                    title,
+                    body,
+                ]
+            );
+        }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = notif;
-        Ok(())
+    #[test]
+    fn linux_notification_preserves_urgency_and_ends_options_before_text() {
+        for (severity, urgency) in [
+            (Severity::Info, "low"),
+            (Severity::Warning, "normal"),
+            (Severity::Critical, "critical"),
+        ] {
+            let notif = notification("--help", "-u critical\n\"review\" \\ λ", severity);
+            let command = desktop_notification_command("linux", &notif).unwrap();
+            assert_eq!(command.get_program(), "notify-send");
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                args,
+                ["-u", urgency, "-a", "pt", "--", &notif.title, &notif.body]
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_desktop_platform_has_no_command() {
+        let notif = notification("Process triage", "Review candidates", Severity::Info);
+        assert!(desktop_notification_command("freebsd", &notif).is_none());
     }
 }
 
