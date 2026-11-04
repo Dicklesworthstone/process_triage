@@ -3747,6 +3747,7 @@ fn build_tui_rows(
     let mut plan_candidates = HashMap::new();
     let mut goal_candidates: HashMap<u32, serde_json::Value> = HashMap::new();
     let mut cpu_total = 0.0;
+    let mut supervision = pt_core::supervision::SupervisionDetector::new();
 
     for proc in processes {
         if proc.pid.0 == 0 || proc.pid.0 == 1 {
@@ -3882,29 +3883,13 @@ fn build_tui_rows(
                 ),
             );
         }
-        if !matches!(recommendation, "keep" | "review") {
-            let subject = if proc.state.is_zombie() {
-                parent
-            } else {
-                Some(proc)
-            };
-            let supervisor = match subject {
-                Some(subject) => {
-                    supervisor_info_for_plan_identity(&process_identity_from_record(subject))
-                }
-                None => unknown_supervision_for_plan(
-                    proc.ppid.0,
-                    "routed parent identity is unavailable in the full process snapshot",
-                ),
-            };
-            if supervisor["status"] == "unknown" {
-                recommendation = "review";
-                rationale = supervisor["reason"]
-                    .as_str()
-                    .unwrap_or("supervision evidence unavailable")
-                    .to_string();
-            }
-        }
+        let _ = finalize_candidate_remedy(
+            proc,
+            parent,
+            &mut recommendation,
+            &mut rationale,
+            |identity| planning_supervision_evidence(identity, &mut supervision),
+        );
         if recommendation == "review" {
             blocked_reasons.push(rationale.clone());
         } else if recommendation == "keep" {
@@ -4685,7 +4670,10 @@ fn build_goal_plan_from_executable_actions(
     for (candidate, pid) in candidates.iter_mut().zip(eligible_pids) {
         let rank = pid.and_then(|pid| selected_rank.get(&pid).copied());
         if let Some(fields) = candidate.as_object_mut() {
-            fields.insert("goal_selected".to_string(), serde_json::json!(rank.is_some()));
+            fields.insert(
+                "goal_selected".to_string(),
+                serde_json::json!(rank.is_some()),
+            );
             fields.remove("goal_rank");
             if let Some(rank) = rank {
                 fields.insert("goal_rank".to_string(), serde_json::json!(rank));
@@ -13101,6 +13089,125 @@ mod process_tree_safety_tests {
         }
     }
 
+    #[test]
+    fn inactive_recommendations_do_not_probe_supervision() {
+        let process = rec(900, 500, "worker", ProcessState::Sleeping);
+        for initial in ["keep", "review"] {
+            let mut action = initial;
+            let mut rationale = "existing verdict".to_string();
+            let target = super::finalize_candidate_remedy(
+                &process,
+                None,
+                &mut action,
+                &mut rationale,
+                |_| panic!("an inactive recommendation must not collect more evidence"),
+            );
+            assert_eq!(action, initial);
+            assert_eq!(rationale, "existing verdict");
+            assert!(target.is_none());
+        }
+    }
+
+    #[test]
+    fn zombie_recommendations_check_and_target_the_parent_incarnation() {
+        let zombie = rec(900, 500, "defunct worker", ProcessState::Zombie);
+        let parent = rec(500, 10, "worker supervisor", ProcessState::Sleeping);
+        let expected = process_identity_from_record(&parent);
+        for initial in ["kill", "restart"] {
+            let mut action = initial;
+            let mut rationale = "expected-loss remedy".to_string();
+            let target = super::finalize_candidate_remedy(
+                &zombie,
+                Some(&parent),
+                &mut action,
+                &mut rationale,
+                |identity| {
+                    assert_eq!(identity, &expected);
+                    assert_ne!(identity, &process_identity_from_record(&zombie));
+                    Ok(())
+                },
+            );
+            assert_eq!(action, "restart");
+            assert_eq!(target, Some(expected.clone()));
+            assert!(rationale.contains("zombie PID 900 is already dead"));
+            assert!(rationale.contains("parent PID 500"));
+        }
+    }
+
+    #[test]
+    fn zombie_recommendations_refuse_missing_wrong_and_init_parents() {
+        let zombie = rec(900, 500, "defunct worker", ProcessState::Zombie);
+        let wrong = rec(600, 10, "unrelated", ProcessState::Sleeping);
+        let init_zombie = rec(901, 1, "defunct worker", ProcessState::Zombie);
+        let init = rec(1, 0, "init", ProcessState::Sleeping);
+        for (process, parent) in [
+            (&zombie, None),
+            (&zombie, Some(&wrong)),
+            (&init_zombie, Some(&init)),
+        ] {
+            let mut action = "kill";
+            let mut rationale = "expected-loss remedy".to_string();
+            let target = super::finalize_candidate_remedy(
+                process,
+                parent,
+                &mut action,
+                &mut rationale,
+                |_| panic!("no usable target exists to probe"),
+            );
+            assert_eq!(action, "review");
+            assert!(target.is_none());
+            assert!(rationale.contains("usable parent identity"));
+        }
+    }
+
+    #[test]
+    fn unavailable_supervision_refuses_direct_and_routed_remedies() {
+        let parent = rec(500, 10, "parent", ProcessState::Sleeping);
+        for (state, initial) in [
+            (ProcessState::Sleeping, "kill"),
+            (ProcessState::Sleeping, "pause"),
+            (ProcessState::Zombie, "kill"),
+            (ProcessState::Zombie, "restart"),
+        ] {
+            let process = rec(900, 500, "worker", state);
+            let mut action = initial;
+            let mut rationale = "expected-loss remedy".to_string();
+            let target = super::finalize_candidate_remedy(
+                &process,
+                Some(&parent),
+                &mut action,
+                &mut rationale,
+                |identity| {
+                    assert_eq!(identity.pid.0, if state.is_zombie() { 500 } else { 900 });
+                    Err("mandatory supervision evidence is unavailable".to_string())
+                },
+            );
+            assert_eq!(action, "review");
+            assert!(target.is_none());
+            assert!(rationale.contains("mandatory supervision evidence is unavailable"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_live_identity_is_not_observed_absence_of_supervision() {
+        let process = rec(u32::MAX, 500, "missing worker", ProcessState::Sleeping);
+        let mut detector = pt_core::supervision::SupervisionDetector::new();
+        let mut action = "kill";
+        let mut rationale = "expected-loss remedy".to_string();
+        let target = super::finalize_candidate_remedy(
+            &process,
+            None,
+            &mut action,
+            &mut rationale,
+            |identity| super::planning_supervision_evidence(identity, &mut detector),
+        );
+        assert_eq!(action, "review");
+        assert!(target.is_none());
+        assert!(rationale.contains("Mandatory supervision evidence unavailable"));
+        assert!(rationale.contains("identity changed or is unavailable"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn supervision_subject_is_bound_to_the_observed_birth_and_owner() {
@@ -13285,7 +13392,12 @@ mod process_tree_safety_tests {
             } else {
                 vec![
                     parent.clone(),
-                    rec(u32::MAX - 2, 1, "postgres -D /tmp/test", ProcessState::Sleeping),
+                    rec(
+                        u32::MAX - 2,
+                        1,
+                        "postgres -D /tmp/test",
+                        ProcessState::Sleeping,
+                    ),
                 ]
             };
             let refusal = super::planned_zombie_parent_refusal(
@@ -15560,6 +15672,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             .collect();
         let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
         let mut recommendations = Vec::new();
+        let mut supervision = pt_core::supervision::SupervisionDetector::new();
         for proc in plan_eligible {
             let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
                 continue;
@@ -15578,12 +15691,12 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 &enforcer,
                 global.robot,
             );
+            let parent = scan_result
+                .processes
+                .iter()
+                .find(|parent| parent.pid == proc.ppid);
             if proc.state.is_zombie() && matches!(advice.action, "kill" | "restart") {
-                let refusal = match scan_result
-                    .processes
-                    .iter()
-                    .find(|parent| parent.pid == proc.ppid)
-                {
+                let refusal = match parent {
                     Some(parent) => planned_zombie_parent_refusal(
                         parent,
                         &PlanningProtection {
@@ -15605,6 +15718,13 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                     advice.rationale = reason;
                 }
             }
+            let _ = finalize_candidate_remedy(
+                proc,
+                parent,
+                &mut advice.action,
+                &mut advice.rationale,
+                |identity| planning_supervision_evidence(identity, &mut supervision),
+            );
             recommendations.push(serde_json::json!({
                 "pid": proc.pid.0,
                 "recommended_action": advice.action,
@@ -16119,6 +16239,92 @@ fn candidate_recommendation(
         fuse_server,
         fuse_mounts,
     }
+}
+
+/// Check only the mandatory supervision evidence needed to authorize advice.
+/// Reuse the detector within one scan; optional adapter discovery is unnecessary
+/// for surfaces that only need to distinguish observed from unavailable evidence.
+fn planning_supervision_evidence(
+    identity: &ProcessIdentity,
+    detector: &mut pt_core::supervision::SupervisionDetector,
+) -> Result<(), String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let unavailable = |reason: &str| {
+        format!(
+            "Mandatory supervision evidence unavailable for PID {}: {reason}",
+            identity.pid.0
+        )
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let provider = LiveIdentityProvider::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if !matches!(provider.revalidate(identity), Ok(true)) {
+        return Err(unavailable(
+            "supervision subject identity changed or is unavailable",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    detector
+        .detect(identity.pid.0)
+        .map_err(|error| unavailable(&error.to_string()))?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = (identity, detector);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if !matches!(provider.revalidate(identity), Ok(true)) {
+        return Err(unavailable(
+            "supervision subject identity changed during probing",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the subject of an actionable recommendation and require its own
+/// supervision evidence. A zombie remedy acts on its parent. Only the displayed
+/// action changes here; the original decision remains available to generate_plan.
+fn finalize_candidate_remedy(
+    process: &ProcessRecord,
+    parent: Option<&ProcessRecord>,
+    action: &mut &'static str,
+    rationale: &mut String,
+    mut check_supervision: impl FnMut(&ProcessIdentity) -> Result<(), String>,
+) -> Option<ProcessIdentity> {
+    if matches!(*action, "keep" | "review") {
+        return None;
+    }
+    let subject = if process.state.is_zombie() {
+        if !matches!(*action, "kill" | "restart") {
+            *action = "review";
+            *rationale =
+                format!("{rationale}; zombie processes cannot receive direct interventions");
+            return None;
+        }
+        match parent.filter(|parent| parent.pid == process.ppid && parent.pid.0 > 1) {
+            Some(parent) => parent,
+            None => {
+                *action = "review";
+                *rationale = format!(
+                    "{rationale}; zombie remedy requires a usable parent identity from the full scan"
+                );
+                return None;
+            }
+        }
+    } else {
+        process
+    };
+    let target = process_identity_from_record(subject);
+    if let Err(reason) = check_supervision(&target) {
+        *action = "review";
+        *rationale = format!("{rationale}; {reason}");
+        return None;
+    }
+    if process.state.is_zombie() {
+        *action = "restart";
+        *rationale = format!(
+            "{rationale}; zombie PID {} is already dead; route the reaping remedy to parent PID {}",
+            process.pid.0, subject.pid.0
+        );
+    }
+    Some(target)
 }
 
 fn process_identity_from_record(proc: &ProcessRecord) -> ProcessIdentity {
@@ -22562,6 +22768,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         scorer.collect_provenance(&eligible);
 
         let mut evaluated = Vec::new();
+        let mut supervision = pt_core::supervision::SupervisionDetector::new();
         for proc in eligible {
             let Some(eval) = evaluate_watch_candidate(
                 proc,
@@ -22573,6 +22780,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                     population: &scan_result.processes,
                 },
                 global.robot,
+                &mut supervision,
             ) else {
                 continue;
             };
@@ -22601,7 +22809,13 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                 global.robot,
             );
         }
-        for (proc, eval) in evaluated {
+        for (proc, mut eval) in evaluated {
+            if matches!(
+                eval.recommendation["recommended_action"].as_str(),
+                Some("keep" | "review")
+            ) {
+                eval.recommendation["action_target"] = serde_json::Value::Null;
+            }
             let classification = match eval.recommendation["recommended_action"].as_str() {
                 Some("keep") => continue,
                 Some("kill") => "kill",
@@ -22631,6 +22845,8 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                             "current_severity": severity_label(candidate.severity),
                             "command": candidate.command,
                             "action_rationale": eval.recommendation["action_rationale"],
+                            "recommended_action": eval.recommendation["recommended_action"],
+                            "action_target": eval.recommendation["action_target"],
                         });
                         emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
                     }
@@ -22649,6 +22865,8 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                     "severity": severity_label(candidate.severity),
                     "command": candidate.command,
                     "action_rationale": eval.recommendation["action_rationale"],
+                    "recommended_action": eval.recommendation["recommended_action"],
+                    "action_target": eval.recommendation["action_target"],
                 });
                 emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
             }
@@ -22681,6 +22899,7 @@ fn evaluate_watch_candidate(
     enforcer: &pt_core::decision::PolicyEnforcer,
     protection: &PlanningProtection<'_>,
     robot: bool,
+    supervision: &mut pt_core::supervision::SupervisionDetector,
 ) -> Option<WatchEval> {
     let score = scorer.score(proc, Evidence::from_snapshot(proc))?;
     let decision_outcome = decide_action(
@@ -22691,12 +22910,12 @@ fn evaluate_watch_candidate(
     .ok()?;
     let mut advice =
         candidate_recommendation(proc, &score, &decision_outcome, policy, enforcer, robot);
+    let parent = protection
+        .population
+        .iter()
+        .find(|parent| parent.pid == proc.ppid);
     if proc.state.is_zombie() && matches!(advice.action, "kill" | "restart") {
-        let refusal = match protection
-            .population
-            .iter()
-            .find(|parent| parent.pid == proc.ppid)
-        {
+        let refusal = match parent {
             Some(parent) => planned_zombie_parent_refusal(
                 parent,
                 protection,
@@ -22715,6 +22934,13 @@ fn evaluate_watch_candidate(
             advice.rationale = reason;
         }
     }
+    let action_target = finalize_candidate_remedy(
+        proc,
+        parent,
+        &mut advice.action,
+        &mut advice.rationale,
+        |identity| planning_supervision_evidence(identity, supervision),
+    );
     let confidence = score.posterior.posterior.abandonment_probability();
 
     Some(WatchEval {
@@ -22723,6 +22949,7 @@ fn evaluate_watch_candidate(
             "pid": proc.pid.0,
             "recommended_action": advice.action,
             "action_rationale": advice.rationale,
+            "action_target": action_target,
         }),
     })
 }
