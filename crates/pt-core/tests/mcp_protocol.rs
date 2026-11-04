@@ -1320,3 +1320,222 @@ fn actual_mcp_scan_and_explain_preserve_config_and_invoker_protection() {
         }
     }
 }
+
+/// Deep scanning must enrich the canonical snapshot instead of replacing age,
+/// CPU and terminal facts with zeroes. Exercise the actual stdin/stdout protocol
+/// with a positive policy age floor and an owned, CPU-active terminal process.
+#[cfg(target_os = "linux")]
+#[test]
+fn actual_mcp_deep_scan_preserves_live_snapshot_and_default_age_candidates() {
+    use assert_cmd::cargo::cargo_bin_cmd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: openpty initializes both output descriptors and null inputs request
+    // default terminal settings; each successful descriptor is owned below.
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: these are distinct descriptors returned by the successful openpty.
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    for descriptor in [&master, &slave] {
+        // SAFETY: fcntl changes only close-on-exec for this fixture's live FDs.
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+            -1,
+            "terminal close-on-exec"
+        );
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("owned listener");
+    let port = listener.local_addr().unwrap().port();
+    let socket: OwnedFd = listener.into();
+    let mut command = std::process::Command::new("bash");
+    command
+        .args([
+            "-c",
+            "deadline=$((SECONDS+300)); while (( SECONDS < deadline )); do :; done",
+        ])
+        .stdin(Stdio::from(slave))
+        // No output is written: the open listener supplies real deep evidence.
+        .stdout(Stdio::from(socket))
+        .stderr(Stdio::null());
+    // SAFETY: only async-signal-safe syscalls run in this child before exec. Its
+    // stdin is the owned PTY slave and becomes its controlling terminal.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1
+                || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = OwnedChild(command.spawn().expect("spawn owned terminal process"));
+    drop(command);
+    let pid = child.0.id();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let baseline = loop {
+        let scan = pt_core::collect::quick_scan(&pt_core::collect::QuickScanOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .expect("observe owned process");
+        if let Some(process) = scan.processes.into_iter().find(|process| {
+            process.pid.0 == pid
+                && process.elapsed.as_secs() >= 1
+                && process.cpu_percent > 0.0
+                && process.has_tty()
+        }) {
+            break process;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owned process never became an aged CPU-active TTY fixture"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let root = std::env::temp_dir().join(format!("pt-mcp-deep-{}", uuid::Uuid::new_v4()));
+    let config = root.join("config");
+    std::fs::create_dir_all(&config).expect("create retained MCP config");
+    eprintln!("retained MCP deep-scan evidence: {}", root.display());
+    let mut policy = pt_core::config::Policy::default();
+    policy.guardrails.min_process_age_seconds = 1;
+    policy.guardrails.builtin_protection = false;
+    policy.guardrails.protected_users.clear();
+    policy.guardrails.protected_categories.clear();
+    policy.guardrails.never_kill_ppid.clear();
+    // Keep the owned child first in the bounded scan response on busy CI hosts,
+    // and limit deep probes to it. The full snapshot is still used for protection.
+    policy.guardrails.never_kill_pid = pt_core::collect::quick_scan(&Default::default())
+        .expect("fixture population")
+        .processes
+        .into_iter()
+        .filter(|process| process.pid.0 != pid)
+        .map(|process| process.pid.0)
+        .collect();
+    std::fs::write(
+        config.join("policy.json"),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .expect("write policy");
+    std::fs::write(
+        root.join("baseline.json"),
+        serde_json::to_vec_pretty(&baseline).unwrap(),
+    )
+    .expect("retain observed baseline");
+
+    let requests = [
+        serde_json::json!({}),
+        serde_json::json!({"deep": true}),
+        serde_json::json!({"deep": true, "min_age": u64::MAX}),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, arguments)| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": index + 1,
+            "method": "tools/call",
+            "params": {"name": "pt_scan", "arguments": arguments},
+        })
+        .to_string()
+            + "\n"
+    })
+    .collect::<String>();
+    let output = cargo_bin_cmd!("pt-core")
+        .arg("--config")
+        .arg(&config)
+        .arg("mcp")
+        .env("PROCESS_TRIAGE_DATA", root.join("data"))
+        .env("PROCESS_TRIAGE_RETENTION", "off")
+        .write_stdin(requests)
+        .timeout(Duration::from_secs(120))
+        .output()
+        .expect("run actual MCP deep scan");
+    std::fs::write(root.join("stdout.jsonl"), &output.stdout).expect("retain MCP stdout");
+    std::fs::write(root.join("stderr.txt"), &output.stderr).expect("retain MCP stderr");
+    assert!(output.status.success(), "{output:?}");
+    let responses: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)
+        .expect("MCP stdout")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("JSON-RPC response"))
+        .collect();
+    assert_eq!(responses.len(), 3, "{responses:?}");
+    for (index, response) in responses.iter().enumerate() {
+        assert_eq!(response["id"], index + 1);
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let result: serde_json::Value = serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("scan JSON text"),
+        )
+        .expect("scan JSON");
+        let processes = result["processes"].as_array().expect("processes");
+        assert_eq!(result["returned"], processes.len(), "{result}");
+        if index == 2 {
+            assert_eq!(result["min_age_seconds"], u64::MAX);
+            assert!(processes.is_empty());
+            assert_eq!(result["deep_scan"]["status"], "no_eligible_processes");
+            assert_eq!(result["deep_scan"]["requested_processes"], 0);
+            continue;
+        }
+        assert_eq!(result["min_age_seconds"], 1, "policy default must be used");
+        let process = processes
+            .iter()
+            .find(|process| process["pid"].as_u64() == Some(u64::from(pid)))
+            .unwrap_or_else(|| {
+                panic!("scan {index} lost the owned age-eligible process: {result}")
+            });
+        assert!(process["elapsed_sec"].as_u64().unwrap() >= 1, "{process}");
+        assert!(process["cpu_pct"].as_f64().unwrap() > 0.0, "{process}");
+        assert!(process["rss_bytes"].as_u64().unwrap() > 0, "{process}");
+        assert_eq!(process["start_id"], baseline.start_id.0);
+        assert_eq!(process["start_time_unix"], baseline.start_time_unix);
+        assert_eq!(process["tty"].as_str(), baseline.tty.as_deref());
+        assert!(process["protected"].is_null(), "{process}");
+        if index == 0 {
+            assert!(process["deep_evidence"].is_null());
+        } else {
+            let deep = &process["deep_evidence"];
+            assert_eq!(deep["start_id"], baseline.start_id.0);
+            assert_eq!(deep["has_network_sockets"], true, "{deep}");
+            assert!(
+                deep["network"]["listening_ports"]
+                    .as_array()
+                    .expect("observed listeners")
+                    .iter()
+                    .any(|listener| listener["port"].as_u64() == Some(u64::from(port))),
+                "{deep}"
+            );
+            assert!(
+                deep["io_activity"].is_null(),
+                "single counters cannot prove current activity"
+            );
+            assert!(result["deep_scan"]["matched_processes"].as_u64().unwrap() > 0);
+        }
+    }
+    assert!(child.0.try_wait().expect("fixture status").is_none());
+}

@@ -4,9 +4,7 @@
 
 use crate::collect::protected::{ProtectedFilter, ProtectedMatch};
 #[cfg(target_os = "linux")]
-use crate::collect::ScanMetadata;
-#[cfg(target_os = "linux")]
-use crate::collect::{deep_scan, DeepScanOptions};
+use crate::collect::{deep_scan, DeepScanOptions, DeepScanRecord};
 use crate::collect::{quick_scan, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
 use crate::scoring::{load_signature_database, ProcessScore, Scorer};
@@ -23,60 +21,6 @@ fn config_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn collect_scan_result(deep: bool) -> Result<ScanResult, String> {
-    if deep {
-        #[cfg(target_os = "linux")]
-        {
-            let options = DeepScanOptions::default();
-            let deep_result =
-                deep_scan(&options).map_err(|e| format!("Deep scan failed: {}", e))?;
-            Ok(ScanResult {
-                processes: deep_result
-                    .processes
-                    .into_iter()
-                    .map(|p| ProcessRecord {
-                        pid: p.pid,
-                        ppid: p.ppid,
-                        uid: p.uid,
-                        user: p.user,
-                        pgid: p.pgid,
-                        sid: p.sid,
-                        start_id: p.start_id,
-                        comm: p.comm,
-                        cmd: p.cmdline,
-                        state: crate::collect::ProcessState::from_char(p.state),
-                        cpu_percent: 0.0,
-                        rss_bytes: p.mem.as_ref().map(|m| m.resident * 4096).unwrap_or(0),
-                        vsz_bytes: p.mem.as_ref().map(|m| m.size * 4096).unwrap_or(0),
-                        tty: None,
-                        start_time_unix: 0,
-                        elapsed: std::time::Duration::from_secs(0),
-                        source: "deep_scan".to_string(),
-                        container_info: None,
-                    })
-                    .collect(),
-                metadata: ScanMetadata {
-                    scan_type: "deep".to_string(),
-                    platform: "linux".to_string(),
-                    boot_id: None,
-                    started_at: deep_result.metadata.started_at,
-                    duration_ms: deep_result.metadata.duration_ms,
-                    process_count: deep_result.metadata.process_count,
-                    warnings: deep_result.metadata.warnings,
-                },
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let options = QuickScanOptions::default();
-            quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))
-        }
-    } else {
-        let options = QuickScanOptions::default();
-        quick_scan(&options).map_err(|e| format!("Scan failed: {}", e))
-    }
-}
-
 fn load_signature_db_with_user_entries() -> SignatureDatabase {
     load_signature_database(&config_dir()).0
 }
@@ -90,6 +34,9 @@ struct Evaluator {
     protected: HashMap<u32, ProtectedMatch>,
     /// `agent plan`'s default age floor for candidates.
     min_age_seconds: u64,
+    /// Optional evidence joined to the quick scan by process incarnation.
+    #[cfg(target_os = "linux")]
+    deep_records: HashMap<u32, DeepScanRecord>,
 }
 
 impl Evaluator {
@@ -103,12 +50,16 @@ impl Evaluator {
             protected: HashMap::new(),
             min_age_seconds: config.policy.guardrails.min_process_age_seconds,
             scorer: Scorer::from_config(&config).0,
+            #[cfg(target_os = "linux")]
+            deep_records: HashMap::new(),
         })
     }
 
     /// Collect provenance as `agent plan` does: for the unprotected processes old
     /// enough to be candidates, plus `extra` (processes asked about explicitly).
     fn collect_provenance(&mut self, scan: &ScanResult, extra: &[&ProcessRecord]) {
+        #[cfg(target_os = "linux")]
+        self.deep_records.clear();
         // A per-process check misses the calling shell/agent and workers whose
         // service ownership is only visible through their ancestors. Use the same
         // full-scan filter as `agent plan`, before age/score filtering hides parents.
@@ -135,11 +86,136 @@ impl Evaluator {
         self.scorer.collect_provenance(&set);
     }
 
+    fn collect_deep_evidence(&mut self, scan: &ScanResult) -> serde_json::Value {
+        #[cfg(target_os = "linux")]
+        {
+            self.deep_records.clear();
+            let eligible: Vec<&ProcessRecord> = scan
+                .processes
+                .iter()
+                .filter(|process| {
+                    process.elapsed.as_secs() >= self.min_age_seconds
+                        && !self.protected.contains_key(&process.pid.0)
+                })
+                .collect();
+            // An empty PID selection means "all processes" to deep_scan.
+            if eligible.is_empty() {
+                return serde_json::json!({
+                    "requested": true,
+                    "status": "no_eligible_processes",
+                    "requested_processes": 0,
+                    "matched_processes": 0,
+                    "duration_ms": 0,
+                });
+            }
+            let options = DeepScanOptions {
+                pids: eligible.iter().map(|process| process.pid.0).collect(),
+                ..Default::default()
+            };
+            let result = match deep_scan(&options) {
+                Ok(result) => result,
+                Err(error) => {
+                    return serde_json::json!({
+                        "requested": true,
+                        "status": "unavailable",
+                        "requested_processes": eligible.len(),
+                        "matched_processes": 0,
+                        "error": error.to_string(),
+                    });
+                }
+            };
+            let (mut records, identity_mismatches) =
+                match_deep_records(&eligible, result.processes);
+            // The deep collector reads stat before its optional probes. Recheck
+            // after those reads so PID reuse during collection cannot attach a
+            // replacement process's socket or I/O facts to the original row.
+            use crate::action::{IdentityProvider, LiveIdentityProvider};
+            let identity_provider = LiveIdentityProvider::new();
+            let joined_count = records.len();
+            records.retain(|_, record| {
+                matches!(
+                    identity_provider.revalidate(&record.to_identity()),
+                    Ok(true)
+                )
+            });
+            let identity_revalidation_failed = joined_count - records.len();
+            self.deep_records = records;
+            serde_json::json!({
+                "requested": true,
+                "status": if self.deep_records.len() == eligible.len() { "collected" } else { "partial" },
+                "requested_processes": eligible.len(),
+                "matched_processes": self.deep_records.len(),
+                "identity_mismatches": identity_mismatches,
+                "identity_revalidation_failed": identity_revalidation_failed,
+                "skipped_processes": result.metadata.skipped_count,
+                "started_at": result.metadata.started_at,
+                "duration_ms": result.metadata.duration_ms,
+                "warnings": result.metadata.warnings,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = scan;
+            serde_json::json!({
+                "requested": true,
+                "status": "unsupported",
+                "matched_processes": 0,
+                "reason": "Deep probes are only available on Linux; quick-scan evidence is retained",
+            })
+        }
+    }
+
+    fn evidence(&self, process: &ProcessRecord) -> crate::inference::Evidence {
+        let evidence = crate::inference::Evidence::from_snapshot(process);
+        #[cfg(target_os = "linux")]
+        let evidence = crate::inference::Evidence {
+            net: self
+                .deep_records
+                .get(&process.pid.0)
+                .and_then(deep_socket_presence),
+            // /proc/PID/io is cumulative. A single deep scan cannot establish
+            // current I/O activity or a queue service rate.
+            ..evidence
+        };
+        evidence
+    }
+
+    fn deep_evidence(&self, process: &ProcessRecord) -> serde_json::Value {
+        #[cfg(target_os = "linux")]
+        {
+            self.deep_records
+                .get(&process.pid.0)
+                .map(|record| {
+                    serde_json::json!({
+                        "start_id": record.start_id,
+                        "source": record.source,
+                        "has_network_sockets": deep_socket_presence(record),
+                        "network": record.network.as_ref().map(|network| serde_json::json!({
+                            "socket_counts": network.socket_counts,
+                            "listening_ports": network.listen_ports,
+                            "rx_queue_bytes": network.total_rx_queue(),
+                            "tx_queue_bytes": network.total_tx_queue(),
+                        })),
+                        "io_counters": record.io,
+                        "io_activity": serde_json::Value::Null,
+                        "fd_count": record.fd.as_ref().map(|fd| fd.count),
+                        "fd_inspection_truncated": record.fd.as_ref().map(|fd| fd.truncated),
+                        "wchan": record.wchan,
+                    })
+                })
+                .unwrap_or(serde_json::Value::Null)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = process;
+            serde_json::Value::Null
+        }
+    }
+
     /// The process's score, as `agent plan` computes it (None if the model cannot
     /// evaluate it).
     fn score(&self, process: &ProcessRecord) -> Option<ProcessScore<'_>> {
-        self.scorer
-            .score(process, crate::inference::Evidence::from_snapshot(process))
+        self.scorer.score(process, self.evidence(process))
     }
 
     /// Posterior class probabilities (None if the model cannot evaluate it).
@@ -154,6 +230,68 @@ impl Evaluator {
             None => serde_json::Value::Null,
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn match_deep_records(
+    processes: &[&ProcessRecord],
+    records: Vec<DeepScanRecord>,
+) -> (HashMap<u32, DeepScanRecord>, usize) {
+    let identities: HashMap<u32, pt_common::ProcessIdentity> = processes
+        .iter()
+        .map(|process| {
+            (
+                process.pid.0,
+                pt_common::ProcessIdentity::new(
+                    process.pid.0,
+                    process.start_id.clone(),
+                    process.uid,
+                ),
+            )
+        })
+        .collect();
+    let mut matched = HashMap::new();
+    let mut identity_mismatches = 0;
+    for record in records {
+        if record.can_automate()
+            && identities
+                .get(&record.pid.0)
+                .is_some_and(|identity| identity.matches(&record.to_identity()))
+        {
+            matched.insert(record.pid.0, record);
+        } else {
+            identity_mismatches += 1;
+        }
+    }
+    (matched, identity_mismatches)
+}
+
+/// Socket presence is evidence of a network resource, not measured traffic.
+/// Empty socket/FD tables cannot prove absence in another namespace or when
+/// descriptor iteration was incomplete. The collector does not yet preserve
+/// every directory-read error, so only positive observations affect inference.
+#[cfg(target_os = "linux")]
+fn deep_socket_presence(record: &DeepScanRecord) -> Option<bool> {
+    if record.network.as_ref().is_some_and(|network| {
+        let counts = &network.socket_counts;
+        [
+            counts.tcp,
+            counts.tcp6,
+            counts.udp,
+            counts.udp6,
+            counts.unix,
+            counts.raw,
+        ]
+        .iter()
+        .any(|count| *count > 0)
+            || !network.listen_ports.is_empty()
+            || !network.tcp_connections.is_empty()
+            || !network.udp_sockets.is_empty()
+            || !network.unix_sockets.is_empty()
+    }) {
+        return Some(true);
+    }
+    record.fd.as_ref().filter(|fd| fd.sockets > 0).map(|_| true)
 }
 
 fn top_signature(process: &ProcessRecord, db: &SignatureDatabase) -> Option<String> {
@@ -209,7 +347,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "deep": {
                         "type": "boolean",
-                        "description": "Enable deep probes (lsof, ss, etc.)",
+                        "description": "Add Linux /proc probes for eligible unprotected processes, preserving quick-scan identity, age, CPU and TTY; reports missing evidence explicitly",
                         "default": false
                     },
                     "min_score": {
@@ -349,13 +487,20 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
     let mut evaluator = Evaluator::load()?;
-    let scan_result = collect_scan_result(deep)?;
+    let scan_started = std::time::Instant::now();
+    let scan_result = quick_scan(&QuickScanOptions::default())
+        .map_err(|error| format!("Scan failed: {error}"))?;
     // `agent plan`'s age floor: a process younger than this is never a candidate, so
     // scoring it would only invite acting on a busy new process.
     if let Some(min_age) = params.get("min_age").and_then(|v| v.as_u64()) {
         evaluator.min_age_seconds = min_age;
     }
     evaluator.collect_provenance(&scan_result, &[]);
+    let deep_scan = if deep {
+        evaluator.collect_deep_evidence(&scan_result)
+    } else {
+        serde_json::json!({"requested": false, "status": "not_requested"})
+    };
 
     // Score = P(abandoned or zombie) from the same posterior `agent plan` uses (it was
     // a signature-match score plus a state bonus, not a probability).
@@ -389,17 +534,24 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
             .reverse()
             .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
     });
+    let matching_processes = candidates.len();
+    candidates.truncate(200);
 
     let result = serde_json::json!({
         "scanned_at": scan_result.metadata.started_at,
-        "duration_ms": scan_result.metadata.duration_ms,
+        "duration_ms": scan_started.elapsed().as_millis(),
+        "quick_scan_duration_ms": scan_result.metadata.duration_ms,
         "platform": scan_result.metadata.platform,
+        "warnings": scan_result.metadata.warnings,
+        "deep_scan": deep_scan,
         "total_processes": scan_result.processes.len(),
         "min_age_seconds": evaluator.min_age_seconds,
         "younger_than_min_age": younger_than_min_age,
         "returned": candidates.len(),
+        "matching_processes": matching_processes,
+        "truncated": matching_processes > candidates.len(),
         "score_definition": "P(abandoned or zombie) from pt's posterior (0-1); suspicion_score = 100 x score",
-        "processes": candidates.iter().take(200).map(|(p, score, posterior, protected, top_signature)| {
+        "processes": candidates.iter().map(|(p, score, posterior, protected, top_signature)| {
             serde_json::json!({
                 "pid": p.pid.0,
                 "ppid": p.ppid.0,
@@ -408,10 +560,14 @@ fn tool_scan(params: &serde_json::Value) -> Result<Vec<ToolContent>, String> {
                 "state": format!("{}", p.state),
                 "uid": p.uid,
                 "user": p.user,
+                "start_id": p.start_id,
+                "start_time_unix": p.start_time_unix,
                 "cpu_pct": p.cpu_percent,
                 "rss_bytes": p.rss_bytes,
                 "vsz_bytes": p.vsz_bytes,
                 "elapsed_sec": p.elapsed.as_secs(),
+                "tty": p.tty,
+                "deep_evidence": evaluator.deep_evidence(p),
                 "score": score,
                 "suspicion_score": posterior.suspicion_score(),
                 "posterior": posterior,
@@ -766,7 +922,167 @@ mod tests {
             // Every record is below the age floor: ancestors must still protect
             // their descendants, without probing synthetic PIDs for provenance.
             min_age_seconds: 3600,
+            #[cfg(target_os = "linux")]
+            deep_records: HashMap::new(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deep_test_record(process: &ProcessRecord) -> DeepScanRecord {
+        DeepScanRecord {
+            pid: process.pid,
+            ppid: process.ppid,
+            uid: process.uid,
+            user: process.user.clone(),
+            pgid: process.pgid,
+            sid: process.sid,
+            start_id: process.start_id.clone(),
+            comm: process.comm.clone(),
+            cmdline: process.cmd.clone(),
+            exe: None,
+            state: 'S',
+            io: Some(crate::collect::IoStats {
+                read_bytes: 1_000_000,
+                write_bytes: 2_000_000,
+                ..Default::default()
+            }),
+            schedstat: None,
+            sched: None,
+            mem: Some(crate::collect::MemStats {
+                size: 1,
+                resident: 1,
+                ..Default::default()
+            }),
+            fd: None,
+            local_resource_evidence: Vec::new(),
+            cgroup: None,
+            wchan: None,
+            network: Some(crate::collect::NetworkInfo {
+                socket_counts: crate::collect::SocketCounts {
+                    tcp: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            environ: None,
+            starttime: 1234567890,
+            source: "deep_scan".to_string(),
+            identity_quality: pt_common::IdentityQuality::Full,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_evidence_preserves_quick_identity_runtime_cpu_and_tty() {
+        let mut process = protection_test_scan().processes.pop().unwrap();
+        process.elapsed = std::time::Duration::from_secs(7200);
+        process.cpu_percent = 25.5;
+        process.tty = Some("pts/7".to_string());
+        process.rss_bytes = 123_456;
+        process.vsz_bytes = 987_654;
+        let original = serde_json::to_value(&process).unwrap();
+        let (records, mismatches) =
+            match_deep_records(&[&process], vec![deep_test_record(&process)]);
+        assert_eq!(mismatches, 0);
+        assert_eq!(records.len(), 1);
+        let filter = ProtectedFilter::new(&[], &[], &[], &[]).unwrap();
+        let mut evaluator = protection_test_evaluator(filter);
+        evaluator.deep_records = records;
+
+        let evidence = evaluator.evidence(&process);
+        assert_eq!(evidence.runtime_seconds, Some(7200.0));
+        assert_eq!(evidence.tty, Some(true));
+        assert!(matches!(
+            evidence.cpu,
+            Some(crate::inference::CpuEvidence::Fraction { occupancy })
+                if (occupancy - 0.255).abs() < 1e-12
+        ));
+        assert_eq!(evidence.net, Some(true));
+        assert_eq!(
+            evidence.io_active, None,
+            "cumulative counters are not activity"
+        );
+        assert_eq!(evidence.queue_saturated, None, "no measured service rate");
+        assert_eq!(serde_json::to_value(&process).unwrap(), original);
+
+        let score = evaluator.score(&process).expect("score enriched process");
+        assert!(score
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|term| term.feature == "net"));
+        assert!(!score
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|term| term.feature == "io_active"));
+        let deep = evaluator.deep_evidence(&process);
+        assert_eq!(deep["start_id"], process.start_id.0);
+        assert_eq!(deep["io_counters"]["read_bytes"], 1_000_000);
+        assert!(deep["io_activity"].is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_records_reject_reused_pids_changed_owners_and_weak_identity() {
+        let process = protection_test_scan().processes.pop().unwrap();
+        for mismatch in ["pid", "start_id", "uid", "identity_quality"] {
+            let mut record = deep_test_record(&process);
+            match mismatch {
+                "pid" => record.pid.0 += 1,
+                "start_id" => {
+                    record.start_id =
+                        pt_common::StartId::from_linux("another-boot", 9, process.pid.0)
+                }
+                "uid" => record.uid += 1,
+                "identity_quality" => record.identity_quality = pt_common::IdentityQuality::PidOnly,
+                _ => unreachable!(),
+            }
+            let (records, mismatches) = match_deep_records(&[&process], vec![record]);
+            assert!(records.is_empty(), "accepted mismatched {mismatch}");
+            assert_eq!(mismatches, 1, "{mismatch}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_socket_absence_remains_unknown_without_collection_completeness() {
+        let process = protection_test_scan().processes.pop().unwrap();
+        let mut record = deep_test_record(&process);
+        record.network = Some(crate::collect::NetworkInfo::default());
+        assert_eq!(deep_socket_presence(&record), None);
+
+        record.fd = Some(crate::collect::FdInfo {
+            count: 2,
+            by_type: HashMap::from([("file".to_string(), 1)]),
+            ..Default::default()
+        });
+        assert_eq!(deep_socket_presence(&record), None);
+        record
+            .fd
+            .as_mut()
+            .unwrap()
+            .by_type
+            .insert("file".to_string(), 2);
+        assert_eq!(deep_socket_presence(&record), None);
+        record.fd.as_mut().unwrap().truncated = true;
+        assert_eq!(deep_socket_presence(&record), None);
+        record.fd.as_mut().unwrap().sockets = 1;
+        assert_eq!(deep_socket_presence(&record), Some(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deep_scan_does_not_expand_an_empty_eligible_set_into_all_pids() {
+        let scan = protection_test_scan();
+        let filter = ProtectedFilter::new(&[], &[], &[], &[]).unwrap();
+        let mut evaluator = protection_test_evaluator(filter);
+        evaluator.collect_provenance(&scan, &[]);
+        let metadata = evaluator.collect_deep_evidence(&scan);
+        assert_eq!(metadata["status"], "no_eligible_processes");
+        assert_eq!(metadata["requested_processes"], 0);
+        assert_eq!(metadata["matched_processes"], 0);
+        assert!(evaluator.deep_records.is_empty());
     }
 
     #[test]
