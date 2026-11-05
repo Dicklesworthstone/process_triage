@@ -278,6 +278,10 @@ fn agent_apply_dry_run_returns_actions_ok() {
         session_id.0.clone(),
         "--pids".to_string(),
         pid.to_string(),
+        // The existing command timeout is shorter than this requested window.
+        // Dry-run must skip resource sampling and the settle wait completely.
+        "--settle".to_string(),
+        "300".to_string(),
     ];
     let output = apply_logged(
         &data_dir,
@@ -317,6 +321,36 @@ fn agent_apply_dry_run_returns_actions_ok() {
         .get("metrics")
         .expect("Missing goal_progress.metrics");
     assert_eq!(goal_progress["planning_only"], true);
+    assert_eq!(json.get("resource_delta"), Some(&Value::Null));
+    assert_eq!(json.get("resource_observation"), Some(&Value::Null));
+    for phase in ["before", "after"] {
+        for metric in [
+            "available_memory_bytes",
+            "total_cpu_frac",
+            "occupied_ports",
+            "total_fds",
+        ] {
+            assert_eq!(goal_progress[phase].get(metric), Some(&Value::Null));
+        }
+    }
+    // This plan has no memory forecast. Lifetime process CPU and socket counts
+    // cannot become host-capacity or exclusive-port predictions in dry-run.
+    for metric in ["memory", "cpu", "ports"] {
+        assert_eq!(metrics[metric].get("expected_progress"), Some(&Value::Null));
+        assert_eq!(
+            metrics[metric]["action_outcomes"][0].get("expected_contribution"),
+            Some(&Value::Null)
+        );
+    }
+    #[cfg(target_os = "linux")]
+    assert!(metrics["file_descriptors"]["expected_progress"]
+        .as_f64()
+        .is_some_and(|value| value > 0.0));
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        metrics["file_descriptors"].get("expected_progress"),
+        Some(&Value::Null)
+    );
     for metric in ["memory", "cpu", "ports", "file_descriptors"] {
         let report = metrics.get(metric).expect("recorded metric");
         assert_eq!(report.get("observed_progress"), Some(&Value::Null));
@@ -345,6 +379,8 @@ fn agent_apply_dry_run_returns_actions_ok() {
     assert_eq!(summary["succeeded"], 0);
     assert_eq!(summary["failed"], 0);
     assert_eq!(outcomes[0]["pid"], pid);
+    assert!(outcomes[0]["executed_at"].is_null());
+    assert!(outcomes[0]["resource_run_id"].is_null());
     for metric in ["memory", "cpu", "ports", "file_descriptors"] {
         let report = &outcomes[0]["goal_progress"][metric];
         assert_eq!(report.get("observed"), Some(&Value::Null));
@@ -354,13 +390,34 @@ fn agent_apply_dry_run_returns_actions_ok() {
         assert_eq!(report["planning_only"], true);
     }
     let saved_path = handle.dir.join("action/outcomes.jsonl");
+    assert!(!handle.dir.join("action/resource_samples.jsonl").exists());
+    assert!(fs::read_dir(handle.dir.join("action"))
+        .unwrap()
+        .all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("resource_delta-")
+        }));
     let saved_before = fs::read(&saved_path).expect("saved dry-run outcomes");
     let saved: Vec<Value> = String::from_utf8(saved_before.clone())
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(saved.as_slice(), outcomes);
+    // The journal is persisted once before any settle wait. Enrichment belongs
+    // to the returned response and goal_progress.json, not a rewritten outcome.
+    let mut expected_execution = outcomes[0].clone();
+    let expected_execution_fields = expected_execution.as_object_mut().unwrap();
+    expected_execution_fields.remove("goal_progress");
+    expected_execution_fields.remove("respawn_detected");
+    assert_eq!(saved, vec![expected_execution]);
+    let saved_goal: Value = serde_json::from_slice(
+        &fs::read(handle.dir.join("action/goal_progress.json")).expect("saved goal report"),
+    )
+    .expect("goal report JSON");
+    assert_eq!(saved_goal, *goal_progress);
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0]["status"], "dry_run");
     assert_eq!(

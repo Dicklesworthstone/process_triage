@@ -652,6 +652,47 @@ single-process actions still receive only their own resource credit and pass
 the existing action gates. Per-cgroup usage counters and PSI, verified pane IDs,
 and automatic group actions are not implemented by this member-sum report.
 
+#### Measuring relief after apply
+
+`pt agent apply --session <id> --recommended --yes` now records a short baseline
+before the action loop and observes the host for 15 seconds after actual action
+attempts. `--settle <seconds>` selects a window from 0 through 300 seconds.
+`--settle 0` records before/after points without waiting; interval CPU and PSI
+rates remain unknown. The remaining global `--timeout` budget can shorten the
+observation window, with an explicit reason in the report. Dry runs and shadow runs execute no actions and produce
+no measured relief. An entirely blocked run does not wait for a settle interval.
+
+The `resource_delta` report keeps observed CPU busy/idle/iowait/steal percentages,
+load averages and load per online CPU, available memory, used swap, allocated
+file handles, and CPU/memory/I/O pressure separate from planned resource
+footprints. Deltas are **after minus before**: more available memory is an
+improvement, while more CPU utilization or pressure is an increase. CPU rates
+use counter deltas within independent before/after windows; PSI window rates
+use cumulative stall counters over the same intervals. CPU `full` pressure is
+undefined at host scope and stays unknown. Counter regressions, changing CPU
+capacity, missing sensors, and incomplete windows cannot manufacture relief.
+Completing the observation interval does not prove the host has settled, and a
+host-wide change does not prove which action caused it.
+
+Raw samples append to `action/resource_samples.jsonl`, and each apply invocation
+retains its own `action/resource_delta-<run-id>.json`. Execution outcomes are
+saved before the post-action wait. Storage or sensor failures appear as missing
+resource evidence without rewriting the actual action's result.
+`agent verify` replays these **historical apply windows** only when the full saved
+plan hash, session, action identities, latest execution records, exact execution
+clocks, and current boot still match. `resource_runs.reports` preserves distinct
+valid runs; `resource_delta` is populated only when exactly one run is valid.
+Missing or rejected artifacts do not imply that the action itself failed.
+
+Goal progress also distinguishes unknown measurements and predictions from
+observed zero. CPU observations are host busy fractions; the old lifetime CPU
+forecast is no longer used. Missing per-action CPU or exclusive port-ownership
+forecasts keep comparisons unavailable while preserving real observations.
+Unreadable process or socket censuses cannot appear as freed descriptors or
+ports. Descriptor counts cover observed processes, port observations cover the
+observer's network namespace, and host allocated file handles are a separate
+kernel metric. These observations do not yet train a relief-calibration model.
+
 ---
 
 ## Telemetry and Data Governance

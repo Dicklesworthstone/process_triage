@@ -3,6 +3,9 @@
 //! Recommendations are not execution evidence. Respawn attribution requires the
 //! executed target's owner, full command, parent and execution clock.
 
+pub mod relief;
+pub mod relief_store;
+
 use crate::collect::{ProcessRecord, ProcessState};
 use crate::decision::Action;
 use crate::plan::{Plan, PlanAction};

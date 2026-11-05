@@ -28,10 +28,10 @@ fn make_candidates(n: usize) -> Vec<PlanCandidate> {
 
 fn make_before() -> MetricSnapshot {
     MetricSnapshot {
-        available_memory_bytes: 2_000_000_000,
-        total_cpu_frac: 0.8,
-        occupied_ports: vec![3000, 8080, 9090],
-        total_fds: 5000,
+        available_memory_bytes: Some(2_000_000_000),
+        total_cpu_frac: Some(0.8),
+        occupied_ports: Some(vec![3000, 8080, 9090]),
+        total_fds: Some(5000),
         timestamp: 1000.0,
     }
 }
@@ -43,7 +43,7 @@ fn make_outcomes(n: usize, expected_each: f64) -> Vec<ActionOutcome> {
             label: format!("proc-{}", i),
             success: i % 5 != 0,          // 80% success
             respawn_detected: i % 4 == 0, // 25% respawn
-            expected_contribution: expected_each,
+            expected_contribution: Some(expected_each),
         })
         .collect()
 }
@@ -166,10 +166,10 @@ fn bench_measure_progress(c: &mut Criterion) {
 
     // Memory: good outcome
     let after_good = MetricSnapshot {
-        available_memory_bytes: 3_000_000_000,
-        total_cpu_frac: 0.5,
-        occupied_ports: vec![8080],
-        total_fds: 4500,
+        available_memory_bytes: Some(3_000_000_000),
+        total_cpu_frac: Some(0.5),
+        occupied_ports: Some(vec![8080]),
+        total_fds: Some(4500),
         timestamp: 1010.0,
     };
 
@@ -222,7 +222,8 @@ fn bench_measure_progress(c: &mut Criterion) {
     // Vary outcome count
     for n in [1, 5, 10, 20] {
         let after = MetricSnapshot {
-            available_memory_bytes: 3_000_000_000,
+            available_memory_bytes: Some(3_000_000_000),
+            timestamp: 1010.0,
             ..make_before()
         };
         let outcomes = make_outcomes(n, 1_000_000_000.0 / n as f64);
@@ -245,11 +246,13 @@ fn bench_measure_progress(c: &mut Criterion) {
 
     // Discrepancy scenarios
     let no_change = MetricSnapshot {
-        available_memory_bytes: 2_000_000_000,
+        available_memory_bytes: Some(2_000_000_000),
+        timestamp: 1010.0,
         ..make_before()
     };
     let overperform = MetricSnapshot {
-        available_memory_bytes: 5_000_000_000,
+        available_memory_bytes: Some(5_000_000_000),
+        timestamp: 1010.0,
         ..make_before()
     };
 

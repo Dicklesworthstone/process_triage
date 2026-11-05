@@ -3207,17 +3207,17 @@ proptest! {
         expected_each in 1.0f64..2_000_000_000.0,
     ) {
         let before = MetricSnapshot {
-            available_memory_bytes: before_avail,
-            total_cpu_frac: 0.5,
-            occupied_ports: vec![],
-            total_fds: 1000,
+            available_memory_bytes: Some(before_avail),
+            total_cpu_frac: Some(0.5),
+            occupied_ports: Some(vec![]),
+            total_fds: Some(1000),
             timestamp: 0.0,
         };
         let after = MetricSnapshot {
-            available_memory_bytes: before_avail + delta,
-            total_cpu_frac: 0.5,
-            occupied_ports: vec![],
-            total_fds: 1000,
+            available_memory_bytes: Some(before_avail + delta),
+            total_cpu_frac: Some(0.5),
+            occupied_ports: Some(vec![]),
+            total_fds: Some(1000),
             timestamp: 1.0,
         };
         let outcomes = vec![ActionOutcome {
@@ -3225,17 +3225,17 @@ proptest! {
             label: "p".to_string(),
             success: true,
             respawn_detected: false,
-            expected_contribution: expected_each,
+            expected_contribution: Some(expected_each),
         }];
         let config = ProgressConfig::default();
         let report = measure_progress(
             GoalMetric::Memory, None, &before, &after, outcomes, &config, None,
         );
         let observed = delta as f64;
-        prop_assert!((report.observed_progress - observed).abs() < 1.0,
-            "observed {} != delta {}", report.observed_progress, observed);
-        prop_assert!((report.discrepancy - (observed - expected_each)).abs() < 1.0,
-            "discrepancy {} != observed-expected {}", report.discrepancy, observed - expected_each);
+        prop_assert!((report.observed_progress.unwrap() - observed).abs() < 1.0,
+            "observed {:?} != delta {}", report.observed_progress, observed);
+        prop_assert!((report.discrepancy.unwrap() - (observed - expected_each)).abs() < 1.0,
+            "discrepancy {:?} != observed-expected {}", report.discrepancy, observed - expected_each);
     }
 
     /// Classification is AsExpected when discrepancy fraction is within tolerance.
@@ -3248,20 +3248,21 @@ proptest! {
         // Need observed > no_effect_threshold (5% of expected)
         prop_assume!(observed.abs() >= expected * 0.05);
         let before = MetricSnapshot {
-            available_memory_bytes: 1_000_000_000,
-            total_cpu_frac: 0.5,
-            occupied_ports: vec![],
-            total_fds: 1000,
+            available_memory_bytes: Some(1_000_000_000),
+            total_cpu_frac: Some(0.5),
+            occupied_ports: Some(vec![]),
+            total_fds: Some(1000),
             timestamp: 0.0,
         };
         let after = MetricSnapshot {
-            available_memory_bytes: 1_000_000_000 + observed as u64,
+            available_memory_bytes: Some(1_000_000_000 + observed as u64),
+            timestamp: 1.0,
             ..before.clone()
         };
         let outcomes = vec![ActionOutcome {
             pid: 1, label: "p".to_string(),
             success: true, respawn_detected: false,
-            expected_contribution: expected,
+            expected_contribution: Some(expected),
         }];
         let config = ProgressConfig::default();
         let report = measure_progress(
@@ -3269,7 +3270,7 @@ proptest! {
         );
         prop_assert_eq!(report.classification,
             pt_core::decision::goal_progress::DiscrepancyClass::AsExpected,
-            "frac_delta={}, discrepancy_fraction={}", frac_delta, report.discrepancy_fraction);
+            "frac_delta={}, discrepancy_fraction={:?}", frac_delta, report.discrepancy_fraction);
     }
 
     /// measure_progress never panics on arbitrary valid inputs.
@@ -3281,17 +3282,17 @@ proptest! {
         expected in 0.0f64..1_000_000_000.0,
     ) {
         let before = MetricSnapshot {
-            available_memory_bytes: before_avail,
-            total_cpu_frac: 0.5,
-            occupied_ports: vec![],
-            total_fds: 1000,
+            available_memory_bytes: Some(before_avail),
+            total_cpu_frac: Some(0.5),
+            occupied_ports: Some(vec![]),
+            total_fds: Some(1000),
             timestamp: 0.0,
         };
         let after = MetricSnapshot {
-            available_memory_bytes: after_avail,
-            total_cpu_frac: 0.5,
-            occupied_ports: vec![],
-            total_fds: 1000,
+            available_memory_bytes: Some(after_avail),
+            total_cpu_frac: Some(0.5),
+            occupied_ports: Some(vec![]),
+            total_fds: Some(1000),
             timestamp: 1.0,
         };
         let outcomes: Vec<ActionOutcome> = (0..n_outcomes).map(|i| ActionOutcome {
@@ -3299,13 +3300,47 @@ proptest! {
             label: format!("p-{}", i),
             success: true,
             respawn_detected: false,
-            expected_contribution: expected / (n_outcomes.max(1)) as f64,
+            expected_contribution: Some(expected / (n_outcomes.max(1)) as f64),
         }).collect();
         let config = ProgressConfig::default();
         let report = measure_progress(
             GoalMetric::Memory, None, &before, &after, outcomes, &config, None,
         );
-        prop_assert!(report.discrepancy.is_finite());
+        prop_assert!(report.discrepancy.is_some_and(f64::is_finite));
+    }
+
+    /// Missing predictions cannot erase measurements or invent a comparison.
+    #[test]
+    fn goal_progress_unknown_prediction_preserves_observed_cpu(
+        before_cpu in 0.0f64..1.0,
+        after_cpu in 0.0f64..1.0,
+        known_prediction in 0.0f64..1.0,
+        succeeded in any::<bool>(),
+        respawned in any::<bool>(),
+    ) {
+        let before = MetricSnapshot {
+            available_memory_bytes: None,
+            total_cpu_frac: Some(before_cpu),
+            occupied_ports: None,
+            total_fds: None,
+            timestamp: 0.0,
+        };
+        let after = MetricSnapshot {
+            total_cpu_frac: Some(after_cpu), timestamp: 1.0, ..before.clone()
+        };
+        let outcomes = vec![
+            ActionOutcome { pid: 1, label: "known".into(), success: succeeded, respawn_detected: respawned, expected_contribution: Some(known_prediction) },
+            ActionOutcome { pid: 2, label: "unknown".into(), success: succeeded, respawn_detected: respawned, expected_contribution: None },
+        ];
+        let report = measure_progress(
+            GoalMetric::Cpu, None, &before, &after, outcomes, &ProgressConfig::default(), None,
+        );
+        prop_assert_eq!(report.expected_progress, None);
+        prop_assert_eq!(report.observed_progress, Some(before_cpu - after_cpu));
+        prop_assert_eq!(report.discrepancy, None);
+        prop_assert_eq!(report.discrepancy_fraction, None);
+        prop_assert_eq!(report.classification, pt_core::decision::goal_progress::DiscrepancyClass::Unavailable);
+        prop_assert!(report.suspected_causes.is_empty());
     }
 
     // ── Escalation properties ───────────────────────────────────────

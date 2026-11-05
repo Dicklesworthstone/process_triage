@@ -82,6 +82,10 @@ use pt_core::supervision::{
 use pt_core::tui::widgets::ProcessRow;
 #[cfg(feature = "ui")]
 use pt_core::tui::{run_ftui, App, ExecutionOutcome, RefreshOutcome};
+use pt_core::verify::relief::{capture_resource_observation, ResourceDelta, DEFAULT_SETTLE_MS};
+use pt_core::verify::relief_store::{
+    begin_resource_run, finish_resource_run, load_resource_runs, ResourceRun, ResourceRunResult,
+};
 #[cfg(test)]
 use pt_core::verify::verify_plan;
 use pt_core::verify::{
@@ -1276,6 +1280,10 @@ struct AgentApplyArgs {
     /// Resume interrupted apply (skip already completed actions)
     #[arg(long)]
     resume: bool,
+
+    /// Observe host resources after executed actions for this many seconds (0 skips the interval)
+    #[arg(long, default_value_t = DEFAULT_SETTLE_MS / 1_000, value_parser = clap::value_parser!(u64).range(0..=300))]
+    settle: u64,
 
     /// Refuse if the current host or recorded plan host differs from this ID
     #[arg(long, requires = "expected_plan_sha256")]
@@ -4500,8 +4508,6 @@ fn build_tui_rows(
     })
 }
 
-#[cfg(target_os = "linux")]
-use pt_core::collect::{parse_fd, parse_proc_net_tcp, parse_proc_net_udp, NetworkSnapshot};
 use pt_core::collect::{quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanResult};
 #[cfg(test)]
 use pt_core::decision::decide_action;
@@ -14380,14 +14386,14 @@ mod process_tree_safety_tests {
     #[test]
     fn goal_progress_planning_retains_expectation_without_observed_effect_claim() {
         let before = super::MetricSnapshot {
-            available_memory_bytes: 100,
-            total_cpu_frac: 0.0,
-            occupied_ports: Vec::new(),
-            total_fds: 0,
+            available_memory_bytes: Some(100),
+            total_cpu_frac: Some(0.0),
+            occupied_ports: Some(Vec::new()),
+            total_fds: Some(0),
             timestamp: 1.0,
         };
         let after = super::MetricSnapshot {
-            available_memory_bytes: 200,
+            available_memory_bytes: Some(200),
             timestamp: 2.0,
             ..before.clone()
         };
@@ -14401,7 +14407,7 @@ mod process_tree_safety_tests {
                 label: "sleep 600".to_string(),
                 success: false,
                 respawn_detected: false,
-                expected_contribution: 50.0,
+                expected_contribution: Some(50.0),
             }],
             &super::ProgressConfig::default(),
             None,
@@ -14409,7 +14415,7 @@ mod process_tree_safety_tests {
         let actual = super::goal_report_json(&report, false);
         assert_eq!(actual["expected_progress"], 50.0);
         assert_eq!(actual["observed_progress"], 100.0);
-        assert!(!actual["suspected_causes"].as_array().unwrap().is_empty());
+        assert!(actual["suspected_causes"].as_array().unwrap().is_empty());
         let planned = super::goal_report_json(&report, true);
         assert_eq!(planned["expected_progress"], 50.0);
         assert!(planned["observed_progress"].is_null());
@@ -18426,6 +18432,118 @@ mod planning_pressure_tests {
     }
 
     #[test]
+    fn measured_goal_resources_require_bound_valid_memory_and_cpu_capacity() {
+        use pt_core::verify::relief::{
+            compare_resource_windows, ObservedMetricDelta, ResourceEvidenceBinding,
+            ResourceObservation, ResourceObservationWindow,
+        };
+        let make_window = |at_ms: u64, available: u64| {
+            let mut pressure = host().snapshot.unwrap();
+            pressure.sampled_at_ms = at_ms;
+            pressure.meminfo.as_mut().unwrap().available = Some(available);
+            ResourceObservationWindow {
+                requested_duration_ms: 0,
+                sample_interval_ms: 1_000,
+                samples: vec![ResourceObservation {
+                    boot_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                    clock_ticks_per_second: Some(100),
+                    monotonic_start_ns: Some(at_ms * 1_000_000),
+                    monotonic_end_ns: Some(at_ms * 1_000_000 + 1),
+                    pressure,
+                    cpu_times: None,
+                    unavailable: Vec::new(),
+                }],
+            }
+        };
+        let before_window = make_window(1000, 100);
+        for available in [200, 1001] {
+            let after_window = make_window(2000, available);
+            let mut delta = compare_resource_windows(&before_window, &after_window);
+            delta.binding = Some(ResourceEvidenceBinding {
+                run_id: "33333333-3333-4333-8333-333333333333".into(),
+                action_ids: vec!["renice-worker".into()],
+                boot_id: "11111111-1111-4111-8111-111111111111".into(),
+                execution_clock_resolution_ns: 10_000_000,
+                timing_validation: "execution_tick_interval_overlaps_inter_window_gap".into(),
+            });
+            let mut run = ResourceRunResult {
+                run_id: "33333333-3333-4333-8333-333333333333".into(),
+                before: Some(before_window.clone()),
+                after: Some(after_window),
+                artifact_path: None,
+                resource_delta: Some(delta),
+                unavailable: Vec::new(),
+            };
+            let mut before = MetricSnapshot {
+                available_memory_bytes: None,
+                total_cpu_frac: None,
+                occupied_ports: Some(vec![8080]),
+                total_fds: Some(100),
+                timestamp: 1.0,
+            };
+            let mut after = MetricSnapshot {
+                timestamp: 2.0,
+                ..before.clone()
+            };
+            attach_measured_goal_resources(&mut before, &mut after, Some(&run));
+            let expected_memory = (available == 200).then_some(available);
+            assert_eq!(after.available_memory_bytes, expected_memory);
+            assert_eq!(before.available_memory_bytes, expected_memory.map(|_| 100));
+            assert!(
+                before.total_cpu_frac.is_none(),
+                "point observations have no CPU rate"
+            );
+
+            let delta = run.resource_delta.as_mut().unwrap();
+            delta.cpu.busy_percent = ObservedMetricDelta {
+                before: Some(80.0),
+                after: Some(20.0),
+                delta: Some(-60.0),
+            };
+            delta.cpu_capacity_comparable = false;
+            attach_measured_goal_resources(&mut before, &mut after, Some(&run));
+            assert!(before.total_cpu_frac.is_none());
+            run.resource_delta.as_mut().unwrap().cpu_capacity_comparable = true;
+            attach_measured_goal_resources(&mut before, &mut after, Some(&run));
+            assert_eq!(before.total_cpu_frac, Some(0.8));
+            assert_eq!(after.total_cpu_frac, Some(0.2));
+
+            run.resource_delta.as_mut().unwrap().binding = None;
+            attach_measured_goal_resources(&mut before, &mut after, Some(&run));
+            assert!(before.total_cpu_frac.is_none());
+            assert!(before.available_memory_bytes.is_none());
+            assert!(before.occupied_ports.is_none());
+            assert!(before.total_fds.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn goal_port_census_rejects_partial_and_malformed_tables() {
+        let header = "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
+        let listening =
+            "0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 10\n";
+        let valid = format!("{header}{listening}");
+        assert_eq!(observed_ports(&valid, true, false), Some(vec![8080]));
+        assert_eq!(observed_ports(header, true, false), Some(Vec::new()));
+        assert_eq!(observed_ports("", true, false), None);
+        assert_eq!(
+            observed_ports(&format!("{valid}broken row\n"), true, false),
+            None
+        );
+        assert_eq!(
+            observed_ports(&valid.replace("1F90", "ZZZZ"), true, false),
+            None
+        );
+        assert_eq!(observed_ports(&valid, true, true), None);
+        assert_eq!(
+            observed_ports(&valid.replace(" 0A ", " 01 "), true, false),
+            Some(Vec::new())
+        );
+        assert_eq!(observed_ports(&valid, false, false), Some(vec![8080]));
+    }
+
+    #[test]
     fn changed_incarnations_and_missing_host_capacity_preserve_unknowns() {
         let proc = process();
         let pressure = host();
@@ -21426,91 +21544,161 @@ fn precheck_label_for_apply(check: &pt_core::plan::PreCheck) -> &'static str {
 }
 
 #[cfg(target_os = "linux")]
-fn read_mem_available_bytes_for_goal_progress() -> u64 {
-    std::fs::read("/proc/meminfo")
-        .ok()
-        .and_then(|bytes| {
-            let content = String::from_utf8_lossy(&bytes);
-            content.lines().find_map(|line| {
-                line.strip_prefix("MemAvailable:")
-                    .and_then(|rest| rest.split_whitespace().next())
-                    .and_then(|value| value.parse::<u64>().ok())
-            })
-        })
-        .map(|kb| kb.saturating_mul(1024))
-        .unwrap_or(0)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_mem_available_bytes_for_goal_progress() -> u64 {
-    0
+fn observed_ports(content: &str, tcp: bool, ipv6: bool) -> Option<Vec<u16>> {
+    let mut lines = content.lines();
+    if !lines.next()?.contains("local_address") {
+        return None;
+    }
+    let address_port = |value: &str| -> Option<u16> {
+        let (address, port) = value.split_once(':')?;
+        if address.len() != if ipv6 { 32 } else { 8 }
+            || !address.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || port.len() != 4
+        {
+            return None;
+        }
+        u16::from_str_radix(port, 16).ok()
+    };
+    let mut ports = Vec::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 10 {
+            return None;
+        }
+        let local = address_port(fields[1])?;
+        let remote = address_port(fields[2])?;
+        let state = u8::from_str_radix(fields[3], 16).ok()?;
+        if local > 0 && if tcp { state == 0x0a } else { remote == 0 } {
+            ports.push(local);
+        }
+    }
+    Some(ports)
 }
 
 #[cfg(target_os = "linux")]
-fn collect_occupied_ports_for_goal_progress() -> Vec<u16> {
+fn collect_occupied_ports_for_goal_progress() -> Option<Vec<u16>> {
     let mut ports = std::collections::BTreeSet::new();
-
-    if let Some(entries) = parse_proc_net_tcp("/proc/net/tcp", false) {
-        for entry in entries.into_iter().filter(|e| e.state.is_listen()) {
-            ports.insert(entry.local_port);
-        }
+    for (path, tcp, ipv6) in [
+        ("/proc/net/tcp", true, false),
+        ("/proc/net/tcp6", true, true),
+        ("/proc/net/udp", false, false),
+        ("/proc/net/udp6", false, true),
+    ] {
+        // A partial/unreadable table is not evidence that a port became free.
+        let content = std::fs::read_to_string(path).ok()?;
+        ports.extend(observed_ports(&content, tcp, ipv6)?);
     }
-    if let Some(entries) = parse_proc_net_tcp("/proc/net/tcp6", true) {
-        for entry in entries.into_iter().filter(|e| e.state.is_listen()) {
-            ports.insert(entry.local_port);
-        }
-    }
-    if let Some(entries) = parse_proc_net_udp("/proc/net/udp", false) {
-        for entry in entries
-            .into_iter()
-            .filter(|e| e.local_port > 0 && e.remote_port == 0)
-        {
-            ports.insert(entry.local_port);
-        }
-    }
-    if let Some(entries) = parse_proc_net_udp("/proc/net/udp6", true) {
-        for entry in entries
-            .into_iter()
-            .filter(|e| e.local_port > 0 && e.remote_port == 0)
-        {
-            ports.insert(entry.local_port);
-        }
-    }
-
-    ports.into_iter().collect()
+    Some(ports.into_iter().collect())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn collect_occupied_ports_for_goal_progress() -> Vec<u16> {
-    Vec::new()
+fn collect_occupied_ports_for_goal_progress() -> Option<Vec<u16>> {
+    None
 }
 
 #[cfg(target_os = "linux")]
-fn collect_total_fds_for_goal_progress(processes: &[ProcessRecord]) -> u64 {
-    processes
-        .iter()
-        .filter_map(|proc| parse_fd(proc.pid.0).map(|fd| fd.count as u64))
-        .sum()
+fn observed_process_fd_count(process: &ProcessRecord) -> Option<u64> {
+    let identity = process_identity_from_record(process);
+    let provider = LiveIdentityProvider::new();
+    if !provider.revalidate(&identity).ok()? {
+        return None;
+    }
+    let mut entries = std::fs::read_dir(format!("/proc/{}/fd", process.pid.0)).ok()?;
+    let count = entries.try_fold(0u64, |count, entry| {
+        let entry = entry.ok()?;
+        entry.file_name().to_str()?.parse::<u32>().ok()?;
+        count.checked_add(1)
+    })?;
+    provider.revalidate(&identity).ok()?.then_some(count)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_total_fds_for_goal_progress(processes: &[ProcessRecord]) -> Option<u64> {
+    if processes.is_empty() {
+        return None;
+    }
+    processes.iter().try_fold(0u64, |count, process| {
+        count.checked_add(observed_process_fd_count(process)?)
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn collect_total_fds_for_goal_progress(_processes: &[ProcessRecord]) -> u64 {
-    0
+fn collect_total_fds_for_goal_progress(_processes: &[ProcessRecord]) -> Option<u64> {
+    None
 }
 
-fn capture_metric_snapshot_for_goal_progress(processes: &[ProcessRecord]) -> MetricSnapshot {
-    let total_cpu_frac = processes
-        .iter()
-        .map(|proc| (proc.cpu_percent / 100.0).max(0.0))
-        .sum();
-
+fn capture_metric_snapshot_for_goal_progress(
+    processes: Option<&[ProcessRecord]>,
+) -> MetricSnapshot {
     MetricSnapshot {
-        available_memory_bytes: read_mem_available_bytes_for_goal_progress(),
-        total_cpu_frac,
+        // Filled only from comparable, execution-bound host observation windows.
+        available_memory_bytes: None,
+        total_cpu_frac: None,
         occupied_ports: collect_occupied_ports_for_goal_progress(),
-        total_fds: collect_total_fds_for_goal_progress(processes),
+        total_fds: processes.and_then(collect_total_fds_for_goal_progress),
         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
     }
+}
+
+fn attach_measured_goal_resources(
+    before: &mut MetricSnapshot,
+    after: &mut MetricSnapshot,
+    run: Option<&ResourceRunResult>,
+) {
+    before.available_memory_bytes = None;
+    after.available_memory_bytes = None;
+    before.total_cpu_frac = None;
+    after.total_cpu_frac = None;
+    let comparable = run
+        .and_then(|run| run.resource_delta.as_ref())
+        .is_some_and(|delta| delta.comparable && delta.binding.is_some());
+    if !comparable {
+        // Even complete-looking port/FD censuses need an executed, comparable run.
+        before.occupied_ports = None;
+        after.occupied_ports = None;
+        before.total_fds = None;
+        after.total_fds = None;
+        return;
+    }
+    let run = run.unwrap();
+    let delta = run.resource_delta.as_ref().unwrap();
+    let available_memory = |window: &pt_core::verify::relief::ResourceObservationWindow| {
+        window.samples.last()?.pressure.meminfo?.available
+    };
+    if delta.available_memory_bytes.delta.is_some() {
+        before.available_memory_bytes = run.before.as_ref().and_then(available_memory);
+        after.available_memory_bytes = run.after.as_ref().and_then(available_memory);
+    }
+    if delta.cpu_capacity_comparable && delta.cpu.busy_percent.delta.is_some() {
+        before.total_cpu_frac = delta.cpu.busy_percent.before.map(|percent| percent / 100.0);
+        after.total_cpu_frac = delta.cpu.busy_percent.after.map(|percent| percent / 100.0);
+    }
+}
+
+fn resource_delta_summary(delta: &ResourceDelta) -> String {
+    let show = |value: Option<f64>, scale: f64| {
+        value
+            .map(|value| format!("{:.1}", value / scale))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    format!(
+        "Observed host resources (after minus before; attribution to actions is unproven): CPU busy {}% -> {}% (delta {} points), available memory {} -> {} MiB (delta {} MiB)",
+        show(delta.cpu.busy_percent.before, 1.0),
+        show(delta.cpu.busy_percent.after, 1.0),
+        show(delta.cpu.busy_percent.delta, 1.0),
+        show(delta.available_memory_bytes.before, 1_048_576.0),
+        show(delta.available_memory_bytes.after, 1_048_576.0),
+        show(delta.available_memory_bytes.delta, 1_048_576.0),
+    )
+}
+
+#[derive(Clone, Default)]
+struct ExpectedGoalContribution {
+    memory_bytes: Option<f64>,
+    cpu_host_fraction: Option<f64>,
+    ports: Option<f64>,
+    file_descriptors: Option<f64>,
+    label: String,
 }
 
 fn successful_goal_action_outcomes(
@@ -21587,6 +21775,7 @@ fn goal_report_brief_json(report: &GoalProgressReport, planning_only: bool) -> s
         "observed": (!planning_only).then_some(report.observed_progress),
         "discrepancy": (!planning_only).then_some(report.discrepancy),
         "discrepancy_fraction": (!planning_only).then_some(report.discrepancy_fraction),
+        "measurement_unavailable_reason": report.measurement_unavailable_reason,
         "classification": if planning_only { "not_executed".to_string() } else { report.classification.to_string() },
         "suspected_causes": if planning_only { Vec::new() } else { report.suspected_causes.iter().map(|cause| cause.cause.clone()).collect::<Vec<_>>() },
         "planning_only": planning_only,
@@ -21594,6 +21783,15 @@ fn goal_report_brief_json(report: &GoalProgressReport, planning_only: bool) -> s
 }
 
 fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
+    let apply_started = std::time::Instant::now();
+    let remaining_observation_budget = || {
+        global.timeout.map(|seconds| {
+            Duration::from_secs(seconds)
+                .saturating_sub(apply_started.elapsed())
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64
+        })
+    };
     let _lock = match acquire_global_lock(global, "agent apply") {
         Ok(lock) => lock,
         Err(code) => return code,
@@ -21899,13 +22097,15 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         progress: None,
     };
 
-    let before_scan_processes = match quick_scan(&goal_progress_scan_options) {
-        Ok(scan) => scan.processes,
+    let before_scan = match quick_scan(&goal_progress_scan_options) {
+        Ok(scan) => scan,
         Err(error) => {
             eprintln!("agent apply: cannot revalidate selected process tree: {error}");
             return ExitCode::InternalError;
         }
     };
+    let before_scan_complete = before_scan.metadata.warnings.is_empty();
+    let before_scan_processes = before_scan.processes;
     let mut selected_candidates: Vec<serde_json::Value> = actions_to_apply
         .iter()
         .map(|action| {
@@ -21931,7 +22131,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             )
         })
         .collect();
-    let before_snapshot = capture_metric_snapshot_for_goal_progress(&before_scan_processes);
+    let mut before_snapshot = capture_metric_snapshot_for_goal_progress(
+        before_scan_complete.then_some(before_scan_processes.as_slice()),
+    );
     let before_by_pid: HashMap<u32, &ProcessRecord> = before_scan_processes
         .iter()
         .map(|proc| (proc.pid.0, proc))
@@ -21950,13 +22152,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         std::cmp::Reverse(ancestors.len())
     });
 
-    #[cfg(target_os = "linux")]
-    let before_network_snapshot = NetworkSnapshot::collect();
-
-    let mut expected_by_action: HashMap<String, (f64, f64, f64, f64, String)> = HashMap::new();
+    let mut expected_by_action: HashMap<String, ExpectedGoalContribution> = HashMap::new();
     for action in &actions_to_apply {
         let pid = action.target.pid.0;
-        let before_proc = before_by_pid.get(&pid).copied();
+        let before_proc = before_by_pid.get(&pid).copied().filter(|process| {
+            process.start_id == action.target.start_id && process.uid == action.target.uid
+        });
         let label = before_proc
             .map(|proc| proc.cmd.clone())
             .unwrap_or_else(|| format!("pid {}", pid));
@@ -21965,64 +22166,43 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             action
                 .rationale
                 .memory_mb
-                .unwrap_or(0.0)
-                .max(0.0)
-                .mul_add(1_048_576.0, 0.0)
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map(|value| value * 1_048_576.0)
+                .filter(|value| value.is_finite())
         } else {
-            0.0
+            Some(0.0)
         };
-        let cpu_expected = if matches!(
-            action.action,
-            Action::Kill
-                | Action::Restart
-                | Action::Pause
-                | Action::Freeze
-                | Action::Quarantine
-                | Action::Throttle
-        ) {
-            before_proc
-                .map(|proc| (proc.cpu_percent / 100.0).max(0.0))
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-
-        #[cfg(target_os = "linux")]
+        // No current per-action CPU window predicts a host-capacity fraction.
+        // Lifetime process averages (in cores) cannot be compared to host busy %.
+        let cpu_expected = None;
         let port_expected = if matches!(action.action, Action::Kill | Action::Restart) {
-            before_network_snapshot
-                .get_process_info(pid)
-                .map(|info| {
-                    info.listen_ports
-                        .iter()
-                        .map(|port| port.port)
-                        .collect::<HashSet<_>>()
-                        .len() as f64
-                })
-                .unwrap_or(0.0)
+            // A process socket count does not prove exclusive ownership in this
+            // observer's network namespace, so it is not a port-release forecast.
+            None
         } else {
-            0.0
+            Some(0.0)
         };
-        #[cfg(not(target_os = "linux"))]
-        let port_expected = 0.0;
 
         #[cfg(target_os = "linux")]
         let fd_expected = if matches!(action.action, Action::Kill | Action::Restart) {
-            parse_fd(pid).map(|fd| fd.count as f64).unwrap_or(0.0)
+            before_proc
+                .and_then(observed_process_fd_count)
+                .map(|count| count as f64)
         } else {
-            0.0
+            Some(0.0)
         };
         #[cfg(not(target_os = "linux"))]
-        let fd_expected = 0.0;
+        let fd_expected = None;
 
         expected_by_action.insert(
             action.action_id.clone(),
-            (
-                memory_expected,
-                cpu_expected,
-                port_expected,
-                fd_expected,
+            ExpectedGoalContribution {
+                memory_bytes: memory_expected,
+                cpu_host_fraction: cpu_expected,
+                ports: port_expected,
+                file_descriptors: fd_expected,
                 label,
-            ),
+            },
         );
     }
 
@@ -22164,6 +22344,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
+    let mut resource_run: Option<ResourceRun> = None;
     // Only the Linux/macOS executor runs actions; elsewhere every action is unsupported.
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
     let mut succeeded = 0usize;
@@ -22364,6 +22545,28 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             // freeze/throttle/quarantine (refused unless the target owns its cgroup).
             // Previously only signals could run, so every other planned action failed.
             let action_runner = pt_core::action::CompositeActionRunner::with_defaults();
+
+            // Observe before the action loop, then let every action perform its
+            // normal fresh safety checks. Dry runs never enter this branch.
+            let plan_sha256 = format!("{:x}", Sha256::digest(plan_content.as_bytes()));
+            let requested_settle_ms = args.settle * 1_000;
+            let initial_settle_ms = remaining_observation_budget()
+                .map_or(requested_settle_ms, |remaining| {
+                    remaining.min(requested_settle_ms)
+                });
+            let mut observations = begin_resource_run(
+                &handle.dir.join("action"),
+                &plan,
+                &plan_sha256,
+                initial_settle_ms,
+            );
+            if initial_settle_ms < requested_settle_ms {
+                observations.unavailable.push(pt_core::collect::pressure::Unavailable {
+                    source: "operation_timeout".to_string(),
+                    reason: format!("Requested settle window shortened from {requested_settle_ms}ms to {initial_settle_ms}ms by the remaining operation timeout"),
+                });
+            }
+            resource_run = Some(observations);
 
             for action in &actions_to_apply {
                 action_index = action_index.saturating_add(1);
@@ -22671,7 +22874,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         break;
                     }
                 }
-                let execution_evidence = match capture_current_action_execution_evidence(action) {
+                let mut execution_evidence = match capture_current_action_execution_evidence(action)
+                {
                     Ok(evidence) => evidence,
                     Err(error) => {
                         if action.action == Action::Kill {
@@ -22694,6 +22898,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         continue;
                     }
                 };
+                execution_evidence["resource_run_id"] =
+                    serde_json::json!(resource_run.as_ref().map(|run| &run.run_id));
                 // "success" means the effect was observed (stopped, reniced, exited,
                 // zombie reaped), not merely that the syscall returned.
                 let result = action_runner
@@ -22823,10 +23029,69 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }
     }
 
-    let after_scan_processes = quick_scan(&goal_progress_scan_options)
-        .map(|scan| scan.processes)
-        .unwrap_or_else(|_| Vec::new());
-    let after_snapshot = capture_metric_snapshot_for_goal_progress(&after_scan_processes);
+    // Persist execution results before the observation wait. A telemetry error
+    // must never erase a real action or rewrite its success as a failure.
+    let action_dir = handle.dir.join("action");
+    let persistence_error = append_action_outcomes(&action_dir, &outcomes).err();
+    if let Some(error) = &persistence_error {
+        eprintln!("agent apply: {error}; actual action outcomes remain in this response");
+    }
+    let resource_outcomes = outcomes
+        .iter()
+        .cloned()
+        .map(serde_json::from_value::<pt_core::verify::SavedActionOutcome>)
+        .collect::<Result<Vec<_>, _>>();
+    let resource_evidence_error = resource_outcomes.as_ref().err().map(ToString::to_string);
+    let executed_attempt = resource_outcomes.as_ref().is_ok_and(|saved| {
+        saved
+            .iter()
+            .any(|outcome| outcome.executed_at.is_some() && outcome.action.is_some())
+    });
+    let mut resource_observation = resource_run.map(|mut run| {
+        if let Some(remaining_ms) = remaining_observation_budget() {
+            run.cap_settle_ms(remaining_ms);
+        }
+        finish_resource_run(
+            run,
+            &plan,
+            resource_outcomes.as_ref().map_or(&[], Vec::as_slice),
+        )
+    });
+    if let Some(run) = resource_observation.as_mut() {
+        if let Some(error) = &persistence_error {
+            run.unavailable.push(pt_core::collect::pressure::Unavailable {
+                source: "execution_outcome_persistence".to_string(),
+                reason: format!("Live observations use in-memory execution evidence; durable replay requires saved outcomes: {error}"),
+            });
+        }
+        if let Some(error) = &resource_evidence_error {
+            run.unavailable
+                .push(pt_core::collect::pressure::Unavailable {
+                    source: "execution_outcome_parsing".to_string(),
+                    reason: error.clone(),
+                });
+        }
+    }
+    let after_scan = quick_scan(&goal_progress_scan_options);
+    let after_scan_error = match &after_scan {
+        Ok(scan) if scan.metadata.warnings.is_empty() => None,
+        Ok(scan) => Some(format!(
+            "incomplete process census: {}",
+            scan.metadata.warnings.join("; ")
+        )),
+        Err(error) => Some(format!("process census failed: {error}")),
+    };
+    let after_scan_processes = after_scan
+        .as_ref()
+        .ok()
+        .filter(|scan| scan.metadata.warnings.is_empty())
+        .map(|scan| scan.processes.as_slice());
+    let mut after_snapshot = capture_metric_snapshot_for_goal_progress(after_scan_processes);
+    attach_measured_goal_resources(
+        &mut before_snapshot,
+        &mut after_snapshot,
+        resource_observation.as_ref(),
+    );
     let (goal_executions, goal_evidence_error) =
         match successful_goal_action_outcomes(&plan, &outcomes) {
             Ok(executions) => (executions, None),
@@ -22840,7 +23105,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .map(|execution| (execution.action_id.as_str(), execution))
         .collect();
 
-    let mut respawn_by_action: HashMap<String, bool> = HashMap::new();
+    let mut respawn_by_action: HashMap<String, Option<bool>> = HashMap::new();
     let mut memory_action_outcomes = Vec::new();
     let mut cpu_action_outcomes = Vec::new();
     let mut port_action_outcomes = Vec::new();
@@ -22848,44 +23113,52 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     for action in &actions_to_apply {
         let execution = execution_by_action.get(action.action_id.as_str()).copied();
         let success = execution.is_some();
-        let respawn_detected = execution.is_some_and(|execution| {
-            detect_respawn_for_goal_progress(action, execution, &after_scan_processes)
-        });
-        respawn_by_action.insert(action.action_id.clone(), respawn_detected);
+        let respawn_observation =
+            execution
+                .zip(after_scan_processes)
+                .map(|(execution, processes)| {
+                    detect_respawn_for_goal_progress(action, execution, processes)
+                });
+        respawn_by_action.insert(action.action_id.clone(), respawn_observation);
+        // Only a positive observed match can support a respawn diagnosis.
+        let respawn_detected = respawn_observation == Some(true);
 
-        let (memory_expected, cpu_expected, port_expected, fd_expected, label) = expected_by_action
+        let expected = expected_by_action
             .get(&action.action_id)
             .cloned()
-            .unwrap_or_else(|| (0.0, 0.0, 0.0, 0.0, format!("pid {}", action.target.pid.0)));
+            .unwrap_or_else(|| ExpectedGoalContribution {
+                label: format!("pid {}", action.target.pid.0),
+                ..Default::default()
+            });
 
         let action_pid = action.target.pid.0;
         memory_action_outcomes.push(GoalActionOutcome {
             pid: action_pid,
-            label: label.clone(),
+            label: expected.label.clone(),
             success,
             respawn_detected,
-            expected_contribution: memory_expected,
+            expected_contribution: expected.memory_bytes,
         });
         cpu_action_outcomes.push(GoalActionOutcome {
             pid: action_pid,
-            label: label.clone(),
+            label: expected.label.clone(),
             success,
             respawn_detected,
-            expected_contribution: cpu_expected,
+            expected_contribution: expected.cpu_host_fraction,
         });
         port_action_outcomes.push(GoalActionOutcome {
             pid: action_pid,
-            label: label.clone(),
+            label: expected.label.clone(),
             success,
             respawn_detected,
-            expected_contribution: port_expected,
+            expected_contribution: expected.ports,
         });
         fd_action_outcomes.push(GoalActionOutcome {
             pid: action_pid,
-            label,
+            label: expected.label,
             success,
             respawn_detected,
-            expected_contribution: fd_expected,
+            expected_contribution: expected.file_descriptors,
         });
     }
 
@@ -22927,13 +23200,21 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         Some(sid.0.clone()),
     );
 
-    let planning_only = global.dry_run || global.shadow;
+    let planning_only = global.dry_run || global.shadow || !executed_attempt;
     let goal_progress_payload = serde_json::json!({
         "session_id": sid.0,
         "before": before_snapshot,
         "after": after_snapshot,
         "planning_only": planning_only,
         "execution_evidence_error": goal_evidence_error,
+        "after_scan_error": after_scan_error,
+        "scope": "host_observations_not_per_action_causal_relief",
+        "units": {"memory": "bytes", "cpu": "host_busy_fraction", "ports": "observer_network_namespace", "file_descriptors": "observed_process_census_fd_entries"},
+        "prediction_notes": [
+            "Per-action CPU relief has no comparable current host-capacity forecast; lifetime process CPU is not a substitute.",
+            "Port-release forecasts require exclusive ownership in the observer network namespace and remain unavailable without it.",
+            "Planned RSS is a footprint estimate, not uniquely reclaimable host memory."
+        ],
         "metrics": {
             "memory": goal_report_json(&memory_report, planning_only),
             "cpu": goal_report_json(&cpu_report, planning_only),
@@ -22946,7 +23227,8 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "cpu": goal_report_brief_json(&cpu_report, planning_only),
         "ports": goal_report_brief_json(&port_report, planning_only),
         "file_descriptors": goal_report_brief_json(&fd_report, planning_only),
-        "respawn_loop_suspected": respawn_by_action.values().any(|detected| *detected),
+        "respawn_loop_suspected": respawn_by_action.values().any(|detected| *detected == Some(true)),
+        "respawn_observation_available": after_scan_processes.is_some(),
     });
 
     for outcome in &mut outcomes {
@@ -22955,7 +23237,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 .get("action_id")
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
-            let respawn_detected = respawn_by_action.get(action_id).copied().unwrap_or(false);
+            let respawn_detected = respawn_by_action.get(action_id).copied().flatten();
             obj.insert(
                 "respawn_detected".to_string(),
                 serde_json::json!(respawn_detected),
@@ -22967,29 +23249,34 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }
     }
 
-    let memory_summary_suffix = if planning_only {
-        format!(
-            ", mem_obs=unobserved mem_exp={:.1}MB (not_executed)",
-            memory_report.expected_progress / 1_048_576.0
-        )
-    } else {
-        format!(
-            ", mem_obs={:.1}MB mem_exp={:.1}MB ({})",
-            memory_report.observed_progress / 1_048_576.0,
-            memory_report.expected_progress / 1_048_576.0,
-            memory_report.classification
-        )
+    let show_mb = |value: Option<f64>| {
+        value
+            .map(|value| format!("{:.1}MiB", value / 1_048_576.0))
+            .unwrap_or_else(|| "unknown".to_string())
     };
-
-    // Write outcomes
-    let action_dir = handle.dir.join("action");
-    let persistence_error = append_action_outcomes(&action_dir, &outcomes).err();
-    if let Some(error) = &persistence_error {
-        eprintln!("agent apply: {error}; actual action outcomes remain in this response");
-    }
+    let memory_summary_suffix = format!(
+        ", mem_obs={} mem_exp={} ({})",
+        if planning_only {
+            "unobserved".to_string()
+        } else {
+            show_mb(memory_report.observed_progress)
+        },
+        show_mb(memory_report.expected_progress),
+        if planning_only {
+            "not_executed".to_string()
+        } else {
+            memory_report.classification.to_string()
+        },
+    );
     let goal_progress_path = action_dir.join("goal_progress.json");
-    if let Ok(payload) = serde_json::to_string_pretty(&goal_progress_payload) {
-        let _ = std::fs::write(&goal_progress_path, payload);
+    let goal_progress_persistence_error = serde_json::to_vec_pretty(&goal_progress_payload)
+        .map_err(|error| error.to_string())
+        .and_then(|payload| {
+            std::fs::write(&goal_progress_path, payload).map_err(|error| error.to_string())
+        })
+        .err();
+    if let Some(error) = &goal_progress_persistence_error {
+        eprintln!("agent apply: cannot save goal observations: {error}; measurements remain in this response");
     }
     let final_state = if failed > 0
         || accounting_error.is_some()
@@ -23023,7 +23310,16 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "persistence_error": persistence_error,
         "session_state_error": session_state_error,
         "goal_evidence_error": goal_evidence_error,
+        "goal_progress_persistence_error": goal_progress_persistence_error,
         "goal_progress": goal_progress_payload,
+        "resource_delta": resource_observation.as_ref().and_then(|run| run.resource_delta.as_ref()),
+        "resource_observation": resource_observation.as_ref().map(|run| serde_json::json!({
+            "run_id": run.run_id,
+            "artifact_path": run.artifact_path,
+            "unavailable": run.unavailable,
+            "settle_seconds": args.settle,
+        })),
+        "resource_evidence_error": resource_evidence_error,
         "constraints_summary": constraints_summary,
         "resumed": args.resume
     });
@@ -23060,10 +23356,18 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 );
             }
         }
-        _ => println!(
-            "# apply\nSession: {}\nSucceeded: {}\nFailed: {}",
-            sid, succeeded, failed
-        ),
+        _ => {
+            println!(
+                "# apply\nSession: {}\nSucceeded: {}\nFailed: {}",
+                sid, succeeded, failed
+            );
+            if let Some(delta) = resource_observation
+                .as_ref()
+                .and_then(|run| run.resource_delta.as_ref())
+            {
+                println!("{}", resource_delta_summary(delta));
+            }
+        }
     }
 
     if persistence_error.is_some() || session_state_error.is_some() {
@@ -23293,7 +23597,28 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         return ExitCode::IoError;
     }
     let verify_path = verify_dir.join("verifications.json");
-    if let Err(e) = pt_core::session::write_json_pretty(&verify_path, &report) {
+    let current_resource_observation = capture_resource_observation();
+    let plan_sha256 = format!("{:x}", Sha256::digest(plan_content.as_bytes()));
+    let resource_runs = load_resource_runs(
+        &verify_dir,
+        &plan,
+        &plan_sha256,
+        &saved_outcomes,
+        &current_resource_observation,
+    );
+    let mut verification_output = serde_json::to_value(&report).unwrap_or_default();
+    // Several resume/apply invocations have separate windows. Never select an
+    // arbitrary latest file or add host-wide deltas as if they were causal.
+    verification_output["resource_delta"] = if resource_runs.reports.len() == 1 {
+        serde_json::json!(&resource_runs.reports[0])
+    } else {
+        serde_json::Value::Null
+    };
+    verification_output["resource_runs"] = serde_json::json!(&resource_runs);
+    verification_output["resource_observation_source"] = serde_json::json!("saved_apply_windows");
+    verification_output["resource_observation_checked_at_ms"] =
+        serde_json::json!(current_resource_observation.pressure.sampled_at_ms);
+    if let Err(e) = pt_core::session::write_json_pretty(&verify_path, &verification_output) {
         eprintln!(
             "agent verify: failed to write {}: {}",
             verify_path.display(),
@@ -23346,7 +23671,7 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             // Extend report with respawn info if checked
-            let mut output = serde_json::to_value(&report).unwrap_or_default();
+            let mut output = verification_output;
             if args.check_respawn {
                 if let Some(obj) = output.as_object_mut() {
                     obj.insert(
@@ -23382,8 +23707,8 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                 String::new()
             };
             println!(
-                "[{}] agent verify: {} verified, {} failed (expected freed {} MB){}",
-                sid, verified_count, failed_count, freed, respawn_info
+                "[{}] agent verify: {} verified, {} failed (expected freed {} MB){}, {} historical resource runs",
+                sid, verified_count, failed_count, freed, respawn_info, resource_runs.reports.len()
             );
         }
         OutputFormat::Exitcode => {}
@@ -23408,6 +23733,26 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                     "- Expected memory freed: {} MB (plan estimate {})",
                     summary.expected_freed_mb, summary.expected_mb
                 );
+            }
+            println!("\n## Resource Observations\n");
+            println!("Saved apply windows; current action postconditions are checked separately.");
+            for delta in &resource_runs.reports {
+                if let Some(binding) = &delta.binding {
+                    println!(
+                        "- Run {}: {}",
+                        binding.run_id,
+                        resource_delta_summary(delta)
+                    );
+                }
+            }
+            for unavailable in &resource_runs.unavailable {
+                println!(
+                    "- Unavailable: {}: {}",
+                    unavailable.source, unavailable.reason
+                );
+            }
+            for rejected in &resource_runs.rejected {
+                println!("- Rejected {}: {}", rejected.artifact_file, rejected.reason);
             }
             if args.check_respawn {
                 println!("- Respawn check: {} processes detected", respawned_count);

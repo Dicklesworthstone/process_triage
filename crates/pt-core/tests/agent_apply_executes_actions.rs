@@ -355,6 +355,20 @@ fn session_with_actions(data_dir: &Path, actions: Vec<PlanAction>) -> String {
     session_id.0
 }
 
+/// Existing action fixtures choose a zero-duration resource window so their
+/// declared safety and action timing windows stay unchanged. Log the real args.
+fn apply_fixture_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut args = args.to_vec();
+    if args.windows(2).any(|pair| pair == ["agent", "apply"])
+        && !args
+            .iter()
+            .any(|arg| *arg == "--settle" || arg.starts_with("--settle="))
+    {
+        args.extend(["--settle", "0"]);
+    }
+    args
+}
+
 /// Run a real (non-dry-run) `agent apply` and return the single outcome status.
 fn apply(data_dir: &Path, config_dir: &Path, session: &str, target: &str) -> (String, Value) {
     apply_with_args(data_dir, config_dir, session, target, &[])
@@ -369,24 +383,26 @@ fn apply_with_args(
     extra: &[&str],
 ) -> (String, Value) {
     let started = std::time::Instant::now();
+    let mut args = vec![
+        "--format",
+        "json",
+        "agent",
+        "apply",
+        "--session",
+        session,
+        "--targets",
+        target,
+        "--yes",
+    ];
+    args.extend_from_slice(extra);
+    let args = apply_fixture_args(&args);
     let out = cargo_bin_cmd!("pt-core")
         .timeout(Duration::from_secs(240))
         .env("PT_SKIP_GLOBAL_LOCK", "1")
         .env("PROCESS_TRIAGE_DATA", data_dir)
         .env("PROCESS_TRIAGE_CONFIG", config_dir)
         .env("PROCESS_TRIAGE_RETENTION", "off")
-        .args([
-            "--format",
-            "json",
-            "agent",
-            "apply",
-            "--session",
-            session,
-            "--targets",
-            target,
-            "--yes",
-        ])
-        .args(extra)
+        .args(&args)
         .output()
         .expect("run agent apply");
     let log_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -402,8 +418,7 @@ fn apply_with_args(
             "{}\n",
             serde_json::json!({
                 "command": "pt-core", "session_id": session,
-                "args": ["--format", "json", "agent", "apply", "--session", session,
-                         "--targets", target, "--yes"], "extra_args": extra,
+                "args": args, "extra_args": extra,
                 "exit_code": out.status.code(), "elapsed_ms": started.elapsed().as_millis(),
                 "stdout_sha256": pt_bundle::FileEntry::compute_checksum(&out.stdout),
                 "stderr_sha256": pt_bundle::FileEntry::compute_checksum(&out.stderr),
@@ -603,7 +618,7 @@ fn agent_apply_persists_the_kill_budget_across_runs() {
             .env("PROCESS_TRIAGE_DATA", data_dir.path())
             .env("PROCESS_TRIAGE_CONFIG", config_dir.path())
             .env("PROCESS_TRIAGE_RETENTION", "off")
-            .args([
+            .args(apply_fixture_args(&[
                 "--format",
                 "json",
                 "agent",
@@ -612,7 +627,7 @@ fn agent_apply_persists_the_kill_budget_across_runs() {
                 session,
                 "--recommended",
                 "--yes",
-            ])
+            ]))
             .output()
             .unwrap();
         let observed_at = chrono::Utc::now();
@@ -789,13 +804,14 @@ fn actual_agent_plan_applies_and_verifies_its_saved_live_identity() {
         timeout_seconds: u64,
     ) -> std::process::Output {
         let started = std::time::Instant::now();
+        let args = apply_fixture_args(args);
         let output = cargo_bin_cmd!("pt-core")
             .timeout(Duration::from_secs(timeout_seconds))
             .env("PT_SKIP_GLOBAL_LOCK", "1")
             .env("PROCESS_TRIAGE_DATA", data_dir)
             .env("PROCESS_TRIAGE_CONFIG", config_dir)
             .env("PROCESS_TRIAGE_RETENTION", "off")
-            .args(args)
+            .args(&args)
             .output()
             .expect("run actual agent step");
         static STEP_NUMBER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1570,7 +1586,7 @@ finally:
         assert_eq!(live_identity(resume_survivor.pid.0), resume_survivor);
         assert!(state_of(pid).is_none_or(|state| state == 'Z'));
     };
-    let resume_args = [
+    let resume_args = apply_fixture_args(&[
         "--format",
         "json",
         "agent",
@@ -1580,7 +1596,7 @@ finally:
         "--resume",
         "--yes",
         "--recommended",
-    ];
+    ]);
     let resumed = run_step(
         &log_dir,
         "resume_actual_success",
@@ -3103,6 +3119,210 @@ fn agent_apply_executes_renice_then_kill_on_live_process() {
     assert!(exited, "target {pid} still running after apply kill");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_apply_records_and_replays_bound_resource_windows_without_inventing_rates() {
+    use sha2::Digest;
+
+    let data_dir = TempDir::new().expect("data dir").keep();
+    let config_dir = TempDir::new().expect("config dir").keep();
+    write_test_policy(&config_dir);
+    let victim = ForeignTarget::spawn("sleep 359");
+    let identity = live_identity(victim.pid);
+    let target = format!("{}:{}", victim.pid, identity.start_id.0);
+    let action = plan_action(Action::Renice, &identity);
+    let session = session_with_plan(&data_dir, action.clone());
+    let handle = SessionStore::at_data_dir(&data_dir)
+        .open(&SessionId::parse(&session).unwrap())
+        .unwrap();
+    let plan_path = handle.dir.join("decision/plan.json");
+    let original_plan = fs::read(&plan_path).expect("canonical saved plan");
+    let plan_sha256 = format!("{:x}", sha2::Sha256::digest(&original_plan));
+
+    // This is a real, identity-bound reversible action on our owned child. Zero
+    // settle time requests points, which cannot establish CPU or PSI rates.
+    let (status, applied) = apply_with_args(
+        &data_dir,
+        &config_dir,
+        &session,
+        &target,
+        &["--settle", "0"],
+    );
+    assert_eq!(status, "success", "{applied}");
+    assert!(victim.alive());
+    assert_eq!(live_identity(victim.pid), identity);
+    assert!(nice_of(victim.pid).unwrap() >= i64::from(pt_core::action::renice::DEFAULT_NICE_VALUE));
+    assert_eq!(applied["resource_observation"]["settle_seconds"], 0);
+    let run_id = applied["resource_observation"]["run_id"]
+        .as_str()
+        .expect("actual apply run ID");
+    assert_eq!(applied["outcomes"][0]["resource_run_id"], run_id);
+    let delta = &applied["resource_delta"];
+    assert!(delta.is_object(), "{applied}");
+    assert_eq!(delta["comparable"], true, "{delta}");
+    assert_eq!(delta["scope"], "host");
+    assert_eq!(
+        delta["attribution"],
+        "observed_host_change_not_per_action_recovery"
+    );
+    assert_eq!(delta["binding"]["run_id"], run_id);
+    assert_eq!(
+        delta["binding"]["action_ids"],
+        serde_json::json!([action.action_id])
+    );
+    for phase in ["before_window", "after_window"] {
+        assert_eq!(delta[phase]["requested_duration_ms"], 0);
+        assert_eq!(delta[phase]["sample_count"], 1);
+        assert_eq!(delta[phase]["complete"], true);
+        assert!(delta[phase]["cpu_usage"].is_null());
+    }
+    for observation in ["before", "after", "delta"] {
+        assert!(delta["cpu"]["busy_percent"][observation].is_null());
+        for resource in ["cpu_pressure", "memory_pressure", "io_pressure"] {
+            assert!(delta[resource]["some_window_percent"][observation].is_null());
+            assert!(delta[resource]["full_window_percent"][observation].is_null());
+        }
+    }
+    let cpu_goal = &applied["goal_progress"]["metrics"]["cpu"];
+    assert!(cpu_goal["expected_progress"].is_null());
+    assert!(cpu_goal["observed_progress"].is_null());
+    assert!(cpu_goal["discrepancy"].is_null());
+    assert_eq!(cpu_goal["classification"], "Unavailable");
+    assert!(!delta["unavailable"].as_array().unwrap().is_empty());
+
+    let action_dir = handle.dir.join("action");
+    let artifact_path = action_dir.join(format!("resource_delta-{run_id}.json"));
+    assert_eq!(
+        applied["resource_observation"]["artifact_path"],
+        artifact_path.to_str().unwrap()
+    );
+    let artifact_bytes = fs::read(&artifact_path).expect("persisted observation artifact");
+    let artifact: Value = serde_json::from_slice(&artifact_bytes).unwrap();
+    assert_eq!(artifact["schema_version"], 1);
+    assert_eq!(artifact["run_id"], run_id);
+    assert_eq!(artifact["session_id"], session);
+    assert_eq!(artifact["plan_sha256"], plan_sha256);
+    assert_eq!(artifact["actions"].as_array().unwrap().len(), 1);
+    let binding = &artifact["actions"][0];
+    assert_eq!(binding["action_id"], action.action_id);
+    assert_eq!(binding["target"], serde_json::to_value(&identity).unwrap());
+    assert_eq!(binding["status"], "success");
+    assert_eq!(
+        binding["executed_at"],
+        applied["outcomes"][0]["executed_at"]
+    );
+    assert_eq!(
+        binding["execution_clock"],
+        applied["outcomes"][0]["execution_clock"]
+    );
+
+    let journal_path = action_dir.join("outcomes.jsonl");
+    let journal_bytes = fs::read(&journal_path).expect("original execution journal");
+    let journal: Vec<Value> = std::str::from_utf8(&journal_bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        journal.len(),
+        1,
+        "the executed attempt is persisted exactly once"
+    );
+    assert_eq!(journal[0]["resource_run_id"], run_id);
+    assert_eq!(journal[0]["target"], binding["target"]);
+    assert_eq!(journal[0]["execution_clock"], binding["execution_clock"]);
+
+    let raw_path = action_dir.join("resource_samples.jsonl");
+    let raw_bytes = fs::read(&raw_path).expect("raw before/after samples");
+    let raw: Vec<Value> = std::str::from_utf8(&raw_bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(raw.len(), 2, "zero-duration windows contain one point each");
+    for (sample, phase) in raw.iter().zip(["before", "after"]) {
+        assert_eq!(sample["phase"], phase);
+        assert_eq!(sample["run_id"], run_id);
+        assert_eq!(sample["session_id"], session);
+        assert_eq!(sample["plan_sha256"], plan_sha256);
+        assert_eq!(sample["observation"], artifact[phase]["samples"][0]);
+        assert_eq!(artifact[phase]["samples"].as_array().unwrap().len(), 1);
+    }
+
+    let verify = |step: &str| -> Value {
+        let output = cargo_bin_cmd!("pt-core")
+            .timeout(Duration::from_secs(60))
+            .env("PT_SKIP_GLOBAL_LOCK", "1")
+            .env("PROCESS_TRIAGE_DATA", &data_dir)
+            .env("PROCESS_TRIAGE_CONFIG", &config_dir)
+            .env("PROCESS_TRIAGE_RETENTION", "off")
+            .args(["--format", "json", "agent", "verify", "--session", &session])
+            .output()
+            .expect("run actual agent verify");
+        fs::write(data_dir.join(format!("{step}.stdout.json")), &output.stdout).unwrap();
+        fs::write(
+            data_dir.join(format!("{step}.stderr.jsonl")),
+            &output.stderr,
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        serde_json::from_slice(&output.stdout).expect("verify JSON")
+    };
+    let verified = verify("resource-replay");
+    assert_eq!(
+        verified["resource_observation_source"],
+        "saved_apply_windows"
+    );
+    assert_eq!(
+        verified["resource_runs"]["reports"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(verified["resource_runs"]["rejected"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(verified["resource_delta"], *delta);
+    assert_eq!(verified["resource_runs"]["reports"][0], *delta);
+    assert_eq!(verified["action_outcomes"][0]["verified"], true);
+    assert_eq!(fs::read(&raw_path).unwrap(), raw_bytes);
+    assert_eq!(fs::read(&artifact_path).unwrap(), artifact_bytes);
+    assert_eq!(fs::read(&journal_path).unwrap(), journal_bytes);
+
+    // Even a byte-only change to a still-valid canonical plan must reject old
+    // resource evidence. The separately observed renice postcondition remains
+    // valid, so an evidence rejection must not turn it into a failed action.
+    let mut changed_plan = original_plan.clone();
+    changed_plan.push(b'\n');
+    fs::write(&plan_path, changed_plan).unwrap();
+    let stale = verify("stale-resource-binding");
+    assert_eq!(stale["action_outcomes"][0]["verified"], true);
+    assert!(stale["resource_delta"].is_null());
+    assert!(stale["resource_runs"]["reports"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let rejected = stale["resource_runs"]["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 1, "{stale}");
+    assert!(rejected[0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("complete canonical plan"));
+    assert_eq!(fs::read(&raw_path).unwrap(), raw_bytes);
+    assert_eq!(fs::read(&artifact_path).unwrap(), artifact_bytes);
+    assert_eq!(fs::read(&journal_path).unwrap(), journal_bytes);
+
+    fs::write(&plan_path, &original_plan).unwrap();
+    assert_eq!(
+        verify("restored-resource-binding")["resource_delta"],
+        *delta
+    );
+    assert!(victim.alive());
+    assert_eq!(live_identity(victim.pid), identity);
+}
+
 /// First letter of the process state from ps ('T' = stopped).
 fn state_of(pid: u32) -> Option<char> {
     let out = ProcessCommand::new("ps")
@@ -3167,7 +3387,7 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
     if let Some(budget) = &original_budget {
         fs::write(log_dir.join("original-budget.json"), budget).unwrap();
     }
-    let resume_args = [
+    let resume_args = apply_fixture_args(&[
         "--format",
         "json",
         "agent",
@@ -3177,7 +3397,7 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
         "--resume",
         "--yes",
         "--recommended",
-    ];
+    ]);
     let resume = |index: usize| {
         let started = std::time::Instant::now();
         let output = cargo_bin_cmd!("pt-core")
@@ -3186,7 +3406,7 @@ fn agent_apply_pauses_resumes_and_refuses_stale_or_protected_targets() {
             .env("PROCESS_TRIAGE_DATA", &data_dir)
             .env("PROCESS_TRIAGE_CONFIG", &config_dir)
             .env("PROCESS_TRIAGE_RETENTION", "off")
-            .args(resume_args)
+            .args(&resume_args)
             .output()
             .expect("run actual resume");
         fs::write(log_dir.join(format!("{index}.stdout.json")), &output.stdout).unwrap();
@@ -3764,6 +3984,7 @@ mod live_agent_verify {
         path_override: Option<&std::ffi::OsStr>,
     ) -> Output {
         let started = std::time::Instant::now();
+        let args = apply_fixture_args(args);
         let mut command = cargo_bin_cmd!("pt-core");
         command
             .timeout(Duration::from_secs(240))
@@ -3771,7 +3992,7 @@ mod live_agent_verify {
             .env("PROCESS_TRIAGE_DATA", data_dir)
             .env("PROCESS_TRIAGE_CONFIG", config_dir)
             .env("PROCESS_TRIAGE_RETENTION", "off")
-            .args(args);
+            .args(&args);
         if let Some(path) = path_override {
             command.env("PATH", path);
         }

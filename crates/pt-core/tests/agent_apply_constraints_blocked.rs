@@ -534,10 +534,26 @@ fn apply_logged(
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(
-        saved.as_slice(),
-        json["outcomes"].as_array().expect("outcomes")
-    );
+    let mut expected_executions = json["outcomes"].as_array().expect("outcomes").clone();
+    for outcome in &mut expected_executions {
+        // Execution evidence is journaled before measurement. These two
+        // enrichment fields are persisted separately in goal_progress.json.
+        let fields = outcome.as_object_mut().expect("outcome object");
+        fields.remove("goal_progress");
+        fields.remove("respawn_detected");
+    }
+    assert_eq!(saved, expected_executions);
+    let saved_goal: Value = serde_json::from_slice(
+        &fs::read(
+            data_dir
+                .join("sessions")
+                .join(&session.0)
+                .join("action/goal_progress.json"),
+        )
+        .expect("saved goal report"),
+    )
+    .expect("goal report JSON");
+    assert_eq!(saved_goal, json["goal_progress"]);
     assert!(saved.iter().all(|outcome| outcome["status"] != "success"));
     assert_eq!(
         optional_file(&budget_path),

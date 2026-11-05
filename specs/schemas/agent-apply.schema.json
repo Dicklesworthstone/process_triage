@@ -37,6 +37,18 @@
         "memory_freed_mb": { "type": "number", "minimum": 0 }
       }
     },
+    "resource_delta": {
+      "type": ["object", "null"],
+      "description": "Measured host changes for this apply run, with after-minus-before deltas and execution binding; null when no valid measurement is available. This does not establish per-action causal relief."
+    },
+    "resource_observation": {
+      "type": ["object", "null"],
+      "description": "Apply-run UUID, retained artifact path, requested settle seconds, and unavailable-evidence reasons"
+    },
+    "goal_progress": {
+      "type": "object",
+      "description": "Observed progress and comparable predictions; unknown metrics or predictions are null, never a fabricated zero"
+    },
     "status": {
       "type": "string",
       "description": "Overall execution status"

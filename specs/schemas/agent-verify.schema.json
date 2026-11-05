@@ -48,6 +48,22 @@
         "shortfall_reason": { "type": "string" }
       }
     },
+    "resource_delta": {
+      "type": ["object", "null"],
+      "description": "The historical measured host delta when exactly one apply run has valid current-plan, execution-record, and boot bindings; otherwise null"
+    },
+    "resource_runs": {
+      "type": "object",
+      "properties": {
+        "reports": { "type": "array", "items": { "type": "object" } },
+        "rejected": { "type": "array", "items": { "type": "object" } },
+        "unavailable": { "type": "array", "items": { "type": "object" } }
+      },
+      "description": "Every valid bounded historical apply run is retained separately; windows are not summed or selected by file timestamp"
+    },
+    "resource_observation_source": {
+      "const": "saved_apply_windows"
+    },
     "status": {
       "type": "string"
     },
