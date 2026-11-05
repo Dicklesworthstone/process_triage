@@ -584,6 +584,49 @@ A policy file is a complete document (`schema_version`, `loss_matrix`, `guardrai
 
 Check a file with `pt-core config validate policy.json`.
 
+#### Pressure-aware decisions
+
+`load_aware.enabled` opts into an additive pressure cost for each observed process:
+`base expected loss + kappa × sum(severity × process share × (1 − estimated relief))`.
+Pressure can favor a reversible action for useful work that is contributing to
+contention without increasing its abandonment probability. Kill or Restart can
+compete only if that exact action already won using evidence-only losses, and
+existing protection and action feasibility gates still apply.
+
+Add this section to a complete policy to use the default heuristic model:
+
+```json
+{
+  "load_aware": {
+    "enabled": true,
+    "pressure": {
+      "kappa": 1.0,
+      "renice_cpu_relief": 0.5,
+      "pause_cpu_relief": 1.0,
+      "throttle_cpu_relief": 0.5
+    }
+  }
+}
+```
+
+CPU attribution uses a fresh measurement window and the observed online CPU
+count. Credit is limited to that process, even if it belongs to a larger agent,
+build, or cgroup. RSS/system RAM provides a memory share, not an estimate of
+unique reclaimable pages; reversible actions receive no memory or I/O relief
+credit. I/O attribution remains unavailable without a comparable denominator.
+Missing observations are reported as unavailable, and disabled, zero-pressure,
+or wholly unattributable cases preserve the evidence-only decision. Reports
+separate base loss, modeled pressure cost, excluded actions, and unavailable
+evidence. Relief fractions are explicit policy assumptions, not measured
+recovery rates or calibrated performance guarantees.
+
+**Migration:** The `server` and `paranoid` presets already enable `load_aware`, so
+they now use this additive model. Legacy `weights`, `multipliers`, and load-score
+threshold fields remain parseable for compatibility but no longer tune these
+decisions. Use `load_aware.pressure` to tune the new model; set
+`load_aware.enabled` to `false` to use evidence-only losses. The default policy
+continues to leave load-aware decisions disabled.
+
 ---
 
 ## Telemetry and Data Governance

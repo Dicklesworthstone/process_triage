@@ -2661,7 +2661,8 @@ fn score_tui_rows(
         .collect();
     scorer.collect_provenance(&eligible);
     collect_planning_activity(&mut scorer, &eligible, population, goal_str, window_ms);
-    let probe_advice = compute_probe_advice(processes, &scorer, policy);
+    let pressure = PlanningPressure::from_system_state(&collect_system_state(Some(population)));
+    let probe_advice = compute_probe_advice(processes, &scorer, policy, &pressure);
     let deep_signals = if deep {
         collect_deep_signals_for_processes(&eligible, &scorer)
     } else {
@@ -2683,6 +2684,7 @@ fn score_tui_rows(
         policy,
         goal_str,
         session_id,
+        &pressure,
     )
 }
 
@@ -3567,6 +3569,7 @@ fn compute_probe_advice(
     processes: &[ProcessRecord],
     scorer: &Scorer,
     policy: &pt_core::config::Policy,
+    pressure: &PlanningPressure,
 ) -> HashMap<u32, ProbeAdvice> {
     let mut advice = HashMap::new();
     let cost_model = pt_core::decision::ProbeCostModel::default();
@@ -3576,10 +3579,18 @@ fn compute_probe_advice(
         let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
             continue;
         };
-        let Ok((decision, _)) = pt_core::decision::decide_sequential(
+        let Ok(inputs) = prepare_pressure_decision(
             &score.posterior.posterior,
             policy,
             &candidate_feasibility(proc),
+            &pressure.for_process(proc, score.activity.as_ref()),
+        ) else {
+            continue;
+        };
+        let Ok((decision, _)) = pt_core::decision::decide_sequential(
+            &score.posterior.posterior,
+            &inputs.policy,
+            &inputs.feasibility,
             &cost_model,
             Some(&available_probes),
         ) else {
@@ -4155,25 +4166,12 @@ fn build_tui_rows(
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
     session_id: &SessionId,
+    pressure: &PlanningPressure,
 ) -> Result<TuiBuildOutput, String> {
     const MIN_POSTERIOR: f64 = 0.7;
     const MAX_CANDIDATES: usize = 50;
 
-    let system_state = collect_system_state(Some(population));
-    let load_adjustment = if policy.load_aware.enabled {
-        let signals = LoadSignals::from_system_state(&system_state, processes.len());
-        compute_load_adjustment(&policy.load_aware, &signals)
-    } else {
-        None
-    };
-
-    let decision_policy = if let Some(adjustment) = &load_adjustment {
-        let mut adjusted = policy.clone();
-        adjusted.loss_matrix = apply_load_to_loss_matrix(&policy.loss_matrix, adjustment);
-        adjusted
-    } else {
-        policy.clone()
-    };
+    let decision_policy = policy.clone();
 
     let rate_limit_path = resolve_data_dir_for_lock().map(|dir| dir.join("rate_limit.json"));
     let enforcer = pt_core::decision::PolicyEnforcer::new(policy, rate_limit_path.as_deref())
@@ -4209,11 +4207,17 @@ fn build_tui_rows(
         let posterior_result = &score.posterior;
         let cpu_percent = process_cpu_percent(proc, score.activity.as_ref());
         let feasibility = candidate_feasibility(proc);
-        let mut decision_outcome =
-            match decide_action(&posterior_result.posterior, &decision_policy, &feasibility) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
+        let inputs = match prepare_pressure_decision(
+            &posterior_result.posterior,
+            &decision_policy,
+            &feasibility,
+            &pressure.for_process(proc, score.activity.as_ref()),
+        ) {
+            Ok(inputs) => inputs,
+            Err(_) => continue,
+        };
+        let mut decision_outcome = inputs.decision;
+        let pressure_decision = inputs.report;
 
         // Populate rationale fields available in current context
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
@@ -4231,6 +4235,16 @@ fn build_tui_rows(
             false,
         );
         let mut ledger = score.ledger.clone();
+        if pressure_decision.changed {
+            let summary = format!(
+                "Pressure model prefers {:?} instead of {:?} before safety checks; modeled relief {:.3} loss units (heuristic)",
+                pressure_decision.chosen_action,
+                pressure_decision.evidence_only_action,
+                pressure_decision.modeled_pressure_relief,
+            );
+            ledger.top_evidence.insert(0, summary.clone());
+            ledger.why_summary = format!("{} {}", ledger.why_summary, summary);
+        }
         if let Some(probe) = probe {
             if probe.should_probe
                 && probe.recommended_probe == Some(pt_core::decision::ProbeType::DeepScan)
@@ -4388,11 +4402,21 @@ fn build_tui_rows(
                 "memory_mb": memory_mb,
                 "cpu_percent": cpu_percent,
                 "expected_loss": expected_loss_entries,
+                "pressure_decision": pressure_decision,
             }),
         );
     }
 
-    rows.sort_by_key(|r| std::cmp::Reverse(r.score));
+    rows.sort_by(|a, b| {
+        let relief = |pid| {
+            goal_candidates
+                .get(&pid)
+                .map_or(0.0, candidate_pressure_relief)
+        };
+        relief(b.pid)
+            .total_cmp(&relief(a.pid))
+            .then_with(|| b.score.cmp(&a.score))
+    });
     rows.truncate(MAX_CANDIDATES);
 
     let mut goal_summary: Option<Vec<String>> = None;
@@ -4472,14 +4496,14 @@ fn build_tui_rows(
 #[cfg(target_os = "linux")]
 use pt_core::collect::{parse_fd, parse_proc_net_tcp, parse_proc_net_udp, NetworkSnapshot};
 use pt_core::collect::{quick_scan, ProcessRecord, ProcessState, QuickScanOptions, ScanResult};
+#[cfg(test)]
+use pt_core::decision::decide_action;
 use pt_core::decision::goal_progress::{
     self, ActionOutcome as GoalActionOutcome, GoalMetric, GoalProgressReport, MetricSnapshot,
     ProgressConfig,
 };
-use pt_core::decision::{
-    apply_load_to_loss_matrix, compute_load_adjustment, decide_action, Action, ActionFeasibility,
-    LoadSignals,
-};
+use pt_core::decision::load_aware::{prepare_pressure_decision, PressureContext, ResourceShares};
+use pt_core::decision::{Action, ActionFeasibility};
 use pt_core::inference::Evidence;
 use pt_core::scoring::{match_level_label, Scorer};
 
@@ -17559,8 +17583,16 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         }
     };
 
+    if let Some(ref scan_result) = scan_result {
+        scorer.collect_activity(
+            &scan_result.processes.iter().collect::<Vec<_>>(),
+            Duration::from_millis(args.window_ms),
+        );
+    }
     let system_state =
         collect_system_state(scan_result.as_ref().map(|scan| scan.processes.as_slice()));
+    let pressure = PlanningPressure::from_system_state(&system_state);
+    let mut pressure_decisions = Vec::new();
 
     // Persist compact artifacts when we have a scan result.
     if let Some(ref scan_result) = scan_result {
@@ -17572,23 +17604,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
             .collect();
         scorer.collect_provenance(&plan_eligible);
-        scorer.collect_activity(
-            &scan_result.processes.iter().collect::<Vec<_>>(),
-            Duration::from_millis(args.window_ms),
-        );
-        let load_adjustment = if policy.load_aware.enabled {
-            let signals = LoadSignals::from_system_state(&system_state, filter_result.passed.len());
-            compute_load_adjustment(&policy.load_aware, &signals)
-        } else {
-            None
-        };
-        let decision_policy = if let Some(adjustment) = &load_adjustment {
-            let mut adjusted = policy.clone();
-            adjusted.loss_matrix = apply_load_to_loss_matrix(&policy.loss_matrix, adjustment);
-            adjusted
-        } else {
-            policy.clone()
-        };
+        let decision_policy = policy.clone();
 
         // Inventory remains useful for diffs even when a process is too young
         // for triage. Only age-eligible processes receive inference/action advice.
@@ -17616,11 +17632,24 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 continue;
             };
             let posterior = &score.posterior.posterior;
-            let decision_outcome =
-                match decide_action(posterior, &decision_policy, &candidate_feasibility(proc)) {
-                    Ok(decision) => decision,
-                    Err(_) => continue,
-                };
+            let inputs = match prepare_pressure_decision(
+                posterior,
+                &decision_policy,
+                &candidate_feasibility(proc),
+                &pressure.for_process(proc, score.activity.as_ref()),
+            ) {
+                Ok(inputs) => inputs,
+                Err(_) => continue,
+            };
+            if inputs.report.enabled {
+                pressure_decisions.push(serde_json::json!({
+                    "pid": proc.pid.0,
+                    "start_id": proc.start_id,
+                    "uid": proc.uid,
+                    "decision": inputs.report,
+                }));
+            }
+            let decision_outcome = inputs.decision;
             let mut advice = candidate_recommendation(
                 proc,
                 &score,
@@ -17707,6 +17736,15 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         for record in &mut persisted_inference_records {
             if let Some(action) = final_actions.get(&record.pid) {
                 record.recommended_action = (*action).to_string();
+            }
+        }
+        for report in &mut pressure_decisions {
+            if let Some(action) = report["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .and_then(|pid| final_actions.get(&pid))
+            {
+                report["recommended_action"] = serde_json::json!(action);
             }
         }
 
@@ -17873,6 +17911,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "system_state": system_state,
                 "capabilities": capabilities_summary,
                 "activity_window_ms": args.window_ms,
+                "pressure_decisions": pressure_decisions,
             });
             if let Some(procs) = &process_snapshot {
                 if let Some(out_mut) = output.as_object_mut() {
@@ -18031,6 +18070,356 @@ fn process_cpu_percent(
     // No activity record means an explicit single snapshot. An unavailable
     // requested window remains unknown rather than reverting to lifetime CPU.
     activity.map_or(Some(proc.cpu_percent), |activity| activity.cpu_percent)
+}
+
+/// One observed host context shared by decisions and their value-of-information
+/// calculations. Coarse display gauges and lifetime CPU are not attribution.
+#[derive(Default)]
+struct PlanningPressure {
+    snapshot: Option<pt_core::collect::pressure::PressureSnapshot>,
+    severity: pt_core::decision::pressure_regime::ResourceSeverity,
+    unavailable: Vec<String>,
+}
+
+impl PlanningPressure {
+    fn from_system_state(system: &serde_json::Value) -> Self {
+        let mut unavailable = Vec::new();
+        let snapshot = match serde_json::from_value::<pt_core::collect::pressure::PressureSnapshot>(
+            system["pressure"].clone(),
+        ) {
+            Ok(snapshot) => {
+                unavailable.extend(
+                    snapshot
+                        .unavailable
+                        .iter()
+                        .map(|source| format!("{}: {}", source.source, source.reason)),
+                );
+                Some(snapshot)
+            }
+            Err(error) => {
+                unavailable.push(format!("host pressure observation unavailable: {error}"));
+                None
+            }
+        };
+        let severity = match serde_json::from_value::<
+            pt_core::decision::pressure_regime::PressureAssessment,
+        >(system["assessment"].clone())
+        {
+            Ok(assessment) => assessment.severity,
+            Err(error) => {
+                unavailable.push(format!("pressure assessment unavailable: {error}"));
+                Default::default()
+            }
+        };
+        Self {
+            snapshot,
+            severity,
+            unavailable,
+        }
+    }
+
+    fn for_process(
+        &self,
+        process: &ProcessRecord,
+        activity: Option<&pt_core::collect::ProcessActivity>,
+    ) -> PressureContext {
+        let mut unavailable = self.unavailable.clone();
+        let activity = activity.filter(|sample| {
+            sample.pid == process.pid.0
+                && sample.uid == process.uid
+                && sample.start_id == process.start_id
+        });
+        let cpu = self
+            .snapshot
+            .as_ref()
+            .filter(|host| host.cpus > 0)
+            .zip(activity)
+            .filter(|(_, sample)| {
+                sample.source == "procfs_window"
+                    && sample.cpu_error.is_none()
+                    && sample
+                        .cpu_window_seconds
+                        .is_some_and(|seconds| seconds.is_finite() && seconds > 0.0)
+            })
+            .and_then(|(host, sample)| {
+                sample
+                    .cpu_percent
+                    .filter(|percent| percent.is_finite() && *percent >= 0.0)
+                    .map(|percent| (percent / 100.0 / f64::from(host.cpus)).clamp(0.0, 1.0))
+            });
+        if cpu.is_none() {
+            unavailable.push("CPU share requires a matching measured activity window and observed online CPU capacity".to_string());
+        }
+        // RSS is an observed share of resident demand, not uniquely reclaimable
+        // memory. Reversible CPU controls receive no memory-relief credit.
+        let rss = activity
+            .and_then(|sample| sample.pressure.as_ref())
+            .filter(|pressure| pressure.memory_error.is_none())
+            .and_then(|pressure| pressure.memory.as_ref())
+            .map_or(process.rss_bytes, |memory| memory.rss_bytes);
+        let memory = self
+            .snapshot
+            .as_ref()
+            .and_then(|host| host.meminfo)
+            .and_then(|memory| memory.total)
+            .filter(|total| *total > 0)
+            .map(|total| (rss as f64 / total as f64).clamp(0.0, 1.0));
+        if memory.is_none() {
+            unavailable.push("memory share requires observed host total memory".to_string());
+        }
+        unavailable.push(
+            "I/O share unavailable: no comparable host-wide I/O rate was measured".to_string(),
+        );
+        PressureContext {
+            severity: self.severity,
+            shares: ResourceShares {
+                cpu,
+                memory,
+                io: None,
+            },
+            unavailable,
+        }
+    }
+}
+
+/// Prioritize modeled pressure relief only while the finalized recommendation
+/// still permits the modeled remedy. A safety downgrade receives no relief credit.
+fn candidate_pressure_relief(candidate: &serde_json::Value) -> f64 {
+    let report = &candidate["pressure_decision"];
+    let action = candidate["recommended_action"].as_str();
+    if report["applied"] != true
+        || !matches!(
+            action,
+            Some("renice" | "pause" | "freeze" | "throttle" | "quarantine" | "kill" | "restart")
+        )
+        || action != report["chosen_action"].as_str()
+    {
+        return 0.0;
+    }
+    report["modeled_pressure_relief"]
+        .as_f64()
+        .filter(|relief| relief.is_finite() && *relief > 0.0)
+        .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod planning_pressure_tests {
+    use super::*;
+    use pt_common::{ProcessId, StartId};
+    use pt_core::collect::pressure::{MemInfo, PressureSnapshot};
+    use pt_core::collect::{ProcessActivity, ProcessMemoryUsage, ProcessPressureActivity};
+    use pt_core::decision::pressure_regime::ResourceSeverity;
+
+    fn process() -> ProcessRecord {
+        ProcessRecord {
+            pid: ProcessId(123),
+            ppid: ProcessId(122),
+            uid: 1000,
+            user: "test".to_string(),
+            pgid: Some(123),
+            sid: Some(123),
+            start_id: StartId::from_linux("pressure-test", 100, 123),
+            comm: "worker".to_string(),
+            cmd: "worker".to_string(),
+            state: ProcessState::Running,
+            cpu_percent: 900.0,
+            rss_bytes: 100,
+            vsz_bytes: 1000,
+            tty: None,
+            start_time_unix: 0,
+            elapsed: Duration::from_secs(3600),
+            source: "quick_scan".to_string(),
+            container_info: None,
+        }
+    }
+
+    fn host() -> PlanningPressure {
+        PlanningPressure {
+            snapshot: Some(PressureSnapshot {
+                sampled_at_ms: 1000,
+                cpus: 8,
+                cpu: None,
+                memory: None,
+                io: None,
+                irq: None,
+                load: None,
+                meminfo: Some(MemInfo {
+                    total: Some(1000),
+                    ..MemInfo::default()
+                }),
+                vmstat: None,
+                file_handles: None,
+                unavailable: Vec::new(),
+            }),
+            severity: ResourceSeverity {
+                cpu: 1.0,
+                memory: 0.5,
+                io: 0.0,
+                fd: 0.0,
+            },
+            unavailable: Vec::new(),
+        }
+    }
+
+    fn activity(proc: &ProcessRecord) -> ProcessActivity {
+        ProcessActivity {
+            pid: proc.pid.0,
+            start_id: proc.start_id.clone(),
+            uid: proc.uid,
+            source: "procfs_window".to_string(),
+            requested_window_ms: 500,
+            cpu_percent: Some(400.0),
+            cpu_ticks: Some(200),
+            cpu_window_seconds: Some(0.5),
+            io_window_seconds: Some(0.5),
+            read_bytes_per_second: Some(1000.0),
+            write_bytes_per_second: Some(0.0),
+            io_active: Some(true),
+            cpu_error: None,
+            io_error: None,
+            pressure: Some(ProcessPressureActivity {
+                memory: Some(ProcessMemoryUsage {
+                    rss_bytes: 250,
+                    rss_anon_bytes: 100,
+                    rss_file_bytes: 100,
+                    rss_shmem_bytes: 50,
+                    swap_bytes: 200,
+                    threads: 4,
+                }),
+                ..ProcessPressureActivity::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn shares_use_measured_multicore_cpu_and_observed_resident_memory() {
+        let proc = process();
+        let mut sample = activity(&proc);
+        let pressure = host();
+        let context = pressure.for_process(&proc, Some(&sample));
+        assert_eq!(context.shares.cpu, Some(0.5));
+        assert_eq!(context.shares.memory, Some(0.25));
+        assert_eq!(
+            context.shares.io, None,
+            "process I/O has no host denominator"
+        );
+        assert!(context
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("I/O")));
+
+        sample.cpu_percent = Some(0.0);
+        assert_eq!(
+            pressure.for_process(&proc, Some(&sample)).shares.cpu,
+            Some(0.0)
+        );
+        sample.pressure.as_mut().unwrap().memory_error = Some("unreadable status".into());
+        assert_eq!(
+            pressure.for_process(&proc, Some(&sample)).shares.memory,
+            Some(0.1)
+        );
+    }
+
+    #[test]
+    fn lifetime_cpu_and_unverifiable_windows_never_become_pressure_attribution() {
+        let proc = process();
+        let pressure = host();
+        assert_eq!(pressure.for_process(&proc, None).shares.cpu, None);
+        for case in 0..8 {
+            let mut sample = activity(&proc);
+            match case {
+                0 => sample.source = "ps_lifetime_fallback".into(),
+                1 => sample.cpu_error = Some("counter reset".into()),
+                2 => sample.cpu_window_seconds = None,
+                3 => sample.cpu_window_seconds = Some(0.0),
+                4 => sample.cpu_window_seconds = Some(f64::NAN),
+                5 => sample.cpu_percent = Some(f64::INFINITY),
+                6 => sample.cpu_percent = Some(-1.0),
+                7 => sample.cpu_percent = None,
+                _ => unreachable!(),
+            }
+            let context = pressure.for_process(&proc, Some(&sample));
+            assert_eq!(context.shares.cpu, None, "case {case}");
+            assert_eq!(
+                context.shares.memory,
+                Some(0.25),
+                "independent observed RSS"
+            );
+        }
+    }
+
+    #[test]
+    fn changed_incarnations_and_missing_host_capacity_preserve_unknowns() {
+        let proc = process();
+        let pressure = host();
+        for case in 0..3 {
+            let mut sample = activity(&proc);
+            match case {
+                0 => sample.pid += 1,
+                1 => sample.uid += 1,
+                2 => sample.start_id = StartId::from_linux("pressure-test", 101, 123),
+                _ => unreachable!(),
+            }
+            let context = pressure.for_process(&proc, Some(&sample));
+            assert_eq!(context.shares.cpu, None);
+            assert_eq!(
+                context.shares.memory,
+                Some(0.1),
+                "use only the current scan's RSS"
+            );
+        }
+        let mut unavailable_host = host();
+        let snapshot = unavailable_host.snapshot.as_mut().unwrap();
+        snapshot.cpus = 0;
+        snapshot.meminfo = Some(MemInfo {
+            total: Some(0),
+            ..MemInfo::default()
+        });
+        let context = unavailable_host.for_process(&proc, Some(&activity(&proc)));
+        assert_eq!(context.shares, ResourceShares::default());
+
+        let coarse_only = PlanningPressure::from_system_state(&serde_json::json!({
+            "cores": 8, "load": [32.0, 32.0, 32.0],
+            "memory": {"total_gb": 64.0, "used_gb": 63.0},
+        }));
+        let context = coarse_only.for_process(&proc, Some(&activity(&proc)));
+        assert_eq!(context.shares, ResourceShares::default());
+        assert_eq!(context.severity.cpu, 0.0);
+        assert_eq!(context.severity.memory, 0.0);
+        assert!(context
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("assessment")));
+    }
+
+    #[test]
+    fn pressure_ranking_credit_requires_the_final_permitted_remedy() {
+        let candidate = |pid, score, recommended, chosen, relief| {
+            serde_json::json!({
+                "pid": pid, "score": score, "recommended_action": recommended,
+                "pressure_decision": {
+                    "applied": true, "chosen_action": chosen, "modeled_pressure_relief": relief,
+                },
+            })
+        };
+        let candidates = [
+            candidate(1, 99, "review", "kill", 10.0),
+            candidate(2, 80, "keep", "keep", 0.0),
+            candidate(3, 5, "renice", "renice", 0.1),
+        ];
+        assert_eq!(candidate_pressure_relief(&candidates[0]), 0.0);
+        assert_eq!(candidate_pressure_relief(&candidates[1]), 0.0);
+        assert_eq!(candidate_pressure_relief(&candidates[2]), 0.1);
+        for recommended in ["review", "keep", "pause"] {
+            assert_eq!(
+                candidate_pressure_relief(&candidate(3, 5, recommended, "renice", 0.1)),
+                0.0
+            );
+        }
+        let mut disabled = candidate(3, 5, "renice", "renice", 0.1);
+        disabled["pressure_decision"]["applied"] = serde_json::json!(false);
+        assert_eq!(candidate_pressure_relief(&disabled), 0.0);
+    }
 }
 
 fn goal_requires_cpu_baseline(goal: &Goal) -> bool {
@@ -18869,21 +19258,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "Protected filter applied"
     );
 
-    let system_state = collect_system_state(Some(&scan_result.processes));
-    let load_adjustment = if policy.load_aware.enabled {
-        let signals = LoadSignals::from_system_state(&system_state, filter_result.passed.len());
-        compute_load_adjustment(&policy.load_aware, &signals)
-    } else {
-        None
-    };
-
-    let decision_policy = if let Some(adjustment) = &load_adjustment {
-        let mut adjusted = policy.clone();
-        adjusted.loss_matrix = apply_load_to_loss_matrix(&policy.loss_matrix, adjustment);
-        adjusted
-    } else {
-        policy
-    };
+    let decision_policy = policy;
 
     // Process each candidate: compute posterior, make decision, build candidate output.
     //
@@ -18950,6 +19325,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         args.goal.as_deref(),
         args.window_ms,
     );
+    let system_state = collect_system_state(Some(&scan_result.processes));
+    let pressure = PlanningPressure::from_system_state(&system_state);
 
     // --deep: one batched deep scan (sockets, I/O, queue backlog, GPU observations) over the
     // candidates, overlaid onto the quick-scan evidence below.
@@ -19048,20 +19425,27 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         // recommend fundamentally invalid actions (e.g., kill for zombie/D-state).
         let feasibility = candidate_feasibility(proc);
 
-        // Compute decision (optimal action based on expected loss)
-        let mut decision_outcome =
-            match decide_action(&posterior_result.posterior, &decision_policy, &feasibility) {
-                Ok(d) => d,
-                Err(_) => continue, // Skip processes that fail decision
-            };
-        let sequential_probe = pt_core::decision::decide_sequential(
+        // The action and any further-probe advice use the same process-specific
+        // loss model and evidence-only eligibility for destructive actions.
+        let inputs = match prepare_pressure_decision(
             &posterior_result.posterior,
             &decision_policy,
             &feasibility,
+            &pressure.for_process(proc, activity.as_ref()),
+        ) {
+            Ok(inputs) => inputs,
+            Err(_) => continue,
+        };
+        let sequential_probe = pt_core::decision::decide_sequential(
+            &posterior_result.posterior,
+            &inputs.policy,
+            &inputs.feasibility,
             &probe_cost_model,
             Some(&deep_scan_probe),
         )
         .ok();
+        let mut decision_outcome = inputs.decision;
+        let pressure_decision = inputs.report;
         decision_outcome.rationale.has_known_signature = Some(signature_match.is_some());
         decision_outcome.rationale.memory_mb = Some(proc.rss_bytes as f64 / (1024.0 * 1024.0));
         decision_outcome.rationale.category = signature_category.clone();
@@ -19298,9 +19682,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             },
             "reversibility": match decision_outcome.optimal_action {
                 Action::Kill | Action::Restart => "irreversible",
-                Action::Pause | Action::Freeze | Action::Throttle | Action::Quarantine => "reversible",
+                Action::Renice | Action::Pause | Action::Freeze | Action::Throttle | Action::Quarantine => "reversible",
                 Action::Resume | Action::Unfreeze | Action::Unquarantine => "reversal",
-                Action::Keep | Action::Renice => "no_action",
+                Action::Keep => "no_action",
             },
             "supervisor": supervisor,
             "source_supervisor": routed_supervision.then_some(source_supervisor),
@@ -19315,6 +19699,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "action_rationale": action_rationale,
             "voi": voi_summary,
             "expected_loss": expected_loss_values,
+            "pressure_decision": pressure_decision,
             "policy_blocked": policy_blocked,
             "policy": policy_value,
         });
@@ -19520,10 +19905,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
     }
 
-    // Rank by P(abandoned or zombie), then by P(intervention warranted), descending.
+    // Under attributed pressure, surface permitted relief before suspicion.
+    // Otherwise preserve the evidence-only ordering and displayed scores.
     all_candidates.sort_by(|a, b| {
-        b.0 .0
-            .total_cmp(&a.0 .0)
+        candidate_pressure_relief(&b.1)
+            .total_cmp(&candidate_pressure_relief(&a.1))
+            .then_with(|| b.0 .0.total_cmp(&a.0 .0))
             .then_with(|| b.0 .1.total_cmp(&a.0 .1))
     });
 
@@ -19535,7 +19922,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     // reapply the filter to that final contract below.
     all_candidates.retain(|candidate| candidate_matches_filter(&candidate.1, &args.only));
 
-    // Take top N candidates in suspicion order.
+    // Take top N candidates after pressure-relief and evidence ranking.
     let mut candidates: Vec<serde_json::Value> = Vec::new();
     let mut persisted_inventory_records: Vec<PersistedProcess> = Vec::new();
     let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
@@ -21426,10 +21813,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             .map(|proc| proc.cmd.clone())
             .unwrap_or_else(|| format!("pid {}", pid));
 
-        let memory_expected = if matches!(
-            action.action,
-            Action::Kill | Action::Restart | Action::Pause
-        ) {
+        let memory_expected = if matches!(action.action, Action::Kill | Action::Restart) {
             action
                 .rationale
                 .memory_mb
@@ -21456,10 +21840,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         };
 
         #[cfg(target_os = "linux")]
-        let port_expected = if matches!(
-            action.action,
-            Action::Kill | Action::Restart | Action::Pause | Action::Freeze
-        ) {
+        let port_expected = if matches!(action.action, Action::Kill | Action::Restart) {
             before_network_snapshot
                 .get_process_info(pid)
                 .map(|info| {
@@ -21477,10 +21858,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         let port_expected = 0.0;
 
         #[cfg(target_os = "linux")]
-        let fd_expected = if matches!(
-            action.action,
-            Action::Kill | Action::Restart | Action::Pause | Action::Freeze
-        ) {
+        let fd_expected = if matches!(action.action, Action::Kill | Action::Restart) {
             parse_fd(pid).map(|fd| fd.count as f64).unwrap_or(0.0)
         } else {
             0.0
@@ -25182,6 +25560,7 @@ fn watch_candidate_events(
             "action_target": null,
             "prior_classification": prior.classification,
             "prior_recommended_action": prior.recommendation["recommended_action"],
+            "prior_probability_basis": prior.recommendation["probability_basis"],
             "prior_confidence": prior.confidence,
             "prior_severity": severity_label(prior.severity),
             "command": prior.command,
@@ -25201,21 +25580,26 @@ fn watch_candidate_events(
             continue;
         };
 
+        let same_probability_basis = candidate.recommendation["probability_basis"]
+            == prior.recommendation["probability_basis"];
         if candidate.recommendation["recommended_action"]
             != prior.recommendation["recommended_action"]
             || candidate.recommendation["action_target"] != prior.recommendation["action_target"]
+            || !same_probability_basis
         {
             let mut event = candidate.event("recommendation_changed", timestamp);
             event["prior_recommended_action"] = prior.recommendation["recommended_action"].clone();
             event["prior_action_target"] = prior.recommendation["action_target"].clone();
+            event["prior_probability_basis"] = prior.recommendation["probability_basis"].clone();
             events.push(event);
         }
-        if candidate.severity > prior.severity {
+        if same_probability_basis && candidate.severity > prior.severity {
             let mut event = candidate.event("severity_escalated", timestamp);
             event["prior_confidence"] = serde_json::json!(prior.confidence);
             event["current_confidence"] = serde_json::json!(candidate.confidence);
             event["prior_severity"] = serde_json::json!(severity_label(prior.severity));
             event["current_severity"] = serde_json::json!(severity_label(candidate.severity));
+            event["prior_probability_basis"] = prior.recommendation["probability_basis"].clone();
             events.push(event);
         }
     }
@@ -25278,18 +25662,6 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
     }
 
     loop {
-        let system_state = collect_system_state(None);
-        if baseline.is_none() {
-            baseline = Some(WatchBaseline::from_state(&system_state));
-        }
-
-        if let Some(event) = check_goal_violation(&system_state, args) {
-            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
-        }
-        if let Some(event) = check_baseline_anomaly(&system_state, baseline.as_ref()) {
-            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
-        }
-
         let scan_result = match quick_scan(&scan_options) {
             Ok(scan) => scan,
             Err(err) => {
@@ -25307,19 +25679,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         };
         let filtered = protected_filter.filter_scan_result(&scan_result);
 
-        let load_adjustment = if policy.load_aware.enabled {
-            let signals = LoadSignals::from_system_state(&system_state, filtered.passed.len());
-            compute_load_adjustment(&policy.load_aware, &signals)
-        } else {
-            None
-        };
-        let decision_policy = if let Some(adjustment) = &load_adjustment {
-            let mut adjusted = policy.clone();
-            adjusted.loss_matrix = apply_load_to_loss_matrix(&policy.loss_matrix, adjustment);
-            adjusted
-        } else {
-            policy.clone()
-        };
+        let decision_policy = policy.clone();
 
         let rate_limit_path = resolve_data_dir_for_lock().map(|dir| dir.join("rate_limit.json"));
         let enforcer = match pt_core::decision::PolicyEnforcer::new(
@@ -25348,6 +25708,17 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             .collect();
         scorer.collect_provenance(&eligible);
         scorer.collect_activity(&eligible, Duration::from_millis(args.window_ms));
+        let system_state = collect_system_state(Some(&scan_result.processes));
+        let pressure = PlanningPressure::from_system_state(&system_state);
+        if baseline.is_none() {
+            baseline = Some(WatchBaseline::from_state(&system_state));
+        }
+        if let Some(event) = check_goal_violation(&system_state, args) {
+            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+        }
+        if let Some(event) = check_baseline_anomaly(&system_state, baseline.as_ref()) {
+            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+        }
 
         let mut evaluated = Vec::new();
         let mut supervision = pt_core::supervision::SupervisionDetector::new();
@@ -25363,6 +25734,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
                 },
                 global.robot,
                 &mut supervision,
+                &pressure,
             ) else {
                 continue;
             };
@@ -25430,6 +25802,7 @@ struct WatchEval {
     recommendation: serde_json::Value,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_watch_candidate(
     proc: &ProcessRecord,
     scorer: &Scorer,
@@ -25438,14 +25811,17 @@ fn evaluate_watch_candidate(
     protection: &PlanningProtection<'_>,
     robot: bool,
     supervision: &mut pt_core::supervision::SupervisionDetector,
+    pressure: &PlanningPressure,
 ) -> Option<WatchEval> {
     let score = scorer.score(proc, Evidence::from_snapshot(proc))?;
-    let decision_outcome = decide_action(
+    let inputs = prepare_pressure_decision(
         &score.posterior.posterior,
         policy,
         &candidate_feasibility(proc),
+        &pressure.for_process(proc, score.activity.as_ref()),
     )
     .ok()?;
+    let decision_outcome = inputs.decision;
     let mut advice =
         candidate_recommendation(proc, &score, &decision_outcome, policy, enforcer, robot);
     let parent = protection
@@ -25479,7 +25855,18 @@ fn evaluate_watch_candidate(
         &mut advice.rationale,
         |identity| planning_supervision_evidence(identity, supervision),
     );
-    let confidence = score.posterior.posterior.abandonment_probability();
+    let confidence = pt_core::decision::robot_constraints::gate_posterior(
+        &score.posterior.posterior,
+        decision_outcome.optimal_action,
+    );
+    let probability_basis = if matches!(
+        decision_outcome.optimal_action,
+        Action::Kill | Action::Restart
+    ) {
+        "abandonment_probability"
+    } else {
+        "intervention_probability"
+    };
 
     Some(WatchEval {
         confidence,
@@ -25491,6 +25878,10 @@ fn evaluate_watch_candidate(
             "activity": score.activity,
             "cpu_percent": process_cpu_percent(proc, score.activity.as_ref()),
             "cpu_lifetime_percent": proc.cpu_percent,
+            "probability_basis": probability_basis,
+            "abandonment_probability": score.posterior.posterior.abandonment_probability(),
+            "intervention_probability": score.posterior.posterior.intervention_probability(),
+            "pressure_decision": inputs.report,
         }),
     })
 }
@@ -25888,6 +26279,74 @@ mod watch_tests {
             assert_eq!(event["recommended_action"], "review");
             assert!(event["action_target"].is_null());
         }
+    }
+
+    #[test]
+    fn watch_probability_basis_changes_are_advice_changes_not_severity_escalations() {
+        let source = identity(10, 100);
+        let observed = HashMap::from([(10, source.clone())]);
+        // The same posterior can have P(abandoned|zombie)=.6 and
+        // P(intervention)=.98. Switching remedies must not imply rising risk.
+        for (prior_action, next_action) in [("kill", "renice"), ("review", "review")] {
+            let mut prior = candidate(source.clone(), prior_action, Some(source.clone()), 0.6);
+            prior.recommendation["probability_basis"] =
+                serde_json::json!("abandonment_probability");
+            let mut next = candidate(source.clone(), next_action, Some(source.clone()), 0.98);
+            next.recommendation["probability_basis"] =
+                serde_json::json!("intervention_probability");
+            let previous = HashMap::from([(10, prior)]);
+            let current = HashMap::from([(10, next)]);
+            let events = watch_candidate_events(&previous, &current, &observed, "tick-2");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event"], "recommendation_changed");
+            assert_eq!(
+                events[0]["prior_probability_basis"],
+                "abandonment_probability"
+            );
+            assert_eq!(events[0]["probability_basis"], "intervention_probability");
+            assert_eq!(events[0]["recommended_action"], next_action);
+            assert!(watch_candidate_events(&current, &current, &observed, "tick-3").is_empty());
+
+            let cleared = watch_candidate_events(&current, &HashMap::new(), &observed, "tick-4");
+            assert_eq!(cleared.len(), 1);
+            assert_eq!(
+                cleared[0]["prior_probability_basis"],
+                "intervention_probability"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_reversible_confidence_uses_intervention_probability() {
+        let posterior = pt_core::inference::ClassScores {
+            useful: 0.02,
+            useful_bad: 0.92,
+            abandoned: 0.05,
+            zombie: 0.01,
+        };
+        let probability = pt_core::decision::robot_constraints::gate_posterior;
+        let threshold = parse_watch_threshold("critical").unwrap();
+        assert!(probability(&posterior, Action::Renice) >= threshold.min_prob);
+        assert!(probability(&posterior, Action::Kill) < threshold.min_prob);
+        let source = identity(10, 100);
+        let current = HashMap::from([(
+            10,
+            candidate(
+                source.clone(),
+                "renice",
+                Some(source.clone()),
+                probability(&posterior, Action::Renice),
+            ),
+        )]);
+        let events = watch_candidate_events(
+            &HashMap::new(),
+            &current,
+            &HashMap::from([(10, source)]),
+            "tick-1",
+        );
+        assert_eq!(events[0]["event"], "candidate_detected");
+        assert_eq!(events[0]["recommended_action"], "renice");
+        assert_eq!(events[0]["severity"], "critical");
     }
 
     #[test]

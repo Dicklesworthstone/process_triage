@@ -229,6 +229,13 @@ fn validate_load_aware(load_aware: &crate::policy::LoadAwareDecision) -> Validat
         return Ok(());
     }
 
+    if let Some((field, message)) = load_aware.pressure.validation_error() {
+        return Err(ValidationError::InvalidValue {
+            field: format!("load_aware.pressure.{field}"),
+            message: message.to_string(),
+        });
+    }
+
     let weight_sum = load_aware.weights.queue
         + load_aware.weights.load
         + load_aware.weights.memory
@@ -761,6 +768,41 @@ mod tests {
     fn load_aware_enabled_defaults_valid() {
         let mut policy = crate::policy::Policy::default();
         policy.load_aware.enabled = true;
+        assert!(validate_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn pressure_model_rejects_invalid_weights_and_relief_fractions() {
+        for value in [-0.1, f64::NAN, f64::INFINITY] {
+            let mut policy = crate::policy::Policy::default();
+            policy.load_aware.enabled = true;
+            policy.load_aware.pressure.kappa = value;
+            let error = validate_policy(&policy).unwrap_err().to_string();
+            assert!(error.contains("load_aware.pressure.kappa"));
+        }
+        for value in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            for action in ["renice", "pause", "throttle"] {
+                let mut policy = crate::policy::Policy::default();
+                policy.load_aware.enabled = true;
+                let pressure = &mut policy.load_aware.pressure;
+                match action {
+                    "renice" => pressure.renice_cpu_relief = value,
+                    "pause" => pressure.pause_cpu_relief = value,
+                    _ => pressure.throttle_cpu_relief = value,
+                }
+                let error = validate_policy(&policy).unwrap_err().to_string();
+                assert!(error.contains(&format!("load_aware.pressure.{action}_cpu_relief")));
+            }
+        }
+    }
+
+    #[test]
+    fn pressure_model_allows_zero_weight_and_endpoint_relief() {
+        let mut policy = crate::policy::Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.pressure.kappa = 0.0;
+        policy.load_aware.pressure.renice_cpu_relief = 0.0;
+        policy.load_aware.pressure.pause_cpu_relief = 1.0;
         assert!(validate_policy(&policy).is_ok());
     }
 

@@ -467,6 +467,7 @@ fn server_preset() -> Policy {
             psi_avg10_high: 30.0,
             weights: crate::policy::LoadWeights::default(),
             multipliers: crate::policy::LoadMultipliers::default(),
+            pressure: crate::policy::PressureLossConfig::default(),
         },
 
         decision_time_bound: DecisionTimeBound {
@@ -896,6 +897,7 @@ fn paranoid_preset() -> Policy {
                 reversible_min: 0.3,
                 risky_max: 3.0,
             },
+            pressure: crate::policy::PressureLossConfig::default(),
         },
 
         decision_time_bound: DecisionTimeBound {

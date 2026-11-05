@@ -426,6 +426,56 @@ pub struct LoadAwareDecision {
     pub weights: LoadWeights,
     #[serde(default)]
     pub multipliers: LoadMultipliers,
+    /// Additive, process-attributed pressure cost. The master `enabled` flag
+    /// controls this model; the legacy multiplier fields do not affect it.
+    #[serde(default)]
+    pub pressure: PressureLossConfig,
+}
+
+/// Heuristic pressure-relief estimates, not measured recovery guarantees.
+///
+/// The additive cost is `kappa * severity * process_share * (1 - relief)`.
+/// CPU relief is modeled only for the action's verified process scope. No
+/// reversible action is assumed to release resident memory or in-flight I/O.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct PressureLossConfig {
+    pub kappa: f64,
+    pub renice_cpu_relief: f64,
+    /// Pause and Freeze share a loss column and the same CPU relief estimate.
+    pub pause_cpu_relief: f64,
+    /// Throttle and Quarantine share a loss column and this heuristic estimate.
+    pub throttle_cpu_relief: f64,
+}
+
+impl Default for PressureLossConfig {
+    fn default() -> Self {
+        Self {
+            kappa: 1.0,
+            renice_cpu_relief: 0.5,
+            pause_cpu_relief: 1.0,
+            throttle_cpu_relief: 0.5,
+        }
+    }
+}
+
+impl PressureLossConfig {
+    /// Validate even when constructed directly rather than loaded from JSON.
+    pub fn validation_error(&self) -> Option<(&'static str, &'static str)> {
+        if !self.kappa.is_finite() || self.kappa < 0.0 {
+            return Some(("kappa", "must be finite and >= 0"));
+        }
+        for (name, value) in [
+            ("renice_cpu_relief", self.renice_cpu_relief),
+            ("pause_cpu_relief", self.pause_cpu_relief),
+            ("throttle_cpu_relief", self.throttle_cpu_relief),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Some((name, "must be finite and in [0, 1]"));
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -490,6 +540,7 @@ impl Default for LoadAwareDecision {
             psi_avg10_high: default_psi_avg10_high(),
             weights: LoadWeights::default(),
             multipliers: LoadMultipliers::default(),
+            pressure: PressureLossConfig::default(),
         }
     }
 }
@@ -1138,5 +1189,19 @@ mod tests {
         let back: LoadAwareDecision = serde_json::from_str(&json).unwrap();
         assert!(!back.enabled);
         assert_eq!(back.queue_high, 50);
+    }
+
+    #[test]
+    fn existing_load_aware_config_keeps_pressure_opt_in_and_defaults() {
+        let disabled: LoadAwareDecision = serde_json::from_str(r#"{"enabled":false}"#).unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.pressure.kappa, 1.0);
+        let enabled: LoadAwareDecision =
+            serde_json::from_str(r#"{"enabled":true,"pressure":{"kappa":0.25}}"#).unwrap();
+        assert!(enabled.enabled);
+        assert_eq!(enabled.pressure.kappa, 0.25);
+        assert_eq!(enabled.pressure.renice_cpu_relief, 0.5);
+        assert_eq!(enabled.pressure.pause_cpu_relief, 1.0);
+        assert_eq!(enabled.pressure.throttle_cpu_relief, 0.5);
     }
 }
