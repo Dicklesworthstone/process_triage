@@ -3524,6 +3524,18 @@ struct DeepSignals {
     queue_backlog_sockets: Option<usize>,
 }
 
+/// Scoring signals and uncalibrated GPU observations are kept separate. The
+/// latter explain measured device/ownership facts without changing posteriors.
+struct DeepObservations {
+    signals: HashMap<u32, DeepSignals>,
+    #[cfg(target_os = "linux")]
+    gpu_snapshot: pt_core::collect::GpuSnapshot,
+    #[cfg(target_os = "linux")]
+    gpu_processes: HashMap<u32, pt_core::collect::ProcessGpuEvidence>,
+    #[cfg(target_os = "linux")]
+    gpu_resources: pt_core::collect::SharedResourceGraph,
+}
+
 #[cfg(feature = "ui")]
 #[derive(Debug, Clone)]
 struct ProbeAdvice {
@@ -3589,10 +3601,18 @@ fn deep_scan_target_pids(
         .collect()
 }
 
+#[cfg(feature = "ui")]
 fn collect_deep_signals_for_processes(
     processes: &[&ProcessRecord],
     scorer: &Scorer,
 ) -> Option<HashMap<u32, DeepSignals>> {
+    collect_deep_observations_for_processes(processes, scorer).map(|result| result.signals)
+}
+
+fn collect_deep_observations_for_processes(
+    processes: &[&ProcessRecord],
+    scorer: &Scorer,
+) -> Option<DeepObservations> {
     #[cfg(target_os = "linux")]
     {
         use pt_core::action::{IdentityProvider, LiveIdentityProvider};
@@ -3623,6 +3643,8 @@ fn collect_deep_signals_for_processes(
             .collect();
         let identity_provider = LiveIdentityProvider::new();
         let mut map = HashMap::new();
+        let mut gpu_processes = HashMap::new();
+        let mut gpu_resources = Vec::new();
         for record in result.processes {
             let Some(process) = by_pid.get(&record.pid.0) else {
                 continue;
@@ -3661,6 +3683,18 @@ fn collect_deep_signals_for_processes(
             let net_active = has_network.then_some(true);
             let queue_metrics = record.network.as_ref().map(observed_queue_metrics);
 
+            if let Some(gpu) = record.gpu {
+                gpu_processes.insert(record.pid.0, gpu);
+            }
+            gpu_resources.push((
+                record.pid.0,
+                record
+                    .local_resource_evidence
+                    .into_iter()
+                    .filter(|resource| resource.kind == pt_common::ResourceKind::GpuDevice)
+                    .collect(),
+            ));
+
             map.insert(
                 record.pid.0,
                 DeepSignals {
@@ -3676,13 +3710,184 @@ fn collect_deep_signals_for_processes(
                 },
             );
         }
-        Some(map)
+        Some(DeepObservations {
+            signals: map,
+            gpu_snapshot: result.gpu,
+            gpu_processes,
+            gpu_resources: pt_core::collect::SharedResourceGraph::from_evidence(&gpu_resources),
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (processes, scorer);
         eprintln!("deep scan not supported on this platform; using quick-scan evidence only");
         None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_gpu_observations(
+    deep: Option<&DeepObservations>,
+    pid: u32,
+) -> (serde_json::Value, serde_json::Value) {
+    let observation = deep.and_then(|deep| deep.gpu_processes.get(&pid));
+    let gpu = observation.map(|gpu| serde_json::to_value(gpu).unwrap()).unwrap_or_else(|| {
+        serde_json::json!({
+            "identity_verified": false,
+            "has_gpu_handle": null,
+            "device_handles": [],
+            "used_gpu_memory_mib": null,
+            "utilization_percent": null,
+            "warnings": ["Deep GPU ownership evidence unavailable or process identity could not be revalidated"],
+        })
+    });
+    let mut resources: Vec<_> = deep
+        .into_iter()
+        .filter(|_| observation.is_some_and(|gpu| gpu.identity_verified))
+        .flat_map(|deep| {
+            deep.gpu_resources
+                .process_resources
+                .get(&pid)
+                .into_iter()
+                .flatten()
+                .filter_map(|key| deep.gpu_resources.resources.get(key))
+                .cloned()
+        })
+        .collect();
+    resources.sort_by(|left, right| left.key.cmp(&right.key));
+    for resource in &mut resources {
+        resource.holder_pids.sort_unstable();
+        resource.holder_states.sort_by_key(|holder| holder.pid);
+    }
+    let shared = serde_json::json!({
+        "scope": "identity_verified_deep_scan_candidates_only",
+        "devices": resources,
+        "impact": "unknown",
+        "scoring_applied": false,
+        "note": "Observed device co-holders; coverage is partial and sharing alone does not establish dependency or harm",
+    });
+    (gpu, shared)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod gpu_observation_tests {
+    use super::*;
+    use pt_core::collect::{
+        GpuDeviceHandle, GpuQueryStatus, GpuSnapshot, ProcessGpuEvidence, SharedResourceGraph,
+    };
+
+    fn deep_fixture() -> DeepObservations {
+        let devices = pt_core::collect::gpu::parse_nvidia_device_csv(
+            "0, A100, GPU-one, 40960, 2048, 99, 55, 535.0\n",
+        )
+        .unwrap();
+        let usages =
+            pt_core::collect::gpu::parse_nvidia_process_csv("42, GPU-one, 2048\n", &devices)
+                .unwrap();
+        DeepObservations {
+            signals: HashMap::new(),
+            gpu_snapshot: GpuSnapshot {
+                has_gpu: Some(true),
+                devices,
+                process_usage: HashMap::from([(42, usages)]),
+                gpu_process_count: 1,
+                device_status: GpuQueryStatus::Observed,
+                process_status: GpuQueryStatus::Observed,
+                ..Default::default()
+            },
+            gpu_processes: HashMap::new(),
+            gpu_resources: SharedResourceGraph::default(),
+        }
+    }
+
+    fn resource(pid: u32) -> pt_common::RawResourceEvidence {
+        pt_common::RawResourceEvidence {
+            kind: pt_common::ResourceKind::GpuDevice,
+            key: "gpu:char:49920".into(),
+            owner_pid: pid,
+            collection_method: pt_common::ResourceCollectionMethod::ProcFd,
+            state: pt_common::ResourceState::Active,
+            details: pt_common::ResourceDetails::Generic {
+                description: "observed GPU device".into(),
+            },
+            observed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn vendor_pid_and_device_activity_never_become_local_process_evidence() {
+        let deep = deep_fixture();
+        for context in [None, Some(&deep)] {
+            let (gpu, shared) = candidate_gpu_observations(context, 42);
+            assert_eq!(gpu["identity_verified"], false);
+            assert!(gpu["has_gpu_handle"].is_null());
+            assert!(gpu["used_gpu_memory_mib"].is_null());
+            assert!(gpu["utilization_percent"].is_null());
+            assert_eq!(shared["devices"], serde_json::json!([]));
+            assert_eq!(shared["scoring_applied"], false);
+        }
+        let snapshot = serde_json::to_value(&deep.gpu_snapshot).unwrap();
+        assert_eq!(
+            snapshot["process_usage"]["42"][0]["used_gpu_memory_mib"],
+            2048
+        );
+        assert_eq!(snapshot["devices"][0]["utilization_percent"], 99);
+        assert_eq!(snapshot["process_pid_namespace_verified"], false);
+    }
+
+    #[test]
+    fn verified_gpu_handles_expose_partial_coholders_without_invented_impact() {
+        let mut deep = deep_fixture();
+        deep.gpu_processes.insert(
+            42,
+            ProcessGpuEvidence {
+                identity_verified: true,
+                has_gpu_handle: Some(true),
+                device_handles: vec![GpuDeviceHandle {
+                    fd: 7,
+                    path: "/dev/nvidia0".into(),
+                    resource_key: Some("gpu:char:49920".into()),
+                }],
+                observed_at: "2026-01-01T00:00:00Z".into(),
+                ..Default::default()
+            },
+        );
+        deep.gpu_resources = SharedResourceGraph::from_evidence(&[
+            (99, vec![resource(99)]),
+            (42, vec![resource(42)]),
+        ]);
+        let (gpu, shared) = candidate_gpu_observations(Some(&deep), 42);
+        assert_eq!(gpu["identity_verified"], true);
+        assert_eq!(gpu["has_gpu_handle"], true);
+        assert_eq!(gpu["device_handles"][0]["path"], "/dev/nvidia0");
+        assert!(gpu["used_gpu_memory_mib"].is_null());
+        assert!(gpu["utilization_percent"].is_null());
+        assert_eq!(
+            shared["scope"],
+            "identity_verified_deep_scan_candidates_only"
+        );
+        assert_eq!(
+            shared["devices"][0]["holder_pids"],
+            serde_json::json!([42, 99])
+        );
+        assert_eq!(shared["impact"], "unknown");
+        assert_eq!(shared["scoring_applied"], false);
+        let encoded =
+            serde_json::to_string(&serde_json::json!({"gpu":gpu,"blast_radius":{"gpu":shared}}))
+                .unwrap();
+        let restored: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert!(restored["gpu"]["used_gpu_memory_mib"].is_null());
+    }
+
+    #[test]
+    fn unverified_local_identity_cannot_expose_stale_shared_device_owners() {
+        let mut deep = deep_fixture();
+        deep.gpu_processes.insert(42, ProcessGpuEvidence::default());
+        deep.gpu_resources = SharedResourceGraph::from_evidence(&[(42, vec![resource(42)])]);
+        let (gpu, shared) = candidate_gpu_observations(Some(&deep), 42);
+        assert_eq!(gpu["identity_verified"], false);
+        assert!(gpu["has_gpu_handle"].is_null());
+        assert_eq!(shared["devices"], serde_json::json!([]));
     }
 }
 
@@ -18357,14 +18562,15 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         args.window_ms,
     );
 
-    // --deep: one batched deep scan (sockets, I/O, queue backlog) over the
+    // --deep: one batched deep scan (sockets, I/O, queue backlog, GPU observations) over the
     // candidates, overlaid onto the quick-scan evidence below.
     let deep_scan_start = std::time::Instant::now();
-    let deep_signals: Option<HashMap<u32, DeepSignals>> = if args.deep {
-        collect_deep_signals_for_processes(&processes_to_infer, &scorer)
+    let deep_observations = if args.deep {
+        collect_deep_observations_for_processes(&processes_to_infer, &scorer)
     } else {
         None
     };
+    let deep_signals = deep_observations.as_ref().map(|deep| &deep.signals);
     let deep_scan_ms = args
         .deep
         .then(|| deep_scan_start.elapsed().as_millis() as u64);
@@ -18723,6 +18929,14 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "policy_blocked": policy_blocked,
             "policy": policy_value,
         });
+
+        #[cfg(target_os = "linux")]
+        if args.deep {
+            let (gpu, shared_devices) =
+                candidate_gpu_observations(deep_observations.as_ref(), proc.pid.0);
+            candidate["gpu"] = gpu;
+            candidate["blast_radius"]["gpu"] = shared_devices;
+        }
 
         let supervision_refusal = (candidate["supervisor"]["status"] == "unknown")
             .then(|| {
@@ -19321,6 +19535,19 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "recommended": recommended,
         "session_created": created,
     });
+
+    #[cfg(target_os = "linux")]
+    if args.deep {
+        plan_output["gpu_snapshot"] = deep_observations.as_ref()
+            .map(|deep| serde_json::to_value(&deep.gpu_snapshot).unwrap())
+            .unwrap_or_else(|| serde_json::json!({
+                "has_gpu": null,
+                "device_status": "not_collected",
+                "process_status": "not_collected",
+                "process_pid_namespace_verified": false,
+                "provenance": {"warnings": ["Deep scan unavailable; GPU presence, ownership and activity unknown"]},
+            }));
+    }
 
     // Add stub_flags section if any future flags were used
     if let Some(stub_flags) = stub_flags_section {

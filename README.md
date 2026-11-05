@@ -647,20 +647,22 @@ Current status: fleet **planning** works: each host runs its own `pt-core agent 
 
 ### GPU Process Detection
 
-> **Status: library-only.** The Linux GPU collector below is implemented and tested, but `pt deep`, plans and blast radius do not call it yet.
-
-The collector reads `nvidia-smi` (CUDA) and `rocm-smi` (AMD ROCm):
+`pt deep` and `pt agent plan --deep` collect GPU observations on Linux. One vendor snapshot serves the entire deep scan, with a 10-second collection deadline and a maximum query timeout of 3 seconds. A driver query that remains stuck after termination cannot block the scan: its result stays unknown, and subsequent scans skip new vendor probes while that worker is pending. The collector tries `nvidia-smi` (CUDA), then `rocm-smi` (AMD ROCm) if the NVIDIA inventory is unavailable. The result describes the selected vendor's visible inventory; it is not a complete census of a mixed-vendor host.
 
 | Field Collected | NVIDIA | AMD |
 |----------------|:------:|:---:|
 | Device name, UUID, index | Yes | Yes |
 | Total/used VRAM (MiB) | Yes | Yes |
-| GPU utilization % | Yes | Yes |
+| Device-wide GPU utilization % | Yes | Yes |
 | Temperature | Yes | Yes |
-| Per-process GPU memory | Yes | Yes |
+| Driver-reported compute-process memory | Yes | Yes |
 | Driver version | Yes | Yes |
 
-If neither `nvidia-smi` nor `rocm-smi` is available, GPU detection degrades with a provenance warning.
+Structured deep output includes `deep_scan.gpu`; plans include `gpu_snapshot`. Both retain device and process-query coverage separately, observation time, source and warnings. Missing tools, timeouts, unsupported output and permission failures remain **unknown**, including `has_gpu: null` when the inventory could not be collected. Missing memory is never summed as zero, and an unresolved GPU UUID is never assigned to device zero. ROCm's aggregate process memory remains unassigned to an individual device.
+
+Driver-reported PIDs can belong to the host namespace even when `pt` runs inside a container. They therefore remain explicitly unverified in the vendor snapshot. Per-candidate `gpu` evidence instead records GPU character-device handles from `/proc`, pins each handle with `O_PATH` without initializing the device, and revalidates process identity after collection. Per-process utilization and allocation remain `null` when this evidence cannot establish them. Neither an empty compute-process list nor an absent device handle establishes that a process is idle.
+
+`blast_radius.gpu` reports observed device co-holders among identity-verified deep-scan candidates. It has partial coverage: control interfaces do not stand in for individual GPUs, and sharing a GPU alone does not prove application dependency or harm. These GPU observations do not change Bayesian scores, action selection, or trajectory predictions; new scoring terms still require the held-out ablation evidence specified in the plan.
 
 ### Container and Kubernetes Detection
 

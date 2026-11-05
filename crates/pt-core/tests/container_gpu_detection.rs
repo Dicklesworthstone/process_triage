@@ -367,10 +367,10 @@ mod gpu {
         let usages = parse_nvidia_process_csv(csv, &devices).unwrap();
         assert_eq!(usages.len(), 2);
         assert_eq!(usages[0].pid, 1234);
-        assert_eq!(usages[0].gpu_index, 0);
+        assert_eq!(usages[0].gpu_index, Some(0));
         assert_eq!(usages[0].used_gpu_memory_mib, Some(4096));
         assert_eq!(usages[1].pid, 5678);
-        assert_eq!(usages[1].gpu_index, 1);
+        assert_eq!(usages[1].gpu_index, Some(1));
     }
 
     #[test]
@@ -511,7 +511,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
         // 4294967296 bytes = 4096 MiB
         let p1 = usages.iter().find(|u| u.pid == 12345).unwrap();
         assert_eq!(p1.used_gpu_memory_mib, Some(4096));
-        assert_eq!(p1.gpu_index, 0);
+        assert_eq!(p1.gpu_index, Some(0));
     }
 
     // ===========================================================================
@@ -548,13 +548,15 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
             vec![
                 ProcessGpuUsage {
                     pid: 1234,
-                    gpu_index: 0,
+                    gpu_index: Some(0),
+                    gpu_uuid: None,
                     used_gpu_memory_mib: Some(1024),
                     gpu_process_type: Some("C".into()),
                 },
                 ProcessGpuUsage {
                     pid: 1234,
-                    gpu_index: 1,
+                    gpu_index: Some(1),
+                    gpu_uuid: None,
                     used_gpu_memory_mib: Some(2048),
                     gpu_process_type: Some("C".into()),
                 },
@@ -564,14 +566,15 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
             5678,
             vec![ProcessGpuUsage {
                 pid: 5678,
-                gpu_index: 0,
+                gpu_index: Some(0),
+                gpu_uuid: None,
                 used_gpu_memory_mib: Some(512),
                 gpu_process_type: Some("G".into()),
             }],
         );
 
         GpuSnapshot {
-            has_gpu: true,
+            has_gpu: Some(true),
             gpu_type: GpuType::Nvidia,
             devices,
             process_usage,
@@ -580,6 +583,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
                 source: GpuDetectionSource::NvidiaSmi,
                 warnings: vec![],
             },
+            ..Default::default()
         }
     }
 
@@ -628,7 +632,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
         let snapshot = make_test_snapshot();
         let json = serde_json::to_string_pretty(&snapshot).unwrap();
         let restored: GpuSnapshot = serde_json::from_str(&json).unwrap();
-        assert!(restored.has_gpu);
+        assert_eq!(restored.has_gpu, Some(true));
         assert_eq!(restored.gpu_type, GpuType::Nvidia);
         assert_eq!(restored.devices.len(), 2);
         assert_eq!(restored.gpu_process_count, 2);
@@ -637,7 +641,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
     #[test]
     fn gpu_snapshot_empty_json_roundtrip() {
         let snapshot = GpuSnapshot {
-            has_gpu: false,
+            has_gpu: None,
             gpu_type: GpuType::None,
             devices: vec![],
             process_usage: HashMap::new(),
@@ -646,11 +650,12 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
                 source: GpuDetectionSource::None,
                 warnings: vec![],
             },
+            ..Default::default()
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         // Empty vecs/maps are skipped by skip_serializing_if, so we validate via Value
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["has_gpu"], false);
+        assert!(parsed["has_gpu"].is_null());
         assert_eq!(parsed["gpu_type"], "none");
         assert_eq!(parsed["gpu_process_count"], 0);
     }
@@ -664,7 +669,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
         // collect_gpu_snapshot should never panic, even if no GPU tools exist.
         // On a system without GPU, it should return a no-GPU snapshot.
         let snapshot = pt_core::collect::collect_gpu_snapshot();
-        // Can be has_gpu=true or false depending on system
+        // Presence may be observed or remain unknown depending on tools/permissions.
         assert!(snapshot.devices.len() <= 100); // Sanity check
                                                 // Provenance should be set
         assert!(
@@ -740,7 +745,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
 
         let usages = parse_nvidia_process_csv(&csv, &devices).unwrap();
         assert_eq!(usages.len(), 100);
-        assert!(usages.iter().all(|u| u.gpu_index == 0));
+        assert!(usages.iter().all(|u| u.gpu_index == Some(0)));
     }
 } // mod gpu
 

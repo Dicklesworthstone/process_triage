@@ -15,6 +15,10 @@
 //! - Target: <5s for 1000 processes
 //! - Graceful degradation for permission-denied paths
 
+use super::gpu::{
+    collect_gpu_handles, collect_gpu_snapshot, gpu_resource_evidence, process_gpu_evidence,
+    GpuSnapshot, ProcessGpuEvidence,
+};
 use super::network::{NetworkInfo, NetworkSnapshot};
 use super::prober::{ProbeResult, Prober, ProberConfig};
 use super::proc_parsers::{
@@ -169,6 +173,10 @@ pub struct DeepScanRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_resource_evidence: Vec<RawResourceEvidence>,
 
+    /// Local GPU descriptor ownership, with explicit unknown allocation/activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<ProcessGpuEvidence>,
+
     /// Cgroup information.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cgroup: Option<CgroupInfo>,
@@ -229,6 +237,11 @@ pub struct DeepScanResult {
 
     /// Scan metadata.
     pub metadata: DeepScanMetadata,
+
+    /// One vendor snapshot for the scan. Driver PIDs remain unverified and are
+    /// not joined to process records merely because numeric PIDs are equal.
+    #[serde(default)]
+    pub gpu: GpuSnapshot,
 }
 
 /// Metadata about a deep scan operation.
@@ -389,7 +402,7 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
         .map(|n| n.get())
         .unwrap_or(1)
         .min(16); // Cap threads
-    let chunk_size = (pids.len() + num_threads - 1) / num_threads.max(1);
+    let chunk_size = pids.len().div_ceil(num_threads.max(1)).max(1);
     let chunks: Vec<_> = pids.chunks(chunk_size).collect();
 
     let (procs, warns, skipped) = thread::scope(|s| {
@@ -475,11 +488,34 @@ pub fn deep_scan(options: &DeepScanOptions) -> Result<DeepScanResult, DeepScanEr
 fn finish_scan(
     start: Instant,
     started_at: String,
-    processes: Vec<DeepScanRecord>,
-    warnings: Vec<String>,
+    mut processes: Vec<DeepScanRecord>,
+    mut warnings: Vec<String>,
     skipped_count: usize,
     progress: Option<&Arc<dyn ProgressEmitter>>,
 ) -> Result<DeepScanResult, DeepScanError> {
+    use crate::action::{IdentityProvider, LiveIdentityProvider};
+
+    let gpu = collect_gpu_snapshot();
+    let identity_provider = LiveIdentityProvider::new();
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    for record in &mut processes {
+        let handles = collect_gpu_handles(record.pid.0, record.fd.as_ref());
+        let identity = record.to_identity();
+        let identity_verified =
+            record.can_automate() && matches!(identity_provider.revalidate(&identity), Ok(true));
+        let evidence =
+            process_gpu_evidence(record.fd.as_ref(), handles, identity_verified, &observed_at);
+        record
+            .local_resource_evidence
+            .extend(gpu_resource_evidence(record.pid.0, &evidence));
+        record.gpu = Some(evidence);
+    }
+    warnings.extend(
+        gpu.provenance
+            .warnings
+            .iter()
+            .map(|warning| format!("GPU: {warning}")),
+    );
     let duration = start.elapsed();
     let process_count = processes.len();
 
@@ -495,6 +531,7 @@ fn finish_scan(
 
     Ok(DeepScanResult {
         processes,
+        gpu,
         metadata: DeepScanMetadata {
             started_at,
             duration_ms: duration.as_millis() as u64,
@@ -619,6 +656,7 @@ fn parse_probed_process(
         mem,
         fd,
         local_resource_evidence,
+        gpu: None,
         cgroup,
         wchan,
         network,
@@ -749,6 +787,7 @@ fn scan_process(
         mem,
         fd,
         local_resource_evidence,
+        gpu: None,
         cgroup,
         wchan,
         network,

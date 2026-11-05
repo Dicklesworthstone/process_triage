@@ -75,7 +75,9 @@ fn open_file_to_resource(
     observed_at: &str,
     probe_paths: bool,
 ) -> Option<RawResourceEvidence> {
-    if !looks_like_regular_path(&open_file.path) {
+    if open_file.fd_type == super::proc_parsers::FdType::Device
+        || !looks_like_regular_path(&open_file.path)
+    {
         return None;
     }
 
@@ -357,6 +359,17 @@ mod tests {
 
         let evidence = collect_resource_evidence_with_path_probes(4242, &fd_info, true);
         assert!(evidence.is_empty());
+    }
+
+    #[test]
+    fn gpu_device_names_are_not_file_coordination_evidence() {
+        let mut device = open_file("/dev/gpu.lock".into(), true);
+        device.fd_type = super::super::proc_parsers::FdType::Device;
+        let info = FdInfo {
+            open_files: vec![device],
+            ..Default::default()
+        };
+        assert!(collect_resource_evidence_with_path_probes(42, &info, false).is_empty());
     }
 
     #[cfg(target_os = "linux")]

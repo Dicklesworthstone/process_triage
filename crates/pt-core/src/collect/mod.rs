@@ -158,8 +158,8 @@ pub use user_intent::{
 #[cfg(target_os = "linux")]
 pub use gpu::{
     collect_gpu_snapshot, gpu_usage_for_pid, is_nvidia_available, is_rocm_available,
-    total_vram_mib_for_pid, GpuDetectionSource, GpuDevice, GpuError, GpuProvenance, GpuSnapshot,
-    GpuType, ProcessGpuUsage,
+    total_vram_mib_for_pid, GpuDetectionSource, GpuDevice, GpuDeviceHandle, GpuError,
+    GpuProvenance, GpuQueryStatus, GpuSnapshot, GpuType, ProcessGpuEvidence, ProcessGpuUsage,
 };
 
 // Re-export lineage collector types

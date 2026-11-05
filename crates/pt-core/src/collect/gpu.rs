@@ -5,17 +5,26 @@
 //! - `rocm-smi` for AMD GPUs (ROCm)
 //!
 //! # Graceful Degradation
-//! - All GPU tools are optional; missing tools are silently skipped
+//! - All GPU tools are optional; missing tools remain explicitly unknown
 //! - Parse failures produce warnings in provenance, never hard errors
-//! - Query results are cached to avoid hammering expensive GPU tools
+//! - One bounded vendor snapshot is collected for an entire deep scan
+//! - Vendor PIDs are not assumed to belong to the mounted procfs PID namespace
 
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::LazyLock;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
+
+const GPU_COLLECTION_BUDGET: Duration = Duration::from_secs(10);
+const GPU_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+static GPU_COLLECTION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -77,6 +86,17 @@ pub struct GpuProvenance {
     pub warnings: Vec<String>,
 }
 
+/// Whether a query yielded usable observations. Empty data is not a failed query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuQueryStatus {
+    #[default]
+    NotCollected,
+    Observed,
+    Unavailable,
+    Failed,
+}
+
 /// Information about a single GPU device.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GpuDevice {
@@ -107,10 +127,13 @@ pub struct GpuDevice {
 /// Per-process GPU usage information.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProcessGpuUsage {
-    /// Process ID.
+    /// Driver-reported process ID, not verified against the mounted procfs namespace.
     pub pid: u32,
-    /// GPU device index this process is using.
-    pub gpu_index: u32,
+    /// GPU index, only when the reported device can be resolved in this snapshot.
+    pub gpu_index: Option<u32>,
+    /// Reported UUID, retained even when the device is absent from the inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_uuid: Option<String>,
     /// GPU memory used by this process in MiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub used_gpu_memory_mib: Option<u64>,
@@ -122,20 +145,64 @@ pub struct ProcessGpuUsage {
 /// System-wide GPU information snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GpuSnapshot {
-    /// Whether any GPU was detected.
-    pub has_gpu: bool,
+    /// GPU presence in the queried vendor inventory; None means unavailable or
+    /// failed observation, and false is scoped to that inventory only.
+    #[serde(default)]
+    pub has_gpu: Option<bool>,
     /// GPU vendor type.
     pub gpu_type: GpuType,
     /// Detected GPU devices.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<GpuDevice>,
-    /// Per-process GPU usage (keyed by PID).
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    /// Vendor-reported compute-process usage, keyed by unverified driver PID.
+    /// An absent row does not establish that a process is idle or GPU-free.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub process_usage: HashMap<u32, Vec<ProcessGpuUsage>>,
     /// Total number of GPU-using processes detected.
     pub gpu_process_count: usize,
+    /// Device-query coverage, independent of process-query coverage.
+    #[serde(default)]
+    pub device_status: GpuQueryStatus,
+    #[serde(default)]
+    pub process_status: GpuQueryStatus,
+    /// Collection start time. Device and process queries are sequential snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    /// Time spent collecting the vendor snapshot.
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// Always false for these CLI backends, which can report host PIDs in containers.
+    #[serde(default)]
+    pub process_pid_namespace_verified: bool,
     /// Provenance tracking.
     pub provenance: GpuProvenance,
+}
+
+/// A GPU-related descriptor belonging to a revalidated local process.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GpuDeviceHandle {
+    pub fd: u32,
+    pub path: String,
+    /// Kernel character-device identity, not a vendor index or UUID.
+    /// Only per-device handles (not global control interfaces) have a resource key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_key: Option<String>,
+}
+
+/// Identity-bound local ownership observations. Vendor PID rows are deliberately
+/// kept in `GpuSnapshot` rather than joined by a possibly unrelated numeric PID.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProcessGpuEvidence {
+    pub identity_verified: bool,
+    /// Positive descriptor observation only; None means unknown, never idle.
+    pub has_gpu_handle: Option<bool>,
+    pub device_handles: Vec<GpuDeviceHandle>,
+    /// No CLI backend used here establishes namespace-safe per-process allocation.
+    pub used_gpu_memory_mib: Option<u64>,
+    /// Device utilization must never be substituted for per-process utilization.
+    pub utilization_percent: Option<u32>,
+    pub observed_at: String,
+    pub warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +217,7 @@ fn tool_available(name: &str) -> bool {
         Some(std::time::Duration::from_secs(1)),
         None,
     )
-    .map(|o| o.success())
+    .map(|o| o.success() && !o.timed_out && !o.truncated)
     .unwrap_or(false)
 }
 
@@ -169,26 +236,15 @@ pub fn is_rocm_available() -> bool {
 // ---------------------------------------------------------------------------
 
 /// Run nvidia-smi and collect GPU device information.
-fn query_nvidia_devices() -> Result<Vec<GpuDevice>, GpuError> {
-    let output = crate::collect::tool_runner::run_tool(
+fn query_nvidia_devices(deadline: Instant) -> Result<Vec<GpuDevice>, GpuError> {
+    let output = run_gpu_tool(
         "nvidia-smi",
         &[
             "--query-gpu=index,name,uuid,memory.total,memory.used,utilization.gpu,temperature.gpu,driver_version",
             "--format=csv,noheader,nounits",
         ],
-        Some(std::time::Duration::from_secs(5)),
-        None,
-    )
-    .map_err(|e| GpuError::ExecutionFailed(format!("nvidia-smi device query: {e}")))?;
-
-    if !output.success() {
-        let stderr = output.stderr_str();
-        return Err(GpuError::ExecutionFailed(format!(
-            "nvidia-smi exited {}: {}",
-            output.exit_code.unwrap_or(-1),
-            stderr
-        )));
-    }
+        deadline,
+    )?;
 
     let stdout = output.stdout_str();
     parse_nvidia_device_csv(&stdout)
@@ -205,20 +261,23 @@ pub fn parse_nvidia_device_csv(csv: &str) -> Result<Vec<GpuDevice>, GpuError> {
         if line.is_empty() {
             continue;
         }
-        let fields: Vec<&str> = line.split(", ").collect();
-        if fields.len() < 8 {
-            // Try comma-only split (some nvidia-smi versions)
-            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-            if fields.len() < 8 {
-                return Err(GpuError::ParseError(format!(
-                    "expected 8 CSV fields, got {}: {line}",
-                    fields.len()
-                )));
-            }
-            devices.push(parse_nvidia_device_fields(&fields)?);
-            continue;
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        if fields.len() != 8 {
+            return Err(GpuError::ParseError(format!(
+                "expected 8 CSV fields, got {}",
+                fields.len()
+            )));
         }
-        devices.push(parse_nvidia_device_fields(&fields)?);
+        let device = parse_nvidia_device_fields(&fields)?;
+        if devices.iter().any(|previous: &GpuDevice| {
+            previous.index == device.index
+                || (device.uuid.is_some() && previous.uuid == device.uuid)
+        }) {
+            return Err(GpuError::ParseError(
+                "duplicate GPU identity in device inventory".into(),
+            ));
+        }
+        devices.push(device);
     }
     Ok(devices)
 }
@@ -235,44 +294,36 @@ fn parse_nvidia_device_fields(fields: &[&str]) -> Result<GpuDevice, GpuError> {
         uuid: non_empty(fields[2]),
         memory_total_mib: parse_u64_opt(fields[3]),
         memory_used_mib: parse_u64_opt(fields[4]),
-        utilization_percent: parse_u32_opt(fields[5]),
+        utilization_percent: parse_percent_opt(fields[5]),
         temperature_c: parse_u32_opt(fields[6]),
         driver_version: non_empty(fields[7]),
     })
 }
 
 /// Query per-process GPU usage from nvidia-smi.
-fn query_nvidia_processes() -> Result<Vec<ProcessGpuUsage>, GpuError> {
-    let output = crate::collect::tool_runner::run_tool(
+fn query_nvidia_processes(
+    devices: &[GpuDevice],
+    deadline: Instant,
+) -> Result<Vec<ProcessGpuUsage>, GpuError> {
+    let output = run_gpu_tool(
         "nvidia-smi",
         &[
             "--query-compute-apps=pid,gpu_uuid,used_memory",
             "--format=csv,noheader,nounits",
         ],
-        Some(std::time::Duration::from_secs(5)),
-        None,
-    )
-    .map_err(|e| GpuError::ExecutionFailed(format!("nvidia-smi process query: {e}")))?;
-
-    if !output.success() {
-        let stderr = output.stderr_str();
-        return Err(GpuError::ExecutionFailed(format!(
-            "nvidia-smi process query exited {}: {}",
-            output.exit_code.unwrap_or(-1),
-            stderr
-        )));
-    }
+        deadline,
+    )?;
 
     let stdout = output.stdout_str();
-    parse_nvidia_process_csv(&stdout, &[])
+    parse_nvidia_process_csv(&stdout, devices)
 }
 
 /// Parse nvidia-smi per-process CSV output.
 ///
 /// Format: `pid, gpu_uuid, used_gpu_memory [MiB]`
 ///
-/// The `devices` slice is used to map GPU UUIDs to device indices. If empty,
-/// GPU index defaults to 0.
+/// The `devices` slice maps UUIDs to indices. Unknown UUIDs stay unresolved;
+/// inventing index zero would incorrectly attribute allocations to another GPU.
 pub fn parse_nvidia_process_csv(
     csv: &str,
     devices: &[GpuDevice],
@@ -286,28 +337,32 @@ pub fn parse_nvidia_process_csv(
     let mut usages = Vec::new();
     for line in csv.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with("No running") {
+        if line.is_empty() || line == "No running compute processes found" {
             continue;
         }
         let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-        if fields.len() < 3 {
-            continue; // skip malformed lines
+        if fields.len() != 3 {
+            return Err(GpuError::ParseError(format!(
+                "expected 3 process CSV fields, got {}",
+                fields.len()
+            )));
         }
 
         let pid = match fields[0].parse::<u32>() {
-            Ok(p) => p,
-            Err(_) => continue,
+            Ok(p) if p > 0 => p,
+            _ => return Err(GpuError::ParseError("invalid GPU process PID".into())),
         };
 
         let gpu_uuid = fields[1].trim();
-        let gpu_index = uuid_to_idx.get(gpu_uuid).copied().unwrap_or(0);
+        let gpu_index = uuid_to_idx.get(gpu_uuid).copied();
         let used_mem = parse_u64_opt(fields[2]);
 
         usages.push(ProcessGpuUsage {
             pid,
             gpu_index,
+            gpu_uuid: non_empty(gpu_uuid),
             used_gpu_memory_mib: used_mem,
-            gpu_process_type: None,
+            gpu_process_type: Some("Compute".to_string()),
         });
     }
     Ok(usages)
@@ -318,43 +373,25 @@ pub fn parse_nvidia_process_csv(
 // ---------------------------------------------------------------------------
 
 /// Run rocm-smi and collect GPU device information.
-fn query_rocm_devices() -> Result<Vec<GpuDevice>, GpuError> {
-    let output = crate::collect::tool_runner::run_tool(
+fn query_rocm_devices(deadline: Instant) -> Result<Vec<GpuDevice>, GpuError> {
+    let output = run_gpu_tool(
         "rocm-smi",
         &[
             "--showid",
+            "--showproductname",
+            "--showuniqueid",
+            "--showdriverversion",
             "--showtemp",
             "--showuse",
             "--showmeminfo",
             "vram",
             "--json",
         ],
-        Some(std::time::Duration::from_secs(5)),
-        None,
-    )
-    .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi: {e}")))?;
-
-    if !output.success() {
-        // rocm-smi without --json for older versions
-        return query_rocm_devices_text();
-    }
+        deadline,
+    )?;
 
     let stdout = output.stdout_str();
     parse_rocm_json(&stdout)
-}
-
-/// Fallback: parse rocm-smi text output for older versions.
-fn query_rocm_devices_text() -> Result<Vec<GpuDevice>, GpuError> {
-    let output = crate::collect::tool_runner::run_tool(
-        "rocm-smi",
-        &[],
-        Some(std::time::Duration::from_secs(5)),
-        None,
-    )
-    .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi text fallback: {e}")))?;
-
-    let stdout = output.stdout_str();
-    parse_rocm_text(&stdout)
 }
 
 /// Parse rocm-smi JSON output.
@@ -363,13 +400,23 @@ pub fn parse_rocm_json(json_str: &str) -> Result<Vec<GpuDevice>, GpuError> {
         .map_err(|e| GpuError::ParseError(format!("rocm-smi JSON: {e}")))?;
 
     let mut devices = Vec::new();
+    let driver_version = val
+        .get("system")
+        .and_then(|system| system.get("Driver version"))
+        .and_then(|value| value.as_str())
+        .and_then(non_empty);
     if let Some(obj) = val.as_object() {
         for (key, card) in obj {
             // Keys look like "card0", "card1", etc.
             static CARD_RE: LazyLock<Regex> =
                 LazyLock::new(|| Regex::new(r"^card(\d+)$").expect("regex"));
             if let Some(caps) = CARD_RE.captures(key) {
-                let index = caps[1].parse::<u32>().unwrap_or(0);
+                if !card.is_object() {
+                    return Err(GpuError::ParseError("invalid ROCm device record".into()));
+                }
+                let index = caps[1]
+                    .parse::<u32>()
+                    .map_err(|_| GpuError::ParseError("invalid ROCm device index".into()))?;
                 let name = card
                     .get("Card Series")
                     .or_else(|| card.get("Card series"))
@@ -386,19 +433,18 @@ pub fn parse_rocm_json(json_str: &str) -> Result<Vec<GpuDevice>, GpuError> {
                 let utilization_percent = card
                     .get("GPU use (%)")
                     .or_else(|| card.get("GPU Usage"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.trim_end_matches('%').trim().parse::<u32>().ok());
+                    .and_then(json_u64_opt)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value <= 100);
 
                 let memory_total_mib = card
                     .get("VRAM Total Memory (B)")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u64>().ok())
+                    .and_then(json_u64_opt)
                     .map(|b| b / (1024 * 1024));
 
                 let memory_used_mib = card
                     .get("VRAM Total Used Memory (B)")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u64>().ok())
+                    .and_then(json_u64_opt)
                     .map(|b| b / (1024 * 1024));
 
                 let uuid = card
@@ -414,12 +460,19 @@ pub fn parse_rocm_json(json_str: &str) -> Result<Vec<GpuDevice>, GpuError> {
                     memory_used_mib,
                     utilization_percent,
                     temperature_c,
-                    driver_version: None,
+                    driver_version: driver_version.clone(),
                 });
             }
         }
     }
 
+    if !val.is_object()
+        || (!val.as_object().is_some_and(|obj| obj.is_empty()) && devices.is_empty())
+    {
+        return Err(GpuError::ParseError(
+            "unrecognized rocm-smi device schema".into(),
+        ));
+    }
     // Sort by index for deterministic output
     devices.sort_by_key(|d| d.index);
     Ok(devices)
@@ -440,7 +493,9 @@ pub fn parse_rocm_text(output: &str) -> Result<Vec<GpuDevice>, GpuError> {
 
     let mut devices = Vec::new();
     for caps in ROW_RE.captures_iter(output) {
-        let index = caps[1].parse::<u32>().unwrap_or(0);
+        let index = caps[1]
+            .parse::<u32>()
+            .map_err(|_| GpuError::ParseError("invalid ROCm text device index".into()))?;
         let temp = caps[2].parse::<u32>().ok();
 
         devices.push(GpuDevice {
@@ -464,19 +519,8 @@ pub fn parse_rocm_text(output: &str) -> Result<Vec<GpuDevice>, GpuError> {
 }
 
 /// Query per-process GPU usage from rocm-smi.
-fn query_rocm_processes() -> Result<Vec<ProcessGpuUsage>, GpuError> {
-    let output = crate::collect::tool_runner::run_tool(
-        "rocm-smi",
-        &["--showpidgpumem", "--json"],
-        Some(std::time::Duration::from_secs(5)),
-        None,
-    )
-    .map_err(|e| GpuError::ExecutionFailed(format!("rocm-smi process query: {e}")))?;
-
-    if !output.success() {
-        // Older rocm-smi may not support this
-        return Ok(Vec::new());
-    }
+fn query_rocm_processes(deadline: Instant) -> Result<Vec<ProcessGpuUsage>, GpuError> {
+    let output = run_gpu_tool("rocm-smi", &["--showpids", "--json"], deadline)?;
 
     let stdout = output.stdout_str();
     parse_rocm_process_json(&stdout)
@@ -490,19 +534,59 @@ pub fn parse_rocm_process_json(json_str: &str) -> Result<Vec<ProcessGpuUsage>, G
     let mut usages = Vec::new();
     if let Some(obj) = val.as_object() {
         for (key, proc_info) in obj {
+            // rocm_smi.py showPids/print2DArray serialize aggregate KFD data as
+            // {"system":{"PID123":"name, GPU count, VRAM bytes, SDMA bytes, CU occupancy"}}.
+            // GPU count is not a device index. Keep the aggregate as one unresolved
+            // allocation instead of duplicating it onto every GPU.
+            if key == "system" {
+                let procs = proc_info.as_object().ok_or_else(|| {
+                    GpuError::ParseError("invalid ROCm system process record".into())
+                })?;
+                for (pid_key, fields) in procs {
+                    let pid = pid_key
+                        .strip_prefix("PID")
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .filter(|pid| *pid > 0)
+                        .ok_or_else(|| {
+                            GpuError::ParseError("invalid ROCm system process PID".into())
+                        })?;
+                    let fields: Vec<_> = fields
+                        .as_str()
+                        .ok_or_else(|| {
+                            GpuError::ParseError("invalid ROCm system process fields".into())
+                        })?
+                        .split(',')
+                        .map(str::trim)
+                        .collect();
+                    if fields.len() < 5 {
+                        return Err(GpuError::ParseError(
+                            "incomplete ROCm system process fields".into(),
+                        ));
+                    }
+                    usages.push(ProcessGpuUsage {
+                        pid,
+                        gpu_index: None,
+                        gpu_uuid: None,
+                        used_gpu_memory_mib: parse_u64_opt(fields[fields.len() - 3])
+                            .map(|bytes| bytes / (1024 * 1024)),
+                        gpu_process_type: Some("Compute".into()),
+                    });
+                }
+                continue;
+            }
             // Keys may be "card0" etc.
             static CARD_RE: LazyLock<Regex> =
-                LazyLock::new(|| Regex::new(r"card(\d+)").expect("regex"));
+                LazyLock::new(|| Regex::new(r"^card(\d+)$").expect("regex"));
             let gpu_index = CARD_RE
                 .captures(key)
                 .and_then(|c| c[1].parse::<u32>().ok())
-                .unwrap_or(0);
+                .ok_or_else(|| GpuError::ParseError("unrecognized ROCm process device".into()))?;
 
             if let Some(procs) = proc_info.as_object() {
                 for (pid_str, mem_val) in procs {
                     let pid = match pid_str.parse::<u32>() {
-                        Ok(p) => p,
-                        Err(_) => continue,
+                        Ok(p) if p > 0 => p,
+                        _ => return Err(GpuError::ParseError("invalid ROCm process PID".into())),
                     };
                     let mem_bytes = mem_val
                         .as_str()
@@ -512,13 +596,22 @@ pub fn parse_rocm_process_json(json_str: &str) -> Result<Vec<ProcessGpuUsage>, G
 
                     usages.push(ProcessGpuUsage {
                         pid,
-                        gpu_index,
+                        gpu_index: Some(gpu_index),
+                        gpu_uuid: None,
                         used_gpu_memory_mib: mem_mib,
                         gpu_process_type: Some("Compute".to_string()),
                     });
                 }
+            } else {
+                return Err(GpuError::ParseError(
+                    "unrecognized ROCm process schema".into(),
+                ));
             }
         }
+    } else {
+        return Err(GpuError::ParseError(
+            "unrecognized ROCm process schema".into(),
+        ));
     }
     Ok(usages)
 }
@@ -529,104 +622,428 @@ pub fn parse_rocm_process_json(json_str: &str) -> Result<Vec<ProcessGpuUsage>, G
 
 /// Collect a system-wide GPU snapshot.
 ///
-/// Tries NVIDIA first, then AMD. Returns a default (no-GPU) snapshot if
-/// neither tool is available.
+/// Tries NVIDIA first, then AMD, within one wall-clock budget. This observes one
+/// vendor's visible devices, not a complete inventory of a mixed-vendor host.
+/// Missing tools and failed queries remain unknown, with provenance warnings.
 pub fn collect_gpu_snapshot() -> GpuSnapshot {
-    // Try NVIDIA
-    if is_nvidia_available() {
+    let started = Instant::now();
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    let worker_observed_at = observed_at.clone();
+    let worker = start_gpu_worker(&GPU_COLLECTION_IN_FLIGHT, move || {
+        collect_gpu_snapshot_inner(started, worker_observed_at)
+    });
+    let (receiver, worker_handle) = match worker {
+        Ok(worker) => worker,
+        Err(error) => {
+            return unavailable_gpu_snapshot(started, observed_at, error);
+        }
+    };
+    // A vendor tool can enter uninterruptible driver I/O. ToolRunner's child.wait()
+    // may then remain blocked even after a kill request. Never join that worker on
+    // the scan thread; the single in-flight lease prevents repeated scans from
+    // accumulating stuck workers. A completed late result is discarded, not cached
+    // or attached to a subsequent process incarnation.
+    drop(worker_handle);
+    let remaining = (started + GPU_COLLECTION_BUDGET).saturating_duration_since(Instant::now());
+    receive_gpu_snapshot(&receiver, remaining, started, observed_at)
+}
+
+struct GpuCollectionLease(&'static AtomicBool);
+
+impl GpuCollectionLease {
+    fn acquire(in_flight: &'static AtomicBool) -> Option<Self> {
+        in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(in_flight))
+    }
+}
+
+impl Drop for GpuCollectionLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn start_gpu_worker(
+    in_flight: &'static AtomicBool,
+    collect: impl FnOnce() -> GpuSnapshot + Send + 'static,
+) -> Result<(Receiver<GpuSnapshot>, JoinHandle<()>), String> {
+    let lease = GpuCollectionLease::acquire(in_flight).ok_or_else(|| {
+        "Previous GPU collection is still running; skipped another probe and retained unknown GPU evidence".to_string()
+    })?;
+    let (sender, receiver) = mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("pt-gpu-probe".into())
+        .spawn(move || {
+            let _lease = lease;
+            let snapshot = collect();
+            let _ = sender.send(snapshot);
+        })
+        .map_err(|error| format!("Cannot start GPU collection worker: {error}"))?;
+    Ok((receiver, handle))
+}
+
+fn receive_gpu_snapshot(
+    receiver: &Receiver<GpuSnapshot>,
+    remaining: Duration,
+    started: Instant,
+    observed_at: String,
+) -> GpuSnapshot {
+    match receiver.recv_timeout(remaining) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let warning = match error {
+                mpsc::RecvTimeoutError::Timeout => "GPU collection deadline exceeded; GPU evidence is unknown and the pending worker will not be duplicated",
+                mpsc::RecvTimeoutError::Disconnected => "GPU collection worker stopped without a result; GPU evidence is unknown",
+            };
+            let mut snapshot = unavailable_gpu_snapshot(started, observed_at, warning.to_owned());
+            snapshot.device_status = GpuQueryStatus::Failed;
+            snapshot
+        }
+    }
+}
+
+fn unavailable_gpu_snapshot(started: Instant, observed_at: String, warning: String) -> GpuSnapshot {
+    GpuSnapshot {
+        device_status: GpuQueryStatus::Unavailable,
+        observed_at: Some(observed_at),
+        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        provenance: GpuProvenance {
+            source: GpuDetectionSource::None,
+            warnings: vec![warning],
+        },
+        ..Default::default()
+    }
+}
+
+fn collect_gpu_snapshot_inner(started: Instant, observed_at: String) -> GpuSnapshot {
+    let deadline = started + GPU_COLLECTION_BUDGET;
+    let mut warnings = Vec::new();
+    let mut attempted = false;
+    let mut snapshot = None;
+    if gpu_tool_available("nvidia-smi", deadline) {
+        attempted = true;
         debug!("nvidia-smi available, querying GPU info");
-        match collect_nvidia_snapshot() {
-            Ok(snap) => return snap,
+        match collect_nvidia_snapshot(deadline) {
+            Ok(snap) => snapshot = Some(snap),
             Err(e) => {
                 warn!(error = %e, "nvidia-smi query failed, trying rocm-smi");
+                warnings.push(format!("nvidia-smi device query failed: {e}"));
             }
         }
     }
 
-    // Try AMD
-    if is_rocm_available() {
+    if snapshot.is_none() && gpu_tool_available("rocm-smi", deadline) {
+        attempted = true;
         debug!("rocm-smi available, querying GPU info");
-        match collect_rocm_snapshot() {
-            Ok(snap) => return snap,
+        match collect_rocm_snapshot(deadline) {
+            Ok(snap) => snapshot = Some(snap),
             Err(e) => {
                 warn!(error = %e, "rocm-smi query failed");
-                return GpuSnapshot {
-                    provenance: GpuProvenance {
-                        source: GpuDetectionSource::RocmSmi,
-                        warnings: vec![format!("rocm-smi failed: {e}")],
-                    },
-                    ..Default::default()
-                };
+                warnings.push(format!("rocm-smi device query failed: {e}"));
             }
         }
     }
 
-    trace!("no GPU tools available");
-    GpuSnapshot::default()
+    let mut snapshot = snapshot.unwrap_or_else(|| GpuSnapshot {
+        device_status: if attempted {
+            GpuQueryStatus::Failed
+        } else {
+            GpuQueryStatus::Unavailable
+        },
+        process_status: GpuQueryStatus::NotCollected,
+        ..Default::default()
+    });
+    if !attempted {
+        warnings.push("GPU tools unavailable or could not be inspected; GPU presence and activity are unknown".into());
+    }
+    warnings.append(&mut snapshot.provenance.warnings);
+    warnings.push("Vendor PIDs are not verified against the mounted procfs namespace; an absent process row does not prove GPU inactivity".into());
+    warnings.push(
+        "Utilization is device-wide; per-process utilization and reclaimable VRAM are unknown"
+            .into(),
+    );
+    snapshot.provenance.warnings = warnings;
+    snapshot.observed_at = Some(observed_at);
+    snapshot.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    snapshot
 }
 
-fn collect_nvidia_snapshot() -> Result<GpuSnapshot, GpuError> {
-    let devices = query_nvidia_devices()?;
-    let processes = query_nvidia_processes().unwrap_or_default();
+fn collect_nvidia_snapshot(deadline: Instant) -> Result<GpuSnapshot, GpuError> {
+    let devices = query_nvidia_devices(deadline)?;
+    let processes = query_nvidia_processes(&devices, deadline);
+    Ok(snapshot_from_queries(
+        GpuType::Nvidia,
+        GpuDetectionSource::NvidiaSmi,
+        devices,
+        processes,
+    ))
+}
 
+fn collect_rocm_snapshot(deadline: Instant) -> Result<GpuSnapshot, GpuError> {
+    let devices = query_rocm_devices(deadline)?;
+    let processes = query_rocm_processes(deadline);
+    Ok(snapshot_from_queries(
+        GpuType::Amd,
+        GpuDetectionSource::RocmSmi,
+        devices,
+        processes,
+    ))
+}
+
+fn snapshot_from_queries(
+    gpu_type: GpuType,
+    source: GpuDetectionSource,
+    devices: Vec<GpuDevice>,
+    processes: Result<Vec<ProcessGpuUsage>, GpuError>,
+) -> GpuSnapshot {
+    let mut warnings = Vec::new();
+    let (processes, process_status) = match processes {
+        Ok(processes) => (processes, GpuQueryStatus::Observed),
+        Err(error) => {
+            warnings.push(format!(
+                "GPU process query failed; process allocations are unknown: {error}"
+            ));
+            (Vec::new(), GpuQueryStatus::Failed)
+        }
+    };
     let mut process_usage: HashMap<u32, Vec<ProcessGpuUsage>> = HashMap::new();
-    for p in &processes {
-        process_usage.entry(p.pid).or_default().push(p.clone());
+    for process in processes {
+        process_usage.entry(process.pid).or_default().push(process);
     }
     let gpu_process_count = process_usage.len();
 
-    Ok(GpuSnapshot {
-        has_gpu: true,
-        gpu_type: GpuType::Nvidia,
+    GpuSnapshot {
+        has_gpu: Some(!devices.is_empty()),
+        gpu_type,
         devices,
         process_usage,
         gpu_process_count,
-        provenance: GpuProvenance {
-            source: GpuDetectionSource::NvidiaSmi,
-            warnings: Vec::new(),
-        },
-    })
-}
-
-fn collect_rocm_snapshot() -> Result<GpuSnapshot, GpuError> {
-    let devices = query_rocm_devices()?;
-    let processes = query_rocm_processes().unwrap_or_default();
-
-    let mut process_usage: HashMap<u32, Vec<ProcessGpuUsage>> = HashMap::new();
-    for p in &processes {
-        process_usage.entry(p.pid).or_default().push(p.clone());
+        provenance: GpuProvenance { source, warnings },
+        device_status: GpuQueryStatus::Observed,
+        process_status,
+        ..Default::default()
     }
-    let gpu_process_count = process_usage.len();
-
-    Ok(GpuSnapshot {
-        has_gpu: true,
-        gpu_type: GpuType::Amd,
-        devices,
-        process_usage,
-        gpu_process_count,
-        provenance: GpuProvenance {
-            source: GpuDetectionSource::RocmSmi,
-            warnings: Vec::new(),
-        },
-    })
 }
 
-/// Look up GPU usage for a specific PID from a snapshot.
+/// Look up usage by driver-reported PID. This does not establish local identity.
 pub fn gpu_usage_for_pid(snapshot: &GpuSnapshot, pid: u32) -> Option<&Vec<ProcessGpuUsage>> {
     snapshot.process_usage.get(&pid)
 }
 
-/// Compute total VRAM used by a PID across all GPUs.
+/// Sum a driver-reported PID's allocations only when every value is known.
+/// This is neither a local-process identity join nor a reclaimable-memory estimate.
 pub fn total_vram_mib_for_pid(snapshot: &GpuSnapshot, pid: u32) -> Option<u64> {
-    snapshot
-        .process_usage
-        .get(&pid)
-        .map(|usages| usages.iter().filter_map(|u| u.used_gpu_memory_mib).sum())
+    let usages = snapshot.process_usage.get(&pid)?;
+    if usages.is_empty() {
+        return None;
+    }
+    usages.iter().try_fold(0_u64, |total, usage| {
+        total.checked_add(usage.used_gpu_memory_mib?)
+    })
+}
+
+/// Read only GPU-related character descriptors from the mounted procfs. The
+/// caller must revalidate process identity after this probe before publishing it.
+pub(super) fn collect_gpu_handles(
+    pid: u32,
+    fd_info: Option<&super::proc_parsers::FdInfo>,
+) -> Vec<GpuDeviceHandle> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    gpu_handles_from_fds(fd_info, |fd, expected_path| {
+        // O_PATH pins the existing object without opening/initializing a GPU
+        // device. Check the pinned path and type together so an FD reused during
+        // collection cannot borrow an earlier descriptor's GPU pathname.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(format!("/proc/{pid}/fd/{fd}"))
+            .ok()?;
+        let path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+        if path != std::path::Path::new(expected_path) {
+            return None;
+        }
+        let metadata = file.metadata().ok()?;
+        metadata
+            .file_type()
+            .is_char_device()
+            .then_some(metadata.rdev())
+    })
+}
+
+fn gpu_handles_from_fds(
+    fd_info: Option<&super::proc_parsers::FdInfo>,
+    mut character_device: impl FnMut(u32, &str) -> Option<u64>,
+) -> Vec<GpuDeviceHandle> {
+    use super::proc_parsers::FdType;
+    let Some(fd_info) = fd_info else {
+        return Vec::new();
+    };
+    let mut handles = Vec::new();
+    for file in &fd_info.open_files {
+        if file.fd_type != FdType::Device {
+            continue;
+        }
+        let Some(individual_device) = gpu_device_path(&file.path) else {
+            continue;
+        };
+        let Some(device) = character_device(file.fd, &file.path) else {
+            continue;
+        };
+        handles.push(GpuDeviceHandle {
+            fd: file.fd,
+            path: file.path.clone(),
+            resource_key: individual_device.then(|| format!("gpu:char:{device}")),
+        });
+    }
+    handles.sort_by_key(|handle| handle.fd);
+    handles
+}
+
+/// Some(false) denotes a GPU control interface, not an individual shared GPU.
+fn gpu_device_path(path: &str) -> Option<bool> {
+    if matches!(
+        path,
+        "/dev/nvidiactl" | "/dev/nvidia-uvm" | "/dev/nvidia-uvm-tools" | "/dev/kfd"
+    ) {
+        return Some(false);
+    }
+    ["/dev/nvidia", "/dev/dri/card", "/dev/dri/renderD"]
+        .iter()
+        .find_map(|prefix| {
+            path.strip_prefix(prefix)
+                .filter(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .map(|_| true)
+        })
+}
+
+/// Combine local descriptor facts with a post-probe identity result. Failed or
+/// missing identity validation removes every positive ownership observation.
+pub(super) fn process_gpu_evidence(
+    fd_info: Option<&super::proc_parsers::FdInfo>,
+    handles: Vec<GpuDeviceHandle>,
+    identity_verified: bool,
+    observed_at: &str,
+) -> ProcessGpuEvidence {
+    let mut evidence = ProcessGpuEvidence {
+        identity_verified,
+        observed_at: observed_at.to_owned(),
+        warnings: vec!["GPU allocation and process utilization remain unknown: vendor PID namespace is unverified".into()],
+        ..Default::default()
+    };
+    if !identity_verified {
+        evidence.warnings.push("Process identity changed or could not be revalidated; GPU descriptor observations discarded".into());
+        return evidence;
+    }
+    match fd_info {
+        None => evidence
+            .warnings
+            .push("GPU descriptor inspection unavailable".into()),
+        Some(info) if info.truncated => evidence.warnings.push(
+            "Descriptor inspection truncated; additional GPU handles may be unobserved".into(),
+        ),
+        Some(_) => {}
+    }
+    if !handles.is_empty() {
+        evidence.has_gpu_handle = Some(true);
+        evidence.device_handles = handles;
+    } else {
+        evidence.warnings.push(
+            "No verified GPU descriptor observed; this does not establish absence or inactivity"
+                .into(),
+        );
+    }
+    evidence
+}
+
+/// Shared-device evidence is observational only: holding the same device does
+/// not prove an application dependency or that another holder would be harmed.
+pub(super) fn gpu_resource_evidence(
+    owner_pid: u32,
+    evidence: &ProcessGpuEvidence,
+) -> Vec<pt_common::RawResourceEvidence> {
+    use pt_common::{
+        RawResourceEvidence, ResourceCollectionMethod, ResourceDetails, ResourceKind, ResourceState,
+    };
+    if !evidence.identity_verified {
+        return Vec::new();
+    }
+    let mut by_key = std::collections::BTreeMap::new();
+    for handle in &evidence.device_handles {
+        let Some(key) = &handle.resource_key else {
+            continue;
+        };
+        by_key.entry(key.clone()).or_insert_with(|| RawResourceEvidence {
+            kind: ResourceKind::GpuDevice,
+            key: key.clone(),
+            owner_pid,
+            collection_method: ResourceCollectionMethod::ProcFd,
+            state: ResourceState::Active,
+            details: ResourceDetails::Generic {
+                description: format!("Observed open GPU character device {}; compute activity and reclaimable VRAM unknown", handle.path),
+            },
+            observed_at: evidence.observed_at.clone(),
+        });
+    }
+    by_key.into_values().collect()
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn gpu_query_timeout(deadline: Instant, now: Instant) -> Result<Duration, GpuError> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .map(|remaining| remaining.min(GPU_QUERY_TIMEOUT))
+        .ok_or(GpuError::Timeout)
+}
+
+fn validate_gpu_output(output: &super::tool_runner::ToolOutput) -> Result<(), GpuError> {
+    if output.timed_out {
+        return Err(GpuError::Timeout);
+    }
+    if output.truncated {
+        return Err(GpuError::ParseError(
+            "GPU output was truncated; completeness is unknown".into(),
+        ));
+    }
+    if !output.success() {
+        return Err(GpuError::ExecutionFailed(format!(
+            "{} exited {:?}: {}",
+            output.command,
+            output.exit_code,
+            output.stderr_str()
+        )));
+    }
+    Ok(())
+}
+
+fn run_gpu_tool(
+    tool: &str,
+    args: &[&str],
+    deadline: Instant,
+) -> Result<super::tool_runner::ToolOutput, GpuError> {
+    let timeout = gpu_query_timeout(deadline, Instant::now())?;
+    let output = super::tool_runner::run_tool(tool, args, Some(timeout), Some(1024 * 1024))
+        .map_err(|error| GpuError::ExecutionFailed(format!("{tool}: {error}")))?;
+    validate_gpu_output(&output)?;
+    Ok(output)
+}
+
+fn gpu_tool_available(tool: &str, deadline: Instant) -> bool {
+    run_gpu_tool(
+        "which",
+        &[tool],
+        deadline.min(Instant::now() + Duration::from_secs(1)),
+    )
+    .is_ok()
+}
 
 fn non_empty(s: &str) -> Option<String> {
     let trimmed = s.trim();
@@ -643,6 +1060,22 @@ fn parse_u64_opt(s: &str) -> Option<u64> {
 
 fn parse_u32_opt(s: &str) -> Option<u32> {
     s.trim().parse::<u32>().ok()
+}
+
+fn parse_percent_opt(s: &str) -> Option<u32> {
+    parse_u32_opt(s).filter(|value| *value <= 100)
+}
+
+fn json_u64_opt(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_str()?
+            .trim()
+            .trim_end_matches('%')
+            .trim()
+            .parse()
+            .ok()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -744,10 +1177,10 @@ mod tests {
         let usages = parse_nvidia_process_csv(csv, &devices).unwrap();
         assert_eq!(usages.len(), 2);
         assert_eq!(usages[0].pid, 12345);
-        assert_eq!(usages[0].gpu_index, 0);
+        assert_eq!(usages[0].gpu_index, Some(0));
         assert_eq!(usages[0].used_gpu_memory_mib, Some(4096));
         assert_eq!(usages[1].pid, 54321);
-        assert_eq!(usages[1].gpu_index, 1);
+        assert_eq!(usages[1].gpu_index, Some(1));
         assert_eq!(usages[1].used_gpu_memory_mib, Some(8192));
     }
 
@@ -769,7 +1202,8 @@ mod tests {
         let csv = "999, GPU-unknown, 512\n";
         let usages = parse_nvidia_process_csv(csv, &[]).unwrap();
         assert_eq!(usages.len(), 1);
-        assert_eq!(usages[0].gpu_index, 0); // defaults to 0
+        assert_eq!(usages[0].gpu_index, None);
+        assert_eq!(usages[0].gpu_uuid.as_deref(), Some("GPU-unknown"));
     }
 
     // === rocm-smi parsing ===
@@ -865,7 +1299,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
         // 4294967296 bytes = 4096 MiB
         let p1 = usages.iter().find(|u| u.pid == 12345).unwrap();
         assert_eq!(p1.used_gpu_memory_mib, Some(4096));
-        assert_eq!(p1.gpu_index, 0);
+        assert_eq!(p1.gpu_index, Some(0));
     }
 
     #[test]
@@ -884,13 +1318,14 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
             100,
             vec![ProcessGpuUsage {
                 pid: 100,
-                gpu_index: 0,
+                gpu_index: Some(0),
+                gpu_uuid: None,
                 used_gpu_memory_mib: Some(2048),
                 gpu_process_type: None,
             }],
         );
         let snap = GpuSnapshot {
-            has_gpu: true,
+            has_gpu: Some(true),
             gpu_type: GpuType::Nvidia,
             process_usage,
             gpu_process_count: 1,
@@ -908,20 +1343,22 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
             vec![
                 ProcessGpuUsage {
                     pid: 42,
-                    gpu_index: 0,
+                    gpu_index: Some(0),
+                    gpu_uuid: None,
                     used_gpu_memory_mib: Some(1024),
                     gpu_process_type: None,
                 },
                 ProcessGpuUsage {
                     pid: 42,
-                    gpu_index: 1,
+                    gpu_index: Some(1),
+                    gpu_uuid: None,
                     used_gpu_memory_mib: Some(2048),
                     gpu_process_type: None,
                 },
             ],
         );
         let snap = GpuSnapshot {
-            has_gpu: true,
+            has_gpu: Some(true),
             gpu_type: GpuType::Nvidia,
             process_usage,
             gpu_process_count: 1,
@@ -936,7 +1373,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
     #[test]
     fn test_gpu_snapshot_default() {
         let snap = GpuSnapshot::default();
-        assert!(!snap.has_gpu);
+        assert_eq!(snap.has_gpu, None);
         assert_eq!(snap.gpu_type, GpuType::None);
         assert!(snap.devices.is_empty());
         assert!(snap.process_usage.is_empty());
@@ -950,13 +1387,14 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
             1,
             vec![ProcessGpuUsage {
                 pid: 1,
-                gpu_index: 0,
+                gpu_index: Some(0),
+                gpu_uuid: None,
                 used_gpu_memory_mib: Some(512),
                 gpu_process_type: Some("C".into()),
             }],
         );
         let snap = GpuSnapshot {
-            has_gpu: true,
+            has_gpu: Some(true),
             gpu_type: GpuType::Nvidia,
             devices: vec![GpuDevice {
                 index: 0,
@@ -974,11 +1412,12 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
                 source: GpuDetectionSource::NvidiaSmi,
                 warnings: Vec::new(),
             },
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&snap).unwrap();
         let restored: GpuSnapshot = serde_json::from_str(&json).unwrap();
-        assert!(restored.has_gpu);
+        assert_eq!(restored.has_gpu, Some(true));
         assert_eq!(restored.gpu_type, GpuType::Nvidia);
         assert_eq!(restored.devices.len(), 1);
         assert_eq!(restored.devices[0].name, "RTX 4090");
@@ -1042,6 +1481,332 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
         assert!(e.to_string().contains("bad format"));
     }
 
+    #[test]
+    fn gpu_regression_vendor_queries_keep_multi_device_identity() {
+        let devices = parse_nvidia_device_csv(
+            "3, A100, GPU-first, 40960, 256, 90, 55, 535.0\n7, A100, GPU-second, 40960, 512, 0, 40, 535.0\n"
+        ).unwrap();
+        let rows =
+            parse_nvidia_process_csv("42, GPU-second, 512\n42, MIG-unlisted, N/A\n", &devices)
+                .unwrap();
+        assert_eq!(rows[0].gpu_index, Some(7));
+        assert_eq!(rows[1].gpu_index, None);
+        assert_eq!(rows[1].gpu_uuid.as_deref(), Some("MIG-unlisted"));
+        let snapshot = snapshot_from_queries(
+            GpuType::Nvidia,
+            GpuDetectionSource::NvidiaSmi,
+            devices,
+            Ok(rows),
+        );
+        assert_eq!(snapshot.process_status, GpuQueryStatus::Observed);
+        assert!(!snapshot.process_pid_namespace_verified);
+        assert_eq!(total_vram_mib_for_pid(&snapshot, 42), None);
+    }
+
+    #[test]
+    fn gpu_regression_failed_process_query_is_not_empty_success() {
+        let devices =
+            parse_nvidia_device_csv("0, A100, GPU-first, 40960, 256, 90, 55, 535.0\n").unwrap();
+        let failed = snapshot_from_queries(
+            GpuType::Nvidia,
+            GpuDetectionSource::NvidiaSmi,
+            devices.clone(),
+            Err(GpuError::Timeout),
+        );
+        assert_eq!(failed.has_gpu, Some(true));
+        assert_eq!(failed.device_status, GpuQueryStatus::Observed);
+        assert_eq!(failed.process_status, GpuQueryStatus::Failed);
+        assert!(!failed.provenance.warnings.is_empty());
+        assert_eq!(total_vram_mib_for_pid(&failed, 42), None);
+        let empty = snapshot_from_queries(
+            GpuType::Nvidia,
+            GpuDetectionSource::NvidiaSmi,
+            devices,
+            Ok(Vec::new()),
+        );
+        assert_eq!(empty.process_status, GpuQueryStatus::Observed);
+        assert!(empty.process_usage.is_empty());
+        // Even an observed empty compute list cannot prove a specific process idle.
+        assert_eq!(total_vram_mib_for_pid(&empty, 42), None);
+    }
+
+    #[test]
+    fn gpu_regression_vram_sum_requires_complete_nonoverflowing_values() {
+        for (values, expected) in [
+            (vec![None], None),
+            (vec![Some(100), None], None),
+            (vec![Some(u64::MAX), Some(1)], None),
+            (vec![Some(0), Some(0)], Some(0)),
+            (vec![Some(100), Some(200)], Some(300)),
+            (vec![], None),
+        ] {
+            let usages = values
+                .into_iter()
+                .enumerate()
+                .map(|(index, memory)| ProcessGpuUsage {
+                    pid: 42,
+                    gpu_index: Some(index as u32),
+                    gpu_uuid: None,
+                    used_gpu_memory_mib: memory,
+                    gpu_process_type: Some("Compute".into()),
+                })
+                .collect();
+            let mut snapshot = GpuSnapshot::default();
+            snapshot.process_usage.insert(42, usages);
+            assert_eq!(total_vram_mib_for_pid(&snapshot, 42), expected);
+        }
+    }
+
+    #[test]
+    fn gpu_regression_malformed_queries_and_duplicate_devices_fail_closed() {
+        for text in [
+            "42, GPU-x",
+            "not-a-pid, GPU-x, 512",
+            "0, GPU-x, 512",
+            "ERROR: driver unavailable",
+        ] {
+            assert!(parse_nvidia_process_csv(text, &[]).is_err(), "{text}");
+        }
+        assert!(parse_nvidia_device_csv(
+            "0, A100, GPU-x, 1024, 0, 0, 30, 1\n1, A100, GPU-x, 1024, 0, 0, 30, 1\n"
+        )
+        .is_err());
+        assert!(parse_rocm_process_json(r#"{"unexpected":{"42":1024}}"#).is_err());
+        assert!(parse_rocm_process_json("[]").is_err());
+        assert!(parse_rocm_json(r#"{"error":"permission denied"}"#).is_err());
+        let devices = parse_nvidia_device_csv("0, A100, GPU-x, 1024, 0, 101, 30, 1\n").unwrap();
+        assert_eq!(devices[0].utilization_percent, None);
+    }
+
+    #[test]
+    fn gpu_regression_rocm_supported_process_schema_keeps_aggregate_unassigned() {
+        // Shape emitted by upstream rocm_smi.py showPids + print2DArray;
+        // process-name spaces become commas, so numeric fields are read from the end.
+        let usages = parse_rocm_process_json(
+            r#"{"system": {
+            "PID42": "python, training, job, 2, 4294967296, 0, 87",
+            "PID43": "worker, 1, unknown, unknown, unknown"
+        }}"#,
+        )
+        .unwrap();
+        let known = usages.iter().find(|usage| usage.pid == 42).unwrap();
+        assert_eq!(known.used_gpu_memory_mib, Some(4096));
+        assert_eq!(known.gpu_index, None); // 2 is a GPU count, never GPU index 2.
+        assert_eq!(known.gpu_uuid, None);
+        assert_eq!(
+            usages
+                .iter()
+                .find(|usage| usage.pid == 43)
+                .unwrap()
+                .used_gpu_memory_mib,
+            None
+        );
+    }
+
+    #[test]
+    fn gpu_regression_rocm_numeric_fields_and_driver_metadata() {
+        let devices = parse_rocm_json(r#"{
+            "card2":{"GPU use (%)": 91,"VRAM Total Memory (B)":1073741824,"VRAM Total Used Memory (B)":"1048576"},
+            "system":{"Driver version":"6.8.0"}
+        }"#).unwrap();
+        assert_eq!(devices[0].index, 2);
+        assert_eq!(devices[0].utilization_percent, Some(91));
+        assert_eq!(devices[0].memory_total_mib, Some(1024));
+        assert_eq!(devices[0].memory_used_mib, Some(1));
+        assert_eq!(devices[0].driver_version.as_deref(), Some("6.8.0"));
+    }
+
+    #[test]
+    fn gpu_regression_timeout_and_truncated_success_are_rejected() {
+        let mut output = super::super::tool_runner::ToolOutput {
+            command: "nvidia-smi".into(),
+            args: Vec::new(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: Some(0),
+            truncated: false,
+            duration: Duration::ZERO,
+            timed_out: false,
+        };
+        assert!(validate_gpu_output(&output).is_ok());
+        output.truncated = true;
+        assert!(validate_gpu_output(&output).is_err());
+        output.truncated = false;
+        output.timed_out = true;
+        assert!(matches!(
+            validate_gpu_output(&output),
+            Err(GpuError::Timeout)
+        ));
+        output.timed_out = false;
+        output.exit_code = Some(1);
+        assert!(validate_gpu_output(&output).is_err());
+    }
+
+    #[test]
+    fn gpu_regression_query_budget_is_deterministic_and_capped() {
+        let now = Instant::now();
+        assert_eq!(
+            gpu_query_timeout(now + GPU_COLLECTION_BUDGET, now).unwrap(),
+            GPU_QUERY_TIMEOUT
+        );
+        assert_eq!(
+            gpu_query_timeout(now + Duration::from_millis(10), now).unwrap(),
+            Duration::from_millis(10)
+        );
+        assert!(matches!(
+            gpu_query_timeout(now, now),
+            Err(GpuError::Timeout)
+        ));
+        assert!(matches!(
+            gpu_query_timeout(now, now + Duration::from_millis(1)),
+            Err(GpuError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn gpu_regression_outer_deadline_returns_unknown_without_duplicate_workers() {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let (release, wait_for_release) = mpsc::channel();
+        let (receiver, worker) = start_gpu_worker(&IN_FLIGHT, move || {
+            wait_for_release.recv().unwrap();
+            GpuSnapshot::default()
+        })
+        .unwrap();
+        let snapshot = receive_gpu_snapshot(
+            &receiver,
+            Duration::ZERO,
+            Instant::now(),
+            "2026-01-01T00:00:00Z".into(),
+        );
+        let pending = IN_FLIGHT.load(Ordering::Acquire);
+        let second = start_gpu_worker(&IN_FLIGHT, GpuSnapshot::default);
+        // Release and join the injected worker before any assertions: no test
+        // leaves a blocked worker behind, even if the behavior regresses.
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let second_rejected = match second {
+            Err(_) => true,
+            Ok((_, worker)) => {
+                worker.join().unwrap();
+                false
+            }
+        };
+        assert!(pending);
+        assert!(second_rejected);
+        assert!(!IN_FLIGHT.load(Ordering::Acquire));
+        assert_eq!(snapshot.has_gpu, None);
+        assert_eq!(snapshot.device_status, GpuQueryStatus::Failed);
+        assert_eq!(snapshot.process_status, GpuQueryStatus::NotCollected);
+        assert!(snapshot.provenance.warnings[0].contains("deadline exceeded"));
+    }
+
+    #[test]
+    fn gpu_regression_worker_lease_releases_on_success_and_unwind() {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        let (receiver, worker) =
+            start_gpu_worker(&IN_FLIGHT, || panic!("injected GPU parser panic")).unwrap();
+        let failed = worker.join().is_err();
+        let snapshot = receive_gpu_snapshot(
+            &receiver,
+            Duration::ZERO,
+            Instant::now(),
+            "2026-01-01T00:00:00Z".into(),
+        );
+        assert!(failed);
+        assert!(!IN_FLIGHT.load(Ordering::Acquire));
+        assert_eq!(snapshot.has_gpu, None);
+        assert!(snapshot.provenance.warnings[0].contains("without a result"));
+
+        let (receiver, worker) = start_gpu_worker(&IN_FLIGHT, || GpuSnapshot {
+            has_gpu: Some(false),
+            device_status: GpuQueryStatus::Observed,
+            ..Default::default()
+        })
+        .unwrap();
+        worker.join().unwrap();
+        let snapshot = receive_gpu_snapshot(
+            &receiver,
+            Duration::ZERO,
+            Instant::now(),
+            "2026-01-01T00:00:00Z".into(),
+        );
+        assert_eq!(snapshot.has_gpu, Some(false));
+        assert_eq!(snapshot.device_status, GpuQueryStatus::Observed);
+        assert!(!IN_FLIGHT.load(Ordering::Acquire));
+    }
+
+    fn gpu_fixture_fds() -> super::super::proc_parsers::FdInfo {
+        use super::super::proc_parsers::{FdInfo, FdType, OpenFile, OpenMode};
+        FdInfo {
+            open_files: [
+                "/dev/nvidia2",
+                "/dev/nvidia2",
+                "/dev/nvidiactl",
+                "/dev/kfd",
+                "/dev/null",
+                "/dev/nvidia2-fake",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| OpenFile {
+                fd: index as u32 + 3,
+                path: path.into(),
+                fd_type: FdType::Device,
+                mode: OpenMode::default(),
+            })
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gpu_regression_local_handles_require_verified_characters_and_identity() {
+        let info = gpu_fixture_fds();
+        let mut inspected = Vec::new();
+        let handles = gpu_handles_from_fds(Some(&info), |fd, _| {
+            inspected.push(fd);
+            Some(if fd <= 4 { 195 * 256 + 2 } else { 123 })
+        });
+        assert_eq!(inspected, vec![3, 4, 5, 6]); // Unrelated descriptors never probed.
+        assert_eq!(handles.len(), 4);
+        assert!(handles[2].resource_key.is_none()); // Global control nodes aren't one GPU.
+        assert!(handles[3].resource_key.is_none());
+        let evidence =
+            process_gpu_evidence(Some(&info), handles.clone(), true, "2026-01-01T00:00:00Z");
+        assert_eq!(evidence.has_gpu_handle, Some(true));
+        assert_eq!(evidence.used_gpu_memory_mib, None);
+        assert_eq!(evidence.utilization_percent, None);
+        let resources = gpu_resource_evidence(42, &evidence);
+        assert_eq!(resources.len(), 1); // Duplicate descriptors don't duplicate a device.
+        assert_eq!(resources[0].owner_pid, 42);
+        assert_eq!(resources[0].kind, pt_common::ResourceKind::GpuDevice);
+        let stale = process_gpu_evidence(Some(&info), handles, false, "2026-01-01T00:00:00Z");
+        assert_eq!(stale.has_gpu_handle, None);
+        assert!(stale.device_handles.is_empty());
+        assert!(gpu_resource_evidence(42, &stale).is_empty());
+        assert!(gpu_handles_from_fds(Some(&info), |_, _| None).is_empty());
+    }
+
+    #[test]
+    fn gpu_regression_missing_or_truncated_local_evidence_never_means_idle() {
+        for info in [
+            None,
+            Some(super::super::proc_parsers::FdInfo::default()),
+            Some(super::super::proc_parsers::FdInfo {
+                truncated: true,
+                ..Default::default()
+            }),
+        ] {
+            let evidence =
+                process_gpu_evidence(info.as_ref(), Vec::new(), true, "2026-01-01T00:00:00Z");
+            let json = serde_json::to_value(&evidence).unwrap();
+            assert!(json["has_gpu_handle"].is_null());
+            assert!(json["used_gpu_memory_mib"].is_null());
+            assert!(json["utilization_percent"].is_null());
+            assert!(!evidence.warnings.is_empty());
+        }
+    }
+
     // === No-mock integration tests ===
 
     #[test]
@@ -1060,7 +1825,7 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
         );
 
         // Structural invariants
-        if snap.has_gpu {
+        if snap.has_gpu == Some(true) {
             assert!(
                 !snap.devices.is_empty(),
                 "has_gpu=true but no devices listed"
@@ -1081,11 +1846,13 @@ GPU  Temp  AvgPwr  SCLK     MCLK     Fan  Perf    PwrCap  VRAM%  GPU%
 
         crate::test_log!(INFO, "GPU tools", nvidia_smi = nvidia, rocm_smi = rocm);
 
-        // If tool check says available, snapshot should detect GPU
+        // A binary can be installed without a usable driver or accessible GPU.
+        // Only a successful inventory can establish observed device presence.
         let snap = collect_gpu_snapshot();
-        if nvidia {
-            assert!(snap.has_gpu, "nvidia-smi available but no GPU detected");
-            assert_eq!(snap.gpu_type, GpuType::Nvidia);
+        if snap.device_status == GpuQueryStatus::Observed {
+            assert_eq!(snap.has_gpu, Some(!snap.devices.is_empty()));
+        } else {
+            assert_eq!(snap.has_gpu, None);
         }
         // Note: if both are available, NVIDIA takes precedence
     }

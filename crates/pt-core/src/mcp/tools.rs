@@ -1016,6 +1016,7 @@ mod tests {
             }),
             fd: None,
             local_resource_evidence: Vec::new(),
+            gpu: None,
             cgroup: None,
             wchan: None,
             network: Some(crate::collect::NetworkInfo {

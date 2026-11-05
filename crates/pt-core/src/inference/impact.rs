@@ -607,7 +607,20 @@ impl ImpactScorer {
     /// Score file descriptor-related impact.
     fn score_fds(&self, info: &FdInfo) -> (f64, usize, usize, usize, Vec<CriticalWriteCategory>) {
         let total_fds = info.count;
-        let write_fds = info.open_files.iter().filter(|f| f.mode.write).count();
+        // Device handles are retained for GPU ownership observations. They are
+        // not writable-file evidence and must not introduce a new scoring term.
+        let write_fds = info
+            .open_files
+            .iter()
+            .filter(|f| {
+                f.mode.write
+                    && matches!(
+                        f.fd_type,
+                        crate::collect::proc_parsers::FdType::File
+                            | crate::collect::proc_parsers::FdType::Directory
+                    )
+            })
+            .count();
         let critical_count = info.critical_writes.len();
 
         // Collect unique critical categories
@@ -933,6 +946,37 @@ mod tests {
         assert_eq!(write, 0);
         assert_eq!(critical, 0);
         assert!(categories.is_empty());
+    }
+
+    #[test]
+    fn gpu_device_descriptors_do_not_change_writable_file_impact() {
+        use crate::collect::proc_parsers::{FdType, OpenFile, OpenMode};
+        let scorer = ImpactScorer::new();
+        let mut info = FdInfo {
+            count: 10,
+            ..Default::default()
+        };
+        let baseline = scorer.score_fds(&info);
+        info.open_files.push(OpenFile {
+            fd: 3,
+            path: "/dev/nvidia0".into(),
+            fd_type: FdType::Device,
+            mode: OpenMode {
+                write: true,
+                ..Default::default()
+            },
+        });
+        assert_eq!(scorer.score_fds(&info), baseline);
+        info.open_files.push(OpenFile {
+            fd: 4,
+            path: "/tmp/output".into(),
+            fd_type: FdType::File,
+            mode: OpenMode {
+                write: true,
+                ..Default::default()
+            },
+        });
+        assert_eq!(scorer.score_fds(&info).2, 1);
     }
 
     #[test]

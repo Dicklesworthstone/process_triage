@@ -774,8 +774,9 @@ pub fn parse_fd_dir(dir: &Path, fdinfo_dir: Option<&Path>) -> Option<FdInfo> {
                 .and_then(|d| parse_fdinfo_flags(d.join(fd_num.to_string()).as_path()))
                 .unwrap_or_default();
 
-            // Record open file details for regular files
-            if fd_type == FdType::File || fd_type == FdType::Directory {
+            // Retain device descriptors too: deep GPU ownership is derived from
+            // actual handles, never from possibly unrelated vendor-reported PIDs.
+            if matches!(fd_type, FdType::File | FdType::Directory | FdType::Device) {
                 info.open_files.push(OpenFile {
                     fd: fd_num,
                     path: target_str.clone(),
@@ -784,7 +785,7 @@ pub fn parse_fd_dir(dir: &Path, fdinfo_dir: Option<&Path>) -> Option<FdInfo> {
                 });
 
                 // Check for critical files if open for writing
-                if mode.write {
+                if mode.write && fd_type != FdType::Device {
                     if let Some(critical) = detect_critical_file(fd_num, &target_str) {
                         info.critical_writes.push(critical);
                     }
@@ -1395,6 +1396,25 @@ nice                                         :                    0
         let content = b"";
         let env = parse_environ_content(content).unwrap();
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn gpu_device_descriptors_are_retained_without_critical_file_classification() {
+        use std::os::unix::fs::symlink;
+        let descriptors = tempfile::tempdir().unwrap();
+        let descriptor_info = tempfile::tempdir().unwrap();
+        symlink("/dev/nvidia0", descriptors.path().join("3")).unwrap();
+        symlink("/dev/gpu.lock", descriptors.path().join("4")).unwrap();
+        fs::write(descriptor_info.path().join("3"), "flags:\t02\n").unwrap();
+        fs::write(descriptor_info.path().join("4"), "flags:\t02\n").unwrap();
+        let info = parse_fd_dir(descriptors.path(), Some(descriptor_info.path())).unwrap();
+        assert_eq!(info.devices, 2);
+        assert_eq!(info.open_files.len(), 2);
+        assert!(info
+            .open_files
+            .iter()
+            .all(|file| file.fd_type == FdType::Device && file.mode.write));
+        assert!(info.critical_writes.is_empty());
     }
 
     // =========================================================================
