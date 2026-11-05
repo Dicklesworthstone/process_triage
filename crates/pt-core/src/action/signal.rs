@@ -12,6 +12,74 @@ use crate::plan::PlanAction;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Procfs identities and numeric-PID syscalls must refer to the same namespace.
+/// A container can inherit an ancestor namespace's procfs mount: in that case
+/// even a matching start time in `/proc/PID` does not identify `kill(PID)` or
+/// `pidfd_open(PID)` in the caller's namespace. Do not cache this check; a mount
+/// namespace or its procfs mount can change while the process is running.
+pub(super) fn ensure_action_pid_namespace() -> Result<(), ActionError> {
+    #[cfg(target_os = "linux")]
+    {
+        let proc_self = std::fs::read_link("/proc/self").map_err(|error| {
+            ActionError::Failed(format!(
+                "cannot establish action PID namespace from /proc/self: {error}"
+            ))
+        })?;
+        let status = std::fs::read_to_string("/proc/self/status").map_err(|error| {
+            ActionError::Failed(format!(
+                "cannot establish action PID namespace from /proc/self/status: {error}"
+            ))
+        })?;
+        validate_procfs_pid_namespace(std::process::id(), &proc_self, &status)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_procfs_pid_namespace(
+    caller_pid: u32,
+    proc_self: &std::path::Path,
+    status: &str,
+) -> Result<(), ActionError> {
+    let observed = proc_self
+        .to_str()
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            ActionError::Failed(
+                "cannot establish action PID namespace: invalid /proc/self link".into(),
+            )
+        })?;
+    if observed != caller_pid {
+        return Err(ActionError::Failed(format!(
+            "refusing action: procfs PID namespace differs from the caller (/proc/self={observed}, caller={caller_pid})"
+        )));
+    }
+    // Numeric PIDs can coincide across nested namespaces after PID wraparound.
+    // NSpid starts in the procfs mount's namespace and lists each nested PID;
+    // only a single observed PID proves the mount uses the caller's namespace.
+    let mut namespace_lines = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NSpid:"));
+    let mut pids = namespace_lines
+        .next()
+        .ok_or_else(|| {
+            ActionError::Failed("cannot establish action PID namespace: NSpid is missing".into())
+        })?
+        .split_whitespace();
+    if namespace_lines.next().is_some()
+        || pids.next().and_then(|pid| pid.parse::<u32>().ok()) != Some(caller_pid)
+        || pids.next().is_some()
+    {
+        return Err(ActionError::Failed(
+            "refusing action: procfs PID namespace is ambiguous or differs from the caller (NSpid)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Signal action runner configuration.
 #[derive(Debug, Clone)]
 pub struct SignalConfig {
@@ -99,6 +167,7 @@ impl SignalActionRunner {
     /// as returned by [`resolve_group_target`].
     #[cfg(unix)]
     fn send_signal(&self, target_id: u32, signal: i32, use_group: bool) -> Result<(), ActionError> {
+        ensure_action_pid_namespace()?;
         if target_id > i32::MAX as u32 {
             return Err(ActionError::Failed(format!(
                 "PID {} exceeds i32 range",
@@ -133,6 +202,7 @@ impl SignalActionRunner {
     /// `Ok(None)` means pidfds are unsupported here (fall back to `kill(2)`).
     #[cfg(target_os = "linux")]
     fn pinned_pidfd(&self, action: &PlanAction) -> Result<Option<PidFd>, ActionError> {
+        ensure_action_pid_namespace()?;
         let pid = action.target.pid.0;
         let Some(fd) = PidFd::open(pid)? else {
             return Ok(None);
@@ -586,6 +656,7 @@ impl Default for LiveIdentityProvider {
 #[cfg(target_os = "linux")]
 impl super::executor::IdentityProvider for LiveIdentityProvider {
     fn revalidate(&self, target: &pt_common::ProcessIdentity) -> Result<bool, ActionError> {
+        ensure_action_pid_namespace()?;
         let pid = target.pid.0;
 
         // Check if process exists
@@ -766,6 +837,70 @@ fn ids_match_starttime(start_id: &str, current_starttime: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn action_namespace_validation_rejects_ancestor_procfs_and_unknown_links() {
+        use std::path::Path;
+
+        let status = "Name:\tpt-core\nNSpid:\t42\n";
+        assert!(validate_procfs_pid_namespace(42, Path::new("42"), status).is_ok());
+        let mismatch = validate_procfs_pid_namespace(42, Path::new("9876"), status).unwrap_err();
+        assert!(mismatch.to_string().contains("PID namespace differs"));
+        for invalid in ["", "0", "-1", "+42", "42/task/42", "/proc/42", "4294967296"] {
+            assert!(
+                validate_procfs_pid_namespace(42, Path::new(invalid), status).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(validate_procfs_pid_namespace(0, Path::new("42"), status).is_err());
+        for status in [
+            "",
+            "NSpid:\n",
+            "NSpid:\t42 42\n",
+            "NSpid:\t42 5\n",
+            "NSpid:\twrong\n",
+            "NSpid:\t42\nNSpid:\t42\n",
+        ] {
+            assert!(
+                validate_procfs_pid_namespace(42, Path::new("42"), status).is_err(),
+                "{status}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_identity_namespace_refusal_precedes_missing_target_lookup() {
+        use super::super::executor::IdentityProvider;
+        use pt_common::{ProcessIdentity, StartId};
+
+        // No action is executed and this PID cannot be allocated by Linux. The
+        // test runs in both ordinary and ancestor-procfs containers: mismatched
+        // procfs must be an explicit namespace error, not a "process gone" result.
+        let target = ProcessIdentity::new(u32::MAX, StartId::from_linux("test", 1, u32::MAX), 0);
+        let result = LiveIdentityProvider::new().revalidate(&target);
+        let proc_pid: u32 = std::fs::read_link("/proc/self")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let namespace_pids: Vec<_> = status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        if proc_pid == std::process::id() && namespace_pids.len() == 1 {
+            assert!(matches!(result, Ok(false)));
+        } else {
+            let error =
+                result.expect_err("namespace mismatch must refuse before reading target identity");
+            assert!(error.to_string().contains("PID namespace"), "{error}");
+        }
+    }
 
     #[test]
     fn signal_config_defaults() {

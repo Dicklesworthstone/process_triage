@@ -98,6 +98,7 @@ impl ReniceActionRunner {
     /// Set process priority using setpriority(2).
     #[cfg(unix)]
     fn set_priority(&self, pid: u32, nice_value: i32) -> Result<(), ActionError> {
+        super::signal::ensure_action_pid_namespace()?;
         // PRIO_PROCESS = 0
         let result =
             unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice_value) };

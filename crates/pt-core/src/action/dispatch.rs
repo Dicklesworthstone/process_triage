@@ -101,6 +101,7 @@ pub(super) fn read_cgroup_identity(pid: u32) -> Option<pt_common::ProcessIdentit
 pub(super) fn ensure_cgroup_target(
     target: &pt_common::ProcessIdentity,
 ) -> Result<String, ActionError> {
+    super::signal::ensure_action_pid_namespace()?;
     let pid = target.pid.0;
     if pid <= 1 || crate::collect::protected::live_invoker_chain_pids().contains(&pid) {
         return Err(ActionError::Failed(format!(
@@ -225,6 +226,9 @@ fn shared_cgroup_members(procs_content: &str, pid: u32) -> Result<usize, ActionE
 
 impl ActionRunner for CompositeActionRunner {
     fn execute(&self, action: &PlanAction) -> Result<(), ActionError> {
+        if action.action != Action::Keep {
+            super::signal::ensure_action_pid_namespace()?;
+        }
         // Each specialized cgroup runner checks isolation at its own write entry,
         // including callers that use the runner without this dispatcher.
         match action.action {
