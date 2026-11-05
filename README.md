@@ -629,7 +629,7 @@ pt report --session <id> --output report.html --include-ledger --embed-assets
 
 ## Fleet Mode
 
-`pt` can plan across several hosts over SSH (each host needs `pt-core` installed):
+`pt` can plan across several hosts over SSH and apply the approved targets through each host's existing safety checks. Each host needs a `pt-core` version that supports the host and plan binding flags, and must retain its saved session between planning and application:
 
 ```bash
 # Plan across hosts (inventory: TOML, YAML or JSON by extension)
@@ -637,9 +637,27 @@ pt-core agent fleet plan --inventory hosts.toml --parallel 10
 
 # Or list hosts directly; kills pooled across hosts within an expected FDR of 5%
 pt-core agent fleet plan --hosts trj,ts1,hz3 --max-fdr 0.05
+
+# Inspect the saved selection locally; this starts no SSH command
+pt-core agent fleet apply --session pt-YYYYMMDD-HHMMSS-xxxx
+
+# Explicitly confirm execution, one host at a time, at most one kill per host
+pt-core agent fleet apply --session pt-YYYYMMDD-HHMMSS-xxxx \
+  --confirm --parallel 1 --max-kills-per-host 1
+
+# Confirmation plus dry-run still produces only a local preview
+pt-core --dry-run agent fleet apply --session pt-YYYYMMDD-HHMMSS-xxxx --confirm
 ```
 
-Current status: fleet **planning** works: each host runs its own `pt-core agent plan` over SSH (so protection, cgroup placement and the posterior are evaluated on that host), and the fleet pools those decisions across hosts by Bayesian expected FDR (the largest kill set, most probable first, whose posterior expected share of wrong kills stays within `--max-fdr`). Hosts need `pt-core` on their PATH. Fleet **apply** only reports planned actions; remote execution is not implemented yet. The Chandy-Lamport consistent-snapshot coordinator exists as a library but is not wired into fleet planning yet, so cross-host dependencies are not considered today.
+Each host runs its own `pt-core agent plan`, evaluating protection, cgroup placement and the posterior on that host. Fleet planning pools direct kill recommendations by Bayesian expected FDR: it keeps the largest set, most probable first, whose posterior expected share of wrong kills stays within `--max-fdr`. The saved fleet session retains the complete remote plans, their real session and host identities, the approved process identities and a SHA-256 digest of each complete plan. Apply recomputes that pooled selection and refuses changed evidence, host aliases that name the same recorded machine, or older sessions that contain summaries without executable evidence.
+
+**Apply defaults to a local preview.** `--confirm` enables execution; global `--dry-run` and `--shadow` still prevent dispatch. The default execution limits are one host at a time and one approved kill per host. `--parallel` accepts 1–32, and `--timeout` bounds each SSH command. All retained requests and host caps are checked before the first dispatch. Missing or invalid host evidence, or a host exceeding `--max-kills-per-host`, blocks the entire fleet: excluding a confident contributor could invalidate the remaining set's pooled approval. `--continue-on-error` does not override these local refusals. Increase a cap explicitly after reviewing the selection. Remote connections require the SSH host key already enrolled during planning.
+
+Confirmed apply passes only exact approved `pid:start_id` targets, with their retained host identity and plan digest, to remote `agent apply --yes --resume --abort-on-unknown`. The remote command checks the current host and saved document before resume or no-action shortcuts, then uses its usual live identity, tree, policy and robot constraints. The remote policy must enable robot execution. Only direct kill sequences and their preceding pause actions are eligible; routed zombie or D-state actions require separate local review. An independent recommendation excluded by fleet pooling is never added back during application.
+
+Before any dispatch, a durable `fleet-apply-<attempt>.jsonl` receipt records the exact intended requests. Per-host responses distinguish applied, blocked, partial, unknown and not-started outcomes, with confirmed action and signal counts. A timeout, lost connection or incomplete response means **unknown remote completion**; stopping the local SSH client does not prove that remote work stopped. Later batches stop on remote failure unless `--continue-on-error` is supplied; receipt-write failure always stops later batches. No command is retried automatically. Inspect the saved remote session and local receipt before deliberately retrying an unknown result. The expected-FDR approval describes the complete planned kill set; partial or unknown runtime execution does not establish the same bound for the executed subset, and the JSON intent and result state that limitation explicitly.
+
+Cross-host dependency coordination remains incomplete: the Chandy-Lamport consistent-snapshot coordinator exists as a library but is not wired into fleet planning. These execution checks preserve host-local safety and the exact pooled approval; they do not establish that stopping processes on different hosts is jointly safe.
 
 ---
 
@@ -1435,7 +1453,7 @@ cargo run -p pt-core -- run
 - **Linux-first**: Deep scan features (`/proc` parsing, cgroup limits, io_uring probes) require Linux. macOS has basic collection via `ps`/`lsof`/`proc_pidinfo`. Actions on macOS: kill, pause/resume and renice run (identity is revalidated to the microsecond immediately before each signal; there is no pidfd, so a tiny PID-reuse window remains), while freeze/throttle/quarantine need cgroups and are Linux-only. Session safety (same session, session leader, parent shell, SSH chain), the macOS protection model and the data-loss gate (via `lsof`, failing closed) all apply on macOS.
 - **No Windows native**: Windows support is via WSL2 only.
 - **Uncalibrated posterior**: the posterior is deliberately conservative and not yet calibrated against labeled outcomes, so `kill` recommendations are rare; most candidates come back as `pause` or `review`. Robot mode gates on the posterior only (no conformal gate is applied yet).
-- **Single-machine focus**: Fleet mode plans across hosts over SSH; fleet apply does not execute remotely yet.
+- **Cross-host dependencies**: Fleet planning and confirmed apply preserve host-local safety and the exact pooled selection. They do not yet coordinate service dependencies or establish that stopping processes on different hosts is jointly safe.
 - **No automatic recovery or restart**: `pt` reports failed actions but does not retry or roll back, and the `restart` action is not executable yet. Supervised services are protected; stop them through their supervisor.
 - **Library-only modules**: many advanced models and collectors in the workspace (see [Experimental Library Models](#experimental-library-models)) are tested but not wired into commands yet.
 

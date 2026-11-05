@@ -26,6 +26,10 @@ use pt_core::events::{
     FanoutEmitter, JsonlWriter, Phase, ProgressEmitter, ProgressEvent, SessionEmitter,
 };
 use pt_core::exit_codes::ExitCode;
+use pt_core::fleet::apply::{
+    bind_fleet_execution, execute_fleet_apply, prepare_fleet_apply, validate_apply_binding,
+    ApplyBindingReceipt, FleetApplyConfig, HostApplyStatus,
+};
 use pt_core::fleet::discovery::{
     FleetDiscoveryConfig, InventoryProvider, ProviderRegistry, StaticInventoryProvider,
 };
@@ -819,11 +823,11 @@ struct AgentFleetPlanArgs {
     discovery_config: Option<String>,
 
     /// Max concurrent host connections
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "10", value_parser = clap::value_parser!(u32).range(1..=32))]
     parallel: u32,
 
     /// Per-host timeout (seconds) for the remote `agent plan`
-    #[arg(long, default_value = "120")]
+    #[arg(long, default_value = "120", value_parser = clap::value_parser!(u64).range(1..=3600))]
     timeout: u64,
 
     /// Remote pt-core command (default: `pt-core` on the host's PATH)
@@ -843,7 +847,7 @@ struct AgentFleetPlanArgs {
     label: Option<String>,
 
     /// Fleet-wide max FDR budget
-    #[arg(long, default_value = "0.05")]
+    #[arg(long, default_value = "0.05", value_parser = parse_probability)]
     max_fdr: f64,
 }
 
@@ -853,13 +857,21 @@ struct AgentFleetApplyArgs {
     #[arg(long, alias = "session")]
     fleet_session: String,
 
-    /// Max concurrent host connections
-    #[arg(long, default_value = "10")]
+    /// Execute the exact approved remote targets (otherwise preview locally)
+    #[arg(long)]
+    confirm: bool,
+
+    /// Max concurrent host connections; stop later batches after a failure
+    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..=32))]
     parallel: u32,
 
     /// Per-host timeout (seconds)
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value = "120", value_parser = clap::value_parser!(u64).range(1..=3600))]
     timeout: u64,
+
+    /// Refuse a host whose approved kill set exceeds this cap
+    #[arg(long, default_value = "1")]
+    max_kills_per_host: u32,
 
     /// Continue if a host fails
     #[arg(long)]
@@ -1257,6 +1269,14 @@ struct AgentApplyArgs {
     /// Resume interrupted apply (skip already completed actions)
     #[arg(long)]
     resume: bool,
+
+    /// Refuse if the current host or recorded plan host differs from this ID
+    #[arg(long, requires = "expected_plan_sha256")]
+    expected_host_id: Option<String>,
+
+    /// Refuse if the complete saved plan differs from this approved SHA-256
+    #[arg(long, requires = "expected_host_id")]
+    expected_plan_sha256: Option<String>,
 }
 
 fn parse_nonnegative_finite(value: &str) -> Result<f64, String> {
@@ -2407,9 +2427,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let decisions_e = Arc::clone(&decisions);
         let execution_state_e = Arc::clone(&execution_state);
 
-        let execute_fn: Arc<
-            dyn Fn(Vec<u32>, Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync,
-        > = Arc::new(move |selected: Vec<u32>, explicitly_selected: Vec<u32>| {
+        let execute_fn = Arc::new(move |selected: Vec<u32>, explicitly_selected: Vec<u32>| {
             let mut state = execution_state_e
                 .lock()
                 .map_err(|_| "interactive execution state lock poisoned".to_string())?;
@@ -8329,12 +8347,17 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
         .collect();
 
     let fleet_session_id = SessionId::new();
-    let fleet_session = create_fleet_session(
+    let mut fleet_session = create_fleet_session(
         &fleet_session_id.0,
         args.label.as_deref(),
         &host_inputs,
         args.max_fdr,
     );
+    fleet_session.execution = Some(bind_fleet_execution(
+        &fleet_session,
+        &scan_result,
+        &ssh_config,
+    ));
 
     let mut warnings: Vec<String> = Vec::new();
     for r in &scan_result.results {
@@ -8344,6 +8367,16 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
                 r.host,
                 r.error.as_deref().unwrap_or("unknown error")
             ));
+        }
+    }
+    if let Some(execution) = &fleet_session.execution {
+        for binding in &execution.hosts {
+            if let Some(error) = &binding.error {
+                warnings.push(format!(
+                    "host '{}' cannot be applied: {error}",
+                    binding.host
+                ));
+            }
         }
     }
 
@@ -8377,7 +8410,7 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
         "fleet_session_id": fleet_session_id.0,
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "command": "agent fleet plan",
-        "status": if scan_result.failed == 0 { "ok" } else { "partial" },
+        "status": if persist_result.is_err() { "error" } else if scan_result.failed == 0 { "ok" } else { "partial" },
         "warnings": warnings,
         "session_dir": session_dir,
         "scan_summary": {
@@ -8457,14 +8490,20 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
         }
     }
 
-    ExitCode::Clean
+    if persist_result.is_err() {
+        ExitCode::IoError
+    } else if scan_result.failed > 0 {
+        ExitCode::PartialFail
+    } else {
+        ExitCode::Clean
+    }
 }
 
 fn load_fleet_session(
     fleet_session_id: &str,
 ) -> Result<(pt_core::session::fleet::FleetSession, PathBuf), String> {
     let store = SessionStore::from_env().map_err(|e| format!("session store error: {}", e))?;
-    let sid = SessionId(fleet_session_id.to_string());
+    let sid = SessionId::parse(fleet_session_id).ok_or("invalid fleet session ID")?;
     let handle = store
         .open(&sid)
         .map_err(|e| format!("cannot open fleet session '{}': {}", fleet_session_id, e))?;
@@ -8478,65 +8517,180 @@ fn load_fleet_session(
     })?;
     let fleet: pt_core::session::fleet::FleetSession =
         serde_json::from_str(&content).map_err(|e| format!("parse error: {}", e))?;
+    if fleet.fleet_session_id != sid.0 {
+        return Err("saved fleet identity differs from requested session".to_string());
+    }
     Ok((fleet, handle.dir))
 }
 
 fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> ExitCode {
+    let _lock = match acquire_global_lock(global, "agent fleet apply") {
+        Ok(lock) => lock,
+        Err(code) => return code,
+    };
     let (fleet, session_dir) = match load_fleet_session(&args.fleet_session) {
         Ok(f) => f,
         Err(e) => return output_agent_error(global, "fleet apply", &e),
     };
-
-    // Collect kill actions from the fleet session
-    let mut kill_actions: Vec<serde_json::Value> = Vec::new();
-    let mut review_actions: Vec<serde_json::Value> = Vec::new();
-
-    for host in &fleet.hosts {
-        for (action, count) in &host.summary.action_counts {
-            match action.as_str() {
-                "kill" => {
-                    kill_actions.push(serde_json::json!({
-                        "host": host.host_id,
-                        "action": "kill",
-                        "count": count,
-                    }));
-                }
-                "review" => {
-                    review_actions.push(serde_json::json!({
-                        "host": host.host_id,
-                        "action": "review",
-                        "count": count,
-                    }));
-                }
-                _ => {}
+    let prepared = match prepare_fleet_apply(&fleet) {
+        Ok(prepared) => prepared,
+        Err(error) => return output_agent_error(global, "fleet apply", &error),
+    };
+    let Some(execution) = fleet.execution.as_ref() else {
+        return output_agent_error(
+            global,
+            "fleet apply",
+            "retained execution binding is missing",
+        );
+    };
+    let config = FleetApplyConfig {
+        confirmed: args.confirm,
+        dry_run: global.dry_run || global.shadow,
+        parallel: args.parallel as usize,
+        timeout_secs: args.timeout,
+        continue_on_error: args.continue_on_error,
+        max_kills_per_host: args.max_kills_per_host,
+    };
+    let executing = config.confirmed && !config.dry_run;
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    let mut receipt_file = None;
+    let mut receipt_path = None;
+    if executing {
+        let path = session_dir.join(format!("fleet-apply-{attempt_id}.jsonl"));
+        let mut file = match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!(
+                    "fleet apply: cannot create execution receipt: {error}; no hosts started"
+                );
+                return ExitCode::IoError;
             }
+        };
+        // An interrupted invocation has pending/unknown hosts, never an implied
+        // zero-action result. Make the exact intent durable before any SSH call.
+        let intent = serde_json::json!({
+            "event": "intent",
+            "attempt_id": attempt_id,
+            "fleet_session_id": fleet.fleet_session_id,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "status": "pending",
+            "completion_without_receipt": "unknown",
+            "limits": config,
+            "fdr_approval": {
+                "scope": "complete_planned_kill_set",
+                "max_fdr": fleet.safety_budget.max_fdr,
+                "applies_to_partial_or_unknown_execution": false,
+            },
+            "hosts": prepared,
+        });
+        if let Err(error) = append_fleet_apply_receipt(&mut file, &intent) {
+            eprintln!("fleet apply: cannot persist execution intent: {error}; no hosts started");
+            return ExitCode::IoError;
+        }
+        // Persist the new receipt's directory entry as well as its contents.
+        // A crash after dispatch must not make the invocation appear absent.
+        if let Err(error) = fs::File::open(&session_dir).and_then(|directory| directory.sync_all())
+        {
+            eprintln!("fleet apply: cannot persist receipt directory: {error}; no hosts started");
+            return ExitCode::IoError;
+        }
+        receipt_path = Some(path.display().to_string());
+        receipt_file = Some(file);
+    }
+    let mut report = execute_fleet_apply(&prepared, &execution.transport, &config, |host| {
+        if let Some(file) = receipt_file.as_mut() {
+            append_fleet_apply_receipt(
+                file,
+                &serde_json::json!({
+                    "event": "host_result",
+                    "attempt_id": attempt_id,
+                    "recorded_at": chrono::Utc::now().to_rfc3339(),
+                    "result": host,
+                }),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    });
+    if let Some(file) = receipt_file.as_mut() {
+        if let Err(error) = append_fleet_apply_receipt(
+            file,
+            &serde_json::json!({
+                "event": "finished",
+                "attempt_id": attempt_id,
+                "recorded_at": chrono::Utc::now().to_rfc3339(),
+                "report": report,
+            }),
+        ) {
+            report
+                .persistence_error
+                .get_or_insert_with(|| error.to_string());
         }
     }
-
-    let total_kills: u32 = kill_actions
+    let failed = report.hosts.iter().any(|host| host.status.is_failure());
+    let unknown = report
+        .hosts
         .iter()
-        .filter_map(|a| a["count"].as_u64())
-        .map(|c| c as u32)
+        .any(|host| host.status == HostApplyStatus::Unknown);
+    let attempted_hosts = report.hosts.iter().filter(|host| host.attempted).count();
+    let successful_actions: usize = report
+        .hosts
+        .iter()
+        .map(|host| host.successful_actions)
         .sum();
-
+    let kill_signals_delivered: usize = report
+        .hosts
+        .iter()
+        .map(|host| host.kill_signals_delivered)
+        .sum();
+    let status = if !executing {
+        "preview"
+    } else if unknown {
+        "unknown"
+    } else if failed && successful_actions > 0 {
+        "partial"
+    } else if failed {
+        "blocked"
+    } else if successful_actions > 0 {
+        "applied"
+    } else {
+        "no_actions"
+    };
     let response = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "fleet_session_id": fleet.fleet_session_id,
+        "attempt_id": attempt_id,
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "command": "agent fleet apply",
-        // Nothing is executed remotely yet: report the plan, but exit non-zero so no
-        // script mistakes this for an apply that ran.
-        "status": "not_implemented",
-        "note": "Remote execution is not implemented; nothing was applied. This lists the planned actions. Apply per host with `pt-core agent apply` on that host.",
+        "status": status,
+        "planning_only": !executing,
+        "confirmation_required": !args.confirm,
         "session_dir": session_dir.display().to_string(),
-        "planned_actions": {
-            "total_kill_candidates": total_kills,
-            "approved_by_fdr": fleet.safety_budget.pooled_fdr.selected_kills,
-            "rejected_by_fdr": fleet.safety_budget.pooled_fdr.rejected_kills,
-            "kills": kill_actions,
-            "reviews": review_actions,
+        "receipt_path": receipt_path,
+        "limits": config,
+        "summary": {
+            "hosts": report.hosts.len(),
+            "attempted_hosts": attempted_hosts,
+            "successful_actions": successful_actions,
+            "kill_signals_delivered": kill_signals_delivered,
         },
+        "hosts": report.hosts,
+        "persistence_error": report.persistence_error,
         "safety_budget": fleet.safety_budget,
+        "fdr_approval": {
+            "scope": "complete_planned_kill_set",
+            "max_fdr": fleet.safety_budget.max_fdr,
+            "applies_to_partial_or_unknown_execution": false,
+        },
+        "note": if executing {
+            "Remote outcomes are reported only from bound receipts. Missing or timed-out responses have unknown completion; inspect the remote session before retrying. Pooled expected-FDR approval covers the complete planned kill set; it does not establish that bound for a partial or unknown executed subset."
+        } else {
+            "Local preview only; no SSH command was started. Use --confirm to apply this exact selection."
+        },
     });
 
     match global.format {
@@ -8548,21 +8702,55 @@ fn run_agent_fleet_apply(global: &GlobalOpts, args: &AgentFleetApplyArgs) -> Exi
             println!("# pt-core agent fleet apply");
             println!();
             println!("Fleet session: {}", fleet.fleet_session_id);
-            println!("Hosts: {}", fleet.hosts.len());
-            println!(
-                "Kill candidates: {} ({} approved by FDR, {} rejected)",
-                total_kills,
-                fleet.safety_budget.pooled_fdr.selected_kills,
-                fleet.safety_budget.pooled_fdr.rejected_kills,
-            );
-            println!();
-            println!(
-                "Note: remote execution is not implemented; nothing was applied. Run `pt-core agent apply` on each host."
-            );
+            println!("Status: {status}; {attempted_hosts} host commands started");
+            for host in &report.hosts {
+                println!(
+                    "  {}: {:?}, {} selected, {} successful actions{}",
+                    host.host,
+                    host.status,
+                    host.selected_targets.len(),
+                    host.successful_actions,
+                    host.error
+                        .as_ref()
+                        .map(|error| format!("; {error}"))
+                        .unwrap_or_default()
+                );
+            }
+            if !executing {
+                println!("Local preview; use --confirm to execute the selected targets.");
+            }
+            if let Some(path) = &receipt_path {
+                println!("Receipt: {path}");
+            }
         }
     }
+    if report.persistence_error.is_some() {
+        ExitCode::IoError
+    } else if failed && (successful_actions > 0 || unknown) {
+        ExitCode::PartialFail
+    } else if failed {
+        ExitCode::PolicyBlocked
+    } else if !executing
+        && prepared.iter().any(|host| {
+            host.request
+                .as_ref()
+                .is_some_and(|request| !request.targets.is_empty())
+        })
+    {
+        ExitCode::PlanReady
+    } else if successful_actions > 0 {
+        ExitCode::ActionsOk
+    } else {
+        ExitCode::Clean
+    }
+}
 
-    ExitCode::CapabilityError
+fn append_fleet_apply_receipt(
+    file: &mut fs::File,
+    value: &serde_json::Value,
+) -> std::io::Result<()> {
+    writeln!(file, "{value}")?;
+    file.sync_data()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20704,6 +20892,46 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             return ExitCode::IoError;
         }
     };
+    let saved_document: serde_json::Value = match serde_json::from_str(&plan_content) {
+        Ok(document) => document,
+        Err(error) => {
+            eprintln!("agent apply: invalid recorded plan: {error}");
+            return ExitCode::InternalError;
+        }
+    };
+    // Fleet approval binds the complete saved document and actual host before
+    // resume, target filtering, or an early no-actions response can occur.
+    let execution_binding = match validate_apply_binding(
+        &saved_document,
+        args.expected_host_id.as_deref(),
+        args.expected_plan_sha256.as_deref(),
+        &pt_core::logging::get_host_id(),
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            eprintln!("agent apply: {error}");
+            println!(
+                "{}",
+                format_structured_output(
+                    global,
+                    serde_json::json!({
+                        "session_id": sid.0,
+                        "mode": "robot_apply",
+                        "status": "blocked",
+                        "error": "fleet_binding_mismatch",
+                        "reason": error,
+                        "expected_execution_binding": {
+                            "host_id": args.expected_host_id,
+                            "session_id": sid.0,
+                            "plan_sha256": args.expected_plan_sha256,
+                        },
+                        "outcomes": [],
+                    })
+                )
+            );
+            return ExitCode::PolicyBlocked;
+        }
+    };
     let plan = match parse_agent_plan(&plan_content) {
         Ok(p) => p,
         Err(e) => {
@@ -20805,20 +21033,18 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         return ExitCode::ArgsError;
     };
 
-    let saved_document: serde_json::Value = match serde_json::from_str(&plan_content) {
-        Ok(document) => document,
-        Err(error) => {
-            eprintln!("agent apply: invalid recorded plan policy: {}", error);
-            return ExitCode::InternalError;
-        }
-    };
     let invalid_policy_snapshot = |reason: String| {
         eprintln!("agent apply: requires a valid recorded policy snapshot: {reason}");
         println!(
             "{}",
             format_structured_output(
                 global,
-                serde_json::json!({"session_id": sid.0, "error": "invalid_policy_snapshot"}),
+                apply_refusal_document(
+                    &sid,
+                    "invalid_policy_snapshot",
+                    &reason,
+                    execution_binding.as_ref()
+                ),
             )
         );
         ExitCode::PolicyBlocked
@@ -20891,7 +21117,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 
     if target_pids.is_empty() {
-        output_apply_nothing(global, &sid);
+        output_apply_nothing(global, &sid, execution_binding.as_ref());
         return ExitCode::Clean;
     }
 
@@ -20908,7 +21134,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .filter(|a| !completed_action_ids.contains(&a.action_id))
         .collect();
     if actions_to_apply.is_empty() {
-        output_apply_nothing(global, &sid);
+        output_apply_nothing(global, &sid, execution_binding.as_ref());
         return ExitCode::Clean;
     }
 
@@ -21086,7 +21312,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
     // Check --yes requirement
     if !args.yes && !global.dry_run && !global.shadow {
-        let err = serde_json::json!({"session_id": sid.0, "error": "confirmation_required", "message": "--yes flag required for execution"});
+        let err = apply_refusal_document(
+            &sid,
+            "confirmation_required",
+            "--yes flag required for execution",
+            execution_binding.as_ref(),
+        );
         println!("{}", format_structured_output(global, err));
         return ExitCode::PolicyBlocked;
     }
@@ -21099,11 +21330,12 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         && !global.dry_run
         && !global.shadow
     {
-        let err = serde_json::json!({
-            "session_id": sid.0,
-            "error": "robot_mode_disabled",
-            "message": "Robot mode is disabled in policy. Use 'pt config' to enable it."
-        });
+        let err = apply_refusal_document(
+            &sid,
+            "robot_mode_disabled",
+            "Robot mode is disabled in policy. Use 'pt config' to enable it.",
+            execution_binding.as_ref(),
+        );
         println!("{}", format_structured_output(global, err));
         return ExitCode::PolicyBlocked;
     }
@@ -22029,7 +22261,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         error
     });
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "session_id": sid.0,
         "mode": "robot_apply",
         "summary": {
@@ -22050,6 +22282,9 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "constraints_summary": constraints_summary,
         "resumed": args.resume
     });
+    if let Some(binding) = &execution_binding {
+        result["execution_binding"] = serde_json::json!(binding);
+    }
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, result));
@@ -22097,8 +22332,31 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     }
 }
 
-fn output_apply_nothing(global: &GlobalOpts, sid: &SessionId) {
-    let result = serde_json::json!({"session_id": sid.0, "mode": "robot_apply", "note": "nothing_to_do", "summary": {"attempted": 0}, "outcomes": []});
+fn apply_refusal_document(
+    sid: &SessionId,
+    error: &str,
+    message: &str,
+    binding: Option<&ApplyBindingReceipt>,
+) -> serde_json::Value {
+    let mut result = serde_json::json!({"session_id": sid.0, "error": error, "message": message});
+    if let Some(binding) = binding {
+        result["execution_binding"] = serde_json::json!(binding);
+        result["mode"] = serde_json::json!("robot_apply");
+        result["status"] = serde_json::json!("blocked");
+        result["outcomes"] = serde_json::json!([]);
+    }
+    result
+}
+
+fn output_apply_nothing(
+    global: &GlobalOpts,
+    sid: &SessionId,
+    binding: Option<&ApplyBindingReceipt>,
+) {
+    let mut result = serde_json::json!({"session_id": sid.0, "mode": "robot_apply", "note": "nothing_to_do", "summary": {"attempted": 0}, "outcomes": []});
+    if let Some(binding) = binding {
+        result["execution_binding"] = serde_json::json!(binding);
+    }
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, result));

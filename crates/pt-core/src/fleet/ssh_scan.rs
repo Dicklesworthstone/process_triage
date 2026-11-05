@@ -14,7 +14,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// Configuration for SSH-based fleet scanning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SshScanConfig {
     /// SSH user (if different from current user).
     pub user: Option<String>,
@@ -162,6 +163,9 @@ pub struct RemotePlan {
     pub pt_version: Option<String>,
     pub total_processes: u64,
     pub candidates: Vec<RemoteCandidate>,
+    /// The complete saved remote plan document, retained for identity-bound apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<serde_json::Value>,
 }
 
 /// Parse `pt-core --format json agent plan` output.
@@ -180,13 +184,33 @@ pub fn parse_remote_plan(json: &str) -> Result<RemotePlan, String> {
                 .and_then(|p| u32::try_from(p).ok())
                 .ok_or("candidate without pid")?;
             let text = |key: &str| c[key].as_str().unwrap_or_default().to_string();
-            let p = |class: &str| c["posterior"][class].as_f64().unwrap_or(0.0);
+            let posterior = &c["posterior"];
+            if !posterior.is_null() && !posterior.is_object() {
+                return Err("candidate posterior is not an object");
+            }
+            let mut probabilities = [0.0; 4];
+            for (index, class) in ["useful", "useful_bad", "abandoned", "zombie"]
+                .iter()
+                .enumerate()
+            {
+                if let Some(value) = posterior.get(class) {
+                    probabilities[index] = value
+                        .as_f64()
+                        .filter(|probability| {
+                            probability.is_finite() && (0.0..=1.0).contains(probability)
+                        })
+                        .ok_or("candidate posterior contains an invalid probability")?;
+                }
+            }
+            if probabilities.iter().sum::<f64>() > 1.0 + 1e-9 {
+                return Err("candidate posterior probabilities exceed one");
+            }
             Ok(RemoteCandidate {
                 pid,
                 comm: text("command_short"),
                 classification: text("classification"),
                 recommendation: text("recommendation"),
-                score: p("abandoned") + p("zombie"),
+                score: (probabilities[2] + probabilities[3]).min(1.0),
             })
         })
         .collect::<Result<Vec<_>, &str>>()?;
@@ -195,51 +219,115 @@ pub fn parse_remote_plan(json: &str) -> Result<RemotePlan, String> {
         pt_version: v["pt_version"].as_str().map(str::to_string),
         total_processes,
         candidates,
+        document: Some(v),
     })
 }
 
-/// Build the SSH command arguments for scanning a remote host.
-fn build_ssh_args(host: &str, config: &SshScanConfig) -> Vec<String> {
-    let mut args = Vec::new();
+/// Quote one remote-shell argument without interpreting it as shell syntax.
+pub(super) fn shell_argument(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
 
-    // Connection options
+pub(super) fn validate_ssh_target(host: &str) -> Result<(), String> {
+    if host.is_empty()
+        || host.starts_with('-')
+        || host.contains('\0')
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._@:%[]".contains(&byte))
+        || host.matches('@').count() > 1
+        || host
+            .split('@')
+            .any(|part| part.is_empty() || part.starts_with('-'))
+    {
+        return Err(format!("invalid SSH target: {host:?}"));
+    }
+    Ok(())
+}
+
+/// Build argv for the existing SSH executor; the remote command is one quoted
+/// argument vector, never an interpolated shell program.
+pub(super) fn build_ssh_command_args(
+    host: &str,
+    config: &SshScanConfig,
+    command: &[String],
+) -> Result<Vec<String>, String> {
+    let target = if let Some(ref user) = config.user {
+        format!("{user}@{host}")
+    } else {
+        host.to_string()
+    };
+    validate_ssh_target(&target)?;
+    if command.is_empty() || command.iter().any(|argument| argument.contains('\0')) {
+        return Err("invalid remote command argument".to_string());
+    }
+    let mut args = Vec::new();
     args.push("-o".to_string());
     args.push(format!("ConnectTimeout={}", config.connect_timeout));
-
-    for opt in &config.ssh_options {
+    for option in &config.ssh_options {
         args.push("-o".to_string());
-        args.push(opt.clone());
+        args.push(option.clone());
     }
-
     if let Some(ref identity) = config.identity_file {
         args.push("-i".to_string());
         args.push(identity.clone());
     }
-
     if let Some(port) = config.port {
         args.push("-p".to_string());
         args.push(port.to_string());
     }
-
-    // Target
-    let target = if let Some(ref user) = config.user {
-        format!("{}@{}", user, host)
-    } else {
-        host.to_string()
-    };
+    args.push("--".to_string());
     args.push(target);
+    args.push(
+        command
+            .iter()
+            .map(|argument| shell_argument(argument))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    Ok(args)
+}
 
-    // Remote command: the host's real planning pipeline (read-only).
-    args.push(format!("{} --format json agent plan", config.remote_binary));
-
-    args
+/// Build the SSH command arguments for scanning a remote host.
+fn build_ssh_args(host: &str, config: &SshScanConfig) -> Result<Vec<String>, String> {
+    build_ssh_command_args(
+        host,
+        config,
+        &[
+            config.remote_binary.clone(),
+            "--format".to_string(),
+            "json".to_string(),
+            "agent".to_string(),
+            "plan".to_string(),
+        ],
+    )
 }
 
 /// Scan a single host via SSH and parse the result.
 pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
     let start = std::time::Instant::now();
 
-    let args = build_ssh_args(host, config);
+    let args = match build_ssh_args(host, config) {
+        Ok(args) => args,
+        Err(error) => {
+            return HostScanResult {
+                host: host.to_string(),
+                success: false,
+                plan: None,
+                error: Some(error),
+                duration_ms: 0,
+                provenance: None,
+            };
+        }
+    };
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let timeout = Duration::from_secs(config.command_timeout);
 
@@ -280,12 +368,16 @@ pub fn ssh_scan_host(host: &str, config: &SshScanConfig) -> HostScanResult {
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    if output.timed_out {
+    if output.timed_out || output.truncated {
         return HostScanResult {
             host: host.to_string(),
             success: false,
             plan: None,
-            error: Some(format!("timed out after {}s", config.command_timeout)),
+            error: Some(if output.timed_out {
+                format!("timed out after {}s", config.command_timeout)
+            } else {
+                "remote plan output was truncated".to_string()
+            }),
             duration_ms,
             provenance: None,
         };
@@ -333,7 +425,7 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
     let start = std::time::Instant::now();
     let results: Arc<Mutex<Vec<(usize, HostScanResult)>>> = Arc::new(Mutex::new(Vec::new()));
     let aborted = Arc::new(Mutex::new(false));
-    let parallel = config.parallel.max(1);
+    let parallel = config.parallel.clamp(1, super::apply::MAX_FLEET_PARALLEL);
 
     // Process hosts in batches of `parallel`
     let chunks: Vec<Vec<(usize, &String)>> = hosts
@@ -379,13 +471,11 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
         }
     }
 
-    // Sort by original index to maintain order
-    let mut collected = Arc::try_unwrap(results)
+    let collected = Arc::try_unwrap(results)
         .expect("Arc has multiple owners")
         .into_inner()
         .expect("lock poisoned");
-    collected.sort_by_key(|(idx, _)| *idx);
-    let results: Vec<HostScanResult> = collected.into_iter().map(|(_, r)| r).collect();
+    let results = complete_scan_results(hosts, collected);
 
     let successful = results.iter().filter(|r| r.success).count();
     let failed = results.iter().filter(|r| !r.success).count();
@@ -400,6 +490,31 @@ pub fn ssh_scan_fleet(hosts: &[String], config: &SshScanConfig) -> FleetScanResu
     }
 }
 
+/// Preserve every requested host when an earlier failure stops dispatch or a
+/// worker fails. Omitted hosts must not silently disappear from saved approval.
+fn complete_scan_results(
+    hosts: &[String],
+    collected: Vec<(usize, HostScanResult)>,
+) -> Vec<HostScanResult> {
+    let mut by_index: std::collections::HashMap<_, _> = collected.into_iter().collect();
+    hosts
+        .iter()
+        .enumerate()
+        .map(|(index, host)| {
+            by_index.remove(&index).unwrap_or_else(|| HostScanResult {
+                host: host.clone(),
+                success: false,
+                plan: None,
+                error: Some(
+                    "no plan returned: fleet dispatch stopped or worker failed".to_string(),
+                ),
+                duration_ms: 0,
+                provenance: None,
+            })
+        })
+        .collect()
+}
+
 /// Convert a HostScanResult into a HostInput for fleet session aggregation.
 pub fn scan_result_to_host_input(result: &HostScanResult) -> crate::session::fleet::HostInput {
     use crate::session::fleet::{CandidateInfo, HostInput};
@@ -408,7 +523,12 @@ pub fn scan_result_to_host_input(result: &HostScanResult) -> crate::session::fle
         // The host's own decisions, unchanged.
         Some(plan) => HostInput {
             host_id: result.host.clone(),
-            session_id: format!("ssh-{}", result.host),
+            session_id: plan
+                .document
+                .as_ref()
+                .and_then(|document| document["session_id"].as_str())
+                .unwrap_or("")
+                .to_string(),
             scanned_at: plan.generated_at.clone(),
             total_processes: u32::try_from(plan.total_processes).unwrap_or(u32::MAX),
             candidates: plan
@@ -451,7 +571,7 @@ mod tests {
     #[test]
     fn build_ssh_args_basic() {
         let config = SshScanConfig::default();
-        let args = build_ssh_args("myhost", &config);
+        let args = build_ssh_args("myhost", &config).unwrap();
 
         assert!(args.contains(&"-o".to_string()));
         assert!(args.contains(&"ConnectTimeout=10".to_string()));
@@ -469,7 +589,7 @@ mod tests {
             user: Some("admin".to_string()),
             ..SshScanConfig::default()
         };
-        let args = build_ssh_args("myhost", &config);
+        let args = build_ssh_args("myhost", &config).unwrap();
         assert!(args.contains(&"admin@myhost".to_string()));
     }
 
@@ -479,7 +599,7 @@ mod tests {
             port: Some(2222),
             ..SshScanConfig::default()
         };
-        let args = build_ssh_args("myhost", &config);
+        let args = build_ssh_args("myhost", &config).unwrap();
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"2222".to_string()));
     }
@@ -490,7 +610,7 @@ mod tests {
             identity_file: Some("/home/user/.ssh/fleet_key".to_string()),
             ..SshScanConfig::default()
         };
-        let args = build_ssh_args("myhost", &config);
+        let args = build_ssh_args("myhost", &config).unwrap();
         assert!(args.contains(&"-i".to_string()));
         assert!(args.contains(&"/home/user/.ssh/fleet_key".to_string()));
     }
@@ -501,11 +621,87 @@ mod tests {
             remote_binary: "/opt/pt/bin/pt-core".to_string(),
             ..SshScanConfig::default()
         };
-        let args = build_ssh_args("myhost", &config);
+        let args = build_ssh_args("myhost", &config).unwrap();
         assert_eq!(
             args.last().map(String::as_str),
             Some("/opt/pt/bin/pt-core --format json agent plan")
         );
+    }
+
+    #[test]
+    fn remote_command_quotes_literal_arguments_and_separates_destination() {
+        let args = build_ssh_command_args(
+            "operator@host.example",
+            &SshScanConfig::default(),
+            &[
+                "/opt/pt tools/pt-core".into(),
+                "--label".into(),
+                "literal 'quote'; $(not-a-command)".into(),
+            ],
+        )
+        .unwrap();
+        let separator = args.iter().position(|argument| argument == "--").unwrap();
+        assert_eq!(args[separator + 1], "operator@host.example");
+        assert_eq!(args.len(), separator + 3);
+        assert_eq!(
+            args.last().unwrap(),
+            "'/opt/pt tools/pt-core' --label 'literal '\\''quote'\\''; $(not-a-command)'"
+        );
+    }
+
+    #[test]
+    fn ssh_destinations_cannot_be_options_or_shell_programs() {
+        for host in [
+            "",
+            "-oProxyCommand=bad",
+            "host;echo bad",
+            "user@-host",
+            "@host",
+            "user@host@other",
+            "host\nother",
+        ] {
+            assert!(
+                build_ssh_args(host, &SshScanConfig::default()).is_err(),
+                "{host:?}"
+            );
+        }
+        let config = SshScanConfig {
+            user: Some("-bad".into()),
+            ..SshScanConfig::default()
+        };
+        assert!(build_ssh_args("host", &config).is_err());
+        assert!(build_ssh_args("[2001:db8::1]", &SshScanConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn aborted_scan_preserves_unattempted_hosts_in_original_order() {
+        let hosts = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        let returned = HostScanResult {
+            host: "beta".into(),
+            success: false,
+            plan: None,
+            error: Some("connection refused".into()),
+            duration_ms: 10,
+            provenance: None,
+        };
+        let results = complete_scan_results(&hosts, vec![(1, returned)]);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.host.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta", "gamma"]
+        );
+        assert!(results
+            .iter()
+            .all(|result| !result.success && result.plan.is_none()));
+        assert_eq!(results[1].error.as_deref(), Some("connection refused"));
+        assert!(results[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("no plan returned"));
+        assert_eq!(results[2].duration_ms, 0);
     }
 
     const PLAN_JSON: &str = r#"{
@@ -545,6 +741,33 @@ mod tests {
             r#"{"summary": {"total_processes_scanned": 1}, "candidates": [{"command_short": "x"}]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn malformed_posteriors_cannot_become_certainty_for_pooled_approval() {
+        for posterior in [
+            serde_json::json!({"abandoned": 99.0}),
+            serde_json::json!({"abandoned": -0.1}),
+            serde_json::json!({"abandoned": "0.99"}),
+            serde_json::json!({"abandoned": 0.8, "zombie": 0.3}),
+            serde_json::json!({"abandoned": 0.8, "useful": 0.3}),
+            serde_json::json!([0.99]),
+        ] {
+            let mut document: serde_json::Value = serde_json::from_str(PLAN_JSON).unwrap();
+            document["candidates"][0]["posterior"] = posterior;
+            assert!(parse_remote_plan(&document.to_string()).is_err());
+        }
+        let mut document: serde_json::Value = serde_json::from_str(PLAN_JSON).unwrap();
+        document["candidates"][0]["posterior"] = serde_json::json!({"abandoned": 0.99});
+        assert_eq!(
+            parse_remote_plan(&document.to_string()).unwrap().candidates[0].score,
+            0.99
+        );
+        document["candidates"][0]["posterior"] = serde_json::Value::Null;
+        assert_eq!(
+            parse_remote_plan(&document.to_string()).unwrap().candidates[0].score,
+            0.0
+        );
     }
 
     #[test]

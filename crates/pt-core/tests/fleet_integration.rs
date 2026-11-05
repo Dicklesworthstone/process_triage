@@ -33,6 +33,7 @@ fn plan(total: u64, candidates: &[(u32, &str, &str, &str, f64)]) -> RemotePlan {
                 score,
             })
             .collect(),
+        document: None,
     }
 }
 

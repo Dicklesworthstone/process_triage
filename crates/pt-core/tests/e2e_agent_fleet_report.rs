@@ -1,10 +1,15 @@
-//! E2E tests for `agent fleet report`.
+//! E2E tests for saved fleet reports and local execution approval.
 //!
 //! Verifies deterministic report sections, profile-based redaction, and --out output writing.
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
-use pt_common::SessionId;
+use pt_common::{ProcessIdentity, SessionId, StartId};
+use pt_core::fleet::apply::{bind_fleet_execution, plan_document_sha256};
+use pt_core::fleet::ssh_scan::{
+    parse_remote_plan, scan_result_to_host_input, FleetScanResult, HostScanResult, SshScanConfig,
+};
+use pt_core::plan::ActionTimeouts;
 use pt_core::session::fleet::{create_fleet_session, CandidateInfo, HostInput};
 use pt_core::session::{SessionManifest, SessionMode, SessionStore};
 use serde_json::Value;
@@ -132,14 +137,100 @@ fn create_fixture_fleet_session() -> String {
     session_id.0
 }
 
-/// Fleet apply executes nothing remotely yet: it lists the plan but must not exit 0,
-/// so no script mistakes it for an apply that ran.
+fn executable_document(host_id: &str, session_id: &str, pids: &[u32]) -> Value {
+    let identities: Vec<_> = pids
+        .iter()
+        .map(|&pid| ProcessIdentity::new(pid, StartId::from_linux("fixture-boot", 42, pid), 1000))
+        .collect();
+    serde_json::json!({
+        "command": "agent plan",
+        "host_id": host_id,
+        "session_id": session_id,
+        "plan_id": "fixture-plan",
+        "generated_at": "2026-11-05T12:00:00Z",
+        "policy_id": null,
+        "policy_version": "1.0.0",
+        "pre_toggled": [],
+        "gates_summary": {"total_candidates": pids.len(), "blocked_candidates": 0, "pre_toggled_actions": 0},
+        "summary": {"total_processes_scanned": pids.len()},
+        "policy_snapshot": pt_core::config::Policy::default(),
+        "actions": identities.iter().enumerate().map(|(order, identity)| serde_json::json!({
+            "action_id": format!("kill-{}", identity.pid.0),
+            "target": identity,
+            "action": "kill",
+            "order": order,
+            "stage": 0,
+            "timeouts": ActionTimeouts::default(),
+            "pre_checks": [],
+            "rationale": {},
+            "on_success": [],
+            "on_failure": [],
+            "blocked": false,
+        })).collect::<Vec<_>>(),
+        "candidates": identities.iter().enumerate().map(|(order, identity)| serde_json::json!({
+            "pid": identity.pid.0,
+            "start_id": identity.start_id,
+            "uid": identity.uid,
+            "action_target": identity,
+            "recommended_action": "kill",
+            "recommendation": "KILL",
+            "command_short": "fixture-worker",
+            "classification": "abandoned",
+            "posterior": {"abandoned": if order == 0 {0.999} else {0.4}, "zombie": 0.0},
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn create_bound_fleet_fixture() -> String {
+    let document = executable_document("machine-alpha", &SessionId::new().0, &[1001, 1002]);
+    let scan = FleetScanResult {
+        total_hosts: 1,
+        successful: 1,
+        failed: 0,
+        duration_ms: 1,
+        provenance_aggregate: None,
+        results: vec![HostScanResult {
+            host: "fixture.invalid".into(),
+            success: true,
+            plan: Some(parse_remote_plan(&document.to_string()).unwrap()),
+            error: None,
+            duration_ms: 1,
+            provenance: None,
+        }],
+    };
+    let id = SessionId::new();
+    let store = SessionStore::from_env().unwrap();
+    let handle = store
+        .create(&SessionManifest::new(
+            &id,
+            None,
+            SessionMode::RobotPlan,
+            None,
+        ))
+        .unwrap();
+    let inputs: Vec<_> = scan.results.iter().map(scan_result_to_host_input).collect();
+    let mut fleet = create_fleet_session(&id.0, None, &inputs, 0.05);
+    fleet.execution = Some(bind_fleet_execution(
+        &fleet,
+        &scan,
+        &SshScanConfig::default(),
+    ));
+    fs::write(
+        handle.dir.join("fleet.json"),
+        serde_json::to_vec(&fleet).unwrap(),
+    )
+    .unwrap();
+    id.0
+}
+
+/// Old summaries contain no executable identity or retained plan evidence.
 #[test]
-fn fleet_apply_reports_not_implemented_and_exits_nonzero() {
+fn fleet_apply_refuses_summary_only_sessions() {
     with_temp_data_dir(|data_dir| {
         let fleet_session_id = create_fixture_fleet_session();
         let output = pt_core_fast()
             .env("PROCESS_TRIAGE_DATA", data_dir.path())
+            .env("PATH", data_dir.path())
             .args([
                 "--format",
                 "json",
@@ -150,13 +241,189 @@ fn fleet_apply_reports_not_implemented_and_exits_nonzero() {
                 &fleet_session_id,
             ])
             .assert()
-            .code(11)
+            .code(10)
             .get_output()
             .stdout
             .clone();
         let json: Value = serde_json::from_slice(&output).expect("valid json");
-        assert_eq!(json["status"], "not_implemented");
-        assert_eq!(json["planned_actions"]["total_kill_candidates"], 5);
+        assert_eq!(json["status"], "error");
+        assert!(json["error"].as_str().unwrap().contains("summaries only"));
+    });
+}
+
+#[test]
+fn fleet_apply_preview_and_dry_run_keep_exact_pooled_selection_without_dispatch() {
+    with_temp_data_dir(|data_dir| {
+        let session_id = create_bound_fleet_fixture();
+        for flags in [
+            vec![],
+            vec!["--confirm", "--dry-run"],
+            vec!["--confirm", "--shadow"],
+        ] {
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", data_dir.path())
+                .env("PATH", data_dir.path())
+                .args([
+                    "--format",
+                    "json",
+                    "agent",
+                    "fleet",
+                    "apply",
+                    "--session",
+                    &session_id,
+                ])
+                .args(flags)
+                .assert()
+                .code(1)
+                .get_output()
+                .stdout
+                .clone();
+            let response: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(response["status"], "preview");
+            assert_eq!(response["planning_only"], true);
+            assert_eq!(response["summary"]["attempted_hosts"], 0);
+            assert!(response["receipt_path"].is_null());
+            let host = &response["hosts"][0];
+            assert_eq!(host["status"], "preview");
+            assert_eq!(host["attempted"], false);
+            assert_eq!(host["selected_targets"].as_array().unwrap().len(), 1);
+            assert_eq!(host["selected_targets"][0]["pid"], 1001);
+            assert_eq!(host["binding"]["host_id"], "machine-alpha");
+        }
+    });
+}
+
+#[test]
+fn fleet_confirmed_cap_refusal_persists_intent_and_zero_attempt_receipts() {
+    with_temp_data_dir(|data_dir| {
+        let session_id = create_bound_fleet_fixture();
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", data_dir.path())
+            .env("PATH", data_dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "fleet",
+                "apply",
+                "--session",
+                &session_id,
+                "--confirm",
+                "--max-kills-per-host",
+                "0",
+            ])
+            .assert()
+            .code(4)
+            .get_output()
+            .stdout
+            .clone();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["status"], "blocked");
+        assert_eq!(response["summary"]["attempted_hosts"], 0);
+        assert_eq!(response["hosts"][0]["attempted"], false);
+        assert_eq!(
+            response["fdr_approval"]["scope"],
+            "complete_planned_kill_set"
+        );
+        assert_eq!(
+            response["fdr_approval"]["applies_to_partial_or_unknown_execution"],
+            false
+        );
+        let content = fs::read_to_string(response["receipt_path"].as_str().unwrap()).unwrap();
+        let records: Vec<Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["intent", "host_result", "finished"]
+        );
+        assert_eq!(records[0]["completion_without_receipt"], "unknown");
+        assert_eq!(records[0]["fdr_approval"], response["fdr_approval"]);
+        assert_eq!(records[0]["hosts"][0]["request"]["targets"][0]["pid"], 1001);
+        assert_eq!(records[1]["result"]["status"], "blocked");
+        assert_eq!(records[1]["result"]["kill_signals_delivered"], 0);
+    });
+}
+
+#[test]
+fn remote_apply_checks_host_and_document_before_resume_or_no_actions() {
+    with_temp_data_dir(|data_dir| {
+        let config_dir = TempDir::new().unwrap();
+        let session_id = SessionId::new();
+        let store = SessionStore::from_env().unwrap();
+        let handle = store
+            .create(&SessionManifest::new(
+                &session_id,
+                None,
+                SessionMode::RobotPlan,
+                None,
+            ))
+            .unwrap();
+        let host_id = pt_core::logging::get_host_id();
+        let document = executable_document(&host_id, &session_id.0, &[]);
+        let digest = plan_document_sha256(&document).unwrap();
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        fs::write(
+            handle.dir.join("decision/plan.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let run = |expected_host: &str, expected_digest: &str, exit_code: i32| {
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", data_dir.path())
+                .env("PT_CONFIG_DIR", config_dir.path())
+                .env("PATH", data_dir.path())
+                .args([
+                    "--format",
+                    "json",
+                    "agent",
+                    "apply",
+                    "--session",
+                    &session_id.0,
+                    "--recommended",
+                    "--resume",
+                    "--yes",
+                    "--expected-host-id",
+                    expected_host,
+                    "--expected-plan-sha256",
+                    expected_digest,
+                ])
+                .assert()
+                .code(exit_code)
+                .get_output()
+                .stdout
+                .clone();
+            serde_json::from_slice::<Value>(&output).unwrap()
+        };
+        let response = run(&host_id, &digest, 0);
+        assert_eq!(response["note"], "nothing_to_do");
+        assert_eq!(response["execution_binding"]["host_id"], host_id);
+        assert_eq!(response["execution_binding"]["plan_sha256"], digest);
+        fs::create_dir_all(handle.dir.join("action")).unwrap();
+        fs::write(
+            handle.dir.join("action/outcomes.jsonl"),
+            "invalid saved outcome\n",
+        )
+        .unwrap();
+        for (expected_host, expected_digest) in [
+            ("wrong-host", digest.as_str()),
+            (
+                host_id.as_str(),
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ] {
+            let response = run(expected_host, expected_digest, 4);
+            assert_eq!(response["error"], "fleet_binding_mismatch");
+            assert_eq!(
+                response["expected_execution_binding"]["host_id"],
+                expected_host
+            );
+            assert!(response["outcomes"].as_array().unwrap().is_empty());
+        }
     });
 }
 

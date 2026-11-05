@@ -30,6 +30,10 @@ pub struct FleetSession {
     pub hosts: Vec<HostEntry>,
     pub aggregate: FleetAggregate,
     pub safety_budget: SafetyBudget,
+    /// Exact remote plans and approved identities needed for confirmed apply.
+    /// Older summary-only sessions remain reportable but cannot be executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::fleet::apply::FleetExecutionPlan>,
 }
 
 /// Per-host entry in a fleet session.
@@ -41,6 +45,9 @@ pub struct HostEntry {
     pub process_count: u32,
     pub candidate_count: u32,
     pub summary: HostSummary,
+    /// Exact PIDs approved by the pooled selection, bound to this host session.
+    #[serde(default)]
+    pub selected_kill_pids: Vec<u32>,
 }
 
 /// Per-host classification and action summary.
@@ -179,6 +186,16 @@ pub fn create_fleet_session(
                 process_count: input.total_processes,
                 candidate_count: input.candidates.len() as u32,
                 summary,
+                selected_kill_pids: input
+                    .candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.recommended_action.eq_ignore_ascii_case("kill")
+                            && selected_kill_keys
+                                .contains(&candidate_key(&input.host_id, candidate.pid))
+                    })
+                    .map(|candidate| candidate.pid)
+                    .collect(),
             }
         })
         .collect();
@@ -193,6 +210,7 @@ pub fn create_fleet_session(
         hosts,
         aggregate,
         safety_budget,
+        execution: None,
     }
 }
 
