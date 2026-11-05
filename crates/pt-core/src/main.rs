@@ -58,8 +58,9 @@ use pt_core::session::diff::{
 };
 use pt_core::session::fleet::{create_fleet_session, HostInput};
 use pt_core::session::snapshot_persist::{
-    load_inference_unchecked, load_inventory_unchecked, persist_inference, persist_inventory,
-    InferenceArtifact, InventoryArtifact, PersistedInference, PersistedProcess,
+    load_inference, load_inference_unchecked, load_inventory, load_inventory_unchecked,
+    persist_inference, persist_inventory, ArtifactEnvelope, InferenceArtifact, InventoryArtifact,
+    PersistedInference, PersistedProcess,
 };
 use pt_core::session::{
     ListSessionsOptions, SessionContext, SessionHandle, SessionManifest, SessionMode, SessionState,
@@ -1118,17 +1119,16 @@ struct AgentPlanArgs {
     #[arg(long, value_name = "FIELDS")]
     prediction_fields: Option<String>,
 
-    // === Future flags (stub implementation for API surface discovery) ===
-    // These are parsed but not yet functional. Using them will generate a warning.
-    // Full implementation is tracked in separate beads.
-    /// Compare against prior session for differential analysis (coming in v1.2)
-    #[arg(long, help = "Compare against prior session (coming in v1.2)")]
+    /// Add an advisory comparison with a prior session to the complete fresh plan
+    #[arg(long, value_name = "SESSION", conflicts_with = "since_time")]
     since: Option<String>,
 
-    /// Compare against time for temporal differential analysis (coming in v1.2)
+    /// Compare with the latest local snapshot at or before a time or duration ago
     #[arg(
         long,
-        help = "Compare against time, e.g. '2h' or ISO timestamp (coming in v1.2)"
+        value_name = "TIME",
+        conflicts_with = "since",
+        help = "Compare with the latest same-host snapshot at or before '2h' ago or an RFC3339 timestamp; always generate a complete fresh plan"
     )]
     since_time: Option<String>,
 
@@ -18490,6 +18490,198 @@ fn agent_recommended_actions(plan: &Plan) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Retain the complete validated baseline before resuming a session can replace it.
+struct AgentPlanBaseline {
+    session_id: String,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    inventory: ArtifactEnvelope<InventoryArtifact>,
+    inference: ArtifactEnvelope<InferenceArtifact>,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    skipped_incompatible_sessions: usize,
+}
+
+fn load_agent_plan_baseline(
+    store: &SessionStore,
+    session_id: &SessionId,
+    host_id: &str,
+) -> Result<AgentPlanBaseline, String> {
+    let handle = store.open(session_id).map_err(|error| error.to_string())?;
+    // These loaders check the schema and canonical payload SHA-256. A plan.json
+    // alone does not establish that comparable observations were persisted.
+    let inventory = load_inventory(&handle)
+        .map_err(|error| format!("baseline {session_id} inventory: {error}"))?;
+    let inference = load_inference(&handle)
+        .map_err(|error| format!("baseline {session_id} inference: {error}"))?;
+    for (kind, artifact_session, artifact_host) in [
+        ("inventory", &inventory.session_id, &inventory.host_id),
+        ("inference", &inference.session_id, &inference.host_id),
+    ] {
+        if artifact_session != &session_id.0 {
+            return Err(format!("baseline {session_id} {kind} session ID mismatch"));
+        }
+        if artifact_host.is_empty() || artifact_host != host_id {
+            return Err(format!("baseline {session_id} {kind} host ID mismatch"));
+        }
+    }
+    let inventory_time = chrono::DateTime::parse_from_rfc3339(&inventory.generated_at)
+        .map_err(|_| format!("baseline {session_id} inventory has an invalid timestamp"))?
+        .with_timezone(&chrono::Utc);
+    let inference_time = chrono::DateTime::parse_from_rfc3339(&inference.generated_at)
+        .map_err(|_| format!("baseline {session_id} inference has an invalid timestamp"))?
+        .with_timezone(&chrono::Utc);
+    if inventory.payload.record_count != inventory.payload.records.len()
+        || inference.payload.candidate_count != inference.payload.candidates.len()
+    {
+        return Err(format!(
+            "baseline {session_id} artifact record count mismatch"
+        ));
+    }
+    let mut identities = HashMap::new();
+    for process in &inventory.payload.records {
+        let identity_pid = process
+            .start_id
+            .rsplit(':')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok());
+        if pt_common::StartId::parse(&process.start_id).is_none()
+            || identity_pid != Some(process.pid)
+            || identities
+                .insert(process.start_id.as_str(), process.pid)
+                .is_some()
+        {
+            return Err(format!(
+                "baseline {session_id} contains an invalid or duplicate process identity"
+            ));
+        }
+    }
+    let mut inference_identities = HashSet::new();
+    for candidate in &inference.payload.candidates {
+        if identities.get(candidate.start_id.as_str()) != Some(&candidate.pid)
+            || !inference_identities.insert(candidate.start_id.as_str())
+        {
+            return Err(format!(
+                "baseline {session_id} inference identities do not match its inventory"
+            ));
+        }
+    }
+    Ok(AgentPlanBaseline {
+        session_id: session_id.0.clone(),
+        // Both artifacts must have existed by a requested time boundary.
+        observed_at: inventory_time.max(inference_time),
+        inventory,
+        inference,
+        cutoff: None,
+        skipped_incompatible_sessions: 0,
+    })
+}
+
+fn parse_agent_plan_since_time(
+    input: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let input = input.trim();
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(input) {
+        let timestamp = timestamp.with_timezone(&chrono::Utc);
+        return if timestamp <= now {
+            Ok(timestamp)
+        } else {
+            Err("--since-time must not be in the future".to_string())
+        };
+    }
+    for (suffix, multiplier) in [("s", 1_i64), ("m", 60), ("h", 3600), ("d", 86400)] {
+        if let Some(number) = input.strip_suffix(suffix) {
+            if let Some(timestamp) = number
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .and_then(|value| value.checked_mul(multiplier))
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|duration| now.checked_sub_signed(duration))
+            {
+                return Ok(timestamp);
+            }
+            break;
+        }
+    }
+    Err("invalid --since-time: use a past RFC3339 timestamp or a positive duration such as 30m, 2h, or 7d".to_string())
+}
+
+fn resolve_agent_plan_baseline(
+    store: &SessionStore,
+    args: &AgentPlanArgs,
+    host_id: &str,
+) -> Result<Option<AgentPlanBaseline>, String> {
+    if args.since.is_some() && args.since_time.is_some() {
+        return Err("--since and --since-time are mutually exclusive".to_string());
+    }
+    let now = chrono::Utc::now();
+    if let Some(raw) = &args.since {
+        let session_id =
+            SessionId::parse(raw).ok_or_else(|| format!("invalid --since session {raw}"))?;
+        let baseline = load_agent_plan_baseline(store, &session_id, host_id)?;
+        if baseline.observed_at > now {
+            return Err(format!(
+                "baseline {session_id} has a future observation timestamp"
+            ));
+        }
+        return Ok(Some(baseline));
+    }
+    let Some(raw_time) = &args.since_time else {
+        return Ok(None);
+    };
+    let cutoff = parse_agent_plan_since_time(raw_time, now)?;
+    let sessions = store
+        .list_sessions(&ListSessionsOptions::default())
+        .map_err(|error| format!("cannot discover baseline sessions: {error}"))?;
+    let mut best: Option<AgentPlanBaseline> = None;
+    let mut skipped = 0;
+    for session in sessions {
+        // Sessions from scan/TUI workflows may not contain both compact artifacts.
+        if !session.path.join("scan/inventory.json").is_file()
+            || !session.path.join("inference/results.json").is_file()
+        {
+            continue;
+        }
+        let Some(session_id) = SessionId::parse(&session.session_id) else {
+            skipped += 1;
+            continue;
+        };
+        let baseline = match load_agent_plan_baseline(store, &session_id, host_id) {
+            Ok(baseline) => baseline,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        // Use parsed artifact timestamps, not directory order or lexicographic
+        // RFC3339 strings (which can carry different UTC offsets).
+        if baseline.observed_at <= cutoff
+            && best.as_ref().is_none_or(|previous| {
+                (&baseline.observed_at, &baseline.session_id)
+                    > (&previous.observed_at, &previous.session_id)
+            })
+        {
+            best = Some(baseline);
+        }
+    }
+    let mut baseline = best.ok_or_else(|| format!(
+        "no valid same-host baseline snapshot at or before {} ({skipped} incompatible sessions skipped)",
+        cutoff.to_rfc3339()
+    ))?;
+    baseline.cutoff = Some(cutoff);
+    baseline.skipped_incompatible_sessions = skipped;
+    Ok(Some(baseline))
+}
+
+fn agent_plan_differential_summary(differential: &serde_json::Value) -> String {
+    let summary = &differential["summary"];
+    format!(
+        "Compared with {}: {} new, {} changed, {} unchanged, {} absent from current candidate observations (absence does not establish exit). Complete fresh plan retained.",
+        differential["baseline"]["session_id"].as_str().unwrap_or("?"),
+        summary["new_count"], summary["changed_count"], summary["unchanged_count"], summary["resolved_count"]
+    )
+}
+
 fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let _lock = match acquire_global_lock(global, "agent plan") {
         Ok(lock) => lock,
@@ -18502,6 +18694,16 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
+
+    // Resolve before any current-session writes, including --session X --since X.
+    let differential_baseline =
+        match resolve_agent_plan_baseline(&store, args, &pt_core::logging::get_host_id()) {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                eprintln!("agent plan: {error}");
+                return ExitCode::ArgsError;
+            }
+        };
 
     let (session_id, handle, created) = match args.session.as_ref() {
         Some(raw) => {
@@ -19507,6 +19709,41 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     }
 
+    // Comparison is advisory: every candidate was freshly scanned and scored,
+    // and every executable action above passed the normal current safety policy.
+    let differential = differential_baseline.as_ref().map(|baseline| {
+        let comparison = compute_diff(
+            &baseline.session_id,
+            &session_id.0,
+            &baseline.inventory.payload.records,
+            &baseline.inference.payload.candidates,
+            &persisted_inventory_records,
+            &persisted_inference_records,
+            &DiffConfig::default(),
+        );
+        serde_json::json!({
+            "advisory_only": true,
+            "plan_scope": "complete_fresh_plan",
+            "comparison_scope": "stored_process_observations_to_current_returned_candidates",
+            "absence_semantics": "Resolved means absent from current candidate observations; filtering or selection can cause absence, which does not establish process exit.",
+            "baseline": {
+                "session_id": baseline.session_id,
+                "host_id": baseline.inventory.host_id,
+                "observed_at": baseline.observed_at.to_rfc3339(),
+                "inventory_sha256": baseline.inventory.integrity_sha256,
+                "inference_sha256": baseline.inference.integrity_sha256,
+            },
+            "cutoff": baseline.cutoff.map(|cutoff| cutoff.to_rfc3339()),
+            "skipped_incompatible_sessions": baseline.skipped_incompatible_sessions,
+            "current_session_id": session_id.0,
+            "generated_at": generated_at,
+            "summary": comparison.summary,
+            "changes": comparison.deltas.into_iter()
+                .filter(|delta| delta.kind != DeltaKind::Unchanged)
+                .collect::<Vec<_>>(),
+        })
+    });
+
     // Executable targets and displayed remedies come from the same final plan.
     let kill_candidates: Vec<u32> = action_plan
         .actions
@@ -19640,29 +19877,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "actions": agent_recommended_actions(&action_plan),
     });
 
-    // Check for stub flags usage (future features parsed but not yet functional)
-    let mut stub_flags_used: Vec<&str> = Vec::new();
-    if args.since.is_some() {
-        stub_flags_used.push("--since");
-    }
-    if args.since_time.is_some() {
-        stub_flags_used.push("--since-time");
-    }
-
-    // Build stub_flags section if any future flags were used
-    let stub_flags_section = if !stub_flags_used.is_empty() {
-        Some(serde_json::json!({
-            "warning": "feature_not_implemented",
-            "message": "Some flags are parsed but not yet functional",
-            "flags_used": stub_flags_used,
-            "flags_ignored": stub_flags_used,
-            "workaround": "Use pt agent diff for manual comparison; goal-oriented mode coming in v1.2",
-            "planned_release": "v1.2"
-        }))
-    } else {
-        None
-    };
-
     let goal_value = goal_summary
         .as_ref()
         .and_then(|goal| goal.get("goal"))
@@ -19736,9 +19950,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             }));
     }
 
-    // Add stub_flags section if any future flags were used
-    if let Some(stub_flags) = stub_flags_section {
-        plan_output["stub_flags"] = stub_flags;
+    if let Some(comparison) = &differential {
+        plan_output["differential"] = comparison.clone();
     }
 
     // The persisted and full stdout document carries the executable Plan fields
@@ -19810,14 +20023,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
     }
 
-    // Warn about stub flags on stderr (for all formats, machine-parseable too)
-    if !stub_flags_used.is_empty() {
-        eprintln!(
-            "warning: flags {} are parsed but not yet functional (coming in v1.2)",
-            stub_flags_used.join(", ")
-        );
-    }
-
     // Handle --narrative flag (outputs prose regardless of format)
     if args.narrative {
         let narrative = generate_narrative_summary(
@@ -19829,6 +20034,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             expected_memory_freed_gb,
         );
         println!("{}", narrative);
+        if let Some(comparison) = &differential {
+            println!("\n{}", agent_plan_differential_summary(comparison));
+        }
         return if candidates.is_empty() {
             ExitCode::Clean
         } else {
@@ -19840,7 +20048,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     match global.format {
         OutputFormat::Json => {
             // Build output based on --minimal, --brief, and --pretty flags
-            let output_json = if args.brief {
+            let mut output_json = if args.brief {
                 // Brief output: minimal fields + single-line rationale
                 let brief_candidates: Vec<serde_json::Value> = candidates
                     .iter()
@@ -19885,6 +20093,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             } else {
                 plan_output.clone()
             };
+            if let Some(comparison) = &differential {
+                output_json["differential"] = comparison.clone();
+            }
 
             // Apply pretty-printing or compact based on --pretty flag
             let output_str = if args.pretty {
@@ -19896,7 +20107,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             println!("{}", output_str);
         }
         OutputFormat::Toon => {
-            let output_json = if args.brief {
+            let mut output_json = if args.brief {
                 // Brief output for TOON: minimal fields + single-line rationale
                 let brief_candidates: Vec<serde_json::Value> = candidates
                     .iter()
@@ -19940,6 +20151,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             } else {
                 plan_output.clone()
             };
+            if let Some(comparison) = &differential {
+                output_json["differential"] = comparison.clone();
+            }
 
             let output_value = if args.pretty {
                 output_json
@@ -19956,6 +20170,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                 kill_candidates.len(),
                 review_candidates.len()
             );
+            if let Some(comparison) = &differential {
+                println!("{}", agent_plan_differential_summary(comparison));
+            }
         }
         OutputFormat::Exitcode => {}
         _ => {
@@ -19967,6 +20184,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             println!("- Candidates identified: {}", candidates.len());
             println!("- Kill recommendations: {}", kill_candidates.len());
             println!("- Review recommendations: {}", review_candidates.len());
+            if let Some(comparison) = &differential {
+                println!("\n{}", agent_plan_differential_summary(comparison));
+            }
             println!("\n## Candidates\n");
             for candidate in &candidates {
                 let pid = candidate.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -23226,10 +23446,31 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         }
     };
 
+    let load_plan = |handle: &SessionHandle| -> Result<serde_json::Value, String> {
+        let plan_path = handle.dir.join("decision").join("plan.json");
+        let content = std::fs::read_to_string(&plan_path)
+            .map_err(|e| format!("missing plan.json at {}: {}", plan_path.display(), e))?;
+        serde_json::from_str(&content).map_err(|e| format!("invalid plan.json: {}", e))
+    };
+    let base_plan = match load_plan(&base_handle) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("agent diff: base {}", e);
+            return ExitCode::ArgsError;
+        }
+    };
+    let base_host = match base_plan.get("host_id").and_then(|value| value.as_str()) {
+        Some(host) if !host.is_empty() => host,
+        _ => {
+            eprintln!("agent diff: base plan does not identify its host");
+            return ExitCode::ArgsError;
+        }
+    };
+
     let compare_id = match args.compare.as_deref() {
         Some("current") | Some("latest") | None => {
             let options = ListSessionsOptions {
-                limit: Some(50),
+                limit: None,
                 state: None,
                 older_than: None,
             };
@@ -23240,19 +23481,50 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
                     return ExitCode::InternalError;
                 }
             };
-            let mut found = None;
+            let mut found: Option<(chrono::DateTime<chrono::Utc>, SessionId)> = None;
             for summary in sessions {
-                if summary.session_id != base.0 {
-                    if let Some(sid) = SessionId::parse(&summary.session_id) {
-                        found = Some(sid);
-                        break;
-                    }
+                if summary.session_id == base.0 {
+                    continue;
+                }
+                let Some(sid) = SessionId::parse(&summary.session_id) else {
+                    continue;
+                };
+                let candidate_plan = store
+                    .open(&sid)
+                    .ok()
+                    .and_then(|handle| load_plan(&handle).ok());
+                let Some(plan) = candidate_plan else {
+                    continue;
+                };
+                let Some(observed_at) = plan["generated_at"]
+                    .as_str()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&chrono::Utc))
+                else {
+                    continue;
+                };
+                // TUI action-only plans and foreign-host sessions cannot be
+                // compared as candidate observations. They must not hide the
+                // newest compatible agent plan during automatic discovery.
+                if plan["session_id"].as_str() == Some(sid.0.as_str())
+                    && plan["host_id"].as_str() == Some(base_host)
+                    && extract_candidates(&plan).is_ok()
+                    && found.as_ref().is_none_or(|(previous_time, previous_id)| {
+                        (&observed_at, &sid.0) > (previous_time, &previous_id.0)
+                    })
+                {
+                    // A resumed session can have newer observations than a
+                    // newly created directory. Compare actual observation times
+                    // after parsing offsets, never manifest or directory order.
+                    found = Some((observed_at, sid));
                 }
             }
             match found {
-                Some(sid) => sid,
+                Some((_, sid)) => sid,
                 None => {
-                    eprintln!("agent diff: no compare session found (need at least two sessions)");
+                    eprintln!(
+                        "agent diff: no compatible candidate plan found for the baseline host"
+                    );
                     return ExitCode::ArgsError;
                 }
             }
@@ -23274,20 +23546,6 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         }
     };
 
-    let load_plan = |handle: &SessionHandle| -> Result<serde_json::Value, String> {
-        let plan_path = handle.dir.join("decision").join("plan.json");
-        let content = std::fs::read_to_string(&plan_path)
-            .map_err(|e| format!("missing plan.json at {}: {}", plan_path.display(), e))?;
-        serde_json::from_str(&content).map_err(|e| format!("invalid plan.json: {}", e))
-    };
-
-    let base_plan = match load_plan(&base_handle) {
-        Ok(plan) => plan,
-        Err(e) => {
-            eprintln!("agent diff: base {}", e);
-            return ExitCode::ArgsError;
-        }
-    };
     let compare_plan = match load_plan(&compare_handle) {
         Ok(plan) => plan,
         Err(e) => {
@@ -23296,85 +23554,88 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         }
     };
 
-    #[derive(Clone)]
+    if base == compare_id {
+        eprintln!("agent diff: base and compare sessions must differ");
+        return ExitCode::ArgsError;
+    }
+    for (plan, expected) in [(&base_plan, &base), (&compare_plan, &compare_id)] {
+        if plan.get("session_id").and_then(|value| value.as_str()) != Some(expected.0.as_str()) {
+            eprintln!("agent diff: saved plan does not belong to session {expected}");
+            return ExitCode::ArgsError;
+        }
+        if plan["generated_at"]
+            .as_str()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_none()
+        {
+            eprintln!("agent diff: saved plan for {expected} has an invalid observation timestamp");
+            return ExitCode::ArgsError;
+        }
+    }
+    let compare_host = compare_plan.get("host_id").and_then(|value| value.as_str());
+    if Some(base_host) != compare_host {
+        eprintln!("agent diff: plans must identify the same host");
+        return ExitCode::ArgsError;
+    }
+
+    #[derive(Clone, serde::Deserialize)]
     struct DiffCandidate {
         pid: u32,
         uid: u32,
+        start_id: String,
+        #[serde(rename = "command_short")]
         cmd_short: String,
-        cmd_full: String,
         classification: String,
         recommended_action: String,
-        score: f64,
+        score: u32,
     }
 
-    fn normalize_cmd(cmd: &str) -> String {
-        cmd.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    let extract_candidates = |plan: &serde_json::Value| -> Vec<DiffCandidate> {
-        let mut out = Vec::new();
+    fn extract_candidates(plan: &serde_json::Value) -> Result<Vec<DiffCandidate>, String> {
         let candidates = plan
             .get("candidates")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for cand in candidates {
-            let pid = cand.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let uid = cand.get("uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let cmd_short = cand
-                .get("cmd_short")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let cmd_full = cand
-                .get("cmd_full")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let classification = cand
-                .get("classification")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let recommended_action = cand
-                .get("recommended_action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("keep")
-                .to_string();
-            let score = cand
-                .get("posterior")
-                .and_then(|p| p.as_object())
-                .map(|p| {
-                    p.values()
-                        .filter_map(|v| v.as_f64())
-                        .fold(0.0_f64, |acc, v| acc.max(v))
-                })
-                .unwrap_or(0.0)
-                * 100.0;
-            out.push(DiffCandidate {
-                pid,
-                uid,
-                cmd_short,
-                cmd_full,
-                classification,
-                recommended_action,
-                score,
-            });
+            .ok_or_else(|| "missing candidates array".to_string())?;
+        let candidates: Vec<DiffCandidate> = serde_json::from_value(candidates.clone())
+            .map_err(|error| format!("invalid saved candidates: {error}"))?;
+        let mut identities = HashSet::new();
+        for candidate in &candidates {
+            if candidate.pid == 0
+                || pt_common::StartId::parse(&candidate.start_id).is_none()
+                || candidate
+                    .start_id
+                    .rsplit(':')
+                    .next()
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                    != Some(candidate.pid)
+                || candidate.score > 100
+            {
+                return Err(format!(
+                    "invalid identity or suspicion score for PID {}",
+                    candidate.pid
+                ));
+            }
+            if !identities.insert((candidate.pid, candidate.start_id.as_str(), candidate.uid)) {
+                return Err(format!(
+                    "duplicate candidate identity for PID {}",
+                    candidate.pid
+                ));
+            }
         }
-        out
+        Ok(candidates)
+    }
+
+    let (base_candidates, compare_candidates) = match (
+        extract_candidates(&base_plan),
+        extract_candidates(&compare_plan),
+    ) {
+        (Ok(base), Ok(compare)) => (base, compare),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("agent diff: {error}");
+            return ExitCode::ArgsError;
+        }
     };
 
-    let base_candidates = extract_candidates(&base_plan);
-    let compare_candidates = extract_candidates(&compare_plan);
-
-    let candidate_key = |c: &DiffCandidate| -> (u32, String) {
-        let cmd = if !c.cmd_full.is_empty() {
-            c.cmd_full.as_str()
-        } else {
-            c.cmd_short.as_str()
-        };
-        (c.uid, normalize_cmd(cmd))
-    };
+    let candidate_key =
+        |c: &DiffCandidate| -> (u32, String, u32) { (c.pid, c.start_id.clone(), c.uid) };
 
     let severity = |action: &str| -> i32 {
         if action == "kill" {
@@ -23396,12 +23657,15 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         }
     };
 
-    let mut base_map: HashMap<(u32, String), DiffCandidate> = HashMap::new();
+    // Command text is display data, not identity: concurrent workers can have
+    // identical argv, and a reused PID belongs to a new process incarnation.
+    // Ordered maps also make repeated comparisons byte-stable.
+    let mut base_map: BTreeMap<(u32, String, u32), DiffCandidate> = BTreeMap::new();
     for cand in &base_candidates {
         base_map.insert(candidate_key(cand), cand.clone());
     }
 
-    let mut compare_map: HashMap<(u32, String), DiffCandidate> = HashMap::new();
+    let mut compare_map: BTreeMap<(u32, String, u32), DiffCandidate> = BTreeMap::new();
     for cand in &compare_candidates {
         compare_map.insert(candidate_key(cand), cand.clone());
     }
@@ -23409,6 +23673,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
     let mut new_list = Vec::new();
     let mut worsened = Vec::new();
     let mut improved = Vec::new();
+    let mut changed = Vec::new();
     let mut resolved = Vec::new();
     let mut persistent = Vec::new();
 
@@ -23416,35 +23681,73 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         if let Some(prior) = base_map.get(key) {
             let prior_sev = severity(&prior.recommended_action);
             let current_sev = severity(&current.recommended_action);
-            let score_change = current.score - prior.score;
+            let score_change = i64::from(current.score) - i64::from(prior.score);
 
-            if current_sev > prior_sev {
+            if current_sev > prior_sev || (current_sev == prior_sev && score_change >= 5) {
                 worsened.push(serde_json::json!({
                     "pid": current.pid,
+                    "uid": current.uid,
+                    "start_id": current.start_id,
                     "prior": bucket(&prior.recommended_action),
                     "current": bucket(&current.recommended_action),
+                    "prior_action": prior.recommended_action,
+                    "current_action": current.recommended_action,
+                    "prior_classification": prior.classification,
+                    "current_classification": current.classification,
                     "score_change": score_change,
                     "cmd_short": current.cmd_short,
                 }));
-            } else if current_sev < prior_sev {
+            } else if current_sev < prior_sev || (current_sev == prior_sev && score_change <= -5) {
                 improved.push(serde_json::json!({
                     "pid": current.pid,
+                    "uid": current.uid,
+                    "start_id": current.start_id,
                     "prior": bucket(&prior.recommended_action),
                     "current": bucket(&current.recommended_action),
+                    "prior_action": prior.recommended_action,
+                    "current_action": current.recommended_action,
+                    "prior_classification": prior.classification,
+                    "current_classification": current.classification,
+                    "score_change": score_change,
+                    "cmd_short": current.cmd_short,
+                }));
+            } else if current.recommended_action != prior.recommended_action
+                || current.classification != prior.classification
+            {
+                // Distinct actions within the review bucket have no reliable
+                // severity ordering, but a changed recommendation must remain
+                // visible even when its suspicion score has not drifted.
+                changed.push(serde_json::json!({
+                    "pid": current.pid,
+                    "uid": current.uid,
+                    "start_id": current.start_id,
+                    "prior": bucket(&prior.recommended_action),
+                    "current": bucket(&current.recommended_action),
+                    "prior_action": prior.recommended_action,
+                    "current_action": current.recommended_action,
+                    "prior_classification": prior.classification,
+                    "current_classification": current.classification,
                     "score_change": score_change,
                     "cmd_short": current.cmd_short,
                 }));
             } else if current_sev > 0 {
                 persistent.push(serde_json::json!({
                     "pid": current.pid,
-                    "consecutive_sessions": 2,
+                    "uid": current.uid,
+                    "start_id": current.start_id,
+                    "observed_sessions": 2,
                     "classification": current.classification,
-                    "note": "Suspicious in consecutive sessions",
+                    "recommended_action": current.recommended_action,
+                    "score": current.score,
+                    "cmd_short": current.cmd_short,
+                    "note": "Suspicious in both compared sessions",
                 }));
             }
         } else {
             new_list.push(serde_json::json!({
                 "pid": current.pid,
+                "uid": current.uid,
+                "start_id": current.start_id,
                 "classification": current.classification,
                 "score": current.score,
                 "cmd_short": current.cmd_short,
@@ -23456,8 +23759,11 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
         if !compare_map.contains_key(key) {
             resolved.push(serde_json::json!({
                 "pid": prior.pid,
-                "reason": "exited_or_below_threshold",
+                "uid": prior.uid,
+                "start_id": prior.start_id,
+                "reason": "absent_from_current_candidates",
                 "was_classification": prior.classification,
+                "cmd_short": prior.cmd_short,
             }));
         }
     }
@@ -23491,6 +23797,14 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
     } else {
         vec![]
     };
+    let filtered_changed = if matches!(
+        focus,
+        FocusMode::Changed | FocusMode::Resources | FocusMode::All
+    ) {
+        changed.clone()
+    } else {
+        vec![]
+    };
     let filtered_resolved = if show_resolved {
         resolved.clone()
     } else {
@@ -23514,6 +23828,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
             "new": filtered_new,
             "worsened": filtered_worsened,
             "improved": filtered_improved,
+            "changed": filtered_changed,
             "resolved": filtered_resolved,
             "persistent": filtered_persistent,
         },
@@ -23523,6 +23838,7 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
             "new_count": new_list.len(),
             "worsened_count": worsened.len(),
             "improved_count": improved.len(),
+            "changed_count": changed.len(),
             "resolved_count": resolved.len(),
             "persistent_count": persistent.len(),
             "filtered": focus != FocusMode::All,
@@ -23540,12 +23856,13 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
                 String::new()
             };
             println!(
-                "[{} → {}] agent diff: +{} new, {} worsened, {} improved, {} resolved, {} persistent{}",
+                "[{} → {}] agent diff: +{} new, {} worsened, {} improved, {} changed, {} resolved, {} persistent{}",
                 base.0,
                 compare_id.0,
                 new_list.len(),
                 worsened.len(),
                 improved.len(),
+                changed.len(),
                 resolved.len(),
                 persistent.len(),
                 focus_note
@@ -23561,10 +23878,11 @@ fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
             }
             println!("## Summary\n");
             println!(
-                "- New: {} | Worsened: {} | Improved: {} | Resolved: {} | Persistent: {}",
+                "- New: {} | Worsened: {} | Improved: {} | Changed: {} | Resolved: {} | Persistent: {}",
                 new_list.len(),
                 worsened.len(),
                 improved.len(),
+                changed.len(),
                 resolved.len(),
                 persistent.len()
             );

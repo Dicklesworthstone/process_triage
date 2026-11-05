@@ -66,6 +66,7 @@ fn create_session_with_candidates(
         "schema_version": "1.0.0",
         "plan_id": format!("plan-{}", session_id.0),
         "session_id": session_id.0,
+        "host_id": "host-test",
         "generated_at": generated_at,
         "candidates": candidates,
     });
@@ -85,13 +86,17 @@ fn make_candidate(pid: u32, classification: &str, action: &str, score: f64) -> V
     serde_json::json!({
         "pid": pid,
         "uid": 1000,
-        "cmd_short": format!("proc-{}", pid),
-        "cmd_full": format!("/usr/bin/proc-{}", pid),
+        "start_id": format!("test-boot:12345:{pid}"),
+        "command_short": format!("proc-{}", pid),
+        "command": format!("/usr/bin/proc-{}", pid),
         "classification": classification,
         "recommended_action": action,
+        "score": (score * 100.0).round() as u32,
         "posterior": {
             "abandoned": score,
             "useful": 1.0 - score,
+            "useful_bad": 0.0,
+            "zombie": 0.0,
         },
     })
 }
@@ -375,6 +380,374 @@ fn diff_focus_changed_detects_worsened() {
             !worsened.is_empty(),
             "should detect worsened candidate (keep → kill)"
         );
+        assert_eq!(worsened[0]["score_change"], 80);
+        assert_eq!(worsened[0]["cmd_short"], "proc-100");
+    });
+}
+
+#[test]
+fn diff_keeps_identical_commands_distinct_and_detects_pid_reuse() {
+    with_temp_data_dir(|dir| {
+        let mut old = vec![
+            make_candidate(100, "abandoned", "kill", 0.9),
+            make_candidate(200, "abandoned", "kill", 0.9),
+            make_candidate(300, "abandoned", "kill", 0.9),
+        ];
+        for candidate in &mut old {
+            candidate["command_short"] = serde_json::json!("worker");
+            candidate["command"] = serde_json::json!("worker --serve");
+        }
+        let mut current = vec![old[0].clone(), old[2].clone(), old[1].clone()];
+        current[1]["start_id"] = serde_json::json!("test-boot:67890:300");
+        // Ownership is part of identity, even if the PID and start token match.
+        current[2]["uid"] = serde_json::json!(1001);
+        let base = create_session_with_candidates(dir, &old, "2026-01-01T00:00:00Z");
+        let compare = create_session_with_candidates(dir, &current, "2026-01-01T01:00:00Z");
+        let run = || {
+            pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .args(["agent", "diff", "--base", &base.0, "--compare", &compare.0])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone()
+        };
+        let output = run();
+        assert_eq!(output, run(), "comparison ordering must be deterministic");
+        let json: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["summary"]["new_count"], 2);
+        assert_eq!(json["summary"]["resolved_count"], 2);
+        assert_eq!(json["summary"]["persistent_count"], 1);
+        assert_eq!(json["delta"]["persistent"][0]["pid"], 100);
+        assert_eq!(json["delta"]["new"][0]["pid"], 200);
+        assert_eq!(json["delta"]["new"][1]["start_id"], "test-boot:67890:300");
+        assert_eq!(json["delta"]["resolved"][0]["uid"], 1000);
+    });
+}
+
+#[test]
+fn diff_reports_suspicion_drift_without_action_changes() {
+    with_temp_data_dir(|dir| {
+        let base = create_session_with_candidates(
+            dir,
+            &[make_candidate(100, "useful", "review", 0.1)],
+            "2026-01-01T00:00:00Z",
+        );
+        let compare = create_session_with_candidates(
+            dir,
+            &[make_candidate(100, "useful", "review", 0.3)],
+            "2026-01-01T01:00:00Z",
+        );
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args(["agent", "diff", "--base", &base.0, "--compare", &compare.0])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["summary"]["worsened_count"], 1);
+        assert_eq!(json["delta"]["worsened"][0]["score_change"], 20);
+        assert_eq!(json["summary"]["improved_count"], 0);
+    });
+}
+
+#[test]
+fn diff_focus_changed_preserves_action_and_classification_changes() {
+    with_temp_data_dir(|dir| {
+        let base = create_session_with_candidates(
+            dir,
+            &[
+                make_candidate(100, "useful_bad", "pause", 0.4),
+                make_candidate(200, "useful", "review", 0.4),
+                make_candidate(300, "useful_bad", "review", 0.4),
+            ],
+            "2026-01-01T00:00:00Z",
+        );
+        let compare = create_session_with_candidates(
+            dir,
+            &[
+                make_candidate(100, "useful_bad", "resume", 0.4),
+                make_candidate(200, "useful", "throttle", 0.4),
+                make_candidate(300, "abandoned", "review", 0.4),
+            ],
+            "2026-01-01T01:00:00Z",
+        );
+        for focus in ["changed", "all", "new"] {
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .args([
+                    "agent",
+                    "diff",
+                    "--base",
+                    &base.0,
+                    "--compare",
+                    &compare.0,
+                    "--focus",
+                    focus,
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let json: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(json["summary"]["changed_count"], 3);
+            for category in ["worsened_count", "improved_count", "persistent_count"] {
+                assert_eq!(json["summary"][category], 0);
+            }
+            let changed = json["delta"]["changed"].as_array().unwrap();
+            if focus == "new" {
+                assert!(changed.is_empty());
+            } else {
+                assert_eq!(changed.len(), 3);
+                assert_eq!(changed[0]["prior_action"], "pause");
+                assert_eq!(changed[0]["current_action"], "resume");
+                assert_eq!(changed[0]["score_change"], 0);
+                assert_eq!(changed[1]["current_action"], "throttle");
+                assert_eq!(changed[2]["prior_classification"], "useful_bad");
+                assert_eq!(changed[2]["current_classification"], "abandoned");
+            }
+        }
+    });
+}
+
+#[test]
+fn diff_rejects_incomplete_or_duplicate_candidate_identities() {
+    with_temp_data_dir(|dir| {
+        let candidate = make_candidate(100, "abandoned", "kill", 0.9);
+        let base = create_session_with_candidates(
+            dir,
+            std::slice::from_ref(&candidate),
+            "2026-01-01T00:00:00Z",
+        );
+        let mut missing_identity = candidate.clone();
+        missing_identity.as_object_mut().unwrap().remove("start_id");
+        for candidates in [vec![missing_identity], vec![candidate.clone(), candidate]] {
+            let compare = create_session_with_candidates(dir, &candidates, "2026-01-01T01:00:00Z");
+            pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .args(["agent", "diff", "--base", &base.0, "--compare", &compare.0])
+                .assert()
+                .code(ExitCode::ArgsError.as_i32());
+        }
+    });
+}
+
+#[test]
+fn diff_latest_skips_action_only_and_foreign_host_plans() {
+    with_temp_data_dir(|dir| {
+        let base = create_session_with_candidates(
+            dir,
+            &[make_candidate(100, "useful", "keep", 0.1)],
+            "2026-01-01T00:00:00Z",
+        );
+        let compare = create_session_with_candidates(
+            dir,
+            &[make_candidate(100, "abandoned", "kill", 0.9)],
+            "2026-01-01T01:00:00Z",
+        );
+        let action_only = create_session_with_candidates(dir, &[], "2026-01-01T02:00:00Z");
+        let foreign = create_session_with_candidates(dir, &[], "2026-01-01T03:00:00Z");
+        let store = SessionStore::from_env().unwrap();
+        let action_path = store
+            .open(&action_only)
+            .unwrap()
+            .dir
+            .join("decision/plan.json");
+        fs::write(
+            action_path,
+            serde_json::to_vec(&serde_json::json!({
+                "session_id": action_only.0,
+                "actions": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let foreign_path = store.open(&foreign).unwrap().dir.join("decision/plan.json");
+        let mut foreign_plan: Value =
+            serde_json::from_slice(&fs::read(&foreign_path).unwrap()).unwrap();
+        foreign_plan["host_id"] = serde_json::json!("another-host");
+        fs::write(&foreign_path, serde_json::to_vec(&foreign_plan).unwrap()).unwrap();
+
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args(["agent", "diff", "--base", &base.0])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["comparison"]["current_session"], compare.0);
+        assert_eq!(json["delta"]["worsened"][0]["score_change"], 80);
+
+        // Explicit references remain errors rather than silently choosing a
+        // different session when the named evidence is incompatible.
+        for incompatible in [&action_only, &foreign] {
+            pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .args([
+                    "agent",
+                    "diff",
+                    "--base",
+                    &base.0,
+                    "--compare",
+                    &incompatible.0,
+                ])
+                .assert()
+                .code(ExitCode::ArgsError.as_i32());
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_latest_uses_plan_observation_times_instead_of_session_creation_order() {
+    with_temp_data_dir(|dir| {
+        // This older directory represents a resumed session. Its observation
+        // is newer after applying the timezone offset, despite its creation
+        // order and the misleading lexical order of the timestamp strings.
+        let resumed = create_session_with_candidates(
+            dir,
+            &[make_candidate(100, "abandoned", "kill", 0.9)],
+            "2026-01-01T01:00:00Z",
+        );
+        let resumed_handle = SessionStore::from_env().unwrap().open(&resumed).unwrap();
+        let mut manifest = resumed_handle.read_manifest().unwrap();
+        manifest.timing.created_at = "2025-12-01T00:00:00Z".to_string();
+        resumed_handle.write_manifest(&manifest).unwrap();
+        let base = create_session_with_candidates(
+            dir,
+            &[make_candidate(100, "useful", "keep", 0.1)],
+            "2026-01-01T00:00:00Z",
+        );
+        create_session_with_candidates(
+            dir,
+            &[make_candidate(100, "useful_bad", "review", 0.3)],
+            "2026-01-01T02:30:00+02:00",
+        );
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args(["agent", "diff", "--base", &base.0, "--compare", "latest"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["comparison"]["current_session"], resumed.0);
+        assert_eq!(json["delta"]["worsened"][0]["score_change"], 80);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_consumes_real_plans_with_concurrent_identical_workers() {
+    struct Worker(std::process::Child);
+    impl Worker {
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("120")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn disposable worker"),
+            )
+        }
+    }
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    with_temp_data_dir(|dir| {
+        let config_dir = dir.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let mut policy = pt_common::config::policy::Policy::default();
+        policy.guardrails.builtin_protection = false;
+        policy.guardrails.protected_users.clear();
+        policy.guardrails.min_process_age_seconds = 0;
+        fs::write(
+            config_dir.join("policy.json"),
+            serde_json::to_vec(&policy).unwrap(),
+        )
+        .unwrap();
+        let stable = Worker::spawn();
+        let departed = Worker::spawn();
+        let plan = |pids: &[u32]| {
+            let selected = pids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", dir.path())
+                .arg("--config")
+                .arg(&config_dir)
+                .args([
+                    "--format",
+                    "json",
+                    "agent",
+                    "plan",
+                    "--pids",
+                    &selected,
+                    "--min-age",
+                    "0",
+                    "--min-posterior",
+                    "0",
+                    "--window-ms",
+                    "0",
+                ])
+                .assert()
+                .code(ExitCode::PlanReady.as_i32())
+                .get_output()
+                .stdout
+                .clone();
+            let json: Value = serde_json::from_slice(&output).unwrap();
+            let actual: std::collections::BTreeSet<_> = json["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|candidate| candidate["pid"].as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(actual, pids.iter().copied().collect());
+            json
+        };
+        let base = plan(&[stable.0.id(), departed.0.id()]);
+        let departed_pid = departed.0.id();
+        drop(departed);
+        let arrived = Worker::spawn();
+        let compare = plan(&[stable.0.id(), arrived.0.id()]);
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "agent",
+                "diff",
+                "--base",
+                base["session_id"].as_str().unwrap(),
+                "--compare",
+                compare["session_id"].as_str().unwrap(),
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["summary"]["prior_candidates"], 2);
+        assert_eq!(json["summary"]["current_candidates"], 2);
+        assert_eq!(json["summary"]["new_count"], 1);
+        assert_eq!(json["summary"]["resolved_count"], 1);
+        assert_eq!(json["delta"]["new"][0]["pid"], arrived.0.id());
+        assert_eq!(json["delta"]["new"][0]["cmd_short"], "sleep");
+        assert_eq!(json["delta"]["resolved"][0]["pid"], departed_pid);
     });
 }
 

@@ -18,9 +18,9 @@ use super::snapshot_persist::{PersistedInference, PersistedProcess};
 pub enum DeltaKind {
     /// Present only in the newer snapshot.
     New,
-    /// Present only in the older snapshot (no longer running).
+    /// Absent from newer observations; a filtered snapshot does not prove exit.
     Resolved,
-    /// Present in both but classification/score changed.
+    /// Present in both but inference, action, or lifecycle changed.
     Changed,
     /// Present in both, effectively the same.
     Unchanged,
@@ -228,8 +228,9 @@ pub fn compute_diff(
                 lifecycle: LifecycleDelta {
                     transition: LifecycleTransition::Resolved,
                     continuity_confidence: 1.0,
-                    reason: "present only in older snapshot".to_string(),
-                    signals: vec!["resolved_process".to_string()],
+                    reason: "absent from newer observations; this does not establish process exit"
+                        .to_string(),
+                    signals: vec!["absent_from_current_observations".to_string()],
                 },
                 old_inference: old_inf.map(|i| InferenceSummary::from(*i)),
                 new_inference: None,
@@ -313,7 +314,20 @@ fn classify_change(
         _ => (None, false),
     };
 
-    let is_changed = classification_changed && config.always_flag_classification_change
+    let action_or_evidence_changed = match (old_inf, new_inf) {
+        (Some(old), Some(new)) => old.recommended_action != new.recommended_action,
+        (None, None) => false,
+        _ => true,
+    };
+    // A transition must remain visible even when the posterior is unchanged.
+    // Repeated observation of PPID 1 is continuity, not a new lifecycle change.
+    let lifecycle_changed = old_proc.ppid != new_proc.ppid
+        || old_proc.uid != new_proc.uid
+        || old_proc.state != new_proc.state
+        || old_proc.identity_quality != new_proc.identity_quality;
+    let is_changed = action_or_evidence_changed
+        || lifecycle_changed
+        || classification_changed && config.always_flag_classification_change
         || score_drift
             .map(|d| d.unsigned_abs() as u32 >= config.score_drift_threshold)
             .unwrap_or(false);

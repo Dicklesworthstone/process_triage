@@ -803,15 +803,22 @@ done
 
 ### Differential Monitoring
 
+`--since SESSION` adds an advisory `differential` section to a complete fresh plan.
+Baselines require valid checksums and the same host. `--since-time 2h` (or a past
+RFC3339 timestamp) selects the latest snapshot at or before that time. The flags
+are mutually exclusive. Resolved means absent from current candidates; filtering
+can cause absence and does not prove process exit.
+
 ```bash
 LAST_SESSION=""
 while true; do
   if [ -n "$LAST_SESSION" ]; then
-    pt agent plan --since $LAST_SESSION --format json
+    PLAN=$(pt agent plan --since "$LAST_SESSION" --format json) || test "$?" -eq 1 || break
   else
-    pt agent plan --format json
+    PLAN=$(pt agent plan --format json) || test "$?" -eq 1 || break
   fi
-  LAST_SESSION=$(jq -r .session_id < /dev/stdin)
+  printf '%s\n' "$PLAN"
+  LAST_SESSION=$(printf '%s\n' "$PLAN" | jq -r .session_id)
   sleep 60
 done
 ```

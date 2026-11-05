@@ -37,6 +37,447 @@ fn pt_core_fast() -> Command {
 /// Default sample size for tests that need inference coverage
 const TEST_SAMPLE_SIZE: &str = "10";
 
+#[cfg(target_os = "linux")]
+mod plan_differential {
+    use super::*;
+    use chrono::{DateTime, FixedOffset, Utc};
+    use pt_common::SessionId;
+    use pt_core::session::snapshot_persist::{
+        load_inference, load_inventory, persist_inference, persist_inventory, InferenceArtifact,
+        InventoryArtifact,
+    };
+    use pt_core::session::{SessionHandle, SessionManifest, SessionMode, SessionStore};
+    use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        config: PathBuf,
+        data: PathBuf,
+        child: OwnedChild,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("pt-plan-differential-{}", uuid::Uuid::new_v4()));
+            let config = root.join("config");
+            let data = root.join("data");
+            std::fs::create_dir_all(&config).unwrap();
+            eprintln!("retained differential plan evidence: {}", root.display());
+            // Observe only our owned child. Host-specific exclusions would hide
+            // root-owned fixtures in containers; no actions are ever applied.
+            let mut policy = pt_core::config::Policy::default();
+            policy.guardrails.builtin_protection = false;
+            policy.guardrails.protected_patterns.clear();
+            policy.guardrails.force_review_patterns.clear();
+            policy.guardrails.protected_users.clear();
+            policy.guardrails.protected_groups.clear();
+            policy.guardrails.protected_categories.clear();
+            policy.guardrails.never_kill_pid.clear();
+            policy.guardrails.never_kill_ppid.clear();
+            policy.guardrails.min_process_age_seconds = 0;
+            policy.load_aware.enabled = false;
+            std::fs::write(
+                config.join("policy.json"),
+                serde_json::to_vec_pretty(&policy).unwrap(),
+            )
+            .unwrap();
+            let mut child = std::process::Command::new("sleep");
+            child
+                .arg("300")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // SAFETY: setsid is async-signal-safe and touches no Rust shared state.
+            unsafe {
+                child.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            Self {
+                root,
+                config,
+                data,
+                child: OwnedChild(child.spawn().unwrap()),
+            }
+        }
+
+        fn store(&self) -> SessionStore {
+            SessionStore::at_data_dir(&self.data)
+        }
+
+        fn command(&self) -> Command {
+            let mut command = pt_core();
+            command
+                .timeout(Duration::from_secs(120))
+                .env_remove("PT_SKIP_GLOBAL_LOCK")
+                .env_remove("PT_CONFIG_DIR")
+                .env("PROCESS_TRIAGE_CONFIG", &self.config)
+                .env("PROCESS_TRIAGE_DATA", &self.data)
+                .env("PROCESS_TRIAGE_RETENTION", "off")
+                .arg("--config")
+                .arg(&self.config)
+                .args([
+                    "--format",
+                    "json",
+                    "agent",
+                    "plan",
+                    "--pretty",
+                    "--min-age",
+                    "0",
+                    "--min-posterior",
+                    "0",
+                    "--max-candidates",
+                    "1",
+                    "--window-ms",
+                    "0",
+                    "--pids",
+                ])
+                .arg(self.child.0.id().to_string());
+            command
+        }
+
+        fn plan(&self, args: &[&str]) -> Value {
+            let output = self.command().args(args).output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            serde_json::from_slice(&output.stdout).unwrap()
+        }
+
+        fn handle(&self, plan: &Value) -> SessionHandle {
+            self.store()
+                .open(&SessionId::parse(plan["session_id"].as_str().unwrap()).unwrap())
+                .unwrap()
+        }
+
+        fn snapshot(
+            &self,
+            inventory: InventoryArtifact,
+            inference: InferenceArtifact,
+            timestamp: &str,
+        ) -> (SessionId, SessionHandle) {
+            let id = SessionId::new();
+            let handle = self
+                .store()
+                .create(&SessionManifest::new(
+                    &id,
+                    None,
+                    SessionMode::RobotPlan,
+                    None,
+                ))
+                .unwrap();
+            let host = pt_core::logging::get_host_id();
+            persist_inventory(&handle, &id.0, &host, inventory).unwrap();
+            persist_inference(&handle, &id.0, &host, inference).unwrap();
+            // Timestamp metadata is outside the payload checksum. Keep both
+            // payloads/checksums valid while placing the fixture in history.
+            rewrite_header(&handle, "scan/inventory.json", "generated_at", timestamp);
+            rewrite_header(&handle, "inference/results.json", "generated_at", timestamp);
+            (id, handle)
+        }
+
+        fn empty_snapshot(&self, timestamp: &str) -> (SessionId, SessionHandle) {
+            self.snapshot(
+                InventoryArtifact {
+                    total_system_processes: 0,
+                    protected_filtered: 0,
+                    record_count: 0,
+                    records: vec![],
+                },
+                InferenceArtifact {
+                    candidate_count: 0,
+                    candidates: vec![],
+                },
+                timestamp,
+            )
+        }
+
+        fn assert_full_current_plan(&self, plan: &Value) {
+            let candidates = plan["candidates"].as_array().unwrap();
+            assert_eq!(candidates.len(), 1, "{plan}");
+            assert_eq!(candidates[0]["pid"], self.child.0.id());
+            assert!(plan["actions"].is_array());
+            assert!(plan["policy_snapshot"].is_object());
+            assert_eq!(plan["differential"]["advisory_only"], true);
+            assert_eq!(plan["differential"]["plan_scope"], "complete_fresh_plan");
+            assert_eq!(plan["differential"]["summary"]["total_new"], 1);
+            assert!(plan.get("stub_flags").is_none());
+            let handle = self.handle(plan);
+            let inventory =
+                load_inventory(&handle).expect("current inventory passes checksum validation");
+            let inference =
+                load_inference(&handle).expect("current inference passes checksum validation");
+            assert_eq!(inventory.payload.records.len(), 1);
+            assert_eq!(inventory.payload.records[0].pid, self.child.0.id());
+            assert_eq!(inference.payload.candidates.len(), 1);
+            assert_eq!(
+                inference.payload.candidates[0].start_id,
+                candidates[0]["start_id"].as_str().unwrap()
+            );
+            assert_eq!(
+                inference.payload.candidates[0].recommended_action,
+                candidates[0]["recommended_action"].as_str().unwrap()
+            );
+            let persisted: Value = serde_json::from_slice(
+                &std::fs::read(handle.dir.join("decision/plan.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                persisted, *plan,
+                "stdout and executable plan must retain the same comparison and current actions"
+            );
+        }
+    }
+
+    fn rewrite_header(handle: &SessionHandle, path: &str, key: &str, value: &str) {
+        let path = handle.dir.join(path);
+        let mut artifact: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        artifact[key] = serde_json::json!(value);
+        std::fs::write(path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn since_keeps_a_complete_fresh_plan_and_checked_observations() {
+        let fixture = Fixture::new();
+        let original = fixture.plan(&[]);
+        let baseline = fixture.handle(&original);
+        let inventory = load_inventory(&baseline).unwrap();
+        let inference = load_inference(&baseline).unwrap();
+        let plan = fixture.plan(&["--since", original["session_id"].as_str().unwrap()]);
+        fixture.assert_full_current_plan(&plan);
+        assert_eq!(
+            plan["differential"]["baseline"]["inventory_sha256"],
+            inventory.integrity_sha256
+        );
+        assert_eq!(
+            plan["differential"]["baseline"]["inference_sha256"],
+            inference.integrity_sha256
+        );
+        assert_eq!(plan["differential"]["summary"]["total_old"], 1);
+        assert_ne!(plan["session_id"], original["session_id"]);
+        let minimal = fixture.plan(&[
+            "--since",
+            original["session_id"].as_str().unwrap(),
+            "--minimal",
+        ]);
+        assert_eq!(
+            minimal["differential"]["baseline"]["session_id"],
+            original["session_id"]
+        );
+        assert_eq!(minimal["candidates"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn since_resume_reads_baseline_before_writes_and_pid_reuse_is_new() {
+        let fixture = Fixture::new();
+        let original = fixture.plan(&[]);
+        let handle = fixture.handle(&original);
+        let mut inventory = load_inventory(&handle).unwrap().payload;
+        let inference = load_inference(&handle).unwrap().payload;
+        inventory.records[0].state = "T".to_string();
+        persist_inventory(
+            &handle,
+            original["session_id"].as_str().unwrap(),
+            &pt_core::logging::get_host_id(),
+            inventory,
+        )
+        .unwrap();
+        let previous = load_inventory(&handle).unwrap();
+        let id = original["session_id"].as_str().unwrap();
+        let resumed = fixture.plan(&["--session", id, "--since", id]);
+        fixture.assert_full_current_plan(&resumed);
+        assert_eq!(resumed["session_id"], original["session_id"]);
+        assert_eq!(
+            resumed["differential"]["baseline"]["inventory_sha256"],
+            previous.integrity_sha256
+        );
+        assert_eq!(resumed["differential"]["summary"]["changed_count"], 1);
+        assert!(
+            resumed["differential"]["changes"][0]["lifecycle"]["signals"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("state_transition"))
+        );
+
+        let mut reused_inventory = load_inventory(&handle).unwrap().payload;
+        let mut reused_inference = inference;
+        let previous_birth = format!("previous-boot:1:{}", fixture.child.0.id());
+        reused_inventory.records[0].start_id = previous_birth.clone();
+        reused_inference.candidates[0].start_id = previous_birth.clone();
+        let (reuse_id, _) =
+            fixture.snapshot(reused_inventory, reused_inference, &Utc::now().to_rfc3339());
+        let current = fixture.plan(&["--since", &reuse_id.0]);
+        fixture.assert_full_current_plan(&current);
+        assert_eq!(current["differential"]["summary"]["new_count"], 1);
+        assert_eq!(current["differential"]["summary"]["resolved_count"], 1);
+        let absent = current["differential"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|delta| delta["kind"] == "resolved")
+            .unwrap();
+        assert_eq!(absent["start_id"], previous_birth);
+        assert!(absent["lifecycle"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not establish process exit"));
+    }
+
+    #[test]
+    fn since_time_selects_by_artifact_chronology_for_duration_and_timestamp() {
+        let fixture = Fixture::new();
+        let now = Utc::now();
+        let (_, older) = fixture.empty_snapshot(&(now - chrono::Duration::hours(3)).to_rfc3339());
+        let offset = FixedOffset::west_opt(12 * 3600).unwrap();
+        let selected_time = (now - chrono::Duration::minutes(75))
+            .with_timezone(&offset)
+            .to_rfc3339();
+        let (selected, _) = fixture.empty_snapshot(&selected_time);
+        fixture.empty_snapshot(&(now - chrono::Duration::minutes(30)).to_rfc3339());
+        // A misleading manifest date must not outrank more recent observations.
+        let mut manifest = older.read_manifest().unwrap();
+        manifest.timing.created_at = (now + chrono::Duration::days(1)).to_rfc3339();
+        older.write_manifest(&manifest).unwrap();
+        let (_, foreign) =
+            fixture.empty_snapshot(&(now - chrono::Duration::minutes(65)).to_rfc3339());
+        rewrite_header(
+            &foreign,
+            "inference/results.json",
+            "host_id",
+            "another-host",
+        );
+        let (_, corrupt) =
+            fixture.empty_snapshot(&(now - chrono::Duration::minutes(62)).to_rfc3339());
+        rewrite_header(
+            &corrupt,
+            "scan/inventory.json",
+            "integrity_sha256",
+            "invalid-checksum",
+        );
+        let cutoff = (now - chrono::Duration::hours(1)).to_rfc3339();
+        for requested_time in [&cutoff[..], "1h"] {
+            let plan = fixture.plan(&["--since-time", requested_time]);
+            fixture.assert_full_current_plan(&plan);
+            assert_eq!(plan["differential"]["baseline"]["session_id"], selected.0);
+            assert_eq!(plan["differential"]["skipped_incompatible_sessions"], 2);
+            let observed = DateTime::parse_from_rfc3339(
+                plan["differential"]["baseline"]["observed_at"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                observed,
+                DateTime::parse_from_rfc3339(&selected_time).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn since_rejects_invalid_missing_or_incompatible_baselines_before_creating_a_plan() {
+        let fixture = Fixture::new();
+        let missing = SessionId::new();
+        for args in [
+            vec!["--since", "not-a-session"],
+            vec!["--since", &missing.0],
+            vec!["--since-time", "nonsense"],
+            vec!["--since-time", "0h"],
+            vec!["--since-time=-1h"],
+            vec!["--since-time", "9223372036854775807d"],
+            vec!["--since-time", "2999-01-01T00:00:00Z"],
+            vec!["--since-time", "1h"],
+            vec!["--since", &missing.0, "--since-time", "1h"],
+        ] {
+            fixture.command().args(args).assert().code(10);
+            assert!(fixture
+                .store()
+                .list_sessions(&Default::default())
+                .unwrap()
+                .is_empty());
+        }
+        for (artifact, field, value, expected_error) in [
+            (
+                "scan/inventory.json",
+                "session_id",
+                "pt-20260101-000000-abcd",
+                "session ID mismatch",
+            ),
+            (
+                "inference/results.json",
+                "host_id",
+                "foreign-host",
+                "host ID mismatch",
+            ),
+            (
+                "scan/inventory.json",
+                "integrity_sha256",
+                "bad",
+                "integrity check failed",
+            ),
+            (
+                "inference/results.json",
+                "generated_at",
+                "bad",
+                "invalid timestamp",
+            ),
+        ] {
+            let (id, handle) = fixture.empty_snapshot(&Utc::now().to_rfc3339());
+            rewrite_header(&handle, artifact, field, value);
+            let before = fixture
+                .store()
+                .list_sessions(&Default::default())
+                .unwrap()
+                .len();
+            fixture
+                .command()
+                .args(["--since", &id.0])
+                .assert()
+                .code(10)
+                .stderr(predicate::str::contains(expected_error));
+            assert_eq!(
+                fixture
+                    .store()
+                    .list_sessions(&Default::default())
+                    .unwrap()
+                    .len(),
+                before
+            );
+            assert!(!handle.dir.join("decision/plan.json").exists());
+        }
+        let id = SessionId::new();
+        let empty = fixture
+            .store()
+            .create(&SessionManifest::new(
+                &id,
+                None,
+                SessionMode::RobotPlan,
+                None,
+            ))
+            .unwrap();
+        fixture
+            .command()
+            .args(["--since", &id.0])
+            .assert()
+            .code(10)
+            .stderr(predicate::str::contains("inventory"));
+        assert!(!empty.dir.join("decision/plan.json").exists());
+        assert!(fixture.root.is_dir());
+    }
+}
+
 // ============================================================================
 // Basic Plan Tests
 // ============================================================================

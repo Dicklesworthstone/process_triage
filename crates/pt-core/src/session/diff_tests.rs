@@ -89,6 +89,84 @@ mod tests {
     // -- Scenario: New stuck test process --
 
     #[test]
+    fn scenario_action_change_is_visible_without_score_drift() {
+        let procs = vec![proc(100, "b1:100:100", "worker", "worker", 3600)];
+        let old_infs = vec![inf(100, "b1:100:100", "abandoned", 85, "kill", 0.9)];
+        let new_infs = vec![inf(100, "b1:100:100", "abandoned", 85, "keep", 0.9)];
+        let diff = compute_diff(
+            "before",
+            "after",
+            &procs,
+            &old_infs,
+            &procs,
+            &new_infs,
+            &DiffConfig::default(),
+        );
+        assert_eq!(diff.summary.changed_count, 1);
+        let delta = &diff.deltas[0];
+        assert_eq!(delta.kind, DeltaKind::Changed);
+        assert_eq!(delta.score_drift, Some(0));
+        assert!(!delta.classification_changed);
+        assert!(!delta.improved && !delta.worsened);
+        assert_eq!(
+            delta.old_inference.as_ref().unwrap().recommended_action,
+            "kill"
+        );
+        assert_eq!(
+            delta.new_inference.as_ref().unwrap().recommended_action,
+            "keep"
+        );
+    }
+
+    #[test]
+    fn scenario_lifecycle_changes_are_visible_without_inference_changes() {
+        let old = proc(100, "b1:100:100", "worker", "worker", 3600);
+        let infs = vec![inf(100, "b1:100:100", "useful", 15, "keep", 0.05)];
+        let mut reparented = old.clone();
+        reparented.ppid = 42;
+        let mut changed_owner = old.clone();
+        changed_owner.uid = 2000;
+        let mut stopped = old.clone();
+        stopped.state = "T".to_string();
+        let mut identity_degraded = old.clone();
+        identity_degraded.identity_quality = "Partial".to_string();
+        for changed in [reparented, changed_owner, stopped, identity_degraded] {
+            let diff = compute_diff(
+                "before",
+                "after",
+                std::slice::from_ref(&old),
+                &infs,
+                std::slice::from_ref(&changed),
+                &infs,
+                &DiffConfig::default(),
+            );
+            assert_eq!(diff.summary.changed_count, 1, "{changed:?}");
+            assert_eq!(diff.deltas[0].score_drift, Some(0));
+            assert!(!diff.deltas[0].classification_changed);
+            assert!(!diff.deltas[0].lifecycle.signals.is_empty());
+        }
+    }
+
+    #[test]
+    fn scenario_missing_inference_is_a_change_not_a_silent_match() {
+        let procs = vec![proc(100, "b1:100:100", "worker", "worker", 3600)];
+        let infs = vec![inf(100, "b1:100:100", "useful", 15, "keep", 0.05)];
+        for (old, new) in [(&infs[..], &[][..]), (&[][..], &infs[..])] {
+            let diff = compute_diff(
+                "before",
+                "after",
+                &procs,
+                old,
+                &procs,
+                new,
+                &DiffConfig::default(),
+            );
+            assert_eq!(diff.summary.changed_count, 1);
+            assert_eq!(diff.deltas[0].score_drift, None);
+        }
+    }
+
+    #[test]
     fn scenario_new_stuck_test() {
         let old_procs = vec![proc(100, "b1:100:100", "node", "node server.js", 3600)];
         let old_infs = vec![inf(100, "b1:100:100", "useful", 15, "keep", 0.05)];
