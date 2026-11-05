@@ -80,6 +80,24 @@ fn validate_procfs_pid_namespace(
     Ok(())
 }
 
+/// Convert a resolved process/group ID without admitting kill(2)'s special
+/// broadcast targets. PID 0 targets the caller's group, and negating PGID 1
+/// produces -1 (all signalable processes), not a process-group-only operation.
+/// PID 1 itself is protected infrastructure and is never an action target.
+#[cfg(any(unix, test))]
+fn signal_syscall_target(target_id: u32, use_group: bool) -> Result<i32, ActionError> {
+    if target_id <= 1 {
+        return Err(ActionError::Failed(format!(
+            "refusing signal to protected {} {}",
+            if use_group { "process group" } else { "PID" },
+            target_id
+        )));
+    }
+    let target = i32::try_from(target_id)
+        .map_err(|_| ActionError::Failed(format!("PID {target_id} exceeds i32 range")))?;
+    Ok(if use_group { -target } else { target })
+}
+
 /// Signal action runner configuration.
 #[derive(Debug, Clone)]
 pub struct SignalConfig {
@@ -167,19 +185,8 @@ impl SignalActionRunner {
     /// as returned by [`resolve_group_target`].
     #[cfg(unix)]
     fn send_signal(&self, target_id: u32, signal: i32, use_group: bool) -> Result<(), ActionError> {
+        let target_pid = signal_syscall_target(target_id, use_group)?;
         ensure_action_pid_namespace()?;
-        if target_id > i32::MAX as u32 {
-            return Err(ActionError::Failed(format!(
-                "PID {} exceeds i32 range",
-                target_id
-            )));
-        }
-
-        let target_pid = if use_group {
-            -(target_id as i32) // Negative PID targets process group
-        } else {
-            target_id as i32
-        };
         self.note_path(if use_group { "kill_group" } else { "kill" });
 
         let result = unsafe { libc::kill(target_pid, signal) };
@@ -725,8 +732,9 @@ struct PidFd(libc::c_int);
 impl PidFd {
     /// `Ok(None)` when the kernel lacks pidfd support.
     fn open(pid: u32) -> Result<Option<Self>, ActionError> {
+        let target = signal_syscall_target(pid, false)?;
         // SAFETY: plain syscall with integer arguments; the returned fd is owned below.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, target as libc::pid_t, 0) };
         if fd >= 0 {
             return Ok(Some(PidFd(fd as libc::c_int)));
         }
@@ -837,6 +845,40 @@ fn ids_match_starttime(start_id: &str, current_starttime: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_syscall_target_rejects_broadcast_and_init_values() {
+        for use_group in [false, true] {
+            for invalid in [0, 1, i32::MAX as u32 + 1, u32::MAX] {
+                assert!(
+                    signal_syscall_target(invalid, use_group).is_err(),
+                    "target={invalid}, group={use_group}"
+                );
+            }
+        }
+
+        // A child may have inherited init's process group. Even an explicit
+        // group-signaling configuration must not turn that PGID into kill(-1).
+        let runner = SignalActionRunner::new(SignalConfig {
+            use_process_groups: true,
+            ..Default::default()
+        });
+        let (target, use_group) = runner.resolve_group_target(42, Some(1));
+        assert!(use_group);
+        assert!(signal_syscall_target(target, use_group).is_err());
+    }
+
+    #[test]
+    fn signal_syscall_target_preserves_valid_process_and_group_ranges() {
+        for id in [2, 3, 42, 65_535, i32::MAX as u32] {
+            let process = signal_syscall_target(id, false).unwrap();
+            let group = signal_syscall_target(id, true).unwrap();
+            assert_eq!(process, id as i32);
+            assert_eq!(group, -(id as i32));
+            assert!(process >= 2);
+            assert!(group <= -2);
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
