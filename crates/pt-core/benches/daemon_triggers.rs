@@ -22,6 +22,7 @@ fn tick(
         swap_used_mb: 0,
         process_count: 512,
         orphan_count,
+        pressure: None,
     }
 }
 

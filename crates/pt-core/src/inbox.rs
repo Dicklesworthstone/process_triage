@@ -91,6 +91,10 @@ pub struct InboxItem {
     /// Number of candidates (for escalations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates: Option<u32>,
+    /// Observed pressure that prompted this review plan. Urgency must not depend
+    /// on how many processes the planner can safely recommend acting on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<crate::decision::mem_pressure::PressureMode>,
     /// Whether the item has been acknowledged.
     pub acknowledged: bool,
     /// When the item was acknowledged.
@@ -124,6 +128,7 @@ impl InboxItem {
             trigger: None,
             summary,
             candidates: None,
+            memory_pressure: None,
             acknowledged: false,
             acknowledged_at: None,
             review_command: None,

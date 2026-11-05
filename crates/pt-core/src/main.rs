@@ -10621,6 +10621,7 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
         if budget_exceeded {
             daemon_state.tick_count += 1;
             daemon_state.last_tick_at = Some(metrics.timestamp.clone());
+            daemon_state.observe_memory_pressure(&config, &metrics);
             daemon_state.record_event(
                 pt_core::daemon::DaemonEventType::TickCompleted,
                 "tick (budget exceeded)",
@@ -10676,12 +10677,16 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                             Ok(result) => {
                                 outcome.session_id = Some(result.session_id.clone());
                                 if let Some(store) = escalation_inbox.as_mut() {
-                                    let item = InboxItem::dormant_escalation(
+                                    let mut item = InboxItem::dormant_escalation(
                                         result.session_id,
                                         summary.clone(),
                                         summary,
                                         result.candidates_found,
                                     );
+                                    item.memory_pressure = fired
+                                        .iter()
+                                        .find_map(|trigger| trigger.memory_pressure.as_ref())
+                                        .map(|pressure| pressure.mode);
                                     let _ = store.add(&item);
                                     // Emit L1 notification immediately for new inbox item.
                                     if config.notifications.enabled {
@@ -10724,7 +10729,14 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
             break;
         }
 
-        if daemon_sleep_with_interrupt(config.tick_interval_secs) {
+        let next_tick_secs = if budget_exceeded {
+            // An overhead violation retains the base interval rather than
+            // increasing this daemon's own load while the host is under pressure.
+            config.tick_interval_secs.max(1)
+        } else {
+            state_bundle.daemon.next_tick_interval_secs(&config)
+        };
+        if daemon_sleep_with_interrupt(next_tick_secs) {
             continue;
         }
     }
@@ -10800,15 +10812,20 @@ fn daemon_submit_inbox_item_trigger(
     };
 
     let candidates = item.candidates.unwrap_or(0);
-    let severity = if item.item_type == InboxItemType::LockContention {
-        Severity::Warning
-    } else if candidates >= 10 {
-        Severity::Critical
-    } else if candidates >= 1 {
-        Severity::Warning
-    } else {
-        Severity::Info
-    };
+    let severity =
+        if item.memory_pressure == Some(pt_core::decision::mem_pressure::PressureMode::Emergency) {
+            Severity::Critical
+        } else if item.item_type == InboxItemType::LockContention {
+            Severity::Warning
+        } else if candidates >= 10 {
+            Severity::Critical
+        } else if candidates >= 1
+            || item.memory_pressure == Some(pt_core::decision::mem_pressure::PressureMode::Warning)
+        {
+            Severity::Warning
+        } else {
+            Severity::Info
+        };
 
     let summary = match (&item.review_command, &item.trigger) {
         (Some(cmd), Some(trig)) => format!("{} ({})\nReview: {}", item.summary, trig, cmd),
@@ -10819,9 +10836,17 @@ fn daemon_submit_inbox_item_trigger(
     notify_mgr.submit_trigger(EscalationTrigger {
         trigger_id: item.id.clone(),
         dedupe_key: key,
-        trigger_type: TriggerType::HighRiskCandidates,
+        trigger_type: if item.memory_pressure.is_some() {
+            TriggerType::MemoryPressure
+        } else {
+            TriggerType::HighRiskCandidates
+        },
         severity,
-        confidence: Some(0.95),
+        confidence: if item.memory_pressure.is_some() {
+            None
+        } else {
+            Some(0.95)
+        },
         summary,
         detected_at,
         session_id: item.session_id.clone(),
@@ -12588,7 +12613,11 @@ struct DaemonStateBundle {
 #[cfg(feature = "daemon")]
 fn load_daemon_state(path: &Path, config: &pt_core::daemon::DaemonConfig) -> DaemonStateBundle {
     if let Ok(content) = std::fs::read_to_string(path) {
-        if let Ok(state) = serde_json::from_str::<DaemonStateBundle>(&content) {
+        if let Ok(mut state) = serde_json::from_str::<DaemonStateBundle>(&content) {
+            // Retain the pressure mode across restarts, but samples separated by
+            // daemon downtime are not a consecutive live-observation sequence.
+            state.daemon.memory_pressure.observe(None);
+            state.daemon.last_memory_pressure = None;
             return state;
         }
     }
@@ -12709,21 +12738,30 @@ fn run_daemon_plan(
 
 #[cfg(feature = "daemon")]
 fn collect_daemon_metrics() -> pt_core::daemon::TickMetrics {
-    let load = collect_load_averages();
-    let load_avg_1 = load.first().copied().unwrap_or(0.0);
-    let load_avg_5 = load.get(1).copied().unwrap_or(load_avg_1);
+    let pressure = pt_core::collect::pressure::read_pressure_snapshot();
+    daemon_metrics_from_pressure(pressure, collect_process_count(), collect_orphan_count())
+}
 
-    let memory = collect_memory_info();
-    let total_gb = memory
-        .get("total_gb")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let used_gb = memory
-        .get("used_gb")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let memory_total_mb = (total_gb * 1024.0).round() as u64;
-    let memory_used_mb = (used_gb * 1024.0).round() as u64;
+#[cfg(feature = "daemon")]
+fn daemon_metrics_from_pressure(
+    pressure: pt_core::collect::pressure::PressureSnapshot,
+    process_count: u32,
+    orphan_count: u32,
+) -> pt_core::daemon::TickMetrics {
+    let load_avg_1 = pressure.load.map(|load| load.one).unwrap_or(0.0);
+    let load_avg_5 = pressure.load.map(|load| load.five).unwrap_or(0.0);
+    let total = pressure.meminfo.and_then(|memory| memory.total);
+    let available = pressure.meminfo.and_then(|memory| memory.available);
+    let memory_total_mb = total.unwrap_or(0) / (1024 * 1024);
+    let memory_used_mb = total
+        .zip(available)
+        .map(|(total, available)| total.saturating_sub(available) / (1024 * 1024))
+        .unwrap_or(0);
+    let swap_used_mb = pressure
+        .meminfo
+        .and_then(|memory| memory.swap_used())
+        .unwrap_or(0)
+        / (1024 * 1024);
 
     pt_core::daemon::TickMetrics {
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -12731,37 +12769,139 @@ fn collect_daemon_metrics() -> pt_core::daemon::TickMetrics {
         load_avg_5,
         memory_used_mb,
         memory_total_mb,
-        swap_used_mb: collect_swap_used_mb(),
-        process_count: collect_process_count(),
-        orphan_count: collect_orphan_count(),
+        swap_used_mb,
+        process_count,
+        orphan_count,
+        // Legacy scalar gauges retain their previous zero fallback. The pressure
+        // state machine consumes this observed snapshot and never those fallbacks.
+        pressure: Some(pressure),
     }
 }
 
-#[cfg(feature = "daemon")]
-fn collect_swap_used_mb() -> u64 {
-    let content_bytes = match std::fs::read("/proc/meminfo") {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    let content = String::from_utf8_lossy(&content_bytes);
-    let mut total = 0u64;
-    let mut free = 0u64;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("SwapTotal:") {
-            total = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("SwapFree:") {
-            free = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-        }
+#[cfg(all(test, feature = "daemon"))]
+mod daemon_pressure_tests {
+    use super::*;
+    use pt_core::daemon::{process_tick, DaemonConfig, DaemonState};
+    use pt_core::decision::mem_pressure::{MemorySignals, PressureMode};
+
+    #[test]
+    fn recorded_linux_pressure_drives_daemon_planning() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("proc/pressure")).unwrap();
+        std::fs::write(
+            fixture.path().join("proc/meminfo"),
+            "MemTotal: 1000000 kB\nMemAvailable: 750000 kB\nSwapTotal: 100000 kB\nSwapFree: 80000 kB\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("proc/pressure/memory"),
+            "some avg10=75.00 avg60=65.00 avg300=50.00 total=123456\nfull avg10=25.00 avg60=20.00 avg300=10.00 total=65432\n",
+        )
+        .unwrap();
+        let pressure = pt_core::collect::pressure::read_pressure_snapshot_from(fixture.path(), 4);
+        let mut metrics = daemon_metrics_from_pressure(pressure, 42, 0);
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        let mut triggers = pt_core::daemon::triggers::TriggerState::new(&config.triggers);
+        let mut calls = 0;
+        let mut plan = |config: &pt_core::daemon::escalation::EscalationConfig,
+                        fired: &[pt_core::daemon::triggers::FiredTrigger]| {
+            calls += 1;
+            assert!(!config.allow_auto_mitigation);
+            let pressure = fired[0].memory_pressure.as_ref().unwrap();
+            assert_eq!(pressure.mode, PressureMode::Emergency);
+            assert_eq!(pressure.utilization, 0.25);
+            assert_eq!(pressure.psi_some10, Some(75.0));
+            pt_core::daemon::escalation::EscalationOutcome {
+                status: pt_core::daemon::escalation::EscalationStatus::Completed,
+                reason: "pressure review plan generated".to_string(),
+                session_id: Some("recorded-pressure-plan".to_string()),
+                provenance_summary: None,
+            }
+        };
+
+        let first = process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+        assert!(first.escalation.is_none());
+        metrics.pressure.as_mut().unwrap().sampled_at_ms += 60_000;
+        let second = process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+        assert_eq!(second.next_tick_interval_secs, 15);
+        assert_eq!(
+            second.escalation.unwrap().session_id.as_deref(),
+            Some("recorded-pressure-plan")
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(metrics.memory_used_mb, 244);
+        assert_eq!(metrics.swap_used_mb, 19);
     }
-    total.saturating_sub(free) / 1024
+
+    #[test]
+    fn restarting_daemon_requires_fresh_consecutive_recovery_readings() {
+        let config = DaemonConfig::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut bundle = load_daemon_state(&path, &config);
+        let mut signal = MemorySignals {
+            total_bytes: 1000,
+            used_bytes: 990,
+            available_bytes: 10,
+            swap_used_bytes: 0,
+            swap_total_bytes: 0,
+            psi_some10: Some(75.0),
+            timestamp: 1000.0,
+        };
+        bundle.daemon.memory_pressure.observe(Some(&signal));
+        signal.timestamp += 60.0;
+        bundle.daemon.memory_pressure.observe(Some(&signal));
+        signal.available_bytes = 750;
+        signal.used_bytes = 250;
+        signal.psi_some10 = Some(1.0);
+        signal.timestamp += 60.0;
+        bundle.daemon.memory_pressure.observe(Some(&signal));
+        save_daemon_state(&path, &bundle).unwrap();
+
+        let mut restored = load_daemon_state(&path, &config);
+        assert_eq!(
+            restored.daemon.memory_pressure.mode(),
+            PressureMode::Emergency
+        );
+        assert!(restored.daemon.last_memory_pressure.is_none());
+        signal.timestamp += 60.0;
+        restored.daemon.memory_pressure.observe(Some(&signal));
+        assert_eq!(
+            restored.daemon.memory_pressure.mode(),
+            PressureMode::Emergency
+        );
+        signal.timestamp += 60.0;
+        restored.daemon.memory_pressure.observe(Some(&signal));
+        assert_eq!(restored.daemon.memory_pressure.mode(), PressureMode::Normal);
+    }
+
+    #[test]
+    fn emergency_notification_is_critical_even_without_kill_candidates() {
+        use pt_core::decision::escalation::{EscalationManager, Severity};
+
+        let config = DaemonConfig::default();
+        let mut manager = EscalationManager::new(config.notification_ladder.clone());
+        let mut item = pt_core::inbox::InboxItem::dormant_escalation(
+            "pressure-plan".to_string(),
+            "memory PSI emergency".to_string(),
+            "Review the plan; no safe action candidates were found".to_string(),
+            0,
+        );
+        item.memory_pressure = Some(PressureMode::Emergency);
+        // The same metadata must survive the durable inbox and later refreshes.
+        let item = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        let now = daemon_now_secs();
+        daemon_submit_inbox_item_trigger(&config, &mut manager, &item, now);
+        let notifications = manager.flush(now);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].severity, Severity::Critical);
+        assert_eq!(
+            notifications[0].session_id.as_deref(),
+            Some("pressure-plan")
+        );
+        assert!(notifications[0].body.contains("no safe action candidates"));
+    }
 }
 
 #[cfg(all(feature = "daemon", target_os = "linux"))]
@@ -12891,6 +13031,7 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
         triggers: Option<DaemonTriggerConfig>,
         auto_mitigate: Option<DaemonAutoMitigate>,
         cooldown: Option<DaemonCooldown>,
+        memory_pressure: Option<pt_core::decision::mem_pressure::MemPressureConfig>,
     }
 
     #[derive(Deserialize)]
@@ -12938,6 +13079,9 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
     let mut enabled = true;
 
     if let Ok(file_cfg) = serde_json::from_str::<DaemonFileConfig>(&content) {
+        if let Some(pressure) = file_cfg.memory_pressure {
+            config.memory_pressure = pressure;
+        }
         if let Some(value) = file_cfg.enabled {
             enabled = value;
         }

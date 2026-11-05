@@ -118,6 +118,9 @@ pub struct FiredTrigger {
     /// Populated when provenance is enabled; absent otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provenance_context: Vec<TriggerProvenanceHint>,
+    /// Validated memory/PSI state behind a pressure-triggered review plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<crate::decision::mem_pressure::PressureEvaluation>,
 }
 
 /// Provenance hint attached to a daemon trigger.
@@ -175,6 +178,7 @@ pub fn evaluate_triggers(
                 threshold: config.load_threshold,
                 sustained_ticks: state.load_sustained,
                 provenance_context: Vec::new(),
+                memory_pressure: None,
             });
             state.load_cooldown = config.cooldown_ticks;
             state.load_sustained = 0;
@@ -210,6 +214,7 @@ pub fn evaluate_triggers(
                 threshold: config.memory_threshold,
                 sustained_ticks: state.memory_sustained,
                 provenance_context: Vec::new(),
+                memory_pressure: None,
             });
             state.memory_cooldown = config.cooldown_ticks;
             state.memory_sustained = 0;
@@ -239,6 +244,7 @@ pub fn evaluate_triggers(
                 threshold: config.orphan_threshold as f64,
                 sustained_ticks: state.orphan_sustained,
                 provenance_context: Vec::new(),
+                memory_pressure: None,
             });
             state.orphan_cooldown = config.cooldown_ticks;
             state.orphan_sustained = 0;
@@ -286,6 +292,7 @@ mod tests {
             swap_used_mb: 0,
             process_count: 200,
             orphan_count: orphans,
+            pressure: None,
         }
     }
 

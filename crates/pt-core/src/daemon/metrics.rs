@@ -456,6 +456,7 @@ mod tests {
             swap_used_mb: 100,
             process_count: 300,
             orphan_count: 5,
+            pressure: None,
         };
         let state = super::super::DaemonState {
             started_at: "2026-01-01T00:00:00Z".to_string(),
@@ -465,6 +466,7 @@ mod tests {
             escalation_count: 3,
             deferred_count: 1,
             recent_events: std::collections::VecDeque::new(),
+            ..Default::default()
         };
 
         metrics.update_from_tick(&tick, &state);

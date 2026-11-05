@@ -208,6 +208,7 @@ mod metric_values {
             swap_used_mb: 200,
             process_count: 450,
             orphan_count: 12,
+            pressure: None,
         };
         let state = DaemonState {
             started_at: "2026-01-15T00:00:00Z".to_string(),
@@ -217,6 +218,7 @@ mod metric_values {
             escalation_count: 7,
             deferred_count: 3,
             recent_events: std::collections::VecDeque::new(),
+            ..Default::default()
         };
         metrics.update_from_tick(&tick, &state);
 
@@ -301,6 +303,7 @@ mod metric_values {
             swap_used_mb: 0,
             process_count: 100,
             orphan_count: 0,
+            pressure: None,
         };
         let state = DaemonState::new();
         metrics.update_from_tick(&tick, &state);

@@ -230,6 +230,7 @@ mod tests {
             threshold: 4.0,
             sustained_ticks: 3,
             provenance_context: Vec::new(),
+            memory_pressure: None,
         }
     }
 

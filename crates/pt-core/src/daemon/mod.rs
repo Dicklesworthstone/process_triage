@@ -20,6 +20,12 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+use crate::collect::pressure::PressureSnapshot;
+use crate::decision::mem_pressure::{
+    MemPressureConfig, MemPressureMonitor, MemorySignals, PressureAction, PressureEvaluation,
+    PressureMode,
+};
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -43,6 +49,9 @@ pub struct DaemonConfig {
     /// Notification delivery configuration.
     #[serde(default)]
     pub notifications: DaemonNotificationsConfig,
+    /// Memory/PSI pressure response. It generates review plans, never actions.
+    #[serde(default)]
+    pub memory_pressure: MemPressureConfig,
 }
 
 /// Notification delivery settings for the daemon.
@@ -84,6 +93,7 @@ impl Default for DaemonConfig {
             escalation: escalation::EscalationConfig::default(),
             notification_ladder: crate::decision::escalation::EscalationConfig::default(),
             notifications: DaemonNotificationsConfig::default(),
+            memory_pressure: MemPressureConfig::default(),
         }
     }
 }
@@ -103,6 +113,10 @@ pub struct TickMetrics {
     pub swap_used_mb: u64,
     pub process_count: u32,
     pub orphan_count: u32,
+    /// The actual pressure reading, including unavailable sensors. Older callers
+    /// without a reading cannot supply evidence of memory-pressure recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<PressureSnapshot>,
 }
 
 /// A daemon event for telemetry / audit.
@@ -128,6 +142,8 @@ pub enum DaemonEventType {
     LockContention,
     OverheadBudgetExceeded,
     ConfigReloaded,
+    MemoryPressureChanged,
+    MemoryPressureUnavailable,
 }
 
 /// Running state of the daemon core loop.
@@ -141,6 +157,18 @@ pub struct DaemonState {
     pub deferred_count: u32,
     /// Recent events for audit.
     pub recent_events: VecDeque<DaemonEvent>,
+    /// Retained hysteresis state survives daemon restarts and missing readings.
+    #[serde(default)]
+    pub memory_pressure: MemPressureMonitor,
+    /// Most recent sensor output; missing values remain explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pressure: Option<PressureSnapshot>,
+    /// None when this tick could not establish a valid pressure observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_memory_pressure: Option<PressureEvaluation>,
+    /// Retain a warning's plan request when lock contention or cooldown defers it.
+    #[serde(default)]
+    pub memory_pressure_plan_pending: bool,
 }
 
 impl Default for DaemonState {
@@ -159,6 +187,58 @@ impl DaemonState {
             escalation_count: 0,
             deferred_count: 0,
             recent_events: VecDeque::with_capacity(100),
+            memory_pressure: MemPressureMonitor::default(),
+            last_pressure: None,
+            last_memory_pressure: None,
+            memory_pressure_plan_pending: false,
+        }
+    }
+
+    /// Record the cheap pressure observation even if the daemon's own overhead
+    /// budget prevents it from generating a plan on this tick.
+    pub fn observe_memory_pressure(&mut self, config: &DaemonConfig, metrics: &TickMetrics) {
+        self.memory_pressure
+            .reconfigure(config.memory_pressure.clone());
+        self.last_pressure = metrics.pressure.clone();
+        let signals = metrics
+            .pressure
+            .as_ref()
+            .and_then(MemorySignals::from_pressure_snapshot);
+        let was_available = self.last_memory_pressure.is_some();
+        let evaluation = self.memory_pressure.observe(signals.as_ref());
+        if let Some(evaluation) = &evaluation {
+            if evaluation.mode == PressureMode::Normal {
+                self.memory_pressure_plan_pending = false;
+            } else if matches!(
+                evaluation.action,
+                PressureAction::GeneratePlan | PressureAction::UrgentPlan
+            ) {
+                self.memory_pressure_plan_pending = true;
+            }
+            if evaluation.transitioned {
+                self.record_event(
+                    DaemonEventType::MemoryPressureChanged,
+                    &evaluation.explanation,
+                );
+            }
+        } else if was_available || self.tick_count <= 1 {
+            self.record_event(
+                DaemonEventType::MemoryPressureUnavailable,
+                "memory-pressure evidence unavailable; retained the previous mode",
+            );
+        }
+        self.last_memory_pressure = evaluation;
+    }
+
+    /// Pressure can increase polling cadence, never slow the configured base
+    /// cadence or create a zero-duration busy loop.
+    pub fn next_tick_interval_secs(&self, config: &DaemonConfig) -> u64 {
+        let base = config.tick_interval_secs.max(1);
+        let requested = self.memory_pressure.scan_interval_secs();
+        if requested.is_finite() && requested > 0.0 {
+            (requested.ceil() as u64).max(1).min(base)
+        } else {
+            base
         }
     }
 
@@ -186,6 +266,11 @@ pub struct TickOutcome {
     pub triggers_fired: Vec<triggers::FiredTrigger>,
     pub escalation: Option<escalation::EscalationOutcome>,
     pub events: Vec<DaemonEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_pressure: Option<PressureEvaluation>,
+    /// Polling interval selected for the next tick, in seconds.
+    #[serde(default)]
+    pub next_tick_interval_secs: u64,
 }
 
 /// Process one daemon tick.
@@ -213,7 +298,36 @@ where
     let mut events = Vec::new();
 
     // 1) Evaluate triggers.
-    let fired = triggers::evaluate_triggers(&config.triggers, trigger_state, metrics);
+    let mut fired = triggers::evaluate_triggers(&config.triggers, trigger_state, metrics);
+    state.observe_memory_pressure(config, metrics);
+    if let Some(evaluation) = &state.last_memory_pressure {
+        if evaluation.transitioned {
+            events.push(DaemonEvent {
+                timestamp: metrics.timestamp.clone(),
+                event_type: DaemonEventType::MemoryPressureChanged,
+                detail: evaluation.explanation.clone(),
+            });
+        }
+        if state.memory_pressure_plan_pending && evaluation.mode != PressureMode::Normal {
+            // The richer observation replaces a same-tick utilization trigger;
+            // the existing escalation callback still enforces cooldown and lock.
+            fired.retain(|trigger| trigger.kind != triggers::TriggerKind::MemoryPressure);
+            fired.push(triggers::FiredTrigger {
+                kind: triggers::TriggerKind::MemoryPressure,
+                description: evaluation.explanation.clone(),
+                current_value: evaluation.utilization,
+                ewma_value: trigger_state.memory_ewma,
+                threshold: match evaluation.mode {
+                    PressureMode::Emergency => config.memory_pressure.emergency_threshold,
+                    _ => config.memory_pressure.warning_threshold,
+                },
+                sustained_ticks: u32::try_from(state.memory_pressure.sustained_samples())
+                    .unwrap_or(u32::MAX),
+                provenance_context: Vec::new(),
+                memory_pressure: Some(evaluation.clone()),
+            });
+        }
+    }
 
     for t in &fired {
         state.record_event(DaemonEventType::TriggerFired, &t.description);
@@ -230,6 +344,12 @@ where
 
         match outcome.status {
             escalation::EscalationStatus::Completed => {
+                if fired
+                    .iter()
+                    .any(|trigger| trigger.memory_pressure.is_some())
+                {
+                    state.memory_pressure_plan_pending = false;
+                }
                 state.escalation_count += 1;
                 state.last_escalation_at = Some(metrics.timestamp.clone());
                 state.record_event(DaemonEventType::EscalationCompleted, "escalation completed");
@@ -273,6 +393,8 @@ where
         triggers_fired: fired,
         escalation,
         events,
+        memory_pressure: state.last_memory_pressure.clone(),
+        next_tick_interval_secs: state.next_tick_interval_secs(config),
     }
 }
 
@@ -294,6 +416,7 @@ mod tests {
             swap_used_mb: 0,
             process_count: 200,
             orphan_count: orphans,
+            pressure: None,
         }
     }
 
@@ -447,5 +570,196 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         let restored: DaemonConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.tick_interval_secs, 60);
+    }
+
+    fn pressure_metrics(utilization_percent: u64, psi: Option<f64>, at_secs: u64) -> TickMetrics {
+        use crate::collect::pressure::{MemInfo, PsiLine, PsiResource};
+
+        let mut metrics = test_metrics(1.0, 8192 * utilization_percent / 100, 0);
+        metrics.pressure = Some(PressureSnapshot {
+            sampled_at_ms: at_secs * 1000,
+            cpus: 4,
+            cpu: None,
+            memory: psi.map(|avg10| PsiResource {
+                some: Some(PsiLine {
+                    avg10,
+                    avg60: avg10,
+                    avg300: avg10,
+                    total_us: 10_000,
+                }),
+                full: None,
+            }),
+            io: None,
+            irq: None,
+            load: None,
+            meminfo: Some(MemInfo {
+                total: Some(1_000_000),
+                available: Some(10_000 * (100 - utilization_percent)),
+                ..Default::default()
+            }),
+            vmstat: None,
+            file_handles: None,
+            unavailable: Vec::new(),
+        });
+        metrics
+    }
+
+    fn advance_reading(metrics: &mut TickMetrics) {
+        metrics.pressure.as_mut().unwrap().sampled_at_ms += 60_000;
+    }
+
+    #[test]
+    fn psi_pressure_reaches_escalation_and_preserves_its_cooldown() {
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        let mut triggers = triggers::TriggerState::new(&config.triggers);
+        let mut escalation = escalation::EscalationState::new();
+        let mut metrics = pressure_metrics(40, Some(75.0), 1000);
+        let mut plan = |config: &escalation::EscalationConfig, fired: &[triggers::FiredTrigger]| {
+            assert!(!config.allow_auto_mitigation);
+            assert_eq!(fired.len(), 1);
+            assert_eq!(fired[0].kind, triggers::TriggerKind::MemoryPressure);
+            let pressure = fired[0].memory_pressure.as_ref().unwrap();
+            assert_eq!(pressure.mode, PressureMode::Emergency);
+            assert_eq!(pressure.psi_some10, Some(75.0));
+            escalation::decide_escalation(config, &mut escalation, fired, || true)
+        };
+
+        let first = process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+        assert!(
+            first.escalation.is_none(),
+            "one PSI spike must not escalate"
+        );
+        advance_reading(&mut metrics);
+        let second = process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+        assert_eq!(
+            second.escalation.unwrap().status,
+            escalation::EscalationStatus::Completed
+        );
+        assert_eq!(second.next_tick_interval_secs, 15);
+        advance_reading(&mut metrics);
+        let third = process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+        let deferred = third.escalation.unwrap();
+        assert_eq!(deferred.status, escalation::EscalationStatus::Deferred);
+        assert!(deferred.reason.contains("Cooldown"));
+        assert_eq!(state.escalation_count, 1);
+        assert_eq!(state.deferred_count, 1);
+    }
+
+    #[test]
+    fn pressure_warning_retries_a_deferred_plan_without_requiring_a_new_episode() {
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        let mut triggers = triggers::TriggerState::new(&config.triggers);
+        let mut escalation = escalation::EscalationState::new();
+        let mut metrics = pressure_metrics(40, Some(25.0), 1000);
+        let mut lock_available = false;
+        let mut plan = |config: &escalation::EscalationConfig, fired: &[triggers::FiredTrigger]| {
+            let outcome =
+                escalation::decide_escalation(config, &mut escalation, fired, || lock_available);
+            lock_available = true;
+            outcome
+        };
+
+        process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+        advance_reading(&mut metrics);
+        let blocked = process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+        assert_eq!(
+            blocked.escalation.unwrap().status,
+            escalation::EscalationStatus::Deferred
+        );
+        assert!(state.memory_pressure_plan_pending);
+        assert_eq!(blocked.next_tick_interval_secs, 30);
+        advance_reading(&mut metrics);
+        let retried = process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+        assert_eq!(
+            retried.escalation.unwrap().status,
+            escalation::EscalationStatus::Completed
+        );
+        assert!(!state.memory_pressure_plan_pending);
+        advance_reading(&mut metrics);
+        let stable = process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+        assert!(stable.escalation.is_none());
+    }
+
+    #[test]
+    fn daemon_restart_and_missing_sensors_cannot_clear_memory_pressure() {
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        let mut emergency = pressure_metrics(40, Some(75.0), 1000);
+        state.observe_memory_pressure(&config, &emergency);
+        advance_reading(&mut emergency);
+        state.observe_memory_pressure(&config, &emergency);
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let mut state: DaemonState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(state.memory_pressure.mode(), PressureMode::Emergency);
+
+        let mut missing = pressure_metrics(40, None, 1120);
+        state.observe_memory_pressure(&config, &missing);
+        assert!(state.last_memory_pressure.is_none());
+        assert_eq!(state.next_tick_interval_secs(&config), 15);
+        missing.pressure.as_mut().unwrap().meminfo = None;
+        advance_reading(&mut missing);
+        state.observe_memory_pressure(&config, &missing);
+        assert!(state.last_memory_pressure.is_none());
+        assert_eq!(state.memory_pressure.mode(), PressureMode::Emergency);
+
+        let mut normal = pressure_metrics(40, Some(1.0), 1240);
+        state.observe_memory_pressure(&config, &normal);
+        assert_eq!(state.memory_pressure.mode(), PressureMode::Emergency);
+        advance_reading(&mut normal);
+        state.observe_memory_pressure(&config, &normal);
+        assert_eq!(state.memory_pressure.mode(), PressureMode::Normal);
+        assert_eq!(state.next_tick_interval_secs(&config), 60);
+        assert!(!state.memory_pressure_plan_pending);
+    }
+
+    #[test]
+    fn pressure_cadence_never_slows_the_base_or_creates_a_busy_loop() {
+        let mut config = DaemonConfig {
+            tick_interval_secs: 5,
+            ..Default::default()
+        };
+        let mut state = DaemonState::new();
+        let mut metrics = pressure_metrics(97, Some(75.0), 1000);
+        state.observe_memory_pressure(&config, &metrics);
+        advance_reading(&mut metrics);
+        state.observe_memory_pressure(&config, &metrics);
+        assert_eq!(state.next_tick_interval_secs(&config), 5);
+
+        config.memory_pressure.emergency_interval_secs = 0.0;
+        advance_reading(&mut metrics);
+        state.observe_memory_pressure(&config, &metrics);
+        assert_eq!(state.next_tick_interval_secs(&config), 5);
+        config.tick_interval_secs = 0;
+        assert_eq!(state.next_tick_interval_secs(&config), 1);
+    }
+
+    #[test]
+    fn pressure_plan_keeps_auto_mitigation_disabled() {
+        let mut config = DaemonConfig::default();
+        config.memory_pressure.transition_count = 1;
+        config.memory_pressure.auto_apply = true;
+        let mut state = DaemonState::new();
+        let mut triggers = triggers::TriggerState::new(&config.triggers);
+        let outcome = process_tick(
+            &config,
+            &mut state,
+            &mut triggers,
+            &pressure_metrics(40, Some(75.0), 1000),
+            &mut |config, _| {
+                assert!(!config.allow_auto_mitigation);
+                escalation::EscalationOutcome {
+                    status: escalation::EscalationStatus::Completed,
+                    reason: "review plan generated".to_string(),
+                    session_id: Some("pressure-plan".to_string()),
+                    provenance_summary: None,
+                }
+            },
+        );
+        assert_eq!(
+            outcome.escalation.unwrap().session_id.as_deref(),
+            Some("pressure-plan")
+        );
     }
 }

@@ -47,6 +47,39 @@ pub struct MemorySignals {
 }
 
 impl MemorySignals {
+    /// Build a reading only when memory capacity and availability were observed.
+    /// Missing `/proc` evidence must not become a zero-utilization sample.
+    pub fn from_pressure_snapshot(
+        snapshot: &crate::collect::pressure::PressureSnapshot,
+    ) -> Option<Self> {
+        let memory = snapshot.meminfo?;
+        let total_bytes = memory.total?;
+        let available_bytes = memory.available?;
+        let signals = Self {
+            total_bytes,
+            used_bytes: total_bytes.saturating_sub(available_bytes),
+            available_bytes,
+            swap_used_bytes: memory.swap_used().unwrap_or(0),
+            swap_total_bytes: memory.swap_total.unwrap_or(0),
+            psi_some10: snapshot
+                .memory
+                .and_then(|psi| psi.some)
+                .map(|psi| psi.avg10),
+            timestamp: snapshot.sampled_at_ms as f64 / 1000.0,
+        };
+        signals.is_valid().then_some(signals)
+    }
+
+    fn is_valid(&self) -> bool {
+        self.total_bytes > 0
+            && self.available_bytes <= self.total_bytes
+            && self.timestamp.is_finite()
+            && self.timestamp >= 0.0
+            && self
+                .psi_some10
+                .is_none_or(|psi| psi.is_finite() && (0.0..=100.0).contains(&psi))
+    }
+
     /// Memory utilization as a fraction (0.0 to 1.0).
     pub fn utilization(&self) -> f64 {
         if self.total_bytes == 0 {
@@ -65,7 +98,8 @@ impl MemorySignals {
 }
 
 /// Configuration for memory pressure response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MemPressureConfig {
     /// Memory utilization threshold for Warning mode (fraction).
     pub warning_threshold: f64,
@@ -94,8 +128,8 @@ impl Default for MemPressureConfig {
             emergency_threshold: 0.95,
             psi_warning_threshold: 20.0,
             psi_emergency_threshold: 60.0,
-            normal_interval_secs: 300.0,
-            warning_interval_secs: 60.0,
+            normal_interval_secs: 60.0,
+            warning_interval_secs: 30.0,
             emergency_interval_secs: 15.0,
             transition_count: 2,
             auto_apply: false,
@@ -131,12 +165,19 @@ pub struct PressureEvaluation {
     pub scan_interval_secs: f64,
     /// Memory utilization at evaluation.
     pub utilization: f64,
+    /// Observed memory PSI (some avg10), when supported by this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psi_some10: Option<f64>,
+    /// False when utilization supports escalation but a previously observed PSI
+    /// sensor is unavailable; such a reading cannot establish recovery.
+    #[serde(default)]
+    pub evidence_complete: bool,
     /// Human-readable explanation.
     pub explanation: String,
 }
 
 /// Memory pressure state machine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemPressureMonitor {
     config: MemPressureConfig,
     current_mode: PressureMode,
@@ -145,9 +186,18 @@ pub struct MemPressureMonitor {
     emergency_count: usize,
     normal_count: usize,
     /// Last evaluation timestamp.
-    last_eval_ts: f64,
+    last_eval_ts: Option<f64>,
     /// Total transitions.
     transition_count: u64,
+    /// Once PSI is observable on this host, losing it cannot prove recovery.
+    #[serde(default)]
+    psi_observed: bool,
+}
+
+impl Default for MemPressureMonitor {
+    fn default() -> Self {
+        Self::new(MemPressureConfig::default())
+    }
 }
 
 impl MemPressureMonitor {
@@ -158,32 +208,83 @@ impl MemPressureMonitor {
             warning_count: 0,
             emergency_count: 0,
             normal_count: 0,
-            last_eval_ts: 0.0,
+            last_eval_ts: None,
             transition_count: 0,
+            psi_observed: false,
         }
+    }
+
+    /// Apply changed thresholds without forgetting an existing pressure episode.
+    /// Consecutive readings under the old thresholds do not count under the new ones.
+    pub fn reconfigure(&mut self, config: MemPressureConfig) {
+        if self.config != config {
+            self.config = config;
+            self.reset_observation_counts();
+        }
+    }
+
+    /// Observe an optional live reading. Unreadable or invalid evidence breaks a
+    /// consecutive-sample streak, but never clears an elevated pressure mode.
+    pub fn observe(&mut self, signals: Option<&MemorySignals>) -> Option<PressureEvaluation> {
+        let Some(signals) = signals.filter(|signals| signals.is_valid()) else {
+            self.reset_observation_counts();
+            return None;
+        };
+        if self
+            .last_eval_ts
+            .is_some_and(|last| signals.timestamp <= last)
+        {
+            self.reset_observation_counts();
+            return None;
+        }
+        self.last_eval_ts = Some(signals.timestamp);
+        let missing_psi = self.psi_observed && signals.psi_some10.is_none();
+        // A failed optional PSI read must not suppress an emergency established
+        // independently by MemAvailable, but absence is never a normal PSI value.
+        if missing_psi && self.classify_signal(signals) == PressureMode::Normal {
+            self.reset_observation_counts();
+            return None;
+        }
+        self.psi_observed |= signals.psi_some10.is_some();
+        let mut evaluation = self.evaluate(signals);
+        evaluation.evidence_complete = !missing_psi;
+        if missing_psi {
+            evaluation.explanation.push_str(
+                "; memory PSI unavailable: utilization supports escalation, recovery requires PSI",
+            );
+        }
+        Some(evaluation)
+    }
+
+    fn reset_observation_counts(&mut self) {
+        self.warning_count = 0;
+        self.emergency_count = 0;
+        self.normal_count = 0;
     }
 
     /// Evaluate memory signals and return the pressure response.
     pub fn evaluate(&mut self, signals: &MemorySignals) -> PressureEvaluation {
         let util = signals.utilization();
-        self.last_eval_ts = signals.timestamp;
+        self.last_eval_ts = Some(signals.timestamp);
 
         let signal_level = self.classify_signal(signals);
 
         // Update counters.
         match signal_level {
             PressureMode::Emergency => {
-                self.emergency_count += 1;
-                self.warning_count = 0;
+                self.emergency_count = self.emergency_count.saturating_add(1);
+                // Emergency readings also establish sustained warning-level
+                // pressure; oscillation around the upper threshold is not normal.
+                self.warning_count = self.warning_count.saturating_add(1);
                 self.normal_count = 0;
             }
             PressureMode::Warning => {
-                self.warning_count += 1;
+                self.warning_count = self.warning_count.saturating_add(1);
                 self.emergency_count = 0;
                 self.normal_count = 0;
             }
             PressureMode::Normal => {
-                self.normal_count += 1;
+                self.normal_count = self.normal_count.saturating_add(1);
                 self.warning_count = 0;
                 self.emergency_count = 0;
             }
@@ -196,7 +297,7 @@ impl MemPressureMonitor {
         let transitioned = new_mode != previous_mode;
         if transitioned {
             self.current_mode = new_mode;
-            self.transition_count += 1;
+            self.transition_count = self.transition_count.saturating_add(1);
         }
 
         let action = match (new_mode, transitioned) {
@@ -206,15 +307,15 @@ impl MemPressureMonitor {
             (PressureMode::Normal, _) => PressureAction::Continue,
         };
 
-        let interval = match new_mode {
-            PressureMode::Normal => self.config.normal_interval_secs,
-            PressureMode::Warning => self.config.warning_interval_secs,
-            PressureMode::Emergency => self.config.emergency_interval_secs,
-        };
+        let interval = self.scan_interval_secs();
 
         let explanation = format!(
-            "Memory {:.0}% → {} mode{}",
+            "Memory {:.0}%{} → {} mode{}",
             util * 100.0,
+            signals
+                .psi_some10
+                .map(|psi| format!(", PSI some avg10 {psi:.1}%"))
+                .unwrap_or_default(),
             new_mode,
             if transitioned {
                 format!(" (was {})", previous_mode)
@@ -234,6 +335,8 @@ impl MemPressureMonitor {
             action,
             scan_interval_secs: interval,
             utilization: util,
+            psi_some10: signals.psi_some10,
+            evidence_complete: true,
             explanation,
         }
     }
@@ -253,7 +356,7 @@ impl MemPressureMonitor {
     }
 
     fn compute_transition(&self) -> PressureMode {
-        let threshold = self.config.transition_count;
+        let threshold = self.config.transition_count.max(1);
 
         // Escalation requires consecutive signals.
         if self.emergency_count >= threshold {
@@ -273,6 +376,25 @@ impl MemPressureMonitor {
     /// Current mode.
     pub fn mode(&self) -> PressureMode {
         self.current_mode
+    }
+
+    /// Cadence for the retained mode, including when a later reading is missing.
+    pub fn scan_interval_secs(&self) -> f64 {
+        match self.current_mode {
+            PressureMode::Normal => self.config.normal_interval_secs,
+            PressureMode::Warning => self.config.warning_interval_secs,
+            PressureMode::Emergency => self.config.emergency_interval_secs,
+        }
+    }
+
+    /// Consecutive readings supporting the retained mode. This can be zero while
+    /// hysteresis waits for enough lower-pressure readings to establish recovery.
+    pub fn sustained_samples(&self) -> usize {
+        match self.current_mode {
+            PressureMode::Normal => self.normal_count,
+            PressureMode::Warning => self.warning_count,
+            PressureMode::Emergency => self.emergency_count,
+        }
     }
 
     /// Total transition count.
@@ -446,6 +568,177 @@ mod tests {
 
         // Only 1 consecutive warning, not 2 → stays normal.
         assert_eq!(mon.mode(), PressureMode::Normal);
+    }
+
+    #[test]
+    fn unavailable_readings_break_streaks_and_never_establish_recovery() {
+        let mut monitor = MemPressureMonitor::default();
+
+        monitor.observe(Some(&make_signals(97.0, 1000.0)));
+        assert!(monitor.observe(None).is_none());
+        monitor.observe(Some(&make_signals(97.0, 1060.0)));
+        assert_eq!(monitor.mode(), PressureMode::Normal);
+        monitor.observe(Some(&make_signals(97.0, 1120.0)));
+        assert_eq!(monitor.mode(), PressureMode::Emergency);
+
+        monitor.observe(Some(&make_signals(40.0, 1180.0)));
+        assert!(monitor.observe(None).is_none());
+        monitor.observe(Some(&make_signals(40.0, 1240.0)));
+        assert_eq!(monitor.mode(), PressureMode::Emergency);
+        monitor.observe(Some(&make_signals(40.0, 1300.0)));
+        assert_eq!(monitor.mode(), PressureMode::Normal);
+    }
+
+    #[test]
+    fn observed_psi_cannot_disappear_and_count_as_recovery() {
+        let mut monitor = MemPressureMonitor::default();
+        let mut signals = make_signals(40.0, 1000.0);
+        signals.psi_some10 = Some(75.0);
+        monitor.observe(Some(&signals));
+        signals.timestamp += 60.0;
+        let emergency = monitor.observe(Some(&signals)).unwrap();
+        assert_eq!(emergency.mode, PressureMode::Emergency);
+        assert_eq!(emergency.psi_some10, Some(75.0));
+
+        signals.psi_some10 = None;
+        for _ in 0..3 {
+            signals.timestamp += 60.0;
+            assert!(monitor.observe(Some(&signals)).is_none());
+            assert_eq!(monitor.mode(), PressureMode::Emergency);
+        }
+        signals.psi_some10 = Some(1.0);
+        signals.timestamp += 60.0;
+        monitor.observe(Some(&signals));
+        assert_eq!(monitor.mode(), PressureMode::Emergency);
+        signals.timestamp += 60.0;
+        monitor.observe(Some(&signals));
+        assert_eq!(monitor.mode(), PressureMode::Normal);
+    }
+
+    #[test]
+    fn missing_psi_cannot_suppress_an_observed_utilization_emergency() {
+        let mut monitor = MemPressureMonitor::default();
+        let mut normal = make_signals(40.0, 1000.0);
+        normal.psi_some10 = Some(1.0);
+        monitor.observe(Some(&normal));
+
+        monitor.observe(Some(&make_signals(99.0, 1060.0)));
+        let emergency = monitor.observe(Some(&make_signals(99.0, 1120.0))).unwrap();
+        assert_eq!(emergency.mode, PressureMode::Emergency);
+        assert!(!emergency.evidence_complete);
+        assert!(emergency.explanation.contains("PSI unavailable"));
+
+        for timestamp in [1180.0, 1240.0] {
+            assert!(monitor
+                .observe(Some(&make_signals(40.0, timestamp)))
+                .is_none());
+            assert_eq!(monitor.mode(), PressureMode::Emergency);
+        }
+        normal.timestamp = 1300.0;
+        monitor.observe(Some(&normal));
+        normal.timestamp = 1360.0;
+        monitor.observe(Some(&normal));
+        assert_eq!(monitor.mode(), PressureMode::Normal);
+    }
+
+    #[test]
+    fn repeated_or_older_samples_cannot_satisfy_sustained_pressure() {
+        let mut monitor = MemPressureMonitor::default();
+        monitor.observe(Some(&make_signals(99.0, 1060.0)));
+        assert!(monitor.observe(Some(&make_signals(99.0, 1060.0))).is_none());
+        assert!(monitor.observe(Some(&make_signals(99.0, 1000.0))).is_none());
+        monitor.observe(Some(&make_signals(99.0, 1120.0)));
+        assert_eq!(monitor.mode(), PressureMode::Normal);
+        monitor.observe(Some(&make_signals(99.0, 1180.0)));
+        assert_eq!(monitor.mode(), PressureMode::Emergency);
+    }
+
+    #[test]
+    fn oscillating_high_pressure_still_establishes_a_warning() {
+        let mut monitor = MemPressureMonitor::default();
+        monitor.observe(Some(&make_signals(94.0, 1000.0)));
+        let warning = monitor.observe(Some(&make_signals(96.0, 1060.0))).unwrap();
+        assert_eq!(warning.mode, PressureMode::Warning);
+        monitor.observe(Some(&make_signals(94.0, 1120.0)));
+        monitor.observe(Some(&make_signals(96.0, 1180.0)));
+        assert_eq!(monitor.mode(), PressureMode::Warning);
+        monitor.observe(Some(&make_signals(96.0, 1240.0)));
+        assert_eq!(monitor.mode(), PressureMode::Emergency);
+    }
+
+    #[test]
+    fn invalid_capacity_or_psi_cannot_clear_pressure() {
+        let mut monitor = MemPressureMonitor::new(MemPressureConfig {
+            transition_count: 1,
+            ..Default::default()
+        });
+        monitor.observe(Some(&make_signals(97.0, 1000.0)));
+        let normal = make_signals(40.0, 1060.0);
+        let invalid = [
+            MemorySignals {
+                total_bytes: 0,
+                ..normal.clone()
+            },
+            MemorySignals {
+                available_bytes: normal.total_bytes + 1,
+                ..normal.clone()
+            },
+            MemorySignals {
+                psi_some10: Some(f64::NAN),
+                ..normal.clone()
+            },
+            MemorySignals {
+                psi_some10: Some(101.0),
+                ..normal
+            },
+        ];
+        for reading in invalid {
+            assert!(monitor.observe(Some(&reading)).is_none());
+            assert_eq!(monitor.mode(), PressureMode::Emergency);
+        }
+    }
+
+    #[test]
+    fn persisted_monitor_retains_pressure_and_recovery_evidence() {
+        let mut monitor = MemPressureMonitor::default();
+        monitor.observe(Some(&make_signals(97.0, 1000.0)));
+        monitor.observe(Some(&make_signals(97.0, 1060.0)));
+        let bytes = serde_json::to_vec(&monitor).unwrap();
+        let mut restored: MemPressureMonitor = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(restored.mode(), PressureMode::Emergency);
+        assert_eq!(restored.scan_interval_secs(), 15.0);
+        restored.observe(None);
+        restored.observe(Some(&make_signals(40.0, 1120.0)));
+        assert_eq!(restored.mode(), PressureMode::Emergency);
+        restored.observe(Some(&make_signals(40.0, 1180.0)));
+        assert_eq!(restored.mode(), PressureMode::Normal);
+    }
+
+    #[test]
+    fn reconfiguration_retains_mode_but_resets_old_threshold_streaks() {
+        let mut monitor = MemPressureMonitor::default();
+        monitor.observe(Some(&make_signals(97.0, 1000.0)));
+        monitor.observe(Some(&make_signals(97.0, 1060.0)));
+        monitor.observe(Some(&make_signals(40.0, 1120.0)));
+        monitor.reconfigure(MemPressureConfig {
+            warning_threshold: 0.75,
+            ..Default::default()
+        });
+        monitor.observe(Some(&make_signals(40.0, 1180.0)));
+        assert_eq!(monitor.mode(), PressureMode::Emergency);
+        monitor.observe(Some(&make_signals(40.0, 1240.0)));
+        assert_eq!(monitor.mode(), PressureMode::Normal);
+    }
+
+    #[test]
+    fn zero_transition_count_still_requires_an_observed_pressure_signal() {
+        let mut monitor = MemPressureMonitor::new(MemPressureConfig {
+            transition_count: 0,
+            ..Default::default()
+        });
+        let evaluation = monitor.observe(Some(&make_signals(40.0, 1000.0))).unwrap();
+        assert_eq!(evaluation.mode, PressureMode::Normal);
     }
 
     #[test]

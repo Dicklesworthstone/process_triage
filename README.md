@@ -686,15 +686,16 @@ pt-core daemon stop               # Stop monitor
 
 ### How It Works
 
-The daemon runs a tick-based event loop (default: every 60 seconds) that evaluates trigger conditions:
+The daemon polls every 60 seconds by default, increasing to 30 seconds under a memory warning and 15 seconds in a memory emergency. It evaluates these trigger conditions:
 
-| Trigger | Default Threshold | What It Detects |
-|---------|------------------|-----------------|
-| Load average | > 4.0 | CPU overload |
-| Orphan count | > 20 | Process leak |
-| Memory pressure | > 85% used | Memory exhaustion |
+| Trigger | Default Threshold | Sustained Window |
+|---------|------------------|------------------|
+| Load average | > 4.0 | 3 consecutive ticks |
+| Orphan count | > 20 | 3 consecutive ticks |
+| Memory utilization | > 85% used | 3 consecutive ticks |
+| Graded memory / PSI pressure | ≥ 80% used or memory PSI ≥ 20%; emergency at ≥ 95% used or PSI ≥ 60% | 2 consecutive observed readings |
 
-When a trigger fires for 3 consecutive ticks, the daemon escalates: it runs `agent plan` and posts the result to the inbox (`pt-core agent inbox`) and as a desktop notification. It never acts on its own.
+When a trigger fires, the daemon requests `agent plan` and posts the result to the inbox (`pt-core agent inbox`) and as a desktop notification. Every request still respects the global action lock and the escalation cooldown (300 seconds by default). A deferred memory warning is retried while pressure persists. It never acts on its own.
 
 ### Self-Limiting
 
@@ -704,7 +705,7 @@ The daemon enforces overhead budgets on itself:
 - **RSS cap**: 64MB by default (configurable)
 - **Event audit ring**: Circular buffer of 100 recent events for debugging
 
-If the daemon itself exceeds its budget, it backs off automatically.
+If the daemon itself exceeds its budget, it skips plan generation and uses the base polling interval. Cheap pressure observations continue, so missing a plan cycle does not erase an ongoing pressure episode.
 
 ---
 
@@ -821,19 +822,19 @@ At 5+ loops, kill utility drops to 20% of baseline. The recommendation escalates
 
 ## Memory Pressure Response
 
-> **Status: library-only.** The shipped daemon uses one memory trigger (≥ 85% used for 3 ticks, see [Daemon](#how-it-works)); the graded modes below are implemented in `mem_pressure.rs` but not wired into the daemon yet.
+The Linux daemon uses observed memory availability and Pressure Stall Information to select a monitoring mode. Memory utilization is `1 - MemAvailable / MemTotal`, so reclaimable cache is not counted as unavailable memory.
 
-The designed behavior: monitor system memory and escalate scan cadence when pressure rises:
-
-| Mode | Threshold | Scan Interval | Action |
+| Mode | Threshold | Default Poll Interval | Response |
 |------|-----------|:-------------:|--------|
-| Normal | < 80% used | 300s | Continue monitoring |
-| Warning | >= 80% used | 60s | Generate triage plan |
-| Emergency | >= 95% used | 15s | Urgent plan, prioritize high-RSS candidates |
+| Normal | < 80% used and memory PSI < 20% | 60s | Continue monitoring |
+| Warning | ≥ 80% used or memory PSI ≥ 20% | 30s | Generate a triage plan for review |
+| Emergency | ≥ 95% used or memory PSI ≥ 60% | 15s | Request an urgent review plan and send a critical notification |
 
-Transitions require 2 consecutive signals at the new level (prevents flapping on momentary spikes). De-escalation also requires 2 consecutive normal readings.
+Transitions require 2 consecutive readings, each with a newer sampling timestamp. Recovery requires 2 consecutive normal observations. The current mode survives daemon restarts; observation streaks restart after downtime. Missing or invalid readings break a streak and cannot establish recovery. On hosts where PSI was previously available, losing it still allows escalation based on high observed memory utilization, but recovery waits for PSI to return. Kernels without PSI can use memory utilization alone.
 
-On Linux, `pt` reads Pressure Stall Information (`/proc/pressure/memory`) when available, using `memory.some` as a more accurate signal than raw utilization. PSI thresholds: 20% for warning, 60% for emergency.
+PSI thresholds use the `some avg10` percentage from `/proc/pressure/memory`. The complete pressure snapshot, the retained mode and the current evaluation when available appear in `pt-core --format json daemon status`. An emergency notification remains critical even when the planner finds no processes safe to act on.
+
+The `memory_pressure` section of `daemon.json` configures the thresholds, `transition_count`, and `normal_interval_secs` / `warning_interval_secs` / `emergency_interval_secs`. Polling never becomes slower than `tick_interval_secs` and never uses a zero-second loop. Pressure responses generate plans and notifications only; execution still requires an explicit apply.
 
 ---
 
