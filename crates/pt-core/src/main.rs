@@ -78,8 +78,11 @@ use pt_core::supervision::{
 use pt_core::tui::widgets::ProcessRow;
 #[cfg(feature = "ui")]
 use pt_core::tui::{run_ftui, App, ExecutionOutcome, RefreshOutcome};
+#[cfg(test)]
+use pt_core::verify::verify_plan;
 use pt_core::verify::{
-    executed_plan_actions, parse_action_outcomes, parse_agent_plan, verify_plan, VerifyOutcome,
+    executed_plan_actions, observe_live_postcondition, parse_action_outcomes, parse_agent_plan,
+    verify_plan_with_postconditions, VerifyOutcome,
 };
 use pt_telemetry::retention::{RetentionConfig, RetentionEnforcer, RetentionError};
 use pt_telemetry::shadow::{Observation, ShadowStorage, ShadowStorageConfig};
@@ -23120,12 +23123,13 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     }
 
     let completed_at = chrono::Utc::now();
-    let report = match verify_plan(
+    let report = match verify_plan_with_postconditions(
         &plan,
         &saved_outcomes,
         &scan_result.processes,
         requested_at,
         completed_at,
+        observe_live_postcondition,
     ) {
         Ok(report) => report,
         Err(error) => {

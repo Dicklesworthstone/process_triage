@@ -40,7 +40,10 @@
     "resource_summary": {
       "type": "object",
       "properties": {
-        "memory_freed_mb": { "type": "number" },
+        "expected_freed_mb": {
+          "type": "number",
+          "description": "Planned footprint of verified kills; not measured host or target relief"
+        },
         "expected_mb": { "type": "number" },
         "shortfall_reason": { "type": "string" }
       }
@@ -70,16 +73,20 @@
           "enum": [
             "confirmed_dead",
             "confirmed_stopped",
+            "confirmed_effect",
+            "effect_not_observed",
             "still_running",
             "respawned",
             "pid_reused",
             "cascaded",
-            "timeout"
+            "timeout",
+            "unsupported"
           ]
         },
         "time_to_death_ms": { "type": "integer" },
-        "resources_freed": {
+        "expected_resources_freed": {
           "type": "object",
+          "description": "Expected footprint of a verified kill, kept separate from measured relief",
           "properties": {
             "memory_mb": { "type": "number" },
             "cpu_pct": { "type": "number" }
@@ -88,8 +95,12 @@
         "respawn_detected": {
           "type": "object",
           "properties": {
-            "new_pid": { "type": "integer" },
-            "new_start_id": { "type": "string" }
+            "pid": { "type": "integer" },
+            "cmd_full": { "type": "string" },
+            "start_time_unix": { "type": "integer" },
+            "parent_pid": { "type": "integer" },
+            "parent_cmd": { "type": "string" },
+            "parent_start_id": { "type": "string" }
           }
         }
       }

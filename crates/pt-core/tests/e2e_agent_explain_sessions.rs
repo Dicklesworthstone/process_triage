@@ -763,6 +763,182 @@ fn verify_with_plan_produces_json() {
     });
 }
 
+/// A process owned by the parent test, with several stable sleeping threads.
+/// It is a fixture entry point, not an action on the surrounding test runner.
+#[cfg(target_os = "linux")]
+#[test]
+fn verify_owned_priority_worker() {
+    if env::var("PT_VERIFY_OWNED_PRIORITY_WORKER").as_deref() != Ok("1") {
+        return;
+    }
+    use std::io::Write;
+    use std::sync::{Arc, Barrier};
+    let ready = Arc::new(Barrier::new(4));
+    for _ in 0..3 {
+        let ready = Arc::clone(&ready);
+        std::thread::spawn(move || {
+            ready.wait();
+            loop {
+                std::thread::park();
+            }
+        });
+    }
+    ready.wait();
+    println!("PT_VERIFY_PRIORITY_READY");
+    std::io::stdout().flush().expect("flush fixture readiness");
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verify_cli_confirms_fresh_all_thread_renice_without_claiming_resource_relief() {
+    use pt_core::action::{ActionRunner, ReniceActionRunner, DEFAULT_NICE_VALUE};
+    use pt_core::verify::{capture_execution_clock, SavedActionOutcome};
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    with_temp_data_dir(|dir| {
+        let mut child = ProcessCommand::new(env::current_exe().expect("current test executable"))
+            .args(["--exact", "verify_owned_priority_worker", "--nocapture"])
+            .env("PT_VERIFY_OWNED_PRIORITY_WORKER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn owned multithreaded fixture");
+        let stdout = child.stdout.take().expect("fixture stdout");
+        let child = ChildGuard { child };
+        let pid = child.child.id();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let readiness = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line
+                    .expect("read fixture output")
+                    .contains("PT_VERIFY_PRIORITY_READY")
+                {
+                    let _ = ready_tx.send(());
+                    return;
+                }
+            }
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("owned fixture readiness");
+        readiness.join().expect("readiness observer");
+
+        let identity = pt_core::collect::tick_delta::collect_tick_snapshot(pid)
+            .expect("read owned fixture identity")
+            .identity;
+        let session_id = create_session_with_plan(dir, identity.clone(), false);
+        let store = SessionStore::from_env().expect("session store");
+        let handle = store.open(&session_id).expect("session");
+        let plan_path = handle.dir.join("decision/plan.json");
+        let mut plan: Plan =
+            serde_json::from_str(&fs::read_to_string(&plan_path).unwrap()).unwrap();
+        plan.actions[0].action = Action::Renice;
+        fs::write(&plan_path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+        let action = &plan.actions[0];
+        let runner = ReniceActionRunner::with_defaults();
+        let executed_at = chrono::Utc::now();
+        let execution_clock = capture_execution_clock().expect("execution clock");
+        runner
+            .execute(action)
+            .expect("renice only the owned fixture");
+        runner
+            .verify(action)
+            .expect("observe all fixture thread priorities");
+        let before_verify = runner
+            .capture_reversal_metadata(pid)
+            .expect("priority census before verify");
+        assert!(before_verify.threads.len() >= 4);
+        assert!(before_verify
+            .threads
+            .iter()
+            .all(|thread| thread.previous_nice >= DEFAULT_NICE_VALUE));
+
+        let execution = SavedActionOutcome {
+            action_id: action.action_id.clone(),
+            pid,
+            status: "success".into(),
+            action: Some(Action::Renice),
+            target: Some(identity),
+            command: None,
+            parent_pid: Some(std::process::id()),
+            parent_identity: None,
+            executed_at: Some(executed_at),
+            execution_clock: Some(execution_clock),
+            time_ms: None,
+        };
+        fs::create_dir_all(handle.dir.join("action")).unwrap();
+        fs::write(
+            handle.dir.join("action/outcomes.jsonl"),
+            format!("{}\n", serde_json::to_string(&execution).unwrap()),
+        )
+        .unwrap();
+
+        let output = pt_core_fast()
+            .env("PROCESS_TRIAGE_DATA", dir.path())
+            .args([
+                "--format",
+                "json",
+                "agent",
+                "verify",
+                "--session",
+                &session_id.0,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let report: Value = serde_json::from_slice(&output).expect("verification JSON");
+        assert_eq!(
+            report["verification"]["overall_status"], "success",
+            "{report}"
+        );
+        let outcome = &report["action_outcomes"][0];
+        assert_eq!(outcome["action"], "renice");
+        assert_eq!(outcome["outcome"], "confirmed_effect", "{outcome}");
+        assert_eq!(outcome["actual"], "priority_verified");
+        assert_eq!(outcome["verified"], true);
+        assert!(outcome["note"]
+            .as_str()
+            .unwrap()
+            .contains("current threads"));
+        assert!(outcome.get("expected_resources_freed").is_none());
+        assert_eq!(report["resource_summary"]["expected_freed_mb"], 0.0);
+        let persisted: Value = serde_json::from_slice(
+            &fs::read(handle.dir.join("action/verifications.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["action_outcomes"][0]["verified"], true);
+
+        let after_verify = runner
+            .capture_reversal_metadata(pid)
+            .expect("priority census after verify");
+        let priorities = |snapshot: &pt_core::action::ReniceReversalMetadata| {
+            snapshot
+                .threads
+                .iter()
+                .map(|thread| {
+                    (
+                        thread.tid,
+                        thread.start_ticks,
+                        thread.uid,
+                        thread.previous_nice,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            priorities(&before_verify),
+            priorities(&after_verify),
+            "verification must not alter priority or membership"
+        );
+    });
+}
+
 // ============================================================================
 // helpers
 // ============================================================================

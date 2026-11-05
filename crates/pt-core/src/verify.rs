@@ -136,10 +136,160 @@ pub struct VerifyTarget {
 pub enum VerifyOutcome {
     ConfirmedDead,
     ConfirmedStopped,
+    /// A reversible action's current postcondition was independently observed.
+    ConfirmedEffect,
+    /// Current evidence establishes that the reversible postcondition is unmet.
+    EffectNotObserved,
     StillRunning,
     Respawned,
     PidReused,
     Unsupported,
+}
+
+/// Fresh action-specific evidence, distinct from a saved execution status.
+///
+/// An observer must only read state and bind every observation to `PlanAction.target`.
+/// It must not replay an action or infer an effect from a saved success record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionPostcondition {
+    Satisfied { detail: String },
+    NotSatisfied { detail: String },
+    Unavailable { reason: String },
+    IdentityChanged,
+}
+
+/// Observe the priority postcondition used by the default production apply runner.
+///
+/// Linux nice values belong to threads: use the existing stable, identity-bound
+/// thread snapshot, not the leader's priority alone. Capturing reversal metadata
+/// reads current priorities; it neither changes them nor restores anything.
+/// Unsupported controller actions remain unknown until their own observations
+/// can prove the configured effect. Priority verification does not prove CPU relief.
+pub fn observe_live_postcondition(action: &PlanAction) -> ActionPostcondition {
+    if action.action != Action::Renice {
+        return ActionPostcondition::Unavailable {
+            reason: "No live observation is implemented for this action's postcondition"
+                .to_string(),
+        };
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use crate::action::{IdentityProvider, LiveIdentityProvider, ReniceActionRunner};
+
+        if !action.target.can_safely_revalidate() {
+            return ActionPostcondition::Unavailable {
+                reason: "The planned identity cannot be safely revalidated".to_string(),
+            };
+        }
+        let identity = LiveIdentityProvider::new();
+        let revalidate = || match identity.revalidate(&action.target) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("The planned identity is absent, changed, or unreadable".to_string()),
+            Err(error) => Err(format!("Cannot revalidate the planned identity: {error}")),
+        };
+        if let Err(reason) = revalidate() {
+            return ActionPostcondition::Unavailable { reason };
+        }
+        let observed =
+            ReniceActionRunner::with_defaults().capture_reversal_metadata(action.target.pid.0);
+        if let Err(reason) = revalidate() {
+            return ActionPostcondition::Unavailable { reason };
+        }
+        match observed {
+            Some(observed) => renice_postcondition(&action.target, &observed),
+            None => ActionPostcondition::Unavailable {
+                reason: "Could not obtain a complete, stable priority observation for the planned process"
+                    .to_string(),
+            },
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        ActionPostcondition::Unavailable {
+            reason: "Live priority verification is unsupported on this platform".to_string(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn renice_postcondition(
+    target: &ProcessIdentity,
+    observed: &crate::action::ReniceReversalMetadata,
+) -> ActionPostcondition {
+    use crate::action::{DEFAULT_NICE_VALUE, MAX_NICE_VALUE};
+
+    if observed.pid != target.pid.0 {
+        return ActionPostcondition::IdentityChanged;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(identity) = observed.identity.as_ref() else {
+            return ActionPostcondition::Unavailable {
+                reason: "The priority snapshot has no process identity".to_string(),
+            };
+        };
+        if identity.pid != target.pid
+            || identity.start_id != target.start_id
+            || identity.uid != target.uid
+        {
+            return ActionPostcondition::IdentityChanged;
+        }
+        let mut seen = HashSet::new();
+        if observed.threads.is_empty()
+            || observed.threads.iter().any(|thread| {
+                thread.tid == 0
+                    || thread.uid != target.uid
+                    || !seen.insert(thread.tid)
+                    || !(-20..=MAX_NICE_VALUE).contains(&thread.previous_nice)
+            })
+            || !seen.contains(&target.pid.0)
+        {
+            return ActionPostcondition::Unavailable {
+                reason: "The priority snapshot has an incomplete or invalid thread census"
+                    .to_string(),
+            };
+        }
+        if let Some(thread) = observed
+            .threads
+            .iter()
+            .find(|thread| thread.previous_nice < DEFAULT_NICE_VALUE)
+        {
+            return ActionPostcondition::NotSatisfied {
+                detail: format!(
+                    "Thread {} remains at nice {}; expected at least {DEFAULT_NICE_VALUE} on every current thread",
+                    thread.tid, thread.previous_nice,
+                ),
+            };
+        }
+        ActionPostcondition::Satisfied {
+            detail: format!(
+                "Observed all {} current threads at nice >= {DEFAULT_NICE_VALUE}; this verifies priority, not resource relief",
+                observed.threads.len(),
+            ),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !(-20..=MAX_NICE_VALUE).contains(&observed.previous_nice) {
+            ActionPostcondition::Unavailable {
+                reason: "The observed process priority is invalid".to_string(),
+            }
+        } else if observed.previous_nice < DEFAULT_NICE_VALUE {
+            ActionPostcondition::NotSatisfied {
+                detail: format!(
+                    "Observed nice {}; expected at least {DEFAULT_NICE_VALUE}",
+                    observed.previous_nice,
+                ),
+            }
+        } else {
+            ActionPostcondition::Satisfied {
+                detail: format!(
+                    "Observed nice {}; expected at least {DEFAULT_NICE_VALUE}; this verifies priority, not resource relief",
+                    observed.previous_nice,
+                ),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -500,6 +650,26 @@ pub fn verify_plan(
     requested_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
 ) -> Result<VerificationReport, VerifyError> {
+    verify_plan_with_postconditions(plan, saved, current, requested_at, completed_at, |_| {
+        ActionPostcondition::Unavailable {
+            reason: "No fresh action-specific observation was supplied".to_string(),
+        }
+    })
+}
+
+/// Verify saved successful executions against current, identity-bound evidence.
+///
+/// Process snapshots prove Kill/Pause/Resume states. Renice needs a separate
+/// current priority observation, injected so fixture verification remains pure.
+/// Missing, failed and planning-only execution records never invoke the observer.
+pub fn verify_plan_with_postconditions(
+    plan: &Plan,
+    saved: &[SavedActionOutcome],
+    current: &[ProcessRecord],
+    requested_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    mut observe: impl FnMut(&PlanAction) -> ActionPostcondition,
+) -> Result<VerificationReport, VerifyError> {
     let recorded = recorded_plan_actions(plan, saved)?;
     validate_execution_timestamps(saved, completed_at)?;
     let by_pid: HashMap<_, _> = current
@@ -579,7 +749,7 @@ pub fn verify_plan(
             )
         } else {
             match (action.action, current_target) {
-                (Action::Kill | Action::Pause, Some(process))
+                (Action::Kill | Action::Pause | Action::Resume | Action::Renice, Some(process))
                     if process.start_id != action.target.start_id
                         || process.uid != action.target.uid =>
                 {
@@ -591,6 +761,58 @@ pub fn verify_plan(
                 }
                 (Action::Pause, Some(process)) if process.state == ProcessState::Stopped => {
                     (VerifyOutcome::ConfirmedStopped, "stopped", None)
+                }
+                (Action::Resume, Some(process))
+                    if matches!(
+                        process.state,
+                        ProcessState::Running
+                            | ProcessState::Sleeping
+                            | ProcessState::DiskSleep
+                            | ProcessState::Idle
+                    ) =>
+                {
+                    (
+                        VerifyOutcome::ConfirmedEffect,
+                        "resumed",
+                        Some(format!(
+                            "The same process is in state {}; it is no longer stopped. This does not establish useful work or resource relief",
+                            process.state,
+                        )),
+                    )
+                }
+                (Action::Resume, Some(process)) if process.state == ProcessState::Stopped => (
+                    VerifyOutcome::EffectNotObserved,
+                    "still_stopped",
+                    Some("The executed target is still stopped".to_string()),
+                ),
+                (Action::Renice, Some(process))
+                    if !matches!(
+                        process.state,
+                        ProcessState::Zombie | ProcessState::Dead | ProcessState::Unknown
+                    ) =>
+                {
+                    match observe(action) {
+                        ActionPostcondition::Satisfied { detail } => (
+                            VerifyOutcome::ConfirmedEffect,
+                            "priority_verified",
+                            Some(detail),
+                        ),
+                        ActionPostcondition::NotSatisfied { detail } => (
+                            VerifyOutcome::EffectNotObserved,
+                            "priority_not_adjusted",
+                            Some(detail),
+                        ),
+                        ActionPostcondition::Unavailable { reason } => (
+                            VerifyOutcome::Unsupported,
+                            "observation_unavailable",
+                            Some(reason),
+                        ),
+                        ActionPostcondition::IdentityChanged => (
+                            VerifyOutcome::PidReused,
+                            "identity_changed",
+                            Some("The process identity changed during priority observation".to_string()),
+                        ),
+                    }
                 }
                 (Action::Kill | Action::Pause, Some(_)) => {
                     (VerifyOutcome::StillRunning, "still_running", None)
@@ -607,7 +829,9 @@ pub fn verify_plan(
         };
         let verified = matches!(
             outcome,
-            VerifyOutcome::ConfirmedDead | VerifyOutcome::ConfirmedStopped
+            VerifyOutcome::ConfirmedDead
+                | VerifyOutcome::ConfirmedStopped
+                | VerifyOutcome::ConfirmedEffect
         );
         any_success |= verified;
         any_failed |= !verified;
@@ -634,6 +858,11 @@ pub fn verify_plan(
             recommendations.push(format!(
                 "PID {} still active; investigate the executed action",
                 action.target.pid.0
+            ));
+        } else if outcome == VerifyOutcome::EffectNotObserved {
+            recommendations.push(format!(
+                "PID {} does not satisfy the requested reversible effect; inspect its current state before retrying",
+                action.target.pid.0,
             ));
         }
         let command = execution
@@ -665,6 +894,8 @@ pub fn verify_plan(
                 match action.action {
                     Action::Kill => "terminated",
                     Action::Pause => "stopped",
+                    Action::Resume => "not_stopped",
+                    Action::Renice => "default_nice_priority_on_every_current_thread",
                     _ => "effect_requires_additional_evidence",
                 }
                 .to_string(),
@@ -1599,6 +1830,286 @@ mod tests {
     }
 
     #[test]
+    fn renice_requires_fresh_postconditions_and_retains_unknown_or_changed_evidence() {
+        let action = make_action(123, Action::Renice);
+        let saved = execution(&action);
+        let current = make_proc(123, 1000, "worker", 5, ProcessState::Sleeping);
+        let plan = make_plan(vec![action]);
+        assert_eq!(
+            report(
+                &plan,
+                std::slice::from_ref(&saved),
+                std::slice::from_ref(&current)
+            )
+            .action_outcomes[0]
+                .outcome,
+            VerifyOutcome::Unsupported,
+            "a saved success and live process do not prove priority"
+        );
+        for (observation, expected, actual, success) in [
+            (
+                ActionPostcondition::Satisfied {
+                    detail: "every current thread is at nice 10".into(),
+                },
+                VerifyOutcome::ConfirmedEffect,
+                "priority_verified",
+                true,
+            ),
+            (
+                ActionPostcondition::NotSatisfied {
+                    detail: "worker thread remains at nice 0".into(),
+                },
+                VerifyOutcome::EffectNotObserved,
+                "priority_not_adjusted",
+                false,
+            ),
+            (
+                ActionPostcondition::Unavailable {
+                    reason: "thread census is unreadable".into(),
+                },
+                VerifyOutcome::Unsupported,
+                "observation_unavailable",
+                false,
+            ),
+            (
+                ActionPostcondition::IdentityChanged,
+                VerifyOutcome::PidReused,
+                "identity_changed",
+                false,
+            ),
+        ] {
+            let mut calls = 0;
+            let verified = verify_plan_with_postconditions(
+                &plan,
+                std::slice::from_ref(&saved),
+                std::slice::from_ref(&current),
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |observed_action| {
+                    calls += 1;
+                    assert_eq!(observed_action.target, plan.actions[0].target);
+                    observation.clone()
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            let outcome = &verified.action_outcomes[0];
+            assert_eq!(outcome.outcome, expected);
+            assert_eq!(outcome.actual.as_deref(), Some(actual));
+            assert_eq!(outcome.verified, Some(success));
+            assert!(outcome.note.is_some());
+            assert!(outcome.expected_resources_freed.is_none());
+            assert_eq!(verified.follow_up_needed, Some(!success));
+            assert_eq!(
+                verified.verification.overall_status,
+                if success { "success" } else { "failure" }
+            );
+            assert_eq!(verified.resource_summary.unwrap().expected_freed_mb, 0.0);
+        }
+    }
+
+    #[test]
+    fn postcondition_observer_never_runs_for_unexecuted_failed_or_unbound_subjects() {
+        for case in [
+            "none",
+            "dry_run",
+            "shadow",
+            "skipped",
+            "failed",
+            "absent",
+            "birth",
+            "uid",
+            "zombie",
+            "dead",
+            "unknown",
+            "controller",
+        ] {
+            let action = make_action(
+                123,
+                if case == "controller" {
+                    Action::Freeze
+                } else {
+                    Action::Renice
+                },
+            );
+            let mut saved = vec![execution(&action)];
+            let mut current = vec![make_proc(123, 1000, "worker", 5, ProcessState::Sleeping)];
+            match case {
+                "none" => saved.clear(),
+                "dry_run" | "shadow" | "skipped" | "failed" => saved[0].status = case.into(),
+                "absent" => current.clear(),
+                "birth" => current[0].start_id = StartId("boot:501:123".into()),
+                "uid" => current[0].uid += 1,
+                "zombie" => current[0].state = ProcessState::Zombie,
+                "dead" => current[0].state = ProcessState::Dead,
+                "unknown" => current[0].state = ProcessState::Unknown,
+                "controller" => {}
+                _ => unreachable!(),
+            }
+            let verified = verify_plan_with_postconditions(
+                &make_plan(vec![action]),
+                &saved,
+                &current,
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |_| panic!("observer called for {case}"),
+            )
+            .unwrap();
+            let unexecuted = matches!(case, "none" | "dry_run" | "shadow" | "skipped");
+            assert_eq!(
+                verified.action_outcomes.len(),
+                if unexecuted { 0 } else { 1 },
+                "{case}"
+            );
+            assert!(
+                verified
+                    .action_outcomes
+                    .iter()
+                    .all(|outcome| outcome.verified == Some(false)),
+                "{case}"
+            );
+            if matches!(case, "birth" | "uid") {
+                assert_eq!(
+                    verified.action_outcomes[0].outcome,
+                    VerifyOutcome::PidReused
+                );
+            }
+        }
+        let action = make_action(123, Action::Renice);
+        let mut saved = execution(&action);
+        saved.target.as_mut().unwrap().uid += 1;
+        assert!(verify_plan_with_postconditions(
+            &make_plan(vec![action]),
+            &[saved],
+            &[make_proc(123, 1000, "worker", 5, ProcessState::Sleeping)],
+            DateTime::from_timestamp(30, 0).unwrap(),
+            DateTime::from_timestamp(31, 0).unwrap(),
+            |_| panic!("observer called for an invalid saved execution identity"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn resume_verification_requires_a_matching_live_nonstopped_state() {
+        for state in [
+            ProcessState::Running,
+            ProcessState::Sleeping,
+            ProcessState::DiskSleep,
+            ProcessState::Idle,
+            ProcessState::Stopped,
+            ProcessState::Zombie,
+            ProcessState::Dead,
+            ProcessState::Unknown,
+        ] {
+            let action = make_action(123, Action::Resume);
+            let saved = execution(&action);
+            let process = make_proc(123, 1000, "worker", 5, state);
+            let verified = report(&make_plan(vec![action]), &[saved], &[process]);
+            let expected = match state {
+                ProcessState::Running
+                | ProcessState::Sleeping
+                | ProcessState::DiskSleep
+                | ProcessState::Idle => VerifyOutcome::ConfirmedEffect,
+                ProcessState::Stopped => VerifyOutcome::EffectNotObserved,
+                _ => VerifyOutcome::Unsupported,
+            };
+            assert_eq!(verified.action_outcomes[0].outcome, expected, "{state}");
+            assert_eq!(
+                verified.action_outcomes[0].verified,
+                Some(expected == VerifyOutcome::ConfirmedEffect)
+            );
+            assert!(verified.action_outcomes[0]
+                .expected_resources_freed
+                .is_none());
+        }
+        let action = make_action(123, Action::Resume);
+        let saved = execution(&action);
+        let plan = make_plan(vec![action]);
+        assert_eq!(
+            report(&plan, std::slice::from_ref(&saved), &[]).action_outcomes[0].verified,
+            Some(false)
+        );
+        for process in [
+            make_proc(123, 1001, "replacement", 5, ProcessState::Running),
+            make_proc(123, 1000, "replacement", 6, ProcessState::Running),
+        ] {
+            assert_eq!(
+                report(&plan, std::slice::from_ref(&saved), &[process]).action_outcomes[0].outcome,
+                VerifyOutcome::PidReused
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn renice_priority_evidence_covers_workers_not_only_the_leader() {
+        use crate::action::renice::ReniceThreadReversal;
+        let target = make_action(123, Action::Renice).target;
+        let mut observed = crate::action::ReniceReversalMetadata {
+            pid: 123,
+            previous_nice: 10,
+            applied_nice: 10,
+            applied_at: String::new(),
+            identity: Some(target.clone()),
+            threads: vec![
+                ReniceThreadReversal {
+                    tid: 123,
+                    start_ticks: 500,
+                    uid: 1000,
+                    previous_nice: 10,
+                    applied_nice: 10,
+                },
+                ReniceThreadReversal {
+                    tid: 124,
+                    start_ticks: 501,
+                    uid: 1000,
+                    previous_nice: 0,
+                    applied_nice: 10,
+                },
+            ],
+        };
+        assert!(matches!(
+            renice_postcondition(&target, &observed),
+            ActionPostcondition::NotSatisfied { .. }
+        ));
+        observed.threads[1].previous_nice = 19;
+        assert!(matches!(
+            renice_postcondition(&target, &observed),
+            ActionPostcondition::Satisfied { .. }
+        ));
+        for case in [
+            "identity",
+            "missing_identity",
+            "empty",
+            "missing_leader",
+            "duplicate",
+            "uid",
+            "invalid_nice",
+        ] {
+            let mut invalid = observed.clone();
+            match case {
+                "identity" => {
+                    invalid.identity.as_mut().unwrap().start_id = StartId("boot:999:123".into())
+                }
+                "missing_identity" => invalid.identity = None,
+                "empty" => invalid.threads.clear(),
+                "missing_leader" => invalid.threads[0].tid = 125,
+                "duplicate" => invalid.threads[1].tid = 123,
+                "uid" => invalid.threads[1].uid += 1,
+                "invalid_nice" => invalid.threads[1].previous_nice = 20,
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    renice_postcondition(&target, &invalid),
+                    ActionPostcondition::Unavailable { .. } | ActionPostcondition::IdentityChanged
+                ),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn expected_resources_and_partial_status_are_truthfully_labeled() {
         let plan = make_plan(vec![
             make_action(123, Action::Kill),
@@ -1711,6 +2222,8 @@ mod tests {
         for (outcome, wire) in [
             (VerifyOutcome::ConfirmedDead, "confirmed_dead"),
             (VerifyOutcome::ConfirmedStopped, "confirmed_stopped"),
+            (VerifyOutcome::ConfirmedEffect, "confirmed_effect"),
+            (VerifyOutcome::EffectNotObserved, "effect_not_observed"),
             (VerifyOutcome::StillRunning, "still_running"),
             (VerifyOutcome::Respawned, "respawned"),
             (VerifyOutcome::PidReused, "pid_reused"),
