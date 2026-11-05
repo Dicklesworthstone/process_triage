@@ -4727,9 +4727,11 @@ fn build_goal_plan_from_candidates(
                 };
                 if score > best_score
                     || (score - best_score).abs() < 1e-9
-                        && best
-                            .as_ref()
-                            .is_none_or(|b| result.total_loss < b.0.total_loss)
+                        && best.as_ref().is_none_or(|(best_result, _)| {
+                            result.total_loss < best_result.total_loss
+                                || (result.total_loss == best_result.total_loss
+                                    && result.selected.len() < best_result.selected.len())
+                        })
                 {
                     best_score = score;
                     best = Some((result, goals));
@@ -5159,6 +5161,57 @@ mod executable_goal_tests {
         assert!(candidates
             .iter()
             .all(|candidate| candidate["recommended_action"] == "kill"));
+    }
+
+    #[test]
+    fn satisfied_or_goal_saves_no_actions_when_kill_loss_is_zero_or_missing() {
+        // Equal modeled loss must prefer fewer actions, independent of OR order.
+        // A missing estimate currently defaults to zero and must be safe too.
+        for goal_str in [
+            "free 1MB RAM OR free port 3000",
+            "free port 3000 OR free 1MB RAM",
+        ] {
+            for missing_loss in [false, true] {
+                let goal = parse_goal(goal_str).unwrap();
+                let (mut candidates, mut plan) = fixture(&[(100, 1000, 0.0)]);
+                if missing_loss {
+                    candidates[0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("expected_loss");
+                } else {
+                    candidates[0]["expected_loss"] =
+                        serde_json::json!([{"action": "kill", "loss": 0.0}]);
+                }
+                let resources = GoalResourceSnapshot {
+                    ports: [(
+                        3000,
+                        PortGoalResources {
+                            holders: Some(Vec::new()),
+                            bound_socket_count: Some(0),
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                };
+                let output = finalize_goal_action_plan(
+                    Some(&goal),
+                    0.0,
+                    &mut candidates,
+                    &mut plan,
+                    &resources,
+                    &[],
+                    false,
+                )
+                .unwrap();
+                assert!(output.result.feasible);
+                assert!(output.selected_pids.is_empty());
+                assert_eq!(output.result.total_loss, 0.0);
+                assert_eq!(output.goals[0].resource, "port_3000");
+                assert_empty_saved_goal_plan(&plan, &candidates);
+                assert_eq!(candidates[0]["recommended_action"], "kill");
+            }
+        }
     }
 
     #[test]
