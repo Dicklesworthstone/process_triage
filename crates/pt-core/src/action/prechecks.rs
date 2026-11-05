@@ -445,17 +445,244 @@ impl From<&DataLossGates> for LivePreCheckConfig {
 /// Holder lines: `1: POSIX  ADVISORY  WRITE 12345 08:02:1234 0 EOF`.
 /// Waiter lines insert `->`: `1: -> POSIX  ADVISORY  WRITE 12346 08:02:1234 0 EOF`,
 /// shifting every field by one; the old fixed-index parse missed all waiters.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn proc_locks_mentions_pid(content: &str, pid: u32) -> bool {
-    let pid_str = pid.to_string();
-    content.lines().any(|line| {
-        let mut parts = line.split_whitespace().skip(1).peekable(); // skip "N:"
-        if parts.peek() == Some(&"->") {
-            parts.next();
+#[cfg(any(target_os = "linux", test))]
+fn proc_locks_mentions_pid(content: &str, pid: u32) -> Result<bool, String> {
+    if !content.is_empty() && !content.ends_with('\n') {
+        return Err("incomplete lock table".to_string());
+    }
+    let mut found = false;
+    for (index, line) in content.lines().enumerate() {
+        let owner = parse_proc_lock_owner(line)
+            .map_err(|error| format!("invalid lock row {}: {error}", index + 1))?;
+        found |= owner == i64::from(pid);
+    }
+    Ok(found)
+}
+
+/// Validate the complete kernel lock record before interpreting its owner.
+/// OFD locks use owner -1; fdinfo, rather than that value, attributes them.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_lock_owner(line: &str) -> Result<i64, String> {
+    let mut parts = line.split_whitespace().peekable();
+    parts
+        .next()
+        .and_then(|index| index.strip_suffix(':'))
+        .and_then(|index| index.parse::<u64>().ok())
+        .ok_or_else(|| "missing or invalid lock index".to_string())?;
+    if parts.peek() == Some(&"->") {
+        parts.next();
+    }
+    let fields: Vec<_> = parts.collect();
+    if fields.len() != 7 {
+        return Err("incomplete or extra lock fields".to_string());
+    }
+    if !matches!(
+        fields[0],
+        "POSIX" | "FLOCK" | "OFDLCK" | "LEASE" | "DELEG" | "ACCESS"
+    ) || !matches!(
+        fields[1],
+        "ADVISORY" | "MANDATORY" | "ACTIVE" | "BREAKING" | "BREAKER" | "*NOINODE*"
+    ) || !matches!(fields[2], "READ" | "WRITE" | "UNLCK")
+    {
+        return Err("unknown lock class, mode or type".to_string());
+    }
+    let owner = fields[3]
+        .parse::<i64>()
+        .ok()
+        .filter(|owner| (-1..=i64::from(u32::MAX)).contains(owner))
+        .ok_or_else(|| "invalid lock owner".to_string())?;
+    if fields[4] != "<none>:0" {
+        let device: Vec<_> = fields[4].split(':').collect();
+        if device.len() != 3
+            || u32::from_str_radix(device[0], 16).is_err()
+            || u32::from_str_radix(device[1], 16).is_err()
+            || device[2].parse::<u64>().is_err()
+        {
+            return Err("invalid lock device or inode".to_string());
         }
-        // class (POSIX/FLOCK/OFDLCK/LEASE), mode (ADVISORY/MANDATORY), type, pid
-        parts.nth(3) == Some(pid_str.as_str())
-    })
+    }
+    let start = fields[5]
+        .parse::<u64>()
+        .map_err(|_| "invalid lock start offset".to_string())?;
+    if fields[6] != "EOF" && fields[6].parse::<u64>().ok().is_none_or(|end| end < start) {
+        return Err("invalid lock end offset".to_string());
+    }
+    Ok(owner)
+}
+
+#[cfg(target_os = "linux")]
+fn fdinfo_has_lock(content: &str) -> Result<bool, String> {
+    if !content.ends_with('\n') {
+        return Err("incomplete descriptor information".to_string());
+    }
+    let mut position = None;
+    let mut flags = None;
+    let mut found = false;
+    for line in content.lines() {
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| "invalid descriptor information row".to_string())?;
+        match key {
+            "pos" => {
+                let value = value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| "invalid descriptor position".to_string())?;
+                if position.replace(value).is_some() {
+                    return Err("duplicate descriptor position".to_string());
+                }
+            }
+            "flags" => {
+                let value = u32::from_str_radix(value.trim(), 8)
+                    .map_err(|_| "invalid descriptor flags".to_string())?;
+                if flags.replace(value).is_some() {
+                    return Err("duplicate descriptor flags".to_string());
+                }
+            }
+            "lock" => {
+                parse_proc_lock_owner(value)?;
+                found = true;
+            }
+            _ => {}
+        }
+    }
+    if position.is_none() || flags.is_none() {
+        return Err("missing descriptor position or flags".to_string());
+    }
+    Ok(found)
+}
+
+#[cfg(target_os = "linux")]
+fn read_locked_files_from_proc(pid: u32, proc_root: &std::path::Path) -> Result<bool, String> {
+    let locks_path = proc_root.join("locks");
+    let content = std::fs::read_to_string(&locks_path)
+        .map_err(|error| format!("cannot read {}: {error}", locks_path.display()))?;
+    if proc_locks_mentions_pid(&content, pid)
+        .map_err(|error| format!("{}: {error}", locks_path.display()))?
+    {
+        return Ok(true);
+    }
+
+    // The global table cannot attribute OFD locks (owner -1), or inherited
+    // flock locks whose original owner has exited. fdinfo lists locks attached
+    // to this target's actual open descriptions, including either case.
+    let fdinfo_dir = proc_root.join(pid.to_string()).join("fdinfo");
+    let entries = std::fs::read_dir(&fdinfo_dir)
+        .map_err(|error| format!("cannot inspect {}: {error}", fdinfo_dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("cannot enumerate {}: {error}", fdinfo_dir.display()))?;
+        let path = entry.path();
+        let content = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if fdinfo_has_lock(&content).map_err(|error| format!("{}: {error}", path.display()))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn lsof_lock_evidence(
+    pid: u32,
+    output: Result<crate::collect::tool_runner::ToolOutput, crate::collect::tool_runner::ToolError>,
+) -> Result<bool, String> {
+    let output = output.map_err(|error| format!("lsof for pid {pid}: {error}"))?;
+    if !output.success() || output.timed_out || output.truncated || !output.stderr.is_empty() {
+        return Err(format!(
+            "incomplete lsof evidence for pid {pid} (exit {:?}, timeout {}, truncated {}): {}",
+            output.exit_code,
+            output.timed_out,
+            output.truncated,
+            output.stderr_str().trim()
+        ));
+    }
+    let content = std::str::from_utf8(&output.stdout)
+        .map_err(|error| format!("invalid lsof evidence for pid {pid}: {error}"))?;
+    if !content.ends_with('\n') {
+        return Err(format!("incomplete lsof fields for pid {pid}"));
+    }
+    let mut seen_process = false;
+    let mut seen_file = false;
+    let mut seen_file_type = false;
+    let mut found = false;
+    for line in content.lines() {
+        if let Some(owner) = line.strip_prefix('p') {
+            if seen_process || owner.parse::<u32>().ok() != Some(pid) {
+                return Err(format!("mismatched lsof process evidence for pid {pid}"));
+            }
+            seen_process = true;
+        } else if let Some(fd) = line.strip_prefix('f') {
+            if !seen_process
+                || fd.is_empty()
+                || fd.eq_ignore_ascii_case("NOFD")
+                || fd.eq_ignore_ascii_case("err")
+            {
+                return Err(format!("unreadable lsof descriptor evidence for pid {pid}"));
+            }
+            if seen_file && !seen_file_type {
+                return Err(format!("missing lsof descriptor type for pid {pid}"));
+            }
+            seen_file = true;
+            seen_file_type = false;
+        } else if let Some(file_type) = line.strip_prefix('t') {
+            let file_type = file_type.trim().to_ascii_uppercase();
+            if !seen_file
+                || seen_file_type
+                || file_type.is_empty()
+                || file_type.starts_with("UNKN")
+                || file_type.contains('?')
+            {
+                return Err(format!("unreadable lsof descriptor type for pid {pid}"));
+            }
+            seen_file_type = true;
+        } else if let Some(lock) = line.strip_prefix('l') {
+            if !seen_file {
+                return Err(format!("lsof lock without descriptor for pid {pid}"));
+            }
+            match lock {
+                "" | " " => {}
+                // Lower-case fields denote partial-file or read/write locks.
+                "r" | "R" | "w" | "W" | "u" | "U" | "N" | "x" | "X" => found = true,
+                _ => return Err(format!("unknown lsof lock state for pid {pid}: {lock}")),
+            }
+        } else {
+            return Err(format!("invalid lsof field for pid {pid}"));
+        }
+    }
+    if !seen_process || !seen_file || !seen_file_type {
+        return Err(format!(
+            "missing lsof process, descriptor, or type evidence for pid {pid}"
+        ));
+    }
+    Ok(found)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_tty(pid: u32, content: &str) -> Result<bool, String> {
+    let invalid = |reason: &str| format!("invalid /proc/{pid}/stat TTY evidence: {reason}");
+    let open = content.find('(').ok_or_else(|| invalid("missing comm"))?;
+    let close = content
+        .rfind(')')
+        .filter(|close| *close > open)
+        .ok_or_else(|| invalid("missing comm terminator"))?;
+    if content[..open].trim().parse::<u32>().ok() != Some(pid) {
+        return Err(invalid("PID differs from requested process"));
+    }
+    let fields: Vec<_> = content[close + 1..].split_whitespace().collect();
+    if !content.ends_with('\n')
+        || fields
+            .get(19)
+            .and_then(|birth| birth.parse::<u64>().ok())
+            .is_none()
+    {
+        return Err(invalid("incomplete process identity"));
+    }
+    fields
+        .get(4)
+        .and_then(|tty| tty.parse::<i32>().ok())
+        .map(|tty| tty != 0)
+        .ok_or_else(|| invalid("missing or invalid tty_nr"))
 }
 
 /// Whether an open-file target (a `/proc/<pid>/fd` link or an lsof NAME) is a file
@@ -982,81 +1209,40 @@ impl LivePreCheckProvider {
         }
     }
 
-    /// Check if process has any locked files.
-    fn has_locked_files(&self, pid: u32) -> bool {
+    /// Check locks without treating unavailable evidence as an unlocked process.
+    fn has_locked_files(&self, pid: u32) -> Result<bool, String> {
         #[cfg(target_os = "linux")]
         {
-            let locks_path = "/proc/locks";
-            let Ok(content) = std::fs::read_to_string(locks_path) else {
-                return false;
-            };
-
-            proc_locks_mentions_pid(&content, pid)
+            read_locked_files_from_proc(pid, std::path::Path::new("/proc"))
         }
         #[cfg(target_os = "macos")]
         {
-            // Use lsof - look for lock status
-            let output = crate::collect::tool_runner::run_tool(
-                "lsof",
-                &["-p", &pid.to_string(), "-F", "l"],
-                Some(std::time::Duration::from_secs(5)),
-                None,
-            );
-
-            if let Ok(out) = output {
-                let stdout = out.stdout_str();
-                for line in stdout.lines() {
-                    if line.starts_with('l') && line.len() > 1 {
-                        let lock_char = line.chars().nth(1).unwrap_or(' ');
-                        // 'R' = read lock, 'W' = write lock, 'U' = unknown lock
-                        if lock_char == 'R' || lock_char == 'W' || lock_char == 'U' {
-                            return true;
-                        }
-                    }
-                }
-            }
-            false
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            false
+            lsof_lock_evidence(
+                pid,
+                crate::collect::tool_runner::run_tool(
+                    "lsof",
+                    &["+w", "-n", "-P", "-p", &pid.to_string(), "-F", "pflt"],
+                    Some(std::time::Duration::from_secs(5)),
+                    None,
+                ),
+            )
         }
     }
 
-    /// Check if process has active TTY.
-    fn has_active_tty(&self, pid: u32) -> bool {
+    /// Check terminal attachment while preserving missing or malformed evidence.
+    fn has_active_tty(&self, pid: u32) -> Result<bool, String> {
         #[cfg(target_os = "linux")]
         {
             let stat_path = format!("/proc/{pid}/stat");
-            let Ok(content_bytes) = std::fs::read(&stat_path) else {
-                return false;
-            };
-            let content = String::from_utf8_lossy(&content_bytes);
-
-            // Parse tty_nr from stat (field 7 after comm)
-            if let Some(comm_end) = content.rfind(')') {
-                if let Some(after_comm) = content.get(comm_end + 2..) {
-                    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-                    if let Some(tty_nr_str) = fields.get(4) {
-                        if let Ok(tty_nr) = tty_nr_str.parse::<i32>() {
-                            return tty_nr != 0;
-                        }
-                    }
-                }
-            }
-
-            false
+            let content = std::fs::read_to_string(&stat_path)
+                .map_err(|error| format!("cannot read {stat_path}: {error}"))?;
+            parse_proc_tty(pid, &content)
         }
         #[cfg(target_os = "macos")]
         {
-            crate::collect::read_process_snapshot(pid)
-                .and_then(|info| info.tty)
-                .is_some()
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = pid;
-            false
+            crate::collect::macos::read_session_stat(pid)
+                .map(|info| info.tty_nr != 0)
+                .ok_or_else(|| format!("cannot read native terminal information for pid {pid}"))
         }
     }
 
@@ -1408,12 +1594,23 @@ impl PreCheckProvider for LivePreCheckProvider {
         }
 
         // Check locked files
-        if self.config.block_if_locked_files && self.has_locked_files(pid) {
-            debug!(pid, "process has locked files");
-            return PreCheckResult::Blocked {
-                check: PreCheck::CheckDataLossGate,
-                reason: "process has locked files".to_string(),
-            };
+        if self.config.block_if_locked_files {
+            match self.has_locked_files(pid) {
+                Ok(false) => {}
+                Ok(true) => {
+                    debug!(pid, "process has locked files");
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckDataLossGate,
+                        reason: "process has locked files".to_string(),
+                    };
+                }
+                Err(error) => {
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckDataLossGate,
+                        reason: format!("locked-file evidence unavailable: {error}"),
+                    };
+                }
+            }
         }
 
         // Check deleted CWD
@@ -1554,12 +1751,23 @@ impl PreCheckProvider for LivePreCheckProvider {
         }
 
         // Check if process has active TTY (basic check, always enabled if configured)
-        if self.config.block_if_active_tty && self.has_active_tty(pid) {
-            debug!(pid, "process has active TTY");
-            return PreCheckResult::Blocked {
-                check: PreCheck::CheckSessionSafety,
-                reason: "process has active TTY".to_string(),
-            };
+        if self.config.block_if_active_tty {
+            match self.has_active_tty(pid) {
+                Ok(false) => {}
+                Ok(true) => {
+                    debug!(pid, "process has active TTY");
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckSessionSafety,
+                        reason: "process has active TTY".to_string(),
+                    };
+                }
+                Err(error) => {
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckSessionSafety,
+                        reason: format!("TTY evidence unavailable: {error}"),
+                    };
+                }
+            }
         }
 
         // Enhanced session safety checks using SessionAnalyzer
@@ -1822,15 +2030,181 @@ mod tests {
                        1: -> POSIX  ADVISORY  WRITE 12346 08:02:1234 0 EOF\n\
                        2: FLOCK  ADVISORY  WRITE 777 00:1a:99 0 EOF\n\
                        3: OFDLCK ADVISORY  READ  -1 00:1a:5 0 EOF\n";
-        assert!(proc_locks_mentions_pid(content, 12345), "holder");
-        assert!(proc_locks_mentions_pid(content, 12346), "blocked waiter");
-        assert!(proc_locks_mentions_pid(content, 777), "flock holder");
+        assert!(proc_locks_mentions_pid(content, 12345).unwrap(), "holder");
         assert!(
-            !proc_locks_mentions_pid(content, 1),
+            proc_locks_mentions_pid(content, 12346).unwrap(),
+            "blocked waiter"
+        );
+        assert!(
+            proc_locks_mentions_pid(content, 777).unwrap(),
+            "flock holder"
+        );
+        assert!(
+            !proc_locks_mentions_pid(content, 1).unwrap(),
             "lock index is not a pid"
         );
-        assert!(!proc_locks_mentions_pid(content, 99), "inode is not a pid");
-        assert!(!proc_locks_mentions_pid("", 12345));
+        assert!(
+            !proc_locks_mentions_pid(content, 99).unwrap(),
+            "inode is not a pid"
+        );
+        assert!(!proc_locks_mentions_pid("", 12345).unwrap());
+    }
+
+    #[test]
+    fn proc_locks_requires_complete_valid_records() {
+        for content in [
+            "1: POSIX ADVISORY WRITE 42 08:02:1234 0 EOF",
+            "1: POSIX ADVISORY WRITE\n",
+            "1: POSIX ADVISORY WRITE invalid 08:02:1234 0 EOF\n",
+            "1: POSIX ADVISORY WRITE 42 invalid 0 EOF\n",
+            "1: POSIX ADVISORY WRITE 42 08:02:1234 10 5\n",
+            "1: POSIX ADVISORY WRITE 42 08:02:1234 0 EOF extra\n",
+            "1: POSIX ADVISORY WRITE 42 08:02:1234 0 EOF\n2: truncated\n",
+        ] {
+            assert!(proc_locks_mentions_pid(content, 42).is_err(), "{content}");
+        }
+        let leases = "1: LEASE ACTIVE READ 42 08:02:1234 0 EOF\n\
+                      2: LEASE BREAKING UNLCK 43 08:02:1235 0 EOF\n\
+                      3: DELEG BREAKER READ 44 <none>:0 0 EOF\n";
+        for pid in [42, 43, 44] {
+            assert_eq!(proc_locks_mentions_pid(leases, pid), Ok(true));
+        }
+        assert_eq!(proc_locks_mentions_pid(leases, 45), Ok(false));
+    }
+
+    fn lsof_output(stdout: &str) -> crate::collect::tool_runner::ToolOutput {
+        crate::collect::tool_runner::ToolOutput {
+            command: "lsof".to_string(),
+            args: Vec::new(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            exit_code: Some(0),
+            truncated: false,
+            duration: Duration::ZERO,
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn lsof_locks_include_partial_locks_and_complete_unlocked_output() {
+        assert_eq!(
+            lsof_lock_evidence(
+                42,
+                Ok(lsof_output(
+                    "p42\nfcwd\ntDIR\nf0\ntCHR\nf1\ntREG\nf4\ntIPv4\n"
+                ))
+            ),
+            Ok(false)
+        );
+        for lock in ["r", "R", "w", "W", "u", "U", "N", "x", "X"] {
+            let content = format!("p42\nfcwd\ntDIR\nf3\nl{lock}\ntREG\n");
+            assert_eq!(lsof_lock_evidence(42, Ok(lsof_output(&content))), Ok(true));
+        }
+        assert_eq!(
+            lsof_lock_evidence(42, Ok(lsof_output("p42\nf0\ntCHR\nl \n"))),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn lsof_locks_reject_failed_or_incomplete_observations() {
+        for content in [
+            "",
+            "p42\n",
+            "p43\nf0\ntCHR\n",
+            "p42\nf0",
+            "p42\nlW\n",
+            "p42\nfNOFD\n",
+            "p42\nferr\ntREG\n",
+            "p42\nf0\ntREG\nl?\n",
+            "p42\ntREG\n",
+            "p42\nf0\n",
+            "p42\nf0\nt\n",
+            "p42\nf0\ntunknown\n",
+            "p42\nf0\ntUNKN123\n",
+            "p42\nf0\nt?\n",
+            "p42\nf0\ntREG\ntREG\n",
+            "p42\nf0\nf1\ntREG\n",
+            "p42\nf0\ntREG\nf1\n",
+            "p42\nf0\ntREG\nf1\ntunknown\n",
+        ] {
+            assert!(
+                lsof_lock_evidence(42, Ok(lsof_output(content))).is_err(),
+                "{content}"
+            );
+        }
+        for failure in ["exit", "timeout", "truncated", "stderr"] {
+            let mut output = lsof_output("p42\nf0\ntCHR\n");
+            match failure {
+                "exit" => output.exit_code = Some(1),
+                "timeout" => output.timed_out = true,
+                "truncated" => output.truncated = true,
+                "stderr" => output.stderr = b"cannot examine file descriptors".to_vec(),
+                _ => unreachable!(),
+            }
+            let error = lsof_lock_evidence(42, Ok(output)).unwrap_err();
+            assert!(error.contains("incomplete lsof evidence"), "{error}");
+        }
+        let error = lsof_lock_evidence(
+            42,
+            Err(crate::collect::tool_runner::ToolError::CommandNotFound(
+                "lsof".to_string(),
+            )),
+        )
+        .unwrap_err();
+        assert!(error.contains("lsof for pid 42"));
+    }
+
+    #[test]
+    fn tty_parser_rejects_unknown_fields_and_keeps_real_device_numbers() {
+        let suffix = "-1 0 0 0 0 0 0 0 0 0 0 0 1 0 123\n";
+        for (tty, expected) in [("0", false), ("34816", true), ("-2147483648", true)] {
+            let content = format!("42 (name ) with parentheses) S 1 2 3 {tty} {suffix}");
+            assert_eq!(parse_proc_tty(42, &content), Ok(expected));
+        }
+        for content in [
+            "42 (name) S 1".to_string(),
+            format!("42 (name) S 1 2 3 invalid {suffix}"),
+            format!("42 (name) S 1 2 3 2147483648 {suffix}"),
+            format!("43 (name) S 1 2 3 0 {suffix}"),
+            "42 (name) S 1 2 3 0\n".to_string(),
+        ] {
+            assert!(parse_proc_tty(42, &content).is_err(), "{content}");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn required_lock_and_tty_gates_refuse_missing_target_evidence() {
+        let config = LivePreCheckConfig {
+            block_if_open_write_fds: false,
+            block_if_locked_files: true,
+            block_if_deleted_cwd: false,
+            block_if_recent_io_seconds: 0,
+            block_if_active_tty: true,
+            enhanced_session_safety: false,
+            ..LivePreCheckConfig::default()
+        };
+        let provider = LivePreCheckProvider::new(None, config.clone()).unwrap();
+        assert!(
+            matches!(provider.check_data_loss(u32::MAX), PreCheckResult::Blocked { check, reason }
+            if check == PreCheck::CheckDataLossGate && reason.contains("locked-file evidence unavailable"))
+        );
+        assert!(
+            matches!(provider.check_session_safety(u32::MAX, None), PreCheckResult::Blocked { check, reason }
+            if check == PreCheck::CheckSessionSafety && reason.contains("TTY evidence unavailable"))
+        );
+        let disabled = LivePreCheckProvider::new(
+            None,
+            LivePreCheckConfig {
+                block_if_locked_files: false,
+                block_if_active_tty: false,
+                ..config
+            },
+        )
+        .unwrap();
+        assert!(disabled.check_data_loss(u32::MAX).is_passed());
+        assert!(disabled.check_session_safety(u32::MAX, None).is_passed());
     }
 
     #[test]
@@ -2526,6 +2900,218 @@ mod tests {
         use super::*;
         use crate::live_test_harness::run_owned_unprivileged_case;
 
+        fn lock_only_provider() -> LivePreCheckProvider {
+            LivePreCheckProvider::new(
+                None,
+                LivePreCheckConfig {
+                    block_if_open_write_fds: false,
+                    block_if_locked_files: true,
+                    block_if_deleted_cwd: false,
+                    block_if_recent_io_seconds: 0,
+                    ..LivePreCheckConfig::default()
+                },
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn locked_file_observation_preserves_proc_read_and_parse_failures() {
+            let root = tempfile::tempdir().unwrap().keep();
+            assert!(read_locked_files_from_proc(42, &root)
+                .unwrap_err()
+                .contains("cannot read"));
+            std::fs::write(root.join("locks"), "1: truncated\n").unwrap();
+            assert!(read_locked_files_from_proc(42, &root)
+                .unwrap_err()
+                .contains("invalid lock row"));
+            std::fs::write(root.join("locks"), "").unwrap();
+            assert!(read_locked_files_from_proc(42, &root)
+                .unwrap_err()
+                .contains("fdinfo"));
+            let fdinfo = root.join("42/fdinfo");
+            std::fs::create_dir_all(&fdinfo).unwrap();
+            assert_eq!(read_locked_files_from_proc(42, &root), Ok(false));
+            std::fs::write(fdinfo.join("3"), "pos:\t0\n").unwrap();
+            assert!(read_locked_files_from_proc(42, &root)
+                .unwrap_err()
+                .contains("missing descriptor"));
+            let complete = "pos:\t0\nflags:\t0100002\nmnt_id:\t1\nino:\t5\n";
+            std::fs::write(fdinfo.join("3"), complete).unwrap();
+            assert_eq!(read_locked_files_from_proc(42, &root), Ok(false));
+            std::fs::write(
+                fdinfo.join("3"),
+                format!("{complete}lock:\t1: OFDLCK ADVISORY WRITE -1 00:01:5 0 EOF\n"),
+            )
+            .unwrap();
+            assert_eq!(read_locked_files_from_proc(42, &root), Ok(true));
+            std::fs::write(fdinfo.join("3"), format!("{complete}lock:\t1: OFDLCK\n")).unwrap();
+            assert!(read_locked_files_from_proc(42, &root).is_err());
+            // A directory is a real read error even for root; it must not be
+            // silently skipped as if the descriptor had no lock.
+            let unreadable = tempfile::tempdir().unwrap().keep();
+            std::fs::write(unreadable.join("locks"), "").unwrap();
+            std::fs::create_dir_all(unreadable.join("42/fdinfo/3")).unwrap();
+            assert!(read_locked_files_from_proc(42, &unreadable)
+                .unwrap_err()
+                .contains("cannot read"));
+        }
+
+        struct DescriptorChild {
+            child: std::process::Child,
+            reader: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Drop for DescriptorChild {
+            fn drop(&mut self) {
+                // This child is owned and unreaped, so its PID cannot be reused.
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                if let Some(reader) = self.reader.take() {
+                    let _ = reader.join();
+                }
+            }
+        }
+
+        fn descriptor_child(file: std::fs::File, attach_tty: bool) -> DescriptorChild {
+            use std::io::BufRead;
+            use std::os::unix::process::CommandExt;
+            use std::process::{Command, Stdio};
+
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "printf 'ready\\n'; read -r finish"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::from(file));
+            // SAFETY: the child hook uses only async-signal-safe syscalls. The
+            // inherited stderr is our owned descriptor, or the owned pty slave.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if attach_tty && libc::ioctl(libc::STDERR_FILENO, libc::TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut fixture = DescriptorChild {
+                child: command.spawn().unwrap(),
+                reader: None,
+            };
+            let stdout = fixture.child.stdout.take().unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            fixture.reader = Some(std::thread::spawn(move || {
+                let mut ready = String::new();
+                let result = std::io::BufReader::new(stdout)
+                    .read_line(&mut ready)
+                    .map(|_| ready);
+                let _ = ready_tx.send(result);
+            }));
+            let ready = ready_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            fixture
+        }
+
+        #[test]
+        fn locked_file_gate_detects_inherited_locks_without_blocking_unrelated_files() {
+            use std::os::fd::AsRawFd;
+
+            let provider = lock_only_provider();
+            for ofd in [false, true] {
+                let root = tempfile::tempdir().unwrap().keep();
+                let path = root.join("held.lock");
+                let file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                let rc = if ofd {
+                    // SAFETY: flock is plain data, fully initialized before
+                    // fcntl reads it; the fd belongs to our retained file.
+                    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+                    lock.l_type = libc::F_WRLCK as i16;
+                    lock.l_whence = libc::SEEK_SET as i16;
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &lock) }
+                } else {
+                    // SAFETY: flock operates on only our owned descriptor.
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
+                };
+                assert_eq!(
+                    rc,
+                    0,
+                    "acquire owned lock: {}",
+                    std::io::Error::last_os_error()
+                );
+
+                // This child opens the same inode through a different open
+                // description. Another process's OFD/flock lock is not its own.
+                let unrelated = descriptor_child(std::fs::File::open(&path).unwrap(), false);
+                assert_eq!(provider.has_locked_files(unrelated.child.id()), Ok(false));
+                assert!(provider.check_data_loss(unrelated.child.id()).is_passed());
+
+                let holder = descriptor_child(file, false);
+                let pid = holder.child.id();
+                let global = std::fs::read_to_string("/proc/locks").unwrap();
+                assert_eq!(proc_locks_mentions_pid(&global, pid), Ok(false));
+                let descriptor = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/2")).unwrap();
+                assert!(descriptor.contains(if ofd { "OFDLCK" } else { "FLOCK" }));
+                assert_eq!(provider.has_locked_files(pid), Ok(true));
+                assert!(
+                    matches!(provider.check_data_loss(pid), PreCheckResult::Blocked { check, reason }
+                    if check == PreCheck::CheckDataLossGate && reason == "process has locked files")
+                );
+            }
+        }
+
+        #[test]
+        fn tty_gate_tracks_real_controlling_terminal() {
+            use std::os::fd::FromRawFd;
+
+            let provider = LivePreCheckProvider::new(
+                None,
+                LivePreCheckConfig {
+                    block_if_active_tty: true,
+                    enhanced_session_safety: false,
+                    ..LivePreCheckConfig::default()
+                },
+            )
+            .unwrap();
+            let detached = descriptor_child(std::fs::File::open("/dev/null").unwrap(), false);
+            assert_eq!(provider.has_active_tty(detached.child.id()), Ok(false));
+            assert!(provider
+                .check_session_safety(detached.child.id(), None)
+                .is_passed());
+
+            let (mut master, mut slave) = (-1, -1);
+            // SAFETY: openpty writes two valid descriptors into these integers;
+            // null optional arguments request the default terminal settings.
+            let rc = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(rc, 0, "open owned pty: {}", std::io::Error::last_os_error());
+            // SAFETY: successful openpty transferred both descriptors to us.
+            let _master = unsafe { std::fs::File::from_raw_fd(master) };
+            let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+            let attached = descriptor_child(slave, true);
+            assert_eq!(provider.has_active_tty(attached.child.id()), Ok(true));
+            assert!(
+                matches!(provider.check_session_safety(attached.child.id(), None), PreCheckResult::Blocked { check, reason }
+                if check == PreCheck::CheckSessionSafety && reason == "process has active TTY")
+            );
+        }
+
         fn io_only_provider(seconds: u64) -> LivePreCheckProvider {
             LivePreCheckProvider::new(
                 None,
@@ -2855,6 +3441,16 @@ mod tests {
                     eprintln!(
                         "owned I/O fixture pid={pid} birth={birth} mode={mode} read_error={error}"
                     );
+                    // The same real non-dumpable child denies fdinfo access.
+                    // An enabled lock gate must retain that refusal as well.
+                    let lock_provider = lock_only_provider();
+                    let error = lock_provider.has_locked_files(pid).unwrap_err();
+                    assert!(error.contains("fdinfo"), "{error}");
+                    let result = lock_provider.check_data_loss(pid);
+                    assert!(matches!(result, PreCheckResult::Blocked { check, reason }
+                        if check == PreCheck::CheckDataLossGate
+                            && reason.contains("locked-file evidence unavailable")
+                            && reason.contains("fdinfo")));
                 } else {
                     read_io(pid).expect("readable owned I/O fixture");
                 }
