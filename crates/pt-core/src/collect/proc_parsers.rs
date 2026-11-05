@@ -154,6 +154,57 @@ pub fn parse_proc_status_content(content: &str) -> Option<ProcessStatus> {
     }
 }
 
+/// Parse the cheap memory counters in `/proc/PID/status` without inventing
+/// zeros for omitted fields (for example, a zombie's missing memory counters).
+/// Keep this separate from the identity parser: malformed optional memory
+/// evidence must not erase an otherwise valid UID/GID observation.
+pub fn parse_process_memory_status(content: &str) -> Result<super::ProcessMemoryUsage, String> {
+    let mut values = HashMap::new();
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !matches!(
+            key,
+            "VmRSS" | "RssAnon" | "RssFile" | "RssShmem" | "VmSwap" | "Threads"
+        ) {
+            continue;
+        }
+        if values.insert(key, value.trim()).is_some() {
+            return Err(format!("duplicate {key} status field"));
+        }
+    }
+    let bytes = |key: &str| -> Result<u64, String> {
+        let value = values
+            .get(key)
+            .ok_or_else(|| format!("missing {key} status field"))?;
+        let mut fields = value.split_whitespace();
+        let count = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| format!("invalid {key} byte count"))?;
+        if fields.next() != Some("kB") || fields.next().is_some() {
+            return Err(format!("invalid {key} status unit (expected kB)"));
+        }
+        count
+            .checked_mul(1024)
+            .ok_or_else(|| format!("{key} byte count overflow"))
+    };
+    let threads = values
+        .get("Threads")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|threads| *threads > 0)
+        .ok_or_else(|| "missing or invalid Threads status field".to_string())?;
+    Ok(super::ProcessMemoryUsage {
+        rss_bytes: bytes("VmRSS")?,
+        rss_anon_bytes: bytes("RssAnon")?,
+        rss_file_bytes: bytes("RssFile")?,
+        rss_shmem_bytes: bytes("RssShmem")?,
+        swap_bytes: bytes("VmSwap")?,
+        threads,
+    })
+}
+
 /// Read the target of /proc/[pid]/exe symlink.
 pub fn parse_proc_exe(pid: u32) -> Option<String> {
     let path = format!("/proc/{}/exe", pid);
@@ -1078,6 +1129,45 @@ pub fn parse_environ_content(content: &[u8]) -> Option<HashMap<String, String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MEMORY_STATUS: &str = "Name:\tworker\nUid:\t1000 1000 1000 1000\nVmRSS:\t12 kB\nRssAnon:\t8 kB\nRssFile:\t3 kB\nRssShmem:\t1 kB\nVmSwap:\t4 kB\nThreads:\t2\n";
+
+    #[test]
+    fn memory_status_preserves_units_components_swap_and_threads() {
+        let memory = parse_process_memory_status(MEMORY_STATUS).unwrap();
+        assert_eq!(memory.rss_bytes, 12 * 1024);
+        assert_eq!(memory.rss_anon_bytes, 8 * 1024);
+        assert_eq!(memory.rss_file_bytes, 3 * 1024);
+        assert_eq!(memory.rss_shmem_bytes, 1024);
+        assert_eq!(memory.swap_bytes, 4 * 1024);
+        assert_eq!(memory.threads, 2);
+        let zero_swap = MEMORY_STATUS.replace("VmSwap:\t4 kB", "VmSwap:\t0 kB");
+        assert_eq!(
+            parse_process_memory_status(&zero_swap).unwrap().swap_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn memory_status_rejects_missing_invalid_duplicate_or_overflowed_counters() {
+        for content in [
+            MEMORY_STATUS.replace("VmSwap:\t4 kB\n", ""),
+            MEMORY_STATUS.replace("VmSwap:\t4 kB", "VmSwap:\t4 MB"),
+            MEMORY_STATUS.replace("VmSwap:\t4 kB", "VmSwap:\t-1 kB"),
+            MEMORY_STATUS.replace("VmSwap:\t4 kB", "VmSwap:\t18446744073709551615 kB"),
+            MEMORY_STATUS.replace("Threads:\t2", "Threads:\t0"),
+            MEMORY_STATUS.replace("Threads:\t2", "Threads:\t2 extra"),
+            format!("{MEMORY_STATUS}RssAnon:\t0 kB\n"),
+            "Name:\tzombie\nUid:\t1000 1000 1000 1000\nThreads:\t1\n".to_string(),
+        ] {
+            assert!(parse_process_memory_status(&content).is_err(), "{content}");
+            assert_eq!(
+                parse_proc_status_content(&content).unwrap().ruid,
+                1000,
+                "optional memory failure must not erase identity"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_proc_stat_content() {

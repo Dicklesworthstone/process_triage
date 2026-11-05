@@ -1571,7 +1571,27 @@ fn plan_deep_adds_network_evidence() {
         assert!(activity["cpu_percent"].as_f64().unwrap() >= 0.0);
         assert_eq!(candidate["cpu_percent"], activity["cpu_percent"]);
         assert!(candidate["cpu_lifetime_percent"].is_number());
-        assert_eq!(candidate["blast_radius"]["cpu_pct"], candidate["cpu_percent"]);
+        assert_eq!(
+            candidate["blast_radius"]["cpu_pct"],
+            candidate["cpu_percent"]
+        );
+        let pressure = &activity["pressure"];
+        assert!(
+            pressure["major_faults_per_second"].is_number(),
+            "{pressure}"
+        );
+        assert!(pressure["memory"]["rss_bytes"].is_u64(), "{pressure}");
+        assert!(pressure["memory"]["swap_bytes"].is_u64(), "{pressure}");
+        assert!(pressure["memory"]["threads"].as_u64().unwrap() > 0);
+        for (measurement, error) in [
+            ("leader_run_queue_wait_percent", "scheduler_error"),
+            ("leader_blkio_delay_percent", "blkio_error"),
+        ] {
+            assert!(
+                pressure[measurement].is_number() || pressure[error].is_string(),
+                "{measurement} is measured or explicitly unavailable: {pressure}"
+            );
+        }
     }
     let legacy_candidate = legacy["candidates"]
         .as_array()

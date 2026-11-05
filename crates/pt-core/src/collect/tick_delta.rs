@@ -15,8 +15,10 @@
 
 use super::cgroup::collect_cgroup_details;
 use super::cpu_capacity::{compute_cpu_capacity, CpuCapacity};
-use super::proc_parsers::{parse_io_content, IoStats};
-use super::{ProcessActivity, ProcessRecord};
+use super::proc_parsers::{
+    parse_io_content, parse_process_memory_status, parse_schedstat_content, IoStats, SchedStats,
+};
+use super::{ProcessActivity, ProcessMemoryUsage, ProcessPressureActivity, ProcessRecord};
 use pt_common::{IdentityQuality, ProcessIdentity, StartId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -264,6 +266,26 @@ impl Default for TickDeltaConfig {
 /// # Returns
 /// * `Option<TickSnapshot>` - Snapshot or None if process not accessible
 pub fn collect_tick_snapshot(pid: u32) -> Option<TickSnapshot> {
+    collect_tick_sample(pid).map(|(ticks, _)| ticks)
+}
+
+#[derive(Debug, Clone)]
+struct PressureStatCounters {
+    major_faults: Option<u64>,
+    leader_blkio_delay_ticks: Option<u64>,
+}
+
+fn parse_pressure_stat_counters(content: &str) -> Option<PressureStatCounters> {
+    let after_comm = content.get(content.rfind(')')? + 1..)?;
+    let fields: Vec<_> = after_comm.split_whitespace().collect();
+    Some(PressureStatCounters {
+        // proc_pid_stat(5): fields 12 and 42; this slice starts at field 3.
+        major_faults: fields.get(9).and_then(|value| value.parse().ok()),
+        leader_blkio_delay_ticks: fields.get(39).and_then(|value| value.parse().ok()),
+    })
+}
+
+fn collect_tick_sample(pid: u32) -> Option<(TickSnapshot, PressureStatCounters)> {
     let path = format!("/proc/{}/stat", pid);
     let bytes = fs::read(&path).ok()?;
     let content = String::from_utf8_lossy(&bytes);
@@ -272,7 +294,7 @@ pub fn collect_tick_snapshot(pid: u32) -> Option<TickSnapshot> {
 
     let mut snapshot = parse_tick_snapshot(&content, pid, timestamp)?;
     snapshot.monotonic = Some(monotonic);
-    Some(snapshot)
+    Some((snapshot, parse_pressure_stat_counters(&content)?))
 }
 
 /// Parse tick snapshot from /proc/\[pid\]/stat content.
@@ -492,6 +514,37 @@ struct ActivitySnapshot {
     ticks: TickSnapshot,
     io: Result<IoStats, String>,
     io_observed_at: Instant,
+    counters: PressureStatCounters,
+    scheduler: Result<SchedStats, String>,
+    scheduler_observed_at: Instant,
+    memory: Result<ProcessMemoryUsage, String>,
+    delay_accounting: Result<(), String>,
+}
+
+/// Read accounting switches once per batch endpoint, never modify them. Kernel
+/// builds with missing/disabled accounting must not supply fabricated zeros.
+struct ActivityAccounting {
+    scheduler: Result<(), String>,
+    delay: Result<(), String>,
+}
+
+fn read_accounting_switch(name: &str) -> Result<(), String> {
+    let path = format!("/proc/sys/kernel/{name}");
+    match fs::read_to_string(&path) {
+        Ok(value) if value.trim() == "1" => Ok(()),
+        Ok(value) if value.trim() == "0" => Err(format!("kernel {name} accounting is disabled")),
+        Ok(_) => Err(format!("invalid kernel {name} accounting switch")),
+        Err(error) => Err(format!("cannot read {path}: {error}")),
+    }
+}
+
+impl ActivityAccounting {
+    fn read() -> Self {
+        Self {
+            scheduler: read_accounting_switch("sched_schedstats"),
+            delay: read_accounting_switch("task_delayacct"),
+        }
+    }
 }
 
 fn parse_activity_io(content: &str) -> Result<IoStats, String> {
@@ -516,7 +569,10 @@ fn ticks_match_process(ticks: &TickSnapshot, process: &ProcessRecord) -> bool {
         && ticks.identity.quality.is_automatable()
 }
 
-fn collect_activity_snapshot(process: &ProcessRecord) -> Result<ActivitySnapshot, String> {
+fn collect_activity_snapshot(
+    process: &ProcessRecord,
+    accounting: &ActivityAccounting,
+) -> Result<ActivitySnapshot, String> {
     let pid = process.pid.0;
     let before = collect_tick_snapshot(pid)
         .ok_or_else(|| "CPU stat/identity is unreadable or invalid".to_string())?;
@@ -529,18 +585,132 @@ fn collect_activity_snapshot(process: &ProcessRecord) -> Result<ActivitySnapshot
         .and_then(|bytes| parse_activity_io(&String::from_utf8_lossy(&bytes)));
     let io_observed_at = Instant::now();
 
-    // The I/O file is addressed by numeric PID. Bracket it with identity reads
-    // so a replacement process cannot donate its counters to the old record.
-    let after = collect_tick_snapshot(pid)
-        .ok_or_else(|| "CPU stat/identity became unreadable while collecting I/O".to_string())?;
+    let scheduler = accounting.scheduler.clone().and_then(|()| {
+        fs::read_to_string(format!("/proc/{pid}/schedstat"))
+            .map_err(|error| format!("cannot read /proc/{pid}/schedstat: {error}"))
+            .and_then(|content| {
+                parse_schedstat_content(&content)
+                    .ok_or_else(|| "invalid scheduler counters".to_string())
+            })
+    });
+    let scheduler_observed_at = Instant::now();
+    let memory = fs::read_to_string(format!("/proc/{pid}/status"))
+        .map_err(|error| format!("cannot read /proc/{pid}/status: {error}"))
+        .and_then(|content| parse_process_memory_status(&content));
+
+    // All these files are addressed by numeric PID. Bracket them with identity
+    // reads so a replacement cannot donate counters or memory to the old record.
+    let (after, counters) = collect_tick_sample(pid).ok_or_else(|| {
+        "CPU stat/identity became unreadable while collecting activity".to_string()
+    })?;
     if !ticks_match_process(&after, process) || !before.identity.matches(&after.identity) {
-        return Err("process identity changed while collecting I/O".to_string());
+        return Err("process identity changed while collecting activity".to_string());
     }
     Ok(ActivitySnapshot {
         ticks: after,
         io,
         io_observed_at,
+        counters,
+        scheduler,
+        scheduler_observed_at,
+        memory,
+        delay_accounting: accounting.delay.clone(),
     })
+}
+
+fn pressure_from_snapshots(
+    before: &ActivitySnapshot,
+    after: &ActivitySnapshot,
+    clock_ticks_per_second: u64,
+) -> ProcessPressureActivity {
+    let mut pressure = ProcessPressureActivity::default();
+    match &after.memory {
+        Ok(memory) => pressure.memory = Some(memory.clone()),
+        Err(error) => pressure.memory_error = Some(error.clone()),
+    }
+    let stat_seconds = tick_window(&before.ticks, &after.ticks).map(|(_, seconds)| seconds);
+    pressure.stat_window_seconds = stat_seconds.ok();
+    let faults = || -> Result<(u64, f64), String> {
+        let first = before
+            .counters
+            .major_faults
+            .ok_or("first major-fault counter unavailable")?;
+        let second = after
+            .counters
+            .major_faults
+            .ok_or("second major-fault counter unavailable")?;
+        counter_rate(first, second, stat_seconds?).map_err(str::to_string)
+    };
+    match faults() {
+        Ok((count, rate)) => {
+            pressure.major_faults = Some(count);
+            pressure.major_faults_per_second = Some(rate);
+        }
+        Err(error) => pressure.faults_error = Some(error),
+    }
+    let scheduler_rate = || -> Result<(f64, f64), String> {
+        let first = before
+            .scheduler
+            .as_ref()
+            .map_err(|error| format!("first scheduler sample: {error}"))?;
+        let second = after
+            .scheduler
+            .as_ref()
+            .map_err(|error| format!("second scheduler sample: {error}"))?;
+        let seconds = after
+            .scheduler_observed_at
+            .checked_duration_since(before.scheduler_observed_at)
+            .ok_or("scheduler sample clock moved backwards")?
+            .as_secs_f64();
+        // Guard every counter so a reset cannot hide behind an unchanged wait.
+        counter_rate(first.cpu_time_ns, second.cpu_time_ns, seconds)?;
+        counter_rate(first.timeslices, second.timeslices, seconds)?;
+        let (_, nanos_per_second) = counter_rate(first.wait_time_ns, second.wait_time_ns, seconds)?;
+        Ok((seconds, nanos_per_second / 1_000_000_000.0 * 100.0))
+    };
+    match scheduler_rate() {
+        Ok((seconds, percent)) => {
+            pressure.scheduler_window_seconds = Some(seconds);
+            pressure.leader_run_queue_wait_percent = Some(percent);
+        }
+        Err(error) => pressure.scheduler_error = Some(error),
+    }
+    let blkio_rate = || -> Result<f64, String> {
+        before
+            .delay_accounting
+            .as_ref()
+            .map_err(|error| format!("first sample: {error}"))?;
+        after
+            .delay_accounting
+            .as_ref()
+            .map_err(|error| format!("second sample: {error}"))?;
+        if clock_ticks_per_second == 0 {
+            return Err("clock ticks per second is zero".to_string());
+        }
+        let first = before
+            .counters
+            .leader_blkio_delay_ticks
+            .ok_or("first block-I/O delay counter unavailable")?;
+        let second = after
+            .counters
+            .leader_blkio_delay_ticks
+            .ok_or("second block-I/O delay counter unavailable")?;
+        // Enabling delayacct only instruments newly created tasks. An all-zero
+        // field cannot establish that this task has accounting, even with the
+        // global switch on (kernel delay-accounting documentation).
+        if first == 0 && second == 0 {
+            return Err(
+                "zero block-I/O counters cannot establish per-task delay accounting".to_string(),
+            );
+        }
+        let (_, ticks_per_second) = counter_rate(first, second, stat_seconds?)?;
+        Ok(ticks_per_second / clock_ticks_per_second as f64 * 100.0)
+    };
+    match blkio_rate() {
+        Ok(percent) => pressure.leader_blkio_delay_percent = Some(percent),
+        Err(error) => pressure.blkio_error = Some(error),
+    }
+    pressure
 }
 
 fn activity_from_snapshots(
@@ -551,9 +721,7 @@ fn activity_from_snapshots(
     clock_ticks_per_second: u64,
 ) -> ProcessActivity {
     let mut activity = ProcessActivity::unavailable(process, window, "no usable samples");
-    if !ticks_match_process(&before.ticks, process)
-        || !ticks_match_process(&after.ticks, process)
-    {
+    if !ticks_match_process(&before.ticks, process) || !ticks_match_process(&after.ticks, process) {
         return ProcessActivity::unavailable(
             process,
             window,
@@ -603,10 +771,15 @@ fn activity_from_snapshots(
         }
         Err(error) => activity.io_error = Some(error),
     }
+    activity.pressure = Some(pressure_from_snapshots(
+        before,
+        after,
+        clock_ticks_per_second,
+    ));
     activity
 }
 
-/// Measure recent CPU and storage-I/O rates using one shared sampling window.
+/// Measure CPU, storage I/O, memory and pressure in one shared sampling window.
 ///
 /// Every sample is bound to the quick-scan PID/start ID/UID. The actual elapsed
 /// time is recorded per signal and process; batch collection overhead is never
@@ -619,25 +792,30 @@ pub fn sample_process_activity(
     if window.is_zero() {
         return BTreeMap::new();
     }
+    let accounting_before = ActivityAccounting::read();
     let first: Vec<_> = processes
         .iter()
         .copied()
-        .map(|process| (process, collect_activity_snapshot(process)))
+        .map(|process| {
+            (
+                process,
+                collect_activity_snapshot(process, &accounting_before),
+            )
+        })
         .collect();
     if first.iter().any(|(_, snapshot)| snapshot.is_ok()) {
         std::thread::sleep(window);
     }
     let tck = clk_tck();
+    let accounting_after = ActivityAccounting::read();
     first
         .into_iter()
         .map(|(process, before)| {
             let activity = match before {
-                Err(error) => ProcessActivity::unavailable(
-                    process,
-                    window,
-                    format!("first sample: {error}"),
-                ),
-                Ok(before) => match collect_activity_snapshot(process) {
+                Err(error) => {
+                    ProcessActivity::unavailable(process, window, format!("first sample: {error}"))
+                }
+                Ok(before) => match collect_activity_snapshot(process, &accounting_after) {
                     Ok(after) => activity_from_snapshots(process, &before, &after, window, tck),
                     Err(error) => ProcessActivity::unavailable(
                         process,
@@ -703,12 +881,121 @@ mod tests {
                 ..IoStats::default()
             }),
             io_observed_at: instant,
+            counters: PressureStatCounters {
+                major_faults: Some(10_000),
+                leader_blkio_delay_ticks: Some(100),
+            },
+            scheduler: Ok(SchedStats {
+                cpu_time_ns: 9_000_000_000,
+                wait_time_ns: 8_000_000_000,
+                timeslices: 1_000,
+            }),
+            scheduler_observed_at: instant,
+            memory: Ok(ProcessMemoryUsage {
+                rss_bytes: 4096,
+                rss_anon_bytes: 2048,
+                rss_file_bytes: 1024,
+                rss_shmem_bytes: 1024,
+                swap_bytes: 8192,
+                threads: 1,
+            }),
+            delay_accounting: Ok(()),
         };
         let mut second = first.clone();
         second.ticks.timestamp += Duration::from_millis(500);
         second.ticks.monotonic = Some(instant + Duration::from_millis(500));
         second.io_observed_at += Duration::from_millis(500);
+        second.scheduler_observed_at += Duration::from_millis(500);
         (process, first, second)
+    }
+
+    #[test]
+    fn pressure_rates_measure_deltas_and_latest_memory_without_another_window() {
+        let (process, first, mut second) = activity_fixture();
+        second.counters.major_faults = Some(10_003);
+        second.counters.leader_blkio_delay_ticks = Some(125);
+        second.scheduler.as_mut().unwrap().wait_time_ns += 125_000_000;
+        // Each source uses its observed time, not the requested batch sleep.
+        second.scheduler_observed_at = first.scheduler_observed_at + Duration::from_secs(1);
+        second.memory.as_mut().unwrap().swap_bytes = 16384;
+        let activity =
+            activity_from_snapshots(&process, &first, &second, Duration::from_millis(50), 100);
+        let pressure = activity.pressure.unwrap();
+        assert_eq!(pressure.major_faults, Some(3));
+        assert_eq!(pressure.major_faults_per_second, Some(6.0));
+        assert_eq!(pressure.stat_window_seconds, Some(0.5));
+        assert_eq!(pressure.leader_run_queue_wait_percent, Some(12.5));
+        assert_eq!(pressure.scheduler_window_seconds, Some(1.0));
+        assert_eq!(pressure.leader_blkio_delay_percent, Some(50.0));
+        assert_eq!(pressure.memory.unwrap().swap_bytes, 16384);
+        assert!(pressure.faults_error.is_none());
+        assert!(pressure.scheduler_error.is_none());
+        assert!(pressure.blkio_error.is_none());
+        assert!(pressure.memory_error.is_none());
+    }
+
+    #[test]
+    fn unavailable_pressure_does_not_erase_cpu_or_io_and_never_means_idle() {
+        for failure in ["unreadable", "reset", "disabled", "zero_delay"] {
+            let (process, mut first, mut second) = activity_fixture();
+            match failure {
+                "unreadable" => {
+                    second.counters.major_faults = None;
+                    second.counters.leader_blkio_delay_ticks = None;
+                    second.scheduler = Err("permission denied".to_string());
+                    second.memory = Err("status is unreadable".to_string());
+                }
+                "reset" => {
+                    second.counters.major_faults = Some(0);
+                    second.counters.leader_blkio_delay_ticks = Some(0);
+                    second.scheduler.as_mut().unwrap().wait_time_ns = 0;
+                }
+                "disabled" => {
+                    first.scheduler = Err("scheduler accounting is disabled".to_string());
+                    first.delay_accounting = Err("delay accounting is disabled".to_string());
+                }
+                "zero_delay" => {
+                    first.counters.leader_blkio_delay_ticks = Some(0);
+                    second.counters.leader_blkio_delay_ticks = Some(0);
+                }
+                _ => unreachable!(),
+            }
+            let activity =
+                activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
+            assert_eq!(activity.cpu_percent, Some(0.0), "{failure}");
+            assert_eq!(activity.io_active, Some(false), "{failure}");
+            let pressure = activity.pressure.unwrap();
+            assert!(pressure.leader_blkio_delay_percent.is_none(), "{failure}");
+            assert!(pressure.blkio_error.is_some(), "{failure}");
+            if failure != "zero_delay" {
+                assert!(
+                    pressure.leader_run_queue_wait_percent.is_none(),
+                    "{failure}"
+                );
+                assert!(pressure.scheduler_error.is_some(), "{failure}");
+            }
+            if matches!(failure, "unreadable" | "reset") {
+                assert!(pressure.major_faults_per_second.is_none(), "{failure}");
+                assert!(pressure.faults_error.is_some(), "{failure}");
+            }
+            if failure == "unreadable" {
+                assert!(pressure.memory.is_none());
+                assert!(pressure.memory_error.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn pressure_stat_fields_are_not_child_faults_or_guest_cpu_ticks() {
+        // Field 12 (majflt) is 7, 13 (cmajflt) is 900, 42 (delayacct_blkio_ticks)
+        // is 25, and the following guest_time field is 800.
+        let content = "42 (worker (thread)) S 1 42 42 0 -1 0 0 0 7 900 100 50 0 0 20 0 1 0 123 4096 1 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 25 800";
+        let counters = parse_pressure_stat_counters(content).unwrap();
+        assert_eq!(counters.major_faults, Some(7));
+        assert_eq!(counters.leader_blkio_delay_ticks, Some(25));
+        let truncated = parse_pressure_stat_counters("42 (worker) S 1").unwrap();
+        assert!(truncated.major_faults.is_none());
+        assert!(truncated.leader_blkio_delay_ticks.is_none());
     }
 
     #[test]
@@ -719,13 +1006,8 @@ mod tests {
         second.io.as_mut().unwrap().read_bytes += 8192;
         second.io.as_mut().unwrap().write_bytes += 4096;
         // A scheduling delay makes the actual window differ from the request.
-        let activity = activity_from_snapshots(
-            &process,
-            &first,
-            &second,
-            Duration::from_millis(250),
-            100,
-        );
+        let activity =
+            activity_from_snapshots(&process, &first, &second, Duration::from_millis(250), 100);
         assert_eq!(activity.requested_window_ms, 250);
         assert_eq!(activity.cpu_ticks, Some(50));
         assert_eq!(activity.cpu_window_seconds, Some(0.5));
@@ -739,26 +1021,16 @@ mod tests {
 
         second.ticks.utime += 50;
         second.ticks.total_ticks += 50;
-        let two_cores = activity_from_snapshots(
-            &process,
-            &first,
-            &second,
-            Duration::from_millis(500),
-            100,
-        );
+        let two_cores =
+            activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
         assert_eq!(two_cores.cpu_percent, Some(200.0));
     }
 
     #[test]
     fn historical_cpu_and_io_totals_do_not_mean_current_activity() {
         let (process, first, second) = activity_fixture();
-        let activity = activity_from_snapshots(
-            &process,
-            &first,
-            &second,
-            Duration::from_millis(500),
-            100,
-        );
+        let activity =
+            activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
         assert_eq!(activity.cpu_percent, Some(0.0));
         assert_eq!(activity.cpu_ticks, Some(0));
         assert_eq!(activity.read_bytes_per_second, Some(0.0));
@@ -778,13 +1050,8 @@ mod tests {
                 "write_reset" => second.io.as_mut().unwrap().write_bytes = 0,
                 _ => unreachable!(),
             }
-            let activity = activity_from_snapshots(
-                &process,
-                &first,
-                &second,
-                Duration::from_millis(500),
-                100,
-            );
+            let activity =
+                activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
             assert_eq!(activity.cpu_percent, Some(100.0), "{failure}");
             assert!(activity.io_active.is_none(), "{failure}");
             assert!(activity.read_bytes_per_second.is_none(), "{failure}");
@@ -807,17 +1074,21 @@ mod tests {
                 "unknown" => second.ticks.identity.quality = IdentityQuality::PidOnly,
                 _ => unreachable!(),
             }
-            let activity = activity_from_snapshots(
-                &process,
-                &first,
-                &second,
-                Duration::from_millis(500),
-                100,
-            );
+            let activity =
+                activity_from_snapshots(&process, &first, &second, Duration::from_millis(500), 100);
             assert!(activity.cpu_percent.is_none(), "{changed}");
             assert!(activity.io_active.is_none(), "{changed}");
             assert!(activity.cpu_error.unwrap().contains("incarnation"));
             assert!(activity.io_error.unwrap().contains("incarnation"));
+            let pressure = activity.pressure.unwrap();
+            assert!(pressure.memory.is_none(), "{changed}");
+            assert!(pressure.major_faults.is_none(), "{changed}");
+            assert!(
+                pressure.leader_run_queue_wait_percent.is_none(),
+                "{changed}"
+            );
+            assert!(pressure.leader_blkio_delay_percent.is_none(), "{changed}");
+            assert!(pressure.memory_error.unwrap().contains("incarnation"));
         }
     }
 
@@ -848,8 +1119,9 @@ mod tests {
             .contains("read_bytes"));
         assert!(parse_activity_io("wchar: 0\nwrite_bytes: 1\nread_bytes: bad\n").is_err());
         assert!(parse_activity_io("wchar: 0\nread_bytes: 0\n").is_err());
-        assert!(parse_activity_io("wchar: 0\nwrite_bytes: 0\nread_bytes: 0\nread_bytes: 1\n")
-            .is_err());
+        assert!(
+            parse_activity_io("wchar: 0\nwrite_bytes: 0\nread_bytes: 0\nread_bytes: 1\n").is_err()
+        );
         let zero = parse_activity_io("wchar: 0\nwrite_bytes: 0\nread_bytes: 0\n").unwrap();
         assert_eq!(zero.read_bytes, 0);
         assert_eq!(zero.write_bytes, 0);
@@ -866,7 +1138,11 @@ mod tests {
         let activity = &measured[&u32::MAX];
         assert!(activity.cpu_percent.is_none());
         assert!(activity.io_active.is_none());
-        assert!(activity.cpu_error.as_ref().unwrap().contains("first sample"));
+        assert!(activity
+            .cpu_error
+            .as_ref()
+            .unwrap()
+            .contains("first sample"));
         assert_eq!(activity.start_id, process.start_id);
         assert!(sample_process_activity(&[&process], Duration::ZERO).is_empty());
     }
@@ -917,6 +1193,20 @@ mod tests {
             assert_eq!(sample.source, "procfs_window");
             assert!(sample.cpu_window_seconds.unwrap() >= 0.5);
             assert!(sample.io_window_seconds.unwrap() >= 0.5);
+            let pressure = sample
+                .pressure
+                .as_ref()
+                .expect("pressure evidence is attached");
+            assert!(pressure.major_faults.is_some(), "{pressure:?}");
+            assert!(pressure.memory.as_ref().unwrap().threads >= 1);
+            // CI may disable task accounting; absence must remain explained.
+            assert!(
+                pressure.leader_run_queue_wait_percent.is_some()
+                    || pressure.scheduler_error.is_some()
+            );
+            assert!(
+                pressure.leader_blkio_delay_percent.is_some() || pressure.blkio_error.is_some()
+            );
         }
     }
 

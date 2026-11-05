@@ -98,7 +98,10 @@ pub use tool_runner::{
     ToolSpec, DEFAULT_BUDGET_MS, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_PARALLEL,
     DEFAULT_TIMEOUT_SECS,
 };
-pub use types::{ProcessActivity, ProcessRecord, ProcessState, ScanMetadata, ScanResult};
+pub use types::{
+    ProcessActivity, ProcessMemoryUsage, ProcessPressureActivity, ProcessRecord, ProcessState,
+    ScanMetadata, ScanResult,
+};
 
 // Re-export protected filter types
 pub use protected::{

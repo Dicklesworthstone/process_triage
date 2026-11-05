@@ -203,7 +203,53 @@ impl ProcessRecord {
     }
 }
 
-/// Recent CPU and storage-I/O activity for one observed process incarnation.
+/// Resident and swapped memory at the end of an activity window.
+///
+/// These are the kernel's inexpensive status counters, not proportional or
+/// uniquely reclaimable memory. Swap excludes shared-memory swap usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProcessMemoryUsage {
+    pub rss_bytes: u64,
+    pub rss_anon_bytes: u64,
+    pub rss_file_bytes: u64,
+    pub rss_shmem_bytes: u64,
+    pub swap_bytes: u64,
+    pub threads: u32,
+}
+
+/// Pressure diagnostics observed alongside CPU and storage-I/O activity.
+///
+/// Scheduler and block-I/O delay counters cover the thread-group leader only;
+/// they must not be interpreted as the sum of all threads. Unknown or disabled
+/// kernel accounting stays null with an explanation instead of looking idle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProcessPressureActivity {
+    pub major_faults: Option<u64>,
+    pub major_faults_per_second: Option<f64>,
+    pub stat_window_seconds: Option<f64>,
+    pub leader_run_queue_wait_percent: Option<f64>,
+    pub scheduler_window_seconds: Option<f64>,
+    pub leader_blkio_delay_percent: Option<f64>,
+    pub memory: Option<ProcessMemoryUsage>,
+    pub faults_error: Option<String>,
+    pub scheduler_error: Option<String>,
+    pub blkio_error: Option<String>,
+    pub memory_error: Option<String>,
+}
+
+impl ProcessPressureActivity {
+    pub(crate) fn unavailable(reason: &str) -> Self {
+        Self {
+            faults_error: Some(reason.to_string()),
+            scheduler_error: Some(reason.to_string()),
+            blkio_error: Some(reason.to_string()),
+            memory_error: Some(reason.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Recent CPU, storage-I/O and pressure activity for one process incarnation.
 ///
 /// Missing measurements remain null, with a reason; they never mean that the
 /// process was idle. CPU percentages use the same one-core = 100% convention as
@@ -226,6 +272,9 @@ pub struct ProcessActivity {
     pub io_active: Option<bool>,
     pub cpu_error: Option<String>,
     pub io_error: Option<String>,
+    /// Diagnostic measurements; these do not independently authorize actions.
+    #[serde(default)]
+    pub pressure: Option<ProcessPressureActivity>,
 }
 
 impl ProcessActivity {
@@ -254,7 +303,8 @@ impl ProcessActivity {
             write_bytes_per_second: None,
             io_active: None,
             cpu_error: Some(reason.clone()),
-            io_error: Some(reason),
+            io_error: Some(reason.clone()),
+            pressure: Some(ProcessPressureActivity::unavailable(&reason)),
         }
     }
 
