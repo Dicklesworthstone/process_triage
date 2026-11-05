@@ -171,7 +171,7 @@ impl<'a> ActionExecutor<'a> {
 
         for action in &plan.actions {
             let start = Instant::now();
-            let result = self.execute_action(action);
+            let (result, details) = self.execute_action(action);
             let time_ms = start.elapsed().as_millis();
             match &result {
                 ActionStatus::Success => succeeded += 1,
@@ -183,7 +183,7 @@ impl<'a> ActionExecutor<'a> {
                 action_id: action.action_id.clone(),
                 status: result,
                 time_ms,
-                details: None,
+                details,
             });
         }
 
@@ -197,9 +197,9 @@ impl<'a> ActionExecutor<'a> {
         })
     }
 
-    fn execute_action(&self, action: &PlanAction) -> ActionStatus {
+    fn execute_action(&self, action: &PlanAction) -> (ActionStatus, Option<String>) {
         if action.blocked {
-            return ActionStatus::Skipped;
+            return (ActionStatus::Skipped, None);
         }
 
         // The plan's pre-checks plus the ones pt requires for this action type.
@@ -209,16 +209,18 @@ impl<'a> ActionExecutor<'a> {
         if pre_checks.contains(&PreCheck::VerifyIdentity) {
             match self.identity_provider.revalidate(&action.target) {
                 Ok(true) => {}
-                Ok(false) => return ActionStatus::IdentityMismatch,
-                Err(_) => return ActionStatus::IdentityMismatch,
+                Ok(false) => return outcome_from_error(ActionError::IdentityMismatch),
+                Err(error) => {
+                    return (ActionStatus::IdentityMismatch, Some(error.to_string()));
+                }
             }
         }
 
         // Just-in-time revalidation by the runner itself
         match self.runner.revalidate(action, self.identity_provider) {
             Ok(true) => {}
-            Ok(false) => return ActionStatus::IdentityMismatch,
-            Err(e) => return status_from_error(e),
+            Ok(false) => return outcome_from_error(ActionError::IdentityMismatch),
+            Err(error) => return outcome_from_error(error),
         }
 
         // Run other pre-checks (protected, data-loss, supervisor, session safety)
@@ -231,21 +233,28 @@ impl<'a> ActionExecutor<'a> {
             for result in results {
                 if let crate::action::prechecks::PreCheckResult::Blocked { check, reason } = result
                 {
-                    return ActionStatus::PreCheckBlocked { check, reason };
+                    return (ActionStatus::PreCheckBlocked { check, reason }, None);
                 }
             }
         }
 
         if let Err(err) = self.runner.execute(action) {
-            return status_from_error(err);
+            return outcome_from_error(err);
         }
 
         if let Err(err) = self.runner.verify(action) {
-            return status_from_error(err);
+            return outcome_from_error(err);
         }
 
-        ActionStatus::Success
+        (ActionStatus::Success, None)
     }
+}
+
+fn outcome_from_error(error: ActionError) -> (ActionStatus, Option<String>) {
+    // A failed action can already have changed part of its target. Preserve the
+    // runner's explanation in persisted/JSON outcomes instead of discarding it.
+    let details = error.to_string();
+    (status_from_error(error), Some(details))
 }
 
 fn status_from_error(err: ActionError) -> ActionStatus {
@@ -385,6 +394,51 @@ mod tests {
         let executor = ActionExecutor::new(&runner, &identity_provider, dir.path().join("lock"));
         let result = executor.execute_plan(&plan).expect("execute");
         assert_eq!(result.outcomes[0].status, ActionStatus::IdentityMismatch);
+    }
+
+    #[test]
+    fn execution_and_verification_failures_preserve_partial_action_details() {
+        struct PartialRunner {
+            fail_during_verify: bool,
+        }
+        const DETAIL: &str = "renice incomplete: permission denied; 1 thread priority write(s) already succeeded; changes were not rolled back";
+        impl ActionRunner for PartialRunner {
+            fn execute(&self, _: &PlanAction) -> Result<(), ActionError> {
+                if self.fail_during_verify {
+                    Ok(())
+                } else {
+                    Err(ActionError::Failed(DETAIL.into()))
+                }
+            }
+            fn verify(&self, _: &PlanAction) -> Result<(), ActionError> {
+                assert!(
+                    self.fail_during_verify,
+                    "verification must not run after execution failure"
+                );
+                Err(ActionError::Failed(DETAIL.into()))
+            }
+        }
+        for fail_during_verify in [false, true] {
+            let plan = make_plan();
+            let dir = tempdir().expect("tempdir");
+            let runner = PartialRunner { fail_during_verify };
+            let provider =
+                StaticIdentityProvider::default().with_identity(plan.actions[0].target.clone());
+            let executor = ActionExecutor::new(&runner, &provider, dir.path().join("lock"));
+            let result = executor.execute_plan(&plan).expect("execute");
+            assert_eq!(result.summary.actions_failed, 1);
+            assert_eq!(result.outcomes[0].status, ActionStatus::Failed);
+            let expected = format!("action failed: {DETAIL}");
+            assert_eq!(
+                result.outcomes[0].details.as_deref(),
+                Some(expected.as_str())
+            );
+            let json = serde_json::to_value(&result).expect("serialize outcome");
+            assert!(json["outcomes"][0]["details"]
+                .as_str()
+                .unwrap()
+                .contains("changes were not rolled back"));
+        }
     }
 
     #[test]
