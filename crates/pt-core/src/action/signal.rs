@@ -98,6 +98,15 @@ fn signal_syscall_target(target_id: u32, use_group: bool) -> Result<i32, ActionE
     Ok(if use_group { -target } else { target })
 }
 
+/// A job-control stopped target cannot handle a pending SIGTERM until resumed.
+/// Tracing stops belong to the debugger, and one process's state cannot justify
+/// resuming every member of its process group. Linux distinguishes these stops
+/// as `T` and `t`; other collectors do not yet provide that distinction.
+#[cfg(any(unix, test))]
+fn should_resume_after_sigterm(state: Option<char>, use_group: bool) -> bool {
+    cfg!(target_os = "linux") && !use_group && state == Some('T')
+}
+
 /// Signal action runner configuration.
 #[derive(Debug, Clone)]
 pub struct SignalConfig {
@@ -359,14 +368,23 @@ impl SignalActionRunner {
     fn execute_kill(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
+        let resume_stopped = should_resume_after_sigterm(self.get_process_state(pid), use_group);
 
-        // Linux: SIGTERM and the SIGKILL escalation both go through one pidfd pinned
-        // to the verified process, closing the PID-reuse window completely.
+        // Linux: TERM, any CONT needed for graceful shutdown, and KILL all go
+        // through one pidfd pinned to the verified process. Never resume a
+        // replacement process if the target exits between these signals.
         #[cfg(target_os = "linux")]
         if !use_group {
             if let Some(pidfd) = self.pinned_pidfd(action)? {
                 pidfd.send(libc::SIGTERM)?;
                 self.note_delivered_signal(libc::SIGTERM);
+                if resume_stopped {
+                    match pidfd.send(libc::SIGCONT) {
+                        Ok(()) => {}
+                        Err(ActionError::ProcessNotFound) => return Ok(()),
+                        Err(error) => return Err(error),
+                    }
+                }
                 let grace = Duration::from_millis(self.config.term_grace_ms);
                 return match self.wait_for_state_change(pid, true, None, grace) {
                     Ok(()) => Ok(()),
@@ -391,6 +409,19 @@ impl SignalActionRunner {
 
         // Stage 1: SIGTERM
         self.send_signal(target, libc::SIGTERM, use_group)?;
+
+        if resume_stopped {
+            // Without a pidfd, revalidate immediately before the additional
+            // signal just as for TERM and KILL. CONT always targets this one
+            // process, never an unverified group or a tracing-stop subject.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            self.check_identity_now(action)?;
+            match self.send_signal(pid, libc::SIGCONT, false) {
+                Ok(()) => {}
+                Err(ActionError::ProcessNotFound) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
 
         // Wait for graceful termination
         let grace = Duration::from_millis(self.config.term_grace_ms);
@@ -880,6 +911,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn graceful_kill_does_not_resume_tracing_stops_or_groups() {
+        assert_eq!(
+            should_resume_after_sigterm(Some('T'), false),
+            cfg!(target_os = "linux")
+        );
+        assert!(!should_resume_after_sigterm(Some('T'), true));
+        for state in [None, Some('t'), Some('R'), Some('S'), Some('Z')] {
+            assert!(!should_resume_after_sigterm(state, false), "{state:?}");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn action_namespace_validation_rejects_ancestor_procfs_and_unknown_links() {
@@ -1128,6 +1171,155 @@ mod tests {
     mod linux_tests {
         use super::*;
         use crate::action::executor::IdentityProvider;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        struct OwnedSignalChild(std::process::Child);
+
+        impl Drop for OwnedSignalChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// The shell stops itself only after installing its handler. Its open
+        /// stdin pipe keeps `read` blocked after CONT without any descendant
+        /// process or busy loop, including when TERM is deliberately ignored.
+        fn stopped_term_child(
+            marker: &std::path::Path,
+            ignore_term: bool,
+            own_group: bool,
+        ) -> (OwnedSignalChild, PlanAction) {
+            let script = if ignore_term {
+                "trap '' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || exit; done"
+            } else {
+                "trap 'printf \"term handled\\n\" > \"$1\"; exit 0' TERM\nkill -STOP \"$$\"\nwhile :; do read -r line || exit; done"
+            };
+            let mut command = std::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(script)
+                .arg("pt-signal-test")
+                .arg(marker)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if own_group {
+                // Any group-directed test signal must stay within this owned
+                // child's group, never the test runner's inherited group.
+                command.process_group(0);
+            }
+            let child = OwnedSignalChild(command.spawn().expect("spawn owned TERM handler"));
+            let pid = child.0.id();
+            SignalActionRunner::with_defaults()
+                .wait_for_state_change(pid, false, Some(true), Duration::from_secs(5))
+                .expect("child installed TERM handler and stopped");
+            let provider = LiveIdentityProvider::new();
+            let target = pt_common::ProcessIdentity {
+                pid: pt_common::ProcessId(pid),
+                start_id: pt_common::StartId(provider.read_start_id(pid).expect("child start ID")),
+                uid: provider.read_uid(pid).expect("child UID"),
+                pgid: own_group.then_some(pid),
+                sid: None,
+                quality: pt_common::IdentityQuality::Full,
+            };
+            let action = serde_json::from_value(serde_json::json!({
+                "action_id": "owned-signal-test",
+                "target": target,
+                "action": "kill",
+                "order": 0,
+                "stage": 0,
+                "timeouts": crate::plan::ActionTimeouts::default(),
+                "pre_checks": [],
+                "rationale": {},
+                "on_success": [],
+                "on_failure": [],
+                "blocked": false,
+            }))
+            .expect("valid kill PlanAction");
+            (child, action)
+        }
+
+        #[test]
+        fn stopped_kill_runs_sigterm_handler_before_escalation() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, action) = stopped_term_child(&marker, false, false);
+            let runner = SignalActionRunner::with_defaults();
+
+            runner.execute(&action).expect("terminate stopped child");
+            runner.verify(&action).expect("child exited");
+            let status = child.0.wait().expect("reap owned child");
+            assert!(
+                status.success(),
+                "TERM handler should exit cleanly: {status}"
+            );
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "term handled\n");
+            assert!(runner.take_kill_signal_delivered());
+        }
+
+        #[test]
+        fn stopped_kill_escalates_when_sigterm_is_ignored() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, action) = stopped_term_child(&marker, true, false);
+            let runner = SignalActionRunner::new(SignalConfig {
+                term_grace_ms: 100,
+                poll_interval_ms: 10,
+                ..SignalConfig::default()
+            });
+
+            runner
+                .execute(&action)
+                .expect("terminate TERM-ignoring child");
+            runner
+                .verify(&action)
+                .expect("child exited after escalation");
+            let status = child.0.wait().expect("reap owned child");
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            assert!(!marker.exists());
+            assert!(runner.take_kill_signal_delivered());
+        }
+
+        #[test]
+        fn stopped_kill_does_not_resume_an_unverified_process_group() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, action) = stopped_term_child(&marker, false, true);
+            let runner = SignalActionRunner::new(SignalConfig {
+                term_grace_ms: 100,
+                poll_interval_ms: 10,
+                use_process_groups: true,
+                ..SignalConfig::default()
+            });
+
+            runner.execute(&action).expect("terminate owned group");
+            runner.verify(&action).expect("group leader exited");
+            assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+            assert!(
+                !marker.exists(),
+                "a leader's state must not authorize group CONT"
+            );
+        }
+
+        #[test]
+        fn stopped_kill_does_not_signal_a_changed_identity() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, mut action) = stopped_term_child(&marker, false, false);
+            let runner = SignalActionRunner::with_defaults();
+            let pid = child.0.id();
+            let other_start = runner.read_starttime(pid).unwrap() + 1;
+            action.target.start_id = pt_common::StartId(format!("unknown:{other_start}:{pid}"));
+
+            assert!(matches!(
+                runner.execute(&action),
+                Err(ActionError::IdentityMismatch)
+            ));
+            assert_eq!(runner.get_process_state(pid), Some('T'));
+            assert!(!runner.take_kill_signal_delivered());
+            assert!(!marker.exists());
+        }
 
         #[test]
         fn live_identity_provider_validates_self() {
