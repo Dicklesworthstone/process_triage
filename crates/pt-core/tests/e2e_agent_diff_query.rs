@@ -670,7 +670,7 @@ fn diff_consumes_real_plans_with_concurrent_identical_workers() {
     with_temp_data_dir(|dir| {
         let config_dir = dir.path().join("config");
         fs::create_dir_all(&config_dir).unwrap();
-        let mut policy = pt_common::config::policy::Policy::default();
+        let mut policy = pt_core::config::Policy::default();
         policy.guardrails.builtin_protection = false;
         policy.guardrails.protected_users.clear();
         policy.guardrails.min_process_age_seconds = 0;
