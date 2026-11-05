@@ -1160,7 +1160,10 @@ fn actual_mcp_sampling_windows_are_advertised_and_rejected_before_process_work()
             }));
         }
     }
-    let input = requests.iter().map(|request| format!("{request}\n")).collect::<String>();
+    let input = requests
+        .iter()
+        .map(|request| format!("{request}\n"))
+        .collect::<String>();
     let output = cargo_bin_cmd!("pt-core")
         .arg("--config")
         .arg(config.path())
@@ -1176,9 +1179,14 @@ fn actual_mcp_sampling_windows_are_advertised_and_rejected_before_process_work()
         .map(|line| serde_json::from_str(line).expect("JSON-RPC response"))
         .collect();
     assert_eq!(responses.len(), requests.len(), "{responses:?}");
-    let definitions = responses[0]["result"]["tools"].as_array().expect("tool definitions");
+    let definitions = responses[0]["result"]["tools"]
+        .as_array()
+        .expect("tool definitions");
     for name in ["pt_scan", "pt_explain", "pt_plan"] {
-        let definition = definitions.iter().find(|tool| tool["name"] == name).unwrap();
+        let definition = definitions
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
         let window = &definition["inputSchema"]["properties"]["window_ms"];
         assert_eq!(window["type"], "integer", "{name}");
         assert_eq!(window["default"], 500, "{name}");
@@ -1415,12 +1423,24 @@ fn actual_mcp_scan_and_explain_preserve_config_and_invoker_protection() {
                 assert_eq!(result["window_ms"], 500, "{label}: {result}");
                 let activity = &result["activity"];
                 assert_eq!(activity["pid"], caller_pid, "{label}: {result}");
-                assert_eq!(activity["start_id"], result["start_id"], "{label}: {result}");
+                assert_eq!(
+                    activity["start_id"], result["start_id"],
+                    "{label}: {result}"
+                );
                 assert_eq!(activity["uid"], result["uid"], "{label}: {result}");
                 assert_eq!(activity["requested_window_ms"], 500, "{label}: {result}");
-                assert_eq!(result["cpu_pct"], activity["cpu_percent"], "{label}: {result}");
-                assert_eq!(result["io_activity"], activity["io_active"], "{label}: {result}");
-                assert!(result["cpu_lifetime_pct"].as_f64().is_some(), "{label}: {result}");
+                assert_eq!(
+                    result["cpu_pct"], activity["cpu_percent"],
+                    "{label}: {result}"
+                );
+                assert_eq!(
+                    result["io_activity"], activity["io_active"],
+                    "{label}: {result}"
+                );
+                assert!(
+                    result["cpu_lifetime_pct"].as_f64().is_some(),
+                    "{label}: {result}"
+                );
                 if result["cpu_pct"].is_null() {
                     assert!(activity["cpu_error"].is_string(), "{label}: {result}");
                 }

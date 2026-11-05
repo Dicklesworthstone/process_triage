@@ -109,7 +109,9 @@ fn procfs_namespace_matches_self(status: &str, local_pid: u32) -> bool {
     if local_pid == 0 {
         return false;
     }
-    let mut entries = status.lines().filter_map(|line| line.strip_prefix("NSpid:"));
+    let mut entries = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NSpid:"));
     let Some(entry) = entries.next() else {
         return false;
     };
@@ -117,8 +119,7 @@ fn procfs_namespace_matches_self(status: &str, local_pid: u32) -> bool {
         return false;
     }
     let mut pids = entry.split_whitespace();
-    pids.next().and_then(|pid| pid.parse::<u32>().ok()) == Some(local_pid)
-        && pids.next().is_none()
+    pids.next().and_then(|pid| pid.parse::<u32>().ok()) == Some(local_pid) && pids.next().is_none()
 }
 
 fn collector_pid_for_scan(platform: &str, child_pid: u32) -> Option<u32> {
@@ -1072,7 +1073,10 @@ mod tests {
 
     #[test]
     fn collector_namespace_proof_rejects_nested_and_ambiguous_pid_mappings() {
-        assert!(procfs_namespace_matches_self("Name: pt-core\nNSpid:\t42\n", 42));
+        assert!(procfs_namespace_matches_self(
+            "Name: pt-core\nNSpid:\t42\n",
+            42
+        ));
         for status in [
             "",
             "Pid:\t42\n",
@@ -1135,8 +1139,7 @@ mod tests {
 
         // An ancestor procfs mount may show an unrelated process at the child
         // handle's numeric PID. Failed namespace proof must retain that row.
-        let collector_pid =
-            procfs_namespace_matches_self("NSpid:\t42\t42\n", 42).then_some(500);
+        let collector_pid = procfs_namespace_matches_self("NSpid:\t42\t42\n", 42).then_some(500);
         let mut mismatched = original;
         omit_owned_collector(&mut mismatched, collector_pid, false);
         assert_eq!(serde_json::to_value(&mismatched).unwrap(), before);

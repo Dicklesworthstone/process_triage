@@ -1187,6 +1187,7 @@ struct AgentExplainArgs {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use pt_core::action::{ActionRunner, IdentityProvider, LiveIdentityProvider};
 use pt_core::decision::{
+    goal_contribution::GoalResourceSnapshot,
     goal_optimizer::{
         optimize_greedy, optimize_ilp, OptCandidate, OptimizationResult, ResourceGoal,
     },
@@ -2045,7 +2046,13 @@ mod cli_definition_tests {
             vec!["pt-core", "agent", "snapshot"],
             vec!["pt-core", "agent", "watch"],
             vec![
-                "pt-core", "agent", "explain", "--session", "test-session", "--pids", "1234",
+                "pt-core",
+                "agent",
+                "explain",
+                "--session",
+                "test-session",
+                "--pids",
+                "1234",
             ],
         ] {
             for (value, expected) in [(None, 500), (Some("0"), 0), (Some("60000"), 60000)] {
@@ -3690,7 +3697,9 @@ fn observed_queue_metrics(info: &pt_core::collect::NetworkInfo) -> QueueMetrics 
     // probability. Storage I/O activity and UNIX socket reference counts do not
     // measure socket throughput either. Retain only positive observed pressure;
     // absent or small queues are not proof that the process is clear or idle.
-    let saturated = info.has_saturated_queue(QUEUE_SATURATION_THRESHOLD).then_some(true);
+    let saturated = info
+        .has_saturated_queue(QUEUE_SATURATION_THRESHOLD)
+        .then_some(true);
 
     QueueMetrics {
         saturated,
@@ -3998,6 +4007,8 @@ fn build_tui_rows(
             proc.pid.0,
             serde_json::json!({
                 "pid": proc.pid.0,
+                "start_id": proc.start_id,
+                "uid": proc.uid,
                 "recommended_action": recommendation,
                 "action_rationale": rationale,
                 "memory_mb": memory_mb,
@@ -4024,6 +4035,7 @@ fn build_tui_rows(
     if let Some(goal_str) = goal_str {
         match parse_goal(goal_str) {
             Ok(parsed) => {
+                let resources = GoalResourceSnapshot::collect(&parsed, population);
                 let mut candidates_for_goal = Vec::new();
                 for row in &rows {
                     if let Some(candidate) = goal_candidates.get(&row.pid) {
@@ -4037,6 +4049,7 @@ fn build_tui_rows(
                         &parsed,
                         cpu_total,
                         &candidates_for_goal,
+                        &resources,
                     ) {
                         Ok(output) => {
                             let mut lines = Vec::new();
@@ -4408,11 +4421,13 @@ struct GoalPlanOutput {
     selected_pids: Vec<u32>,
     strategy: String,
     warnings: Vec<String>,
+    resource_observations: serde_json::Value,
 }
 
 fn resource_goal_from_target(
     target: &ResourceTarget,
     current_cpu_pct: f64,
+    resources: &GoalResourceSnapshot,
 ) -> Result<(ResourceGoal, Vec<String>), String> {
     if !target.value.is_finite() || target.value < 0.0 {
         return Err("goal target must be finite and non-negative".to_string());
@@ -4452,15 +4467,37 @@ fn resource_goal_from_target(
             }
         }
         Metric::Port => {
-            warnings.push("port_goal_requires_socket_inspection".to_string());
+            let port = target
+                .port
+                .filter(|port| *port > 0)
+                .ok_or("port goal requires a port between 1 and 65535")?;
+            let holders = resources
+                .ports
+                .get(&port)
+                .and_then(|port| port.holders.as_ref());
+            let required = match holders {
+                Some(holders) if holders.is_empty() => {
+                    warnings.push(format!("port_{port}_already_free"));
+                    0.0
+                }
+                Some(holders) => holders.len() as f64,
+                None => {
+                    warnings.push(format!("port_{port}_ownership_unavailable"));
+                    1.0
+                }
+            };
             ResourceGoal {
-                resource: format!("port_{}", target.port.unwrap_or(0)),
-                target: 1.0,
+                resource: format!("port_{port}"),
+                // Port release is a conjunction over all holder processes,
+                // including duplicate descriptors and SO_REUSEPORT sockets.
+                target: required,
                 weight: 1.0,
             }
         }
         Metric::FileDescriptors => {
-            warnings.push("fd_goal_requires_fd_counts".to_string());
+            if resources.processes.is_empty() {
+                warnings.push("fd_goal_measurements_unavailable".to_string());
+            }
             ResourceGoal {
                 resource: "fd_count".to_string(),
                 target: target.value,
@@ -4474,12 +4511,13 @@ fn resource_goal_from_target(
 fn build_resource_goals(
     goal: &Goal,
     current_cpu_pct: f64,
+    resources: &GoalResourceSnapshot,
 ) -> Result<(Vec<ResourceGoal>, Vec<String>), String> {
     let mut warnings = Vec::new();
     let mut goals = Vec::new();
     match goal {
         Goal::Target(t) => {
-            let (g, mut w) = resource_goal_from_target(t, current_cpu_pct)?;
+            let (g, mut w) = resource_goal_from_target(t, current_cpu_pct, resources)?;
             warnings.append(&mut w);
             goals.push(g);
         }
@@ -4488,7 +4526,7 @@ fn build_resource_goals(
                 let Goal::Target(t) = sub else {
                     return Err("nested composite goals not supported".to_string());
                 };
-                let (g, mut w) = resource_goal_from_target(t, current_cpu_pct)?;
+                let (g, mut w) = resource_goal_from_target(t, current_cpu_pct, resources)?;
                 warnings.append(&mut w);
                 goals.push(g);
             }
@@ -4520,7 +4558,13 @@ fn parse_kill_loss(candidate: &serde_json::Value) -> f64 {
 fn build_opt_candidates_for_goals(
     candidates: &[serde_json::Value],
     goals: &[ResourceGoal],
+    resources: &GoalResourceSnapshot,
 ) -> Vec<OptCandidate> {
+    let eligible: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate["recommended_action"].as_str() == Some("kill"))
+        .filter_map(goal_candidate_identity)
+        .collect();
     candidates
         .iter()
         .filter_map(|candidate| {
@@ -4540,14 +4584,41 @@ fn build_opt_candidates_for_goals(
                 .get("cpu_percent")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
+            let identity = goal_candidate_identity(candidate);
 
             let contributions: Vec<f64> = goals
                 .iter()
                 .map(|goal| match goal.resource.as_str() {
                     "memory_mb" => memory_mb,
                     "cpu_pct" => cpu_pct,
-                    "fd_count" => 0.0,
-                    r if r.starts_with("port_") => 0.0,
+                    "fd_count" => identity
+                        .as_ref()
+                        .and_then(|identity| resources.fd_count(identity))
+                        .unwrap_or(0) as f64,
+                    resource if resource.starts_with("port_") => {
+                        let holders = resource
+                            .strip_prefix("port_")
+                            .and_then(|port| port.parse::<u16>().ok())
+                            .and_then(|port| resources.ports.get(&port))
+                            .and_then(|port| port.holders.as_ref());
+                        holders
+                            .filter(|holders| {
+                                // A partial kill set does not free a port. Do not
+                                // select a subset solely for an unattainable goal.
+                                holders
+                                    .iter()
+                                    .all(|holder| eligible.iter().any(|id| id.matches(holder)))
+                            })
+                            .map_or(0.0, |holders| {
+                                if identity.as_ref().is_some_and(|identity| {
+                                    holders.iter().any(|holder| holder.matches(identity))
+                                }) {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            })
+                    }
                     _ => 0.0,
                 })
                 .collect();
@@ -4563,13 +4634,53 @@ fn build_opt_candidates_for_goals(
         .collect()
 }
 
+fn goal_candidate_identity(candidate: &serde_json::Value) -> Option<ProcessIdentity> {
+    Some(ProcessIdentity::new(
+        u32::try_from(candidate["pid"].as_u64()?).ok()?,
+        pt_common::StartId(candidate["start_id"].as_str()?.to_string()),
+        u32::try_from(candidate["uid"].as_u64()?).ok()?,
+    ))
+}
+
+fn goal_candidate_action_identity(candidate: &serde_json::Value) -> Option<ProcessIdentity> {
+    if candidate["recommended_action"].as_str() != Some("kill") {
+        return None;
+    }
+    let identity: ProcessIdentity =
+        serde_json::from_value(candidate["action_target"].clone()).ok()?;
+    if candidate["pid"].as_u64() != Some(u64::from(identity.pid.0))
+        || candidate["start_id"].as_str() != Some(identity.start_id.0.as_str())
+        || candidate["uid"].as_u64() != Some(u64::from(identity.uid))
+    {
+        return None;
+    }
+    Some(identity)
+}
+
+fn attach_goal_resource_observations(
+    candidates: &mut [serde_json::Value],
+    resources: &GoalResourceSnapshot,
+) {
+    for candidate in candidates {
+        let identity = goal_candidate_identity(candidate);
+        candidate["goal_resources"] = serde_json::json!({
+            "fd_count": identity.as_ref().and_then(|identity| resources.fd_count(identity)),
+            "bound_ports": resources.ports.iter().filter_map(|(port, observed)| {
+                observed.holders.as_ref().filter(|holders| identity.as_ref().is_some_and(|identity|
+                    holders.iter().any(|holder| holder.matches(identity)))).map(|_| *port)
+            }).collect::<Vec<_>>(),
+        });
+    }
+}
+
 fn build_goal_plan_from_candidates(
     _goal_str: &str,
     goal: &Goal,
     current_cpu_pct: f64,
     candidates: &[serde_json::Value],
+    resources: &GoalResourceSnapshot,
 ) -> Result<GoalPlanOutput, String> {
-    let mut warnings = Vec::new();
+    let mut warnings = resources.warnings.clone();
     let (goals, mut w) = match goal {
         Goal::Or(parts) => {
             let mut best: Option<(OptimizationResult, Vec<ResourceGoal>)> = None;
@@ -4578,7 +4689,7 @@ fn build_goal_plan_from_candidates(
                 let Goal::Target(t) = sub else {
                     continue;
                 };
-                let (g, mut w) = match resource_goal_from_target(t, current_cpu_pct) {
+                let (g, mut w) = match resource_goal_from_target(t, current_cpu_pct, resources) {
                     Ok(value) => value,
                     Err(error)
                         if goal_requires_cpu_baseline(sub)
@@ -4594,14 +4705,16 @@ fn build_goal_plan_from_candidates(
                 };
                 warnings.append(&mut w);
                 let goals = vec![g.clone()];
-                let opt_candidates = build_opt_candidates_for_goals(candidates, &goals);
+                let opt_candidates = build_opt_candidates_for_goals(candidates, &goals, resources);
                 let result = optimize_ilp(&opt_candidates, &goals);
                 let achieved = result
                     .goal_achievement
                     .first()
                     .map(|g| {
                         if g.target > 0.0 {
-                            g.achieved / g.target
+                            // Once an OR branch is satisfied, overshooting it
+                            // must not outrank a cheaper satisfied branch.
+                            (g.achieved / g.target).clamp(0.0, 1.0)
                         } else {
                             1.0
                         }
@@ -4635,13 +4748,19 @@ fn build_goal_plan_from_candidates(
                 result,
                 strategy: "or_best".to_string(),
                 warnings,
+                resource_observations: serde_json::json!({
+                    "basis": "observed_snapshot",
+                    "port_scope": "current_network_namespace",
+                    "process_scope": "mounted_procfs",
+                    "ports": resources.ports,
+                }),
             });
         }
-        _ => build_resource_goals(goal, current_cpu_pct)?,
+        _ => build_resource_goals(goal, current_cpu_pct, resources)?,
     };
     warnings.append(&mut w);
 
-    let opt_candidates = build_opt_candidates_for_goals(candidates, &goals);
+    let opt_candidates = build_opt_candidates_for_goals(candidates, &goals, resources);
     let result = if goals.len() == 1 {
         optimize_ilp(&opt_candidates, &goals)
     } else {
@@ -4660,6 +4779,12 @@ fn build_goal_plan_from_candidates(
         selected_pids,
         strategy: "and".to_string(),
         warnings,
+        resource_observations: serde_json::json!({
+            "basis": "observed_snapshot",
+            "port_scope": "current_network_namespace",
+            "process_scope": "mounted_procfs",
+            "ports": resources.ports,
+        }),
     })
 }
 
@@ -4667,7 +4792,20 @@ fn goal_summary_json(goal_str: &str, goal: &Goal, output: &GoalPlanOutput) -> se
     let targets: Vec<serde_json::Value> = output
         .goals
         .iter()
-        .map(|g| serde_json::json!({"resource": g.resource, "target": g.target}))
+        .map(|g| {
+            serde_json::json!({
+                "resource": g.resource,
+                "target": g.target,
+                "unit": match g.resource.as_str() {
+                    "memory_mb" => "MiB",
+                    "cpu_pct" => "percent_of_one_core",
+                    "fd_count" => "descriptors",
+                    resource if resource.starts_with("port_") => "holder_processes",
+                    _ => "unknown",
+                },
+                "requires_all_holders": g.resource.starts_with("port_"),
+            })
+        })
         .collect();
     let goal_achievement = serde_json::to_value(&output.result.goal_achievement)
         .unwrap_or_else(|_| serde_json::json!([]));
@@ -4679,6 +4817,7 @@ fn goal_summary_json(goal_str: &str, goal: &Goal, output: &GoalPlanOutput) -> se
         "goal": goal_str,
         "parsed": goal.canonical(),
         "strategy": output.strategy,
+        "optimizer_algorithm": output.result.algorithm,
         "achievable": output.result.feasible,
         "targets": targets,
         "projected_recovery": output.result.total_contributions,
@@ -4688,6 +4827,7 @@ fn goal_summary_json(goal_str: &str, goal: &Goal, output: &GoalPlanOutput) -> se
         "alternatives": alternatives,
         "log_events": log_events,
         "warnings": output.warnings,
+        "resource_observations": output.resource_observations,
     })
 }
 
@@ -4700,6 +4840,7 @@ fn build_goal_plan_from_executable_actions(
     current_cpu_pct: f64,
     candidates: &mut [serde_json::Value],
     plan: &Plan,
+    resources: &GoalResourceSnapshot,
 ) -> Result<GoalPlanOutput, String> {
     let executable: HashSet<ProcessIdentity> = plan
         .actions
@@ -4715,17 +4856,7 @@ fn build_goal_plan_from_executable_actions(
     let eligible_pids: Vec<Option<u32>> = candidates
         .iter()
         .map(|candidate| {
-            if candidate["recommended_action"].as_str() != Some("kill") {
-                return None;
-            }
-            let identity: ProcessIdentity =
-                serde_json::from_value(candidate["action_target"].clone()).ok()?;
-            if candidate["pid"].as_u64() != Some(u64::from(identity.pid.0))
-                || candidate["start_id"].as_str() != Some(identity.start_id.0.as_str())
-                || candidate["uid"].as_u64() != Some(u64::from(identity.uid))
-            {
-                return None;
-            }
+            let identity = goal_candidate_action_identity(candidate)?;
             executable.contains(&identity).then_some(identity.pid.0)
         })
         .collect();
@@ -4735,8 +4866,13 @@ fn build_goal_plan_from_executable_actions(
         .filter(|(_, pid)| pid.is_some())
         .map(|(candidate, _)| candidate.clone())
         .collect();
-    let output =
-        build_goal_plan_from_candidates(goal_str, goal, current_cpu_pct, &executable_candidates)?;
+    let output = build_goal_plan_from_candidates(
+        goal_str,
+        goal,
+        current_cpu_pct,
+        &executable_candidates,
+        resources,
+    )?;
     let selected_rank: HashMap<u32, usize> = output
         .selected_pids
         .iter()
@@ -4759,10 +4895,150 @@ fn build_goal_plan_from_executable_actions(
     Ok(output)
 }
 
+/// Make the saved plan, default apply selection and displayed action IDs agree
+/// with the optimized goal set. Independent candidate advice remains available,
+/// but it must not become an additional action in a goal-oriented session.
+fn constrain_plan_to_goal_selection(
+    plan: &mut Plan,
+    candidates: &mut [serde_json::Value],
+    selected_pids: &[u32],
+) {
+    let selected_pids: HashSet<u32> = selected_pids.iter().copied().collect();
+    let selected_identities: HashSet<ProcessIdentity> = candidates
+        .iter()
+        .filter_map(goal_candidate_action_identity)
+        .filter(|identity| selected_pids.contains(&identity.pid.0))
+        .collect();
+    let kill_stages: HashMap<ProcessIdentity, u8> = plan
+        .actions
+        .iter()
+        .filter(|action| {
+            !action.blocked
+                && action.action == Action::Kill
+                && action.routing == pt_core::plan::ActionRouting::Direct
+                && action.original_zombie_target.is_none()
+                && selected_identities.contains(&action.target)
+        })
+        .map(|action| (action.target.clone(), action.stage))
+        .collect();
+    plan.actions.retain(|action| {
+        !action.blocked
+            && action.routing == pt_core::plan::ActionRouting::Direct
+            && action.original_zombie_target.is_none()
+            && kill_stages.get(&action.target).is_some_and(|kill_stage| {
+                action.action == Action::Kill
+                    || (action.action == Action::Pause && action.stage < *kill_stage)
+            })
+    });
+    for (order, action) in plan.actions.iter_mut().enumerate() {
+        action.order = order as u32;
+    }
+    let action_ids: HashSet<&str> = plan
+        .actions
+        .iter()
+        .map(|action| action.action_id.as_str())
+        .collect();
+    plan.pre_toggled
+        .retain(|action_id| action_ids.contains(action_id.as_str()));
+    plan.gates_summary.pre_toggled_actions = plan.pre_toggled.len();
+
+    for candidate in candidates {
+        let identity = goal_candidate_action_identity(candidate);
+        let selected = identity
+            .as_ref()
+            .is_some_and(|identity| kill_stages.contains_key(identity));
+        let action_ids: Vec<&str> = plan
+            .actions
+            .iter()
+            .filter(|action| identity.as_ref() == Some(&action.target))
+            .map(|action| action.action_id.as_str())
+            .collect();
+        candidate["goal_selected"] = serde_json::json!(selected);
+        candidate["plan_action_ids"] = serde_json::json!(action_ids);
+        if let Some(fields) = candidate.as_object_mut() {
+            if selected {
+                fields.remove("goal_exclusion_reason");
+            } else {
+                fields.remove("goal_rank");
+                fields.remove("action_target");
+                fields.insert(
+                    "goal_exclusion_reason".to_string(),
+                    serde_json::json!("not_selected_for_resource_goal"),
+                );
+            }
+        }
+    }
+}
+
+/// Selecting fewer kills can invalidate a parent's earlier live-child gate.
+/// Recheck that exact selection and exclude refused parents before optimizing
+/// again. Each retry removes an eligible identity, so this terminates even when
+/// the goal is infeasible. Errors always leave an empty executable goal plan.
+fn finalize_goal_action_plan(
+    goal: Option<&Goal>,
+    current_cpu_pct: f64,
+    candidates: &mut [serde_json::Value],
+    plan: &mut Plan,
+    resources: &GoalResourceSnapshot,
+    population: &[ProcessRecord],
+    builtin_protection: bool,
+) -> Result<GoalPlanOutput, String> {
+    let Some(goal) = goal else {
+        constrain_plan_to_goal_selection(plan, candidates, &[]);
+        return Err("a valid resource goal is required before selecting actions".to_string());
+    };
+    loop {
+        let output = match build_goal_plan_from_executable_actions(
+            &goal.canonical(),
+            goal,
+            current_cpu_pct,
+            candidates,
+            plan,
+            resources,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                constrain_plan_to_goal_selection(plan, candidates, &[]);
+                return Err(error);
+            }
+        };
+        let mut selected_candidates: Vec<serde_json::Value> = candidates
+            .iter()
+            .filter(|candidate| candidate["goal_selected"].as_bool() == Some(true))
+            .cloned()
+            .collect();
+        let mut selected_refs: Vec<_> = selected_candidates.iter_mut().collect();
+        apply_process_tree_safety(&mut selected_refs, population, builtin_protection);
+        let refused: HashMap<ProcessIdentity, serde_json::Value> = selected_candidates
+            .into_iter()
+            .filter(|candidate| candidate["recommended_action"].as_str() != Some("kill"))
+            .filter_map(|candidate| {
+                let identity = serde_json::from_value(candidate["action_target"].clone()).ok()?;
+                Some((identity, candidate))
+            })
+            .collect();
+        if refused.is_empty() {
+            constrain_plan_to_goal_selection(plan, candidates, &output.selected_pids);
+            return Ok(output);
+        }
+        plan.actions
+            .retain(|action| !refused.contains_key(&action.target));
+        plan.gates_summary.blocked_candidates += refused.len();
+        for candidate in candidates.iter_mut() {
+            if let Some(refusal) = goal_candidate_action_identity(candidate)
+                .and_then(|identity| refused.get(&identity))
+            {
+                *candidate = refusal.clone();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod executable_goal_tests {
     use super::*;
     use pt_common::StartId;
+    use pt_core::decision::goal_contribution::{PortGoalResources, ProcessGoalResources};
     use pt_core::plan::{
         ActionConfidence, ActionRationale, ActionRouting, ActionTimeouts, GatesSummary, PlanAction,
     };
@@ -4835,15 +5111,229 @@ mod executable_goal_tests {
         (candidates, plan)
     }
 
+    fn assert_empty_saved_goal_plan(plan: &Plan, candidates: &[serde_json::Value]) {
+        // Apply loads these Plan fields from JSON and --recommended selects all
+        // unblocked actions. Exercise that same boundary without any signals.
+        let saved: Plan = serde_json::from_value(serde_json::to_value(plan).unwrap()).unwrap();
+        assert!(saved.actions.is_empty());
+        assert!(saved.pre_toggled.is_empty());
+        assert_eq!(saved.gates_summary.pre_toggled_actions, 0);
+        assert!(agent_recommended_actions(&saved).is_empty());
+        for candidate in candidates {
+            assert_eq!(candidate["goal_selected"], false);
+            assert_eq!(candidate["plan_action_ids"], serde_json::json!([]));
+            assert!(candidate.get("goal_rank").is_none());
+            assert!(candidate.get("action_target").is_none());
+        }
+    }
+
+    #[test]
+    fn satisfied_goal_saves_no_actions_even_with_independent_kill_advice() {
+        let goal_str = "free port 3000";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, mut plan) = fixture(&[(100, 1000, 90.0), (200, 500, 10.0)]);
+        let resources = GoalResourceSnapshot {
+            ports: [(
+                3000,
+                PortGoalResources {
+                    holders: Some(Vec::new()),
+                    bound_socket_count: Some(0),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let output = finalize_goal_action_plan(
+            Some(&goal),
+            100.0,
+            &mut candidates,
+            &mut plan,
+            &resources,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert!(output.selected_pids.is_empty());
+        assert_empty_saved_goal_plan(&plan, &candidates);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate["recommended_action"] == "kill"));
+    }
+
+    #[test]
+    fn incomplete_port_goal_cannot_save_partial_or_unrelated_actions() {
+        let goal_str = "release port 3000";
+        let goal = parse_goal(goal_str).unwrap();
+        for unavailable in [false, true] {
+            let (mut candidates, mut plan) =
+                fixture(&[(100, 10, 0.0), (200, 10, 0.0), (300, 1000, 90.0)]);
+            let holders = (!unavailable).then(|| {
+                plan.actions[..2]
+                    .iter()
+                    .map(|action| action.target.clone())
+                    .collect()
+            });
+            let resources = GoalResourceSnapshot {
+                ports: [(
+                    3000,
+                    PortGoalResources {
+                        holders,
+                        bound_socket_count: Some(1),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            plan.actions[1].blocked = true;
+            let output = finalize_goal_action_plan(
+                Some(&goal),
+                90.0,
+                &mut candidates,
+                &mut plan,
+                &resources,
+                &[],
+                false,
+            )
+            .unwrap();
+            assert!(!output.result.feasible);
+            assert!(output.selected_pids.is_empty());
+            assert_empty_saved_goal_plan(&plan, &candidates);
+        }
+    }
+
+    #[test]
+    fn invalid_or_unmeasured_goal_saves_no_fallback_actions() {
+        for goal_str in ["not a goal", "free -2 FDs", "reduce CPU below 50%"] {
+            let goal = parse_goal(goal_str).ok();
+            let (mut candidates, mut plan) = fixture(&[(100, 1000, 90.0)]);
+            assert!(finalize_goal_action_plan(
+                goal.as_ref(),
+                f64::NAN,
+                &mut candidates,
+                &mut plan,
+                &GoalResourceSnapshot::default(),
+                &[],
+                false,
+            )
+            .is_err());
+            assert_empty_saved_goal_plan(&plan, &candidates);
+        }
+    }
+
+    #[test]
+    fn goal_plan_keeps_only_selected_identity_and_its_pause_stage() {
+        let goal_str = "free 100MB RAM";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, mut plan) = fixture(&[(100, 1000, 90.0), (200, 10, 10.0)]);
+        plan.actions[0].stage = 1;
+        let mut pause = plan.actions[0].clone();
+        pause.action = Action::Pause;
+        pause.stage = 0;
+        pause.action_id = "pause-100".to_string();
+        plan.actions.insert(0, pause);
+        let mut stale = plan.actions[1].clone();
+        stale.target.start_id.0.push_str("-reused");
+        stale.action_id = "stale-kill-100".to_string();
+        plan.actions.push(stale);
+        plan.pre_toggled = plan
+            .actions
+            .iter()
+            .map(|action| action.action_id.clone())
+            .collect();
+        let output = finalize_goal_action_plan(
+            Some(&goal),
+            100.0,
+            &mut candidates,
+            &mut plan,
+            &GoalResourceSnapshot::default(),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(output.selected_pids, [100]);
+        let saved: Plan = serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(saved.actions.len(), 2);
+        assert_eq!(saved.actions[0].action, Action::Pause);
+        assert_eq!(saved.actions[1].action, Action::Kill);
+        assert_eq!(saved.actions[0].order, 0);
+        assert_eq!(saved.actions[1].order, 1);
+        assert_eq!(saved.actions[0].target, saved.actions[1].target);
+        assert_eq!(saved.pre_toggled, ["pause-100", "kill-100"]);
+        assert_eq!(saved.gates_summary.pre_toggled_actions, 2);
+        assert_eq!(
+            candidates[0]["plan_action_ids"],
+            serde_json::json!(["pause-100", "kill-100"])
+        );
+        assert_eq!(candidates[1]["goal_selected"], false);
+        assert_eq!(candidates[1]["plan_action_ids"], serde_json::json!([]));
+        assert!(candidates[1].get("action_target").is_none());
+    }
+
+    #[test]
+    fn goal_subset_rechecks_live_children_before_saving_actions() {
+        let goal_str = "free 100MB RAM";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, mut plan) = fixture(&[(100, 1000, 90.0), (200, 100, 10.0)]);
+        let population: Vec<_> = [(100, 1), (200, 100)]
+            .into_iter()
+            .map(|(pid, ppid)| ProcessRecord {
+                pid: pt_common::ProcessId(pid),
+                ppid: pt_common::ProcessId(ppid),
+                uid: 1000,
+                user: "test".to_string(),
+                pgid: None,
+                sid: None,
+                start_id: StartId::from_linux("goal-test", 1, pid),
+                comm: "worker".to_string(),
+                cmd: "worker".to_string(),
+                state: ProcessState::Sleeping,
+                cpu_percent: 0.0,
+                rss_bytes: 0,
+                vsz_bytes: 0,
+                tty: None,
+                start_time_unix: 0,
+                elapsed: Duration::from_secs(7200),
+                source: "fixture".to_string(),
+                container_info: None,
+            })
+            .collect();
+        // The cheapest first solution selects only the large parent. Its live
+        // child is outside that subset, so reoptimize using the safe child.
+        let output = finalize_goal_action_plan(
+            Some(&goal),
+            100.0,
+            &mut candidates,
+            &mut plan,
+            &GoalResourceSnapshot::default(),
+            &population,
+            true,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert_eq!(output.selected_pids, [200]);
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target.pid.0, 200);
+        assert_eq!(candidates[0]["recommended_action"], "review");
+        assert_eq!(candidates[0]["tree_safety"]["rule"], "live_child");
+        assert_eq!(candidates[0]["goal_selected"], false);
+        assert_eq!(candidates[1]["goal_selected"], true);
+    }
+
     #[test]
     fn preliminary_goal_excludes_review_and_non_kill_remedies() {
         let goal = parse_goal("free 100MB RAM").unwrap();
         for action in ["keep", "review", "pause", "renice", "restart", "freeze", ""] {
             let (mut candidates, _) = fixture(&[(100, 1000, 90.0), (200, 10, 10.0)]);
             candidates[0]["recommended_action"] = serde_json::json!(action);
-            let output =
-                build_goal_plan_from_candidates("free 100MB RAM", &goal, 100.0, &candidates)
-                    .unwrap();
+            let output = build_goal_plan_from_candidates(
+                "free 100MB RAM",
+                &goal,
+                100.0,
+                &candidates,
+                &GoalResourceSnapshot::default(),
+            )
+            .unwrap();
             assert!(!output.result.feasible, "action={action}");
             assert_eq!(output.selected_pids, vec![200], "action={action}");
             assert_eq!(output.result.total_contributions, vec![10.0]);
@@ -4851,20 +5341,280 @@ mod executable_goal_tests {
     }
 
     #[test]
+    fn fd_goal_uses_identity_bound_measurements() {
+        let goal_str = "free 100 FDs";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, plan) = fixture(&[(100, 0, 0.0), (200, 0, 0.0)]);
+        let resources = GoalResourceSnapshot {
+            processes: plan
+                .actions
+                .iter()
+                .zip([60, 50])
+                .map(|(action, fd_count)| {
+                    (
+                        action.target.pid.0,
+                        ProcessGoalResources {
+                            identity: action.target.clone(),
+                            fd_count,
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        attach_goal_resource_observations(&mut candidates, &resources);
+        let output = build_goal_plan_from_executable_actions(
+            goal_str,
+            &goal,
+            0.0,
+            &mut candidates,
+            &plan,
+            &resources,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert_eq!(output.selected_pids.len(), 2);
+        assert_eq!(output.result.total_contributions, [110.0]);
+        assert_eq!(candidates[0]["goal_resources"]["fd_count"], 60);
+        assert_eq!(candidates[1]["goal_resources"]["fd_count"], 50);
+
+        for change_uid in [false, true] {
+            let mut stale = resources.clone();
+            let identity = &mut stale.processes.get_mut(&200).unwrap().identity;
+            if change_uid {
+                identity.uid += 1;
+            } else {
+                identity.start_id.0.push_str("-reused");
+            }
+            let output = build_goal_plan_from_executable_actions(
+                goal_str,
+                &goal,
+                0.0,
+                &mut candidates,
+                &plan,
+                &stale,
+            )
+            .unwrap();
+            assert!(!output.result.feasible);
+            assert_eq!(output.selected_pids, [100]);
+            assert_eq!(output.result.total_contributions, [60.0]);
+            assert_eq!(output.result.goal_achievement[0].shortfall, 40.0);
+            attach_goal_resource_observations(&mut candidates, &stale);
+            assert!(candidates[1]["goal_resources"]["fd_count"].is_null());
+        }
+    }
+
+    #[test]
+    fn port_goal_requires_every_shared_holder() {
+        let goal_str = "free port 3000";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, mut plan) = fixture(&[(100, 0, 0.0), (200, 0, 0.0)]);
+        for socket_count in [1, 2] {
+            // One inherited socket or two SO_REUSEPORT bindings: the port is
+            // released only after both processes close their descriptors.
+            let resources = GoalResourceSnapshot {
+                ports: [(
+                    3000,
+                    PortGoalResources {
+                        holders: Some(
+                            plan.actions
+                                .iter()
+                                .map(|action| action.target.clone())
+                                .collect(),
+                        ),
+                        bound_socket_count: Some(socket_count),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let output = build_goal_plan_from_executable_actions(
+                goal_str,
+                &goal,
+                0.0,
+                &mut candidates,
+                &plan,
+                &resources,
+            )
+            .unwrap();
+            assert!(output.result.feasible);
+            assert_eq!(output.selected_pids.len(), 2);
+            assert_eq!(output.goals[0].target, 2.0);
+            let summary = goal_summary_json(goal_str, &goal, &output);
+            assert_eq!(summary["targets"][0]["unit"], "holder_processes");
+            assert_eq!(summary["targets"][0]["requires_all_holders"], true);
+
+            // The final action budget removes one holder without changing the
+            // observed ownership requirements. A futile partial kill is not
+            // selected just to claim progress toward freeing the port.
+            plan.actions[1].blocked = true;
+            let output = build_goal_plan_from_executable_actions(
+                goal_str,
+                &goal,
+                0.0,
+                &mut candidates,
+                &plan,
+                &resources,
+            )
+            .unwrap();
+            assert!(!output.result.feasible);
+            assert!(output.selected_pids.is_empty());
+            assert_eq!(output.result.total_contributions, [0.0]);
+            plan.actions[1].blocked = false;
+        }
+    }
+
+    #[test]
+    fn port_goal_never_selects_partial_or_unknown_ownership() {
+        let goal_str = "release port 3000";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, plan) = fixture(&[(100, 0, 0.0)]);
+        let holder = plan.actions[0].target.clone();
+        let absent = ProcessIdentity::new(200, StartId::from_linux("goal-test", 1, 200), 1000);
+        let mut reused = holder.clone();
+        reused.start_id.0.push_str("-previous-incarnation");
+        for holders in [None, Some(vec![holder.clone(), absent]), Some(vec![reused])] {
+            let resources = GoalResourceSnapshot {
+                ports: [(
+                    3000,
+                    PortGoalResources {
+                        holders,
+                        bound_socket_count: Some(1),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let output = build_goal_plan_from_executable_actions(
+                goal_str,
+                &goal,
+                0.0,
+                &mut candidates,
+                &plan,
+                &resources,
+            )
+            .unwrap();
+            assert!(!output.result.feasible);
+            assert!(output.selected_pids.is_empty());
+            assert_eq!(output.result.total_contributions, [0.0]);
+        }
+
+        let resources = GoalResourceSnapshot {
+            ports: [(
+                3000,
+                PortGoalResources {
+                    holders: Some(vec![holder]),
+                    bound_socket_count: Some(1),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        for action in ["keep", "review", "pause", "renice", "freeze", "restart"] {
+            candidates[0]["recommended_action"] = serde_json::json!(action);
+            let output = build_goal_plan_from_executable_actions(
+                goal_str,
+                &goal,
+                0.0,
+                &mut candidates,
+                &plan,
+                &resources,
+            )
+            .unwrap();
+            assert!(!output.result.feasible, "{action}");
+            assert!(output.selected_pids.is_empty(), "{action}");
+        }
+    }
+
+    #[test]
+    fn observed_free_port_needs_no_actions() {
+        let goal_str = "free port 3000";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, plan) = fixture(&[(100, 0, 0.0)]);
+        let resources = GoalResourceSnapshot {
+            ports: [(
+                3000,
+                PortGoalResources {
+                    holders: Some(Vec::new()),
+                    bound_socket_count: Some(0),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let output = build_goal_plan_from_executable_actions(
+            goal_str,
+            &goal,
+            0.0,
+            &mut candidates,
+            &plan,
+            &resources,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert!(output.selected_pids.is_empty());
+        assert_eq!(output.goals[0].target, 0.0);
+        assert!(output
+            .warnings
+            .iter()
+            .any(|warning| warning == "port_3000_already_free"));
+
+        // An already free port satisfies an OR goal without any action, even
+        // when a kill would overshoot the alternative's FD target.
+        let mut resources = resources;
+        resources.processes.insert(
+            100,
+            ProcessGoalResources {
+                identity: plan.actions[0].target.clone(),
+                fd_count: 100,
+            },
+        );
+        let either = parse_goal("free 1 FDs OR free port 3000").unwrap();
+        let output = build_goal_plan_from_executable_actions(
+            "free 1 FDs OR free port 3000",
+            &either,
+            0.0,
+            &mut candidates,
+            &plan,
+            &resources,
+        )
+        .unwrap();
+        assert!(output.result.feasible);
+        assert!(output.selected_pids.is_empty());
+        assert_eq!(output.result.total_loss, 0.0);
+        assert_eq!(output.goals[0].resource, "port_3000");
+        assert_eq!(candidates[0]["goal_selected"], false);
+        assert!(candidates[0].get("goal_rank").is_none());
+        assert_eq!(candidates[0]["recommended_action"], "kill");
+    }
+
+    #[test]
     fn final_goal_reports_budget_shortfall_and_clears_stale_selection() {
         let goal_str = "free 100MB RAM";
         let goal = parse_goal(goal_str).unwrap();
         let (mut candidates, mut plan) = fixture(&[(100, 60, 0.0), (200, 60, 0.0)]);
-        let preliminary =
-            build_goal_plan_from_candidates(goal_str, &goal, 0.0, &candidates).unwrap();
+        let preliminary = build_goal_plan_from_candidates(
+            goal_str,
+            &goal,
+            0.0,
+            &candidates,
+            &GoalResourceSnapshot::default(),
+        )
+        .unwrap();
         assert!(preliminary.result.feasible);
 
         // A one-kill budget leaves only the first executable action. The
         // forecast must remain truthful even if a display label is stale.
         plan.actions.truncate(1);
-        let output =
-            build_goal_plan_from_executable_actions(goal_str, &goal, 0.0, &mut candidates, &plan)
-                .unwrap();
+        let output = build_goal_plan_from_executable_actions(
+            goal_str,
+            &goal,
+            0.0,
+            &mut candidates,
+            &plan,
+            &GoalResourceSnapshot::default(),
+        )
+        .unwrap();
         let summary = goal_summary_json(goal_str, &goal, &output);
         assert_eq!(summary["achievable"], false);
         assert_eq!(summary["selected_pids"], serde_json::json!([100]));
@@ -4876,9 +5626,15 @@ mod executable_goal_tests {
 
         // A final --only filter can remove the remaining target as well.
         candidates.retain(|candidate| candidate["pid"] == 200);
-        let output =
-            build_goal_plan_from_executable_actions(goal_str, &goal, 0.0, &mut candidates, &plan)
-                .unwrap();
+        let output = build_goal_plan_from_executable_actions(
+            goal_str,
+            &goal,
+            0.0,
+            &mut candidates,
+            &plan,
+            &GoalResourceSnapshot::default(),
+        )
+        .unwrap();
         assert!(!output.result.feasible);
         assert!(output.selected_pids.is_empty());
         assert_eq!(output.result.total_contributions, vec![0.0]);
@@ -4907,6 +5663,7 @@ mod executable_goal_tests {
                 0.0,
                 &mut candidates,
                 &plan,
+                &GoalResourceSnapshot::default(),
             )
             .unwrap();
             assert!(!output.result.feasible, "case={case}");
@@ -4924,21 +5681,31 @@ mod executable_goal_tests {
         assert!(goal_requires_cpu_baseline(&Goal::And(vec![goal.clone()])));
         assert!(goal_requires_cpu_baseline(&Goal::Or(vec![goal.clone()])));
         for missing in [f64::NAN, f64::INFINITY, -1.0] {
-            let error = build_resource_goals(&goal, missing).unwrap_err();
-            assert!(error.contains("full observed process population"), "{error}");
+            let error =
+                build_resource_goals(&goal, missing, &GoalResourceSnapshot::default()).unwrap_err();
+            assert!(
+                error.contains("full observed process population"),
+                "{error}"
+            );
         }
-        let (goals, _) = build_resource_goals(&goal, 100.0).unwrap();
+        let (goals, _) =
+            build_resource_goals(&goal, 100.0, &GoalResourceSnapshot::default()).unwrap();
         assert_eq!(goals[0].target, 50.0);
 
         let memory = parse_goal("free 100MB RAM").unwrap();
         assert!(!goal_requires_cpu_baseline(&memory));
-        assert!(build_resource_goals(&memory, f64::NAN).is_ok());
+        assert!(build_resource_goals(&memory, f64::NAN, &GoalResourceSnapshot::default()).is_ok());
 
         let (candidates, _) = fixture(&[(100, 1000, 0.0)]);
         let alternative = Goal::Or(vec![goal.clone(), memory.clone()]);
-        let output =
-            build_goal_plan_from_candidates("CPU or memory", &alternative, f64::NAN, &candidates)
-                .unwrap();
+        let output = build_goal_plan_from_candidates(
+            "CPU or memory",
+            &alternative,
+            f64::NAN,
+            &candidates,
+            &GoalResourceSnapshot::default(),
+        )
+        .unwrap();
         assert!(output.result.feasible);
         assert_eq!(output.goals[0].resource, "memory_mb");
         assert!(output
@@ -4946,7 +5713,9 @@ mod executable_goal_tests {
             .iter()
             .any(|warning| warning.starts_with("cpu_reduce_below_baseline_unavailable")));
         let required = Goal::And(vec![goal.clone(), memory]);
-        assert!(build_resource_goals(&required, f64::NAN).is_err());
+        assert!(
+            build_resource_goals(&required, f64::NAN, &GoalResourceSnapshot::default()).is_err()
+        );
 
         for invalid in [f64::NAN, f64::INFINITY, -1.0, f64::MAX] {
             let mut invalid_goal = goal.clone();
@@ -4954,7 +5723,10 @@ mod executable_goal_tests {
                 unreachable!();
             };
             target.value = invalid;
-            assert!(build_resource_goals(&invalid_goal, 100.0).is_err());
+            assert!(
+                build_resource_goals(&invalid_goal, 100.0, &GoalResourceSnapshot::default())
+                    .is_err()
+            );
         }
     }
 
@@ -4967,8 +5739,14 @@ mod executable_goal_tests {
         // The 80% process cannot be killed, but its usage still determines
         // how much CPU a host-level reduce-below goal needs to recover.
         candidates[1]["recommended_action"] = serde_json::json!("review");
-        let preliminary =
-            build_goal_plan_from_candidates(goal_str, &goal, original_cpu, &candidates).unwrap();
+        let preliminary = build_goal_plan_from_candidates(
+            goal_str,
+            &goal,
+            original_cpu,
+            &candidates,
+            &GoalResourceSnapshot::default(),
+        )
+        .unwrap();
         assert!(!preliminary.result.feasible);
         assert_eq!(preliminary.result.goal_achievement[0].shortfall, 30.0);
         candidates.truncate(1);
@@ -4980,6 +5758,7 @@ mod executable_goal_tests {
             original_cpu,
             &mut candidates,
             &plan,
+            &GoalResourceSnapshot::default(),
         )
         .unwrap();
         assert!(!output.result.feasible);
@@ -5004,8 +5783,9 @@ fn build_goal_advisory_from_scan(
         .map(|p| p.rss_bytes as f64 / (1024.0 * 1024.0))
         .sum();
     let total_cpu_pct: f64 = result.processes.iter().map(|p| p.cpu_percent).sum();
+    let resources = GoalResourceSnapshot::collect(goal, &result.processes);
 
-    let (goals, warnings) = match build_resource_goals(goal, total_cpu_pct) {
+    let (goals, mut warnings) = match build_resource_goals(goal, total_cpu_pct, &resources) {
         Ok(v) => v,
         Err(err) => {
             return serde_json::json!({
@@ -5015,6 +5795,7 @@ fn build_goal_advisory_from_scan(
             });
         }
     };
+    warnings.extend(resources.warnings.iter().cloned());
 
     let achievements: Vec<serde_json::Value> = goals
         .iter()
@@ -16242,7 +17023,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                     for p in procs.iter().take(10) {
                         let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
                         let comm = p.get("comm").and_then(|v| v.as_str()).unwrap_or("?");
-                        let cpu = p.get("cpu_percent").and_then(|v| v.as_f64())
+                        let cpu = p
+                            .get("cpu_percent")
+                            .and_then(|v| v.as_f64())
                             .map(|cpu| format!("{cpu:.1}%"))
                             .unwrap_or_else(|| "unknown".to_string());
                         let rss = p.get("rss_mb").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -17297,6 +18080,19 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             })
         });
 
+        // Keep the nested loss objects outside the large candidate macro so
+        // its expansion remains within Rust's normal recursion limit.
+        let expected_loss_values: Vec<_> = decision_outcome
+            .expected_loss
+            .iter()
+            .map(|el| {
+                serde_json::json!({
+                    "action": format!("{:?}", el.action),
+                    "loss": el.loss,
+                })
+            })
+            .collect();
+
         // Build candidate JSON (action tracking moved to after sorting)
         let mut candidate = serde_json::json!({
             "pid": proc.pid.0,
@@ -17378,12 +18174,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "recommended_action": recommended_action,
             "action_rationale": action_rationale,
             "voi": voi_summary,
-            "expected_loss": decision_outcome.expected_loss.iter()
-                .map(|el| serde_json::json!({
-                    "action": format!("{:?}", el.action),
-                    "loss": el.loss,
-                }))
-                .collect::<Vec<_>>(),
+            "expected_loss": expected_loss_values,
             "policy_blocked": policy_blocked,
             "policy": policy_value,
         });
@@ -17623,6 +18414,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut goal_summary: Option<serde_json::Value> = None;
     let mut goal_selected: Option<HashSet<u32>> = None;
     let mut parsed_goal: Option<Goal> = None;
+    let mut goal_resources = GoalResourceSnapshot::default();
     // Reduce-below goals use the full observed host snapshot. Protection,
     // --pids, sampling, --only and candidate caps constrain actions; they do
     // not remove the excluded processes' CPU usage from the recovery target.
@@ -17633,6 +18425,8 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     if let Some(goal_str) = args.goal.as_deref() {
         match parse_goal(goal_str) {
             Ok(goal) => {
+                goal_resources = GoalResourceSnapshot::collect(&goal, &scan_result.processes);
+                attach_goal_resource_observations(&mut candidates, &goal_resources);
                 // Goal ranking influences the kill budget, but only the final
                 // executable plan below can substantiate a recovery forecast.
                 match build_goal_plan_from_candidates(
@@ -17640,6 +18434,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
                     &goal,
                     total_cpu_pct_for_goal,
                     &candidates,
+                    &goal_resources,
                 ) {
                     Ok(goal_output) => {
                         let selected_rank: HashMap<u32, usize> = goal_output
@@ -17706,25 +18501,35 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         &action_inputs,
         generated_at.clone(),
     );
-    if let (Some(goal_str), Some(goal)) = (args.goal.as_deref(), parsed_goal.as_ref()) {
-        match build_goal_plan_from_executable_actions(
-            goal_str,
-            goal,
+    if let Some(goal_str) = args.goal.as_deref() {
+        match finalize_goal_action_plan(
+            parsed_goal.as_ref(),
             total_cpu_pct_for_goal,
             &mut candidates,
-            &action_plan,
+            &mut action_plan,
+            &goal_resources,
+            &scan_result.processes,
+            decision_policy.guardrails.builtin_protection,
         ) {
             Ok(output) => {
                 goal_selected = Some(output.selected_pids.iter().copied().collect());
-                goal_summary = Some(goal_summary_json(goal_str, goal, &output));
+                if let Some(goal) = parsed_goal.as_ref() {
+                    goal_summary = Some(goal_summary_json(goal_str, goal, &output));
+                }
             }
             Err(error) => {
-                goal_summary = Some(serde_json::json!({
-                    "goal": goal_str,
-                    "parsed": goal.canonical(),
-                    "error": error,
-                }));
+                goal_selected = Some(HashSet::new());
+                if let Some(goal) = parsed_goal.as_ref() {
+                    goal_summary = Some(serde_json::json!({
+                        "goal": goal_str,
+                        "parsed": goal.canonical(),
+                        "error": error,
+                    }));
+                }
             }
+        }
+        if let Some(summary) = goal_summary.as_mut() {
+            summary["execution_scope"] = serde_json::json!("selected_direct_kills");
         }
     }
     let returned_pids: HashSet<u32> = candidates
@@ -17763,6 +18568,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         .filter(|action| action.action == Action::Kill)
         .map(|action| action.target.pid.0)
         .collect();
+    let executable_kill_pids: HashSet<u32> = kill_candidates.iter().copied().collect();
     let mut review_candidates: Vec<u32> = Vec::new();
     let mut spare_candidates: Vec<u32> = Vec::new();
     let mut expected_memory_freed_bytes: u64 = 0;
@@ -17778,7 +18584,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .as_ref()
             .map(|selected| selected.contains(&pid))
             .unwrap_or(false);
-        if action == "kill" {
+        if action == "kill" && executable_kill_pids.contains(&pid) {
             expected_memory_freed_bytes += memory_mb * 1024 * 1024;
         } else if action == "review" {
             review_candidates.push(pid);
@@ -23053,8 +23859,7 @@ fn watch_candidate_events(
             || candidate.recommendation["action_target"] != prior.recommendation["action_target"]
         {
             let mut event = candidate.event("recommendation_changed", timestamp);
-            event["prior_recommended_action"] =
-                prior.recommendation["recommended_action"].clone();
+            event["prior_recommended_action"] = prior.recommendation["recommended_action"].clone();
             event["prior_action_target"] = prior.recommendation["action_target"].clone();
             events.push(event);
         }
@@ -23611,14 +24416,25 @@ mod watch_tests {
         )]);
         let current = HashMap::from([(
             10,
-            candidate(source.clone(), "restart", Some(replacement_parent.clone()), 0.9),
+            candidate(
+                source.clone(),
+                "restart",
+                Some(replacement_parent.clone()),
+                0.9,
+            ),
         )]);
         let events = watch_candidate_events(&previous, &current, &observed, "tick-2");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event"], "recommendation_changed");
         assert_eq!(events[0]["source_identity"], serde_json::json!(source));
-        assert_eq!(events[0]["prior_action_target"], serde_json::json!(prior_parent));
-        assert_eq!(events[0]["action_target"], serde_json::json!(replacement_parent));
+        assert_eq!(
+            events[0]["prior_action_target"],
+            serde_json::json!(prior_parent)
+        );
+        assert_eq!(
+            events[0]["action_target"],
+            serde_json::json!(replacement_parent)
+        );
     }
 
     #[test]
@@ -23662,7 +24478,10 @@ mod watch_tests {
         let newcomer = identity(20, 200);
         let previous = HashMap::from([
             (30, candidate(absent, "review", None, 0.9)),
-            (10, candidate(first.clone(), "kill", Some(first.clone()), 0.9)),
+            (
+                10,
+                candidate(first.clone(), "kill", Some(first.clone()), 0.9),
+            ),
         ]);
         let observed = HashMap::from([(10, first.clone()), (20, newcomer.clone())]);
         // Keep is no longer a watch candidate, just like a protected process or

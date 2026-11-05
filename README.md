@@ -866,11 +866,19 @@ Instead of ranking processes individually, `pt` can optimize kill sets to achiev
 ```bash
 pt agent plan --goal "free 4GB memory" --format json
 pt agent plan --goal "release port 8080" --format json
+pt agent plan --goal "free port 3000" --format json
+pt agent plan --goal "free 100 FDs" --format json
 ```
 
-The optimizer evaluates which combination of kills achieves the goal with minimum collateral damage: exact branch-and-bound for a single goal, greedy for combined goals. Only candidates whose own recommendation is `kill` enter the kill set; goal-selected processes with a milder recommendation are listed for review.
+The optimizer searches for a low-loss combination of kills: bounded branch-and-bound for a single goal, with a greedy fallback when its work budget is exhausted, and greedy selection for combined goals. Only candidates whose final, identity-bound action is an unblocked direct `kill` contribute to the forecast. Policy refusals, review decisions, and kill budgets are applied before the final goal summary is calculated.
 
-Each candidate's "efficiency" is `contribution / expected_loss`, measuring how much resource it frees per unit of risk. The optimizer selects the minimum-cost set that meets the target.
+For `agent plan --goal`, the saved executable plan contains only that selected set and any preceding pause stage for the same identities. `agent apply --recommended`, default resume, and `agent plan --yes` use this restricted set. A goal that is already satisfied produces no executable actions; malformed goals and goals lacking required evidence cannot fall back to unrelated triage actions. The selected subset is checked again for live-child safety. Independent candidate advice remains visible, with `goal_selected` and `plan_action_ids` identifying what this session actually plans to execute.
+
+Each candidate's "efficiency" is `contribution / expected_loss`, measuring how much resource it frees per unit of risk. A completed branch-and-bound search proves the minimum cost within the eligible set; bounded and greedy results report their algorithm without claiming a proven optimum.
+
+On Linux, FD goals use measured `/proc/PID/fd` counts bound to the process's PID, start identity, and UID. Port goals inspect TCP and UDP bindings, including IPv6, in the current network namespace. Both `release port N` and `free port N` require **every observed holder** to be eligible for termination: duplicated or inherited sockets and separate `SO_REUSEPORT` sockets must all be accounted for. A protected, filtered, or budget-blocked holder prevents the optimizer from claiming that the port can be released; it does not select a partial set solely for that port goal. An already unbound port requires no action.
+
+The JSON goal summary identifies these observations as a snapshot forecast scoped to the mounted procfs and current network namespace. Port targets and projected recovery use `holder_processes` as the unit, with `requires_all_holders: true`; per-candidate `goal_resources` exposes measured descriptor counts and bound ports. Inaccessible process evidence, a `hidepid` restriction, changed socket bindings or process censuses, and sockets without a discoverable owner produce an explicit unavailable/shortfall result. FD and port observations are currently unavailable on other platforms. Holders outside the visible PID namespace cannot generally be ruled out, and processes can open, transfer, or inherit descriptors after observation, so a forecast is not a guarantee of the port's state after execution.
 
 ---
 

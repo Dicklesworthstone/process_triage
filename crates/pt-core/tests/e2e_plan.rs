@@ -1915,6 +1915,8 @@ fn plan_only_kill_filters_final_policy_and_budget_decisions() {
                 "3",
                 "--only",
                 only,
+                "--goal",
+                "free 1 FDs",
             ])
             .output()
             .expect("run actual agent plan");
@@ -1939,6 +1941,30 @@ fn plan_only_kill_filters_final_policy_and_budget_decisions() {
         assert!(control_pids.contains(&kill_pid), "{only}: {kill}");
         assert_eq!(kill["policy"]["allowed"], true, "{only}: {kill}");
 
+        // The production goal collector must measure the selected child's
+        // descriptors and recompute recovery after the writer refusal and kill
+        // budget. The sleep fixtures keep their descriptor tables unchanged.
+        let measured_fds = std::fs::read_dir(format!("/proc/{kill_pid}/fd"))
+            .expect("read owned control descriptors")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("enumerate owned control descriptors")
+            .len();
+        assert!(measured_fds > 0);
+        assert_eq!(kill["goal_resources"]["fd_count"], measured_fds);
+        assert_eq!(kill["goal_selected"], true);
+        assert_eq!(plan["goal_summary"]["achievable"], true, "{only}: {plan}");
+        assert_eq!(
+            plan["goal_summary"]["selected_pids"],
+            serde_json::json!([kill_pid])
+        );
+        assert_eq!(plan["goal_summary"]["targets"][0]["unit"], "descriptors");
+        assert_eq!(
+            plan["goal_summary"]["projected_recovery"][0].as_f64(),
+            Some(measured_fds as f64),
+            "{only}: {plan}"
+        );
+        assert_eq!(plan["summary"]["goal_selected_count"], 1);
+
         if only == "all" {
             assert_eq!(candidates.len(), 3, "{plan}");
             assert_eq!(pid_set(candidates), fixture_pids, "{plan}");
@@ -1947,6 +1973,7 @@ fn plan_only_kill_filters_final_policy_and_budget_decisions() {
                 .find(|candidate| candidate["pid"].as_u64() == Some(writer_pid))
                 .expect("writer remains visible for review");
             assert_eq!(writer["recommended_action"], "review", "{writer}");
+            assert_eq!(writer["goal_selected"], false, "{writer}");
             assert_eq!(writer["policy"]["allowed"], false, "{writer}");
             assert_eq!(
                 writer["policy"]["violation"]["rule"], "data_loss_gates.block_if_open_write_fds",
@@ -1964,6 +1991,7 @@ fn plan_only_kill_filters_final_policy_and_budget_decisions() {
                 "{budget_review}"
             );
             assert_eq!(budget_review["policy"]["allowed"], true, "{budget_review}");
+            assert_eq!(budget_review["goal_selected"], false, "{budget_review}");
             assert_eq!(budget_review["plan_budget"]["rule"], "max_planned_kills");
             assert_eq!(budget_review["plan_budget"]["limit"], 1);
             assert_eq!(plan["summary"]["review_recommendations"], 2);

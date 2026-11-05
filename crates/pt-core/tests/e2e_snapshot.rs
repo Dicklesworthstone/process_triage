@@ -458,7 +458,10 @@ fn snapshot_exposes_sampled_activity_and_explicit_single_snapshot_mode() {
         let snapshot = &result["process_snapshot"];
         assert_eq!(snapshot["window_ms"], expected_window);
         let processes = snapshot["processes"].as_array().expect("top processes");
-        assert!(!processes.is_empty(), "snapshot must exercise process output");
+        assert!(
+            !processes.is_empty(),
+            "snapshot must exercise process output"
+        );
         for process in processes {
             assert!(process["cpu_lifetime_percent"].is_number());
             if expected_window == 0 {

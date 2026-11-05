@@ -7,7 +7,7 @@ use crate::collect::protected::{ProtectedFilter, ProtectedMatch};
 use crate::collect::{deep_scan, DeepScanOptions, DeepScanRecord};
 use crate::collect::{quick_scan, ProcessActivity, ProcessRecord, QuickScanOptions, ScanResult};
 use crate::mcp::protocol::{ToolContent, ToolDefinition};
-use crate::scoring::{load_signature_database, ProcessScore, Scorer};
+use crate::scoring::{ProcessScore, Scorer};
 use crate::signature_cli::load_user_signatures;
 use crate::supervision::signature::ProcessMatchContext;
 use crate::supervision::{SignatureDatabase, SupervisorCategory};
@@ -25,9 +25,7 @@ fn activity_window_ms(params: &serde_json::Value) -> Result<u64, String> {
             .as_u64()
             .filter(|window| *window <= MAX_ACTIVITY_WINDOW_MS)
             .ok_or_else(|| {
-                format!(
-                    "window_ms must be an integer between 0 and {MAX_ACTIVITY_WINDOW_MS}"
-                )
+                format!("window_ms must be an integer between 0 and {MAX_ACTIVITY_WINDOW_MS}")
             }),
     }
 }
@@ -59,10 +57,6 @@ fn reported_cpu_percent(
 fn config_dir() -> PathBuf {
     crate::config::resolve_config_dir(&crate::mcp::config_options())
         .unwrap_or_else(|_| PathBuf::from("."))
-}
-
-fn load_signature_db_with_user_entries() -> SignatureDatabase {
-    load_signature_database(&config_dir()).0
 }
 
 /// What the MCP tools score against: the scorer and protection rules `agent plan`
@@ -1339,11 +1333,8 @@ mod tests {
             serde_json::Value::Null,
         ] {
             for name in ["pt_scan", "pt_explain", "pt_plan"] {
-                let error = call_tool(
-                    name,
-                    &serde_json::json!({"pid": 1, "window_ms": invalid}),
-                )
-                .unwrap_err();
+                let error = call_tool(name, &serde_json::json!({"pid": 1, "window_ms": invalid}))
+                    .unwrap_err();
                 assert!(error.contains("window_ms"), "{name}: {error}");
                 assert!(error.contains("60000"), "{name}: {error}");
             }
@@ -1368,7 +1359,9 @@ mod tests {
         assert!(activity.io_active.is_none());
         assert!(activity.cpu_error.is_some());
         assert_eq!(reported_cpu_percent(&process, Some(&activity)), None);
-        let score = evaluator.score(&process).expect("unknown activity still scores");
+        let score = evaluator
+            .score(&process)
+            .expect("unknown activity still scores");
         assert!(score.activity.as_ref().unwrap().cpu_percent.is_none());
         assert!(!score
             .posterior
@@ -1380,7 +1373,10 @@ mod tests {
         assert_eq!(reported_cpu_percent(&process, Some(&activity)), Some(0.0));
         activity.cpu_percent = Some(12.5);
         assert_eq!(reported_cpu_percent(&process, Some(&activity)), Some(12.5));
-        assert_eq!(process.cpu_percent, 81.0, "lifetime observation is retained");
+        assert_eq!(
+            process.cpu_percent, 81.0,
+            "lifetime observation is retained"
+        );
 
         evaluator.scorer.collect_activity(&[], Duration::ZERO);
         assert!(evaluator.scorer.activity_for(&process).is_none());

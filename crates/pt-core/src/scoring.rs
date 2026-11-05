@@ -1128,7 +1128,9 @@ mod tests {
             .unwrap();
         let mut measured = scorer(SignatureDatabase::new());
         measured.activity_window = Some(Duration::from_millis(500));
-        measured.activity.insert(process.pid.0, sampled_idle(&process));
+        measured
+            .activity
+            .insert(process.pid.0, sampled_idle(&process));
         let actual = measured
             .score_with_desktop(&process, incoming, None)
             .unwrap();
@@ -1187,8 +1189,13 @@ mod tests {
         let process = record(1234, "worker", "worker", FOUR_DAYS);
         let mut measured = scorer(SignatureDatabase::new());
         measured.activity_window = Some(Duration::from_millis(500));
-        measured.activity.insert(process.pid.0, sampled_idle(&process));
-        assert_eq!(measured.activity_for(&process).unwrap().cpu_percent, Some(0.0));
+        measured
+            .activity
+            .insert(process.pid.0, sampled_idle(&process));
+        assert_eq!(
+            measured.activity_for(&process).unwrap().cpu_percent,
+            Some(0.0)
+        );
         for changed in ["start", "owner"] {
             let mut replacement = process.clone();
             if changed == "start" {
@@ -1199,7 +1206,10 @@ mod tests {
             let activity = measured.activity_for(&replacement).unwrap();
             assert!(activity.cpu_percent.is_none());
             assert!(activity.io_active.is_none());
-            assert!(activity.cpu_error.unwrap().contains("different process incarnation"));
+            assert!(activity
+                .cpu_error
+                .unwrap()
+                .contains("different process incarnation"));
         }
     }
 
@@ -1213,7 +1223,9 @@ mod tests {
             .unwrap();
         let mut measured = scorer(SignatureDatabase::new());
         measured.activity_window = Some(Duration::from_millis(500));
-        measured.activity.insert(process.pid.0, sampled_idle(&process));
+        measured
+            .activity
+            .insert(process.pid.0, sampled_idle(&process));
         measured.collect_activity(&[&process], Duration::ZERO);
         assert!(measured.activity.is_empty());
         let actual = measured

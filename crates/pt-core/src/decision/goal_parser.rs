@@ -127,6 +127,7 @@ impl std::fmt::Display for GoalParseError {
 /// - "reduce CPU below 50%"
 /// - "free 20% CPU"
 /// - "release port 3000"
+/// - "free port 3000"
 /// - "free 100 FDs"
 /// - "free 50 file descriptors"
 /// - Composition: "free 4GB RAM AND release port 3000"
@@ -138,7 +139,7 @@ pub fn parse_goal(input: &str) -> Result<Goal, GoalParseError> {
 
     // Check for composition.
     // Split on " AND " or " OR " (case insensitive).
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
 
     if upper.contains(" AND ") {
         let parts = split_preserving_case(trimmed, " AND ");
@@ -163,8 +164,10 @@ pub fn parse_goal(input: &str) -> Result<Goal, GoalParseError> {
 
 /// Split a string on a separator (case-insensitive) but preserve original case.
 fn split_preserving_case<'a>(input: &'a str, sep: &str) -> Vec<&'a str> {
-    let upper_input = input.to_uppercase();
-    let upper_sep = sep.to_uppercase();
+    // Preserve byte offsets into the original string. Unicode case folding can
+    // change its length (for example, the ligature ﬃ becomes three letters).
+    let upper_input = input.to_ascii_uppercase();
+    let upper_sep = sep.to_ascii_uppercase();
     let mut parts = Vec::new();
     let mut start = 0;
 
@@ -184,8 +187,8 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
         return Err(GoalParseError::EmptyInput);
     }
 
-    // "release port <N>"
-    if tokens.len() >= 3 && tokens[0] == "release" && tokens[1] == "port" {
+    // "release port <N>" / "free port <N>"
+    if tokens.len() == 3 && matches!(tokens[0], "release" | "free") && tokens[1] == "port" {
         let port_str = tokens[2];
         let port: u16 = port_str
             .parse()
@@ -364,6 +367,28 @@ mod tests {
             assert_eq!(t.port, Some(3000));
         } else {
             panic!("Expected Target");
+        }
+    }
+
+    #[test]
+    fn free_port_is_the_same_goal_as_release_port() {
+        for port in [1, 3000, 65535] {
+            assert_eq!(
+                parse_goal(&format!("FrEe PoRt {port}")),
+                parse_goal(&format!("release port {port}")),
+            );
+        }
+        assert!(parse_goal("free port 0").is_err());
+        assert!(parse_goal("free port 65536").is_err());
+        assert!(parse_goal("free port 3000 extra").is_err());
+        let goal = parse_goal("free 10 FDs AND free port 3000").unwrap();
+        assert!(matches!(goal, Goal::And(parts) if parts.len() == 2));
+    }
+
+    #[test]
+    fn composite_invalid_unicode_does_not_corrupt_byte_offsets() {
+        for input in ["ﬃ AND free port 3000", "ſ OR free port 3000"] {
+            assert!(parse_goal(input).is_err());
         }
     }
 
