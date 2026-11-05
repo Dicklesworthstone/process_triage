@@ -45,6 +45,7 @@ pub mod protected;
 pub mod provenance_continuity;
 mod quick_scan;
 pub mod resource_collector;
+pub mod responsible_units;
 pub mod shared_resource_graph;
 pub mod systemd;
 #[cfg(target_os = "linux")]

@@ -627,6 +627,31 @@ decisions. Use `load_aware.pressure` to tune the new model; set
 `load_aware.enabled` to `false` to use evidence-only losses. The default policy
 continues to leave load-aware decisions disabled.
 
+#### Responsible workloads
+
+Full `agent plan` and `agent snapshot` reports include a `responsible_units`
+table over the observed process census, including protected and young processes.
+It attributes each process once to a tool cgroup, an agent tree, a terminal
+subtree, a service, a login scope, or an individual process. Separate agent and
+terminal trees inside a shared multiplexer service stay separate. Ownership and
+birth identities constrain ancestry; reused PIDs and ambiguous duplicate rows
+cannot inherit an earlier process's attribution.
+
+The table ranks workloads by the strongest observed CPU, memory, or I/O pressure
+and includes measured CPU cores and host-capacity share, resident and swapped
+memory, I/O rates, and the top three contributors. It reuses one process sampling
+window for the whole census. Each total distinguishes a complete `value` from
+the known `observed` subtotal and records member coverage. Missing samples remain
+unknown; lifetime CPU is never substituted. RSS sums can count shared pages more
+than once and are not a forecast of reclaimable memory.
+
+Candidates and watch events include a compact `responsible_unit` summary; full
+membership is emitted only once in the top-level table. Snapshots also retain
+the table in `scan/responsible_units.json`. These are workload diagnostics:
+single-process actions still receive only their own resource credit and pass
+the existing action gates. Per-cgroup usage counters and PSI, verified pane IDs,
+and automatic group actions are not implemented by this member-sum report.
+
 ---
 
 ## Telemetry and Data Governance

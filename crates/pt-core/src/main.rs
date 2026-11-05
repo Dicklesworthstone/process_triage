@@ -17,6 +17,10 @@ use pt_common::{
 use pt_core::calibrate::{validation::ValidationEngine, CalibrationError};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
 use pt_core::collect::protected::ProtectedFilter;
+use pt_core::collect::responsible_units::{
+    attribute_responsible_units, collect_cgroup_memberships, AttributionResource, ResponsibleUnit,
+    ResponsibleUnitTable,
+};
 #[cfg(target_os = "linux")]
 use pt_core::collect::ContainerRuntime;
 use pt_core::config::{
@@ -2663,7 +2667,7 @@ fn score_tui_rows(
         .filter(|proc| proc.elapsed.as_secs() >= min_age)
         .collect();
     scorer.collect_provenance(&eligible);
-    collect_planning_activity(&mut scorer, &eligible, population, goal_str, window_ms);
+    collect_planning_activity(&mut scorer, population, window_ms);
     let pressure = PlanningPressure::from_system_state(&collect_system_state(Some(population)));
     let probe_advice = compute_probe_advice(processes, &scorer, policy, &pressure);
     let deep_signals = if deep {
@@ -17595,6 +17599,24 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
     let system_state =
         collect_system_state(scan_result.as_ref().map(|scan| scan.processes.as_slice()));
     let pressure = PlanningPressure::from_system_state(&system_state);
+    let responsible_units = scan_result
+        .as_ref()
+        .map(|scan| collect_responsible_units(scan, &scorer, &pressure));
+    if let Some(table) = &responsible_units {
+        let artifact = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id.0,
+            "host_id": host_id,
+            "generated_at": timestamp.to_rfc3339(),
+            "responsible_units": table,
+        });
+        if let Err(error) = std::fs::write(
+            handle.dir.join("scan/responsible_units.json"),
+            serde_json::to_vec_pretty(&artifact).unwrap(),
+        ) {
+            eprintln!("agent snapshot: warning: failed to persist workload attribution: {error}");
+        }
+    }
     let mut pressure_decisions = Vec::new();
 
     // Persist compact artifacts when we have a scan result.
@@ -17650,6 +17672,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                     "start_id": proc.start_id,
                     "uid": proc.uid,
                     "decision": inputs.report,
+                    "responsible_unit": responsible_unit_summary(
+                        responsible_units.as_ref().and_then(|table| table.unit_for(proc)),
+                    ),
                 }));
             }
             let decision_outcome = inputs.decision;
@@ -17810,6 +17835,9 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                         "cpu_percent": cpu_percent,
                         "cpu_lifetime_percent": p.cpu_percent,
                         "activity": activity,
+                        "responsible_unit": responsible_unit_summary(
+                            responsible_units.as_ref().and_then(|table| table.unit_for(p)),
+                        ),
                         "rss_mb": p.rss_bytes / 1_048_576,
                         "vsz_mb": p.vsz_bytes / 1_048_576,
                         "state": format!("{:?}", p.state),
@@ -17915,6 +17943,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "capabilities": capabilities_summary,
                 "activity_window_ms": args.window_ms,
                 "pressure_decisions": pressure_decisions,
+                "responsible_units": responsible_units,
             });
             if let Some(procs) = &process_snapshot {
                 if let Some(out_mut) = output.as_object_mut() {
@@ -17985,6 +18014,10 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 let mem = psi.get("memory").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let io = psi.get("io").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 println!("  PSI: cpu={:.2}%, mem={:.2}%, io={:.2}%", cpu, mem, io);
+            }
+
+            if let Some(table) = &responsible_units {
+                print_responsible_units(table);
             }
 
             // Display process snapshot if collected
@@ -18324,6 +18357,47 @@ mod planning_pressure_tests {
     }
 
     #[test]
+    fn workload_summary_keeps_membership_once_and_rejects_a_reused_pid() {
+        let process = process();
+        let sample = activity(&process);
+        let table = attribute_responsible_units(
+            std::slice::from_ref(&process),
+            &[sample],
+            &[],
+            Some(8),
+            AttributionResource::Cpu,
+        );
+        let summary = responsible_unit_summary(table.unit_for(&process));
+        assert_eq!(summary["member_count"], 1);
+        assert_eq!(summary["usage"]["cpu_cores"]["value"], 4.0);
+        assert_eq!(summary["usage"]["cpu_capacity_fraction"], 0.5);
+        assert_eq!(summary["group_action_authorized"], false);
+        assert!(summary.get("members").is_none());
+        assert!(summary.get("top_processes").is_none());
+        assert_eq!(table.units[0].members.len(), 1);
+        let mut replacement = process.clone();
+        replacement.start_id = StartId::from_linux("pressure-test", 101, 123);
+        assert!(responsible_unit_summary(table.unit_for(&replacement)).is_null());
+    }
+
+    #[test]
+    fn workload_ranking_tracks_the_observed_pressure_resource() {
+        let mut pressure = host();
+        assert_eq!(responsible_unit_rank(&pressure), AttributionResource::Cpu);
+        pressure.severity.memory = 1.0;
+        pressure.severity.cpu = 0.0;
+        assert_eq!(
+            responsible_unit_rank(&pressure),
+            AttributionResource::Memory
+        );
+        pressure.severity.memory = 0.5;
+        pressure.severity.io = 1.0;
+        assert_eq!(responsible_unit_rank(&pressure), AttributionResource::Io);
+        pressure.severity = Default::default();
+        assert_eq!(responsible_unit_rank(&pressure), AttributionResource::Cpu);
+    }
+
+    #[test]
     fn lifetime_cpu_and_unverifiable_windows_never_become_pressure_attribution() {
         let proc = process();
         let pressure = host();
@@ -18435,25 +18509,98 @@ fn goal_requires_cpu_baseline(goal: &Goal) -> bool {
     }
 }
 
-fn collect_planning_activity(
-    scorer: &mut Scorer,
-    candidates: &[&ProcessRecord],
-    population: &[ProcessRecord],
-    goal_str: Option<&str>,
-    window_ms: u64,
-) {
-    let full_population = goal_str
-        .and_then(|goal| parse_goal(goal).ok())
-        .is_some_and(|goal| goal_requires_cpu_baseline(&goal));
-    if full_population {
-        // Excluded and protected workloads still count toward host CPU goals.
-        // Only procfs counters are sampled; this does not make them actionable.
-        scorer.collect_activity(
-            &population.iter().collect::<Vec<_>>(),
-            Duration::from_millis(window_ms),
-        );
+fn collect_planning_activity(scorer: &mut Scorer, population: &[ProcessRecord], window_ms: u64) {
+    // One shared window includes protected/young processes and ancestors. They
+    // still consume resources and establish ownership, without becoming action
+    // candidates. Never resample per unit or use lifetime CPU to fill a gap.
+    scorer.collect_activity(
+        &population.iter().collect::<Vec<_>>(),
+        Duration::from_millis(window_ms),
+    );
+}
+
+fn responsible_unit_rank(pressure: &PlanningPressure) -> AttributionResource {
+    if pressure.severity.memory > pressure.severity.cpu
+        && pressure.severity.memory >= pressure.severity.io
+    {
+        AttributionResource::Memory
+    } else if pressure.severity.io > pressure.severity.cpu {
+        AttributionResource::Io
     } else {
-        scorer.collect_activity(candidates, Duration::from_millis(window_ms));
+        AttributionResource::Cpu
+    }
+}
+
+fn collect_responsible_units(
+    scan: &ScanResult,
+    scorer: &Scorer,
+    pressure: &PlanningPressure,
+) -> ResponsibleUnitTable {
+    let activities: Vec<_> = scan
+        .processes
+        .iter()
+        .filter_map(|process| scorer.activity_for(process))
+        .collect();
+    let memberships = collect_cgroup_memberships(&scan.processes);
+    let online_cpus = pressure.snapshot.as_ref().map(|host| host.cpus);
+    let mut table = attribute_responsible_units(
+        &scan.processes,
+        &activities,
+        &memberships,
+        online_cpus,
+        responsible_unit_rank(pressure),
+    );
+    table.unavailable.extend(
+        scan.metadata
+            .warnings
+            .iter()
+            .map(|warning| format!("process census: {warning}")),
+    );
+    table
+}
+
+/// Repeat only a bounded summary per candidate; the full membership census
+/// appears once in the top-level table, avoiding quadratic output for big units.
+fn responsible_unit_summary(unit: Option<&ResponsibleUnit>) -> serde_json::Value {
+    unit.map_or(serde_json::Value::Null, |unit| {
+        serde_json::json!({
+            "id": unit.id,
+            "kind": unit.kind,
+            "label": unit.label,
+            "member_count": unit.member_count,
+            "usage": unit.usage,
+            "scope": "observed_census_members",
+            "group_action_authorized": false,
+        })
+    })
+}
+
+fn print_responsible_units(table: &ResponsibleUnitTable) {
+    println!("\n## Responsible Workloads\n");
+    println!("Observed census only; totals do not authorize a group action.");
+    for unit in table.units.iter().take(8) {
+        let cpu = unit
+            .usage
+            .cpu_cores
+            .value
+            .map(|value| format!("{value:.2} cores"))
+            .unwrap_or_else(|| "CPU unknown/partial".to_string());
+        let rss = unit
+            .usage
+            .rss_bytes
+            .value
+            .map(|value| format!("{:.1} MiB RSS", value / 1_048_576.0))
+            .unwrap_or_else(|| "RSS unknown/partial".to_string());
+        println!(
+            "- {}: {} members; {}; {}",
+            unit.label, unit.member_count, cpu, rss
+        );
+    }
+    if table.units.len() > 8 {
+        println!(
+            "- {} more workloads in the full JSON report",
+            table.units.len() - 8
+        );
     }
 }
 
@@ -19321,15 +19468,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let probe_cost_model = pt_core::decision::ProbeCostModel::default();
     let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
     scorer.collect_provenance(&processes_to_infer);
-    collect_planning_activity(
-        &mut scorer,
-        &processes_to_infer,
-        &scan_result.processes,
-        args.goal.as_deref(),
-        args.window_ms,
-    );
+    collect_planning_activity(&mut scorer, &scan_result.processes, args.window_ms);
     let system_state = collect_system_state(Some(&scan_result.processes));
     let pressure = PlanningPressure::from_system_state(&system_state);
+    let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
 
     // --deep: one batched deep scan (sockets, I/O, queue backlog, GPU observations) over the
     // candidates, overlaid onto the quick-scan evidence below.
@@ -19705,6 +19847,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "pressure_decision": pressure_decision,
             "policy_blocked": policy_blocked,
             "policy": policy_value,
+            "responsible_unit": responsible_unit_summary(responsible_units.unit_for(proc)),
         });
 
         #[cfg(target_os = "linux")]
@@ -20291,6 +20434,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         "host": host_info,
         "system_state": system_state,
         "scan": scan_info,
+        "responsible_units": responsible_units,
         "command": "agent plan",
         "args": {
             "max_candidates": args.max_candidates,
@@ -20577,6 +20721,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             if let Some(comparison) = &differential {
                 println!("\n{}", agent_plan_differential_summary(comparison));
             }
+            print_responsible_units(&responsible_units);
             println!("\n## Candidates\n");
             for candidate in &candidates {
                 let pid = candidate.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -25711,9 +25856,10 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
             .collect();
         scorer.collect_provenance(&eligible);
-        scorer.collect_activity(&eligible, Duration::from_millis(args.window_ms));
+        collect_planning_activity(&mut scorer, &scan_result.processes, args.window_ms);
         let system_state = collect_system_state(Some(&scan_result.processes));
         let pressure = PlanningPressure::from_system_state(&system_state);
+        let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
         if baseline.is_none() {
             baseline = Some(WatchBaseline::from_state(&system_state));
         }
@@ -25727,7 +25873,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         let mut evaluated = Vec::new();
         let mut supervision = pt_core::supervision::SupervisionDetector::new();
         for proc in eligible {
-            let Some(eval) = evaluate_watch_candidate(
+            let Some(mut eval) = evaluate_watch_candidate(
                 proc,
                 &scorer,
                 &decision_policy,
@@ -25749,6 +25895,8 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             if severity < threshold.level {
                 continue;
             }
+            eval.recommendation["responsible_unit"] =
+                responsible_unit_summary(responsible_units.unit_for(proc));
             evaluated.push((proc, eval));
         }
 
