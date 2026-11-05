@@ -114,7 +114,7 @@ pub struct TickMetrics {
     pub process_count: u32,
     pub orphan_count: u32,
     /// The actual pressure reading, including unavailable sensors. Older callers
-    /// without a reading cannot supply evidence of memory-pressure recovery.
+    /// without a reading cannot supply CPU capacity or memory-pressure recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pressure: Option<PressureSnapshot>,
 }
@@ -142,6 +142,7 @@ pub enum DaemonEventType {
     LockContention,
     OverheadBudgetExceeded,
     ConfigReloaded,
+    LoadEvidenceUnavailable,
     MemoryPressureChanged,
     MemoryPressureUnavailable,
 }
@@ -298,7 +299,19 @@ where
     let mut events = Vec::new();
 
     // 1) Evaluate triggers.
+    let previous_load_error = trigger_state.load_unavailable_reason.clone();
     let mut fired = triggers::evaluate_triggers(&config.triggers, trigger_state, metrics);
+    if trigger_state.load_unavailable_reason != previous_load_error {
+        if let Some(reason) = &trigger_state.load_unavailable_reason {
+            let detail = format!("load trigger unavailable: {reason}; no load escalation");
+            state.record_event(DaemonEventType::LoadEvidenceUnavailable, &detail);
+            events.push(DaemonEvent {
+                timestamp: metrics.timestamp.clone(),
+                event_type: DaemonEventType::LoadEvidenceUnavailable,
+                detail,
+            });
+        }
+    }
     state.observe_memory_pressure(config, metrics);
     if let Some(evaluation) = &state.last_memory_pressure {
         if evaluation.transitioned {
@@ -449,7 +462,7 @@ mod tests {
     #[test]
     fn test_tick_with_trigger_and_escalation() {
         let mut config = DaemonConfig::default();
-        config.triggers.load_threshold = 2.0;
+        config.triggers.load_threshold = Some(2.0);
         config.triggers.sustained_ticks = 1; // Fire immediately
         let mut state = DaemonState::new();
         let mut trig_state = triggers::TriggerState::new(&config.triggers);
@@ -476,7 +489,7 @@ mod tests {
     #[test]
     fn test_tick_deferred_escalation() {
         let mut config = DaemonConfig::default();
-        config.triggers.load_threshold = 2.0;
+        config.triggers.load_threshold = Some(2.0);
         config.triggers.sustained_ticks = 1;
         let mut state = DaemonState::new();
         let mut trig_state = triggers::TriggerState::new(&config.triggers);
@@ -503,7 +516,7 @@ mod tests {
     #[test]
     fn test_tick_failed_escalation_emits_failed_event() {
         let mut config = DaemonConfig::default();
-        config.triggers.load_threshold = 2.0;
+        config.triggers.load_threshold = Some(2.0);
         config.triggers.sustained_ticks = 1;
         let mut state = DaemonState::new();
         let mut trig_state = triggers::TriggerState::new(&config.triggers);
@@ -606,6 +619,101 @@ mod tests {
 
     fn advance_reading(metrics: &mut TickMetrics) {
         metrics.pressure.as_mut().unwrap().sampled_at_ms += 60_000;
+    }
+
+    fn load_metrics(load: f64, cpus: u32) -> TickMetrics {
+        use crate::collect::pressure::LoadAvg;
+
+        let mut metrics = pressure_metrics(40, None, 1000);
+        let pressure = metrics.pressure.as_mut().unwrap();
+        pressure.cpus = cpus;
+        pressure.load = Some(LoadAvg {
+            one: load,
+            five: load,
+            fifteen: load,
+            runnable: Some(1),
+            total: Some(200),
+        });
+        metrics
+    }
+
+    #[test]
+    fn observed_load_capacity_controls_the_escalation_callback() {
+        for (cpus, expected_escalations) in [(2, 1), (64, 0)] {
+            let config = DaemonConfig::default();
+            let mut state = DaemonState::new();
+            let mut triggers = triggers::TriggerState::new(&config.triggers);
+            let mut metrics = load_metrics(10.0, cpus);
+            let mut callbacks = 0;
+            let mut plan = |config: &escalation::EscalationConfig,
+                            fired: &[triggers::FiredTrigger]| {
+                callbacks += 1;
+                assert!(!config.allow_auto_mitigation);
+                assert_eq!(fired.len(), 1);
+                assert_eq!(fired[0].kind, triggers::TriggerKind::SustainedLoad);
+                assert_eq!(fired[0].current_value, 10.0);
+                assert_eq!(fired[0].threshold, 4.0);
+                assert!(fired[0].description.contains("online_cpus=2"));
+                escalation::EscalationOutcome {
+                    status: escalation::EscalationStatus::Completed,
+                    reason: fired[0].description.clone(),
+                    session_id: Some("load-review-plan".to_string()),
+                    provenance_summary: None,
+                }
+            };
+
+            for tick in 1..=4 {
+                let outcome = process_tick(&config, &mut state, &mut triggers, &metrics, &mut plan);
+                if tick < 3 {
+                    assert!(outcome.escalation.is_none());
+                }
+                advance_reading(&mut metrics);
+            }
+            assert_eq!(callbacks, expected_escalations);
+            assert_eq!(state.escalation_count, expected_escalations);
+        }
+    }
+
+    #[test]
+    fn unavailable_load_evidence_is_reported_once_per_outage() {
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        let mut triggers = triggers::TriggerState::new(&config.triggers);
+        let missing = test_metrics(1000.0, 2000, 0);
+        let mut plan = |_: &escalation::EscalationConfig, _: &[triggers::FiredTrigger]| {
+            panic!("missing CPU capacity must never trigger a load plan")
+        };
+        for tick in 0..3 {
+            let outcome = process_tick(&config, &mut state, &mut triggers, &missing, &mut plan);
+            let errors: Vec<_> = outcome
+                .events
+                .iter()
+                .filter(|event| event.event_type == DaemonEventType::LoadEvidenceUnavailable)
+                .collect();
+            assert_eq!(errors.len(), usize::from(tick == 0));
+            if let Some(error) = errors.first() {
+                assert!(error
+                    .detail
+                    .contains("CPU capacity observation unavailable"));
+            }
+        }
+        assert_eq!(
+            state
+                .recent_events
+                .iter()
+                .filter(|event| event.event_type == DaemonEventType::LoadEvidenceUnavailable)
+                .count(),
+            1
+        );
+
+        let observed = load_metrics(3.0, 2);
+        process_tick(&config, &mut state, &mut triggers, &observed, &mut plan);
+        assert!(triggers.load_unavailable_reason.is_none());
+        let failed_again = process_tick(&config, &mut state, &mut triggers, &missing, &mut plan);
+        assert!(failed_again
+            .events
+            .iter()
+            .any(|event| event.event_type == DaemonEventType::LoadEvidenceUnavailable));
     }
 
     #[test]

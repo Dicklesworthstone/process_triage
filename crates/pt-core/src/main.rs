@@ -13656,8 +13656,7 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
         if let Some(triggers) = file_cfg.triggers {
             if let Some(load) = triggers.sustained_load {
                 if let Some(multiplier) = load.threshold_multiplier {
-                    let cores = collect_cpu_count().max(1) as f64;
-                    config.triggers.load_threshold = cores * multiplier;
+                    config.triggers.load_per_cpu_threshold = multiplier;
                 }
                 if let Some(seconds) = load.min_duration_seconds {
                     let ticks = (seconds / config.tick_interval_secs.max(1)).max(1) as u32;

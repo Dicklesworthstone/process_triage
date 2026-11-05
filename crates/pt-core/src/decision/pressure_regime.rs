@@ -549,8 +549,8 @@ mod tests {
                 one: load,
                 five: load,
                 fifteen: load,
-                runnable: 1,
-                total: 100,
+                runnable: Some(1),
+                total: Some(100),
             }),
             meminfo: Some(MemInfo {
                 total: Some(32 * GB),

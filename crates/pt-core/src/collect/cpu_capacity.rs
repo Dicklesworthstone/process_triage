@@ -321,7 +321,14 @@ fn read_cpuset_file(path: &str) -> Option<u32> {
 }
 
 /// Get the number of logical CPUs on the system.
+/// Uses one CPU as a conservative fallback for capacity heuristics. Consumers
+/// that need an observation must use `observed_logical_cpus` instead.
 pub fn num_logical_cpus() -> u32 {
+    observed_logical_cpus().unwrap_or(1)
+}
+
+/// Observe the number of online logical CPUs without inventing a fallback.
+pub fn observed_logical_cpus() -> Option<u32> {
     // Try /proc/cpuinfo first
     if let Ok(bytes) = fs::read("/proc/cpuinfo") {
         let content = String::from_utf8_lossy(&bytes);
@@ -330,7 +337,7 @@ pub fn num_logical_cpus() -> u32 {
             .filter(|l| l.starts_with("processor"))
             .count();
         if count > 0 {
-            return count as u32;
+            return u32::try_from(count).ok();
         }
     }
 
@@ -339,12 +346,11 @@ pub fn num_logical_cpus() -> u32 {
     {
         let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
         if cpus > 0 {
-            return cpus as u32;
+            return u32::try_from(cpus).ok();
         }
     }
 
-    // Ultimate fallback
-    1
+    None
 }
 
 /// Compute N_eff_cores directly from individual constraints.

@@ -15,8 +15,9 @@
 //! A source that cannot be read is reported as unavailable with the reason. It never
 //! reads as zero: "no PSI on this kernel" is not "no pressure".
 //!
-//! Everything reads from a root directory (`/` on a live system) so the parsers and
-//! the window math are testable against recorded files.
+//! Linux sources read from a root directory (`/` on a live system) so the parsers
+//! and window math are testable against recorded files. macOS obtains native load
+//! averages with `getloadavg`; unsupported pressure sensors remain unavailable.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -38,16 +39,18 @@ pub struct PsiResource {
     pub full: Option<PsiLine>,
 }
 
-/// `/proc/loadavg`.
+/// System load averages and task counts when the source provides them.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LoadAvg {
     pub one: f64,
     pub five: f64,
     pub fifteen: f64,
-    /// Runnable scheduling entities right now.
-    pub runnable: u32,
-    /// Scheduling entities that exist.
-    pub total: u32,
+    /// Runnable scheduling entities right now. Not reported by macOS getloadavg.
+    #[serde(default)]
+    pub runnable: Option<u32>,
+    /// Scheduling entities that exist. Not reported by macOS getloadavg.
+    #[serde(default)]
+    pub total: Option<u32>,
 }
 
 /// `/proc/meminfo`, in bytes. Fields a kernel does not report are `None`.
@@ -129,6 +132,7 @@ pub struct PressureSnapshot {
     /// Unix time of the reading, milliseconds.
     pub sampled_at_ms: u64,
     /// Online logical CPUs (the capacity the load average is compared with).
+    /// Zero means unavailable, with the reason recorded in `unavailable`.
     pub cpus: u32,
     pub cpu: Option<PsiResource>,
     pub memory: Option<PsiResource>,
@@ -199,8 +203,8 @@ pub fn parse_loadavg(text: &str) -> Option<LoadAvg> {
         one,
         five,
         fifteen,
-        runnable: runnable.parse().ok()?,
-        total: total.parse().ok()?,
+        runnable: Some(runnable.parse().ok()?),
+        total: Some(total.parse().ok()?),
     })
 }
 
@@ -315,6 +319,12 @@ fn parsed<T>(
 /// Read a pressure snapshot from `root` (`/` on a live system).
 pub fn read_pressure_snapshot_from(root: &Path, cpus: u32) -> PressureSnapshot {
     let mut unavailable = Vec::new();
+    if cpus == 0 {
+        unavailable.push(Unavailable {
+            source: "online_cpu_count".to_string(),
+            reason: "online CPU capacity could not be observed".to_string(),
+        });
+    }
     let psi = |name: &str, unavailable: &mut Vec<Unavailable>| {
         let rel = format!("proc/pressure/{name}");
         let text = read(root, &rel, unavailable);
@@ -364,14 +374,91 @@ pub fn read_pressure_snapshot_from(root: &Path, cpus: u32) -> PressureSnapshot {
 /// Read a pressure snapshot of this machine.
 #[cfg(target_os = "linux")]
 pub fn read_pressure_snapshot() -> PressureSnapshot {
-    read_pressure_snapshot_from(Path::new("/"), super::cpu_capacity::num_logical_cpus())
+    read_pressure_snapshot_from(
+        Path::new("/"),
+        super::cpu_capacity::observed_logical_cpus().unwrap_or(0),
+    )
 }
 
-/// Read a pressure snapshot of this machine. Without /proc every source reports
-/// unavailable with its reason; only the CPU count is known.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "macos", test))]
+fn checked_native_loadavg(sample_count: i32, values: [f64; 3]) -> Result<LoadAvg, String> {
+    if sample_count != 3 {
+        return Err(format!(
+            "getloadavg returned {sample_count} averages; all 3 are required"
+        ));
+    }
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err("getloadavg returned a non-finite or negative load average".to_string());
+    }
+    let [one, five, fifteen] = values;
+    Ok(LoadAvg {
+        one,
+        five,
+        fifteen,
+        runnable: None,
+        total: None,
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn apply_native_loadavg(snapshot: &mut PressureSnapshot, load: Result<LoadAvg, String>) {
+    // Native load replaces the unsupported Linux source, including its failure
+    // report. Other unavailable pressure sensors retain their own explanations.
+    snapshot
+        .unavailable
+        .retain(|source| source.source != "/proc/loadavg");
+    snapshot.load = match load {
+        Ok(load) => Some(load),
+        Err(reason) => {
+            snapshot.unavailable.push(Unavailable {
+                source: "getloadavg".to_string(),
+                reason,
+            });
+            None
+        }
+    };
+    snapshot.unavailable.push(Unavailable {
+        source: "load_task_counts".to_string(),
+        reason: "macOS getloadavg does not report runnable or total scheduling-entity counts"
+            .to_string(),
+    });
+}
+
+/// Read native macOS load averages and observed online CPU capacity. Other
+/// pressure sources that require Linux procfs remain explicitly unavailable.
+#[cfg(target_os = "macos")]
 pub fn read_pressure_snapshot() -> PressureSnapshot {
-    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    let mut snapshot = read_pressure_snapshot_from(
+        Path::new("/"),
+        super::cpu_capacity::observed_logical_cpus().unwrap_or(0),
+    );
+    let mut values = [f64::NAN; 3];
+    // SAFETY: values has space for exactly the three doubles requested, and
+    // getloadavg writes only within that buffer for the duration of this call.
+    let sample_count = unsafe { libc::getloadavg(values.as_mut_ptr(), 3) };
+    let load = if sample_count < 0 {
+        Err(format!(
+            "getloadavg failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        checked_native_loadavg(sample_count, values)
+    };
+    apply_native_loadavg(&mut snapshot, load);
+    snapshot
+}
+
+/// Read a pressure snapshot on other platforms. Without procfs every source
+/// reports unavailable; CPU capacity is retained only when observed.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn read_pressure_snapshot() -> PressureSnapshot {
+    let cpus = std::thread::available_parallelism()
+        .ok()
+        .and_then(|n| u32::try_from(n.get()).ok())
+        .unwrap_or(0);
     read_pressure_snapshot_from(Path::new("/"), cpus)
 }
 
@@ -486,7 +573,15 @@ mod tests {
     #[test]
     fn parses_loadavg_meminfo_vmstat_file_nr() {
         let load = parse_loadavg("4.71 2.61 1.19 3/811 290046\n").unwrap();
-        assert_eq!((load.one, load.runnable, load.total), (4.71, 3, 811));
+        assert_eq!(
+            (load.one, load.runnable, load.total),
+            (4.71, Some(3), Some(811))
+        );
+        // Existing Linux snapshots retain numeric task counts on the wire.
+        let json = serde_json::to_value(load).unwrap();
+        assert_eq!(json["runnable"], 3);
+        assert_eq!(json["total"], 811);
+        assert_eq!(serde_json::from_value::<LoadAvg>(json).unwrap(), load);
         assert!(parse_loadavg("1.0 2.0\n").is_none());
 
         let mem = parse_meminfo(MEMINFO).unwrap();
@@ -525,6 +620,68 @@ mod tests {
     }
 
     #[test]
+    fn native_loadavg_requires_complete_finite_nonnegative_readings() {
+        let values = [0.0, 1.5, 2.25];
+        let load = checked_native_loadavg(3, values).unwrap();
+        assert_eq!([load.one, load.five, load.fifteen], values);
+        assert_eq!(load.runnable, None);
+        assert_eq!(load.total, None);
+        let json = serde_json::to_value(load).unwrap();
+        assert!(json["runnable"].is_null());
+        assert!(json["total"].is_null());
+        assert_eq!(serde_json::from_value::<LoadAvg>(json).unwrap(), load);
+
+        for received in [-1, 0, 1, 2, 4] {
+            assert!(checked_native_loadavg(received, values).is_err());
+        }
+        for index in 0..3 {
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+                let mut invalid_values = values;
+                invalid_values[index] = invalid;
+                assert!(checked_native_loadavg(3, invalid_values).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn native_loadavg_reports_its_own_availability_without_inventing_task_counts() {
+        let root = fake_root(&[]);
+        let missing = read_pressure_snapshot_from(root.path(), 8);
+        let mut observed = missing.clone();
+        apply_native_loadavg(&mut observed, checked_native_loadavg(3, [2.0, 1.0, 0.5]));
+        assert_eq!(observed.load_ratio(), Some(0.25));
+        let load = observed.load.unwrap();
+        assert_eq!(load.runnable, None);
+        assert_eq!(load.total, None);
+        assert!(!observed
+            .unavailable
+            .iter()
+            .any(|source| source.source == "/proc/loadavg" || source.source == "getloadavg"));
+        assert!(observed
+            .unavailable
+            .iter()
+            .any(|source| source.source == "load_task_counts"));
+        assert!(observed.meminfo.is_none());
+        assert!(observed
+            .unavailable
+            .iter()
+            .any(|source| source.source == "/proc/meminfo"));
+
+        let mut failed = missing;
+        apply_native_loadavg(&mut failed, checked_native_loadavg(2, [2.0, 1.0, f64::NAN]));
+        assert!(failed.load.is_none());
+        assert!(failed.load_ratio().is_none());
+        assert!(!failed
+            .unavailable
+            .iter()
+            .any(|source| source.source == "/proc/loadavg"));
+        assert!(failed
+            .unavailable
+            .iter()
+            .any(|source| source.source == "getloadavg" && source.reason.contains("all 3")));
+    }
+
+    #[test]
     fn missing_sources_are_unavailable_never_zero() {
         // A kernel without PSI: pressure is unknown, not 0.
         let root = fake_root(&[
@@ -541,6 +698,16 @@ mod tests {
             "irq absence is normal"
         );
         assert!((snap.load_ratio().unwrap() - 0.1 / 8.0).abs() < 1e-12);
+
+        // A valid load reading cannot imply one CPU when capacity is unknown.
+        let unknown_capacity = read_pressure_snapshot_from(root.path(), 0);
+        assert_eq!(unknown_capacity.load.unwrap().one, 0.1);
+        assert_eq!(unknown_capacity.cpus, 0);
+        assert_eq!(unknown_capacity.load_ratio(), None);
+        assert!(unknown_capacity
+            .unavailable
+            .iter()
+            .any(|source| source.source == "online_cpu_count"));
 
         // An unparseable file is reported, not silently dropped.
         let root = fake_root(&[("proc/loadavg", "nonsense\n")]);
@@ -608,7 +775,7 @@ mod tests {
         let snap = read_pressure_snapshot();
         assert!(snap.cpus >= 1);
         let load = snap.load.expect("/proc/loadavg is always readable");
-        assert!(load.one >= 0.0 && load.total >= 1);
+        assert!(load.one >= 0.0 && load.total.is_some_and(|total| total >= 1));
         let mem = snap.meminfo.expect("/proc/meminfo is always readable");
         assert!(mem.total.unwrap() > 0);
         if let Some(cpu) = snap.cpu {
@@ -620,5 +787,28 @@ mod tests {
                 .iter()
                 .any(|u| u.source == "/proc/pressure/cpu"));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_live_load_snapshot_is_plausible() {
+        let snapshot = read_pressure_snapshot();
+        assert!(snapshot.cpus > 0);
+        let load = snapshot
+            .load
+            .expect("native macOS load average is readable");
+        assert!([load.one, load.five, load.fifteen]
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0));
+        assert_eq!(load.runnable, None);
+        assert_eq!(load.total, None);
+        assert!(!snapshot
+            .unavailable
+            .iter()
+            .any(|source| source.source == "getloadavg" || source.source == "/proc/loadavg"));
+        assert!(snapshot
+            .unavailable
+            .iter()
+            .any(|source| source.source == "load_task_counts"));
     }
 }

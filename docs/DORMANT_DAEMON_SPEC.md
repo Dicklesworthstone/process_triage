@@ -493,6 +493,35 @@ impl Daemon {
 
 ## Configuration
 
+### Implemented Load Thresholds
+
+The default daemon load trigger compares the one-minute load with **2.0 times the
+online CPU count observed in the same pressure snapshot**. It requires three
+consecutive observed breaches by default and retains the configured tick-based
+cooldown. CPU capacity is read on each tick, so a changed capacity changes the
+threshold for that tick. This is a load-pressure signal; it does not establish
+that any particular process is abandoned.
+
+Native `DaemonConfig` JSON uses `triggers.load_per_cpu_threshold` for this ratio.
+An explicit numeric `triggers.load_threshold` remains an absolute load threshold
+and takes precedence over the ratio, preserving existing configurations. Omitting
+the absolute threshold or setting it to `null` selects the ratio. The legacy
+`sustained_load.threshold_multiplier` format below also selects a per-CPU ratio.
+
+Missing, zero, or invalid capacity cannot become a guessed one-CPU observation.
+Missing or non-finite/negative load cannot become zero activity. Such a reading
+breaks the consecutive-breach sequence, preserves the last observed load EWMA,
+and skips the load trigger. Other trigger types still run. Trigger state records
+`load_unavailable_reason`, and `load_evidence_unavailable` audit events report
+new or changed failures without repeating the same failure every tick. An
+explicit absolute threshold needs no CPU count, but still requires a valid load
+observation; when a pressure snapshot exists, its missing load is never replaced
+with a scalar fallback.
+
+Fired load triggers report `current_value`, `ewma_value`, and the effective
+`threshold` in raw load-average units. The description also includes the observed
+CPU count and per-CPU ratio when capacity normalization is active.
+
 ### Daemon-Specific Config
 
 `~/.config/process_triage/daemon.json`:

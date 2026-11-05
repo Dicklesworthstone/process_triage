@@ -710,12 +710,16 @@ The daemon polls every 60 seconds by default, increasing to 30 seconds under a m
 
 | Trigger | Default Threshold | Sustained Window |
 |---------|------------------|------------------|
-| Load average | > 4.0 | 3 consecutive ticks |
+| Load average per observed online CPU | > 2.0 | 3 consecutive observed ticks |
 | Orphan count | > 20 | 3 consecutive ticks |
 | Memory utilization | > 85% used | 3 consecutive ticks |
 | Graded memory / PSI pressure | ≥ 80% used or memory PSI ≥ 20%; emergency at ≥ 95% used or PSI ≥ 60% | 2 consecutive observed readings |
 
 When a trigger fires, the daemon requests `agent plan` and posts the result to the inbox (`pt-core agent inbox`) and as a desktop notification. Every request still respects the global action lock and the escalation cooldown (300 seconds by default). A deferred memory warning is retried while pressure persists. It never acts on its own.
+
+The load trigger uses the load and CPU count observed in the same pressure reading. A load of 10 exceeds the default threshold on a 2-CPU machine but stays below it on a 64-CPU machine. Missing or invalid load/capacity readings interrupt the sustained window and record an unavailable-evidence reason; they never substitute one CPU or a zero load. Notifications include the observed CPU count and effective threshold.
+
+In native `daemon.json` configuration, `triggers.load_per_cpu_threshold` sets the ratio (default `2.0`). An explicitly configured `triggers.load_threshold` keeps its existing **absolute** meaning and takes precedence; omit it or set it to `null` to use the ratio. The older `triggers.sustained_load.threshold_multiplier` setting also uses the observed CPU count on each tick.
 
 ### Self-Limiting
 
