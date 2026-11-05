@@ -9,6 +9,7 @@
 //! - Keep `From<ftui::Event>` mapping shallow (Event -> Msg::KeyPressed/Resized/etc.)
 //! - Update `App::update` to handle the new transition explicitly
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ftui::{Event, KeyEvent};
@@ -24,6 +25,16 @@ pub struct ExecutionOutcome {
     pub attempted: usize,
     pub succeeded: usize,
     pub failed: usize,
+}
+
+/// Rows and goal metadata from the same completed scan.
+#[derive(Debug, Clone, Default)]
+pub struct RefreshOutcome {
+    pub rows: Vec<ProcessRow>,
+    pub goal_summary: Option<Vec<String>>,
+    /// Only the executable goal selection is ranked. An empty map explicitly
+    /// recommends no actions; `None` uses the ordinary row recommendations.
+    pub goal_selection: Option<HashMap<u32, usize>>,
 }
 
 /// Single message type used by the ftui model update loop.
@@ -93,7 +104,7 @@ pub enum Msg {
     },
     RefreshComplete {
         ticket: u64,
-        result: Result<Vec<ProcessRow>, String>,
+        result: Result<RefreshOutcome, String>,
     },
     LedgerExported(Result<PathBuf, String>),
 
@@ -172,7 +183,7 @@ mod tests {
     fn async_payloads_are_send_and_static() {
         assert_send_static::<Vec<ProcessRow>>();
         assert_send_static::<Result<ExecutionOutcome, String>>();
-        assert_send_static::<Result<Vec<ProcessRow>, String>>();
+        assert_send_static::<Result<RefreshOutcome, String>>();
         assert_send_static::<Result<PathBuf, String>>();
     }
 }

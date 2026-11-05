@@ -36,14 +36,17 @@ use ftui::{
 
 use super::events::KeyBindings;
 use super::layout::{Breakpoint, LayoutState, ResponsiveLayout};
-use super::msg::{ExecutionOutcome, Msg};
+use super::msg::{ExecutionOutcome, Msg, RefreshOutcome};
 use super::theme::Theme;
 use super::widgets::{
     AuxPanel, ConfirmChoice, ConfirmDialog, ConfirmDialogState, DetailView, HelpOverlay,
-    ProcessDetail, ProcessRow, ProcessTable, ProcessTableState, SearchInput, SearchInputState,
-    StatusBar, StatusMode,
+    ProcessDetail, ProcessTable, ProcessTableState, SearchInput, SearchInputState, StatusBar,
+    StatusMode,
 };
 use super::{TuiError, TuiResult};
+
+#[cfg(test)]
+use super::widgets::ProcessRow;
 
 /// Focus targets in the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,8 +73,8 @@ pub enum AppState {
     Quitting,
 }
 
-type RefreshOp = Arc<dyn Fn() -> Result<Vec<ProcessRow>, String> + Send + Sync>;
-type ExecuteOp = Arc<dyn Fn(Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync>;
+type RefreshOp = Arc<dyn Fn() -> Result<RefreshOutcome, String> + Send + Sync>;
+type ExecuteOp = Arc<dyn Fn(Vec<u32>, Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PendingOperation {
@@ -81,9 +84,14 @@ enum PendingOperation {
     Executing(u64),
 }
 
+struct SelectionSnapshot {
+    pids: Vec<u32>,
+    explicitly_selected: Vec<u32>,
+}
+
 struct ConfirmedSelection {
     ticket: u64,
-    pids: Vec<u32>,
+    selection: SelectionSnapshot,
 }
 
 /// Main TUI application.
@@ -108,7 +116,7 @@ pub struct App {
     needs_redraw: bool,
     operation: PendingOperation,
     last_operation_ticket: u64,
-    confirmation_selection: Option<Vec<u32>>,
+    confirmation_selection: Option<SelectionSnapshot>,
     confirmed_selection: Option<ConfirmedSelection>,
     /// Responsive layout state for tracking breakpoint changes.
     layout_state: LayoutState,
@@ -119,10 +127,10 @@ pub struct App {
     /// Optional goal summary lines to display.
     goal_summary: Option<Vec<String>>,
     /// Injected refresh operation for ftui Cmd::task (Send + 'static).
-    /// Returns new process rows on success.
+    /// Returns new rows and their goal metadata on success.
     refresh_op: Option<RefreshOp>,
     /// Injected execute operation for ftui Cmd::task (Send + 'static).
-    /// Takes selected PIDs, returns execution outcome.
+    /// Takes selected PIDs and the explicit per-row label subset.
     execute_op: Option<ExecuteOp>,
     /// Toast notification queue for async operation feedback.
     notifications: NotificationQueue,
@@ -346,6 +354,16 @@ impl App {
     /// Set the async refresh operation for ftui Cmd::task.
     pub fn set_refresh_op(&mut self, op: RefreshOp) {
         self.refresh_op = Some(op);
+    }
+
+    /// Replace one scan atomically, expiring any previous selection and goal.
+    pub fn replace_processes(&mut self, outcome: RefreshOutcome) {
+        self.invalidate_selection();
+        self.process_table.set_rows(outcome.rows);
+        self.process_table
+            .set_goal_selection(outcome.goal_selection);
+        self.goal_summary = outcome.goal_summary;
+        self.needs_redraw = true;
     }
 
     /// Set the async execute operation for ftui Cmd::task.
@@ -636,7 +654,10 @@ impl App {
         let selected_pids = self.process_table.get_selected();
         let selected_count = selected_pids.len();
         if selected_count > 0 {
-            self.confirmation_selection = Some(selected_pids);
+            self.confirmation_selection = Some(SelectionSnapshot {
+                pids: selected_pids,
+                explicitly_selected: self.process_table.get_explicitly_selected(),
+            });
             self.confirm_dialog.show();
             self.state = AppState::Confirming;
             self.set_status(format!("Confirm action on {} process(es)?", selected_count));
@@ -661,15 +682,16 @@ impl App {
         self.state = AppState::Normal;
         match choice {
             ConfirmChoice::Yes => {
-                let Some(pids) = selection.filter(|pids| !pids.is_empty()) else {
+                let Some(selection) = selection.filter(|selection| !selection.pids.is_empty())
+                else {
                     self.set_status("Confirmation expired; select processes and confirm again");
                     return FtuiCmd::none();
                 };
                 let Some(ticket) = self.issue_operation_ticket() else {
                     return FtuiCmd::none();
                 };
-                let count = pids.len();
-                self.confirmed_selection = Some(ConfirmedSelection { ticket, pids });
+                let count = selection.pids.len();
+                self.confirmed_selection = Some(ConfirmedSelection { ticket, selection });
                 self.set_status(format!("Preparing actions for {} process(es)...", count));
                 FtuiCmd::msg(Msg::RequestExecute { ticket })
             }
@@ -873,7 +895,8 @@ impl App {
                 let Some(selection) = self.confirmed_selection.take() else {
                     return FtuiCmd::none();
                 };
-                let selected_pids = selection.pids;
+                let selected_pids = selection.selection.pids;
+                let explicitly_selected = selection.selection.explicitly_selected;
                 let selected_count = selected_pids.len();
                 self.operation = PendingOperation::Executing(ticket);
                 tracing::info!(
@@ -894,7 +917,7 @@ impl App {
                         )),
                         FtuiCmd::task_named("execute-selected", move || Msg::ExecutionComplete {
                             ticket,
-                            result: execute(selected_pids),
+                            result: execute(selected_pids, explicitly_selected),
                         }),
                     ])
                 } else {
@@ -942,12 +965,16 @@ impl App {
                     ])
                 } else {
                     self.set_status("Refreshing process list (skeleton mode)...");
-                    let prior_rows = self.process_table.rows.clone();
+                    let prior = RefreshOutcome {
+                        rows: self.process_table.rows.clone(),
+                        goal_summary: self.goal_summary.clone(),
+                        goal_selection: self.process_table.goal_selection().cloned(),
+                    };
                     FtuiCmd::sequence(vec![
                         FtuiCmd::log("refresh: skeleton mode"),
                         FtuiCmd::task_named("refresh-processes", move || Msg::RefreshComplete {
                             ticket,
-                            result: Ok(prior_rows),
+                            result: Ok(prior),
                         }),
                     ])
                 }
@@ -961,22 +988,23 @@ impl App {
                 if !self.operation_is_idle() {
                     return FtuiCmd::none();
                 }
-                self.invalidate_selection();
-                self.process_table.set_rows(rows);
+                self.replace_processes(RefreshOutcome {
+                    rows,
+                    ..RefreshOutcome::default()
+                });
                 self.set_status("Process list refreshed");
                 FtuiCmd::none()
             }
             Msg::RefreshComplete {
                 ticket,
-                result: Ok(rows),
+                result: Ok(outcome),
             } => {
                 if self.operation != PendingOperation::Refreshing(ticket) {
                     return FtuiCmd::none();
                 }
                 self.operation = PendingOperation::Idle;
-                self.invalidate_selection();
-                let count = rows.len();
-                self.process_table.set_rows(rows);
+                let count = outcome.rows.len();
+                self.replace_processes(outcome);
                 self.set_status(format!("Process list refreshed ({})", count));
                 self.push_toast(
                     format!("Refreshed: {} processes", count),
@@ -1330,7 +1358,8 @@ impl FtuiModel for App {
         if self.detail_visible {
             if let Some(detail_area) = areas.detail {
                 let current_row = self.process_table.current_row();
-                let selected = current_row.map(|r| r.selected).unwrap_or(false);
+                let selected =
+                    current_row.is_some_and(|row| self.process_table.selected.contains(&row.pid));
                 ProcessDetail::new()
                     .theme(&self.theme)
                     .row(current_row, selected)
@@ -1728,8 +1757,9 @@ mod tests {
     fn complete_execution_fixture(app: &mut App, result: Result<ExecutionOutcome, String>) {
         app.process_table.set_rows(vec![make_row(42)]);
         app.process_table.select_all();
-        app.set_execute_op(Arc::new(move |pids| {
+        app.set_execute_op(Arc::new(move |pids, explicit| {
             assert_eq!(pids, vec![42]);
+            assert!(explicit.is_empty());
             result.clone()
         }));
         let request = confirmed_request(app);
@@ -1749,7 +1779,12 @@ mod tests {
     #[test]
     fn test_refresh_complete_ok() {
         let mut app = App::new();
-        app.set_refresh_op(Arc::new(|| Ok(vec![make_row(99)])));
+        app.set_refresh_op(Arc::new(|| {
+            Ok(RefreshOutcome {
+                rows: vec![make_row(99)],
+                ..RefreshOutcome::default()
+            })
+        }));
         let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
         <App as FtuiModel>::update(&mut app, refresh());
         assert_eq!(app.process_table.rows.len(), 1);
@@ -1763,6 +1798,52 @@ mod tests {
         let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
         <App as FtuiModel>::update(&mut app, refresh());
         assert!(app.status_message.as_deref().unwrap().contains("failed"));
+    }
+
+    #[test]
+    fn refresh_replaces_goal_forecast_and_selection_with_the_same_scan() {
+        let kill_row = |pid| {
+            let mut row = make_row(pid);
+            row.classification = "KILL".to_string();
+            row
+        };
+        let mut app = App::new();
+        app.replace_processes(RefreshOutcome {
+            rows: vec![kill_row(42), kill_row(99)],
+            goal_summary: Some(vec!["old forecast".to_string()]),
+            goal_selection: Some([(42, 0)].into()),
+        });
+        <App as FtuiModel>::update(&mut app, Msg::SelectRecommended);
+        assert_eq!(app.process_table.get_selected(), vec![42]);
+        app.set_refresh_op(Arc::new(move || {
+            Ok(RefreshOutcome {
+                rows: vec![kill_row(42), kill_row(99)],
+                goal_summary: Some(vec!["new forecast".to_string()]),
+                goal_selection: Some([(99, 0)].into()),
+            })
+        }));
+        let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+        let completed = refresh();
+        assert_eq!(app.goal_summary.as_ref().unwrap(), &["old forecast"]);
+        assert_eq!(app.process_table.selected_count(), 0);
+        <App as FtuiModel>::update(&mut app, completed);
+        assert_eq!(app.goal_summary.as_ref().unwrap(), &["new forecast"]);
+        assert_eq!(app.process_table.selected_count(), 0);
+        <App as FtuiModel>::update(&mut app, Msg::SelectRecommended);
+        assert_eq!(app.process_table.get_selected(), vec![99]);
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::RefreshComplete {
+                ticket: 0,
+                result: Ok(RefreshOutcome::default()),
+            },
+        );
+        assert_eq!(app.goal_summary.as_ref().unwrap(), &["new forecast"]);
+        assert_eq!(app.process_table.get_selected(), vec![99]);
+        <App as FtuiModel>::update(&mut app, Msg::ProcessesScanned(vec![kill_row(42)]));
+        assert!(app.goal_summary.is_none());
+        assert!(app.process_table.goal_selection().is_none());
+        assert_eq!(app.process_table.selected_count(), 0);
     }
 
     #[test]
@@ -1869,12 +1950,16 @@ mod tests {
             *cache_r.lock().unwrap() = after_r.clone();
             let mut row = make_row(42);
             row.command = "replacement incarnation".to_string();
-            Ok(vec![row])
+            Ok(RefreshOutcome {
+                rows: vec![row],
+                ..RefreshOutcome::default()
+            })
         }));
         let cache_e = Arc::clone(&cache);
         let executions_e = Arc::clone(&executions);
-        app.set_execute_op(Arc::new(move |pids| {
+        app.set_execute_op(Arc::new(move |pids, explicit| {
             assert_eq!(pids, vec![42]);
+            assert!(explicit.is_empty());
             executions_e
                 .lock()
                 .unwrap()
@@ -1952,8 +2037,9 @@ mod tests {
         app.process_table.set_rows(vec![make_row(42)]);
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_e = Arc::clone(&calls);
-        app.set_execute_op(Arc::new(move |pids| {
+        app.set_execute_op(Arc::new(move |pids, explicit| {
             assert_eq!(pids, vec![42]);
+            assert!(explicit.is_empty());
             if calls_e.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err("dispatch callback failure".to_string())
             } else {
@@ -1975,7 +2061,10 @@ mod tests {
             Msg::ConfirmExecute,
             Msg::RefreshComplete {
                 ticket: 0,
-                result: Ok(vec![make_row(99)]),
+                result: Ok(RefreshOutcome {
+                    rows: vec![make_row(99)],
+                    ..RefreshOutcome::default()
+                }),
             },
             Msg::ExecutionComplete {
                 ticket: 0,
@@ -2072,8 +2161,11 @@ mod tests {
         app.process_table.set_rows(vec![make_row(42), make_row(99)]);
         let received = Arc::new(Mutex::new(Vec::<Vec<u32>>::new()));
         let received_e = Arc::clone(&received);
-        app.set_execute_op(Arc::new(move |pids| {
+        let labels = Arc::new(Mutex::new(Vec::<Vec<u32>>::new()));
+        let labels_e = Arc::clone(&labels);
+        app.set_execute_op(Arc::new(move |pids, explicit| {
             received_e.lock().unwrap().push(pids);
+            labels_e.lock().unwrap().push(explicit);
             Ok(ExecutionOutcome {
                 mode: Some("dry_run".to_string()),
                 attempted: 1,
@@ -2091,7 +2183,8 @@ mod tests {
         assert_ne!(app.process_table.get_selected(), confirmed);
         let execute = deferred_task(<App as FtuiModel>::update(&mut app, request));
         <App as FtuiModel>::update(&mut app, execute());
-        assert_eq!(*received.lock().unwrap(), vec![confirmed]);
+        assert_eq!(*received.lock().unwrap(), vec![confirmed.clone()]);
+        assert_eq!(*labels.lock().unwrap(), vec![confirmed]);
 
         <App as FtuiModel>::update(&mut app, Msg::ProcessesScanned(vec![make_row(42)]));
         <App as FtuiModel>::update(&mut app, Msg::SelectAll);
@@ -2110,6 +2203,7 @@ mod tests {
         let execute = deferred_task(<App as FtuiModel>::update(&mut app, fresh));
         <App as FtuiModel>::update(&mut app, execute());
         assert_eq!(received.lock().unwrap()[1], vec![42]);
+        assert!(labels.lock().unwrap()[1].is_empty());
         assert_eq!(app.operation, PendingOperation::Idle);
     }
 

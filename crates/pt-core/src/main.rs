@@ -72,7 +72,7 @@ use pt_core::supervision::{
 #[cfg(feature = "ui")]
 use pt_core::tui::widgets::ProcessRow;
 #[cfg(feature = "ui")]
-use pt_core::tui::{run_ftui, App, ExecutionOutcome};
+use pt_core::tui::{run_ftui, App, ExecutionOutcome, RefreshOutcome};
 use pt_core::verify::{
     executed_plan_actions, parse_action_outcomes, parse_agent_plan, verify_plan, VerifyOutcome,
 };
@@ -2285,11 +2285,15 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     };
 
     let TuiBuildOutput {
-        rows,
+        snapshot,
         plan_candidates,
-        goal_summary,
-        goal_order,
-    } = build_tui_data_from_live_scan(global, args, scorer_with(decisions.as_ref()), &policy)?;
+    } = build_tui_data_from_live_scan(
+        global,
+        args,
+        scorer_with(decisions.as_ref()),
+        &policy,
+        &session_id,
+    )?;
     let decisions = Arc::new(Mutex::new(decisions));
 
     handle
@@ -2330,11 +2334,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         app.reduce_motion = true;
     }
 
-    app.process_table.set_rows(rows);
-    app.process_table.set_goal_order(goal_order);
-    if let Some(lines) = goal_summary {
-        app.set_goal_summary(lines);
-    }
+    app.replace_processes(snapshot);
     app.process_table.select_recommended();
     app.set_status(format!(
         "Session {} • {} candidates",
@@ -2358,8 +2358,9 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let goal_r = args.goal.clone();
         let policy_scan_r = policy.clone();
         let decisions_r = Arc::clone(&decisions);
+        let session_id_r = session_id.clone();
 
-        let refresh_fn: Arc<dyn Fn() -> Result<Vec<ProcessRow>, String> + Send + Sync> =
+        let refresh_fn: Arc<dyn Fn() -> Result<RefreshOutcome, String> + Send + Sync> =
             Arc::new(move || {
                 let scan_options = QuickScanOptions {
                     pids: vec![],
@@ -2387,12 +2388,13 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     scorer,
                     &policy_r,
                     goal_r.as_deref(),
+                    &session_id_r,
                 )?;
                 let mut guard = plan_cache_r
                     .lock()
                     .map_err(|_| "plan cache lock poisoned".to_string())?;
                 *guard = output.plan_candidates;
-                Ok(output.rows)
+                Ok(output.snapshot)
             });
 
         // Build execute closure
@@ -2405,70 +2407,73 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let decisions_e = Arc::clone(&decisions);
         let execution_state_e = Arc::clone(&execution_state);
 
-        let execute_fn: Arc<dyn Fn(Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync> =
-            Arc::new(move |selected: Vec<u32>| {
-                let mut state = execution_state_e
+        let execute_fn: Arc<
+            dyn Fn(Vec<u32>, Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync,
+        > = Arc::new(move |selected: Vec<u32>, explicitly_selected: Vec<u32>| {
+            let mut state = execution_state_e
+                .lock()
+                .map_err(|_| "interactive execution state lock poisoned".to_string())?;
+            let outcome = (|| {
+                let candidates = plan_cache_e
                     .lock()
-                    .map_err(|_| "interactive execution state lock poisoned".to_string())?;
-                let outcome = (|| {
-                    let candidates = plan_cache_e
-                        .lock()
-                        .map_err(|_| "plan cache lock poisoned".to_string())?;
-                    let plan = build_plan_from_selection(
-                        &session_id_e,
-                        &policy_e,
-                        &selected,
-                        &candidates,
-                    )?;
-                    let commands: HashMap<u32, (String, String)> = selected
-                        .iter()
-                        .filter_map(|pid| {
-                            let c = candidates.get(pid)?;
-                            Some((*pid, (c.comm.clone(), c.cmd.clone())))
-                        })
-                        .collect();
-                    drop(candidates); // release lock before I/O
-
-                    if plan.actions.is_empty() {
-                        return Err("no actions to apply for selected processes".to_string());
-                    }
-
-                    if dry_run || shadow {
-                        write_plan_to_session(&handle_e, &plan)?;
-                        let mode = if dry_run { "dry_run" } else { "shadow" };
-                        write_outcomes_for_mode(&handle_e, &plan, mode)
-                            .map_err(|e| format!("write outcomes: {}", e))?;
-                        return Ok(ExecutionOutcome {
-                            mode: Some(mode.to_string()),
-                            attempted: plan.actions.len(),
-                            succeeded: 0,
-                            failed: 0,
-                        });
-                    }
-
-                    let (result, _) =
-                        execute_tui_plan_selection(&handle_e, &policy_e, &plan, &mut state)?;
-                    if let Ok(mut guard) = decisions_e.lock() {
-                        if let Some(store) = guard.as_mut() {
-                            record_confirmed_kills(store, &plan, &result, &commands);
-                        }
-                    }
-                    if let Some(error) = result.outcomes.iter().find_map(|outcome| {
-                        (outcome.status == pt_core::action::ActionStatus::Success)
-                            .then_some(outcome.details.as_ref())
-                            .flatten()
-                    }) {
-                        return Err(error.clone());
-                    }
-                    Ok(ExecutionOutcome {
-                        mode: None,
-                        attempted: result.summary.actions_attempted,
-                        succeeded: result.summary.actions_succeeded,
-                        failed: result.summary.actions_failed,
+                    .map_err(|_| "plan cache lock poisoned".to_string())?;
+                let plan =
+                    build_plan_from_selection(&session_id_e, &policy_e, &selected, &candidates)?;
+                let commands: HashMap<u32, (String, String)> = selected
+                    .iter()
+                    .filter_map(|pid| {
+                        let c = candidates.get(pid)?;
+                        Some((*pid, (c.comm.clone(), c.cmd.clone())))
                     })
-                })();
-                outcome.map_err(|error| record_tui_execution_failure(&handle_e, &mut state, error))
-            });
+                    .collect();
+                drop(candidates); // release lock before I/O
+
+                if plan.actions.is_empty() {
+                    return Err("no actions to apply for selected processes".to_string());
+                }
+
+                if dry_run || shadow {
+                    write_plan_to_session(&handle_e, &plan)?;
+                    let mode = if dry_run { "dry_run" } else { "shadow" };
+                    write_outcomes_for_mode(&handle_e, &plan, mode)
+                        .map_err(|e| format!("write outcomes: {}", e))?;
+                    return Ok(ExecutionOutcome {
+                        mode: Some(mode.to_string()),
+                        attempted: plan.actions.len(),
+                        succeeded: 0,
+                        failed: 0,
+                    });
+                }
+
+                let (result, _) =
+                    execute_tui_plan_selection(&handle_e, &policy_e, &plan, &mut state)?;
+                if let Ok(mut guard) = decisions_e.lock() {
+                    if let Some(store) = guard.as_mut() {
+                        record_confirmed_kills(
+                            store,
+                            &plan,
+                            &result,
+                            &commands,
+                            &explicitly_selected,
+                        );
+                    }
+                }
+                if let Some(error) = result.outcomes.iter().find_map(|outcome| {
+                    (outcome.status == pt_core::action::ActionStatus::Success)
+                        .then_some(outcome.details.as_ref())
+                        .flatten()
+                }) {
+                    return Err(error.clone());
+                }
+                Ok(ExecutionOutcome {
+                    mode: None,
+                    attempted: result.summary.actions_attempted,
+                    succeeded: result.summary.actions_succeeded,
+                    failed: result.summary.actions_failed,
+                })
+            })();
+            outcome.map_err(|error| record_tui_execution_failure(&handle_e, &mut state, error))
+        });
 
         app.set_refresh_op(refresh_fn);
         app.set_execute_op(execute_fn);
@@ -2514,19 +2519,37 @@ struct PlanCandidateInput {
     parent_identity: Option<ProcessIdentity>,
 }
 
-/// Record a "kill" verdict for every kill the human confirmed in the TUI that
-/// actually succeeded. Failed, blocked and non-kill actions teach nothing.
+#[cfg(feature = "ui")]
+impl PlanCandidateInput {
+    fn decision_candidate(&self) -> DecisionCandidate {
+        DecisionCandidate {
+            identity: self.identity.clone(),
+            ppid: self.ppid,
+            decision: self.decision.clone(),
+            blocked_reasons: self.blocked_reasons.clone(),
+            stage_pause_before_kill: false,
+            process_state: Some(self.process_state),
+            parent_identity: self.parent_identity.clone(),
+            d_state_diagnostics: None,
+        }
+    }
+}
+
+/// Learn only explicit per-row judgments whose direct kill actually succeeded.
+/// Bulk confirmation authorizes actions; it does not label default recommendations.
 #[cfg(feature = "ui")]
 fn record_confirmed_kills(
     store: &mut pt_core::decision::decision_store::DecisionStore,
     plan: &Plan,
     result: &pt_core::action::ExecutionResult,
     commands: &HashMap<u32, (String, String)>,
+    explicitly_selected: &[u32],
 ) {
     use pt_core::action::ActionStatus;
     use pt_core::decision::decision_store::Verdict;
 
     let mut recorded = false;
+    let mut learned = HashSet::new();
     for outcome in &result.outcomes {
         if !matches!(outcome.status, ActionStatus::Success) {
             continue;
@@ -2538,7 +2561,13 @@ fn record_confirmed_kills(
         else {
             continue;
         };
-        if action.action != Action::Kill {
+        if action.action != Action::Kill
+            || action.blocked
+            || action.routing != pt_core::plan::ActionRouting::Direct
+            || action.original_zombie_target.is_some()
+            || !explicitly_selected.contains(&action.target.pid.0)
+            || !learned.insert(action.target.clone())
+        {
             continue;
         }
         if let Some((comm, cmd)) = commands.get(&action.target.pid.0) {
@@ -2555,10 +2584,8 @@ fn record_confirmed_kills(
 
 #[cfg(feature = "ui")]
 struct TuiBuildOutput {
-    rows: Vec<ProcessRow>,
+    snapshot: RefreshOutcome,
     plan_candidates: HashMap<u32, PlanCandidateInput>,
-    goal_summary: Option<Vec<String>>,
-    goal_order: Option<HashMap<u32, usize>>,
 }
 
 #[cfg(feature = "ui")]
@@ -2567,6 +2594,7 @@ fn build_tui_data_from_live_scan(
     args: &RunArgs,
     scorer: Scorer,
     policy: &pt_core::config::Policy,
+    session_id: &SessionId,
 ) -> Result<TuiBuildOutput, String> {
     let scan_options = QuickScanOptions {
         pids: vec![],
@@ -2588,6 +2616,7 @@ fn build_tui_data_from_live_scan(
         scorer,
         policy,
         args.goal.as_deref(),
+        session_id,
     )
 }
 
@@ -2605,6 +2634,7 @@ fn score_tui_rows(
     mut scorer: Scorer,
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
+    session_id: &SessionId,
 ) -> Result<TuiBuildOutput, String> {
     let min_age = min_age.unwrap_or(policy.guardrails.min_process_age_seconds);
     let eligible: Vec<&ProcessRecord> = processes
@@ -2634,6 +2664,7 @@ fn score_tui_rows(
         &scorer,
         policy,
         goal_str,
+        session_id,
     )
 }
 
@@ -2649,16 +2680,7 @@ fn build_plan_from_selection(
         let Some(candidate) = candidates.get(pid) else {
             continue;
         };
-        plan_candidates.push(DecisionCandidate {
-            identity: candidate.identity.clone(),
-            ppid: candidate.ppid,
-            decision: candidate.decision.clone(),
-            blocked_reasons: candidate.blocked_reasons.clone(),
-            stage_pause_before_kill: false,
-            process_state: Some(candidate.process_state),
-            parent_identity: candidate.parent_identity.clone(),
-            d_state_diagnostics: None,
-        });
+        plan_candidates.push(candidate.decision_candidate());
     }
 
     if plan_candidates.is_empty() {
@@ -3739,6 +3761,15 @@ fn finalize_tui_recommendations(
             goal_candidates.insert(pid, candidate);
         }
     }
+    sync_tui_recommendations(rows, goal_candidates, plan_candidates);
+}
+
+#[cfg(feature = "ui")]
+fn sync_tui_recommendations(
+    rows: &mut [ProcessRow],
+    goal_candidates: &HashMap<u32, serde_json::Value>,
+    plan_candidates: &mut HashMap<u32, PlanCandidateInput>,
+) {
     for row in rows {
         let Some(candidate) = goal_candidates.get(&row.pid) else {
             continue;
@@ -3756,11 +3787,13 @@ fn finalize_tui_recommendations(
                 .as_str()
                 .unwrap_or("requires review")
                 .to_string();
-            row.top_evidence.insert(0, reason.clone());
-            row.why_summary = Some(format!(
-                "{} {reason}",
-                row.why_summary.as_deref().unwrap_or("")
-            ));
+            if !row.top_evidence.contains(&reason) {
+                row.top_evidence.insert(0, reason.clone());
+                row.why_summary = Some(format!(
+                    "{} {reason}",
+                    row.why_summary.as_deref().unwrap_or("")
+                ));
+            }
             if let Some(input) = plan_candidates.get_mut(&row.pid) {
                 if !input.blocked_reasons.contains(&reason) {
                     input.blocked_reasons.push(reason);
@@ -3768,6 +3801,123 @@ fn finalize_tui_recommendations(
             }
         }
     }
+}
+
+/// Use the same budget, routing and exact-selection tree checks as agent plans.
+/// The preliminary ranking only orders budget choices; the executable plan is
+/// the sole basis for the displayed resource forecast and recommended set.
+#[cfg(feature = "ui")]
+#[allow(clippy::too_many_arguments)]
+fn finalize_tui_goal_selection(
+    session_id: &SessionId,
+    goal: &Goal,
+    current_cpu_pct: f64,
+    rows: &mut [ProcessRow],
+    goal_candidates: &mut HashMap<u32, serde_json::Value>,
+    plan_candidates: &mut HashMap<u32, PlanCandidateInput>,
+    policy: &pt_core::config::Policy,
+    population: &[ProcessRecord],
+    resources: &GoalResourceSnapshot,
+) -> Result<GoalPlanOutput, String> {
+    let mut candidates: Vec<_> = rows
+        .iter()
+        .filter_map(|row| goal_candidates.get(&row.pid).cloned())
+        .collect();
+    if let Ok(preliminary) = build_goal_plan_from_candidates(
+        &goal.canonical(),
+        goal,
+        current_cpu_pct,
+        &candidates,
+        resources,
+    ) {
+        let ranks: HashMap<_, _> = preliminary
+            .selected_pids
+            .iter()
+            .enumerate()
+            .map(|(rank, &pid)| (pid, rank))
+            .collect();
+        rows.sort_by_key(|row| ranks.get(&row.pid).copied().unwrap_or(usize::MAX));
+    }
+    finalize_tui_recommendations(rows, goal_candidates, plan_candidates, population, policy);
+    candidates = rows
+        .iter()
+        .filter_map(|row| goal_candidates.get(&row.pid).cloned())
+        .collect();
+    let action_inputs: HashMap<_, _> = plan_candidates
+        .iter()
+        .map(|(&pid, input)| (pid, input.decision_candidate()))
+        .collect();
+    let mut plan = build_agent_action_plan(
+        session_id,
+        policy,
+        &candidates,
+        &action_inputs,
+        chrono::Utc::now().to_rfc3339(),
+    );
+    reconcile_agent_action_candidates(&mut candidates, &action_inputs, &plan);
+    let output = finalize_goal_action_plan(
+        Some(goal),
+        current_cpu_pct,
+        &mut candidates,
+        &mut plan,
+        resources,
+        population,
+        policy.guardrails.builtin_protection,
+    );
+    for candidate in candidates {
+        if let Some(pid) = candidate["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        {
+            goal_candidates.insert(pid, candidate);
+        }
+    }
+    sync_tui_recommendations(rows, goal_candidates, plan_candidates);
+    for row in rows {
+        row.selected = goal_candidates
+            .get(&row.pid)
+            .is_some_and(|candidate| candidate["goal_selected"].as_bool() == Some(true));
+    }
+    output
+}
+
+#[cfg(feature = "ui")]
+fn tui_goal_summary(goal_str: &str, output: &GoalPlanOutput) -> Vec<String> {
+    let mut lines = vec![
+        format!("Goal: {goal_str}"),
+        format!(
+            "Status: {} • Optimizer: {}",
+            if output.result.feasible {
+                "achievable"
+            } else {
+                "partial"
+            },
+            output.result.algorithm,
+        ),
+    ];
+    for entry in &output.result.goal_achievement {
+        let fraction = if entry.target > 0.0 {
+            (entry.achieved / entry.target).min(1.0)
+        } else {
+            1.0
+        };
+        lines.push(format!(
+            "{}: {:.1}/{:.1} ({:.0}%)",
+            entry.resource,
+            entry.achieved,
+            entry.target,
+            fraction * 100.0,
+        ));
+    }
+    lines.push(format!(
+        "Expected loss: {:.2} • Recommended goal selection: {}",
+        output.result.total_loss,
+        output.selected_pids.len(),
+    ));
+    if !output.warnings.is_empty() {
+        lines.push(format!("Warnings: {}", output.warnings.join(", ")));
+    }
+    lines
 }
 
 #[cfg(feature = "ui")]
@@ -3781,6 +3931,7 @@ fn build_tui_rows(
     scorer: &Scorer,
     policy: &pt_core::config::Policy,
     goal_str: Option<&str>,
+    session_id: &SessionId,
 ) -> Result<TuiBuildOutput, String> {
     const MIN_POSTERIOR: f64 = 0.7;
     const MAX_CANDIDATES: usize = 50;
@@ -4021,117 +4172,77 @@ fn build_tui_rows(
     rows.sort_by_key(|r| std::cmp::Reverse(r.score));
     rows.truncate(MAX_CANDIDATES);
 
-    finalize_tui_recommendations(
-        &mut rows,
-        &mut goal_candidates,
-        &mut plan_candidates,
-        population,
-        &decision_policy,
-    );
-
     let mut goal_summary: Option<Vec<String>> = None;
-    let mut goal_order: Option<HashMap<u32, usize>> = None;
+    let mut goal_selection = goal_str.map(|_| HashMap::new());
 
     if let Some(goal_str) = goal_str {
         match parse_goal(goal_str) {
             Ok(parsed) => {
                 let resources = GoalResourceSnapshot::collect(&parsed, population);
-                let mut candidates_for_goal = Vec::new();
-                for row in &rows {
-                    if let Some(candidate) = goal_candidates.get(&row.pid) {
-                        candidates_for_goal.push(candidate.clone());
+                match finalize_tui_goal_selection(
+                    session_id,
+                    &parsed,
+                    cpu_total,
+                    &mut rows,
+                    &mut goal_candidates,
+                    &mut plan_candidates,
+                    &decision_policy,
+                    population,
+                    &resources,
+                ) {
+                    Ok(output) => {
+                        goal_summary = Some(tui_goal_summary(goal_str, &output));
+                        goal_selection = Some(
+                            output
+                                .selected_pids
+                                .iter()
+                                .enumerate()
+                                .map(|(rank, &pid)| (pid, rank))
+                                .collect(),
+                        );
                     }
-                }
-
-                if !candidates_for_goal.is_empty() {
-                    match build_goal_plan_from_candidates(
-                        goal_str,
-                        &parsed,
-                        cpu_total,
-                        &candidates_for_goal,
-                        &resources,
-                    ) {
-                        Ok(output) => {
-                            let mut lines = Vec::new();
-                            lines.push(format!("Goal: {}", goal_str));
-                            lines.push(format!(
-                                "Status: {}",
-                                if output.result.feasible {
-                                    "achievable"
-                                } else {
-                                    "partial"
-                                }
-                            ));
-                            for entry in &output.result.goal_achievement {
-                                let fraction = if entry.target > 0.0 {
-                                    (entry.achieved / entry.target).min(1.0)
-                                } else {
-                                    1.0
-                                };
-                                lines.push(format!(
-                                    "{}: {:.1}/{:.1} ({:.0}%)",
-                                    entry.resource,
-                                    entry.achieved,
-                                    entry.target,
-                                    fraction * 100.0
-                                ));
-                            }
-                            lines.push(format!(
-                                "Expected loss: {:.2} • Selected: {}",
-                                output.result.total_loss,
-                                output.selected_pids.len()
-                            ));
-                            if !output.warnings.is_empty() {
-                                lines.push(format!("Warnings: {}", output.warnings.join(", ")));
-                            }
-                            goal_summary = Some(lines);
-
-                            let mut rank_map = HashMap::new();
-                            let mut rank = 0usize;
-                            for pid in &output.selected_pids {
-                                if rows.iter().any(|row| row.pid == *pid) {
-                                    rank_map.insert(*pid, rank);
-                                    rank = rank.saturating_add(1);
-                                }
-                            }
-                            for row in &rows {
-                                if let std::collections::hash_map::Entry::Vacant(e) =
-                                    rank_map.entry(row.pid)
-                                {
-                                    e.insert(rank);
-                                    rank = rank.saturating_add(1);
-                                }
-                            }
-                            goal_order = Some(rank_map);
-                        }
-                        Err(err) => {
-                            goal_summary = Some(vec![
-                                format!("Goal: {}", goal_str),
-                                format!("Error: {}", err),
-                            ]);
-                        }
+                    Err(err) => {
+                        goal_summary = Some(vec![
+                            format!("Goal: {goal_str}"),
+                            format!("Error: {err} • No goal actions selected"),
+                        ]);
                     }
-                } else {
-                    goal_summary = Some(vec![
-                        format!("Goal: {}", goal_str),
-                        "No candidates available for goal optimization".to_string(),
-                    ]);
                 }
             }
             Err(err) => {
+                finalize_tui_recommendations(
+                    &mut rows,
+                    &mut goal_candidates,
+                    &mut plan_candidates,
+                    population,
+                    &decision_policy,
+                );
+                for row in &mut rows {
+                    row.selected = false;
+                }
                 goal_summary = Some(vec![
-                    format!("Goal: {}", goal_str),
-                    format!("Error: {}", err),
+                    format!("Goal: {goal_str}"),
+                    format!("Error: {err} • No goal actions selected"),
                 ]);
             }
         }
+    } else {
+        finalize_tui_recommendations(
+            &mut rows,
+            &mut goal_candidates,
+            &mut plan_candidates,
+            population,
+            &decision_policy,
+        );
     }
 
     Ok(TuiBuildOutput {
-        rows,
+        snapshot: RefreshOutcome {
+            rows,
+            goal_summary,
+            goal_selection,
+        },
         plan_candidates,
-        goal_summary,
-        goal_order,
     })
 }
 
@@ -13517,6 +13628,223 @@ mod process_tree_safety_tests {
         serde_json::json!({"pid": pid, "recommended_action": "kill", "recommendation": "KILL"})
     }
 
+    #[cfg(feature = "ui")]
+    mod tui_goals {
+        use super::rec;
+        use crate::*;
+        use pt_core::decision::goal_contribution::PortGoalResources;
+        use pt_core::inference::ClassScores;
+
+        struct Fixture {
+            session: SessionId,
+            policy: pt_core::config::Policy,
+            population: Vec<ProcessRecord>,
+            rows: Vec<ProcessRow>,
+            candidates: HashMap<u32, serde_json::Value>,
+            inputs: HashMap<u32, PlanCandidateInput>,
+        }
+
+        impl Fixture {
+            fn new(processes: &[(u32, u32, u64, ProcessState)]) -> Self {
+                let policy = pt_core::config::Policy::default();
+                let decision = decide_action(
+                    &ClassScores {
+                        useful: 0.001,
+                        useful_bad: 0.0,
+                        abandoned: 0.999,
+                        zombie: 0.0,
+                    },
+                    &policy,
+                    &ActionFeasibility::allow_all(),
+                )
+                .unwrap();
+                assert_eq!(decision.optimal_action, Action::Kill);
+                let mut fixture = Self {
+                    session: SessionId::new(),
+                    policy,
+                    population: Vec::new(),
+                    rows: Vec::new(),
+                    candidates: HashMap::new(),
+                    inputs: HashMap::new(),
+                };
+                for &(pid, ppid, memory_mb, state) in processes {
+                    let mut process = rec(pid, ppid, "sleep 600", state);
+                    process.rss_bytes = memory_mb * 1024 * 1024;
+                    fixture.candidates.insert(
+                        pid,
+                        serde_json::json!({
+                            "pid": pid, "start_id": process.start_id, "uid": process.uid,
+                            "recommended_action": "kill", "action_rationale": "fixture",
+                            "memory_mb": memory_mb, "cpu_percent": 0.0,
+                            "expected_loss": [{"action": "kill", "loss": 1.0}],
+                        }),
+                    );
+                    fixture.inputs.insert(
+                        pid,
+                        PlanCandidateInput {
+                            identity: process_identity_from_record(&process),
+                            ppid: Some(ppid),
+                            decision: decision.clone(),
+                            process_state: state,
+                            comm: process.comm.clone(),
+                            cmd: process.cmd.clone(),
+                            blocked_reasons: Vec::new(),
+                            parent_identity: None,
+                        },
+                    );
+                    fixture.rows.push(ProcessRow {
+                        pid,
+                        score: 99,
+                        classification: "KILL".to_string(),
+                        runtime: "2h".to_string(),
+                        memory: format!("{memory_mb} MiB"),
+                        command: process.cmd.clone(),
+                        selected: true,
+                        galaxy_brain: None,
+                        why_summary: None,
+                        top_evidence: Vec::new(),
+                        confidence: None,
+                        plan_preview: Vec::new(),
+                        provenance_headline: None,
+                        provenance_sections: Vec::new(),
+                        provenance_caveats: Vec::new(),
+                        blast_radius_risk: None,
+                    });
+                    fixture.population.push(process);
+                }
+                fixture
+            }
+
+            fn optimize(
+                &mut self,
+                goal: &str,
+                cpu: f64,
+                resources: &GoalResourceSnapshot,
+            ) -> Result<GoalPlanOutput, String> {
+                finalize_tui_goal_selection(
+                    &self.session,
+                    &parse_goal(goal).unwrap(),
+                    cpu,
+                    &mut self.rows,
+                    &mut self.candidates,
+                    &mut self.inputs,
+                    &self.policy,
+                    &self.population,
+                    resources,
+                )
+            }
+
+            fn executable(&self, selected: &[u32]) -> Plan {
+                build_plan_from_selection(&self.session, &self.policy, selected, &self.inputs)
+                    .unwrap()
+            }
+        }
+
+        #[test]
+        fn goal_ranking_precedes_budget_and_defaults_match_the_executable_plan() {
+            let mut fixture = Fixture::new(&[
+                (100, 1, 1, ProcessState::Sleeping),
+                (200, 1, 1000, ProcessState::Sleeping),
+            ]);
+            fixture.policy.guardrails.max_kills_per_run = 1;
+            let output = fixture
+                .optimize("free 100MB RAM", 0.0, &GoalResourceSnapshot::default())
+                .unwrap();
+            assert!(output.result.feasible);
+            assert_eq!(output.selected_pids, [200]);
+            assert_eq!(
+                fixture
+                    .rows
+                    .iter()
+                    .filter(|row| row.selected)
+                    .map(|row| row.pid)
+                    .collect::<Vec<_>>(),
+                [200]
+            );
+            let plan = fixture.executable(&output.selected_pids);
+            assert_eq!(plan.actions.len(), 1);
+            assert_eq!(plan.actions[0].target, fixture.inputs[&200].identity);
+            assert_eq!(fixture.candidates[&100]["recommended_action"], "review");
+            assert!(tui_goal_summary("free 100MB RAM", &output)
+                .iter()
+                .any(|line| line.contains(&output.result.algorithm)));
+        }
+
+        #[test]
+        fn zombie_advice_without_a_direct_executable_kill_cannot_supply_recovery() {
+            let mut fixture = Fixture::new(&[
+                (100, 1, 1000, ProcessState::Zombie),
+                (200, 1, 100, ProcessState::Sleeping),
+            ]);
+            let output = fixture
+                .optimize("free 50MB RAM", 0.0, &GoalResourceSnapshot::default())
+                .unwrap();
+            assert!(output.result.feasible);
+            assert_eq!(output.selected_pids, [200]);
+            assert_eq!(fixture.candidates[&100]["recommended_action"], "review");
+            // Even a manual bulk selection cannot revive the unsupported route.
+            let plan = fixture.executable(&[100, 200]);
+            assert_eq!(plan.actions.len(), 1);
+            assert_eq!(plan.actions[0].target.pid.0, 200);
+        }
+
+        #[test]
+        fn goal_subset_rechecks_live_children_before_tui_selection() {
+            let mut fixture = Fixture::new(&[
+                (100, 1, 1000, ProcessState::Sleeping),
+                (200, 100, 100, ProcessState::Sleeping),
+            ]);
+            let output = fixture
+                .optimize("free 100MB RAM", 0.0, &GoalResourceSnapshot::default())
+                .unwrap();
+            assert_eq!(output.selected_pids, [200]);
+            assert_eq!(
+                fixture.candidates[&100]["tree_safety"]["rule"],
+                "live_child"
+            );
+            assert!(!fixture.inputs[&100].blocked_reasons.is_empty());
+            let plan = fixture.executable(&[100, 200]);
+            assert_eq!(plan.actions.len(), 1);
+            assert_eq!(plan.actions[0].target.pid.0, 200);
+        }
+
+        #[test]
+        fn satisfied_and_unmeasured_goals_never_select_unrelated_kills() {
+            let resources = GoalResourceSnapshot {
+                ports: [(
+                    3000,
+                    PortGoalResources {
+                        holders: Some(Vec::new()),
+                        bound_socket_count: Some(0),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            for populated in [false, true] {
+                let rows = if populated {
+                    vec![(100, 1, 1000, ProcessState::Sleeping)]
+                } else {
+                    vec![]
+                };
+                let mut fixture = Fixture::new(&rows);
+                let output = fixture.optimize("free port 3000", 0.0, &resources).unwrap();
+                assert!(output.result.feasible);
+                assert!(output.selected_pids.is_empty());
+                assert!(fixture.rows.iter().all(|row| !row.selected));
+            }
+            let mut fixture = Fixture::new(&[(100, 1, 1000, ProcessState::Sleeping)]);
+            assert!(fixture
+                .optimize(
+                    "reduce CPU below 50%",
+                    f64::NAN,
+                    &GoalResourceSnapshot::default()
+                )
+                .is_err());
+            assert!(fixture.rows.iter().all(|row| !row.selected));
+        }
+    }
+
     /// Payload-level reporting test: no live signal or kill is claimed here.
     #[test]
     fn goal_progress_uses_executed_identity_parent_clock_and_actual_success() {
@@ -15800,10 +16128,10 @@ mod tui_learning_tests {
     }
 
     #[test]
-    fn only_successful_kills_are_learned() {
+    fn only_explicit_successful_direct_kills_are_learned_once() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = DecisionStore::load(dir.path()).unwrap();
-        let plan = Plan {
+        let mut plan = Plan {
             plan_id: "p".to_string(),
             session_id: "s".to_string(),
             generated_at: String::new(),
@@ -15813,45 +16141,65 @@ mod tui_learning_tests {
                 action("a1", 11, Action::Kill),
                 action("a2", 12, Action::Kill),
                 action("a3", 13, Action::Pause),
+                action("a4", 14, Action::Kill),
+                action("a5", 15, Action::Kill),
+                action("a6", 16, Action::Kill),
             ],
             pre_toggled: Vec::new(),
             gates_summary: GatesSummary {
-                total_candidates: 3,
-                blocked_candidates: 0,
+                total_candidates: 6,
+                blocked_candidates: 1,
                 pre_toggled_actions: 0,
             },
         };
+        plan.actions[4].blocked = true;
+        plan.actions[5].original_zombie_target = Some(plan.actions[1].target.clone());
         let result = ExecutionResult {
             summary: ExecutionSummary {
-                actions_attempted: 3,
-                actions_succeeded: 2,
+                actions_attempted: 7,
+                actions_succeeded: 6,
                 actions_failed: 1,
             },
             outcomes: vec![
                 outcome("a1", ActionStatus::Success),
                 outcome("a2", ActionStatus::PermissionDenied),
                 outcome("a3", ActionStatus::Success),
+                outcome("a4", ActionStatus::Success),
+                outcome("a5", ActionStatus::Success),
+                outcome("a6", ActionStatus::Success),
+                outcome("a1", ActionStatus::Success),
             ],
         };
         let commands: HashMap<u32, (String, String)> = [
             (11, ("sleep".to_string(), "sleep 900".to_string())),
             (12, ("vim".to_string(), "vim notes.txt".to_string())),
             (13, ("cat".to_string(), "cat".to_string())),
+            (14, ("perl".to_string(), "perl worker.pl".to_string())),
+            (15, ("ruby".to_string(), "ruby worker.rb".to_string())),
+            (16, ("python".to_string(), "python worker.py".to_string())),
         ]
         .into_iter()
         .collect();
 
-        record_confirmed_kills(&mut store, &plan, &result, &commands);
-
-        // Persisted, and only the successful kill counts.
-        let store = DecisionStore::load(dir.path()).unwrap();
+        record_confirmed_kills(&mut store, &plan, &result, &commands, &[]);
         let g = Priors::default();
+        assert!(store.learned_prior("sleep", "sleep 900", &g).is_none());
+        record_confirmed_kills(&mut store, &plan, &result, &commands, &[11, 12, 13, 15, 16]);
+
+        // Persisted once, excluding an untouched default, failures, non-kills,
+        // blocked actions and a remedy routed from a different process.
+        let store = DecisionStore::load(dir.path()).unwrap();
         let killed = store
             .learned_prior("sleep", "sleep 900", &g)
             .expect("kill learned");
         assert_eq!((killed.kill, killed.spare), (1, 0));
         assert!(store.learned_prior("vim", "vim notes.txt", &g).is_none());
         assert!(store.learned_prior("cat", "cat", &g).is_none());
+        assert!(store.learned_prior("perl", "perl worker.pl", &g).is_none());
+        assert!(store.learned_prior("ruby", "ruby worker.rb", &g).is_none());
+        assert!(store
+            .learned_prior("python", "python worker.py", &g)
+            .is_none());
     }
 }
 

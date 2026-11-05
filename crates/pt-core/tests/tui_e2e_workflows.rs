@@ -815,7 +815,12 @@ fn refresh_complete_updates_rows() {
         "test-process",
         None,
     )];
-    app.set_refresh_op(std::sync::Arc::new(move || Ok(new_rows.clone())));
+    app.set_refresh_op(std::sync::Arc::new(move || {
+        Ok(pt_core::tui::RefreshOutcome {
+            rows: new_rows.clone(),
+            ..Default::default()
+        })
+    }));
     let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
     send_msg(&mut app, refresh());
     assert_eq!(app.process_table.rows.len(), 1);
@@ -828,8 +833,9 @@ fn execution_complete_ok() {
     let mut app = app_with_rows();
 
     send_msg(&mut app, Msg::SelectAll);
-    app.set_execute_op(std::sync::Arc::new(|pids| {
+    app.set_execute_op(std::sync::Arc::new(|pids, explicit| {
         assert_eq!(pids.len(), 5);
+        assert!(explicit.is_empty());
         Ok(ExecutionOutcome {
             mode: None,
             attempted: 3,
@@ -849,8 +855,9 @@ fn execution_complete_err() {
     let mut app = app_with_rows();
 
     send_msg(&mut app, Msg::SelectAll);
-    app.set_execute_op(std::sync::Arc::new(|pids| {
+    app.set_execute_op(std::sync::Arc::new(|pids, explicit| {
         assert_eq!(pids.len(), 5);
+        assert!(explicit.is_empty());
         Err("test error".to_string())
     }));
     let request = confirmed_request(&mut app);

@@ -43,7 +43,7 @@ pub use events::{handle_event, AppAction, KeyBindings};
 pub use layout::{
     Breakpoint, DetailAreas, GalaxyBrainAreas, LayoutState, MainAreas, ResponsiveLayout,
 };
-pub use msg::{ExecutionOutcome, Msg};
+pub use msg::{ExecutionOutcome, Msg, RefreshOutcome};
 pub use theme::{Theme, ThemeMode};
 
 use thiserror::Error;

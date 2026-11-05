@@ -525,6 +525,9 @@ pub struct ProcessTableState {
     pub rows: Vec<ProcessRow>,
     /// Currently selected PIDs.
     pub selected: HashSet<u32>,
+    /// Positive selections made by toggling individual rows in this scan.
+    /// Bulk/default selections authorize execution but are not human labels.
+    explicitly_selected: HashSet<u32>,
     /// Current cursor position.
     pub cursor: usize,
     /// Scroll offset (first visible row).
@@ -537,7 +540,7 @@ pub struct ProcessTableState {
     pub filter: Option<String>,
     /// Current view mode (score vs goal ordering).
     pub view_mode: ViewMode,
-    /// Optional goal-based ordering (pid -> rank).
+    /// Executable goal selection (pid -> rank); an empty map selects nothing.
     goal_rank: Option<HashMap<u32, usize>>,
     /// Last known visible height of the table area.
     pub last_visible_height: usize,
@@ -556,6 +559,7 @@ impl ProcessTableState {
             focused: false,
             rows: Vec::new(),
             selected: HashSet::new(),
+            explicitly_selected: HashSet::new(),
             cursor: 0,
             scroll_offset: 0,
             sort_column: SortColumn::Score,
@@ -569,19 +573,25 @@ impl ProcessTableState {
 
     /// Set the rows.
     pub fn set_rows(&mut self, rows: Vec<ProcessRow>) {
+        self.deselect_all();
         self.rows = rows;
         self.cursor = 0;
         self.scroll_offset = 0;
         self.sort();
     }
 
-    /// Set goal ordering for goal-first view.
-    pub fn set_goal_order(&mut self, order: Option<HashMap<u32, usize>>) {
-        self.goal_rank = order;
+    /// Set the recommended goal selection and its order in goal-first view.
+    pub fn set_goal_selection(&mut self, selection: Option<HashMap<u32, usize>>) {
+        self.goal_rank = selection;
         if self.goal_rank.is_none() && self.view_mode == ViewMode::GoalFirst {
             self.view_mode = ViewMode::SuspicionFirst;
         }
         self.sort();
+    }
+
+    /// The goal selection belonging to the current scan, including an empty set.
+    pub fn goal_selection(&self) -> Option<&HashMap<u32, usize>> {
+        self.goal_rank.as_ref()
     }
 
     /// Toggle view mode (score vs goal).
@@ -723,8 +733,10 @@ impl ProcessTableState {
             let pid = row.pid;
             if self.selected.contains(&pid) {
                 self.selected.remove(&pid);
+                self.explicitly_selected.remove(&pid);
             } else {
                 self.selected.insert(pid);
+                self.explicitly_selected.insert(pid);
             }
         }
     }
@@ -737,12 +749,19 @@ impl ProcessTableState {
         }
     }
 
-    /// Select all recommended rows (defaults to KILL classification).
+    /// Select the executable goal set, or ordinary KILL recommendations when
+    /// no resource goal is active. Goal errors and satisfied goals select none.
     pub fn select_recommended(&mut self) {
         let pids: Vec<u32> = self
             .visible_rows()
             .iter()
-            .filter(|row| row.classification.eq_ignore_ascii_case("KILL"))
+            .filter(|row| {
+                row.classification.eq_ignore_ascii_case("KILL")
+                    && self
+                        .goal_rank
+                        .as_ref()
+                        .is_none_or(|ranks| ranks.contains_key(&row.pid))
+            })
             .map(|row| row.pid)
             .collect();
         for pid in pids {
@@ -754,6 +773,7 @@ impl ProcessTableState {
     pub fn invert_selection(&mut self) {
         let pids: Vec<u32> = self.visible_rows().iter().map(|row| row.pid).collect();
         for pid in pids {
+            self.explicitly_selected.remove(&pid);
             if self.selected.contains(&pid) {
                 self.selected.remove(&pid);
             } else {
@@ -765,11 +785,20 @@ impl ProcessTableState {
     /// Deselect all rows.
     pub fn deselect_all(&mut self) {
         self.selected.clear();
+        self.explicitly_selected.clear();
     }
 
     /// Get selected PIDs.
     pub fn get_selected(&self) -> Vec<u32> {
         self.selected.iter().copied().collect()
+    }
+
+    /// Explicit per-row positive judgments still present in the selection.
+    pub fn get_explicitly_selected(&self) -> Vec<u32> {
+        self.selected
+            .intersection(&self.explicitly_selected)
+            .copied()
+            .collect()
     }
 
     /// Get count of selected processes.
@@ -1230,6 +1259,57 @@ mod tests {
         // Verify REVIEW and SPARE are not selected
         assert!(!state.selected.contains(&5678));
         assert!(!state.selected.contains(&9012));
+    }
+
+    #[test]
+    fn goal_selection_limits_defaults_and_an_empty_goal_never_falls_back() {
+        let mut rows = sample_rows();
+        rows[1].classification = "KILL".to_string();
+        let mut state = ProcessTableState::new();
+        state.set_rows(rows);
+        state.set_goal_selection(Some([(5678, 0)].into()));
+        state.select_recommended();
+        assert_eq!(state.get_selected(), vec![5678]);
+        state.toggle_view_mode();
+        assert_eq!(state.rows[0].pid, 5678);
+        state.deselect_all();
+        state.set_goal_selection(Some(HashMap::new()));
+        state.select_recommended();
+        assert!(state.get_selected().is_empty());
+        // An explicit human selection remains possible; it is not a default.
+        state.select_all();
+        assert_eq!(state.selected_count(), 3);
+        state.deselect_all();
+        state.set_goal_selection(None);
+        state.select_recommended();
+        assert_eq!(state.selected_count(), 2);
+        assert_eq!(state.view_mode, ViewMode::SuspicionFirst);
+    }
+
+    #[test]
+    fn only_individual_positive_toggles_create_labels_for_the_current_scan() {
+        let mut state = ProcessTableState::new();
+        state.set_rows(sample_rows());
+        state.set_goal_selection(Some([(1234, 0)].into()));
+        state.select_recommended();
+        assert!(state.get_explicitly_selected().is_empty());
+        state.select_all();
+        assert!(state.get_explicitly_selected().is_empty());
+        state.invert_selection();
+        state.invert_selection();
+        assert!(state.get_explicitly_selected().is_empty());
+        state.toggle_selection(); // Remove a bulk-selected row.
+        state.toggle_selection(); // An individual positive judgment.
+        assert_eq!(state.get_explicitly_selected(), vec![1234]);
+        state.toggle_selection();
+        state.select_recommended();
+        assert!(state.get_explicitly_selected().is_empty());
+        state.deselect_all();
+        state.toggle_selection();
+        assert_eq!(state.get_explicitly_selected(), vec![1234]);
+        state.set_rows(sample_rows()); // Same PID must not inherit a prior label.
+        assert!(state.get_selected().is_empty());
+        assert!(state.get_explicitly_selected().is_empty());
     }
 
     // ── Sort edge cases ───────────────────────────────────────────────
