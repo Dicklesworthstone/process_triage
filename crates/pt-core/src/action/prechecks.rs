@@ -1246,28 +1246,13 @@ impl LivePreCheckProvider {
         }
     }
 
-    /// Check if process CWD is deleted.
-    fn has_deleted_cwd(&self, pid: u32) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            let cwd_link = format!("/proc/{pid}/cwd");
-            if let Ok(target) = std::fs::read_link(&cwd_link) {
-                let target_str = target.to_string_lossy();
-                return target_str.ends_with(" (deleted)");
-            }
-            false
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // macOS doesn't easily expose this info via sysctl/proc
-            let _ = pid;
-            false
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = pid;
-            false
-        }
+    /// Check Linux CWD evidence without treating an unreadable link as healthy.
+    #[cfg(target_os = "linux")]
+    fn has_deleted_cwd(&self, pid: u32) -> Result<bool, String> {
+        let cwd_link = format!("/proc/{pid}/cwd");
+        let target = std::fs::read_link(&cwd_link)
+            .map_err(|error| format!("cannot read {cwd_link}: {error}"))?;
+        Ok(target.to_string_lossy().ends_with(" (deleted)"))
     }
 
     /// Read process state.
@@ -1613,13 +1598,25 @@ impl PreCheckProvider for LivePreCheckProvider {
             }
         }
 
-        // Check deleted CWD
-        if self.config.block_if_deleted_cwd && self.has_deleted_cwd(pid) {
-            debug!(pid, "process has deleted cwd");
-            return PreCheckResult::Blocked {
-                check: PreCheck::CheckDataLossGate,
-                reason: "process CWD is deleted".to_string(),
-            };
+        // This gate is supported on Linux, where procfs exposes deleted CWDs.
+        #[cfg(target_os = "linux")]
+        if self.config.block_if_deleted_cwd {
+            match self.has_deleted_cwd(pid) {
+                Ok(false) => {}
+                Ok(true) => {
+                    debug!(pid, "process has deleted cwd");
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckDataLossGate,
+                        reason: "process CWD is deleted".to_string(),
+                    };
+                }
+                Err(error) => {
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckDataLossGate,
+                        reason: format!("CWD evidence unavailable: {error}"),
+                    };
+                }
+            }
         }
 
         // Enabled I/O gates require a complete observation, including identity.
@@ -1819,9 +1816,11 @@ impl PreCheckProvider for LivePreCheckProvider {
                         };
                     }
                 }
-                Err(e) => {
-                    // Log but don't fail on analyzer errors - fall through to pass
-                    trace!(pid, error = %e, "session analyzer error, skipping enhanced checks");
+                Err(error) => {
+                    return PreCheckResult::Blocked {
+                        check: PreCheck::CheckSessionSafety,
+                        reason: format!("session safety evidence unavailable: {error}"),
+                    };
                 }
             }
         }
@@ -2205,6 +2204,40 @@ mod tests {
         .unwrap();
         assert!(disabled.check_data_loss(u32::MAX).is_passed());
         assert!(disabled.check_session_safety(u32::MAX, None).is_passed());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn enhanced_session_gate_refuses_missing_evidence_without_basic_tty_gate() {
+        let config = LivePreCheckConfig {
+            block_if_active_tty: false,
+            enhanced_session_safety: true,
+            ..LivePreCheckConfig::default()
+        };
+        let provider = LivePreCheckProvider::new(None, config.clone()).unwrap();
+        assert!(matches!(
+            provider.check_session_safety(u32::MAX, None),
+            PreCheckResult::Blocked { check, reason }
+                if check == PreCheck::CheckSessionSafety
+                    && reason.contains("session safety evidence unavailable")
+                    && reason.contains(&u32::MAX.to_string())
+        ));
+
+        let disabled = LivePreCheckProvider::new(
+            None,
+            LivePreCheckConfig {
+                enhanced_session_safety: false,
+                ..config
+            },
+        )
+        .unwrap();
+        assert!(disabled.check_session_safety(u32::MAX, None).is_passed());
+        // Disabling enhanced analysis does not remove the explicit leader guard.
+        assert!(matches!(
+            disabled.check_session_safety(42, Some(42)),
+            PreCheckResult::Blocked { check, reason }
+                if check == PreCheck::CheckSessionSafety && reason == "process is session leader"
+        ));
     }
 
     #[test]
@@ -2914,6 +2947,42 @@ mod tests {
             .unwrap()
         }
 
+        fn cwd_only_provider() -> LivePreCheckProvider {
+            LivePreCheckProvider::new(
+                None,
+                LivePreCheckConfig {
+                    block_if_open_write_fds: false,
+                    block_if_locked_files: false,
+                    block_if_deleted_cwd: true,
+                    block_if_recent_io_seconds: 0,
+                    ..LivePreCheckConfig::default()
+                },
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn deleted_cwd_gate_preserves_unavailable_evidence_and_disabled_policy() {
+            let provider = cwd_only_provider();
+            assert!(matches!(
+                provider.check_data_loss(u32::MAX),
+                PreCheckResult::Blocked { check, reason }
+                    if check == PreCheck::CheckDataLossGate
+                        && reason.contains("CWD evidence unavailable")
+                        && reason.contains(&format!("/proc/{}/cwd", u32::MAX))
+            ));
+
+            let disabled = LivePreCheckProvider::new(
+                None,
+                LivePreCheckConfig {
+                    block_if_deleted_cwd: false,
+                    ..provider.config.clone()
+                },
+            )
+            .unwrap();
+            assert!(disabled.check_data_loss(u32::MAX).is_passed());
+        }
+
         #[test]
         fn locked_file_observation_preserves_proc_read_and_parse_failures() {
             let root = tempfile::tempdir().unwrap().keep();
@@ -3451,8 +3520,21 @@ mod tests {
                         if check == PreCheck::CheckDataLossGate
                             && reason.contains("locked-file evidence unavailable")
                             && reason.contains("fdinfo")));
+
+                    // The same owned, live child also hides its CWD. A failed
+                    // lookup must not become a negative deleted-directory result.
+                    let cwd_path = format!("/proc/{pid}/cwd");
+                    let error =
+                        std::fs::read_link(&cwd_path).expect_err("actual CWD permission refusal");
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    let result = cwd_only_provider().check_data_loss(pid);
+                    assert!(matches!(result, PreCheckResult::Blocked { check, reason }
+                        if check == PreCheck::CheckDataLossGate
+                            && reason.contains("CWD evidence unavailable")
+                            && reason.contains(&cwd_path)));
                 } else {
                     read_io(pid).expect("readable owned I/O fixture");
+                    assert!(cwd_only_provider().check_data_loss(pid).is_passed());
                 }
                 let provider = io_only_provider(1);
                 provider.prime_recent_io(&[pid]);
@@ -4097,7 +4179,8 @@ while True:
             let provider = LivePreCheckProvider::with_defaults();
             let pid = std::process::id();
             // Our CWD should not be deleted
-            assert!(!provider.has_deleted_cwd(pid));
+            assert_eq!(provider.has_deleted_cwd(pid), Ok(false));
+            assert!(cwd_only_provider().check_data_loss(pid).is_passed());
         }
 
         #[test]
