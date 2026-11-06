@@ -702,10 +702,12 @@ fn raw_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
     (n == size).then_some(info)
 }
 
-/// Session facts for `pid` in the shape of a Linux `/proc/<pid>/stat` record (the
-/// fields session safety uses: pid, comm, state, ppid, pgrp, session, tty, tpgid;
-/// the rest are zero). `tty_nr` is 0 when there is no controlling terminal, as on
-/// Linux.
+/// Session facts for `pid` in the shape of a Linux `/proc/<pid>/stat` record.
+/// `starttime` carries the native process birth in microseconds since the Unix
+/// epoch, rather than Linux clock ticks, so session safety can compare process
+/// identity across repeated macOS observations. Uncollected CPU and memory
+/// fields remain zero. `tty_nr` is 0 when there is no controlling terminal, as
+/// on Linux.
 pub fn read_session_stat(pid: u32) -> Option<crate::collect::proc_parsers::ProcessStat> {
     let info = raw_bsd_info(pid)?;
     // SAFETY: getsid only reads kernel state for the pid.
@@ -739,7 +741,10 @@ pub fn read_session_stat(pid: u32) -> Option<crate::collect::proc_parsers::Proce
         tpgid: info.e_tpgid as i32,
         utime: 0,
         stime: 0,
-        starttime: 0,
+        starttime: info
+            .pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
         vsize: 0,
         rss: 0,
         nice: info.pbi_nice,
@@ -1187,6 +1192,24 @@ fn parse_etime_macos(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_session_stat_preserves_native_process_birth() {
+        let pid = std::process::id();
+        let identity = read_bsd_info(pid).expect("read current process native identity");
+        assert!(identity.start_us > 0, "native birth must be available");
+
+        let stat = read_session_stat(pid).expect("read current process session facts");
+        assert_eq!(stat.pid, pid);
+        assert_eq!(stat.starttime, identity.start_us);
+        assert_eq!(
+            read_session_stat(pid)
+                .expect("reread current process session facts")
+                .starttime,
+            stat.starttime,
+            "revalidation must preserve the same live process birth"
+        );
+    }
 
     #[test]
     fn test_parse_csrutil_output_enabled() {

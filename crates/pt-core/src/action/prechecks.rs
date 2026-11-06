@@ -3532,6 +3532,18 @@ mod tests {
                         if check == PreCheck::CheckDataLossGate
                             && reason.contains("CWD evidence unavailable")
                             && reason.contains(&cwd_path)));
+
+                    // An unreadable caller environment cannot establish that
+                    // its multiplexer or SSH session is absent, either.
+                    let session_error = SessionAnalyzer::new()
+                        .analyze(pid, pid)
+                        .expect_err("required session environment is unreadable");
+                    assert!(matches!(
+                        session_error,
+                        crate::supervision::session::SessionError::Environment(
+                            crate::supervision::environ::EnvironError::IoError { source, .. }
+                        ) if source.kind() == std::io::ErrorKind::PermissionDenied
+                    ));
                 } else {
                     read_io(pid).expect("readable owned I/O fixture");
                     assert!(cwd_only_provider().check_data_loss(pid).is_passed());

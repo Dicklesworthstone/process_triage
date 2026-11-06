@@ -30,7 +30,7 @@
 //! }
 //! ```
 
-use super::environ::read_environ;
+use super::environ::{read_environ, EnvironError};
 use super::types::SupervisionEvidence;
 use serde::Serialize;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -55,6 +55,21 @@ pub enum SessionError {
 
     #[error("Failed to parse /proc/{pid}/stat: {reason}")]
     StatParseError { pid: u32, reason: String },
+
+    #[error("Session environment evidence unavailable: {0}")]
+    Environment(#[from] EnvironError),
+
+    #[error("Session ancestry contains a cycle at PID {0}")]
+    AncestryLoop(u32),
+
+    #[error("Session ancestry for PID {pid} is incomplete at depth {depth}")]
+    AncestryDepth { pid: u32, depth: usize },
+
+    #[error("Session evidence changed for PID {0} during analysis")]
+    ProcessChanged(u32),
+
+    #[error("Session evidence is unavailable on this platform for PID {0}")]
+    Unsupported(u32),
 }
 
 /// Type of session protection detected.
@@ -179,10 +194,83 @@ impl From<SessionEvidence> for SupervisionEvidence {
     }
 }
 
-#[cfg(target_os = "linux")]
-use crate::collect::parse_proc_stat;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::collect::proc_parsers::ProcessStat;
+
+/// Read the fields used by session safety without replacing unreadable or
+/// malformed fields with a zero-valued session, process group, or parent.
+#[cfg(target_os = "linux")]
+fn read_session_stat(pid: u32) -> Result<ProcessStat, SessionError> {
+    let bytes = fs::read(format!("/proc/{pid}/stat")).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            SessionError::ProcessNotFound(pid)
+        } else {
+            SessionError::IoError { pid, source }
+        }
+    })?;
+    let content = std::str::from_utf8(&bytes).map_err(|_| SessionError::StatParseError {
+        pid,
+        reason: "invalid UTF-8".to_string(),
+    })?;
+    parse_session_stat(pid, content)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_session_stat(pid: u32, content: &str) -> Result<ProcessStat, SessionError> {
+    let invalid = |reason: &str| SessionError::StatParseError {
+        pid,
+        reason: reason.to_string(),
+    };
+    let stat = crate::collect::parse_proc_stat_content(content)
+        .ok_or_else(|| invalid("invalid process stat"))?;
+    if stat.pid != pid {
+        return Err(invalid("PID differs from requested process"));
+    }
+    let close = content.rfind(')').ok_or_else(|| invalid("missing comm"))?;
+    let fields: Vec<_> = content[close + 1..].split_whitespace().collect();
+    if fields.first().is_none_or(|state| {
+        !matches!(
+            *state,
+            "R" | "S" | "D" | "Z" | "T" | "t" | "X" | "x" | "K" | "W" | "P" | "I"
+        )
+    }) {
+        return Err(invalid("missing or invalid process state"));
+    }
+    if fields
+        .get(1)
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_none()
+        || fields
+            .get(19)
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_none()
+    {
+        return Err(invalid("missing or invalid parent PID or birth ticks"));
+    }
+    for (index, name) in [(2, "pgrp"), (3, "session"), (4, "tty_nr"), (5, "tpgid")] {
+        let value = fields
+            .get(index)
+            .and_then(|value| value.parse::<i32>().ok())
+            .ok_or_else(|| invalid(&format!("missing or invalid {name}")))?;
+        if matches!(index, 2 | 3) && value < 0 {
+            return Err(invalid(&format!("invalid negative {name}")));
+        }
+    }
+    Ok(stat)
+}
+
+#[cfg(target_os = "macos")]
+fn read_session_stat(pid: u32) -> Result<ProcessStat, SessionError> {
+    let stat =
+        crate::collect::macos::read_session_stat(pid).ok_or(SessionError::ProcessNotFound(pid))?;
+    if stat.session < 0 || stat.pgrp < 0 {
+        return Err(SessionError::IoError {
+            pid,
+            source: std::io::Error::other("cannot read native session or process group ID"),
+        });
+    }
+    Ok(stat)
+}
 
 /// SSH connection information.
 #[derive(Debug, Clone, Serialize)]
@@ -239,7 +327,11 @@ impl SshConnectionInfo {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detect_ssh_connection(pid: u32) -> Option<SshConnectionInfo> {
     let env = read_environ(pid).ok()?;
+    ssh_connection_from_env(&env)
+}
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ssh_connection_from_env(env: &HashMap<String, String>) -> Option<SshConnectionInfo> {
     // Try SSH_CONNECTION first (most complete)
     if let Some(value) = env.get("SSH_CONNECTION") {
         if let Some(mut info) = SshConnectionInfo::from_ssh_connection(value) {
@@ -279,13 +371,12 @@ impl TmuxInfo {
     /// Parse from TMUX environment variable.
     /// Format: "/tmp/tmux-1000/default,12345,0" (socket,pid,pane)
     pub fn from_tmux_env(value: &str) -> Option<Self> {
-        let parts: Vec<&str> = value.split(',').collect();
-        if parts.is_empty() {
-            return None;
-        }
-
-        let socket_path = parts[0].to_string();
-        let server_pid = parts.get(1).and_then(|s| s.parse().ok());
+        // The socket path can itself contain commas; the final two fields are
+        // the server PID and session index.
+        let (socket_and_pid, _) = value.rsplit_once(',')?;
+        let (socket_path, server_pid) = socket_and_pid.rsplit_once(',')?;
+        let socket_path = socket_path.to_string();
+        let server_pid = server_pid.parse().ok();
 
         Some(Self {
             socket_path,
@@ -352,6 +443,62 @@ pub fn detect_screen_session(_pid: u32) -> Option<ScreenInfo> {
     None
 }
 
+/// Optional hints remain optional to callers collecting user-intent features.
+/// Safety decisions require the environment read itself to succeed, and must
+/// not turn a present but unusable session identifier into evidence of absence.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn invalid_session_env(pid: u32, variable: &str) -> SessionError {
+    EnvironError::Parse {
+        pid,
+        reason: format!("invalid {variable} session identifier"),
+    }
+    .into()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn required_tmux_session(
+    pid: u32,
+    env: &HashMap<String, String>,
+) -> Result<Option<TmuxInfo>, SessionError> {
+    let Some(value) = env.get("TMUX").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    TmuxInfo::from_tmux_env(value)
+        .filter(|info| !info.socket_path.is_empty() && info.server_pid.is_some_and(|pid| pid > 0))
+        .map(Some)
+        .ok_or_else(|| invalid_session_env(pid, "TMUX"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn required_screen_session(
+    pid: u32,
+    env: &HashMap<String, String>,
+) -> Result<Option<ScreenInfo>, SessionError> {
+    let Some(value) = env.get("STY").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    ScreenInfo::from_sty_env(value)
+        .filter(|info| info.pid.is_some_and(|pid| pid > 0))
+        .map(Some)
+        .ok_or_else(|| invalid_session_env(pid, "STY"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn required_ssh_connection(
+    pid: u32,
+    env: &HashMap<String, String>,
+) -> Result<Option<SshConnectionInfo>, SessionError> {
+    if let Some(info) = ssh_connection_from_env(env) {
+        return Ok(Some(info));
+    }
+    for variable in ["SSH_CONNECTION", "SSH_CLIENT"] {
+        if env.get(variable).is_some_and(|value| !value.is_empty()) {
+            return Err(invalid_session_env(pid, variable));
+        }
+    }
+    Ok(None)
+}
+
 /// Configuration for session analysis.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -391,7 +538,7 @@ const SHELL_NAMES: &[&str] = &[
 /// Session analyzer for comprehensive session safety detection.
 pub struct SessionAnalyzer {
     config: SessionConfig,
-    /// Cache of parsed proc stats.
+    /// Facts shared within one analysis, never reused to authorize a later one.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     stat_cache: HashMap<u32, ProcessStat>,
 }
@@ -424,45 +571,59 @@ impl SessionAnalyzer {
     /// Get or fetch the session facts for a pid (/proc on Linux, proc_pidinfo +
     /// getsid on macOS).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn get_stat(&mut self, pid: u32) -> Option<ProcessStat> {
+    fn get_stat(&mut self, pid: u32) -> Result<ProcessStat, SessionError> {
         if let Some(stat) = self.stat_cache.get(&pid) {
-            return Some(stat.clone());
+            return Ok(stat.clone());
         }
 
-        #[cfg(target_os = "linux")]
-        let fetched = parse_proc_stat(pid);
-        #[cfg(target_os = "macos")]
-        let fetched = crate::collect::macos::read_session_stat(pid);
-        if let Some(stat) = fetched {
-            self.stat_cache.insert(pid, stat.clone());
-            Some(stat)
-        } else {
-            None
-        }
+        let stat = read_session_stat(pid)?;
+        self.stat_cache.insert(pid, stat.clone());
+        Ok(stat)
     }
 
-    /// Walk the parent chain from a PID up to init.
+    /// Walk the complete parent chain to init or a namespace boundary. Missing
+    /// ancestors, cycles and a depth limit are not proof that a target is absent.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn get_ancestry(&mut self, pid: u32) -> Vec<u32> {
+    fn get_ancestry(&mut self, pid: u32) -> Result<Vec<u32>, SessionError> {
         let mut chain = vec![pid];
         let mut current = pid;
         let mut visited = HashSet::new();
         visited.insert(pid);
 
-        for _ in 0..self.config.max_ancestry_depth {
-            if let Some(stat) = self.get_stat(current) {
-                if stat.ppid == 0 || stat.ppid == current || visited.contains(&stat.ppid) {
-                    break;
-                }
-                visited.insert(stat.ppid);
-                chain.push(stat.ppid);
-                current = stat.ppid;
-            } else {
-                break;
+        let mut depth = 0;
+        loop {
+            let stat = self.get_stat(current)?;
+            if current == 1 || stat.ppid == 0 {
+                return Ok(chain);
+            }
+            if !visited.insert(stat.ppid) {
+                return Err(SessionError::AncestryLoop(stat.ppid));
+            }
+            if depth == self.config.max_ancestry_depth {
+                return Err(SessionError::AncestryDepth { pid, depth });
+            }
+            chain.push(stat.ppid);
+            current = stat.ppid;
+            depth += 1;
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn revalidate_stats(&self) -> Result<(), SessionError> {
+        for (&pid, before) in &self.stat_cache {
+            let after = read_session_stat(pid)?;
+            if before.starttime != after.starttime
+                || before.ppid != after.ppid
+                || before.comm != after.comm
+                || before.session != after.session
+                || before.pgrp != after.pgrp
+                || before.tty_nr != after.tty_nr
+                || before.tpgid != after.tpgid
+            {
+                return Err(SessionError::ProcessChanged(pid));
             }
         }
-
-        chain
+        Ok(())
     }
 
     /// Check if a process name is a shell.
@@ -472,22 +633,23 @@ impl SessionAnalyzer {
     }
 
     /// Analyze whether a target PID is in the protected session chain of pt_pid.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn analyze(&mut self, target_pid: u32, pt_pid: u32) -> Result<SessionResult, SessionError> {
         trace!(target_pid, pt_pid, "analyzing session safety");
 
+        self.clear_cache();
+        let target_stat = self.get_stat(target_pid)?;
+        let pt_stat = self.get_stat(pt_pid)?;
+        let pt_env = if self.config.protect_multiplexers || self.config.protect_ssh_chains {
+            read_environ(pt_pid)?
+        } else {
+            HashMap::new()
+        };
         let mut protection_types = Vec::new();
         let mut evidence = Vec::new();
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            // Get stat info for both processes
-            let target_stat = self
-                .get_stat(target_pid)
-                .ok_or(SessionError::ProcessNotFound(target_pid))?;
-            let pt_stat = self
-                .get_stat(pt_pid)
-                .ok_or(SessionError::ProcessNotFound(pt_pid))?;
-
             // Check 1: Is target a session leader?
             if target_stat.pid == target_stat.session as u32 {
                 protection_types.push(SessionProtectionType::SessionLeader);
@@ -526,22 +688,18 @@ impl SessionAnalyzer {
 
             // Check 3: Parent shell of pt?
             if self.config.protect_parent_shells {
-                let pt_ancestry = self.get_ancestry(pt_pid);
-                if pt_ancestry.contains(&target_pid) {
-                    if let Some(stat) = self.get_stat(target_pid) {
-                        if self.is_shell(&stat.comm) {
-                            protection_types.push(SessionProtectionType::ParentShell);
-                            evidence.push(SessionEvidence {
-                                protection_type: SessionProtectionType::ParentShell,
-                                description: format!(
-                                    "PID {} ({}) is parent shell of pt",
-                                    target_pid, stat.comm
-                                ),
-                                weight: 1.0,
-                            });
-                            debug!(target_pid, comm = %stat.comm, "target is parent shell of pt");
-                        }
-                    }
+                let pt_ancestry = self.get_ancestry(pt_pid)?;
+                if pt_ancestry.contains(&target_pid) && self.is_shell(&target_stat.comm) {
+                    protection_types.push(SessionProtectionType::ParentShell);
+                    evidence.push(SessionEvidence {
+                        protection_type: SessionProtectionType::ParentShell,
+                        description: format!(
+                            "PID {} ({}) is parent shell of pt",
+                            target_pid, target_stat.comm
+                        ),
+                        weight: 1.0,
+                    });
+                    debug!(target_pid, comm = %target_stat.comm, "target is parent shell of pt");
                 }
             }
 
@@ -573,7 +731,7 @@ impl SessionAnalyzer {
         // Check 4: tmux/screen server of pt's session?
         if self.config.protect_multiplexers {
             // Check tmux
-            if let Some(tmux_info) = detect_tmux_session(pt_pid) {
+            if let Some(tmux_info) = required_tmux_session(pt_pid, &pt_env)? {
                 if let Some(server_pid) = tmux_info.server_pid {
                     if target_pid == server_pid {
                         protection_types.push(SessionProtectionType::TmuxServer);
@@ -590,28 +748,25 @@ impl SessionAnalyzer {
                 }
 
                 // Also check if target is in a tmux process tree
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                if let Some(stat) = self.get_stat(target_pid) {
-                    if stat.comm == "tmux" || stat.comm == "tmux: server" {
-                        // Check if this tmux serves our session
-                        let target_ancestry = self.get_ancestry(pt_pid);
-                        if target_ancestry.contains(&target_pid) {
-                            protection_types.push(SessionProtectionType::TmuxServer);
-                            evidence.push(SessionEvidence {
-                                protection_type: SessionProtectionType::TmuxServer,
-                                description: format!(
-                                    "PID {} (tmux) is in pt's ancestry chain",
-                                    target_pid
-                                ),
-                                weight: 0.9,
-                            });
-                        }
+                if target_stat.comm == "tmux" || target_stat.comm == "tmux: server" {
+                    // Check if this tmux serves our session
+                    let pt_ancestry = self.get_ancestry(pt_pid)?;
+                    if pt_ancestry.contains(&target_pid) {
+                        protection_types.push(SessionProtectionType::TmuxServer);
+                        evidence.push(SessionEvidence {
+                            protection_type: SessionProtectionType::TmuxServer,
+                            description: format!(
+                                "PID {} (tmux) is in pt's ancestry chain",
+                                target_pid
+                            ),
+                            weight: 0.9,
+                        });
                     }
                 }
             }
 
             // Check screen
-            if let Some(screen_info) = detect_screen_session(pt_pid) {
+            if let Some(screen_info) = required_screen_session(pt_pid, &pt_env)? {
                 if let Some(screen_pid) = screen_info.pid {
                     if target_pid == screen_pid {
                         protection_types.push(SessionProtectionType::ScreenServer);
@@ -628,21 +783,18 @@ impl SessionAnalyzer {
                 }
 
                 // Also check if target is in a screen process tree
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                if let Some(stat) = self.get_stat(target_pid) {
-                    if stat.comm == "screen" || stat.comm == "SCREEN" {
-                        let target_ancestry = self.get_ancestry(pt_pid);
-                        if target_ancestry.contains(&target_pid) {
-                            protection_types.push(SessionProtectionType::ScreenServer);
-                            evidence.push(SessionEvidence {
-                                protection_type: SessionProtectionType::ScreenServer,
-                                description: format!(
-                                    "PID {} (screen) is in pt's ancestry chain",
-                                    target_pid
-                                ),
-                                weight: 0.9,
-                            });
-                        }
+                if target_stat.comm == "screen" || target_stat.comm == "SCREEN" {
+                    let pt_ancestry = self.get_ancestry(pt_pid)?;
+                    if pt_ancestry.contains(&target_pid) {
+                        protection_types.push(SessionProtectionType::ScreenServer);
+                        evidence.push(SessionEvidence {
+                            protection_type: SessionProtectionType::ScreenServer,
+                            description: format!(
+                                "PID {} (screen) is in pt's ancestry chain",
+                                target_pid
+                            ),
+                            weight: 0.9,
+                        });
                     }
                 }
             }
@@ -651,35 +803,37 @@ impl SessionAnalyzer {
         // Check 5: SSH chain protection
         if self.config.protect_ssh_chains {
             // Check if pt is in an SSH session (needs the process ancestry)
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if let Some(pt_ssh) = detect_ssh_connection(pt_pid) {
+            if let Some(pt_ssh) = required_ssh_connection(pt_pid, &pt_env)? {
                 // If target is sshd and in our ancestry, protect it
-                if let Some(stat) = self.get_stat(target_pid) {
-                    if stat.comm == "sshd" {
-                        let pt_ancestry = self.get_ancestry(pt_pid);
-                        if pt_ancestry.contains(&target_pid) {
-                            protection_types.push(SessionProtectionType::SshChain);
-                            evidence.push(SessionEvidence {
-                                protection_type: SessionProtectionType::SshChain,
-                                description: format!(
-                                    "PID {} (sshd) is in pt's SSH chain (from {}:{})",
-                                    target_pid, pt_ssh.client_ip, pt_ssh.client_port
-                                ),
-                                weight: 1.0,
-                            });
-                            debug!(
-                                target_pid,
-                                client_ip = %pt_ssh.client_ip,
-                                "target sshd is in pt's SSH chain"
-                            );
-                        }
+                if target_stat.comm == "sshd" {
+                    let pt_ancestry = self.get_ancestry(pt_pid)?;
+                    if pt_ancestry.contains(&target_pid) {
+                        protection_types.push(SessionProtectionType::SshChain);
+                        evidence.push(SessionEvidence {
+                            protection_type: SessionProtectionType::SshChain,
+                            description: format!(
+                                "PID {} (sshd) is in pt's SSH chain (from {}:{})",
+                                target_pid, pt_ssh.client_ip, pt_ssh.client_port
+                            ),
+                            weight: 1.0,
+                        });
+                        debug!(
+                            target_pid,
+                            client_ip = %pt_ssh.client_ip,
+                            "target sshd is in pt's SSH chain"
+                        );
                     }
                 }
-            }
 
-            // Also check if target has matching SSH session
-            if let Some(target_ssh) = detect_ssh_connection(target_pid) {
-                if let Some(pt_ssh) = detect_ssh_connection(pt_pid) {
+                // Target environment is required only when pt has an SSH
+                // connection to compare. An unrelated unreadable hint must not
+                // prevent a valid independent-session decision.
+                let target_env = if target_pid == pt_pid {
+                    pt_env.clone()
+                } else {
+                    read_environ(target_pid)?
+                };
+                if let Some(target_ssh) = required_ssh_connection(target_pid, &target_env)? {
                     // Same SSH connection (same client IP and port)
                     if target_ssh.client_ip == pt_ssh.client_ip
                         && target_ssh.client_port == pt_ssh.client_port
@@ -700,6 +854,9 @@ impl SessionAnalyzer {
 
         // Build result
         let is_protected = !protection_types.is_empty();
+        if !is_protected {
+            self.revalidate_stats()?;
+        }
         let reason = if is_protected {
             let types: Vec<String> = protection_types.iter().map(|t| t.to_string()).collect();
             Some(format!("protected: {}", types.join(", ")))
@@ -717,15 +874,20 @@ impl SessionAnalyzer {
             SessionResult::not_protected()
         };
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let result = match self.get_stat(target_pid) {
-            Some(stat) => {
-                result.with_session_info(stat.session as u32, stat.pgrp as u32, stat.tty_nr)
-            }
-            None => result,
-        };
+        Ok(result.with_session_info(
+            target_stat.session as u32,
+            target_stat.pgrp as u32,
+            target_stat.tty_nr,
+        ))
+    }
 
-        Ok(result)
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn analyze(
+        &mut self,
+        target_pid: u32,
+        _pt_pid: u32,
+    ) -> Result<SessionResult, SessionError> {
+        Err(SessionError::Unsupported(target_pid))
     }
 
     /// Batch analyze multiple PIDs against the same pt_pid.
@@ -743,9 +905,8 @@ impl SessionAnalyzer {
     /// Get all processes in pt's session.
     #[cfg(target_os = "linux")]
     pub fn enumerate_session_members(&mut self, pt_pid: u32) -> Result<Vec<u32>, SessionError> {
-        let pt_stat = self
-            .get_stat(pt_pid)
-            .ok_or(SessionError::ProcessNotFound(pt_pid))?;
+        self.clear_cache();
+        let pt_stat = self.get_stat(pt_pid)?;
         let session_id = pt_stat.session;
 
         let mut members = Vec::new();
@@ -755,7 +916,7 @@ impl SessionAnalyzer {
             for entry in entries.flatten() {
                 if let Ok(name) = entry.file_name().into_string() {
                     if let Ok(pid) = name.parse::<u32>() {
-                        if let Some(stat) = self.get_stat(pid) {
+                        if let Ok(stat) = self.get_stat(pid) {
                             if stat.session == session_id {
                                 members.push(pid);
                             }
@@ -785,7 +946,13 @@ pub fn is_in_protected_session(target_pid: u32, pt_pid: u32) -> SessionResult {
     let mut analyzer = SessionAnalyzer::new();
     analyzer
         .analyze(target_pid, pt_pid)
-        .unwrap_or_else(|_| SessionResult::not_protected())
+        .unwrap_or_else(|error| {
+            SessionResult::protected(
+                vec![],
+                format!("session evidence unavailable: {error}"),
+                vec![],
+            )
+        })
 }
 
 /// Check if a process is protected from being killed.
@@ -856,6 +1023,13 @@ mod tests {
         let info = TmuxInfo::from_tmux_env(value).unwrap();
 
         assert_eq!(info.socket_path, "/tmp/tmux-1000/default");
+        assert_eq!(info.server_pid, Some(12345));
+    }
+
+    #[test]
+    fn test_tmux_info_preserves_commas_in_socket_path() {
+        let info = TmuxInfo::from_tmux_env("/tmp/work,session/default,12345,0").unwrap();
+        assert_eq!(info.socket_path, "/tmp/work,session/default");
         assert_eq!(info.server_pid, Some(12345));
     }
 
@@ -958,6 +1132,169 @@ mod tests {
                 .protection_types
         }
 
+        fn unprotected_config() -> SessionConfig {
+            SessionConfig {
+                max_ancestry_depth: 20,
+                protect_same_session: false,
+                protect_parent_shells: false,
+                protect_multiplexers: false,
+                protect_ssh_chains: false,
+                protect_foreground_groups: false,
+            }
+        }
+
+        fn process_with_session_env(vars: &[(&str, String)]) -> Reap {
+            let mut command = Command::new("sleep");
+            command.arg("60");
+            for name in ["TMUX", "STY", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+                command.env_remove(name);
+            }
+            for (name, value) in vars {
+                command.env(name, value);
+            }
+            Reap(
+                command.spawn().expect("spawn session evidence process"),
+                None,
+            )
+        }
+
+        #[test]
+        fn session_analysis_does_not_reuse_an_exited_process() {
+            let mut target = process_with_session_env(&[]);
+            let mut analyzer = SessionAnalyzer::with_config(unprotected_config());
+            let pid = target.0.id();
+            let result = analyzer.analyze(pid, std::process::id()).unwrap();
+            assert!(!result.is_protected);
+
+            target.0.kill().unwrap();
+            target.0.wait().unwrap();
+            assert!(matches!(
+                analyzer.analyze(pid, std::process::id()),
+                Err(SessionError::ProcessNotFound(missing)) if missing == pid
+            ));
+        }
+
+        #[test]
+        fn required_ancestry_depth_error_reaches_session_analysis() {
+            let target = process_with_session_env(&[]);
+            let caller = process_with_session_env(&[]);
+            let config = SessionConfig {
+                max_ancestry_depth: 0,
+                protect_parent_shells: true,
+                ..unprotected_config()
+            };
+            let mut analyzer = SessionAnalyzer::with_config(config);
+            assert!(matches!(
+                analyzer.analyze(target.0.id(), caller.0.id()),
+                Err(SessionError::AncestryDepth { pid, depth: 0 }) if pid == caller.0.id()
+            ));
+        }
+
+        #[test]
+        fn malformed_required_session_hints_do_not_prove_absence() {
+            let target = process_with_session_env(&[]);
+            for (name, value) in [
+                ("TMUX", "/tmp/socket,not-a-pid,0"),
+                ("STY", "not-a-pid.session"),
+                ("SSH_CONNECTION", "not-a-connection"),
+                ("SSH_CLIENT", "127.0.0.1 invalid 22"),
+            ] {
+                let caller = process_with_session_env(&[(name, value.to_string())]);
+                let mut analyzer = SessionAnalyzer::with_config(SessionConfig {
+                    protect_multiplexers: true,
+                    protect_ssh_chains: true,
+                    ..unprotected_config()
+                });
+                let error = analyzer
+                    .analyze(target.0.id(), caller.0.id())
+                    .expect_err("malformed required evidence must refuse analysis");
+                assert!(matches!(error, SessionError::Environment(_)));
+                assert!(error.to_string().contains(name), "{error}");
+            }
+        }
+
+        #[test]
+        fn absent_and_disabled_session_hints_allow_independent_processes() {
+            let target = process_with_session_env(&[(
+                "SSH_CONNECTION",
+                "malformed unrelated hint".to_string(),
+            )]);
+            let caller = process_with_session_env(&[]);
+            let mut analyzer = SessionAnalyzer::with_config(SessionConfig {
+                protect_multiplexers: true,
+                protect_ssh_chains: true,
+                ..unprotected_config()
+            });
+            assert!(
+                !analyzer
+                    .analyze(target.0.id(), caller.0.id())
+                    .unwrap()
+                    .is_protected
+            );
+
+            // Disabled gates need no environment evidence, even for the caller.
+            let mut analyzer = SessionAnalyzer::with_config(unprotected_config());
+            assert!(
+                !analyzer
+                    .analyze(caller.0.id(), target.0.id())
+                    .unwrap()
+                    .is_protected
+            );
+        }
+
+        #[test]
+        fn named_tmux_and_screen_servers_remain_protected() {
+            let server = process_with_session_env(&[]);
+            for (name, value, expected) in [
+                (
+                    "TMUX",
+                    format!("/tmp/work,session/default,{},0", server.0.id()),
+                    SessionProtectionType::TmuxServer,
+                ),
+                (
+                    "STY",
+                    format!("{}.pts-0.hostname", server.0.id()),
+                    SessionProtectionType::ScreenServer,
+                ),
+            ] {
+                let caller = process_with_session_env(&[(name, value)]);
+                let mut analyzer = SessionAnalyzer::with_config(SessionConfig {
+                    protect_multiplexers: true,
+                    ..unprotected_config()
+                });
+                let result = analyzer.analyze(server.0.id(), caller.0.id()).unwrap();
+                assert!(result.is_protected);
+                assert!(result.protection_types.contains(&expected), "{result:?}");
+            }
+        }
+
+        #[test]
+        fn matching_ssh_connection_is_protected_but_distinct_peer_is_not() {
+            let caller = process_with_session_env(&[(
+                "SSH_CONNECTION",
+                "127.0.0.1 12345 127.0.0.1 22".to_string(),
+            )]);
+            let matching =
+                process_with_session_env(&[("SSH_CLIENT", "127.0.0.1 12345 22".to_string())]);
+            let independent =
+                process_with_session_env(&[("SSH_CLIENT", "127.0.0.1 23456 22".to_string())]);
+            let mut analyzer = SessionAnalyzer::with_config(SessionConfig {
+                protect_ssh_chains: true,
+                ..unprotected_config()
+            });
+            let result = analyzer.analyze(matching.0.id(), caller.0.id()).unwrap();
+            assert!(result.is_protected);
+            assert!(result
+                .protection_types
+                .contains(&SessionProtectionType::SshChain));
+            assert!(
+                !analyzer
+                    .analyze(independent.0.id(), caller.0.id())
+                    .unwrap()
+                    .is_protected
+            );
+        }
+
         #[test]
         fn own_session_child_is_protected() {
             let child = Reap(Command::new("sleep").arg("60").spawn().unwrap(), None);
@@ -987,6 +1324,118 @@ mod tests {
     mod linux_tests {
         use super::*;
         use crate::collect::parse_proc_stat;
+
+        fn stat_fixture(pid: u32, ppid: u32) -> ProcessStat {
+            parse_session_stat(
+                pid,
+                &format!(
+                    "{pid} (fixture) S {ppid} 10 10 0 -1 4194304 0 0 0 0 100 50 0 0 20 0 1 0 12345 1048576 256\n"
+                ),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn session_stat_requires_actual_identity_and_session_fields() {
+            let valid = "1234 (fixture) S 1000 1234 1234 34816 -1 4194304 0 0 0 0 100 50 0 0 20 0 1 0 12345 1048576 256\n";
+            let stat = parse_session_stat(1234, valid).unwrap();
+            assert_eq!(stat.session, 1234);
+            assert_eq!(stat.tty_nr, 34816);
+            assert_eq!(stat.tpgid, -1);
+            assert_eq!(stat.starttime, 12345);
+            assert!(parse_session_stat(1235, valid).is_err());
+            assert!(parse_session_stat(1234, "1234 (fixture) S 1000").is_err());
+
+            let fields: Vec<_> = valid
+                .split(") ")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .collect();
+            for index in [0, 1, 2, 3, 4, 5, 19] {
+                let mut corrupt = fields.clone();
+                corrupt[index] = "invalid";
+                let content = format!("1234 (fixture) {}\n", corrupt.join(" "));
+                assert!(
+                    matches!(
+                        parse_session_stat(1234, &content),
+                        Err(SessionError::StatParseError { .. })
+                    ),
+                    "field {index} must not silently become zero"
+                );
+            }
+            for index in [2, 3] {
+                let mut corrupt = fields.clone();
+                corrupt[index] = "-1";
+                let content = format!("1234 (fixture) {}\n", corrupt.join(" "));
+                assert!(parse_session_stat(1234, &content).is_err());
+            }
+        }
+
+        #[test]
+        fn complete_ancestry_accepts_init_and_namespace_boundaries() {
+            let mut analyzer = SessionAnalyzer::with_config(SessionConfig {
+                max_ancestry_depth: 2,
+                ..SessionConfig::default()
+            });
+            for (pid, ppid) in [(200, 100), (100, 1), (1, 0), (300, 0)] {
+                analyzer.stat_cache.insert(pid, stat_fixture(pid, ppid));
+            }
+            assert_eq!(analyzer.get_ancestry(200).unwrap(), vec![200, 100, 1]);
+            assert_eq!(analyzer.get_ancestry(300).unwrap(), vec![300]);
+            analyzer.config.max_ancestry_depth = 0;
+            assert_eq!(analyzer.get_ancestry(1).unwrap(), vec![1]);
+        }
+
+        #[test]
+        fn incomplete_ancestry_never_returns_a_partial_success() {
+            let mut analyzer = SessionAnalyzer::new();
+            analyzer.stat_cache.insert(200, stat_fixture(200, u32::MAX));
+            assert!(matches!(
+                analyzer.get_ancestry(200),
+                Err(SessionError::ProcessNotFound(u32::MAX))
+            ));
+
+            analyzer.stat_cache.insert(200, stat_fixture(200, 100));
+            analyzer.stat_cache.insert(100, stat_fixture(100, 1));
+            analyzer.config.max_ancestry_depth = 1;
+            assert!(matches!(
+                analyzer.get_ancestry(200),
+                Err(SessionError::AncestryDepth { pid: 200, depth: 1 })
+            ));
+        }
+
+        #[test]
+        fn session_ancestry_rejects_self_parent_and_longer_cycles() {
+            let mut analyzer = SessionAnalyzer::new();
+            analyzer.stat_cache.insert(200, stat_fixture(200, 200));
+            assert!(matches!(
+                analyzer.get_ancestry(200),
+                Err(SessionError::AncestryLoop(200))
+            ));
+            analyzer.stat_cache.insert(200, stat_fixture(200, 100));
+            analyzer.stat_cache.insert(100, stat_fixture(100, 200));
+            assert!(matches!(
+                analyzer.get_ancestry(200),
+                Err(SessionError::AncestryLoop(200))
+            ));
+        }
+
+        #[test]
+        fn convenience_session_checks_refuse_unknown_evidence() {
+            let result = is_in_protected_session(u32::MAX, std::process::id());
+            assert!(result.is_protected);
+            assert!(result
+                .reason
+                .unwrap()
+                .contains("session evidence unavailable"));
+            assert!(result.protection_types.is_empty());
+            assert!(result.evidence.is_empty());
+
+            let (protected, reason) = check_session_protection(u32::MAX, std::process::id());
+            assert!(protected);
+            assert!(reason.unwrap().contains("session evidence unavailable"));
+        }
 
         #[test]
         fn test_read_proc_stat_current_process() {
