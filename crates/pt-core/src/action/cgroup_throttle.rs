@@ -8,15 +8,15 @@
 //! - Explicit refusal when safe cgroup mutation is unavailable
 
 use super::executor::{ActionError, ActionRunner};
-use crate::collect::cgroup::{collect_cgroup_details, CgroupVersion, CpuLimitSource};
+use crate::collect::cgroup::{collect_cgroup_details, CpuLimitSource};
 use crate::decision::Action;
 use crate::plan::PlanAction;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
-use tracing::{debug, info, warn};
+use std::path::{Path, PathBuf};
+use tracing::{debug, info};
 
-/// Default CPU throttle fraction (25% of current allocation or one core).
+/// Default maximum CPU bandwidth (25% of one core).
 pub const DEFAULT_THROTTLE_FRACTION: f64 = 0.25;
 
 /// Default period in microseconds (100ms = standard scheduler quantum).
@@ -25,11 +25,16 @@ pub const DEFAULT_PERIOD_US: u64 = 100_000;
 /// Minimum quota in microseconds (1ms - prevent starvation).
 pub const MIN_QUOTA_US: i64 = 1_000;
 
+/// Scheduler bandwidth periods are limited to 1ms through 1s.
+const MIN_PERIOD_US: u64 = 1_000;
+const MAX_PERIOD_US: u64 = 1_000_000;
+
 /// CPU throttle action configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CpuThrottleConfig {
-    /// Target CPU fraction (0.0-1.0 for fraction, >1.0 for multiple cores).
+    /// Maximum CPU fraction (0.0-1.0 for fraction, >1.0 for multiple cores).
     /// E.g., 0.25 = 25% of one core, 2.0 = 2 full cores.
+    /// An existing stricter limit is preserved.
     pub target_fraction: f64,
 
     /// Period in microseconds for the throttle quota.
@@ -62,11 +67,69 @@ impl CpuThrottleConfig {
         }
     }
 
-    /// Calculate quota from fraction and period.
+    /// Calculate the nominal quota from fraction and period.
+    /// Execution separately refuses invalid or unrepresentable configurations;
+    /// it never rounds an unrepresentable requested cap up to this minimum.
     pub fn quota_us(&self) -> i64 {
         let quota = (self.target_fraction * self.period_us as f64) as i64;
         quota.max(MIN_QUOTA_US)
     }
+
+    fn validated_limit(&self) -> Result<CpuBandwidthLimit, ActionError> {
+        if !self.target_fraction.is_finite() || self.target_fraction <= 0.0 {
+            return Err(ActionError::Failed(
+                "CPU throttle fraction must be finite and positive".to_string(),
+            ));
+        }
+        let quota = self.target_fraction * self.period_us as f64;
+        if !quota.is_finite() || quota < MIN_QUOTA_US as f64 || quota >= i64::MAX as f64 {
+            return Err(ActionError::Failed(
+                "CPU throttle cap cannot be represented by a valid scheduler quota".to_string(),
+            ));
+        }
+        CpuBandwidthLimit::new(quota as i64, self.period_us)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CpuBandwidthLimit {
+    /// -1 is the kernel's unlimited sentinel.
+    quota_us: i64,
+    period_us: u64,
+}
+
+impl CpuBandwidthLimit {
+    fn new(quota_us: i64, period_us: u64) -> Result<Self, ActionError> {
+        if (quota_us != -1 && quota_us < MIN_QUOTA_US)
+            || !(MIN_PERIOD_US..=MAX_PERIOD_US).contains(&period_us)
+        {
+            return Err(ActionError::Failed(
+                "invalid CPU quota or scheduler period".to_string(),
+            ));
+        }
+        Ok(Self {
+            quota_us,
+            period_us,
+        })
+    }
+
+    fn within(self, maximum: Self) -> bool {
+        self.quota_us > 0
+            && (self.quota_us as u128) * u128::from(maximum.period_us)
+                <= (maximum.quota_us as u128) * u128::from(self.period_us)
+    }
+}
+
+/// Check a finite controller limit against the requested maximum bandwidth.
+/// Invalid observations/configuration are errors; a valid unlimited limit (-1)
+/// is an observed failure to meet the cap, not missing evidence.
+pub(crate) fn quota_within_limit(
+    current_quota: i64,
+    current_period: u64,
+    config: &CpuThrottleConfig,
+) -> Result<bool, ActionError> {
+    let current = CpuBandwidthLimit::new(current_quota, current_period)?;
+    Ok(current.within(config.validated_limit()?))
 }
 
 /// Captured state for reversal of throttle action.
@@ -131,6 +194,7 @@ impl CpuThrottleActionRunner {
     /// Execute a throttle action on a process.
     #[cfg(target_os = "linux")]
     fn execute_throttle(&self, action: &PlanAction) -> Result<(), ActionError> {
+        self.config.validated_limit()?;
         let pid = action.target.pid.0;
         let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
         debug!(
@@ -148,150 +212,135 @@ impl CpuThrottleActionRunner {
             ));
         }
 
-        // Try cgroup v2 first
-        if cgroup_details.version == CgroupVersion::V2
-            || cgroup_details.version == CgroupVersion::Hybrid
-        {
-            if let Some(ref unified_path) = cgroup_details.unified_path {
-                let result = self.apply_throttle_v2(pid, unified_path);
-                if result.is_ok() {
-                    return result;
-                }
-                // Fall through to v1 if v2 failed and fallback enabled
-                if !self.config.fallback_to_v1 {
-                    return result;
-                }
-                warn!(pid, "cgroup v2 throttle failed, trying v1 fallback");
-            }
-        }
-
-        // Try cgroup v1 if available
-        if self.config.fallback_to_v1 {
-            if let Some(cpu_path) = cgroup_details.v1_paths.get("cpu") {
-                return self.apply_throttle_v1(pid, cpu_path);
-            }
-        }
-
-        Err(ActionError::Failed(format!(
-            "no writable cgroup CPU controller found for pid {}",
-            pid
-        )))
+        let v2_directory = PathBuf::from(format!("/sys/fs/cgroup{checked_path}"));
+        let v1_path = self
+            .config
+            .fallback_to_v1
+            .then(|| cgroup_details.v1_paths.get("cpu"))
+            .flatten();
+        let v1_directory = v1_path.map(|path| PathBuf::from(format!("/sys/fs/cgroup/cpu{path}")));
+        let (directory, is_v2) = select_cpu_controller(&v2_directory, v1_directory.as_deref())?;
+        self.apply_throttle_at(&directory, is_v2, || {
+            self.revalidate_membership(
+                action,
+                &checked_path,
+                if is_v2 {
+                    None
+                } else {
+                    v1_path.map(String::as_str)
+                },
+            )
+        })
     }
 
-    /// Apply CPU throttle using cgroup v2 cpu.max.
+    /// Recheck the planned incarnation and isolation in every affected hierarchy.
     #[cfg(target_os = "linux")]
-    fn apply_throttle_v2(&self, pid: u32, unified_path: &str) -> Result<(), ActionError> {
-        let cgroup_root = "/sys/fs/cgroup";
-        super::dispatch::ensure_exclusive_cgroup_path(
-            pid,
-            Path::new(&format!("{cgroup_root}{unified_path}")),
-        )?;
-        let cpu_max_path = format!("{}{}/cpu.max", cgroup_root, unified_path);
-
-        // Check if cpu.max exists and is writable
-        if !Path::new(&cpu_max_path).exists() {
-            return Err(ActionError::Failed(format!(
-                "cpu.max not found at {}",
-                cpu_max_path
-            )));
+    fn revalidate_membership(
+        &self,
+        action: &PlanAction,
+        unified_path: &str,
+        v1_cpu_path: Option<&str>,
+    ) -> Result<(), ActionError> {
+        if super::dispatch::ensure_cgroup_target(&action.target)? != unified_path {
+            return Err(ActionError::Failed(
+                "refusing throttle after cgroup membership changed".to_string(),
+            ));
         }
-
-        // Calculate new quota
-        let quota = self.config.quota_us();
-        let period = self.config.period_us;
-        let cpu_max_value = format!("{} {}", quota, period);
-
-        debug!(
-            pid,
-            path = %cpu_max_path,
-            value = %cpu_max_value,
-            "writing cpu.max"
-        );
-
-        // Write new cpu.max value
-        fs::write(&cpu_max_path, &cpu_max_value).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                ActionError::PermissionDenied
-            } else {
-                ActionError::Failed(format!("failed to write cpu.max: {}", e))
+        if let Some(expected) = v1_cpu_path {
+            let details = collect_cgroup_details(action.target.pid.0).ok_or_else(|| {
+                ActionError::Failed("cannot revalidate CPU controller membership".to_string())
+            })?;
+            if details.v1_paths.get("cpu").map(String::as_str) != Some(expected) {
+                return Err(ActionError::Failed(
+                    "refusing throttle after v1 CPU membership changed".to_string(),
+                ));
             }
-        })?;
-
-        info!(
-            pid,
-            cgroup = unified_path,
-            quota_us = quota,
-            period_us = period,
-            "CPU throttle applied via cgroup v2"
-        );
-
+            super::dispatch::ensure_exclusive_cgroup_path(
+                action.target.pid.0,
+                Path::new(&format!("/sys/fs/cgroup/cpu{expected}")),
+            )?;
+        }
         Ok(())
     }
 
-    /// Apply CPU throttle using cgroup v1 cpu.cfs_quota_us.
+    /// Tighten a controller without increasing a pre-existing bandwidth limit.
+    /// v1 keeps its period and changes only quota, avoiding a partial two-file
+    /// update that could transiently increase bandwidth.
     #[cfg(target_os = "linux")]
-    fn apply_throttle_v1(&self, pid: u32, cpu_path: &str) -> Result<(), ActionError> {
-        let cgroup_root = "/sys/fs/cgroup/cpu";
-        super::dispatch::ensure_exclusive_cgroup_path(
-            pid,
-            Path::new(&format!("{cgroup_root}{cpu_path}")),
-        )?;
-        let quota_path = format!("{}{}/cpu.cfs_quota_us", cgroup_root, cpu_path);
-        let period_path = format!("{}{}/cpu.cfs_period_us", cgroup_root, cpu_path);
-
-        // Check if paths exist
-        if !Path::new(&quota_path).exists() {
-            return Err(ActionError::Failed(format!(
-                "cpu.cfs_quota_us not found at {}",
-                quota_path
-            )));
+    fn apply_throttle_at(
+        &self,
+        directory: &Path,
+        is_v2: bool,
+        revalidate: impl Fn() -> Result<(), ActionError>,
+    ) -> Result<(), ActionError> {
+        let maximum = self.config.validated_limit()?;
+        revalidate()?;
+        let current = read_cpu_limit(directory, is_v2)?;
+        let desired = if current.within(maximum) {
+            current
+        } else if is_v2 {
+            maximum
+        } else {
+            let quota = (maximum.quota_us as u128) * u128::from(current.period_us)
+                / u128::from(maximum.period_us);
+            let quota = i64::try_from(quota).map_err(|_| {
+                ActionError::Failed(
+                    "CPU quota is not representable at the current period".to_string(),
+                )
+            })?;
+            // Never round up to the minimum: that would exceed the requested cap.
+            CpuBandwidthLimit::new(quota, current.period_us)?
+        };
+        revalidate()?;
+        if read_cpu_limit(directory, is_v2)? != current {
+            return Err(ActionError::Failed(
+                "CPU limits changed before applying throttle".to_string(),
+            ));
         }
-
-        // Calculate new quota
-        let quota = self.config.quota_us();
-        let period = self.config.period_us;
-
-        debug!(
-            pid,
-            quota_path = %quota_path,
-            quota = quota,
-            period = period,
-            "writing cgroup v1 CPU limits"
-        );
-
-        // Write period first, then quota
-        fs::write(&period_path, period.to_string()).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                ActionError::PermissionDenied
+        if desired != current {
+            let (path, value) = if is_v2 {
+                (
+                    directory.join("cpu.max"),
+                    format!("{} {}", desired.quota_us, desired.period_us),
+                )
             } else {
-                ActionError::Failed(format!("failed to write cpu.cfs_period_us: {}", e))
-            }
-        })?;
-
-        fs::write(&quota_path, quota.to_string()).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                ActionError::PermissionDenied
-            } else {
-                ActionError::Failed(format!("failed to write cpu.cfs_quota_us: {}", e))
-            }
-        })?;
-
+                (
+                    directory.join("cpu.cfs_quota_us"),
+                    desired.quota_us.to_string(),
+                )
+            };
+            fs::write(&path, value).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    ActionError::PermissionDenied
+                } else {
+                    ActionError::Failed(format!("cannot write {}: {error}", path.display()))
+                }
+            })?;
+        }
+        revalidate()?;
+        let observed = read_cpu_limit(directory, is_v2)?;
+        if observed != desired || !observed.within(maximum) {
+            return Err(ActionError::Failed(
+                "CPU throttle readback does not match the selected cap".to_string(),
+            ));
+        }
+        revalidate()?;
         info!(
-            pid,
-            cgroup = cpu_path,
-            quota_us = quota,
-            period_us = period,
-            "CPU throttle applied via cgroup v1"
+            cgroup = %directory.display(),
+            quota_us = observed.quota_us,
+            period_us = observed.period_us,
+            changed = desired != current,
+            is_v2,
+            "CPU bandwidth cap verified"
         );
-
         Ok(())
     }
 
-    /// Verify throttle was applied by reading back cpu.max.
+    /// Verify the live CPU bandwidth is no greater than the requested maximum.
     #[cfg(target_os = "linux")]
     fn verify_throttle(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
-        super::dispatch::ensure_cgroup_target(&action.target)?;
+        let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
 
         // Re-collect cgroup details to verify
         let cgroup_details = collect_cgroup_details(pid).ok_or_else(|| {
@@ -301,63 +350,37 @@ impl CpuThrottleActionRunner {
             ))
         })?;
 
-        let expected_quota = self.config.quota_us();
-        let expected_period = self.config.period_us;
-
-        // Check v2 first
-        if let Some(ref limits) = cgroup_details.cpu_limits {
-            match limits.source {
-                CpuLimitSource::CgroupV2CpuMax => {
-                    // Verify quota and period match what we set
-                    let actual_quota = limits.quota_us.unwrap_or(-1);
-                    let actual_period = limits.period_us.unwrap_or(0);
-
-                    if actual_quota != expected_quota {
-                        return Err(ActionError::Failed(format!(
-                            "quota mismatch: expected {}, got {}",
-                            expected_quota, actual_quota
-                        )));
-                    }
-                    if actual_period != expected_period {
-                        return Err(ActionError::Failed(format!(
-                            "period mismatch: expected {}, got {}",
-                            expected_period, actual_period
-                        )));
-                    }
-                    debug!(pid, "throttle verification passed (v2)");
-                    return Ok(());
-                }
-                CpuLimitSource::CgroupV1Cfs => {
-                    // Verify v1 settings
-                    let actual_quota = limits.quota_us.unwrap_or(-1);
-                    let actual_period = limits.period_us.unwrap_or(0);
-
-                    if actual_quota != expected_quota {
-                        return Err(ActionError::Failed(format!(
-                            "v1 quota mismatch: expected {}, got {}",
-                            expected_quota, actual_quota
-                        )));
-                    }
-                    if actual_period != expected_period {
-                        return Err(ActionError::Failed(format!(
-                            "v1 period mismatch: expected {}, got {}",
-                            expected_period, actual_period
-                        )));
-                    }
-                    debug!(pid, "throttle verification passed (v1)");
-                    return Ok(());
-                }
-                CpuLimitSource::None => {
-                    return Err(ActionError::Failed(
-                        "no CPU limits found after throttle".to_string(),
-                    ));
-                }
-            }
+        if cgroup_details.unified_path.as_deref() != Some(checked_path.as_str()) {
+            return Err(ActionError::Failed(
+                "cannot verify throttle after cgroup membership changed".to_string(),
+            ));
         }
-
-        Err(ActionError::Failed(
-            "could not verify throttle - no CPU limits in cgroup".to_string(),
-        ))
+        let v2_directory = PathBuf::from(format!("/sys/fs/cgroup{checked_path}"));
+        let v1_path = self
+            .config
+            .fallback_to_v1
+            .then(|| cgroup_details.v1_paths.get("cpu"))
+            .flatten();
+        let v1_directory = v1_path.map(|path| PathBuf::from(format!("/sys/fs/cgroup/cpu{path}")));
+        let (directory, is_v2) = select_cpu_controller(&v2_directory, v1_directory.as_deref())?;
+        let v1_path = if is_v2 {
+            None
+        } else {
+            v1_path.map(String::as_str)
+        };
+        self.revalidate_membership(action, &checked_path, v1_path)?;
+        let observed = read_cpu_limit(&directory, is_v2)?;
+        if !quota_within_limit(observed.quota_us, observed.period_us, &self.config)? {
+            return Err(ActionError::Failed(
+                "CPU bandwidth remains above the requested throttle cap".to_string(),
+            ));
+        }
+        if read_cpu_limit(&directory, is_v2)? != observed {
+            return Err(ActionError::Failed(
+                "CPU limits changed during throttle verification".to_string(),
+            ));
+        }
+        self.revalidate_membership(action, &checked_path, v1_path)
     }
 
     /// Capture reversal metadata before applying throttle.
@@ -583,6 +606,92 @@ pub fn can_throttle_process(_pid: u32) -> bool {
     false
 }
 
+/// Choose v1 only when the v2 controller is absent. A present but unreadable,
+/// invalid or unwritable v2 limit is never a reason to mutate another hierarchy.
+#[cfg(target_os = "linux")]
+fn select_cpu_controller(
+    v2_directory: &Path,
+    v1_directory: Option<&Path>,
+) -> Result<(PathBuf, bool), ActionError> {
+    let v2_path = v2_directory.join("cpu.max");
+    match fs::metadata(&v2_path) {
+        Ok(_) => return Ok((v2_directory.to_path_buf(), true)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ActionError::Failed(format!(
+                "cannot inspect {}: {error}",
+                v2_path.display()
+            )));
+        }
+    }
+    let directory = v1_directory
+        .ok_or_else(|| ActionError::Failed("no cgroup CPU controller is available".to_string()))?;
+    let quota_path = directory.join("cpu.cfs_quota_us");
+    fs::metadata(&quota_path).map_err(|error| {
+        ActionError::Failed(format!("cannot inspect {}: {error}", quota_path.display()))
+    })?;
+    Ok((directory.to_path_buf(), false))
+}
+
+#[cfg(target_os = "linux")]
+fn read_cpu_control(path: &Path) -> Result<String, ActionError> {
+    fs::read_to_string(path)
+        .map_err(|error| ActionError::Failed(format!("cannot read {}: {error}", path.display())))
+}
+
+fn parse_cpu_limit(
+    quota: &str,
+    period: &str,
+    is_v2: bool,
+) -> Result<CpuBandwidthLimit, ActionError> {
+    let quota = quota.trim();
+    let period = period.trim();
+    let invalid = || ActionError::Failed("invalid CPU bandwidth controller evidence".to_string());
+    if period.is_empty() || !period.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let period = period.parse().map_err(|_| invalid())?;
+    let quota = if (is_v2 && quota == "max") || (!is_v2 && quota == "-1") {
+        -1
+    } else {
+        if quota.is_empty() || !quota.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        quota.parse().map_err(|_| invalid())?
+    };
+    CpuBandwidthLimit::new(quota, period)
+}
+
+#[cfg(target_os = "linux")]
+fn read_cpu_limit(directory: &Path, is_v2: bool) -> Result<CpuBandwidthLimit, ActionError> {
+    if is_v2 {
+        let content = read_cpu_control(&directory.join("cpu.max"))?;
+        let mut fields = content.split_whitespace();
+        let quota = fields
+            .next()
+            .ok_or_else(|| ActionError::Failed("CPU quota is missing".to_string()))?;
+        let period = fields
+            .next()
+            .ok_or_else(|| ActionError::Failed("CPU period is missing".to_string()))?;
+        if fields.next().is_some() {
+            return Err(ActionError::Failed(
+                "unexpected fields in CPU bandwidth controller evidence".to_string(),
+            ));
+        }
+        parse_cpu_limit(quota, period, true)
+    } else {
+        let period_path = directory.join("cpu.cfs_period_us");
+        let period = read_cpu_control(&period_path)?;
+        let quota = read_cpu_control(&directory.join("cpu.cfs_quota_us"))?;
+        if read_cpu_control(&period_path)?.trim() != period.trim() {
+            return Err(ActionError::Failed(
+                "CPU period changed while reading the v1 bandwidth limit".to_string(),
+            ));
+        }
+        parse_cpu_limit(&quota, &period, false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,6 +737,81 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.quota_us(), MIN_QUOTA_US);
+        assert!(config.validated_limit().is_err());
+    }
+
+    #[test]
+    fn cpu_quota_bound_accepts_equivalent_and_stricter_limits() {
+        let config = CpuThrottleConfig::default();
+        for (quota, period) in [
+            (10_000, 100_000),
+            (25_000, 100_000),
+            (50_000, 200_000),
+            (1_000, 1_000_000),
+        ] {
+            assert!(quota_within_limit(quota, period, &config).unwrap());
+        }
+        for (quota, period) in [
+            (-1, 100_000),
+            (25_001, 100_000),
+            (50_000, 100_000),
+            (i64::MAX, 1_000_000),
+        ] {
+            assert!(!quota_within_limit(quota, period, &config).unwrap());
+        }
+    }
+
+    #[test]
+    fn cpu_quota_bound_refuses_invalid_limits_and_configuration() {
+        let config = CpuThrottleConfig::default();
+        for (quota, period) in [
+            (0, 100_000),
+            (-2, 100_000),
+            (999, 100_000),
+            (25_000, 0),
+            (25_000, 999),
+            (25_000, 1_000_001),
+        ] {
+            assert!(quota_within_limit(quota, period, &config).is_err());
+        }
+        for fraction in [0.0, -0.25, f64::NAN, f64::INFINITY, f64::MAX, 0.00001] {
+            assert!(quota_within_limit(
+                10_000,
+                100_000,
+                &CpuThrottleConfig::with_fraction(fraction)
+            )
+            .is_err());
+        }
+        for period_us in [0, 999, 1_000_001] {
+            let invalid = CpuThrottleConfig {
+                period_us,
+                ..Default::default()
+            };
+            assert!(quota_within_limit(10_000, 100_000, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn cpu_controller_parser_requires_complete_valid_evidence() {
+        for (quota, period, is_v2) in [
+            ("max", "100000", true),
+            ("-1", "100000", false),
+            ("25000", "100000", true),
+        ] {
+            assert!(parse_cpu_limit(quota, period, is_v2).is_ok());
+        }
+        for (quota, period, is_v2) in [
+            ("", "100000", true),
+            ("bad", "100000", true),
+            ("+25000", "100000", true),
+            ("-1", "100000", true),
+            ("max", "100000", false),
+            ("25000", "100000 extra", false),
+            ("25000", "+100000", true),
+            ("9223372036854775808", "100000", true),
+        ] {
+            assert!(parse_cpu_limit(quota, period, is_v2).is_err());
+        }
     }
 
     #[test]
@@ -639,6 +823,253 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux_tests {
         use super::*;
+
+        fn controller_fixture(is_v2: bool, quota: &str, period: &str) -> tempfile::TempDir {
+            let fixture = tempfile::tempdir().unwrap();
+            if is_v2 {
+                fs::write(
+                    fixture.path().join("cpu.max"),
+                    format!("{quota} {period}\n"),
+                )
+                .unwrap();
+            } else {
+                fs::write(
+                    fixture.path().join("cpu.cfs_quota_us"),
+                    format!("{quota}\n"),
+                )
+                .unwrap();
+                fs::write(
+                    fixture.path().join("cpu.cfs_period_us"),
+                    format!("{period}\n"),
+                )
+                .unwrap();
+            }
+            fixture
+        }
+
+        #[test]
+        fn throttle_preserves_existing_ten_percent_and_equivalent_caps_exactly() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            for is_v2 in [true, false] {
+                for (quota, period) in [
+                    ("10000", "100000"),
+                    ("20000", "200000"),
+                    ("50000", "200000"),
+                ] {
+                    let fixture = controller_fixture(is_v2, quota, period);
+                    runner
+                        .apply_throttle_at(fixture.path(), is_v2, || Ok(()))
+                        .unwrap();
+                    if is_v2 {
+                        assert_eq!(
+                            fs::read_to_string(fixture.path().join("cpu.max")).unwrap(),
+                            format!("{quota} {period}\n")
+                        );
+                    } else {
+                        assert_eq!(
+                            fs::read_to_string(fixture.path().join("cpu.cfs_quota_us")).unwrap(),
+                            format!("{quota}\n")
+                        );
+                        assert_eq!(
+                            fs::read_to_string(fixture.path().join("cpu.cfs_period_us")).unwrap(),
+                            format!("{period}\n")
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn throttle_tightens_unlimited_and_weaker_v2_caps_to_the_default_maximum() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            for quota in ["max", "50000", "100000"] {
+                let fixture = controller_fixture(true, quota, "100000");
+                runner
+                    .apply_throttle_at(fixture.path(), true, || Ok(()))
+                    .unwrap();
+                assert_eq!(
+                    fs::read_to_string(fixture.path().join("cpu.max")).unwrap(),
+                    "25000 100000"
+                );
+            }
+        }
+
+        #[test]
+        fn throttle_v1_changes_only_quota_at_the_existing_period_and_rounds_down() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            for (quota, period, expected) in [
+                ("-1", "200000", "50000"),
+                ("200000", "200000", "50000"),
+                ("333333", "333333", "83333"),
+            ] {
+                let fixture = controller_fixture(false, quota, period);
+                runner
+                    .apply_throttle_at(fixture.path(), false, || Ok(()))
+                    .unwrap();
+                assert_eq!(
+                    fs::read_to_string(fixture.path().join("cpu.cfs_quota_us")).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.path().join("cpu.cfs_period_us")).unwrap(),
+                    format!("{period}\n")
+                );
+                let observed = read_cpu_limit(fixture.path(), false).unwrap();
+                assert!(
+                    quota_within_limit(observed.quota_us, observed.period_us, &runner.config)
+                        .unwrap()
+                );
+            }
+        }
+
+        #[test]
+        fn throttle_v1_refuses_an_unrepresentable_cap_without_changing_either_file() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            let fixture = controller_fixture(false, "1000", "2000");
+            assert!(runner
+                .apply_throttle_at(fixture.path(), false, || Ok(()))
+                .is_err());
+            assert_eq!(
+                fs::read_to_string(fixture.path().join("cpu.cfs_quota_us")).unwrap(),
+                "1000\n"
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.path().join("cpu.cfs_period_us")).unwrap(),
+                "2000\n"
+            );
+        }
+
+        #[test]
+        fn throttle_refuses_invalid_configuration_before_mutating_a_valid_limit() {
+            for fraction in [f64::NAN, f64::INFINITY, -1.0, 0.0, 0.00001] {
+                let runner =
+                    CpuThrottleActionRunner::new(CpuThrottleConfig::with_fraction(fraction));
+                let fixture = controller_fixture(true, "10000", "100000");
+                assert!(runner
+                    .apply_throttle_at(fixture.path(), true, || Ok(()))
+                    .is_err());
+                assert_eq!(
+                    fs::read_to_string(fixture.path().join("cpu.max")).unwrap(),
+                    "10000 100000\n"
+                );
+            }
+        }
+
+        #[test]
+        fn throttle_refuses_invalid_or_missing_controller_evidence_before_mutation() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            for content in [
+                "",
+                "max",
+                "bad 100000",
+                "25000 0",
+                "25000 100000 extra",
+                "999 100000",
+            ] {
+                let fixture = tempfile::tempdir().unwrap();
+                let path = fixture.path().join("cpu.max");
+                fs::write(&path, content).unwrap();
+                assert!(runner
+                    .apply_throttle_at(fixture.path(), true, || Ok(()))
+                    .is_err());
+                assert_eq!(fs::read_to_string(path).unwrap(), content);
+            }
+            let fixture = tempfile::tempdir().unwrap();
+            let quota_path = fixture.path().join("cpu.cfs_quota_us");
+            fs::write(&quota_path, "-1\n").unwrap();
+            assert!(runner
+                .apply_throttle_at(fixture.path(), false, || Ok(()))
+                .is_err());
+            assert_eq!(fs::read_to_string(quota_path).unwrap(), "-1\n");
+            assert!(!fixture.path().join("cpu.cfs_period_us").exists());
+        }
+
+        #[test]
+        fn throttle_fallback_requires_an_absent_v2_controller() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            let v1 = controller_fixture(false, "-1", "100000");
+            for unreadable in [false, true] {
+                let v2 = tempfile::tempdir().unwrap();
+                if unreadable {
+                    fs::create_dir(v2.path().join("cpu.max")).unwrap();
+                } else {
+                    fs::write(v2.path().join("cpu.max"), "malformed").unwrap();
+                }
+                let (selected, is_v2) = select_cpu_controller(v2.path(), Some(v1.path())).unwrap();
+                assert!(is_v2);
+                assert!(runner
+                    .apply_throttle_at(&selected, is_v2, || Ok(()))
+                    .is_err());
+                assert_eq!(
+                    fs::read_to_string(v1.path().join("cpu.cfs_quota_us")).unwrap(),
+                    "-1\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(v1.path().join("cpu.cfs_period_us")).unwrap(),
+                    "100000\n"
+                );
+            }
+            let absent_v2 = tempfile::tempdir().unwrap();
+            let (selected, is_v2) =
+                select_cpu_controller(absent_v2.path(), Some(v1.path())).unwrap();
+            assert!(!is_v2);
+            runner
+                .apply_throttle_at(&selected, is_v2, || Ok(()))
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(v1.path().join("cpu.cfs_quota_us")).unwrap(),
+                "25000"
+            );
+            assert_eq!(
+                fs::read_to_string(v1.path().join("cpu.cfs_period_us")).unwrap(),
+                "100000\n"
+            );
+        }
+
+        #[test]
+        fn throttle_preserves_a_concurrent_stricter_limit_instead_of_overwriting_it() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            let fixture = controller_fixture(true, "max", "100000");
+            let checks = std::cell::Cell::new(0);
+            let path = fixture.path().join("cpu.max");
+            let result = runner.apply_throttle_at(fixture.path(), true, || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    // A different controller owner tightens the limit after the
+                    // initial snapshot and before our mutation.
+                    fs::write(&path, "1000 100000").unwrap();
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert_eq!(fs::read_to_string(path).unwrap(), "1000 100000");
+        }
+
+        #[test]
+        fn throttle_requires_identity_before_mutation_and_before_success() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            for failure_check in [1, 3] {
+                let fixture = controller_fixture(true, "max", "100000");
+                let checks = std::cell::Cell::new(0);
+                let result = runner.apply_throttle_at(fixture.path(), true, || {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == failure_check {
+                        Err(ActionError::IdentityMismatch)
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert!(matches!(result, Err(ActionError::IdentityMismatch)));
+                assert_eq!(
+                    fs::read_to_string(fixture.path().join("cpu.max")).unwrap(),
+                    if failure_check == 1 {
+                        "max 100000\n"
+                    } else {
+                        "25000 100000"
+                    }
+                );
+            }
+        }
 
         #[test]
         fn can_check_throttle_availability() {
