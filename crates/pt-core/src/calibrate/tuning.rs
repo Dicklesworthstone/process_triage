@@ -129,7 +129,8 @@ impl TuningEngine {
         records: &[ValidationRecord],
         current_class_priors: &[(String, f64)],
     ) -> Result<TuningResult, CalibrationError> {
-        // Filter to resolved records only.
+        // Exit causes do not establish abandonment. Only explicit supported
+        // labels may influence sample thresholds, category rates or class priors.
         let resolved: Vec<&ValidationRecord> = records
             .iter()
             .filter(|r| r.ground_truth.is_some_and(|gt| gt.is_resolved()))
@@ -395,7 +396,7 @@ mod tests {
             let gt = if abandoned {
                 GroundTruth::UserKilled
             } else {
-                GroundTruth::NormalExit
+                GroundTruth::UserSpared
             };
             records.push(make_record(
                 prob,
@@ -440,6 +441,79 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_outcomes_cannot_supply_tuning_data() {
+        let engine = TuningEngine::new(TuningConfig::default());
+        let priors = vec![("abandoned".to_string(), 0.15), ("useful".to_string(), 0.7)];
+        let mut records = Vec::new();
+        for outcome in [
+            GroundTruth::NormalExit,
+            GroundTruth::Crash,
+            GroundTruth::ExternalKill,
+            GroundTruth::SystemShutdown,
+            GroundTruth::StillRunning,
+            GroundTruth::Expired,
+            GroundTruth::Vanished,
+        ] {
+            for i in 0..30 {
+                records.push(make_record(
+                    0.9,
+                    outcome,
+                    Some("test_runner"),
+                    &format!("unknown_{outcome:?}_{i}"),
+                ));
+            }
+        }
+        assert!(matches!(
+            engine.compute_adjustments(&records, &priors),
+            Err(CalibrationError::NoData)
+        ));
+
+        // Many known exit causes still cannot satisfy the sample minimum when
+        // only two independent human verdicts are available.
+        records.extend(make_records(2));
+        let result = engine.compute_adjustments(&records, &priors).unwrap();
+        assert!(!result.has_recommendations);
+        assert!(result.adjustments.is_empty());
+        assert_eq!(result.category_stats.len(), 1);
+        assert_eq!(result.category_stats[0].count, 2);
+        assert_eq!(result.category_stats[0].actual_abandoned_rate, 0.5);
+        assert!(!result.category_stats[0].sufficient_data);
+    }
+
+    #[test]
+    fn ambiguous_outcomes_do_not_change_supported_prior_adjustments() {
+        let engine = TuningEngine::new(TuningConfig::default());
+        let priors = vec![("abandoned".to_string(), 0.15), ("useful".to_string(), 0.7)];
+        let mut records = make_records(60);
+        let baseline = engine.compute_adjustments(&records, &priors).unwrap();
+        assert!(baseline.has_recommendations);
+        assert_eq!(baseline.category_stats[0].count, 60);
+        assert_eq!(baseline.category_stats[0].actual_abandoned_rate, 0.5);
+
+        for outcome in [
+            GroundTruth::NormalExit,
+            GroundTruth::Crash,
+            GroundTruth::ExternalKill,
+            GroundTruth::SystemShutdown,
+        ] {
+            for i in 0..40 {
+                records.push(make_record(
+                    0.99,
+                    outcome,
+                    Some("test_runner"),
+                    &format!("unknown_{outcome:?}_{i}"),
+                ));
+            }
+        }
+        let result = engine.compute_adjustments(&records, &priors).unwrap();
+        let baseline = serde_json::to_value(&baseline).unwrap();
+        let result = serde_json::to_value(&result).unwrap();
+        for field in ["adjustments", "metrics_before", "category_stats"] {
+            assert_eq!(result[field], baseline[field], "{field}");
+        }
+    }
+
+    #[test]
     fn test_clamp_change() {
         let engine = TuningEngine::new(TuningConfig {
             max_change_fraction: 0.2,
@@ -472,9 +546,9 @@ mod tests {
         let records: Vec<ValidationRecord> = vec![
             make_record(0.9, GroundTruth::UserKilled, Some("test_runner"), "jest1"),
             make_record(0.8, GroundTruth::UserKilled, Some("test_runner"), "jest2"),
-            make_record(0.7, GroundTruth::NormalExit, Some("test_runner"), "jest3"),
-            make_record(0.3, GroundTruth::NormalExit, Some("dev_server"), "vite1"),
-            make_record(0.2, GroundTruth::NormalExit, Some("dev_server"), "vite2"),
+            make_record(0.7, GroundTruth::UserSpared, Some("test_runner"), "jest3"),
+            make_record(0.3, GroundTruth::UserSpared, Some("dev_server"), "vite1"),
+            make_record(0.2, GroundTruth::UserSpared, Some("dev_server"), "vite2"),
         ];
 
         let resolved: Vec<&ValidationRecord> = records.iter().collect();
@@ -503,7 +577,7 @@ mod tests {
         for i in 0..10 {
             records.push(make_record(
                 0.8,                     // High predicted abandonment
-                GroundTruth::NormalExit, // But they exit normally
+                GroundTruth::UserSpared, // But human verdicts reject abandonment
                 Some("test_runner"),
                 &format!("jest_{}", i),
             ));
@@ -535,7 +609,7 @@ mod tests {
         for _ in 0..15 {
             records.push(make_record(
                 0.15,
-                GroundTruth::NormalExit,
+                GroundTruth::UserSpared,
                 Some("dev_server"),
                 "next",
             ));
