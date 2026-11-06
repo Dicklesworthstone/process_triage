@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -428,6 +428,9 @@ pub struct ShadowStorage {
     /// In-memory cache: PID -> recent observations.
     hot_cache: HashMap<u32, Vec<Observation>>,
 
+    /// Observations awaiting durable publication, independent of cache eviction.
+    unflushed: HashMap<u32, Vec<Observation>>,
+
     /// Index: identity_hash -> list of PIDs that used this identity.
     identity_index: HashMap<String, Vec<u32>>,
 
@@ -488,6 +491,7 @@ impl ShadowStorage {
         let mut storage = ShadowStorage {
             config,
             hot_cache: HashMap::new(),
+            unflushed: HashMap::new(),
             identity_index: HashMap::new(),
             pid_to_identity: HashMap::new(),
             stats: StorageStats::default(),
@@ -519,6 +523,9 @@ impl ShadowStorage {
         self.stats.hot_observations += 1;
         self.stats.total_events += obs.events.len() as u64;
         self.stats.unique_identities = self.identity_index.len() as u64;
+
+        // Query-cache limits must never discard observations before flush.
+        self.unflushed.entry(pid).or_default().push(obs.clone());
 
         // Add to hot cache
         {
@@ -660,86 +667,21 @@ impl ShadowStorage {
 
     /// Compact observations according to retention tiers.
     pub fn compact(&mut self) -> Result<(), ShadowStorageError> {
-        let now = Utc::now();
+        self.compact_at(Utc::now())
+    }
+
+    fn compact_at(&mut self, now: DateTime<Utc>) -> Result<(), ShadowStorageError> {
         let hot_cutoff = now - chrono::Duration::seconds(3600);
-        let warm_cutoff = now - chrono::Duration::seconds(86400);
-        let cold_cutoff = now - chrono::Duration::seconds(604800);
 
-        // Collect observations to persist (avoiding borrow checker issues)
-        let mut to_persist: Vec<(u32, Vec<Observation>, RetentionTier)> = Vec::new();
-        let mut archive_count = 0u64;
+        self.persist_unflushed(now)?;
 
-        // Process hot cache
-        for (pid, cache) in self.hot_cache.iter_mut() {
-            // Partition by age
-            let (hot, older): (Vec<_>, Vec<_>) =
-                cache.drain(..).partition(|o| o.timestamp >= hot_cutoff);
-
-            // Keep hot observations in cache
-            *cache = hot;
-
-            // Downsample older observations
-            if !older.is_empty() {
-                let warm_interval = Duration::from_secs(60);
-                let cold_interval = Duration::from_secs(300);
-
-                let mut warm_obs = Vec::new();
-                let mut cold_obs = Vec::new();
-
-                let mut last_warm_ts: Option<DateTime<Utc>> = None;
-                let mut last_cold_ts: Option<DateTime<Utc>> = None;
-
-                for obs in older {
-                    if obs.timestamp >= warm_cutoff {
-                        // Warm tier: sample at 1-minute intervals
-                        let should_keep = last_warm_ts.is_none_or(|last| {
-                            obs.timestamp.signed_duration_since(last).num_seconds()
-                                >= warm_interval.as_secs() as i64
-                        });
-                        if should_keep {
-                            last_warm_ts = Some(obs.timestamp);
-                            warm_obs.push(obs);
-                        }
-                    } else if obs.timestamp >= cold_cutoff {
-                        // Cold tier: sample at 5-minute intervals
-                        let should_keep = last_cold_ts.is_none_or(|last| {
-                            obs.timestamp.signed_duration_since(last).num_seconds()
-                                >= cold_interval.as_secs() as i64
-                        });
-                        if should_keep {
-                            last_cold_ts = Some(obs.timestamp);
-                            cold_obs.push(obs);
-                        }
-                    } else {
-                        // Archive tier: just count, don't keep individual observations
-                        archive_count += 1;
-                    }
-                }
-
-                // Collect for persistence
-                if !warm_obs.is_empty() {
-                    to_persist.push((*pid, warm_obs, RetentionTier::Warm));
-                }
-                if !cold_obs.is_empty() {
-                    to_persist.push((*pid, cold_obs, RetentionTier::Cold));
-                }
-            }
+        // The cache is only a query window. Its observations have already been
+        // published, so aging or flushing it again must not duplicate them.
+        for cache in self.hot_cache.values_mut() {
+            cache.retain(|obs| obs.timestamp >= hot_cutoff);
         }
-
-        // Now persist collected observations (outside the borrow)
-        for (pid, obs, tier) in to_persist {
-            let count = obs.len() as u64;
-            self.persist_observations(pid, &obs, tier)?;
-            match tier {
-                RetentionTier::Warm => self.stats.warm_observations += count,
-                RetentionTier::Cold => self.stats.cold_observations += count,
-                _ => {}
-            }
-        }
-        self.stats.archive_observations += archive_count;
 
         // Update stats
-        self.stats.hot_observations = self.hot_cache.values().map(|v| v.len() as u64).sum();
         self.stats.unique_pids = self.hot_cache.len() as u64;
         self.stats.unique_identities = self.identity_index.len() as u64;
         self.stats.last_compact = Some(now);
@@ -748,6 +690,94 @@ impl ShadowStorage {
         // Save stats
         self.save_stats()?;
 
+        Ok(())
+    }
+
+    /// Publish each pending batch once, including full-resolution hot records.
+    /// Existing warm/cold sampling applies when a record is first persisted.
+    /// This does not migrate previously published files between disk tiers.
+    fn persist_unflushed(&mut self, now: DateTime<Utc>) -> Result<(), ShadowStorageError> {
+        let mut pids: Vec<u32> = self.unflushed.keys().copied().collect();
+        pids.sort_unstable();
+
+        for pid in pids {
+            let mut pending = self.unflushed.remove(&pid).unwrap_or_default();
+            pending.sort_by_key(|obs| obs.timestamp);
+            let mut hot = Vec::new();
+            let mut warm = Vec::new();
+            let mut cold = Vec::new();
+            let mut archive = Vec::new();
+            for obs in pending {
+                let age = now
+                    .signed_duration_since(obs.timestamp)
+                    .to_std()
+                    .unwrap_or_default();
+                match RetentionTier::for_age(age) {
+                    RetentionTier::Hot => hot.push(obs),
+                    RetentionTier::Warm => warm.push(obs),
+                    RetentionTier::Cold => cold.push(obs),
+                    RetentionTier::Archive => archive.push(obs),
+                }
+            }
+
+            let mut batches = [
+                (RetentionTier::Hot, hot),
+                (RetentionTier::Warm, warm),
+                (RetentionTier::Cold, cold),
+                (RetentionTier::Archive, archive),
+            ]
+            .into_iter();
+            while let Some((tier, observations)) = batches.next() {
+                if tier == RetentionTier::Archive {
+                    self.stats.hot_observations = self
+                        .stats
+                        .hot_observations
+                        .saturating_sub(observations.len() as u64);
+                    self.stats.archive_observations += observations.len() as u64;
+                    continue;
+                }
+
+                let interval = tier.sample_interval().as_secs() as i64;
+                let mut last_timestamp: Option<DateTime<Utc>> = None;
+                let sampled: Vec<Observation> = observations
+                    .iter()
+                    .filter(|obs| {
+                        let keep = interval == 0
+                            || last_timestamp.is_none_or(|last| {
+                                obs.timestamp.signed_duration_since(last).num_seconds() >= interval
+                            });
+                        if keep {
+                            last_timestamp = Some(obs.timestamp);
+                        }
+                        keep
+                    })
+                    .cloned()
+                    .collect();
+
+                if let Err(err) = self.persist_observations(pid, &sampled, tier) {
+                    // Earlier successful batches stay committed. Only this failed
+                    // batch and its unattempted successors are retried.
+                    let retry = self.unflushed.entry(pid).or_default();
+                    retry.extend(observations);
+                    for (_, remaining) in batches {
+                        retry.extend(remaining);
+                    }
+                    return Err(err);
+                }
+
+                if tier != RetentionTier::Hot {
+                    self.stats.hot_observations = self
+                        .stats
+                        .hot_observations
+                        .saturating_sub(observations.len() as u64);
+                }
+                match tier {
+                    RetentionTier::Warm => self.stats.warm_observations += sampled.len() as u64,
+                    RetentionTier::Cold => self.stats.cold_observations += sampled.len() as u64,
+                    _ => {}
+                }
+            }
+        }
         Ok(())
     }
 
@@ -777,9 +807,13 @@ impl ShadowStorage {
 
         fs::create_dir_all(&dir)?;
 
-        let (file, _path) = create_unique_observation_file(&dir, pid, Utc::now())?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer(writer, observations)?;
+        let (file, staging_path) = create_unique_observation_file(&dir, pid, Utc::now())?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, observations)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        publish_observation_file(&staging_path)?;
 
         Ok(())
     }
@@ -803,9 +837,14 @@ impl ShadowStorage {
     /// Save storage stats to disk.
     fn save_stats(&self) -> Result<(), ShadowStorageError> {
         let stats_path = self.config.base_dir.join("stats.json");
-        let file = File::create(&stats_path)?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, &self.stats)?;
+        let (file, staging_path) =
+            create_unique_observation_file(&self.config.base_dir, 0, Utc::now())?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &self.stats)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        fs::rename(staging_path, stats_path)?;
         Ok(())
     }
 
@@ -831,9 +870,7 @@ impl ShadowStorage {
 
     /// Flush all pending writes.
     pub fn flush(&mut self) -> Result<(), ShadowStorageError> {
-        self.compact()?;
-        self.save_stats()?;
-        Ok(())
+        self.compact()
     }
 
     /// Clean up expired data.
@@ -876,9 +913,9 @@ fn create_unique_observation_file(
 
     for suffix in 0u32.. {
         let file_name = if suffix == 0 {
-            format!("{timestamp}_{pid}.json")
+            format!("{timestamp}_{pid}.pending")
         } else {
-            format!("{timestamp}_{pid}_{suffix}.json")
+            format!("{timestamp}_{pid}_{suffix}.pending")
         };
         let path = dir.join(file_name);
 
@@ -890,6 +927,41 @@ fn create_unique_observation_file(
     }
 
     unreachable!("u32 suffix space exhausted while creating observation file")
+}
+
+/// Publish complete JSON without overwriting an existing batch or exposing a
+/// partial file to readers. Staging files have a non-JSON extension and are
+/// ignored after an interrupted write.
+fn publish_observation_file(staging_path: &Path) -> std::io::Result<()> {
+    let stem = staging_path.file_stem().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing observation file name",
+        )
+    })?;
+    for suffix in 0u32.. {
+        let final_path = if suffix == 0 {
+            staging_path.with_extension("json")
+        } else {
+            let mut name = stem.to_os_string();
+            name.push(format!("_{suffix}.json"));
+            staging_path.with_file_name(name)
+        };
+        match fs::hard_link(staging_path, &final_path) {
+            Ok(()) => {
+                // Publication is committed. A cleanup failure cannot turn it
+                // into a retry, which would duplicate the durable observation.
+                if let Err(err) = fs::remove_file(staging_path) {
+                    tracing::warn!(path = %staging_path.display(), error = %err,
+                        "could not remove published shadow staging file");
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("u32 suffix space exhausted while publishing observation file")
 }
 
 fn cleanup_archive_path(path: &Path, cutoff: DateTime<Utc>) -> Result<u64, ShadowStorageError> {
@@ -1293,6 +1365,27 @@ mod tests {
         );
     }
 
+    fn persisted_observations(base: &Path) -> Vec<Observation> {
+        fn visit(dir: &Path, rows: &mut Vec<Observation>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, rows);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                    && path.file_name().and_then(|name| name.to_str()) != Some("stats.json")
+                {
+                    let batch: Vec<Observation> =
+                        serde_json::from_reader(BufReader::new(File::open(path).unwrap())).unwrap();
+                    rows.extend(batch);
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        visit(base, &mut rows);
+        rows.sort_by_key(|obs| obs.timestamp);
+        rows
+    }
+
     #[test]
     fn test_storage_flush_and_persist() {
         let temp_dir = TempDir::new().unwrap();
@@ -1302,20 +1395,273 @@ mod tests {
             ..Default::default()
         };
 
-        let mut storage = ShadowStorage::new(config).unwrap();
-
-        let obs = Observation {
+        let mut storage = ShadowStorage::new(config.clone()).unwrap();
+        let now = Utc::now();
+        let first = Observation {
+            timestamp: now,
             pid: 999,
             identity_hash: "flush_test".to_string(),
+            state: StateSnapshot {
+                cpu_percent: 17.5,
+                io_write_bytes: 12345,
+                state_char: 'S',
+                ..Default::default()
+            },
+            events: vec![ProcessEvent {
+                timestamp: now,
+                event_type: EventType::EvidenceSnapshot,
+                details: Some("{\"comm\":\"worker\"}".to_string()),
+            }],
+            belief: BeliefState {
+                p_abandoned: 0.7,
+                p_legitimate: 0.2,
+                p_zombie: 0.05,
+                p_useful_but_bad: 0.05,
+                score: 75.0,
+                confidence: 0.8,
+                recommendation: "keep".to_string(),
+            },
+        };
+        storage.record(first.clone()).unwrap();
+        storage.flush().unwrap();
+        storage.flush().unwrap();
+        assert!(temp_dir.path().join("stats.json").exists());
+        drop(storage);
+
+        let mut restarted = ShadowStorage::new(config).unwrap();
+        assert_eq!(restarted.stats().total_observations, 1);
+        assert_eq!(restarted.stats().hot_observations, 1);
+        let second = Observation {
+            timestamp: now + chrono::Duration::milliseconds(1),
+            identity_hash: "replacement_identity".to_string(),
+            ..first.clone()
+        };
+        restarted.record(second.clone()).unwrap();
+        restarted.flush().unwrap();
+        restarted.flush().unwrap();
+        drop(restarted);
+
+        let rows = persisted_observations(temp_dir.path());
+        assert_eq!(
+            rows.len(),
+            2,
+            "flush/restart must not duplicate or replace a batch"
+        );
+        assert_eq!(
+            serde_json::to_value(&rows).unwrap(),
+            serde_json::to_value([first, second]).unwrap(),
+            "identity, prediction, evidence and resource fields must survive exactly",
+        );
+    }
+
+    #[test]
+    fn cache_eviction_cannot_discard_unflushed_observations() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = ShadowStorage::new(ShadowStorageConfig {
+            base_dir: temp_dir.path().to_path_buf(),
+            auto_compact: false,
+            cache_size_per_pid: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let now = Utc::now();
+        for index in 0..8 {
+            storage
+                .record(Observation {
+                    timestamp: now - chrono::Duration::milliseconds(8 - index),
+                    pid: 99,
+                    identity_hash: "many_observations".to_string(),
+                    state: StateSnapshot {
+                        io_read_bytes: index as u64,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert!(storage.hot_cache[&99].len() <= 2);
+        storage.flush().unwrap();
+        let rows = persisted_observations(temp_dir.path());
+        assert_eq!(rows.len(), 8);
+        assert_eq!(
+            rows.iter()
+                .map(|obs| obs.state.io_read_bytes)
+                .collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        assert_eq!(storage.stats().hot_observations, 8);
+    }
+
+    #[test]
+    fn compacting_a_persisted_cache_does_not_reemit_observations() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = ShadowStorage::new(ShadowStorageConfig {
+            base_dir: temp_dir.path().to_path_buf(),
+            auto_compact: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let now = Utc::now();
+        storage
+            .record(Observation {
+                timestamp: now,
+                pid: 99,
+                identity_hash: "already_persisted".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage.flush().unwrap();
+        storage
+            .compact_at(now + chrono::Duration::hours(2))
+            .unwrap();
+        storage.flush().unwrap();
+        assert!(storage.get_current_state(99).is_none());
+        assert_eq!(persisted_observations(temp_dir.path()).len(), 1);
+        assert_eq!(storage.stats().hot_observations, 1);
+        assert_eq!(storage.stats().warm_observations, 0);
+    }
+
+    #[test]
+    fn flush_retries_only_failed_and_unattempted_batches() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = ShadowStorage::new(ShadowStorageConfig {
+            base_dir: temp_dir.path().to_path_buf(),
+            auto_compact: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let now = Utc::now();
+        for (pid, timestamp, identity) in [
+            (7, now, "first_hot"),
+            (7, now - chrono::Duration::hours(2), "failed_warm"),
+            (8, now, "unattempted_hot"),
+        ] {
+            storage
+                .record(Observation {
+                    timestamp,
+                    pid,
+                    identity_hash: identity.to_string(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let blocker = temp_dir.path().join("warm/pid_7");
+        fs::write(&blocker, b"not a directory").unwrap();
+        assert!(storage.flush().is_err());
+        let rows = persisted_observations(temp_dir.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity_hash, "first_hot");
+        assert_eq!(storage.unflushed[&7].len(), 1);
+        assert_eq!(storage.unflushed[&8].len(), 1);
+
+        fs::rename(&blocker, temp_dir.path().join("warm_blocker")).unwrap();
+        storage.flush().unwrap();
+        storage.flush().unwrap();
+        let rows = persisted_observations(temp_dir.path());
+        let mut identities: Vec<_> = rows.iter().map(|obs| obs.identity_hash.as_str()).collect();
+        identities.sort_unstable();
+        assert_eq!(identities, ["failed_warm", "first_hot", "unattempted_hot"]);
+        assert!(storage.unflushed.is_empty());
+        assert_eq!(storage.stats().total_observations, 3);
+        assert_eq!(storage.stats().hot_observations, 2);
+        assert_eq!(storage.stats().warm_observations, 1);
+    }
+
+    #[test]
+    fn stats_write_failure_does_not_requeue_published_observations() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = ShadowStorage::new(ShadowStorageConfig {
+            base_dir: temp_dir.path().to_path_buf(),
+            auto_compact: false,
+            ..Default::default()
+        })
+        .unwrap();
+        storage
+            .record(Observation {
+                pid: 11,
+                identity_hash: "published_before_stats".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let stats_path = temp_dir.path().join("stats.json");
+        fs::create_dir(&stats_path).unwrap();
+        assert!(storage.flush().is_err());
+        assert!(storage.unflushed.is_empty());
+        assert_eq!(persisted_observations(temp_dir.path()).len(), 1);
+        fs::rename(&stats_path, temp_dir.path().join("stats_blocker")).unwrap();
+        storage.flush().unwrap();
+        assert_eq!(persisted_observations(temp_dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn pending_retention_keeps_existing_sampling_and_archive_counts() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = ShadowStorage::new(ShadowStorageConfig {
+            base_dir: temp_dir.path().to_path_buf(),
+            auto_compact: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let now = Utc::now();
+        for (hours, offset) in [
+            (2, 80),
+            (2, 20),
+            (2, 0),
+            (2, 61),
+            (48, 301),
+            (48, 100),
+            (48, 0),
+            (192, 0),
+        ] {
+            storage
+                .record(Observation {
+                    timestamp: now - chrono::Duration::hours(hours)
+                        + chrono::Duration::seconds(offset),
+                    pid: 12,
+                    identity_hash: "retention".to_string(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        storage.compact_at(now).unwrap();
+        assert_eq!(persisted_observations(temp_dir.path()).len(), 4);
+        assert_eq!(storage.stats().total_observations, 8);
+        assert_eq!(storage.stats().hot_observations, 0);
+        assert_eq!(storage.stats().warm_observations, 2);
+        assert_eq!(storage.stats().cold_observations, 2);
+        assert_eq!(storage.stats().archive_observations, 1);
+    }
+
+    #[test]
+    fn publication_keeps_complete_colliding_batches_and_ignores_staging() {
+        let temp_dir = TempDir::new().unwrap();
+        let now = Utc::now();
+        let first = Observation {
+            pid: 9,
+            identity_hash: "first".to_string(),
             ..Default::default()
         };
-        storage.record(obs).unwrap();
-
-        // Flush should succeed
-        storage.flush().unwrap();
-
-        // Stats file should exist
-        assert!(temp_dir.path().join("stats.json").exists());
+        let second = Observation {
+            pid: 9,
+            identity_hash: "second".to_string(),
+            ..Default::default()
+        };
+        for obs in [first, second] {
+            let (file, staging) = create_unique_observation_file(temp_dir.path(), 9, now).unwrap();
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &[obs]).unwrap();
+            writer.flush().unwrap();
+            writer.get_ref().sync_all().unwrap();
+            drop(writer);
+            publish_observation_file(&staging).unwrap();
+        }
+        fs::write(temp_dir.path().join("interrupted.pending"), b"[{incomplete").unwrap();
+        let mut identities: Vec<_> = persisted_observations(temp_dir.path())
+            .into_iter()
+            .map(|obs| obs.identity_hash)
+            .collect();
+        identities.sort_unstable();
+        assert_eq!(identities, ["first", "second"]);
     }
 
     #[test]
