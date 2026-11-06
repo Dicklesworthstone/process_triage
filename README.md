@@ -898,6 +898,14 @@ Categories: `agent`, `ide`, `ci`, `orchestrator`, `terminal`, `other`. `--patter
 
 Signatures are matched against the process name and command line. A matched signature with priors sets the class prior: `--prior useful` (about 90% useful) or `--prior abandoned` (about 80% abandoned). Built-in test-runner and build-tool signatures (jest, pytest, webpack, ...) lean toward "likely abandoned if old", dev-server signatures toward "likely useful"; their argument patterns match the tool as a command word (`node_modules/.bin/jest`, `python -m pytest`), not any path that contains the name. A signature added without `--prior` only labels its matches. Signature and learned priors apply the same way in `pt agent plan`, the TUI, `pt agent explain`, `snapshot`, `watch` and the MCP tools.
 
+Signature shortcut candidates also pass through ordinary inference, which retains
+the current activity/state likelihoods and complete evidence ledger. Agreement on
+the most likely class is insufficient to discard a change in its probability.
+`inference.fast_path.used` remains false when this verification ran, and the skip
+reason explains conflicting, missing, or probability-changing evidence. This also
+covers custom policies that lower the shortcut threshold; the default threshold
+is unchanged.
+
 ---
 
 ## Supervision Detection

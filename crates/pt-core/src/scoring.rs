@@ -7,7 +7,7 @@
 //!
 //! A score combines:
 //! 1. the class prior: a human verdict learned for the command pattern
-//!    ([`DecisionStore`]), else a matching signature's priors (or its fast path), else
+//!    ([`DecisionStore`]), else a matching signature's priors, else
 //!    the configured priors;
 //! 2. the snapshot evidence (CPU, runtime, orphan, TTY, state, plus deep-scan signals
 //!    when the caller collected them);
@@ -16,6 +16,10 @@
 //!    without a terminal is an app someone has open (GH #12);
 //! 4. on Linux, provenance evidence (lineage ownership, listeners, blast radius) when
 //!    the caller collected it with [`Scorer::collect_provenance`].
+//!
+//! Signature shortcut candidates are verified through ordinary inference. Its
+//! probabilities and full evidence ledger are retained, including when the most
+//! likely class agrees with the signature.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -26,8 +30,8 @@ use crate::config::{Policy, Priors, ResolvedConfig};
 use crate::decision::decision_store::{DecisionStore, LearnedPrior};
 use crate::inference::{
     apply_evidence_terms, compute_posterior_with_overrides, try_signature_fast_path, ClassScores,
-    CpuEvidence, Evidence, EvidenceLedger, EvidenceTerm, FastPathConfig, FastPathSkipReason,
-    PosteriorResult, PriorContext,
+    Classification, CpuEvidence, Evidence, EvidenceLedger, EvidenceTerm, FastPathConfig,
+    FastPathResult, FastPathSkipReason, PosteriorResult, PriorContext,
 };
 use crate::supervision::signature::{
     BetaParams, MatchLevel, ProcessExpectations, ProcessMatchContext, SignatureDatabase,
@@ -89,6 +93,62 @@ pub fn fast_path_skip_reason_label(reason: FastPathSkipReason) -> &'static str {
         FastPathSkipReason::NoMatch => "no_match",
         FastPathSkipReason::ScoreBelowThreshold => "score_below_threshold",
         FastPathSkipReason::NoPriors => "no_priors",
+    }
+}
+
+/// Explain why a signature candidate cannot replace the shared inference result.
+/// A matching command and its age do not verify current behavior. Use the
+/// existing likelihoods for observed activity/state/context, without introducing
+/// another scoring model or a tolerance that could hide an action-boundary change.
+fn signature_verification_reason(
+    candidate: &FastPathResult,
+    observed: &PosteriorResult,
+) -> (&'static str, &'static str) {
+    let mut informative = false;
+    for term in observed.evidence_terms.iter().filter(|term| {
+        matches!(
+            term.feature.as_str(),
+            "cpu" | "io_active" | "state_flag" | "net" | "tty" | "orphan" | "queue_saturated"
+        )
+    }) {
+        let scores = term.log_likelihood;
+        let proposed = match candidate.classification {
+            Classification::Useful => scores.useful,
+            Classification::UsefulBad => scores.useful_bad,
+            Classification::Abandoned => scores.abandoned,
+            Classification::Zombie => scores.zombie,
+        };
+        let alternatives = [
+            scores.useful,
+            scores.useful_bad,
+            scores.abandoned,
+            scores.zombie,
+        ];
+        // An absent optional likelihood model can yield equal scores even when
+        // the input contains a reading; that does not verify the signature.
+        informative |= alternatives.iter().any(|score| *score != proposed);
+        if alternatives.iter().any(|score| *score > proposed) {
+            return (
+                "conflicting_current_evidence",
+                "Current observations contradict the signature shortcut; retained the measured posterior and full evidence ledger",
+            );
+        }
+    }
+    if !informative {
+        (
+            "no_current_evidence",
+            "No informative current observations verify the signature; retained ordinary inference with unknown signals omitted",
+        )
+    } else if observed.posterior != candidate.posterior.posterior {
+        (
+            "current_evidence_changes_posterior",
+            "Current observations change class probabilities; retained the measured posterior and full evidence ledger",
+        )
+    } else {
+        (
+            "verified_with_inference",
+            "Signature probabilities agree with current observations; retained the verification and its full evidence ledger",
+        )
     }
 }
 
@@ -191,8 +251,8 @@ pub struct ProcessScore<'a> {
     /// Identity-bound windowed activity, including reasons for missing signals.
     /// None when no window was requested; then snapshot CPU remains the input.
     pub activity: Option<ProcessActivity>,
-    /// Where the class prior came from (`global`, `signature`, `user` for a learned
-    /// verdict, or `signature_fast_path`).
+    /// Where the class prior came from (`global`, `signature`, or `user` for a learned
+    /// verdict).
     pub prior_source: String,
     pub signature: Option<SignatureMatch<'a>>,
     /// When the matched signature expects its processes to be left behind and states
@@ -200,6 +260,8 @@ pub struct ProcessScore<'a> {
     /// probability a normal run would have finished by now). `None` otherwise.
     pub signature_age_weight: Option<f64>,
     pub learned_prior: Option<LearnedPrior>,
+    /// Whether shared inference was bypassed. Signature candidates currently
+    /// require verification, so scoring retains that inference and reports false.
     pub fast_path_used: bool,
     pub fast_path_skip_reason: Option<&'static str>,
     /// The desktop application unit, when the process is a desktop application.
@@ -413,9 +475,9 @@ impl Scorer {
             user_overrides: learned_overrides.as_ref(),
         };
 
-        // A human verdict on this pattern outranks the signature fast path.
+        // A human verdict on this pattern outranks the signature candidate.
         let mut fast_path_skip_reason = None;
-        let fast_path = match prior_signature.filter(|_| learned_prior.is_none()) {
+        let signature_candidate = match prior_signature.filter(|_| learned_prior.is_none()) {
             Some(sig_match) => match try_signature_fast_path(&self.fast_path, Some(sig_match), pid)
             {
                 Ok(result) => result,
@@ -426,25 +488,25 @@ impl Scorer {
             },
             None => None,
         };
-        let fast_path_used = fast_path.is_some();
-        let (mut posterior, mut ledger, prior_source) = match fast_path {
-            Some(fast_path) => (
-                fast_path.posterior,
-                fast_path.ledger,
-                "signature_fast_path".to_string(),
-            ),
-            None => {
-                let (result, source_info) =
-                    compute_posterior_with_overrides(&prior_context, &evidence).ok()?;
-                let ledger = EvidenceLedger::from_posterior_result(&result, Some(pid), None);
-                (result, ledger, source_info.source.to_string())
-            }
-        };
+        // A signature match establishes a prior, not fresh activity or kernel
+        // state. Always verify it through the same likelihoods as other scores.
+        // Even an unchanged winning class can hide a probability change that
+        // crosses an action threshold; retain the computed probabilities and
+        // complete ledger rather than returning the prior-only shortcut.
+        let (mut posterior, source_info) =
+            compute_posterior_with_overrides(&prior_context, &evidence).ok()?;
+        let mut ledger = EvidenceLedger::from_posterior_result(&posterior, Some(pid), None);
+        let prior_source = source_info.source.to_string();
+        let signature_verification = signature_candidate
+            .as_ref()
+            .map(|candidate| signature_verification_reason(candidate, &posterior));
+        if let Some((reason, _)) = signature_verification {
+            fast_path_skip_reason = Some(reason);
+        }
 
         // Only when the signature actually set the prior (not a learned verdict, and
         // not a match too weak for its priors to apply).
-        let signature_set_prior =
-            matches!(prior_source.as_str(), "signature" | "signature_fast_path");
+        let signature_set_prior = prior_source == "signature";
         let abandon_signature = signature
             .as_ref()
             .filter(|sig_match| {
@@ -502,25 +564,27 @@ impl Scorer {
         }
 
         if let Some(sig_match) = signature.as_ref() {
-            if !fast_path_used {
-                ledger.top_evidence.insert(
-                    0,
-                    format!(
-                        "Signature match: {} (score={:.2}, level={})",
-                        sig_match.signature.name,
-                        sig_match.score,
-                        match_level_label(sig_match.level)
-                    ),
-                );
-                ledger.why_summary = format!(
-                    "Matched signature '{}' (score {:.2}, level {}, prior source {}). {}",
+            ledger.top_evidence.insert(
+                0,
+                format!(
+                    "Signature match: {} (score={:.2}, level={})",
                     sig_match.signature.name,
                     sig_match.score,
-                    match_level_label(sig_match.level),
-                    prior_source,
-                    ledger.why_summary
-                );
-            }
+                    match_level_label(sig_match.level)
+                ),
+            );
+            ledger.why_summary = format!(
+                "Matched signature '{}' (score {:.2}, level {}, prior source {}). {}",
+                sig_match.signature.name,
+                sig_match.score,
+                match_level_label(sig_match.level),
+                prior_source,
+                ledger.why_summary
+            );
+        }
+        if let Some((_, explanation)) = signature_verification {
+            ledger.top_evidence.push(explanation.to_string());
+            ledger.why_summary.push_str(&format!(" {explanation}."));
         }
 
         // The age weight only shaped the prior when the signature set it.
@@ -557,13 +621,8 @@ impl Scorer {
                     activity.io_error.as_deref().unwrap_or("no usable sample")
                 ),
             };
-            let usage = if fast_path_used {
-                "; signature fast path did not use these likelihoods"
-            } else {
-                ""
-            };
             ledger.top_evidence.push(format!(
-                "Activity ({}; requested {}ms): {cpu}; {io}{usage}",
+                "Activity ({}; requested {}ms): {cpu}; {io}",
                 activity.source, activity.requested_window_ms
             ));
         }
@@ -576,7 +635,7 @@ impl Scorer {
             signature,
             signature_age_weight,
             learned_prior,
-            fast_path_used,
+            fast_path_used: false,
             fast_path_skip_reason,
             desktop_app,
             desktop_app_credited,
@@ -1101,6 +1160,269 @@ mod tests {
         activity.cpu_error = None;
         activity.io_error = None;
         activity
+    }
+
+    fn configured_signature_scorer(priors: SignaturePriors) -> Scorer {
+        let mut signatures = SignatureDatabase::new();
+        signatures
+            .add(
+                SupervisorSignature::new("worker", SupervisorCategory::Other)
+                    .with_process_patterns(vec![r"^worker$"])
+                    .with_confidence(1.0)
+                    .with_priors(priors),
+            )
+            .unwrap();
+        let mut scorer = scorer(signatures);
+        // The supported custom policy reaches the exact-name match at 0.85.
+        // Production's default 0.90 threshold and matching context are unchanged.
+        scorer.fast_path = FastPathConfig::with_threshold(0.85);
+        scorer
+    }
+
+    fn strongly_abandoned_signature() -> SignaturePriors {
+        SignaturePriors {
+            useful: Some(BetaParams::new(1.0, 999.0)),
+            useful_bad: Some(BetaParams::new(1.0, 999.0)),
+            abandoned: Some(BetaParams::new(997.0, 3.0)),
+            zombie: Some(BetaParams::new(1.0, 999.0)),
+        }
+    }
+
+    #[test]
+    fn configured_signature_cannot_discard_fresh_cpu_or_io_likelihoods() {
+        let process = record(1234, "worker", "worker --job", FOUR_DAYS);
+        for feature in ["cpu", "io_active"] {
+            let mut measured = configured_signature_scorer(strongly_abandoned_signature());
+            let mut activity =
+                ProcessActivity::unavailable(&process, Duration::from_millis(500), "fixture");
+            activity.source = "procfs_window".to_string();
+            if feature == "cpu" {
+                activity.cpu_percent = Some(80.0);
+                activity.cpu_ticks = Some(40);
+                activity.cpu_window_seconds = Some(0.5);
+                activity.cpu_error = None;
+            } else {
+                activity.io_active = Some(true);
+                activity.read_bytes_per_second = Some(4096.0);
+                activity.write_bytes_per_second = Some(1024.0);
+                activity.io_window_seconds = Some(0.5);
+                activity.io_error = None;
+            }
+            measured.activity_window = Some(Duration::from_millis(500));
+            measured.activity.insert(process.pid.0, activity);
+            let mut reference = measured.clone();
+            reference.fast_path = FastPathConfig::disabled();
+            let incoming = Evidence {
+                cpu: Some(CpuEvidence::Fraction { occupancy: 0.0 }),
+                io_active: Some(false),
+                ..Evidence::default()
+            };
+            let expected = reference
+                .score_with_desktop(&process, incoming.clone(), None)
+                .unwrap();
+            let actual = measured
+                .score_with_desktop(&process, incoming, None)
+                .unwrap();
+            let shortcut = try_signature_fast_path(
+                &measured.fast_path,
+                actual.signature.as_ref(),
+                process.pid.0,
+            )
+            .unwrap()
+            .unwrap();
+
+            assert!(!actual.fast_path_used);
+            assert_eq!(actual.prior_source, "signature");
+            assert_eq!(
+                actual.fast_path_skip_reason,
+                Some("conflicting_current_evidence")
+            );
+            assert_eq!(actual.posterior, expected.posterior);
+            assert_eq!(actual.ledger.posterior, expected.ledger.posterior);
+            assert!(actual
+                .posterior
+                .evidence_terms
+                .iter()
+                .any(|term| term.feature == feature));
+            // The class can still agree while prior-only confidence would be
+            // higher and could pass a downstream action threshold incorrectly.
+            assert_eq!(actual.ledger.classification, shortcut.classification);
+            assert!(
+                actual.posterior.posterior.abandonment_probability()
+                    < shortcut.posterior.posterior.abandonment_probability()
+            );
+            assert!(!actual.ledger.why_summary.contains("bypassed"));
+        }
+    }
+
+    #[test]
+    fn configured_signature_cannot_hide_zombie_or_disk_sleep_state() {
+        let measured = configured_signature_scorer(SignaturePriors::likely_useful());
+        let mut reference = measured.clone();
+        reference.fast_path = FastPathConfig::disabled();
+        for state in [ProcessState::Zombie, ProcessState::DiskSleep] {
+            let mut process = record(1234, "worker", "worker --job", FOUR_DAYS);
+            process.state = state;
+            let evidence = Evidence {
+                state_flag: Evidence::from_snapshot(&process).state_flag,
+                ..Evidence::default()
+            };
+            let expected = reference
+                .score_with_desktop(&process, evidence.clone(), None)
+                .unwrap();
+            let actual = measured
+                .score_with_desktop(&process, evidence, None)
+                .unwrap();
+            assert!(!actual.fast_path_used);
+            assert_eq!(
+                actual.fast_path_skip_reason,
+                Some("conflicting_current_evidence")
+            );
+            assert_eq!(actual.posterior, expected.posterior);
+            assert!(actual
+                .ledger
+                .posterior
+                .evidence_terms
+                .iter()
+                .any(|term| term.feature == "state_flag"));
+            if state == ProcessState::Zombie {
+                assert_eq!(actual.ledger.classification, Classification::Zombie);
+            }
+        }
+    }
+
+    #[test]
+    fn agreeing_signature_keeps_probability_updates_and_complete_ledger() {
+        let measured = configured_signature_scorer(SignaturePriors {
+            useful: Some(BetaParams::new(90.0, 10.0)),
+            useful_bad: Some(BetaParams::new(3.0, 97.0)),
+            abandoned: Some(BetaParams::new(4.0, 96.0)),
+            zombie: Some(BetaParams::new(3.0, 97.0)),
+        });
+        let process = record(1234, "worker", "worker --job", FOUR_DAYS);
+        let actual = measured
+            .score_with_desktop(
+                &process,
+                Evidence {
+                    io_active: Some(true),
+                    ..Evidence::default()
+                },
+                None,
+            )
+            .unwrap();
+        let shortcut = try_signature_fast_path(
+            &measured.fast_path,
+            actual.signature.as_ref(),
+            process.pid.0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual.ledger.classification, shortcut.classification);
+        assert!(!actual.fast_path_used);
+        assert_eq!(
+            actual.fast_path_skip_reason,
+            Some("current_evidence_changes_posterior")
+        );
+        assert_ne!(actual.posterior.posterior, shortcut.posterior.posterior);
+        assert!(actual
+            .ledger
+            .posterior
+            .evidence_terms
+            .iter()
+            .any(|term| term.feature == "io_active"));
+    }
+
+    #[test]
+    fn unknown_window_cannot_validate_signature_or_restore_stale_activity() {
+        let mut process = record(1234, "worker", "worker --job", FOUR_DAYS);
+        process.cpu_percent = 90.0;
+        let mut measured = configured_signature_scorer(strongly_abandoned_signature());
+        measured.collect_activity(&[], Duration::from_millis(500));
+        let mut reference = measured.clone();
+        reference.fast_path = FastPathConfig::disabled();
+        let incoming = Evidence {
+            cpu: Some(CpuEvidence::Fraction { occupancy: 0.9 }),
+            io_active: Some(true),
+            runtime_seconds: Some(process.elapsed.as_secs_f64()),
+            ..Evidence::default()
+        };
+        let expected = reference
+            .score_with_desktop(&process, incoming.clone(), None)
+            .unwrap();
+        let actual = measured
+            .score_with_desktop(&process, incoming, None)
+            .unwrap();
+        assert!(!actual.fast_path_used);
+        assert_eq!(actual.fast_path_skip_reason, Some("no_current_evidence"));
+        assert_eq!(actual.posterior, expected.posterior);
+        assert!(actual
+            .posterior
+            .evidence_terms
+            .iter()
+            .all(|term| term.feature != "cpu" && term.feature != "io_active"));
+        let activity = actual.activity.as_ref().unwrap();
+        assert!(activity.cpu_percent.is_none());
+        assert!(activity.io_active.is_none());
+        assert!(actual
+            .ledger
+            .top_evidence
+            .iter()
+            .any(|line| line.contains("CPU unavailable") && line.contains("I/O unavailable")));
+
+        let empty = measured
+            .score_with_desktop(&process, Evidence::default(), None)
+            .unwrap();
+        assert!(!empty.fast_path_used);
+        assert_eq!(empty.fast_path_skip_reason, Some("no_current_evidence"));
+        assert!(empty
+            .posterior
+            .evidence_terms
+            .iter()
+            .all(|term| term.feature == "prior"));
+    }
+
+    #[test]
+    fn unmodeled_reading_does_not_verify_signature() {
+        let process = record(1234, "worker", "worker --job", FOUR_DAYS);
+        let mut measured = configured_signature_scorer(SignaturePriors::likely_useful());
+        measured.priors.classes.useful.io_active_beta = None;
+        measured.priors.classes.useful_bad.io_active_beta = None;
+        measured.priors.classes.abandoned.io_active_beta = None;
+        measured.priors.classes.zombie.io_active_beta = None;
+        let actual = measured
+            .score_with_desktop(
+                &process,
+                Evidence {
+                    io_active: Some(true),
+                    ..Evidence::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert!(!actual.fast_path_used);
+        assert_eq!(actual.fast_path_skip_reason, Some("no_current_evidence"));
+    }
+
+    #[test]
+    fn configured_signature_cannot_bypass_evidence_validation_errors() {
+        let measured = configured_signature_scorer(strongly_abandoned_signature());
+        let process = record(1234, "worker", "worker --job", FOUR_DAYS);
+        for evidence in [
+            Evidence {
+                cpu: Some(CpuEvidence::Fraction {
+                    occupancy: f64::NAN,
+                }),
+                ..Evidence::default()
+            },
+            Evidence {
+                state_flag: Some(usize::MAX),
+                ..Evidence::default()
+            },
+        ] {
+            assert!(measured
+                .score_with_desktop(&process, evidence, None)
+                .is_none());
+        }
     }
 
     #[test]
