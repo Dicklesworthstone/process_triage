@@ -11160,6 +11160,9 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
             let (reloaded, enabled) = load_daemon_config(global);
             if enabled {
                 config = reloaded;
+                // Observations under the old limits cannot establish recovery
+                // under newly loaded overhead budgets.
+                state_bundle.daemon.interrupt_overhead_recovery();
                 // Apply new ladder config while preserving persisted state.
                 notify_mgr = pt_core::decision::escalation::EscalationManager::from_persisted(
                     config.notification_ladder.clone(),
@@ -11180,13 +11183,17 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
         }
 
         let mut budget_exceeded = false;
+        let mut cpu_budget_observed = false;
         let now = std::time::Instant::now();
-        if let Some(cpu_total) = current_cpu_seconds() {
+        if let Some(cpu_total) = current_cpu_seconds().filter(|v| v.is_finite() && *v >= 0.0) {
             if let Some((prev_cpu, prev_time)) = last_cpu_sample {
                 let wall = now.duration_since(prev_time).as_secs_f64();
                 let cpu_delta = cpu_total - prev_cpu;
                 if wall > 0.0 && cpu_delta >= 0.0 {
                     let cpu_pct = (cpu_delta / wall) * 100.0;
+                    cpu_budget_observed = cpu_pct.is_finite()
+                        && config.max_cpu_percent.is_finite()
+                        && config.max_cpu_percent >= 0.0;
                     if cpu_pct > config.max_cpu_percent {
                         budget_exceeded = true;
                         state_bundle.daemon.record_event(
@@ -11200,8 +11207,11 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                 }
             }
             last_cpu_sample = Some((cpu_total, now));
+        } else {
+            last_cpu_sample = None;
         }
-        if let Some(rss_mb) = current_rss_mb() {
+        let rss_mb = current_rss_mb();
+        if let Some(rss_mb) = rss_mb {
             if rss_mb > config.max_rss_mb {
                 budget_exceeded = true;
                 state_bundle.daemon.record_event(
@@ -11209,6 +11219,18 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                     &format!("rss {} MB exceeds budget {}", rss_mb, config.max_rss_mb),
                 );
             }
+        }
+
+        if budget_exceeded
+            || (cpu_budget_observed && (rss_mb.is_some() || !cfg!(target_os = "linux")))
+        {
+            state_bundle
+                .daemon
+                .observe_overhead_budget(&config, budget_exceeded);
+        } else {
+            // Missing readings (including the first CPU baseline) cannot prove
+            // recovery. RSS budgeting is currently implemented only on Linux.
+            state_bundle.daemon.interrupt_overhead_recovery();
         }
 
         let (daemon_state, trigger_state, escalation_state) = (
@@ -11328,13 +11350,7 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
             break;
         }
 
-        let next_tick_secs = if budget_exceeded {
-            // An overhead violation retains the base interval rather than
-            // increasing this daemon's own load while the host is under pressure.
-            config.tick_interval_secs.max(1)
-        } else {
-            state_bundle.daemon.next_tick_interval_secs(&config)
-        };
+        let next_tick_secs = state_bundle.daemon.next_tick_interval_secs(&config);
         if daemon_sleep_with_interrupt(next_tick_secs) {
             continue;
         }
@@ -11794,11 +11810,16 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
         None
     };
 
+    let (config, _) = load_daemon_config(global);
+    let next_tick_interval_secs = state
+        .as_ref()
+        .map(|state| state.daemon.next_tick_interval_secs(&config));
     let response = serde_json::json!({
         "command": "daemon status",
         "running": running,
         "pid": pid,
         "base_dir": daemon_base_dir().display().to_string(),
+        "next_tick_interval_secs": next_tick_interval_secs,
         "state": state
             .as_ref()
             .and_then(|s| serde_json::to_value(s).ok()),
@@ -11813,6 +11834,16 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
                 println!("Daemon running (pid {}).", pid.unwrap_or(0));
             } else {
                 println!("Daemon not running.");
+            }
+            if let Some(state) = &state {
+                if state.daemon.overhead_backoff.interval_secs > 0 {
+                    println!(
+                        "Overhead backoff: {}s between ticks; {}/{} healthy ticks toward recovery.",
+                        state.daemon.next_tick_interval_secs(&config),
+                        state.daemon.overhead_backoff.healthy_ticks,
+                        config.overhead_backoff.healthy_ticks_before_recovery.max(1)
+                    );
+                }
             }
         }
     }
@@ -13217,6 +13248,7 @@ fn load_daemon_state(path: &Path, config: &pt_core::daemon::DaemonConfig) -> Dae
             // daemon downtime are not a consecutive live-observation sequence.
             state.daemon.memory_pressure.observe(None);
             state.daemon.last_memory_pressure = None;
+            state.daemon.interrupt_overhead_recovery();
             return state;
         }
     }
@@ -13456,9 +13488,14 @@ mod daemon_pressure_tests {
         signal.psi_some10 = Some(1.0);
         signal.timestamp += 60.0;
         bundle.daemon.memory_pressure.observe(Some(&signal));
+        bundle.daemon.observe_overhead_budget(&config, true);
+        bundle.daemon.observe_overhead_budget(&config, false);
+        assert_eq!(bundle.daemon.overhead_backoff.healthy_ticks, 1);
         save_daemon_state(&path, &bundle).unwrap();
 
         let mut restored = load_daemon_state(&path, &config);
+        assert_eq!(restored.daemon.next_tick_interval_secs(&config), 120);
+        assert_eq!(restored.daemon.overhead_backoff.healthy_ticks, 0);
         assert_eq!(
             restored.daemon.memory_pressure.mode(),
             PressureMode::Emergency
@@ -13631,6 +13668,7 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
         auto_mitigate: Option<DaemonAutoMitigate>,
         cooldown: Option<DaemonCooldown>,
         memory_pressure: Option<pt_core::decision::mem_pressure::MemPressureConfig>,
+        overhead_backoff: Option<pt_core::daemon::OverheadBackoffConfig>,
     }
 
     #[derive(Deserialize)]
@@ -13680,6 +13718,9 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
     if let Ok(file_cfg) = serde_json::from_str::<DaemonFileConfig>(&content) {
         if let Some(pressure) = file_cfg.memory_pressure {
             config.memory_pressure = pressure;
+        }
+        if let Some(backoff) = file_cfg.overhead_backoff {
+            config.overhead_backoff = backoff;
         }
         if let Some(value) = file_cfg.enabled {
             enabled = value;

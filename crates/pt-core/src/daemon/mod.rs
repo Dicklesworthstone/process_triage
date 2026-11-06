@@ -52,6 +52,42 @@ pub struct DaemonConfig {
     /// Memory/PSI pressure response. It generates review plans, never actions.
     #[serde(default)]
     pub memory_pressure: MemPressureConfig,
+    /// Reduce the daemon's sampling frequency when its own overhead is too high.
+    #[serde(default)]
+    pub overhead_backoff: OverheadBackoffConfig,
+}
+
+/// Polling backoff after a daemon CPU or RSS budget violation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverheadBackoffConfig {
+    /// Maximum backed-off interval. A slower configured base interval takes
+    /// precedence, so a budget violation can never make the daemon poll faster.
+    pub max_interval_secs: u64,
+    /// Consecutive ticks within budget before halving the backed-off interval.
+    /// Zero is treated as one tick.
+    pub healthy_ticks_before_recovery: u32,
+}
+
+impl Default for OverheadBackoffConfig {
+    fn default() -> Self {
+        Self {
+            max_interval_secs: 300,
+            healthy_ticks_before_recovery: 3,
+        }
+    }
+}
+
+/// Persisted overhead delay and the current consecutive recovery observations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverheadBackoffState {
+    /// Zero means normal polling; otherwise this interval overrides the faster
+    /// memory-pressure cadence, subject to the current configuration's bounds.
+    pub interval_secs: u64,
+    /// Exposed in status. The daemon resets this after restart or a missing
+    /// overhead observation, because neither establishes continued recovery.
+    pub healthy_ticks: u32,
 }
 
 /// Notification delivery settings for the daemon.
@@ -94,6 +130,7 @@ impl Default for DaemonConfig {
             notification_ladder: crate::decision::escalation::EscalationConfig::default(),
             notifications: DaemonNotificationsConfig::default(),
             memory_pressure: MemPressureConfig::default(),
+            overhead_backoff: OverheadBackoffConfig::default(),
         }
     }
 }
@@ -141,6 +178,7 @@ pub enum DaemonEventType {
     EscalationFailed,
     LockContention,
     OverheadBudgetExceeded,
+    OverheadBackoffChanged,
     ConfigReloaded,
     LoadEvidenceUnavailable,
     MemoryPressureChanged,
@@ -170,6 +208,9 @@ pub struct DaemonState {
     /// Retain a warning's plan request when lock contention or cooldown defers it.
     #[serde(default)]
     pub memory_pressure_plan_pending: bool,
+    /// Persistent self-limiting delay, independent of the host pressure state.
+    #[serde(default)]
+    pub overhead_backoff: OverheadBackoffState,
 }
 
 impl Default for DaemonState {
@@ -192,6 +233,7 @@ impl DaemonState {
             last_pressure: None,
             last_memory_pressure: None,
             memory_pressure_plan_pending: false,
+            overhead_backoff: OverheadBackoffState::default(),
         }
     }
 
@@ -231,10 +273,94 @@ impl DaemonState {
         self.last_memory_pressure = evaluation;
     }
 
-    /// Pressure can increase polling cadence, never slow the configured base
-    /// cadence or create a zero-duration busy loop.
+    /// Observe the daemon's own budget exactly once per collection tick, before
+    /// deciding whether planning is allowed. A breach doubles the delay, up to
+    /// the configured cap. Recovery requires consecutive within-budget ticks
+    /// and halves the delay one step at a time.
+    ///
+    /// The first delay is measured from at least the configured base interval:
+    /// a host emergency must not make an over-budget daemon poll more often.
+    /// Existing state is bounded on every observation so config reloads and
+    /// persisted out-of-range intervals cannot bypass the cap.
+    /// Pass `false` only after observing that the daemon is within budget; if
+    /// overhead evidence is unavailable, interrupt recovery instead.
+    pub fn observe_overhead_budget(&mut self, config: &DaemonConfig, budget_exceeded: bool) {
+        let base = config.tick_interval_secs.max(1);
+        let cap = config.overhead_backoff.max_interval_secs.max(base);
+        let recovery_ticks = config.overhead_backoff.healthy_ticks_before_recovery.max(1);
+        let previous_interval = self.next_tick_interval_secs(config);
+        let previous_backoff = self.overhead_backoff.interval_secs;
+        let mut recovered = false;
+        if self.overhead_backoff.interval_secs > 0 {
+            self.overhead_backoff.interval_secs =
+                self.overhead_backoff.interval_secs.clamp(base, cap);
+        }
+        if self.overhead_backoff.healthy_ticks >= recovery_ticks {
+            // A valid streak is always shorter than the threshold: reaching it
+            // consumes the streak. Do not trust stale or out-of-range state.
+            self.overhead_backoff.healthy_ticks = 0;
+        }
+
+        if budget_exceeded {
+            self.overhead_backoff.interval_secs = self
+                .overhead_backoff
+                .interval_secs
+                .max(base)
+                .saturating_mul(2)
+                .min(cap);
+            self.overhead_backoff.healthy_ticks = 0;
+        } else if self.overhead_backoff.interval_secs > 0 {
+            self.overhead_backoff.healthy_ticks =
+                self.overhead_backoff.healthy_ticks.saturating_add(1);
+            if self.overhead_backoff.healthy_ticks >= recovery_ticks {
+                let reduced = self.overhead_backoff.interval_secs / 2;
+                self.overhead_backoff.interval_secs = if reduced > base { reduced } else { 0 };
+                self.overhead_backoff.healthy_ticks = 0;
+                recovered = true;
+            }
+        } else {
+            self.overhead_backoff.healthy_ticks = 0;
+        }
+
+        if self.overhead_backoff.interval_secs != previous_backoff {
+            let reason = if budget_exceeded {
+                "overhead budget exceeded"
+            } else if self.overhead_backoff.interval_secs == 0 {
+                "within-budget recovery completed"
+            } else if recovered {
+                "consecutive within-budget observations"
+            } else {
+                "configured overhead backoff limit"
+            };
+            self.record_event(
+                DaemonEventType::OverheadBackoffChanged,
+                &format!(
+                    "poll interval {}s -> {}s: {}",
+                    previous_interval,
+                    self.next_tick_interval_secs(config),
+                    reason
+                ),
+            );
+        }
+    }
+
+    /// Restart downtime and missing overhead samples break the consecutive
+    /// healthy streak without discarding an active self-limiting delay.
+    pub fn interrupt_overhead_recovery(&mut self) {
+        self.overhead_backoff.healthy_ticks = 0;
+    }
+
+    /// Pressure can increase polling cadence only while overhead backoff is
+    /// inactive. Every interval is at least one second and bounded arithmetic
+    /// prevents extreme configuration or persisted values from overflowing.
     pub fn next_tick_interval_secs(&self, config: &DaemonConfig) -> u64 {
         let base = config.tick_interval_secs.max(1);
+        if self.overhead_backoff.interval_secs > 0 {
+            return self
+                .overhead_backoff
+                .interval_secs
+                .clamp(base, config.overhead_backoff.max_interval_secs.max(base));
+        }
         let requested = self.memory_pressure.scan_interval_secs();
         if requested.is_finite() && requested > 0.0 {
             (requested.ceil() as u64).max(1).min(base)
@@ -583,6 +709,190 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         let restored: DaemonConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.tick_interval_secs, 60);
+    }
+
+    #[test]
+    fn overhead_backoff_doubles_until_capped() {
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        assert_eq!(state.next_tick_interval_secs(&config), 60);
+
+        for expected in [120, 240, 300, 300, 300] {
+            state.observe_overhead_budget(&config, true);
+            assert_eq!(state.next_tick_interval_secs(&config), expected);
+            assert_eq!(state.overhead_backoff.healthy_ticks, 0);
+        }
+        assert_eq!(
+            state
+                .recent_events
+                .iter()
+                .filter(|event| event.event_type == DaemonEventType::OverheadBackoffChanged)
+                .count(),
+            3,
+            "a sustained violation at the cap must not emit duplicate delay changes"
+        );
+    }
+
+    #[test]
+    fn overhead_backoff_recovers_gradually_after_consecutive_healthy_ticks() {
+        let config = DaemonConfig {
+            overhead_backoff: OverheadBackoffConfig {
+                max_interval_secs: 480,
+                healthy_ticks_before_recovery: 3,
+            },
+            ..Default::default()
+        };
+        let mut state = DaemonState::new();
+        state.observe_overhead_budget(&config, true);
+        state.observe_overhead_budget(&config, true);
+        for _ in 0..2 {
+            state.observe_overhead_budget(&config, false);
+            assert_eq!(state.next_tick_interval_secs(&config), 240);
+        }
+        state.observe_overhead_budget(&config, true);
+        assert_eq!(state.next_tick_interval_secs(&config), 480);
+        assert_eq!(state.overhead_backoff.healthy_ticks, 0);
+
+        for (before, after) in [(480, 240), (240, 120), (120, 60)] {
+            for _ in 0..2 {
+                state.observe_overhead_budget(&config, false);
+                assert_eq!(state.next_tick_interval_secs(&config), before);
+            }
+            state.observe_overhead_budget(&config, false);
+            assert_eq!(state.next_tick_interval_secs(&config), after);
+            assert_eq!(state.overhead_backoff.healthy_ticks, 0);
+        }
+        assert_eq!(state.overhead_backoff.interval_secs, 0);
+        state.observe_overhead_budget(&config, false);
+        assert_eq!(state.overhead_backoff.healthy_ticks, 0);
+    }
+
+    #[test]
+    fn overhead_backoff_survives_restart_without_reusing_recovery_streak() {
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        state.observe_overhead_budget(&config, true);
+        state.observe_overhead_budget(&config, false);
+        state.observe_overhead_budget(&config, false);
+        let saved = serde_json::to_value(&state).unwrap();
+        assert_eq!(saved["overhead_backoff"]["healthy_ticks"], 2);
+
+        let mut restored: DaemonState = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.next_tick_interval_secs(&config), 120);
+        assert_eq!(restored.overhead_backoff.healthy_ticks, 2);
+        restored.interrupt_overhead_recovery();
+        assert_eq!(restored.overhead_backoff.healthy_ticks, 0);
+        for _ in 0..2 {
+            restored.observe_overhead_budget(&config, false);
+            assert_eq!(restored.next_tick_interval_secs(&config), 120);
+        }
+        restored.observe_overhead_budget(&config, false);
+        assert_eq!(restored.next_tick_interval_secs(&config), 60);
+    }
+
+    #[test]
+    fn overhead_backoff_defaults_allow_existing_config_and_state() {
+        let mut config = serde_json::to_value(DaemonConfig::default()).unwrap();
+        config.as_object_mut().unwrap().remove("overhead_backoff");
+        let config: DaemonConfig = serde_json::from_value(config).unwrap();
+        assert_eq!(config.overhead_backoff.max_interval_secs, 300);
+        assert_eq!(config.overhead_backoff.healthy_ticks_before_recovery, 3);
+
+        let partial: OverheadBackoffConfig =
+            serde_json::from_str(r#"{"healthy_ticks_before_recovery":5}"#).unwrap();
+        assert_eq!(partial.max_interval_secs, 300);
+        assert_eq!(partial.healthy_ticks_before_recovery, 5);
+
+        let mut state = serde_json::to_value(DaemonState::new()).unwrap();
+        state.as_object_mut().unwrap().remove("overhead_backoff");
+        let state: DaemonState = serde_json::from_value(state).unwrap();
+        assert_eq!(state.overhead_backoff.interval_secs, 0);
+        assert_eq!(state.next_tick_interval_secs(&config), 60);
+    }
+
+    #[test]
+    fn overhead_backoff_reconfiguration_bounds_the_existing_delay() {
+        let mut config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        state.observe_overhead_budget(&config, true);
+        state.observe_overhead_budget(&config, true);
+        assert_eq!(state.next_tick_interval_secs(&config), 240);
+
+        config.tick_interval_secs = 30;
+        config.overhead_backoff.max_interval_secs = 90;
+        config.overhead_backoff.healthy_ticks_before_recovery = 2;
+        assert_eq!(state.next_tick_interval_secs(&config), 90);
+        state.observe_overhead_budget(&config, false);
+        assert_eq!(state.overhead_backoff.interval_secs, 90);
+        state.observe_overhead_budget(&config, false);
+        assert_eq!(state.next_tick_interval_secs(&config), 45);
+        state.observe_overhead_budget(&config, false);
+        state.observe_overhead_budget(&config, false);
+        assert_eq!(state.overhead_backoff.interval_secs, 0);
+        assert_eq!(state.next_tick_interval_secs(&config), 30);
+
+        config.tick_interval_secs = 180;
+        state.observe_overhead_budget(&config, true);
+        assert_eq!(state.next_tick_interval_secs(&config), 180);
+    }
+
+    #[test]
+    fn overhead_backoff_handles_zero_and_extreme_values_without_overflow() {
+        let mut config = DaemonConfig {
+            tick_interval_secs: 0,
+            overhead_backoff: OverheadBackoffConfig {
+                max_interval_secs: 0,
+                healthy_ticks_before_recovery: 0,
+            },
+            ..Default::default()
+        };
+        let mut state = DaemonState::new();
+        state.observe_overhead_budget(&config, true);
+        assert_eq!(state.next_tick_interval_secs(&config), 1);
+        state.observe_overhead_budget(&config, false);
+        assert_eq!(state.next_tick_interval_secs(&config), 1);
+        assert_eq!(state.overhead_backoff.interval_secs, 0);
+
+        config.tick_interval_secs = u64::MAX;
+        config.overhead_backoff.max_interval_secs = u64::MAX;
+        for _ in 0..3 {
+            state.observe_overhead_budget(&config, true);
+            assert_eq!(state.next_tick_interval_secs(&config), u64::MAX);
+        }
+
+        config = DaemonConfig::default();
+        let mut saved = serde_json::to_value(&state).unwrap();
+        saved["overhead_backoff"]["healthy_ticks"] = serde_json::json!(u32::MAX);
+        let mut restored: DaemonState = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.next_tick_interval_secs(&config), 300);
+        restored.observe_overhead_budget(&config, false);
+        assert_eq!(restored.overhead_backoff.interval_secs, 300);
+        assert_eq!(restored.overhead_backoff.healthy_ticks, 1);
+    }
+
+    #[test]
+    fn overhead_backoff_overrides_emergency_cadence_without_clearing_pressure() {
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        let mut metrics = pressure_metrics(40, Some(75.0), 1000);
+        state.observe_memory_pressure(&config, &metrics);
+        advance_reading(&mut metrics);
+        state.observe_memory_pressure(&config, &metrics);
+        assert_eq!(state.memory_pressure.mode(), PressureMode::Emergency);
+        assert_eq!(state.next_tick_interval_secs(&config), 15);
+
+        state.observe_overhead_budget(&config, true);
+        assert_eq!(state.next_tick_interval_secs(&config), 120);
+        for _ in 0..2 {
+            advance_reading(&mut metrics);
+            state.observe_memory_pressure(&config, &metrics);
+            state.observe_overhead_budget(&config, false);
+            assert_eq!(state.next_tick_interval_secs(&config), 120);
+        }
+        state.observe_overhead_budget(&config, false);
+        assert_eq!(state.next_tick_interval_secs(&config), 15);
+        assert_eq!(state.memory_pressure.mode(), PressureMode::Emergency);
+        assert!(state.memory_pressure_plan_pending);
     }
 
     fn pressure_metrics(utilization_percent: u64, psi: Option<f64>, at_secs: u64) -> TickMetrics {

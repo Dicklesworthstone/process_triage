@@ -838,7 +838,9 @@ The daemon enforces overhead budgets on itself:
 - **RSS cap**: 64MB by default (configurable)
 - **Event audit ring**: Circular buffer of 100 recent events for debugging
 
-If the daemon itself exceeds its budget, it skips plan generation and uses the base polling interval. Cheap pressure observations continue, so missing a plan cycle does not erase an ongoing pressure episode.
+If the daemon itself exceeds its budget, it skips plan generation and doubles its polling interval, up to 300 seconds by default. After three consecutive observed ticks within budget, it halves the delay; further healthy sequences restore normal polling. Missing overhead readings interrupt recovery, and restarting preserves the delay while requiring fresh recovery observations. An active overhead delay takes precedence over the faster memory-pressure cadence. Cheap pressure observations continue, so missing a plan cycle does not erase an ongoing pressure episode.
+
+Configure `overhead_backoff.max_interval_secs` and `overhead_backoff.healthy_ticks_before_recovery` in `daemon.json`. A configured base interval longer than the cap remains the minimum. `daemon status` reports the effective next interval and recovery progress; delay transitions appear in the event audit ring.
 
 ---
 
