@@ -19,6 +19,95 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 
+/// The requested freezer state and the kernel's completed effective state.
+///
+/// `cgroup.freeze` is only a request. In particular, a thaw request does not
+/// thaw a cgroup while an ancestor remains frozen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FreezerState {
+    pub(crate) requested: bool,
+    pub(crate) frozen: bool,
+}
+
+/// Read both freezer facts without changing the cgroup. Missing or malformed
+/// acknowledgement data is an error, never evidence that an action completed.
+pub(crate) fn read_freezer_state(directory: &Path) -> Result<FreezerState, ActionError> {
+    let request_path = directory.join("cgroup.freeze");
+    let request = fs::read_to_string(&request_path).map_err(|error| {
+        ActionError::Failed(format!("cannot read {}: {error}", request_path.display()))
+    })?;
+    let requested = parse_freezer_bit(request.trim(), "cgroup.freeze")?;
+    let frozen = read_frozen_event(&directory.join("cgroup.events"))?;
+    Ok(FreezerState { requested, frozen })
+}
+
+fn parse_freezer_bit(value: &str, source: &str) -> Result<bool, ActionError> {
+    match value {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        _ => Err(ActionError::Failed(format!(
+            "unexpected {source} value: {value:?}"
+        ))),
+    }
+}
+
+/// Read the completed state, refusing missing, ambiguous, or malformed evidence.
+fn parse_frozen_event(content: &str) -> Result<bool, ActionError> {
+    let mut frozen = None;
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("frozen") {
+            continue;
+        }
+        let state = match (fields.next(), fields.next()) {
+            (Some("0"), None) => false,
+            (Some("1"), None) => true,
+            _ => {
+                return Err(ActionError::Failed(
+                    "malformed frozen field in cgroup.events".to_string(),
+                ));
+            }
+        };
+        if frozen.replace(state).is_some() {
+            return Err(ActionError::Failed(
+                "duplicate frozen field in cgroup.events".to_string(),
+            ));
+        }
+    }
+    frozen.ok_or_else(|| ActionError::Failed("missing frozen field in cgroup.events".to_string()))
+}
+
+fn read_frozen_event(events_path: &Path) -> Result<bool, ActionError> {
+    let content = fs::read_to_string(events_path).map_err(|error| {
+        ActionError::Failed(format!("cannot read {}: {error}", events_path.display()))
+    })?;
+    parse_frozen_event(&content)
+}
+
+/// Observe immediately, then poll without sleeping beyond the remaining budget.
+/// A zero timeout permits one observation but never waits for a transition.
+fn wait_for_frozen_state(
+    expected: bool,
+    timeout: Duration,
+    mut observe: impl FnMut() -> Result<FreezerState, ActionError>,
+) -> Result<(), ActionError> {
+    let started = Instant::now();
+    loop {
+        let state = observe()?;
+        if state.requested == expected && state.frozen == expected {
+            return Ok(());
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(ActionError::Timeout);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        if started.elapsed() >= timeout {
+            return Err(ActionError::Timeout);
+        }
+    }
+}
+
 /// Freeze action runner configuration.
 #[derive(Debug, Clone)]
 pub struct FreezeConfig {
@@ -105,7 +194,7 @@ impl FreezeActionRunner {
     fn verify_frozen_state(&self, action: &PlanAction, frozen: bool) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
         let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
-        let events_path = format!("/sys/fs/cgroup{checked_path}/cgroup.events");
+        let directory = format!("/sys/fs/cgroup{checked_path}");
         let timeout = Duration::from_millis(
             self.config
                 .propagation_timeout_ms
@@ -114,74 +203,25 @@ impl FreezeActionRunner {
 
         // cgroup.freeze records the request. Only cgroup.events reports that
         // freezing has completed, or that an ancestor no longer keeps it frozen.
-        wait_for_frozen_state(Path::new(&events_path), frozen, timeout)?;
-
-        // Waiting opens another identity/membership race. Recheck the complete
-        // guard and require the target to remain in the cgroup we just observed.
-        if super::dispatch::ensure_cgroup_target(&action.target)? != checked_path {
-            return Err(ActionError::Failed(
-                "cannot verify freezer transition after cgroup membership changed".to_string(),
-            ));
-        }
+        // Every sample rechecks the complete guard and the same cgroup path,
+        // including the final sample that can establish a completed transition.
+        wait_for_frozen_state(frozen, timeout, || {
+            if super::dispatch::ensure_cgroup_target(&action.target)? != checked_path {
+                return Err(ActionError::Failed(
+                    "target cgroup changed during freezer verification".to_string(),
+                ));
+            }
+            let state = read_freezer_state(Path::new(&directory));
+            if super::dispatch::ensure_cgroup_target(&action.target)? != checked_path {
+                return Err(ActionError::Failed(
+                    "target cgroup changed during freezer observation".to_string(),
+                ));
+            }
+            state
+        })?;
 
         debug!(pid, frozen, "freezer transition verified");
         Ok(())
-    }
-}
-
-/// Read the completed state, refusing missing, ambiguous, or malformed evidence.
-fn parse_frozen_event(content: &str) -> Result<bool, ActionError> {
-    let mut frozen = None;
-    for line in content.lines() {
-        let mut fields = line.split_whitespace();
-        if fields.next() != Some("frozen") {
-            continue;
-        }
-        let state = match (fields.next(), fields.next()) {
-            (Some("0"), None) => false,
-            (Some("1"), None) => true,
-            _ => {
-                return Err(ActionError::Failed(
-                    "malformed frozen field in cgroup.events".to_string(),
-                ));
-            }
-        };
-        if frozen.replace(state).is_some() {
-            return Err(ActionError::Failed(
-                "duplicate frozen field in cgroup.events".to_string(),
-            ));
-        }
-    }
-    frozen.ok_or_else(|| ActionError::Failed("missing frozen field in cgroup.events".to_string()))
-}
-
-fn read_frozen_event(events_path: &Path) -> Result<bool, ActionError> {
-    let content = fs::read_to_string(events_path).map_err(|error| {
-        ActionError::Failed(format!("cannot read {}: {error}", events_path.display()))
-    })?;
-    parse_frozen_event(&content)
-}
-
-/// Observe immediately, then poll without sleeping beyond the remaining budget.
-/// A zero timeout permits one observation but never waits for a transition.
-fn wait_for_frozen_state(
-    events_path: &Path,
-    frozen: bool,
-    timeout: Duration,
-) -> Result<(), ActionError> {
-    let started = Instant::now();
-    loop {
-        if read_frozen_event(events_path)? == frozen {
-            return Ok(());
-        }
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(ActionError::Timeout);
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
-        if started.elapsed() >= timeout {
-            return Err(ActionError::Timeout);
-        }
     }
 }
 
@@ -330,8 +370,17 @@ mod tests {
             // may keep the target frozen after its own freeze request is cleared.
             fs::write(&freeze_path, request).unwrap();
             fs::write(&events_path, events).unwrap();
+            assert_eq!(
+                read_freezer_state(dir.path()).unwrap(),
+                FreezerState {
+                    requested: expected,
+                    frozen: !expected,
+                }
+            );
             assert!(matches!(
-                wait_for_frozen_state(&events_path, expected, Duration::ZERO),
+                wait_for_frozen_state(expected, Duration::ZERO, || {
+                    read_freezer_state(dir.path())
+                }),
                 Err(ActionError::Timeout)
             ));
         }
@@ -343,11 +392,19 @@ mod tests {
         let events_path = dir.path().join("cgroup.events");
         for frozen in [true, false] {
             fs::write(
+                dir.path().join("cgroup.freeze"),
+                u8::from(frozen).to_string(),
+            )
+            .unwrap();
+            fs::write(
                 &events_path,
                 format!("populated 1\nfrozen {}\n", u8::from(frozen)),
             )
             .unwrap();
-            assert!(wait_for_frozen_state(&events_path, frozen, Duration::ZERO).is_ok());
+            assert!(wait_for_frozen_state(frozen, Duration::ZERO, || {
+                read_freezer_state(dir.path())
+            })
+            .is_ok());
         }
     }
 
@@ -357,6 +414,11 @@ mod tests {
         let events_path = dir.path().join("cgroup.events");
         let transition_delay = Duration::from_millis(20);
         for frozen in [true, false] {
+            fs::write(
+                dir.path().join("cgroup.freeze"),
+                u8::from(frozen).to_string(),
+            )
+            .unwrap();
             fs::write(
                 &events_path,
                 format!("populated 1\nfrozen {}\n", u8::from(!frozen)),
@@ -376,7 +438,9 @@ mod tests {
                 // accept a truncated frozen field as evidence of completion.
                 fs::rename(pending_path, destination).unwrap();
             });
-            let result = wait_for_frozen_state(&events_path, frozen, Duration::from_secs(2));
+            let result = wait_for_frozen_state(frozen, Duration::from_secs(2), || {
+                read_freezer_state(dir.path())
+            });
             let elapsed = started.elapsed();
             writer.join().unwrap();
             assert!(result.is_ok(), "transition not observed: {result:?}");
@@ -391,11 +455,12 @@ mod tests {
     fn freezer_completion_times_out_while_still_pending() {
         let dir = tempfile::tempdir().unwrap();
         let events_path = dir.path().join("cgroup.events");
+        fs::write(dir.path().join("cgroup.freeze"), "1\n").unwrap();
         fs::write(&events_path, "populated 1\nfrozen 0\n").unwrap();
         let timeout = Duration::from_millis(5);
         let started = Instant::now();
         assert!(matches!(
-            wait_for_frozen_state(&events_path, true, timeout),
+            wait_for_frozen_state(true, timeout, || read_freezer_state(dir.path())),
             Err(ActionError::Timeout)
         ));
         assert!(started.elapsed() >= timeout);
@@ -407,17 +472,114 @@ mod tests {
         let events_path = dir.path().join("cgroup.events");
         for path in [events_path.as_path(), dir.path()] {
             assert!(matches!(
-                wait_for_frozen_state(path, false, Duration::ZERO),
+                wait_for_frozen_state(false, Duration::ZERO, || {
+                    read_frozen_event(path).map(|frozen| FreezerState {
+                        requested: false,
+                        frozen,
+                    })
+                }),
                 Err(ActionError::Failed(_))
             ));
         }
+        fs::write(dir.path().join("cgroup.freeze"), "0\n").unwrap();
         for content in ["populated 1\n", "frozen 0 extra\n", "frozen 1\nfrozen 0\n"] {
             fs::write(&events_path, content).unwrap();
             assert!(matches!(
-                wait_for_frozen_state(&events_path, false, Duration::ZERO),
+                wait_for_frozen_state(false, Duration::ZERO, || read_freezer_state(dir.path())),
                 Err(ActionError::Failed(_))
             ));
         }
+    }
+
+    #[test]
+    fn freezer_read_refuses_missing_or_malformed_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(read_freezer_state(directory.path()).is_err());
+        fs::write(directory.path().join("cgroup.freeze"), "1\n").unwrap();
+        assert!(read_freezer_state(directory.path()).is_err());
+        fs::write(directory.path().join("cgroup.events"), "populated 1\n").unwrap();
+        assert!(read_freezer_state(directory.path()).is_err());
+        fs::write(directory.path().join("cgroup.events"), "frozen 1\n").unwrap();
+        fs::write(directory.path().join("cgroup.freeze"), "yes\n").unwrap();
+        assert!(read_freezer_state(directory.path()).is_err());
+    }
+
+    #[test]
+    fn zero_timeout_observes_once_and_requires_completed_transition() {
+        for expected in [false, true] {
+            for state in [
+                FreezerState {
+                    requested: expected,
+                    frozen: expected,
+                },
+                FreezerState {
+                    requested: expected,
+                    frozen: !expected,
+                },
+                FreezerState {
+                    requested: !expected,
+                    frozen: expected,
+                },
+            ] {
+                let mut observations = 0;
+                let result = wait_for_frozen_state(expected, Duration::ZERO, || {
+                    observations += 1;
+                    Ok(state)
+                });
+                assert_eq!(observations, 1);
+                if state.requested == expected && state.frozen == expected {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(result, Err(ActionError::Timeout)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn freezer_poll_propagates_identity_failure_during_transition() {
+        let mut observations = 0;
+        let result = wait_for_frozen_state(true, Duration::from_secs(2), || {
+            observations += 1;
+            if observations == 1 {
+                Ok(FreezerState {
+                    requested: true,
+                    frozen: false,
+                })
+            } else {
+                Err(ActionError::IdentityMismatch)
+            }
+        });
+        assert_eq!(observations, 2);
+        assert!(matches!(result, Err(ActionError::IdentityMismatch)));
+    }
+
+    #[test]
+    fn freezer_poll_never_observes_again_after_its_deadline() {
+        let mut observations = 0;
+        let result = wait_for_frozen_state(true, Duration::from_millis(5), || {
+            observations += 1;
+            Ok(FreezerState {
+                requested: true,
+                frozen: observations > 1,
+            })
+        });
+        assert!(matches!(result, Err(ActionError::Timeout)));
+        assert_eq!(observations, 1);
+    }
+
+    #[test]
+    fn completed_freezer_transition_does_not_wait_out_timeout() {
+        let mut observations = 0;
+        wait_for_frozen_state(false, Duration::from_secs(60), || {
+            observations += 1;
+            Ok(FreezerState {
+                requested: false,
+                frozen: false,
+            })
+        })
+        .unwrap();
+        assert_eq!(observations, 1);
     }
 
     #[cfg(target_os = "linux")]
