@@ -596,13 +596,13 @@ pub fn can_quarantine_cpuset(_pid: u32) -> bool {
 const MAX_CPUSET_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CpuSet {
+pub(crate) struct CpuSet {
     // Sorted, nonoverlapping inclusive intervals; always nonempty.
     ranges: Vec<(u32, u32)>,
 }
 
 impl CpuSet {
-    fn parse(input: &str) -> Result<Self, ActionError> {
+    pub(crate) fn parse(input: &str) -> Result<Self, ActionError> {
         if input.len() > MAX_CPUSET_BYTES {
             return Err(ActionError::Failed(
                 "CPU list exceeds the size limit".to_string(),
@@ -666,7 +666,7 @@ impl CpuSet {
         true
     }
 
-    fn first(&self, count: u32) -> Self {
+    pub(crate) fn first(&self, count: u32) -> Self {
         let mut remaining = u64::from(count);
         let mut ranges = Vec::new();
         for &(start, end) in &self.ranges {
@@ -682,7 +682,7 @@ impl CpuSet {
         Self { ranges }
     }
 
-    fn as_list(&self) -> String {
+    pub(crate) fn as_list(&self) -> String {
         self.ranges
             .iter()
             .map(|&(start, end)| {

@@ -161,14 +161,36 @@ pub enum ActionPostcondition {
     IdentityChanged,
 }
 
-/// Observe the priority postcondition used by the default production apply runner.
+/// Observe the postconditions used by the default production apply runner.
 ///
 /// Linux nice values belong to threads: use the existing stable, identity-bound
 /// thread snapshot, not the leader's priority alone. Capturing reversal metadata
 /// reads current priorities; it neither changes them nor restores anything.
-/// Unsupported controller actions remain unknown until their own observations
-/// can prove the configured effect. Priority verification does not prove CPU relief.
+/// Controller observations bind both process identity and cgroup membership around
+/// their reads. Verifying a configured effect does not establish resource relief.
 pub fn observe_live_postcondition(action: &PlanAction) -> ActionPostcondition {
+    #[cfg(target_os = "linux")]
+    if matches!(
+        action.action,
+        Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine
+    ) {
+        use crate::action::LiveIdentityProvider;
+
+        return observe_bound_cgroup(
+            action,
+            &LiveIdentityProvider::new(),
+            || std::fs::read_to_string(format!("/proc/{}/cgroup", action.target.pid.0)),
+            |membership| {
+                observe_cgroup_files(
+                    action.action,
+                    action.target.pid.0,
+                    membership,
+                    std::path::Path::new("/sys/fs/cgroup"),
+                )
+                .unwrap_or_else(|reason| ActionPostcondition::Unavailable { reason })
+            },
+        );
+    }
     if action.action != Action::Renice {
         return ActionPostcondition::Unavailable {
             reason: "No live observation is implemented for this action's postcondition"
@@ -212,6 +234,310 @@ pub fn observe_live_postcondition(action: &PlanAction) -> ActionPostcondition {
             reason: "Live priority verification is unsupported on this platform".to_string(),
         }
     }
+}
+
+/// Keep a successful controller read from surviving process exit, PID reuse or
+/// migration to another cgroup during observation. This function only reads.
+#[cfg(target_os = "linux")]
+fn observe_bound_cgroup(
+    action: &PlanAction,
+    identity: &dyn crate::action::IdentityProvider,
+    mut read_membership: impl FnMut() -> std::io::Result<String>,
+    observe: impl FnOnce(&str) -> ActionPostcondition,
+) -> ActionPostcondition {
+    if !action.target.can_safely_revalidate() {
+        return ActionPostcondition::Unavailable {
+            reason: "The planned identity cannot be safely revalidated".to_string(),
+        };
+    }
+    let revalidate = || match identity.revalidate(&action.target) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("The planned identity is absent, changed, or unreadable".to_string()),
+        Err(error) => Err(format!("Cannot revalidate the planned identity: {error}")),
+    };
+    if let Err(reason) = revalidate() {
+        return ActionPostcondition::Unavailable { reason };
+    }
+    let before = match read_membership() {
+        Ok(membership) => membership,
+        Err(error) => {
+            return ActionPostcondition::Unavailable {
+                reason: format!("Cannot read the target's cgroup membership: {error}"),
+            };
+        }
+    };
+    let observation = observe(&before);
+    let after = read_membership();
+    if let Err(reason) = revalidate() {
+        return ActionPostcondition::Unavailable { reason };
+    }
+    match after {
+        Ok(after) if after == before => observation,
+        Ok(_) => ActionPostcondition::Unavailable {
+            reason: "The target's cgroup membership changed during observation".to_string(),
+        },
+        Err(error) => ActionPostcondition::Unavailable {
+            reason: format!("Cannot recheck the target's cgroup membership: {error}"),
+        },
+    }
+}
+
+/// Resolve only kernel membership paths beneath the same controller mounts used
+/// by the action runners. A namespace-relative `..` path cannot be safely mapped.
+#[cfg(target_os = "linux")]
+fn controller_directory(
+    membership: &str,
+    root: &std::path::Path,
+    controller: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    use std::path::Component;
+
+    let mut selected = None;
+    for line in membership.lines() {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+            .ok_or("Invalid cgroup hierarchy in membership evidence")?;
+        let controllers = fields.next().ok_or("Missing cgroup controllers")?;
+        let path = fields.next().ok_or("Missing cgroup membership path")?;
+        let matches = match controller {
+            None => hierarchy == 0 && controllers.is_empty(),
+            Some(controller) => controllers.split(',').any(|name| name == controller),
+        };
+        if !matches {
+            continue;
+        }
+        if selected.is_some() {
+            return Err("Ambiguous duplicate controller membership".to_string());
+        }
+        let path = std::path::Path::new(path);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+        {
+            return Err(
+                "Cgroup membership cannot be mapped safely to its controller mount".to_string(),
+            );
+        }
+        let relative = path
+            .strip_prefix("/")
+            .map_err(|error| format!("Invalid cgroup membership path: {error}"))?;
+        selected = Some(match controller {
+            Some(controller) => root.join(controller).join(relative),
+            None => root.join(relative),
+        });
+    }
+    Ok(selected)
+}
+
+#[cfg(target_os = "linux")]
+fn read_controller_file(path: &std::path::Path) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| format!("Cannot read {}: {error}", path.display()))
+}
+
+/// A cgroup namespace and the mounted filesystem can have different roots. The
+/// selected directory must actually contain the target in our PID namespace;
+/// checking the same pathname twice alone would not establish this binding.
+#[cfg(target_os = "linux")]
+fn observe_controller_directory(
+    pid: u32,
+    directory: &std::path::Path,
+    observe: impl FnOnce() -> Result<ActionPostcondition, String>,
+) -> Result<ActionPostcondition, String> {
+    let check_membership = || {
+        let content = read_controller_file(&directory.join("cgroup.procs"))?;
+        let mut target_present = false;
+        for line in content.lines() {
+            let member = line
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|member| *member > 0)
+                .ok_or_else(|| format!("Invalid cgroup.procs at {}", directory.display()))?;
+            target_present |= member == pid;
+        }
+        if target_present {
+            Ok(())
+        } else {
+            Err(format!(
+                "Controller directory {} does not contain target PID {pid}",
+                directory.display()
+            ))
+        }
+    };
+    check_membership()?;
+    let result = observe();
+    check_membership()?;
+    result
+}
+
+/// Observe the default runner's actual controller settings without replaying it.
+/// Missing v2 interfaces may use the same hybrid v1 controller as execution;
+/// unreadable or malformed v2 evidence must not silently fall back to another.
+#[cfg(target_os = "linux")]
+fn observe_cgroup_files(
+    action: Action,
+    pid: u32,
+    membership: &str,
+    root: &std::path::Path,
+) -> Result<ActionPostcondition, String> {
+    let unified = controller_directory(membership, root, None)?;
+    if matches!(action, Action::Freeze | Action::Unfreeze) {
+        let directory = unified.ok_or("No unified cgroup freezer membership is available")?;
+        return observe_controller_directory(pid, &directory, || {
+            let state = crate::action::freeze::read_freezer_state(&directory)
+                .map_err(|error| error.to_string())?;
+            let expected = action == Action::Freeze;
+            let detail = format!(
+            "Observed cgroup {}: freeze requested={}, effectively frozen={}; expected both {}. This verifies freezer state, not resource relief",
+            directory.display(), state.requested, state.frozen, expected,
+        );
+            Ok(if state.requested == expected && state.frozen == expected {
+                ActionPostcondition::Satisfied { detail }
+            } else {
+                ActionPostcondition::NotSatisfied { detail }
+            })
+        });
+    }
+
+    let (controller, filename) = match action {
+        Action::Throttle => ("cpu", "cpu.max"),
+        Action::Quarantine => ("cpuset", "cpuset.cpus"),
+        _ => return Err("No controller postcondition is defined for this action".to_string()),
+    };
+    if let Some(directory) = unified {
+        let path = directory.join(filename);
+        match std::fs::metadata(&path) {
+            Ok(_) => {
+                return observe_controller_directory(pid, &directory, || match action {
+                    Action::Throttle => throttle_postcondition(&read_controller_file(&path)?),
+                    Action::Quarantine => observe_quarantine(
+                        || read_controller_file(&path),
+                        || read_controller_file(&directory.join("cpuset.cpus.effective")),
+                    ),
+                    _ => unreachable!(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Cannot read {}: {error}", path.display())),
+        }
+    }
+
+    let directory = controller_directory(membership, root, Some(controller))?
+        .ok_or_else(|| format!("No readable {controller} controller is available"))?;
+    observe_controller_directory(pid, &directory, || match action {
+        Action::Throttle => {
+            observe_v1_throttle(|filename| read_controller_file(&directory.join(filename)))
+        }
+        Action::Quarantine => observe_quarantine(
+            || read_controller_file(&directory.join("cpuset.cpus")),
+            || read_controller_file(&directory.join("cpuset.effective_cpus")),
+        ),
+        _ => unreachable!(),
+    })
+}
+
+/// V1 exposes quota and period separately. Bracket the quota read with period
+/// reads so a concurrent period update cannot fabricate a stronger limit.
+#[cfg(target_os = "linux")]
+fn observe_v1_throttle(
+    mut read: impl FnMut(&str) -> Result<String, String>,
+) -> Result<ActionPostcondition, String> {
+    let period = read("cpu.cfs_period_us")?;
+    let quota = read("cpu.cfs_quota_us")?;
+    let quota_after = read("cpu.cfs_quota_us")?;
+    let after = read("cpu.cfs_period_us")?;
+    if period.trim() != after.trim() || quota.trim() != quota_after.trim() {
+        return Err("CPU quota or period changed during controller observation".to_string());
+    }
+    // The v1 unlimited sentinel has the same meaning as v2's `max`.
+    let quota = if quota.trim() == "-1" {
+        "max"
+    } else {
+        quota.trim()
+    };
+    throttle_postcondition(&format!("{} {}", quota, period.trim()))
+}
+
+#[cfg(target_os = "linux")]
+fn throttle_postcondition(content: &str) -> Result<ActionPostcondition, String> {
+    let mut fields = content.split_whitespace();
+    let quota = match fields.next() {
+        Some("max") => -1,
+        Some(value) => value
+            .parse::<i64>()
+            .ok()
+            .filter(|quota| *quota > 0)
+            .ok_or("Invalid CPU quota in controller evidence")?,
+        None => return Err("Missing CPU quota in controller evidence".to_string()),
+    };
+    let period = fields
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|period| *period > 0)
+        .ok_or("Invalid CPU period in controller evidence")?;
+    if fields.next().is_some() {
+        return Err("Unexpected extra fields in CPU controller evidence".to_string());
+    }
+    let expected = crate::action::CpuThrottleConfig::default();
+    let matches = crate::action::cgroup_throttle::quota_within_limit(quota, period, &expected)
+        .map_err(|error| error.to_string())?;
+    let detail = format!(
+        "Observed CPU quota {} per {period} us; expected no more bandwidth than {} per {} us from the default runner. This verifies the configured limit, not measured CPU relief",
+        if quota == -1 { "unlimited".to_string() } else { quota.to_string() },
+        expected.quota_us(), expected.period_us,
+    );
+    Ok(if matches {
+        ActionPostcondition::Satisfied { detail }
+    } else {
+        ActionPostcondition::NotSatisfied { detail }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn observe_quarantine(
+    mut read_configured: impl FnMut() -> Result<String, String>,
+    mut read_effective: impl FnMut() -> Result<String, String>,
+) -> Result<ActionPostcondition, String> {
+    let configured = read_configured()?;
+    let effective = read_effective()?;
+    let effective_after = read_effective()?;
+    let configured_after = read_configured()?;
+    if configured.trim() != configured_after.trim() || effective.trim() != effective_after.trim() {
+        return Err("CPU confinement changed during controller observation".to_string());
+    }
+    quarantine_postcondition(&configured, &effective)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_postcondition(
+    configured: &str,
+    effective: &str,
+) -> Result<ActionPostcondition, String> {
+    use crate::action::cpuset_quarantine::CpuSet;
+
+    if configured.trim().is_empty() || effective.trim().is_empty() {
+        return Ok(ActionPostcondition::NotSatisfied {
+            detail: "An empty configured or effective CPU set does not establish quarantine"
+                .to_string(),
+        });
+    }
+    let requested = CpuSet::parse(configured).map_err(|error| error.to_string())?;
+    let effective = CpuSet::parse(effective).map_err(|error| error.to_string())?;
+    let limit = crate::action::DEFAULT_QUARANTINE_CPUS;
+    let matches = requested == effective && effective.first(limit) == effective;
+    let detail = format!(
+        "Observed configured CPUs {}, effective CPUs {}; expected the same nonempty set of at most {limit} CPU(s) from the default runner. This verifies CPU confinement, not resource relief",
+        requested.as_list(), effective.as_list(),
+    );
+    Ok(if matches {
+        ActionPostcondition::Satisfied { detail }
+    } else {
+        ActionPostcondition::NotSatisfied { detail }
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -662,8 +988,8 @@ pub fn verify_plan(
 
 /// Verify saved successful executions against current, identity-bound evidence.
 ///
-/// Process snapshots prove Kill/Pause/Resume states. Renice needs a separate
-/// current priority observation, injected so fixture verification remains pure.
+/// Process snapshots prove Kill/Pause/Resume states. Priority and controller
+/// actions need separate current observations, injected to keep fixture replay pure.
 /// Missing, failed and planning-only execution records never invoke the observer.
 pub fn verify_plan_with_postconditions(
     plan: &Plan,
@@ -752,7 +1078,11 @@ pub fn verify_plan_with_postconditions(
             )
         } else {
             match (action.action, current_target) {
-                (Action::Kill | Action::Pause | Action::Resume | Action::Renice, Some(process))
+                (
+                    Action::Kill | Action::Pause | Action::Resume | Action::Renice
+                    | Action::Freeze | Action::Unfreeze | Action::Throttle | Action::Quarantine,
+                    Some(process),
+                )
                     if process.start_id != action.target.start_id
                         || process.uid != action.target.uid =>
                 {
@@ -788,7 +1118,11 @@ pub fn verify_plan_with_postconditions(
                     "still_stopped",
                     Some("The executed target is still stopped".to_string()),
                 ),
-                (Action::Renice, Some(process))
+                (
+                    Action::Renice | Action::Freeze | Action::Unfreeze
+                    | Action::Throttle | Action::Quarantine,
+                    Some(process),
+                )
                     if !matches!(
                         process.state,
                         ProcessState::Zombie | ProcessState::Dead | ProcessState::Unknown
@@ -797,12 +1131,26 @@ pub fn verify_plan_with_postconditions(
                     match observe(action) {
                         ActionPostcondition::Satisfied { detail } => (
                             VerifyOutcome::ConfirmedEffect,
-                            "priority_verified",
+                            match action.action {
+                                Action::Renice => "priority_verified",
+                                Action::Freeze => "freeze_verified",
+                                Action::Unfreeze => "thaw_verified",
+                                Action::Throttle => "cpu_limit_verified",
+                                Action::Quarantine => "cpu_confinement_verified",
+                                _ => unreachable!(),
+                            },
                             Some(detail),
                         ),
                         ActionPostcondition::NotSatisfied { detail } => (
                             VerifyOutcome::EffectNotObserved,
-                            "priority_not_adjusted",
+                            match action.action {
+                                Action::Renice => "priority_not_adjusted",
+                                Action::Freeze => "not_frozen",
+                                Action::Unfreeze => "still_frozen",
+                                Action::Throttle => "cpu_limit_not_adjusted",
+                                Action::Quarantine => "cpu_confinement_not_adjusted",
+                                _ => unreachable!(),
+                            },
                             Some(detail),
                         ),
                         ActionPostcondition::Unavailable { reason } => (
@@ -813,7 +1161,7 @@ pub fn verify_plan_with_postconditions(
                         ActionPostcondition::IdentityChanged => (
                             VerifyOutcome::PidReused,
                             "identity_changed",
-                            Some("The process identity changed during priority observation".to_string()),
+                            Some("The process identity changed during postcondition observation".to_string()),
                         ),
                     }
                 }
@@ -899,6 +1247,10 @@ pub fn verify_plan_with_postconditions(
                     Action::Pause => "stopped",
                     Action::Resume => "not_stopped",
                     Action::Renice => "default_nice_priority_on_every_current_thread",
+                    Action::Freeze => "cgroup_freeze_requested_and_completed",
+                    Action::Unfreeze => "cgroup_thaw_requested_and_completed",
+                    Action::Throttle => "default_cpu_bandwidth_ceiling",
+                    Action::Quarantine => "nonempty_effective_cpu_confinement",
                     _ => "effect_requires_additional_evidence",
                 }
                 .to_string(),
@@ -1912,6 +2264,389 @@ mod tests {
     }
 
     #[test]
+    fn controller_effects_require_fresh_observations_of_the_executed_identity() {
+        for action_kind in [
+            Action::Freeze,
+            Action::Unfreeze,
+            Action::Throttle,
+            Action::Quarantine,
+        ] {
+            let action = make_action(123, action_kind);
+            let saved = execution(&action);
+            let current = make_proc(123, 1000, "worker", 5, ProcessState::Sleeping);
+            let plan = make_plan(vec![action]);
+            let without_evidence = report(
+                &plan,
+                std::slice::from_ref(&saved),
+                std::slice::from_ref(&current),
+            );
+            assert_eq!(without_evidence.action_outcomes[0].verified, Some(false));
+
+            for (observation, expected) in [
+                (
+                    ActionPostcondition::Satisfied {
+                        detail: "current kernel state matches".into(),
+                    },
+                    VerifyOutcome::ConfirmedEffect,
+                ),
+                (
+                    ActionPostcondition::NotSatisfied {
+                        detail: "current kernel state differs".into(),
+                    },
+                    VerifyOutcome::EffectNotObserved,
+                ),
+                (
+                    ActionPostcondition::Unavailable {
+                        reason: "controller unreadable".into(),
+                    },
+                    VerifyOutcome::Unsupported,
+                ),
+                (
+                    ActionPostcondition::IdentityChanged,
+                    VerifyOutcome::PidReused,
+                ),
+            ] {
+                let result = verify_plan_with_postconditions(
+                    &plan,
+                    std::slice::from_ref(&saved),
+                    std::slice::from_ref(&current),
+                    DateTime::from_timestamp(30, 0).unwrap(),
+                    DateTime::from_timestamp(31, 0).unwrap(),
+                    |observed| {
+                        assert_eq!(observed.target, plan.actions[0].target);
+                        observation.clone()
+                    },
+                )
+                .unwrap();
+                let outcome = &result.action_outcomes[0];
+                assert_eq!(outcome.outcome, expected, "{action_kind:?}");
+                assert_eq!(
+                    outcome.verified,
+                    Some(expected == VerifyOutcome::ConfirmedEffect)
+                );
+                assert!(outcome.expected_resources_freed.is_none());
+                assert_eq!(result.resource_summary.unwrap().expected_freed_mb, 0.0);
+            }
+
+            for case in ["birth", "uid", "gone", "zombie", "failed", "dry_run"] {
+                let mut current = vec![current.clone()];
+                let mut saved = saved.clone();
+                match case {
+                    "birth" => current[0].start_id = StartId("boot:501:123".into()),
+                    "uid" => current[0].uid += 1,
+                    "gone" => current.clear(),
+                    "zombie" => current[0].state = ProcessState::Zombie,
+                    "failed" | "dry_run" => saved.status = case.into(),
+                    _ => unreachable!(),
+                }
+                let result = verify_plan_with_postconditions(
+                    &plan,
+                    &[saved],
+                    &current,
+                    DateTime::from_timestamp(30, 0).unwrap(),
+                    DateTime::from_timestamp(31, 0).unwrap(),
+                    |_| panic!("controller observer called for {action_kind:?}, {case}"),
+                )
+                .unwrap();
+                assert!(result
+                    .action_outcomes
+                    .iter()
+                    .all(|outcome| outcome.verified == Some(false)));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn controller_file_observations_distinguish_requested_effective_and_unknown_states() {
+        use std::fs;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let leaf = fixture.path().join("worker");
+        fs::create_dir(&leaf).unwrap();
+        fs::write(leaf.join("cgroup.procs"), "123\n456\n").unwrap();
+        let observe = |action| observe_cgroup_files(action, 123, "0::/worker\n", fixture.path());
+
+        fs::write(leaf.join("cgroup.freeze"), "1\n").unwrap();
+        fs::write(leaf.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(matches!(
+            observe(Action::Freeze).unwrap(),
+            ActionPostcondition::NotSatisfied { .. }
+        ));
+        fs::write(leaf.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        assert!(matches!(
+            observe(Action::Freeze).unwrap(),
+            ActionPostcondition::Satisfied { .. }
+        ));
+        fs::write(leaf.join("cgroup.freeze"), "0\n").unwrap();
+        assert!(
+            matches!(
+                observe(Action::Unfreeze).unwrap(),
+                ActionPostcondition::NotSatisfied { .. }
+            ),
+            "an ancestor can keep the cgroup effectively frozen after a local thaw request"
+        );
+        fs::write(leaf.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(matches!(
+            observe(Action::Unfreeze).unwrap(),
+            ActionPostcondition::Satisfied { .. }
+        ));
+        fs::write(leaf.join("cgroup.events"), "populated 1\n").unwrap();
+        assert!(observe(Action::Unfreeze).is_err());
+
+        for limit in [
+            "25000 100000",
+            "10000 100000",
+            "25000 200000",
+            "50000 200000",
+        ] {
+            fs::write(leaf.join("cpu.max"), limit).unwrap();
+            assert!(
+                matches!(
+                    observe(Action::Throttle).unwrap(),
+                    ActionPostcondition::Satisfied { .. }
+                ),
+                "stricter or equivalent cap must remain valid: {limit}"
+            );
+        }
+        for limit in ["max 100000", "100000 100000", "50000 100000"] {
+            fs::write(leaf.join("cpu.max"), limit).unwrap();
+            assert!(
+                matches!(
+                    observe(Action::Throttle).unwrap(),
+                    ActionPostcondition::NotSatisfied { .. }
+                ),
+                "{limit}"
+            );
+        }
+        for invalid in [
+            "",
+            "25000",
+            "25000 0",
+            "0 100000",
+            "-1 100000",
+            "25000 100000 extra",
+            "n/a 100000",
+        ] {
+            assert!(throttle_postcondition(invalid).is_err(), "{invalid}");
+        }
+
+        fs::write(leaf.join("cpuset.cpus"), "7\n").unwrap();
+        assert!(
+            observe(Action::Quarantine).is_err(),
+            "missing effective evidence is unknown"
+        );
+        fs::write(leaf.join("cpuset.cpus.effective"), "7\n").unwrap();
+        assert!(matches!(
+            observe(Action::Quarantine).unwrap(),
+            ActionPostcondition::Satisfied { .. }
+        ));
+        for (requested, effective) in [
+            ("", "7"),
+            ("7", ""),
+            ("7", "8"),
+            ("7", "7-8"),
+            ("7-8", "7-8"),
+        ] {
+            assert!(
+                matches!(
+                    quarantine_postcondition(requested, effective).unwrap(),
+                    ActionPostcondition::NotSatisfied { .. }
+                ),
+                "{requested:?}, {effective:?}"
+            );
+        }
+        assert!(matches!(
+            quarantine_postcondition("7,7", "7").unwrap(),
+            ActionPostcondition::Satisfied { .. }
+        ));
+        assert!(matches!(
+            quarantine_postcondition("0-4294967295", "0-4294967295").unwrap(),
+            ActionPostcondition::NotSatisfied { .. }
+        ));
+        for invalid in ["7,bad", "8-7", "7-8-9"] {
+            assert!(quarantine_postcondition(invalid, "7").is_err(), "{invalid}");
+            assert!(quarantine_postcondition("7", invalid).is_err(), "{invalid}");
+        }
+        for members in ["456\n", "", "123\nbad\n", "123\n0\n"] {
+            fs::write(leaf.join("cgroup.procs"), members).unwrap();
+            assert!(observe(Action::Quarantine).is_err(),
+                "matching controller values in a wrong or unreadable group cannot verify the target: {members:?}");
+        }
+        fs::write(leaf.join("cgroup.procs"), "123\n").unwrap();
+        assert!(
+            observe_controller_directory(123, &leaf, || {
+                fs::write(leaf.join("cgroup.procs"), "456\n").unwrap();
+                Ok(ActionPostcondition::Satisfied {
+                    detail: "matching settings".into(),
+                })
+            })
+            .is_err(),
+            "migration during a controller read invalidates its result"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hybrid_controller_observation_requires_real_fallback_evidence() {
+        use std::fs;
+
+        let fixture = tempfile::tempdir().unwrap();
+        fs::create_dir_all(fixture.path().join("worker")).unwrap();
+        let cpu = fixture.path().join("cpu/worker");
+        let cpuset = fixture.path().join("cpuset/worker");
+        fs::create_dir_all(&cpu).unwrap();
+        fs::create_dir_all(&cpuset).unwrap();
+        for directory in [&cpu, &cpuset, &fixture.path().join("worker")] {
+            fs::write(directory.join("cgroup.procs"), "123\n").unwrap();
+        }
+        let membership = "0::/worker\n2:cpu,cpuacct:/worker\n3:cpuset:/worker\n";
+        fs::write(cpu.join("cpu.cfs_quota_us"), "25000\n").unwrap();
+        fs::write(cpu.join("cpu.cfs_period_us"), "100000\n").unwrap();
+        assert!(matches!(
+            observe_cgroup_files(Action::Throttle, 123, membership, fixture.path()).unwrap(),
+            ActionPostcondition::Satisfied { .. }
+        ));
+        fs::write(cpu.join("cpu.cfs_quota_us"), "-1\n").unwrap();
+        assert!(matches!(
+            observe_cgroup_files(Action::Throttle, 123, membership, fixture.path()).unwrap(),
+            ActionPostcondition::NotSatisfied { .. }
+        ));
+        fs::write(cpuset.join("cpuset.cpus"), "9\n").unwrap();
+        fs::write(cpuset.join("cpuset.effective_cpus"), "9\n").unwrap();
+        assert!(matches!(
+            observe_cgroup_files(Action::Quarantine, 123, membership, fixture.path()).unwrap(),
+            ActionPostcondition::Satisfied { .. }
+        ));
+
+        fs::write(fixture.path().join("worker/cpu.max"), "malformed").unwrap();
+        assert!(
+            observe_cgroup_files(Action::Throttle, 123, membership, fixture.path()).is_err(),
+            "malformed v2 evidence must not be hidden by a valid v1 fallback"
+        );
+        for membership in [
+            "",
+            "0::/worker\n0::/other",
+            "0::relative",
+            "0::/../worker",
+            "not:a:membership",
+        ] {
+            assert!(
+                observe_cgroup_files(Action::Throttle, 123, membership, fixture.path()).is_err(),
+                "{membership}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v1_throttle_observation_rejects_mixed_generation_limits() {
+        for (quota_after, period_after) in [
+            ("200000", "600000"),
+            ("100000", "600000"),
+            ("200000", "100000"),
+        ] {
+            let mut reads = [
+                ("cpu.cfs_period_us", "100000"),
+                ("cpu.cfs_quota_us", "100000"),
+                ("cpu.cfs_quota_us", quota_after),
+                ("cpu.cfs_period_us", period_after),
+            ]
+            .into_iter();
+            // Neither 100000/100000 nor a later 200000/600000 meets the 25%
+            // ceiling, but combining the old quota with the new period would.
+            let result = observe_v1_throttle(|filename| {
+                let (expected, value) = reads.next().unwrap();
+                assert_eq!(filename, expected);
+                Ok(value.to_string())
+            });
+            assert!(result.is_err());
+            assert!(reads.next().is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quarantine_observation_rejects_changing_controller_values() {
+        for (configured_after, effective_after) in [("8", "8"), ("8", "7"), ("7", "8")] {
+            let mut configured = ["7", configured_after].into_iter();
+            let mut effective = ["7", effective_after].into_iter();
+            assert!(observe_quarantine(
+                || Ok(configured.next().unwrap().to_string()),
+                || Ok(effective.next().unwrap().to_string()),
+            )
+            .is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn controller_observation_discards_results_after_identity_or_membership_changes() {
+        use crate::action::{ActionError, IdentityProvider, StaticIdentityProvider};
+        use std::cell::Cell;
+
+        struct ChangingIdentity(Cell<usize>);
+        impl IdentityProvider for ChangingIdentity {
+            fn revalidate(&self, _: &ProcessIdentity) -> Result<bool, ActionError> {
+                let checks = self.0.get();
+                self.0.set(checks + 1);
+                Ok(checks == 0)
+            }
+        }
+        let action = make_action(123, Action::Throttle);
+        let observed = || ActionPostcondition::Satisfied {
+            detail: "matching limit".into(),
+        };
+        assert!(matches!(
+            observe_bound_cgroup(
+                &action,
+                &ChangingIdentity(Cell::new(0)),
+                || Ok("0::/worker\n".into()),
+                |_| observed(),
+            ),
+            ActionPostcondition::Unavailable { .. }
+        ));
+
+        let identity = StaticIdentityProvider::default().with_identity(action.target.clone());
+        let mut reads = 0;
+        let result = observe_bound_cgroup(
+            &action,
+            &identity,
+            || {
+                reads += 1;
+                Ok(if reads == 1 {
+                    "0::/worker\n"
+                } else {
+                    "0::/different\n"
+                }
+                .into())
+            },
+            |_| observed(),
+        );
+        assert!(matches!(result, ActionPostcondition::Unavailable { .. }));
+        assert_eq!(reads, 2);
+
+        assert_eq!(
+            observe_bound_cgroup(
+                &action,
+                &identity,
+                || Ok("0::/worker\n".into()),
+                |_| observed()
+            ),
+            observed()
+        );
+        assert!(matches!(
+            observe_bound_cgroup(
+                &action,
+                &identity,
+                || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                |_| panic!("must not observe without membership")
+            ),
+            ActionPostcondition::Unavailable { .. }
+        ));
+    }
+
+    #[test]
     fn postcondition_observer_never_runs_for_unexecuted_failed_or_unbound_subjects() {
         for case in [
             "none",
@@ -1925,12 +2660,12 @@ mod tests {
             "zombie",
             "dead",
             "unknown",
-            "controller",
+            "unsupported_restore",
         ] {
             let action = make_action(
                 123,
-                if case == "controller" {
-                    Action::Freeze
+                if case == "unsupported_restore" {
+                    Action::Unquarantine
                 } else {
                     Action::Renice
                 },
@@ -1946,7 +2681,7 @@ mod tests {
                 "zombie" => current[0].state = ProcessState::Zombie,
                 "dead" => current[0].state = ProcessState::Dead,
                 "unknown" => current[0].state = ProcessState::Unknown,
-                "controller" => {}
+                "unsupported_restore" => {}
                 _ => unreachable!(),
             }
             let verified = verify_plan_with_postconditions(

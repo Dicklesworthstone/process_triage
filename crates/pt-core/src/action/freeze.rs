@@ -33,11 +33,30 @@ pub(crate) struct FreezerState {
 /// acknowledgement data is an error, never evidence that an action completed.
 pub(crate) fn read_freezer_state(directory: &Path) -> Result<FreezerState, ActionError> {
     let request_path = directory.join("cgroup.freeze");
-    let request = fs::read_to_string(&request_path).map_err(|error| {
-        ActionError::Failed(format!("cannot read {}: {error}", request_path.display()))
-    })?;
-    let requested = parse_freezer_bit(request.trim(), "cgroup.freeze")?;
-    let frozen = read_frozen_event(&directory.join("cgroup.events"))?;
+    read_freezer_state_with(
+        || {
+            let request = fs::read_to_string(&request_path).map_err(|error| {
+                ActionError::Failed(format!("cannot read {}: {error}", request_path.display()))
+            })?;
+            parse_freezer_bit(request.trim(), "cgroup.freeze")
+        },
+        || read_frozen_event(&directory.join("cgroup.events")),
+    )
+}
+
+/// The request and acknowledgement are separate files. A concurrent request
+/// change must not fabricate agreement between states observed at different times.
+fn read_freezer_state_with(
+    mut read_request: impl FnMut() -> Result<bool, ActionError>,
+    read_frozen: impl FnOnce() -> Result<bool, ActionError>,
+) -> Result<FreezerState, ActionError> {
+    let requested = read_request()?;
+    let frozen = read_frozen()?;
+    if read_request()? != requested {
+        return Err(ActionError::Failed(
+            "freezer request changed during observation".to_string(),
+        ));
+    }
     Ok(FreezerState { requested, frozen })
 }
 
@@ -502,6 +521,38 @@ mod tests {
         fs::write(directory.path().join("cgroup.events"), "frozen 1\n").unwrap();
         fs::write(directory.path().join("cgroup.freeze"), "yes\n").unwrap();
         assert!(read_freezer_state(directory.path()).is_err());
+    }
+
+    #[test]
+    fn freezer_read_rejects_a_request_change_around_the_acknowledgement() {
+        for requested in [false, true] {
+            let mut request_reads = 0;
+            let result = read_freezer_state_with(
+                || {
+                    request_reads += 1;
+                    Ok(if request_reads == 1 {
+                        requested
+                    } else {
+                        !requested
+                    })
+                },
+                || Ok(requested),
+            );
+            assert!(
+                matches!(result, Err(ActionError::Failed(_))),
+                "an old request and a later matching acknowledgement cannot prove completion"
+            );
+            assert_eq!(request_reads, 2);
+
+            // A stable request can legitimately have either acknowledgement:
+            // the caller decides whether the transition is still pending.
+            for frozen in [false, true] {
+                assert_eq!(
+                    read_freezer_state_with(|| Ok(requested), || Ok(frozen)).unwrap(),
+                    FreezerState { requested, frozen },
+                );
+            }
+        }
     }
 
     #[test]
