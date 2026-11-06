@@ -475,20 +475,40 @@ impl RegimeTracker {
     /// Feed one assessment; returns the regimes currently active after hysteresis,
     /// each at the severity of its latest sighting.
     pub fn update(&mut self, assessment: &PressureAssessment) -> Vec<(RegimeKind, Severity)> {
+        self.update_observed(Some(assessment), |_| true)
+    }
+
+    /// Update only regimes whose required evidence was observed. Unavailable
+    /// readings interrupt both confirmation streaks without clearing an active
+    /// regime: losing a sensor is not evidence of recovery. `None` interrupts
+    /// every regime, for example when an entire sample could not be collected.
+    pub fn update_observed(
+        &mut self,
+        assessment: Option<&PressureAssessment>,
+        is_observed: impl Fn(RegimeKind) -> bool,
+    ) -> Vec<(RegimeKind, Severity)> {
         for (kind, tracked) in self.state.iter_mut() {
+            let Some(assessment) = assessment.filter(|_| is_observed(*kind)) else {
+                tracked.seen = 0;
+                tracked.missed = 0;
+                continue;
+            };
             match assessment.regimes.iter().find(|r| r.kind == *kind) {
                 Some(regime) => {
-                    tracked.seen += 1;
+                    tracked.seen = tracked.seen.saturating_add(1);
                     tracked.missed = 0;
                     tracked.severity = regime.severity;
                 }
                 None => {
-                    tracked.missed += 1;
+                    tracked.missed = tracked.missed.saturating_add(1);
                     tracked.seen = 0;
                 }
             }
         }
-        for regime in &assessment.regimes {
+        for regime in assessment.into_iter().flat_map(|a| &a.regimes) {
+            if !is_observed(regime.kind) {
+                continue;
+            }
             self.state.entry(regime.kind).or_insert(TrackedRegime {
                 seen: 1,
                 missed: 0,
@@ -753,5 +773,32 @@ mod tests {
             assert!(tracker.update(&hot).is_empty());
             assert!(tracker.update(&cool).is_empty());
         }
+    }
+
+    #[test]
+    fn tracker_missing_evidence_interrupts_confirmation_without_recovery() {
+        let thresholds = PressureThresholds::default();
+        let mut hot_snapshot = snapshot(8, 1.0);
+        hot_snapshot.cpu = psi(40.0, 40.0);
+        hot_snapshot.io = psi(20.0, 20.0);
+        let hot = assess(&hot_snapshot, None, None, &thresholds);
+        let cool = assess(&snapshot(8, 1.0), None, None, &thresholds);
+        let mut tracker = RegimeTracker::new(2, 2);
+
+        assert!(tracker.update(&hot).is_empty());
+        assert!(tracker.update_observed(None, |_| false).is_empty());
+        assert!(tracker.update(&hot).is_empty(), "missing tick breaks entry");
+        assert_eq!(tracker.update(&hot).len(), 2);
+
+        assert_eq!(tracker.update(&cool).len(), 2);
+        let active = tracker.update_observed(Some(&cool), |kind| kind != RegimeKind::CpuContention);
+        assert_eq!(active, vec![(RegimeKind::CpuContention, Severity::Crit)]);
+        assert_eq!(
+            tracker.update_observed(None, |_| false),
+            active,
+            "losing the full sample is not recovery"
+        );
+        assert_eq!(tracker.update(&cool), active, "missing tick breaks exit");
+        assert!(tracker.update(&cool).is_empty());
     }
 }

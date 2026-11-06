@@ -16,6 +16,7 @@ use pt_common::{
 };
 use pt_core::calibrate::{validation::ValidationEngine, CalibrationError};
 use pt_core::capabilities::{get_capabilities, ToolCapability};
+use pt_core::collect::pressure::{pressure_window, PressureSnapshot, PressureWindow};
 use pt_core::collect::protected::ProtectedFilter;
 use pt_core::collect::responsible_units::{
     attribute_responsible_units, collect_cgroup_memberships, AttributionResource, ResponsibleUnit,
@@ -25,6 +26,10 @@ use pt_core::collect::responsible_units::{
 use pt_core::collect::ContainerRuntime;
 use pt_core::config::{
     get_preset, list_presets, load_config, ConfigError, ConfigOptions, PresetName, Priors,
+};
+use pt_core::decision::pressure_regime::{
+    assess as assess_pressure, PressureThresholds, ProcessCensus, RegimeKind, RegimeTracker,
+    Severity as PressureSeverity,
 };
 use pt_core::events::{
     FanoutEmitter, JsonlWriter, Phase, ProgressEmitter, ProgressEvent, SessionEmitter,
@@ -26145,6 +26150,7 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
     };
 
     let mut baseline: Option<WatchBaseline> = None;
+    let mut pressure_watch = WatchPressureState::new();
     let mut previous: HashMap<u32, WatchCandidate> = HashMap::new();
     let interval = Duration::from_secs(args.interval.max(1));
     let notify_cmd = args.notify_cmd.as_deref();
@@ -26205,6 +26211,26 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         let system_state = collect_system_state(Some(&scan_result.processes));
         let pressure = PlanningPressure::from_system_state(&system_state);
         let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
+        // These are system events, independent of process age and posterior
+        // filters. An incomplete process census cannot establish recovery from
+        // a zombie leak or D-state storm.
+        let census = watch_process_census(&scan_result.processes, &scan_result.metadata.warnings);
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        for mut event in pressure_watch.update(
+            pressure.snapshot.as_ref(),
+            census.as_ref(),
+            args.once,
+            &timestamp,
+        ) {
+            event["responsible_units"] = serde_json::json!({
+                "rank_by": responsible_units.rank_by,
+                "units": responsible_units.units.iter().take(3)
+                    .map(|unit| responsible_unit_summary(Some(unit))).collect::<Vec<_>>(),
+                "unavailable": responsible_units.unavailable,
+                "limitations": responsible_units.limitations,
+            });
+            emit_watch_event(&event, notify_exec, notify_cmd, notify_args);
+        }
         if baseline.is_none() {
             baseline = Some(WatchBaseline::from_state(&system_state));
         }
@@ -26434,6 +26460,290 @@ struct WatchBaseline {
     available_gb: f64,
 }
 
+const WATCH_PRESSURE_ENTER_SAMPLES: u32 = 2;
+const WATCH_PRESSURE_EXIT_SAMPLES: u32 = 2;
+
+fn watch_process_census(processes: &[ProcessRecord], warnings: &[String]) -> Option<ProcessCensus> {
+    if !warnings.is_empty()
+        || processes
+            .iter()
+            .any(|process| process.state == ProcessState::Unknown)
+    {
+        return None;
+    }
+    Some(ProcessCensus {
+        zombies: processes
+            .iter()
+            .filter(|process| process.state.is_zombie())
+            .count() as u32,
+        dstate: processes
+            .iter()
+            .filter(|process| process.state.is_disksleep())
+            .count() as u32,
+    })
+}
+
+/// System-pressure transitions are independent of per-process recommendations.
+/// A missing source breaks confirmation, but never proves that pressure cleared.
+struct WatchPressureState {
+    tracker: RegimeTracker,
+    active: BTreeMap<RegimeKind, PressureSeverity>,
+    previous: Option<PressureSnapshot>,
+    // Keep the evidence sources that supported pending/active CPU pressure.
+    // Losing one must not establish recovery via a different, quiet source.
+    cpu_psi_required: bool,
+    cpu_load_required: bool,
+}
+
+impl WatchPressureState {
+    fn new() -> Self {
+        Self {
+            tracker: RegimeTracker::new(WATCH_PRESSURE_ENTER_SAMPLES, WATCH_PRESSURE_EXIT_SAMPLES),
+            active: BTreeMap::new(),
+            previous: None,
+            cpu_psi_required: false,
+            cpu_load_required: false,
+        }
+    }
+
+    fn update(
+        &mut self,
+        snapshot: Option<&PressureSnapshot>,
+        census: Option<&ProcessCensus>,
+        once: bool,
+        timestamp: &str,
+    ) -> Vec<serde_json::Value> {
+        let Some(snapshot) = snapshot else {
+            self.previous = None;
+            self.active = self
+                .tracker
+                .update_observed(None, |_| false)
+                .into_iter()
+                .collect();
+            if !self.active.contains_key(&RegimeKind::CpuContention) {
+                self.cpu_psi_required = false;
+                self.cpu_load_required = false;
+            }
+            return Vec::new();
+        };
+        let window = self
+            .previous
+            .as_ref()
+            .and_then(|before| pressure_window(before, snapshot));
+        self.previous = Some(snapshot.clone());
+        let assessment = assess_pressure(
+            snapshot,
+            window.as_ref(),
+            census,
+            &PressureThresholds::default(),
+        );
+        let cpu_psi_required = self.cpu_psi_required;
+        let cpu_load_required = self.cpu_load_required;
+        let observed = |kind| {
+            watch_regime_evidence_available(
+                kind,
+                snapshot,
+                window.as_ref(),
+                census,
+                cpu_psi_required,
+                cpu_load_required,
+            )
+        };
+        let evidence = serde_json::json!({
+            "sampled_at_ms": snapshot.sampled_at_ms,
+            "online_cpus": (snapshot.cpus > 0).then_some(snapshot.cpus),
+            "assessment": assessment,
+            "window": window,
+            "meminfo": snapshot.meminfo,
+            "file_handles": snapshot.file_handles,
+            "process_census": census,
+            "process_census_scope": "observed_non_kernel_processes",
+            "unavailable": snapshot.unavailable,
+        });
+        let event = |name: &str,
+                     kind: RegimeKind,
+                     severity: PressureSeverity,
+                     prior: Option<PressureSeverity>,
+                     confirmation: &str| {
+            let explanation = assessment
+                .regimes
+                .iter()
+                .find(|regime| regime.kind == kind)
+                .map(|regime| regime.explanation.clone())
+                .unwrap_or_else(|| {
+                    "Regime absent in two consecutive samples with its required evidence available"
+                        .to_string()
+                });
+            serde_json::json!({
+                "event": name,
+                "timestamp": timestamp,
+                "regime": kind,
+                "severity": severity,
+                "prior_severity": prior,
+                "confirmation": confirmation,
+                "enter_after_samples": WATCH_PRESSURE_ENTER_SAMPLES,
+                "exit_after_samples": WATCH_PRESSURE_EXIT_SAMPLES,
+                "explanation": explanation,
+                "evidence": evidence,
+            })
+        };
+
+        if once {
+            // --once is a snapshot, not two fabricated confirmation ticks.
+            return assessment
+                .regimes
+                .iter()
+                .filter(|regime| observed(regime.kind))
+                .map(|regime| {
+                    event(
+                        "pressure_regime_observed",
+                        regime.kind,
+                        regime.severity,
+                        None,
+                        "single_observation",
+                    )
+                })
+                .collect();
+        }
+
+        let active: BTreeMap<_, _> = self
+            .tracker
+            .update_observed(Some(&assessment), |kind| {
+                // An OOM counter increment already proves an incident. Requiring
+                // a second window of OOM kills would hide isolated real kills.
+                kind != RegimeKind::OomKills && observed(kind)
+            })
+            .into_iter()
+            .collect();
+        let mut events = Vec::new();
+        for (&kind, &severity) in &active {
+            match self.active.get(&kind).copied() {
+                None => events.push(event(
+                    "pressure_regime_entered",
+                    kind,
+                    severity,
+                    None,
+                    "two_consecutive_samples",
+                )),
+                Some(prior) if prior != severity => events.push(event(
+                    "pressure_regime_changed",
+                    kind,
+                    severity,
+                    Some(prior),
+                    "latest_observation",
+                )),
+                _ => {}
+            }
+        }
+        for (&kind, &prior) in &self.active {
+            if !active.contains_key(&kind) {
+                events.push(event(
+                    "pressure_regime_recovered",
+                    kind,
+                    PressureSeverity::Ok,
+                    Some(prior),
+                    "two_consecutive_samples",
+                ));
+            }
+        }
+        if let Some(regime) = assessment
+            .regimes
+            .iter()
+            .find(|regime| regime.kind == RegimeKind::OomKills)
+        {
+            events.push(event(
+                "pressure_regime_observed",
+                regime.kind,
+                regime.severity,
+                None,
+                "counter_delta",
+            ));
+        }
+        if observed(RegimeKind::CpuContention)
+            && assessment
+                .regimes
+                .iter()
+                .any(|regime| regime.kind == RegimeKind::CpuContention)
+        {
+            if watch_psi_available(snapshot.cpu) {
+                self.cpu_psi_required = true;
+            } else {
+                self.cpu_load_required = true;
+            }
+        } else if !active.contains_key(&RegimeKind::CpuContention) {
+            self.cpu_psi_required = false;
+            self.cpu_load_required = false;
+        }
+        self.active = active;
+        events
+    }
+}
+
+fn watch_psi_available(resource: Option<pt_core::collect::pressure::PsiResource>) -> bool {
+    resource
+        .and_then(|resource| resource.some)
+        .is_some_and(|line| {
+            [line.avg10, line.avg60, line.avg300]
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=100.0).contains(value))
+        })
+}
+
+fn watch_regime_evidence_available(
+    kind: RegimeKind,
+    snapshot: &PressureSnapshot,
+    window: Option<&PressureWindow>,
+    census: Option<&ProcessCensus>,
+    cpu_psi_required: bool,
+    cpu_load_required: bool,
+) -> bool {
+    let memory = snapshot.meminfo.is_some_and(|memory| {
+        memory
+            .total
+            .zip(memory.available)
+            .is_some_and(|(total, available)| total > 0 && available <= total)
+    });
+    let swap = snapshot.meminfo.is_some_and(|memory| {
+        memory
+            .swap_total
+            .zip(memory.swap_free)
+            .is_some_and(|(total, free)| free <= total)
+    });
+    match kind {
+        RegimeKind::CpuContention => {
+            let psi = watch_psi_available(snapshot.cpu);
+            let load = snapshot
+                .load_ratio()
+                .is_some_and(|ratio| ratio.is_finite() && ratio >= 0.0);
+            (psi || (snapshot.cpu.and_then(|resource| resource.some).is_none() && load))
+                && (!cpu_psi_required || psi)
+                && (!cpu_load_required || load)
+        }
+        RegimeKind::IoBound => watch_psi_available(snapshot.io),
+        // Without available-memory data the two diagnoses cannot be distinguished.
+        RegimeKind::MemoryExhaustion | RegimeKind::CacheBloat => {
+            watch_psi_available(snapshot.memory) && memory
+        }
+        RegimeKind::SwapThrash => window.is_some_and(|window| {
+            window
+                .swap_in_per_s
+                .zip(window.swap_out_per_s)
+                .is_some_and(|(input, output)| {
+                    input.is_finite() && input >= 0.0 && output.is_finite() && output >= 0.0
+                })
+        }),
+        RegimeKind::SwapParadox => memory && swap,
+        RegimeKind::SwapExhaustion => swap,
+        RegimeKind::OomKills => window.and_then(|window| window.oom_kills).is_some(),
+        RegimeKind::FdExhaustion => snapshot
+            .file_handles
+            .and_then(|handles| handles.used_fraction())
+            .is_some_and(|fraction| fraction.is_finite()),
+        RegimeKind::ZombieLeak => census.is_some(),
+        RegimeKind::DstateStorm => census.is_some() && snapshot.cpus > 0,
+    }
+}
+
 impl WatchBaseline {
     fn from_state(state: &serde_json::Value) -> Self {
         Self {
@@ -26574,6 +26884,369 @@ fn emit_watch_event(
 mod watch_tests {
     use super::*;
     use pt_common::StartId;
+    use pt_core::collect::pressure::{FileHandles, LoadAvg, MemInfo, PsiLine, PsiResource, VmStat};
+
+    fn pressure_sample(
+        previous: Option<&PressureSnapshot>,
+        cpu_percent: f64,
+        io_percent: f64,
+    ) -> PressureSnapshot {
+        let psi = |percent: f64, prior: Option<PsiResource>| {
+            Some(PsiResource {
+                some: Some(PsiLine {
+                    avg10: percent,
+                    avg60: percent,
+                    avg300: percent,
+                    total_us: prior
+                        .and_then(|resource| resource.some)
+                        .map_or(0, |line| line.total_us)
+                        + (percent * 10_000.0) as u64,
+                }),
+                full: None,
+            })
+        };
+        PressureSnapshot {
+            sampled_at_ms: previous.map_or(1_000, |snapshot| snapshot.sampled_at_ms + 1_000),
+            cpus: 4,
+            cpu: psi(cpu_percent, previous.and_then(|snapshot| snapshot.cpu)),
+            memory: psi(0.0, previous.and_then(|snapshot| snapshot.memory)),
+            io: psi(io_percent, previous.and_then(|snapshot| snapshot.io)),
+            irq: None,
+            load: Some(LoadAvg {
+                one: 1.0,
+                five: 1.0,
+                fifteen: 1.0,
+                runnable: Some(1),
+                total: Some(20),
+            }),
+            meminfo: Some(MemInfo {
+                total: Some(8 << 30),
+                available: Some(6 << 30),
+                swap_total: Some(2 << 30),
+                swap_free: Some(2 << 30),
+                ..MemInfo::default()
+            }),
+            vmstat: Some(
+                previous
+                    .and_then(|snapshot| snapshot.vmstat)
+                    .unwrap_or(VmStat {
+                        pswpin: Some(0),
+                        pswpout: Some(0),
+                        oom_kill: Some(0),
+                        ..VmStat::default()
+                    }),
+            ),
+            file_handles: Some(FileHandles {
+                allocated: 10,
+                max: 100,
+            }),
+            unavailable: Vec::new(),
+        }
+    }
+
+    fn pressure_events(
+        state: &mut WatchPressureState,
+        snapshot: &PressureSnapshot,
+    ) -> Vec<serde_json::Value> {
+        state.update(
+            Some(snapshot),
+            Some(&ProcessCensus::default()),
+            false,
+            "tick",
+        )
+    }
+
+    #[test]
+    fn watch_pressure_enters_changes_and_recovers_with_observed_evidence() {
+        let mut state = WatchPressureState::new();
+        let mut snapshot = pressure_sample(None, 20.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 20.0, 0.0);
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "pressure_regime_entered");
+        assert_eq!(events[0]["regime"], "cpu_contention");
+        assert_eq!(events[0]["severity"], "warn");
+        assert_eq!(events[0]["confirmation"], "two_consecutive_samples");
+        assert_eq!(events[0]["evidence"]["assessment"]["cpu_some"], 20.0);
+        assert_eq!(events[0]["evidence"]["window"]["seconds"], 1.0);
+
+        snapshot = pressure_sample(Some(&snapshot), 20.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 45.0, 0.0);
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "pressure_regime_changed");
+        assert_eq!(events[0]["prior_severity"], "warn");
+        assert_eq!(events[0]["severity"], "crit");
+
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "pressure_regime_recovered");
+        assert_eq!(events[0]["prior_severity"], "crit");
+        assert_eq!(events[0]["severity"], "ok");
+        assert_eq!(events[0]["evidence"]["assessment"]["cpu_some"], 0.0);
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+    }
+
+    #[test]
+    fn watch_pressure_missing_psi_does_not_recover_via_quiet_load() {
+        let mut state = WatchPressureState::new();
+        let mut snapshot = pressure_sample(None, 40.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        assert!(state.update(None, None, false, "gap").is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 40.0, 0.0);
+        assert!(
+            pressure_events(&mut state, &snapshot).is_empty(),
+            "gap interrupts entry"
+        );
+        snapshot = pressure_sample(Some(&snapshot), 40.0, 0.0);
+        assert_eq!(pressure_events(&mut state, &snapshot).len(), 1);
+
+        for tick in 0..2 {
+            snapshot = pressure_sample(Some(&snapshot), 0.0, 20.0);
+            snapshot.cpu = None;
+            let events = pressure_events(&mut state, &snapshot);
+            if tick == 0 {
+                assert!(events.is_empty());
+            } else {
+                assert_eq!(events.len(), 1, "independent I/O observations still enter");
+                assert_eq!(events[0]["event"], "pressure_regime_entered");
+                assert_eq!(events[0]["regime"], "io_bound");
+            }
+            assert!(state.active.contains_key(&RegimeKind::CpuContention));
+        }
+        assert!(state.update(None, None, false, "gap").is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event["event"] == "pressure_regime_recovered"));
+        assert!(state.active.is_empty());
+    }
+
+    #[test]
+    fn watch_pressure_once_reports_observations_without_fabricated_confirmation() {
+        let mut state = WatchPressureState::new();
+        let snapshot = pressure_sample(None, 40.0, 20.0);
+        let events = state.update(Some(&snapshot), None, true, "once");
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(event["event"], "pressure_regime_observed");
+            assert_eq!(event["confirmation"], "single_observation");
+            assert_eq!(event["timestamp"], "once");
+            assert!(event["evidence"]["window"].is_null());
+        }
+        assert!(state.active.is_empty());
+    }
+
+    #[test]
+    fn watch_pressure_load_fallback_can_recover_on_hosts_without_psi() {
+        let mut state = WatchPressureState::new();
+        let mut snapshot = pressure_sample(None, 0.0, 0.0);
+        snapshot.cpu = None;
+        snapshot.load.as_mut().unwrap().one = 20.0;
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot.sampled_at_ms += 1_000;
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["regime"], "cpu_contention");
+        assert!(events[0]["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("no CPU pressure data"));
+        snapshot.load.as_mut().unwrap().one = 1.0;
+        snapshot.sampled_at_ms += 1_000;
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot.sampled_at_ms += 1_000;
+        assert_eq!(
+            pressure_events(&mut state, &snapshot)[0]["event"],
+            "pressure_regime_recovered"
+        );
+    }
+
+    #[test]
+    fn watch_pressure_source_changes_cannot_clear_unobserved_load() {
+        let mut state = WatchPressureState::new();
+        let mut snapshot = pressure_sample(None, 0.0, 0.0);
+        snapshot.cpu = None;
+        snapshot.load.as_mut().unwrap().one = 20.0;
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot.sampled_at_ms += 1_000;
+        assert_eq!(pressure_events(&mut state, &snapshot).len(), 1);
+
+        for _ in 0..2 {
+            snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+            snapshot.load = None;
+            assert!(pressure_events(&mut state, &snapshot).is_empty());
+            assert!(state.active.contains_key(&RegimeKind::CpuContention));
+        }
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        assert_eq!(
+            pressure_events(&mut state, &snapshot)[0]["event"],
+            "pressure_regime_recovered"
+        );
+
+        // A new PSI-derived regime does not inherit an old, recovered load dependency.
+        snapshot = pressure_sample(Some(&snapshot), 40.0, 0.0);
+        snapshot.load = None;
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 40.0, 0.0);
+        snapshot.load = None;
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "pressure_regime_entered");
+        assert_eq!(events[0]["severity"], "crit");
+    }
+
+    #[test]
+    fn watch_pressure_invalid_psi_is_not_a_healthy_load_fallback() {
+        let mut state = WatchPressureState::new();
+        let mut snapshot = pressure_sample(None, 0.0, 0.0);
+        snapshot.cpu = None;
+        snapshot.load.as_mut().unwrap().one = 20.0;
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot.sampled_at_ms += 1_000;
+        assert_eq!(pressure_events(&mut state, &snapshot).len(), 1);
+
+        for _ in 0..2 {
+            snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+            snapshot.load.as_mut().unwrap().one = 20.0;
+            let some = snapshot.cpu.as_mut().unwrap().some.as_mut().unwrap();
+            some.avg10 = -1.0;
+            some.avg60 = -1.0;
+            some.avg300 = -1.0;
+            assert!(pressure_events(&mut state, &snapshot).is_empty());
+            assert!(state.active.contains_key(&RegimeKind::CpuContention));
+        }
+    }
+
+    #[test]
+    fn watch_pressure_reports_oom_immediately_and_requires_observed_swap_recovery() {
+        let mut state = WatchPressureState::new();
+        let mut snapshot = pressure_sample(None, 0.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        snapshot.vmstat.as_mut().unwrap().pswpin = Some(12_000);
+        snapshot.vmstat.as_mut().unwrap().oom_kill = Some(1);
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["regime"], "oom_kills");
+        assert_eq!(events[0]["confirmation"], "counter_delta");
+        assert_eq!(events[0]["evidence"]["window"]["oom_kills"], 1);
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        snapshot.vmstat.as_mut().unwrap().pswpin = Some(24_000);
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(
+            events.len(),
+            1,
+            "unchanged OOM counter must not repeat an incident"
+        );
+        assert_eq!(events[0]["event"], "pressure_regime_entered");
+        assert_eq!(events[0]["regime"], "swap_thrash");
+
+        for _ in 0..2 {
+            snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+            snapshot.vmstat = None;
+            assert!(pressure_events(&mut state, &snapshot).is_empty());
+        }
+        // The first restored counter is a baseline, not an observed zero rate.
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "pressure_regime_recovered");
+        assert_eq!(events[0]["regime"], "swap_thrash");
+    }
+
+    #[test]
+    fn watch_pressure_partial_census_cannot_clear_zombie_regime() {
+        let mut state = WatchPressureState::new();
+        let mut snapshot = pressure_sample(None, 0.0, 0.0);
+        let zombies = ProcessCensus {
+            zombies: 250,
+            dstate: 0,
+        };
+        assert!(state
+            .update(Some(&snapshot), Some(&zombies), false, "first")
+            .is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        let events = state.update(Some(&snapshot), Some(&zombies), false, "second");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["regime"], "zombie_leak");
+        for _ in 0..2 {
+            snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+            assert!(state
+                .update(Some(&snapshot), None, false, "partial")
+                .is_empty());
+        }
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        assert!(pressure_events(&mut state, &snapshot).is_empty());
+        snapshot = pressure_sample(Some(&snapshot), 0.0, 0.0);
+        let events = pressure_events(&mut state, &snapshot);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "pressure_regime_recovered");
+        assert_eq!(events[0]["regime"], "zombie_leak");
+    }
+
+    #[test]
+    fn watch_pressure_census_requires_known_states_and_no_parse_warnings() {
+        let mut processes: Vec<_> = [
+            ProcessState::Zombie,
+            ProcessState::DiskSleep,
+            ProcessState::Sleeping,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, state)| {
+            let pid = index as u32 + 10;
+            ProcessRecord {
+                pid: pt_common::ProcessId(pid),
+                ppid: pt_common::ProcessId(2),
+                uid: 1000,
+                user: "test".to_string(),
+                pgid: Some(pid),
+                sid: Some(pid),
+                start_id: StartId::from_linux("watch-census", 1, pid),
+                comm: "test".to_string(),
+                cmd: "test".to_string(),
+                state,
+                cpu_percent: 0.0,
+                rss_bytes: 0,
+                vsz_bytes: 0,
+                tty: None,
+                start_time_unix: 0,
+                elapsed: Duration::from_secs(1),
+                source: "test".to_string(),
+                container_info: None,
+            }
+        })
+        .collect();
+        assert_eq!(
+            watch_process_census(&processes, &[]),
+            Some(ProcessCensus {
+                zombies: 1,
+                dstate: 1
+            })
+        );
+        assert!(
+            watch_process_census(&processes, &["unreadable process row".to_string()]).is_none()
+        );
+        processes[0].state = ProcessState::Unknown;
+        assert!(watch_process_census(&processes, &[]).is_none());
+    }
 
     fn identity(pid: u32, birth: u64) -> ProcessIdentity {
         ProcessIdentity::full(

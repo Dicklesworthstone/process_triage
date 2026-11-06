@@ -511,11 +511,16 @@ pt-core agent watch [OPTIONS]
 | `--notify-cmd <cmd>` | Execute directly (no shell) on threshold crossing |
 | `--notify-arg <arg>` | Repeatable args for `--notify-cmd` |
 | `--format jsonl` | Stream events |
-| `--threshold low\|medium\|high\|critical` | Trigger sensitivity |
+| `--threshold low\|medium\|high\|critical` | Process-candidate trigger sensitivity |
 | `--interval <seconds>` | Check frequency (default: 60) |
+| `--once` | Observe once and exit; pressure events report single observations |
 
 Notes:
+
 - If both `--notify-cmd` and `--notify-exec` are set, `--notify-cmd` takes precedence.
+- System-pressure events use the shared pressure classifier's thresholds and are
+  independent of process-candidate sensitivity and minimum age. They are emitted
+  even when no process qualifies for a recommendation.
 
 **Events Emitted:**
 
@@ -525,6 +530,33 @@ Notes:
 | `severity_escalated` | Existing candidate worsens |
 | `goal_violated` | Resource target exceeded |
 | `baseline_anomaly` | Significant deviation from baseline |
+| `pressure_regime_entered` | A pressure regime appears in two consecutive observed samples |
+| `pressure_regime_changed` | An active regime's observed severity changes (`warn` or `crit`) |
+| `pressure_regime_recovered` | An active regime is absent in two consecutive samples with its required evidence available |
+| `pressure_regime_observed` | A single `--once` observation, or a measured kernel OOM-counter increment |
+
+Pressure events include `regime`, `severity`, `prior_severity`, `confirmation`,
+`explanation`, and `evidence`. The evidence contains the sample timestamp, pressure
+assessment, available-memory and file-handle observations, process-state census,
+and the measured interval between samples when available. PSI counter deltas and
+swap rates use that actual interval; the first observation has no interval rate.
+The census covers observed non-kernel processes. Parse warnings or unknown process
+states make the census unavailable for confirming a regime or its recovery.
+
+Missing readings interrupt confirmation streaks and preserve active regimes;
+they never count as healthy samples. CPU contention previously identified using
+PSI cannot clear just because PSI disappears and load is low; the converse applies
+to missing load after a load-based diagnosis. Hosts without PSI may still use the
+classifier's explicitly labeled load fallback. OOM counter increments are reported
+immediately with `confirmation: "counter_delta"`; watch does not wait for a second
+OOM kill. `--once` reports detected regimes with `confirmation: "single_observation"`
+and makes no repeated-sample confirmation claim.
+
+Each pressure event also carries up to three observed workload summaries in
+`responsible_units`, with their ranking resource, coverage and limitations. These
+are investigation context, not proof that a workload caused the pressure or
+authorization for a group action. Existing process, goal and baseline events and
+notification hooks continue to operate alongside pressure events.
 
 ---
 
