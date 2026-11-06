@@ -2330,6 +2330,8 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     let TuiBuildOutput {
         snapshot,
         plan_candidates,
+        #[cfg(target_os = "linux")]
+        recent_io_baselines,
     } = build_tui_data_from_live_scan(
         global,
         args,
@@ -2343,6 +2345,13 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         .update_state(SessionState::Planned)
         .map_err(|error| format!("persist interactive planned state: {error}"))?;
     let execution_state = Arc::new(Mutex::new(TuiExecutionState::default()));
+    #[cfg(target_os = "linux")]
+    {
+        execution_state
+            .lock()
+            .map_err(|_| "interactive execution state lock poisoned".to_string())?
+            .recent_io_baselines = recent_io_baselines;
+    }
 
     let mut app = App::new();
 
@@ -2402,6 +2411,8 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let policy_scan_r = policy.clone();
         let decisions_r = Arc::clone(&decisions);
         let session_id_r = session_id.clone();
+        #[cfg(target_os = "linux")]
+        let execution_state_r = Arc::clone(&execution_state);
 
         let refresh_fn: Arc<dyn Fn() -> Result<RefreshOutcome, String> + Send + Sync> =
             Arc::new(move || {
@@ -2433,10 +2444,20 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                     goal_r.as_deref(),
                     &session_id_r,
                 )?;
+                // Keep the same state -> candidates lock order as execution.
+                // Replace observations with the refreshed identities atomically.
+                #[cfg(target_os = "linux")]
+                let mut execution = execution_state_r
+                    .lock()
+                    .map_err(|_| "interactive execution state lock poisoned".to_string())?;
                 let mut guard = plan_cache_r
                     .lock()
                     .map_err(|_| "plan cache lock poisoned".to_string())?;
                 *guard = output.plan_candidates;
+                #[cfg(target_os = "linux")]
+                {
+                    execution.recent_io_baselines = output.recent_io_baselines;
+                }
                 Ok(output.snapshot)
             });
 
@@ -2627,6 +2648,19 @@ fn record_confirmed_kills(
 struct TuiBuildOutput {
     snapshot: RefreshOutcome,
     plan_candidates: HashMap<u32, PlanCandidateInput>,
+    #[cfg(target_os = "linux")]
+    recent_io_baselines: Vec<pt_core::action::prechecks::RecentIoBaseline>,
+}
+
+#[cfg(target_os = "linux")]
+fn capture_recent_io_baselines<'a>(
+    targets: impl Iterator<Item = &'a pt_common::ProcessIdentity>,
+) -> Vec<pt_core::action::prechecks::RecentIoBaseline> {
+    let mut seen = HashSet::new();
+    targets
+        .filter(|target| seen.insert((target.pid, target.start_id.clone(), target.uid)))
+        .filter_map(pt_core::action::prechecks::RecentIoBaseline::capture)
+        .collect()
 }
 
 #[cfg(feature = "ui")]
@@ -3157,6 +3191,8 @@ type RecordedExecution = (
 struct TuiExecutionState {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     enforcer: Option<pt_core::decision::PolicyEnforcer>,
+    #[cfg(target_os = "linux")]
+    recent_io_baselines: Vec<pt_core::action::prechecks::RecentIoBaseline>,
     failure: Option<String>,
 }
 
@@ -3264,13 +3300,20 @@ fn execute_plan_actions(
             LivePreCheckConfig::from(&policy.data_loss_gates),
         )
         .map_err(|error| format!("cannot configure safety checks: {error}"))?;
-        pre_checks.prime_recent_io(
-            &plan
-                .actions
-                .iter()
-                .map(|action| action.target.pid.0)
-                .collect::<Vec<_>>(),
-        );
+        let gated: Vec<_> = plan
+            .actions
+            .iter()
+            .filter(|action| {
+                !action.blocked
+                    && pt_core::plan::effective_pre_checks(action)
+                        .contains(&pt_core::plan::PreCheck::CheckDataLossGate)
+            })
+            .map(|action| action.target.clone())
+            .collect();
+        #[cfg(target_os = "linux")]
+        pre_checks.prime_recent_io_from_baselines(&gated, &state.recent_io_baselines);
+        #[cfg(not(target_os = "linux"))]
+        pre_checks.prime_recent_io(&gated.iter().map(|target| target.pid.0).collect::<Vec<_>>());
 
         let executor = ActionExecutor::new(&runner, &identity_provider, lock_path)
             .with_pre_check_provider(&pre_checks);
@@ -4506,6 +4549,11 @@ fn build_tui_rows(
         );
     }
 
+    #[cfg(target_os = "linux")]
+    let recent_io_baselines =
+        capture_recent_io_baselines(plan_candidates.values().flat_map(|candidate| {
+            std::iter::once(&candidate.identity).chain(candidate.parent_identity.iter())
+        }));
     Ok(TuiBuildOutput {
         snapshot: RefreshOutcome {
             rows,
@@ -4513,6 +4561,8 @@ fn build_tui_rows(
             goal_selection,
         },
         plan_candidates,
+        #[cfg(target_os = "linux")]
+        recent_io_baselines,
     })
 }
 
@@ -20845,6 +20895,19 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
     // The persisted and full stdout document carries the executable Plan fields
     // alongside its recorded candidate evidence. Apply consumes this same contract.
+    #[cfg(target_os = "linux")]
+    {
+        // Start the observation window while the user/agent reviews the plan.
+        // Apply must still read current counters and revalidate every identity.
+        let baselines =
+            capture_recent_io_baselines(action_plan.actions.iter().filter_map(|action| {
+                (!action.blocked
+                    && pt_core::plan::effective_pre_checks(action)
+                        .contains(&pt_core::plan::PreCheck::CheckDataLossGate))
+                .then_some(&action.target)
+            }));
+        plan_output["recent_io_baselines"] = serde_json::to_value(baselines).unwrap();
+    }
     if let serde_json::Value::Object(fields) = serde_json::to_value(action_plan).unwrap() {
         plan_output.as_object_mut().unwrap().extend(fields);
     }
@@ -22561,21 +22624,43 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     // instead of one full window per target.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let gated: Vec<u32> = actions_to_apply
+        let gated: Vec<pt_common::ProcessIdentity> = actions_to_apply
             .iter()
             .filter(|a| !a.blocked && !completed_action_ids.contains(&a.action_id))
             .filter(|a| {
                 pt_core::plan::effective_pre_checks(a)
                     .contains(&pt_core::plan::PreCheck::CheckDataLossGate)
             })
-            .map(|a| a.target.pid.0)
+            .map(|a| a.target.clone())
             .collect();
+        #[cfg(target_os = "linux")]
+        let baselines: Vec<pt_core::action::prechecks::RecentIoBaseline> = saved_document
+            .get("recent_io_baselines")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "agent apply: invalid saved I/O observations ({error}); using the full live probe window"
+                );
+                None
+            })
+            .unwrap_or_default();
         // Observe both policies' I/O windows concurrently. Each retains its
         // own threshold and cache; neither policy can disable the other's gate.
         std::thread::scope(|scope| {
             let gated = gated.as_slice();
             for provider in &precheck_providers {
-                scope.spawn(move || provider.prime_recent_io(gated));
+                #[cfg(target_os = "linux")]
+                {
+                    let baselines = baselines.as_slice();
+                    scope.spawn(move || provider.prime_recent_io_from_baselines(gated, baselines));
+                }
+                #[cfg(not(target_os = "linux"))]
+                scope.spawn(move || {
+                    provider.prime_recent_io(
+                        &gated.iter().map(|target| target.pid.0).collect::<Vec<_>>(),
+                    )
+                });
             }
         });
     }

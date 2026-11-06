@@ -20,6 +20,8 @@ use crate::decision::Action;
 use crate::plan::PreCheck;
 use crate::supervision::session::{SessionAnalyzer, SessionConfig, SessionProtectionType};
 use crate::supervision::{detect_supervision, is_human_supervised, SupervisorCategory};
+#[cfg(target_os = "linux")]
+use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
@@ -826,6 +828,176 @@ struct IoSample {
     finished_at: Instant,
 }
 
+/// A read-only observation retained by the planner. It is only a starting point
+/// for a new live read, never permission to act on a saved "idle" verdict.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentIoBaseline {
+    target: pt_common::ProcessIdentity,
+    scope: RecentIoScope,
+    started_boot_ns: u64,
+    finished_boot_ns: u64,
+    birth_ticks: u64,
+    wchar: u64,
+    write_bytes: u64,
+}
+
+/// Boot and namespace identities keep persisted clock/counter observations
+/// comparable across separate planner and executor processes.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RecentIoScope {
+    boot_id: String,
+    pid_namespace: String,
+    time_namespace: String,
+}
+
+#[cfg(target_os = "linux")]
+impl RecentIoScope {
+    fn read() -> Result<Self, String> {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|error| format!("cannot read I/O observation boot identity: {error}"))?
+            .trim()
+            .to_string();
+        if boot_id.is_empty() || boot_id == "unknown" {
+            return Err("I/O observation boot identity is unavailable".to_string());
+        }
+        let namespace = |name| {
+            std::fs::read_link(format!("/proc/self/ns/{name}"))
+                .map_err(|error| format!("cannot read I/O {name} namespace: {error}"))?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| format!("invalid I/O {name} namespace"))
+        };
+        Ok(Self {
+            boot_id,
+            pid_namespace: namespace("pid")?,
+            time_namespace: namespace("time")?,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn io_boot_clock_ns() -> Result<u64, String> {
+    let mut clock = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes into the valid stack-allocated timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut clock) } != 0 {
+        return Err(format!(
+            "cannot read I/O observation clock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let seconds = u64::try_from(clock.tv_sec).map_err(|_| "negative I/O boot clock")?;
+    let nanos = u64::try_from(clock.tv_nsec).map_err(|_| "negative I/O clock nanoseconds")?;
+    if nanos >= 1_000_000_000 {
+        return Err("invalid I/O clock nanoseconds".to_string());
+    }
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or_else(|| "I/O boot clock overflow".to_string())
+}
+
+#[cfg(target_os = "linux")]
+impl RecentIoBaseline {
+    /// Observe a verified process without sleeping. Unavailable observations are
+    /// omitted; apply will use its ordinary full-window probe for those targets.
+    pub fn capture(target: &pt_common::ProcessIdentity) -> Option<Self> {
+        Self::capture_with_sample(target)
+            .ok()
+            .map(|(baseline, _)| baseline)
+    }
+
+    fn capture_with_sample(
+        target: &pt_common::ProcessIdentity,
+    ) -> Result<(Self, IoSample), String> {
+        use super::executor::IdentityProvider;
+        if target.quality != pt_common::IdentityQuality::Full || target.pid.0 <= 1 {
+            return Err("I/O observation requires a full target identity".to_string());
+        }
+        let identity = super::signal::LiveIdentityProvider::new();
+        let validate = || match identity.revalidate(target) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("I/O observation target identity changed".to_string()),
+            Err(error) => Err(format!("cannot verify I/O observation identity: {error}")),
+        };
+        validate()?;
+        let scope = RecentIoScope::read()?;
+        let started_boot_ns = io_boot_clock_ns()?;
+        let sample = read_io_sample(target.pid.0)?;
+        let finished_boot_ns = io_boot_clock_ns()?;
+        validate()?;
+        if scope != RecentIoScope::read()?
+            || finished_boot_ns < started_boot_ns
+            || target.start_id
+                != pt_common::StartId::from_linux(&scope.boot_id, sample.birth_ticks, target.pid.0)
+        {
+            return Err("I/O observation scope, clock or identity changed".to_string());
+        }
+        Ok((
+            Self {
+                target: target.clone(),
+                scope,
+                started_boot_ns,
+                finished_boot_ns,
+                birth_ticks: sample.birth_ticks,
+                wchar: sample.wchar,
+                write_bytes: sample.write_bytes,
+            },
+            sample,
+        ))
+    }
+
+    /// Translate a valid saved observation into the current process's monotonic
+    /// clock only after a fresh, equally scoped read. The interval excludes both
+    /// reads, so serialization or slow procfs reads cannot inflate coverage.
+    fn observation(
+        &self,
+        current: &Self,
+        after: IoSample,
+        window: Duration,
+    ) -> Option<RecentIoObservation> {
+        if self.target.quality != pt_common::IdentityQuality::Full
+            || current.target.quality != pt_common::IdentityQuality::Full
+            || !self.target.matches(&current.target)
+            || self.scope != current.scope
+            || self.started_boot_ns > self.finished_boot_ns
+            || current.started_boot_ns > current.finished_boot_ns
+            || self.birth_ticks != current.birth_ticks
+            || self.target.start_id
+                != pt_common::StartId::from_linux(
+                    &self.scope.boot_id,
+                    self.birth_ticks,
+                    self.target.pid.0,
+                )
+            || self.wchar > current.wchar
+            || self.write_bytes > current.write_bytes
+        {
+            return None;
+        }
+        let elapsed =
+            Duration::from_nanos(current.started_boot_ns.checked_sub(self.finished_boot_ns)?);
+        if elapsed < window {
+            return None;
+        }
+        let before_at = after.started_at.checked_sub(elapsed)?;
+        Some(RecentIoObservation {
+            before: Ok(IoSample {
+                birth_ticks: self.birth_ticks,
+                wchar: self.wchar,
+                write_bytes: self.write_bytes,
+                started_at: before_at,
+                finished_at: before_at,
+            }),
+            after: Ok(after),
+            window,
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 struct RecentIoObservation {
@@ -978,6 +1150,54 @@ pub struct LivePreCheckProvider {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl LivePreCheckProvider {
+    /// Reuse plan-time counters only when a fresh read already covers the full
+    /// configured window for the same process, boot and namespaces. Missing,
+    /// ambiguous, young or invalid baselines use the unchanged shared live probe.
+    /// Counter growth over a longer saved interval conservatively blocks action.
+    #[cfg(target_os = "linux")]
+    pub fn prime_recent_io_from_baselines(
+        &self,
+        targets: &[pt_common::ProcessIdentity],
+        baselines: &[RecentIoBaseline],
+    ) {
+        if self.config.block_if_recent_io_seconds == 0 {
+            return;
+        }
+        let window = Duration::from_secs(self.config.block_if_recent_io_seconds);
+        let mut unobserved = Vec::new();
+        let mut seen = HashSet::new();
+        let mut observations = Vec::new();
+        for target in targets {
+            if !seen.insert(target.pid.0) {
+                continue;
+            }
+            let mut matching = baselines
+                .iter()
+                .filter(|baseline| baseline.target.pid == target.pid);
+            let baseline = matching.next().filter(|_| matching.next().is_none());
+            let observation = baseline
+                .filter(|baseline| baseline.target.matches(target))
+                .and_then(|baseline| {
+                    let (current, sample) = RecentIoBaseline::capture_with_sample(target).ok()?;
+                    baseline.observation(&current, sample, window)
+                });
+            match observation {
+                Some(observation) => observations.push((target.pid.0, observation)),
+                None => unobserved.push(target.pid.0),
+            }
+        }
+        trace!(
+            reused = observations.len(),
+            fresh = unobserved.len(),
+            "priming identity-bound recent I/O evidence"
+        );
+        self.recent_io
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .extend(observations);
+        self.prime_recent_io(&unobserved);
+    }
+
     /// Sample recent I/O for all `pids` in ONE probe window and cache the results,
     /// so applying N destructive actions costs one window instead of N (it slept
     /// the full window, 60 s by default, per target). Pids not primed are probed
@@ -3205,6 +3425,213 @@ mod tests {
                 started_at: at,
                 finished_at: at,
             }
+        }
+
+        fn saved_io_baseline(started_boot_ns: u64, finished_boot_ns: u64) -> RecentIoBaseline {
+            RecentIoBaseline {
+                target: pt_common::ProcessIdentity::new(
+                    42,
+                    pt_common::StartId::from_linux("test-boot", 10, 42),
+                    1000,
+                ),
+                scope: RecentIoScope {
+                    boot_id: "test-boot".to_string(),
+                    pid_namespace: "pid:[123]".to_string(),
+                    time_namespace: "time:[456]".to_string(),
+                },
+                started_boot_ns,
+                finished_boot_ns,
+                birth_ticks: 10,
+                wchar: 20,
+                write_bytes: 30,
+            }
+        }
+
+        #[test]
+        fn saved_io_window_uses_read_boundaries_and_preserves_active_evidence() {
+            let window = Duration::from_secs(60);
+            let before = saved_io_baseline(1_000_000_000, 2_000_000_000);
+            let after = saved_io_baseline(62_000_000_000, 63_000_000_000);
+            let sample = io_sample_at(Instant::now() + window, 10, 20, 30);
+            let restored: RecentIoBaseline =
+                serde_json::from_slice(&serde_json::to_vec(&before).unwrap()).unwrap();
+            let observation = restored
+                .observation(&after, sample.clone(), window)
+                .expect("complete persisted observation window");
+            assert_eq!(observation.evidence(), RecentIoEvidence::Idle);
+            let short = RecentIoBaseline {
+                started_boot_ns: after.started_boot_ns - 1,
+                ..after.clone()
+            };
+            assert!(restored
+                .observation(&short, sample.clone(), window)
+                .is_none());
+            // Long read latency is not observation coverage: neither wall-clock
+            // timestamps nor the end of the new read may extend the interval.
+            let slow = RecentIoBaseline {
+                started_boot_ns: 61_000_000_000,
+                finished_boot_ns: 120_000_000_000,
+                ..after.clone()
+            };
+            assert!(restored
+                .observation(&slow, sample.clone(), window)
+                .is_none());
+            for (wchar, write_bytes) in [(21, 30), (20, 31)] {
+                let current = RecentIoBaseline {
+                    wchar,
+                    write_bytes,
+                    ..after.clone()
+                };
+                let sample = io_sample_at(sample.started_at, 10, wchar, write_bytes);
+                assert_eq!(
+                    restored
+                        .observation(&current, sample, window)
+                        .unwrap()
+                        .evidence(),
+                    RecentIoEvidence::Active
+                );
+            }
+        }
+
+        #[test]
+        fn saved_io_window_refuses_identity_scope_clock_and_counter_changes() {
+            let before = saved_io_baseline(1_000_000_000, 2_000_000_000);
+            let after = saved_io_baseline(62_000_000_000, 63_000_000_000);
+            let window = Duration::from_secs(60);
+            let sample = io_sample_at(Instant::now() + window, 10, 20, 30);
+            let changes: [fn(&mut RecentIoBaseline); 12] = [
+                |value| value.target.uid += 1,
+                |value| value.target.pid.0 += 1,
+                |value| value.target.start_id.0 = "test-boot:11:42".to_string(),
+                |value| value.target.quality = pt_common::IdentityQuality::PidOnly,
+                |value| value.scope.boot_id = "different-boot".to_string(),
+                |value| value.scope.pid_namespace = "pid:[789]".to_string(),
+                |value| value.scope.time_namespace = "time:[789]".to_string(),
+                |value| value.birth_ticks += 1,
+                |value| value.started_boot_ns = 1,
+                |value| value.finished_boot_ns = 0,
+                |value| value.wchar -= 1,
+                |value| value.write_bytes -= 1,
+            ];
+            for (index, change) in changes.iter().enumerate() {
+                let mut current = after.clone();
+                change(&mut current);
+                assert!(
+                    before
+                        .observation(&current, sample.clone(), window)
+                        .is_none(),
+                    "invalid current observation {index} was reused"
+                );
+            }
+            let mut invalid = before.clone();
+            invalid.finished_boot_ns = invalid.started_boot_ns - 1;
+            assert!(invalid
+                .observation(&after, sample.clone(), window)
+                .is_none());
+            invalid = before.clone();
+            invalid.target.quality = pt_common::IdentityQuality::NoBootId;
+            assert!(invalid.observation(&after, sample, window).is_none());
+        }
+
+        #[test]
+        fn saved_io_observations_reuse_live_idle_window_and_fallback_on_ambiguity() {
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = OwnedChild(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("owned idle child"),
+            );
+            let pid = child.0.id();
+            let scope = RecentIoScope::read().expect("live boot and namespace identities");
+            let target = pt_common::ProcessIdentity::new(
+                pid,
+                pt_common::StartId::from_linux(&scope.boot_id, read_io_birth(pid).unwrap(), pid),
+                // SAFETY: getuid reads this process's real UID, inherited by the child.
+                unsafe { libc::getuid() },
+            );
+            let baseline = RecentIoBaseline::capture(&target).expect("capture live baseline");
+            let serialized = serde_json::to_vec(&baseline).unwrap();
+            let restored: RecentIoBaseline = serde_json::from_slice(&serialized).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            let provider = io_only_provider(2);
+            let began = Instant::now();
+            provider.prime_recent_io_from_baselines(
+                std::slice::from_ref(&target),
+                std::slice::from_ref(&restored),
+            );
+            assert!(
+                began.elapsed() < Duration::from_secs(2),
+                "saved window was not reused"
+            );
+            assert!(provider.check_data_loss(pid).is_passed());
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "owned process must survive"
+            );
+
+            // Ambiguous evidence cannot choose whichever baseline grants action.
+            let provider = io_only_provider(1);
+            let began = Instant::now();
+            provider.prime_recent_io_from_baselines(
+                std::slice::from_ref(&target),
+                &[restored.clone(), restored],
+            );
+            assert!(began.elapsed() >= Duration::from_secs(1));
+            assert!(provider.check_data_loss(pid).is_passed());
+        }
+
+        #[test]
+        fn saved_io_observations_still_block_a_live_periodic_writer() {
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            // Python writes and closes /dev/null repeatedly without spawning
+            // descendants or holding a persistent regular-file descriptor.
+            let mut child = OwnedChild(
+                std::process::Command::new("python3")
+                    .args([
+                        "-c",
+                        "import time\nwhile True:\n with open('/dev/null', 'w') as f: f.write('heartbeat')\n time.sleep(0.1)",
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("owned periodic writer"),
+            );
+            let pid = child.0.id();
+            let scope = RecentIoScope::read().unwrap();
+            let target = pt_common::ProcessIdentity::new(
+                pid,
+                pt_common::StartId::from_linux(&scope.boot_id, read_io_birth(pid).unwrap(), pid),
+                // SAFETY: getuid only reads the real UID inherited by the child.
+                unsafe { libc::getuid() },
+            );
+            let baseline = RecentIoBaseline::capture(&target).expect("writer observation");
+            std::thread::sleep(Duration::from_secs(2));
+            let provider = io_only_provider(2);
+            let began = Instant::now();
+            provider.prime_recent_io_from_baselines(&[target], &[baseline]);
+            assert!(began.elapsed() < Duration::from_secs(2));
+            assert!(matches!(
+                provider.check_data_loss(pid),
+                PreCheckResult::Blocked { reason, .. } if reason.contains("recent I/O")
+            ));
+            assert!(child.0.try_wait().unwrap().is_none(), "writer must survive");
         }
 
         #[test]

@@ -1275,6 +1275,22 @@ finally:
     assert_eq!(action.target.start_id, identity.start_id);
     assert_eq!(action.target.uid, identity.uid);
     assert_eq!(action.target.sid, identity.sid);
+    let io_baseline = document["recent_io_baselines"]
+        .as_array()
+        .expect("planner retains recent-I/O observations")
+        .iter()
+        .find(|baseline| baseline["target"]["pid"] == pid)
+        .expect("actual executable target has a saved I/O baseline");
+    assert_eq!(io_baseline["target"]["start_id"], identity.start_id.0);
+    assert_eq!(io_baseline["target"]["uid"], identity.uid);
+    assert!(io_baseline["wchar"].is_u64());
+    assert!(io_baseline["write_bytes"].is_u64());
+    assert!(
+        io_baseline["started_boot_ns"].as_u64().unwrap()
+            <= io_baseline["finished_boot_ns"].as_u64().unwrap()
+    );
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    assert_eq!(io_baseline["scope"]["boot_id"], boot_id.trim());
     assert_eq!(document["candidates"][0]["ppid"], reaper.0.id());
     assert_eq!(
         document["candidates"][0]["inference"]["prior_source"],
