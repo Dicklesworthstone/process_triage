@@ -8511,6 +8511,16 @@ fn run_agent_fleet_plan(global: &GlobalOpts, args: &AgentFleetPlanArgs) -> ExitC
                 scan_result.duration_ms,
             );
             println!("Fleet session: {}", fleet_session_id.0);
+            print_fleet_health_summary(fleet_session.aggregate.health.as_ref());
+            for host in &fleet_session.hosts {
+                let health = fleet_host_health_summary(&host.health);
+                println!(
+                    "  {}: pressure {}, {} coverage",
+                    host.host_id,
+                    health["status"].as_str().unwrap_or("unknown"),
+                    health["coverage"].as_str().unwrap_or("unavailable")
+                );
+            }
             for r in scan_result.results.iter().filter(|r| r.success) {
                 let version = r.plan.as_ref().and_then(|p| p.pt_version.as_deref());
                 if version != Some(env!("CARGO_PKG_VERSION")) {
@@ -8945,6 +8955,36 @@ fn build_fleet_top_offenders(
         .collect()
 }
 
+/// Report only sensor enums and counts, so public report profiles do not leak
+/// raw host blocks or remote error messages through their health diagnostics.
+fn fleet_host_health_summary(health: &pt_core::session::fleet::HostHealth) -> serde_json::Value {
+    serde_json::json!({
+        "status": health.status,
+        "coverage": health.coverage,
+        "sampled_at_ms": health.pressure.as_ref().map(|pressure| pressure.sampled_at_ms),
+        "observed_regimes": health.assessment.as_ref()
+            .map(|assessment| assessment.regimes.iter().map(|regime| regime.kind).collect::<Vec<_>>())
+            .unwrap_or_default(),
+        "unavailable_sources": health.unavailable.len(),
+    })
+}
+
+fn print_fleet_health_summary(health: Option<&pt_core::session::fleet::FleetHealthSummary>) {
+    if let Some(health) = health {
+        println!(
+            "Pressure observations: {} healthy, {} warning, {} critical, {} unknown; {} partial, {} unavailable.",
+            health.healthy_hosts,
+            health.warning_hosts,
+            health.critical_hosts,
+            health.unknown_hosts,
+            health.partial_hosts,
+            health.unavailable_hosts
+        );
+    } else {
+        println!("Pressure observations: unavailable in this saved fleet session.");
+    }
+}
+
 fn build_host_comparison(
     fleet: &pt_core::session::fleet::FleetSession,
     profile: FleetReportProfile,
@@ -8982,6 +9022,7 @@ fn build_host_comparison(
                 "kill_rate": kill_rate,
                 "risk_index": risk_index,
                 "risk_tier": risk_tier,
+                "health": fleet_host_health_summary(&h.health),
                 "class_counts": ordered_u32_map(&h.summary.class_counts),
                 "action_counts": ordered_u32_map(&h.summary.action_counts),
             })
@@ -9237,6 +9278,7 @@ fn run_agent_fleet_report(global: &GlobalOpts, args: &AgentFleetReportArgs) -> E
                 "action_counts": ordered_u32_map(&fleet.aggregate.action_counts),
                 "mean_candidate_score": fleet.aggregate.mean_candidate_score,
                 "max_candidate_score": fleet.aggregate.max_candidate_score,
+                "health": fleet.aggregate.health,
                 "recurring_patterns": top_offenders,
             },
             "safety_budget": safety_budget,
@@ -9268,6 +9310,7 @@ fn run_agent_fleet_report(global: &GlobalOpts, args: &AgentFleetReportArgs) -> E
             println!("  Candidates: {}", fleet.aggregate.total_candidates);
             println!("  Mean score: {:.3}", fleet.aggregate.mean_candidate_score);
             println!("  Max score:  {:.3}", fleet.aggregate.max_candidate_score);
+            print_fleet_health_summary(fleet.aggregate.health.as_ref());
             println!();
             println!("## Top Offenders");
             for offender in response["report"]["top_offenders"]
@@ -9294,13 +9337,15 @@ fn run_agent_fleet_report(global: &GlobalOpts, args: &AgentFleetReportArgs) -> E
                 .take(12)
             {
                 println!(
-                    "  #{} {} — {} candidates / {} processes (risk: {}, index {:.2})",
+                    "  #{} {} — {} candidates / {} processes (risk: {}, index {:.2}; pressure: {}, {} coverage)",
                     host["rank"].as_u64().unwrap_or(0),
                     host["host_id"].as_str().unwrap_or("?"),
                     host["candidate_count"].as_u64().unwrap_or(0),
                     host["process_count"].as_u64().unwrap_or(0),
                     host["risk_tier"].as_str().unwrap_or("?"),
                     host["risk_index"].as_f64().unwrap_or(0.0),
+                    host["health"]["status"].as_str().unwrap_or("unknown"),
+                    host["health"]["coverage"].as_str().unwrap_or("unavailable"),
                 );
             }
             println!();
@@ -9350,10 +9395,15 @@ fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> E
             "total_candidates": fleet.aggregate.total_candidates,
             "mean_candidate_score": fleet.aggregate.mean_candidate_score,
             "max_candidate_score": fleet.aggregate.max_candidate_score,
+            "health": fleet.aggregate.health,
             "class_counts": fleet.aggregate.class_counts,
             "action_counts": fleet.aggregate.action_counts,
             "recurring_patterns": fleet.aggregate.recurring_patterns.len(),
         },
+        "host_health": fleet.hosts.iter().map(|host| serde_json::json!({
+            "host_id": host.host_id,
+            "health": fleet_host_health_summary(&host.health),
+        })).collect::<Vec<_>>(),
         "safety_budget": {
             "max_fdr": fleet.safety_budget.max_fdr,
             "alpha_spent": fleet.safety_budget.alpha_spent,
@@ -9379,6 +9429,16 @@ fn run_agent_fleet_status(global: &GlobalOpts, args: &AgentFleetStatusArgs) -> E
             println!("Hosts:      {}", fleet.aggregate.total_hosts);
             println!("Processes:  {}", fleet.aggregate.total_processes);
             println!("Candidates: {}", fleet.aggregate.total_candidates);
+            print_fleet_health_summary(fleet.aggregate.health.as_ref());
+            for host in &fleet.hosts {
+                let health = fleet_host_health_summary(&host.health);
+                println!(
+                    "  {}: pressure {}, {} coverage",
+                    host.host_id,
+                    health["status"].as_str().unwrap_or("unknown"),
+                    health["coverage"].as_str().unwrap_or("unavailable")
+                );
+            }
             println!();
             println!(
                 "FDR budget: {:.1}% (spent {:.3}, remaining {:.3})",
@@ -17110,6 +17170,7 @@ fn collect_system_state(processes: Option<&[ProcessRecord]>) -> serde_json::Valu
         "process_count": process_count,
         "psi": psi,
         "pressure": snapshot,
+        "census": census,
         "assessment": assessment,
     })
 }

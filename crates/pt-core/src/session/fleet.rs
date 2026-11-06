@@ -14,6 +14,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use crate::collect::pressure::{PressureSnapshot, Unavailable};
+use crate::decision::pressure_regime::{PressureAssessment, ProcessCensus, Severity};
 use crate::decision::{select_fdr, FdrCandidate, FdrMethod, TargetIdentity};
 
 // ---------------------------------------------------------------------------
@@ -45,6 +47,14 @@ pub struct HostEntry {
     pub process_count: u32,
     pub candidate_count: u32,
     pub summary: HostSummary,
+    /// The remote host and system blocks, retained with their host association.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_state: Option<serde_json::Value>,
+    /// Locally assessed system pressure, independent of process recommendations.
+    #[serde(default)]
+    pub health: HostHealth,
     /// Exact PIDs approved by the pooled selection, bound to this host session.
     #[serde(default)]
     pub selected_kill_pids: Vec<u32>,
@@ -63,6 +73,79 @@ pub struct HostSummary {
     pub max_candidate_score: f64,
 }
 
+/// Health of the observed snapshot. Incomplete quiet readings are unknown, not OK.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostHealthStatus {
+    #[default]
+    Unknown,
+    Ok,
+    Warn,
+    Crit,
+}
+
+/// Coverage of the point-in-time pressure checks. A single snapshot cannot measure
+/// swap throughput or new OOM kills; those require two observations on that host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureCoverage {
+    #[default]
+    Unavailable,
+    Partial,
+    Complete,
+}
+
+/// Validated remote sensor readings and the local classifier's interpretation.
+///
+/// `assessment.worst` describes only observed signals. Use `status` to distinguish
+/// a fully observed quiet snapshot from one with missing evidence. The unmodified
+/// remote blocks remain in `HostEntry`; rejected sensor values appear in
+/// `unavailable`, never as zero-pressure observations here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostHealth {
+    pub status: HostHealthStatus,
+    pub coverage: PressureCoverage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<PressureSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub census: Option<ProcessCensus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<PressureAssessment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<Unavailable>,
+}
+
+impl Default for HostHealth {
+    fn default() -> Self {
+        Self {
+            status: HostHealthStatus::Unknown,
+            coverage: PressureCoverage::Unavailable,
+            pressure: None,
+            census: None,
+            assessment: None,
+            unavailable: vec![Unavailable {
+                source: "system_state.pressure".to_string(),
+                reason: "remote pressure observation unavailable".to_string(),
+            }],
+        }
+    }
+}
+
+/// Fleet snapshot-health counts. Partial or unavailable quiet hosts are excluded
+/// from `healthy_hosts`; warnings and critical observations still count even when
+/// other sensors on that host are unavailable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetHealthSummary {
+    pub healthy_hosts: usize,
+    pub warning_hosts: usize,
+    pub critical_hosts: usize,
+    pub unknown_hosts: usize,
+    pub partial_hosts: usize,
+    pub unavailable_hosts: usize,
+    /// Greatest observed severity; None when no host supplied usable observations.
+    pub worst_observed: Option<Severity>,
+}
+
 /// Aggregated fleet-level metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetAggregate {
@@ -79,6 +162,9 @@ pub struct FleetAggregate {
     pub max_candidate_score: f64,
     /// Patterns recurring across multiple hosts.
     pub recurring_patterns: Vec<RecurringPattern>,
+    /// None for saved sessions produced before system-health aggregation existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<FleetHealthSummary>,
 }
 
 /// A pattern (command signature) seen on multiple hosts.
@@ -159,6 +245,9 @@ pub struct HostInput {
     pub scanned_at: String,
     pub total_processes: u32,
     pub candidates: Vec<CandidateInfo>,
+    pub host: Option<serde_json::Value>,
+    pub system_state: Option<serde_json::Value>,
+    pub health: HostHealth,
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +275,9 @@ pub fn create_fleet_session(
                 process_count: input.total_processes,
                 candidate_count: input.candidates.len() as u32,
                 summary,
+                host: input.host.clone(),
+                system_state: input.system_state.clone(),
+                health: input.health.clone(),
                 selected_kill_pids: input
                     .candidates
                     .iter()
@@ -290,7 +382,33 @@ fn compute_aggregate(
         mean_candidate_score: mean,
         max_candidate_score: max_score,
         recurring_patterns,
+        health: Some(summarize_health(hosts)),
     }
+}
+
+fn summarize_health(hosts: &[HostEntry]) -> FleetHealthSummary {
+    let mut summary = FleetHealthSummary::default();
+    for host in hosts {
+        match host.health.status {
+            HostHealthStatus::Ok => summary.healthy_hosts += 1,
+            HostHealthStatus::Warn => summary.warning_hosts += 1,
+            HostHealthStatus::Crit => summary.critical_hosts += 1,
+            HostHealthStatus::Unknown => summary.unknown_hosts += 1,
+        }
+        match host.health.coverage {
+            PressureCoverage::Partial => summary.partial_hosts += 1,
+            PressureCoverage::Unavailable => summary.unavailable_hosts += 1,
+            PressureCoverage::Complete => {}
+        }
+        if let Some(assessment) = &host.health.assessment {
+            summary.worst_observed = Some(
+                summary
+                    .worst_observed
+                    .map_or(assessment.worst, |previous| previous.max(assessment.worst)),
+            );
+        }
+    }
+    summary
 }
 
 fn find_recurring_patterns(
@@ -620,6 +738,9 @@ mod tests {
             scanned_at: "2026-02-01T12:00:00Z".to_string(),
             total_processes: 100 + candidates.len() as u32,
             candidates,
+            host: None,
+            system_state: None,
+            health: HostHealth::default(),
         }
     }
 
@@ -878,6 +999,7 @@ mod tests {
         assert_eq!(fleet.aggregate.total_candidates, 0);
         assert!((fleet.aggregate.mean_candidate_score - 0.0).abs() < f64::EPSILON);
         assert!(fleet.aggregate.recurring_patterns.is_empty());
+        assert_eq!(fleet.aggregate.health, Some(FleetHealthSummary::default()));
     }
 
     #[test]
@@ -909,6 +1031,31 @@ mod tests {
         assert_eq!(restored.aggregate.total_hosts, 2);
         assert_eq!(restored.aggregate.recurring_patterns.len(), 1);
         assert_eq!(restored.label.as_deref(), Some("roundtrip test"));
+    }
+
+    #[test]
+    fn legacy_fleet_sessions_load_without_claiming_healthy_hosts() {
+        let fleet = create_fleet_session("legacy", None, &[host("old", vec![])], 0.05);
+        let mut document = serde_json::to_value(fleet).unwrap();
+        let old_host = document["hosts"][0].as_object_mut().unwrap();
+        old_host.remove("health");
+        old_host.remove("host");
+        old_host.remove("system_state");
+        document["aggregate"]
+            .as_object_mut()
+            .unwrap()
+            .remove("health");
+
+        let restored: FleetSession = serde_json::from_value(document).unwrap();
+        assert_eq!(restored.hosts[0].health.status, HostHealthStatus::Unknown);
+        assert_eq!(
+            restored.hosts[0].health.coverage,
+            PressureCoverage::Unavailable
+        );
+        assert!(restored.hosts[0].health.pressure.is_none());
+        assert!(restored.hosts[0].host.is_none());
+        assert!(restored.hosts[0].system_state.is_none());
+        assert!(restored.aggregate.health.is_none());
     }
 
     #[test]

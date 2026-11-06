@@ -21,6 +21,15 @@ use tempfile::TempDir;
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+const HEALTH_SAMPLE_MS: u64 = 1_770_552_000_000;
+const PRIVATE_HEALTH_MARKERS: [&str; 5] = [
+    "private-health-host-metadata",
+    "private-health-system-context",
+    "private-health-source-path",
+    "private-health-sensor-error",
+    "private-health-regime-explanation",
+];
+
 fn with_temp_data_dir<T>(f: impl FnOnce(&TempDir) -> T) -> T {
     let _guard = ENV_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -88,7 +97,144 @@ fn host_input(id: &str, candidates: Vec<CandidateInfo>) -> HostInput {
         scanned_at: "2026-02-08T12:00:00Z".to_string(),
         total_processes: 250 + candidates.len() as u32,
         candidates,
+        host: None,
+        system_state: None,
+        health: Default::default(),
     }
+}
+
+fn add_fixture_health(input: &mut HostInput, index: usize) {
+    let cpu = if index == 0 { 45.0 } else { 0.0 };
+    let mut document = serde_json::json!({
+        "generated_at": input.scanned_at,
+        "session_id": input.session_id,
+        "host": {"hostname": PRIVATE_HEALTH_MARKERS[0]},
+        "summary": {"total_processes_scanned": input.total_processes},
+        "candidates": [],
+        "system_state": {
+            "operator_context": PRIVATE_HEALTH_MARKERS[1],
+            "census": {"zombies": 0, "dstate": 0},
+            "pressure": {
+                "sampled_at_ms": HEALTH_SAMPLE_MS + index as u64 * 1000,
+                "cpus": 8,
+                "cpu": {"some": {"avg10": cpu, "avg60": cpu, "avg300": cpu, "total_us": 100}},
+                "memory": {"some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total_us": 0}},
+                "io": {"some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total_us": 0}},
+                "load": {"one": 1.0, "five": 1.0, "fifteen": 1.0},
+                "meminfo": {"total": 16_u64 << 30, "available": 8_u64 << 30, "swap_total": 0, "swap_free": 0},
+                "file_handles": {"allocated": 10, "max": 10000},
+                "unavailable": []
+            }
+        }
+    });
+    if index == 2 {
+        document["system_state"]["pressure"]["io"] = Value::Null;
+        document["system_state"]["pressure"]["unavailable"] = serde_json::json!([
+            {"source": PRIVATE_HEALTH_MARKERS[2], "reason": PRIVATE_HEALTH_MARKERS[3]}
+        ]);
+    }
+    let observation = scan_result_to_host_input(&HostScanResult {
+        host: input.host_id.clone(),
+        success: true,
+        plan: Some(parse_remote_plan(&document.to_string()).expect("parse health fixture")),
+        error: None,
+        duration_ms: 1,
+        provenance: None,
+    });
+    input.host = observation.host;
+    input.system_state = observation.system_state;
+    input.health = observation.health;
+    if let Some(regime) = input
+        .health
+        .assessment
+        .as_mut()
+        .and_then(|assessment| assessment.regimes.first_mut())
+    {
+        // Free-form explanations are not a safe public-report surface either.
+        regime.explanation = PRIVATE_HEALTH_MARKERS[4].to_string();
+    }
+}
+
+fn assert_fixture_health_counts(health: &Value) {
+    assert_eq!(health["healthy_hosts"], 1);
+    assert_eq!(health["critical_hosts"], 1);
+    assert_eq!(health["warning_hosts"], 0);
+    assert_eq!(health["unknown_hosts"], 1);
+    assert_eq!(health["partial_hosts"], 1);
+    assert_eq!(health["unavailable_hosts"], 0);
+    assert_eq!(health["worst_observed"], "crit");
+}
+
+fn assert_compact_host_health(health: &Value, index: usize) {
+    let mut keys: Vec<_> = health
+        .as_object()
+        .expect("compact health object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "coverage",
+            "observed_regimes",
+            "sampled_at_ms",
+            "status",
+            "unavailable_sources"
+        ]
+    );
+    assert_eq!(
+        health["sampled_at_ms"],
+        HEALTH_SAMPLE_MS + index as u64 * 1000
+    );
+    assert_eq!(health["status"], ["crit", "ok", "unknown"][index]);
+    assert_eq!(
+        health["coverage"],
+        if index == 2 { "partial" } else { "complete" }
+    );
+    assert_eq!(
+        health["observed_regimes"],
+        if index == 0 {
+            serde_json::json!(["cpu_contention"])
+        } else {
+            serde_json::json!([])
+        }
+    );
+    let unavailable = health["unavailable_sources"]
+        .as_u64()
+        .expect("unavailable source count");
+    if index == 2 {
+        assert!(unavailable > 0);
+    } else {
+        assert_eq!(unavailable, 0);
+    }
+}
+
+fn assert_health_details_private(rendered: &str) {
+    for marker in PRIVATE_HEALTH_MARKERS {
+        assert!(
+            !rendered.contains(marker),
+            "raw health detail leaked: {marker}"
+        );
+    }
+}
+
+fn assert_report_host_health(report: &Value) {
+    assert_fixture_health_counts(&report["aggregate"]["health"]);
+    let rows = report["host_comparison"]
+        .as_array()
+        .expect("comparison rows");
+    assert_eq!(rows.len(), 3);
+    for index in 0..3 {
+        let timestamp = HEALTH_SAMPLE_MS + index as u64 * 1000;
+        let host = rows
+            .iter()
+            .find(|row| row["health"]["sampled_at_ms"].as_u64() == Some(timestamp))
+            .expect("host health remains associated with its own sample");
+        assert_compact_host_health(&host["health"], index);
+        assert!(host["host_id"].as_str().unwrap().starts_with("host_"));
+    }
+    assert_eq!(report["hosts"], report["host_comparison"]);
 }
 
 fn create_fixture_fleet_session() -> String {
@@ -102,7 +248,7 @@ fn create_fixture_fleet_session() -> String {
     );
     let handle = store.create(&manifest).expect("create session");
 
-    let inputs = vec![
+    let mut inputs = vec![
         host_input(
             "alpha.internal",
             vec![
@@ -128,10 +274,19 @@ fn create_fixture_fleet_session() -> String {
             ],
         ),
     ];
+    for (index, input) in inputs.iter_mut().enumerate() {
+        add_fixture_health(input, index);
+    }
 
     let fleet = create_fleet_session(&session_id.0, Some("fixture"), &inputs, 0.05);
     let fleet_path = handle.dir.join("fleet.json");
     let payload = serde_json::to_string_pretty(&fleet).expect("serialize fleet");
+    for marker in PRIVATE_HEALTH_MARKERS {
+        assert!(
+            payload.contains(marker),
+            "redaction fixture lost private marker: {marker}"
+        );
+    }
     fs::write(&fleet_path, payload).expect("write fleet session");
 
     session_id.0
@@ -450,6 +605,22 @@ fn fleet_status_accepts_documented_session_flag() {
             .clone();
         let json: Value = serde_json::from_slice(&output).expect("valid json");
         assert!(json.to_string().contains(&fleet_session_id), "{json}");
+        assert_fixture_health_counts(&json["aggregate"]["health"]);
+        let hosts = json["host_health"]
+            .as_array()
+            .expect("host health metadata");
+        assert_eq!(hosts.len(), 3);
+        for (index, host_id) in ["alpha.internal", "beta.internal", "gamma.internal"]
+            .iter()
+            .enumerate()
+        {
+            let host = hosts
+                .iter()
+                .find(|host| host["host_id"].as_str() == Some(*host_id))
+                .expect("each host is present");
+            assert_compact_host_health(&host["health"], index);
+        }
+        assert_health_details_private(&String::from_utf8(output).unwrap());
     });
 }
 
@@ -476,6 +647,8 @@ fn fleet_report_json_contains_expected_sections() {
 
         let json: Value = serde_json::from_slice(&output).expect("valid json");
         let report = json.get("report").expect("report section");
+        assert_report_host_health(report);
+        assert_health_details_private(&String::from_utf8(output).unwrap());
 
         assert_eq!(
             report.get("profile").and_then(|v| v.as_str()),
@@ -533,6 +706,7 @@ fn fleet_report_minimal_profile_redacts_hosts_and_signatures() {
             .clone();
 
         let rendered = String::from_utf8(output.clone()).expect("utf8");
+        assert_health_details_private(&rendered);
         assert!(
             !rendered.contains("alpha.internal")
                 && !rendered.contains("beta.internal")
@@ -547,6 +721,7 @@ fn fleet_report_minimal_profile_redacts_hosts_and_signatures() {
         );
 
         let json: Value = serde_json::from_slice(&output).expect("valid json");
+        assert_report_host_health(&json["report"]);
         let first_host = json["report"]["host_comparison"][0]["host_id"]
             .as_str()
             .unwrap_or_default()
@@ -585,6 +760,8 @@ fn fleet_report_writes_json_output_file() {
         assert!(out_path.exists(), "--out should create report file");
         let content = fs::read_to_string(&out_path).expect("read output file");
         let json: Value = serde_json::from_str(&content).expect("file should contain valid json");
+        assert_report_host_health(&json["report"]);
+        assert_health_details_private(&content);
         assert_eq!(
             json.get("fleet_session_id").and_then(|v| v.as_str()),
             Some(fleet_session_id.as_str())
@@ -595,5 +772,39 @@ fn fleet_report_writes_json_output_file() {
                 .is_some(),
             "written report should include computed sections"
         );
+    });
+}
+
+#[test]
+fn fleet_status_and_report_prose_distinguish_partial_pressure_from_healthy() {
+    with_temp_data_dir(|data_dir| {
+        let fleet_session_id = create_fixture_fleet_session();
+        for command in ["status", "report"] {
+            let output = pt_core_fast()
+                .env("PROCESS_TRIAGE_DATA", data_dir.path())
+                .args([
+                    "--format",
+                    "prose",
+                    "agent",
+                    "fleet",
+                    command,
+                    "--session",
+                    &fleet_session_id,
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let rendered = String::from_utf8(output).expect("readable pressure summary");
+            assert!(
+                rendered.contains("1 healthy, 0 warning, 1 critical, 1 unknown"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("1 partial, 0 unavailable"), "{rendered}");
+            assert!(rendered.contains("partial coverage"), "{rendered}");
+            assert!(rendered.contains("complete coverage"), "{rendered}");
+            assert_health_details_private(&rendered);
+        }
     });
 }

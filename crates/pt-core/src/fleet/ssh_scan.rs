@@ -7,11 +7,17 @@
 //! to fetch a raw scan and apply a local state heuristic that, for example,
 //! recommended `kill` for every zombie and every process stopped for an hour.)
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
+
+use crate::collect::pressure::{
+    FileHandles, LoadAvg, MemInfo, PressureSnapshot, PsiLine, PsiResource, Unavailable, VmStat,
+};
+use crate::decision::pressure_regime::{assess, PressureThresholds, ProcessCensus, Severity};
+use crate::session::fleet::{HostHealth, HostHealthStatus, PressureCoverage};
 
 /// Configuration for SSH-based fleet scanning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +227,298 @@ pub fn parse_remote_plan(json: &str) -> Result<RemotePlan, String> {
         candidates,
         document: Some(v),
     })
+}
+
+/// Read a sensor independently: a malformed memory reading must not hide a valid
+/// CPU-pressure observation, or invalidate the remote host's process decisions.
+fn remote_sensor<T: DeserializeOwned>(
+    value: Option<&serde_json::Value>,
+    source: &str,
+    required: bool,
+    unavailable: &mut Vec<Unavailable>,
+) -> Option<T> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        if required {
+            unavailable.push(Unavailable {
+                source: source.to_string(),
+                reason: "not reported by the remote host".to_string(),
+            });
+        }
+        return None;
+    };
+    match serde_json::from_value(value.clone()) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            unavailable.push(Unavailable {
+                source: source.to_string(),
+                reason: format!("invalid remote observation: {error}"),
+            });
+            None
+        }
+    }
+}
+
+fn remote_psi(
+    pressure: &serde_json::Value,
+    name: &str,
+    required: bool,
+    unavailable: &mut Vec<Unavailable>,
+) -> Option<PsiResource> {
+    let source = format!("system_state.pressure.{name}");
+    let resource = remote_sensor::<serde_json::Map<String, serde_json::Value>>(
+        pressure.get(name),
+        &source,
+        required,
+        unavailable,
+    )?;
+    let mut line = |name: &str, required: bool| {
+        let source = format!("{source}.{name}");
+        let line = remote_sensor::<PsiLine>(resource.get(name), &source, required, unavailable)?;
+        if [line.avg10, line.avg60, line.avg300]
+            .iter()
+            .all(|average| average.is_finite() && (0.0..=100.0).contains(average))
+        {
+            Some(line)
+        } else {
+            unavailable.push(Unavailable {
+                source,
+                reason: "PSI averages must be finite percentages between 0 and 100".to_string(),
+            });
+            None
+        }
+    };
+    let some = line("some", required);
+    let full = line("full", false);
+    (some.is_some() || full.is_some()).then_some(PsiResource { some, full })
+}
+
+/// Recompute snapshot health from remote measurements, never from the remote
+/// `assessment` or a claimed severity. No local host readings fill remote gaps.
+fn remote_health(system_state: Option<&serde_json::Value>, total_processes: u64) -> HostHealth {
+    let Some(system_state) = system_state.filter(|value| value.is_object()) else {
+        return HostHealth::default();
+    };
+    let Some(raw) = system_state
+        .get("pressure")
+        .filter(|value| value.is_object())
+    else {
+        return HostHealth::default();
+    };
+    let mut unavailable = Vec::new();
+    let Some(sampled_at_ms) = remote_sensor::<u64>(
+        raw.get("sampled_at_ms"),
+        "system_state.pressure.sampled_at_ms",
+        true,
+        &mut unavailable,
+    ) else {
+        return HostHealth {
+            unavailable,
+            ..HostHealth::default()
+        };
+    };
+    let cpus = remote_sensor::<u32>(
+        raw.get("cpus"),
+        "system_state.pressure.cpus",
+        true,
+        &mut unavailable,
+    )
+    .unwrap_or(0);
+    if cpus == 0 && raw.get("cpus").and_then(serde_json::Value::as_u64) == Some(0) {
+        unavailable.push(Unavailable {
+            source: "system_state.pressure.cpus".to_string(),
+            reason: "online CPU count is unavailable".to_string(),
+        });
+    }
+    let cpu = remote_psi(raw, "cpu", true, &mut unavailable);
+    let memory = remote_psi(raw, "memory", true, &mut unavailable);
+    let io = remote_psi(raw, "io", true, &mut unavailable);
+    let irq = remote_psi(raw, "irq", false, &mut unavailable);
+    let load = remote_sensor::<LoadAvg>(
+        raw.get("load"),
+        "system_state.pressure.load",
+        true,
+        &mut unavailable,
+    )
+    .filter(|load| {
+        let valid = [load.one, load.five, load.fifteen]
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0);
+        if !valid {
+            unavailable.push(Unavailable {
+                source: "system_state.pressure.load".to_string(),
+                reason: "load averages must be finite and nonnegative".to_string(),
+            });
+        }
+        valid
+    });
+    let meminfo = remote_sensor::<MemInfo>(
+        raw.get("meminfo"),
+        "system_state.pressure.meminfo",
+        true,
+        &mut unavailable,
+    )
+    .map(|mut memory| {
+        if memory.total == Some(0)
+            || memory
+                .total
+                .zip(memory.available)
+                .is_some_and(|(total, available)| available > total)
+        {
+            memory.total = None;
+            memory.available = None;
+            unavailable.push(Unavailable {
+                source: "system_state.pressure.meminfo".to_string(),
+                reason: "RAM total must be positive and available RAM must not exceed it"
+                    .to_string(),
+            });
+        }
+        if memory
+            .swap_total
+            .zip(memory.swap_free)
+            .is_some_and(|(total, free)| free > total)
+        {
+            memory.swap_total = None;
+            memory.swap_free = None;
+            unavailable.push(Unavailable {
+                source: "system_state.pressure.meminfo".to_string(),
+                reason: "free swap must not exceed total swap".to_string(),
+            });
+        }
+        for (field, value) in [
+            ("total", memory.total),
+            ("available", memory.available),
+            ("swap_total", memory.swap_total),
+            ("swap_free", memory.swap_free),
+        ] {
+            if value.is_none() {
+                unavailable.push(Unavailable {
+                    source: format!("system_state.pressure.meminfo.{field}"),
+                    reason: "required snapshot-health reading unavailable".to_string(),
+                });
+            }
+        }
+        memory
+    });
+    let file_handles = remote_sensor::<FileHandles>(
+        raw.get("file_handles"),
+        "system_state.pressure.file_handles",
+        true,
+        &mut unavailable,
+    )
+    .filter(|handles| {
+        if handles.max == 0 {
+            unavailable.push(Unavailable {
+                source: "system_state.pressure.file_handles".to_string(),
+                reason: "file-handle limit is unavailable".to_string(),
+            });
+            false
+        } else {
+            // Allocations above the configured limit are pressure, not bad data.
+            true
+        }
+    });
+    let vmstat = remote_sensor::<VmStat>(
+        raw.get("vmstat"),
+        "system_state.pressure.vmstat",
+        false,
+        &mut unavailable,
+    );
+    let census = remote_sensor::<ProcessCensus>(
+        system_state.get("census"),
+        "system_state.census",
+        true,
+        &mut unavailable,
+    )
+    .filter(|census| {
+        if u64::from(census.zombies) + u64::from(census.dstate) > total_processes {
+            unavailable.push(Unavailable {
+                source: "system_state.census".to_string(),
+                reason: "process-state counts exceed the reported scan population".to_string(),
+            });
+            false
+        } else {
+            true
+        }
+    });
+    let reported_unavailable = remote_sensor::<Vec<Unavailable>>(
+        raw.get("unavailable"),
+        "system_state.pressure.unavailable",
+        false,
+        &mut unavailable,
+    )
+    .unwrap_or_default();
+
+    // Optional fields may be absent, but an explicit remote evidence failure
+    // cannot earn an all-clear even if that host also supplies fallback numbers.
+    let complete = unavailable.is_empty() && reported_unavailable.is_empty();
+    unavailable.extend(reported_unavailable);
+    let mut snapshot = PressureSnapshot {
+        sampled_at_ms,
+        cpus,
+        cpu,
+        memory,
+        io,
+        irq,
+        load,
+        meminfo,
+        vmstat,
+        file_handles,
+        unavailable: unavailable.clone(),
+    };
+    // Some older/custom producers accompany unavailable sensors with fallback
+    // numbers. Keep the raw block, but never assess those as observations.
+    for issue in &snapshot.unavailable {
+        match issue.source.as_str() {
+            "online_cpu_count" => snapshot.cpus = 0,
+            "/proc/pressure/cpu" => snapshot.cpu = None,
+            "/proc/pressure/memory" => snapshot.memory = None,
+            "/proc/pressure/io" => snapshot.io = None,
+            "/proc/pressure/irq" => snapshot.irq = None,
+            "/proc/loadavg" | "getloadavg" => snapshot.load = None,
+            "/proc/meminfo" => snapshot.meminfo = None,
+            "/proc/vmstat" => snapshot.vmstat = None,
+            "/proc/sys/fs/file-nr" => snapshot.file_handles = None,
+            _ => {}
+        }
+    }
+    let observed = snapshot.cpu.and_then(|resource| resource.some).is_some()
+        || snapshot.memory.and_then(|resource| resource.some).is_some()
+        || snapshot.io.and_then(|resource| resource.some).is_some()
+        || snapshot.load_ratio().is_some()
+        || snapshot
+            .meminfo
+            .is_some_and(|memory| memory.used_fraction().is_some() || memory.swap_used().is_some())
+        || snapshot.file_handles.is_some()
+        || census.is_some();
+    let assessment = observed.then(|| {
+        assess(
+            &snapshot,
+            None,
+            census.as_ref(),
+            &PressureThresholds::default(),
+        )
+    });
+    let coverage = if complete {
+        PressureCoverage::Complete
+    } else if observed {
+        PressureCoverage::Partial
+    } else {
+        PressureCoverage::Unavailable
+    };
+    let status = match assessment.as_ref().map(|assessment| assessment.worst) {
+        Some(Severity::Crit) => HostHealthStatus::Crit,
+        Some(Severity::Warn) => HostHealthStatus::Warn,
+        Some(Severity::Ok) if complete => HostHealthStatus::Ok,
+        _ => HostHealthStatus::Unknown,
+    };
+    HostHealth {
+        status,
+        coverage,
+        pressure: Some(snapshot),
+        census,
+        assessment,
+        unavailable,
+    }
 }
 
 /// Quote one remote-shell argument without interpreting it as shell syntax.
@@ -543,6 +841,28 @@ pub fn scan_result_to_host_input(result: &HostScanResult) -> crate::session::fle
                     e_value: None,
                 })
                 .collect(),
+            host: plan
+                .document
+                .as_ref()
+                .and_then(|document| document.get("host"))
+                .filter(|host| !host.is_null())
+                .cloned(),
+            system_state: plan
+                .document
+                .as_ref()
+                .and_then(|document| document.get("system_state"))
+                .filter(|state| !state.is_null())
+                .cloned(),
+            health: if result.success {
+                remote_health(
+                    plan.document
+                        .as_ref()
+                        .and_then(|document| document.get("system_state")),
+                    plan.total_processes,
+                )
+            } else {
+                failed_host_health(result)
+            },
         },
         None => HostInput {
             host_id: result.host.clone(),
@@ -550,7 +870,23 @@ pub fn scan_result_to_host_input(result: &HostScanResult) -> crate::session::fle
             scanned_at: chrono::Utc::now().to_rfc3339(),
             total_processes: 0,
             candidates: Vec::new(),
+            host: None,
+            system_state: None,
+            health: failed_host_health(result),
         },
+    }
+}
+
+fn failed_host_health(result: &HostScanResult) -> HostHealth {
+    HostHealth {
+        unavailable: vec![Unavailable {
+            source: "remote_scan".to_string(),
+            reason: result
+                .error
+                .clone()
+                .unwrap_or_else(|| "remote scan returned no usable plan".to_string()),
+        }],
+        ..HostHealth::default()
     }
 }
 
@@ -790,6 +1126,328 @@ mod tests {
         assert_eq!(input.candidates[0].recommended_action, "restart");
         assert_eq!(input.candidates[1].recommended_action, "keep");
         assert_eq!(input.candidates[1].signature, "node");
+    }
+
+    fn pressure_plan(hostname: &str, cpu: f64, io: f64) -> serde_json::Value {
+        let mut document: serde_json::Value = serde_json::from_str(PLAN_JSON).unwrap();
+        document["session_id"] = serde_json::json!(format!("session-{hostname}"));
+        document["host"] = serde_json::json!({"hostname": hostname, "cores": 8});
+        document["system_state"] = serde_json::json!({
+            "pressure": {
+                "sampled_at_ms": 1_790_325_600_000_u64,
+                "cpus": 8,
+                "cpu": {"some": {"avg10": cpu, "avg60": cpu, "avg300": cpu, "total_us": 1234}},
+                "memory": {"some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total_us": 0}},
+                "io": {"some": {"avg10": io, "avg60": io, "avg300": io, "total_us": 456}},
+                "irq": null,
+                "load": {"one": 2.0, "five": 1.0, "fifteen": 1.0},
+                "meminfo": {
+                    "total": 16_u64 << 30,
+                    "available": 8_u64 << 30,
+                    "swap_total": 2_u64 << 30,
+                    "swap_free": 2_u64 << 30
+                },
+                "vmstat": {"pswpin": 100, "pswpout": 100, "oom_kill": 10},
+                "file_handles": {"allocated": 100, "max": 10000},
+                "unavailable": []
+            },
+            "census": {"zombies": 0, "dstate": 0},
+            // A host's asserted assessment is not the fleet's evidence.
+            "assessment": {"worst": "crit", "regimes": [{"kind": "oom_kills"}]}
+        });
+        document
+    }
+
+    fn scan_from_document(host: &str, document: &serde_json::Value) -> HostScanResult {
+        HostScanResult {
+            host: host.to_string(),
+            success: true,
+            plan: Some(parse_remote_plan(&document.to_string()).unwrap()),
+            error: None,
+            duration_ms: 10,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn fleet_health_recomputes_pressure_and_keeps_each_hosts_observations() {
+        use crate::decision::pressure_regime::RegimeKind;
+        use crate::session::fleet::{create_fleet_session, FleetSession};
+
+        let quiet = pressure_plan("quiet.local", 0.0, 0.0);
+        let mut busy = pressure_plan("busy.local", 45.0, 0.0);
+        busy["system_state"]["assessment"] = serde_json::json!({"worst": "ok", "regimes": []});
+        busy["system_state"]["pressure"]["sampled_at_ms"] = serde_json::json!(12345678);
+        let io = pressure_plan("io.local", 0.0, 8.0);
+        let mut partial = pressure_plan("partial.local", 0.0, 0.0);
+        partial["system_state"]["pressure"]["io"] = serde_json::Value::Null;
+        let old: serde_json::Value = serde_json::from_str(PLAN_JSON).unwrap();
+        let inputs = [
+            scan_from_document("quiet", &quiet),
+            scan_from_document("busy", &busy),
+            scan_from_document("io", &io),
+            scan_from_document("partial", &partial),
+            scan_from_document("old", &old),
+            HostScanResult {
+                host: "offline".to_string(),
+                success: false,
+                plan: None,
+                error: Some("SSH connection timed out".to_string()),
+                duration_ms: 30000,
+                provenance: None,
+            },
+        ]
+        .iter()
+        .map(scan_result_to_host_input)
+        .collect::<Vec<_>>();
+        let fleet = create_fleet_session("health", None, &inputs, 0.05);
+        let health = fleet.aggregate.health.as_ref().unwrap();
+        assert_eq!(health.healthy_hosts, 1);
+        assert_eq!(health.warning_hosts, 1);
+        assert_eq!(health.critical_hosts, 1);
+        assert_eq!(health.unknown_hosts, 3);
+        assert_eq!(health.partial_hosts, 1);
+        assert_eq!(health.unavailable_hosts, 2);
+        assert_eq!(health.worst_observed, Some(Severity::Crit));
+        assert_eq!(fleet.hosts[0].health.status, HostHealthStatus::Ok);
+        assert_eq!(fleet.hosts[0].health.coverage, PressureCoverage::Complete);
+        assert_eq!(fleet.hosts[3].health.status, HostHealthStatus::Unknown);
+        assert_eq!(fleet.hosts[3].health.coverage, PressureCoverage::Partial);
+        assert_eq!(fleet.hosts[1].host.as_ref().unwrap(), &busy["host"]);
+        assert_eq!(
+            fleet.hosts[1].system_state.as_ref().unwrap(),
+            &busy["system_state"]
+        );
+        assert_eq!(
+            fleet.hosts[1]
+                .health
+                .pressure
+                .as_ref()
+                .unwrap()
+                .sampled_at_ms,
+            12345678
+        );
+        let regimes = &fleet.hosts[1].health.assessment.as_ref().unwrap().regimes;
+        assert_eq!(regimes.len(), 1);
+        assert_eq!(regimes[0].kind, RegimeKind::CpuContention);
+        assert_eq!(regimes[0].severity, Severity::Crit);
+        // Absolute vmstat counters never become an invented rate or recent OOM.
+        assert!(fleet.hosts[0]
+            .health
+            .assessment
+            .as_ref()
+            .unwrap()
+            .regimes
+            .is_empty());
+        assert!(fleet.hosts[5].health.unavailable[0]
+            .reason
+            .contains("timed out"));
+        // Health annotation never changes a host's process classifications/actions.
+        assert_eq!(
+            fleet.hosts[0].summary.action_counts,
+            fleet.hosts[1].summary.action_counts
+        );
+        assert_eq!(
+            fleet.hosts[1].summary.action_counts.get("restart"),
+            Some(&1)
+        );
+
+        let restored: FleetSession =
+            serde_json::from_str(&serde_json::to_string(&fleet).unwrap()).unwrap();
+        assert_eq!(restored.aggregate.health, fleet.aggregate.health);
+        for (original, restored) in fleet.hosts.iter().zip(&restored.hosts) {
+            assert_eq!(restored.host_id, original.host_id);
+            assert_eq!(restored.health, original.health);
+            assert_eq!(restored.host, original.host);
+            assert_eq!(restored.system_state, original.system_state);
+        }
+    }
+
+    #[test]
+    fn missing_or_malformed_health_never_invalidates_a_remote_process_plan() {
+        for (pointer, bad_value, source) in [
+            (
+                "/system_state/pressure/cpu/some/avg10",
+                serde_json::json!(101.0),
+                "cpu.some",
+            ),
+            (
+                "/system_state/pressure/cpu/some/avg60",
+                serde_json::json!(-1.0),
+                "cpu.some",
+            ),
+            (
+                "/system_state/pressure/io",
+                serde_json::json!("unreadable"),
+                "io",
+            ),
+            (
+                "/system_state/pressure/load/one",
+                serde_json::json!(-0.1),
+                "load",
+            ),
+            ("/system_state/pressure/cpus", serde_json::json!(0), "cpus"),
+            (
+                "/system_state/pressure/meminfo/total",
+                serde_json::json!(0),
+                "meminfo",
+            ),
+            (
+                "/system_state/pressure/meminfo/available",
+                serde_json::json!(20_u64 << 30),
+                "meminfo",
+            ),
+            (
+                "/system_state/pressure/meminfo/swap_free",
+                serde_json::json!(3_u64 << 30),
+                "meminfo",
+            ),
+            (
+                "/system_state/pressure/file_handles/max",
+                serde_json::json!(0),
+                "file_handles",
+            ),
+            ("/system_state/census", serde_json::Value::Null, "census"),
+            (
+                "/system_state/census/zombies",
+                serde_json::json!(413),
+                "census",
+            ),
+            (
+                "/system_state/pressure/sampled_at_ms",
+                serde_json::json!("unknown"),
+                "sampled_at_ms",
+            ),
+        ] {
+            let mut document = pressure_plan("host.local", 0.0, 0.0);
+            *document.pointer_mut(pointer).unwrap() = bad_value;
+            let result = scan_from_document("host", &document);
+            let input = scan_result_to_host_input(&result);
+            assert_eq!(input.health.status, HostHealthStatus::Unknown, "{pointer}");
+            assert_ne!(
+                input.health.coverage,
+                PressureCoverage::Complete,
+                "{pointer}"
+            );
+            assert!(
+                input
+                    .health
+                    .unavailable
+                    .iter()
+                    .any(|unavailable| unavailable.source.contains(source)),
+                "{pointer}"
+            );
+            assert_eq!(input.candidates.len(), 2, "{pointer}");
+            assert_eq!(
+                input.candidates[0].recommended_action, "restart",
+                "{pointer}"
+            );
+            assert_eq!(
+                input.system_state.as_ref().unwrap(),
+                &document["system_state"]
+            );
+        }
+
+        for state in [
+            serde_json::Value::Null,
+            serde_json::json!("bad snapshot"),
+            serde_json::json!({"pressure": 42}),
+        ] {
+            let mut document = pressure_plan("host.local", 0.0, 0.0);
+            document["system_state"] = state;
+            let input = scan_result_to_host_input(&scan_from_document("host", &document));
+            assert_eq!(input.health.status, HostHealthStatus::Unknown);
+            assert_eq!(input.health.coverage, PressureCoverage::Unavailable);
+            assert!(input.health.assessment.is_none());
+            assert_eq!(input.candidates.len(), 2);
+        }
+    }
+
+    #[test]
+    fn bad_memory_sensor_preserves_real_cpu_pressure_and_remote_error_provenance() {
+        let mut document = pressure_plan("busy.local", 45.0, 0.0);
+        document["system_state"]["pressure"]["meminfo"] = serde_json::json!({"total": "bad"});
+        document["system_state"]["pressure"]["unavailable"] = serde_json::json!([
+            {"source": "/proc/meminfo", "reason": "remote permission denied"}
+        ]);
+        let input = scan_result_to_host_input(&scan_from_document("busy", &document));
+        assert_eq!(input.health.status, HostHealthStatus::Crit);
+        assert_eq!(input.health.coverage, PressureCoverage::Partial);
+        assert!(input.health.pressure.as_ref().unwrap().meminfo.is_none());
+        assert_eq!(
+            input.health.assessment.as_ref().unwrap().cpu_some,
+            Some(45.0)
+        );
+        assert!(input
+            .health
+            .unavailable
+            .iter()
+            .any(|item| item.reason == "remote permission denied"));
+    }
+
+    #[test]
+    fn explicit_sensor_failure_and_failed_scan_cannot_claim_healthy() {
+        let mut document = pressure_plan("host.local", 0.0, 90.0);
+        document["system_state"]["pressure"]["unavailable"] = serde_json::json!([
+            {"source": "/proc/pressure/io", "reason": "unreadable; returned zero fallback"}
+        ]);
+        let input = scan_result_to_host_input(&scan_from_document("host", &document));
+        assert_eq!(input.health.coverage, PressureCoverage::Partial);
+        assert_eq!(input.health.status, HostHealthStatus::Unknown);
+        assert!(input.health.pressure.as_ref().unwrap().io.is_none());
+        assert!(input.health.assessment.as_ref().unwrap().io_some.is_none());
+
+        let mut failed = scan_from_document("host", &pressure_plan("host.local", 0.0, 0.0));
+        failed.success = false;
+        failed.error = Some("incomplete remote response".to_string());
+        let input = scan_result_to_host_input(&failed);
+        assert_eq!(input.health.status, HostHealthStatus::Unknown);
+        assert_eq!(input.health.coverage, PressureCoverage::Unavailable);
+        assert!(input.health.pressure.is_none());
+    }
+
+    #[test]
+    fn pressure_health_does_not_change_fleet_kill_approval() {
+        use crate::session::fleet::create_fleet_session;
+
+        let mut document = pressure_plan("host.local", 90.0, 90.0);
+        document["candidates"][0]["recommendation"] = serde_json::json!("KILL");
+        document["candidates"][0]["classification"] = serde_json::json!("abandoned");
+        document["candidates"][0]["posterior"] = serde_json::json!({
+            "useful": 0.01, "useful_bad": 0.0, "abandoned": 0.99, "zombie": 0.0
+        });
+        let pressured = create_fleet_session(
+            "same-plan",
+            None,
+            &[scan_result_to_host_input(&scan_from_document(
+                "host", &document,
+            ))],
+            0.05,
+        );
+        document["system_state"] = serde_json::Value::Null;
+        let unknown = create_fleet_session(
+            "same-plan",
+            None,
+            &[scan_result_to_host_input(&scan_from_document(
+                "host", &document,
+            ))],
+            0.05,
+        );
+        assert_eq!(pressured.hosts[0].health.status, HostHealthStatus::Crit);
+        assert_eq!(unknown.hosts[0].health.status, HostHealthStatus::Unknown);
+        assert_eq!(pressured.hosts[0].selected_kill_pids, vec![4242]);
+        assert_eq!(
+            pressured.hosts[0].selected_kill_pids,
+            unknown.hosts[0].selected_kill_pids
+        );
+        assert_eq!(
+            pressured.aggregate.action_counts,
+            unknown.aggregate.action_counts
+        );
+        assert_eq!(
+            serde_json::to_value(&pressured.safety_budget).unwrap(),
+            serde_json::to_value(&unknown.safety_budget).unwrap()
+        );
     }
 
     #[test]

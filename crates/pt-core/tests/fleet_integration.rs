@@ -44,6 +44,9 @@ fn host_input(id: &str, candidates: Vec<CandidateInfo>) -> HostInput {
         scanned_at: "2026-02-01T12:00:00Z".to_string(),
         total_processes: 200 + candidates.len() as u32,
         candidates,
+        host: None,
+        system_state: None,
+        health: Default::default(),
     }
 }
 
