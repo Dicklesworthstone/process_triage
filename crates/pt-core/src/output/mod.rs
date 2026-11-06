@@ -4,6 +4,7 @@
 //! for optimizing output for AI agents with limited context windows.
 
 pub mod agent_errors;
+pub mod prediction_history;
 pub mod predictions;
 pub mod progressive;
 

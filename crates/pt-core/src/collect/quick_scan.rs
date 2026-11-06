@@ -705,8 +705,9 @@ fn parse_ps_fields(line: &str) -> Result<ParsedPsFields<'_>, String> {
         .unwrap_or(0.0);
     let rss_bytes = next_ps_field(&mut fields, &mut seen)?
         .parse::<u64>()
-        .unwrap_or(0)
-        .saturating_mul(1024);
+        .map_err(|_| "Invalid RSS")?
+        .checked_mul(1024)
+        .ok_or("RSS byte count overflow")?;
     let vsz_bytes = next_ps_field(&mut fields, &mut seen)?
         .parse::<u64>()
         .unwrap_or(0)
@@ -1580,6 +1581,41 @@ mod tests {
         assert_eq!(record.comm, "bash");
         assert!(record.cmd.contains("/bin/bash"));
         assert_eq!(record.elapsed.as_secs(), 3600);
+    }
+
+    #[test]
+    fn test_parse_ps_line_rejects_invalid_rss() {
+        let boot_id = Some("test-boot-id".to_string());
+        for (rss, expected_error) in [
+            ("unavailable", "Invalid RSS"),
+            ("-1", "Invalid RSS"),
+            ("18446744073709551616", "Invalid RSS"),
+            ("18014398509481984", "RSS byte count overflow"),
+            ("18446744073709551615", "RSS byte count overflow"),
+        ] {
+            let line = format!(
+                "1234 1 1000 testuser 1234 1234 S 0.5 {rss} 20480 ? Tue Jan 14 10:30:00 2026 3600 bash /bin/bash"
+            );
+            let error = parse_ps_line_synthetic(&line, "linux", &boot_id, 1_800_000_000)
+                .expect_err("invalid RSS must not become an observed byte count");
+            assert_eq!(error, expected_error, "RSS fixture: {rss}");
+        }
+    }
+
+    #[test]
+    fn test_parse_ps_line_preserves_zero_and_largest_valid_rss() {
+        let boot_id = Some("test-boot-id".to_string());
+        for (state, rss_kib) in [('Z', 0), ('S', u64::MAX / 1024)] {
+            let line = format!(
+                "1234 1 1000 testuser 1234 1234 {state} 0.0 {rss_kib} 20480 ? Tue Jan 14 10:30:00 2026 3600 child child"
+            );
+            let record = parse_ps_line_synthetic(&line, "linux", &boot_id, 1_800_000_000)
+                .expect("valid RSS must remain representable");
+            assert_eq!(record.rss_bytes, rss_kib * 1024);
+            if rss_kib == 0 {
+                assert_eq!(record.state, ProcessState::Zombie);
+            }
+        }
     }
 
     #[test]

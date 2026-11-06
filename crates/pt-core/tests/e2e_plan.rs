@@ -250,6 +250,48 @@ mod plan_differential {
     }
 
     #[test]
+    fn predictions_load_recorded_observations_from_previous_real_plans() {
+        let fixture = Fixture::new();
+        let first = fixture.plan(&[]);
+        let candidate = &first["candidates"][0];
+        assert_eq!(candidate["pid"], fixture.child.0.id());
+        assert!(candidate.get("predictions").is_none());
+        let observation = &candidate["resource_observation"];
+        assert_eq!(observation["source"], "quick_scan");
+        assert!(observation["sample"]["rss_bytes"].is_u64());
+        assert!(observation["sample"]["cpu_percent"].is_null());
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(fixture.handle(&first).dir.join("decision/plan.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["candidates"][0]["resource_observation"], *observation);
+
+        let second = fixture.plan(&["--include-predictions"]);
+        let predictions = &second["candidates"][0]["predictions"];
+        assert_eq!(
+            predictions["diagnostics"]["model"],
+            "observed_resource_trends"
+        );
+        assert_eq!(predictions["diagnostics"]["n_observations"], 2);
+        assert_eq!(predictions["diagnostics"]["calibrated"], false);
+        assert_eq!(predictions["trajectory"]["label"], "unknown");
+        assert!(predictions.get("memory").is_none());
+        assert!(predictions.get("cpu").is_none());
+        assert!(predictions.get("eta_abandoned").is_none());
+        assert!(predictions.get("eta_resource_limit").is_none());
+
+        let selected = fixture.plan(&[
+            "--include-predictions",
+            "--prediction-fields",
+            "diagnostics",
+        ]);
+        let predictions = &selected["candidates"][0]["predictions"];
+        assert_eq!(predictions.as_object().unwrap().len(), 1);
+        assert_eq!(predictions["diagnostics"]["n_observations"], 3);
+        assert!(selected["candidates"][0]["resource_observation"].is_object());
+    }
+
+    #[test]
     fn since_keeps_a_complete_fresh_plan_and_checked_observations() {
         let fixture = Fixture::new();
         let original = fixture.plan(&[]);

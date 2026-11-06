@@ -54,9 +54,12 @@ use pt_core::learn::{
     verify_tutorial as verify_learn_tutorial,
 };
 
+use pt_core::output::prediction_history::{
+    load_resource_history, ProcessIdentity as ResourceProcessIdentity, RecordedResourceObservation,
+};
 use pt_core::output::predictions::{
-    apply_field_selection, PredictionDiagnostics, PredictionField, PredictionFieldSelector,
-    Predictions, TrajectoryAssessment, TrajectoryLabel,
+    apply_field_selection, build_observed_predictions, PredictionField, PredictionFieldSelector,
+    ResourceSample,
 };
 use pt_core::output::{encode_toon_value, CompactConfig, FieldSelector, TokenEfficientOutput};
 use pt_core::plan::{generate_plan, DecisionBundle, DecisionCandidate};
@@ -17366,25 +17369,50 @@ fn parse_prediction_fields(spec: &str) -> Result<PredictionFieldSelector, String
     Ok(PredictionFieldSelector { include })
 }
 
-fn build_stub_predictions() -> Predictions {
-    // One snapshot has no trend: memory/CPU trends are absent (they used to claim
-    // "stable" with slope 0), and the diagnostics say why.
-    Predictions {
-        memory: None,
-        cpu: None,
-        eta_abandoned: None,
-        eta_resource_limit: None,
-        trajectory: Some(TrajectoryAssessment {
-            label: TrajectoryLabel::Unknown,
-            confidence: 0.0,
-            summary: "insufficient history for trajectory prediction".to_string(),
-        }),
-        diagnostics: Some(PredictionDiagnostics {
-            n_observations: 1,
-            calibrated: false,
-            model: "snapshot".to_string(),
-            warnings: vec!["insufficient_history".to_string()],
-        }),
+/// Retain measurements with their collection time, never lifetime CPU presented
+/// as a fresh window. A failed window stays unknown rather than reusing scan RSS
+/// under the later timestamp or substituting a different process incarnation.
+fn record_prediction_observation(
+    process: &ProcessRecord,
+    activity: Option<&pt_core::collect::ProcessActivity>,
+    scan_observed_at_ms: i64,
+    activity_observed_at_ms: i64,
+) -> RecordedResourceObservation {
+    if let Some(activity) = activity.filter(|activity| activity.source == "procfs_window") {
+        let same_identity = activity.pid == process.pid.0
+            && activity.uid == process.uid
+            && activity.start_id == process.start_id;
+        let cpu_percent = (same_identity
+            && activity.requested_window_ms > 0
+            && activity.cpu_error.is_none()
+            && activity
+                .cpu_window_seconds
+                .is_some_and(|seconds| seconds.is_finite() && seconds > 0.0))
+        .then_some(activity.cpu_percent)
+        .flatten()
+        .filter(|cpu| cpu.is_finite() && *cpu >= 0.0);
+        let rss_bytes = activity
+            .pressure
+            .as_ref()
+            .filter(|pressure| same_identity && pressure.memory_error.is_none())
+            .and_then(|pressure| pressure.memory.as_ref())
+            .map(|memory| memory.rss_bytes);
+        return RecordedResourceObservation {
+            source: "procfs_window".to_string(),
+            sample: ResourceSample {
+                observed_at_unix_ms: activity_observed_at_ms,
+                rss_bytes,
+                cpu_percent,
+            },
+        };
+    }
+    RecordedResourceObservation {
+        source: "quick_scan".to_string(),
+        sample: ResourceSample {
+            observed_at_unix_ms: scan_observed_at_ms,
+            rss_bytes: Some(process.rss_bytes),
+            cpu_percent: None,
+        },
     }
 }
 
@@ -18437,6 +18465,63 @@ mod planning_pressure_tests {
                 }),
                 ..ProcessPressureActivity::default()
             }),
+        }
+    }
+
+    #[test]
+    fn predictions_record_measured_window_values_at_the_window_time() {
+        let process = process();
+        let mut measured = activity(&process);
+        let sample = record_prediction_observation(&process, Some(&measured), 1000, 2000);
+        assert_eq!(sample.source, "procfs_window");
+        assert_eq!(sample.sample.observed_at_unix_ms, 2000);
+        assert_eq!(sample.sample.rss_bytes, Some(250));
+        assert_eq!(sample.sample.cpu_percent, Some(400.0));
+
+        measured.cpu_error = Some("CPU counters unavailable".into());
+        let sample = record_prediction_observation(&process, Some(&measured), 1000, 2000);
+        assert_eq!(sample.sample.cpu_percent, None);
+        assert_eq!(sample.sample.rss_bytes, Some(250));
+        measured.pressure.as_mut().unwrap().memory_error = Some("status unavailable".into());
+        let sample = record_prediction_observation(&process, Some(&measured), 1000, 2000);
+        assert_eq!(sample.sample.cpu_percent, None);
+        assert_eq!(sample.sample.rss_bytes, None);
+    }
+
+    #[test]
+    fn predictions_never_record_lifetime_cpu_as_a_fresh_measurement() {
+        let process = process();
+        let mut native = activity(&process);
+        native.source = "ps_lifetime_fallback".into();
+        for activity in [None, Some(&native)] {
+            let sample = record_prediction_observation(&process, activity, 1000, 2000);
+            assert_eq!(sample.source, "quick_scan");
+            assert_eq!(sample.sample.observed_at_unix_ms, 1000);
+            assert_eq!(sample.sample.rss_bytes, Some(process.rss_bytes));
+            assert_eq!(sample.sample.cpu_percent, None);
+        }
+    }
+
+    #[test]
+    fn predictions_reject_mismatched_identity_and_invalid_cpu_windows() {
+        let process = process();
+        for mismatch in 0..3 {
+            let mut measured = activity(&process);
+            match mismatch {
+                0 => measured.pid += 1,
+                1 => measured.uid += 1,
+                _ => measured.start_id = StartId::from_linux("pressure-test", 101, 123),
+            }
+            let sample = record_prediction_observation(&process, Some(&measured), 1000, 2000);
+            assert_eq!(sample.sample.rss_bytes, None);
+            assert_eq!(sample.sample.cpu_percent, None);
+        }
+        for seconds in [None, Some(0.0), Some(-1.0), Some(f64::NAN)] {
+            let mut measured = activity(&process);
+            measured.cpu_window_seconds = seconds;
+            let sample = record_prediction_observation(&process, Some(&measured), 1000, 2000);
+            assert_eq!(sample.sample.cpu_percent, None);
+            assert_eq!(sample.sample.rss_bytes, Some(250));
         }
     }
 
@@ -19585,6 +19670,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     };
     let scan_duration_ms = scan_start.elapsed().as_millis() as u64;
+    let scan_observed_at_ms = chrono::Utc::now().timestamp_millis();
 
     // Quick scan emits its own progress events via the shared emitter.
 
@@ -19694,6 +19780,23 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
     scorer.collect_provenance(&processes_to_infer);
     collect_planning_activity(&mut scorer, &scan_result.processes, args.window_ms);
+    let activity_observed_at_ms = chrono::Utc::now().timestamp_millis();
+    let prediction_history = args.include_predictions.then(|| {
+        let wanted = processes_to_infer
+            .iter()
+            .map(|process| ResourceProcessIdentity {
+                pid: process.pid.0,
+                uid: process.uid,
+                start_id: process.start_id.to_string(),
+            })
+            .collect();
+        load_resource_history(
+            store.sessions_root(),
+            &pt_core::logging::get_host_id(),
+            &wanted,
+            activity_observed_at_ms,
+        )
+    });
     let system_state = collect_system_state(Some(&scan_result.processes));
     let pressure = PlanningPressure::from_system_state(&system_state);
     let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
@@ -19917,8 +20020,34 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .and_then(|p| serde_json::to_value(p.to_candidate_output()).ok())
             .unwrap_or_else(|| serde_json::json!({"enabled": false}));
 
-        let predictions = if args.include_predictions {
-            let mut predictions = build_stub_predictions();
+        let resource_observation = record_prediction_observation(
+            proc,
+            activity.as_ref(),
+            scan_observed_at_ms,
+            activity_observed_at_ms,
+        );
+        let predictions = if let Some(history) = &prediction_history {
+            let identity = ResourceProcessIdentity {
+                pid: proc.pid.0,
+                uid: proc.uid,
+                start_id: proc.start_id.to_string(),
+            };
+            let mut samples = history.samples_for(&identity);
+            let birth_ms = proc.start_time_unix.saturating_mul(1000);
+            samples.retain(|sample| {
+                sample.observed_at_unix_ms >= birth_ms
+                    && sample.observed_at_unix_ms < resource_observation.sample.observed_at_unix_ms
+            });
+            samples.push(resource_observation.sample.clone());
+            let mut predictions = build_observed_predictions(&samples);
+            if let Some(diagnostics) = predictions.diagnostics.as_mut() {
+                diagnostics
+                    .warnings
+                    .push("candidate_history_only".to_string());
+                diagnostics
+                    .warnings
+                    .extend(history.warnings.iter().cloned());
+            }
             if let Some(selector) = &prediction_field_selector {
                 predictions = apply_field_selection(&predictions, selector);
             }
@@ -20009,6 +20138,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "cpu_percent": cpu_percent,
             "cpu_lifetime_percent": proc.cpu_percent,
             "activity": activity,
+            "resource_observation": resource_observation,
             "score": score,
             "classification": ledger.classification.label(),
             "posterior": {

@@ -652,6 +652,32 @@ single-process actions still receive only their own resource credit and pass
 the existing action gates. Per-cgroup usage counters and PSI, verified pane IDs,
 and automatic group actions are not implemented by this member-sum report.
 
+#### Resource trends from saved observations
+
+`pt agent plan --include-predictions` estimates RSS and windowed CPU trends from
+previous saved plans for the same process incarnation on the same host. Each
+returned candidate now records its measured resource sample even without that
+flag, so later plans can use the accumulated history. There is one observation
+per plan; this option does not wait for a complete time series.
+
+The reader considers at most 64 recent sessions and 4 MiB per plan. It requires
+the current schema, matching host/PID/UID/start identity, and a real boot UUID;
+old snapshots, reused PIDs, duplicate timestamps, corrupt records, and lifetime
+CPU values do not become trend evidence. Current macOS collectors lack the boot
+UUID needed for this cross-session history, so their predictions remain unknown.
+
+Memory estimation requires at least 10 samples over 60 seconds, with the existing
+trimming and fit checks potentially requiring more observations. CPU estimation
+requires at least five measured windows over 30 seconds. The output reports real
+slopes, windows, rising/falling/stable/bursty or unknown trends, and diagnostic
+reasons when support is insufficient. Confidence describes model fit and sample
+support; `calibrated` remains false. These advisory trends neither authorize
+actions nor supply abandonment or resource-exhaustion ETAs.
+
+Use `--prediction-fields memory,cpu,trajectory,diagnostics` to select the sections
+you need. Diagnostics also identify the limited candidate-only history: processes
+filtered out of earlier plans have no recorded samples in those plans.
+
 #### Measuring relief after apply
 
 `pt agent apply --session <id> --recommended --yes` now records a short baseline
