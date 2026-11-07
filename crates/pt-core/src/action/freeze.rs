@@ -11,12 +11,19 @@
 //! - Cleaner state management via cgroup.events
 
 use super::executor::{ActionError, ActionRunner};
+#[cfg(target_os = "linux")]
 use crate::collect::cgroup::{collect_cgroup_details, CgroupVersion};
+#[cfg(target_os = "linux")]
 use crate::decision::Action;
 use crate::plan::PlanAction;
 use std::fs;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
 use tracing::{debug, trace};
 
 /// The requested freezer state and the kernel's completed effective state.
@@ -150,11 +157,119 @@ impl Default for FreezeConfig {
 #[derive(Debug)]
 pub struct FreezeActionRunner {
     config: FreezeConfig,
+    /// Verification belongs to the exact action and cgroup used by execution,
+    /// including changes that occur before verification starts.
+    #[cfg(target_os = "linux")]
+    applied: Mutex<Option<AppliedFreeze>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct AppliedFreeze {
+    action_id: String,
+    identity: pt_common::ProcessIdentity,
+    frozen: bool,
+    scope: FreezerScope,
+}
+
+#[cfg(target_os = "linux")]
+impl AppliedFreeze {
+    fn check_action(&self, action: &PlanAction, frozen: bool) -> Result<(), ActionError> {
+        let expected_action = if self.frozen {
+            Action::Freeze
+        } else {
+            Action::Unfreeze
+        };
+        if self.action_id != action.action_id
+            || self.identity != action.target
+            || self.frozen != frozen
+            || action.action != expected_action
+        {
+            return Err(ActionError::IdentityMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Hold the original cgroup directory open so a removed/recreated pathname
+/// cannot masquerade as the cgroup that received the freezer request.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct FreezerScope {
+    cgroup_path: String,
+    directory: PathBuf,
+    handle: fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl FreezerScope {
+    fn open(cgroup_path: String, directory: PathBuf) -> Result<Self, ActionError> {
+        let handle = fs::File::open(&directory).map_err(|error| {
+            ActionError::Failed(format!(
+                "cannot open cgroup {}: {error}",
+                directory.display()
+            ))
+        })?;
+        let scope = Self {
+            cgroup_path,
+            directory,
+            handle,
+        };
+        scope.check_current_path(&scope.cgroup_path)?;
+        Ok(scope)
+    }
+
+    fn pinned_directory(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self.handle.as_raw_fd()))
+    }
+
+    fn check_current_path(&self, current_path: &str) -> Result<(), ActionError> {
+        use std::os::unix::fs::MetadataExt;
+        if current_path != self.cgroup_path {
+            return Err(ActionError::Failed(
+                "target cgroup changed since freezer execution".to_string(),
+            ));
+        }
+        let original = self.handle.metadata().map_err(|error| {
+            ActionError::Failed(format!("cannot inspect pinned freezer cgroup: {error}"))
+        })?;
+        let current = fs::symlink_metadata(&self.directory).map_err(|error| {
+            ActionError::Failed(format!(
+                "cannot inspect freezer cgroup {}: {error}",
+                self.directory.display()
+            ))
+        })?;
+        if !original.is_dir()
+            || !current.is_dir()
+            || original.dev() != current.dev()
+            || original.ino() != current.ino()
+        {
+            return Err(ActionError::Failed(
+                "freezer cgroup directory changed since execution".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn observe(
+        &self,
+        mut current_path: impl FnMut() -> Result<String, ActionError>,
+    ) -> Result<FreezerState, ActionError> {
+        self.check_current_path(&current_path()?)?;
+        let state = read_freezer_state(&self.pinned_directory());
+        self.check_current_path(&current_path()?)?;
+        state
+    }
 }
 
 impl FreezeActionRunner {
     pub fn new(config: FreezeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            #[cfg(target_os = "linux")]
+            applied: Mutex::new(None),
+        }
     }
 
     pub fn with_defaults() -> Self {
@@ -164,37 +279,54 @@ impl FreezeActionRunner {
     /// Write freeze state to cgroup.freeze.
     ///
     /// `frozen=true` freezes the cgroup, `frozen=false` unfreezes it.
-    fn write_freeze_state(&self, freeze_path: &str, frozen: bool) -> Result<(), ActionError> {
+    #[cfg(target_os = "linux")]
+    fn write_freeze_state(&self, freeze_path: &Path, frozen: bool) -> Result<(), ActionError> {
         let value = if frozen { "1" } else { "0" };
 
-        trace!(path = freeze_path, value = value, "writing freeze state");
+        trace!(path = %freeze_path.display(), value = value, "writing freeze state");
 
         fs::write(freeze_path, value).map_err(|e| match e.kind() {
             std::io::ErrorKind::PermissionDenied => ActionError::PermissionDenied,
-            _ => ActionError::Failed(format!("cannot write {}: {}", freeze_path, e)),
+            _ => ActionError::Failed(format!("cannot write {}: {}", freeze_path.display(), e)),
         })
     }
 
     /// Execute a freeze action.
     #[cfg(target_os = "linux")]
     fn execute_freeze(&self, action: &PlanAction) -> Result<(), ActionError> {
-        let pid = action.target.pid.0;
-        let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
-        debug!(pid = pid, "executing freeze");
-
-        let freeze_path = format!("/sys/fs/cgroup{checked_path}/cgroup.freeze");
-        self.write_freeze_state(&freeze_path, true)
+        self.execute_frozen_state(action, true)
     }
 
     /// Execute an unfreeze action.
     #[cfg(target_os = "linux")]
     fn execute_unfreeze(&self, action: &PlanAction) -> Result<(), ActionError> {
+        self.execute_frozen_state(action, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn execute_frozen_state(&self, action: &PlanAction, frozen: bool) -> Result<(), ActionError> {
+        let mut applied = self.applied.lock().map_err(|_| {
+            ActionError::Failed("freezer execution record is unavailable".to_string())
+        })?;
+        // A failed attempt must not leave an earlier success available to verify.
+        *applied = None;
         let pid = action.target.pid.0;
         let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
-        debug!(pid = pid, "executing unfreeze");
+        let directory = PathBuf::from(format!("/sys/fs/cgroup{checked_path}"));
+        let scope = FreezerScope::open(checked_path, directory)?;
+        scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
+        debug!(pid, frozen, "executing freezer request");
 
-        let freeze_path = format!("/sys/fs/cgroup{checked_path}/cgroup.freeze");
-        self.write_freeze_state(&freeze_path, false)
+        // Write through the pinned directory, never a replacement at its old path.
+        self.write_freeze_state(&scope.pinned_directory().join("cgroup.freeze"), frozen)?;
+        scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
+        *applied = Some(AppliedFreeze {
+            action_id: action.action_id.clone(),
+            identity: action.target.clone(),
+            frozen,
+            scope,
+        });
+        Ok(())
     }
 
     /// Verify a freeze action succeeded.
@@ -211,9 +343,19 @@ impl FreezeActionRunner {
 
     #[cfg(target_os = "linux")]
     fn verify_frozen_state(&self, action: &PlanAction, frozen: bool) -> Result<(), ActionError> {
+        let applied = self.applied.lock().map_err(|_| {
+            ActionError::Failed("freezer execution record is unavailable".to_string())
+        })?;
+        let record = applied.as_ref().ok_or_else(|| {
+            ActionError::Failed(
+                "cannot verify freezer state without an executed request".to_string(),
+            )
+        })?;
+        record.check_action(action, frozen)?;
         let pid = action.target.pid.0;
-        let checked_path = super::dispatch::ensure_cgroup_target(&action.target)?;
-        let directory = format!("/sys/fs/cgroup{checked_path}");
+        record
+            .scope
+            .check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
         let timeout = Duration::from_millis(
             self.config
                 .propagation_timeout_ms
@@ -222,21 +364,12 @@ impl FreezeActionRunner {
 
         // cgroup.freeze records the request. Only cgroup.events reports that
         // freezing has completed, or that an ancestor no longer keeps it frozen.
-        // Every sample rechecks the complete guard and the same cgroup path,
+        // Every sample rechecks the complete guard and the executed cgroup,
         // including the final sample that can establish a completed transition.
         wait_for_frozen_state(frozen, timeout, || {
-            if super::dispatch::ensure_cgroup_target(&action.target)? != checked_path {
-                return Err(ActionError::Failed(
-                    "target cgroup changed during freezer verification".to_string(),
-                ));
-            }
-            let state = read_freezer_state(Path::new(&directory));
-            if super::dispatch::ensure_cgroup_target(&action.target)? != checked_path {
-                return Err(ActionError::Failed(
-                    "target cgroup changed during freezer observation".to_string(),
-                ));
-            }
-            state
+            record
+                .scope
+                .observe(|| super::dispatch::ensure_cgroup_target(&action.target))
         })?;
 
         debug!(pid, frozen, "freezer transition verified");
@@ -636,6 +769,242 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux_tests {
         use super::*;
+
+        fn freezer_action(frozen: bool) -> PlanAction {
+            PlanAction {
+                action_id: "test-freezer-request".to_string(),
+                target: pt_common::ProcessIdentity::new(
+                    123,
+                    pt_common::StartId("test-boot:456:123".to_string()),
+                    1000,
+                ),
+                action: if frozen {
+                    Action::Freeze
+                } else {
+                    Action::Unfreeze
+                },
+                order: 0,
+                stage: 0,
+                timeouts: Default::default(),
+                pre_checks: vec![],
+                rationale: crate::plan::ActionRationale {
+                    expected_loss: None,
+                    expected_recovery: None,
+                    expected_recovery_stddev: None,
+                    posterior_odds_abandoned_vs_useful: None,
+                    sprt_boundary: None,
+                    posterior: None,
+                    memory_mb: None,
+                    has_known_signature: None,
+                    category: None,
+                },
+                on_success: vec![],
+                on_failure: vec![],
+                blocked: false,
+                routing: Default::default(),
+                confidence: Default::default(),
+                original_zombie_target: None,
+                d_state_diagnostics: None,
+            }
+        }
+
+        fn completed_freezer_files(directory: &Path, frozen: bool) {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(
+                directory.join("cgroup.freeze"),
+                u8::from(frozen).to_string(),
+            )
+            .unwrap();
+            fs::write(
+                directory.join("cgroup.events"),
+                format!("populated 1\nfrozen {}\n", u8::from(frozen)),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn freezer_verification_requires_matching_execution() {
+            for frozen in [false, true] {
+                let runner = FreezeActionRunner::with_defaults();
+                let action = freezer_action(frozen);
+                assert!(runner
+                    .verify(&action)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("without an executed request"));
+                let directory = tempfile::tempdir().unwrap();
+                *runner.applied.lock().unwrap() = Some(AppliedFreeze {
+                    action_id: action.action_id.clone(),
+                    identity: action.target.clone(),
+                    frozen,
+                    scope: FreezerScope::open(
+                        "/executed".to_string(),
+                        directory.path().to_path_buf(),
+                    )
+                    .unwrap(),
+                });
+                runner
+                    .applied
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .check_action(&action, frozen)
+                    .unwrap();
+                for field in [
+                    "action_id",
+                    "action_kind",
+                    "birth",
+                    "pid",
+                    "uid",
+                    "pgid",
+                    "sid",
+                    "quality",
+                ] {
+                    let mut changed = action.clone();
+                    match field {
+                        "action_id" => changed.action_id.push_str("-different"),
+                        "action_kind" => {
+                            changed.action = if frozen {
+                                Action::Unfreeze
+                            } else {
+                                Action::Freeze
+                            }
+                        }
+                        "birth" => changed.target.start_id.0.push_str("-different"),
+                        "pid" => changed.target.pid.0 += 1,
+                        "uid" => changed.target.uid += 1,
+                        "pgid" => changed.target.pgid = Some(234),
+                        "sid" => changed.target.sid = Some(345),
+                        "quality" => changed.target.quality = pt_common::IdentityQuality::PidOnly,
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        matches!(runner.verify(&changed), Err(ActionError::IdentityMismatch)),
+                        "accepted mismatched {field} for frozen={frozen}"
+                    );
+                }
+
+                // No cgroup is mutated: protected PID 1 is refused before a write.
+                // Its failed attempt must also invalidate the previous receipt.
+                let mut protected = action.clone();
+                protected.target.pid.0 = 1;
+                assert!(runner.execute(&protected).is_err());
+                assert!(runner.applied.lock().unwrap().is_none());
+                assert!(runner
+                    .verify(&action)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("without an executed request"));
+            }
+        }
+
+        #[test]
+        fn pinned_freezer_scope_observes_both_completed_states() {
+            let directory = tempfile::tempdir().unwrap();
+            let scope = FreezerScope::open("/executed".to_string(), directory.path().to_path_buf())
+                .unwrap();
+            for frozen in [true, false] {
+                completed_freezer_files(directory.path(), frozen);
+                fs::write(
+                    directory.path().join("cgroup.freeze"),
+                    u8::from(!frozen).to_string(),
+                )
+                .unwrap();
+                fs::write(
+                    scope.pinned_directory().join("cgroup.freeze"),
+                    u8::from(frozen).to_string(),
+                )
+                .unwrap();
+                assert_eq!(
+                    fs::read_to_string(directory.path().join("cgroup.freeze")).unwrap(),
+                    u8::from(frozen).to_string()
+                );
+                wait_for_frozen_state(frozen, Duration::ZERO, || {
+                    scope.observe(|| Ok("/executed".to_string()))
+                })
+                .unwrap();
+            }
+        }
+
+        #[test]
+        fn freezer_scope_rejects_migration_before_or_during_verification() {
+            for frozen in [true, false] {
+                let directory = tempfile::tempdir().unwrap();
+                let original = directory.path().join("executed");
+                let replacement = directory.path().join("other");
+                completed_freezer_files(&original, frozen);
+                completed_freezer_files(&replacement, frozen);
+                let scope = FreezerScope::open("/executed".to_string(), original).unwrap();
+                // Both groups already show the requested state. Verification must
+                // still refuse a different group, even before its first sample.
+                assert!(matches!(
+                    scope.observe(|| Ok("/other".to_string())),
+                    Err(ActionError::Failed(reason)) if reason.contains("target cgroup changed")
+                ));
+                let mut observations = 0;
+                let result = scope.observe(|| {
+                    observations += 1;
+                    Ok(if observations == 1 {
+                        "/executed"
+                    } else {
+                        "/other"
+                    }
+                    .to_string())
+                });
+                assert_eq!(observations, 2);
+                assert!(matches!(
+                    result,
+                    Err(ActionError::Failed(reason)) if reason.contains("target cgroup changed")
+                ));
+                assert!(matches!(
+                    scope.observe(|| Err(ActionError::IdentityMismatch)),
+                    Err(ActionError::IdentityMismatch)
+                ));
+            }
+        }
+
+        #[test]
+        fn freezer_scope_rejects_directory_replacement_at_the_same_path() {
+            for replace_during_observation in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let original = directory.path().join("executed");
+                let retained = directory.path().join("previous");
+                completed_freezer_files(&original, true);
+                let scope = FreezerScope::open("/executed".to_string(), original.clone()).unwrap();
+                let replace = || {
+                    fs::rename(&original, &retained).unwrap();
+                    completed_freezer_files(&original, true);
+                };
+                if !replace_during_observation {
+                    replace();
+                }
+                let mut observations = 0;
+                let result = scope.observe(|| {
+                    observations += 1;
+                    if replace_during_observation && observations == 2 {
+                        replace();
+                    }
+                    Ok("/executed".to_string())
+                });
+                assert!(matches!(
+                    result,
+                    Err(ActionError::Failed(reason)) if reason.contains("directory changed")
+                ));
+
+                // The retained descriptor also pins writes: changing the former
+                // cgroup path cannot redirect a request to the replacement.
+                fs::write(scope.pinned_directory().join("cgroup.freeze"), "0").unwrap();
+                assert_eq!(
+                    fs::read_to_string(retained.join("cgroup.freeze")).unwrap(),
+                    "0"
+                );
+                assert_eq!(
+                    fs::read_to_string(original.join("cgroup.freeze")).unwrap(),
+                    "1"
+                );
+            }
+        }
 
         #[test]
         fn check_freeze_availability_for_self() {
