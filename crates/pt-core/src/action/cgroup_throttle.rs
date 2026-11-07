@@ -120,6 +120,27 @@ impl CpuBandwidthLimit {
     }
 }
 
+/// Derive exactly the cap the runner can apply, without changing a controller.
+/// v1 preserves its period and must never round a too-small quota upward.
+fn desired_cpu_limit(
+    current: CpuBandwidthLimit,
+    maximum: CpuBandwidthLimit,
+    is_v2: bool,
+) -> Result<CpuBandwidthLimit, ActionError> {
+    if current.within(maximum) {
+        Ok(current)
+    } else if is_v2 {
+        Ok(maximum)
+    } else {
+        let quota = (maximum.quota_us as u128) * u128::from(current.period_us)
+            / u128::from(maximum.period_us);
+        let quota = i64::try_from(quota).map_err(|_| {
+            ActionError::Failed("CPU quota is not representable at the current period".to_string())
+        })?;
+        CpuBandwidthLimit::new(quota, current.period_us)
+    }
+}
+
 /// Check a finite controller limit against the requested maximum bandwidth.
 /// Invalid observations/configuration are errors; a valid unlimited limit (-1)
 /// is an observed failure to meet the cap, not missing evidence.
@@ -276,21 +297,7 @@ impl CpuThrottleActionRunner {
         let maximum = self.config.validated_limit()?;
         revalidate()?;
         let current = read_cpu_limit(directory, is_v2)?;
-        let desired = if current.within(maximum) {
-            current
-        } else if is_v2 {
-            maximum
-        } else {
-            let quota = (maximum.quota_us as u128) * u128::from(current.period_us)
-                / u128::from(maximum.period_us);
-            let quota = i64::try_from(quota).map_err(|_| {
-                ActionError::Failed(
-                    "CPU quota is not representable at the current period".to_string(),
-                )
-            })?;
-            // Never round up to the minimum: that would exceed the requested cap.
-            CpuBandwidthLimit::new(quota, current.period_us)?
-        };
+        let desired = desired_cpu_limit(current, maximum, is_v2)?;
         revalidate()?;
         if read_cpu_limit(directory, is_v2)? != current {
             return Err(ActionError::Failed(
@@ -570,40 +577,34 @@ pub fn can_throttle_process(pid: u32) -> bool {
     let Some(identity) = super::dispatch::read_cgroup_identity(pid) else {
         return false;
     };
-    if super::dispatch::ensure_cgroup_target(&identity).is_err() {
-        return false;
-    }
-    if let Some(details) = collect_cgroup_details(pid) {
-        // Check if we have a writable cgroup path
-        if let Some(ref unified_path) = details.unified_path {
-            let cpu_max_path = format!("/sys/fs/cgroup{}/cpu.max", unified_path);
-            if Path::new(&cpu_max_path).exists() {
-                // Check write permission
-                if let Ok(metadata) = fs::metadata(&cpu_max_path) {
-                    if !metadata.permissions().readonly() {
-                        return true;
-                    }
-                }
-            }
-        }
-        // Check v1 fallback
-        if let Some(cpu_path) = details.v1_paths.get("cpu") {
-            let quota_path = format!("/sys/fs/cgroup/cpu{}/cpu.cfs_quota_us", cpu_path);
-            if Path::new(&quota_path).exists() {
-                if let Ok(metadata) = fs::metadata(&quota_path) {
-                    if !metadata.permissions().readonly() {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
+    super::dispatch::cgroup_action_feasibility(&identity).is_allowed(Action::Throttle)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn can_throttle_process(_pid: u32) -> bool {
     false
+}
+
+/// Use the execution selector and limit parser. Only an absent v2 controller
+/// permits fallback; the distinct v1 hierarchy must also contain only this PID.
+#[cfg(target_os = "linux")]
+pub(super) fn check_throttle_capability(
+    pid: u32,
+    v2_directory: &Path,
+    v1_directory: Option<&Path>,
+) -> Result<(), ActionError> {
+    let (directory, is_v2) = select_cpu_controller(v2_directory, v1_directory)?;
+    if !is_v2 {
+        super::dispatch::ensure_exclusive_cgroup_path(pid, &directory)?;
+    }
+    let current = read_cpu_limit(&directory, is_v2)?;
+    let maximum = CpuThrottleConfig::default().validated_limit()?;
+    desired_cpu_limit(current, maximum, is_v2)?;
+    super::dispatch::check_controller_access(&directory.join(if is_v2 {
+        "cpu.max"
+    } else {
+        "cpu.cfs_quota_us"
+    }))
 }
 
 /// Choose v1 only when the v2 controller is absent. A present but unreadable,

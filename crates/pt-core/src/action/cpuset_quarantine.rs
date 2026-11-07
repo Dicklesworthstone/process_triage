@@ -25,7 +25,7 @@
 //!   a bare Unquarantine action cannot reconstruct it and is refused
 
 use super::executor::{ActionError, ActionRunner};
-use crate::collect::cgroup::{collect_cgroup_details, CgroupVersion};
+use crate::collect::cgroup::collect_cgroup_details;
 use crate::decision::Action;
 use crate::plan::PlanAction;
 use serde::{Deserialize, Serialize};
@@ -274,52 +274,30 @@ impl CpusetQuarantineActionRunner {
             ));
         }
 
-        // Only fall back when the v2 controller is absent. Unreadable evidence,
-        // invalid selections and failed writes must not redirect an action to
-        // another controller with different membership or CPU availability.
-        if cgroup_details.version == CgroupVersion::V2
-            || cgroup_details.version == CgroupVersion::Hybrid
-        {
-            if let Some(ref unified_path) = cgroup_details.unified_path {
-                let scope = CpusetScope {
-                    unified_path: checked_path.clone(),
-                    controller_path: unified_path.clone(),
-                    is_v2: true,
-                };
-                let cpuset_path = scope.directory().join("cpuset.cpus");
-                if cpuset_path.try_exists().map_err(|error| {
-                    ActionError::Failed(format!(
-                        "cannot inspect {}: {error}",
-                        cpuset_path.display()
-                    ))
-                })? {
-                    *applied = Some(self.apply_quarantine(action, scope)?);
-                    return Ok(());
-                }
-            }
-        }
-
-        // Try cgroup v1 if available
-        if self.config.fallback_to_v1 {
-            if let Some(cpuset_path) = cgroup_details.v1_paths.get("cpuset") {
-                warn!(
-                    pid,
-                    "cgroup v2 cpuset unavailable, using isolated v1 controller"
-                );
-                let scope = CpusetScope {
-                    unified_path: checked_path,
-                    controller_path: cpuset_path.clone(),
-                    is_v2: false,
-                };
-                *applied = Some(self.apply_quarantine(action, scope)?);
-                return Ok(());
-            }
-        }
-
-        Err(ActionError::Failed(format!(
-            "no writable cgroup cpuset controller found for pid {}",
-            pid
-        )))
+        let v2_directory = PathBuf::from(format!("/sys/fs/cgroup{checked_path}"));
+        let v1_path = self
+            .config
+            .fallback_to_v1
+            .then(|| cgroup_details.v1_paths.get("cpuset"))
+            .flatten();
+        let v1_directory =
+            v1_path.map(|path| PathBuf::from(format!("/sys/fs/cgroup/cpuset{path}")));
+        let (_, is_v2) = select_cpuset_controller(&v2_directory, v1_directory.as_deref())?;
+        let controller_path = if is_v2 {
+            checked_path.clone()
+        } else {
+            warn!(pid, "cgroup v2 cpuset unavailable, using isolated v1 controller");
+            v1_path
+                .cloned()
+                .ok_or_else(|| ActionError::Failed("missing v1 cpuset membership".to_string()))?
+        };
+        let scope = CpusetScope {
+            unified_path: checked_path,
+            controller_path,
+            is_v2,
+        };
+        *applied = Some(self.apply_quarantine(action, scope)?);
+        Ok(())
     }
 
     /// Apply quarantine using the selected controller's actual effective CPUs.
@@ -555,40 +533,71 @@ pub fn can_quarantine_cpuset(pid: u32) -> bool {
     let Some(identity) = super::dispatch::read_cgroup_identity(pid) else {
         return false;
     };
-    if super::dispatch::ensure_cgroup_target(&identity).is_err() {
-        return false;
-    }
-    if let Some(details) = collect_cgroup_details(pid) {
-        // Check if we have a writable cpuset cgroup path
-        if let Some(ref unified_path) = details.unified_path {
-            let cpuset_path = format!("/sys/fs/cgroup{}/cpuset.cpus", unified_path);
-            if Path::new(&cpuset_path).exists() {
-                // Check write permission
-                if let Ok(metadata) = fs::metadata(&cpuset_path) {
-                    if !metadata.permissions().readonly() {
-                        return true;
-                    }
-                }
-            }
-        }
-        // Check v1 fallback
-        if let Some(cpuset_path) = details.v1_paths.get("cpuset") {
-            let cpus_path = format!("/sys/fs/cgroup/cpuset{}/cpuset.cpus", cpuset_path);
-            if Path::new(&cpus_path).exists() {
-                if let Ok(metadata) = fs::metadata(&cpus_path) {
-                    if !metadata.permissions().readonly() {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
+    super::dispatch::cgroup_action_feasibility(&identity).is_allowed(Action::Quarantine)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn can_quarantine_cpuset(_pid: u32) -> bool {
     false
+}
+
+/// Planning and execution select the same hierarchy. Present but broken v2
+/// controls must not silently redirect an action into a different v1 hierarchy.
+#[cfg(target_os = "linux")]
+fn select_cpuset_controller(
+    v2_directory: &Path,
+    v1_directory: Option<&Path>,
+) -> Result<(PathBuf, bool), ActionError> {
+    let cpus_path = v2_directory.join("cpuset.cpus");
+    if cpus_path.try_exists().map_err(|error| {
+        ActionError::Failed(format!("cannot inspect {}: {error}", cpus_path.display()))
+    })? {
+        return Ok((v2_directory.to_path_buf(), true));
+    }
+    let directory = v1_directory.ok_or_else(|| {
+        ActionError::Failed("no cgroup cpuset controller is available".to_string())
+    })?;
+    let cpus_path = directory.join("cpuset.cpus");
+    fs::metadata(&cpus_path).map_err(|error| {
+        ActionError::Failed(format!("cannot inspect {}: {error}", cpus_path.display()))
+    })?;
+    Ok((directory.to_path_buf(), false))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn check_quarantine_capability(
+    pid: u32,
+    comm: &str,
+    v2_directory: &Path,
+    v1_directory: Option<&Path>,
+) -> Result<(), ActionError> {
+    let config = CpusetQuarantineConfig::default();
+    if config.protected_names.contains(comm) {
+        return Err(ActionError::Failed(
+            "refusing quarantine for a configured protected process name".to_string(),
+        ));
+    }
+    let (directory, is_v2) = select_cpuset_controller(v2_directory, v1_directory)?;
+    if !is_v2 {
+        super::dispatch::ensure_exclusive_cgroup_path(pid, &directory)?;
+    }
+    let cpus_path = directory.join("cpuset.cpus");
+    super::dispatch::check_controller_access(&cpus_path)?;
+    let previous = fs::read_to_string(&cpus_path).map_err(|error| {
+        ActionError::Failed(format!("cannot read {}: {error}", cpus_path.display()))
+    })?;
+    // Empty assignments inherit CPUs and are valid reversal evidence. Effective
+    // CPUs must still form a nonempty set accepted by the execution selector.
+    if !previous.trim().is_empty() {
+        CpuSet::parse(&previous)?;
+    }
+    let available = read_cpuset_file(&directory.join(if is_v2 {
+        "cpuset.cpus.effective"
+    } else {
+        "cpuset.effective_cpus"
+    }))?;
+    select_cpuset(config.target_cpus, config.specific_cpus.as_deref(), &available)?;
+    Ok(())
 }
 
 // Bound control-file reads and parsing work without imposing a CPU-ID limit or

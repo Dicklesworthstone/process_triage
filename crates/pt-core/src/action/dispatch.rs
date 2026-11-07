@@ -1,8 +1,10 @@
 //! Composite action runner that dispatches to specialized runners.
 
 use super::executor::{ActionError, ActionRunner};
-use crate::decision::Action;
+use crate::collect::ProcessState;
+use crate::decision::{Action, ActionFeasibility, DisabledAction};
 use crate::plan::{ActionRouting, PlanAction};
+use pt_common::ProcessIdentity;
 
 use super::renice::ReniceActionRunner;
 use super::signal::SignalActionRunner;
@@ -62,6 +64,186 @@ impl Default for CompositeActionRunner {
     }
 }
 
+/// State and runtime capabilities used before expected-loss minimization.
+///
+/// A capability is an observation, not authorization: execution still repeats
+/// identity, ownership, isolation and controller checks. Probing never writes
+/// controller values, creates a cgroup, or moves a process.
+pub fn planning_action_feasibility(
+    target: &ProcessIdentity,
+    state: ProcessState,
+) -> ActionFeasibility {
+    let mut feasibility =
+        ActionFeasibility::from_process_state(state.is_zombie(), state.is_disksleep(), None);
+    if !state.is_zombie() {
+        feasibility.disabled.push(DisabledAction {
+            action: Action::Restart,
+            reason: "restart needs a supervisor adapter; only zombie-parent reaping is supported"
+                .to_string(),
+        });
+    }
+    feasibility.disabled.push(DisabledAction {
+        action: Action::Unquarantine,
+        reason: "unquarantine requires the recorded previous cpuset; use reversal metadata"
+            .to_string(),
+    });
+    #[cfg(target_os = "linux")]
+    {
+        // Preserve the zombie-parent reaping route without probing controllers
+        // for a dead child. Its direct interventions are already excluded.
+        if !state.is_zombie() {
+            feasibility = feasibility.merge(&cgroup_action_feasibility(target));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = target;
+        feasibility = feasibility.merge(&unavailable_cgroup_actions(
+            "cgroup actions require the Linux cgroup runner".to_string(),
+        ));
+    }
+    feasibility
+}
+
+fn unavailable_cgroup_actions(reason: String) -> ActionFeasibility {
+    ActionFeasibility {
+        disabled: [
+            Action::Freeze,
+            Action::Unfreeze,
+            Action::Throttle,
+            Action::Quarantine,
+            Action::Unquarantine,
+        ]
+        .into_iter()
+        .map(|action| DisabledAction {
+            action,
+            reason: reason.clone(),
+        })
+        .collect(),
+    }
+}
+
+/// Reuse one identity/membership inspection for all cgroup capabilities. The
+/// public availability helpers use these same facts rather than mode-bit guesses.
+#[cfg(target_os = "linux")]
+pub(super) fn cgroup_action_feasibility(target: &ProcessIdentity) -> ActionFeasibility {
+    let inspect = || -> Result<ActionFeasibility, ActionError> {
+        let comm = ensure_cgroup_identity(target)?;
+        let pid = target.pid.0;
+        let details = crate::collect::collect_cgroup_details(pid)
+            .ok_or_else(|| ActionError::Failed(format!("cannot read cgroup of pid {pid}")))?;
+        let path = details.unified_path.as_deref().ok_or_else(|| {
+            ActionError::Failed("an isolated unified cgroup is required by the runner".to_string())
+        })?;
+        let directory = std::path::PathBuf::from(format!("/sys/fs/cgroup{path}"));
+        let cpu_v1 = details
+            .v1_paths
+            .get("cpu")
+            .map(|path| std::path::PathBuf::from(format!("/sys/fs/cgroup/cpu{path}")));
+        let cpuset_v1 = details
+            .v1_paths
+            .get("cpuset")
+            .map(|path| std::path::PathBuf::from(format!("/sys/fs/cgroup/cpuset{path}")));
+        let feasibility = cgroup_action_feasibility_at(
+            pid,
+            &comm,
+            &directory,
+            cpu_v1.as_deref(),
+            cpuset_v1.as_deref(),
+        );
+
+        // Do not combine controller facts from different incarnations or
+        // memberships. Parse membership alone instead of walking limits again.
+        let source = format!("/proc/{pid}/cgroup");
+        let content = std::fs::read_to_string(&source)
+            .map_err(|error| ActionError::Failed(format!("cannot recheck {source}: {error}")))?;
+        let observed = crate::collect::collect_cgroup_from_content(&content, &source, None)
+            .ok_or_else(|| ActionError::Failed("cannot recheck cgroup membership".to_string()))?;
+        if observed.unified_path != details.unified_path || observed.v1_paths != details.v1_paths {
+            return Err(ActionError::Failed(
+                "cgroup membership changed during capability inspection".to_string(),
+            ));
+        }
+        let current = read_cgroup_identity(pid).ok_or(ActionError::IdentityMismatch)?;
+        if !target.matches(&current) {
+            return Err(ActionError::IdentityMismatch);
+        }
+        Ok(feasibility)
+    };
+    inspect().unwrap_or_else(|error| unavailable_cgroup_actions(error.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_action_feasibility_at(
+    pid: u32,
+    comm: &str,
+    directory: &std::path::Path,
+    cpu_v1: Option<&std::path::Path>,
+    cpuset_v1: Option<&std::path::Path>,
+) -> ActionFeasibility {
+    if let Err(error) = ensure_exclusive_cgroup_path(pid, directory) {
+        return unavailable_cgroup_actions(error.to_string());
+    }
+    let mut disabled = Vec::new();
+    if let Err(error) = super::freeze::check_freeze_capability(directory) {
+        for action in [Action::Freeze, Action::Unfreeze] {
+            disabled.push(DisabledAction {
+                action,
+                reason: error.to_string(),
+            });
+        }
+    }
+    for (action, observation) in [
+        (
+            Action::Throttle,
+            super::cgroup_throttle::check_throttle_capability(pid, directory, cpu_v1),
+        ),
+        (
+            Action::Quarantine,
+            super::cpuset_quarantine::check_quarantine_capability(pid, comm, directory, cpuset_v1),
+        ),
+    ] {
+        if let Err(error) = observation {
+            disabled.push(DisabledAction {
+                action,
+                reason: error.to_string(),
+            });
+        }
+    }
+    ActionFeasibility { disabled }
+}
+
+/// Ask the kernel about effective read/write access, including ACLs and read-only
+/// mounts. Open without create, truncate, or a write; callers separately parse
+/// the observed controller contents. Metadata write bits alone do not establish
+/// that this caller can operate another owner's controller.
+#[cfg(target_os = "linux")]
+pub(super) fn check_controller_access(path: &std::path::Path) -> Result<(), ActionError> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| {
+            ActionError::Failed(format!(
+                "controller {} requires read/write access: {error}",
+                path.display()
+            ))
+        })?;
+    if !file
+        .metadata()
+        .map_err(|error| {
+            ActionError::Failed(format!("cannot inspect {}: {error}", path.display()))
+        })?
+        .is_file()
+    {
+        return Err(ActionError::Failed(format!(
+            "controller {} is not a regular control file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse cgroup-wide actions unless the target is the only process in its cgroup.
 ///
 /// Freeze/throttle/quarantine write to the target's *existing* cgroup
@@ -101,6 +283,14 @@ pub(super) fn read_cgroup_identity(pid: u32) -> Option<pt_common::ProcessIdentit
 pub(super) fn ensure_cgroup_target(
     target: &pt_common::ProcessIdentity,
 ) -> Result<String, ActionError> {
+    ensure_cgroup_identity(target)?;
+    ensure_exclusive_cgroup(target.pid.0)
+}
+
+/// Common identity/ownership/infrastructure checks; return the observed command
+/// name for runner-specific protection checks during capability inspection.
+#[cfg(target_os = "linux")]
+fn ensure_cgroup_identity(target: &pt_common::ProcessIdentity) -> Result<String, ActionError> {
     super::signal::ensure_action_pid_namespace()?;
     let pid = target.pid.0;
     if pid <= 1 || crate::collect::protected::live_invoker_chain_pids().contains(&pid) {
@@ -132,7 +322,7 @@ pub(super) fn ensure_cgroup_target(
             "refusing cgroup mutation for protected infrastructure".to_string(),
         ));
     }
-    ensure_exclusive_cgroup(pid)
+    Ok(comm.trim().to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -343,6 +533,278 @@ mod tests {
         };
         let plan = generate_plan(&bundle);
         plan.actions[0].clone()
+    }
+
+    #[test]
+    fn planning_feasibility_preserves_zombie_routing_and_state_constraints() {
+        let mut target = make_action().target;
+        target.pid = ProcessId(u32::MAX);
+        let live = planning_action_feasibility(&target, ProcessState::Running);
+        assert!(!live.is_allowed(Action::Restart));
+        assert!(live.is_allowed(Action::Keep));
+        for action in [Action::Freeze, Action::Throttle, Action::Quarantine] {
+            assert!(!live.is_allowed(action));
+            assert!(live
+                .disabled
+                .iter()
+                .any(|disabled| disabled.action == action && !disabled.reason.is_empty()));
+        }
+        let zombie = planning_action_feasibility(&target, ProcessState::Zombie);
+        assert!(zombie.is_allowed(Action::Restart));
+        assert!(zombie.is_allowed(Action::Keep));
+        for action in [
+            Action::Kill,
+            Action::Pause,
+            Action::Renice,
+            Action::Freeze,
+            Action::Throttle,
+            Action::Quarantine,
+            Action::Unquarantine,
+        ] {
+            assert!(!zombie.is_allowed(action));
+        }
+        assert!(!planning_action_feasibility(&target, ProcessState::DiskSleep)
+            .is_allowed(Action::Kill));
+    }
+
+    #[test]
+    fn planning_reoptimizes_without_unavailable_actions_even_under_pressure() {
+        use crate::decision::load_aware::{
+            prepare_pressure_decision, PressureContext, ResourceShares,
+        };
+        use crate::decision::pressure_regime::ResourceSeverity;
+        use crate::inference::ClassScores;
+
+        let mut target = make_action().target;
+        target.pid = ProcessId(u32::MAX);
+        let feasibility = planning_action_feasibility(&target, ProcessState::Running);
+        let mut policy = Policy::default();
+        policy.load_aware.enabled = true;
+        policy.load_aware.pressure.kappa = 1.0;
+        for row in [
+            &mut policy.loss_matrix.useful,
+            &mut policy.loss_matrix.useful_bad,
+            &mut policy.loss_matrix.abandoned,
+            &mut policy.loss_matrix.zombie,
+        ] {
+            row.keep = 10.0;
+            row.pause = Some(6.0);
+            row.throttle = Some(0.0);
+            row.restart = Some(0.0);
+            row.renice = Some(5.0);
+            row.kill = 100.0;
+        }
+        let posterior = ClassScores {
+            useful: 0.0,
+            useful_bad: 1.0,
+            abandoned: 0.0,
+            zombie: 0.0,
+        };
+        assert_eq!(
+            crate::decision::decide_action(&posterior, &policy, &ActionFeasibility::allow_all())
+                .unwrap()
+                .optimal_action,
+            Action::Throttle
+        );
+        for cpu_pressure in [0.0, 1.0] {
+            let context = PressureContext {
+                severity: ResourceSeverity {
+                    cpu: cpu_pressure,
+                    ..ResourceSeverity::default()
+                },
+                shares: ResourceShares {
+                    cpu: Some(1.0),
+                    ..ResourceShares::default()
+                },
+                unavailable: Vec::new(),
+            };
+            let prepared =
+                prepare_pressure_decision(&posterior, &policy, &feasibility, &context).unwrap();
+            assert_eq!(prepared.decision.optimal_action, Action::Renice);
+            for action in [
+                Action::Freeze,
+                Action::Throttle,
+                Action::Quarantine,
+                Action::Restart,
+            ] {
+                assert!(!prepared.feasibility.is_allowed(action));
+                assert!(!prepared
+                    .decision
+                    .expected_loss
+                    .iter()
+                    .any(|loss| loss.action == action));
+                assert!(prepared
+                    .decision
+                    .rationale
+                    .disabled_actions
+                    .iter()
+                    .any(|disabled| disabled.action == action && !disabled.reason.is_empty()));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const CAPABILITY_FILES: [(&str, &str); 6] = [
+        ("cgroup.procs", "123\n"),
+        ("cgroup.freeze", "0\n"),
+        ("cgroup.events", "populated 1\nfrozen 0\n"),
+        ("cpu.max", "max 100000\n"),
+        ("cpuset.cpus", "\n"),
+        ("cpuset.cpus.effective", "2-3,8\n"),
+    ];
+
+    #[cfg(target_os = "linux")]
+    fn capability_leaf(omit: &[&str]) -> std::path::PathBuf {
+        let directory = tempfile::tempdir().unwrap().keep();
+        for (name, content) in CAPABILITY_FILES {
+            if !omit.contains(&name) {
+                std::fs::write(directory.join(name), content).unwrap();
+            }
+        }
+        directory
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_probe_is_read_only_and_respects_runner_protections() {
+        let directory = capability_leaf(&[]);
+        let observed = cgroup_action_feasibility_at(123, "worker", &directory, None, None);
+        for action in [Action::Freeze, Action::Unfreeze, Action::Throttle, Action::Quarantine] {
+            assert!(observed.is_allowed(action), "{action:?}: {:?}", observed.disabled);
+        }
+        for (name, content) in CAPABILITY_FILES {
+            assert_eq!(std::fs::read_to_string(directory.join(name)).unwrap(), content);
+        }
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), CAPABILITY_FILES.len());
+        let protected = cgroup_action_feasibility_at(123, "dockerd", &directory, None, None);
+        assert!(!protected.is_allowed(Action::Quarantine));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_probe_requires_complete_exclusive_leaf_membership() {
+        for members in ["123\n456\n", "456\n", "", "123\ninvalid\n"] {
+            let directory = capability_leaf(&[]);
+            std::fs::write(directory.join("cgroup.procs"), members).unwrap();
+            let observed = cgroup_action_feasibility_at(123, "worker", &directory, None, None);
+            for action in [Action::Freeze, Action::Throttle, Action::Quarantine] {
+                assert!(!observed.is_allowed(action), "{members:?}: {action:?}");
+            }
+        }
+        let directory = capability_leaf(&[]);
+        std::fs::create_dir(directory.join("descendant")).unwrap();
+        let observed = cgroup_action_feasibility_at(123, "worker", &directory, None, None);
+        assert!(observed
+            .disabled
+            .iter()
+            .all(|disabled| disabled.reason.contains("descendants")));
+        let absent = capability_leaf(&["cgroup.procs"]);
+        let observed = cgroup_action_feasibility_at(123, "worker", &absent, None, None);
+        assert!(!observed.is_allowed(Action::Throttle));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_or_malformed_controller_disables_only_its_actions() {
+        for (name, action) in [
+            ("cgroup.freeze", Action::Freeze),
+            ("cgroup.events", Action::Freeze),
+            ("cpu.max", Action::Throttle),
+            ("cpuset.cpus", Action::Quarantine),
+            ("cpuset.cpus.effective", Action::Quarantine),
+        ] {
+            let directory = capability_leaf(&[name]);
+            let observed = cgroup_action_feasibility_at(123, "worker", &directory, None, None);
+            for checked in [Action::Freeze, Action::Throttle, Action::Quarantine] {
+                assert_eq!(observed.is_allowed(checked), checked != action, "{name}: {checked:?}");
+            }
+            assert!(!directory.join(name).exists(), "capability probe created {name}");
+        }
+        for (name, value, action) in [
+            ("cgroup.events", "populated 1\n", Action::Freeze),
+            ("cpu.max", "invalid quota\n", Action::Throttle),
+            ("cpuset.cpus.effective", "\n", Action::Quarantine),
+        ] {
+            let directory = capability_leaf(&[]);
+            std::fs::write(directory.join(name), value).unwrap();
+            let observed = cgroup_action_feasibility_at(123, "worker", &directory, None, None);
+            for checked in [Action::Freeze, Action::Throttle, Action::Quarantine] {
+                assert_eq!(observed.is_allowed(checked), checked != action, "{name}: {checked:?}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hybrid_capabilities_check_the_selected_hierarchy_and_do_not_hide_v2_failures() {
+        let unified = capability_leaf(&["cpu.max", "cpuset.cpus"]);
+        let cpu_v1 = capability_leaf(&[]);
+        let cpuset_v1 = capability_leaf(&[]);
+        std::fs::write(cpu_v1.join("cpu.cfs_quota_us"), "-1\n").unwrap();
+        std::fs::write(cpu_v1.join("cpu.cfs_period_us"), "100000\n").unwrap();
+        std::fs::write(cpuset_v1.join("cpuset.effective_cpus"), "4-5\n").unwrap();
+        let observe = || {
+            cgroup_action_feasibility_at(123, "worker", &unified, Some(&cpu_v1), Some(&cpuset_v1))
+        };
+        let available = observe();
+        assert!(available.is_allowed(Action::Throttle));
+        assert!(available.is_allowed(Action::Quarantine));
+
+        std::fs::write(cpu_v1.join("cgroup.procs"), "123\n456\n").unwrap();
+        std::fs::write(cpuset_v1.join("cgroup.procs"), "456\n").unwrap();
+        let unsafe_fallback = observe();
+        assert!(!unsafe_fallback.is_allowed(Action::Throttle));
+        assert!(!unsafe_fallback.is_allowed(Action::Quarantine));
+        assert!(unsafe_fallback.is_allowed(Action::Freeze));
+
+        std::fs::write(cpu_v1.join("cgroup.procs"), "123\n").unwrap();
+        std::fs::write(cpuset_v1.join("cgroup.procs"), "123\n").unwrap();
+        std::fs::write(unified.join("cpu.max"), "invalid quota\n").unwrap();
+        std::fs::write(unified.join("cpuset.cpus"), "invalid CPUs\n").unwrap();
+        let broken_v2 = observe();
+        assert!(!broken_v2.is_allowed(Action::Throttle));
+        assert!(!broken_v2.is_allowed(Action::Quarantine));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn controller_capability_uses_effective_access() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        const CHILD_FLAG: &str = "PT_CAPABILITY_ACCESS_CHILD";
+        if let Some(path) = std::env::var_os(CHILD_FLAG) {
+            assert!(check_controller_access(std::path::Path::new(&path)).is_err());
+            eprintln!("effective-controller-access-refused");
+            return;
+        }
+        let directory = capability_leaf(&[]);
+        let path = directory.join("cpu.max");
+        assert!(check_controller_access(&path).is_ok());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Writable mode bits exist, but the owning user has no read/write access.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o020)).unwrap();
+        assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
+        // SAFETY: geteuid only reads the current effective user ID.
+        if unsafe { libc::geteuid() } == 0 {
+            // Drop privileges in a child, never in the shared test process.
+            let output = std::process::Command::new("/proc/self/exe")
+                .args([
+                    "--exact",
+                    "action::dispatch::tests::controller_capability_uses_effective_access",
+                    "--nocapture",
+                ])
+                .env(CHILD_FLAG, &path)
+                .gid(65534)
+                .uid(65534)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("effective-controller-access-refused"));
+        } else {
+            assert!(check_controller_access(&path).is_err());
+        }
     }
 
     #[test]

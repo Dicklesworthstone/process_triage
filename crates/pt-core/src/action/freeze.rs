@@ -11,8 +11,8 @@
 //! - Cleaner state management via cgroup.events
 
 use super::executor::{ActionError, ActionRunner};
-#[cfg(target_os = "linux")]
-use crate::collect::cgroup::{collect_cgroup_details, CgroupVersion};
+#[cfg(all(target_os = "linux", test))]
+use crate::collect::cgroup::collect_cgroup_details;
 #[cfg(target_os = "linux")]
 use crate::decision::Action;
 use crate::plan::PlanAction;
@@ -432,38 +432,28 @@ impl ActionRunner for FreezeActionRunner {
 
 /// Check if cgroup v2 freeze is available for a process.
 ///
-/// Returns `true` when the target passes the direct runner's safety checks and
-/// its cgroup supports the freezer. Write permission is checked at execution.
+/// Reports the same identity, isolation, access and acknowledgement facts used
+/// by planning. Execution still rechecks them before a transition.
 #[cfg(target_os = "linux")]
 pub fn is_freeze_available(pid: u32) -> bool {
     let Some(identity) = super::dispatch::read_cgroup_identity(pid) else {
         return false;
     };
-    if super::dispatch::ensure_cgroup_target(&identity).is_err() {
-        return false;
-    }
-    let details = match collect_cgroup_details(pid) {
-        Some(d) => d,
-        None => return false,
-    };
-
-    // Require cgroup v2
-    if details.version != CgroupVersion::V2 && details.version != CgroupVersion::Hybrid {
-        return false;
-    }
-
-    // Check for unified path and freeze file
-    if let Some(ref unified_path) = details.unified_path {
-        let freeze_path = format!("/sys/fs/cgroup{}/cgroup.freeze", unified_path);
-        Path::new(&freeze_path).exists()
-    } else {
-        false
-    }
+    super::dispatch::cgroup_action_feasibility(&identity).is_allowed(Action::Freeze)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn is_freeze_available(_pid: u32) -> bool {
     false
+}
+
+/// Read the same request/acknowledgement pair used by verification, without
+/// requesting a transition. Unwritable or unverifiable freezers are infeasible.
+#[cfg(target_os = "linux")]
+pub(super) fn check_freeze_capability(directory: &Path) -> Result<(), ActionError> {
+    super::dispatch::check_controller_access(&directory.join("cgroup.freeze"))?;
+    read_freezer_state(directory)?;
+    Ok(())
 }
 
 #[cfg(test)]

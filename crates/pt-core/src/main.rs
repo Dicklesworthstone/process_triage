@@ -19207,7 +19207,7 @@ fn process_cpu_total(population: &[ProcessRecord], scorer: &Scorer) -> Option<f6
 }
 
 fn candidate_feasibility(proc: &ProcessRecord) -> ActionFeasibility {
-    ActionFeasibility::from_process_state(proc.state.is_zombie(), proc.state.is_disksleep(), None)
+    pt_core::action::planning_action_feasibility(&process_identity_from_record(proc), proc.state)
 }
 
 fn candidate_recommendation(

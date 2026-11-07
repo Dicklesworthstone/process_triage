@@ -30,7 +30,7 @@ pub use cpuset_quarantine::{
     can_quarantine_cpuset, CpusetQuarantineActionRunner, CpusetQuarantineConfig, QuarantineResult,
     QuarantineReversalMetadata, DEFAULT_QUARANTINE_CPUS, MIN_QUARANTINE_CPUS,
 };
-pub use dispatch::CompositeActionRunner;
+pub use dispatch::{planning_action_feasibility, CompositeActionRunner};
 pub use executor::{
     ActionError, ActionExecutor, ActionResult, ActionRunner, ActionStatus, ExecutionError,
     ExecutionResult, ExecutionSummary, IdentityProvider, NoopActionRunner, StaticIdentityProvider,
