@@ -4259,7 +4259,7 @@ fn build_tui_rows(
     let mut plan_candidates = HashMap::new();
     let mut goal_candidates: HashMap<u32, serde_json::Value> = HashMap::new();
     let cpu_total = process_cpu_total(population, scorer).unwrap_or(f64::NAN);
-    let mut supervision = pt_core::supervision::SupervisionDetector::new();
+    let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
 
     for proc in processes {
         if proc.pid.0 == 0 || proc.pid.0 == 1 {
@@ -15392,7 +15392,8 @@ mod process_tree_safety_tests {
             .find(|process| process.pid.0 == pid)
             .expect("current process remains observable");
         let identity = process_identity_from_record(process);
-        let observed = super::supervisor_info_for_plan_identity(&identity);
+        let mut supervision = pt_core::supervision::SupervisionDetector::new();
+        let observed = super::supervisor_info_for_plan_identity(&identity, &mut supervision);
         assert_eq!(observed["status"], "observed", "{observed}");
         assert_eq!(
             observed["subject_identity"],
@@ -15412,7 +15413,7 @@ mod process_tree_safety_tests {
             } else {
                 stale.uid = identity.uid.checked_add(1).unwrap();
             }
-            let refused = super::supervisor_info_for_plan_identity(&stale);
+            let refused = super::supervisor_info_for_plan_identity(&stale, &mut supervision);
             assert_eq!(refused["status"], "unknown", "{changed}: {refused}");
             assert!(refused["detected"].is_null(), "{changed}: {refused}");
             assert!(
@@ -15436,7 +15437,8 @@ mod process_tree_safety_tests {
     #[test]
     fn macos_plan_and_robot_supervision_do_not_refuse_for_missing_linux_probes() {
         let pid = std::process::id();
-        let observed = super::supervisor_info_for_plan(pid);
+        let mut supervision = pt_core::supervision::SupervisionDetector::new();
+        let observed = super::supervisor_info_for_plan(pid, &mut supervision);
         assert_eq!(observed["status"], "observed", "{observed}");
         assert_eq!(observed["detected"], false, "{observed}");
         assert_eq!(observed["recommended_action"], "kill", "{observed}");
@@ -17918,7 +17920,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
             .collect();
         let mut persisted_inference_records: Vec<PersistedInference> = Vec::new();
         let mut recommendations = Vec::new();
-        let mut supervision = pt_core::supervision::SupervisionDetector::new();
+        let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
         for proc in plan_eligible {
             let Some(score) = scorer.score(proc, Evidence::from_snapshot(proc)) else {
                 continue;
@@ -18621,7 +18623,10 @@ mod planning_pressure_tests {
         // The rolling average is quiet; only the measured counters can reveal
         // this CPU pressure, swap storm and newly observed OOM kill.
         let single = system_state_from_pressure(after.clone(), None, None);
-        assert!(single["assessment"]["regimes"].as_array().unwrap().is_empty());
+        assert!(single["assessment"]["regimes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert!(single["pressure_window"].is_null());
         let measured = system_state_from_pressure(after, Some(window), None);
         assert_eq!(measured["psi"]["cpu"], 0.0);
@@ -18648,7 +18653,11 @@ mod planning_pressure_tests {
     fn planning_host_window_requires_completed_sampling_interval() {
         let before = host().snapshot.unwrap();
         let requested = Duration::from_millis(25);
-        for elapsed in [None, Some(Duration::ZERO), Some(Duration::from_micros(24_999))] {
+        for elapsed in [
+            None,
+            Some(Duration::ZERO),
+            Some(Duration::from_micros(24_999)),
+        ] {
             let mut after = before.clone();
             let window = planning_pressure_window(
                 &mut after,
@@ -18656,9 +18665,10 @@ mod planning_pressure_tests {
                 requested,
             );
             assert!(window.is_none());
-            assert!(after.unavailable.iter().any(|source| {
-                source.source == "pressure_window" && !source.reason.is_empty()
-            }));
+            assert!(after
+                .unavailable
+                .iter()
+                .any(|source| { source.source == "pressure_window" && !source.reason.is_empty() }));
         }
         let mut after = before.clone();
         let boundary = planning_pressure_window(&mut after, Some((&before, requested)), requested)
@@ -18695,9 +18705,15 @@ mod planning_pressure_tests {
         let state = system_state_from_pressure(after, window, None);
         assert!(state["pressure_window"]["cpu"]["some"].is_null());
         for field in ["memory", "swap_in_per_s", "swap_out_per_s", "oom_kills"] {
-            assert!(state["pressure_window"][field].is_null(), "{field}: {state}");
+            assert!(
+                state["pressure_window"][field].is_null(),
+                "{field}: {state}"
+            );
         }
-        assert!(state["assessment"]["regimes"].as_array().unwrap().is_empty());
+        assert!(state["assessment"]["regimes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -20120,6 +20136,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
     }
 
+    // Share namespace-bound IPC tables only for this candidate scan. Action-time
+    // guards construct fresh detectors before authorizing a remedy.
+    let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
+
     // Use filtered (and optionally sampled) processes for inference
     for proc in processes_to_infer {
         // Skip PID 0/1 (extra safety - should already be filtered)
@@ -20349,15 +20369,18 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             .processes
             .iter()
             .find(|parent| parent.pid == proc.ppid);
-        let source_supervisor =
-            supervisor_info_for_plan_identity(&process_identity_from_record(proc));
+        let source_supervisor = supervisor_info_for_plan_identity(
+            &process_identity_from_record(proc),
+            &mut supervision,
+        );
         let routed_supervision =
             proc.state.is_zombie() && matches!(recommended_action, "kill" | "restart");
         let mut supervisor = if routed_supervision {
             match parent {
-                Some(parent) => {
-                    supervisor_info_for_plan_identity(&process_identity_from_record(parent))
-                }
+                Some(parent) => supervisor_info_for_plan_identity(
+                    &process_identity_from_record(parent),
+                    &mut supervision,
+                ),
                 None => unknown_supervision_for_plan(
                     proc.ppid.0,
                     "routed parent identity is unavailable in the full process snapshot",
@@ -21834,13 +21857,16 @@ fn build_process_explanation(
     explanation
 }
 
-fn supervisor_info_for_plan_identity(identity: &ProcessIdentity) -> serde_json::Value {
+fn supervisor_info_for_plan_identity(
+    identity: &ProcessIdentity,
+    supervision: &mut pt_core::supervision::SupervisionDetector,
+) -> serde_json::Value {
     let pid = identity.pid.0;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let provider = LiveIdentityProvider::new();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut info = if matches!(provider.revalidate(identity), Ok(true)) {
-        let observed = supervisor_info_for_plan(pid);
+        let observed = supervisor_info_for_plan(pid, supervision);
         if matches!(provider.revalidate(identity), Ok(true)) {
             observed
         } else {
@@ -21853,15 +21879,18 @@ fn supervisor_info_for_plan_identity(identity: &ProcessIdentity) -> serde_json::
         )
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let mut info = supervisor_info_for_plan(pid);
+    let mut info = supervisor_info_for_plan(pid, supervision);
     info["subject_identity"] = serde_json::json!(identity);
     info["subject_kind"] = serde_json::json!("process");
     info
 }
 
 #[cfg(target_os = "linux")]
-fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
-    let human_supervision = match detect_supervision(pid) {
+fn supervisor_info_for_plan(
+    pid: u32,
+    supervision: &mut pt_core::supervision::SupervisionDetector,
+) -> serde_json::Value {
+    let human_supervision = match supervision.detect(pid) {
         Ok(result) => result,
         Err(error) => return unknown_supervision_for_plan(pid, &error.to_string()),
     };
@@ -21993,7 +22022,10 @@ fn supervisor_info_for_plan(pid: u32) -> serde_json::Value {
 /// the apply-time pre-check). As in v2.2.1 the plan reports none detected; an
 /// "unknown" status turned every macOS candidate into REVIEW.
 #[cfg(not(target_os = "linux"))]
-fn supervisor_info_for_plan(_pid: u32) -> serde_json::Value {
+fn supervisor_info_for_plan(
+    _pid: u32,
+    _supervision: &mut pt_core::supervision::SupervisionDetector,
+) -> serde_json::Value {
     serde_json::json!({
         "detected": false,
         "status": "observed",
@@ -26833,7 +26865,9 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
         }
 
         let mut evaluated = Vec::new();
-        let mut supervision = pt_core::supervision::SupervisionDetector::new();
+        // A watch iteration is a new scan; do not retain negative IPC evidence
+        // across refreshes.
+        let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
         for proc in eligible {
             let Some(mut eval) = evaluate_watch_candidate(
                 proc,

@@ -285,12 +285,24 @@ impl IpcDatabase {
 /// Read socket paths connected by a process.
 #[cfg(target_os = "linux")]
 pub fn read_socket_paths(pid: u32) -> Result<Vec<String>, IpcError> {
-    read_socket_paths_with_refresh(pid, false)
+    read_socket_paths_with_refresh(pid, false, None)
 }
 
 #[cfg(target_os = "linux")]
-fn read_socket_paths_with_refresh(pid: u32, refresh: bool) -> Result<Vec<String>, IpcError> {
+fn read_socket_paths_with_refresh(
+    pid: u32,
+    refresh: bool,
+    scan: Option<&ScanUnixSocketPaths>,
+) -> Result<Vec<String>, IpcError> {
     let before = read_required_proc_stat(pid)?;
+    let scan_namespace = match scan {
+        Some(snapshot) => {
+            let (namespace, handle) = open_network_namespace(pid)?;
+            Some((snapshot, namespace, handle))
+        }
+        None => None,
+    };
+    let expected_namespace = scan_namespace.as_ref().map(|(_, namespace, _)| *namespace);
     let fd_dir = format!("/proc/{}/fd", pid);
     let entries = fs::read_dir(&fd_dir).map_err(|source| IpcError::IoError {
         pid,
@@ -340,16 +352,46 @@ fn read_socket_paths_with_refresh(pid: u32, refresh: bool) -> Result<Vec<String>
     }
 
     if !socket_inodes.is_empty() {
-        let mut table = unix_socket_paths_by_inode(pid, refresh)?;
-        if !refresh
+        let mut table = match scan_namespace {
+            Some((snapshot, namespace, handle)) => snapshot.table_for(pid, namespace, handle)?,
+            None => unix_socket_paths_by_inode(pid, refresh)?,
+        };
+        if scan.is_none()
+            && !refresh
             && socket_inodes
                 .iter()
                 .any(|inode| table.get(inode).is_none_or(|path| path.is_none()))
         {
             table = unix_socket_paths_by_inode(pid, true)?;
         }
+        // An unnamed Unix socket can acquire a supervisor path without changing
+        // its inode. Refresh those uncertain entries before admitting a negative,
+        // but retain the original scan view for every other inode. In particular,
+        // a missing inode must not become trusted merely because an unrelated
+        // unnamed descriptor triggered this read.
+        let unnamed = if let Some(snapshot) = scan.filter(|_| {
+            socket_inodes
+                .iter()
+                .any(|inode| matches!(table.get(inode), Some(None)))
+        }) {
+            #[cfg(test)]
+            snapshot
+                .table_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(test))]
+            let _ = snapshot;
+            Some(unix_socket_paths_by_inode(pid, true)?)
+        } else {
+            None
+        };
         for inode in socket_inodes {
-            if let Some(path) = table.get(&inode) {
+            let observed = match table.get(&inode) {
+                Some(None) if unnamed.is_some() => {
+                    unnamed.as_ref().and_then(|view| view.get(&inode))
+                }
+                observed => observed,
+            };
+            if let Some(path) = observed {
                 if let Some(path) = path {
                     sockets.push(path.clone());
                 }
@@ -363,6 +405,9 @@ fn read_socket_paths_with_refresh(pid: u32, refresh: bool) -> Result<Vec<String>
         }
     }
 
+    if let Some(namespace) = expected_namespace {
+        check_network_namespace(pid, namespace)?;
+    }
     let after = read_required_proc_stat(pid)?;
     if after.starttime != before.starttime {
         return Err(IpcError::ProcessChanged(pid));
@@ -375,20 +420,105 @@ fn read_socket_paths_with_refresh(pid: u32, refresh: bool) -> Result<Vec<String>
 #[cfg(target_os = "linux")]
 const UNIX_TABLE_TTL: Duration = Duration::from_secs(2);
 
+#[cfg(target_os = "linux")]
+type NetworkNamespace = (u64, u64);
+
+#[cfg(target_os = "linux")]
+type UnixSocketPaths = HashMap<u64, Option<String>>;
+
+/// Scan evidence is scoped to the detector, never the action-time global cache.
+/// Keep each namespace open so its inode cannot be recycled while a view is used.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct ScanUnixSocketPaths {
+    tables: Mutex<HashMap<NetworkNamespace, ScanUnixSocketTable>>,
+    #[cfg(test)]
+    table_reads: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(target_os = "linux")]
+struct ScanUnixSocketTable {
+    _namespace: fs::File,
+    table: Arc<UnixSocketPaths>,
+}
+
+#[cfg(target_os = "linux")]
+impl ScanUnixSocketPaths {
+    fn table_for(
+        &self,
+        pid: u32,
+        namespace: NetworkNamespace,
+        handle: fs::File,
+    ) -> Result<Arc<UnixSocketPaths>, IpcError> {
+        check_network_namespace(pid, namespace)?;
+        let mut tables = self
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = tables.get(&namespace) {
+            return Ok(Arc::clone(&entry.table));
+        }
+        #[cfg(test)]
+        self.table_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let table = read_unix_socket_paths(pid)?;
+        check_network_namespace(pid, namespace)?;
+        tables.insert(
+            namespace,
+            ScanUnixSocketTable {
+                _namespace: handle,
+                table: Arc::clone(&table),
+            },
+        );
+        Ok(table)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_network_namespace(pid: u32) -> Result<(NetworkNamespace, fs::File), IpcError> {
+    let path = format!("/proc/{pid}/ns/net");
+    let failure = |source| IpcError::IoError {
+        pid,
+        path: path.clone(),
+        source,
+    };
+    let handle = fs::File::open(&path).map_err(failure)?;
+    let metadata = handle.metadata().map_err(failure)?;
+    Ok(((metadata.dev(), metadata.ino()), handle))
+}
+
+#[cfg(target_os = "linux")]
+fn check_network_namespace(pid: u32, expected: NetworkNamespace) -> Result<(), IpcError> {
+    let path = format!("/proc/{pid}/ns/net");
+    let metadata = fs::metadata(&path).map_err(|source| IpcError::IoError { pid, path, source })?;
+    if (metadata.dev(), metadata.ino()) != expected {
+        return Err(IpcError::ProcessChanged(pid));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_unix_socket_paths(pid: u32) -> Result<Arc<UnixSocketPaths>, IpcError> {
+    let path = format!("/proc/{pid}/net/unix");
+    let table = parse_proc_net_unix(&path)
+        .map_err(|source| IpcError::IoError { pid, path, source })?
+        .into_iter()
+        .map(|socket| (socket.inode, socket.path.filter(|path| !path.is_empty())))
+        .collect();
+    Ok(Arc::new(table))
+}
+
 /// A successful table in one observed network namespace. Cached positives can
 /// conservatively block; the analyzer refreshes before admitting a negative.
 #[cfg(target_os = "linux")]
 struct CachedUnixSocketPaths {
-    namespace: (u64, u64),
+    namespace: NetworkNamespace,
     parsed_at: Instant,
-    table: Arc<HashMap<u64, Option<String>>>,
+    table: Arc<UnixSocketPaths>,
 }
 
 #[cfg(target_os = "linux")]
-fn unix_socket_paths_by_inode(
-    pid: u32,
-    refresh: bool,
-) -> Result<Arc<HashMap<u64, Option<String>>>, IpcError> {
+fn unix_socket_paths_by_inode(pid: u32, refresh: bool) -> Result<Arc<UnixSocketPaths>, IpcError> {
     static CACHE: Mutex<Option<CachedUnixSocketPaths>> = Mutex::new(None);
     let namespace_path = format!("/proc/{pid}/ns/net");
     let namespace = fs::metadata(&namespace_path).map_err(|source| IpcError::IoError {
@@ -405,25 +535,8 @@ fn unix_socket_paths_by_inode(
             return Ok(Arc::clone(&entry.table));
         }
     }
-    let table_path = format!("/proc/{pid}/net/unix");
-    let table: HashMap<u64, Option<String>> = parse_proc_net_unix(&table_path)
-        .map_err(|source| IpcError::IoError {
-            pid,
-            path: table_path,
-            source,
-        })?
-        .into_iter()
-        .map(|socket| (socket.inode, socket.path.filter(|path| !path.is_empty())))
-        .collect();
-    let after_namespace = fs::metadata(&namespace_path).map_err(|source| IpcError::IoError {
-        pid,
-        path: namespace_path,
-        source,
-    })?;
-    if (after_namespace.dev(), after_namespace.ino()) != namespace {
-        return Err(IpcError::ProcessChanged(pid));
-    }
-    let table = Arc::new(table);
+    let table = read_unix_socket_paths(pid)?;
+    check_network_namespace(pid, namespace)?;
     *cached = Some(CachedUnixSocketPaths {
         namespace,
         parsed_at: Instant::now(),
@@ -440,6 +553,8 @@ pub fn read_socket_paths(pid: u32) -> Result<Vec<String>, IpcError> {
 /// Analyzer for IPC-based supervision detection.
 pub struct IpcAnalyzer {
     database: IpcDatabase,
+    #[cfg(target_os = "linux")]
+    scan: Option<ScanUnixSocketPaths>,
 }
 
 impl IpcAnalyzer {
@@ -447,22 +562,47 @@ impl IpcAnalyzer {
     pub fn new() -> Self {
         Self {
             database: IpcDatabase::with_defaults(),
+            #[cfg(target_os = "linux")]
+            scan: None,
+        }
+    }
+
+    /// Reuse one strict Unix-socket view per network namespace during a read-only
+    /// scan. Descriptors and process/namespace identities are still read live;
+    /// sockets absent from that view must be classified or reported as unknown.
+    /// Known unnamed sockets are refreshed because a later bind can name them.
+    /// Create a new analyzer for every scan or watch refresh; views do not expire.
+    /// Never use this constructor for action-time authorization.
+    pub fn for_scan() -> Self {
+        Self {
+            database: IpcDatabase::with_defaults(),
+            #[cfg(target_os = "linux")]
+            scan: Some(ScanUnixSocketPaths::default()),
         }
     }
 
     /// Create an analyzer with a custom database.
     pub fn with_database(database: IpcDatabase) -> Self {
-        Self { database }
+        Self {
+            database,
+            #[cfg(target_os = "linux")]
+            scan: None,
+        }
     }
 
     /// Analyze a process for supervision via IPC.
     pub fn analyze(&self, pid: u32) -> Result<IpcResult, IpcError> {
+        #[cfg(target_os = "linux")]
+        if let Some(snapshot) = self.scan.as_ref() {
+            let sockets = read_socket_paths_with_refresh(pid, false, Some(snapshot))?;
+            return Ok(self.analyze_sockets(&sockets));
+        }
         let sockets = read_socket_paths(pid)?;
         let result = self.analyze_sockets(&sockets);
         #[cfg(target_os = "linux")]
         if !result.is_supervised {
             // A cached positive can conservatively block; absence needs a fresh table.
-            let sockets = read_socket_paths_with_refresh(pid, true)?;
+            let sockets = read_socket_paths_with_refresh(pid, true, None)?;
             return Ok(self.analyze_sockets(&sockets));
         }
         Ok(result)
@@ -527,6 +667,225 @@ pub fn detect_ipc_supervision(pid: u32) -> Result<IpcResult, IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    mod scan_tests {
+        use super::*;
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        use std::path::Path;
+        use std::process::{Child, Command, Stdio};
+        use std::sync::atomic::Ordering;
+
+        struct SocketChild(Child);
+
+        impl SocketChild {
+            fn new(path: &Path) -> Self {
+                let socket: OwnedFd = UnixListener::bind(path).unwrap().into();
+                Self::with_socket(socket, Stdio::null())
+            }
+
+            fn with_socket(socket: OwnedFd, stderr: Stdio) -> Self {
+                Self(
+                    Command::new("sleep")
+                        .arg("60")
+                        .stdin(Stdio::from(socket))
+                        .stdout(Stdio::null())
+                        .stderr(stderr)
+                        .spawn()
+                        .unwrap(),
+                )
+            }
+
+            fn pid(&self) -> u32 {
+                self.0.id()
+            }
+        }
+
+        #[test]
+        fn scan_refreshes_a_known_unnamed_socket_after_late_bind() {
+            let socket = UnixDatagram::unbound().unwrap();
+            let child = SocketChild::with_socket(socket.try_clone().unwrap().into(), Stdio::null());
+            let scan = IpcAnalyzer::for_scan();
+            assert!(!scan.analyze(child.pid()).unwrap().is_supervised);
+            let snapshot = scan.scan.as_ref().unwrap();
+            let original_tables: Vec<_> = snapshot
+                .tables
+                .lock()
+                .unwrap()
+                .values()
+                .map(|entry| Arc::clone(&entry.table))
+                .collect();
+            assert_eq!(snapshot.table_reads.load(Ordering::Relaxed), 2);
+
+            let directory = tempfile::Builder::new()
+                .prefix("vscode-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let path = directory.path().join("late.sock");
+            let path_bytes = path.as_os_str().as_bytes();
+            // SAFETY: zero initializes the sockaddr including its terminated path.
+            let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            assert!(path_bytes.len() < address.sun_path.len());
+            for (out, byte) in address.sun_path.iter_mut().zip(path_bytes) {
+                *out = *byte as libc::c_char;
+            }
+            // SAFETY: address is a fully initialized sockaddr_un with a bounded,
+            // NUL-terminated pathname; the live owned datagram descriptor is valid.
+            let bound = unsafe {
+                libc::bind(
+                    socket.as_raw_fd(),
+                    std::ptr::from_ref(&address).cast(),
+                    std::mem::size_of_val(&address) as libc::socklen_t,
+                )
+            };
+            assert_eq!(
+                bound,
+                0,
+                "late bind failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let observed = scan.analyze(child.pid()).unwrap();
+            assert!(observed.is_supervised);
+            assert_eq!(observed.supervisor_name.as_deref(), Some("vscode"));
+            assert_eq!(snapshot.table_reads.load(Ordering::Relaxed), 3);
+            let tables = snapshot.tables.lock().unwrap();
+            assert_eq!(tables.len(), original_tables.len());
+            assert!(tables.values().all(|entry| original_tables
+                .iter()
+                .any(|original| Arc::ptr_eq(original, &entry.table))));
+            assert!(original_tables
+                .iter()
+                .all(|table| !table.values().any(|name| name.as_deref() == path.to_str())));
+        }
+
+        #[test]
+        fn unnamed_refresh_does_not_admit_a_previously_missing_inode() {
+            let unnamed = UnixDatagram::unbound().unwrap();
+            let original =
+                SocketChild::with_socket(unnamed.try_clone().unwrap().into(), Stdio::null());
+            let scan = IpcAnalyzer::for_scan();
+            assert!(!scan.analyze(original.pid()).unwrap().is_supervised);
+            let directory = tempfile::Builder::new()
+                .prefix("vscode-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let new_socket: OwnedFd = UnixListener::bind(directory.path().join("new.sock"))
+                .unwrap()
+                .into();
+            let mixed = SocketChild::with_socket(
+                unnamed.try_clone().unwrap().into(),
+                Stdio::from(new_socket),
+            );
+            assert!(matches!(
+                scan.analyze(mixed.pid()),
+                Err(IpcError::UnclassifiedSocket { pid, .. }) if pid == mixed.pid()
+            ));
+            assert!(
+                IpcAnalyzer::new()
+                    .analyze(mixed.pid())
+                    .unwrap()
+                    .is_supervised
+            );
+        }
+
+        impl Drop for SocketChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        #[test]
+        fn scan_reuses_one_strict_table_for_unsupervised_candidates() {
+            let directory = tempfile::tempdir().unwrap();
+            let children: Vec<_> = (0..8)
+                .map(|index| SocketChild::new(&directory.path().join(format!("{index}.sock"))))
+                .collect();
+            let scan = IpcAnalyzer::for_scan();
+            let live = IpcAnalyzer::new();
+            for child in &children {
+                let observed = scan.analyze(child.pid()).unwrap();
+                assert!(!observed.is_supervised);
+                // Both modes inspect the same real, stable descriptors. Reusing
+                // negative scan evidence must not change their classification.
+                let current = live.analyze(child.pid()).unwrap();
+                assert_eq!(observed.is_supervised, current.is_supervised);
+                assert_eq!(observed.matched_sockets, current.matched_sockets);
+                assert!(!scan.analyze(child.pid()).unwrap().is_supervised);
+            }
+            let snapshot = scan.scan.as_ref().unwrap();
+            assert_eq!(snapshot.table_reads.load(Ordering::Relaxed), 1);
+            assert_eq!(snapshot.tables.lock().unwrap().len(), 1);
+            assert!(live.scan.is_none());
+        }
+
+        #[test]
+        fn scan_refuses_new_unix_inodes_while_live_and_new_scan_refresh() {
+            let directory = tempfile::tempdir().unwrap();
+            let original = SocketChild::new(&directory.path().join("original.sock"));
+            let scan = IpcAnalyzer::for_scan();
+            assert!(!scan.analyze(original.pid()).unwrap().is_supervised);
+
+            let supervised_directory = tempfile::Builder::new()
+                .prefix("vscode-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let supervised = SocketChild::new(&supervised_directory.path().join("ipc.sock"));
+            assert!(matches!(
+                scan.analyze(supervised.pid()),
+                Err(IpcError::UnclassifiedSocket { pid, .. }) if pid == supervised.pid()
+            ));
+            assert_eq!(
+                scan.scan
+                    .as_ref()
+                    .unwrap()
+                    .table_reads
+                    .load(Ordering::Relaxed),
+                1
+            );
+
+            // A scan view must never leak into action-time detection, and a
+            // subsequent watch refresh must get a new view rather than a TTL hit.
+            for analyzer in [IpcAnalyzer::new(), IpcAnalyzer::for_scan()] {
+                let observed = analyzer.analyze(supervised.pid()).unwrap();
+                assert!(observed.is_supervised);
+                assert_eq!(observed.supervisor_name.as_deref(), Some("vscode"));
+            }
+        }
+
+        #[test]
+        fn scan_preserves_namespace_and_process_read_failures() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut child = SocketChild::new(&directory.path().join("child.sock"));
+            let pid = child.pid();
+            let scan = IpcAnalyzer::for_scan();
+            assert!(!scan.analyze(pid).unwrap().is_supervised);
+            let snapshot = scan.scan.as_ref().unwrap();
+            let (namespace, handle) = open_network_namespace(pid).unwrap();
+            let other_namespace = (namespace.0, namespace.1 ^ 1);
+            assert!(matches!(
+                snapshot.table_for(pid, other_namespace, handle),
+                Err(IpcError::ProcessChanged(changed)) if changed == pid
+            ));
+            assert_eq!(snapshot.table_reads.load(Ordering::Relaxed), 1);
+            assert_eq!(snapshot.tables.lock().unwrap().len(), 1);
+
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            assert!(matches!(
+                scan.analyze(pid),
+                Err(IpcError::Identity(StatReadError::Read { pid: failed, .. })) if failed == pid
+            ));
+            assert!(matches!(
+                open_network_namespace(pid),
+                Err(IpcError::IoError { pid: failed, .. }) if failed == pid
+            ));
+            assert_eq!(snapshot.table_reads.load(Ordering::Relaxed), 1);
+        }
+    }
 
     /// A unix socket this process binds is found through the shared inode table, and
     /// repeated lookups within the TTL reuse one parse.

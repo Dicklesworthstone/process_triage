@@ -208,6 +208,18 @@ impl SupervisionDetector {
         }
     }
 
+    /// Share strict IPC table observations within one read-only scan. Required
+    /// per-process and namespace evidence stays live. Action-time authorization
+    /// must use `new()` so negative IPC evidence is refreshed before acting.
+    /// Construct a new detector for every scan or watch refresh; views do not expire.
+    pub fn for_scan() -> Self {
+        Self {
+            ancestry: AncestryAnalyzer::new(),
+            environ: EnvironAnalyzer::new(),
+            ipc: IpcAnalyzer::for_scan(),
+        }
+    }
+
     /// Pre-populate observed identities; detection refreshes required evidence.
     #[cfg(target_os = "linux")]
     pub fn populate_cache(&mut self) -> Result<(), AncestryError> {
