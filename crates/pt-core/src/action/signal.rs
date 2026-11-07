@@ -107,6 +107,30 @@ fn should_resume_after_sigterm(state: Option<char>, use_group: bool) -> bool {
     cfg!(target_os = "linux") && !use_group && state == Some('T')
 }
 
+/// A phase budget from the approved plan. Elapsed time is measured monotonically;
+/// using a duration instead of adding to Instant also accepts large saved budgets
+/// without overflowing the platform's clock representation.
+struct SignalDeadline {
+    started: Instant,
+    budget: Duration,
+}
+
+impl SignalDeadline {
+    fn new(timeout_ms: u64) -> Self {
+        Self {
+            started: Instant::now(),
+            budget: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, ActionError> {
+        self.budget
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ActionError::Timeout)
+    }
+}
+
 /// Signal action runner configuration.
 #[derive(Debug, Clone)]
 pub struct SignalConfig {
@@ -114,7 +138,8 @@ pub struct SignalConfig {
     pub term_grace_ms: u64,
     /// Polling interval when waiting for process to exit.
     pub poll_interval_ms: u64,
-    /// Maximum time to wait for process state change after signal.
+    /// Maximum time to wait for process state change after signal. A saved
+    /// action's verify_ms may impose a shorter observation budget.
     pub verify_timeout_ms: u64,
     /// Whether to send signals to process groups (negative PID).
     pub use_process_groups: bool,
@@ -300,7 +325,7 @@ impl SignalActionRunner {
         timeout: Duration,
     ) -> Result<(), ActionError> {
         let start = Instant::now();
-        let poll_interval = Duration::from_millis(self.config.poll_interval_ms);
+        let poll_interval = Duration::from_millis(self.config.poll_interval_ms.max(1));
 
         while start.elapsed() < timeout {
             if expect_exit {
@@ -324,21 +349,53 @@ impl SignalActionRunner {
                 }
             }
 
-            thread::sleep(poll_interval);
+            // A coarse polling interval must not extend the approved deadline.
+            thread::sleep(poll_interval.min(timeout.saturating_sub(start.elapsed())));
         }
 
         Err(ActionError::Timeout)
     }
 
+    /// Observe the full configured TERM grace period when the plan permits it.
+    /// A shorter execution budget is a timeout, never permission to escalate to
+    /// KILL early. `false` means the full grace expired with time left to escalate.
+    #[cfg(unix)]
+    fn wait_for_term_grace(
+        &self,
+        pid: u32,
+        deadline: &SignalDeadline,
+    ) -> Result<bool, ActionError> {
+        let remaining = deadline.remaining()?;
+        let grace = Duration::from_millis(self.config.term_grace_ms);
+        match self.wait_for_state_change(pid, true, None, grace.min(remaining)) {
+            Ok(()) => Ok(true),
+            Err(ActionError::Timeout) => {
+                if remaining <= grace {
+                    return Err(ActionError::Timeout);
+                }
+                deadline.remaining()?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn verification_timeout(&self, action: &PlanAction) -> Duration {
+        Duration::from_millis(self.config.verify_timeout_ms.min(action.timeouts.verify_ms))
+    }
+
     /// Execute a pause action (SIGSTOP).
     #[cfg(unix)]
     fn execute_pause(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let deadline = SignalDeadline::new(action.timeouts.execute_ms);
+        deadline.remaining()?;
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
 
         #[cfg(target_os = "linux")]
         if !use_group {
             if let Some(pidfd) = self.pinned_pidfd(action)? {
+                deadline.remaining()?;
                 return pidfd.send(libc::SIGSTOP);
             }
         }
@@ -348,6 +405,7 @@ impl SignalActionRunner {
         if !use_group {
             self.check_identity_now(action)?;
         }
+        deadline.remaining()?;
         self.send_signal(target, libc::SIGSTOP, use_group)?;
         Ok(())
     }
@@ -366,6 +424,8 @@ impl SignalActionRunner {
     /// Execute a kill action (SIGTERM → SIGKILL).
     #[cfg(unix)]
     fn execute_kill(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let deadline = SignalDeadline::new(action.timeouts.execute_ms);
+        deadline.remaining()?;
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
         let resume_stopped = should_resume_after_sigterm(self.get_process_state(pid), use_group);
@@ -376,19 +436,22 @@ impl SignalActionRunner {
         #[cfg(target_os = "linux")]
         if !use_group {
             if let Some(pidfd) = self.pinned_pidfd(action)? {
+                deadline.remaining()?;
                 pidfd.send(libc::SIGTERM)?;
                 self.note_delivered_signal(libc::SIGTERM);
                 if resume_stopped {
+                    deadline.remaining()?;
                     match pidfd.send(libc::SIGCONT) {
                         Ok(()) => {}
                         Err(ActionError::ProcessNotFound) => return Ok(()),
                         Err(error) => return Err(error),
                     }
                 }
-                let grace = Duration::from_millis(self.config.term_grace_ms);
-                return match self.wait_for_state_change(pid, true, None, grace) {
-                    Ok(()) => Ok(()),
-                    Err(ActionError::Timeout) => match pidfd.send(libc::SIGKILL) {
+                return if self.wait_for_term_grace(pid, &deadline)? {
+                    Ok(())
+                } else {
+                    deadline.remaining()?;
+                    match pidfd.send(libc::SIGKILL) {
                         Ok(()) => {
                             self.note_delivered_signal(libc::SIGKILL);
                             Ok(())
@@ -396,8 +459,7 @@ impl SignalActionRunner {
                         // Exited between the grace timeout and SIGKILL: done.
                         Err(ActionError::ProcessNotFound) => Ok(()),
                         other => other,
-                    },
-                    Err(e) => Err(e),
+                    }
                 };
             }
         }
@@ -408,6 +470,7 @@ impl SignalActionRunner {
         }
 
         // Stage 1: SIGTERM
+        deadline.remaining()?;
         self.send_signal(target, libc::SIGTERM, use_group)?;
 
         if resume_stopped {
@@ -416,6 +479,7 @@ impl SignalActionRunner {
             // process, never an unverified group or a tracing-stop subject.
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             self.check_identity_now(action)?;
+            deadline.remaining()?;
             match self.send_signal(pid, libc::SIGCONT, false) {
                 Ok(()) => {}
                 Err(ActionError::ProcessNotFound) => return Ok(()),
@@ -424,13 +488,8 @@ impl SignalActionRunner {
         }
 
         // Wait for graceful termination
-        let grace = Duration::from_millis(self.config.term_grace_ms);
-        match self.wait_for_state_change(pid, true, None, grace) {
-            Ok(()) => return Ok(()),
-            Err(ActionError::Timeout) => {
-                // Escalate to SIGKILL
-            }
-            Err(e) => return Err(e),
+        if self.wait_for_term_grace(pid, &deadline)? {
+            return Ok(());
         }
 
         // Stage 2: SIGKILL (only if process still exists)
@@ -443,6 +502,7 @@ impl SignalActionRunner {
         }
 
         if self.process_exists(pid) {
+            deadline.remaining()?;
             self.send_signal(target, libc::SIGKILL, use_group)?;
         }
 
@@ -454,12 +514,16 @@ impl SignalActionRunner {
     /// itself is never signaled and the parent is never killed or restarted here.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn nudge_parent_to_reap(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let deadline = SignalDeadline::new(action.timeouts.execute_ms);
+        deadline.remaining()?;
         #[cfg(target_os = "linux")]
         if let Some(pidfd) = self.pinned_pidfd(action)? {
+            deadline.remaining()?;
             return pidfd.send(libc::SIGCHLD);
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.check_identity_now(action)?;
+        deadline.remaining()?;
         self.send_signal(action.target.pid.0, libc::SIGCHLD, false)
     }
 
@@ -477,12 +541,13 @@ impl SignalActionRunner {
                     .is_some_and(|st| !ids_match_starttime(&zombie.start_id.0, st))
         };
         let start = Instant::now();
-        let timeout = Duration::from_millis(self.config.verify_timeout_ms);
+        let timeout = self.verification_timeout(action);
         while start.elapsed() < timeout {
             if reaped() {
                 return Ok(());
             }
-            thread::sleep(Duration::from_millis(self.config.poll_interval_ms));
+            let poll_interval = Duration::from_millis(self.config.poll_interval_ms.max(1));
+            thread::sleep(poll_interval.min(timeout.saturating_sub(start.elapsed())));
         }
         Err(ActionError::Failed(format!(
             "zombie {pid} persists: parent {} did not reap it on SIGCHLD; \
@@ -495,7 +560,7 @@ impl SignalActionRunner {
     #[cfg(unix)]
     fn verify_pause(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
-        let timeout = Duration::from_millis(self.config.verify_timeout_ms);
+        let timeout = self.verification_timeout(action);
         self.wait_for_state_change(pid, false, Some(true), timeout)
     }
 
@@ -503,7 +568,7 @@ impl SignalActionRunner {
     #[cfg(unix)]
     fn verify_kill(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
-        let timeout = Duration::from_millis(self.config.verify_timeout_ms);
+        let timeout = self.verification_timeout(action);
         self.wait_for_state_change(pid, true, None, timeout)
     }
 
@@ -526,12 +591,15 @@ impl SignalActionRunner {
     /// Execute a resume action (SIGCONT) from PlanAction.
     #[cfg(unix)]
     fn execute_resume(&self, action: &PlanAction) -> Result<(), ActionError> {
+        let deadline = SignalDeadline::new(action.timeouts.execute_ms);
+        deadline.remaining()?;
         let pid = action.target.pid.0;
         let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);
 
         #[cfg(target_os = "linux")]
         if !use_group {
             if let Some(pidfd) = self.pinned_pidfd(action)? {
+                deadline.remaining()?;
                 return pidfd.send(libc::SIGCONT);
             }
         }
@@ -539,6 +607,7 @@ impl SignalActionRunner {
         if !use_group {
             self.check_identity_now(action)?;
         }
+        deadline.remaining()?;
         self.send_signal(target, libc::SIGCONT, use_group)?;
         Ok(())
     }
@@ -547,7 +616,7 @@ impl SignalActionRunner {
     #[cfg(unix)]
     fn verify_resume(&self, action: &PlanAction) -> Result<(), ActionError> {
         let pid = action.target.pid.0;
-        let timeout = Duration::from_millis(self.config.verify_timeout_ms);
+        let timeout = self.verification_timeout(action);
         // Process should not be stopped anymore
         self.wait_for_state_change(pid, false, Some(false), timeout)
     }
@@ -1279,6 +1348,123 @@ mod tests {
             assert_eq!(status.signal(), Some(libc::SIGKILL));
             assert!(!marker.exists());
             assert!(runner.take_kill_signal_delivered());
+        }
+
+        #[test]
+        fn exhausted_plan_execution_budget_sends_no_signals() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, mut action) = stopped_term_child(&marker, false, false);
+            let runner = SignalActionRunner::with_defaults();
+            action.timeouts.execute_ms = 0;
+
+            for kind in [Action::Kill, Action::Pause, Action::Resume] {
+                action.action = kind;
+                assert!(matches!(runner.execute(&action), Err(ActionError::Timeout)));
+                assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+                assert!(!runner.take_kill_signal_delivered());
+                assert!(runner.take_signal_path().is_none());
+            }
+            assert!(matches!(
+                runner.nudge_parent_to_reap(&action),
+                Err(ActionError::Timeout)
+            ));
+            assert!(!marker.exists());
+        }
+
+        #[test]
+        fn short_plan_budget_never_accelerates_sigkill() {
+            for own_group in [false, true] {
+                let dir = tempfile::tempdir().expect("marker directory");
+                let marker = dir.path().join("term-handled");
+                let (mut child, mut action) = stopped_term_child(&marker, true, own_group);
+                let runner = SignalActionRunner::new(SignalConfig {
+                    term_grace_ms: 5_000,
+                    poll_interval_ms: 5_000,
+                    use_process_groups: own_group,
+                    ..SignalConfig::default()
+                });
+                action.timeouts.execute_ms = 30;
+
+                let started = Instant::now();
+                assert!(matches!(runner.execute(&action), Err(ActionError::Timeout)));
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "polling must be bounded by the saved execution budget"
+                );
+                assert!(child.0.try_wait().unwrap().is_none(), "no early SIGKILL");
+                assert_eq!(
+                    runner.get_process_state(child.0.id()) == Some('T'),
+                    own_group,
+                    "only the individually verified process may be resumed"
+                );
+                assert!(runner.take_kill_signal_delivered(), "TERM still counts");
+                assert!(!marker.exists());
+            }
+        }
+
+        #[test]
+        fn short_plan_budget_still_allows_graceful_exit() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (mut child, mut action) = stopped_term_child(&marker, false, false);
+            let runner = SignalActionRunner::new(SignalConfig {
+                poll_interval_ms: 1,
+                ..SignalConfig::default()
+            });
+            action.timeouts.execute_ms = 1_000;
+
+            runner
+                .execute(&action)
+                .expect("TERM handler exits in budget");
+            runner.verify(&action).expect("observe graceful exit");
+            assert!(child.0.wait().unwrap().success());
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "term handled\n");
+            assert!(runner.take_kill_signal_delivered());
+        }
+
+        #[test]
+        fn verification_honors_plan_budget_and_caps_polling() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (child, mut action) = stopped_term_child(&marker, false, false);
+            let runner = SignalActionRunner::new(SignalConfig {
+                poll_interval_ms: 5_000,
+                ..SignalConfig::default()
+            });
+            action.timeouts.verify_ms = 25;
+
+            for kind in [Action::Kill, Action::Resume] {
+                action.action = kind;
+                let started = Instant::now();
+                assert!(matches!(runner.verify(&action), Err(ActionError::Timeout)));
+                assert!(started.elapsed() < Duration::from_secs(2));
+                assert_eq!(runner.get_process_state(child.0.id()), Some('T'));
+            }
+            action.action = Action::Pause;
+            runner
+                .verify(&action)
+                .expect("observe already stopped child");
+            action.timeouts.verify_ms = 0;
+            assert!(matches!(runner.verify(&action), Err(ActionError::Timeout)));
+            assert!(!runner.take_kill_signal_delivered());
+        }
+
+        #[test]
+        fn verification_retains_stricter_runner_budget() {
+            let dir = tempfile::tempdir().expect("marker directory");
+            let marker = dir.path().join("term-handled");
+            let (_child, mut action) = stopped_term_child(&marker, false, false);
+            let runner = SignalActionRunner::new(SignalConfig {
+                verify_timeout_ms: 25,
+                poll_interval_ms: 5_000,
+                ..SignalConfig::default()
+            });
+            action.timeouts.verify_ms = u64::MAX;
+
+            let started = Instant::now();
+            assert!(matches!(runner.verify(&action), Err(ActionError::Timeout)));
+            assert!(started.elapsed() < Duration::from_secs(2));
         }
 
         #[test]
