@@ -268,6 +268,8 @@ pub enum EventType {
     ProcessExit,
     /// Evidence snapshot captured for calibration linkage.
     EvidenceSnapshot,
+    /// Explicit human kill/spare judgment, not a model prediction or an exit.
+    HumanVerdict,
 }
 
 impl EventType {
@@ -286,6 +288,7 @@ impl EventType {
             EventType::SupervisorDetected => "supervisor_detected",
             EventType::ProcessExit => "process_exit",
             EventType::EvidenceSnapshot => "evidence_snapshot",
+            EventType::HumanVerdict => "human_verdict",
         }
     }
 
@@ -304,6 +307,7 @@ impl EventType {
             x if x == EventType::SupervisorDetected as u32 => Some(EventType::SupervisorDetected),
             x if x == EventType::ProcessExit as u32 => Some(EventType::ProcessExit),
             x if x == EventType::EvidenceSnapshot as u32 => Some(EventType::EvidenceSnapshot),
+            x if x == EventType::HumanVerdict as u32 => Some(EventType::HumanVerdict),
             _ => None,
         }
     }

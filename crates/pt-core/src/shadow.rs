@@ -3,6 +3,7 @@
 //! Records prediction snapshots into pt-telemetry shadow storage for calibration.
 
 use crate::collect::ProcessRecord;
+use crate::decision::decision_store::Verdict;
 use crate::decision::{Action, DecisionOutcome};
 use crate::inference::{ClassScores, Confidence, EvidenceLedger};
 use chrono::Utc;
@@ -41,6 +42,61 @@ impl From<serde_json::Error> for ShadowRecordError {
     fn from(err: serde_json::Error) -> Self {
         ShadowRecordError::Json(err)
     }
+}
+
+/// Persist an explicit judgment about one live process incarnation for shadow
+/// calibration. A command-pattern label alone cannot identify a past prediction.
+///
+/// Call this before updating learned priors so predictions made with the new
+/// verdict cannot be evaluated against that same verdict. The event carries no
+/// prediction: validation joins it only to an earlier observation with the same
+/// identity, and ignores it if no such observation exists.
+pub fn record_human_verdict(
+    proc: &ProcessRecord,
+    verdict: Verdict,
+) -> Result<String, ShadowRecordError> {
+    record_human_verdict_with_config(shadow_config_from_env(), proc, verdict)
+}
+
+fn record_human_verdict_with_config(
+    config: ShadowStorageConfig,
+    proc: &ProcessRecord,
+    verdict: Verdict,
+) -> Result<String, ShadowRecordError> {
+    let timestamp = Utc::now();
+    let identity_hash = compute_identity_hash(proc);
+    let mut storage = ShadowStorage::new(config)?;
+    storage.record(Observation {
+        timestamp,
+        pid: proc.pid.0,
+        identity_hash: identity_hash.clone(),
+        state: StateSnapshot::default(),
+        events: vec![ProcessEvent {
+            timestamp,
+            event_type: EventType::HumanVerdict,
+            details: Some(
+                serde_json::json!({
+                    "verdict": verdict,
+                    "source": "agent_label",
+                    "comm": proc.comm,
+                })
+                .to_string(),
+            ),
+        }],
+        // An event-only observation has no model belief. In particular, never
+        // insert the learned prior or the verdict itself as a prediction.
+        belief: BeliefState {
+            p_abandoned: 0.0,
+            p_legitimate: 0.0,
+            p_zombie: 0.0,
+            p_useful_but_bad: 0.0,
+            confidence: 0.0,
+            score: 0.0,
+            recommendation: "human_verdict".to_string(),
+        },
+    })?;
+    storage.flush()?;
+    Ok(identity_hash)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -552,6 +608,60 @@ mod tests {
             state: StateSnapshot::default(),
             comm: comm.to_string(),
         }
+    }
+
+    #[test]
+    fn human_verdicts_are_durable_identity_bound_events_without_predictions() {
+        let directory = TempDir::new().unwrap();
+        let config = ShadowStorageConfig {
+            base_dir: directory.path().to_path_buf(),
+            auto_compact: false,
+            delete_expired: false,
+            ..Default::default()
+        };
+        let proc = make_proc(412, "sleep", "sleep 621");
+        for verdict in [Verdict::Kill, Verdict::Spare] {
+            let identity = record_human_verdict_with_config(config.clone(), &proc, verdict)
+                .expect("persist explicit verdict");
+            assert_eq!(identity, compute_identity_hash(&proc));
+        }
+
+        // Read the published batches after each short-lived writer has gone;
+        // neither the in-memory query cache nor pending.json is the evidence.
+        let mut observations = Vec::new();
+        for entry in fs::read_dir(directory.path().join("hot/pid_412")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                let batch: Vec<Observation> =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                observations.extend(batch);
+            }
+        }
+        observations.sort_by_key(|obs| obs.timestamp);
+        assert_eq!(observations.len(), 2);
+        for (obs, verdict) in observations.iter().zip(["kill", "spare"]) {
+            assert_eq!(obs.pid, proc.pid.0);
+            assert_eq!(obs.identity_hash, compute_identity_hash(&proc));
+            assert_eq!(obs.events.len(), 1);
+            let event = &obs.events[0];
+            assert_eq!(event.event_type, EventType::HumanVerdict);
+            assert_eq!(event.timestamp, obs.timestamp);
+            let details: serde_json::Value =
+                serde_json::from_str(event.details.as_deref().unwrap()).unwrap();
+            assert_eq!(details["verdict"], verdict);
+            assert_eq!(details["source"], "agent_label");
+            assert_eq!(details["comm"], "sleep");
+            assert_eq!(obs.belief.recommendation, "human_verdict");
+        }
+        assert!(!directory.path().join("pending.json").exists());
+        let engine = crate::calibrate::validation::ValidationEngine::from_shadow_observations(
+            &observations,
+            0.5,
+        );
+        assert!(
+            engine.records().is_empty(),
+            "verdicts cannot invent predictions"
+        );
     }
 
     // ── action_to_recommendation ────────────────────────────────────

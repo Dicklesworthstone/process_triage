@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use pt_telemetry::shadow::{EventType, Observation, ProcessEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     bias::{analyze_bias, BiasAnalysis},
@@ -398,22 +398,89 @@ impl ValidationEngine {
     ///
     /// The prediction calibrated is P(abandoned or zombie), the quantity pt displays
     /// as its score and gates robot kills on (not P(abandoned) alone).
+    /// Only the first valid human verdict for a process incarnation may supply a
+    /// label. Later predictions may already incorporate that verdict in their
+    /// learned prior, even when no prediction existed before the first verdict.
+    /// Legacy explicit verdicts carried by exit-event hints follow the same rule.
     pub fn from_shadow_observations(observations: &[Observation], threshold: f64) -> Self {
         let predicted = |obs: &Observation| {
             f64::from(obs.belief.p_abandoned + obs.belief.p_zombie).clamp(0.0, 1.0)
         };
         let mut engine = ValidationEngine::new(threshold);
-        let mut ordered: Vec<&Observation> = observations.iter().collect();
-        ordered.sort_by_key(|a| a.timestamp);
-
-        for obs in ordered {
-            let exit_event = obs
+        let mut ordered = Vec::new();
+        for obs in observations {
+            if obs
                 .events
                 .iter()
-                .find(|event| event.event_type == EventType::ProcessExit);
+                .any(|event| event.event_type == EventType::HumanVerdict)
+            {
+                // Verdict observations have no prediction. Even an invalid verdict
+                // must not turn their default belief into a calibration sample.
+                for event in &obs.events {
+                    if event.event_type == EventType::HumanVerdict
+                        && event.timestamp <= obs.timestamp
+                    {
+                        ordered.push((event.timestamp, 0, obs, Some(event)));
+                    }
+                }
+            } else {
+                let exit_event = obs
+                    .events
+                    .iter()
+                    .find(|event| event.event_type == EventType::ProcessExit);
+                let at = exit_event.map_or(obs.timestamp, |event| event.timestamp);
+                if at <= obs.timestamp {
+                    let order = if exit_event.is_some_and(is_explicit_shadow_verdict) {
+                        0
+                    } else {
+                        1
+                    };
+                    ordered.push((at, order, obs, exit_event));
+                }
+            }
+        }
+        // Replay by event time even when a verdict was flushed after a newer
+        // prediction. Verdicts precede equal-time predictions: a label must be
+        // strictly later than the prediction it evaluates.
+        ordered.sort_by_key(|(at, order, _, _)| (*at, *order));
+        let mut latest_predictions = HashMap::new();
+        let mut verdict_identities = HashSet::new();
 
-            if let Some(exit_event) = exit_event {
-                if !engine.has_unresolved_identity(&obs.identity_hash) {
+        for (_, _, obs, event) in ordered {
+            let key = (obs.identity_hash.clone(), obs.pid);
+            if let Some((event, (ground_truth, exit_code, exit_signal, outcome_source))) =
+                event.and_then(|event| map_explicit_verdict(event).map(|outcome| (event, outcome)))
+            {
+                if obs.identity_hash.is_empty() || !verdict_identities.insert(key.clone()) {
+                    continue;
+                }
+                // Reserve the incarnation before looking for a prior prediction.
+                // A repeated label must never evaluate an in-sample prediction
+                // that learned from the first label.
+                let Some(&index) = latest_predictions.get(&key) else {
+                    continue;
+                };
+                let record: &mut ValidationRecord = &mut engine.records[index];
+                if record.predicted_at >= event.timestamp
+                    || record.predicted_at >= obs.timestamp
+                    || record.ground_truth.is_some_and(|truth| truth.is_resolved())
+                {
+                    continue;
+                }
+                record.ground_truth = Some(ground_truth);
+                record.resolved_at = Some(event.timestamp);
+                record.exit_code = exit_code.or(record.exit_code);
+                record.exit_signal = exit_signal.or(record.exit_signal);
+                record.outcome_source = outcome_source;
+                continue;
+            }
+            if event.is_some_and(|event| event.event_type == EventType::HumanVerdict) {
+                // Malformed/unsupported verdicts are neither labels nor predictions.
+                continue;
+            }
+
+            if let Some(exit_event) = event {
+                if !engine.has_unresolved_identity(&obs.identity_hash, obs.pid) {
                     let comm = extract_comm_from_events(&obs.events)
                         .unwrap_or_else(|| "unknown".to_string());
                     engine.upsert_prediction(
@@ -430,19 +497,23 @@ impl ValidationEngine {
 
                 let (ground_truth, exit_code, exit_signal, outcome_source) =
                     map_exit_event(exit_event);
-                engine.record_outcome_with_source(
-                    &obs.identity_hash,
-                    ground_truth,
-                    exit_code,
-                    exit_signal,
-                    outcome_source,
-                );
+                if let Some(record) = engine.records.iter_mut().rev().find(|record| {
+                    record.identity_hash == obs.identity_hash
+                        && record.pid == obs.pid
+                        && record.ground_truth.is_none()
+                }) {
+                    record.ground_truth = Some(ground_truth);
+                    record.resolved_at = Some(exit_event.timestamp);
+                    record.exit_code = exit_code;
+                    record.exit_signal = exit_signal;
+                    record.outcome_source = outcome_source;
+                }
                 continue;
             }
 
             let comm =
                 extract_comm_from_events(&obs.events).unwrap_or_else(|| "unknown".to_string());
-            engine.upsert_prediction(
+            let index = engine.upsert_prediction(
                 obs.identity_hash.clone(),
                 obs.pid,
                 predicted(obs),
@@ -452,6 +523,7 @@ impl ValidationEngine {
                 None,
                 obs.timestamp,
             );
+            latest_predictions.insert(key, index);
         }
 
         engine
@@ -465,11 +537,11 @@ impl ValidationEngine {
             .collect()
     }
 
-    fn has_unresolved_identity(&self, identity_hash: &str) -> bool {
+    fn has_unresolved_identity(&self, identity_hash: &str, pid: u32) -> bool {
         self.records
             .iter()
             .rev()
-            .any(|r| r.identity_hash == identity_hash && r.ground_truth.is_none())
+            .any(|r| r.identity_hash == identity_hash && r.pid == pid && r.ground_truth.is_none())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -483,13 +555,10 @@ impl ValidationEngine {
         comm: String,
         host_id: Option<String>,
         predicted_at: DateTime<Utc>,
-    ) {
-        if let Some(record) = self
-            .records
-            .iter_mut()
-            .rev()
-            .find(|r| r.identity_hash == identity_hash && r.ground_truth.is_none())
-        {
+    ) -> usize {
+        if let Some((index, record)) = self.records.iter_mut().enumerate().rev().find(|(_, r)| {
+            r.identity_hash == identity_hash && r.pid == pid && r.ground_truth.is_none()
+        }) {
             record.pid = pid;
             record.predicted_abandoned = predicted_abandoned;
             record.recommended_action = recommended_action;
@@ -497,7 +566,7 @@ impl ValidationEngine {
             record.comm = comm;
             record.predicted_at = predicted_at;
             record.host_id = host_id;
-            return;
+            return index;
         }
 
         self.records.push(ValidationRecord {
@@ -515,6 +584,7 @@ impl ValidationEngine {
             outcome_source: None,
             host_id,
         });
+        self.records.len() - 1
     }
 
     /// Generate a full validation report.
@@ -580,11 +650,21 @@ impl ValidationEngine {
         })
     }
 
-    /// Generate a full calibration report from supported labels.
+    /// Generate a full calibration report from supported labels, requiring the
+    /// same minimum representation of both classes as the structured report.
     pub fn calibration_report(&self) -> Result<CalibrationReport, CalibrationError> {
         let cal_data = self.to_calibration_data();
         if cal_data.is_empty() {
             return Err(CalibrationError::NoData);
+        }
+        let positive_labels = cal_data.iter().filter(|datum| datum.actual).count();
+        let negative_labels = cal_data.len() - positive_labels;
+        let minority_labels = positive_labels.min(negative_labels);
+        if minority_labels < MIN_LABELS_PER_CLASS {
+            return Err(CalibrationError::InsufficientData {
+                count: minority_labels,
+                min_required: MIN_LABELS_PER_CLASS,
+            });
         }
         CalibrationReport::from_data(&cal_data, 10, self.threshold)
     }
@@ -797,6 +877,45 @@ fn extract_comm_from_events(events: &[ProcessEvent]) -> Option<String> {
     }
 
     preferred
+}
+
+/// Whether an event carries an explicit human verdict that must survive a
+/// prediction-window limit. Both formats share one process-incarnation guard:
+/// a first verdict with no preceding prediction still excludes later predictions
+/// from evaluation against repeated labels. Event time and identity checks are
+/// applied separately when replaying the observations.
+pub fn is_explicit_shadow_verdict(event: &ProcessEvent) -> bool {
+    map_explicit_verdict(event).is_some()
+}
+
+fn map_explicit_verdict(
+    event: &ProcessEvent,
+) -> Option<(GroundTruth, Option<i32>, Option<i32>, Option<String>)> {
+    match event.event_type {
+        EventType::HumanVerdict => Some((
+            map_human_verdict(event)?,
+            None,
+            None,
+            Some("human:agent_label".to_string()),
+        )),
+        EventType::ProcessExit => {
+            let outcome = map_exit_event(event);
+            outcome.0.is_resolved().then_some(outcome)
+        }
+        _ => None,
+    }
+}
+
+fn map_human_verdict(event: &ProcessEvent) -> Option<GroundTruth> {
+    let details = serde_json::from_str::<JsonValue>(event.details.as_deref()?).ok()?;
+    if details.get("source")?.as_str()? != "agent_label" {
+        return None;
+    }
+    match details.get("verdict")?.as_str()? {
+        "kill" => Some(GroundTruth::UserKilled),
+        "spare" => Some(GroundTruth::UserSpared),
+        _ => None,
+    }
 }
 
 fn map_exit_event(event: &ProcessEvent) -> (GroundTruth, Option<i32>, Option<i32>, Option<String>) {
@@ -1157,6 +1276,9 @@ mod tests {
             }],
             belief: BeliefState {
                 p_abandoned: 0.8,
+                p_legitimate: 0.2,
+                p_zombie: 0.0,
+                p_useful_but_bad: 0.0,
                 recommendation: "kill".to_string(),
                 ..BeliefState::default()
             },
@@ -1180,6 +1302,9 @@ mod tests {
             }],
             belief: BeliefState {
                 p_abandoned: 0.8,
+                p_legitimate: 0.2,
+                p_zombie: 0.0,
+                p_useful_but_bad: 0.0,
                 recommendation: "kill".to_string(),
                 ..BeliefState::default()
             },
@@ -1210,7 +1335,9 @@ mod tests {
             events: vec![],
             belief: BeliefState {
                 p_abandoned: 0.5,
+                p_legitimate: 0.2,
                 p_zombie: 0.3,
+                p_useful_but_bad: 0.0,
                 recommendation: "kill".to_string(),
                 ..BeliefState::default()
             },
@@ -1218,6 +1345,467 @@ mod tests {
         let engine = ValidationEngine::from_shadow_observations(&[obs], 0.5);
         let record = &engine.pending_records()[0];
         assert!((record.predicted_abandoned - 0.8).abs() < 1e-6);
+    }
+
+    fn human_label_prediction(
+        at: DateTime<Utc>,
+        pid: u32,
+        identity: &str,
+        probability: f32,
+    ) -> Observation {
+        Observation {
+            timestamp: at,
+            pid,
+            identity_hash: identity.to_string(),
+            state: StateSnapshot::default(),
+            events: vec![ProcessEvent {
+                timestamp: at,
+                event_type: EventType::EvidenceSnapshot,
+                details: Some(serde_json::json!({"comm": "test-worker"}).to_string()),
+            }],
+            belief: BeliefState {
+                p_abandoned: probability,
+                p_legitimate: 1.0 - probability,
+                p_zombie: 0.0,
+                p_useful_but_bad: 0.0,
+                recommendation: "review".to_string(),
+                ..BeliefState::default()
+            },
+        }
+    }
+
+    fn human_label_observation(
+        at: DateTime<Utc>,
+        pid: u32,
+        identity: &str,
+        verdict: &str,
+    ) -> Observation {
+        Observation {
+            timestamp: at,
+            pid,
+            identity_hash: identity.to_string(),
+            state: StateSnapshot::default(),
+            events: vec![ProcessEvent {
+                timestamp: at,
+                event_type: EventType::HumanVerdict,
+                details: Some(
+                    serde_json::json!({
+                        "verdict": verdict,
+                        "source": "agent_label",
+                        "comm": "test-worker"
+                    })
+                    .to_string(),
+                ),
+            }],
+            belief: BeliefState {
+                p_abandoned: 0.0,
+                p_legitimate: 0.0,
+                p_zombie: 0.0,
+                p_useful_but_bad: 0.0,
+                recommendation: "human_verdict".to_string(),
+                ..BeliefState::default()
+            },
+        }
+    }
+
+    fn hinted_exit_observation(
+        at: DateTime<Utc>,
+        pid: u32,
+        identity: &str,
+        hint: &str,
+    ) -> Observation {
+        let mut observation = human_label_prediction(at, pid, identity, 0.1);
+        observation.events = vec![ProcessEvent {
+            timestamp: at,
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"outcome_hint": hint}).to_string()),
+        }];
+        observation
+    }
+
+    #[test]
+    fn human_verdicts_label_latest_earlier_prediction_of_each_class() {
+        let at = Utc::now() - Duration::days(2);
+        for (verdict, expected) in [
+            ("kill", GroundTruth::UserKilled),
+            ("spare", GroundTruth::UserSpared),
+        ] {
+            let older = human_label_prediction(at, 100, "worker", 0.1);
+            let mut latest = human_label_prediction(at + Duration::seconds(1), 100, "worker", 0.6);
+            latest.belief.p_zombie = 0.2;
+            latest.belief.p_legitimate = 0.2;
+            let label = human_label_observation(at + Duration::seconds(2), 100, "worker", verdict);
+            let engine = ValidationEngine::from_shadow_observations(&[label, older, latest], 0.5);
+            assert_eq!(engine.records().len(), 1);
+            let record = &engine.records()[0];
+            assert_eq!(record.ground_truth, Some(expected));
+            assert!((record.predicted_abandoned - 0.8).abs() < 1e-6);
+            assert_eq!(record.predicted_at, at + Duration::seconds(1));
+            assert_eq!(record.resolved_at, Some(at + Duration::seconds(2)));
+            assert_eq!(record.outcome_source.as_deref(), Some("human:agent_label"));
+            assert_eq!(record.comm, "test-worker");
+            assert_eq!(record.recommended_action, "review");
+        }
+    }
+
+    #[test]
+    fn human_verdicts_require_an_earlier_exact_process_prediction() {
+        let at = Utc::now();
+        let label = human_label_observation(at, 100, "worker", "kill");
+        let cases = [
+            Vec::new(),
+            vec![human_label_prediction(at, 100, "worker", 0.8)],
+            vec![human_label_prediction(
+                at + Duration::seconds(1),
+                100,
+                "worker",
+                0.8,
+            )],
+            vec![human_label_prediction(
+                at - Duration::seconds(1),
+                100,
+                "previous-incarnation",
+                0.8,
+            )],
+            vec![human_label_prediction(
+                at - Duration::seconds(1),
+                101,
+                "worker",
+                0.8,
+            )],
+        ];
+        for mut observations in cases {
+            let predictions = observations.len();
+            observations.push(label.clone());
+            let engine = ValidationEngine::from_shadow_observations(&observations, 0.5);
+            assert!(engine.resolved_records().is_empty());
+            assert_eq!(
+                engine.records().len(),
+                predictions,
+                "verdict must not create a prediction"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_human_verdicts_do_not_overwrite_or_multiply_labels() {
+        let at = Utc::now();
+        let prediction = human_label_prediction(at, 100, "worker", 0.8);
+        let label = human_label_observation(at + Duration::seconds(1), 100, "worker", "kill");
+        let later_prediction =
+            human_label_prediction(at + Duration::seconds(2), 100, "worker", 0.2);
+        let repeated = human_label_observation(at + Duration::seconds(3), 100, "worker", "spare");
+        let engine = ValidationEngine::from_shadow_observations(
+            &[prediction, label.clone(), later_prediction, repeated, label],
+            0.5,
+        );
+        assert_eq!(engine.records().len(), 2);
+        assert_eq!(engine.resolved_records().len(), 1);
+        assert_eq!(
+            engine.resolved_records()[0].ground_truth,
+            Some(GroundTruth::UserKilled)
+        );
+        assert_eq!(
+            engine.resolved_records()[0].resolved_at,
+            Some(at + Duration::seconds(1))
+        );
+        assert_eq!(engine.pending_records().len(), 1);
+        assert_eq!(
+            engine.pending_records()[0].predicted_at,
+            at + Duration::seconds(2)
+        );
+    }
+
+    #[test]
+    fn first_verdict_without_prior_prediction_excludes_later_in_sample_labels() {
+        let at = Utc::now();
+        for prediction_delay in [Duration::zero(), Duration::seconds(1)] {
+            for repeated_verdict in ["kill", "spare"] {
+                for first in [
+                    human_label_observation(at, 100, "worker", "kill"),
+                    hinted_exit_observation(at, 100, "worker", "user_killed"),
+                ] {
+                    let hint = if repeated_verdict == "kill" {
+                        "user_kill"
+                    } else {
+                        "user_spare"
+                    };
+                    for repeated in [
+                        human_label_observation(
+                            at + Duration::seconds(2),
+                            100,
+                            "worker",
+                            repeated_verdict,
+                        ),
+                        hinted_exit_observation(at + Duration::seconds(2), 100, "worker", hint),
+                    ] {
+                        let prediction =
+                            human_label_prediction(at + prediction_delay, 100, "worker", 0.9);
+                        let engine = ValidationEngine::from_shadow_observations(
+                            &[repeated, prediction, first.clone()],
+                            0.5,
+                        );
+                        assert_eq!(engine.records().len(), 1);
+                        assert_eq!(engine.pending_records().len(), 1);
+                        assert!(engine.resolved_records().is_empty());
+                        assert!(engine.records()[0].to_calibration_data().is_none());
+                        assert_eq!(engine.records()[0].predicted_at, at + prediction_delay);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_verdict_storage_uses_event_time_without_labeling_later_predictions() {
+        let at = Utc::now();
+        let prediction = human_label_prediction(at, 100, "worker", 0.8);
+        let equal_time = human_label_prediction(at + Duration::seconds(1), 100, "worker", 0.5);
+        let later = human_label_prediction(at + Duration::seconds(2), 100, "worker", 0.2);
+        let mut label = human_label_observation(at + Duration::seconds(1), 100, "worker", "spare");
+        label.timestamp = at + Duration::seconds(10);
+        let engine = ValidationEngine::from_shadow_observations(
+            &[later, label, prediction, equal_time],
+            0.5,
+        );
+        assert_eq!(engine.resolved_records().len(), 1);
+        let labeled = engine.resolved_records()[0];
+        assert_eq!(labeled.predicted_at, at);
+        assert!((labeled.predicted_abandoned - 0.8).abs() < 1e-6);
+        assert_eq!(labeled.resolved_at, Some(at + Duration::seconds(1)));
+        assert_eq!(engine.pending_records().len(), 1);
+        assert_eq!(
+            engine.pending_records()[0].predicted_at,
+            at + Duration::seconds(2)
+        );
+    }
+
+    #[test]
+    fn human_verdict_can_upgrade_an_unknown_outcome_but_not_invent_a_prediction() {
+        let at = Utc::now();
+        let prediction = human_label_prediction(at, 100, "worker", 0.8);
+        let mut exit = human_label_prediction(at + Duration::seconds(1), 100, "worker", 0.1);
+        exit.events = vec![ProcessEvent {
+            timestamp: exit.timestamp,
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"reason": "missing"}).to_string()),
+        }];
+        let label = human_label_observation(at + Duration::seconds(2), 100, "worker", "kill");
+        let engine = ValidationEngine::from_shadow_observations(
+            &[prediction, exit.clone(), label.clone()],
+            0.5,
+        );
+        assert_eq!(engine.records().len(), 1);
+        assert_eq!(
+            engine.records()[0].ground_truth,
+            Some(GroundTruth::UserKilled)
+        );
+        assert_eq!(engine.records()[0].predicted_at, at);
+        assert_eq!(
+            engine.records()[0].resolved_at,
+            Some(at + Duration::seconds(2))
+        );
+
+        // An exit-only historical row carries a cached belief, not a separately
+        // recorded prediction. It may be shown as an outcome but earns no label.
+        let exit_only = ValidationEngine::from_shadow_observations(&[exit, label], 0.5);
+        assert!(exit_only.resolved_records().is_empty());
+        assert_eq!(
+            exit_only.records()[0].ground_truth,
+            Some(GroundTruth::Vanished)
+        );
+        assert_eq!(
+            exit_only.records()[0].resolved_at,
+            Some(at + Duration::seconds(1))
+        );
+    }
+
+    #[test]
+    fn invalid_human_verdicts_never_supply_predictions_or_labels() {
+        let at = Utc::now();
+        for invalid in 0..6 {
+            let prediction = human_label_prediction(at, 100, "worker", 0.8);
+            let mut label =
+                human_label_observation(at + Duration::seconds(1), 100, "worker", "kill");
+            match invalid {
+                0 => label.events[0].details = None,
+                1 => label.events[0].details = Some("malformed".to_string()),
+                2 => {
+                    label.events[0].details = Some(
+                        serde_json::json!({"verdict": "kill", "source": "automatic"}).to_string(),
+                    )
+                }
+                3 => {
+                    label.events[0].details = Some(
+                        serde_json::json!({"verdict": "review", "source": "agent_label"})
+                            .to_string(),
+                    )
+                }
+                4 => label.events[0].timestamp = at + Duration::seconds(2),
+                5 => label.identity_hash.clear(),
+                _ => unreachable!(),
+            }
+            let engine = ValidationEngine::from_shadow_observations(&[prediction, label], 0.5);
+            assert_eq!(engine.records().len(), 1, "case {invalid}");
+            assert!(engine.resolved_records().is_empty(), "case {invalid}");
+            assert_eq!(engine.pending_records().len(), 1, "case {invalid}");
+        }
+    }
+
+    #[test]
+    fn human_verdict_preserves_an_existing_explicit_outcome() {
+        let at = Utc::now();
+        let prediction = human_label_prediction(at, 100, "worker", 0.8);
+        let mut exit = human_label_prediction(at + Duration::seconds(1), 100, "worker", 0.1);
+        exit.events = vec![ProcessEvent {
+            timestamp: exit.timestamp,
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"outcome_hint": "user_spared"}).to_string()),
+        }];
+        let label = human_label_observation(at + Duration::seconds(2), 100, "worker", "kill");
+        let engine = ValidationEngine::from_shadow_observations(&[prediction, exit, label], 0.5);
+        assert_eq!(engine.records().len(), 1);
+        assert_eq!(
+            engine.records()[0].ground_truth,
+            Some(GroundTruth::UserSpared)
+        );
+        assert_eq!(
+            engine.records()[0].resolved_at,
+            Some(at + Duration::seconds(1))
+        );
+    }
+
+    #[test]
+    fn human_and_legacy_verdicts_share_one_label_per_incarnation_in_both_orders() {
+        let at = Utc::now();
+        for human_first in [true, false] {
+            let prediction = human_label_prediction(at, 100, "worker", 0.8);
+            let human = human_label_observation(
+                at + Duration::seconds(if human_first { 1 } else { 2 }),
+                100,
+                "worker",
+                "kill",
+            );
+            let hint = hinted_exit_observation(
+                at + Duration::seconds(if human_first { 2 } else { 1 }),
+                100,
+                "worker",
+                "user_spared",
+            );
+            let duplicate_hint =
+                hinted_exit_observation(at + Duration::seconds(3), 100, "worker", "user_kill");
+            let repeated_hint =
+                hinted_exit_observation(at + Duration::seconds(4), 100, "worker", "user_spare");
+            let engine = ValidationEngine::from_shadow_observations(
+                &[
+                    repeated_hint,
+                    human,
+                    prediction,
+                    duplicate_hint,
+                    hint.clone(),
+                    hint,
+                ],
+                0.5,
+            );
+            assert_eq!(engine.records().len(), 1);
+            assert_eq!(engine.resolved_records().len(), 1);
+            let record = &engine.records()[0];
+            assert_eq!(
+                record.ground_truth,
+                Some(if human_first {
+                    GroundTruth::UserKilled
+                } else {
+                    GroundTruth::UserSpared
+                })
+            );
+            assert_eq!(record.predicted_at, at);
+            assert_eq!(record.resolved_at, Some(at + Duration::seconds(1)));
+            assert!((record.predicted_abandoned - 0.8).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn repeated_hinted_exits_do_not_add_calibration_samples() {
+        let at = Utc::now();
+        let prediction = human_label_prediction(at, 100, "worker", 0.8);
+        let first =
+            hinted_exit_observation(at + Duration::seconds(1), 100, "worker", "user_killed");
+        let repeated =
+            hinted_exit_observation(at + Duration::seconds(2), 100, "worker", "user_spared");
+        let later_prediction =
+            human_label_prediction(at + Duration::seconds(3), 100, "worker", 0.2);
+        let repeated_after_training =
+            hinted_exit_observation(at + Duration::seconds(4), 100, "worker", "user_kill");
+        let engine = ValidationEngine::from_shadow_observations(
+            &[
+                prediction,
+                first,
+                repeated,
+                later_prediction,
+                repeated_after_training,
+            ],
+            0.5,
+        );
+        assert_eq!(engine.records().len(), 2);
+        assert_eq!(engine.resolved_records().len(), 1);
+        assert_eq!(
+            engine.resolved_records()[0].ground_truth,
+            Some(GroundTruth::UserKilled)
+        );
+        assert_eq!(
+            engine.resolved_records()[0].resolved_at,
+            Some(at + Duration::seconds(1))
+        );
+        assert_eq!(engine.pending_records().len(), 1);
+        assert_eq!(
+            engine.pending_records()[0].predicted_at,
+            at + Duration::seconds(3)
+        );
+    }
+
+    #[test]
+    fn hinted_exit_verdicts_require_an_earlier_real_prediction() {
+        let at = Utc::now();
+        let label = hinted_exit_observation(at, 100, "worker", "user_killed");
+        let cases = [
+            Vec::new(),
+            vec![human_label_prediction(at, 100, "worker", 0.8)],
+            vec![human_label_prediction(
+                at + Duration::seconds(1),
+                100,
+                "worker",
+                0.8,
+            )],
+            vec![human_label_prediction(
+                at - Duration::seconds(1),
+                100,
+                "previous-incarnation",
+                0.8,
+            )],
+            vec![human_label_prediction(
+                at - Duration::seconds(1),
+                101,
+                "worker",
+                0.8,
+            )],
+            vec![hinted_exit_observation(
+                at - Duration::seconds(1),
+                100,
+                "worker",
+                "normal_exit",
+            )],
+        ];
+        for mut observations in cases {
+            let predictions = observations.len();
+            observations.push(label.clone());
+            let engine = ValidationEngine::from_shadow_observations(&observations, 0.5);
+            assert!(engine.resolved_records().is_empty());
+            assert_eq!(
+                engine.records().len(),
+                predictions,
+                "an exit hint must not manufacture a prediction"
+            );
+        }
     }
 
     #[test]
@@ -1370,16 +1958,23 @@ mod tests {
         for i in 0..10 {
             // Include genuine false positives and false negatives so excluding
             // unknown exits cannot accidentally erase the supported errors.
-            observations.push(shadow_exit_observation(
-                &format!("kill_{i}"),
-                0.2,
-                serde_json::json!({"outcome_hint": "user_killed"}),
-            ));
-            observations.push(shadow_exit_observation(
-                &format!("spare_{i}"),
-                0.8,
-                serde_json::json!({"outcome_hint": "user_spared"}),
-            ));
+            for (identity, probability, hint) in [
+                (format!("kill_{i}"), 0.2, "user_killed"),
+                (format!("spare_{i}"), 0.8, "user_spared"),
+            ] {
+                let exit = shadow_exit_observation(
+                    &identity,
+                    probability,
+                    serde_json::json!({"outcome_hint": hint}),
+                );
+                observations.push(human_label_prediction(
+                    exit.timestamp - Duration::seconds(1),
+                    exit.pid,
+                    &identity,
+                    probability,
+                ));
+                observations.push(exit);
+            }
         }
         let baseline = ValidationEngine::from_shadow_observations(&observations, 0.5)
             .compute_report()
@@ -1924,7 +2519,57 @@ mod tests {
     fn calibration_report_no_data_errors() {
         let engine = ValidationEngine::new(0.5);
         let result = engine.calibration_report();
-        assert!(result.is_err());
+        assert!(matches!(result, Err(CalibrationError::NoData)));
+    }
+
+    #[test]
+    fn calibration_report_requires_five_supported_labels_in_each_class() {
+        for (positive_labels, negative_labels) in [(10, 0), (9, 1), (0, 10), (1, 9), (5, 5)] {
+            let mut engine = ValidationEngine::new(0.5);
+            for index in 0..positive_labels + negative_labels {
+                let identity = format!("labeled_{index}");
+                let positive = index < positive_labels;
+                engine.track_prediction(
+                    identity.clone(),
+                    index as u32,
+                    if positive { 0.9 } else { 0.1 },
+                    "review".into(),
+                    None,
+                    "worker".into(),
+                    None,
+                );
+                assert!(engine.record_outcome(
+                    &identity,
+                    if positive {
+                        GroundTruth::UserKilled
+                    } else {
+                        GroundTruth::UserSpared
+                    },
+                    None,
+                    None,
+                ));
+            }
+
+            let minority_labels = positive_labels.min(negative_labels);
+            if minority_labels < MIN_LABELS_PER_CLASS {
+                assert!(matches!(
+                    engine.calibration_report(),
+                    Err(CalibrationError::InsufficientData { count, min_required })
+                        if count == minority_labels && min_required == MIN_LABELS_PER_CLASS
+                ));
+                assert!(engine.compute_report().unwrap().metrics.is_none());
+            } else {
+                let report = engine.calibration_report().unwrap();
+                assert_eq!(
+                    report.metrics.sample_count,
+                    positive_labels + negative_labels
+                );
+                assert_eq!(report.metrics.positive_count, positive_labels);
+                assert_eq!(report.metrics.negative_count, negative_labels);
+                assert!((report.metrics.brier_score - 0.01).abs() < 1e-10);
+                assert!(engine.compute_report().unwrap().metrics.is_some());
+            }
+        }
     }
 
     #[test]

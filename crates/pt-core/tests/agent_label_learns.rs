@@ -211,6 +211,195 @@ fn label_rejects_missing_verdict_and_target() {
     assert!(!config_dir.path().join("decisions.json").exists());
 }
 
+#[test]
+fn explicit_live_labels_calibrate_prior_shadow_predictions_once() {
+    let config_dir = TempDir::new().expect("config dir");
+    let data_dir = TempDir::new().expect("data dir");
+    // Observe only owned children, including when CI runs inside a root-owned
+    // service cgroup. This read-only scenario never applies an action.
+    let mut policy = pt_core::config::Policy::default();
+    policy.guardrails.builtin_protection = false;
+    policy.guardrails.protected_users.clear();
+    std::fs::write(
+        config_dir.path().join("policy.json"),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    let kill_target = ChildGuard(ProcessCommand::new("sleep").arg("619").spawn().unwrap());
+    let spare_target = ChildGuard(ProcessCommand::new("sleep").arg("623").spawn().unwrap());
+    let pids = format!("{},{}", kill_target.0.id(), spare_target.0.id());
+    let plan = || {
+        let output = pt_core(config_dir.path(), data_dir.path())
+            .args([
+                "--shadow",
+                "--format",
+                "json",
+                "agent",
+                "plan",
+                "--pids",
+                &pids,
+                "--min-age",
+                "0",
+                "--min-posterior",
+                "0",
+                "--window-ms",
+                "0",
+            ])
+            .output()
+            .expect("record real shadow predictions");
+        assert!(
+            matches!(output.status.code(), Some(0 | 1)),
+            "shadow plan failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["summary"]["shadow_observations_recorded"], 2);
+    };
+    plan();
+
+    // Repeating a label may teach the pattern again, but cannot turn a single
+    // shadow prediction into multiple independent calibration samples.
+    for (pid, verdict) in [
+        (kill_target.0.id(), "--kill"),
+        (spare_target.0.id(), "--spare"),
+        (kill_target.0.id(), "--kill"),
+    ] {
+        let output = pt_core(config_dir.path(), data_dir.path())
+            .args(["--format", "jsonl", "agent", "label", "--pid"])
+            .arg(pid.to_string())
+            .arg(verdict)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output).lines().count(),
+            1,
+            "JSONL must contain exactly one record per line"
+        );
+        assert_eq!(response["shadow_label"]["recorded"], true);
+        assert!(response["shadow_label"]["identity_hash"].is_string());
+    }
+    let report = || {
+        let output = pt_core(config_dir.path(), data_dir.path())
+            .args(["--format", "json", "shadow", "report"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<Value>(&output).unwrap()
+    };
+    let labeled = report();
+    assert_eq!(labeled["total_predictions"], 2, "{labeled}");
+    assert_eq!(labeled["resolved_predictions"], 2, "{labeled}");
+    assert_eq!(labeled["positive_labels"], 1, "{labeled}");
+    assert_eq!(labeled["negative_labels"], 1, "{labeled}");
+    assert!(
+        labeled["metrics"].is_null(),
+        "insufficient labels: {labeled}"
+    );
+    let text_report = pt_core(config_dir.path(), data_dir.path())
+        .args(["--format", "md", "shadow", "report"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text_report = String::from_utf8(text_report).unwrap();
+    assert!(text_report.contains("Positive labels: 1; negative labels: 1"));
+    assert!(!text_report.contains("Brier"));
+
+    // Predictions made with the learned prior are new, unlabeled observations.
+    plan();
+    let later = report();
+    assert_eq!(later["resolved_predictions"], 2, "{later}");
+    assert_eq!(later["pending_predictions"], 2, "{later}");
+    assert_eq!(later["positive_labels"], 1, "{later}");
+    assert_eq!(later["negative_labels"], 1, "{later}");
+
+    pt_core(config_dir.path(), data_dir.path())
+        .args(["agent", "label", "--pid"])
+        .arg(kill_target.0.id().to_string())
+        .arg("--kill")
+        .assert()
+        .success();
+    let output = pt_core(config_dir.path(), data_dir.path())
+        .args(["--format", "json", "shadow", "report", "--limit", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let limited: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(limited["resolved_predictions"], 0, "{limited}");
+    assert_eq!(limited["positive_labels"], 0, "{limited}");
+    assert_eq!(limited["negative_labels"], 0, "{limited}");
+
+    // Export's limit still limits raw records; context retention is a report
+    // safeguard rather than a change to the exported observation contract.
+    let output = pt_core(config_dir.path(), data_dir.path())
+        .args(["--format", "json", "shadow", "export", "--limit", "1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let exported: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(exported.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn pattern_labels_do_not_invent_shadow_process_identities() {
+    let config_dir = TempDir::new().expect("config dir");
+    let data_dir = TempDir::new().expect("data dir");
+    let output = pt_core(config_dir.path(), data_dir.path())
+        .args([
+            "--format",
+            "json",
+            "agent",
+            "label",
+            "--cmd",
+            "sleep 631",
+            "--spare",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["shadow_label"]["recorded"], false);
+    assert!(response["shadow_label"]["identity_hash"].is_null());
+    assert!(config_dir.path().join("decisions.json").exists());
+    assert!(!data_dir.path().join("shadow").exists());
+}
+
+#[test]
+fn shadow_label_write_failure_does_not_train_the_prior() {
+    let config_dir = TempDir::new().expect("config dir");
+    let data_dir = TempDir::new().expect("data dir");
+    let target = ChildGuard(ProcessCommand::new("sleep").arg("641").spawn().unwrap());
+    // A regular file at the storage directory is an actual I/O failure, even
+    // under root where chmod-based permission fixtures are ineffective.
+    std::fs::write(data_dir.path().join("shadow"), "keep existing data").unwrap();
+    let output = pt_core(config_dir.path(), data_dir.path())
+        .args(["agent", "label", "--pid"])
+        .arg(target.0.id().to_string())
+        .arg("--kill")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("learned prior unchanged"));
+    assert!(!config_dir.path().join("decisions.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(data_dir.path().join("shadow")).unwrap(),
+        "keep existing data"
+    );
+}
+
 /// GH #16/#18/#13: `signature add --prior useful` under a `PT_CONFIG_DIR` override
 /// writes the signature there, and both `agent plan` and `agent explain` score the
 /// matching live process with the signature's prior.

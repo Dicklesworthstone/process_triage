@@ -12665,7 +12665,7 @@ fn run_shadow_status(global: &GlobalOpts) -> ExitCode {
 
 fn run_shadow_export(global: &GlobalOpts, args: &ShadowExportArgs) -> ExitCode {
     let base_dir = shadow_base_dir();
-    let observations = match collect_shadow_observations(&base_dir, args.limit) {
+    let observations = match collect_shadow_observations(&base_dir, args.limit, false) {
         Ok(observations) => observations,
         Err(err) => {
             eprintln!("shadow export: {}", err);
@@ -12715,7 +12715,7 @@ fn run_shadow_export(global: &GlobalOpts, args: &ShadowExportArgs) -> ExitCode {
 
 fn run_shadow_report(global: &GlobalOpts, args: &ShadowReportArgs) -> ExitCode {
     let base_dir = shadow_base_dir();
-    let observations = match collect_shadow_observations(&base_dir, args.limit) {
+    let observations = match collect_shadow_observations(&base_dir, args.limit, true) {
         Ok(observations) => observations,
         Err(err) => {
             eprintln!("shadow report: {}", err);
@@ -12778,6 +12778,37 @@ fn run_shadow_report(global: &GlobalOpts, args: &ShadowReportArgs) -> ExitCode {
             }
         }
 
+        return ExitCode::Clean;
+    }
+
+    let label_counts = match engine.compute_report() {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("shadow report: {}", err);
+            return ExitCode::InternalError;
+        }
+    };
+    if label_counts.metrics.is_none() {
+        let message = format!(
+            "Calibration requires at least {} explicit labels of each class.\n\
+             Positive labels: {}; negative labels: {}; unlabeled outcomes: {}; pending predictions: {}.\n\
+             Record an independent judgment with `pt agent label --pid <pid> --kill` or `--spare` \
+             after the observer has recorded that process.\n",
+            pt_core::calibrate::validation::MIN_LABELS_PER_CLASS,
+            label_counts.positive_labels,
+            label_counts.negative_labels,
+            label_counts.unlabeled_outcomes,
+            label_counts.pending_predictions,
+        );
+        if let Some(path) = &args.output {
+            if let Err(err) = write_report_output_file(path, &message) {
+                eprintln!("shadow report: failed to write {}: {}", path, err);
+                return ExitCode::IoError;
+            }
+            println!("Label summary written to {}.", path);
+        } else {
+            print!("{}", message);
+        }
         return ExitCode::Clean;
     }
 
@@ -13964,6 +13995,7 @@ impl From<serde_json::Error> for ShadowExportError {
 fn collect_shadow_observations(
     base_dir: &PathBuf,
     limit: Option<usize>,
+    preserve_label_context: bool,
 ) -> Result<Vec<Observation>, ShadowExportError> {
     let mut files = Vec::new();
     collect_shadow_files(base_dir, &mut files)?;
@@ -13977,7 +14009,20 @@ fn collect_shadow_observations(
 
     observations.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
     if let Some(max) = limit {
-        observations.truncate(max);
+        if preserve_label_context && max < observations.len() {
+            // A prior verdict may already have trained a newer prediction.
+            // Keep that context even outside the report window, otherwise a
+            // repeated label could turn an in-sample prediction into calibration
+            // evidence. Verdict-only records do not add prediction samples.
+            let older = observations.split_off(max);
+            observations.extend(older.into_iter().filter(|obs| {
+                obs.events
+                    .iter()
+                    .any(pt_core::calibrate::validation::is_explicit_shadow_verdict)
+            }));
+        } else {
+            observations.truncate(max);
+        }
     }
     observations.sort_by_key(|a| a.timestamp);
 
@@ -25099,6 +25144,7 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
         Err(e) => return output_config_error(global, &e),
     };
 
+    let mut labeled_process = None;
     let (comm, cmd) = if let Some(pid) = args.pid {
         let scan = match quick_scan(&QuickScanOptions {
             pids: vec![pid],
@@ -25113,7 +25159,11 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
             }
         };
         match scan.processes.into_iter().find(|p| p.pid.0 == pid) {
-            Some(p) => (p.comm, p.cmd),
+            Some(p) => {
+                let command = (p.comm.clone(), p.cmd.clone());
+                labeled_process = Some(p);
+                command
+            }
             None => {
                 eprintln!("agent label: process {} not found", pid);
                 return ExitCode::ArgsError;
@@ -25144,9 +25194,28 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
             return ExitCode::IoError;
         }
     };
+    let shadow_identity = if let Some(proc) = labeled_process.as_ref() {
+        match pt_core::shadow::record_human_verdict(proc, verdict) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                eprintln!(
+                    "agent label: shadow verdict persistence reported an error; learned prior unchanged \
+                     (a verdict batch may already be retained): {error:?}"
+                );
+                return ExitCode::IoError;
+            }
+        }
+    } else {
+        None
+    };
     store.record(&comm, &cmd, verdict);
     if let Err(e) = store.save() {
         eprintln!("agent label: {}", e);
+        if shadow_identity.is_some() {
+            eprintln!(
+                "agent label: shadow verdict was recorded, but the learned prior was not saved"
+            );
+        }
         return ExitCode::IoError;
     }
     let learned = store.learned_prior(&comm, &cmd, &config.priors);
@@ -25158,10 +25227,25 @@ fn run_agent_label(global: &GlobalOpts, args: &AgentLabelArgs) -> ExitCode {
         "patterns": DecisionStore::pattern_keys(&comm, &cmd),
         "learned_prior": learned,
         "store": config.config_dir.join(pt_core::decision::decision_store::DECISIONS_FILE),
+        "shadow_label": {
+            "recorded": shadow_identity.is_some(),
+            "identity_hash": shadow_identity,
+            "reason": if labeled_process.is_some() {
+                "explicit_live_process_verdict"
+            } else {
+                "command_pattern_has_no_process_identity"
+            },
+        },
     });
     match global.format {
         OutputFormat::Json | OutputFormat::Toon => {
             println!("{}", format_structured_output(global, response));
+        }
+        OutputFormat::Jsonl => {
+            println!(
+                "{}",
+                serde_json::to_string(&global.process_output_value(response)).unwrap()
+            );
         }
         OutputFormat::Exitcode => {}
         _ => {
