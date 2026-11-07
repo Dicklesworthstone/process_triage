@@ -2330,6 +2330,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     let TuiBuildOutput {
         snapshot,
         plan_candidates,
+        system_state,
         #[cfg(target_os = "linux")]
         recent_io_baselines,
     } = build_tui_data_from_live_scan(
@@ -2341,6 +2342,9 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     )?;
     let decisions = Arc::new(Mutex::new(decisions));
 
+    if let Some(system_state) = &system_state {
+        write_system_state_to_session(&handle, system_state)?;
+    }
     handle
         .update_state(SessionState::Planned)
         .map_err(|error| format!("persist interactive planned state: {error}"))?;
@@ -2411,6 +2415,7 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let policy_scan_r = policy.clone();
         let decisions_r = Arc::clone(&decisions);
         let session_id_r = session_id.clone();
+        let handle_r = handle.clone();
         #[cfg(target_os = "linux")]
         let execution_state_r = Arc::clone(&execution_state);
 
@@ -2453,6 +2458,9 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
                 let mut guard = plan_cache_r
                     .lock()
                     .map_err(|_| "plan cache lock poisoned".to_string())?;
+                if let Some(system_state) = &output.system_state {
+                    write_system_state_to_session(&handle_r, system_state)?;
+                }
                 *guard = output.plan_candidates;
                 #[cfg(target_os = "linux")]
                 {
@@ -2648,6 +2656,7 @@ fn record_confirmed_kills(
 struct TuiBuildOutput {
     snapshot: RefreshOutcome,
     plan_candidates: HashMap<u32, PlanCandidateInput>,
+    system_state: Option<serde_json::Value>,
     #[cfg(target_os = "linux")]
     recent_io_baselines: Vec<pt_core::action::prechecks::RecentIoBaseline>,
 }
@@ -2717,8 +2726,8 @@ fn score_tui_rows(
         .filter(|proc| proc.elapsed.as_secs() >= min_age)
         .collect();
     scorer.collect_provenance(&eligible);
-    collect_planning_activity(&mut scorer, population, window_ms);
-    let pressure = PlanningPressure::from_system_state(&collect_system_state(Some(population)));
+    let system_state = collect_planning_activity(&mut scorer, population, window_ms);
+    let pressure = PlanningPressure::from_system_state(&system_state);
     let probe_advice = compute_probe_advice(processes, &scorer, policy, &pressure);
     let deep_signals = if deep {
         collect_deep_signals_for_processes(&eligible, &scorer)
@@ -2731,7 +2740,7 @@ fn score_tui_rows(
             .collect();
         collect_deep_signals_for_processes(&targeted, &scorer)
     };
-    build_tui_rows(
+    let mut output = build_tui_rows(
         processes,
         population,
         Some(min_age),
@@ -2742,7 +2751,9 @@ fn score_tui_rows(
         goal_str,
         session_id,
         &pressure,
-    )
+    )?;
+    output.system_state = Some(system_state);
+    Ok(output)
 }
 
 #[cfg(feature = "ui")]
@@ -4561,6 +4572,7 @@ fn build_tui_rows(
             goal_selection,
         },
         plan_candidates,
+        system_state: None,
         #[cfg(target_os = "linux")]
         recent_io_baselines,
     })
@@ -17224,9 +17236,19 @@ fn output_capabilities(global: &GlobalOpts) {
 /// Collect system state for snapshot output.
 fn collect_system_state(processes: Option<&[ProcessRecord]>) -> serde_json::Value {
     use pt_core::collect::pressure::read_pressure_snapshot;
+
+    system_state_from_pressure(read_pressure_snapshot(), None, processes)
+}
+
+/// Render the same host observation used by planning. A measured window must
+/// accompany its ending snapshot, rather than a fresh read taken after inference.
+fn system_state_from_pressure(
+    snapshot: PressureSnapshot,
+    window: Option<PressureWindow>,
+    processes: Option<&[ProcessRecord]>,
+) -> serde_json::Value {
     use pt_core::decision::pressure_regime::{assess, PressureThresholds, ProcessCensus};
 
-    let snapshot = read_pressure_snapshot();
     let census = processes.map(|processes| ProcessCensus {
         zombies: processes
             .iter()
@@ -17239,7 +17261,7 @@ fn collect_system_state(processes: Option<&[ProcessRecord]>) -> serde_json::Valu
     });
     let assessment = assess(
         &snapshot,
-        None,
+        window.as_ref(),
         census.as_ref(),
         &PressureThresholds::default(),
     );
@@ -17268,9 +17290,18 @@ fn collect_system_state(processes: Option<&[ProcessRecord]>) -> serde_json::Valu
         "process_count": process_count,
         "psi": psi,
         "pressure": snapshot,
+        "pressure_window": window,
         "census": census,
         "assessment": assessment,
     })
+}
+
+fn write_system_state_to_session(
+    handle: &SessionHandle,
+    system_state: &serde_json::Value,
+) -> Result<(), String> {
+    pt_core::session::write_json_pretty(&handle.dir.join("scan/system_state.json"), system_state)
+        .map_err(|error| format!("persist measured system state: {error}"))
 }
 
 /// Read /proc/loadavg and return [1min, 5min, 15min].
@@ -17826,14 +17857,14 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
         }
     };
 
-    if let Some(ref scan_result) = scan_result {
-        scorer.collect_activity(
-            &scan_result.processes.iter().collect::<Vec<_>>(),
-            Duration::from_millis(args.window_ms),
-        );
+    let system_state = match &scan_result {
+        Some(scan) => collect_planning_activity(&mut scorer, &scan.processes, args.window_ms),
+        None => collect_system_state(None),
+    };
+    if let Err(error) = write_system_state_to_session(&handle, &system_state) {
+        eprintln!("agent snapshot: {error}");
+        return ExitCode::InternalError;
     }
-    let system_state =
-        collect_system_state(scan_result.as_ref().map(|scan| scan.processes.as_slice()));
     let pressure = PlanningPressure::from_system_state(&system_state);
     let responsible_units = scan_result
         .as_ref()
@@ -18564,6 +18595,112 @@ mod planning_pressure_tests {
     }
 
     #[test]
+    fn planning_host_window_drives_regimes_and_survives_serialization() {
+        use pt_core::collect::pressure::{parse_psi, parse_vmstat};
+
+        let mut before = host().snapshot.unwrap();
+        before.cpu = parse_psi("some avg10=0.00 avg60=0.00 avg300=0.00 total=1000000\n");
+        before.vmstat = parse_vmstat("pswpin 100\npswpout 200\noom_kill 3\n");
+        let mut after = before.clone();
+        after.sampled_at_ms = 10;
+        after.cpu = parse_psi("some avg10=0.00 avg60=0.00 avg300=0.00 total=1800000\n");
+        after.vmstat = parse_vmstat("pswpin 40100\npswpout 20200\noom_kill 4\n");
+
+        let window = planning_pressure_window(
+            &mut after,
+            Some((&before, Duration::from_secs(2))),
+            Duration::from_millis(25),
+        )
+        .expect("completed monotonic sampling interval");
+        assert_eq!(window.seconds, 2.0);
+        assert_eq!(window.cpu.unwrap().some, Some(0.4));
+        assert_eq!(window.swap_in_per_s, Some(20_000.0));
+        assert_eq!(window.swap_out_per_s, Some(10_000.0));
+        assert_eq!(window.oom_kills, Some(1));
+
+        // The rolling average is quiet; only the measured counters can reveal
+        // this CPU pressure, swap storm and newly observed OOM kill.
+        let single = system_state_from_pressure(after.clone(), None, None);
+        assert!(single["assessment"]["regimes"].as_array().unwrap().is_empty());
+        assert!(single["pressure_window"].is_null());
+        let measured = system_state_from_pressure(after, Some(window), None);
+        assert_eq!(measured["psi"]["cpu"], 0.0);
+        assert_eq!(measured["assessment"]["cpu_some"], 40.0);
+        for kind in ["cpu_contention", "swap_thrash", "oom_kills"] {
+            assert!(measured["assessment"]["regimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|regime| regime["kind"] == kind && regime["severity"] == "crit"));
+        }
+        let round_trip: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&measured).unwrap()).unwrap();
+        assert_eq!(round_trip["pressure_window"]["seconds"], 2.0);
+        assert_eq!(round_trip["pressure_window"]["oom_kills"], 1);
+        let planning = PlanningPressure::from_system_state(&round_trip);
+        let proc = process();
+        let context = planning.for_process(&proc, Some(&activity(&proc)));
+        assert_eq!(context.severity.cpu, 1.0);
+        assert_eq!(context.severity.memory, 1.0);
+    }
+
+    #[test]
+    fn planning_host_window_requires_completed_sampling_interval() {
+        let before = host().snapshot.unwrap();
+        let requested = Duration::from_millis(25);
+        for elapsed in [None, Some(Duration::ZERO), Some(Duration::from_micros(24_999))] {
+            let mut after = before.clone();
+            let window = planning_pressure_window(
+                &mut after,
+                elapsed.map(|elapsed| (&before, elapsed)),
+                requested,
+            );
+            assert!(window.is_none());
+            assert!(after.unavailable.iter().any(|source| {
+                source.source == "pressure_window" && !source.reason.is_empty()
+            }));
+        }
+        let mut after = before.clone();
+        let boundary = planning_pressure_window(&mut after, Some((&before, requested)), requested)
+            .expect("exactly the requested interval is sufficient");
+        assert_eq!(boundary.seconds, 0.025);
+        assert!(after.unavailable.is_empty());
+
+        // Explicit snapshot mode neither invents a window nor treats the
+        // deliberately disabled measurement as a failed observation.
+        let disabled = planning_pressure_window(
+            &mut after,
+            Some((&before, Duration::from_secs(1))),
+            Duration::ZERO,
+        );
+        assert!(disabled.is_none());
+        assert!(after.unavailable.is_empty());
+    }
+
+    #[test]
+    fn planning_host_window_keeps_reset_and_missing_rates_unknown() {
+        use pt_core::collect::pressure::{parse_psi, parse_vmstat};
+
+        let mut before = host().snapshot.unwrap();
+        before.cpu = parse_psi("some avg10=0.00 avg60=0.00 avg300=0.00 total=1000000\n");
+        before.vmstat = parse_vmstat("pswpin 100\npswpout 200\noom_kill 3\n");
+        let mut after = before.clone();
+        after.cpu = parse_psi("some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n");
+        after.vmstat = parse_vmstat("pswpin 0\noom_kill 0\n");
+        let window = planning_pressure_window(
+            &mut after,
+            Some((&before, Duration::from_secs(1))),
+            Duration::from_millis(25),
+        );
+        let state = system_state_from_pressure(after, window, None);
+        assert!(state["pressure_window"]["cpu"]["some"].is_null());
+        for field in ["memory", "swap_in_per_s", "swap_out_per_s", "oom_kills"] {
+            assert!(state["pressure_window"][field].is_null(), "{field}: {state}");
+        }
+        assert!(state["assessment"]["regimes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn predictions_record_measured_window_values_at_the_window_time() {
         let process = process();
         let mut measured = activity(&process);
@@ -18914,14 +19051,63 @@ fn goal_requires_cpu_baseline(goal: &Goal) -> bool {
     }
 }
 
-fn collect_planning_activity(scorer: &mut Scorer, population: &[ProcessRecord], window_ms: u64) {
+/// Do not turn a skipped process-sampling wait into an extremely short host rate.
+/// The sampler can return immediately when every first process sample failed.
+fn planning_pressure_window(
+    snapshot: &mut PressureSnapshot,
+    baseline: Option<(&PressureSnapshot, Duration)>,
+    requested: Duration,
+) -> Option<PressureWindow> {
+    use pt_core::collect::pressure::{pressure_window_with_elapsed, Unavailable};
+
+    if requested.is_zero() {
+        return None;
+    }
+    let reason = match baseline {
+        Some((before, elapsed)) if elapsed >= requested => {
+            return pressure_window_with_elapsed(before, snapshot, elapsed);
+        }
+        Some((_, elapsed)) => format!(
+            "process sampling ended after {:.3} ms, before the requested {} ms window; host counter rates unavailable",
+            elapsed.as_secs_f64() * 1000.0,
+            requested.as_millis(),
+        ),
+        None => "no process sampling interval was observed (empty population or unsupported platform)"
+            .to_string(),
+    };
+    snapshot.unavailable.push(Unavailable {
+        source: "pressure_window".to_string(),
+        reason,
+    });
+    None
+}
+
+fn collect_planning_activity(
+    scorer: &mut Scorer,
+    population: &[ProcessRecord],
+    window_ms: u64,
+) -> serde_json::Value {
+    use pt_core::collect::pressure::read_pressure_snapshot;
+
+    // Linux process sampling already waits once for the whole population. Read
+    // host counters around that work without a second sleep, and use its actual
+    // monotonic duration rather than the requested delay or wall-clock delta.
+    let requested = Duration::from_millis(window_ms);
+    let baseline = (cfg!(target_os = "linux") && !requested.is_zero() && !population.is_empty())
+        .then(|| {
+            let snapshot = read_pressure_snapshot();
+            (snapshot, std::time::Instant::now())
+        });
     // One shared window includes protected/young processes and ancestors. They
     // still consume resources and establish ownership, without becoming action
     // candidates. Never resample per unit or use lifetime CPU to fill a gap.
-    scorer.collect_activity(
-        &population.iter().collect::<Vec<_>>(),
-        Duration::from_millis(window_ms),
-    );
+    scorer.collect_activity(&population.iter().collect::<Vec<_>>(), requested);
+    let mut snapshot = read_pressure_snapshot();
+    let baseline = baseline
+        .as_ref()
+        .map(|(before, started)| (before, started.elapsed()));
+    let window = planning_pressure_window(&mut snapshot, baseline, requested);
+    system_state_from_pressure(snapshot, window, Some(population))
 }
 
 fn responsible_unit_rank(pressure: &PlanningPressure) -> AttributionResource {
@@ -19874,8 +20060,13 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let probe_cost_model = pt_core::decision::ProbeCostModel::default();
     let deep_scan_probe = [pt_core::decision::ProbeType::DeepScan];
     scorer.collect_provenance(&processes_to_infer);
-    collect_planning_activity(&mut scorer, &scan_result.processes, args.window_ms);
+    let system_state =
+        collect_planning_activity(&mut scorer, &scan_result.processes, args.window_ms);
     let activity_observed_at_ms = chrono::Utc::now().timestamp_millis();
+    if let Err(error) = write_system_state_to_session(&handle, &system_state) {
+        eprintln!("agent plan: {error}");
+        return ExitCode::InternalError;
+    }
     let prediction_history = args.include_predictions.then(|| {
         let wanted = processes_to_infer
             .iter()
@@ -19892,7 +20083,6 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             activity_observed_at_ms,
         )
     });
-    let system_state = collect_system_state(Some(&scan_result.processes));
     let pressure = PlanningPressure::from_system_state(&system_state);
     let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
 
@@ -26608,8 +26798,8 @@ fn run_agent_watch(global: &GlobalOpts, args: &AgentWatchArgs) -> ExitCode {
             .filter(|proc| proc.pid.0 > 1 && proc.elapsed.as_secs() >= min_age)
             .collect();
         scorer.collect_provenance(&eligible);
-        collect_planning_activity(&mut scorer, &scan_result.processes, args.window_ms);
-        let system_state = collect_system_state(Some(&scan_result.processes));
+        let system_state =
+            collect_planning_activity(&mut scorer, &scan_result.processes, args.window_ms);
         let pressure = PlanningPressure::from_system_state(&system_state);
         let responsible_units = collect_responsible_units(&scan_result, &scorer, &pressure);
         // These are system events, independent of process age and posterior

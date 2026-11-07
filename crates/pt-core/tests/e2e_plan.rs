@@ -2035,6 +2035,13 @@ fn plan_deep_adds_network_evidence() {
     );
     for output in [&quick, &deep] {
         assert_eq!(output["args"]["window_ms"], 25);
+        let host_window = &output["system_state"]["pressure_window"];
+        assert!(
+            host_window["seconds"]
+                .as_f64()
+                .is_some_and(|seconds| seconds >= 0.025),
+            "host pressure uses the completed process-sampling interval: {host_window}"
+        );
         let candidate = output["candidates"]
             .as_array()
             .unwrap()
@@ -2076,6 +2083,23 @@ fn plan_deep_adds_network_evidence() {
             );
         }
     }
+    for output in [&quick, &deep, &legacy] {
+        let session_dir = data_dir
+            .path()
+            .join("sessions")
+            .join(output["session_id"].as_str().expect("session ID"));
+        let persisted_state: Value = serde_json::from_slice(
+            &std::fs::read(session_dir.join("scan/system_state.json"))
+                .expect("persisted host pressure evidence"),
+        )
+        .unwrap();
+        let persisted_plan: Value = serde_json::from_slice(
+            &std::fs::read(session_dir.join("decision/plan.json")).expect("persisted plan"),
+        )
+        .unwrap();
+        assert_eq!(persisted_state, output["system_state"]);
+        assert_eq!(persisted_plan["system_state"], output["system_state"]);
+    }
     let legacy_candidate = legacy["candidates"]
         .as_array()
         .unwrap()
@@ -2083,6 +2107,10 @@ fn plan_deep_adds_network_evidence() {
         .find(|candidate| candidate["pid"].as_u64() == Some(u64::from(pid)))
         .expect("single-snapshot candidate");
     assert_eq!(legacy["args"]["window_ms"], 0);
+    assert!(legacy["system_state"]
+        .get("pressure_window")
+        .expect("explicit pressure-window availability")
+        .is_null());
     assert!(legacy_candidate["activity"].is_null());
     assert_eq!(
         legacy_candidate["cpu_percent"],

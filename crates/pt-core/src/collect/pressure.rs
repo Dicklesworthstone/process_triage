@@ -21,6 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 
 /// One PSI line (`some` or `full`): running averages in percent and the cumulative
 /// stall time in microseconds.
@@ -514,10 +515,21 @@ pub fn pressure_window(
     after: &PressureSnapshot,
 ) -> Option<PressureWindow> {
     let millis = after.sampled_at_ms.checked_sub(before.sampled_at_ms)?;
-    if millis == 0 {
+    pressure_window_with_elapsed(before, after, Duration::from_millis(millis))
+}
+
+/// Rates between live snapshots using the observed monotonic interval. Wall-clock
+/// adjustments must not inflate, suppress or reverse rates during a scan. Use
+/// [`pressure_window`] for recorded snapshots that have only wall timestamps.
+pub fn pressure_window_with_elapsed(
+    before: &PressureSnapshot,
+    after: &PressureSnapshot,
+    elapsed: Duration,
+) -> Option<PressureWindow> {
+    if elapsed.is_zero() {
         return None;
     }
-    let seconds = millis as f64 / 1000.0;
+    let seconds = elapsed.as_secs_f64();
     let vm = |f: fn(&VmStat) -> Option<u64>| {
         counter_rate(
             before.vmstat.as_ref().and_then(f),
@@ -767,6 +779,75 @@ mod tests {
         let window = pressure_window(&after, &reset).unwrap();
         assert!(window.cpu.unwrap().some.is_none());
         assert!(window.swap_in_per_s.is_none());
+    }
+
+    #[test]
+    fn live_window_uses_elapsed_time_despite_wall_clock_adjustments() {
+        let before_root = fake_root(&[
+            (
+                "proc/pressure/cpu",
+                "some avg10=0.00 avg60=0.00 avg300=0.00 total=1000000\n",
+            ),
+            ("proc/vmstat", "pswpin 100\npswpout 200\noom_kill 3\n"),
+        ]);
+        let after_root = fake_root(&[
+            (
+                "proc/pressure/cpu",
+                "some avg10=0.00 avg60=0.00 avg300=0.00 total=1600000\n",
+            ),
+            ("proc/vmstat", "pswpin 500\npswpout 300\noom_kill 4\n"),
+        ]);
+        let mut before = read_pressure_snapshot_from(before_root.path(), 8);
+        let mut after = read_pressure_snapshot_from(after_root.path(), 8);
+        before.sampled_at_ms = 10_000;
+        for wall_time in [1, 10_000, 1_000_000] {
+            after.sampled_at_ms = wall_time;
+            let window = pressure_window_with_elapsed(&before, &after, Duration::from_secs(2))
+                .expect("monotonic observation does not depend on the wall clock");
+            assert_eq!(window.seconds, 2.0);
+            assert_eq!(window.cpu.unwrap().some, Some(0.3));
+            assert_eq!(window.swap_in_per_s, Some(200.0));
+            assert_eq!(window.swap_out_per_s, Some(50.0));
+            assert_eq!(window.oom_kills, Some(1));
+            assert!(window.memory.is_none());
+            assert!(window.major_faults_per_s.is_none());
+        }
+        assert!(pressure_window_with_elapsed(&before, &after, Duration::ZERO).is_none());
+
+        // Keep real sub-millisecond precision rather than a nominal delay.
+        let mut short_after = before.clone();
+        short_after.cpu.as_mut().unwrap().some.as_mut().unwrap().total_us += 250;
+        let short =
+            pressure_window_with_elapsed(&before, &short_after, Duration::from_micros(500)).unwrap();
+        assert_eq!(short.seconds, 0.0005);
+        assert_eq!(short.cpu.unwrap().some, Some(0.5));
+    }
+
+    #[test]
+    fn live_window_preserves_missing_and_reset_counters() {
+        let before_root = fake_root(&[
+            (
+                "proc/pressure/cpu",
+                "some avg10=0.00 avg60=0.00 avg300=0.00 total=1000000\n",
+            ),
+            ("proc/vmstat", "pswpin 100\npswpout 200\noom_kill 3\n"),
+        ]);
+        let after_root = fake_root(&[
+            (
+                "proc/pressure/cpu",
+                "some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n",
+            ),
+            ("proc/vmstat", "pswpin 0\noom_kill 0\n"),
+        ]);
+        let before = read_pressure_snapshot_from(before_root.path(), 8);
+        let after = read_pressure_snapshot_from(after_root.path(), 8);
+        let window = pressure_window_with_elapsed(&before, &after, Duration::from_secs(1)).unwrap();
+        assert_eq!(window.cpu.unwrap().some, None);
+        assert_eq!(window.cpu.unwrap().full, None);
+        assert_eq!(window.memory, None);
+        assert_eq!(window.swap_in_per_s, None);
+        assert_eq!(window.swap_out_per_s, None);
+        assert_eq!(window.oom_kills, None);
     }
 
     #[cfg(target_os = "linux")]

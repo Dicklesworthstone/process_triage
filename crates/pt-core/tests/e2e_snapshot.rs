@@ -455,6 +455,29 @@ fn snapshot_exposes_sampled_activity_and_explicit_single_snapshot_mode() {
         let result: Value = serde_json::from_slice(&output).expect("snapshot JSON");
         let expected_window: u64 = window.parse().unwrap();
         assert_eq!(result["activity_window_ms"], expected_window);
+        let system = &result["system_state"];
+        let pressure_window = system
+            .get("pressure_window")
+            .expect("explicit pressure-window availability");
+        if expected_window > 0 && cfg!(target_os = "linux") {
+            assert!(
+                pressure_window["seconds"]
+                    .as_f64()
+                    .is_some_and(|seconds| seconds >= expected_window as f64 / 1000.0),
+                "host pressure uses the completed process-sampling interval: {pressure_window}"
+            );
+        } else {
+            assert!(pressure_window.is_null());
+        }
+        let state_path = std::path::Path::new(
+            result["session_dir"].as_str().expect("snapshot session directory"),
+        )
+        .join("scan/system_state.json");
+        let persisted_state: Value = serde_json::from_slice(
+            &std::fs::read(state_path).expect("persisted snapshot host pressure evidence"),
+        )
+        .unwrap();
+        assert_eq!(&persisted_state, system);
         let snapshot = &result["process_snapshot"];
         assert_eq!(snapshot["window_ms"], expected_window);
         let processes = snapshot["processes"].as_array().expect("top processes");
