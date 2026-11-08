@@ -150,7 +150,7 @@ Most tools only know "kill" or "don't kill." `pt` evaluates 8 possible actions r
 | **Renice** | lower priority (`nice`), never raises it | Yes | Linux, macOS |
 | **Pause** | `SIGSTOP` (resume: `SIGCONT`) | Yes | Linux, macOS |
 | **Freeze** | cgroup v2 freezer | Yes | Linux, if the target owns its cgroup |
-| **Throttle** | cgroup CPU quota | Explicit prior metadata | Linux, in an exclusive leaf |
+| **Throttle** | cgroup CPU quota | Durable session receipt on v2 | Linux, in an exclusive leaf |
 | **Quarantine** | cpuset controller | Explicit prior metadata | Linux, in an exclusive leaf |
 | **Restart** | via the supervisor | Partial | not executable yet (planned, e.g. for a zombie's parent); apply reports it as failed |
 | **Kill** | SIGTERM → SIGKILL | No | Linux, macOS |
@@ -333,6 +333,7 @@ pt shadow stop                    # Stop observer
 | `pt agent explain` | Evidence for specific PIDs | `pt agent explain --session <id> --pids 1234` |
 | `pt agent label` | Record your kill/spare verdict | `pt agent label --pid 1234 --spare` |
 | `pt agent apply` | Execute a plan (robot mode) | `pt agent apply --session <id> --yes` |
+| `pt agent undo` | Inspect or restore a recorded cgroup control | `pt agent undo --session <id> --action-id <action-id>` |
 | `pt agent verify` | Confirm outcomes | `pt agent verify --session <id>` |
 | `pt agent watch` | Stream events | `pt agent watch --format jsonl` |
 | `pt agent report` | Generate HTML report | `pt agent report --session <id>` |
@@ -1360,10 +1361,58 @@ shell-launched dev processes share a cgroup and cannot be changed safely here.
 These checks are snapshots; automatic creation of a dedicated target leaf is
 not implemented.
 
-The library can capture prior CPU limits and CPU sets for explicit reversal,
-bound to the original process identity and controller path. Unknown prior
-settings are refused. A bare Unquarantine action cannot restore a prior CPU set
-and is refused; durable reversal wiring into the CLI remains incomplete.
+### Restoring a recorded control
+
+`agent apply` records durable undo receipts for Linux cgroup-v2 **Freeze,
+Unfreeze, and Throttle** actions. Each receipt saves the exact previous freezer
+request or CPU quota and period before the controller write. The receipt is
+bound to the complete saved plan, action ID, process incarnation, boot,
+namespace, mount, and cgroup directory identity.
+
+```bash
+# Inspect the saved receipt without changing the controller.
+pt agent undo --session <id> --action-id <action-id>
+
+# Revalidate the live target and restore the recorded value.
+pt agent undo --session <id> --action-id <action-id> --confirm
+
+# Select a particular execution attempt when needed.
+pt agent undo --session <id> --action-id <action-id> --attempt-id <uuid> --confirm
+```
+
+`--execute` is an alias for `--confirm`. Global `--dry-run` and `--shadow`
+always keep this command read-only. Preview reports saved facts; confirmed
+restoration checks current eligibility under the same execution lock as apply.
+
+Restoration requires the original live process and its exclusive cgroup to
+remain identifiable. It refuses an unrelated controller value, changed scope,
+or a later unresolved control operation. If the original value is already
+present, undo verifies it without another write. Freezer undo also waits for
+the actual `cgroup.events` frozen state, including when the request is already
+correct. A completed receipt cannot authorize a second write after another
+actor changes the control again.
+
+An unresolved durable receipt also reserves that physical control across
+sessions. A different session, or an unjournaled TUI action, cannot replace it
+until it has been restored. Within one session, later control operations must
+be undone before earlier ones; undo does not guess the order from wall-clock
+timestamps.
+
+Receipts live in `action/reversals/` within the session. Execution state and
+individual restoration attempts are retained separately. An interrupted
+`prepared` receipt means the write may or may not have happened; it is not
+reported as success. Failed post-write checks retain the receipt and report
+the incomplete outcome. Missing prior state, old sessions without receipts,
+and unsupported controls are refused instead of guessing a restoration value.
+Plans with retained receipts keep their original bytes. To plan again, create
+a new session by omitting `agent plan --session`; replacing the old plan would
+invalidate the evidence needed for undo and verification.
+
+This command currently covers cgroup-v2 freezer and CPU bandwidth controls
+from `agent apply`. Hybrid v1 throttling records that durable undo is
+unsupported. Renice, pause/resume, cpuset quarantine, service restart, and TUI
+actions do not use this receipt path. The cpuset library retains explicit prior
+metadata, but a bare Unquarantine action cannot reconstruct the old CPU set.
 
 ### cpuset Quarantine
 

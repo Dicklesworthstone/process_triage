@@ -11,6 +11,8 @@
 //! - Cleaner state management via cgroup.events
 
 use super::executor::{ActionError, ActionRunner};
+#[cfg(target_os = "linux")]
+use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus, ReversalValue};
 #[cfg(all(target_os = "linux", test))]
 use crate::collect::cgroup::collect_cgroup_details;
 #[cfg(target_os = "linux")]
@@ -21,7 +23,7 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use tracing::{debug, trace};
@@ -112,7 +114,7 @@ fn read_frozen_event(events_path: &Path) -> Result<bool, ActionError> {
 
 /// Observe immediately, then poll without sleeping beyond the remaining budget.
 /// A zero timeout permits one observation but never waits for a transition.
-fn wait_for_frozen_state(
+pub(crate) fn wait_for_frozen_state(
     expected: bool,
     timeout: Duration,
     mut observe: impl FnMut() -> Result<FreezerState, ActionError>,
@@ -161,6 +163,10 @@ pub struct FreezeActionRunner {
     /// including changes that occur before verification starts.
     #[cfg(target_os = "linux")]
     applied: Mutex<Option<AppliedFreeze>>,
+    #[cfg(target_os = "linux")]
+    reversal_journal: Option<Arc<ReversalJournal>>,
+    #[cfg(target_os = "linux")]
+    reversal_ownership_root: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -170,6 +176,7 @@ struct AppliedFreeze {
     identity: pt_common::ProcessIdentity,
     frozen: bool,
     scope: FreezerScope,
+    reversal: Option<PreparedReversal>,
 }
 
 #[cfg(target_os = "linux")]
@@ -269,11 +276,29 @@ impl FreezeActionRunner {
             config,
             #[cfg(target_os = "linux")]
             applied: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            reversal_journal: None,
+            #[cfg(target_os = "linux")]
+            reversal_ownership_root: None,
         }
     }
 
     pub fn with_defaults() -> Self {
         Self::new(FreezeConfig::default())
+    }
+
+    /// Record exact previous requests durably at the actual controller writer.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_journal(mut self, journal: Arc<ReversalJournal>) -> Self {
+        self.reversal_journal = Some(journal);
+        self
+    }
+
+    /// Protect existing durable owners without promising undo for this caller.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_ownership_guard(mut self, sessions_root: PathBuf) -> Self {
+        self.reversal_ownership_root = Some(sessions_root);
+        self
     }
 
     /// Write freeze state to cgroup.freeze.
@@ -317,14 +342,62 @@ impl FreezeActionRunner {
         scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
         debug!(pid, frozen, "executing freezer request");
 
-        // Write through the pinned directory, never a replacement at its old path.
-        self.write_freeze_state(&scope.pinned_directory().join("cgroup.freeze"), frozen)?;
-        scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
+        if self.reversal_journal.is_none() {
+            if let Some(sessions_root) = &self.reversal_ownership_root {
+                super::reversal::ensure_control_unowned(
+                    sessions_root,
+                    &scope.cgroup_path,
+                    &scope.handle,
+                    ReversalValue::Freeze { requested: frozen },
+                )?;
+            }
+        }
+
+        let before = self
+            .reversal_journal
+            .as_ref()
+            .map(|_| scope.observe(|| super::dispatch::ensure_cgroup_target(&action.target)))
+            .transpose()?;
+        let reversal = match (&self.reversal_journal, before) {
+            (Some(journal), Some(before)) => Some(
+                journal.prepare(
+                    action,
+                    &scope.cgroup_path,
+                    &scope.handle,
+                    ReversalValue::Freeze {
+                        requested: before.requested,
+                    },
+                    ReversalValue::Freeze { requested: frozen },
+                    self.config
+                        .propagation_timeout_ms
+                        .min(action.timeouts.verify_ms),
+                )?,
+            ),
+            _ => None,
+        };
+        let execution = (|| {
+            scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
+            if let Some(before) = before {
+                if read_freezer_state(&scope.pinned_directory())?.requested != before.requested {
+                    return Err(ActionError::Failed(
+                        "freezer request changed before the journaled write".to_string(),
+                    ));
+                }
+            }
+            // Write through the pinned directory, never a replacement at its old path.
+            self.write_freeze_state(&scope.pinned_directory().join("cgroup.freeze"), frozen)?;
+            scope.check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)
+        })();
+        match &reversal {
+            Some(receipt) => receipt.finish(execution, ReversalStatus::Applied)?,
+            None => execution?,
+        }
         *applied = Some(AppliedFreeze {
             action_id: action.action_id.clone(),
             identity: action.target.clone(),
             frozen,
             scope,
+            reversal,
         });
         Ok(())
     }
@@ -353,9 +426,6 @@ impl FreezeActionRunner {
         })?;
         record.check_action(action, frozen)?;
         let pid = action.target.pid.0;
-        record
-            .scope
-            .check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
         let timeout = Duration::from_millis(
             self.config
                 .propagation_timeout_ms
@@ -366,11 +436,20 @@ impl FreezeActionRunner {
         // freezing has completed, or that an ancestor no longer keeps it frozen.
         // Every sample rechecks the complete guard and the executed cgroup,
         // including the final sample that can establish a completed transition.
-        wait_for_frozen_state(frozen, timeout, || {
+        let verification = (|| {
             record
                 .scope
-                .observe(|| super::dispatch::ensure_cgroup_target(&action.target))
-        })?;
+                .check_current_path(&super::dispatch::ensure_cgroup_target(&action.target)?)?;
+            wait_for_frozen_state(frozen, timeout, || {
+                record
+                    .scope
+                    .observe(|| super::dispatch::ensure_cgroup_target(&action.target))
+            })
+        })();
+        match &record.reversal {
+            Some(receipt) => receipt.finish(verification, ReversalStatus::Verified)?,
+            None => verification?,
+        }
 
         debug!(pid, frozen, "freezer transition verified");
         Ok(())
@@ -828,6 +907,7 @@ mod tests {
                     action_id: action.action_id.clone(),
                     identity: action.target.clone(),
                     frozen,
+                    reversal: None,
                     scope: FreezerScope::open(
                         "/executed".to_string(),
                         directory.path().to_path_buf(),

@@ -16,6 +16,7 @@ pub mod prechecks;
 pub mod recovery;
 pub mod recovery_tree;
 pub mod renice;
+pub mod reversal;
 #[cfg(unix)]
 pub mod signal;
 pub mod supervisor;
@@ -44,6 +45,7 @@ pub use renice::{
     ReniceActionRunner, ReniceConfig, ReniceResult, ReniceReversalMetadata, DEFAULT_NICE_VALUE,
     MAX_NICE_VALUE,
 };
+pub use reversal::{RestorationStatus, ReversalJournal, ReversalOutcome, ReversalRecord};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use signal::LiveIdentityProvider;
 #[cfg(unix)]

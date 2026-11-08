@@ -8,6 +8,8 @@
 //! - Explicit refusal when safe cgroup mutation is unavailable
 
 use super::executor::{ActionError, ActionRunner};
+#[cfg(target_os = "linux")]
+use super::reversal::{PreparedReversal, ReversalJournal, ReversalStatus, ReversalValue};
 use crate::collect::cgroup::{collect_cgroup_details, CpuLimitSource};
 use crate::decision::Action;
 use crate::plan::PlanAction;
@@ -15,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 /// Default maximum CPU bandwidth (25% of one core).
@@ -207,6 +209,10 @@ pub struct CpuThrottleActionRunner {
     /// actually used, including changes before verification starts.
     #[cfg(target_os = "linux")]
     applied: Mutex<Option<AppliedThrottle>>,
+    #[cfg(target_os = "linux")]
+    reversal_journal: Option<Arc<ReversalJournal>>,
+    #[cfg(target_os = "linux")]
+    reversal_ownership_root: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -216,6 +222,7 @@ struct AppliedThrottle {
     identity: pt_common::ProcessIdentity,
     limit: CpuBandwidthLimit,
     scope: ThrottleScope,
+    reversal: Option<PreparedReversal>,
 }
 
 #[cfg(target_os = "linux")]
@@ -370,11 +377,30 @@ impl CpuThrottleActionRunner {
             config,
             #[cfg(target_os = "linux")]
             applied: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            reversal_journal: None,
+            #[cfg(target_os = "linux")]
+            reversal_ownership_root: None,
         }
     }
 
     pub fn with_defaults() -> Self {
         Self::new(CpuThrottleConfig::default())
+    }
+
+    /// Attach write-before-act receipts for v2; v1 remains explicitly unsupported
+    /// for durable undo instead of promising an unsafe two-file restoration.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_journal(mut self, journal: Arc<ReversalJournal>) -> Self {
+        self.reversal_journal = Some(journal);
+        self
+    }
+
+    /// Protect durable v2 owners for callers which do not record undo receipts.
+    #[cfg(target_os = "linux")]
+    pub fn with_reversal_ownership_guard(mut self, sessions_root: PathBuf) -> Self {
+        self.reversal_ownership_root = Some(sessions_root);
+        self
     }
 
     /// Execute a throttle action on a process.
@@ -417,16 +443,59 @@ impl CpuThrottleActionRunner {
                 Some(ThrottleCgroup::open(path.clone(), directory)?)
             },
         };
-        let limit = self.apply_throttle_at(
+        if !scope.is_v2() {
+            if let Some(journal) = &self.reversal_journal {
+                journal.record_unsupported(
+                    action,
+                    "cgroup-v1 throttle has no supported durable undo; its two-file restoration is not journaled",
+                )?;
+            }
+        }
+        let (limit, reversal) = self.apply_throttle_with_reversal(
             &scope.controller().pinned_directory(),
             scope.is_v2(),
             || self.revalidate_membership(action, &scope),
+            |before, applied| match &self.reversal_journal {
+                Some(journal) if scope.is_v2() => journal
+                    .prepare(
+                        action,
+                        &scope.unified.cgroup_path,
+                        &scope.unified.handle,
+                        ReversalValue::CpuMax {
+                            quota_us: before.quota_us,
+                            period_us: before.period_us,
+                        },
+                        ReversalValue::CpuMax {
+                            quota_us: applied.quota_us,
+                            period_us: applied.period_us,
+                        },
+                        0,
+                    )
+                    .map(Some),
+                _ => {
+                    if scope.is_v2() {
+                        if let Some(sessions_root) = &self.reversal_ownership_root {
+                            super::reversal::ensure_control_unowned(
+                                sessions_root,
+                                &scope.unified.cgroup_path,
+                                &scope.unified.handle,
+                                ReversalValue::CpuMax {
+                                    quota_us: applied.quota_us,
+                                    period_us: applied.period_us,
+                                },
+                            )?;
+                        }
+                    }
+                    Ok(None)
+                }
+            },
         )?;
         Ok(AppliedThrottle {
             action_id: action.action_id.clone(),
             identity: action.target.clone(),
             limit,
             scope,
+            reversal,
         })
     }
 
@@ -463,60 +532,85 @@ impl CpuThrottleActionRunner {
     /// Tighten a controller without increasing a pre-existing bandwidth limit.
     /// v1 keeps its period and changes only quota, avoiding a partial two-file
     /// update that could transiently increase bandwidth.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     fn apply_throttle_at(
         &self,
         directory: &Path,
         is_v2: bool,
         revalidate: impl Fn() -> Result<(), ActionError>,
     ) -> Result<CpuBandwidthLimit, ActionError> {
+        self.apply_throttle_with_reversal(directory, is_v2, revalidate, |_, _| Ok(None))
+            .map(|(limit, _)| limit)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn apply_throttle_with_reversal(
+        &self,
+        directory: &Path,
+        is_v2: bool,
+        revalidate: impl Fn() -> Result<(), ActionError>,
+        prepare: impl FnOnce(
+            CpuBandwidthLimit,
+            CpuBandwidthLimit,
+        ) -> Result<Option<PreparedReversal>, ActionError>,
+    ) -> Result<(CpuBandwidthLimit, Option<PreparedReversal>), ActionError> {
         let maximum = self.config.validated_limit()?;
         revalidate()?;
         let current = read_cpu_limit(directory, is_v2)?;
         let desired = desired_cpu_limit(current, maximum, is_v2)?;
-        revalidate()?;
-        if read_cpu_limit(directory, is_v2)? != current {
-            return Err(ActionError::Failed(
-                "CPU limits changed before applying throttle".to_string(),
-            ));
-        }
-        if desired != current {
-            let (path, value) = if is_v2 {
-                (
-                    directory.join("cpu.max"),
-                    format!("{} {}", desired.quota_us, desired.period_us),
-                )
-            } else {
-                (
-                    directory.join("cpu.cfs_quota_us"),
-                    desired.quota_us.to_string(),
-                )
-            };
-            fs::write(&path, value).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    ActionError::PermissionDenied
+        // The durable before/applied values come from this exact observation,
+        // followed by the existing final revalidation and concurrent-change check.
+        let reversal = prepare(current, desired)?;
+        let execution = (|| {
+            revalidate()?;
+            if read_cpu_limit(directory, is_v2)? != current {
+                return Err(ActionError::Failed(
+                    "CPU limits changed before applying throttle".to_string(),
+                ));
+            }
+            if desired != current {
+                let (path, value) = if is_v2 {
+                    (
+                        directory.join("cpu.max"),
+                        format!("{} {}", desired.quota_us, desired.period_us),
+                    )
                 } else {
-                    ActionError::Failed(format!("cannot write {}: {error}", path.display()))
-                }
-            })?;
-        }
-        revalidate()?;
-        let observed = read_cpu_limit(directory, is_v2)?;
-        if observed != desired || !observed.within(maximum) {
-            return Err(ActionError::Failed(
-                "CPU throttle readback does not match the selected cap".to_string(),
-            ));
-        }
-        revalidate()?;
-        info!(
-            cgroup = %directory.display(),
-            quota_us = observed.quota_us,
-            period_us = observed.period_us,
-            changed = desired != current,
-            is_v2,
-            "CPU bandwidth cap verified"
-        );
-        Ok(observed)
+                    (
+                        directory.join("cpu.cfs_quota_us"),
+                        desired.quota_us.to_string(),
+                    )
+                };
+                fs::write(&path, value).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        ActionError::PermissionDenied
+                    } else {
+                        ActionError::Failed(format!("cannot write {}: {error}", path.display()))
+                    }
+                })?;
+            }
+            revalidate()?;
+            let observed = read_cpu_limit(directory, is_v2)?;
+            if observed != desired || !observed.within(maximum) {
+                return Err(ActionError::Failed(
+                    "CPU throttle readback does not match the selected cap".to_string(),
+                ));
+            }
+            revalidate()?;
+            info!(
+                cgroup = %directory.display(),
+                quota_us = observed.quota_us,
+                period_us = observed.period_us,
+                changed = desired != current,
+                is_v2,
+                "CPU bandwidth cap verified"
+            );
+            Ok(observed)
+        })();
+        let observed = match &reversal {
+            Some(receipt) => receipt.finish(execution, ReversalStatus::Applied)?,
+            None => execution?,
+        };
+        Ok((observed, reversal))
     }
 
     /// Verify the exact cap and controller retained by the successful execution.
@@ -532,9 +626,13 @@ impl CpuThrottleActionRunner {
             ))
         })?;
         record.check_action(action)?;
-        record.verify_limit(&self.config, || {
+        let verification = record.verify_limit(&self.config, || {
             self.revalidate_membership(action, &record.scope)
-        })
+        });
+        match &record.reversal {
+            Some(receipt) => receipt.finish(verification, ReversalStatus::Verified),
+            None => verification,
+        }
     }
 
     /// Capture reversal metadata before applying throttle.
@@ -1066,6 +1164,7 @@ mod tests {
                 identity: action.target,
                 limit,
                 scope,
+                reversal: None,
             }
         }
 
@@ -1499,6 +1598,74 @@ mod tests {
                 .is_err());
             assert_eq!(fs::read_to_string(quota_path).unwrap(), "-1\n");
             assert!(!fixture.path().join("cpu.cfs_period_us").exists());
+        }
+
+        #[test]
+        fn throttle_prepare_observes_exact_original_and_applied_limits_before_write() {
+            let runner = CpuThrottleActionRunner::with_defaults();
+            for original in ["max", "10000"] {
+                let fixture = controller_fixture(true, original, "100000");
+                let path = fixture.path().join("cpu.max");
+                let observed_before = fs::read_to_string(&path).unwrap();
+                let captured = std::cell::Cell::new(None);
+                let (applied, receipt) = runner
+                    .apply_throttle_with_reversal(
+                        fixture.path(),
+                        true,
+                        || Ok(()),
+                        |before, after| {
+                            assert_eq!(fs::read_to_string(&path).unwrap(), observed_before);
+                            captured.set(Some((before, after)));
+                            Ok(None)
+                        },
+                    )
+                    .unwrap();
+                let (before, desired) = captured.get().unwrap();
+                assert_eq!(before.quota_us, if original == "max" { -1 } else { 10_000 });
+                assert_eq!(
+                    desired.quota_us,
+                    if original == "max" { 25_000 } else { 10_000 }
+                );
+                assert_eq!(applied, desired);
+                assert!(receipt.is_none());
+            }
+        }
+
+        #[test]
+        fn throttle_preparation_io_failure_prevents_controller_mutation() {
+            let fixture = controller_fixture(true, "max", "100000");
+            let path = fixture.path().join("cpu.max");
+            let before = fs::read_to_string(&path).unwrap();
+            let result = CpuThrottleActionRunner::with_defaults().apply_throttle_with_reversal(
+                fixture.path(),
+                true,
+                || Ok(()),
+                |_, _| {
+                    // An actual unavailable record file, not a successful fake journal.
+                    fs::File::open(fixture.path().join("absent-receipt-directory/receipt"))
+                        .map_err(|error| ActionError::Failed(error.to_string()))?;
+                    Ok(None)
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(fs::read_to_string(path).unwrap(), before);
+        }
+
+        #[test]
+        fn throttle_rechecks_current_limit_after_preparation() {
+            let fixture = controller_fixture(true, "max", "100000");
+            let path = fixture.path().join("cpu.max");
+            let result = CpuThrottleActionRunner::with_defaults().apply_throttle_with_reversal(
+                fixture.path(),
+                true,
+                || Ok(()),
+                |_, _| {
+                    fs::write(&path, "17000 100000").unwrap();
+                    Ok(None)
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(fs::read_to_string(path).unwrap(), "17000 100000");
         }
 
         #[test]

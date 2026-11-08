@@ -5,8 +5,10 @@ use crate::collect::ProcessState;
 use crate::decision::{Action, ActionFeasibility, DisabledAction};
 use crate::plan::{ActionRouting, PlanAction};
 use pt_common::ProcessIdentity;
+use std::{path::PathBuf, sync::Arc};
 
 use super::renice::ReniceActionRunner;
+use super::reversal::ReversalJournal;
 use super::signal::SignalActionRunner;
 
 #[cfg(target_os = "linux")]
@@ -45,6 +47,42 @@ impl CompositeActionRunner {
             throttle: CpuThrottleActionRunner::with_defaults(),
             #[cfg(target_os = "linux")]
             quarantine: CpusetQuarantineActionRunner::with_defaults(),
+        }
+    }
+
+    /// Capture durable restoration receipts at the actual cgroup controller writes.
+    /// The same journal binds freeze and throttle attempts to the saved session plan.
+    pub fn with_reversal_journal(self, journal: Arc<ReversalJournal>) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut runner = self;
+            runner.freeze = runner.freeze.with_reversal_journal(Arc::clone(&journal));
+            runner.throttle = runner.throttle.with_reversal_journal(journal);
+            runner
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = journal;
+            self
+        }
+    }
+
+    /// Keep unjournaled writers from superseding an unresolved durable undo.
+    /// This guard reads ownership evidence but does not create reversal receipts.
+    pub fn with_reversal_ownership_guard(self, sessions_root: PathBuf) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut runner = self;
+            runner.freeze = runner
+                .freeze
+                .with_reversal_ownership_guard(sessions_root.clone());
+            runner.throttle = runner.throttle.with_reversal_ownership_guard(sessions_root);
+            runner
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = sessions_root;
+            self
         }
     }
 }

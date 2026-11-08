@@ -731,6 +731,9 @@ enum AgentCommands {
     /// Execute actions from a session
     Apply(AgentApplyArgs),
 
+    /// Inspect or restore the recorded state of a reversible cgroup action
+    Undo(AgentUndoArgs),
+
     /// Verify action outcomes
     Verify(AgentVerifyArgs),
 
@@ -1304,6 +1307,25 @@ struct AgentApplyArgs {
     /// Refuse if the complete saved plan differs from this approved SHA-256
     #[arg(long, requires = "expected_host_id")]
     expected_plan_sha256: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct AgentUndoArgs {
+    /// Session containing the original action and its durable reversal receipt
+    #[arg(long)]
+    session: String,
+
+    /// Canonical action ID from the saved plan
+    #[arg(long)]
+    action_id: String,
+
+    /// Select an execution attempt when the action has more than one receipt
+    #[arg(long)]
+    attempt_id: Option<String>,
+
+    /// Restore the recorded state (otherwise inspect receipts without mutation)
+    #[arg(long, alias = "execute")]
+    confirm: bool,
 }
 
 fn parse_nonnegative_finite(value: &str) -> Result<f64, String> {
@@ -2804,6 +2826,106 @@ fn build_plan_from_selection(
     Ok(plan)
 }
 
+fn session_has_control_receipts(handle: &SessionHandle) -> Result<bool, String> {
+    let directory = handle.dir.join("action/reversals");
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("cannot inspect saved control receipts: {error}")),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err("control receipt directory is not a regular directory".into()),
+    }
+    let mut entries = fs::read_dir(&directory)
+        .map_err(|error| format!("cannot inspect saved control receipts: {error}"))?;
+    entries
+        .next()
+        .transpose()
+        .map(|entry| entry.is_some())
+        .map_err(|error| format!("cannot read saved control receipt entry: {error}"))
+}
+
+/// Once controls depend on exact plan bytes, keep those bytes available for
+/// undo and replay. Serialize this check with all journaled controller writers.
+fn write_canonical_session_plan(handle: &SessionHandle, content: &str) -> Result<PathBuf, String> {
+    let data_dir = handle
+        .dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("cannot resolve session execution data directory")?;
+    let _lock = GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock"))
+        .map_err(|error| format!("cannot lock canonical plan write: {error}"))?
+        .ok_or("cannot replace a plan while another command is executing or restoring actions")?;
+    let plan_path = handle.dir.join("decision/plan.json");
+    if session_has_control_receipts(handle)? {
+        let previous = fs::read(&plan_path).map_err(|error| {
+            format!("cannot read the plan bound to saved control receipts: {error}")
+        })?;
+        if previous == content.as_bytes() {
+            return Ok(plan_path);
+        }
+        return Err("this session has durable control receipts; create a new plan session to preserve its original undo and verification binding".into());
+    }
+    fs::write(&plan_path, content).map_err(|error| format!("write plan: {error}"))?;
+    Ok(plan_path)
+}
+
+#[cfg(test)]
+mod canonical_plan_write_tests {
+    use super::*;
+
+    fn session(directory: &Path) -> SessionHandle {
+        let id = SessionId::new();
+        let handle = SessionStore::at_data_dir(directory)
+            .create(&SessionManifest::new(
+                &id,
+                None,
+                SessionMode::RobotPlan,
+                None,
+            ))
+            .unwrap();
+        fs::create_dir_all(handle.dir.join("decision")).unwrap();
+        handle
+    }
+
+    #[test]
+    fn retained_control_evidence_keeps_original_plan_bytes_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = session(directory.path());
+        let original = "{\"plan_id\":\"original\"}";
+        let path = write_canonical_session_plan(&handle, original).unwrap();
+        let receipts = handle.dir.join("action/reversals");
+        fs::create_dir_all(&receipts).unwrap();
+        // Even an incomplete/corrupt receipt must retain its original binding
+        // for inspection; rewriting the plan cannot make it disappear.
+        fs::write(receipts.join("interrupted.json"), b"{\"prepared\":").unwrap();
+        assert!(session_has_control_receipts(&handle).unwrap());
+        assert!(write_canonical_session_plan(&handle, "{\"plan_id\":\"replacement\"}").is_err());
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+        assert_eq!(
+            write_canonical_session_plan(&handle, original).unwrap(),
+            path
+        );
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn canonical_plan_write_cannot_race_active_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = session(directory.path());
+        let original = "{\"plan_id\":\"original\"}";
+        let path = write_canonical_session_plan(&handle, original).unwrap();
+        let execution_lock =
+            GlobalLock::try_acquire(&directory.path().join(".execution-policy-lock"))
+                .unwrap()
+                .unwrap();
+        assert!(write_canonical_session_plan(&handle, "replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+        drop(execution_lock);
+        assert!(!session_has_control_receipts(&handle).unwrap());
+        write_canonical_session_plan(&handle, "replacement").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+    }
+}
+
 #[cfg(feature = "ui")]
 fn write_plan_to_session(handle: &SessionHandle, plan: &Plan) -> Result<PathBuf, String> {
     if plan.session_id != handle.id.0 {
@@ -2883,8 +3005,7 @@ fn write_plan_to_session(handle: &SessionHandle, plan: &Plan) -> Result<PathBuf,
     canonical.gates_summary.pre_toggled_actions = canonical.pre_toggled.len();
     let content =
         serde_json::to_string_pretty(&canonical).map_err(|e| format!("serialize plan: {}", e))?;
-    std::fs::write(&plan_path, content).map_err(|e| format!("write plan: {}", e))?;
-    Ok(plan_path)
+    write_canonical_session_plan(handle, &content)
 }
 
 /// Serialize budget checks, real execution and persistent accounting across
@@ -3351,12 +3472,20 @@ fn execute_plan_actions(
         let action_dir = handle.dir.join("action");
         std::fs::create_dir_all(&action_dir).map_err(|e| format!("create action dir: {}", e))?;
         let lock_path = action_dir.join("lock");
-        let runner = RecordedActionRunner {
-            runner: CompositeActionRunner::with_defaults(),
-            evidence: std::cell::RefCell::new(None),
-        };
         let identity_provider = LiveIdentityProvider::new();
         let (_execution_lock, new_enforcer) = acquire_execution_policy(policy, None, handle)?;
+        let sessions_root = handle
+            .dir
+            .parent()
+            .ok_or("cannot resolve session directory for control ownership checks")?
+            .to_path_buf();
+        let runner = RecordedActionRunner {
+            // TUI selections append to their canonical plan. Guard existing
+            // durable owners without binding undo receipts to mutable bytes.
+            runner: CompositeActionRunner::with_defaults()
+                .with_reversal_ownership_guard(sessions_root),
+            evidence: std::cell::RefCell::new(None),
+        };
         let enforcer = state.enforcer.get_or_insert(new_enforcer);
         let pre_checks = LivePreCheckProvider::new(
             Some(&policy.guardrails),
@@ -9296,6 +9425,7 @@ fn run_agent(global: &GlobalOpts, args: &AgentArgs) -> ExitCode {
         AgentCommands::Plan(args) => run_agent_plan(global, args),
         AgentCommands::Explain(args) => run_agent_explain(global, args),
         AgentCommands::Apply(args) => run_agent_apply(global, args),
+        AgentCommands::Undo(args) => run_agent_undo(global, args),
         AgentCommands::Verify(args) => run_agent_verify(global, args),
         AgentCommands::Diff(args) => run_agent_diff(global, args),
         AgentCommands::Sessions(args) => run_agent_sessions(global, args),
@@ -21533,6 +21663,20 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         }
     };
 
+    if !created {
+        match session_has_control_receipts(&handle) {
+            Ok(false) => {}
+            Ok(true) => {
+                eprintln!("agent plan: this session has durable control receipts; omit --session to create a new plan and retain the original undo binding");
+                return ExitCode::PolicyBlocked;
+            }
+            Err(error) => {
+                eprintln!("agent plan: {error}");
+                return ExitCode::IoError;
+            }
+        }
+    }
+
     // Load configuration and priors
     let config_options = ConfigOptions {
         config_dir: global.config.as_ref().map(PathBuf::from),
@@ -22907,14 +23051,16 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
         return ExitCode::InternalError;
     }
-    let plan_path = decision_dir.join("plan.json");
-    if let Err(e) = std::fs::write(
-        &plan_path,
-        serde_json::to_string_pretty(&plan_output).unwrap(),
+    let plan_path = match write_canonical_session_plan(
+        &handle,
+        &serde_json::to_string_pretty(&plan_output).unwrap(),
     ) {
-        eprintln!("agent plan: failed to write {}: {}", plan_path.display(), e);
-        return ExitCode::InternalError;
-    }
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("agent plan: {error}");
+            return ExitCode::PolicyBlocked;
+        }
+    };
 
     // Persist compact diff artifacts so `pt diff` can compare sessions reliably.
     // Best-effort: don't fail the plan output if persistence fails, but emit a warning.
@@ -24978,14 +25124,26 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                     }
                 };
             let identity_provider = LiveIdentityProvider::new();
-            // Composite runner: signals (kill/pause/resume), renice, and on Linux
-            // freeze/throttle/quarantine (refused unless the target owns its cgroup).
-            // Previously only signals could run, so every other planned action failed.
-            let action_runner = pt_core::action::CompositeActionRunner::with_defaults();
 
             // Observe before the action loop, then let every action perform its
             // normal fresh safety checks. Dry runs never enter this branch.
             let plan_sha256 = format!("{:x}", Sha256::digest(plan_content.as_bytes()));
+            let reversal_journal = match pt_core::action::ReversalJournal::new(
+                handle.dir.join("action"),
+                sid.0.as_str(),
+                plan_sha256.as_str(),
+                store.sessions_root(),
+            ) {
+                Ok(journal) => Arc::new(journal),
+                Err(error) => {
+                    eprintln!("agent apply: cannot bind durable cgroup undo journal: {error}");
+                    return ExitCode::PolicyBlocked;
+                }
+            };
+            // The specialized writers persist the original controller state
+            // immediately before mutation and retain partial/crash receipts.
+            let action_runner = pt_core::action::CompositeActionRunner::with_defaults()
+                .with_reversal_journal(reversal_journal);
             let requested_settle_ms = args.settle * 1_000;
             let initial_settle_ms = remaining_observation_budget()
                 .map_or(requested_settle_ms, |remaining| {
@@ -26851,6 +27009,466 @@ fn run_diff(global: &GlobalOpts, args: &DiffArgs) -> ExitCode {
     }
 
     ExitCode::Clean
+}
+
+/// Undo authorization is independent of --robot; read-only modes always win.
+fn agent_undo_execution_requested(global: &GlobalOpts, args: &AgentUndoArgs) -> bool {
+    args.confirm && !global.dry_run && !global.shadow
+}
+
+fn parse_undo_action(
+    content: &str,
+    session_id: &str,
+    action_id: &str,
+) -> Result<pt_core::plan::PlanAction, String> {
+    let plan = parse_agent_plan(content).map_err(|error| format!("invalid saved plan: {error}"))?;
+    if plan.session_id != session_id {
+        return Err("saved plan belongs to a different session".to_string());
+    }
+    plan.actions
+        .into_iter()
+        .find(|action| action.action_id == action_id)
+        .ok_or_else(|| format!("action {action_id} is absent from the canonical saved plan"))
+}
+
+fn validate_undo_host_binding(
+    document: &serde_json::Value,
+    current_host: &str,
+) -> Result<(), String> {
+    let Some(value) = document.get("host_id") else {
+        // Canonical TUI plans may omit host metadata. A newly captured receipt
+        // must still pass the full live boot, namespace, mount and target checks.
+        return Ok(());
+    };
+    let recorded = value
+        .as_str()
+        .filter(|host| !host.trim().is_empty() && !host.eq_ignore_ascii_case("unknown"))
+        .ok_or("recorded plan host_id is not a known host identifier")?;
+    if recorded != current_host {
+        return Err("recorded plan host does not match the current host".to_string());
+    }
+    Ok(())
+}
+
+fn run_agent_undo(global: &GlobalOpts, args: &AgentUndoArgs) -> ExitCode {
+    use pt_core::action::reversal::ReversalOperation;
+    use pt_core::action::{RestorationStatus, ReversalJournal};
+
+    let execute = agent_undo_execution_requested(global, args);
+    let mut output = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "command": "agent undo",
+        "mode": if execute { "restore" } else { "preview" },
+        "session_id": args.session,
+        "action_id": args.action_id,
+        "attempt_id": args.attempt_id,
+        "confirmation_requested": args.confirm,
+        "dry_run": global.dry_run,
+        "shadow": global.shadow,
+        "records": [],
+    });
+    let emit = |value: serde_json::Value| {
+        if !matches!(global.format, OutputFormat::Exitcode) {
+            println!("{}", format_structured_output(global, value));
+        }
+    };
+    let refuse = |mut value: serde_json::Value, error: &str, reason: String, code: ExitCode| {
+        value["status"] = serde_json::json!("refused");
+        value["error"] = serde_json::json!(error);
+        value["reason"] = serde_json::json!(reason);
+        emit(value);
+        code
+    };
+
+    let _lock = if execute {
+        match acquire_global_lock(global, "agent undo") {
+            Ok(lock) => lock,
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
+    let sid = match SessionId::parse(&args.session) {
+        Some(sid) => sid,
+        None => {
+            return refuse(
+                output,
+                "invalid_session",
+                format!("invalid --session {}", args.session),
+                ExitCode::ArgsError,
+            );
+        }
+    };
+    let store = match SessionStore::from_env() {
+        Ok(store) => store,
+        Err(error) => {
+            return refuse(
+                output,
+                "session_store",
+                error.to_string(),
+                ExitCode::IoError,
+            );
+        }
+    };
+    let handle = match store.open(&sid) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return refuse(
+                output,
+                "session_unavailable",
+                error.to_string(),
+                ExitCode::ArgsError,
+            );
+        }
+    };
+    let plan_path = handle.dir.join("decision").join("plan.json");
+    let content = match fs::read_to_string(&plan_path) {
+        Ok(content) => content,
+        Err(error) => {
+            return refuse(
+                output,
+                "plan_unavailable",
+                error.to_string(),
+                ExitCode::IoError,
+            );
+        }
+    };
+    let action = match parse_undo_action(&content, &sid.0, &args.action_id) {
+        Ok(action) => action,
+        Err(error) => {
+            return refuse(
+                output,
+                "invalid_action_binding",
+                error,
+                ExitCode::PolicyBlocked,
+            );
+        }
+    };
+    let document: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(document) => document,
+        Err(error) => {
+            return refuse(
+                output,
+                "invalid_plan",
+                error.to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+    };
+    // Hash the same complete saved bytes used by agent apply, not a reserialized Plan.
+    let plan_sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let current_host = pt_core::logging::get_host_id();
+    let recorded_host = document["host_id"].as_str();
+    output["plan_sha256"] = serde_json::json!(&plan_sha256);
+    output["recorded_host_id"] = serde_json::json!(recorded_host);
+    output["current_host_id"] = serde_json::json!(&current_host);
+    output["action"] = serde_json::json!(action.action);
+    output["target"] = serde_json::json!(&action.target);
+    output["receipt_directory"] = serde_json::json!(handle
+        .dir
+        .join("action")
+        .join("reversals")
+        .display()
+        .to_string());
+    let journal = match ReversalJournal::new(
+        handle.dir.join("action"),
+        sid.0.as_str(),
+        plan_sha256.as_str(),
+        store.sessions_root(),
+    ) {
+        Ok(journal) => journal,
+        Err(error) => {
+            return refuse(
+                output,
+                "invalid_journal_binding",
+                error.to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+    };
+    let records = match journal.inspect(&action) {
+        Ok(records) => records,
+        Err(error) => {
+            return refuse(
+                output,
+                "invalid_reversal_receipt",
+                error.to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+    };
+    output["records"] = serde_json::json!(&records);
+    if !matches!(
+        action.action,
+        Action::Freeze | Action::Unfreeze | Action::Throttle
+    ) {
+        return refuse(
+            output,
+            "unsupported_action",
+            "durable undo currently supports Linux cgroup-v2 freeze, unfreeze and CPU throttle"
+                .to_string(),
+            ExitCode::PolicyBlocked,
+        );
+    }
+    if records.is_empty() {
+        return refuse(
+            output,
+            "reversal_state_unavailable",
+            "no durable receipt was captured for this action; legacy execution history cannot reconstruct its original controller state".to_string(),
+            ExitCode::PolicyBlocked,
+        );
+    }
+    let selected: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            args.attempt_id
+                .as_deref()
+                .is_none_or(|id| record.attempt_id == id)
+        })
+        .collect();
+    if selected.is_empty() {
+        return refuse(
+            output,
+            "unknown_attempt",
+            "--attempt-id does not identify a receipt for this canonical action".to_string(),
+            ExitCode::ArgsError,
+        );
+    }
+    if selected
+        .iter()
+        .all(|record| matches!(&record.operation, ReversalOperation::Unsupported { .. }))
+    {
+        return refuse(
+            output,
+            "unsupported_reversal_receipt",
+            "the selected receipt records an unsupported controller; inspect its operation reason"
+                .to_string(),
+            ExitCode::PolicyBlocked,
+        );
+    }
+    if !execute {
+        output["status"] = serde_json::json!("preview");
+        output["live_eligibility_checked"] = serde_json::json!(false);
+        output["note"] = serde_json::json!(
+            "receipt inspection only; --confirm revalidates process identity, ownership, cgroup scope and controller values before restoration. Select --attempt-id when multiple attempts exist."
+        );
+        emit(output);
+        return ExitCode::Clean;
+    }
+    if let Err(reason) = validate_undo_host_binding(&document, &current_host) {
+        return refuse(
+            output,
+            "host_binding_mismatch",
+            reason,
+            ExitCode::PolicyBlocked,
+        );
+    }
+    // This is also held by agent apply and TUI execution, even when the optional
+    // command lock is skipped. Undo never rewrites original execution accounting.
+    let Some(data_dir) = handle.dir.parent().and_then(Path::parent) else {
+        return refuse(
+            output,
+            "execution_lock_unavailable",
+            "cannot resolve session execution data directory".to_string(),
+            ExitCode::IoError,
+        );
+    };
+    let _execution_lock = match GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock")) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return refuse(
+                output,
+                "execution_lock_held",
+                "another command is executing or restoring actions".to_string(),
+                ExitCode::LockError,
+            );
+        }
+        Err(error) => {
+            return refuse(
+                output,
+                "execution_lock_error",
+                error.to_string(),
+                ExitCode::IoError,
+            );
+        }
+    };
+    // Recheck the saved bytes after taking the shared execution lock. A changed
+    // plan cannot inherit authority from an earlier read or a prior inspection.
+    match fs::read(&plan_path) {
+        Ok(current) if current.as_slice() == content.as_bytes() => {}
+        Ok(_) => {
+            return refuse(
+                output,
+                "plan_changed",
+                "saved plan changed during undo inspection; inspect the current session again"
+                    .to_string(),
+                ExitCode::PolicyBlocked,
+            );
+        }
+        Err(error) => {
+            return refuse(
+                output,
+                "plan_unavailable",
+                error.to_string(),
+                ExitCode::IoError,
+            );
+        }
+    }
+    let restored = journal.restore(&action, args.attempt_id.as_deref());
+    // Keep incomplete crash records visible even if restoration or persistence
+    // failed. Original action outcomes and session state remain untouched.
+    match journal.inspect(&action) {
+        Ok(records) => output["records"] = serde_json::json!(records),
+        Err(error) => output["receipt_inspection_error"] = serde_json::json!(error.to_string()),
+    }
+    match restored {
+        Ok(outcome) => {
+            let success = matches!(outcome.status, RestorationStatus::Restored);
+            output["status"] = serde_json::json!(if success { "restored" } else { "failed" });
+            output["restoration"] = serde_json::json!(outcome);
+            emit(output);
+            if success {
+                ExitCode::ActionsOk
+            } else {
+                ExitCode::PartialFail
+            }
+        }
+        Err(error) => {
+            // A persistence error may follow a controller write. Never describe
+            // every error as an unchanged/refused operation or synthesize success.
+            output["status"] = serde_json::json!("failed");
+            output["error"] = serde_json::json!("restoration_incomplete");
+            output["reason"] = serde_json::json!(error.to_string());
+            emit(output);
+            ExitCode::PartialFail
+        }
+    }
+}
+
+#[cfg(test)]
+mod agent_undo_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn undo_cli_requires_explicit_confirmation_and_read_only_modes_override_it() {
+        for (flags, expected) in [
+            (vec![], false),
+            (vec!["--robot"], false),
+            (vec!["--confirm"], true),
+            (vec!["--execute"], true),
+            (vec!["--confirm", "--dry-run"], false),
+            (vec!["--execute", "--shadow"], false),
+            (vec!["--robot", "--confirm", "--dry-run", "--shadow"], false),
+        ] {
+            let mut argv = vec![
+                "pt-core",
+                "agent",
+                "undo",
+                "--session",
+                "test-session",
+                "--action-id",
+                "freeze-42",
+                "--attempt-id",
+                "attempt-1",
+            ];
+            argv.extend(flags);
+            let cli = Cli::try_parse_from(argv).expect("undo arguments");
+            let Some(Commands::Agent(agent)) = &cli.command else {
+                panic!("expected agent")
+            };
+            let AgentCommands::Undo(args) = &agent.command else {
+                panic!("expected undo")
+            };
+            assert_eq!(args.attempt_id.as_deref(), Some("attempt-1"));
+            assert_eq!(agent_undo_execution_requested(&cli.global, args), expected);
+        }
+        for missing in ["--session", "--action-id"] {
+            let (flag, value) = if missing == "--session" {
+                ("--action-id", "freeze-42")
+            } else {
+                ("--session", "test-session")
+            };
+            assert!(Cli::try_parse_from(["pt-core", "agent", "undo", flag, value]).is_err());
+        }
+    }
+
+    fn saved_plan() -> serde_json::Value {
+        serde_json::json!({
+            "plan_id": "plan-a",
+            "session_id": "session-a",
+            "generated_at": "2026-11-08T00:00:00Z",
+            "policy_version": "1.0.0",
+            "actions": [{
+                "action_id": "freeze-42",
+                "target": {
+                    "pid": 42,
+                    "start_id": pt_common::StartId::from_linux(
+                        "11111111-1111-1111-1111-111111111111", 12345, 42
+                    ),
+                    "uid": 1000,
+                    "pgid": 40,
+                    "sid": 30,
+                    "quality": "full",
+                },
+                "action": "freeze",
+                "order": 0,
+                "stage": 0,
+                "timeouts": pt_core::plan::ActionTimeouts::default(),
+                "pre_checks": ["verify_identity", "check_not_protected"],
+                "rationale": {},
+                "on_success": [],
+                "on_failure": [],
+                "blocked": false,
+            }],
+            "pre_toggled": ["freeze-42"],
+            "gates_summary": {
+                "total_candidates": 1,
+                "blocked_candidates": 0,
+                "pre_toggled_actions": 1,
+            },
+        })
+    }
+
+    #[test]
+    fn undo_uses_the_exact_canonical_action_and_rejects_foreign_or_ambiguous_ids() {
+        let mut document = saved_plan();
+        let original = document.to_string();
+        let action = parse_undo_action(&original, "session-a", "freeze-42").unwrap();
+        assert_eq!(action.action, Action::Freeze);
+        assert_eq!(action.target.uid, 1000);
+        assert_eq!(action.target.pgid, Some(40));
+        assert_eq!(action.target.sid, Some(30));
+        assert!(parse_undo_action(&original, "session-b", "freeze-42").is_err());
+        assert!(parse_undo_action(&original, "session-a", "42").is_err());
+        let duplicate = document["actions"][0].clone();
+        document["actions"].as_array_mut().unwrap().push(duplicate);
+        assert!(parse_undo_action(&document.to_string(), "session-a", "freeze-42").is_err());
+    }
+
+    #[test]
+    fn undo_allows_absent_host_metadata_but_never_invalid_or_conflicting_metadata() {
+        let mut document = saved_plan();
+        assert!(validate_undo_host_binding(&document, "host-a").is_ok());
+        document["host_id"] = serde_json::json!("host-a");
+        assert!(validate_undo_host_binding(&document, "host-a").is_ok());
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!("unknown"),
+            serde_json::json!("UNKNOWN"),
+            serde_json::json!("host-b"),
+        ] {
+            document["host_id"] = invalid;
+            assert!(validate_undo_host_binding(&document, "host-a").is_err());
+        }
+    }
 }
 
 fn run_agent_diff(global: &GlobalOpts, args: &AgentDiffArgs) -> ExitCode {
