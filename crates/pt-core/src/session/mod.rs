@@ -582,27 +582,70 @@ impl SessionStore {
 
     /// Remove sessions older than `older_than`.
     ///
-    /// Only `Executing` sessions are preserved regardless of age (an action may be in
-    /// progress). A `Planned`/`Scanning` session older than the retention window is
-    /// stale: its identity-bound plan can no longer be applied safely, so keeping it
-    /// forever only accumulates disk (every unapplied `agent plan` ends in `Planned`).
+    /// Retain executing sessions and every session with reversal artifacts,
+    /// including incomplete or unreadable artifacts. A reversible controller can
+    /// outlive the ordinary retention window; its original settings and ownership
+    /// receipt must survive too. Cleanup shares the execution-policy lock with
+    /// action preparation, undo and canonical plan writes.
     pub fn cleanup_sessions(&self, older_than: Duration) -> Result<CleanupResult, SessionError> {
-        let options = ListSessionsOptions {
-            older_than: Some(older_than),
-            ..Default::default()
-        };
-
-        let sessions = self.list_sessions(&options)?;
         let mut result = CleanupResult {
             removed_count: 0,
             removed_sessions: Vec::new(),
             preserved_count: 0,
             errors: Vec::new(),
         };
+        match std::fs::symlink_metadata(&self.sessions_root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+            Err(source) => {
+                return Err(SessionError::Io {
+                    path: self.sessions_root.clone(),
+                    source,
+                });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(SessionError::Io {
+                    path: self.sessions_root.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "session retention root is not a real directory",
+                    ),
+                });
+            }
+            Ok(_) => {}
+        }
+        let cleanup_lock = SessionCleanupLock::acquire(&self.sessions_root).map_err(|source| {
+            SessionError::Io {
+                path: self.sessions_root.clone(),
+                source,
+            }
+        })?;
+        let options = ListSessionsOptions {
+            older_than: Some(older_than),
+            ..Default::default()
+        };
+
+        let sessions = self.list_sessions(&options)?;
 
         for session in sessions {
-            // Preserve sessions that might be in use
-            if matches!(session.state, SessionState::Executing) {
+            cleanup_lock
+                .revalidate()
+                .map_err(|source| SessionError::Io {
+                    path: self.sessions_root.clone(),
+                    source,
+                })?;
+            // The list is a discovery snapshot. Read the current manifest and
+            // reversal metadata while holding the same lock as their writers.
+            if retention_requires_preservation(&session.path, &session.session_id, older_than) {
+                result.preserved_count += 1;
+                continue;
+            }
+            cleanup_lock
+                .revalidate()
+                .map_err(|source| SessionError::Io {
+                    path: self.sessions_root.clone(),
+                    source,
+                })?;
+            if retention_has_reversal_artifacts(&session.path) {
                 result.preserved_count += 1;
                 continue;
             }
@@ -626,6 +669,209 @@ impl SessionStore {
 
         Ok(result)
     }
+}
+
+/// This lock uses the same stable inode and flock protocol as main's
+/// `.execution-policy-lock`. It is never removed or truncated by retention.
+struct SessionCleanupLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+    #[cfg(unix)]
+    path: PathBuf,
+    #[cfg(unix)]
+    directory: std::fs::File,
+    #[cfg(unix)]
+    sessions_root: PathBuf,
+}
+
+impl SessionCleanupLock {
+    #[cfg(unix)]
+    fn acquire(sessions_root: &Path) -> std::io::Result<Self> {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        let data_directory = sessions_root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "session root has no execution data directory",
+                )
+            })?;
+        let path = data_directory.join(".execution-policy-lock");
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(sessions_root)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&path)?;
+        // SAFETY: file owns a live descriptor; flock only acquires its advisory lock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let lock = Self {
+            file,
+            path,
+            directory,
+            sessions_root: sessions_root.to_path_buf(),
+        };
+        lock.revalidate()?;
+        Ok(lock)
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_sessions_root: &Path) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session retention requires the shared execution-policy file lock",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn revalidate(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let opened = self.file.metadata()?;
+        let current = std::fs::symlink_metadata(&self.path)?;
+        let opened_directory = self.directory.metadata()?;
+        let current_directory = std::fs::symlink_metadata(&self.sessions_root)?;
+        // SAFETY: geteuid only reads the caller's effective credentials.
+        let uid = unsafe { libc::geteuid() };
+        if !opened.is_file()
+            || !current.is_file()
+            || opened.nlink() != 1
+            || opened.uid() != uid
+            || current.uid() != uid
+            || current.mode() & 0o022 != 0
+            || opened.dev() != current.dev()
+            || opened.ino() != current.ino()
+            || !current_directory.is_dir()
+            || opened_directory.dev() != current_directory.dev()
+            || opened_directory.ino() != current_directory.ino()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "execution-policy lock identity, ownership or permissions changed",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn revalidate(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session retention requires the shared execution-policy file lock",
+        ))
+    }
+}
+
+impl Drop for SessionCleanupLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: this guard still owns the descriptor acquired above.
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+/// Absence is the only evidence that permits ordinary retention. Even an empty
+/// directory can be a crash-interrupted prepare; a malformed file or lookup
+/// failure must not erase the only path to the original controller settings.
+fn retention_has_reversal_artifacts(session_path: &Path) -> bool {
+    let action_path = session_path.join(ACTION_DIR);
+    match std::fs::symlink_metadata(&action_path) {
+        Ok(metadata) if !metadata.is_dir() => return true,
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+        Ok(_) => {}
+    }
+    match std::fs::symlink_metadata(action_path.join("reversals")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        _ => true,
+    }
+}
+
+fn retention_requires_preservation(
+    session_path: &Path,
+    expected_session_id: &str,
+    older_than: Duration,
+) -> bool {
+    if retention_has_reversal_artifacts(session_path) {
+        return true;
+    }
+    let inspect = || -> Option<bool> {
+        use std::io::Read;
+        if session_path.file_name()?.to_str()? != expected_session_id {
+            return None;
+        }
+        let directory_metadata = std::fs::symlink_metadata(session_path).ok()?;
+        if !directory_metadata.is_dir() {
+            return None;
+        }
+        let manifest_path = session_path.join(MANIFEST_FILE);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        }
+        let file = options.open(&manifest_path).ok()?;
+        let metadata = file.metadata().ok()?;
+        const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+        if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+            return None;
+        }
+        let mut content = Vec::new();
+        file.take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut content)
+            .ok()?;
+        if content.len() as u64 > MAX_MANIFEST_BYTES {
+            return None;
+        }
+        let manifest: SessionManifest = serde_json::from_slice(&content).ok()?;
+        if manifest.session_id != expected_session_id {
+            return None;
+        }
+        if manifest.state == SessionState::Executing {
+            return Some(true);
+        }
+        let created = DateTime::parse_from_rfc3339(&manifest.timing.created_at)
+            .map(|value| value.with_timezone(&Utc))
+            .ok()
+            .or_else(|| metadata.modified().ok().map(DateTime::<Utc>::from))?;
+        if Utc::now().signed_duration_since(created) < older_than {
+            return Some(true);
+        }
+        let current_directory = std::fs::symlink_metadata(session_path).ok()?;
+        let current_manifest = std::fs::symlink_metadata(&manifest_path).ok()?;
+        if !current_directory.is_dir() || !current_manifest.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if current_directory.dev() != directory_metadata.dev()
+                || current_directory.ino() != directory_metadata.ino()
+                || current_manifest.dev() != metadata.dev()
+                || current_manifest.ino() != metadata.ino()
+                || current_manifest.mtime() != metadata.mtime()
+                || current_manifest.mtime_nsec() != metadata.mtime_nsec()
+            {
+                return None;
+            }
+        }
+        Some(retention_has_reversal_artifacts(session_path))
+    };
+    inspect().unwrap_or(true)
 }
 
 #[derive(Debug, Clone)]
@@ -1067,9 +1313,9 @@ mod tests {
     // ── SessionStore with tempdir ───────────────────────────────────
 
     fn make_store(dir: &std::path::Path) -> SessionStore {
-        SessionStore {
-            sessions_root: dir.to_path_buf(),
-        }
+        // Use the production data-dir/sessions layout so parallel fixtures do
+        // not accidentally share their parent's execution-policy lock.
+        SessionStore::at_data_dir(dir)
     }
 
     #[test]
@@ -1200,7 +1446,7 @@ mod tests {
     fn store_sessions_root() {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path());
-        assert_eq!(store.sessions_root(), tmp.path());
+        assert_eq!(store.sessions_root(), tmp.path().join("sessions"));
     }
 
     #[test]
@@ -1208,7 +1454,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path());
         let sid = SessionId("pt-test".to_string());
-        assert_eq!(store.session_dir(&sid), tmp.path().join("pt-test"));
+        assert_eq!(store.session_dir(&sid), tmp.path().join("sessions/pt-test"));
     }
 
     // ── list_sessions ───────────────────────────────────────────────
@@ -1299,9 +1545,10 @@ mod tests {
         let store = make_store(tmp.path());
 
         // Create a dir that doesn't match session format
-        std::fs::create_dir(tmp.path().join("random-dir")).unwrap();
+        std::fs::create_dir_all(store.sessions_root()).unwrap();
+        std::fs::create_dir(store.sessions_root().join("random-dir")).unwrap();
         // Create a dir too short to be session ID
-        std::fs::create_dir(tmp.path().join("pt-short")).unwrap();
+        std::fs::create_dir(store.sessions_root().join("pt-short")).unwrap();
 
         let result = store
             .list_sessions(&ListSessionsOptions::default())
@@ -1310,6 +1557,196 @@ mod tests {
     }
 
     // ── cleanup_sessions ────────────────────────────────────────────
+
+    /// Retention safety tests keep every fixture and never call a deletion path.
+    fn retained_retention_fixture() -> PathBuf {
+        let directory = tempfile::tempdir().unwrap().keep();
+        std::fs::create_dir(directory.join("sessions")).unwrap();
+        directory
+    }
+
+    #[test]
+    fn retention_preserves_empty_partial_and_malformed_reversal_artifacts() {
+        for kind in 0..3 {
+            let directory = retained_retention_fixture();
+            let session = directory.join("sessions/pt-retained");
+            let action = session.join(ACTION_DIR);
+            std::fs::create_dir_all(&action).unwrap();
+            assert!(!retention_has_reversal_artifacts(&session));
+            let reversals = action.join("reversals");
+            match kind {
+                0 => std::fs::create_dir(&reversals).unwrap(),
+                1 => {
+                    std::fs::create_dir(&reversals).unwrap();
+                    std::fs::write(reversals.join("incomplete.tmp"), b"{\"version\":").unwrap();
+                }
+                _ => std::fs::write(&reversals, b"not a directory or valid receipt").unwrap(),
+            }
+            assert!(retention_has_reversal_artifacts(&session));
+            assert!(std::fs::symlink_metadata(&reversals).is_ok());
+        }
+    }
+
+    #[test]
+    fn retention_preserves_on_actual_metadata_lookup_errors() {
+        let directory = retained_retention_fixture();
+        let not_a_directory = directory.join("not-a-directory");
+        std::fs::write(&not_a_directory, b"retained").unwrap();
+        assert!(std::fs::symlink_metadata(not_a_directory.join(ACTION_DIR)).is_err());
+        assert!(retention_has_reversal_artifacts(&not_a_directory));
+        assert_eq!(std::fs::read(&not_a_directory).unwrap(), b"retained");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_preserves_dangling_or_redirected_reversal_locations() {
+        use std::os::unix::fs::symlink;
+        let directory = retained_retention_fixture();
+        let session = directory.join("sessions/pt-retained");
+        let action = session.join(ACTION_DIR);
+        std::fs::create_dir_all(&action).unwrap();
+        symlink(directory.join("missing-receipt"), action.join("reversals")).unwrap();
+        assert!(retention_has_reversal_artifacts(&session));
+        std::fs::rename(&action, session.join("retained-action")).unwrap();
+        symlink(directory.join("missing-action"), &action).unwrap();
+        assert!(retention_has_reversal_artifacts(&session));
+        assert!(std::fs::symlink_metadata(&action)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_lock_contends_with_the_real_execution_policy_flock_without_deleting() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = retained_retention_fixture();
+        let root = directory.join("sessions");
+        let path = directory.join(".execution-policy-lock");
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, b"active executor").unwrap();
+        // SAFETY: other owns this descriptor for the complete external lock lifetime.
+        assert_eq!(
+            unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let error = match SessionCleanupLock::acquire(&root) {
+            Ok(_) => panic!("retention must not acquire an active execution lock"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(std::fs::read(&path).unwrap(), b"active executor");
+        // SAFETY: this is the same owned descriptor which acquired the lock.
+        assert_eq!(unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_UN) }, 0);
+        {
+            let guard = SessionCleanupLock::acquire(&root).unwrap();
+            guard.revalidate().unwrap();
+            // SAFETY: other remains open, independently from the retention descriptor.
+            assert_ne!(
+                unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        let guard = SessionCleanupLock::acquire(&root).unwrap();
+        guard.revalidate().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"active executor");
+        assert!(root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_lock_refuses_symlink_and_replaced_lock_inodes() {
+        use std::os::unix::fs::symlink;
+        let directory = retained_retention_fixture();
+        let outside = directory.join("outside");
+        std::fs::write(&outside, b"unchanged").unwrap();
+        symlink(&outside, directory.join(".execution-policy-lock")).unwrap();
+        assert!(SessionCleanupLock::acquire(&directory.join("sessions")).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
+
+        let directory = retained_retention_fixture();
+        let path = directory.join(".execution-policy-lock");
+        let guard = SessionCleanupLock::acquire(&directory.join("sessions")).unwrap();
+        let retained = directory.join("retained-lock");
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        assert!(guard.revalidate().is_err());
+        assert!(retained.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+
+        let directory = retained_retention_fixture();
+        let root = directory.join("sessions");
+        let guard = SessionCleanupLock::acquire(&root).unwrap();
+        let retained_root = directory.join("retained-sessions");
+        std::fs::rename(&root, &retained_root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert!(guard.revalidate().is_err());
+        assert!(retained_root.exists());
+        assert!(root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_lock_storage_failure_does_not_touch_session_artifacts() {
+        let directory = retained_retention_fixture();
+        let artifact = directory.join("sessions/retained-artifact");
+        std::fs::write(&artifact, b"receipt evidence").unwrap();
+        std::fs::create_dir(directory.join(".execution-policy-lock")).unwrap();
+        assert!(SessionCleanupLock::acquire(&directory.join("sessions")).is_err());
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"receipt evidence");
+    }
+
+    #[test]
+    fn retention_rechecks_current_manifest_state_age_and_errors() {
+        let directory = retained_retention_fixture();
+        let id = SessionId("pt-20260101-000000-kept".to_string());
+        let session = directory.join("sessions").join(&id.0);
+        std::fs::create_dir_all(session.join(ACTION_DIR)).unwrap();
+        let mut manifest = SessionManifest::new(&id, None, SessionMode::RobotApply, None);
+        manifest.state = SessionState::Completed;
+        manifest.timing.created_at = (Utc::now() - Duration::days(30)).to_rfc3339();
+        let path = session.join(MANIFEST_FILE);
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(!retention_requires_preservation(
+            &session,
+            &id.0,
+            Duration::days(7)
+        ));
+        // A discovery summary can still say Completed while execution has begun.
+        manifest.state = SessionState::Executing;
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(retention_requires_preservation(
+            &session,
+            &id.0,
+            Duration::days(7)
+        ));
+        manifest.state = SessionState::Completed;
+        manifest.timing.created_at = Utc::now().to_rfc3339();
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(retention_requires_preservation(
+            &session,
+            &id.0,
+            Duration::days(7)
+        ));
+        std::fs::write(&path, b"partial manifest").unwrap();
+        assert!(retention_requires_preservation(
+            &session,
+            &id.0,
+            Duration::days(7)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"partial manifest");
+    }
 
     #[test]
     fn cleanup_preserves_executing_sessions() {
@@ -1399,7 +1836,10 @@ mod tests {
         let m = SessionManifest::new(&sid, None, SessionMode::RobotPlan, None);
         store.create(&m).unwrap();
         assert!(store.session_dir(&sid).exists(), "fresh session kept");
-        assert!(tmp.path().join(".last_gc").exists(), "gc marker written");
+        assert!(
+            store.sessions_root().join(".last_gc").exists(),
+            "gc marker written"
+        );
         let listed = store
             .list_sessions(&ListSessionsOptions::default())
             .unwrap();

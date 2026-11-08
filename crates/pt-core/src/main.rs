@@ -2845,7 +2845,10 @@ fn session_has_control_receipts(handle: &SessionHandle) -> Result<bool, String> 
 
 /// Once controls depend on exact plan bytes, keep those bytes available for
 /// undo and replay. Serialize this check with all journaled controller writers.
-fn write_canonical_session_plan(handle: &SessionHandle, content: &str) -> Result<PathBuf, String> {
+fn update_canonical_session_plan(
+    handle: &SessionHandle,
+    update: impl FnOnce(Option<&str>) -> Result<String, String>,
+) -> Result<PathBuf, String> {
     let data_dir = handle
         .dir
         .parent()
@@ -2855,11 +2858,16 @@ fn write_canonical_session_plan(handle: &SessionHandle, content: &str) -> Result
         .map_err(|error| format!("cannot lock canonical plan write: {error}"))?
         .ok_or("cannot replace a plan while another command is executing or restoring actions")?;
     let plan_path = handle.dir.join("decision/plan.json");
+    let previous = match fs::read_to_string(&plan_path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("cannot read the saved canonical plan: {error}")),
+    };
+    // Read, merge, validate and write under one lock: a TUI selection must not
+    // overwrite bindings appended by another selection after its earlier read.
+    let content = update(previous.as_deref())?;
     if session_has_control_receipts(handle)? {
-        let previous = fs::read(&plan_path).map_err(|error| {
-            format!("cannot read the plan bound to saved control receipts: {error}")
-        })?;
-        if previous == content.as_bytes() {
+        if previous.as_deref() == Some(content.as_str()) {
             return Ok(plan_path);
         }
         return Err("this session has durable control receipts; create a new plan session to preserve its original undo and verification binding".into());
@@ -2891,17 +2899,20 @@ mod canonical_plan_write_tests {
         let directory = tempfile::tempdir().unwrap();
         let handle = session(directory.path());
         let original = "{\"plan_id\":\"original\"}";
-        let path = write_canonical_session_plan(&handle, original).unwrap();
+        let path = update_canonical_session_plan(&handle, |_| Ok(original.into())).unwrap();
         let receipts = handle.dir.join("action/reversals");
         fs::create_dir_all(&receipts).unwrap();
         // Even an incomplete/corrupt receipt must retain its original binding
         // for inspection; rewriting the plan cannot make it disappear.
         fs::write(receipts.join("interrupted.json"), b"{\"prepared\":").unwrap();
         assert!(session_has_control_receipts(&handle).unwrap());
-        assert!(write_canonical_session_plan(&handle, "{\"plan_id\":\"replacement\"}").is_err());
+        assert!(update_canonical_session_plan(&handle, |_| Ok(
+            "{\"plan_id\":\"replacement\"}".into()
+        ))
+        .is_err());
         assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
         assert_eq!(
-            write_canonical_session_plan(&handle, original).unwrap(),
+            update_canonical_session_plan(&handle, |_| Ok(original.into())).unwrap(),
             path
         );
         assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
@@ -2912,17 +2923,40 @@ mod canonical_plan_write_tests {
         let directory = tempfile::tempdir().unwrap();
         let handle = session(directory.path());
         let original = "{\"plan_id\":\"original\"}";
-        let path = write_canonical_session_plan(&handle, original).unwrap();
+        let path = update_canonical_session_plan(&handle, |_| Ok(original.into())).unwrap();
         let execution_lock =
             GlobalLock::try_acquire(&directory.path().join(".execution-policy-lock"))
                 .unwrap()
                 .unwrap();
-        assert!(write_canonical_session_plan(&handle, "replacement").is_err());
+        assert!(update_canonical_session_plan(&handle, |_| Ok("replacement".into())).is_err());
         assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
         drop(execution_lock);
         assert!(!session_has_control_receipts(&handle).unwrap());
-        write_canonical_session_plan(&handle, "replacement").unwrap();
+        update_canonical_session_plan(&handle, |_| Ok("replacement".into())).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn canonical_merge_reads_latest_bytes_while_execution_lock_is_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = session(directory.path());
+        let path = update_canonical_session_plan(&handle, |_| Ok("first".into())).unwrap();
+        update_canonical_session_plan(&handle, |previous| {
+            assert_eq!(previous, Some("first"));
+            assert!(
+                GlobalLock::try_acquire(&directory.path().join(".execution-policy-lock"))
+                    .unwrap()
+                    .is_none()
+            );
+            Ok(format!("{} second", previous.unwrap()))
+        })
+        .unwrap();
+        update_canonical_session_plan(&handle, |previous| {
+            assert_eq!(previous, Some("first second"));
+            Ok(format!("{} third", previous.unwrap()))
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "first second third");
     }
 }
 
@@ -2935,77 +2969,77 @@ fn write_plan_to_session(handle: &SessionHandle, plan: &Plan) -> Result<PathBuf,
     if let Err(e) = std::fs::create_dir_all(&decision_dir) {
         return Err(format!("create decision dir: {}", e));
     }
-    let plan_path = decision_dir.join("plan.json");
-    let mut canonical = match std::fs::read_to_string(&plan_path) {
-        Ok(content) => parse_agent_plan(&content)
-            .map_err(|error| format!("read previous interactive plan: {error}"))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => plan.clone(),
-        Err(error) => return Err(format!("read previous interactive plan: {error}")),
-    };
-    if canonical.session_id != plan.session_id
-        || canonical.policy_id != plan.policy_id
-        || canonical.policy_version != plan.policy_version
-    {
-        return Err("interactive selections do not share the saved session and policy".to_string());
-    }
-    for action in &plan.actions {
-        if let Some(previous) = canonical
+    update_canonical_session_plan(handle, |previous| {
+        let mut canonical = match previous {
+            Some(content) => parse_agent_plan(content)
+                .map_err(|error| format!("read previous interactive plan: {error}"))?,
+            None => plan.clone(),
+        };
+        if canonical.session_id != plan.session_id
+            || canonical.policy_id != plan.policy_id
+            || canonical.policy_version != plan.policy_version
+        {
+            return Err(
+                "interactive selections do not share the saved session and policy".to_string(),
+            );
+        }
+        for action in &plan.actions {
+            if let Some(previous) = canonical
+                .actions
+                .iter()
+                .find(|previous| previous.action_id == action.action_id)
+            {
+                if previous.target != action.target
+                    || previous.action != action.action
+                    || previous.blocked != action.blocked
+                    || previous.routing != action.routing
+                    || previous.supervisor_restart != action.supervisor_restart
+                {
+                    return Err(format!(
+                        "interactive action {} conflicts with its saved binding",
+                        action.action_id
+                    ));
+                }
+            } else {
+                let mut appended = action.clone();
+                appended.order = u32::try_from(canonical.actions.len())
+                    .map_err(|error| format!("too many interactive actions: {error}"))?;
+                canonical.actions.push(appended);
+            }
+        }
+        for action_id in &plan.pre_toggled {
+            if !canonical.pre_toggled.contains(action_id) {
+                canonical.pre_toggled.push(action_id.clone());
+            }
+        }
+        let identities: HashSet<_> = canonical
             .actions
             .iter()
-            .find(|previous| previous.action_id == action.action_id)
-        {
-            if previous.target != action.target
-                || previous.action != action.action
-                || previous.blocked != action.blocked
-                || previous.routing != action.routing
-                || previous.supervisor_restart != action.supervisor_restart
-            {
-                return Err(format!(
-                    "interactive action {} conflicts with its saved binding",
-                    action.action_id
-                ));
-            }
-        } else {
-            let mut appended = action.clone();
-            appended.order = u32::try_from(canonical.actions.len())
-                .map_err(|error| format!("too many interactive actions: {error}"))?;
-            canonical.actions.push(appended);
-        }
-    }
-    for action_id in &plan.pre_toggled {
-        if !canonical.pre_toggled.contains(action_id) {
-            canonical.pre_toggled.push(action_id.clone());
-        }
-    }
-    let identities: HashSet<_> = canonical
-        .actions
-        .iter()
-        .map(|action| {
-            (
-                &action.target.start_id,
-                action.target.pid,
-                action.target.uid,
-            )
-        })
-        .collect();
-    let blocked: HashSet<_> = canonical
-        .actions
-        .iter()
-        .filter(|action| action.blocked)
-        .map(|action| {
-            (
-                &action.target.start_id,
-                action.target.pid,
-                action.target.uid,
-            )
-        })
-        .collect();
-    canonical.gates_summary.total_candidates = identities.len();
-    canonical.gates_summary.blocked_candidates = blocked.len();
-    canonical.gates_summary.pre_toggled_actions = canonical.pre_toggled.len();
-    let content =
-        serde_json::to_string_pretty(&canonical).map_err(|e| format!("serialize plan: {}", e))?;
-    write_canonical_session_plan(handle, &content)
+            .map(|action| {
+                (
+                    &action.target.start_id,
+                    action.target.pid,
+                    action.target.uid,
+                )
+            })
+            .collect();
+        let blocked: HashSet<_> = canonical
+            .actions
+            .iter()
+            .filter(|action| action.blocked)
+            .map(|action| {
+                (
+                    &action.target.start_id,
+                    action.target.pid,
+                    action.target.uid,
+                )
+            })
+            .collect();
+        canonical.gates_summary.total_candidates = identities.len();
+        canonical.gates_summary.blocked_candidates = blocked.len();
+        canonical.gates_summary.pre_toggled_actions = canonical.pre_toggled.len();
+        serde_json::to_string_pretty(&canonical).map_err(|e| format!("serialize plan: {}", e))
+    })
 }
 
 /// Serialize budget checks, real execution and persistent accounting across
@@ -3395,13 +3429,14 @@ fn execute_tui_plan_selection(
     selection: &Plan,
     state: &mut TuiExecutionState,
 ) -> Result<RecordedExecution, String> {
+    // Keep execution serialized until its evidence and final state have been
+    // persisted, including failures after a real action has already returned.
+    let mut execution_lock = None;
     let execution = (|| {
         // Persist every earlier binding, but execute only this new selection.
         write_plan_to_session(handle, selection)?;
-        handle
-            .update_state(SessionState::Executing)
-            .map_err(|error| format!("persist interactive execution state: {error}"))?;
-        let (result, evidence) = execute_plan_actions(handle, policy, selection, state)?;
+        let ((result, evidence), lock) = execute_plan_actions(handle, policy, selection, state)?;
+        execution_lock = Some(lock);
         let executions = write_outcomes_from_execution(handle, selection, &result, &evidence)?;
         if executions
             .iter()
@@ -3453,7 +3488,9 @@ fn execute_tui_plan_selection(
             .map_err(|error| format!("persist interactive action result state: {error}"))?;
         Ok((result, evidence))
     })();
-    execution.map_err(|error| record_tui_execution_failure(handle, state, error))
+    let execution = execution.map_err(|error| record_tui_execution_failure(handle, state, error));
+    drop(execution_lock);
+    execution
 }
 
 #[cfg(feature = "ui")]
@@ -3462,7 +3499,7 @@ fn execute_plan_actions(
     policy: &pt_core::config::Policy,
     plan: &Plan,
     state: &mut TuiExecutionState,
-) -> Result<RecordedExecution, String> {
+) -> Result<(RecordedExecution, GlobalLock), String> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use pt_core::action::{
@@ -3473,7 +3510,51 @@ fn execute_plan_actions(
         std::fs::create_dir_all(&action_dir).map_err(|e| format!("create action dir: {}", e))?;
         let lock_path = action_dir.join("lock");
         let identity_provider = LiveIdentityProvider::new();
-        let (_execution_lock, new_enforcer) = acquire_execution_policy(policy, None, handle)?;
+        let (execution_lock, new_enforcer) = acquire_execution_policy(policy, None, handle)?;
+        // The selection was saved before this lock was acquired. A concurrent
+        // replan must not leave real actions without their canonical bindings.
+        let canonical_content = std::fs::read_to_string(handle.dir.join("decision/plan.json"))
+            .map_err(|error| format!("cannot revalidate saved interactive plan: {error}"))?;
+        let canonical = parse_agent_plan(&canonical_content)
+            .map_err(|error| format!("invalid saved interactive plan: {error}"))?;
+        if canonical.session_id != handle.id.0
+            || canonical.session_id != plan.session_id
+            || canonical.policy_id != plan.policy_id
+            || canonical.policy_version != plan.policy_version
+        {
+            return Err(
+                "interactive selection no longer matches its saved session and policy".to_string(),
+            );
+        }
+        for action in &plan.actions {
+            let mut saved = canonical
+                .actions
+                .iter()
+                .find(|saved| saved.action_id == action.action_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "selected action {} is no longer in the canonical plan",
+                        action.action_id
+                    )
+                })?;
+            // Cumulative plans append action orders. Every intrinsic field,
+            // including identity, gates, routing, deadlines and hooks, must match.
+            saved.order = action.order;
+            let saved = serde_json::to_value(&saved)
+                .map_err(|error| format!("cannot compare saved action binding: {error}"))?;
+            let selected = serde_json::to_value(action)
+                .map_err(|error| format!("cannot compare selected action binding: {error}"))?;
+            if saved != selected {
+                return Err(format!(
+                    "selected action {} changed in the canonical plan",
+                    action.action_id
+                ));
+            }
+        }
+        handle
+            .update_state(SessionState::Executing)
+            .map_err(|error| format!("persist interactive execution state: {error}"))?;
         let sessions_root = handle
             .dir
             .parent()
@@ -3653,12 +3734,18 @@ fn execute_plan_actions(
                         "kill delivery={kill_signal_delivered}, restart attempted={supervisor_restart_attempted}, but accounting completion could not be persisted: {error}"
                     ));
                     outcomes.push(outcome);
-                    return Ok((execution_result(outcomes), execution_evidence));
+                    return Ok((
+                        (execution_result(outcomes), execution_evidence),
+                        execution_lock,
+                    ));
                 }
                 outcomes.push(outcome);
             }
         }
-        Ok((execution_result(outcomes), execution_evidence))
+        Ok((
+            (execution_result(outcomes), execution_evidence),
+            execution_lock,
+        ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -17625,6 +17712,83 @@ mod process_tree_safety_tests {
         }
     }
 
+    /// Exercise the handoff using blocked actions: no live mutation is requested.
+    #[cfg(all(feature = "ui", any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn tui_execution_revalidates_saved_bindings_and_retains_its_lock_for_persistence() {
+        use pt_core::action::ActionStatus;
+        use pt_core::plan::PreCheck;
+        use pt_core::session::SessionState;
+
+        for case in [
+            "order",
+            "missing",
+            "uid",
+            "deadline",
+            "gate",
+            "rationale",
+            "policy",
+            "session",
+        ] {
+            let (directory, handle, mut selection, _, _) =
+                tui_respawn_fixture(&format!("tui-handoff-{case}"));
+            selection.actions[0].blocked = true;
+            let mut canonical = selection.clone();
+            match case {
+                "order" => canonical.actions[0].order += 7,
+                "missing" => canonical.actions.clear(),
+                "uid" => canonical.actions[0].target.uid += 1,
+                "deadline" => canonical.actions[0].timeouts.execute_ms += 1,
+                "gate" => canonical.actions[0]
+                    .pre_checks
+                    .push(PreCheck::CheckDataLossGate),
+                "rationale" => canonical.actions[0].rationale.memory_mb = Some(123.0),
+                "policy" => canonical.policy_version.push_str("-changed"),
+                "session" => canonical.session_id.push_str("-changed"),
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                handle.dir.join("decision/plan.json"),
+                serde_json::to_vec_pretty(&canonical).unwrap(),
+            )
+            .unwrap();
+            let mut state = super::TuiExecutionState::default();
+            let result = super::execute_plan_actions(
+                &handle,
+                &pt_core::config::Policy::default(),
+                &selection,
+                &mut state,
+            );
+            if case == "order" {
+                let ((result, evidence), lock) =
+                    result.expect("appended order preserves intrinsic action");
+                assert_eq!(result.outcomes[0].status, ActionStatus::Skipped);
+                let lock_path = directory.join(".execution-policy-lock");
+                assert!(super::GlobalLock::try_acquire(&lock_path)
+                    .unwrap()
+                    .is_none());
+                super::write_outcomes_from_execution(&handle, &selection, &result, &evidence)
+                    .unwrap();
+                handle.update_state(SessionState::Completed).unwrap();
+                assert!(super::GlobalLock::try_acquire(&lock_path)
+                    .unwrap()
+                    .is_none());
+                drop(lock);
+                assert!(super::GlobalLock::try_acquire(&lock_path)
+                    .unwrap()
+                    .is_some());
+            } else {
+                assert!(result.is_err(), "{case}");
+                assert!(!handle.dir.join("action/outcomes.jsonl").exists(), "{case}");
+                assert_ne!(
+                    handle.read_manifest().unwrap().state,
+                    SessionState::Executing,
+                    "{case}"
+                );
+            }
+        }
+    }
+
     /// Exercise the TUI's real execution helper, including its saved budget and
     /// a later missing target. This proves execution/accounting, not rendering
     /// or inference calibration.
@@ -17753,11 +17917,12 @@ mod process_tree_safety_tests {
             .iter()
             .any(|record| record.pid.0 == missing.pid));
         let mut execution_state = super::TuiExecutionState::default();
-        let (result, execution_evidence) =
+        let ((result, execution_evidence), execution_lock) =
             super::execute_plan_actions(&handle, &policy, &plan, &mut execution_state)
                 .expect("TUI helper retains results after missing policy evidence");
         super::write_outcomes_from_execution(&handle, &plan, &result, &execution_evidence)
             .expect("save retained TUI outcomes");
+        drop(execution_lock);
         writeln!(
             evidence,
             "{}",
@@ -23224,10 +23389,9 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
         );
         return ExitCode::InternalError;
     }
-    let plan_path = match write_canonical_session_plan(
-        &handle,
-        &serde_json::to_string_pretty(&plan_output).unwrap(),
-    ) {
+    let plan_path = match update_canonical_session_plan(&handle, |_| {
+        serde_json::to_string_pretty(&plan_output).map_err(|error| error.to_string())
+    }) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("agent plan: {error}");
@@ -24767,7 +24931,16 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         };
 
     // Resume only executions bound to this canonical action and target identity.
-    let completed_action_ids: std::collections::HashSet<String> = if args.resume {
+    // Retain the exact bytes (including absence) until the execution lock is held:
+    // another apply may complete while this invocation prepares its safety checks.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        allow(unused_variables)
+    )]
+    let (completed_action_ids, resume_outcomes_snapshot): (
+        std::collections::HashSet<String>,
+        Option<Vec<u8>>,
+    ) = if args.resume {
         let outcomes_path = handle.dir.join("action").join("outcomes.jsonl");
         match std::fs::read_to_string(&outcomes_path) {
             Ok(content) => match parse_action_outcomes(&content).and_then(|saved| {
@@ -24778,7 +24951,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         .collect()
                 })
             }) {
-                Ok(completed) => completed,
+                Ok(completed) => (completed, Some(content.into_bytes())),
                 Err(error) => {
                     eprintln!(
                         "agent apply: saved execution evidence is invalid for this Plan; refusing --resume: {error}"
@@ -24787,7 +24960,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::collections::HashSet::new()
+                (std::collections::HashSet::new(), None)
             }
             Err(error) => {
                 eprintln!(
@@ -24798,7 +24971,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
             }
         }
     } else {
-        std::collections::HashSet::new()
+        (std::collections::HashSet::new(), None)
     };
 
     // Determine which actions to apply
@@ -25126,8 +25299,6 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 .map(|constraint| format!("recorded {constraint}")),
         );
     }
-    let _ = handle.update_state(SessionState::Executing);
-
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let precheck_providers = {
         use pt_core::action::{LivePreCheckConfig, LivePreCheckProvider};
@@ -25194,6 +25365,10 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
 
     let mut outcomes: Vec<serde_json::Value> = Vec::new();
     let mut resource_run: Option<ResourceRun> = None;
+    // Verification and retention use this same lock. Keep it through outcome
+    // append, resource evidence and final state persistence, not just actuation.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut _execution_guard: Option<GlobalLock> = None;
     // Only the Linux/macOS executor runs actions; elsewhere every action is unsupported.
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
     let mut succeeded = 0usize;
@@ -25381,7 +25556,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
     } else {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let (_execution_lock, enforcer) =
+            let (execution_lock, enforcer) =
                 match acquire_execution_policy(&config.policy, recorded_policy.as_ref(), &handle) {
                     Ok(policy) => policy,
                     Err(error) => {
@@ -25389,6 +25564,44 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                         return ExitCode::PolicyBlocked;
                     }
                 };
+            _execution_guard = Some(execution_lock);
+            // Approval and forecasts refer to these exact bytes. A replan may
+            // have acquired the execution lock after our initial read; never
+            // execute that old document or journal a hash no longer on disk.
+            match fs::read(&plan_path) {
+                Ok(current) if current.as_slice() == plan_content.as_bytes() => {}
+                Ok(_) => {
+                    eprintln!("agent apply: the canonical plan changed before execution; review and apply the current saved plan");
+                    return ExitCode::PolicyBlocked;
+                }
+                Err(error) => {
+                    eprintln!("agent apply: cannot revalidate the canonical plan before execution: {error}");
+                    return ExitCode::IoError;
+                }
+            }
+            if args.resume {
+                let outcomes_path = handle.dir.join("action/outcomes.jsonl");
+                let current = match fs::read(&outcomes_path) {
+                    Ok(content) => Some(content),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        eprintln!(
+                            "agent apply: cannot revalidate resume execution evidence: {error}"
+                        );
+                        return ExitCode::IoError;
+                    }
+                };
+                if current != resume_outcomes_snapshot {
+                    eprintln!("agent apply: execution outcomes changed before resume acquired the action lock; retry --resume against the current saved evidence");
+                    return ExitCode::PolicyBlocked;
+                }
+            }
+            // Preview modes never enter an execution phase. Real execution
+            // publishes this state under the lock held through final persistence.
+            if let Err(error) = handle.update_state(SessionState::Executing) {
+                eprintln!("agent apply: cannot persist execution state before actuation: {error}");
+                return ExitCode::IoError;
+            }
             let identity_provider = LiveIdentityProvider::new();
 
             // Observe before the action loop, then let every action perform its
@@ -26380,6 +26593,24 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         }
     };
 
+    // Keep canonical plan/outcome reads and current control observations in one
+    // execution window. Apply, undo, TUI and plan replacement use this same lock.
+    let Some(data_dir) = handle.dir.parent().and_then(Path::parent) else {
+        eprintln!("agent verify: cannot resolve session execution data directory");
+        return ExitCode::IoError;
+    };
+    let _execution_lock = match GlobalLock::try_acquire(&data_dir.join(".execution-policy-lock")) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!("agent verify: another command is executing or restoring actions");
+            return ExitCode::LockError;
+        }
+        Err(error) => {
+            eprintln!("agent verify: cannot lock execution evidence: {error}");
+            return ExitCode::IoError;
+        }
+    };
+
     let plan_path = handle.dir.join("decision").join("plan.json");
     if !plan_path.exists() {
         eprintln!("agent verify: missing plan.json for session {}", sid);
@@ -26521,14 +26752,46 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         return ExitCode::InternalError;
     }
 
+    let plan_sha256 = format!("{:x}", Sha256::digest(plan_content.as_bytes()));
+    let reversal_journal = pt_core::action::ReversalJournal::new(
+        handle.dir.join("action"),
+        sid.0.as_str(),
+        plan_sha256.as_str(),
+        store.sessions_root(),
+    );
     let completed_at = chrono::Utc::now();
-    let report = match verify_plan_with_postconditions(
+    let mut report = match verify_plan_with_postconditions(
         &plan,
         &saved_outcomes,
         &scan_result.processes,
         requested_at,
         completed_at,
-        observe_live_postcondition,
+        |action| {
+            use pt_core::verify::ActionPostcondition;
+
+            if !matches!(
+                action.action,
+                Action::Freeze | Action::Unfreeze | Action::Throttle
+            ) {
+                return observe_live_postcondition(action);
+            }
+            let restoration = match &reversal_journal {
+                Ok(journal) => journal.observe_restoration(action),
+                Err(error) => {
+                    return ActionPostcondition::RestorationUnverified {
+                        reason: format!("cannot bind restoration evidence: {error}"),
+                    };
+                }
+            };
+            match restoration {
+                Ok(Some(observation)) => ActionPostcondition::Restored { observation },
+                Ok(None) => observe_live_postcondition(action),
+                Err(error) => ActionPostcondition::RestorationUnverified {
+                    reason: error.to_string(),
+                },
+            }
+        },
+        resource_predictions.as_ref(),
     ) {
         Ok(report) => report,
         Err(error) => {
@@ -26536,6 +26799,8 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
             return ExitCode::InternalError;
         }
     };
+    let completed_at = chrono::Utc::now();
+    report.verification.completed_at = completed_at.to_rfc3339();
 
     let verify_dir = handle.dir.join("action");
     if let Err(e) = std::fs::create_dir_all(&verify_dir) {
@@ -26548,7 +26813,6 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
     }
     let verify_path = verify_dir.join("verifications.json");
     let current_resource_observation = capture_resource_observation();
-    let plan_sha256 = format!("{:x}", Sha256::digest(plan_content.as_bytes()));
     let mut resource_runs = load_resource_runs(
         &verify_dir,
         &plan,
@@ -26565,7 +26829,22 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                 reason: error.clone(),
             });
     }
+    let restored_count = report
+        .action_outcomes
+        .iter()
+        .filter(|outcome| outcome.outcome == VerifyOutcome::ConfirmedRestored)
+        .count();
+    let restoration_unverified_count = report
+        .action_outcomes
+        .iter()
+        .filter(|outcome| outcome.outcome == VerifyOutcome::RestorationUnverified)
+        .count();
     let mut verification_output = serde_json::to_value(&report).unwrap_or_default();
+    verification_output["restoration_summary"] = serde_json::json!({
+        "confirmed_restored": restored_count,
+        "restoration_unverified": restoration_unverified_count,
+        "observation_source": "current_controller_state",
+    });
     verification_output["resource_prediction_error"] =
         serde_json::json!(&resource_prediction_error);
     let respawn_history_update = record_respawn_history(
@@ -26666,11 +26945,11 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
             println!("{}", format_structured_output(global, output));
         }
         OutputFormat::Summary => {
-            let freed = report
+            let forecast = report
                 .resource_summary
                 .as_ref()
-                .map(|s| s.expected_freed_mb)
-                .unwrap_or(0.0);
+                .map(|summary| format!("{} MiB", summary.expected_freed_mb))
+                .unwrap_or_else(|| "unavailable".to_string());
             let respawn_info = if args.check_respawn && respawned_count > 0 {
                 format!(", {} respawned!", respawned_count)
             } else if unknown_respawn_count > 0 {
@@ -26679,8 +26958,8 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                 String::new()
             };
             println!(
-                "[{}] agent verify: {} verified, {} failed (expected freed {} MB){}, {} historical resource runs",
-                sid, verified_count, failed_count, freed, respawn_info, resource_runs.reports.len()
+                "[{}] agent verify: {} verified ({} restored), {} failed (saved private-memory forecast {}){}, {} historical resource runs",
+                sid, verified_count, restored_count, failed_count, forecast, respawn_info, resource_runs.reports.len()
             );
         }
         OutputFormat::Exitcode => {}
@@ -26697,14 +26976,19 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                 verify_path.display()
             );
             println!(
-                "- Outcomes: {} verified, {} failed",
-                verified_count, failed_count
+                "- Outcomes: {} verified ({} restored), {} failed",
+                verified_count, restored_count, failed_count
             );
+            if restored_count > 0 {
+                println!("- Restored controls match their recorded original values; restoration earns no resource-relief credit.");
+            }
             if let Some(summary) = &report.resource_summary {
                 println!(
-                    "- Expected memory freed: {} MB (plan estimate {})",
+                    "- Saved private-memory footprint forecast: {} MiB associated with confirmed-dead targets ({} MiB across executed targets)",
                     summary.expected_freed_mb, summary.expected_mb
                 );
+            } else {
+                println!("- Saved private-memory footprint forecast: unavailable (no complete saved Kill forecast).");
             }
             println!("\n## Resource Observations\n");
             println!("Saved apply windows; current action postconditions are checked separately.");

@@ -909,7 +909,7 @@ fn verify_cli_confirms_fresh_all_thread_renice_without_claiming_resource_relief(
             .unwrap()
             .contains("current threads"));
         assert!(outcome.get("expected_resources_freed").is_none());
-        assert_eq!(report["resource_summary"]["expected_freed_mb"], 0.0);
+        assert!(report.get("resource_summary").is_none());
         let persisted: Value = serde_json::from_slice(
             &fs::read(handle.dir.join("action/verifications.json")).unwrap(),
         )

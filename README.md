@@ -1419,6 +1419,19 @@ Plans with retained receipts keep their original bytes. To plan again, create
 a new session by omitting `agent plan --session`; replacing the old plan would
 invalidate the evidence needed for undo and verification.
 
+`agent verify` distinguishes a **confirmed restoration** from a missing
+original action effect. After a successful undo, it independently checks the
+saved original control and current process/cgroup binding, then reports
+`confirmed_restored` and counts that restored action separately. It does not
+reapply the control or change either execution history. Pending or failed
+attempts, conflicting owners, and missing or changed live evidence cannot earn
+restoration credit. An original failed execution remains a failure.
+
+Automatic session retention preserves sessions containing reversal evidence,
+including completed restoration histories and incomplete or unreadable
+receipts. Cleanup uses the execution lock so it cannot remove a session while
+an action is preparing the state needed for undo.
+
 This command currently covers cgroup-v2 freezer and CPU bandwidth controls
 from `agent apply`. Hybrid v1 throttling records that durable undo is
 unsupported. Renice, pause/resume, cpuset quarantine, service restart, and TUI

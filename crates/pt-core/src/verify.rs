@@ -7,11 +7,13 @@ pub mod relief;
 pub mod relief_store;
 pub mod resource_prediction;
 
+use crate::action::reversal::{RestorationObservation, ReversalValue};
 use crate::collect::{ProcessRecord, ProcessState};
 use crate::decision::Action;
 use crate::plan::{Plan, PlanAction};
 use chrono::{DateTime, Utc};
 use pt_common::ProcessIdentity;
+use resource_prediction::ValidatedResourcePredictions;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -126,6 +128,9 @@ pub struct ActionOutcome {
     pub verified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// An intentional restoration independently observed during this verification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restoration: Option<RestorationObservation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,6 +151,10 @@ pub enum VerifyOutcome {
     ConfirmedStopped,
     /// A reversible action's current postcondition was independently observed.
     ConfirmedEffect,
+    /// The latest completed undo's original controller state was freshly observed.
+    ConfirmedRestored,
+    /// Undo evidence or its current original state could not be independently verified.
+    RestorationUnverified,
     /// Current evidence establishes that the reversible postcondition is unmet.
     EffectNotObserved,
     StillRunning,
@@ -164,6 +173,8 @@ pub enum ActionPostcondition {
     NotSatisfied { detail: String },
     Unavailable { reason: String },
     IdentityChanged,
+    Restored { observation: RestorationObservation },
+    RestorationUnverified { reason: String },
 }
 
 /// Observe the postconditions used by the default production apply runner.
@@ -651,6 +662,7 @@ fn renice_postcondition(
 
 #[derive(Debug, Serialize)]
 pub struct ExpectedResourcesFreed {
+    /// Saved private-clean plus private-dirty forecast, in MiB; not measured relief.
     pub memory_mb: f64,
 }
 
@@ -669,8 +681,8 @@ pub struct RespawnDetected {
 
 #[derive(Debug, Serialize)]
 pub struct ResourceSummary {
-    /// Expected footprint of executed kills whose target is confirmed dead.
-    /// This is an estimate from the plan, not a measured resource delta.
+    /// Saved private-memory forecasts for unique executed targets confirmed dead.
+    /// This is a planning forecast in MiB, not a measured resource delta.
     pub expected_freed_mb: f64,
     pub expected_mb: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -685,6 +697,8 @@ pub enum VerifyError {
     InvalidOutcomes(String),
     #[error("invalid execution timestamp: {0}")]
     InvalidTimestamp(String),
+    #[error("invalid saved resource predictions: {0}")]
+    InvalidResourcePredictions(String),
 }
 
 pub fn parse_agent_plan(content: &str) -> Result<Plan, VerifyError> {
@@ -1026,11 +1040,17 @@ pub fn verify_plan(
     requested_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
 ) -> Result<VerificationReport, VerifyError> {
-    verify_plan_with_postconditions(plan, saved, current, requested_at, completed_at, |_| {
-        ActionPostcondition::Unavailable {
+    verify_plan_with_postconditions(
+        plan,
+        saved,
+        current,
+        requested_at,
+        completed_at,
+        |_| ActionPostcondition::Unavailable {
             reason: "No fresh action-specific observation was supplied".to_string(),
-        }
-    })
+        },
+        None,
+    )
 }
 
 /// Verify saved successful executions against current, identity-bound evidence.
@@ -1045,16 +1065,28 @@ pub fn verify_plan_with_postconditions(
     requested_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
     mut observe: impl FnMut(&PlanAction) -> ActionPostcondition,
+    resource_predictions: Option<&ValidatedResourcePredictions>,
 ) -> Result<VerificationReport, VerifyError> {
     let recorded = recorded_plan_actions(plan, saved)?;
     validate_execution_timestamps(saved, completed_at)?;
+    let resource_predictions = resource_predictions
+        .map(|predictions| predictions.snapshot().validate(plan))
+        .transpose()
+        .map_err(VerifyError::InvalidResourcePredictions)?;
+    let prediction_generated_at = resource_predictions
+        .as_ref()
+        .and_then(|predictions| {
+            DateTime::parse_from_rfc3339(&predictions.snapshot().generated_at).ok()
+        })
+        .map(|time| time.with_timezone(&Utc));
     let by_pid: HashMap<_, _> = current
         .iter()
         .map(|process| (process.pid.0, process))
         .collect();
     let mut outcomes = Vec::new();
-    let mut expected_mb = 0.0;
-    let mut expected_freed_mb = 0.0;
+    // A staged plan may mention the same incarnation more than once. Totals
+    // require complete, consistent saved forecasts and count each target once.
+    let mut kill_memory: HashMap<(u32, String, u32), (Option<u64>, bool)> = HashMap::new();
     let mut recommendations = Vec::new();
     let mut any_failed = false;
     let mut any_success = false;
@@ -1092,19 +1124,25 @@ pub fn verify_plan_with_postconditions(
                     "Apply recorded a {} attempt; its effects and respawns are not established",
                     execution.status
                 )),
+                restoration: None,
             });
             continue;
         }
-        let expected_mem = if action.action == Action::Kill {
-            action
-                .rationale
-                .memory_mb
-                .filter(|memory| memory.is_finite() && *memory >= 0.0)
-                .unwrap_or(0.0)
+        let mut restoration = None;
+        let memory_prediction = resource_predictions
+            .as_ref()
+            .and_then(|predictions| predictions.for_action(action))
+            .and_then(|prediction| prediction.memory.as_ref());
+        let forecast_precedes_execution = prediction_generated_at
+            .as_ref()
+            .zip(execution.executed_at.as_ref())
+            .is_some_and(|(generated, executed)| generated <= executed);
+        let expected_memory_bytes = if action.action == Action::Kill && forecast_precedes_execution
+        {
+            memory_prediction.map(|memory| memory.bytes)
         } else {
-            0.0
+            None
         };
-        expected_mb += expected_mem;
         let current_target = by_pid.get(&action.target.pid.0).copied();
         let respawn = detect_respawn(action, execution, current);
         let ambiguous_respawn = if respawn.is_none() {
@@ -1112,7 +1150,7 @@ pub fn verify_plan_with_postconditions(
         } else {
             None
         };
-        let (outcome, actual, note) = if respawn.is_some() {
+        let (outcome, actual, mut note) = if respawn.is_some() {
             (VerifyOutcome::Respawned, "respawned", None)
         } else if let Some(possible) = &ambiguous_respawn {
             (
@@ -1150,6 +1188,16 @@ pub fn verify_plan_with_postconditions(
                             VerifyOutcome::Unsupported,
                             "supervisor_binding_changed",
                             Some("The service binding changed during observation".to_string()),
+                        ),
+                        ActionPostcondition::Restored { .. } => (
+                            VerifyOutcome::RestorationUnverified,
+                            "restoration_unverified",
+                            Some("Cgroup restoration evidence cannot verify a supervisor restart".to_string()),
+                        ),
+                        ActionPostcondition::RestorationUnverified { reason } => (
+                            VerifyOutcome::RestorationUnverified,
+                            "restoration_unverified",
+                            Some(reason),
                         ),
                     }
                 }
@@ -1238,6 +1286,31 @@ pub fn verify_plan_with_postconditions(
                             "identity_changed",
                             Some("The process identity changed during postcondition observation".to_string()),
                         ),
+                        ActionPostcondition::Restored { observation }
+                            if observation.action_id == action.action_id
+                                && matches!(
+                                    (action.action, observation.original_value),
+                                    (Action::Freeze | Action::Unfreeze, ReversalValue::Freeze { .. })
+                                        | (Action::Throttle, ReversalValue::CpuMax { .. })
+                                ) =>
+                        {
+                            let detail = format!(
+                                "The recorded original controller state was independently observed at {}; undo {} restored execution attempt {}. The original action history is retained; this is not evidence of resource relief",
+                                observation.observed_at, observation.restore_id, observation.attempt_id,
+                            );
+                            restoration = Some(observation);
+                            (VerifyOutcome::ConfirmedRestored, "restoration_verified", Some(detail))
+                        }
+                        ActionPostcondition::Restored { .. } => (
+                            VerifyOutcome::RestorationUnverified,
+                            "restoration_unverified",
+                            Some("Restoration observation does not match this action and controller".to_string()),
+                        ),
+                        ActionPostcondition::RestorationUnverified { reason } => (
+                            VerifyOutcome::RestorationUnverified,
+                            "restoration_unverified",
+                            Some(reason),
+                        ),
                     }
                 }
                 (Action::Kill | Action::Pause, Some(_)) => {
@@ -1258,11 +1331,34 @@ pub fn verify_plan_with_postconditions(
             VerifyOutcome::ConfirmedDead
                 | VerifyOutcome::ConfirmedStopped
                 | VerifyOutcome::ConfirmedEffect
+                | VerifyOutcome::ConfirmedRestored
         );
         any_success |= verified;
         any_failed |= !verified;
-        if verified && action.action == Action::Kill {
-            expected_freed_mb += expected_mem;
+        if action.action == Action::Kill
+            && memory_prediction.is_some()
+            && !forecast_precedes_execution
+        {
+            let reason = "Saved private-memory forecast does not precede the recorded execution; its recovery estimate is unavailable";
+            note = Some(match note {
+                Some(previous) => format!("{previous}. {reason}"),
+                None => reason.to_string(),
+            });
+        }
+        if action.action == Action::Kill {
+            kill_memory
+                .entry((
+                    action.target.pid.0,
+                    action.target.start_id.0.clone(),
+                    action.target.uid,
+                ))
+                .and_modify(|(bytes, confirmed)| {
+                    if *bytes != expected_memory_bytes {
+                        *bytes = None;
+                    }
+                    *confirmed &= verified;
+                })
+                .or_insert((expected_memory_bytes, verified));
         }
         if let Some(respawn) = &respawn {
             recommendations.push(format!(
@@ -1290,6 +1386,11 @@ pub fn verify_plan_with_postconditions(
                 "PID {} does not satisfy the requested action effect; inspect its current state before retrying",
                 action.target.pid.0,
             ));
+        } else if outcome == VerifyOutcome::RestorationUnverified {
+            recommendations.push(format!(
+                "PID {} has unverified restoration evidence; inspect the durable undo receipt and current controller state before taking further action",
+                action.target.pid.0,
+            ));
         }
         let command = execution
             .command
@@ -1309,33 +1410,40 @@ pub fn verify_plan_with_postconditions(
             outcome,
             time_to_death_ms: None,
             expected_resources_freed: if verified && action.action == Action::Kill {
-                Some(ExpectedResourcesFreed {
-                    memory_mb: expected_mem,
+                expected_memory_bytes.map(|bytes| ExpectedResourcesFreed {
+                    memory_mb: bytes as f64 / (1024.0 * 1024.0),
                 })
             } else {
                 None
             },
             respawn_detected: respawn,
             expected: Some(
-                match action.action {
-                    Action::Kill => "terminated",
-                    Action::Pause => "stopped",
-                    Action::Resume => "not_stopped",
-                    Action::Renice => "default_nice_priority_on_every_current_thread",
-                    Action::Freeze => "cgroup_freeze_requested_and_completed",
-                    Action::Unfreeze => "cgroup_thaw_requested_and_completed",
-                    Action::Throttle => "default_cpu_bandwidth_ceiling",
-                    Action::Quarantine => "nonempty_effective_cpu_confinement",
-                    Action::Restart if action.routing == crate::plan::ActionRouting::Supervisor => {
-                        "new_live_main_pid_and_invocation_in_bound_user_service"
+                if restoration.is_some() {
+                    "recorded_original_controller_state"
+                } else {
+                    match action.action {
+                        Action::Kill => "terminated",
+                        Action::Pause => "stopped",
+                        Action::Resume => "not_stopped",
+                        Action::Renice => "default_nice_priority_on_every_current_thread",
+                        Action::Freeze => "cgroup_freeze_requested_and_completed",
+                        Action::Unfreeze => "cgroup_thaw_requested_and_completed",
+                        Action::Throttle => "default_cpu_bandwidth_ceiling",
+                        Action::Quarantine => "nonempty_effective_cpu_confinement",
+                        Action::Restart
+                            if action.routing == crate::plan::ActionRouting::Supervisor =>
+                        {
+                            "new_live_main_pid_and_invocation_in_bound_user_service"
+                        }
+                        _ => "effect_requires_additional_evidence",
                     }
-                    _ => "effect_requires_additional_evidence",
                 }
                 .to_string(),
             ),
             actual: Some(actual.to_string()),
             verified: Some(verified),
             note,
+            restoration,
         });
     }
     let overall_status = if any_success && any_failed {
@@ -1344,6 +1452,25 @@ pub fn verify_plan_with_postconditions(
         "failure"
     } else {
         "success"
+    };
+    let resource_summary = if kill_memory.is_empty() {
+        None
+    } else {
+        kill_memory
+            .values()
+            .try_fold((0_u128, 0_u128), |(expected, freed), (bytes, confirmed)| {
+                let bytes = u128::from((*bytes)?);
+                Some((
+                    expected.checked_add(bytes)?,
+                    freed.checked_add(if *confirmed { bytes } else { 0 })?,
+                ))
+            })
+            .map(|(expected, freed)| ResourceSummary {
+                expected_mb: expected as f64 / (1024.0 * 1024.0),
+                expected_freed_mb: freed as f64 / (1024.0 * 1024.0),
+                shortfall_reason: (freed < expected)
+                    .then(|| "some executed kills remain active or respawned".to_string()),
+            })
     };
     Ok(VerificationReport {
         schema_version: pt_common::SCHEMA_VERSION.to_string(),
@@ -1354,12 +1481,7 @@ pub fn verify_plan_with_postconditions(
             overall_status: overall_status.to_string(),
         },
         action_outcomes: outcomes,
-        resource_summary: Some(ResourceSummary {
-            expected_freed_mb: round_to_tenth(expected_freed_mb),
-            expected_mb: round_to_tenth(expected_mb),
-            shortfall_reason: (expected_freed_mb + f64::EPSILON < expected_mb)
-                .then(|| "some executed kills remain active or respawned".to_string()),
-        }),
+        resource_summary,
         follow_up_needed: Some(any_failed),
         recommendations: (!recommendations.is_empty()).then_some(recommendations),
     })
@@ -1367,10 +1489,6 @@ pub fn verify_plan_with_postconditions(
 
 fn normalize_cmd(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn round_to_tenth(value: f64) -> f64 {
-    (value * 10.0).round() / 10.0
 }
 
 #[cfg(test)]
@@ -1502,6 +1620,54 @@ mod tests {
         .unwrap()
     }
 
+    fn private_predictions(plan: &Plan, measured: &[(usize, u64)]) -> ValidatedResourcePredictions {
+        use crate::verify::resource_prediction::{
+            ActionResourcePrediction, PrivateMemoryPrediction, ResourcePredictionSnapshot,
+            RESOURCE_PREDICTION_SCHEMA_VERSION,
+        };
+        ResourcePredictionSnapshot {
+            schema_version: RESOURCE_PREDICTION_SCHEMA_VERSION,
+            session_id: plan.session_id.clone(),
+            plan_id: plan.plan_id.clone(),
+            generated_at: "1970-01-01T00:00:09Z".into(),
+            actions: measured
+                .iter()
+                .map(|&(index, bytes)| {
+                    let action = &plan.actions[index];
+                    ActionResourcePrediction {
+                        action_id: action.action_id.clone(),
+                        action: action.action,
+                        target: action.target.clone(),
+                        memory: Some(PrivateMemoryPrediction::new(bytes, 0, None, 1_000).unwrap()),
+                        cpu: None,
+                        file_descriptors: None,
+                        unavailable: Vec::new(),
+                    }
+                })
+                .collect(),
+        }
+        .validate(plan)
+        .unwrap()
+    }
+
+    fn forecast_report(
+        plan: &Plan,
+        saved: &[SavedActionOutcome],
+        current: &[ProcessRecord],
+        predictions: &ValidatedResourcePredictions,
+    ) -> VerificationReport {
+        verify_plan_with_postconditions(
+            plan,
+            saved,
+            current,
+            DateTime::from_timestamp(30, 0).unwrap(),
+            DateTime::from_timestamp(31, 0).unwrap(),
+            |_| panic!("Kill verification uses process observations"),
+            Some(predictions),
+        )
+        .unwrap()
+    }
+
     #[cfg(target_os = "linux")]
     fn supervisor_restart_action() -> PlanAction {
         let mut action = make_action(123, Action::Restart);
@@ -1567,6 +1733,7 @@ mod tests {
                     calls += 1;
                     observation.clone()
                 },
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -1575,7 +1742,7 @@ mod tests {
             );
             assert_eq!(report.action_outcomes[0].outcome, expected);
             assert!(report.action_outcomes[0].expected_resources_freed.is_none());
-            assert_eq!(report.resource_summary.unwrap().expected_freed_mb, 0.0);
+            assert!(report.resource_summary.is_none());
         }
         for case in 0..2 {
             let mut changed = saved.clone();
@@ -1608,6 +1775,7 @@ mod tests {
             DateTime::from_timestamp(30, 0).unwrap(),
             DateTime::from_timestamp(31, 0).unwrap(),
             |_| panic!("failed attempts are not recovery evidence"),
+            None,
         )
         .unwrap();
         assert_eq!(report.action_outcomes[0].verified, Some(false));
@@ -1842,9 +2010,7 @@ mod tests {
                 assert!(outcome.note.as_ref().unwrap().contains("not established"));
                 assert!(outcome.note.as_ref().unwrap().contains(status));
             }
-            let summary = verified.resource_summary.as_ref().unwrap();
-            assert_eq!(summary.expected_mb, 0.0);
-            assert_eq!(summary.expected_freed_mb, 0.0);
+            assert!(verified.resource_summary.is_none());
             let json = serde_json::to_value(&verified).unwrap();
             assert_eq!(json["action_outcomes"][0]["outcome"], "unsupported");
             assert_eq!(json["action_outcomes"][0]["actual"], "failed_attempt");
@@ -1863,7 +2029,15 @@ mod tests {
             failed_attempt(&plan.actions[1]),
             execution(&plan.actions[0]),
         ];
-        let verified = report(&plan, &saved, &[]);
+        let predictions = private_predictions(
+            &plan,
+            &[
+                (0, 100 * 1024 * 1024),
+                (1, 200 * 1024 * 1024),
+                (2, 300 * 1024 * 1024),
+            ],
+        );
+        let verified = forecast_report(&plan, &saved, &[], &predictions);
         assert_eq!(verified.action_outcomes.len(), 2);
         assert_eq!(verified.verification.overall_status, "partial_success");
         assert_eq!(verified.follow_up_needed, Some(true));
@@ -1961,7 +2135,7 @@ mod tests {
                 assert_eq!(outcome.actual.as_deref(), Some("failed_attempt"), "{case}");
                 assert!(outcome.expected_resources_freed.is_none(), "{case}");
                 assert!(outcome.respawn_detected.is_none(), "{case}");
-                assert_eq!(verified.resource_summary.unwrap().expected_freed_mb, 0.0);
+                assert!(verified.resource_summary.is_none());
             }
         }
     }
@@ -2177,10 +2351,7 @@ mod tests {
                 assert!(outcome.respawn_detected.is_none());
                 assert!(outcome.note.as_ref().unwrap().contains("cannot be ordered"));
                 assert_eq!(verification.verification.overall_status, "failure");
-                assert_eq!(
-                    verification.resource_summary.unwrap().expected_freed_mb,
-                    0.0
-                );
+                assert!(verification.resource_summary.is_none());
             }
         }
     }
@@ -2319,14 +2490,7 @@ mod tests {
                 outcome.respawn_detected.is_some(),
                 expected == VerifyOutcome::Respawned
             );
-            assert_eq!(
-                verified
-                    .resource_summary
-                    .as_ref()
-                    .unwrap()
-                    .expected_freed_mb,
-                0.0
-            );
+            assert!(verified.resource_summary.is_none());
         }
     }
 
@@ -2375,7 +2539,7 @@ mod tests {
                 verified.action_outcomes[0].verified,
                 Some(expected == VerifyOutcome::ConfirmedStopped)
             );
-            assert_eq!(verified.resource_summary.unwrap().expected_freed_mb, 0.0);
+            assert!(verified.resource_summary.is_none());
         }
     }
 
@@ -2440,6 +2604,7 @@ mod tests {
                     assert_eq!(observed_action.target, plan.actions[0].target);
                     observation.clone()
                 },
+                None,
             )
             .unwrap();
             assert_eq!(calls, 1);
@@ -2454,8 +2619,169 @@ mod tests {
                 verified.verification.overall_status,
                 if success { "success" } else { "failure" }
             );
-            assert_eq!(verified.resource_summary.unwrap().expected_freed_mb, 0.0);
+            assert!(verified.resource_summary.is_none());
         }
+    }
+
+    fn restored_observation(action: &PlanAction) -> RestorationObservation {
+        RestorationObservation {
+            attempt_id: "00000000-0000-4000-8000-000000000001".into(),
+            restore_id: "00000000-0000-4000-8000-000000000002".into(),
+            action_id: action.action_id.clone(),
+            original_value: match action.action {
+                Action::Throttle => ReversalValue::CpuMax {
+                    quota_us: -1,
+                    period_us: 100_000,
+                },
+                Action::Unfreeze => ReversalValue::Freeze { requested: true },
+                _ => ReversalValue::Freeze { requested: false },
+            },
+            recorded_restored_at: "1970-01-01T00:00:20Z".into(),
+            observed_at: "1970-01-01T00:00:30Z".into(),
+        }
+    }
+
+    #[test]
+    fn confirmed_restoration_preserves_action_history_and_earns_no_relief_credit() {
+        for action_kind in [Action::Freeze, Action::Unfreeze, Action::Throttle] {
+            let action = make_action(123, action_kind);
+            let saved = execution(&action);
+            let saved_before = serde_json::to_value(&saved).unwrap();
+            let observation = restored_observation(&action);
+            let current = make_proc(123, 1000, "worker", 5, ProcessState::Sleeping);
+            let result = verify_plan_with_postconditions(
+                &make_plan(vec![action]),
+                std::slice::from_ref(&saved),
+                &[current],
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |_| ActionPostcondition::Restored {
+                    observation: observation.clone(),
+                },
+                None,
+            )
+            .unwrap();
+            let outcome = &result.action_outcomes[0];
+            assert_eq!(outcome.outcome, VerifyOutcome::ConfirmedRestored);
+            assert_eq!(outcome.verified, Some(true));
+            assert_eq!(outcome.action, format!("{action_kind:?}").to_lowercase());
+            assert_eq!(
+                outcome.expected.as_deref(),
+                Some("recorded_original_controller_state")
+            );
+            assert_eq!(outcome.actual.as_deref(), Some("restoration_verified"));
+            assert_eq!(outcome.restoration.as_ref(), Some(&observation));
+            assert!(outcome.expected_resources_freed.is_none());
+            assert!(result.resource_summary.is_none());
+            assert_eq!(result.verification.overall_status, "success");
+            assert_eq!(result.follow_up_needed, Some(false));
+            assert_eq!(serde_json::to_value(&saved).unwrap(), saved_before);
+        }
+    }
+
+    #[test]
+    fn unverified_restoration_retains_original_expectation_and_failure() {
+        for reason in [
+            "latest restore is pending",
+            "latest restore failed",
+            "original controller value changed",
+            "scope identity changed",
+            "another session owns this controller",
+            "receipt is malformed",
+        ] {
+            let action = make_action(123, Action::Freeze);
+            let saved = execution(&action);
+            let result = verify_plan_with_postconditions(
+                &make_plan(vec![action]),
+                &[saved],
+                &[make_proc(123, 1000, "worker", 5, ProcessState::Sleeping)],
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |_| ActionPostcondition::RestorationUnverified {
+                    reason: reason.to_string(),
+                },
+                None,
+            )
+            .unwrap();
+            let outcome = &result.action_outcomes[0];
+            assert_eq!(outcome.outcome, VerifyOutcome::RestorationUnverified);
+            assert_eq!(outcome.verified, Some(false));
+            assert_eq!(
+                outcome.expected.as_deref(),
+                Some("cgroup_freeze_requested_and_completed")
+            );
+            assert_eq!(outcome.actual.as_deref(), Some("restoration_unverified"));
+            assert_eq!(outcome.note.as_deref(), Some(reason));
+            assert!(outcome.restoration.is_none());
+            assert_eq!(result.verification.overall_status, "failure");
+            assert_eq!(result.follow_up_needed, Some(true));
+        }
+    }
+
+    #[test]
+    fn restoration_observations_cannot_cross_actions_or_controller_types() {
+        for case in ["action_id", "control", "renice", "quarantine"] {
+            let action_kind = match case {
+                "renice" => Action::Renice,
+                "quarantine" => Action::Quarantine,
+                _ => Action::Freeze,
+            };
+            let action = make_action(123, action_kind);
+            let saved = execution(&action);
+            let mut observation = restored_observation(&action);
+            match case {
+                "action_id" => observation.action_id = "unrelated-action".into(),
+                "control" => {
+                    observation.original_value = ReversalValue::CpuMax {
+                        quota_us: -1,
+                        period_us: 100_000,
+                    }
+                }
+                _ => {}
+            }
+            let result = verify_plan_with_postconditions(
+                &make_plan(vec![action]),
+                &[saved],
+                &[make_proc(123, 1000, "worker", 5, ProcessState::Sleeping)],
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |_| ActionPostcondition::Restored {
+                    observation: observation.clone(),
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                result.action_outcomes[0].outcome,
+                VerifyOutcome::RestorationUnverified,
+                "{case}"
+            );
+            assert_eq!(result.action_outcomes[0].verified, Some(false), "{case}");
+            assert!(result.action_outcomes[0].restoration.is_none(), "{case}");
+        }
+    }
+
+    #[test]
+    fn newer_failed_execution_is_not_hidden_by_an_older_restoration() {
+        let action = make_action(123, Action::Throttle);
+        let saved = vec![execution(&action), failed_attempt(&action)];
+        let result = verify_plan_with_postconditions(
+            &make_plan(vec![action]),
+            &saved,
+            &[make_proc(123, 1000, "worker", 5, ProcessState::Sleeping)],
+            DateTime::from_timestamp(30, 0).unwrap(),
+            DateTime::from_timestamp(31, 0).unwrap(),
+            |_| panic!("failed execution must not consult restoration history"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.action_outcomes[0].actual.as_deref(),
+            Some("failed_attempt")
+        );
+        assert_eq!(result.action_outcomes[0].verified, Some(false));
+        assert!(result.action_outcomes[0].restoration.is_none());
+        assert_eq!(result.verification.overall_status, "failure");
     }
 
     #[test]
@@ -2511,6 +2837,7 @@ mod tests {
                         assert_eq!(observed.target, plan.actions[0].target);
                         observation.clone()
                     },
+                    None,
                 )
                 .unwrap();
                 let outcome = &result.action_outcomes[0];
@@ -2520,7 +2847,7 @@ mod tests {
                     Some(expected == VerifyOutcome::ConfirmedEffect)
                 );
                 assert!(outcome.expected_resources_freed.is_none());
-                assert_eq!(result.resource_summary.unwrap().expected_freed_mb, 0.0);
+                assert!(result.resource_summary.is_none());
             }
 
             for case in ["birth", "uid", "gone", "zombie", "failed", "dry_run"] {
@@ -2541,6 +2868,7 @@ mod tests {
                     DateTime::from_timestamp(30, 0).unwrap(),
                     DateTime::from_timestamp(31, 0).unwrap(),
                     |_| panic!("controller observer called for {action_kind:?}, {case}"),
+                    None,
                 )
                 .unwrap();
                 assert!(result
@@ -2886,6 +3214,7 @@ mod tests {
                 DateTime::from_timestamp(30, 0).unwrap(),
                 DateTime::from_timestamp(31, 0).unwrap(),
                 |_| panic!("observer called for {case}"),
+                None,
             )
             .unwrap();
             let unexecuted = matches!(case, "none" | "dry_run" | "shadow" | "skipped");
@@ -2918,6 +3247,7 @@ mod tests {
             DateTime::from_timestamp(30, 0).unwrap(),
             DateTime::from_timestamp(31, 0).unwrap(),
             |_| panic!("observer called for an invalid saved execution identity"),
+            None,
         )
         .is_err());
     }
@@ -3051,7 +3381,9 @@ mod tests {
         let saved: Vec<_> = plan.actions.iter().map(execution).collect();
         let mut current = make_proc(456, 1000, "node app --port 3000", 5, ProcessState::Running);
         current.start_id = plan.actions[1].target.start_id.clone();
-        let verified = report(&plan, &saved, &[current]);
+        let predictions =
+            private_predictions(&plan, &[(0, 100 * 1024 * 1024), (1, 100 * 1024 * 1024)]);
+        let verified = forecast_report(&plan, &saved, &[current], &predictions);
         assert_eq!(verified.verification.overall_status, "partial_success");
         let summary = verified.resource_summary.as_ref().unwrap();
         assert_eq!(summary.expected_mb, 200.0);
@@ -3077,6 +3409,158 @@ mod tests {
         );
         assert_eq!(json["schema_version"], pt_common::SCHEMA_VERSION);
         assert_eq!(json["session_id"], "session-test");
+    }
+
+    #[test]
+    fn saved_private_forecast_replaces_neither_rss_nor_a_missing_measurement_with_zero() {
+        for bytes in [0, 1_024, 32 * 1024 * 1024 + 4_096] {
+            let mut action = make_action(123, Action::Kill);
+            action.rationale.memory_mb = Some(9_999.0);
+            let saved = execution(&action);
+            let plan = make_plan(vec![action]);
+            let predictions = private_predictions(&plan, &[(0, bytes)]);
+            let mut current = make_proc(123, 1000, "worker", 5, ProcessState::Zombie);
+            current.rss_bytes = u64::MAX;
+            let verified = forecast_report(
+                &plan,
+                std::slice::from_ref(&saved),
+                &[current],
+                &predictions,
+            );
+            let expected = bytes as f64 / (1024.0 * 1024.0);
+            let summary = verified.resource_summary.unwrap();
+            assert_eq!(summary.expected_mb, expected);
+            assert_eq!(summary.expected_freed_mb, expected);
+            assert_eq!(
+                verified.action_outcomes[0]
+                    .expected_resources_freed
+                    .as_ref()
+                    .unwrap()
+                    .memory_mb,
+                expected
+            );
+            let unknown = report(&plan, &[saved], &[]);
+            assert!(unknown.resource_summary.is_none());
+            assert!(unknown.action_outcomes[0]
+                .expected_resources_freed
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn partial_forecasts_keep_known_action_values_without_inventing_a_total() {
+        let plan = make_plan(vec![
+            make_action(123, Action::Kill),
+            make_action(456, Action::Kill),
+        ]);
+        let saved: Vec<_> = plan.actions.iter().map(execution).collect();
+        let predictions = private_predictions(&plan, &[(0, 16 * 1024 * 1024)]);
+        let verified = forecast_report(&plan, &saved, &[], &predictions);
+        assert_eq!(verified.verification.overall_status, "success");
+        assert!(verified.resource_summary.is_none());
+        assert_eq!(
+            verified.action_outcomes[0]
+                .expected_resources_freed
+                .as_ref()
+                .unwrap()
+                .memory_mb,
+            16.0
+        );
+        assert!(verified.action_outcomes[1]
+            .expected_resources_freed
+            .is_none());
+    }
+
+    #[test]
+    fn repeated_kill_targets_are_counted_once_and_conflicting_or_missing_values_are_unknown() {
+        let first = make_action(123, Action::Kill);
+        let mut second = first.clone();
+        second.action_id.push_str("-second-stage");
+        second.order = 1;
+        let plan = make_plan(vec![first, second]);
+        let saved: Vec<_> = plan.actions.iter().map(execution).collect();
+        for (measurements, expected) in [
+            (
+                vec![(0, 32 * 1024 * 1024), (1, 32 * 1024 * 1024)],
+                Some(32.0),
+            ),
+            (vec![(0, 32 * 1024 * 1024), (1, 64 * 1024 * 1024)], None),
+            (vec![(0, 32 * 1024 * 1024)], None),
+        ] {
+            let predictions = private_predictions(&plan, &measurements);
+            let verified = forecast_report(&plan, &saved, &[], &predictions);
+            assert_eq!(
+                verified
+                    .resource_summary
+                    .as_ref()
+                    .map(|summary| summary.expected_mb),
+                expected
+            );
+            assert_eq!(
+                verified
+                    .resource_summary
+                    .as_ref()
+                    .map(|summary| summary.expected_freed_mb),
+                expected
+            );
+        }
+        for change in ["birth", "owner"] {
+            let mut distinct = plan.clone();
+            if change == "birth" {
+                distinct.actions[1].target.start_id = StartId("boot:600:123".into());
+            } else {
+                distinct.actions[1].target.uid += 1;
+            }
+            let saved: Vec<_> = distinct.actions.iter().map(execution).collect();
+            let predictions =
+                private_predictions(&distinct, &[(0, 32 * 1024 * 1024), (1, 32 * 1024 * 1024)]);
+            let verified = forecast_report(&distinct, &saved, &[], &predictions);
+            assert_eq!(
+                verified.resource_summary.unwrap().expected_freed_mb,
+                64.0,
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn forecasts_created_after_execution_are_unknown_and_foreign_plans_are_rejected() {
+        let plan = make_plan(vec![make_action(123, Action::Kill)]);
+        let saved = execution(&plan.actions[0]);
+        let predictions = private_predictions(&plan, &[(0, 64 * 1024 * 1024)]);
+        let mut late = predictions.snapshot().clone();
+        late.generated_at = "1970-01-01T00:00:11Z".into();
+        let late = late.validate(&plan).unwrap();
+        let verified = forecast_report(&plan, std::slice::from_ref(&saved), &[], &late);
+        assert_eq!(
+            verified.action_outcomes[0].outcome,
+            VerifyOutcome::ConfirmedDead
+        );
+        assert_eq!(verified.action_outcomes[0].verified, Some(true));
+        assert!(verified.resource_summary.is_none());
+        assert!(verified.action_outcomes[0]
+            .expected_resources_freed
+            .is_none());
+        assert!(verified.action_outcomes[0]
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("does not precede"));
+
+        let mut foreign = plan.clone();
+        foreign.plan_id = "different-plan".into();
+        assert!(matches!(
+            verify_plan_with_postconditions(
+                &foreign,
+                &[saved],
+                &[],
+                DateTime::from_timestamp(30, 0).unwrap(),
+                DateTime::from_timestamp(31, 0).unwrap(),
+                |_| panic!("invalid prediction binding must fail before observation"),
+                Some(&predictions),
+            ),
+            Err(VerifyError::InvalidResourcePredictions(_))
+        ));
     }
 
     #[test]
@@ -3139,14 +3623,17 @@ mod tests {
         assert_eq!(verified.verification.overall_status, "success");
         assert_eq!(verified.follow_up_needed, Some(false));
         assert!(verified.recommendations.is_none());
-        let summary = verified.resource_summary.as_ref().unwrap();
-        assert_eq!(summary.expected_mb, 100.0);
-        assert_eq!(summary.expected_freed_mb, 100.0);
-        assert!(summary.shortfall_reason.is_none());
+        assert!(verified.resource_summary.is_none());
         let json = serde_json::to_value(&verified).unwrap();
         assert!(json.get("recommendations").is_none());
-        assert!(json["resource_summary"].get("shortfall_reason").is_none());
-        for optional in ["respawn_detected", "time_to_death_ms", "note"] {
+        assert!(json.get("resource_summary").is_none());
+        for optional in [
+            "respawn_detected",
+            "time_to_death_ms",
+            "note",
+            "restoration",
+            "expected_resources_freed",
+        ] {
             assert!(json["action_outcomes"][0].get(optional).is_none());
         }
         assert_eq!(json["action_outcomes"][0]["outcome"], "confirmed_dead");
@@ -3156,6 +3643,11 @@ mod tests {
             (VerifyOutcome::ConfirmedDead, "confirmed_dead"),
             (VerifyOutcome::ConfirmedStopped, "confirmed_stopped"),
             (VerifyOutcome::ConfirmedEffect, "confirmed_effect"),
+            (VerifyOutcome::ConfirmedRestored, "confirmed_restored"),
+            (
+                VerifyOutcome::RestorationUnverified,
+                "restoration_unverified",
+            ),
             (VerifyOutcome::EffectNotObserved, "effect_not_observed"),
             (VerifyOutcome::StillRunning, "still_running"),
             (VerifyOutcome::Respawned, "respawned"),
@@ -3193,14 +3685,7 @@ mod tests {
                 .any(|recommendation| {
                     recommendation.contains("PID 123") && recommendation.contains(reason)
                 }));
-            assert_eq!(
-                verified
-                    .resource_summary
-                    .as_ref()
-                    .unwrap()
-                    .expected_freed_mb,
-                0.0
-            );
+            assert!(verified.resource_summary.is_none());
             assert!(verified.action_outcomes[0]
                 .expected_resources_freed
                 .is_none());
@@ -3208,15 +3693,23 @@ mod tests {
     }
 
     #[test]
-    fn absent_invalid_expected_memory_does_not_invent_resource_relief() {
-        for memory in [None, Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+    fn rss_never_substitutes_for_a_missing_saved_private_memory_forecast() {
+        for memory in [
+            None,
+            Some(0.0),
+            Some(1_000_000.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
             let mut action = make_action(123, Action::Kill);
             action.rationale.memory_mb = memory;
             let saved = execution(&action);
             let verified = report(&make_plan(vec![action]), &[saved], &[]);
-            let summary = verified.resource_summary.unwrap();
-            assert_eq!(summary.expected_mb, 0.0);
-            assert_eq!(summary.expected_freed_mb, 0.0);
+            assert!(verified.resource_summary.is_none());
+            assert!(verified.action_outcomes[0]
+                .expected_resources_freed
+                .is_none());
         }
     }
 
@@ -3247,7 +3740,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_cmd_preserves_arguments_and_rounding_is_stable() {
+    fn normalize_cmd_preserves_arguments() {
         assert_eq!(
             normalize_cmd("  node\t app  --port 3000\n"),
             "node app --port 3000"
@@ -3257,8 +3750,5 @@ mod tests {
             normalize_cmd("node app --port 30000")
         );
         assert_eq!(normalize_cmd("  "), "");
-        for (input, expected) in [(0.0, 0.0), (1.24, 1.2), (1.25, 1.3), (999.99, 1000.0)] {
-            assert!((round_to_tenth(input) - expected).abs() < f64::EPSILON);
-        }
     }
 }

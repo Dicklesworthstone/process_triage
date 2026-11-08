@@ -150,6 +150,20 @@ pub struct ReversalOutcome {
     pub timestamp: String,
 }
 
+/// Read-only evidence that a successfully executed action was intentionally
+/// undone and that its exact original controller state is still present.
+/// The original execution and restoration records remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestorationObservation {
+    pub attempt_id: String,
+    pub restore_id: String,
+    pub action_id: String,
+    pub original_value: ReversalValue,
+    pub recorded_restored_at: String,
+    pub observed_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReversalRecord {
@@ -285,6 +299,65 @@ impl ReversalJournal {
     #[cfg(not(target_os = "linux"))]
     pub fn inspect(&self, _action: &PlanAction) -> Result<Vec<ReversalRecord>, ActionError> {
         Err(failed("cgroup undo receipts are supported only on Linux"))
+    }
+
+    /// Observe intentional restoration without changing a controller or receipt.
+    /// Callers hold the same execution-policy lock as apply and undo. Only the
+    /// latest execution receipt can change the expected postcondition; a newer
+    /// incomplete attempt or restoration never inherits an older success.
+    #[cfg(target_os = "linux")]
+    pub fn observe_restoration(
+        &self,
+        action: &PlanAction,
+    ) -> Result<Option<RestorationObservation>, ActionError> {
+        if !matches!(
+            action.action,
+            Action::Freeze | Action::Unfreeze | Action::Throttle
+        ) {
+            return Ok(None);
+        }
+        let _lock = self
+            .lock
+            .lock()
+            .map_err(|_| failed("undo journal lock unavailable"))?;
+        let Some(directory) = JournalDirectory::open(&self.directory, false)? else {
+            return Ok(None);
+        };
+        let records = self.read_records(&directory)?;
+        let Some((record, restored)) = latest_recorded_restoration(&records, action)? else {
+            return Ok(None);
+        };
+        let observed_at = chrono::Utc::now();
+        validate_restoration_times(record, restored, observed_at)?;
+        refuse_newer_control(&records, record)?;
+        refuse_other_session_owner(
+            &self.sessions_root,
+            &record.operation,
+            Some(&self.session_id),
+        )?;
+        observe_restored_control(record)?;
+        directory.revalidate()?;
+        let observed_at = chrono::Utc::now();
+        validate_restoration_times(record, restored, observed_at)?;
+        let ReversalOperation::CgroupV2 { before, .. } = record.operation else {
+            return Err(failed("unsupported recorded restoration"));
+        };
+        Ok(Some(RestorationObservation {
+            attempt_id: record.attempt_id.clone(),
+            restore_id: restored.restore_id.clone(),
+            action_id: record.action_id.clone(),
+            original_value: before,
+            recorded_restored_at: restored.timestamp.clone(),
+            observed_at: observed_at.to_rfc3339(),
+        }))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn observe_restoration(
+        &self,
+        _action: &PlanAction,
+    ) -> Result<Option<RestorationObservation>, ActionError> {
+        Err(failed("restoration observation is supported only on Linux"))
     }
 
     /// Restore one saved attempt. The caller must hold the normal action and
@@ -752,6 +825,68 @@ fn refuse_newer_control(
                 later.attempt_id
             )));
         }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn latest_recorded_restoration<'a>(
+    records: &'a [ReversalRecord],
+    action: &PlanAction,
+) -> Result<Option<(&'a ReversalRecord, &'a ReversalOutcome)>, ActionError> {
+    let mut latest: Option<&ReversalRecord> = None;
+    for record in records
+        .iter()
+        .filter(|record| record.action_id == action.action_id)
+    {
+        record.check_action(action)?;
+        if latest.is_none_or(|previous| previous.sequence < record.sequence) {
+            latest = Some(record);
+        }
+    }
+    let Some(record) = latest else {
+        return Ok(None);
+    };
+    if matches!(
+        record.status,
+        ReversalStatus::Prepared | ReversalStatus::Failed
+    ) {
+        return Err(failed(
+            "latest recorded execution is incomplete or failed; restoration cannot replace its verification",
+        ));
+    }
+    let Some(restored) = record.restorations.last() else {
+        return Ok(None);
+    };
+    if record.status != ReversalStatus::Verified
+        || restored.status != RestorationStatus::Restored
+        || !matches!(record.operation, ReversalOperation::CgroupV2 { .. })
+    {
+        return Err(failed(
+            "latest recorded execution/restoration is not a verified action followed by a completed undo",
+        ));
+    }
+    Ok(Some((record, restored)))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_restoration_times(
+    record: &ReversalRecord,
+    restored: &ReversalOutcome,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ActionError> {
+    let parse = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+            .map_err(|_| failed("invalid recorded restoration timestamp"))
+    };
+    let prepared_at = parse(&record.prepared_at)?;
+    let restored_at = parse(&restored.timestamp)?;
+    let updated_at = parse(&record.updated_at)?;
+    if prepared_at > restored_at || restored_at > updated_at || updated_at > observed_at {
+        return Err(failed(
+            "recorded restoration timestamps are out of order or in the future",
+        ));
     }
     Ok(())
 }
@@ -1257,6 +1392,72 @@ fn restore_live(record: &ReversalRecord) -> Result<bool, ActionError> {
     restore_record_at(record, &pinned, revalidate)
 }
 
+/// The observation path deliberately invokes no restoration writer or journal
+/// updater. It proves the same complete live scope before reading old values.
+#[cfg(target_os = "linux")]
+fn observe_restored_control(record: &ReversalRecord) -> Result<(), ActionError> {
+    let ReversalOperation::CgroupV2 { scope, before, .. } = &record.operation else {
+        return Err(failed("unsupported recorded restoration"));
+    };
+    let current_path = super::dispatch::ensure_cgroup_target(&record.target)?;
+    if current_path != scope.cgroup_path {
+        return Err(failed("target moved from its recorded restoration cgroup"));
+    }
+    let directory = PathBuf::from(format!("/sys/fs/cgroup{current_path}"));
+    let handle = open_directory(&directory)?;
+    let pinned = pinned_directory(&handle);
+    let revalidate = || -> Result<(), ActionError> {
+        if super::dispatch::ensure_cgroup_target(&record.target)? != scope.cgroup_path {
+            return Err(failed(
+                "target changed cgroup during restoration observation",
+            ));
+        }
+        let current = open_directory(&directory)?;
+        if ReversalScope::capture(&scope.cgroup_path, &current)? != *scope
+            || ReversalScope::capture(&scope.cgroup_path, &handle)? != *scope
+        {
+            return Err(failed(
+                "recorded cgroup directory, mount, namespace, or boot changed",
+            ));
+        }
+        super::dispatch::ensure_exclusive_cgroup_path(record.target.pid.0, &pinned)
+    };
+    observe_original_control_at(&pinned, *before, revalidate)
+}
+
+/// Read exact original values twice with scope guards surrounding each sample.
+/// Freezer request and completed state must agree; no waiting or repair occurs.
+#[cfg(target_os = "linux")]
+fn observe_original_control_at(
+    directory: &Path,
+    original: ReversalValue,
+    revalidate: impl Fn() -> Result<(), ActionError>,
+) -> Result<(), ActionError> {
+    original.validate()?;
+    revalidate()?;
+    for _ in 0..2 {
+        match original {
+            ReversalValue::Freeze { requested } => {
+                let state = super::freeze::read_freezer_state(directory)?;
+                if state.requested != requested || state.frozen != requested {
+                    return Err(failed(
+                        "original freezer request and completed state are not both present",
+                    ));
+                }
+            }
+            ReversalValue::CpuMax { .. } => {
+                if read_control(directory, original)? != original {
+                    return Err(failed(
+                        "current CPU limit differs from the recorded original",
+                    ));
+                }
+            }
+        }
+        revalidate()?;
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn restore_record_at(
     record: &ReversalRecord,
@@ -1512,6 +1713,248 @@ mod tests {
                 .unwrap()
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn restoration_observation_without_history_is_read_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        assert!(journal
+            .observe_restoration(&action(Action::Freeze))
+            .unwrap()
+            .is_none());
+        assert!(!journal.directory().exists());
+
+        let action = action(Action::Freeze);
+        journal
+            .insert(&action, freeze_operation(), ReversalStatus::Verified)
+            .unwrap();
+        let before = fs::read_dir(journal.directory())
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.clone(), fs::read(path).unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert!(journal.observe_restoration(&action).unwrap().is_none());
+        assert_eq!(
+            fs::read_dir(journal.directory()).unwrap().count(),
+            before.len()
+        );
+        for (path, bytes) in before {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn restoration_credit_requires_latest_verified_execution_and_latest_completed_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let action = action(Action::Freeze);
+        let mut earlier = journal
+            .insert(&action, freeze_operation(), ReversalStatus::Verified)
+            .unwrap();
+        earlier.restorations.push(restored_outcome(&earlier));
+        assert!(latest_recorded_restoration(&[earlier.clone()], &action)
+            .unwrap()
+            .is_some());
+
+        for status in [ReversalStatus::Prepared, ReversalStatus::Failed] {
+            let mut later = earlier.clone();
+            later.attempt_id = uuid::Uuid::new_v4().to_string();
+            later.sequence += 1;
+            later.status = status;
+            later.restorations.clear();
+            assert!(latest_recorded_restoration(&[later, earlier.clone()], &action).is_err());
+        }
+        for status in [ReversalStatus::Applied, ReversalStatus::Verified] {
+            let mut later = earlier.clone();
+            later.attempt_id = uuid::Uuid::new_v4().to_string();
+            later.sequence += 1;
+            later.status = status;
+            later.restorations.clear();
+            assert!(
+                latest_recorded_restoration(&[later, earlier.clone()], &action)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for status in [RestorationStatus::Prepared, RestorationStatus::Failed] {
+            let mut record = earlier.clone();
+            let mut latest = restored_outcome(&record);
+            latest.status = status;
+            latest.changed = None;
+            record.restorations.push(latest);
+            assert!(latest_recorded_restoration(&[record], &action).is_err());
+        }
+        for status in [
+            ReversalStatus::Applied,
+            ReversalStatus::Prepared,
+            ReversalStatus::Failed,
+        ] {
+            let mut record = earlier.clone();
+            record.status = status;
+            assert!(latest_recorded_restoration(&[record], &action).is_err());
+        }
+        let mut foreign_action = action.clone();
+        foreign_action.target.uid += 1;
+        assert!(latest_recorded_restoration(&[earlier], &foreign_action).is_err());
+    }
+
+    #[test]
+    fn unsupported_execution_has_no_restoration_credit() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let action = action(Action::Throttle);
+        let mut record = journal
+            .insert(
+                &action,
+                ReversalOperation::Unsupported {
+                    reason: "v1 has no durable undo".to_string(),
+                },
+                ReversalStatus::Unsupported,
+            )
+            .unwrap();
+        assert!(latest_recorded_restoration(&[record.clone()], &action)
+            .unwrap()
+            .is_none());
+        record.restorations.push(restored_outcome(&record));
+        assert!(latest_recorded_restoration(&[record], &action).is_err());
+    }
+
+    #[test]
+    fn restoration_observation_refuses_malformed_future_and_reversed_timestamps() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let mut record = journal
+            .insert(
+                &action(Action::Freeze),
+                freeze_operation(),
+                ReversalStatus::Verified,
+            )
+            .unwrap();
+        record.prepared_at = "2020-01-01T00:00:00Z".to_string();
+        record.updated_at = "2020-01-01T00:00:02Z".to_string();
+        let mut restored = restored_outcome(&record);
+        restored.timestamp = "2020-01-01T00:00:01Z".to_string();
+        let now = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:03Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(validate_restoration_times(&record, &restored, now).is_ok());
+        for timestamp in ["invalid", "2019-12-31T23:59:59Z", "2020-01-01T00:00:04Z"] {
+            let mut invalid = restored.clone();
+            invalid.timestamp = timestamp.to_string();
+            assert!(validate_restoration_times(&record, &invalid, now).is_err());
+        }
+        record.updated_at = "2020-01-01T00:00:04Z".to_string();
+        assert!(validate_restoration_times(&record, &restored, now).is_err());
+    }
+
+    #[test]
+    fn original_cpu_observation_never_repairs_a_different_or_missing_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cpu.max");
+        let original = ReversalValue::CpuMax {
+            quota_us: -1,
+            period_us: 100_000,
+        };
+        assert!(observe_original_control_at(directory.path(), original, || Ok(())).is_err());
+        assert!(!path.exists());
+        for (text, matches) in [
+            ("max 100000\n", true),
+            ("25000 100000\n", false),
+            ("max 50000\n", false),
+            ("not-a-limit\n", false),
+        ] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(
+                observe_original_control_at(directory.path(), original, || Ok(())).is_ok(),
+                matches
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn original_freezer_observation_requires_request_and_completed_state_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        for requested in [false, true] {
+            let original = ReversalValue::Freeze { requested };
+            for current_request in [false, true] {
+                for completed in [false, true] {
+                    let request = format!("{}\n", u8::from(current_request));
+                    let events = format!("populated 1\nfrozen {}\n", u8::from(completed));
+                    fs::write(directory.path().join("cgroup.freeze"), &request).unwrap();
+                    fs::write(directory.path().join("cgroup.events"), &events).unwrap();
+                    assert_eq!(
+                        observe_original_control_at(directory.path(), original, || Ok(())).is_ok(),
+                        current_request == requested && completed == requested,
+                    );
+                    assert_eq!(
+                        fs::read_to_string(directory.path().join("cgroup.freeze")).unwrap(),
+                        request
+                    );
+                    assert_eq!(
+                        fs::read_to_string(directory.path().join("cgroup.events")).unwrap(),
+                        events
+                    );
+                }
+            }
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn original_control_observation_rechecks_late_controller_and_directory_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cpu.max");
+        fs::write(&path, "max 100000").unwrap();
+        let checks = Cell::new(0);
+        let original = ReversalValue::CpuMax {
+            quota_us: -1,
+            period_us: 100_000,
+        };
+        let result = observe_original_control_at(directory.path(), original, || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 {
+                fs::write(&path, "25000 100000").unwrap();
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "25000 100000");
+
+        let leaf = directory.path().join("leaf");
+        let moved = directory.path().join("moved");
+        fs::create_dir(&leaf).unwrap();
+        fs::write(leaf.join("cpu.max"), "max 100000").unwrap();
+        let handle = open_directory(&leaf).unwrap();
+        let expected = handle.metadata().unwrap();
+        let checks = Cell::new(0);
+        let result = observe_original_control_at(&pinned_directory(&handle), original, || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 {
+                fs::rename(&leaf, &moved).unwrap();
+                fs::create_dir(&leaf).unwrap();
+                fs::write(leaf.join("cpu.max"), "25000 100000").unwrap();
+            }
+            let current = fs::symlink_metadata(&leaf).unwrap();
+            if current.dev() != expected.dev() || current.ino() != expected.ino() {
+                Err(failed("directory changed"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(moved.join("cpu.max")).unwrap(),
+            "max 100000"
+        );
+        assert_eq!(
+            fs::read_to_string(leaf.join("cpu.max")).unwrap(),
+            "25000 100000"
         );
     }
 
