@@ -160,7 +160,7 @@ pub struct ProcessCandidate {
     pub memory_mb: Option<f64>,
     /// Whether process has known signature.
     pub has_known_signature: bool,
-    /// Open write file descriptors.
+    /// Open write file descriptors; None cannot satisfy an enabled data-loss gate.
     pub open_write_fds: Option<u32>,
     /// Whether process has locked files.
     pub has_locked_files: Option<bool>,
@@ -1108,6 +1108,16 @@ impl PolicyEnforcer {
                         context: Some(context),
                     });
                 }
+            } else {
+                return Some(PolicyViolation {
+                    kind: ViolationKind::DataLossGate,
+                    message: "open write file descriptor evidence is unavailable".to_string(),
+                    rule: "data_loss_gates.block_if_open_write_fds".to_string(),
+                    context: Some(
+                        "cannot establish the configured writable-file limit without complete evidence"
+                            .to_string(),
+                    ),
+                });
             }
         }
 
@@ -2092,6 +2102,73 @@ mod tests {
             result.violation.as_ref().unwrap().kind,
             ViolationKind::DataLossGate
         );
+    }
+
+    #[test]
+    fn data_loss_gate_unknown_write_descriptors_refuses_destructive_actions() {
+        let mut policy = test_policy();
+        policy.robot_mode.enabled = true;
+        policy.data_loss_gates.max_open_write_fds = Some(u32::MAX);
+        let enforcer = PolicyEnforcer::new(&policy, None).unwrap();
+        let mut candidate = test_candidate();
+        candidate.open_write_fds = None;
+        for robot in [false, true] {
+            for action in [Action::Kill, Action::Restart] {
+                let result = enforcer.check_action(&candidate, action, robot);
+                assert!(!result.allowed, "{action:?}, robot={robot}");
+                let violation = result.violation.unwrap();
+                assert_eq!(violation.kind, ViolationKind::DataLossGate);
+                assert_eq!(violation.rule, "data_loss_gates.block_if_open_write_fds");
+                assert!(violation.message.contains("unavailable"));
+            }
+            for action in [
+                Action::Keep,
+                Action::Renice,
+                Action::Resume,
+                Action::Unfreeze,
+            ] {
+                assert!(
+                    enforcer.check_action(&candidate, action, robot).allowed,
+                    "{action:?}, robot={robot}"
+                );
+            }
+        }
+        // An explicit disabled gate is distinct from unknown evidence under an
+        // enabled gate, regardless of how generous the numeric limit is.
+        policy.data_loss_gates.block_if_open_write_fds = false;
+        let disabled = PolicyEnforcer::new(&policy, None).unwrap();
+        for action in [Action::Kill, Action::Restart] {
+            assert!(disabled.check_action(&candidate, action, false).allowed);
+        }
+        candidate.open_write_fds = Some(0);
+        assert!(
+            enforcer
+                .check_action(&candidate, Action::Kill, false)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn recorded_write_descriptor_gate_refuses_unknown_evidence() {
+        let mut current = test_policy();
+        current.robot_mode.enabled = true;
+        current.data_loss_gates.block_if_open_write_fds = false;
+        let mut recorded = current.clone();
+        recorded.data_loss_gates.block_if_open_write_fds = true;
+        recorded.data_loss_gates.max_open_write_fds = Some(5);
+        let mut candidate = test_candidate();
+        candidate.open_write_fds = None;
+        for (current, recorded) in [(&current, &recorded), (&recorded, &current)] {
+            let enforcer =
+                PolicyEnforcer::new_with_recorded_policy(current, Some(recorded), None).unwrap();
+            for robot in [false, true] {
+                let result = enforcer.check_action(&candidate, Action::Kill, robot);
+                assert!(!result.allowed);
+                let violation = result.violation.unwrap();
+                assert_eq!(violation.kind, ViolationKind::DataLossGate);
+                assert!(violation.message.contains("unavailable"));
+            }
+        }
     }
 
     #[test]

@@ -4623,6 +4623,7 @@ fn build_tui_rows(
             .map(|matched| format!("{:?}", matched.signature.category));
         let advice = candidate_recommendation(
             proc,
+            population.iter().find(|parent| parent.pid == proc.ppid),
             &score,
             &decision_outcome,
             &decision_policy,
@@ -16825,6 +16826,100 @@ mod process_tree_safety_tests {
     }
 
     #[test]
+    fn zombie_policy_evidence_uses_the_actual_parent_only_for_routed_actions() {
+        use pt_core::decision::Action;
+
+        let zombie = rec(900, 500, "defunct worker", ProcessState::Zombie);
+        let parent = rec(500, 10, "worker supervisor", ProcessState::Sleeping);
+        let mut live = zombie.clone();
+        live.state = ProcessState::Sleeping;
+        for action in [Action::Kill, Action::Restart] {
+            let subject =
+                super::candidate_policy_evidence_subject(&zombie, Some(&parent), action).unwrap();
+            assert!(std::ptr::eq(subject, &parent));
+            assert_eq!(
+                process_identity_from_record(subject),
+                process_identity_from_record(&parent)
+            );
+            let direct =
+                super::candidate_policy_evidence_subject(&live, Some(&parent), action).unwrap();
+            assert!(std::ptr::eq(direct, &live));
+        }
+        // Keep/recovery/advice paths retain their own subject without requiring
+        // an unrelated parent's descriptors or creating a destructive route.
+        for action in [
+            Action::Keep,
+            Action::Renice,
+            Action::Pause,
+            Action::Resume,
+            Action::Freeze,
+            Action::Unfreeze,
+        ] {
+            let subject = super::candidate_policy_evidence_subject(&zombie, None, action).unwrap();
+            assert!(std::ptr::eq(subject, &zombie));
+        }
+    }
+
+    #[test]
+    fn zombie_policy_evidence_refuses_unusable_routes_before_probing() {
+        use pt_core::decision::Action;
+
+        let zombie = rec(900, 500, "defunct worker", ProcessState::Zombie);
+        let parent = rec(500, 10, "worker supervisor", ProcessState::Sleeping);
+        for case in [
+            "missing",
+            "wrong_parent",
+            "init",
+            "self_parent",
+            "zombie_parent",
+            "dead_parent",
+            "unknown_parent",
+            "missing_parent_birth",
+            "foreign_parent_birth",
+            "unknown_parent_boot",
+            "synthetic_parent_boot",
+            "unknown_source_boot",
+            "foreign_source_birth",
+        ] {
+            let mut source = zombie.clone();
+            let mut target = parent.clone();
+            match case {
+                "wrong_parent" => target.pid = pt_common::ProcessId(600),
+                "init" => {
+                    source.ppid = pt_common::ProcessId(1);
+                    target = rec(1, 0, "init", ProcessState::Sleeping);
+                }
+                "self_parent" => {
+                    source.ppid = source.pid;
+                    target = source.clone();
+                    target.state = ProcessState::Sleeping;
+                }
+                "zombie_parent" => target.state = ProcessState::Zombie,
+                "dead_parent" => target.state = ProcessState::Dead,
+                "unknown_parent" => target.state = ProcessState::Unknown,
+                "missing_parent_birth" => target.start_id = StartId(String::new()),
+                "foreign_parent_birth" => target.start_id = StartId::from_linux("b", 1, 600),
+                "unknown_parent_boot" => target.start_id = StartId::from_linux("unknown", 1, 500),
+                "synthetic_parent_boot" => {
+                    target.start_id = StartId::from_macos("synthetic", 1, 500);
+                }
+                "unknown_source_boot" => source.start_id = StartId::from_linux("unknown", 1, 900),
+                "foreign_source_birth" => source.start_id = StartId::from_linux("b", 1, 901),
+                _ => {}
+            }
+            for action in [Action::Kill, Action::Restart] {
+                let subject = super::candidate_policy_evidence_subject(
+                    &source,
+                    (case != "missing").then_some(&target),
+                    action,
+                );
+                assert!(subject.is_err(), "{case}: {action:?}");
+                assert!(subject.unwrap_err().contains("usable parent identity"));
+            }
+        }
+    }
+
+    #[test]
     fn zombie_recommendations_refuse_missing_wrong_and_init_parents() {
         let zombie = rec(900, 500, "defunct worker", ProcessState::Zombie);
         let wrong = rec(600, 10, "unrelated", ProcessState::Sleeping);
@@ -19478,18 +19573,19 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 }));
             }
             let decision_outcome = inputs.decision;
+            let parent = scan_result
+                .processes
+                .iter()
+                .find(|parent| parent.pid == proc.ppid);
             let mut advice = candidate_recommendation(
                 proc,
+                parent,
                 &score,
                 &decision_outcome,
                 &decision_policy,
                 &enforcer,
                 global.robot,
             );
-            let parent = scan_result
-                .processes
-                .iter()
-                .find(|parent| parent.pid == proc.ppid);
             if proc.state.is_zombie() && matches!(advice.action, "kill" | "restart") {
                 let refusal = match parent {
                     Some(parent) => planned_zombie_parent_refusal(
@@ -20974,31 +21070,81 @@ fn candidate_feasibility(
     feasibility
 }
 
+/// Select the process whose writable-file evidence the proposed remedy needs.
+/// A zombie cannot lose more data; its parent receives the reaping notification.
+/// Reject an unusable route before any probe, independently of policy opt-outs.
+fn candidate_policy_evidence_subject<'a>(
+    process: &'a ProcessRecord,
+    parent: Option<&'a ProcessRecord>,
+    action: Action,
+) -> Result<&'a ProcessRecord, &'static str> {
+    if !process.state.is_zombie() || !matches!(action, Action::Kill | Action::Restart) {
+        return Ok(process);
+    }
+    let usable_identity = |record: &ProcessRecord| {
+        process_identity_from_record(record).quality == IdentityQuality::Full
+            && pt_common::StartId::parse(&record.start_id.0).is_some()
+            && record
+                .start_id
+                .0
+                .rsplit(':')
+                .next()
+                .and_then(|pid| pid.parse::<u32>().ok())
+                == Some(record.pid.0)
+    };
+    parent
+        .filter(|parent| {
+            parent.pid == process.ppid
+                && parent.pid.0 > 1
+                && parent.pid != process.pid
+                && !matches!(
+                    parent.state,
+                    ProcessState::Zombie | ProcessState::Dead | ProcessState::Unknown
+                )
+                && usable_identity(process)
+                && usable_identity(parent)
+        })
+        .ok_or("zombie remedy requires a usable parent identity from the full scan")
+}
+
 fn candidate_recommendation(
     proc: &ProcessRecord,
+    parent: Option<&ProcessRecord>,
     score: &pt_core::scoring::ProcessScore<'_>,
     decision: &pt_core::decision::DecisionOutcome,
     policy: &pt_core::config::Policy,
     enforcer: &pt_core::decision::PolicyEnforcer,
     robot: bool,
 ) -> CandidateRecommendation {
+    let subject = candidate_policy_evidence_subject(proc, parent, decision.optimal_action);
+    let mut evidence_refusal = subject.as_ref().err().map(|reason| (*reason).to_string());
+    let subject = subject.ok();
+    let routed_zombie =
+        proc.state.is_zombie() && matches!(decision.optimal_action, Action::Kill | Action::Restart);
+    let evidence_action = if routed_zombie {
+        Action::Restart
+    } else {
+        decision.optimal_action
+    };
     // Only read descriptor links to recognize a FUSE server. Following files
     // under its mounts for a writable-file probe can itself block on a stalled
     // server, so do not probe them once the infrastructure gate has refused.
-    let fuse_server = policy
-        .guardrails
-        .builtin_protection
-        .then(|| pt_core::collect::protected::holds_fuse_device(proc.pid.0))
-        .flatten();
+    // For a zombie remedy this evidence belongs to the actual parent target.
+    let fuse_server = if policy.guardrails.builtin_protection {
+        subject.and_then(|subject| pt_core::collect::protected::holds_fuse_device(subject.pid.0))
+    } else {
+        None
+    };
     let fuse_mounts = if fuse_server == Some(true) {
-        pt_core::collect::protected::fuse_mountpoints(proc.pid.0)
+        subject
+            .map(|subject| pt_core::collect::protected::fuse_mountpoints(subject.pid.0))
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
     #[cfg(target_os = "linux")]
-    let fuse_refusal = if policy.guardrails.builtin_protection {
-        match pt_core::action::prechecks::fuse_action_precheck(fuse_server, decision.optimal_action)
-        {
+    let fuse_refusal = if policy.guardrails.builtin_protection && subject.is_some() {
+        match pt_core::action::prechecks::fuse_action_precheck(fuse_server, evidence_action) {
             pt_core::action::prechecks::PreCheckResult::Blocked { reason, .. } => Some(reason),
             _ => None,
         }
@@ -21009,12 +21155,30 @@ fn candidate_recommendation(
     let fuse_refusal: Option<String> = None;
     let destructive =
         fuse_refusal.is_none() && matches!(decision.optimal_action, Action::Kill | Action::Restart);
-    let open_write_fds = destructive
-        .then(|| pt_core::action::prechecks::open_write_fd_count(proc.pid.0))
-        .flatten();
+    let open_write_fds = if destructive {
+        subject.and_then(|subject| {
+            if routed_zombie {
+                // Preserve the parent's infrastructure/group evidence ordering;
+                // a dead source's empty or unreadable table proves nothing about it.
+                match process_policy_candidate(enforcer, subject, evidence_action) {
+                    Ok(target) => target.open_write_fds,
+                    Err(error) => {
+                        evidence_refusal =
+                            Some(format!("parent policy evidence unavailable: {error}"));
+                        None
+                    }
+                }
+            } else {
+                pt_core::action::prechecks::open_write_fd_count(subject.pid.0)
+            }
+        })
+    } else {
+        None
+    };
     #[cfg(target_os = "linux")]
-    let critical_files = if destructive {
-        pt_core::collect::parse_fd(proc.pid.0)
+    let critical_files = if destructive && evidence_refusal.is_none() {
+        subject
+            .and_then(|subject| pt_core::collect::parse_fd(subject.pid.0).ok())
             .map(|fd| fd.critical_writes)
             .unwrap_or_default()
     } else {
@@ -21132,6 +21296,10 @@ fn candidate_recommendation(
             action = "review";
             rationale = format!("Downgraded to review: {reason}; {rationale}");
         }
+    }
+    if let Some(reason) = evidence_refusal {
+        action = "review";
+        rationale = format!("Downgraded to review: {reason}; {rationale}");
     }
     if action == "restart" && !proc.state.is_zombie() && score.supervisor_restart.is_none() {
         action = "review";
@@ -22050,6 +22218,10 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
 
         let advice = candidate_recommendation(
             proc,
+            scan_result
+                .processes
+                .iter()
+                .find(|parent| parent.pid == proc.ppid),
             &score,
             &decision_outcome,
             &decision_policy,
@@ -29654,12 +29826,19 @@ fn evaluate_watch_candidate(
     )
     .ok()?;
     let decision_outcome = inputs.decision;
-    let mut advice =
-        candidate_recommendation(proc, &score, &decision_outcome, policy, enforcer, robot);
     let parent = protection
         .population
         .iter()
         .find(|parent| parent.pid == proc.ppid);
+    let mut advice = candidate_recommendation(
+        proc,
+        parent,
+        &score,
+        &decision_outcome,
+        policy,
+        enforcer,
+        robot,
+    );
     if proc.state.is_zombie() && matches!(advice.action, "kill" | "restart") {
         let refusal = match parent {
             Some(parent) => planned_zombie_parent_refusal(
