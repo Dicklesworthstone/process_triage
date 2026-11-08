@@ -125,6 +125,7 @@ impl std::fmt::Display for GoalParseError {
 /// - "free 4GB RAM"
 /// - "free 500MB memory"
 /// - "reduce CPU below 50%"
+/// - "CPU < 50%" or "CPU <= 50%" (whole-host capacity)
 /// - "free 20% CPU"
 /// - "release port 3000"
 /// - "free port 3000"
@@ -204,15 +205,24 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
         });
     }
 
+    // "CPU < <N>%" / "CPU <= <N>%", including compact forms.
+    if let Some(rest) = lower.strip_prefix("cpu") {
+        let rest = rest.trim_start();
+        if let Some(amount) = rest.strip_prefix("<=").or_else(|| rest.strip_prefix('<')) {
+            return Ok(ResourceTarget {
+                metric: Metric::Cpu,
+                value: parse_cpu_fraction(amount.trim())?,
+                comparator: Comparator::ReduceBelow,
+                port: None,
+            });
+        }
+    }
+
     // "reduce CPU below <N>%"
-    if tokens.len() >= 4 && tokens[0] == "reduce" && tokens[1] == "cpu" && tokens[2] == "below" {
-        let pct_str = tokens[3].trim_end_matches('%');
-        let pct: f64 = pct_str
-            .parse()
-            .map_err(|_| GoalParseError::InvalidNumber(pct_str.to_string()))?;
+    if tokens.len() == 4 && tokens[0] == "reduce" && tokens[1] == "cpu" && tokens[2] == "below" {
         return Ok(ResourceTarget {
             metric: Metric::Cpu,
-            value: pct / 100.0,
+            value: parse_cpu_fraction(tokens[3])?,
             comparator: Comparator::ReduceBelow,
             port: None,
         });
@@ -223,14 +233,10 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
         let amount_str = tokens[1];
 
         // CPU percentage: "free 20% CPU"
-        if amount_str.ends_with('%') && (tokens[2] == "cpu") {
-            let pct_str = amount_str.trim_end_matches('%');
-            let pct: f64 = pct_str
-                .parse()
-                .map_err(|_| GoalParseError::InvalidNumber(pct_str.to_string()))?;
+        if tokens.len() == 3 && amount_str.ends_with('%') && tokens[2] == "cpu" {
             return Ok(ResourceTarget {
                 metric: Metric::Cpu,
-                value: pct / 100.0,
+                value: parse_cpu_fraction(amount_str)?,
                 comparator: Comparator::FreeAtLeast,
                 port: None,
             });
@@ -274,6 +280,17 @@ fn parse_single_goal(input: &str) -> Result<ResourceTarget, GoalParseError> {
     }
 
     Err(GoalParseError::UnrecognizedFormat(input.to_string()))
+}
+
+/// CPU goals are fractions of the whole host, not percentages of one core.
+fn parse_cpu_fraction(amount: &str) -> Result<f64, GoalParseError> {
+    let number = amount.strip_suffix('%').unwrap_or(amount);
+    let percent = number
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+        .ok_or_else(|| GoalParseError::InvalidNumber(amount.to_string()))?;
+    Ok(percent / 100.0)
 }
 
 /// Parse a memory amount string like "4GB", "500MB", "1024B" into bytes.
@@ -357,6 +374,34 @@ mod tests {
         } else {
             panic!("Expected Target");
         }
+    }
+
+    #[test]
+    fn cpu_threshold_aliases_and_canonical_form_round_trip() {
+        let expected = parse_goal("reduce CPU below 50%").unwrap();
+        for input in ["CPU < 50%", "cpu<=50%", "CpU <= 50%"] {
+            assert_eq!(parse_goal(input).unwrap(), expected, "{input}");
+        }
+        assert_eq!(parse_goal(&expected.canonical()).unwrap(), expected);
+        let combined = parse_goal("CPU < 80% AND free 4GB RAM").unwrap();
+        assert!(matches!(combined, Goal::And(parts) if parts.len() == 2));
+    }
+
+    #[test]
+    fn cpu_targets_are_finite_whole_host_percentages() {
+        for amount in ["-1", "100.1", "NaN", "inf", "1e309", "20%", "20 extra"] {
+            for input in [
+                format!("CPU < {amount}%"),
+                format!("reduce CPU below {amount}%"),
+                format!("free {amount}% CPU"),
+            ] {
+                assert!(parse_goal(&input).is_err(), "{input}");
+            }
+        }
+        assert!(parse_goal("CPU <= 0%").is_ok());
+        assert!(parse_goal("CPU <= 100%").is_ok());
+        assert!(parse_goal("reduce CPU below 50% extra").is_err());
+        assert!(parse_goal("free 20% CPU extra").is_err());
     }
 
     #[test]

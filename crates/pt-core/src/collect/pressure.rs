@@ -20,8 +20,182 @@
 //! averages with `getloadavg`; unsupported pressure sensors remain unavailable.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
+
+/// Aggregate CPU accounting from `/proc/stat`, with the observed online CPU IDs.
+/// The first eight counters include guest time through user/nice already; adding
+/// the separate guest counters would count that work twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCpuCounters {
+    ticks: [u64; 8],
+    cpu_ids: BTreeSet<u32>,
+}
+
+/// CPU capacity observed over the same interval as process tick deltas.
+/// Percentages use the whole host as 100%, including unselected processes and
+/// kernel work. Idle and I/O-wait ticks are excluded from busy time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HostCpuWindow {
+    pub total_ticks: u64,
+    pub busy_ticks: u64,
+    pub logical_cpus: u32,
+    pub window_seconds: f64,
+}
+
+impl HostCpuWindow {
+    /// Whole-host busy percentage, or unknown for an invalid observation.
+    pub fn busy_percent(&self) -> Option<f64> {
+        self.process_percent(self.busy_ticks)
+    }
+
+    /// A process's measured share of host capacity, using its raw tick delta.
+    /// A contribution larger than all observed busy time cannot be trusted.
+    pub fn process_percent(&self, process_ticks: u64) -> Option<f64> {
+        if self.total_ticks == 0
+            || self.busy_ticks > self.total_ticks
+            || self.logical_cpus == 0
+            || !self.window_seconds.is_finite()
+            || self.window_seconds <= 0.0
+            || process_ticks > self.busy_ticks
+        {
+            return None;
+        }
+        Some(100.0 * (process_ticks as f64 / self.total_ticks as f64))
+    }
+}
+
+const HOST_CPU_FIELDS: [&str; 8] = [
+    "user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal",
+];
+
+fn parse_host_cpu_row(
+    label: &str,
+    mut values: std::str::SplitWhitespace<'_>,
+) -> Result<[u64; 8], String> {
+    let mut ticks = [0; 8];
+    for (index, field) in HOST_CPU_FIELDS.iter().enumerate() {
+        let value = values
+            .next()
+            .ok_or_else(|| format!("{label}: missing {field} counter"))?;
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(format!("{label}: invalid {field} counter"));
+        }
+        ticks[index] = value
+            .parse()
+            .map_err(|_| format!("{label}: {field} counter exceeds u64"))?;
+    }
+    // Guest columns and future extensions are not additional CPU capacity, but
+    // malformed counters still invalidate the reading rather than disappearing.
+    for value in values {
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) || value.parse::<u64>().is_err() {
+            return Err(format!("{label}: invalid trailing CPU counter"));
+        }
+    }
+    ticks
+        .iter()
+        .try_fold(0_u64, |sum, tick| sum.checked_add(*tick))
+        .ok_or_else(|| format!("{label}: accounting counter sum exceeds u64"))?;
+    Ok(ticks)
+}
+
+/// Parse aggregate accounting and online CPU identities from `/proc/stat`.
+/// Missing, duplicate, malformed or overflowing CPU rows are unavailable.
+pub fn parse_host_cpu_counters(text: &str) -> Result<HostCpuCounters, String> {
+    let mut aggregate = None;
+    let mut cpu_ids = BTreeSet::new();
+    for line in text.lines() {
+        let mut values = line.split_whitespace();
+        let Some(label) = values.next() else {
+            continue;
+        };
+        if label == "cpu" {
+            if aggregate.is_some() {
+                return Err("duplicate aggregate cpu row".to_string());
+            }
+            aggregate = Some(parse_host_cpu_row(label, values)?);
+        } else if let Some(id) = label.strip_prefix("cpu") {
+            if !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("invalid CPU identifier: {label}"));
+            }
+            let id = id
+                .parse::<u32>()
+                .map_err(|_| format!("CPU identifier exceeds u32: {label}"))?;
+            if !cpu_ids.insert(id) {
+                return Err(format!("duplicate CPU identifier: {label}"));
+            }
+            parse_host_cpu_row(label, values)?;
+        }
+    }
+    let ticks = aggregate.ok_or_else(|| "missing aggregate cpu row".to_string())?;
+    if cpu_ids.is_empty() {
+        return Err("no online CPU rows in /proc/stat".to_string());
+    }
+    Ok(HostCpuCounters { ticks, cpu_ids })
+}
+
+/// Read CPU accounting from a filesystem root (`/` on the live machine).
+pub fn read_host_cpu_counters_from(root: &Path) -> Result<HostCpuCounters, String> {
+    let path = root.join("proc/stat");
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    parse_host_cpu_counters(&text).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Read the live host's CPU accounting without substituting load averages.
+#[cfg(target_os = "linux")]
+pub fn read_host_cpu_counters() -> Result<HostCpuCounters, String> {
+    read_host_cpu_counters_from(Path::new("/"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_host_cpu_counters() -> Result<HostCpuCounters, String> {
+    Err("host CPU accounting requires Linux /proc/stat".to_string())
+}
+
+/// Measure host capacity over a monotonic interval. A reset in any accounting
+/// component (including the kernel's occasionally decreasing iowait) or a change
+/// in online CPU identities makes the window unknown instead of a zero baseline.
+pub fn host_cpu_window(
+    before: &HostCpuCounters,
+    after: &HostCpuCounters,
+    elapsed: Duration,
+) -> Result<HostCpuWindow, String> {
+    if elapsed.is_zero() {
+        return Err("host CPU sampling interval is zero".to_string());
+    }
+    if before.cpu_ids != after.cpu_ids {
+        return Err("online CPU topology changed during sampling".to_string());
+    }
+    let logical_cpus = u32::try_from(after.cpu_ids.len())
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| "online CPU count is unavailable".to_string())?;
+    let mut deltas = [0; 8];
+    for (index, field) in HOST_CPU_FIELDS.iter().enumerate() {
+        deltas[index] = after.ticks[index]
+            .checked_sub(before.ticks[index])
+            .ok_or_else(|| format!("host CPU {field} counter decreased during sampling"))?;
+    }
+    let total_ticks = deltas
+        .iter()
+        .try_fold(0_u64, |sum, tick| sum.checked_add(*tick))
+        .filter(|total| *total > 0)
+        .ok_or_else(|| "host CPU tick delta is zero or exceeds u64".to_string())?;
+    let idle_ticks = deltas[3]
+        .checked_add(deltas[4])
+        .ok_or_else(|| "host idle CPU tick delta exceeds u64".to_string())?;
+    let busy_ticks = total_ticks
+        .checked_sub(idle_ticks)
+        .ok_or_else(|| "host idle CPU ticks exceed total ticks".to_string())?;
+    Ok(HostCpuWindow {
+        total_ticks,
+        busy_ticks,
+        logical_cpus,
+        window_seconds: elapsed.as_secs_f64(),
+    })
+}
 
 /// One PSI line (`some` or `full`): running averages in percent and the cumulative
 /// stall time in microseconds.
@@ -556,6 +730,166 @@ pub fn pressure_window_with_elapsed(
 }
 
 #[cfg(test)]
+mod host_cpu_tests {
+    use super::*;
+
+    const BEFORE: &str = "cpu 100 20 30 800 20 10 10 10 7 3\n\
+                         cpu0 60 10 20 390 10 5 3 2 4 2\n\
+                         cpu3 40 10 10 410 10 5 7 8 3 1\n\
+                         intr 1000 0 0\n";
+    // Reversed, noncontiguous CPU IDs still describe the same two online CPUs.
+    const AFTER: &str = "cpu 140 30 50 860 60 20 20 20 37 8\n\
+                        cpu3 60 15 20 440 30 10 12 13 18 3\n\
+                        cpu0 80 15 30 420 30 10 8 7 19 5\n\
+                        intr 1200 0 0\n";
+
+    #[test]
+    fn host_window_uses_observed_ticks_without_double_counting_guests() {
+        let before = parse_host_cpu_counters(BEFORE).unwrap();
+        let after = parse_host_cpu_counters(AFTER).unwrap();
+        let window = host_cpu_window(&before, &after, Duration::from_secs(1)).unwrap();
+        // 200 total ticks, with 60 idle and 40 iowait. The 35 guest ticks are
+        // already in user/nice and do not increase either total or busy time.
+        assert_eq!(window.total_ticks, 200);
+        assert_eq!(window.busy_ticks, 100);
+        assert_eq!(window.logical_cpus, 2);
+        assert_eq!(window.window_seconds, 1.0);
+        assert_eq!(window.busy_percent(), Some(50.0));
+        assert_eq!(window.process_percent(40), Some(20.0));
+        assert_eq!(window.process_percent(100), Some(50.0));
+        assert_eq!(window.process_percent(101), None);
+        assert_eq!(window.process_percent(0), Some(0.0));
+    }
+
+    #[test]
+    fn host_parser_accepts_eight_counters_without_guest_columns() {
+        let bare =
+            parse_host_cpu_counters("cpu 10 2 3 40 5 6 7 8\ncpu0 10 2 3 40 5 6 7 8\n").unwrap();
+        let guest =
+            parse_host_cpu_counters("cpu 10 2 3 40 5 6 7 8 8 1\ncpu0 10 2 3 40 5 6 7 8 8 1\n")
+                .unwrap();
+        assert_eq!(bare, guest);
+    }
+
+    #[test]
+    fn host_parser_refuses_incomplete_duplicate_and_invalid_cpu_rows() {
+        let row = "1 2 3 4 5 6 7 8";
+        let cpu = format!("cpu {row}\n");
+        let cpu0 = format!("cpu0 {row}\n");
+        for invalid in [
+            String::new(),
+            cpu0.clone(),
+            cpu.clone(),
+            format!("{cpu}{cpu}{cpu0}"),
+            format!("{cpu}{cpu0}{cpu0}"),
+            format!("{cpu}cpu0 1 2 3 4 5 6 7\n"),
+            format!("cpu 1 2 3 4 5 6 7\n{cpu0}"),
+            format!("cpu +1 2 3 4 5 6 7 8\n{cpu0}"),
+            format!("cpu 1 2 3 -4 5 6 7 8\n{cpu0}"),
+            format!("cpu 1 2 3 4 5 6 7 8 broken\n{cpu0}"),
+            format!("{cpu}cpuwrong {row}\n"),
+            format!("{cpu}cpu4294967296 {row}\n"),
+            format!("cpu 18446744073709551616 0 0 0 0 0 0 0\n{cpu0}"),
+            format!("cpu {} 1 0 0 0 0 0 0\n{cpu0}", u64::MAX),
+        ] {
+            assert!(parse_host_cpu_counters(&invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn host_window_refuses_each_counter_reset_even_when_other_counters_advance() {
+        let before = parse_host_cpu_counters(BEFORE).unwrap();
+        for (index, field) in HOST_CPU_FIELDS.iter().enumerate() {
+            let mut after = parse_host_cpu_counters(AFTER).unwrap();
+            after.ticks[index] = before.ticks[index] - 1;
+            let error = host_cpu_window(&before, &after, Duration::from_secs(1)).unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn host_window_refuses_zero_observation_and_changed_cpu_identity_sets() {
+        let before = parse_host_cpu_counters(BEFORE).unwrap();
+        let after = parse_host_cpu_counters(AFTER).unwrap();
+        assert!(host_cpu_window(&before, &after, Duration::ZERO).is_err());
+        assert!(host_cpu_window(&before, &before, Duration::from_secs(1)).is_err());
+        for cpu_ids in [
+            BTreeSet::from([0, 7]),
+            BTreeSet::from([0]),
+            BTreeSet::from([0, 3, 7]),
+        ] {
+            let changed = HostCpuCounters {
+                cpu_ids,
+                ..after.clone()
+            };
+            assert!(host_cpu_window(&before, &changed, Duration::from_secs(1)).is_err());
+        }
+        let short = host_cpu_window(&before, &after, Duration::from_nanos(1)).unwrap();
+        assert_eq!(short.window_seconds, 1e-9);
+        assert_eq!(short.busy_percent(), Some(50.0));
+    }
+
+    #[test]
+    fn host_percentages_refuse_invalid_window_fields() {
+        let valid = HostCpuWindow {
+            total_ticks: 200,
+            busy_ticks: 100,
+            logical_cpus: 2,
+            window_seconds: 0.5,
+        };
+        for invalid in [
+            HostCpuWindow {
+                total_ticks: 0,
+                ..valid
+            },
+            HostCpuWindow {
+                busy_ticks: 201,
+                ..valid
+            },
+            HostCpuWindow {
+                logical_cpus: 0,
+                ..valid
+            },
+        ] {
+            assert_eq!(invalid.busy_percent(), None);
+            assert_eq!(invalid.process_percent(0), None);
+        }
+        for window_seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let invalid = HostCpuWindow {
+                window_seconds,
+                ..valid
+            };
+            assert_eq!(invalid.busy_percent(), None);
+            assert_eq!(invalid.process_percent(0), None);
+        }
+        let idle = HostCpuWindow {
+            busy_ticks: 0,
+            ..valid
+        };
+        assert_eq!(idle.busy_percent(), Some(0.0));
+        assert_eq!(idle.process_percent(0), Some(0.0));
+        assert_eq!(idle.process_percent(1), None);
+        let large = HostCpuWindow {
+            total_ticks: u64::MAX,
+            busy_ticks: u64::MAX - 1,
+            ..valid
+        };
+        assert!(large.busy_percent().unwrap().is_finite());
+        assert_eq!(large.process_percent(u64::MAX), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_cpu_live_reader_keeps_real_observations_and_io_errors() {
+        let live = read_host_cpu_counters().expect("live /proc/stat is readable");
+        assert!(!live.cpu_ids.is_empty());
+        assert!(live.ticks.iter().any(|ticks| *ticks > 0));
+        let error = read_host_cpu_counters_from(Path::new("/dev/null")).unwrap_err();
+        assert!(error.contains("/dev/null/proc/stat"), "{error}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -629,6 +963,48 @@ mod tests {
             std::fs::write(path, text).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn host_cpu_window_round_trip_retains_capacity_and_validation() {
+        let window = HostCpuWindow {
+            total_ticks: 200,
+            busy_ticks: 100,
+            logical_cpus: 2,
+            window_seconds: 1.0,
+        };
+        let mut json = serde_json::to_value(window).unwrap();
+        assert_eq!(json["total_ticks"], 200);
+        assert_eq!(json["busy_ticks"], 100);
+        assert_eq!(json["logical_cpus"], 2);
+        assert_eq!(json["window_seconds"], 1.0);
+        assert_eq!(
+            serde_json::from_value::<HostCpuWindow>(json.clone()).unwrap(),
+            window
+        );
+        json["busy_ticks"] = serde_json::json!(201);
+        let invalid = serde_json::from_value::<HostCpuWindow>(json).unwrap();
+        assert_eq!(invalid.busy_percent(), None);
+        assert_eq!(invalid.process_percent(1), None);
+    }
+
+    #[test]
+    fn host_cpu_root_reader_reports_missing_and_malformed_accounting() {
+        let text = "cpu 10 2 3 40 5 6 7 8\ncpu0 10 2 3 40 5 6 7 8\n";
+        let root = fake_root(&[("proc/stat", text)]);
+        assert_eq!(
+            read_host_cpu_counters_from(root.path()).unwrap(),
+            parse_host_cpu_counters(text).unwrap()
+        );
+        let missing = fake_root(&[]);
+        let error = read_host_cpu_counters_from(missing.path()).unwrap_err();
+        assert!(error.contains("proc/stat"), "{error}");
+        let malformed = fake_root(&[("proc/stat", "cpu 1 2\n")]);
+        let error = read_host_cpu_counters_from(malformed.path()).unwrap_err();
+        assert!(
+            error.contains("proc/stat") && error.contains("missing system"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -816,9 +1192,16 @@ mod tests {
 
         // Keep real sub-millisecond precision rather than a nominal delay.
         let mut short_after = before.clone();
-        short_after.cpu.as_mut().unwrap().some.as_mut().unwrap().total_us += 250;
-        let short =
-            pressure_window_with_elapsed(&before, &short_after, Duration::from_micros(500)).unwrap();
+        short_after
+            .cpu
+            .as_mut()
+            .unwrap()
+            .some
+            .as_mut()
+            .unwrap()
+            .total_us += 250;
+        let short = pressure_window_with_elapsed(&before, &short_after, Duration::from_micros(500))
+            .unwrap();
         assert_eq!(short.seconds, 0.0005);
         assert_eq!(short.cpu.unwrap().some, Some(0.5));
     }

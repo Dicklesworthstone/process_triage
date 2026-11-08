@@ -2061,6 +2061,22 @@ fn plan_deep_adds_network_evidence() {
         assert!(activity["cpu_percent"].as_f64().unwrap() >= 0.0);
         assert_eq!(candidate["cpu_percent"], activity["cpu_percent"]);
         assert!(candidate["cpu_lifetime_percent"].is_number());
+        let host_cpu = &output["system_state"]["cpu_usage"];
+        if host_cpu.is_null() {
+            assert!(candidate["cpu_host_percent"].is_null());
+            assert!(output["system_state"]["pressure"]["unavailable"]
+                .as_array().unwrap().iter().any(|source| source["source"] == "cpu_usage"),
+                "an unavailable host CPU interval must retain its reason");
+        } else {
+            let total = host_cpu["total_ticks"].as_u64().unwrap();
+            assert!(total > 0);
+            assert!(host_cpu["logical_cpus"].as_u64().unwrap() > 0);
+            assert!(host_cpu["busy_ticks"].as_u64().unwrap() <= total);
+            assert!(host_cpu["window_seconds"].as_f64().unwrap()
+                >= activity["cpu_window_seconds"].as_f64().unwrap());
+            assert_eq!(candidate["cpu_host_percent"].as_f64(),
+                Some(100.0 * (activity["cpu_ticks"].as_u64().unwrap() as f64 / total as f64)));
+        }
         assert_eq!(
             candidate["blast_radius"]["cpu_pct"],
             candidate["cpu_percent"]
@@ -2112,6 +2128,8 @@ fn plan_deep_adds_network_evidence() {
         .expect("explicit pressure-window availability")
         .is_null());
     assert!(legacy_candidate["activity"].is_null());
+    assert!(legacy["system_state"]["cpu_usage"].is_null());
+    assert!(legacy_candidate["cpu_host_percent"].is_null());
     assert_eq!(
         legacy_candidate["cpu_percent"],
         legacy_candidate["cpu_lifetime_percent"]

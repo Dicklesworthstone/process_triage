@@ -4258,7 +4258,7 @@ fn build_tui_rows(
     let mut rows = Vec::new();
     let mut plan_candidates = HashMap::new();
     let mut goal_candidates: HashMap<u32, serde_json::Value> = HashMap::new();
-    let cpu_total = process_cpu_total(population, scorer).unwrap_or(f64::NAN);
+    let cpu_total = pressure.cpu_goal_baseline().unwrap_or(f64::NAN);
     let mut supervision = pt_core::supervision::SupervisionDetector::for_scan();
 
     for proc in processes {
@@ -4283,6 +4283,7 @@ fn build_tui_rows(
         };
         let posterior_result = &score.posterior;
         let cpu_percent = process_cpu_percent(proc, score.activity.as_ref());
+        let cpu_host_percent = pressure.cpu_goal_percent(proc, score.activity.as_ref());
         let feasibility = candidate_feasibility(proc);
         let inputs = match prepare_pressure_decision(
             &posterior_result.posterior,
@@ -4478,6 +4479,7 @@ fn build_tui_rows(
                 "action_rationale": rationale,
                 "memory_mb": memory_mb,
                 "cpu_percent": cpu_percent,
+                "cpu_host_percent": cpu_host_percent,
                 "expected_loss": expected_loss_entries,
                 "pressure_decision": pressure_decision,
             }),
@@ -4882,14 +4884,14 @@ fn resource_goal_from_target(
         },
         Metric::Cpu => {
             let target_pct = target.value * 100.0;
-            if !target_pct.is_finite() {
-                return Err("CPU goal percentage must be finite".to_string());
+            if !target_pct.is_finite() || target_pct > 100.0 {
+                return Err("CPU goal percentage must be between 0 and 100% of host capacity".to_string());
             }
             let desired = match target.comparator {
                 Comparator::ReduceBelow => {
-                    if !current_cpu_pct.is_finite() || current_cpu_pct < 0.0 {
+                    if !current_cpu_pct.is_finite() || !(0.0..=100.0).contains(&current_cpu_pct) {
                         return Err(
-                            "CPU reduce-below goal requires complete CPU measurements for the full observed process population".to_string(),
+                            "CPU reduce-below goal requires a measured host CPU window; use agent plan with --window-ms greater than zero".to_string(),
                         );
                     }
                     let required = (current_cpu_pct - target_pct).max(0.0);
@@ -4898,8 +4900,12 @@ fn resource_goal_from_target(
                     }
                     required
                 }
-                Comparator::FreeAtLeast => target_pct,
-                Comparator::Release => target_pct,
+                Comparator::FreeAtLeast | Comparator::Release => {
+                    if !current_cpu_pct.is_finite() || !(0.0..=100.0).contains(&current_cpu_pct) {
+                        warnings.push("cpu_host_measurement_unavailable".to_string());
+                    }
+                    target_pct
+                }
             };
             ResourceGoal {
                 resource: "cpu_pct".to_string(),
@@ -5022,8 +5028,9 @@ fn build_opt_candidates_for_goals(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as f64;
             let cpu_pct = candidate
-                .get("cpu_percent")
+                .get("cpu_host_percent")
                 .and_then(|v| v.as_f64())
+                .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
                 .unwrap_or(0.0);
             let identity = goal_candidate_identity(candidate);
 
@@ -5122,6 +5129,44 @@ fn build_goal_plan_from_candidates(
     resources: &GoalResourceSnapshot,
 ) -> Result<GoalPlanOutput, String> {
     let mut warnings = resources.warnings.clone();
+    let requests_cpu = match goal {
+        Goal::Target(target) => target.metric == Metric::Cpu,
+        Goal::And(parts) | Goal::Or(parts) => parts
+            .iter()
+            .any(|part| matches!(part, Goal::Target(target) if target.metric == Metric::Cpu)),
+    };
+    if requests_cpu {
+        let unavailable = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate["recommended_action"].as_str() == Some("kill")
+                    && candidate["cpu_host_percent"]
+                        .as_f64()
+                        .is_none_or(|percent| {
+                            !percent.is_finite() || !(0.0..=100.0).contains(&percent)
+                        })
+            })
+            .count();
+        if unavailable > 0 {
+            warnings.push(format!(
+                "cpu_host_contribution_unavailable_for_{unavailable}_candidates"
+            ));
+        }
+    }
+    let resource_observations = serde_json::json!({
+        "basis": "observed_snapshot",
+        "port_scope": "current_network_namespace",
+        "process_scope": "mounted_procfs",
+        "ports": resources.ports,
+        "cpu": requests_cpu.then(|| serde_json::json!({
+            "basis": "proc_stat_tick_window",
+            "unit": "percent_of_host_capacity",
+            "busy_percent": current_cpu_pct.is_finite()
+                .then_some(current_cpu_pct)
+                .filter(|percent| (0.0..=100.0).contains(percent)),
+            "process_contribution": "process_tick_delta_divided_by_host_total_tick_delta",
+        })),
+    });
     let (goals, mut w) = match goal {
         Goal::Or(parts) => {
             let mut best: Option<(OptimizationResult, Vec<ResourceGoal>)> = None;
@@ -5136,8 +5181,7 @@ fn build_goal_plan_from_candidates(
                         if goal_requires_cpu_baseline(sub)
                             && (!current_cpu_pct.is_finite() || current_cpu_pct < 0.0)
                             && t.value.is_finite()
-                            && t.value >= 0.0
-                            && (t.value * 100.0).is_finite() =>
+                            && (0.0..=1.0).contains(&t.value) =>
                     {
                         warnings.push(format!("cpu_reduce_below_baseline_unavailable: {error}"));
                         continue;
@@ -5191,12 +5235,7 @@ fn build_goal_plan_from_candidates(
                 result,
                 strategy: "or_best".to_string(),
                 warnings,
-                resource_observations: serde_json::json!({
-                    "basis": "observed_snapshot",
-                    "port_scope": "current_network_namespace",
-                    "process_scope": "mounted_procfs",
-                    "ports": resources.ports,
-                }),
+                resource_observations,
             });
         }
         _ => build_resource_goals(goal, current_cpu_pct, resources)?,
@@ -5222,12 +5261,7 @@ fn build_goal_plan_from_candidates(
         selected_pids,
         strategy: "and".to_string(),
         warnings,
-        resource_observations: serde_json::json!({
-            "basis": "observed_snapshot",
-            "port_scope": "current_network_namespace",
-            "process_scope": "mounted_procfs",
-            "ports": resources.ports,
-        }),
+        resource_observations,
     })
 }
 
@@ -5241,7 +5275,7 @@ fn goal_summary_json(goal_str: &str, goal: &Goal, output: &GoalPlanOutput) -> se
                 "target": g.target,
                 "unit": match g.resource.as_str() {
                     "memory_mb" => "MiB",
-                    "cpu_pct" => "percent_of_one_core",
+                    "cpu_pct" => "percent_of_host_capacity",
                     "fd_count" => "descriptors",
                     resource if resource.starts_with("port_") => "holder_processes",
                     _ => "unknown",
@@ -5501,6 +5535,7 @@ mod executable_goal_tests {
                     "recommended_action": "kill",
                     "memory_mb": memory_mb,
                     "cpu_percent": cpu_percent,
+                    "cpu_host_percent": cpu_percent,
                     "expected_loss": [{"action": "kill", "loss": 1.0}],
                     "goal_selected": true,
                     "goal_rank": 99,
@@ -6169,16 +6204,16 @@ mod executable_goal_tests {
     }
 
     #[test]
-    fn cpu_goal_requires_full_current_baseline_without_affecting_memory_goals() {
+    fn cpu_goal_requires_host_window_without_affecting_memory_goals() {
         let goal = parse_goal("reduce CPU below 50%").unwrap();
         assert!(goal_requires_cpu_baseline(&goal));
         assert!(goal_requires_cpu_baseline(&Goal::And(vec![goal.clone()])));
         assert!(goal_requires_cpu_baseline(&Goal::Or(vec![goal.clone()])));
-        for missing in [f64::NAN, f64::INFINITY, -1.0] {
+        for missing in [f64::NAN, f64::INFINITY, -1.0, 800.0] {
             let error =
                 build_resource_goals(&goal, missing, &GoalResourceSnapshot::default()).unwrap_err();
             assert!(
-                error.contains("full observed process population"),
+                error.contains("measured host CPU window"),
                 "{error}"
             );
         }
@@ -6211,7 +6246,7 @@ mod executable_goal_tests {
             build_resource_goals(&required, f64::NAN, &GoalResourceSnapshot::default()).is_err()
         );
 
-        for invalid in [f64::NAN, f64::INFINITY, -1.0, f64::MAX] {
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 1.01, f64::MAX] {
             let mut invalid_goal = goal.clone();
             let Goal::Target(target) = &mut invalid_goal else {
                 unreachable!();
@@ -6221,6 +6256,58 @@ mod executable_goal_tests {
                 build_resource_goals(&invalid_goal, 100.0, &GoalResourceSnapshot::default())
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn cpu_goal_uses_measured_host_share_and_never_raw_process_percent() {
+        let goal_str = "CPU < 50%";
+        let goal = parse_goal(goal_str).unwrap();
+        let (mut candidates, plan) = fixture(&[(100, 0, 25.0)]);
+        // Two fully occupied cores on an eight-core host are 25% of host
+        // capacity. The process display remains 200% of one core.
+        candidates[0]["cpu_percent"] = serde_json::json!(200.0);
+        let output = build_goal_plan_from_executable_actions(
+            goal_str,
+            &goal,
+            80.0,
+            &mut candidates,
+            &plan,
+            &GoalResourceSnapshot::default(),
+        )
+        .unwrap();
+        assert!(!output.result.feasible);
+        assert_eq!(output.result.total_contributions, vec![25.0]);
+        assert_eq!(output.result.goal_achievement[0].shortfall, 5.0);
+        let summary = goal_summary_json(goal_str, &goal, &output);
+        assert_eq!(summary["targets"][0]["unit"], "percent_of_host_capacity");
+        assert_eq!(
+            summary["resource_observations"]["cpu"]["busy_percent"],
+            80.0
+        );
+
+        for missing in [
+            serde_json::Value::Null,
+            serde_json::json!(-1.0),
+            serde_json::json!(200.0),
+        ] {
+            candidates[0]["cpu_host_percent"] = missing;
+            let output = build_goal_plan_from_executable_actions(
+                goal_str,
+                &goal,
+                80.0,
+                &mut candidates,
+                &plan,
+                &GoalResourceSnapshot::default(),
+            )
+            .unwrap();
+            assert!(!output.result.feasible);
+            assert_eq!(output.result.total_contributions, vec![0.0]);
+            assert!(output.selected_pids.is_empty());
+            assert!(output
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("cpu_host_contribution_unavailable")));
         }
     }
 
@@ -6276,7 +6363,9 @@ fn build_goal_advisory_from_scan(
         .iter()
         .map(|p| p.rss_bytes as f64 / (1024.0 * 1024.0))
         .sum();
-    let total_cpu_pct: f64 = result.processes.iter().map(|p| p.cpu_percent).sum();
+    // A one-shot inventory has no host or per-process counter interval. Lifetime
+    // percentages cannot establish current utilization or attainable CPU relief.
+    let total_cpu_pct = f64::NAN;
     let resources = GoalResourceSnapshot::collect(goal, &result.processes);
 
     let (goals, mut warnings) = match build_resource_goals(goal, total_cpu_pct, &resources) {
@@ -6296,7 +6385,7 @@ fn build_goal_advisory_from_scan(
         .map(|g| {
             let achieved = match g.resource.as_str() {
                 "memory_mb" => total_mem_mb,
-                "cpu_pct" => total_cpu_pct,
+                "cpu_pct" => 0.0,
                 _ => 0.0,
             };
             serde_json::json!({
@@ -17291,6 +17380,7 @@ fn system_state_from_pressure(
         "memory": memory,
         "process_count": process_count,
         "psi": psi,
+        "cpu_usage": serde_json::Value::Null,
         "pressure": snapshot,
         "pressure_window": window,
         "census": census,
@@ -18382,6 +18472,7 @@ fn process_cpu_percent(
 #[derive(Default)]
 struct PlanningPressure {
     snapshot: Option<pt_core::collect::pressure::PressureSnapshot>,
+    cpu_usage: Option<pt_core::collect::pressure::HostCpuWindow>,
     severity: pt_core::decision::pressure_regime::ResourceSeverity,
     unavailable: Vec<String>,
 }
@@ -18416,11 +18507,59 @@ impl PlanningPressure {
                 Default::default()
             }
         };
+        let cpu_usage = system
+            .get("cpu_usage")
+            .filter(|value| !value.is_null())
+            .and_then(|value| {
+                match serde_json::from_value::<pt_core::collect::pressure::HostCpuWindow>(
+                    value.clone(),
+                ) {
+                    Ok(window) if window.busy_percent().is_some() => Some(window),
+                    Ok(_) => {
+                        unavailable.push("host CPU accounting window is invalid".to_string());
+                        None
+                    }
+                    Err(error) => {
+                        unavailable
+                            .push(format!("host CPU accounting window unavailable: {error}"));
+                        None
+                    }
+                }
+            });
         Self {
             snapshot,
+            cpu_usage,
             severity,
             unavailable,
         }
+    }
+
+    fn cpu_goal_baseline(&self) -> Option<f64> {
+        self.cpu_usage.as_ref()?.busy_percent()
+    }
+
+    /// Credit only CPU ticks observed inside the enclosing host counter window.
+    /// This puts every process on the same whole-host scale without substituting
+    /// lifetime percentages, affinity limits or a filtered candidate census.
+    fn cpu_goal_percent(
+        &self,
+        process: &ProcessRecord,
+        activity: Option<&pt_core::collect::ProcessActivity>,
+    ) -> Option<f64> {
+        let host = self.cpu_usage.as_ref()?;
+        let activity = activity.filter(|sample| {
+            sample.pid == process.pid.0
+                && sample.uid == process.uid
+                && sample.start_id == process.start_id
+                && sample.source == "procfs_window"
+                && sample.cpu_error.is_none()
+                && sample.requested_window_ms > 0
+        })?;
+        let seconds = activity.cpu_window_seconds?;
+        if !seconds.is_finite() || seconds <= 0.0 || seconds > host.window_seconds {
+            return None;
+        }
+        host.process_percent(activity.cpu_ticks?)
     }
 
     fn for_process(
@@ -18562,6 +18701,7 @@ mod planning_pressure_tests {
                 io: 0.0,
                 fd: 0.0,
             },
+            cpu_usage: None,
             unavailable: Vec::new(),
         }
     }
@@ -18594,6 +18734,70 @@ mod planning_pressure_tests {
                 ..ProcessPressureActivity::default()
             }),
         }
+    }
+
+    #[test]
+    fn cpu_goals_use_enclosing_host_ticks_and_exact_process_identity() {
+        use pt_core::collect::pressure::HostCpuWindow;
+
+        let process = process();
+        let mut host = host();
+        host.cpu_usage = Some(HostCpuWindow {
+            total_ticks: 800,
+            busy_ticks: 600,
+            logical_cpus: 8,
+            window_seconds: 1.0,
+        });
+        let sample = activity(&process);
+        assert_eq!(host.cpu_goal_baseline(), Some(75.0));
+        assert_eq!(host.cpu_goal_percent(&process, Some(&sample)), Some(25.0));
+        assert_eq!(host.cpu_goal_percent(&process, None), None);
+        for case in 0..11 {
+            let mut invalid = sample.clone();
+            match case {
+                0 => invalid.pid += 1,
+                1 => invalid.uid += 1,
+                2 => invalid.start_id = StartId("reused".to_string()),
+                3 => invalid.source = "ps_lifetime_fallback".to_string(),
+                4 => invalid.cpu_error = Some("unreadable".to_string()),
+                5 => invalid.requested_window_ms = 0,
+                6 => invalid.cpu_window_seconds = Some(0.0),
+                7 => invalid.cpu_window_seconds = Some(f64::NAN),
+                8 => invalid.cpu_window_seconds = Some(2.0),
+                9 => invalid.cpu_ticks = None,
+                10 => invalid.cpu_ticks = Some(601),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                host.cpu_goal_percent(&process, Some(&invalid)),
+                None,
+                "case {case}"
+            );
+        }
+        // Display/lifetime percentages cannot change a tick-based contribution.
+        let mut sample = sample;
+        sample.cpu_percent = Some(9900.0);
+        assert_eq!(host.cpu_goal_percent(&process, Some(&sample)), Some(25.0));
+        let mut system = system_state_from_pressure(host.snapshot.clone().unwrap(), None, None);
+        system["cpu_usage"] = serde_json::json!(host.cpu_usage);
+        let restored = PlanningPressure::from_system_state(&system);
+        assert_eq!(restored.cpu_goal_baseline(), Some(75.0));
+        assert_eq!(
+            restored.cpu_goal_percent(&process, Some(&sample)),
+            Some(25.0)
+        );
+        system["cpu_usage"]["busy_ticks"] = serde_json::json!(801);
+        let invalid = PlanningPressure::from_system_state(&system);
+        assert_eq!(invalid.cpu_goal_baseline(), None);
+        assert!(invalid
+            .unavailable
+            .iter()
+            .any(|reason| reason.contains("CPU accounting window")));
+        system["cpu_usage"] = serde_json::Value::Null;
+        assert_eq!(
+            PlanningPressure::from_system_state(&system).cpu_goal_baseline(),
+            None
+        );
     }
 
     #[test]
@@ -19103,7 +19307,9 @@ fn collect_planning_activity(
     population: &[ProcessRecord],
     window_ms: u64,
 ) -> serde_json::Value {
-    use pt_core::collect::pressure::read_pressure_snapshot;
+    use pt_core::collect::pressure::{
+        host_cpu_window, read_host_cpu_counters, read_pressure_snapshot,
+    };
 
     // Linux process sampling already waits once for the whole population. Read
     // host counters around that work without a second sleep, and use its actual
@@ -19112,18 +19318,46 @@ fn collect_planning_activity(
     let baseline = (cfg!(target_os = "linux") && !requested.is_zero() && !population.is_empty())
         .then(|| {
             let snapshot = read_pressure_snapshot();
-            (snapshot, std::time::Instant::now())
+            let pressure_started = std::time::Instant::now();
+            let cpu = read_host_cpu_counters();
+            (snapshot, pressure_started, cpu, std::time::Instant::now())
         });
     // One shared window includes protected/young processes and ancestors. They
     // still consume resources and establish ownership, without becoming action
     // candidates. Never resample per unit or use lifetime CPU to fill a gap.
     scorer.collect_activity(&population.iter().collect::<Vec<_>>(), requested);
+    let cpu_usage = match baseline.as_ref() {
+        Some((_, _, before, started)) => {
+            let after = read_host_cpu_counters();
+            let elapsed = started.elapsed();
+            if elapsed < requested {
+                Err("process sampling did not complete the requested host CPU interval".to_string())
+            } else {
+                before.as_ref().map_err(Clone::clone).and_then(|before| {
+                    after.and_then(|after| host_cpu_window(before, &after, elapsed))
+                })
+            }
+        }
+        None => Err(
+            "host CPU utilization requires a nonzero process sampling window on Linux".to_string(),
+        ),
+    };
     let mut snapshot = read_pressure_snapshot();
+    if let Err(reason) = &cpu_usage {
+        snapshot
+            .unavailable
+            .push(pt_core::collect::pressure::Unavailable {
+                source: "cpu_usage".to_string(),
+                reason: reason.clone(),
+            });
+    }
     let baseline = baseline
         .as_ref()
-        .map(|(before, started)| (before, started.elapsed()));
+        .map(|(before, started, _, _)| (before, started.elapsed()));
     let window = planning_pressure_window(&mut snapshot, baseline, requested);
-    system_state_from_pressure(snapshot, window, Some(population))
+    let mut system = system_state_from_pressure(snapshot, window, Some(population));
+    system["cpu_usage"] = serde_json::json!(cpu_usage.ok());
+    system
 }
 
 fn responsible_unit_rank(pressure: &PlanningPressure) -> AttributionResource {
@@ -19209,17 +19443,6 @@ fn print_responsible_units(table: &ResponsibleUnitTable) {
             table.units.len() - 8
         );
     }
-}
-
-fn process_cpu_total(population: &[ProcessRecord], scorer: &Scorer) -> Option<f64> {
-    if population.is_empty() {
-        return None;
-    }
-    population.iter().try_fold(0.0, |total, process| {
-        let percent = process_cpu_percent(process, scorer.activity_for(process).as_ref())?;
-        let sum = total + percent;
-        (percent.is_finite() && percent >= 0.0 && sum.is_finite()).then_some(sum)
-    })
 }
 
 fn candidate_feasibility(proc: &ProcessRecord) -> ActionFeasibility {
@@ -20445,6 +20668,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "memory_mb": proc.rss_bytes / (1024 * 1024),
             "cpu_percent": cpu_percent,
             "cpu_lifetime_percent": proc.cpu_percent,
+            "cpu_host_percent": pressure.cpu_goal_percent(proc, activity.as_ref()),
             "activity": activity,
             "resource_observation": resource_observation,
             "score": score,
@@ -20759,13 +20983,12 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
     let mut goal_selected: Option<HashSet<u32>> = None;
     let mut parsed_goal: Option<Goal> = None;
     let mut goal_resources = GoalResourceSnapshot::default();
-    // Reduce-below goals use the full observed host snapshot. Protection,
-    // --pids, sampling, --only and candidate caps constrain actions; they do
-    // not remove the excluded processes' CPU usage from the recovery target.
+// The host counter interval includes all work, including kernel activity and
+    // processes outside the visible census. Candidate filters constrain actions;
+    // they never shrink the host utilization baseline or change percentage units.
     // NaN is an internal unknown marker; CPU reduce-below conversion rejects
     // it before arithmetic, while goals that need no CPU baseline still work.
-    let total_cpu_pct_for_goal =
-        process_cpu_total(&scan_result.processes, &scorer).unwrap_or(f64::NAN);
+    let total_cpu_pct_for_goal = pressure.cpu_goal_baseline().unwrap_or(f64::NAN);
     if let Some(goal_str) = args.goal.as_deref() {
         match parse_goal(goal_str) {
             Ok(goal) => {

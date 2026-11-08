@@ -1040,9 +1040,12 @@ pt agent plan --goal "free 4GB memory" --format json
 pt agent plan --goal "release port 8080" --format json
 pt agent plan --goal "free port 3000" --format json
 pt agent plan --goal "free 100 FDs" --format json
+pt agent plan --goal "CPU < 80%" --window-ms 1000 --format json
 ```
 
 The optimizer searches for a low-loss combination of kills: bounded branch-and-bound for a single goal, with a greedy fallback when its work budget is exhausted, and greedy selection for combined goals. Only candidates whose final, identity-bound action is an unblocked direct `kill` contribute to the forecast. Policy refusals, review decisions, and kill budgets are applied before the final goal summary is calculated.
+
+CPU goals use **100% for the whole host**, including kernel work and processes outside the candidate list. On Linux, `CPU < 80%`, `CPU <= 80%`, and `reduce CPU below 80%` use an aggregate `/proc/stat` interval around the same sampling window as the process counters. `free 20% CPU` requests 20 percentage points of host capacity. Each candidate's `cpu_host_percent` is its measured CPU tick delta divided by the host's total tick delta; the ordinary `cpu_percent` display still uses 100% per core. The saved `system_state.cpu_usage` contains the host counters, interval, and logical CPU count, and the goal summary states the units and baseline. These are forecasts of recent demand, not a guarantee about future utilization. A zero sampling window, unreadable or reset counters, changed online CPUs, or a missing process interval cannot supply CPU recovery credit. Reduce-below goals require a valid host window; use `--window-ms` greater than zero.
 
 For `agent plan --goal`, the saved executable plan contains only that selected set and any preceding pause stage for the same identities. `agent apply --recommended`, default resume, and `agent plan --yes` use this restricted set. A goal that is already satisfied produces no executable actions; malformed goals and goals lacking required evidence cannot fall back to unrelated triage actions. The selected subset is checked again for live-child safety. Independent candidate advice remains visible, with `goal_selected` and `plan_action_ids` identifying what this session actually plans to execute.
 
