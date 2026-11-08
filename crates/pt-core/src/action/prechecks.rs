@@ -680,6 +680,157 @@ fn lsof_lock_evidence(
     Ok(found)
 }
 
+/// Keep the safety query separate from the best-effort inventory collector.
+/// `+w` enables warnings, and `0` keeps field contents separate from records.
+#[cfg(any(target_os = "macos", test))]
+fn lsof_write_fd_args(pid: &str) -> [&str; 7] {
+    ["+w", "-n", "-P", "-p", pid, "-F", "0pftna"]
+}
+
+/// Read one complete lsof field set: NUL-terminated fields followed by a newline.
+/// A newline within a name remains part of that field, never a second descriptor.
+#[cfg(any(target_os = "macos", test))]
+fn take_lsof_field_set<'a>(remaining: &mut &'a str) -> Result<Vec<&'a str>, String> {
+    let mut fields = Vec::new();
+    loop {
+        let rest = *remaining;
+        let end = rest
+            .find('\0')
+            .ok_or_else(|| "unterminated lsof field".to_string())?;
+        let field = &rest[..end];
+        if field.is_empty() {
+            return Err("empty lsof field".to_string());
+        }
+        fields.push(field);
+        *remaining = &rest[end + 1..];
+        if let Some(rest) = remaining.strip_prefix('\n') {
+            *remaining = rest;
+            return Ok(fields);
+        }
+    }
+}
+
+/// Count writable regular descriptors only from complete, scoped lsof evidence.
+/// The inventory collector can return an empty list on errors, omit unknown
+/// fields and keep partial output; none of those outcomes proves a safe zero.
+#[cfg(any(target_os = "macos", test))]
+fn lsof_write_fd_evidence(
+    pid: u32,
+    output: Result<crate::collect::tool_runner::ToolOutput, crate::collect::tool_runner::ToolError>,
+) -> Result<u32, String> {
+    let output = output.map_err(|error| format!("lsof for pid {pid}: {error}"))?;
+    if !output.success() || output.timed_out || output.truncated || !output.stderr.is_empty() {
+        return Err(format!(
+            "incomplete lsof writable-descriptor evidence for pid {pid} (exit {:?}, timeout {}, truncated {}): {}",
+            output.exit_code,
+            output.timed_out,
+            output.truncated,
+            output.stderr_str().trim()
+        ));
+    }
+    let mut remaining = std::str::from_utf8(&output.stdout)
+        .map_err(|error| format!("invalid lsof evidence for pid {pid}: {error}"))?;
+    let process = take_lsof_field_set(&mut remaining)?;
+    let owner = process
+        .first()
+        .and_then(|field| field.strip_prefix('p'))
+        .filter(|owner| !owner.is_empty() && owner.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|owner| owner.parse::<u32>().ok());
+    if pid == 0 || process.len() != 1 || owner != Some(pid) || remaining.is_empty() {
+        return Err(format!(
+            "missing or mismatched lsof process/descriptor evidence for pid {pid}"
+        ));
+    }
+
+    let mut descriptors = HashSet::new();
+    let mut write_count = 0_u32;
+    while !remaining.is_empty() {
+        let fields = take_lsof_field_set(&mut remaining)?;
+        let fd = fields[0]
+            .strip_prefix('f')
+            .filter(|fd| !fd.is_empty())
+            .ok_or_else(|| format!("missing lsof descriptor for pid {pid}"))?;
+        let numeric = fd.bytes().all(|byte| byte.is_ascii_digit());
+        if numeric {
+            let fd = fd
+                .parse::<i32>()
+                .map_err(|_| format!("invalid lsof descriptor number for pid {pid}"))?;
+            if !descriptors.insert(fd) {
+                return Err(format!("duplicate lsof descriptor for pid {pid}"));
+            }
+        } else if !matches!(fd, "cwd" | "rtd" | "txt" | "mem" | "ltx" | "mmap" | "ctty") {
+            // NOFD/err mean the descriptor table could not be inspected. Unknown
+            // pseudo descriptors (including fileports with unknown access) must
+            // not be silently treated as read-only references.
+            return Err(format!(
+                "unreadable or unknown lsof descriptor for pid {pid}"
+            ));
+        }
+
+        let mut file_type = None;
+        let mut access = None;
+        let mut name = None;
+        for field in &fields[1..] {
+            if let Some(value) = field.strip_prefix('t') {
+                if file_type.replace(value).is_some() || value.is_empty() {
+                    return Err(format!(
+                        "duplicate or empty lsof descriptor type for pid {pid}"
+                    ));
+                }
+            } else if let Some(value) = field.strip_prefix('a') {
+                if access.replace(value).is_some() || !matches!(value, "r" | "w" | "u" | " " | "-")
+                {
+                    return Err(format!(
+                        "duplicate or invalid lsof access mode for pid {pid}"
+                    ));
+                }
+            } else if let Some(value) = field.strip_prefix('n') {
+                if name.replace(value).is_some() {
+                    return Err(format!("duplicate lsof descriptor name for pid {pid}"));
+                }
+            } else {
+                return Err(format!("unexpected lsof descriptor field for pid {pid}"));
+            }
+        }
+        let file_type =
+            file_type.ok_or_else(|| format!("missing lsof descriptor type for pid {pid}"))?;
+        match file_type {
+            "REG" | "VREG" => {
+                if name.is_none_or(str::is_empty) {
+                    return Err(format!("missing lsof regular-file name for pid {pid}"));
+                }
+                if numeric {
+                    match access {
+                        Some("r") => {}
+                        Some("w" | "u") => {
+                            // A path ending in " (deleted)" does not prove that
+                            // every link/reference is gone. Unlike Linux's
+                            // metadata probe, this query has no link-count proof.
+                            write_count = write_count.checked_add(1).ok_or_else(|| {
+                                "lsof writable-descriptor count overflow".to_string()
+                            })?;
+                        }
+                        _ => {
+                            return Err(format!(
+                                "missing or unknown regular-file access mode for pid {pid}"
+                            ));
+                        }
+                    }
+                } else if matches!(access, Some("w" | "u")) {
+                    return Err(format!(
+                        "writable lsof reference has no numeric descriptor for pid {pid}"
+                    ));
+                }
+            }
+            "DIR" | "VDIR" | "CHR" | "VCHR" | "BLK" | "VBLK" | "FIFO" | "VFIFO" | "PIPE"
+            | "SOCK" | "unix" | "IPv4" | "IPv6" | "KQUEUE" | "PSXSEM" | "PSXSHM" | "FSEVENT"
+            | "NPOLICY" | "systm" => {}
+            _ => return Err(format!("unknown lsof descriptor type for pid {pid}")),
+        }
+    }
+    Ok(write_count)
+}
+
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn parse_proc_tty(pid: u32, content: &str) -> Result<bool, String> {
     let invalid = |reason: &str| format!("invalid /proc/{pid}/stat TTY evidence: {reason}");
@@ -707,7 +858,7 @@ pub(super) fn parse_proc_tty(pid: u32, content: &str) -> Result<bool, String> {
         .ok_or_else(|| invalid("missing or invalid tty_nr"))
 }
 
-/// Whether an open-file target (a `/proc/<pid>/fd` link or an lsof NAME) is a file
+/// Whether an open-file target (a `/proc/<pid>/fd` link) is a file
 /// whose pending writes could be lost by killing the process.
 ///
 /// memfds and unlinked files that had a name are excluded: nothing in them can
@@ -717,6 +868,7 @@ pub(super) fn parse_proc_tty(pid: u32, content: &str) -> Result<bool, String> {
 /// may be linked into place, so it stays protected, as do named `/dev/shm` files.
 /// `still_linked` is the file's own link count being nonzero: a " (deleted)" link
 /// only says the name it was opened by is gone, not that the file is.
+#[cfg(any(target_os = "linux", test))]
 fn is_persistent_file_target(target: &str, still_linked: bool) -> bool {
     if !target.starts_with('/') || target.starts_with("/memfd:") {
         return false;
@@ -733,6 +885,7 @@ fn is_persistent_file_target(target: &str, still_linked: bool) -> bool {
 }
 
 /// Linux names an `O_TMPFILE` descriptor `<dir>/#<inode>`.
+#[cfg(any(target_os = "linux", test))]
 fn is_unnamed_tmpfile(path: &str) -> bool {
     path.rsplit('/')
         .next()
@@ -804,18 +957,16 @@ pub fn open_write_fd_count(pid: u32) -> Option<u32> {
     }
     #[cfg(target_os = "macos")]
     {
-        let (files, _) =
-            crate::collect::macos::collect_lsof_info(pid, Duration::from_secs(5)).ok()?;
-        let write_count = files
-            .iter()
-            .filter(|f| f.file_type == "REG" && is_persistent_file_target(&f.name, false))
-            .filter(|f| {
-                f.mode
-                    .as_ref()
-                    .is_some_and(|mode| mode.contains('w') || mode.contains('u'))
-            })
-            .count() as u32;
-        Some(write_count)
+        lsof_write_fd_evidence(
+            pid,
+            crate::collect::tool_runner::run_tool(
+                crate::collect::macos::lsof_path(),
+                &lsof_write_fd_args(&pid.to_string()),
+                Some(Duration::from_secs(5)),
+                None,
+            ),
+        )
+        .ok()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -2651,6 +2802,216 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("lsof for pid 42"));
+    }
+
+    #[test]
+    fn lsof_writable_descriptors_require_observed_regular_write_access() {
+        let content = concat!(
+            "p42\0\n",
+            "fcwd\0a \0tDIR\0n/work\0\n",
+            "ftxt\0a \0tREG\0n/bin/worker\0\n",
+            "fmem\0a \0tREG\0n/lib/one\0\n",
+            "fmem\0a \0tREG\0n/lib/two\0\n",
+            "f0\0ar\0tCHR\0n/dev/null\0\n",
+            "f1\0aw\0tFIFO\0npipe\0\n",
+            "f2\0aw\0tPIPE\0npipe\0\n",
+            "f3\0ar\0tREG\0n/work/input\0\n",
+            "f4\0au\0tunix\0n/tmp/ipc.sock\0\n",
+            "f5\0au\0tIPv4\0n127.0.0.1:8000\0\n",
+            "f6\0au\0tKQUEUE\0\n",
+        );
+        assert_eq!(lsof_write_fd_evidence(42, Ok(lsof_output(content))), Ok(0));
+        let writers = format!(
+            "{content}f7\0aw\0tREG\0n/work/output\0\n\
+             f8\0au\0tVREG\0n/private/tmp/pending (deleted)\0\n"
+        );
+        assert_eq!(lsof_write_fd_evidence(42, Ok(lsof_output(&writers))), Ok(2));
+    }
+
+    #[test]
+    fn lsof_writable_descriptors_refuse_failed_or_partial_tool_results() {
+        let complete = "p42\0\nf3\0ar\0tREG\0n/work/input\0\n";
+        for failure in [
+            "nonzero",
+            "signal",
+            "timeout",
+            "truncated",
+            "stderr",
+            "utf8",
+        ] {
+            let mut output = lsof_output(complete);
+            match failure {
+                "nonzero" => output.exit_code = Some(1),
+                "signal" => output.exit_code = None,
+                "timeout" => output.timed_out = true,
+                "truncated" => output.truncated = true,
+                "stderr" => output.stderr = b"WARNING: cannot inspect descriptor".to_vec(),
+                "utf8" => output.stdout.push(0xff),
+                _ => unreachable!(),
+            }
+            assert!(lsof_write_fd_evidence(42, Ok(output)).is_err(), "{failure}");
+        }
+        for error in [
+            crate::collect::tool_runner::ToolError::CommandNotFound("lsof".into()),
+            crate::collect::tool_runner::ToolError::Timeout(Duration::from_secs(5)),
+            crate::collect::tool_runner::ToolError::OutputTruncated {
+                limit: 32,
+                actual: 32,
+            },
+        ] {
+            assert!(lsof_write_fd_evidence(42, Err(error)).is_err());
+        }
+    }
+
+    #[test]
+    fn lsof_writable_descriptors_reject_missing_or_foreign_process_scope() {
+        for content in [
+            "",
+            "p42\0\n",
+            "p0\0\nf3\0ar\0tREG\0n/work/input\0\n",
+            "p43\0\nf3\0ar\0tREG\0n/work/input\0\n",
+            "p+42\0\nf3\0ar\0tREG\0n/work/input\0\n",
+            "p42 \0\nf3\0ar\0tREG\0n/work/input\0\n",
+            "f3\0ar\0tREG\0n/work/input\0\n",
+            "p42\0p42\0\nf3\0ar\0tREG\0n/work/input\0\n",
+            "p42\0\nf3\0ar\0tREG\0n/work/input\0\np43\0\n",
+            "p42\0\nf3\0ar\0tREG\0n/work/input\0\np42\0\n",
+        ] {
+            assert!(
+                lsof_write_fd_evidence(42, Ok(lsof_output(content))).is_err(),
+                "{content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lsof_writable_descriptors_reject_incomplete_or_ambiguous_records() {
+        for record in [
+            "fNOFD\0\n",
+            "ferr\0tREG\0ar\0nPermission denied\0\n",
+            "funknown\0tREG\0ar\0n/work/input\0\n",
+            "ffp.3\0tREG\0a \0n/work/input\0\n",
+            "f2147483648\0tREG\0ar\0n/work/input\0\n",
+            "f3\0\n",
+            "f3\0ar\0n/work/input\0\n",
+            "f3\0tREG\0n/work/input\0\n",
+            "f3\0tREG\0ar\0\n",
+            "f3\0tREG\0ar\0n\0\n",
+            "f3\0tREG\0a \0n/work/input\0\n",
+            "f3\0tREG\0a-\0n/work/input\0\n",
+            "f3\0tREG\0ax\0n/work/input\0\n",
+            "f3\0tunknown\0ar\0n/work/input\0\n",
+            "f3\0tUNKNv\0ar\0n/work/input\0\n",
+            "f3\0tREG\0tREG\0ar\0n/work/input\0\n",
+            "f3\0tREG\0tCHR\0ar\0n/work/input\0\n",
+            "f3\0tREG\0ar\0ar\0n/work/input\0\n",
+            "f3\0tREG\0ar\0aw\0n/work/input\0\n",
+            "f3\0tREG\0ar\0n/work/input\0n/work/other\0\n",
+            "f3\0tREG\0ar\0n/work/input\0f4\0\n",
+            "f3\0tREG\0ar\0n/work/input\0zunexpected\0\n",
+            "f3\0tREG\0ar\0n/work/input\0\nf3\0tREG\0ar\0n/work/input\0\n",
+            "f3\0tREG\0ar\0n/work/input\0\nf03\0tREG\0ar\0n/work/input\0\n",
+            "ftxt\0tREG\0aw\0n/work/output\0\n",
+        ] {
+            let content = format!("p42\0\n{record}");
+            assert!(
+                lsof_write_fd_evidence(42, Ok(lsof_output(&content))).is_err(),
+                "{record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lsof_writable_descriptors_require_terminated_sets_and_keep_names_opaque() {
+        for content in [
+            "p42\nf3\nar\ntREG\nn/work/input\n",
+            "p42\0f3\0ar\0tREG\0n/work/input\0\n",
+            "p42\0\nf3\0ar\0tREG\0n/work/input\0",
+            "p42\0\nf3\0ar\0tREG\0n/work/input",
+            "p42\0\nf3\0ar\0tREG\0n/work/input\0\n\n",
+            "p42\0\nf3\0ar\0tREG\0n/work/input\0\0\n",
+            "p42\0\nf3\0ar\0tREG\0n/work/input\0\nf4",
+            "p42\0\nf3\0ar\0tREG\0n/work/input\0aw\0\n",
+        ] {
+            assert!(
+                lsof_write_fd_evidence(42, Ok(lsof_output(content))).is_err(),
+                "{content:?}"
+            );
+        }
+        // A name can contain newline/field-like text, including "(deleted)".
+        // None can manufacture another descriptor or remove its write mode.
+        let content = "p42\0\nf3\0aw\0tREG\0n/work/output\nf4\nar\ntCHR (deleted)\0\n";
+        assert_eq!(lsof_write_fd_evidence(42, Ok(lsof_output(content))), Ok(1));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lsof_writable_descriptors_observe_owned_regular_and_ipc_handles() {
+        use std::io::{BufRead, Write};
+        use std::process::{Child, Command, Stdio};
+
+        struct Holder(Child);
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                // EOF releases only this test's read-blocked child. No process
+                // found by scanning is signalled, and fixture files are kept.
+                drop(self.0.stdin.take());
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap().keep();
+        let regular = dir.join("pending\nwork (deleted)");
+        std::fs::write(&regular, b"existing data").unwrap();
+        let fifo = dir.join("ipc.fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: c_path is NUL-terminated and valid for this call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        for (path, open, expected) in [
+            (&regular, "exec 3>>\"$1\"", 1),
+            (&regular, "exec 3<\"$1\"", 0),
+            (&fifo, "exec 3<>\"$1\"", 0),
+        ] {
+            let script = format!("{open}; printf 'ready\\n'; read -r done");
+            let mut holder = Holder(
+                Command::new("sh")
+                    .args(["-c", &script, "pt-lsof-test"])
+                    .arg(path)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn owned descriptor holder"),
+            );
+            let mut ready = String::new();
+            std::io::BufReader::new(holder.0.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready.trim(), "ready");
+            let pid = holder.0.id();
+            #[cfg(target_os = "macos")]
+            let command = crate::collect::macos::lsof_path();
+            #[cfg(target_os = "linux")]
+            let command = "lsof";
+            let output = crate::collect::tool_runner::run_tool(
+                command,
+                &lsof_write_fd_args(&pid.to_string()),
+                Some(Duration::from_secs(5)),
+                None,
+            );
+            #[cfg(target_os = "linux")]
+            if matches!(
+                output,
+                Err(crate::collect::tool_runner::ToolError::CommandNotFound(_))
+            ) {
+                eprintln!("SKIP real lsof descriptor test: optional Linux lsof is not installed");
+                return;
+            }
+            assert_eq!(lsof_write_fd_evidence(pid, output), Ok(expected), "{open}");
+            assert!(holder.0.try_wait().unwrap().is_none());
+            writeln!(holder.0.stdin.as_mut().unwrap(), "done").unwrap();
+            assert!(holder.0.wait().unwrap().success());
+        }
     }
 
     #[test]
