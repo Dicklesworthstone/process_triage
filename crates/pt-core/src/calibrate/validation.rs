@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     bias::{analyze_bias, BiasAnalysis},
+    curve::CalibrationCurve,
     metrics::{compute_metrics, CalibrationMetrics},
     report::CalibrationReport,
     CalibrationData, CalibrationError, CalibrationQuality,
@@ -155,6 +156,26 @@ pub struct CategoryValidation {
     pub total: usize,
     /// Predictions with supported labels.
     pub resolved: usize,
+    /// Explicit kill and spare verdicts for predictions made in this category.
+    #[serde(default)]
+    pub positive_labels: usize,
+    #[serde(default)]
+    pub negative_labels: usize,
+    /// Recorded outcomes without a supported abandonment verdict.
+    #[serde(default)]
+    pub unlabeled_outcomes: usize,
+    /// Predictions awaiting an outcome or verdict.
+    #[serde(default)]
+    pub pending_predictions: usize,
+    /// Reliability metrics require at least `MIN_LABELS_PER_CLASS` labels of
+    /// each class in this category, independent of support in other categories.
+    #[serde(default)]
+    pub metrics: Option<CalibrationMetrics>,
+    #[serde(default)]
+    pub quality: Option<CalibrationQuality>,
+    /// Reliability diagram bins from exactly the same supported labels as metrics.
+    #[serde(default)]
+    pub curve: Option<CalibrationCurve>,
     /// True positives (predicted abandoned, actually abandoned).
     pub true_positives: usize,
     /// False positives (predicted abandoned, actually useful).
@@ -163,11 +184,11 @@ pub struct CategoryValidation {
     pub true_negatives: usize,
     /// False negatives (predicted useful, actually abandoned).
     pub false_negatives: usize,
-    /// Accuracy rate.
+    /// Observed accuracy among supported labels (a descriptive frequency).
     pub accuracy: f64,
-    /// Precision for kill recommendations.
+    /// Observed precision for kill recommendations.
     pub precision: f64,
-    /// Recall for kill recommendations.
+    /// Observed recall for kill recommendations.
     pub recall: f64,
 }
 
@@ -208,6 +229,57 @@ pub struct ValidationReport {
     pub top_false_negatives: Vec<FalseOutcome>,
     /// Prior adjustment recommendations.
     pub recommendations: Vec<PriorAdjustment>,
+}
+
+impl ValidationReport {
+    /// A readable category appendix, including categories that do not yet have
+    /// enough independent labels for calibration. The structured report also
+    /// retains the full reliability-curve bins for supported categories.
+    pub fn category_summary(&self) -> String {
+        if self.by_category.is_empty() {
+            return String::new();
+        }
+        let mut output = String::from("Calibration by signature category\n");
+        for category in &self.by_category {
+            output.push_str(&format!(
+                "  {}: {} predictions; {} kill labels, {} spare labels; {} unlabeled outcomes, {} pending\n",
+                category.category,
+                category.total,
+                category.positive_labels,
+                category.negative_labels,
+                category.unlabeled_outcomes,
+                category.pending_predictions,
+            ));
+            if let Some(metrics) = &category.metrics {
+                output.push_str(&format!(
+                    "    ECE {:.4}; Brier {:.4}; log loss {:.4}; AUC-ROC {:.4} (n={})\n",
+                    metrics.ece,
+                    metrics.brier_score,
+                    metrics.log_loss,
+                    metrics.auc_roc,
+                    metrics.sample_count,
+                ));
+                if let Some(curve) = &category.curve {
+                    for bin in curve.bins.iter().filter(|bin| bin.count > 0) {
+                        output.push_str(&format!(
+                            "    {:>3.0}-{:>3.0}%: predicted {:>5.1}%, observed {:>5.1}% (n={})\n",
+                            bin.lower * 100.0,
+                            bin.upper * 100.0,
+                            bin.mean_predicted * 100.0,
+                            bin.actual_rate * 100.0,
+                            bin.count,
+                        ));
+                    }
+                }
+            } else {
+                output.push_str(&format!(
+                    "    Calibration unavailable; requires at least {} kill and {} spare labels in this category.\n",
+                    MIN_LABELS_PER_CLASS, MIN_LABELS_PER_CLASS,
+                ));
+            }
+        }
+        output
+    }
 }
 
 /// A false prediction for reporting.
@@ -511,6 +583,7 @@ impl ValidationEngine {
                 continue;
             }
 
+            let (proc_type, host_id) = extract_prediction_metadata(obs);
             let comm =
                 extract_comm_from_events(&obs.events).unwrap_or_else(|| "unknown".to_string());
             let index = engine.upsert_prediction(
@@ -518,9 +591,9 @@ impl ValidationEngine {
                 obs.pid,
                 predicted(obs),
                 obs.belief.recommendation.clone(),
-                None,
+                proc_type,
                 comm,
-                None,
+                host_id,
                 obs.timestamp,
             );
             latest_predictions.insert(key, index);
@@ -627,7 +700,7 @@ impl ValidationEngine {
             None
         };
 
-        let by_category = self.compute_category_validation(&resolved);
+        let by_category = self.compute_category_validation();
         let (top_false_positives, top_false_negatives) = self.compute_false_outcomes(&resolved);
         let recommendations = self.compute_prior_adjustments(&bias, &by_category);
 
@@ -669,12 +742,9 @@ impl ValidationEngine {
         CalibrationReport::from_data(&cal_data, 10, self.threshold)
     }
 
-    fn compute_category_validation(
-        &self,
-        resolved: &[&ValidationRecord],
-    ) -> Vec<CategoryValidation> {
+    fn compute_category_validation(&self) -> Vec<CategoryValidation> {
         let mut by_cat: HashMap<String, Vec<&ValidationRecord>> = HashMap::new();
-        for r in resolved {
+        for r in &self.records {
             let cat = r.proc_type.clone().unwrap_or_else(|| "unknown".to_string());
             by_cat.entry(cat).or_default().push(r);
         }
@@ -682,23 +752,40 @@ impl ValidationEngine {
         let mut results: Vec<CategoryValidation> = by_cat
             .into_iter()
             .map(|(category, records)| {
-                let total = self
-                    .records
+                let total = records.len();
+                let cal_data: Vec<_> = records
                     .iter()
-                    .filter(|r| {
-                        r.proc_type.as_deref() == Some(category.as_str())
-                            || (r.proc_type.is_none() && category == "unknown")
-                    })
+                    .filter_map(|record| record.to_calibration_data())
+                    .collect();
+                let positive_labels = cal_data.iter().filter(|datum| datum.actual).count();
+                let negative_labels = cal_data.len() - positive_labels;
+                let pending_predictions = records
+                    .iter()
+                    .filter(|record| record.ground_truth.is_none())
                     .count();
+                let unlabeled_outcomes = total - cal_data.len() - pending_predictions;
+                let metrics = if positive_labels >= MIN_LABELS_PER_CLASS
+                    && negative_labels >= MIN_LABELS_PER_CLASS
+                {
+                    compute_metrics(&cal_data, self.threshold).ok()
+                } else {
+                    None
+                };
+                let quality = metrics
+                    .as_ref()
+                    .map(|m| CalibrationQuality::from_metrics(m.ece, m.brier_score));
+                let curve = metrics
+                    .as_ref()
+                    .map(|_| CalibrationCurve::from_data(&cal_data, 10));
 
                 let mut tp = 0usize;
                 let mut fp = 0usize;
                 let mut tn = 0usize;
                 let mut fn_ = 0usize;
 
-                for r in &records {
-                    let predicted_kill = r.predicted_abandoned >= self.threshold;
-                    let actually_abandoned = r.ground_truth.is_some_and(|gt| gt.is_abandoned());
+                for datum in &cal_data {
+                    let predicted_kill = datum.predicted >= self.threshold;
+                    let actually_abandoned = datum.actual;
 
                     match (predicted_kill, actually_abandoned) {
                         (true, true) => tp += 1,
@@ -708,7 +795,7 @@ impl ValidationEngine {
                     }
                 }
 
-                let resolved_count = records.len();
+                let resolved_count = cal_data.len();
                 let total_classified = tp + fp + tn + fn_;
                 let accuracy = if total_classified > 0 {
                     (tp + tn) as f64 / total_classified as f64
@@ -730,6 +817,13 @@ impl ValidationEngine {
                     category,
                     total,
                     resolved: resolved_count,
+                    positive_labels,
+                    negative_labels,
+                    unlabeled_outcomes,
+                    pending_predictions,
+                    metrics,
+                    quality,
+                    curve,
                     true_positives: tp,
                     false_positives: fp,
                     true_negatives: tn,
@@ -741,7 +835,11 @@ impl ValidationEngine {
             })
             .collect();
 
-        results.sort_by_key(|b| std::cmp::Reverse(b.resolved));
+        results.sort_by(|a, b| {
+            b.resolved
+                .cmp(&a.resolved)
+                .then_with(|| a.category.cmp(&b.category))
+        });
         results
     }
 
@@ -857,6 +955,34 @@ impl ValidationEngine {
         });
         adjustments
     }
+}
+
+/// Read metadata only from the evidence snapshot accompanying this prediction.
+/// Older observations without these fields remain unclassified. Exit/verdict
+/// observations are handled before this helper is called, so neither can
+/// retroactively classify a prediction.
+fn extract_prediction_metadata(obs: &Observation) -> (Option<String>, Option<String>) {
+    let snapshot = obs
+        .events
+        .iter()
+        .filter(|event| {
+            event.event_type == EventType::EvidenceSnapshot && event.timestamp <= obs.timestamp
+        })
+        .max_by_key(|event| event.timestamp)
+        .and_then(|event| event.details.as_deref())
+        .and_then(|details| serde_json::from_str::<JsonValue>(details).ok());
+    let metadata = |key: &str| {
+        snapshot
+            .as_ref()?
+            .get(key)?
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let category = metadata("signature_category");
+    let host_id = metadata("host_id").filter(|host| host != "unknown");
+    (category, host_id)
 }
 
 fn extract_comm_from_events(events: &[ProcessEvent]) -> Option<String> {
@@ -1421,6 +1547,272 @@ mod tests {
             details: Some(serde_json::json!({"outcome_hint": hint}).to_string()),
         }];
         observation
+    }
+
+    fn categorized_prediction(
+        at: DateTime<Utc>,
+        pid: u32,
+        identity: &str,
+        probability: f32,
+        category: &str,
+    ) -> Observation {
+        let mut observation = human_label_prediction(at, pid, identity, probability);
+        observation.events[0].details = Some(
+            serde_json::json!({
+                "comm": "test-worker",
+                "signature_category": category,
+                "host_id": "prediction-host"
+            })
+            .to_string(),
+        );
+        observation
+    }
+
+    #[test]
+    fn category_metadata_belongs_to_the_labeled_prediction_not_later_events() {
+        let at = Utc::now() - Duration::days(1);
+        let older = categorized_prediction(at, 101, "worker", 0.1, "OldCategory");
+        let latest =
+            categorized_prediction(at + Duration::seconds(1), 101, "worker", 0.8, "TestRunner");
+        let mut verdict = human_label_observation(at + Duration::seconds(2), 101, "worker", "kill");
+        verdict.events[0].details = Some(
+            serde_json::json!({
+                "verdict": "kill", "source": "agent_label", "comm": "different-command",
+                "signature_category": "VerdictCategory", "host_id": "verdict-host"
+            })
+            .to_string(),
+        );
+        // Even an evidence-shaped event attached to a verdict cannot supply
+        // prediction metadata retroactively.
+        verdict.events.push(ProcessEvent {
+            timestamp: verdict.timestamp,
+            event_type: EventType::EvidenceSnapshot,
+            details: Some(
+                serde_json::json!({
+                    "signature_category": "VerdictCategory", "host_id": "verdict-host"
+                })
+                .to_string(),
+            ),
+        });
+        let future = categorized_prediction(
+            at + Duration::seconds(3),
+            101,
+            "worker",
+            0.9,
+            "LaterCategory",
+        );
+        let duplicate = human_label_observation(at + Duration::seconds(4), 101, "worker", "spare");
+        let engine = ValidationEngine::from_shadow_observations(
+            &[duplicate, latest, verdict, future, older],
+            0.5,
+        );
+        let labeled = engine.resolved_records();
+        assert_eq!(labeled.len(), 1);
+        assert_eq!(labeled[0].proc_type.as_deref(), Some("TestRunner"));
+        assert_eq!(labeled[0].host_id.as_deref(), Some("prediction-host"));
+        assert_eq!(labeled[0].predicted_at, at + Duration::seconds(1));
+        assert_eq!(labeled[0].ground_truth, Some(GroundTruth::UserKilled));
+        let pending = engine.pending_records();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].proc_type.as_deref(), Some("LaterCategory"));
+        let report = engine.compute_report().unwrap();
+        assert_eq!(report.by_category.len(), 2);
+        assert_eq!(report.by_category[0].category, "TestRunner");
+        assert_eq!(report.by_category[0].positive_labels, 1);
+        assert_eq!(report.by_category[1].pending_predictions, 1);
+    }
+
+    #[test]
+    fn old_predictions_and_exit_only_records_do_not_gain_later_metadata() {
+        let at = Utc::now() - Duration::days(1);
+        let mut prediction = human_label_prediction(at, 102, "old-record", 0.8);
+        // A recognizable command is not a recorded signature match.
+        prediction.events[0].details = Some(serde_json::json!({"comm": "pytest"}).to_string());
+        prediction.events.push(ProcessEvent {
+            timestamp: at,
+            event_type: EventType::SupervisorDetected,
+            details: Some(
+                serde_json::json!({
+                    "signature_category": "WrongEvent", "host_id": "wrong-host"
+                })
+                .to_string(),
+            ),
+        });
+        prediction.events.push(ProcessEvent {
+            timestamp: at + Duration::seconds(1),
+            event_type: EventType::EvidenceSnapshot,
+            details: Some(
+                serde_json::json!({
+                    "signature_category": "FutureEvent", "host_id": "future-host"
+                })
+                .to_string(),
+            ),
+        });
+        let mut verdict =
+            human_label_observation(at + Duration::seconds(2), 102, "old-record", "spare");
+        verdict.events[0].details = Some(
+            serde_json::json!({
+                "verdict": "spare", "source": "agent_label",
+                "signature_category": "TestRunner", "host_id": "verdict-host"
+            })
+            .to_string(),
+        );
+        let mut exit_only = categorized_prediction(at, 103, "exit-only", 0.9, "ExitCategory");
+        exit_only.events.push(ProcessEvent {
+            timestamp: at,
+            event_type: EventType::ProcessExit,
+            details: Some(serde_json::json!({"exit_code": 0}).to_string()),
+        });
+        let engine =
+            ValidationEngine::from_shadow_observations(&[prediction, verdict, exit_only], 0.5);
+        assert_eq!(engine.records().len(), 2);
+        for record in engine.records() {
+            assert!(record.proc_type.is_none());
+            assert!(record.host_id.is_none());
+        }
+        let report = engine.compute_report().unwrap();
+        assert_eq!(report.by_category.len(), 1);
+        let category = &report.by_category[0];
+        assert_eq!(category.category, "unknown");
+        assert_eq!((category.positive_labels, category.negative_labels), (0, 1));
+        assert_eq!(category.unlabeled_outcomes, 1);
+        assert!(category.metrics.is_none());
+        assert!(category.curve.is_none());
+    }
+
+    #[test]
+    fn category_calibration_uses_only_its_own_independent_labels() {
+        let at = Utc::now() - Duration::days(1);
+        let mut observations = Vec::new();
+        for (category_index, category) in ["Accurate", "Inaccurate"].into_iter().enumerate() {
+            for index in 0..10 {
+                let pid = 1000 + category_index as u32 * 10 + index;
+                let identity = format!("process-{pid}");
+                let positive = index < 5;
+                let probability = if positive == (category == "Accurate") {
+                    0.8
+                } else {
+                    0.2
+                };
+                observations.push(categorized_prediction(
+                    at,
+                    pid,
+                    &identity,
+                    probability,
+                    category,
+                ));
+                observations.push(human_label_observation(
+                    at + Duration::seconds(1),
+                    pid,
+                    &identity,
+                    if positive { "kill" } else { "spare" },
+                ));
+            }
+        }
+        observations.push(categorized_prediction(
+            at,
+            2000,
+            "pending",
+            0.4,
+            "AwaitingLabels",
+        ));
+        let report = ValidationEngine::from_shadow_observations(&observations, 0.5)
+            .compute_report()
+            .unwrap();
+        assert_eq!(report.by_category.len(), 3);
+        for (name, expected_ece, expected_brier) in
+            [("Accurate", 0.2, 0.04), ("Inaccurate", 0.8, 0.64)]
+        {
+            let category = report
+                .by_category
+                .iter()
+                .find(|c| c.category == name)
+                .unwrap();
+            assert_eq!((category.positive_labels, category.negative_labels), (5, 5));
+            let metrics = category.metrics.as_ref().unwrap();
+            assert_eq!(metrics.sample_count, 10);
+            assert!((metrics.ece - expected_ece).abs() < 1e-6);
+            assert!((metrics.brier_score - expected_brier).abs() < 1e-6);
+            let curve = category.curve.as_ref().unwrap();
+            assert_eq!(curve.bins.iter().map(|bin| bin.count).sum::<usize>(), 10);
+            assert!((curve.ece - metrics.ece).abs() < 1e-9);
+            assert!(category.quality.is_some());
+        }
+        let pending = report
+            .by_category
+            .iter()
+            .find(|c| c.category == "AwaitingLabels")
+            .unwrap();
+        assert_eq!(pending.pending_predictions, 1);
+        assert_eq!(pending.resolved, 0);
+        assert!(pending.metrics.is_none());
+        assert!(pending.curve.is_none());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["by_category"][0]["metrics"]["sample_count"], 10);
+        assert!(json["by_category"][2]["metrics"].is_null());
+        let text = report.category_summary();
+        assert!(text.contains("Accurate: 10 predictions; 5 kill labels, 5 spare labels"));
+        assert!(text.contains("ECE 0.2000; Brier 0.0400"));
+        assert!(text.contains("ECE 0.8000; Brier 0.6400"));
+        assert!(text.contains("AwaitingLabels: 1 predictions; 0 kill labels, 0 spare labels"));
+        assert!(text.contains("requires at least 5 kill and 5 spare labels in this category"));
+    }
+
+    #[test]
+    fn category_metrics_require_five_labels_of_each_class_within_each_category() {
+        let mut engine = ValidationEngine::new(0.5);
+        for (category, positives, negatives) in [
+            ("ten_zero", 10, 0),
+            ("nine_one", 9, 1),
+            ("four_six", 4, 6),
+            ("five_five", 5, 5),
+        ] {
+            for index in 0..positives + negatives {
+                let identity = format!("{category}-{index}");
+                engine.track_prediction(
+                    identity.clone(),
+                    index,
+                    0.7,
+                    "review".into(),
+                    Some(category.into()),
+                    "worker".into(),
+                    None,
+                );
+                engine.record_outcome(
+                    &identity,
+                    if index < positives {
+                        GroundTruth::UserKilled
+                    } else {
+                        GroundTruth::UserSpared
+                    },
+                    None,
+                    None,
+                );
+            }
+        }
+        let report = engine.compute_report().unwrap();
+        assert!(
+            report.metrics.is_some(),
+            "pooled support does not supply category support"
+        );
+        for category in &report.by_category {
+            assert_eq!(category.resolved, 10);
+            assert_eq!(category.positive_labels + category.negative_labels, 10);
+            let supported = category.category == "five_five";
+            assert_eq!(
+                category.metrics.is_some(),
+                supported,
+                "{}",
+                category.category
+            );
+            assert_eq!(
+                category.quality.is_some(),
+                supported,
+                "{}",
+                category.category
+            );
+            assert_eq!(category.curve.is_some(), supported, "{}", category.category);
+        }
     }
 
     #[test]
@@ -2175,6 +2567,13 @@ mod tests {
             category: "test_runner".to_string(),
             total: 50,
             resolved: 40,
+            positive_labels: 20,
+            negative_labels: 20,
+            unlabeled_outcomes: 3,
+            pending_predictions: 7,
+            metrics: None,
+            quality: None,
+            curve: None,
             true_positives: 15,
             false_positives: 5,
             true_negatives: 15,

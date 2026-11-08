@@ -1252,6 +1252,8 @@ never treats disappearance, successful execution of an action, or a model's own
 recommendation as a human judgment. It requires at least five labels of each class
 before computing metrics; see [the shadow calibration tutorial](docs/tutorials/06-shadow-calibration.md).
 
+Shadow reports also break calibration down by the signature category recorded with each prediction. Each category shows kill/spare label counts, unlabeled outcomes, and pending predictions. With at least five independent labels of each class **in that category**, it gains ECE, Brier score, log loss, AUC-ROC, and reliability-curve bins in JSON and the text report. Categories with fewer labels remain explicitly uncalibrated even when the pooled report has enough data. Older predictions without recorded signature metadata stay in `unknown`; a later verdict cannot supply or change the prediction's category or host. These diagnostics do not automatically fit new four-class priors from binary verdicts.
+
 Each verdict is stored at three specificity levels:
 
 | Level | What's Preserved | Example |

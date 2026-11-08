@@ -181,8 +181,20 @@ impl ShadowRecorder {
             child_count: 0,
         };
 
+        // Only the signature that influenced this prediction may classify its
+        // calibration sample. A later verdict must never supply this metadata.
+        let signature_category = decision
+            .rationale
+            .category
+            .as_deref()
+            .filter(|_| decision.rationale.has_known_signature == Some(true));
         let mut events = Vec::new();
-        if let Some(event) = build_evidence_event(ledger, &proc.comm) {
+        if let Some(event) = build_evidence_event(
+            ledger,
+            &proc.comm,
+            signature_category,
+            Some(&self.storage.config().host_id),
+        ) {
             events.push(event);
         }
 
@@ -323,7 +335,16 @@ fn compute_identity_hash(proc: &ProcessRecord) -> String {
     hex::encode(&digest[..8])
 }
 
-fn build_evidence_event(ledger: &EvidenceLedger, comm: &str) -> Option<ProcessEvent> {
+fn build_evidence_event(
+    ledger: &EvidenceLedger,
+    comm: &str,
+    signature_category: Option<&str>,
+    host_id: Option<&str>,
+) -> Option<ProcessEvent> {
+    let signature_category = signature_category.map(str::trim).filter(|s| !s.is_empty());
+    let host_id = host_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "unknown");
     let top: Vec<_> = ledger
         .bayes_factors
         .iter()
@@ -337,11 +358,17 @@ fn build_evidence_event(ledger: &EvidenceLedger, comm: &str) -> Option<ProcessEv
             })
         })
         .collect();
-    if top.is_empty() && ledger.top_evidence.is_empty() {
+    if top.is_empty()
+        && ledger.top_evidence.is_empty()
+        && signature_category.is_none()
+        && host_id.is_none()
+    {
         return None;
     }
     let details = serde_json::json!({
         "comm": comm,
+        "signature_category": signature_category,
+        "host_id": host_id,
         "why_summary": ledger.why_summary,
         "top_evidence": ledger.top_evidence,
         "bayes_factors": top,
@@ -795,11 +822,14 @@ mod tests {
         let factors = vec![make_bf("age", 3.0, "supports abandoned", "strong")];
         let top = vec!["old process".to_string()];
         let ledger = make_ledger(Confidence::High, factors, top, "Likely abandoned");
-        let event = build_evidence_event(&ledger, "sleep").unwrap();
+        let event =
+            build_evidence_event(&ledger, "sleep", Some("TestRunner"), Some("host-a")).unwrap();
         assert_eq!(event.event_type, EventType::EvidenceSnapshot);
         let details: serde_json::Value =
             serde_json::from_str(event.details.as_ref().unwrap()).unwrap();
         assert_eq!(details["comm"], "sleep");
+        assert_eq!(details["signature_category"], "TestRunner");
+        assert_eq!(details["host_id"], "host-a");
         assert_eq!(details["why_summary"], "Likely abandoned");
         assert!(details["bayes_factors"].as_array().unwrap().len() == 1);
     }
@@ -807,7 +837,19 @@ mod tests {
     #[test]
     fn evidence_event_none_when_empty() {
         let ledger = make_ledger(Confidence::Low, vec![], vec![], "");
-        assert!(build_evidence_event(&ledger, "bash").is_none());
+        assert!(build_evidence_event(&ledger, "bash", None, None).is_none());
+    }
+
+    #[test]
+    fn prediction_metadata_survives_an_empty_evidence_ledger() {
+        let ledger = make_ledger(Confidence::Low, vec![], vec![], "");
+        let event =
+            build_evidence_event(&ledger, "worker", Some("TestRunner"), Some("unknown")).unwrap();
+        let details: serde_json::Value =
+            serde_json::from_str(event.details.as_deref().unwrap()).unwrap();
+        assert_eq!(details["signature_category"], "TestRunner");
+        assert!(details["host_id"].is_null());
+        assert!(build_evidence_event(&ledger, "worker", Some(" "), Some("unknown")).is_none());
     }
 
     #[test]
@@ -818,7 +860,7 @@ mod tests {
             vec!["some evidence".to_string()],
             "why",
         );
-        let event = build_evidence_event(&ledger, "node");
+        let event = build_evidence_event(&ledger, "node", None, None);
         assert!(event.is_some());
     }
 
@@ -826,7 +868,7 @@ mod tests {
     fn evidence_event_with_only_bayes_factors() {
         let factors = vec![make_bf("cpu", 1.5, "supports useful", "weak")];
         let ledger = make_ledger(Confidence::Low, factors, vec![], "");
-        let event = build_evidence_event(&ledger, "python");
+        let event = build_evidence_event(&ledger, "python", None, None);
         assert!(event.is_some());
     }
 
@@ -839,7 +881,7 @@ mod tests {
             make_bf("d", 4.0, "supports abandoned", "decisive"),
         ];
         let ledger = make_ledger(Confidence::High, factors, vec![], "");
-        let event = build_evidence_event(&ledger, "x").unwrap();
+        let event = build_evidence_event(&ledger, "x", None, None).unwrap();
         let details: serde_json::Value =
             serde_json::from_str(event.details.as_ref().unwrap()).unwrap();
         assert_eq!(details["bayes_factors"].as_array().unwrap().len(), 3);
@@ -953,6 +995,79 @@ mod tests {
     }
 
     // ── ShadowRecorder with tempdir ─────────────────────────────────
+
+    #[test]
+    fn persisted_prediction_category_requires_a_real_signature_match() {
+        let directory = TempDir::new().unwrap();
+        let storage = ShadowStorage::new(ShadowStorageConfig {
+            base_dir: directory.path().to_path_buf(),
+            host_id: "host-a".to_string(),
+            auto_compact: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut recorder = ShadowRecorder {
+            storage,
+            recorded: 0,
+            pending: HashMap::new(),
+            seen_identities: HashSet::new(),
+            seen_pids: HashMap::new(),
+            pending_path: directory.path().join("pending.json"),
+            miss_threshold: DEFAULT_MISS_THRESHOLD,
+            had_records: false,
+        };
+        let ledger = make_ledger(Confidence::Low, vec![], vec![], "");
+        let posterior = ClassScores {
+            useful: 0.2,
+            useful_bad: 0.0,
+            abandoned: 0.6,
+            zombie: 0.2,
+        };
+        for (pid, known_signature) in [(101, Some(true)), (102, Some(false)), (103, None)] {
+            let mut decision = make_decision(Action::Keep);
+            decision.rationale.category = Some("TestRunner".to_string());
+            decision.rationale.has_known_signature = known_signature;
+            recorder
+                .record_candidate(
+                    &make_proc(pid, "worker", "worker"),
+                    &posterior,
+                    &ledger,
+                    &decision,
+                )
+                .unwrap();
+        }
+        recorder.flush().unwrap();
+
+        let mut observations = Vec::new();
+        for pid in [101, 102, 103] {
+            let files: Vec<_> = fs::read_dir(directory.path().join(format!("hot/pid_{pid}")))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(files.len(), 1);
+            let obs: Observation = serde_json::from_slice(&fs::read(&files[0]).unwrap()).unwrap();
+            let details: serde_json::Value =
+                serde_json::from_str(obs.events[0].details.as_deref().unwrap()).unwrap();
+            assert_eq!(details["host_id"], "host-a");
+            assert_eq!(
+                details["signature_category"].as_str(),
+                (pid == 101).then_some("TestRunner"),
+            );
+            observations.push(obs);
+        }
+        let engine = crate::calibrate::validation::ValidationEngine::from_shadow_observations(
+            &observations,
+            0.5,
+        );
+        for record in engine.records() {
+            assert_eq!(record.host_id.as_deref(), Some("host-a"));
+            assert_eq!(
+                record.proc_type.as_deref(),
+                (record.pid == 101).then_some("TestRunner")
+            );
+            assert!((record.predicted_abandoned - 0.8).abs() < 1e-6);
+        }
+    }
 
     #[test]
     fn recorder_starts_with_zero_count() {

@@ -12890,7 +12890,7 @@ fn run_shadow_report(global: &GlobalOpts, args: &ShadowReportArgs) -> ExitCode {
         }
     };
     if label_counts.metrics.is_none() {
-        let message = format!(
+        let mut message = format!(
             "Calibration requires at least {} explicit labels of each class.\n\
              Positive labels: {}; negative labels: {}; unlabeled outcomes: {}; pending predictions: {}.\n\
              Record an independent judgment with `pt agent label --pid <pid> --kill` or `--spare` \
@@ -12901,6 +12901,8 @@ fn run_shadow_report(global: &GlobalOpts, args: &ShadowReportArgs) -> ExitCode {
             label_counts.unlabeled_outcomes,
             label_counts.pending_predictions,
         );
+        message.push('\n');
+        message.push_str(&label_counts.category_summary());
         if let Some(path) = &args.output {
             if let Err(err) = write_report_output_file(path, &message) {
                 eprintln!("shadow report: failed to write {}: {}", path, err);
@@ -12935,7 +12937,11 @@ fn run_shadow_report(global: &GlobalOpts, args: &ShadowReportArgs) -> ExitCode {
         }
     };
 
-    let ascii_report = report.ascii_report(60, 14);
+    let ascii_report = format!(
+        "{}\n{}",
+        report.ascii_report(60, 14),
+        label_counts.category_summary(),
+    );
 
     let wrote_file = if let Some(ref path) = args.output {
         if let Err(err) = write_report_output_file(path, &ascii_report) {
