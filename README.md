@@ -701,6 +701,17 @@ capacity, missing sensors, and incomplete windows cannot manufacture relief.
 Completing the observation interval does not prove the host has settled, and a
 host-wide change does not prove which action caused it.
 
+`resource_delta.processes` adds CPU and RSS observations for the exact target
+incarnations actually attempted in that run. CPU uses each process's own
+monotonic read interval and reports cores plus the percentage of observed host
+capacity. RSS is resident footprint, including shared pages, **not memory freed**.
+An exited target, PID reuse, changed UID, unreadable counters, or an incomplete
+window leaves the affected after-values and deltas unknown. Repeated action
+stages share one process row with their action IDs; service and descendant usage
+is not included. Collection is bounded to 32 distinct selected targets; a larger
+selection retains host measurements and explicitly marks process evidence
+unavailable. Old host-only artifacts remain readable.
+
 Raw samples append to `action/resource_samples.jsonl`, and each apply invocation
 retains its own `action/resource_delta-<run-id>.json`. Execution outcomes are
 saved before the post-action wait. Storage or sensor failures appear as missing

@@ -7,13 +7,15 @@
 use super::relief::{
     capture_resource_observation, collect_resource_window, replay_resource_artifact,
     summarize_window, ResourceActionBinding, ResourceDelta, ResourceObservation,
-    ResourceObservationArtifact, ResourceObservationWindow, MAX_RESOURCE_WINDOW_MS,
-    RESOURCE_OBSERVATION_SCHEMA_VERSION,
+    ResourceObservationArtifact, ResourceObservationWindow, MAX_PROCESS_RESOURCE_TARGETS,
+    MAX_RESOURCE_WINDOW_MS, RESOURCE_OBSERVATION_SCHEMA_VERSION,
 };
 use super::resource_prediction::ValidatedResourcePredictions;
 use super::SavedActionOutcome;
 use crate::collect::pressure::Unavailable;
+use crate::decision::Action;
 use crate::plan::Plan;
+use pt_common::{IdentityQuality, ProcessIdentity};
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -39,6 +41,7 @@ pub struct ResourceRun {
     plan_id: String,
     plan_sha256: String,
     settle_ms: u64,
+    observed_targets: Vec<ProcessIdentity>,
     enabled: bool,
     predictions: Option<ValidatedResourcePredictions>,
 }
@@ -254,13 +257,15 @@ pub fn begin_resource_run(
     plan_sha256: &str,
     settle_ms: u64,
     predictions: Option<&ValidatedResourcePredictions>,
+    observed_targets: &[ProcessIdentity],
 ) -> ResourceRun {
     let mut run = begin_resource_run_with(
         action_dir,
         plan,
         plan_sha256,
         settle_ms,
-        |duration, sample| collect_resource_window(duration, sample),
+        observed_targets,
+        |duration, targets, sample| collect_resource_window(duration, targets, sample),
     );
     if let Some(predictions) = predictions {
         match predictions.snapshot().validate(plan) {
@@ -271,13 +276,42 @@ pub fn begin_resource_run(
     run
 }
 
+fn checked_observation_targets(
+    plan: &Plan,
+    targets: &[ProcessIdentity],
+) -> Result<Vec<ProcessIdentity>, String> {
+    let mut selected: Vec<ProcessIdentity> = Vec::new();
+    for target in targets {
+        if target.quality != IdentityQuality::Full
+            || !plan.actions.iter().any(|action| {
+                !action.blocked && action.action != Action::Keep && action.target == *target
+            })
+        {
+            return Err("a selected process observation does not match a full, unblocked canonical action target; no partial subset was sampled".into());
+        }
+        if let Some(existing) = selected.iter().find(|existing| existing.pid == target.pid) {
+            if existing.matches(target) {
+                continue;
+            }
+            return Err("selection contains conflicting incarnations of the same PID; no partial subset was sampled".into());
+        }
+        if selected.len() >= MAX_PROCESS_RESOURCE_TARGETS {
+            return Err(format!("selection exceeds the {MAX_PROCESS_RESOURCE_TARGETS}-process observation bound; no partial subset was sampled"));
+        }
+        selected.push(target.clone());
+    }
+    Ok(selected)
+}
+
 fn begin_resource_run_with(
     action_dir: &Path,
     plan: &Plan,
     plan_sha256: &str,
     settle_ms: u64,
+    observed_targets: &[ProcessIdentity],
     collect: impl FnOnce(
         Duration,
+        &[ProcessIdentity],
         &mut dyn FnMut(&ResourceObservation),
     ) -> Result<ResourceObservationWindow, String>,
 ) -> ResourceRun {
@@ -290,6 +324,7 @@ fn begin_resource_run_with(
         plan_id: plan.plan_id.clone(),
         plan_sha256: plan_sha256.to_string(),
         settle_ms,
+        observed_targets: Vec::new(),
         enabled: true,
         predictions: None,
     };
@@ -302,13 +337,19 @@ fn begin_resource_run_with(
         run.enabled = false;
         return run;
     }
+    match checked_observation_targets(plan, observed_targets) {
+        Ok(targets) => run.observed_targets = targets,
+        Err(reason) => missing(&mut run.unavailable, "process_observations", reason),
+    }
     let duration = if settle_ms == 0 || !cfg!(target_os = "linux") {
         Duration::ZERO
     } else {
         Duration::from_millis(BASELINE_WINDOW_MS.min(settle_ms))
     };
     let mut errors = Vec::new();
-    run.before = collect_for_run(&run, "before", duration, &mut errors, collect);
+    run.before = collect_for_run(&run, "before", duration, &mut errors, |duration, sample| {
+        collect(duration, &run.observed_targets, sample)
+    });
     run.unavailable.extend(errors);
     run
 }
@@ -338,6 +379,11 @@ fn persist_artifact(
     if !canonical_run_id(&artifact.run_id) {
         return Err("invalid apply-run UUID".into());
     }
+    let mut bytes = serde_json::to_vec(artifact).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_RESOURCE_ARTIFACT_BYTES {
+        return Err("resource artifact exceeds its bounded replay byte limit; no oversized artifact was written".into());
+    }
     ensure_action_directory(action_dir, true)?;
     let path = action_dir.join(format!(
         "{ARTIFACT_PREFIX}{}{ARTIFACT_SUFFIX}",
@@ -347,8 +393,7 @@ fn persist_artifact(
     options.write(true).create_new(true);
     no_follow(&mut options);
     let mut file = options.open(&path).map_err(|error| error.to_string())?;
-    serde_json::to_writer(&mut file, artifact).map_err(|error| error.to_string())?;
-    file.write_all(b"\n").map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
     Ok(path)
 }
@@ -361,11 +406,12 @@ pub fn finish_resource_run(
     plan: &Plan,
     saved_outcomes: &[SavedActionOutcome],
 ) -> ResourceRunResult {
+    let targets = run.observed_targets.clone();
     finish_resource_run_with(
         run,
         plan,
         saved_outcomes,
-        |duration, sample| collect_resource_window(duration, sample),
+        |duration, sample| collect_resource_window(duration, &targets, sample),
         capture_resource_observation,
     )
 }
@@ -685,6 +731,7 @@ mod tests {
             monotonic_start_ns: Some(ms * 1_000_000),
             monotonic_end_ns: Some(ms * 1_000_000),
             cpu_times: None,
+            processes: Vec::new(),
             unavailable: Vec::new(),
             pressure: PressureSnapshot {
                 sampled_at_ms: ms,
@@ -765,12 +812,196 @@ mod tests {
     }
 
     #[test]
+    fn selected_process_observations_require_canonical_targets_and_a_complete_bounded_set() {
+        let (plan, _, _) = fixture();
+        let target = plan.actions[0].target.clone();
+        assert_eq!(
+            checked_observation_targets(&plan, &[target.clone(), target.clone()]).unwrap(),
+            [target.clone()]
+        );
+        let mut foreign = target.clone();
+        foreign.uid = 1001;
+        assert!(checked_observation_targets(&plan, &[foreign]).is_err());
+        let mut weak = target.clone();
+        weak.quality = IdentityQuality::NoBootId;
+        assert!(checked_observation_targets(&plan, &[weak]).is_err());
+        let mut blocked = plan.clone();
+        blocked.actions[0].blocked = true;
+        assert!(checked_observation_targets(&blocked, std::slice::from_ref(&target)).is_err());
+        let mut keep = plan.clone();
+        keep.actions[0].action = Action::Keep;
+        assert!(checked_observation_targets(&keep, std::slice::from_ref(&target)).is_err());
+
+        let mut conflicting = plan.clone();
+        let mut newer = conflicting.actions[0].clone();
+        newer.action_id = "newer-42".into();
+        newer.target.start_id = StartId::from_linux(BOOT, 11, 42);
+        conflicting.actions.push(newer.clone());
+        assert!(
+            checked_observation_targets(&conflicting, &[target, newer.target])
+                .unwrap_err()
+                .contains("conflicting incarnations")
+        );
+
+        let mut many = plan.clone();
+        many.actions.clear();
+        let mut targets = Vec::new();
+        for i in 0..=MAX_PROCESS_RESOURCE_TARGETS {
+            let pid = 100 + i as u32;
+            let mut action = plan.actions[0].clone();
+            action.action_id = format!("renice-{pid}");
+            action.target = ProcessIdentity::new(pid, StartId::from_linux(BOOT, 10, pid), 1000);
+            targets.push(action.target.clone());
+            many.actions.push(action);
+        }
+        assert!(checked_observation_targets(&many, &targets)
+            .unwrap_err()
+            .contains("observation bound"));
+        targets.pop();
+        assert_eq!(
+            checked_observation_targets(&many, &targets).unwrap().len(),
+            MAX_PROCESS_RESOURCE_TARGETS
+        );
+    }
+
+    #[test]
+    fn target_samples_persist_and_replay_without_becoming_freed_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let (plan, saved, digest) = fixture();
+        let target = plan.actions[0].target.clone();
+        let measured = |ms, rss| {
+            let mut sample = observation(ms);
+            sample.processes = vec![super::super::relief::ProcessResourceObservation {
+                target: target.clone(),
+                monotonic_start_ns: sample.monotonic_start_ns,
+                monotonic_end_ns: sample.monotonic_end_ns,
+                user_ticks: Some(10),
+                system_ticks: Some(2),
+                rss_bytes: Some(rss),
+                unavailable: Vec::new(),
+            }];
+            ResourceObservationWindow {
+                requested_duration_ms: 0,
+                sample_interval_ms: 1000,
+                samples: vec![sample],
+            }
+        };
+        let run = begin_resource_run_with(
+            temp.path(),
+            &plan,
+            &digest,
+            0,
+            &[target.clone(), target.clone()],
+            |duration, selected, callback| {
+                assert_eq!(duration, Duration::ZERO);
+                assert_eq!(selected, std::slice::from_ref(&target));
+                let window = measured(1000, 20_000);
+                stream(&window, callback);
+                Ok(window)
+            },
+        );
+        assert_eq!(run.observed_targets, [target.clone()]);
+        let report = finish_resource_run_with(
+            run,
+            &plan,
+            std::slice::from_ref(&saved),
+            |duration, callback| {
+                assert_eq!(duration, Duration::ZERO);
+                let window = measured(3000, 15_000);
+                stream(&window, callback);
+                Ok(window)
+            },
+            || observation(4000),
+        );
+        let delta = report.resource_delta.as_ref().unwrap();
+        assert_eq!(delta.processes.len(), 1);
+        assert_eq!(delta.processes[0].rss_bytes.delta, Some(-5000.0));
+        assert_eq!(delta.processes[0].cpu_cores.delta, None);
+        assert_eq!(delta.available_memory_bytes.delta, Some(2_000_000.0));
+        let restored = load_resource_runs(
+            temp.path(),
+            &plan,
+            &digest,
+            &[saved],
+            &observation(4000),
+            None,
+        );
+        assert!(restored.rejected.is_empty());
+        assert_eq!(restored.reports.len(), 1);
+        assert_eq!(restored.reports[0].processes[0].target, target);
+        assert_eq!(
+            restored.reports[0].processes[0].rss_bytes.delta,
+            Some(-5000.0)
+        );
+        let lines = fs::read_to_string(temp.path().join(SAMPLE_FILE)).unwrap();
+        let records: Vec<serde_json::Value> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0]["observation"]["processes"][0]["rss_bytes"],
+            20_000
+        );
+        assert_eq!(
+            records[1]["observation"]["processes"][0]["rss_bytes"],
+            15_000
+        );
+    }
+
+    #[test]
+    fn invalid_target_selection_retains_host_evidence_without_sampling_a_subset() {
+        let temp = tempfile::tempdir().unwrap();
+        let (plan, _, digest) = fixture();
+        let mut wrong = plan.actions[0].target.clone();
+        wrong.uid += 1;
+        let run = begin_resource_run_with(
+            temp.path(),
+            &plan,
+            &digest,
+            0,
+            &[plan.actions[0].target.clone(), wrong],
+            |duration, selected, callback| {
+                assert!(selected.is_empty());
+                let measured = window(1000, duration);
+                stream(&measured, callback);
+                Ok(measured)
+            },
+        );
+        assert!(run.observed_targets.is_empty());
+        assert!(run.before.is_some());
+        assert!(run
+            .unavailable
+            .iter()
+            .any(|error| error.source == "process_observations"));
+    }
+
+    #[test]
+    fn artifact_size_is_bounded_before_any_file_is_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let (plan, saved, digest) = fixture();
+        let mut evidence = artifact(&plan, &saved, &digest, RUN_A, 1000, 3000);
+        evidence.before.samples[0].unavailable.push(Unavailable {
+            source: "oversized_fixture".into(),
+            reason: "x".repeat(MAX_RESOURCE_ARTIFACT_BYTES as usize),
+        });
+        let error = persist_artifact(temp.path(), &evidence).unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn baseline_streams_run_identity_and_appends_without_replacing_previous_samples() {
         let temp = tempfile::tempdir().unwrap();
         let action_dir = temp.path().join("action");
         let (plan, _, digest) = fixture();
-        let run =
-            begin_resource_run_with(&action_dir, &plan, &digest, 15_000, |duration, callback| {
+        let run = begin_resource_run_with(
+            &action_dir,
+            &plan,
+            &digest,
+            15_000,
+            &[],
+            |duration, _, callback| {
                 assert_eq!(
                     duration,
                     if cfg!(target_os = "linux") {
@@ -782,7 +1013,8 @@ mod tests {
                 let measured = window(1000, duration);
                 stream(&measured, callback);
                 Ok(measured)
-            });
+            },
+        );
         assert!(run.before.is_some());
         assert!(run.unavailable.is_empty());
         let first_bytes = fs::read(action_dir.join(SAMPLE_FILE)).unwrap();
@@ -798,27 +1030,39 @@ mod tests {
             assert_eq!(record["plan_sha256"], digest);
             assert_eq!(record["phase"], "before");
         }
-        let next = begin_resource_run_with(&action_dir, &plan, &digest, 0, |duration, callback| {
-            assert_eq!(duration, Duration::ZERO);
-            let measured = window(2000, duration);
-            stream(&measured, callback);
-            Ok(measured)
-        });
+        let next = begin_resource_run_with(
+            &action_dir,
+            &plan,
+            &digest,
+            0,
+            &[],
+            |duration, _, callback| {
+                assert_eq!(duration, Duration::ZERO);
+                let measured = window(2000, duration);
+                stream(&measured, callback);
+                Ok(measured)
+            },
+        );
         assert_ne!(run.run_id, next.run_id);
         let appended = fs::read(action_dir.join(SAMPLE_FILE)).unwrap();
         assert!(appended.starts_with(&first_bytes));
         assert!(appended.len() > first_bytes.len());
-        let invalid =
-            begin_resource_run_with(&action_dir, &plan, "not-a-full-digest", 0, |_, _| {
-                panic!("invalid binding must not collect")
-            });
+        let invalid = begin_resource_run_with(
+            &action_dir,
+            &plan,
+            "not-a-full-digest",
+            0,
+            &[],
+            |_, _, _| panic!("invalid binding must not collect"),
+        );
         assert!(invalid.before.is_none());
         let invalid = begin_resource_run_with(
             &action_dir,
             &plan,
             &digest,
             MAX_RESOURCE_WINDOW_MS + 1,
-            |_, _| panic!("unbounded duration must not collect"),
+            &[],
+            |_, _, _| panic!("unbounded duration must not collect"),
         );
         assert!(invalid.before.is_none());
     }
@@ -828,11 +1072,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let action_dir = temp.path().join("action");
         let (plan, saved, digest) = fixture();
-        let run = begin_resource_run_with(&action_dir, &plan, &digest, 0, |duration, callback| {
-            let measured = window(1000, duration);
-            stream(&measured, callback);
-            Ok(measured)
-        });
+        let run = begin_resource_run_with(
+            &action_dir,
+            &plan,
+            &digest,
+            0,
+            &[],
+            |duration, _, callback| {
+                let measured = window(1000, duration);
+                stream(&measured, callback);
+                Ok(measured)
+            },
+        );
         let report = finish_resource_run_with(
             run,
             &plan,
@@ -899,6 +1150,8 @@ mod tests {
         let (mut plan, mut saved, _) = fixture();
         plan.actions[0].action = Action::Kill;
         saved.action = Some(Action::Kill);
+        saved.command = Some("sleep 30".into());
+        saved.parent_pid = Some(1);
         let snapshot = ResourcePredictionSnapshot {
             schema_version: RESOURCE_PREDICTION_SCHEMA_VERSION,
             session_id: plan.session_id.clone(),
@@ -921,12 +1174,18 @@ mod tests {
             "{:x}",
             sha2::Sha256::digest(serde_json::to_vec(&canonical).unwrap())
         );
-        let mut run =
-            begin_resource_run_with(temp.path(), &plan, &digest, 0, |duration, callback| {
+        let mut run = begin_resource_run_with(
+            temp.path(),
+            &plan,
+            &digest,
+            0,
+            &[],
+            |duration, _, callback| {
                 let measured = window(1000, duration);
                 stream(&measured, callback);
                 Ok(measured)
-            });
+            },
+        );
         run.predictions = Some(predictions.clone());
         let report = finish_resource_run_with(
             run,
@@ -938,6 +1197,11 @@ mod tests {
                 Ok(measured)
             },
             || observation(4000),
+        );
+        assert!(
+            report.artifact_path.is_some(),
+            "resource artifact was unavailable: {:?}",
+            report.unavailable
         );
         let stored: ResourceObservationArtifact =
             serde_json::from_slice(&fs::read(report.artifact_path.unwrap()).unwrap()).unwrap();
@@ -1010,8 +1274,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (plan, saved, digest) = fixture();
         for remaining_ms in [0, 50] {
-            let mut run =
-                begin_resource_run_with(temp.path(), &plan, &digest, 120, |duration, callback| {
+            let mut run = begin_resource_run_with(
+                temp.path(),
+                &plan,
+                &digest,
+                120,
+                &[],
+                |duration, _, callback| {
                     assert_eq!(
                         duration,
                         if cfg!(target_os = "linux") {
@@ -1023,7 +1292,8 @@ mod tests {
                     let measured = window(1000, duration);
                     stream(&measured, callback);
                     Ok(measured)
-                });
+                },
+            );
             run.cap_settle_ms(500);
             assert_eq!(
                 run.settle_ms, 120,
@@ -1092,7 +1362,8 @@ mod tests {
                 &plan,
                 &digest,
                 15_000,
-                |duration, callback| {
+                &[],
+                |duration, _, callback| {
                     let measured = window(1000, duration);
                     stream(&measured, callback);
                     Ok(measured)
@@ -1121,8 +1392,13 @@ mod tests {
             assert!(!report.unavailable.is_empty());
         }
         for missing in ["boot", "incomplete"] {
-            let run =
-                begin_resource_run_with(temp.path(), &plan, &digest, 15_000, |_, callback| {
+            let run = begin_resource_run_with(
+                temp.path(),
+                &plan,
+                &digest,
+                15_000,
+                &[],
+                |_, _, callback| {
                     let mut measured = window(1000, Duration::ZERO);
                     if missing == "boot" {
                         measured.samples[0].boot_id = None;
@@ -1131,7 +1407,8 @@ mod tests {
                     }
                     stream(&measured, callback);
                     Ok(measured)
-                });
+                },
+            );
             let report = finish_resource_run_with(
                 run,
                 &plan,
@@ -1149,11 +1426,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join(SAMPLE_FILE)).unwrap();
         let (plan, saved, digest) = fixture();
-        let run = begin_resource_run_with(temp.path(), &plan, &digest, 0, |duration, callback| {
-            let measured = window(1000, duration);
-            stream(&measured, callback);
-            Ok(measured)
-        });
+        let run = begin_resource_run_with(
+            temp.path(),
+            &plan,
+            &digest,
+            0,
+            &[],
+            |duration, _, callback| {
+                let measured = window(1000, duration);
+                stream(&measured, callback);
+                Ok(measured)
+            },
+        );
         assert!(run
             .unavailable
             .iter()
@@ -1195,11 +1479,18 @@ mod tests {
         let torn = b"{\"run_id\":\"unfinished";
         fs::write(&sample_path, torn).unwrap();
         let (plan, _, digest) = fixture();
-        let run = begin_resource_run_with(temp.path(), &plan, &digest, 0, |duration, callback| {
-            let measured = window(1000, duration);
-            stream(&measured, callback);
-            Ok(measured)
-        });
+        let run = begin_resource_run_with(
+            temp.path(),
+            &plan,
+            &digest,
+            0,
+            &[],
+            |duration, _, callback| {
+                let measured = window(1000, duration);
+                stream(&measured, callback);
+                Ok(measured)
+            },
+        );
         let bytes = fs::read(&sample_path).unwrap();
         assert!(bytes.starts_with(torn));
         assert_eq!(bytes[torn.len()], b'\n');
@@ -1364,11 +1655,18 @@ mod tests {
         )
         .unwrap();
         let (plan, saved, digest) = fixture();
-        let run = begin_resource_run_with(&action_dir, &plan, &digest, 0, |duration, callback| {
-            let measured = window(1000, duration);
-            stream(&measured, callback);
-            Ok(measured)
-        });
+        let run = begin_resource_run_with(
+            &action_dir,
+            &plan,
+            &digest,
+            0,
+            &[],
+            |duration, _, callback| {
+                let measured = window(1000, duration);
+                stream(&measured, callback);
+                Ok(measured)
+            },
+        );
         assert!(run
             .unavailable
             .iter()

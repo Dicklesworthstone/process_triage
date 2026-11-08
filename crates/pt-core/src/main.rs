@@ -20542,6 +20542,7 @@ mod planning_pressure_tests {
                     monotonic_end_ns: Some(at_ms * 1_000_000 + 1),
                     pressure,
                     cpu_times: None,
+                    processes: Vec::new(),
                     unavailable: Vec::new(),
                 }],
             }
@@ -24124,13 +24125,82 @@ fn attach_measured_goal_resources(
     }
 }
 
+/// Observe only the selected executable targets, once per exact incarnation.
+/// Canonical replay further restricts published deltas to actual executed attempts.
+fn resource_observation_targets(actions: &[&PlanAction]) -> Vec<ProcessIdentity> {
+    let mut seen = HashSet::new();
+    actions
+        .iter()
+        .filter(|action| !action.blocked && action.action != Action::Keep)
+        .filter(|action| {
+            seen.insert((
+                action.target.pid,
+                action.target.start_id.clone(),
+                action.target.uid,
+            ))
+        })
+        .map(|action| action.target.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod resource_observation_selection_tests {
+    use super::*;
+
+    #[test]
+    fn only_selected_executable_incarnations_are_observed_once() {
+        let target = ProcessIdentity::full(
+            123,
+            pt_common::StartId::from_linux("observation-test", 100, 123),
+            1000,
+            None,
+            None,
+            pt_common::IdentityQuality::Full,
+        );
+        let action: PlanAction = serde_json::from_value(serde_json::json!({
+            "action_id": "renice-123", "target": target, "action": "renice",
+            "order": 0, "stage": 0, "timeouts": pt_core::plan::ActionTimeouts::default(),
+            "pre_checks": [], "rationale": {}, "on_success": [], "on_failure": [],
+            "blocked": false
+        }))
+        .unwrap();
+        let mut second_stage = action.clone();
+        second_stage.action_id = "kill-123".into();
+        second_stage.action = Action::Kill;
+        let mut replacement = action.clone();
+        replacement.target.start_id = pt_common::StartId::from_linux("observation-test", 200, 123);
+        let mut other_user = action.clone();
+        other_user.target.uid = 1001;
+        let mut blocked = action.clone();
+        blocked.target.pid = pt_common::ProcessId(124);
+        blocked.blocked = true;
+        let mut keep = action.clone();
+        keep.target.pid = pt_common::ProcessId(125);
+        keep.action = Action::Keep;
+
+        let targets = resource_observation_targets(&[
+            &action,
+            &second_stage,
+            &replacement,
+            &other_user,
+            &blocked,
+            &keep,
+        ]);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0], action.target);
+        assert_eq!(targets[1], replacement.target);
+        assert_eq!(targets[2], other_user.target);
+        assert!(resource_observation_targets(&[]).is_empty());
+    }
+}
+
 fn resource_delta_summary(delta: &ResourceDelta) -> String {
     let show = |value: Option<f64>, scale: f64| {
         value
             .map(|value| format!("{:.1}", value / scale))
             .unwrap_or_else(|| "unknown".to_string())
     };
-    format!(
+    let mut summary = format!(
         "Observed host resources (after minus before; attribution to actions is unproven): CPU busy {}% -> {}% (delta {} points), available memory {} -> {} MiB (delta {} MiB)",
         show(delta.cpu.busy_percent.before, 1.0),
         show(delta.cpu.busy_percent.after, 1.0),
@@ -24138,7 +24208,31 @@ fn resource_delta_summary(delta: &ResourceDelta) -> String {
         show(delta.available_memory_bytes.before, 1_048_576.0),
         show(delta.available_memory_bytes.after, 1_048_576.0),
         show(delta.available_memory_bytes.delta, 1_048_576.0),
-    )
+    );
+    for process in delta.processes.iter().take(8) {
+        summary.push_str(&format!(
+            "\n  PID {} (UID {}, start {}): CPU {} -> {} cores (delta {}), RSS {} -> {} MiB (delta {} MiB)",
+            process.target.pid.0,
+            process.target.uid,
+            process.target.start_id,
+            show(process.cpu_cores.before, 1.0),
+            show(process.cpu_cores.after, 1.0),
+            show(process.cpu_cores.delta, 1.0),
+            show(process.rss_bytes.before, 1_048_576.0),
+            show(process.rss_bytes.after, 1_048_576.0),
+            show(process.rss_bytes.delta, 1_048_576.0),
+        ));
+    }
+    if !delta.processes.is_empty() {
+        summary.push_str("\n  Exact process incarnations only; RSS includes shared pages. An exited or replaced target has unknown after-values, not zero usage or proven freed memory.");
+    }
+    if delta.processes.len() > 8 {
+        summary.push_str(&format!(
+            "\n  {} more process observations in the structured resource delta.",
+            delta.processes.len() - 8,
+        ));
+    }
+    summary
 }
 
 #[derive(Clone, Default)]
@@ -25149,12 +25243,14 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
                 .map_or(requested_settle_ms, |remaining| {
                     remaining.min(requested_settle_ms)
                 });
+            let observation_targets = resource_observation_targets(&actions_to_apply);
             let mut observations = begin_resource_run(
                 &handle.dir.join("action"),
                 &plan,
                 &plan_sha256,
                 initial_settle_ms,
                 resource_predictions.as_ref(),
+                &observation_targets,
             );
             if let Some(error) = &resource_prediction_error {
                 observations
