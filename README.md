@@ -1281,7 +1281,8 @@ The checked-in files under `completions/` are snapshots and may lag behind the C
 
 `pt` remembers human verdicts, per command pattern, in `decisions.json` in your config directory:
 
-- **Kills you confirm in the TUI** are recorded once they succeed (dry-run, shadow, failed and blocked actions are not).
+- **Kills you individually select and confirm in the TUI** are recorded once they succeed (dry-run, shadow, failed and blocked actions are not).
+- **Spare feedback in the TUI**: individually unselect a process, then press `e` and confirm. With no selected actions, the dialog becomes **Save Feedback** and saves only the reviewed spare judgments. Reselecting a row cancels its pending spare. Bulk selection changes do not create labels, refresh clears pending judgments, and dry-run/shadow previews save no labels.
 - **Explicit labels**: `pt agent label --pid 1234 --kill` or `pt agent label --cmd "python3 -m http.server 8000" --spare`.
 - **Robot/agent applies are never recorded**, so the model cannot teach itself its own mistakes.
 
@@ -1310,7 +1311,9 @@ Each verdict is stored at three specificity levels:
 - Long numbers (4+ digits) → `\d+`
 - Versioned interpreters (`python3.11`) → `python.*`
 
-When a process matches a learned pattern (most specific level with any verdicts wins), its class prior is replaced by a Beta-Binomial estimate, `P(abandoned) = (kills + 2·g) / (kills + spares + 2)`, where `g` is the global abandoned+zombie prior, clamped to [0.02, 0.95] so live evidence can still overturn it. One kill moves a default 0.25 prior to about 0.5; one spare moves it to about 0.17. Counts fade with a 180-day half-life since the pattern was last labeled. This applies in `pt agent plan` (candidates show `inference.learned_prior`), the TUI and `pt agent explain`, and it takes precedence over the signature fast path. `pt history` lists the patterns and counts; `pt clear` resets them, and `pt clear TEXT` forgets only patterns containing TEXT.
+When a process matches a learned pattern (the most specific eligible level wins), its class prior is replaced by a Beta-Binomial estimate, `P(abandoned) = (kills + 2·g) / (kills + spares + 2)`, where `g` is the global abandoned+zombie prior, clamped to [0.02, 0.95] so live evidence can still overturn it. The formula uses effective counts: each verdict fades with a 180-day half-life from when it was given. One fresh kill moves a default 0.25 prior to about 0.5; one spare moves it to about 0.17. This applies in `pt agent plan` (candidates show `inference.learned_prior`), the TUI and `pt agent explain`, and it takes precedence over the signature fast path. `pt history` lists the patterns and raw counts; `pt clear` resets them, and `pt clear TEXT` forgets only patterns containing TEXT.
+
+Broad patterns need at least two distinct specific sources with agreeing verdicts and at least half an effective verdict of net support each. Repeated kills of one script plus a spare of another cannot teach an interpreter-wide kill preference. Tied, contradictory, or stale source evidence cannot supply a corroborating vote, and agreement must move the aggregate prior in that same direction. Up to 16 source summaries are retained per pattern; old source-ID-only records wait for new corroborating labels before broad transfer resumes. Explanations include `specificity` and `effective_sample_count` so you can see the scope and current strength of the learned evidence.
 
 ---
 
@@ -1729,7 +1732,7 @@ cargo run -p pt-core -- run
 It is built to avoid that. Interactive mode always asks for confirmation. Robot mode is off by default and, when enabled, needs `--yes`, 95%+ posterior for the event that justifies the action, RSS and kill-count limits, and live pre-checks (identity, protection, session safety, data-loss gate) immediately before each action. Protected processes are never candidates. It is still software: start with `pt agent plan` and review what it proposes.
 
 **Q: How does it learn from my decisions?**
-Successful direct kills you individually select in the TUI and verdicts you give with `pt agent label --kill|--spare` are saved to `decisions.json`. Default recommendations, goal selections, select-all, and bulk confirmation do not become human labels. Refresh clears per-row judgments, and confirmation binds them to that scan's selection. When `pt` sees a similar command pattern again, it replaces the prior with one learned from those counts (see "How pt Learns From Your Decisions"). Robot/agent applies are not learned from.
+Successful direct kills you individually select in the TUI, individually unselected rows you confirm as spared, and verdicts you give with `pt agent label --kill|--spare` are saved to `decisions.json`. You can confirm spare feedback with `e` even when no actions are selected. Default recommendations, goal selections, select-all, and bulk confirmation do not become human labels. Refresh clears per-row judgments, and confirmation binds them to that scan's selection. When `pt` sees a similar command pattern again, it replaces the prior with one learned from those counts (see "How pt Learns From Your Decisions"). Robot/agent applies are not learned from.
 
 **Q: Does it phone home?**
 No. All data stays on your machine. No telemetry, no analytics, no network calls except `install.sh`/`pt update` downloading releases and SSH to your own hosts in fleet mode.

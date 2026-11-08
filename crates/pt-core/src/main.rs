@@ -2325,8 +2325,8 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
     let config = load_config(&config_options).map_err(|e| format!("load config: {}", e))?;
     let priors = config.priors.clone();
     let policy = config.policy.clone();
-    // Kills the human confirms here are recorded; later scans (TUI and agent plan)
-    // use them as learned priors. An unreadable store disables learning, not the TUI.
+    // Explicit per-row judgments are recorded; later scans use them as learned
+    // priors. An unreadable store disables learning, not the TUI.
     let decisions = match pt_core::decision::decision_store::DecisionStore::load(&config.config_dir)
     {
         Ok(store) => Some(store),
@@ -2508,71 +2508,117 @@ fn run_interactive_tui(global: &GlobalOpts, args: &RunArgs) -> Result<(), String
         let decisions_e = Arc::clone(&decisions);
         let execution_state_e = Arc::clone(&execution_state);
 
-        let execute_fn = Arc::new(move |selected: Vec<u32>, explicitly_selected: Vec<u32>| {
-            let mut state = execution_state_e
-                .lock()
-                .map_err(|_| "interactive execution state lock poisoned".to_string())?;
-            let outcome = (|| {
-                let candidates = plan_cache_e
+        let execute_fn = Arc::new(
+            move |selected: Vec<u32>,
+                  explicitly_selected: Vec<u32>,
+                  explicitly_spared: Vec<u32>| {
+                let mut state = execution_state_e
                     .lock()
-                    .map_err(|_| "plan cache lock poisoned".to_string())?;
-                let plan =
-                    build_plan_from_selection(&session_id_e, &policy_e, &selected, &candidates)?;
-                let commands: HashMap<u32, (String, String)> = selected
-                    .iter()
-                    .filter_map(|pid| {
-                        let c = candidates.get(pid)?;
-                        Some((*pid, (c.comm.clone(), c.cmd.clone())))
-                    })
-                    .collect();
-                drop(candidates); // release lock before I/O
+                    .map_err(|_| "interactive execution state lock poisoned".to_string())?;
+                let outcome = (|| {
+                    let candidates = plan_cache_e
+                        .lock()
+                        .map_err(|_| "plan cache lock poisoned".to_string())?;
+                    // A confirmed spare-only review needs no executable plan. Keep
+                    // the planner's rejection of empty/invalid action selections.
+                    let plan = if selected.is_empty() {
+                        None
+                    } else {
+                        Some(build_plan_from_selection(
+                            &session_id_e,
+                            &policy_e,
+                            &selected,
+                            &candidates,
+                        )?)
+                    };
+                    let commands: HashMap<u32, (String, String)> = selected
+                        .iter()
+                        .chain(explicitly_spared.iter())
+                        .filter_map(|pid| {
+                            let c = candidates.get(pid)?;
+                            Some((*pid, (c.comm.clone(), c.cmd.clone())))
+                        })
+                        .collect();
+                    drop(candidates); // release lock before I/O
 
-                if plan.actions.is_empty() {
-                    return Err("no actions to apply for selected processes".to_string());
-                }
-
-                if dry_run || shadow {
-                    write_plan_to_session(&handle_e, &plan)?;
-                    let mode = if dry_run { "dry_run" } else { "shadow" };
-                    write_outcomes_for_mode(&handle_e, &plan, mode)
-                        .map_err(|e| format!("write outcomes: {}", e))?;
-                    return Ok(ExecutionOutcome {
-                        mode: Some(mode.to_string()),
-                        attempted: plan.actions.len(),
-                        succeeded: 0,
-                        failed: 0,
-                    });
-                }
-
-                let (result, _) =
-                    execute_tui_plan_selection(&handle_e, &policy_e, &plan, &mut state)?;
-                if let Ok(mut guard) = decisions_e.lock() {
-                    if let Some(store) = guard.as_mut() {
-                        record_confirmed_kills(
-                            store,
-                            &plan,
-                            &result,
-                            &commands,
-                            &explicitly_selected,
-                        );
+                    if dry_run || shadow {
+                        let mode = if dry_run { "dry_run" } else { "shadow" };
+                        if let Some(plan) = &plan {
+                            write_plan_to_session(&handle_e, plan)?;
+                            write_outcomes_for_mode(&handle_e, plan, mode)
+                                .map_err(|e| format!("write outcomes: {}", e))?;
+                        }
+                        return Ok(ExecutionOutcome {
+                            mode: Some(if plan.is_some() {
+                                mode.to_string()
+                            } else {
+                                format!("feedback_{mode}")
+                            }),
+                            attempted: plan.as_ref().map_or(0, |plan| plan.actions.len()),
+                            succeeded: 0,
+                            failed: 0,
+                        });
                     }
+
+                    if !explicitly_spared.is_empty() {
+                        let mut guard = decisions_e
+                            .lock()
+                            .map_err(|_| "decision store lock poisoned".to_string())?;
+                        let store = guard.as_mut().ok_or_else(|| {
+                            "cannot save spare feedback: decision learning is unavailable"
+                                .to_string()
+                        })?;
+                        record_confirmed_spares(store, &commands, &selected, &explicitly_spared)?;
+                    }
+                    let Some(plan) = plan else {
+                        if explicitly_spared.is_empty() {
+                            return Err("no actions to apply for selected processes".to_string());
+                        }
+                        return Ok(ExecutionOutcome {
+                            mode: Some("feedback".to_string()),
+                            attempted: 0,
+                            succeeded: 0,
+                            failed: 0,
+                        });
+                    };
+
+                    let (result, _) =
+                        execute_tui_plan_selection(&handle_e, &policy_e, &plan, &mut state)?;
+                    if let Ok(mut guard) = decisions_e.lock() {
+                        if let Some(store) = guard.as_mut() {
+                            record_confirmed_kills(
+                                store,
+                                &plan,
+                                &result,
+                                &commands,
+                                &explicitly_selected,
+                            );
+                        }
+                    }
+                    if let Some(error) = result.outcomes.iter().find_map(|outcome| {
+                        (outcome.status == pt_core::action::ActionStatus::Success)
+                            .then_some(outcome.details.as_ref())
+                            .flatten()
+                    }) {
+                        return Err(error.clone());
+                    }
+                    Ok(ExecutionOutcome {
+                        mode: None,
+                        attempted: result.summary.actions_attempted,
+                        succeeded: result.summary.actions_succeeded,
+                        failed: result.summary.actions_failed,
+                    })
+                })();
+                if selected.is_empty() {
+                    // Feedback persistence failures are not action failures and must
+                    // not change the session's execution state.
+                    outcome
+                } else {
+                    outcome
+                        .map_err(|error| record_tui_execution_failure(&handle_e, &mut state, error))
                 }
-                if let Some(error) = result.outcomes.iter().find_map(|outcome| {
-                    (outcome.status == pt_core::action::ActionStatus::Success)
-                        .then_some(outcome.details.as_ref())
-                        .flatten()
-                }) {
-                    return Err(error.clone());
-                }
-                Ok(ExecutionOutcome {
-                    mode: None,
-                    attempted: result.summary.actions_attempted,
-                    succeeded: result.summary.actions_succeeded,
-                    failed: result.summary.actions_failed,
-                })
-            })();
-            outcome.map_err(|error| record_tui_execution_failure(&handle_e, &mut state, error))
-        });
+            },
+        );
 
         app.set_refresh_op(refresh_fn);
         app.set_execute_op(execute_fn);
@@ -2634,6 +2680,48 @@ impl PlanCandidateInput {
             supervisor_restart: self.supervisor_restart.clone(),
         }
     }
+}
+
+/// A confirmed spare is a judgment about the command the user saw. Use that
+/// frozen snapshot, never a fresh PID lookup that may refer to another process.
+/// Bulk omissions do not reach this function, and duplicate PIDs count once.
+#[cfg(feature = "ui")]
+fn record_confirmed_spares(
+    store: &mut pt_core::decision::decision_store::DecisionStore,
+    commands: &HashMap<u32, (String, String)>,
+    selected: &[u32],
+    explicitly_spared: &[u32],
+) -> Result<usize, String> {
+    use pt_core::decision::decision_store::Verdict;
+
+    let spared: HashSet<u32> = explicitly_spared.iter().copied().collect();
+    for pid in &spared {
+        if selected.contains(pid) {
+            return Err(format!(
+                "conflicting action and spare feedback for PID {pid}"
+            ));
+        }
+        if !commands.contains_key(pid) {
+            return Err(format!(
+                "spare feedback lacks the reviewed command for PID {pid}"
+            ));
+        }
+    }
+    if spared.is_empty() {
+        return Ok(0);
+    }
+    // A rejected/unwritable save must not add unpersisted feedback to the next
+    // scan's in-memory priors or silently discard the user's explicit choice.
+    let mut updated = store.clone();
+    for pid in &spared {
+        let (comm, command) = &commands[pid];
+        updated.record(comm, command, Verdict::Spare);
+    }
+    updated
+        .save()
+        .map_err(|error| format!("save spare feedback: {error}"))?;
+    *store = updated;
+    Ok(spared.len())
 }
 
 /// Learn only explicit per-row judgments whose direct kill actually succeeded.
@@ -18682,7 +18770,7 @@ mod process_tree_safety_tests {
 
 #[cfg(all(test, feature = "ui"))]
 mod tui_learning_tests {
-    use super::record_confirmed_kills;
+    use super::{record_confirmed_kills, record_confirmed_spares};
     use pt_common::{IdentityQuality, ProcessIdentity, StartId};
     use pt_core::action::{ActionResult, ActionStatus, ExecutionResult, ExecutionSummary};
     use pt_core::config::Priors;
@@ -18739,6 +18827,60 @@ mod tui_learning_tests {
             time_ms: 1,
             details: None,
         }
+    }
+
+    #[test]
+    fn confirmed_spares_use_reviewed_commands_and_persist_without_an_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(directory.path()).unwrap();
+        let commands = HashMap::from([
+            (21, ("vim".to_string(), "vim notes.txt".to_string())),
+            (22, ("sleep".to_string(), "sleep 900".to_string())),
+        ]);
+        assert_eq!(
+            record_confirmed_spares(&mut store, &commands, &[], &[21, 21]).unwrap(),
+            1
+        );
+        let loaded = DecisionStore::load(directory.path()).unwrap();
+        let priors = Priors::default();
+        let kept = loaded
+            .learned_prior("vim", "vim notes.txt", &priors)
+            .unwrap();
+        assert_eq!((kept.kill, kept.spare), (0, 1));
+        assert!(loaded
+            .learned_prior("sleep", "sleep 900", &priors)
+            .is_none());
+    }
+
+    #[test]
+    fn conflicting_or_missing_spare_snapshot_never_partially_trains() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(directory.path()).unwrap();
+        let commands = HashMap::from([(21, ("vim".to_string(), "vim notes.txt".to_string()))]);
+        assert!(record_confirmed_spares(&mut store, &commands, &[21], &[21]).is_err());
+        assert!(record_confirmed_spares(&mut store, &commands, &[], &[21, 22]).is_err());
+        assert_eq!(
+            record_confirmed_spares(&mut store, &commands, &[], &[]).unwrap(),
+            0
+        );
+        assert!(store
+            .learned_prior("vim", "vim notes.txt", &Priors::default())
+            .is_none());
+        assert!(!directory.path().join("decisions.json").exists());
+    }
+
+    #[test]
+    fn failed_spare_save_does_not_update_in_memory_priors() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(directory.path()).unwrap();
+        // A directory at the destination fails even when the test runs as root.
+        std::fs::create_dir(directory.path().join("decisions.json")).unwrap();
+        let commands = HashMap::from([(21, ("vim".to_string(), "vim notes.txt".to_string()))]);
+        assert!(record_confirmed_spares(&mut store, &commands, &[], &[21]).is_err());
+        assert!(store
+            .learned_prior("vim", "vim notes.txt", &Priors::default())
+            .is_none());
+        assert!(directory.path().join("decisions.json").is_dir());
     }
 
     #[test]

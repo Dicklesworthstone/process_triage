@@ -74,7 +74,8 @@ pub enum AppState {
 }
 
 type RefreshOp = Arc<dyn Fn() -> Result<RefreshOutcome, String> + Send + Sync>;
-type ExecuteOp = Arc<dyn Fn(Vec<u32>, Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync>;
+type ExecuteOp =
+    Arc<dyn Fn(Vec<u32>, Vec<u32>, Vec<u32>) -> Result<ExecutionOutcome, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PendingOperation {
@@ -87,6 +88,7 @@ enum PendingOperation {
 struct SelectionSnapshot {
     pids: Vec<u32>,
     explicitly_selected: Vec<u32>,
+    explicitly_spared: Vec<u32>,
 }
 
 struct ConfirmedSelection {
@@ -130,7 +132,8 @@ pub struct App {
     /// Returns new rows and their goal metadata on success.
     refresh_op: Option<RefreshOp>,
     /// Injected execute operation for ftui Cmd::task (Send + 'static).
-    /// Takes selected PIDs and the explicit per-row label subset.
+    /// Takes selected PIDs, explicit positive selections, and explicit spares.
+    /// An empty action selection with spares saves feedback without acting.
     execute_op: Option<ExecuteOp>,
     /// Toast notification queue for async operation feedback.
     notifications: NotificationQueue,
@@ -206,8 +209,8 @@ impl App {
         let mut palette = CommandPalette::new().with_max_visible(12);
         let mut actions = vec![
             ActionItem::new("action.execute", "Execute selected  [e]")
-                .with_description("Open confirmation dialog for selected processes")
-                .with_tags(&["execute", "kill", "confirm"])
+                .with_description("Confirm selected actions and save explicit spare decisions")
+                .with_tags(&["execute", "kill", "confirm", "spare", "feedback"])
                 .with_category("Actions"),
             ActionItem::new("action.refresh", "Refresh processes  [r]")
                 .with_description("Rescan processes and refresh recommendations")
@@ -433,6 +436,19 @@ impl App {
         true
     }
 
+    fn show_selection_status(&mut self) {
+        let selected_count = self.process_table.selected_count();
+        let spare_count = self.process_table.get_explicitly_spared().len();
+        self.set_status(if spare_count > 0 {
+            format!(
+                "{} selected; {} spare decision(s) pending. Press e to confirm.",
+                selected_count, spare_count
+            )
+        } else {
+            format!("{} process(es) selected", selected_count)
+        });
+    }
+
     fn invalidate_selection(&mut self) {
         self.confirmation_selection = None;
         self.confirmed_selection = None;
@@ -652,15 +668,27 @@ impl App {
         }
         self.confirmed_selection = None;
         let selected_pids = self.process_table.get_selected();
+        let explicitly_spared = self.process_table.get_explicitly_spared();
         let selected_count = selected_pids.len();
-        if selected_count > 0 {
+        let spare_count = explicitly_spared.len();
+        if selected_count > 0 || spare_count > 0 {
             self.confirmation_selection = Some(SelectionSnapshot {
                 pids: selected_pids,
                 explicitly_selected: self.process_table.get_explicitly_selected(),
+                explicitly_spared,
             });
             self.confirm_dialog.show();
             self.state = AppState::Confirming;
-            self.set_status(format!("Confirm action on {} process(es)?", selected_count));
+            self.set_status(if selected_count == 0 {
+                format!("Confirm saving {} spare decision(s)?", spare_count)
+            } else if spare_count > 0 {
+                format!(
+                    "Confirm action on {} process(es) and save {} spare decision(s)?",
+                    selected_count, spare_count
+                )
+            } else {
+                format!("Confirm action on {} process(es)?", selected_count)
+            });
         } else {
             self.confirmation_selection = None;
             self.set_status("No processes selected");
@@ -682,8 +710,9 @@ impl App {
         self.state = AppState::Normal;
         match choice {
             ConfirmChoice::Yes => {
-                let Some(selection) = selection.filter(|selection| !selection.pids.is_empty())
-                else {
+                let Some(selection) = selection.filter(|selection| {
+                    !selection.pids.is_empty() || !selection.explicitly_spared.is_empty()
+                }) else {
                     self.set_status("Confirmation expired; select processes and confirm again");
                     return FtuiCmd::none();
                 };
@@ -692,7 +721,11 @@ impl App {
                 };
                 let count = selection.pids.len();
                 self.confirmed_selection = Some(ConfirmedSelection { ticket, selection });
-                self.set_status(format!("Preparing actions for {} process(es)...", count));
+                self.set_status(if count == 0 {
+                    "Preparing to save spare decisions...".to_string()
+                } else {
+                    format!("Preparing actions for {} process(es)...", count)
+                });
                 FtuiCmd::msg(Msg::RequestExecute { ticket })
             }
             ConfirmChoice::No => {
@@ -784,30 +817,35 @@ impl App {
             Msg::ToggleSelection => {
                 if self.selection_is_available() {
                     self.process_table.toggle_selection();
+                    self.show_selection_status();
                 }
                 FtuiCmd::none()
             }
             Msg::SelectRecommended => {
                 if self.selection_is_available() {
                     self.process_table.select_recommended();
+                    self.show_selection_status();
                 }
                 FtuiCmd::none()
             }
             Msg::SelectAll => {
                 if self.selection_is_available() {
                     self.process_table.select_all();
+                    self.show_selection_status();
                 }
                 FtuiCmd::none()
             }
             Msg::DeselectAll => {
                 if self.selection_is_available() {
                     self.process_table.deselect_all();
+                    self.show_selection_status();
                 }
                 FtuiCmd::none()
             }
             Msg::InvertSelection => {
                 if self.selection_is_available() {
                     self.process_table.invert_selection();
+                    self.show_selection_status();
                 }
                 FtuiCmd::none()
             }
@@ -897,27 +935,31 @@ impl App {
                 };
                 let selected_pids = selection.selection.pids;
                 let explicitly_selected = selection.selection.explicitly_selected;
+                let explicitly_spared = selection.selection.explicitly_spared;
                 let selected_count = selected_pids.len();
+                let spare_count = explicitly_spared.len();
                 self.operation = PendingOperation::Executing(ticket);
                 tracing::info!(
                     target: "tui.user_input",
                     action = "execute_requested",
                     selected_count,
-                    "Execution requested"
+                    spare_count,
+                    "Confirmed actions and feedback requested"
                 );
                 if let Some(execute) = self.execute_op.clone() {
-                    self.set_status(format!(
-                        "Executing actions on {} process(es)...",
-                        selected_count
-                    ));
+                    self.set_status(if selected_count == 0 {
+                        format!("Saving {} spare decision(s)...", spare_count)
+                    } else {
+                        format!("Executing actions on {} process(es)...", selected_count)
+                    });
                     FtuiCmd::sequence(vec![
                         FtuiCmd::log(format!(
-                            "execute: starting (selected_count={})",
-                            selected_count
+                            "execute: starting (selected_count={}, spare_count={})",
+                            selected_count, spare_count
                         )),
                         FtuiCmd::task_named("execute-selected", move || Msg::ExecutionComplete {
                             ticket,
-                            result: execute(selected_pids, explicitly_selected),
+                            result: execute(selected_pids, explicitly_selected, explicitly_spared),
                         }),
                     ])
                 } else {
@@ -1050,6 +1092,13 @@ impl App {
                             "Plan saved (shadow): {} action(s) (no execution)",
                             outcome.attempted
                         ),
+                        "feedback" => "Spare decisions saved for future scans".to_string(),
+                        "feedback_dry_run" => {
+                            "Spare feedback preview (dry_run): no decisions saved".to_string()
+                        }
+                        "feedback_shadow" => {
+                            "Spare feedback preview (shadow): no decisions saved".to_string()
+                        }
                         "skeleton" => "Execution not wired yet (skeleton mode)".to_string(),
                         other => format!("Execution finished ({})", other),
                     }
@@ -1411,14 +1460,47 @@ impl FtuiModel for App {
         // Confirmation dialog (centered popup)
         if self.state == AppState::Confirming {
             let popup_area = layout.popup_area(50, 30);
-            let msg = format!(
-                "Execute actions on {} selected process(es)?",
-                self.process_table.selected_count()
-            );
+            let selected_count = self
+                .confirmation_selection
+                .as_ref()
+                .map_or(0, |selection| selection.pids.len());
+            let spare_count = self
+                .confirmation_selection
+                .as_ref()
+                .map_or(0, |selection| selection.explicitly_spared.len());
+            let (title, msg, confirm_label) = if selected_count == 0 {
+                (
+                    "Save Feedback",
+                    format!(
+                        "Remember your spare decisions for {} process(es) in future scans?",
+                        spare_count
+                    ),
+                    "Save feedback",
+                )
+            } else if spare_count > 0 {
+                (
+                    "Confirm Execution",
+                    format!(
+                        "Execute actions on {} selected process(es) and remember {} spare decision(s)?",
+                        selected_count, spare_count
+                    ),
+                    "Yes",
+                )
+            } else {
+                (
+                    "Confirm Execution",
+                    format!(
+                        "Execute actions on {} selected process(es)?",
+                        selected_count
+                    ),
+                    "Yes",
+                )
+            };
             ConfirmDialog::new()
                 .theme(&self.theme)
-                .title("Confirm Execution")
+                .title(title)
                 .message(&msg)
+                .labels(confirm_label, "No")
                 .render_view(popup_area, frame, &self.confirm_dialog);
         }
 
@@ -1757,14 +1839,205 @@ mod tests {
     fn complete_execution_fixture(app: &mut App, result: Result<ExecutionOutcome, String>) {
         app.process_table.set_rows(vec![make_row(42)]);
         app.process_table.select_all();
-        app.set_execute_op(Arc::new(move |pids, explicit| {
+        app.set_execute_op(Arc::new(move |pids, explicit, spares| {
             assert_eq!(pids, vec![42]);
             assert!(explicit.is_empty());
+            assert!(spares.is_empty());
             result.clone()
         }));
         let request = confirmed_request(app);
         let run = deferred_task(<App as FtuiModel>::update(app, request));
         <App as FtuiModel>::update(app, run());
+    }
+
+    #[test]
+    fn spare_only_feedback_is_cancelable_and_uses_its_confirmed_snapshot_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut app = App::new();
+        let mut row = make_row(42);
+        row.classification = "KILL".to_string();
+        app.process_table.set_rows(vec![row]);
+        <App as FtuiModel>::update(&mut app, Msg::SelectRecommended);
+        <App as FtuiModel>::update(&mut app, Msg::ToggleSelection);
+        assert!(app.process_table.get_selected().is_empty());
+        assert_eq!(app.process_table.get_explicitly_spared(), vec![42]);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_e = Arc::clone(&calls);
+        app.set_execute_op(Arc::new(move |pids, explicit, spares| {
+            assert!(pids.is_empty(), "saving spares must not invent an action");
+            assert!(explicit.is_empty());
+            assert_eq!(spares, vec![42]);
+            calls_e.fetch_add(1, Ordering::SeqCst);
+            Ok(ExecutionOutcome {
+                mode: Some("feedback".to_string()),
+                ..ExecutionOutcome::default()
+            })
+        }));
+
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char('e'))),
+        );
+        assert_eq!(app.state, AppState::Confirming);
+        assert_eq!(app.confirm_dialog.selected, ConfirmChoice::No);
+        assert!(app.status_message.as_deref().unwrap().contains("spare"));
+        let cancelled = <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Enter)),
+        );
+        assert!(matches!(cancelled, FtuiCmd::None));
+        assert_eq!(app.state, AppState::Normal);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let request = confirmed_request(&mut app);
+        // Selection can change before the queued task request is delivered; the
+        // explicit confirmation still applies only to its frozen spare decision.
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        assert_eq!(app.process_table.get_selected(), vec![42]);
+        assert!(app.process_table.get_explicitly_spared().is_empty());
+        let save = deferred_task(<App as FtuiModel>::update(&mut app, request.clone()));
+        for message in [Msg::RequestRefresh, Msg::ToggleSelection, request.clone()] {
+            assert!(matches!(
+                <App as FtuiModel>::update(&mut app, message),
+                FtuiCmd::None
+            ));
+        }
+        <App as FtuiModel>::update(&mut app, save());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.operation, PendingOperation::Idle);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Spare decisions saved for future scans")
+        );
+        assert!(app.process_table.get_explicitly_spared().is_empty());
+        assert!(app.process_table.get_selected().is_empty());
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, request),
+            FtuiCmd::None
+        ));
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char('e'))),
+        );
+        assert_eq!(app.state, AppState::Normal);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mixed_confirmation_separates_default_actions_explicit_kills_and_spares() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut app = App::new();
+        let rows = [(42, 90), (99, 80), (100, 70)]
+            .into_iter()
+            .map(|(pid, score)| {
+                let mut row = make_row(pid);
+                row.score = score;
+                row.classification = "KILL".to_string();
+                row
+            })
+            .collect();
+        app.process_table.set_rows(rows);
+        <App as FtuiModel>::update(&mut app, Msg::SelectRecommended);
+        <App as FtuiModel>::update(&mut app, Msg::ToggleSelection); // Spare 42.
+        <App as FtuiModel>::update(&mut app, Msg::CursorDown);
+        <App as FtuiModel>::update(&mut app, Msg::ToggleSelection);
+        <App as FtuiModel>::update(&mut app, Msg::ToggleSelection); // Explicit kill 99.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_e = Arc::clone(&calls);
+        app.set_execute_op(Arc::new(move |mut pids, explicit, spares| {
+            pids.sort_unstable();
+            assert_eq!(pids, vec![99, 100]);
+            assert_eq!(explicit, vec![99], "default acceptance is not a verdict");
+            assert_eq!(spares, vec![42]);
+            calls_e.fetch_add(1, Ordering::SeqCst);
+            Ok(ExecutionOutcome {
+                attempted: 2,
+                succeeded: 2,
+                ..ExecutionOutcome::default()
+            })
+        }));
+        let request = confirmed_request(&mut app);
+        <App as FtuiModel>::update(&mut app, Msg::DeselectAll);
+        let execute = deferred_task(<App as FtuiModel>::update(&mut app, request));
+        <App as FtuiModel>::update(&mut app, execute());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(app.process_table.get_explicitly_spared().is_empty());
+        assert!(app.process_table.get_explicitly_selected().is_empty());
+    }
+
+    #[test]
+    fn spare_feedback_previews_do_not_claim_to_save_labels_or_a_plan() {
+        for (mode, expected) in [
+            (
+                "feedback_dry_run",
+                "Spare feedback preview (dry_run): no decisions saved",
+            ),
+            (
+                "feedback_shadow",
+                "Spare feedback preview (shadow): no decisions saved",
+            ),
+        ] {
+            let mut app = App::new();
+            app.process_table.set_rows(vec![make_row(42)]);
+            <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+            <App as FtuiModel>::update(&mut app, Msg::ToggleSelection);
+            app.set_execute_op(Arc::new(move |pids, explicit, spares| {
+                assert!(pids.is_empty());
+                assert!(explicit.is_empty());
+                assert_eq!(spares, vec![42]);
+                Ok(ExecutionOutcome {
+                    mode: Some(mode.to_string()),
+                    ..ExecutionOutcome::default()
+                })
+            }));
+            let request = confirmed_request(&mut app);
+            let preview = deferred_task(<App as FtuiModel>::update(&mut app, request));
+            <App as FtuiModel>::update(&mut app, preview());
+            assert_eq!(app.status_message.as_deref(), Some(expected));
+            assert!(app.process_table.get_explicitly_spared().is_empty());
+            assert_eq!(app.operation, PendingOperation::Idle);
+        }
+    }
+
+    #[test]
+    fn refresh_discards_spare_judgments_and_their_confirmed_request() {
+        let mut app = App::new();
+        app.process_table.set_rows(vec![make_row(42)]);
+        <App as FtuiModel>::update(&mut app, Msg::SelectAll);
+        <App as FtuiModel>::update(&mut app, Msg::ToggleSelection);
+        let stale = confirmed_request(&mut app);
+        app.set_execute_op(Arc::new(|_, _, _| {
+            panic!("a refreshed scan must not reuse a prior spare judgment")
+        }));
+        app.set_refresh_op(Arc::new(|| {
+            let mut replacement = make_row(42);
+            replacement.command = "replacement incarnation".to_string();
+            Ok(RefreshOutcome {
+                rows: vec![replacement],
+                ..RefreshOutcome::default()
+            })
+        }));
+        let refresh = deferred_task(<App as FtuiModel>::update(&mut app, Msg::RequestRefresh));
+        assert!(app.process_table.get_explicitly_spared().is_empty());
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, stale.clone()),
+            FtuiCmd::None
+        ));
+        <App as FtuiModel>::update(&mut app, refresh());
+        assert_eq!(app.process_table.rows[0].command, "replacement incarnation");
+        assert!(app.process_table.get_explicitly_spared().is_empty());
+        assert!(matches!(
+            <App as FtuiModel>::update(&mut app, stale),
+            FtuiCmd::None
+        ));
+        <App as FtuiModel>::update(
+            &mut app,
+            Msg::KeyPressed(FtuiKeyEvent::new(FtuiKeyCode::Char('e'))),
+        );
+        assert_eq!(app.state, AppState::Normal);
     }
 
     #[test]
@@ -1957,9 +2230,10 @@ mod tests {
         }));
         let cache_e = Arc::clone(&cache);
         let executions_e = Arc::clone(&executions);
-        app.set_execute_op(Arc::new(move |pids, explicit| {
+        app.set_execute_op(Arc::new(move |pids, explicit, spares| {
             assert_eq!(pids, vec![42]);
             assert!(explicit.is_empty());
+            assert!(spares.is_empty());
             executions_e
                 .lock()
                 .unwrap()
@@ -2037,9 +2311,10 @@ mod tests {
         app.process_table.set_rows(vec![make_row(42)]);
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_e = Arc::clone(&calls);
-        app.set_execute_op(Arc::new(move |pids, explicit| {
+        app.set_execute_op(Arc::new(move |pids, explicit, spares| {
             assert_eq!(pids, vec![42]);
             assert!(explicit.is_empty());
+            assert!(spares.is_empty());
             if calls_e.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err("dispatch callback failure".to_string())
             } else {
@@ -2163,9 +2438,10 @@ mod tests {
         let received_e = Arc::clone(&received);
         let labels = Arc::new(Mutex::new(Vec::<Vec<u32>>::new()));
         let labels_e = Arc::clone(&labels);
-        app.set_execute_op(Arc::new(move |pids, explicit| {
+        app.set_execute_op(Arc::new(move |pids, explicit, spares| {
             received_e.lock().unwrap().push(pids);
             labels_e.lock().unwrap().push(explicit);
+            assert!(spares.is_empty());
             Ok(ExecutionOutcome {
                 mode: Some("dry_run".to_string()),
                 attempted: 1,

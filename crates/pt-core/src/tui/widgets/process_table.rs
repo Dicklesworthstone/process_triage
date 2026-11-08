@@ -149,8 +149,14 @@ impl<'a> ProcessTable<'a> {
             ViewMode::SuspicionFirst => "score",
             ViewMode::GoalFirst => "goal",
         };
+        let spare_count = state.get_explicitly_spared().len();
 
-        if selected_count > 0 {
+        if spare_count > 0 {
+            format!(
+                " Processes [{}/{} selected, {} spare decision(s)] [view: {}] [e: confirm actions/feedback, u: clear] ",
+                selected_count, total_count, spare_count, view_label
+            )
+        } else if selected_count > 0 {
             format!(
                 " Processes [{}/{} selected] [view: {}] [Space: toggle, a: rec, A: all, u: clear, x: invert, e: execute] ",
                 selected_count, total_count, view_label
@@ -528,6 +534,9 @@ pub struct ProcessTableState {
     /// Positive selections made by toggling individual rows in this scan.
     /// Bulk/default selections authorize execution but are not human labels.
     explicitly_selected: HashSet<u32>,
+    /// Negative judgments made by individually unselecting rows in this scan.
+    /// These become spare labels only after the user confirms saving feedback.
+    explicitly_spared: HashSet<u32>,
     /// Current cursor position.
     pub cursor: usize,
     /// Scroll offset (first visible row).
@@ -560,6 +569,7 @@ impl ProcessTableState {
             rows: Vec::new(),
             selected: HashSet::new(),
             explicitly_selected: HashSet::new(),
+            explicitly_spared: HashSet::new(),
             cursor: 0,
             scroll_offset: 0,
             sort_column: SortColumn::Score,
@@ -734,9 +744,11 @@ impl ProcessTableState {
             if self.selected.contains(&pid) {
                 self.selected.remove(&pid);
                 self.explicitly_selected.remove(&pid);
+                self.explicitly_spared.insert(pid);
             } else {
                 self.selected.insert(pid);
                 self.explicitly_selected.insert(pid);
+                self.explicitly_spared.remove(&pid);
             }
         }
     }
@@ -746,6 +758,7 @@ impl ProcessTableState {
         let pids: Vec<u32> = self.visible_rows().iter().map(|row| row.pid).collect();
         for pid in pids {
             self.selected.insert(pid);
+            self.explicitly_spared.remove(&pid);
         }
     }
 
@@ -767,6 +780,7 @@ impl ProcessTableState {
             .collect();
         for pid in pids {
             self.selected.insert(pid);
+            self.explicitly_spared.remove(&pid);
         }
     }
 
@@ -775,6 +789,7 @@ impl ProcessTableState {
         let pids: Vec<u32> = self.visible_rows().iter().map(|row| row.pid).collect();
         for pid in pids {
             self.explicitly_selected.remove(&pid);
+            self.explicitly_spared.remove(&pid);
             if self.selected.contains(&pid) {
                 self.selected.remove(&pid);
             } else {
@@ -787,6 +802,7 @@ impl ProcessTableState {
     pub fn deselect_all(&mut self) {
         self.selected.clear();
         self.explicitly_selected.clear();
+        self.explicitly_spared.clear();
     }
 
     /// Get selected PIDs.
@@ -798,6 +814,14 @@ impl ProcessTableState {
     pub fn get_explicitly_selected(&self) -> Vec<u32> {
         self.selected
             .intersection(&self.explicitly_selected)
+            .copied()
+            .collect()
+    }
+
+    /// Explicit per-row spare judgments still excluded from the action selection.
+    pub fn get_explicitly_spared(&self) -> Vec<u32> {
+        self.explicitly_spared
+            .difference(&self.selected)
             .copied()
             .collect()
     }
@@ -1335,6 +1359,79 @@ mod tests {
         state.set_rows(sample_rows()); // Same PID must not inherit a prior label.
         assert!(state.get_selected().is_empty());
         assert!(state.get_explicitly_selected().is_empty());
+    }
+
+    #[test]
+    fn individual_spares_require_a_current_negative_choice() {
+        let mut state = ProcessTableState::new();
+        state.set_rows(sample_rows());
+        state.select_recommended();
+        assert!(state.get_explicitly_spared().is_empty());
+
+        state.toggle_selection(); // Decline the recommended action for PID 1234.
+        assert!(state.get_selected().is_empty());
+        assert_eq!(state.get_explicitly_spared(), vec![1234]);
+        assert!(state.get_explicitly_selected().is_empty());
+
+        state.toggle_selection(); // A later individual selection cancels the spare.
+        assert_eq!(state.get_explicitly_selected(), vec![1234]);
+        assert!(state.get_explicitly_spared().is_empty());
+        state.toggle_selection();
+        assert_eq!(state.get_explicitly_spared(), vec![1234]);
+
+        state.set_rows(sample_rows()); // Even the same PID is a new scan judgment.
+        assert!(state.get_selected().is_empty());
+        assert!(state.get_explicitly_selected().is_empty());
+        assert!(state.get_explicitly_spared().is_empty());
+    }
+
+    #[test]
+    fn bulk_choices_cancel_spares_without_creating_training_labels() {
+        for choose in [
+            ProcessTableState::select_all,
+            ProcessTableState::select_recommended,
+            ProcessTableState::invert_selection,
+            ProcessTableState::deselect_all,
+        ] {
+            let mut state = ProcessTableState::new();
+            state.set_rows(sample_rows());
+            state.select_recommended();
+            state.toggle_selection();
+            assert_eq!(state.get_explicitly_spared(), vec![1234]);
+            choose(&mut state);
+            assert!(state.get_explicitly_spared().is_empty());
+            assert!(state.get_explicitly_selected().is_empty());
+        }
+
+        let mut state = ProcessTableState::new();
+        state.set_rows(sample_rows());
+        state.select_all();
+        state.invert_selection();
+        assert!(state.get_selected().is_empty());
+        assert!(state.get_explicitly_spared().is_empty());
+        state.select_all();
+        state.deselect_all();
+        assert!(state.get_explicitly_spared().is_empty());
+    }
+
+    #[test]
+    fn filtered_bulk_choices_preserve_spares_outside_the_changed_rows() {
+        let mut state = ProcessTableState::new();
+        state.set_rows(sample_rows());
+        state.select_recommended();
+        state.toggle_selection();
+        assert_eq!(state.get_explicitly_spared(), vec![1234]);
+
+        state.set_filter(Some("5678".to_string()));
+        state.select_all();
+        assert_eq!(state.get_selected(), vec![5678]);
+        assert_eq!(state.get_explicitly_spared(), vec![1234]);
+        state.invert_selection();
+        assert!(state.get_selected().is_empty());
+        assert_eq!(state.get_explicitly_spared(), vec![1234]);
+
+        state.deselect_all(); // Explicitly clearing all choices also discards feedback.
+        assert!(state.get_explicitly_spared().is_empty());
     }
 
     // ── Sort edge cases ───────────────────────────────────────────────

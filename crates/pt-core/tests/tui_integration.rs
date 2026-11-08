@@ -67,6 +67,24 @@ fn app_help_overlay_renders() {
     assert!(buffer_to_text(&buf).contains("Process Triage TUI Help"));
 }
 
+#[test]
+fn explicit_spare_opens_feedback_confirmation_without_an_action_selection() {
+    let mut app = App::new();
+    app.process_table.set_rows(vec![sample_row()]);
+    <App as FtuiModel>::update(&mut app, Msg::SelectRecommended);
+    <App as FtuiModel>::update(&mut app, Msg::ToggleSelection);
+    assert!(app.process_table.get_selected().is_empty());
+    assert_eq!(app.process_table.get_explicitly_spared(), vec![4242]);
+    <App as FtuiModel>::update(&mut app, Msg::KeyPressed(KeyEvent::new(KeyCode::Char('e'))));
+    assert_eq!(app.state, AppState::Confirming);
+
+    let text = buffer_to_text(&render_app_view(&app, 140, 40));
+    assert!(text.contains("Save Feedback"), "{text}");
+    assert!(text.contains("spare decisions"), "{text}");
+    assert!(text.contains("Save feedback"), "{text}");
+    assert!(!text.contains("Execute actions on 0"), "{text}");
+}
+
 // ── Tests using the real Model::view() code path ────────────────────
 
 #[test]

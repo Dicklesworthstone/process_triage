@@ -833,9 +833,10 @@ fn execution_complete_ok() {
     let mut app = app_with_rows();
 
     send_msg(&mut app, Msg::SelectAll);
-    app.set_execute_op(std::sync::Arc::new(|pids, explicit| {
+    app.set_execute_op(std::sync::Arc::new(|pids, explicit, spares| {
         assert_eq!(pids.len(), 5);
         assert!(explicit.is_empty());
+        assert!(spares.is_empty());
         Ok(ExecutionOutcome {
             mode: None,
             attempted: 3,
@@ -855,9 +856,10 @@ fn execution_complete_err() {
     let mut app = app_with_rows();
 
     send_msg(&mut app, Msg::SelectAll);
-    app.set_execute_op(std::sync::Arc::new(|pids, explicit| {
+    app.set_execute_op(std::sync::Arc::new(|pids, explicit, spares| {
         assert_eq!(pids.len(), 5);
         assert!(explicit.is_empty());
+        assert!(spares.is_empty());
         Err("test error".to_string())
     }));
     let request = confirmed_request(&mut app);

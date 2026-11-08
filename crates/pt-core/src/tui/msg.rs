@@ -20,6 +20,8 @@ use super::widgets::{DetailView, ProcessRow};
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionOutcome {
     /// Execution mode hint for status messaging (e.g. "dry_run", "shadow", "skeleton").
+    /// "feedback" means explicit spare judgments were saved without executing actions.
+    /// "feedback_dry_run" and "feedback_shadow" preview those judgments without saving.
     /// When `None`, the outcome represents a real execution attempt.
     pub mode: Option<String>,
     pub attempted: usize,
