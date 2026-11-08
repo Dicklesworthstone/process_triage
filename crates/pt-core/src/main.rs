@@ -18089,6 +18089,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                 "pid": proc.pid.0,
                 "recommended_action": advice.action,
                 "action_rationale": advice.rationale,
+                "respawn_history": score.respawn_history,
             }));
             persisted_inference_records.push(PersistedInference {
                 pid: proc.pid.0,
@@ -18200,6 +18201,7 @@ fn run_agent_snapshot(global: &GlobalOpts, args: &AgentSnapshotArgs) -> ExitCode
                         "cpu_percent": cpu_percent,
                         "cpu_lifetime_percent": p.cpu_percent,
                         "activity": activity,
+                        "respawn_history": scorer.respawn_history_for(p),
                         "responsible_unit": responsible_unit_summary(
                             responsible_units.as_ref().and_then(|table| table.unit_for(p)),
                         ),
@@ -19363,7 +19365,54 @@ fn collect_planning_activity(
     let window = planning_pressure_window(&mut snapshot, baseline, requested);
     let mut system = system_state_from_pressure(snapshot, window, Some(population));
     system["cpu_usage"] = serde_json::json!(cpu_usage.ok());
+    system["respawn_history"] = collect_planning_respawn_history(scorer, population);
     system
+}
+
+/// Load remediation history once per census. Outcomes are action advice, not
+/// additional Bayesian evidence that a process is abandoned.
+fn collect_planning_respawn_history(
+    scorer: &mut Scorer,
+    population: &[ProcessRecord],
+) -> serde_json::Value {
+    use pt_core::decision::respawn_loop::RespawnHistoryStore;
+
+    let observed_at = chrono::Utc::now();
+    let history = resolve_data_dir_for_lock()
+        .ok_or_else(|| "cannot resolve the process_triage data directory".to_string())
+        .and_then(|directory| {
+            RespawnHistoryStore::from_data_dir(&directory)
+                .load(observed_at)
+                .map_err(|error| error.to_string())
+        });
+    match history {
+        Ok(history) => {
+            scorer.collect_respawn_history(Some(&history), population, observed_at);
+            let matching_processes = population
+                .iter()
+                .filter(|process| scorer.respawn_history_for(process).is_some())
+                .count();
+            let recurrent_processes = population
+                .iter()
+                .filter(|process| {
+                    scorer
+                        .respawn_history_for(process)
+                        .is_some_and(|history| history.detection.is_loop)
+                })
+                .count();
+            serde_json::json!({
+                "available": true,
+                "observed_at": observed_at,
+                "matching_processes": matching_processes,
+                "recurrent_processes": recurrent_processes,
+                "scope": "same_uid_command_and_parent_incarnation",
+            })
+        }
+        Err(error) => {
+            scorer.collect_respawn_history(None, population, observed_at);
+            serde_json::json!({"available": false, "error": error})
+        }
+    }
 }
 
 fn responsible_unit_rank(pressure: &PlanningPressure) -> AttributionResource {
@@ -19612,6 +19661,19 @@ fn candidate_recommendation(
     if action == "restart" && !proc.state.is_zombie() {
         action = "review";
         rationale = "Restart requires a supported supervisor adapter".to_string();
+    }
+    if action == "kill" {
+        if let Some(history) = score
+            .respawn_history
+            .as_ref()
+            .filter(|history| history.detection.is_loop)
+        {
+            action = "review";
+            rationale = format!(
+                "Repeated child kills have not resolved this workload. {}",
+                history.review_message
+            );
+        }
     }
     CandidateRecommendation {
         action,
@@ -20676,6 +20738,7 @@ fn run_agent_plan(global: &GlobalOpts, args: &AgentPlanArgs) -> ExitCode {
             "cpu_lifetime_percent": proc.cpu_percent,
             "cpu_host_percent": pressure.cpu_goal_percent(proc, activity.as_ref()),
             "activity": activity,
+            "respawn_history": scorer.respawn_history_for(proc),
             "resource_observation": resource_observation,
             "score": score,
             "classification": ledger.classification.label(),
@@ -21933,9 +21996,6 @@ fn collect_explain_provenance(
     min_age_seconds: u64,
     targets: &[ProcessRecord],
 ) {
-    if !cfg!(target_os = "linux") {
-        return;
-    }
     let scan_options = QuickScanOptions {
         pids: vec![],
         include_kernel_threads: false,
@@ -21946,10 +22006,21 @@ fn collect_explain_provenance(
         Ok(result) => result,
         Err(e) => {
             eprintln!("agent explain: warning: provenance scan failed: {e}");
+            scorer.collect_respawn_history(None, &[], chrono::Utc::now());
             scorer.collect_provenance(&targets.iter().collect::<Vec<_>>());
             return;
         }
     };
+    let history = collect_planning_respawn_history(scorer, &population.processes);
+    if history["available"].as_bool() == Some(false) {
+        eprintln!(
+            "agent explain: respawn history unavailable: {}",
+            history["error"]
+        );
+    }
+    if !cfg!(target_os = "linux") {
+        return;
+    }
     let passed = match protected {
         Some(filter) => filter.filter_scan_result(&population).passed,
         None => population.processes,
@@ -22028,6 +22099,7 @@ fn build_process_explanation(
         "cpu_percent": cpu_percent,
         "cpu_lifetime_percent": proc.cpu_percent,
         "activity": activity,
+        "respawn_history": score.respawn_history,
         "classification": ledger.classification.label(),
         "confidence": ledger.confidence.label(),
         "why_summary": ledger.why_summary,
@@ -22523,6 +22595,103 @@ fn detect_respawn_for_goal_progress(
     after_processes: &[ProcessRecord],
 ) -> bool {
     pt_core::verify::detect_respawn(action, execution, after_processes).is_some()
+}
+
+#[derive(Default, serde::Serialize)]
+struct RespawnHistoryUpdate {
+    observations_available: bool,
+    new_events: usize,
+    events: Vec<RespawnHistoryObservation>,
+    errors: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct RespawnHistoryObservation {
+    action_id: String,
+    inserted: bool,
+    summary: pt_core::decision::respawn_loop::RespawnLoopSummary,
+}
+
+/// Persist only replacements tied to successful executions of this exact plan.
+/// Apply and later verify share idempotent attempt keys, so repeated observation
+/// cannot inflate the number of kill/respawn cycles or duplicate notifications.
+fn record_respawn_history(
+    session_id: &SessionId,
+    plan: &Plan,
+    executions: &[pt_core::verify::SavedActionOutcome],
+    current: Option<&[ProcessRecord]>,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> RespawnHistoryUpdate {
+    use pt_core::decision::respawn_loop::RespawnHistoryStore;
+    use pt_core::inbox::{InboxItem, InboxStore};
+
+    let mut update = RespawnHistoryUpdate {
+        observations_available: current.is_some(),
+        ..Default::default()
+    };
+    let Some(current) = current else {
+        return update;
+    };
+    let executed = match executed_plan_actions(plan, executions) {
+        Ok(executed) => executed,
+        Err(error) => {
+            update
+                .errors
+                .push(format!("invalid execution evidence: {error}"));
+            return update;
+        }
+    };
+    if !executed
+        .iter()
+        .any(|(action, _)| action.action == Action::Kill)
+    {
+        return update;
+    }
+    let Some(data_dir) = resolve_data_dir_for_lock() else {
+        update
+            .errors
+            .push("cannot resolve the respawn-history data directory".to_string());
+        return update;
+    };
+    let store = RespawnHistoryStore::from_data_dir(&data_dir);
+    let inbox = InboxStore::from_data_dir(&data_dir);
+    for (action, execution) in executed {
+        if action.action != Action::Kill {
+            continue;
+        }
+        match store.ingest_verified_respawn(action, execution, current, &session_id.0, observed_at)
+        {
+            Ok(Some(recorded)) => {
+                if recorded.inserted {
+                    update.new_events += 1;
+                    let item = InboxItem::respawn_detected(
+                        session_id.0.clone(),
+                        recorded.summary.review_message.clone(),
+                        Some(format!(
+                            "pt agent plan --pids {} --min-age 0 --min-posterior 0",
+                            recorded.summary.parent.pid.0
+                        )),
+                    );
+                    if let Err(error) = inbox.add(&item) {
+                        update.errors.push(format!(
+                            "respawn history retained, but inbox notification failed: {error}"
+                        ));
+                    }
+                }
+                update.events.push(RespawnHistoryObservation {
+                    action_id: action.action_id.clone(),
+                    inserted: recorded.inserted,
+                    summary: recorded.summary,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => update.errors.push(format!(
+                "cannot retain respawn for action {}: {error}",
+                action.action_id
+            )),
+        }
+    }
+    update
 }
 
 /// Persist the actual results, including refusals, without replacing a previous
@@ -23923,6 +24092,17 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         .map(|execution| (execution.action_id.as_str(), execution))
         .collect();
 
+    let respawn_history_update = record_respawn_history(
+        &sid,
+        &plan,
+        &goal_executions,
+        after_scan_processes,
+        chrono::Utc::now(),
+    );
+    for error in &respawn_history_update.errors {
+        eprintln!("agent apply: {error}");
+    }
+
     let mut respawn_by_action: HashMap<String, Option<bool>> = HashMap::new();
     let mut memory_action_outcomes = Vec::new();
     let mut cpu_action_outcomes = Vec::new();
@@ -24100,6 +24280,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         || accounting_error.is_some()
         || goal_evidence_error.is_some()
         || persistence_error.is_some()
+        || !respawn_history_update.errors.is_empty()
     {
         SessionState::Failed
     } else {
@@ -24130,6 +24311,7 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         "goal_evidence_error": goal_evidence_error,
         "goal_progress_persistence_error": goal_progress_persistence_error,
         "goal_progress": goal_progress_payload,
+        "respawn_history": respawn_history_update,
         "resource_delta": resource_observation.as_ref().and_then(|run| run.resource_delta.as_ref()),
         "resource_observation": resource_observation.as_ref().map(|run| serde_json::json!({
             "run_id": run.run_id,
@@ -24188,7 +24370,19 @@ fn run_agent_apply(global: &GlobalOpts, args: &AgentApplyArgs) -> ExitCode {
         }
     }
 
-    if persistence_error.is_some() || session_state_error.is_some() {
+    if !matches!(
+        global.format,
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
+    ) {
+        for event in &respawn_history_update.events {
+            println!("Respawn: {}", event.summary.review_message);
+        }
+    }
+
+    if persistence_error.is_some()
+        || session_state_error.is_some()
+        || !respawn_history_update.errors.is_empty()
+    {
         ExitCode::IoError
     } else if (blocked_by_constraints + blocked_by_prechecks) > 0 && succeeded == 0 && failed == 0 {
         ExitCode::PolicyBlocked
@@ -24425,6 +24619,17 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
         &current_resource_observation,
     );
     let mut verification_output = serde_json::to_value(&report).unwrap_or_default();
+    let respawn_history_update = record_respawn_history(
+        &sid,
+        &plan,
+        &saved_outcomes,
+        Some(&scan_result.processes),
+        completed_at,
+    );
+    for error in &respawn_history_update.errors {
+        eprintln!("agent verify: {error}");
+    }
+    verification_output["respawn_history"] = serde_json::json!(&respawn_history_update);
     // Several resume/apply invocations have separate windows. Never select an
     // arbitrary latest file or add host-wide deltas as if they were causal.
     verification_output["resource_delta"] = if resource_runs.reports.len() == 1 {
@@ -24593,6 +24798,19 @@ fn run_agent_verify(global: &GlobalOpts, args: &AgentVerifyArgs) -> ExitCode {
                 }
             }
         }
+    }
+
+    if !matches!(
+        global.format,
+        OutputFormat::Json | OutputFormat::Jsonl | OutputFormat::Toon | OutputFormat::Exitcode
+    ) {
+        for event in &respawn_history_update.events {
+            println!("Respawn: {}", event.summary.review_message);
+        }
+    }
+
+    if !respawn_history_update.errors.is_empty() {
+        return ExitCode::IoError;
     }
 
     // If respawned processes were detected, indicate partial failure
@@ -27253,6 +27471,7 @@ fn evaluate_watch_candidate(
             "action_rationale": advice.rationale,
             "action_target": action_target,
             "activity": score.activity,
+            "respawn_history": score.respawn_history,
             "cpu_percent": process_cpu_percent(proc, score.activity.as_ref()),
             "cpu_lifetime_percent": proc.cpu_percent,
             "probability_basis": probability_basis,

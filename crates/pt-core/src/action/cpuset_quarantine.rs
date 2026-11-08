@@ -286,7 +286,10 @@ impl CpusetQuarantineActionRunner {
         let controller_path = if is_v2 {
             checked_path.clone()
         } else {
-            warn!(pid, "cgroup v2 cpuset unavailable, using isolated v1 controller");
+            warn!(
+                pid,
+                "cgroup v2 cpuset unavailable, using isolated v1 controller"
+            );
             v1_path
                 .cloned()
                 .ok_or_else(|| ActionError::Failed("missing v1 cpuset membership".to_string()))?
@@ -596,7 +599,11 @@ pub(super) fn check_quarantine_capability(
     } else {
         "cpuset.effective_cpus"
     }))?;
-    select_cpuset(config.target_cpus, config.specific_cpus.as_deref(), &available)?;
+    select_cpuset(
+        config.target_cpus,
+        config.specific_cpus.as_deref(),
+        &available,
+    )?;
     Ok(())
 }
 

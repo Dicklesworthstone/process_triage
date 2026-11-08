@@ -470,7 +470,9 @@ fn snapshot_exposes_sampled_activity_and_explicit_single_snapshot_mode() {
             assert!(pressure_window.is_null());
         }
         let state_path = std::path::Path::new(
-            result["session_dir"].as_str().expect("snapshot session directory"),
+            result["session_dir"]
+                .as_str()
+                .expect("snapshot session directory"),
         )
         .join("scan/system_state.json");
         let persisted_state: Value = serde_json::from_slice(

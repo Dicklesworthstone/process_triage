@@ -28,6 +28,7 @@ use std::time::Duration;
 use crate::collect::{ProcessActivity, ProcessRecord};
 use crate::config::{Policy, Priors, ResolvedConfig};
 use crate::decision::decision_store::{DecisionStore, LearnedPrior};
+use crate::decision::respawn_loop::{RespawnHistorySnapshot, RespawnLoopSummary};
 use crate::inference::{
     apply_evidence_terms, compute_posterior_with_overrides, try_signature_fast_path, ClassScores,
     Classification, CpuEvidence, Evidence, EvidenceLedger, EvidenceTerm, FastPathConfig,
@@ -260,6 +261,9 @@ pub struct ProcessScore<'a> {
     /// probability a normal run would have finished by now). `None` otherwise.
     pub signature_age_weight: Option<f64>,
     pub learned_prior: Option<LearnedPrior>,
+    /// Observed kill/respawn history for this command and exact parent incarnation.
+    /// This informs action utility and review, never the class posterior.
+    pub respawn_history: Option<RespawnLoopSummary>,
     /// Whether shared inference was bypassed. Signature candidates currently
     /// require verification, so scoring retains that inference and reports false.
     pub fast_path_used: bool,
@@ -283,6 +287,7 @@ pub struct Scorer {
     pub fast_path: FastPathConfig,
     activity_window: Option<Duration>,
     activity: BTreeMap<u32, ProcessActivity>,
+    respawn_history: BTreeMap<u32, (pt_common::StartId, u32, RespawnLoopSummary)>,
     #[cfg(target_os = "linux")]
     provenance: Option<ProvenanceInferenceBundle>,
 }
@@ -301,6 +306,7 @@ impl Scorer {
             fast_path,
             activity_window: None,
             activity: BTreeMap::new(),
+            respawn_history: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             provenance: None,
         }
@@ -343,6 +349,58 @@ impl Scorer {
         {
             let _ = processes;
         }
+    }
+
+    /// Join persisted remediation outcomes to one complete process census.
+    /// Parent lookup is shared by the batch, and every refresh drops old joins.
+    pub fn collect_respawn_history(
+        &mut self,
+        history: Option<&RespawnHistorySnapshot>,
+        processes: &[ProcessRecord],
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.respawn_history.clear();
+        let Some(history) = history else {
+            return;
+        };
+        let mut parents = BTreeMap::new();
+        for process in processes {
+            parents
+                .entry(process.pid.0)
+                .and_modify(|parent| *parent = None)
+                .or_insert(Some(process));
+        }
+        for process in processes {
+            if parents.get(&process.pid.0).copied().flatten().is_none() {
+                continue;
+            }
+            if let Some(summary) = history.for_process_with_parent(
+                process,
+                parents.get(&process.ppid.0).copied().flatten(),
+                observed_at,
+            ) {
+                self.respawn_history.insert(
+                    process.pid.0,
+                    (process.start_id.clone(), process.uid, summary),
+                );
+            }
+        }
+    }
+
+    /// A reused PID or a reparented child must not inherit an earlier join.
+    pub fn respawn_history_for(&self, process: &ProcessRecord) -> Option<&RespawnLoopSummary> {
+        self.respawn_history
+            .get(&process.pid.0)
+            .filter(|(start_id, uid, summary)| {
+                *start_id == process.start_id
+                    && *uid == process.uid
+                    && summary.parent.pid == process.ppid
+                    && summary
+                        .command
+                        .split_whitespace()
+                        .eq(process.cmd.split_whitespace())
+            })
+            .map(|(_, _, summary)| summary)
     }
 
     /// Collect recent CPU and storage-I/O evidence once for the entire batch.
@@ -417,6 +475,7 @@ impl Scorer {
     ) -> Option<ProcessScore<'_>> {
         let pid = proc.pid.0;
         let activity = self.activity_for(proc);
+        let respawn_history = self.respawn_history_for(proc).cloned();
         if let Some(activity) = &activity {
             evidence.cpu = activity.cpu_percent.map(|percent| CpuEvidence::Fraction {
                 occupancy: (percent / 100.0).clamp(0.0, 1.0),
@@ -627,6 +686,15 @@ impl Scorer {
             ));
         }
 
+        if let Some(history) = &respawn_history {
+            ledger.top_evidence.push(history.review_message.clone());
+            if history.detection.is_loop {
+                ledger
+                    .why_summary
+                    .push_str(&format!(" {}", history.review_message));
+            }
+        }
+
         Some(ProcessScore {
             posterior,
             ledger,
@@ -635,6 +703,7 @@ impl Scorer {
             signature,
             signature_age_weight,
             learned_prior,
+            respawn_history,
             fast_path_used: false,
             fast_path_skip_reason,
             desktop_app,
@@ -1145,6 +1214,129 @@ mod tests {
     }
 
     const FOUR_DAYS: Duration = Duration::from_secs(4 * 24 * 3600);
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_respawn_join_preserves_posterior_and_rejects_stale_scope() {
+        use crate::decision::respawn_loop::RespawnHistoryStore;
+        use crate::decision::Action;
+        use crate::plan::PlanAction;
+        use crate::verify::SavedActionOutcome;
+        use pt_common::ProcessIdentity;
+
+        let at = |seconds| chrono::DateTime::from_timestamp(seconds, 0).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = RespawnHistoryStore::from_data_dir(directory.path());
+        let mut parent = record(4000, "bash", "bash respawner.sh", FOUR_DAYS);
+        parent.start_id = StartId::from_linux("test-boot-id", 1, 4000);
+        parent.start_time_unix = 1;
+        let parent_identity = ProcessIdentity::new(4000, parent.start_id.clone(), parent.uid);
+        let mut current = Vec::new();
+        for index in 0..2_u32 {
+            let killed_at = 1000 + i64::from(index) * 2;
+            let target_pid = 5000 + index;
+            let target = ProcessIdentity::new(
+                target_pid,
+                StartId::from_linux("test-boot-id", killed_at as u64 - 1, target_pid),
+                1000,
+            );
+            let action: PlanAction = serde_json::from_value(serde_json::json!({
+                "action_id": format!("kill-{index}"),
+                "target": target,
+                "action": "kill",
+                "order": 0,
+                "stage": 0,
+                "timeouts": {"preflight_ms": 2000, "execute_ms": 10000, "verify_ms": 5000},
+                "pre_checks": [],
+                "rationale": {},
+                "on_success": [],
+                "on_failure": [],
+                "blocked": false,
+            }))
+            .unwrap();
+            let execution = SavedActionOutcome {
+                action_id: action.action_id.clone(),
+                pid: target_pid,
+                status: "success".to_string(),
+                action: Some(Action::Kill),
+                target: Some(target),
+                command: Some("sleep 600".to_string()),
+                parent_pid: Some(4000),
+                parent_identity: Some(parent_identity.clone()),
+                executed_at: Some(at(killed_at)),
+                execution_clock: None,
+                time_ms: Some(1),
+            };
+            let replacement_pid = 6000 + index;
+            let mut replacement = record(replacement_pid, "sleep", "sleep 600", FOUR_DAYS);
+            replacement.ppid = parent.pid;
+            replacement.start_id =
+                StartId::from_linux("test-boot-id", killed_at as u64 + 1, replacement_pid);
+            replacement.start_time_unix = killed_at + 1;
+            current = vec![replacement, parent.clone()];
+            let observed = store
+                .ingest_verified_respawn(
+                    &action,
+                    &execution,
+                    &current,
+                    &format!("session-{index}"),
+                    at(killed_at + 2),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(observed.inserted);
+        }
+        let now = at(1010);
+        let history = RespawnHistoryStore::from_data_dir(directory.path())
+            .load(now)
+            .unwrap();
+        let mut measured = scorer(SignatureDatabase::with_defaults());
+        let evidence = Evidence::from_snapshot(&current[0]);
+        let baseline = serde_json::to_value(
+            &measured
+                .score_with_desktop(&current[0], evidence.clone(), None)
+                .unwrap()
+                .posterior
+                .posterior,
+        )
+        .unwrap();
+        measured.collect_respawn_history(Some(&history), &current, now);
+        let scored = measured
+            .score_with_desktop(&current[0], evidence, None)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&scored.posterior.posterior).unwrap(),
+            baseline
+        );
+        let summary = scored.respawn_history.as_ref().unwrap();
+        assert!(summary.detection.is_loop);
+        assert_eq!(summary.detection.loop_count, 2);
+        assert!((summary.detection.kill_utility_multiplier - 0.68).abs() < 1e-6);
+        assert!(scored
+            .ledger
+            .top_evidence
+            .iter()
+            .any(|text| text.contains("Spawner PID 4000")));
+
+        let mut changed_command = current[0].clone();
+        changed_command.cmd = "sleep 6000".to_string();
+        assert!(measured.respawn_history_for(&changed_command).is_none());
+        let mut reused_pid = current[0].clone();
+        reused_pid.start_id = StartId::from_linux("test-boot-id", 9999, reused_pid.pid.0);
+        assert!(measured.respawn_history_for(&reused_pid).is_none());
+        let mut ambiguous = current.clone();
+        ambiguous.push(parent.clone());
+        measured.collect_respawn_history(Some(&history), &ambiguous, now);
+        assert!(measured.respawn_history_for(&current[0]).is_none());
+        let mut reused_parent = current.clone();
+        reused_parent[1].start_id = StartId::from_linux("test-boot-id", 9999, 4000);
+        measured.collect_respawn_history(Some(&history), &reused_parent, now);
+        assert!(measured.respawn_history_for(&current[0]).is_none());
+        measured.collect_respawn_history(Some(&history), &current, now);
+        assert!(measured.respawn_history_for(&current[0]).is_some());
+        measured.collect_respawn_history(None, &current, now);
+        assert!(measured.respawn_history_for(&current[0]).is_none());
+    }
 
     fn sampled_idle(process: &ProcessRecord) -> ProcessActivity {
         let mut activity =
