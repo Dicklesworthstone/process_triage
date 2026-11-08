@@ -212,6 +212,41 @@ fn label_rejects_missing_verdict_and_target() {
 }
 
 #[test]
+fn command_labels_require_agreement_before_generalizing_to_an_unseen_script() {
+    let config_dir = TempDir::new().expect("config dir");
+    let data_dir = TempDir::new().expect("data dir");
+    let label = |cmd: &str, verdict: &str| {
+        pt_core(config_dir.path(), data_dir.path())
+            .args(["agent", "label", "--cmd", cmd, verdict])
+            .assert()
+            .success();
+    };
+    for _ in 0..3 {
+        label("node /srv/abandoned.js", "--kill");
+    }
+    label("node /srv/useful.js", "--spare");
+
+    let global = pt_core::config::Priors::default();
+    let learned = || {
+        pt_core::decision::decision_store::DecisionStore::load(config_dir.path())
+            .expect("load label output")
+            .learned_prior("node", "node /srv/unseen.js", &global)
+    };
+    assert!(
+        learned().is_none(),
+        "conflicting scripts must not become a broad kill habit"
+    );
+    // A revised human decision first ties the second source, then changes its
+    // direction; only the latter supplies a second concordant source.
+    label("node /srv/useful.js", "--kill");
+    assert!(learned().is_none());
+    label("node /srv/useful.js", "--kill");
+    let learned = learned().expect("two agreeing scripts can generalize");
+    assert_eq!(learned.specificity, "broad");
+    assert!((learned.effective_sample_count - 6.0).abs() < 0.01);
+}
+
+#[test]
 fn explicit_live_labels_calibrate_prior_shadow_predictions_once() {
     let config_dir = TempDir::new().expect("config dir");
     let data_dir = TempDir::new().expect("data dir");

@@ -37,12 +37,17 @@ pub const LEARNED_PRIOR_MAX: f64 = 0.95;
 pub const DECAY_HALF_LIFE_DAYS: f64 = 180.0;
 
 /// A broad pattern (the program name plus a few primary flags, so it also covers
-/// unrelated runs of the same interpreter) only sets the prior once verdicts for at
-/// least this many distinct specific patterns were counted under it: one kill of
-/// `node x.js` says nothing about `node y.js`.
+/// unrelated runs of the same interpreter) only sets the prior once at least this
+/// many distinct specific patterns support the same verdict direction. A kill of
+/// `node x.js` and a spare of `node y.js` do not establish an interpreter-wide habit.
 pub const MIN_SOURCES_FOR_GENERALIZATION: usize = 2;
 
-/// Distinct source patterns remembered per key (enough to apply the rule above).
+/// A source needs at least half an effective verdict of net support. A lone fresh
+/// verdict remains material for one half-life; ties and vanishing old votes cannot
+/// establish consensus merely because their source identifiers were remembered.
+pub const MIN_SOURCE_SUPPORT_FOR_GENERALIZATION: f64 = 0.5;
+
+/// Distinct source patterns remembered per key, without keeping a verdict history.
 const MAX_TRACKED_SOURCES: usize = 16;
 
 fn parse_ts(ts: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -77,6 +82,32 @@ pub enum Verdict {
     Spare,
 }
 
+/// Sufficient statistics for one specific pattern contributing to a broader key.
+/// Both sums are measured at the containing [`PatternCounts::updated_at`] and
+/// decay with the same half-life as that key's aggregate counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SourceWeights {
+    pub kill: f64,
+    pub spare: f64,
+}
+
+impl SourceWeights {
+    fn direction(&self, decay: f64) -> Option<Verdict> {
+        if !self.kill.is_finite() || !self.spare.is_finite() || self.kill < 0.0 || self.spare < 0.0
+        {
+            return None;
+        }
+        let support = (self.kill - self.spare) * decay;
+        if support >= MIN_SOURCE_SUPPORT_FOR_GENERALIZATION {
+            Some(Verdict::Kill)
+        } else if support <= -MIN_SOURCE_SUPPORT_FOR_GENERALIZATION {
+            Some(Verdict::Spare)
+        } else {
+            None
+        }
+    }
+}
+
 /// Counts for one pattern key.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PatternCounts {
@@ -93,10 +124,11 @@ pub struct PatternCounts {
     pub kill_weight: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spare_weight: Option<f64>,
-    /// Ids of the distinct most-specific patterns whose verdicts were counted here
-    /// (capped at `MAX_TRACKED_SOURCES`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sources: Vec<String>,
+    /// Bounded evidence per most-specific source, keyed by its stable short id.
+    /// Legacy `sources` arrays carried no verdict directions and are intentionally
+    /// not migrated into votes. Only new labels can establish their consensus.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_weights: BTreeMap<String, SourceWeights>,
 }
 
 impl PatternCounts {
@@ -111,6 +143,41 @@ impl PatternCounts {
             self.kill_weight.unwrap_or(f64::from(self.kill)) * decay,
             self.spare_weight.unwrap_or(f64::from(self.spare)) * decay,
         )
+    }
+
+    fn supports_generalization(&self, now: chrono::DateTime<chrono::Utc>, global: f64) -> bool {
+        let (kill, spare) = self.weights_at(now);
+        let Some(direction) = (SourceWeights { kill, spare }).direction(1.0) else {
+            return false;
+        };
+        // The aggregate must actually move the prior in the agreed direction.
+        // For example, a narrow spare majority can still raise a low global prior.
+        let probability = ((kill + PRIOR_STRENGTH * global) / (kill + spare + PRIOR_STRENGTH))
+            .clamp(LEARNED_PRIOR_MIN, LEARNED_PRIOR_MAX);
+        let prior_shift = probability - global;
+        if !prior_shift.is_finite()
+            || match direction {
+                Verdict::Kill => prior_shift <= 0.0,
+                Verdict::Spare => prior_shift >= 0.0,
+            }
+        {
+            return false;
+        }
+        let decay = decay_weight(self.updated_at.as_deref(), now);
+        self.source_weights
+            .values()
+            .filter(|source| source.direction(decay) == Some(direction))
+            .take(MIN_SOURCES_FOR_GENERALIZATION)
+            .count()
+            >= MIN_SOURCES_FOR_GENERALIZATION
+    }
+
+    fn bound_sources(&mut self) {
+        // Retain the lowest stable ids, so bounded merging is deterministic even
+        // when independently loaded writers save in a different order.
+        while self.source_weights.len() > MAX_TRACKED_SOURCES {
+            self.source_weights.pop_last();
+        }
     }
 }
 
@@ -138,10 +205,14 @@ pub enum DecisionStoreError {
 #[derive(Debug, Clone, Serialize)]
 pub struct LearnedPrior {
     pub pattern_key: String,
+    /// Matching pattern level: exact, standard, or broad.
+    pub specificity: &'static str,
     pub kill: u32,
     pub spare: u32,
     /// Effective weight per verdict after age decay (1.0 = all labeled just now).
     pub weight: f64,
+    /// Sum of decayed human-verdict weights, excluding the global pseudo-counts.
+    pub effective_sample_count: f64,
     /// Posterior mean P(abandoned or zombie) after combining with the global prior.
     pub abandonment_prior: f64,
 }
@@ -177,7 +248,7 @@ fn read_entries(path: &Path) -> Result<BTreeMap<String, PatternCounts>, Decision
     Ok(raw
         .into_iter()
         .map(|(k, v)| {
-            let counts = match v {
+            let mut counts = match v {
                 StoredEntry::Counts(c) => c,
                 StoredEntry::Legacy(Verdict::Kill) => PatternCounts {
                     kill: 1,
@@ -190,6 +261,7 @@ fn read_entries(path: &Path) -> Result<BTreeMap<String, PatternCounts>, Decision
                     ..Default::default()
                 },
             };
+            counts.bound_sources();
             (k, counts)
         })
         .collect())
@@ -201,6 +273,8 @@ fn add_counts(into: &mut PatternCounts, delta: &PatternCounts) {
     let into_ts = parse_ts(into.updated_at.as_deref());
     let delta_ts = parse_ts(delta.updated_at.as_deref());
     let at = into_ts.max(delta_ts);
+    let into_decay = at.map_or(1.0, |t| decay_weight(into.updated_at.as_deref(), t));
+    let delta_decay = at.map_or(1.0, |t| decay_weight(delta.updated_at.as_deref(), t));
     let (ik, is) = at.map_or_else(
         || {
             (
@@ -229,11 +303,16 @@ fn add_counts(into: &mut PatternCounts, delta: &PatternCounts) {
     if let Some(t) = at {
         into.updated_at = Some(t.to_rfc3339());
     }
-    for source in &delta.sources {
-        if into.sources.len() < MAX_TRACKED_SOURCES && !into.sources.contains(source) {
-            into.sources.push(source.clone());
-        }
+    for source in into.source_weights.values_mut() {
+        source.kill *= into_decay;
+        source.spare *= into_decay;
     }
+    for (id, source) in &delta.source_weights {
+        let merged = into.source_weights.entry(id.clone()).or_default();
+        merged.kill += source.kill * delta_decay;
+        merged.spare += source.spare * delta_decay;
+    }
+    into.bound_sources();
 }
 
 /// Exclusive advisory lock on `<store>.lock`, held until dropped.
@@ -365,7 +444,13 @@ impl DecisionStore {
             updated_at: Some(at.to_rfc3339()),
             kill_weight: None,
             spare_weight: None,
-            sources: vec![source_id(most_specific)],
+            source_weights: BTreeMap::from([(
+                source_id(most_specific),
+                SourceWeights {
+                    kill: f64::from(u32::from(verdict == Verdict::Kill)),
+                    spare: f64::from(u32::from(verdict == Verdict::Spare)),
+                },
+            )]),
         };
         for key in keys {
             add_counts(self.entries.entry(key.clone()).or_default(), &delta);
@@ -375,9 +460,9 @@ impl DecisionStore {
 
     /// Learned prior for a process: decayed counts of the most specific pattern with
     /// decisions that may speak for it, combined with the global prior (Beta-Binomial
-    /// posterior mean). Exact and standard patterns always may; a broad one only after
-    /// verdicts for `MIN_SOURCES_FOR_GENERALIZATION` distinct specific patterns were
-    /// counted under it.
+    /// posterior mean). Exact and standard patterns always may; a broad one needs
+    /// material, concordant evidence from `MIN_SOURCES_FOR_GENERALIZATION` distinct
+    /// specific patterns, agreeing with the aggregate prior's direction.
     pub fn learned_prior(
         &self,
         comm: &str,
@@ -403,8 +488,7 @@ impl DecisionStore {
                     .get(&key)
                     .filter(|c| c.total() > 0)
                     .filter(|c| {
-                        !key.starts_with("broad|")
-                            || c.sources.len() >= MIN_SOURCES_FOR_GENERALIZATION
+                        !key.starts_with("broad|") || c.supports_generalization(now, global_ab)
                     })
                     .map(|c| (key, c))
             })
@@ -413,10 +497,18 @@ impl DecisionStore {
                 let p = (kill_w + PRIOR_STRENGTH * global_ab) / (kill_w + spare_w + PRIOR_STRENGTH);
                 let p = p.clamp(LEARNED_PRIOR_MIN, LEARNED_PRIOR_MAX);
                 LearnedPrior {
+                    specificity: if key.starts_with("exact|") {
+                        "exact"
+                    } else if key.starts_with("standard|") {
+                        "standard"
+                    } else {
+                        "broad"
+                    },
                     pattern_key: key,
                     kill: c.kill,
                     spare: c.spare,
                     weight: (kill_w + spare_w) / f64::from(c.total()),
+                    effective_sample_count: kill_w + spare_w,
                     abandonment_prior: p,
                 }
             })
@@ -459,6 +551,17 @@ mod tests {
         Priors::default()
     }
 
+    fn test_time() -> chrono::DateTime<chrono::Utc> {
+        parse_ts(Some("2026-06-01T00:00:00Z")).unwrap()
+    }
+
+    fn broad_key() -> String {
+        DecisionStore::pattern_keys("node", "node /srv/unseen.js")
+            .into_iter()
+            .find(|key| key.starts_with("broad|"))
+            .unwrap()
+    }
+
     #[test]
     fn empty_and_missing_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -499,6 +602,8 @@ mod tests {
         let base = g.classes.abandoned.prior_prob + g.classes.zombie.prior_prob;
         assert!(learned.abandonment_prior > base, "kills raise the prior");
         assert_eq!((learned.kill, learned.spare), (2, 0));
+        assert_eq!(learned.specificity, "exact");
+        assert!((learned.effective_sample_count - 2.0).abs() < 1e-3);
 
         // Overrides are a valid distribution carrying the learned mass.
         let o = DecisionStore::overrides_for(&learned, &g);
@@ -540,6 +645,13 @@ mod tests {
         let store = DecisionStore::load(dir.path()).unwrap();
         let learned = store.learned_prior("node", cmd, &global()).unwrap();
         assert_eq!((learned.kill, learned.spare), (17, 1));
+        let key = DecisionStore::pattern_keys("node", cmd)
+            .into_iter()
+            .find(|key| key.starts_with("broad|"))
+            .unwrap();
+        let source = store.entries[&key].source_weights.values().next().unwrap();
+        assert!((source.kill - 17.0).abs() < 1e-3);
+        assert!((source.spare - 1.0).abs() < 1e-3);
     }
 
     #[test]
@@ -641,6 +753,251 @@ mod tests {
             learned.pattern_key.starts_with("broad|"),
             "{}",
             learned.pattern_key
+        );
+    }
+
+    #[test]
+    fn conflicting_sources_cannot_generalize_a_heavily_repeated_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        let now = test_time();
+        for _ in 0..50 {
+            store.record_at("node", "node /srv/a.js", Verdict::Kill, now);
+        }
+        store.record_at("node", "node /srv/b.js", Verdict::Spare, now);
+        assert_eq!(store.entries[&broad_key()].source_weights.len(), 2);
+        assert!(store
+            .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+            .is_none());
+        // The guard concerns broad transfer; each explicitly labeled script keeps
+        // its own verdict, including the minority spare.
+        let base = global().classes.abandoned.prior_prob + global().classes.zombie.prior_prob;
+        let killed = store
+            .learned_prior_at("node", "node /srv/a.js", &global(), now)
+            .unwrap();
+        let spared = store
+            .learned_prior_at("node", "node /srv/b.js", &global(), now)
+            .unwrap();
+        assert!(killed.abandonment_prior > base);
+        assert!(spared.abandonment_prior < base);
+        store.save().unwrap();
+        let reloaded = DecisionStore::load(dir.path()).unwrap();
+        assert!(reloaded
+            .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+            .is_none());
+    }
+
+    #[test]
+    fn broad_prior_reports_specificity_and_effective_sample_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        let now = test_time();
+        let earlier = now - chrono::Duration::days(90);
+        store.record_at("node", "node /srv/a.js", Verdict::Kill, earlier);
+        store.record_at("node", "node /srv/b.js", Verdict::Kill, earlier);
+        let learned = store
+            .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+            .expect("two agreeing sources still have material support");
+        assert_eq!(learned.specificity, "broad");
+        assert!((learned.effective_sample_count - 2.0_f64.sqrt()).abs() < 1e-12);
+        let explanation = serde_json::to_value(&learned).unwrap();
+        assert_eq!(explanation["specificity"], "broad");
+        assert_eq!(
+            explanation["effective_sample_count"].as_f64(),
+            Some(learned.effective_sample_count)
+        );
+    }
+
+    #[test]
+    fn contradictory_updates_revoke_source_agreement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        let now = test_time();
+        store.record_at("node", "node /srv/a.js", Verdict::Kill, now);
+        store.record_at("node", "node /srv/a.js", Verdict::Kill, now);
+        store.record_at("node", "node /srv/b.js", Verdict::Kill, now);
+        assert!(store
+            .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+            .is_some());
+
+        // B first becomes tied, then disagrees with A. Neither state is a second
+        // kill-supporting source, although aggregate kills still outnumber spares.
+        for _ in 0..2 {
+            store.record_at("node", "node /srv/b.js", Verdict::Spare, now);
+            assert!(store
+                .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+                .is_none());
+        }
+        store.save().unwrap();
+        let store = DecisionStore::load(dir.path()).unwrap();
+        assert!(store
+            .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+            .is_none());
+    }
+
+    #[test]
+    fn stale_source_ids_cannot_supply_a_second_material_vote() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        let earlier = test_time();
+        for cmd in ["node /srv/a.js", "node /srv/b.js"] {
+            store.record_at("node", cmd, Verdict::Kill, earlier);
+        }
+        let at_half_life = earlier + chrono::Duration::days(180);
+        assert!(store
+            .learned_prior_at("node", "node /srv/unseen.js", &global(), at_half_life)
+            .is_some());
+        let now = at_half_life + chrono::Duration::days(1);
+        assert!(store
+            .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+            .is_none());
+        for _ in 0..50 {
+            store.record_at("node", "node /srv/a.js", Verdict::Kill, now);
+        }
+        assert!(
+            store
+                .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+                .is_none(),
+            "fresh A labels must not refresh B's old vote"
+        );
+        store.record_at("node", "node /srv/b.js", Verdict::Kill, now);
+        assert!(store
+            .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+            .is_some());
+    }
+
+    #[test]
+    fn concurrent_source_merges_decay_and_reverse_in_either_save_order() {
+        let now = test_time();
+        let earlier = now - chrono::Duration::days(720);
+        let mut outcomes = Vec::new();
+        for reverse in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut old = DecisionStore::load(dir.path()).unwrap();
+            let mut recent = DecisionStore::load(dir.path()).unwrap();
+            for cmd in ["node /srv/a.js", "node /srv/b.js"] {
+                old.record_at("node", cmd, Verdict::Kill, earlier);
+                recent.record_at("node", cmd, Verdict::Spare, now);
+            }
+            if reverse {
+                recent.save().unwrap();
+                old.save().unwrap();
+            } else {
+                old.save().unwrap();
+                recent.save().unwrap();
+            }
+            let store = DecisionStore::load(dir.path()).unwrap();
+            let learned = store
+                .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+                .expect("both sources now support spare");
+            assert_eq!((learned.kill, learned.spare), (2, 2));
+            assert!((learned.effective_sample_count - 2.125).abs() < 1e-12);
+            let base = global().classes.abandoned.prior_prob + global().classes.zombie.prior_prob;
+            assert!(learned.abandonment_prior < base);
+            for source in store.entries[&broad_key()].source_weights.values() {
+                assert_eq!(
+                    *source,
+                    SourceWeights {
+                        kill: 0.0625,
+                        spare: 1.0
+                    }
+                );
+            }
+            outcomes.push(store.entries[&broad_key()].clone());
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
+
+    #[test]
+    fn legacy_ids_without_directions_do_not_establish_consensus() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = test_time();
+        let file = serde_json::json!({
+            (broad_key()): {
+                "kill": 50,
+                "spare": 1,
+                "updated_at": now.to_rfc3339(),
+                "sources": ["source-a", "source-b"]
+            }
+        });
+        std::fs::write(dir.path().join(DECISIONS_FILE), file.to_string()).unwrap();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        assert!(store
+            .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+            .is_none());
+        store.record_at("node", "node /srv/a.js", Verdict::Kill, now);
+        assert!(
+            store
+                .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+                .is_none(),
+            "one new label cannot promote unknown legacy directions"
+        );
+        store.record_at("node", "node /srv/b.js", Verdict::Kill, now);
+        assert!(
+            store
+                .learned_prior_at("node", "node /srv/unseen.js", &global(), now)
+                .is_some(),
+            "two newly observed agreeing sources can generalize"
+        );
+    }
+
+    #[test]
+    fn source_metadata_is_bounded_and_order_independent() {
+        let now = test_time();
+        let mut outcomes = Vec::new();
+        for reverse in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = DecisionStore::load(dir.path()).unwrap();
+            let mut commands: Vec<_> = (0..64)
+                .map(|index| format!("node /srv/task_{index}.js"))
+                .collect();
+            if reverse {
+                commands.reverse();
+            }
+            for cmd in commands {
+                store.record_at("node", &cmd, Verdict::Kill, now);
+            }
+            store.save().unwrap();
+            let store = DecisionStore::load(dir.path()).unwrap();
+            let broad = &store.entries[&broad_key()];
+            assert_eq!(broad.source_weights.len(), MAX_TRACKED_SOURCES);
+            assert_eq!(broad.kill, 64);
+            outcomes.push(broad.clone());
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
+
+    #[test]
+    fn broad_consensus_must_match_actual_prior_movement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        let now = test_time();
+        let mut g = global();
+        g.classes.abandoned.prior_prob = 0.15;
+        g.classes.zombie.prior_prob = 0.10;
+        for cmd in ["node /srv/a.js", "node /srv/b.js"] {
+            store.record_at("node", cmd, Verdict::Kill, now);
+            store.record_at("node", cmd, Verdict::Spare, now);
+            store.record_at("node", cmd, Verdict::Spare, now);
+        }
+        assert!(
+            store
+                .learned_prior_at("node", "node /srv/unseen.js", &g, now)
+                .is_none(),
+            "spare consensus must not raise a 25% abandonment prior"
+        );
+
+        let mut store = DecisionStore::load(dir.path()).unwrap();
+        g.classes.abandoned.prior_prob = 0.88;
+        g.classes.zombie.prior_prob = 0.10;
+        for cmd in ["node /srv/a.js", "node /srv/b.js"] {
+            store.record_at("node", cmd, Verdict::Kill, now);
+        }
+        assert!(
+            store
+                .learned_prior_at("node", "node /srv/unseen.js", &g, now)
+                .is_none(),
+            "the 95% cap must not turn kill agreement into a reduction from 98%"
         );
     }
 
