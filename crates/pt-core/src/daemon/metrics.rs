@@ -457,6 +457,7 @@ mod tests {
             process_count: 300,
             orphan_count: 5,
             pressure: None,
+            pressure_observed_at: None,
         };
         let state = super::super::DaemonState {
             started_at: "2026-01-01T00:00:00Z".to_string(),

@@ -95,6 +95,9 @@ pub struct InboxItem {
     /// on how many processes the planner can safely recommend acting on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_pressure: Option<crate::decision::mem_pressure::PressureMode>,
+    /// Confirmed system-pressure diagnoses behind a daemon review request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pressure_regimes: Vec<crate::decision::pressure_regime::Regime>,
     /// Whether the item has been acknowledged.
     pub acknowledged: bool,
     /// When the item was acknowledged.
@@ -129,6 +132,7 @@ impl InboxItem {
             summary,
             candidates: None,
             memory_pressure: None,
+            pressure_regimes: Vec::new(),
             acknowledged: false,
             acknowledged_at: None,
             review_command: None,
@@ -260,8 +264,28 @@ impl InboxStore {
 
     /// Add an item to the inbox.
     pub fn add(&self, item: &InboxItem) -> Result<(), InboxError> {
+        #[cfg(unix)]
+        let mut directories_to_sync = Vec::new();
         // Ensure parent directory exists
         if let Some(parent) = self.inbox_path.parent() {
+            #[cfg(unix)]
+            {
+                // Include the existing ancestor that will receive the first
+                // new directory entry, not just the directory holding the file.
+                let mut directory = Some(parent);
+                while let Some(path) = directory {
+                    let path = if path.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        path
+                    };
+                    directories_to_sync.push(path.to_path_buf());
+                    if path.exists() {
+                        break;
+                    }
+                    directory = path.parent();
+                }
+            }
             fs::create_dir_all(parent).map_err(|e| InboxError::Io {
                 path: parent.to_path_buf(),
                 source: e,
@@ -281,10 +305,26 @@ impl InboxStore {
                 source: e,
             })?;
 
-        writeln!(file, "{}", line).map_err(|e| InboxError::Io {
+        file.write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| InboxError::Io {
+                path: self.inbox_path.clone(),
+                source: e,
+            })?;
+        // A daemon episode is acknowledged only after its review request is
+        // stored. Surface delayed write errors before reporting delivery.
+        file.sync_all().map_err(|e| InboxError::Io {
             path: self.inbox_path.clone(),
             source: e,
         })?;
+        #[cfg(unix)]
+        for directory in directories_to_sync {
+            fs::File::open(&directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|e| InboxError::Io {
+                    path: directory,
+                    source: e,
+                })?;
+        }
 
         Ok(())
     }

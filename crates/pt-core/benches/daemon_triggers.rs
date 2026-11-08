@@ -23,6 +23,7 @@ fn tick(
         process_count: 512,
         orphan_count,
         pressure: None,
+        pressure_observed_at: None,
     }
 }
 

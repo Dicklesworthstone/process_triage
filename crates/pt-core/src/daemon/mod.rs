@@ -154,6 +154,9 @@ pub struct TickMetrics {
     /// without a reading cannot supply CPU capacity or memory-pressure recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pressure: Option<PressureSnapshot>,
+    /// Live monotonic sampling time; deliberately not restored from a saved tick.
+    #[serde(skip)]
+    pub pressure_observed_at: Option<std::time::Instant>,
 }
 
 /// A daemon event for telemetry / audit.
@@ -454,16 +457,17 @@ where
             fired.push(triggers::FiredTrigger {
                 kind: triggers::TriggerKind::MemoryPressure,
                 description: evaluation.explanation.clone(),
-                current_value: evaluation.utilization,
-                ewma_value: trigger_state.memory_ewma,
-                threshold: match evaluation.mode {
+                current_value: Some(evaluation.utilization),
+                ewma_value: Some(trigger_state.memory_ewma),
+                threshold: Some(match evaluation.mode {
                     PressureMode::Emergency => config.memory_pressure.emergency_threshold,
                     _ => config.memory_pressure.warning_threshold,
-                },
+                }),
                 sustained_ticks: u32::try_from(state.memory_pressure.sustained_samples())
                     .unwrap_or(u32::MAX),
                 provenance_context: Vec::new(),
                 memory_pressure: Some(evaluation.clone()),
+                pressure_regime: None,
             });
         }
     }
@@ -483,6 +487,7 @@ where
 
         match outcome.status {
             escalation::EscalationStatus::Completed => {
+                trigger_state.pressure.acknowledge(&fired);
                 if fired
                     .iter()
                     .any(|trigger| trigger.memory_pressure.is_some())
@@ -556,6 +561,7 @@ mod tests {
             process_count: 200,
             orphan_count: orphans,
             pressure: None,
+            pressure_observed_at: None,
         }
     }
 
@@ -931,6 +937,39 @@ mod tests {
         metrics.pressure.as_mut().unwrap().sampled_at_ms += 60_000;
     }
 
+    fn typed_pressure_metrics(
+        started_at: std::time::Instant,
+        elapsed_secs: u64,
+        cpu: (f64, u64),
+        io: (f64, u64),
+    ) -> TickMetrics {
+        use crate::collect::pressure::{LoadAvg, PsiLine, PsiResource};
+
+        let mut metrics = pressure_metrics(40, Some(0.0), 1000 + elapsed_secs);
+        metrics.pressure_observed_at =
+            Some(started_at + std::time::Duration::from_secs(elapsed_secs));
+        let psi = |(average, total_us)| PsiResource {
+            some: Some(PsiLine {
+                avg10: average,
+                avg60: average,
+                avg300: average,
+                total_us,
+            }),
+            full: None,
+        };
+        let pressure = metrics.pressure.as_mut().unwrap();
+        pressure.cpu = Some(psi(cpu));
+        pressure.io = Some(psi(io));
+        pressure.load = Some(LoadAvg {
+            one: 1.0,
+            five: 1.0,
+            fifteen: 1.0,
+            runnable: Some(1),
+            total: Some(200),
+        });
+        metrics
+    }
+
     fn load_metrics(load: f64, cpus: u32) -> TickMetrics {
         use crate::collect::pressure::LoadAvg;
 
@@ -961,8 +1000,8 @@ mod tests {
                 assert!(!config.allow_auto_mitigation);
                 assert_eq!(fired.len(), 1);
                 assert_eq!(fired[0].kind, triggers::TriggerKind::SustainedLoad);
-                assert_eq!(fired[0].current_value, 10.0);
-                assert_eq!(fired[0].threshold, 4.0);
+                assert_eq!(fired[0].current_value, Some(10.0));
+                assert_eq!(fired[0].threshold, Some(4.0));
                 assert!(fired[0].description.contains("online_cpus=2"));
                 escalation::EscalationOutcome {
                     status: escalation::EscalationStatus::Completed,
@@ -1024,6 +1063,173 @@ mod tests {
             .events
             .iter()
             .any(|event| event.event_type == DaemonEventType::LoadEvidenceUnavailable));
+    }
+
+    #[test]
+    fn typed_pressure_episodes_share_planning_and_retry_until_delivery_completes() {
+        use crate::decision::pressure_regime::{RegimeKind, Severity};
+
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        let mut triggers = triggers::TriggerState::new(&config.triggers);
+        let started_at = std::time::Instant::now();
+        let mut callbacks = 0;
+
+        for tick in 0..7 {
+            // The counters agree with the 40% CPU and 20% I/O stalls in each
+            // real one-second monotonic interval, not only the PSI averages.
+            let metrics = typed_pressure_metrics(
+                started_at,
+                tick,
+                (40.0, 1_000_000 + tick * 400_000),
+                (20.0, 1_000_000 + tick * 200_000),
+            );
+            let outcome = process_tick(
+                &config,
+                &mut state,
+                &mut triggers,
+                &metrics,
+                &mut |escalation_config, fired| {
+                    assert!(!escalation_config.allow_auto_mitigation);
+                    assert_eq!(fired.len(), 2, "both regimes use one planning call");
+                    let mut kinds = Vec::new();
+                    for trigger in fired {
+                        assert_eq!(trigger.kind, triggers::TriggerKind::PressureRegime);
+                        assert_eq!(trigger.sustained_ticks, 3);
+                        assert!(trigger.current_value.is_none());
+                        assert!(trigger.memory_pressure.is_none());
+                        let regime = trigger.pressure_regime.as_ref().unwrap();
+                        assert_eq!(regime.severity, Severity::Crit);
+                        kinds.push(regime.kind);
+                    }
+                    kinds.sort();
+                    assert_eq!(kinds, [RegimeKind::CpuContention, RegimeKind::IoBound]);
+                    let status = match callbacks {
+                        0 => escalation::EscalationStatus::Deferred,
+                        1 => escalation::EscalationStatus::Failed,
+                        2 => escalation::EscalationStatus::Completed,
+                        _ => panic!("a delivered active episode must not create another plan"),
+                    };
+                    callbacks += 1;
+                    escalation::EscalationOutcome {
+                        status,
+                        reason: format!("review-plan delivery attempt {callbacks}"),
+                        session_id: (status == escalation::EscalationStatus::Completed)
+                            .then(|| "typed-pressure-review".to_string()),
+                        provenance_summary: None,
+                    }
+                },
+            );
+
+            match tick {
+                0 | 1 => {
+                    assert!(outcome.triggers_fired.is_empty());
+                    assert!(outcome.escalation.is_none());
+                    assert!(triggers.pressure.pending.is_empty());
+                }
+                2 | 3 => {
+                    let expected = if tick == 2 {
+                        escalation::EscalationStatus::Deferred
+                    } else {
+                        escalation::EscalationStatus::Failed
+                    };
+                    assert_eq!(outcome.escalation.as_ref().unwrap().status, expected);
+                    assert_eq!(triggers.pressure.pending.len(), 2);
+                    assert_eq!(state.escalation_count, 0);
+                }
+                4 => {
+                    assert_eq!(
+                        outcome.escalation.as_ref().unwrap().status,
+                        escalation::EscalationStatus::Completed
+                    );
+                    assert!(triggers.pressure.pending.is_empty());
+                    assert_eq!(state.escalation_count, 1);
+                }
+                _ => {
+                    assert!(outcome.triggers_fired.is_empty());
+                    assert!(outcome.escalation.is_none());
+                    assert!(triggers.pressure.pending.is_empty());
+                    assert_eq!(triggers.pressure.active.len(), 2);
+                }
+            }
+        }
+        assert_eq!(callbacks, 3);
+        assert_eq!(state.deferred_count, 1);
+        assert_eq!(state.escalation_count, 1);
+    }
+
+    #[test]
+    fn typed_pressure_requires_fresh_confirmation_and_observed_recovery_between_plans() {
+        use crate::decision::pressure_regime::RegimeKind;
+
+        let config = DaemonConfig::default();
+        let mut state = DaemonState::new();
+        let mut triggers = triggers::TriggerState::new(&config.triggers);
+        let started_at = std::time::Instant::now();
+        let readings = [
+            Some(40),
+            Some(40),
+            None,
+            Some(40),
+            Some(40),
+            Some(40),
+            Some(0),
+            Some(0),
+            None,
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(40),
+            Some(40),
+            Some(40),
+        ];
+        let mut cpu_total_us = 1_000_000;
+        let mut planned_ticks = Vec::new();
+        for (tick, reading) in readings.into_iter().enumerate() {
+            cpu_total_us += reading.unwrap_or(0) * 10_000;
+            let mut metrics = typed_pressure_metrics(
+                started_at,
+                tick as u64,
+                (reading.unwrap_or(0) as f64, cpu_total_us),
+                (0.0, 1_000_000),
+            );
+            if reading.is_none() {
+                metrics.pressure = None;
+            }
+            let outcome = process_tick(
+                &config,
+                &mut state,
+                &mut triggers,
+                &metrics,
+                &mut |escalation_config, fired| {
+                    assert!(!escalation_config.allow_auto_mitigation);
+                    assert_eq!(fired.len(), 1);
+                    assert_eq!(fired[0].kind, triggers::TriggerKind::PressureRegime);
+                    assert_eq!(
+                        fired[0].pressure_regime.as_ref().unwrap().kind,
+                        RegimeKind::CpuContention
+                    );
+                    planned_ticks.push(tick);
+                    escalation::EscalationOutcome {
+                        status: escalation::EscalationStatus::Completed,
+                        reason: "review plan delivered".to_string(),
+                        session_id: Some(format!("pressure-episode-{tick}")),
+                        provenance_summary: None,
+                    }
+                },
+            );
+            assert_eq!(outcome.escalation.is_some(), matches!(tick, 5 | 14));
+            assert_eq!(
+                triggers
+                    .pressure
+                    .active
+                    .contains_key(&RegimeKind::CpuContention),
+                matches!(tick, 5..=10 | 14),
+                "missing data must interrupt confirmation and recovery at tick {tick}"
+            );
+        }
+        assert_eq!(planned_ticks, [5, 14]);
+        assert_eq!(state.escalation_count, 2);
     }
 
     #[test]

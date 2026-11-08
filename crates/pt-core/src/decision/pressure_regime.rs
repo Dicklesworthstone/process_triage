@@ -445,16 +445,83 @@ pub fn assess(
     }
 }
 
+/// Whether a PSI average is usable evidence, including a genuine observed zero.
+pub fn psi_evidence_available(resource: Option<crate::collect::pressure::PsiResource>) -> bool {
+    resource
+        .and_then(|resource| resource.some)
+        .is_some_and(|line| {
+            [line.avg10, line.avg60, line.avg300]
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=100.0).contains(value))
+        })
+}
+
+/// A missing source cannot establish that a previously observed regime cleared.
+/// CPU callers retain which sources supported their pending or active episode.
+pub fn regime_evidence_available(
+    kind: RegimeKind,
+    snapshot: &PressureSnapshot,
+    window: Option<&PressureWindow>,
+    census: Option<&ProcessCensus>,
+    cpu_psi_required: bool,
+    cpu_load_required: bool,
+) -> bool {
+    let memory = snapshot.meminfo.is_some_and(|memory| {
+        memory
+            .total
+            .zip(memory.available)
+            .is_some_and(|(total, available)| total > 0 && available <= total)
+    });
+    let swap = snapshot.meminfo.is_some_and(|memory| {
+        memory
+            .swap_total
+            .zip(memory.swap_free)
+            .is_some_and(|(total, free)| free <= total)
+    });
+    match kind {
+        RegimeKind::CpuContention => {
+            let psi = psi_evidence_available(snapshot.cpu);
+            let load = snapshot
+                .load_ratio()
+                .is_some_and(|ratio| ratio.is_finite() && ratio >= 0.0);
+            (psi || (snapshot.cpu.and_then(|resource| resource.some).is_none() && load))
+                && (!cpu_psi_required || psi)
+                && (!cpu_load_required || load)
+        }
+        RegimeKind::IoBound => psi_evidence_available(snapshot.io),
+        RegimeKind::MemoryExhaustion | RegimeKind::CacheBloat => {
+            psi_evidence_available(snapshot.memory) && memory
+        }
+        RegimeKind::SwapThrash => window.is_some_and(|window| {
+            window
+                .swap_in_per_s
+                .zip(window.swap_out_per_s)
+                .is_some_and(|(input, output)| {
+                    input.is_finite() && input >= 0.0 && output.is_finite() && output >= 0.0
+                })
+        }),
+        RegimeKind::SwapParadox => memory && swap,
+        RegimeKind::SwapExhaustion => swap,
+        RegimeKind::OomKills => window.and_then(|window| window.oom_kills).is_some(),
+        RegimeKind::FdExhaustion => snapshot
+            .file_handles
+            .and_then(|handles| handles.used_fraction())
+            .is_some_and(|fraction| fraction.is_finite()),
+        RegimeKind::ZombieLeak => census.is_some(),
+        RegimeKind::DstateStorm => census.is_some() && snapshot.cpus > 0,
+    }
+}
+
 /// Hysteresis for repeated assessments: a regime is reported only after it was seen in
 /// `enter_after` consecutive samples, and stays until it was absent for `exit_after`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegimeTracker {
     enter_after: u32,
     exit_after: u32,
     state: std::collections::BTreeMap<RegimeKind, TrackedRegime>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct TrackedRegime {
     /// Consecutive samples it was seen in / missing from.
     seen: u32,

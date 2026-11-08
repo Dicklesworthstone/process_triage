@@ -876,14 +876,24 @@ The daemon polls every 60 seconds by default, increasing to 30 seconds under a m
 
 | Trigger | Default Threshold | Sustained Window |
 |---------|------------------|------------------|
-| Load average per observed online CPU | > 2.0 | 3 consecutive observed ticks |
+| CPU pressure | PSI ≥ 10% warning / ≥ 30% critical | 3 consecutive observed ticks |
+| I/O pressure | PSI ≥ 5% warning / ≥ 15% critical | 3 consecutive observed ticks |
+| Memory exhaustion / cache pressure | PSI ≥ 5% / ≥ 20%, classified using observed available RAM | 3 consecutive observed ticks |
+| Swap thrashing | ≥ 1,000 / ≥ 10,000 pages moved per second | 3 consecutive observed counter intervals |
+| Swap or file-handle exhaustion | ≥ 80% / ≥ 95% of observed capacity | 3 consecutive observed ticks |
+| Kernel OOM incident | Positive observed OOM-counter increment | One valid counter interval |
+| Load average per observed online CPU (fallback without usable CPU PSI) | > 2.0 | 3 consecutive observed ticks |
 | Orphan count | > 20 | 3 consecutive ticks |
 | Memory utilization | > 85% used | 3 consecutive ticks |
 | Graded memory / PSI pressure | ≥ 80% used or memory PSI ≥ 20%; emergency at ≥ 95% used or PSI ≥ 60% | 2 consecutive observed readings |
 
-When a trigger fires, the daemon requests `agent plan` and posts the result to the inbox (`pt-core agent inbox`) and as a desktop notification. Every request still respects the global action lock and the escalation cooldown (300 seconds by default). A deferred memory warning is retried while pressure persists. It never acts on its own.
+When a trigger fires, the daemon requests the normal pressure-conditioned `agent plan` and posts the result to the inbox (`pt-core agent inbox`) and as a desktop notification. Simultaneous pressure diagnoses share one planning request. Every request still respects the global action lock and the escalation cooldown (300 seconds by default). Deferred or failed pressure requests remain pending; a pressure episode is acknowledged only after its review request is stored and readable. It never acts on its own.
 
-The load trigger uses the load and CPU count observed in the same pressure reading. A load of 10 exceeds the default threshold on a 2-CPU machine but stays below it on a 64-CPU machine. Missing or invalid load/capacity readings interrupt the sustained window and record an unavailable-evidence reason; they never substitute one CPU or a zero load. Notifications include the observed CPU count and effective threshold.
+Pressure diagnoses retain their kind and severity in the inbox, including when no safe action candidates exist. A delivered warning can escalate to critical once; a deferred critical upgrade is sent only while fresh evidence still supports it. Three consecutive observed recovery readings end an episode. Missing sensors and daemon restarts interrupt confirmation and recovery streaks without declaring recovery. OOM counter increments remain known incidents until delivery, even if the next sensor read fails. Counter resets never become new OOM incidents or evidence of swap recovery.
+
+The native `triggers.pressure_regimes` configuration controls `enabled`, `minimum_severity` (`warn` by default), `exit_after_ticks` (default `3`), and `thresholds` using the pressure classifier's warn/critical bands. `triggers.sustained_ticks` controls episode entry. CPU/I/O rates use live monotonic sampling intervals when valid counters are available; serialized ticks cannot manufacture a live interval. `daemon status` includes the confirmed episodes, pending diagnoses, latest assessment and unavailable-evidence reason. Swap paradox diagnosis is also supported; process-census-only diagnoses are not inferred from missing census data.
+
+Without usable CPU PSI, the load fallback uses load and CPU count observed in the same pressure reading. A load of 10 exceeds its default threshold on a 2-CPU machine but stays below it on a 64-CPU machine. With CPU PSI, high load alongside quiet CPU and high I/O pressure is diagnosed as I/O pressure. Missing or invalid load/capacity readings interrupt the sustained window and record an unavailable-evidence reason; they never substitute one CPU or a zero load. Load notifications include the observed CPU count and effective threshold.
 
 In native `daemon.json` configuration, `triggers.load_per_cpu_threshold` sets the ratio (default `2.0`). An explicitly configured `triggers.load_threshold` keeps its existing **absolute** meaning and takes precedence; omit it or set it to `null` to use the ratio. The older `triggers.sustained_load.threshold_multiplier` setting also uses the observed CPU count on each tick.
 

@@ -209,6 +209,7 @@ mod metric_values {
             process_count: 450,
             orphan_count: 12,
             pressure: None,
+            pressure_observed_at: None,
         };
         let state = DaemonState {
             started_at: "2026-01-15T00:00:00Z".to_string(),
@@ -304,6 +305,7 @@ mod metric_values {
             process_count: 100,
             orphan_count: 0,
             pressure: None,
+            pressure_observed_at: None,
         };
         let state = DaemonState::new();
         metrics.update_from_tick(&tick, &state);

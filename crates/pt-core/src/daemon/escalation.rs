@@ -225,12 +225,13 @@ mod tests {
         FiredTrigger {
             kind,
             description: format!("{:?} fired", kind),
-            current_value: 10.0,
-            ewma_value: 8.0,
-            threshold: 4.0,
+            current_value: Some(10.0),
+            ewma_value: Some(8.0),
+            threshold: Some(4.0),
             sustained_ticks: 3,
             provenance_context: Vec::new(),
             memory_pressure: None,
+            pressure_regime: None,
         }
     }
 

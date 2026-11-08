@@ -28,8 +28,9 @@ use pt_core::config::{
     get_preset, list_presets, load_config, ConfigError, ConfigOptions, PresetName, Priors,
 };
 use pt_core::decision::pressure_regime::{
-    assess as assess_pressure, PressureThresholds, ProcessCensus, RegimeKind, RegimeTracker,
-    Severity as PressureSeverity,
+    assess as assess_pressure, psi_evidence_available as watch_psi_available,
+    regime_evidence_available as watch_regime_evidence_available, PressureThresholds,
+    ProcessCensus, RegimeKind, RegimeTracker, Severity as PressureSeverity,
 };
 use pt_core::events::{
     FanoutEmitter, JsonlWriter, Phase, ProgressEmitter, ProgressEvent, SessionEmitter,
@@ -12608,6 +12609,9 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
             daemon_state.tick_count += 1;
             daemon_state.last_tick_at = Some(metrics.timestamp.clone());
             daemon_state.observe_memory_pressure(&config, &metrics);
+            // Keep cheap pressure evidence and pending episodes while deferring
+            // expensive planning under the daemon's own overhead budget.
+            trigger_state.pressure.observe(&config.triggers, &metrics);
             daemon_state.record_event(
                 pt_core::daemon::DaemonEventType::TickCompleted,
                 "tick (budget exceeded)",
@@ -12658,34 +12662,33 @@ fn run_daemon_foreground(global: &GlobalOpts, config: &pt_core::daemon::DaemonCo
                         outcome.status,
                         pt_core::daemon::escalation::EscalationStatus::Completed
                     ) {
-                        let summary = pt_core::daemon::escalation::build_inbox_summary(fired);
                         match run_daemon_escalation(global, fired, esc_config) {
                             Ok(result) => {
                                 outcome.session_id = Some(result.session_id.clone());
-                                if let Some(store) = escalation_inbox.as_mut() {
-                                    let mut item = InboxItem::dormant_escalation(
-                                        result.session_id,
-                                        summary.clone(),
-                                        summary,
-                                        result.candidates_found,
-                                    );
-                                    item.memory_pressure = fired
-                                        .iter()
-                                        .find_map(|trigger| trigger.memory_pressure.as_ref())
-                                        .map(|pressure| pressure.mode);
-                                    let _ = store.add(&item);
-                                    // Emit L1 notification immediately for new inbox item.
-                                    if config.notifications.enabled {
-                                        daemon_submit_inbox_item_trigger(
-                                            &config,
-                                            &mut notify_mgr,
-                                            &item,
-                                            now_secs,
-                                        );
-                                        let notifs = notify_mgr.flush(now_secs);
-                                        for n in notifs {
-                                            daemon_deliver_notification(&config, &n);
+                                match persist_daemon_review_request(
+                                    escalation_inbox.as_ref(),
+                                    &result,
+                                    fired,
+                                ) {
+                                    Ok(item) => {
+                                        // Emit L1 notification immediately for new inbox item.
+                                        if config.notifications.enabled {
+                                            daemon_submit_inbox_item_trigger(
+                                                &config,
+                                                &mut notify_mgr,
+                                                &item,
+                                                now_secs,
+                                            );
+                                            let notifs = notify_mgr.flush(now_secs);
+                                            for n in notifs {
+                                                daemon_deliver_notification(&config, &n);
+                                            }
                                         }
+                                    }
+                                    Err(error) => {
+                                        outcome.status =
+                                            pt_core::daemon::escalation::EscalationStatus::Failed;
+                                        outcome.reason = error;
                                     }
                                 }
                             }
@@ -12766,6 +12769,52 @@ fn inbox_item_dedupe_key(item: &pt_core::inbox::InboxItem) -> String {
 }
 
 #[cfg(feature = "daemon")]
+fn persist_daemon_review_request(
+    store: Option<&pt_core::inbox::InboxStore>,
+    result: &DaemonEscalationResult,
+    fired: &[pt_core::daemon::triggers::FiredTrigger],
+) -> Result<pt_core::inbox::InboxItem, String> {
+    let store = store.ok_or("review plan created but durable inbox is unavailable")?;
+    // Preserve a corrupt ledger for diagnosis instead of appending an unreadable
+    // request and acknowledging an alert the user cannot retrieve.
+    store.list().map_err(|error| {
+        format!("review plan created but existing inbox is unreadable: {error}")
+    })?;
+    let summary = pt_core::daemon::escalation::build_inbox_summary(fired);
+    let mut item = pt_core::inbox::InboxItem::dormant_escalation(
+        result.session_id.clone(),
+        summary.clone(),
+        summary,
+        result.candidates_found,
+    );
+    item.memory_pressure = fired
+        .iter()
+        .find_map(|trigger| trigger.memory_pressure.as_ref())
+        .map(|pressure| pressure.mode);
+    item.pressure_regimes = fired
+        .iter()
+        .filter_map(|trigger| trigger.pressure_regime.clone())
+        .collect();
+    store.add(&item).map_err(|error| {
+        format!("review plan created but durable inbox delivery failed: {error}")
+    })?;
+    let saved = store
+        .list()
+        .map_err(|error| format!("review plan created but inbox read-back failed: {error}"))?;
+    if saved.iter().any(|saved| {
+        saved.id == item.id
+            && saved.session_id == item.session_id
+            && saved.pressure_regimes == item.pressure_regimes
+            && saved.memory_pressure == item.memory_pressure
+            && saved.candidates == item.candidates
+    }) {
+        Ok(item)
+    } else {
+        Err("review plan created but its inbox request was not retained".into())
+    }
+}
+
+#[cfg(feature = "daemon")]
 fn daemon_submit_inbox_item_trigger(
     config: &pt_core::daemon::DaemonConfig,
     notify_mgr: &mut pt_core::decision::escalation::EscalationManager,
@@ -12792,20 +12841,28 @@ fn daemon_submit_inbox_item_trigger(
     };
 
     let candidates = item.candidates.unwrap_or(0);
-    let severity =
-        if item.memory_pressure == Some(pt_core::decision::mem_pressure::PressureMode::Emergency) {
-            Severity::Critical
-        } else if item.item_type == InboxItemType::LockContention {
-            Severity::Warning
-        } else if candidates >= 10 {
-            Severity::Critical
-        } else if candidates >= 1
-            || item.memory_pressure == Some(pt_core::decision::mem_pressure::PressureMode::Warning)
-        {
-            Severity::Warning
-        } else {
-            Severity::Info
-        };
+    let pressure_severity = item
+        .pressure_regimes
+        .iter()
+        .map(|regime| regime.severity)
+        .max();
+    let severity = if item.memory_pressure
+        == Some(pt_core::decision::mem_pressure::PressureMode::Emergency)
+        || pressure_severity == Some(PressureSeverity::Crit)
+    {
+        Severity::Critical
+    } else if item.item_type == InboxItemType::LockContention {
+        Severity::Warning
+    } else if candidates >= 10 {
+        Severity::Critical
+    } else if candidates >= 1
+        || item.memory_pressure == Some(pt_core::decision::mem_pressure::PressureMode::Warning)
+        || pressure_severity == Some(PressureSeverity::Warn)
+    {
+        Severity::Warning
+    } else {
+        Severity::Info
+    };
 
     let summary = match (&item.review_command, &item.trigger) {
         (Some(cmd), Some(trig)) => format!("{} ({})\nReview: {}", item.summary, trig, cmd),
@@ -12818,11 +12875,19 @@ fn daemon_submit_inbox_item_trigger(
         dedupe_key: key,
         trigger_type: if item.memory_pressure.is_some() {
             TriggerType::MemoryPressure
+        } else if item
+            .pressure_regimes
+            .iter()
+            .any(|regime| regime.kind == RegimeKind::CpuContention)
+        {
+            TriggerType::CpuPressure
+        } else if !item.pressure_regimes.is_empty() {
+            TriggerType::ThresholdExceeded
         } else {
             TriggerType::HighRiskCandidates
         },
         severity,
-        confidence: if item.memory_pressure.is_some() {
+        confidence: if item.memory_pressure.is_some() || !item.pressure_regimes.is_empty() {
             None
         } else {
             Some(0.95)
@@ -13201,6 +13266,12 @@ fn run_daemon_status(global: &GlobalOpts) -> ExitCode {
                 println!("Daemon not running.");
             }
             if let Some(state) = &state {
+                for (kind, severity) in &state.triggers.pressure.active {
+                    println!("Confirmed pressure: {kind:?} ({severity:?}).");
+                }
+                if let Some(reason) = &state.triggers.pressure.unavailable_reason {
+                    println!("Pressure evidence: {reason}.");
+                }
                 if state.daemon.overhead_backoff.interval_secs > 0 {
                     println!(
                         "Overhead backoff: {}s between ticks; {}/{} healthy ticks toward recovery.",
@@ -14651,6 +14722,7 @@ fn load_daemon_state(path: &Path, config: &pt_core::daemon::DaemonConfig) -> Dae
             state.daemon.memory_pressure.observe(None);
             state.daemon.last_memory_pressure = None;
             state.daemon.interrupt_overhead_recovery();
+            state.triggers.pressure.interrupt_observations();
             return state;
         }
     }
@@ -14771,8 +14843,12 @@ fn run_daemon_plan(
 
 #[cfg(feature = "daemon")]
 fn collect_daemon_metrics() -> pt_core::daemon::TickMetrics {
+    let observed_at = std::time::Instant::now();
     let pressure = pt_core::collect::pressure::read_pressure_snapshot();
-    daemon_metrics_from_pressure(pressure, collect_process_count(), collect_orphan_count())
+    let mut metrics =
+        daemon_metrics_from_pressure(pressure, collect_process_count(), collect_orphan_count());
+    metrics.pressure_observed_at = Some(observed_at);
+    metrics
 }
 
 #[cfg(feature = "daemon")]
@@ -14808,6 +14884,7 @@ fn daemon_metrics_from_pressure(
         // Legacy scalar gauges retain their previous zero fallback. The pressure
         // state machine consumes this observed snapshot and never those fallbacks.
         pressure: Some(pressure),
+        pressure_observed_at: None,
     }
 }
 
@@ -14816,6 +14893,106 @@ mod daemon_pressure_tests {
     use super::*;
     use pt_core::daemon::{process_tick, DaemonConfig, DaemonState};
     use pt_core::decision::mem_pressure::{MemorySignals, PressureMode};
+
+    fn critical_io_trigger() -> pt_core::daemon::triggers::FiredTrigger {
+        pt_core::daemon::triggers::FiredTrigger {
+            kind: pt_core::daemon::triggers::TriggerKind::PressureRegime,
+            description: "I/O pressure requires review; no safe action candidates".into(),
+            current_value: None,
+            ewma_value: None,
+            threshold: None,
+            sustained_ticks: 3,
+            provenance_context: Vec::new(),
+            memory_pressure: None,
+            pressure_regime: Some(pt_core::decision::pressure_regime::Regime {
+                kind: RegimeKind::IoBound,
+                severity: PressureSeverity::Crit,
+                sustained: true,
+                explanation: "I/O pressure requires review; no safe action candidates".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn pressure_review_is_persisted_and_critical_even_without_candidates() {
+        use pt_core::decision::escalation::{EscalationManager, Severity};
+        let directory = tempfile::tempdir().unwrap();
+        let store = pt_core::inbox::InboxStore::from_data_dir(directory.path());
+        let result = DaemonEscalationResult {
+            session_id: "io-review-plan".into(),
+            candidates_found: 0,
+        };
+        let trigger = critical_io_trigger();
+        let item =
+            persist_daemon_review_request(Some(&store), &result, &[trigger.clone()]).unwrap();
+        let persisted = store.list().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].id, item.id);
+        assert_eq!(
+            persisted[0].pressure_regimes,
+            vec![trigger.pressure_regime.unwrap()]
+        );
+        assert_eq!(persisted[0].candidates, Some(0));
+        assert!(persisted[0]
+            .review_command
+            .as_ref()
+            .unwrap()
+            .contains("io-review-plan"));
+        let config = DaemonConfig::default();
+        let mut manager = EscalationManager::new(config.notification_ladder.clone());
+        let now = daemon_now_secs();
+        daemon_submit_inbox_item_trigger(&config, &mut manager, &persisted[0], now);
+        let notifications = manager.flush(now);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].severity, Severity::Critical);
+        assert_eq!(
+            notifications[0].session_id.as_deref(),
+            Some("io-review-plan")
+        );
+        assert!(notifications[0].body.contains("no safe action candidates"));
+    }
+
+    #[test]
+    fn pressure_review_delivery_reports_missing_and_unwritable_inbox() {
+        let result = DaemonEscalationResult {
+            session_id: "io-review-plan".into(),
+            candidates_found: 0,
+        };
+        let triggers = [critical_io_trigger()];
+        assert!(persist_daemon_review_request(None, &result, &triggers)
+            .unwrap_err()
+            .contains("inbox is unavailable"));
+        let directory = tempfile::tempdir().unwrap();
+        let blocked_path = directory.path().join("not-a-directory");
+        std::fs::write(&blocked_path, "owned test fixture").unwrap();
+        let store = pt_core::inbox::InboxStore::from_data_dir(&blocked_path);
+        assert!(
+            persist_daemon_review_request(Some(&store), &result, &triggers)
+                .unwrap_err()
+                .contains("delivery failed")
+        );
+    }
+
+    #[test]
+    fn pressure_review_delivery_preserves_and_refuses_a_corrupt_inbox() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = pt_core::inbox::InboxStore::from_data_dir(directory.path());
+        let result = DaemonEscalationResult {
+            session_id: "io-review-plan".into(),
+            candidates_found: 0,
+        };
+        let inbox_directory = directory.path().join("inbox");
+        std::fs::create_dir_all(&inbox_directory).unwrap();
+        let ledger = inbox_directory.join("items.jsonl");
+        let original = b"{\"id\":\"interrupted-record\"";
+        std::fs::write(&ledger, original).unwrap();
+        assert!(
+            persist_daemon_review_request(Some(&store), &result, &[critical_io_trigger()])
+                .unwrap_err()
+                .contains("existing inbox is unreadable")
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), original);
+    }
 
     #[test]
     fn recorded_linux_pressure_drives_daemon_planning() {
@@ -15084,6 +15261,7 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
         sustained_load: Option<DaemonLoadTrigger>,
         memory_pressure: Option<DaemonMemoryTrigger>,
         orphan_spike: Option<DaemonOrphanTrigger>,
+        pressure_regimes: Option<pt_core::daemon::triggers::PressureRegimeConfig>,
     }
 
     #[derive(Deserialize)]
@@ -15139,6 +15317,9 @@ fn load_daemon_config(global: &GlobalOpts) -> (pt_core::daemon::DaemonConfig, bo
             }
         }
         if let Some(triggers) = file_cfg.triggers {
+            if let Some(regimes) = triggers.pressure_regimes {
+                config.triggers.pressure_regimes = regimes;
+            }
             if let Some(load) = triggers.sustained_load {
                 if let Some(multiplier) = load.threshold_multiplier {
                     config.triggers.load_per_cpu_threshold = multiplier;
@@ -30451,71 +30632,6 @@ impl WatchPressureState {
         }
         self.active = active;
         events
-    }
-}
-
-fn watch_psi_available(resource: Option<pt_core::collect::pressure::PsiResource>) -> bool {
-    resource
-        .and_then(|resource| resource.some)
-        .is_some_and(|line| {
-            [line.avg10, line.avg60, line.avg300]
-                .iter()
-                .all(|value| value.is_finite() && (0.0..=100.0).contains(value))
-        })
-}
-
-fn watch_regime_evidence_available(
-    kind: RegimeKind,
-    snapshot: &PressureSnapshot,
-    window: Option<&PressureWindow>,
-    census: Option<&ProcessCensus>,
-    cpu_psi_required: bool,
-    cpu_load_required: bool,
-) -> bool {
-    let memory = snapshot.meminfo.is_some_and(|memory| {
-        memory
-            .total
-            .zip(memory.available)
-            .is_some_and(|(total, available)| total > 0 && available <= total)
-    });
-    let swap = snapshot.meminfo.is_some_and(|memory| {
-        memory
-            .swap_total
-            .zip(memory.swap_free)
-            .is_some_and(|(total, free)| free <= total)
-    });
-    match kind {
-        RegimeKind::CpuContention => {
-            let psi = watch_psi_available(snapshot.cpu);
-            let load = snapshot
-                .load_ratio()
-                .is_some_and(|ratio| ratio.is_finite() && ratio >= 0.0);
-            (psi || (snapshot.cpu.and_then(|resource| resource.some).is_none() && load))
-                && (!cpu_psi_required || psi)
-                && (!cpu_load_required || load)
-        }
-        RegimeKind::IoBound => watch_psi_available(snapshot.io),
-        // Without available-memory data the two diagnoses cannot be distinguished.
-        RegimeKind::MemoryExhaustion | RegimeKind::CacheBloat => {
-            watch_psi_available(snapshot.memory) && memory
-        }
-        RegimeKind::SwapThrash => window.is_some_and(|window| {
-            window
-                .swap_in_per_s
-                .zip(window.swap_out_per_s)
-                .is_some_and(|(input, output)| {
-                    input.is_finite() && input >= 0.0 && output.is_finite() && output >= 0.0
-                })
-        }),
-        RegimeKind::SwapParadox => memory && swap,
-        RegimeKind::SwapExhaustion => swap,
-        RegimeKind::OomKills => window.and_then(|window| window.oom_kills).is_some(),
-        RegimeKind::FdExhaustion => snapshot
-            .file_handles
-            .and_then(|handles| handles.used_fraction())
-            .is_some_and(|fraction| fraction.is_finite()),
-        RegimeKind::ZombieLeak => census.is_some(),
-        RegimeKind::DstateStorm => census.is_some() && snapshot.cpus > 0,
     }
 }
 
